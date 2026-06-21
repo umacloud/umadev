@@ -683,6 +683,115 @@ impl<R: Runtime> AgentRunner<R> {
         }
     }
 
+    /// Self-evolution memory upkeep at delivery, the BASE-driven half of the
+    /// learning loop (the template/no-base halves already ran inside
+    /// `run_delivery`). Two passes, both fail-open and both skipped when offline:
+    ///
+    /// 1. **Memory reconcile** — ask the base, per fresh lesson vs. its most
+    ///    similar priors, whether it ADD/UPDATE/INVALIDATE/NOOPs, then re-sediment
+    ///    with that decision map so the lesson corpus is curated instead of
+    ///    purely appended. With no base this never runs, leaving the pure-append
+    ///    behaviour intact.
+    /// 2. **Skill cards** — replace the deterministic template description on each
+    ///    freshly-graduated skill with a base-written ≤6-sentence reusable card.
+    ///
+    /// Driven entirely through the existing `try_generate` host-driver seam — no
+    /// new model endpoint. Bounded (a small cap on base calls) so a huge corpus
+    /// can't explode delivery latency.
+    async fn evolve_memory_at_delivery(&self) {
+        if self.runtime.is_offline() {
+            return;
+        }
+        let root = &self.options.project_root;
+
+        // ---- Pass 1: base-judged memory reconcile -------------------------
+        // Cap the number of fresh lessons we spend a base call on, so a large
+        // corpus stays cheap. Newest candidates first (reconcile_candidates is
+        // already newest-first).
+        const MAX_RECONCILE_CALLS: usize = 8;
+        let candidates = crate::lessons::reconcile_candidates(root);
+        if !candidates.is_empty() {
+            // Decision map keyed by the fresh lesson's identity triple.
+            let mut decisions: std::collections::HashMap<
+                (String, String, String),
+                crate::lessons::ReconcileDecision,
+            > = std::collections::HashMap::new();
+            for (fresh, similar) in candidates.iter().take(MAX_RECONCILE_CALLS) {
+                let (system, user) = crate::lessons::reconcile_prompt(fresh, similar);
+                if let Some(reply) = self
+                    .try_generate(Phase::Delivery, Prompt { system, user })
+                    .await
+                    .filter(|t| !t.trim().is_empty())
+                {
+                    let id = (
+                        fresh.domain.clone(),
+                        fresh.title.clone(),
+                        fresh.first_seen.clone(),
+                    );
+                    decisions.insert(id, crate::lessons::parse_reconcile_decision(&reply));
+                }
+            }
+            if !decisions.is_empty() {
+                let judge = move |fresh: &crate::lessons::Lesson,
+                                  _similar: &[crate::lessons::Lesson]| {
+                    let id = (
+                        fresh.domain.clone(),
+                        fresh.title.clone(),
+                        fresh.first_seen.clone(),
+                    );
+                    decisions
+                        .get(&id)
+                        .copied()
+                        .unwrap_or(crate::lessons::ReconcileDecision::Noop)
+                };
+                let _ = crate::lessons::sediment_lessons_with_judge(root, Some(&judge));
+                self.emit(EngineEvent::Note(
+                    "[learned] 记忆整理：让底座对相似旧教训做了 ADD/UPDATE/INVALIDATE 判定，已合并并淘汰过期条目。"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // ---- Pass 2: base-written reusable skill cards --------------------
+        // The freshly-graduated skills carry a template description; upgrade the
+        // ones produced this run with a base-written reusable card. Bounded.
+        const MAX_SKILL_CARDS: usize = 6;
+        let skills = crate::skills::read_skills(root);
+        let mut carded = 0usize;
+        for s in skills.iter().take(MAX_SKILL_CARDS) {
+            let (system, user) = crate::skills::skill_description_prompt(
+                &s.title,
+                &s.content,
+                &s.source_requirement,
+            );
+            if let Some(card) = self
+                .try_generate(Phase::Delivery, Prompt { system, user })
+                .await
+                .filter(|t| !t.trim().is_empty())
+            {
+                // Re-graduate with the base card (gate already passed + multi-step
+                // this run, so the gate re-admits and refreshes the description).
+                if crate::skills::graduate_skill(
+                    root,
+                    &s.title,
+                    &s.content,
+                    &card,
+                    &s.domain,
+                    &s.keywords,
+                    &s.source_requirement,
+                    true,
+                ) {
+                    carded += 1;
+                }
+            }
+        }
+        if carded > 0 {
+            self.emit(EngineEvent::Note(format!(
+                "[learned] 技能库：让底座为 {carded} 条已毕业技能生成了可复用的解法卡片。"
+            )));
+        }
+    }
+
     /// Initialise the workspace for a new run.
     pub fn start(&self) -> std::io::Result<WorkflowState> {
         let state = WorkflowState {
@@ -1878,6 +1987,21 @@ impl<R: Runtime> AgentRunner<R> {
                 &self.options.requirement,
             ),
         );
+        // Success-compounding: reusable SKILLS that already cleared the gate on a
+        // similar problem. Retrieved by the SOLUTION IDEA (the requirement) via the
+        // curated BM25/vector path, only for the build phases that can reuse them.
+        // Fail-open / empty for first runs, so the prompt is unchanged then.
+        if matches!(phase, Phase::Spec | Phase::Frontend | Phase::Backend) {
+            append(
+                &mut prompt.system,
+                crate::skills::skills_for_prompt(
+                    &self.options.project_root,
+                    &crate::phases::knowledge_root(&self.options.project_root),
+                    &self.options.requirement,
+                    3,
+                ),
+            );
+        }
         // Design system: only for the phases that decide/implement the UI.
         if matches!(phase, Phase::Docs | Phase::Frontend) {
             append(
@@ -3259,6 +3383,9 @@ impl<R: Runtime> AgentRunner<R> {
                 });
             }
             completed.push(self.record_phase(Phase::Delivery, run_delivery(&self.options))?);
+            // Base-driven self-evolution upkeep: reconcile the lesson corpus and
+            // write reusable skill cards (no-op offline; fail-open).
+            self.evolve_memory_at_delivery().await;
             self.record_phase_timing(Phase::Delivery, phase_start);
         }
 

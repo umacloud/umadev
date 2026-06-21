@@ -1717,6 +1717,27 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
     );
     let _ = crate::lessons::sediment_lessons(&opts.project_root);
 
+    // D2b: graduate the validated patterns into the reusable SKILL library — but
+    // only when the run actually GRADUATED (quality gate passed) AND it was a
+    // multi-step solve (the graduation gate inside `graduate_validated_patterns`
+    // enforces both). A clean one-pass run carries no reusable insight, so it
+    // is intentionally not admitted. The `description` is left empty here so the
+    // module's deterministic template card is used; the runner's delivery seam
+    // may pre-generate a richer base-written card via `skill_description_prompt`
+    // before this point. Fail-open: any failure is a no-op.
+    let quality_passed = fs::read_to_string(
+        opts.project_root
+            .join(format!("output/{slug}-quality-gate.json")),
+    )
+    .ok()
+    .and_then(|j| serde_json::from_str::<QualityReport>(&j).ok())
+    .is_some_and(|r| r.passed);
+    let _ = crate::skills::graduate_validated_patterns(
+        &opts.project_root,
+        "", // empty → deterministic template description (base call is optional)
+        quality_passed,
+    );
+
     // 1. Compliance mapping
     let mut artifacts = Vec::new();
     if let Some((path, _)) = write_compliance_mapping(&opts.project_root, &slug) {

@@ -53,6 +53,7 @@ pub mod run_lock;
 pub mod runner;
 pub mod runtime_proof;
 pub mod scaffolding;
+pub mod skills;
 pub mod state;
 pub mod tech_debt;
 pub mod verify;
@@ -69,9 +70,10 @@ pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{classify_reply, Gate, GateOutcome};
 pub use lessons::{
     capture_dev_errors, capture_gate_revision, capture_quality_failures,
-    capture_validated_patterns, lessons_report, list_sedimented_lessons, pitfall_efficacy_summary,
-    pitfall_overview, sediment_lessons, LessonsReport, PitfallEfficacySummary, PitfallEntry,
-    PitfallStatus, ValidatedEntry,
+    capture_validated_patterns, lessons_report, list_sedimented_lessons, parse_reconcile_decision,
+    pitfall_efficacy_summary, pitfall_overview, reconcile_candidates, reconcile_prompt,
+    sediment_lessons, sediment_lessons_with_judge, Lesson, LessonsReport, PitfallEfficacySummary,
+    PitfallEntry, PitfallStatus, ReconcileDecision, ValidatedEntry,
 };
 pub use manifest::{ConformanceLevel, Profile, SpecManifest};
 pub use phases::{knowledge_top_files, phase_knowledge_digest, PhaseOutput};
@@ -82,6 +84,10 @@ pub use runner::{AgentRunner, RunOptions, RunReport};
 pub use runtime_proof::{
     run_runtime_proof, runtime_proof_rel_path, write_runtime_proof, E2eResult, RouteProbe,
     RuntimeProof, RuntimeStatus,
+};
+pub use skills::{
+    graduate_skill, graduate_validated_patterns, read_skills, retrieve_skills,
+    skill_description_prompt, skills_for_prompt, skills_report, Skill,
 };
 pub use state::{
     list_snapshots, read_workflow_state, read_workflow_state_diagnostic, restore_snapshot,

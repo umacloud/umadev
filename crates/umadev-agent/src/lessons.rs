@@ -111,6 +111,14 @@ pub struct Lesson {
     /// kinds and for pitfalls never yet surfaced to the worker.
     #[serde(default)]
     pub efficacy: Option<PitfallEfficacy>,
+    /// `true` once the memory-reconcile step judged this lesson superseded /
+    /// contradicted by a newer one. INVALIDATE marks, never physically deletes
+    /// (audit posture): an invalidated lesson is excluded from sediment + the
+    /// retrieval candidate set but stays on disk for provenance. `#[serde(default)]`
+    /// keeps every pre-existing JSONL row (written before this field existed)
+    /// readable, and a row that has never been reconciled stays `false`.
+    #[serde(default)]
+    pub invalidated: bool,
 }
 
 /// Tracks whether a pitfall's fix actually works once we start warning about it.
@@ -257,6 +265,7 @@ pub fn capture_quality_failures(
             occurrences: 1,
             context: Vec::new(),
             efficacy: None,
+            invalidated: false,
         });
     }
     append_raw_lessons(project_root, "quality-failures.jsonl", &lessons);
@@ -324,6 +333,7 @@ pub fn capture_gate_revision(
         occurrences: 1,
         context: Vec::new(),
         efficacy: None,
+        invalidated: false,
     };
     append_raw_lessons(project_root, "gate-revisions.jsonl", &[lesson]);
 
@@ -368,6 +378,7 @@ pub fn capture_validated_patterns(
         occurrences: 1,
         context: Vec::new(),
         efficacy: None,
+        invalidated: false,
     };
     append_raw_lessons(project_root, "validated-decisions.jsonl", &[lesson]);
 }
@@ -464,6 +475,7 @@ pub fn capture_tech_debt(
             occurrences: 1,
             context: Vec::new(),
             efficacy: None,
+            invalidated: false,
         });
     }
     let written = lessons.len();
@@ -583,6 +595,7 @@ pub fn capture_dev_errors(
             occurrences: 1,
             context: context.clone(),
             efficacy: None,
+            invalidated: false,
         });
         new_count += 1;
         changed = true;
@@ -1242,12 +1255,335 @@ fn lesson_precedes(a: &Lesson, b: &Lesson) -> bool {
     }
 }
 
+// =====================================================================
+// Memory reconcile: keep the sedimented corpus from rotting.
+//
+// Before each sediment write we reconcile every fresh lesson against the
+// most-similar PRIOR ones, deciding ADD / UPDATE / INVALIDATE / NOOP. The
+// JUDGEMENT is delegated to the base via [`reconcile_prompt`] +
+// [`parse_reconcile_decision`] (the same host-driver seam reflection uses); with
+// NO base (no judge supplied / no key) every decision is NOOP, which is
+// byte-for-byte the previous pure-append behaviour — zero change. INVALIDATE
+// marks the conflicting old lesson invalid (audit posture: never a physical
+// delete) so it leaves the retrieval candidate set; a separate decay pass drops
+// long-unmatched stale lessons from the sediment top-k via the existing 30-day
+// recency curve.
+// =====================================================================
+
+/// What the reconcile step decides for a fresh lesson vs. its most-similar prior
+/// lessons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileDecision {
+    /// Genuinely new knowledge — keep it alongside the existing corpus.
+    Add,
+    /// A better/fresher version of an existing lesson — supersede the old one
+    /// (mark the most-similar prior lesson invalid, keep the new one).
+    Update,
+    /// The fresh lesson CONTRADICTS a prior one that is now wrong — mark the
+    /// conflicting prior lesson invalid (kept on disk for provenance).
+    Invalidate,
+    /// No change — duplicate or not worth touching the corpus over. This is the
+    /// default and the no-base fallback (pure-append behaviour).
+    Noop,
+}
+
+/// How many similar prior lessons the reconcile step considers per fresh lesson.
+/// Small — a handful of nearest neighbours is enough to judge ADD vs UPDATE vs
+/// INVALIDATE without ballooning the base prompt.
+const RECONCILE_TOP_S: usize = 10;
+
+/// Below this recency weight, a lesson that NEVER positively matched its own
+/// reconcile neighbourhood is treated as decayed-out and skipped from the
+/// sediment top-k (it stays in the raw ledger). 0.03 ≈ 5 half-lives ≈ 150 days,
+/// so only genuinely ancient, never-reinforced lessons fade. Pitfalls
+/// (`DevError`) are exempt — their own efficacy/frequency loop governs them.
+const RECONCILE_DECAY_FLOOR: f64 = 0.03;
+
+/// Build the reconcile prompt for a fresh lesson against its similar priors. The
+/// system half pins the base to a librarian that OUTPUTS ONE verdict word; the
+/// user half lays out the new lesson and the candidates. Returns `(system,
+/// user)`. Mirrors [`reflection_prompt`]'s seam so the runner can drive it with
+/// the same `try_generate` call and feed the reply to [`parse_reconcile_decision`].
+#[must_use]
+pub fn reconcile_prompt(new_lesson: &Lesson, similar: &[Lesson]) -> (String, String) {
+    let system = "\
+You are curating a long-lived engineering lesson library so it does not rot. \
+Given a NEW lesson and the most similar EXISTING lessons, decide ONE action: \
+ADD (genuinely new knowledge), UPDATE (the new one is a better version of an \
+existing lesson — supersede it), INVALIDATE (the new one shows an existing \
+lesson is now WRONG/contradicted), or NOOP (duplicate or not worth a change). \
+Answer with exactly one of: ADD, UPDATE, INVALIDATE, NOOP — nothing else."
+        .to_string();
+    let mut sim_block = String::new();
+    for (i, l) in similar.iter().enumerate() {
+        sim_block.push_str(&format!(
+            "{n}. [{domain}] {title}\n   fix: {fix}\n",
+            n = i + 1,
+            domain = l.domain,
+            title = truncate(&l.title, 120),
+            fix = truncate(&l.fix, 200),
+        ));
+    }
+    if sim_block.is_empty() {
+        sim_block.push_str("(no similar existing lessons)\n");
+    }
+    let user = format!(
+        "## New lesson\n[{domain}] {title}\nfix: {fix}\nroot cause: {root}\n\n\
+         ## Similar existing lessons\n{sim_block}\n\
+         Reply with one word: ADD, UPDATE, INVALIDATE, or NOOP.",
+        domain = new_lesson.domain,
+        title = truncate(&new_lesson.title, 120),
+        fix = truncate(&new_lesson.fix, 200),
+        root = truncate(&new_lesson.root_cause, 200),
+    );
+    (system, user)
+}
+
+/// Parse a base reply into a [`ReconcileDecision`]. Tolerant: scans for the
+/// verdict word anywhere in the reply (bases sometimes add a sentence). Anything
+/// unrecognised → [`ReconcileDecision::Noop`] (fail-open: an unclear verdict
+/// never mutates the corpus).
+#[must_use]
+pub fn parse_reconcile_decision(reply: &str) -> ReconcileDecision {
+    let up = reply.to_ascii_uppercase();
+    // Order matters: check the rarer, more-specific verbs before NOOP so a reply
+    // like "INVALIDATE — it's wrong" isn't shadowed.
+    if up.contains("INVALIDATE") {
+        ReconcileDecision::Invalidate
+    } else if up.contains("UPDATE") {
+        ReconcileDecision::Update
+    } else if up.contains("ADD") {
+        ReconcileDecision::Add
+    } else {
+        ReconcileDecision::Noop
+    }
+}
+
+/// A reconcile judge: given a fresh lesson and its similar priors, return the
+/// action. The runner supplies one that calls the base (host-driver subprocess)
+/// via [`reconcile_prompt`] + [`parse_reconcile_decision`]; `None` means "no
+/// base" → every decision is NOOP (pure append, zero behaviour change).
+pub type ReconcileJudge<'a> = &'a dyn Fn(&Lesson, &[Lesson]) -> ReconcileDecision;
+
+/// Cosine-free cheap similarity between two lessons: shared keyword count plus a
+/// same-domain bonus. Used only to pick the top-s neighbours to hand the judge —
+/// the judge (base) makes the actual semantic call.
+fn lesson_similarity(a: &Lesson, b: &Lesson) -> i64 {
+    let bset: std::collections::HashSet<&str> = b.keywords.iter().map(String::as_str).collect();
+    let shared = a
+        .keywords
+        .iter()
+        .filter(|k| bset.contains(k.as_str()))
+        .count() as i64;
+    let domain_bonus = i64::from(a.domain == b.domain);
+    shared * 2 + domain_bonus
+}
+
+/// Stable per-lesson identity used to mark a specific prior lesson invalid
+/// across the read-merge-rewrite boundary (`read_all_raw_lessons` loses the
+/// source file, so we re-open each file and match on this triple).
+fn lesson_identity(l: &Lesson) -> (String, String, String) {
+    (l.domain.clone(), l.title.clone(), l.first_seen.clone())
+}
+
+/// The raw files that hold reconcilable lessons. Pitfalls (`dev-errors.jsonl`)
+/// are governed by their own efficacy loop and excluded — reconcile only curates
+/// the append-only failure/revision/validated/tech-debt ledgers.
+const RECONCILE_FILES: &[&str] = &[
+    "quality-failures.jsonl",
+    "gate-revisions.jsonl",
+    "validated-decisions.jsonl",
+    "tech-debt.jsonl",
+];
+
+/// Build the reconcile candidate pairs `(fresh_lesson, its top-s older similar
+/// lessons)` for the current raw corpus. Each fresh lesson is paired with the
+/// most-similar OLDER non-pitfall lessons (zero-similarity neighbours dropped).
+/// This is the read-only half the runner uses to drive the BASE judge
+/// asynchronously: it calls [`reconcile_prompt`] per pair, parses the verdict,
+/// and feeds the resulting decision map back via [`sediment_lessons_with_judge`].
+///
+/// Pure read; pitfalls (`DevError`) are excluded (their own efficacy loop
+/// governs them), as are already-invalidated rows. Empty when nothing has enough
+/// neighbours to reconcile.
+#[must_use]
+pub fn reconcile_candidates(project_root: &Path) -> Vec<(Lesson, Vec<Lesson>)> {
+    let all = read_all_raw_lessons(project_root);
+    // Newest-first so a fresher lesson is judged against its older neighbours.
+    let mut pool: Vec<&Lesson> = all
+        .iter()
+        .filter(|l| l.kind != LessonKind::DevError && !l.invalidated)
+        .collect();
+    pool.sort_by(|a, b| b.first_seen.cmp(&a.first_seen));
+
+    let mut out: Vec<(Lesson, Vec<Lesson>)> = Vec::new();
+    for (i, fresh) in pool.iter().enumerate() {
+        let fresh_id = lesson_identity(fresh);
+        let mut similar: Vec<&Lesson> = pool[i + 1..]
+            .iter()
+            .filter(|c| lesson_identity(c) != fresh_id)
+            .copied()
+            .collect();
+        similar.sort_by_key(|c| std::cmp::Reverse(lesson_similarity(fresh, c)));
+        similar.retain(|c| lesson_similarity(fresh, c) > 0);
+        similar.truncate(RECONCILE_TOP_S);
+        if similar.is_empty() {
+            continue;
+        }
+        out.push((
+            (*fresh).clone(),
+            similar.iter().map(|l| (*l).clone()).collect(),
+        ));
+    }
+    out
+}
+
+/// Reconcile the corpus: for each lesson (treated as the FRESH one), find its
+/// top-[`RECONCILE_TOP_S`] OLDER similar lessons and ask `judge` whether the new
+/// lesson ADDs, UPDATEs, INVALIDATEs, or NOOPs. On UPDATE/INVALIDATE the single
+/// most-similar OLDER conflicting lesson is marked `invalidated` in its raw file
+/// (never physically deleted). Returns `true` if anything was marked (so the
+/// caller re-reads). Fail-open: a `None` judge or any error marks nothing.
+///
+/// Operates per-file (re-opening each [`RECONCILE_FILES`] entry) so the invalid
+/// mark lands on the right on-disk row, matched by [`lesson_identity`].
+fn reconcile_lessons(project_root: &Path, all: &[Lesson], judge: Option<ReconcileJudge>) -> bool {
+    let Some(judge) = judge else {
+        return false;
+    };
+    // Reconcilable (non-pitfall, not-already-invalid) lessons, newest first so a
+    // fresher lesson is the one judged against its older neighbours.
+    let mut pool: Vec<&Lesson> = all
+        .iter()
+        .filter(|l| l.kind != LessonKind::DevError && !l.invalidated)
+        .collect();
+    pool.sort_by(|a, b| b.first_seen.cmp(&a.first_seen));
+
+    // Identities to mark invalid (the superseded/contradicted priors).
+    let mut to_invalidate: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+
+    for (i, fresh) in pool.iter().enumerate() {
+        // Older candidates = everything after this one in the newest-first order,
+        // excluding ones already slated for invalidation and exact self-identity.
+        let fresh_id = lesson_identity(fresh);
+        let mut similar: Vec<&Lesson> = pool[i + 1..]
+            .iter()
+            .filter(|c| {
+                let cid = lesson_identity(c);
+                cid != fresh_id && !to_invalidate.contains(&cid)
+            })
+            .copied()
+            .collect();
+        if similar.is_empty() {
+            continue;
+        }
+        // Keep the top-s most-similar (drop zero-similarity neighbours so the
+        // judge isn't asked to compare unrelated lessons).
+        similar.sort_by_key(|c| std::cmp::Reverse(lesson_similarity(fresh, c)));
+        similar.retain(|c| lesson_similarity(fresh, c) > 0);
+        similar.truncate(RECONCILE_TOP_S);
+        if similar.is_empty() {
+            continue;
+        }
+        let owned: Vec<Lesson> = similar.iter().map(|l| (*l).clone()).collect();
+        match judge(fresh, &owned) {
+            ReconcileDecision::Update | ReconcileDecision::Invalidate => {
+                // Supersede / contradict the single most-similar older lesson.
+                if let Some(target) = similar.first() {
+                    to_invalidate.insert(lesson_identity(target));
+                }
+            }
+            ReconcileDecision::Add | ReconcileDecision::Noop => {}
+        }
+    }
+
+    if to_invalidate.is_empty() {
+        return false;
+    }
+
+    // Apply the marks per-file (the only place a raw file is rewritten by the
+    // reconcile path). Fail-open per file.
+    let mut changed = false;
+    for file in RECONCILE_FILES {
+        let mut rows = read_raw_lessons(project_root, file);
+        if rows.is_empty() {
+            continue;
+        }
+        let mut file_changed = false;
+        for row in &mut rows {
+            if !row.invalidated && to_invalidate.contains(&lesson_identity(row)) {
+                row.invalidated = true;
+                file_changed = true;
+            }
+        }
+        if file_changed {
+            write_raw_lessons(project_root, file, &rows);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Returns the number of markdown files written. Fail-open: errors return 0.
+///
+/// This is the no-base entry point: it reconciles with a `None` judge, so every
+/// decision is NOOP and the behaviour is byte-for-byte the historical
+/// pure-append sediment. The runner calls [`sediment_lessons_with_judge`] with a
+/// base-backed judge when a host driver is available.
 #[must_use]
 pub fn sediment_lessons(project_root: &Path) -> usize {
-    let lessons = read_all_raw_lessons(project_root);
+    sediment_lessons_with_judge(project_root, None)
+}
+
+/// Sediment all raw lessons into markdown, running the memory-reconcile step
+/// first when `judge` is `Some`. With `judge == None` this is identical to the
+/// historical [`sediment_lessons`] (NOOP for every lesson → pure append).
+///
+/// Reconcile flow (only when a judge is supplied):
+/// 1. For each fresh lesson, find the top-[`RECONCILE_TOP_S`] similar PRIOR
+///    lessons and ask the judge for ADD/UPDATE/INVALIDATE/NOOP.
+/// 2. UPDATE / INVALIDATE → mark the most-similar conflicting prior lesson
+///    `invalidated` in the raw ledger (never a physical delete).
+/// 3. A decay pass drops long-unmatched, ancient non-pitfall lessons from the
+///    sediment top-k (they remain in the raw ledger).
+///
+/// Returns the number of markdown files written. Fail-open throughout.
+#[must_use]
+pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJudge>) -> usize {
+    let mut lessons = read_all_raw_lessons(project_root);
     if lessons.is_empty() {
         return 0;
+    }
+
+    // Reconcile (base-judged) — may mark some prior lessons invalid in the raw
+    // ledger. Re-read afterwards so the sediment set reflects the marks.
+    if judge.is_some() && reconcile_lessons(project_root, &lessons, judge) {
+        lessons = read_all_raw_lessons(project_root);
+    }
+
+    // Drop invalidated lessons from the sediment candidate set (they stay on
+    // disk for provenance but never become retrievable markdown). No-op for the
+    // no-base path, where nothing is ever marked invalid.
+    lessons.retain(|l| !l.invalidated);
+    if lessons.is_empty() {
+        return 0;
+    }
+
+    // Decay pass: an ancient, never-reinforced NON-pitfall lesson whose recency
+    // weight has fallen below the floor drops out of the sediment top-k (it
+    // stays in the raw ledger, so it is recoverable, just not re-surfaced).
+    // Pitfalls are exempt — their efficacy/frequency loop governs their fate.
+    // Skipped entirely for the no-base path so existing behaviour is unchanged.
+    if judge.is_some() {
+        let now = Utc::now();
+        lessons.retain(|l| {
+            l.kind == LessonKind::DevError
+                || recency_weight(&l.first_seen, now) >= RECONCILE_DECAY_FLOOR
+        });
+        if lessons.is_empty() {
+            return 0;
+        }
     }
 
     // Dedupe by (domain, title) — keep the latest first_seen. On a
@@ -2547,6 +2883,7 @@ mod tests {
             occurrences: 3,
             context: vec!["react".into()],
             efficacy: None,
+            invalidated: false,
         };
         let with: std::collections::HashSet<String> =
             ["react-router-dom".to_string(), "react".to_string()]
@@ -2613,6 +2950,7 @@ mod tests {
             occurrences: 1,
             context: vec!["react".into()],
             efficacy: None,
+            invalidated: false,
         };
         let stale_lesson = Lesson {
             first_seen: stale,
@@ -2646,6 +2984,7 @@ mod tests {
             occurrences: 3,
             context: vec![],
             efficacy: eff,
+            invalidated: false,
         };
         let recurring = mk(Some(PitfallEfficacy {
             injected: 1,
@@ -2697,6 +3036,7 @@ mod tests {
                 failed_fixes: vec!["npm install lodash".into()],
                 next_strategy: String::new(),
             }),
+            invalidated: false,
         };
         write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&recurring));
 
@@ -2812,6 +3152,7 @@ mod tests {
                 failed_fixes: Vec::new(),
                 next_strategy: String::new(),
             }),
+            invalidated: false,
         });
         // Fill past the cap with ancient, validated (handled) pitfalls.
         for n in 0..MAX_DEV_PITFALLS + 10 {
@@ -2836,6 +3177,7 @@ mod tests {
                     failed_fixes: Vec::new(),
                     next_strategy: String::new(),
                 }),
+                invalidated: false,
             });
         }
         prune_pitfalls(&mut store);
@@ -2864,6 +3206,7 @@ mod tests {
             occurrences: 1,
             context: vec![],
             efficacy: None,
+            invalidated: false,
         };
         assert!(group_is_global_worthy(&[&dev], 1));
 
@@ -3225,5 +3568,193 @@ mod tests {
         assert!(!r.is_empty());
         assert_eq!(r.validated_patterns.len(), 1);
         assert!(r.validated_patterns[0].title.contains("blog"));
+    }
+
+    // ---- Memory reconcile (Task 2) ------------------------------------------
+
+    /// Hand-write two same-domain, keyword-overlapping lessons with an OLD and a
+    /// NEW timestamp into the quality-failures ledger, so the newer one is the
+    /// "fresh" lesson and the older one is its similar neighbour.
+    fn seed_two_similar(root: &Path) -> (Lesson, Lesson) {
+        let mk = |title: &str, when: &str| Lesson {
+            kind: LessonKind::Failure,
+            domain: "api".into(),
+            title: title.into(),
+            body: String::new(),
+            fix: format!("fix for {title}"),
+            root_cause: String::new(),
+            keywords: vec!["api".into(), "contract".into(), "openapi".into()],
+            source_requirement: "做一个博客".into(),
+            first_seen: when.into(),
+            signature: String::new(),
+            occurrences: 1,
+            context: Vec::new(),
+            efficacy: None,
+            invalidated: false,
+        };
+        let old = mk("OLD api lesson", "2026-06-01T00:00:00Z");
+        let fresh = mk("FRESH api lesson", "2026-06-20T00:00:00Z");
+        write_raw_lessons(
+            root,
+            "quality-failures.jsonl",
+            &[old.clone(), fresh.clone()],
+        );
+        (old, fresh)
+    }
+
+    #[test]
+    fn parse_reconcile_decision_is_tolerant() {
+        assert_eq!(parse_reconcile_decision("ADD"), ReconcileDecision::Add);
+        assert_eq!(
+            parse_reconcile_decision("verdict: UPDATE — better version"),
+            ReconcileDecision::Update
+        );
+        assert_eq!(
+            parse_reconcile_decision("INVALIDATE, the old one is wrong"),
+            ReconcileDecision::Invalidate
+        );
+        // Unknown / empty → NOOP (fail-open: never mutate on an unclear verdict).
+        assert_eq!(
+            parse_reconcile_decision("hmm not sure"),
+            ReconcileDecision::Noop
+        );
+        assert_eq!(parse_reconcile_decision(""), ReconcileDecision::Noop);
+    }
+
+    #[test]
+    fn reconcile_candidates_pairs_fresh_with_older_similar() {
+        let tmp = TempDir::new().unwrap();
+        seed_two_similar(tmp.path());
+        let pairs = reconcile_candidates(tmp.path());
+        // Only the fresh lesson has an OLDER similar neighbour; the oldest one has
+        // none after it, so exactly one pair is produced.
+        assert_eq!(pairs.len(), 1, "one fresh→older pair: {pairs:?}");
+        assert_eq!(pairs[0].0.title, "FRESH api lesson");
+        assert_eq!(pairs[0].1.len(), 1);
+        assert_eq!(pairs[0].1[0].title, "OLD api lesson");
+    }
+
+    #[test]
+    fn reconcile_noop_and_no_base_keep_pure_append() {
+        let tmp = TempDir::new().unwrap();
+        let (_old, _fresh) = seed_two_similar(tmp.path());
+
+        // No-base path: sediment_lessons must behave EXACTLY like pure append —
+        // both lessons survive (nothing invalidated) and both sediment.
+        let written = sediment_lessons(tmp.path());
+        assert_eq!(written, 2, "no-base sediment writes both lessons");
+        assert!(read_raw_lessons(tmp.path(), "quality-failures.jsonl")
+            .iter()
+            .all(|l| !l.invalidated));
+
+        // An explicit NOOP judge is identical — nothing is invalidated.
+        let noop = |_f: &Lesson, _s: &[Lesson]| ReconcileDecision::Noop;
+        let _ = sediment_lessons_with_judge(tmp.path(), Some(&noop));
+        assert!(read_raw_lessons(tmp.path(), "quality-failures.jsonl")
+            .iter()
+            .all(|l| !l.invalidated));
+    }
+
+    #[test]
+    fn reconcile_add_keeps_both_lessons() {
+        let tmp = TempDir::new().unwrap();
+        seed_two_similar(tmp.path());
+        let add = |_f: &Lesson, _s: &[Lesson]| ReconcileDecision::Add;
+        let written = sediment_lessons_with_judge(tmp.path(), Some(&add));
+        // ADD = genuinely new knowledge → neither lesson invalidated; both kept.
+        assert_eq!(written, 2, "ADD keeps both lessons");
+        assert!(read_raw_lessons(tmp.path(), "quality-failures.jsonl")
+            .iter()
+            .all(|l| !l.invalidated));
+    }
+
+    #[test]
+    fn reconcile_update_supersedes_the_older_lesson() {
+        let tmp = TempDir::new().unwrap();
+        seed_two_similar(tmp.path());
+        // UPDATE: the fresh lesson is a better version of the older one → the
+        // OLDER similar lesson is marked invalid (kept on disk, not deleted).
+        let update = |_f: &Lesson, _s: &[Lesson]| ReconcileDecision::Update;
+        let written = sediment_lessons_with_judge(tmp.path(), Some(&update));
+        let rows = read_raw_lessons(tmp.path(), "quality-failures.jsonl");
+        // The old lesson is still ON DISK (audit posture) but marked invalid.
+        let old = rows.iter().find(|l| l.title == "OLD api lesson").unwrap();
+        assert!(old.invalidated, "UPDATE marks the superseded prior invalid");
+        let fresh = rows.iter().find(|l| l.title == "FRESH api lesson").unwrap();
+        assert!(!fresh.invalidated, "the fresh lesson stays valid");
+        // Only the surviving fresh lesson sediments to markdown.
+        assert_eq!(
+            written, 1,
+            "the invalidated prior is excluded from sediment"
+        );
+    }
+
+    #[test]
+    fn reconcile_invalidate_marks_contradicted_prior() {
+        let tmp = TempDir::new().unwrap();
+        seed_two_similar(tmp.path());
+        // INVALIDATE: the fresh lesson shows the older one is now WRONG.
+        let inval = |_f: &Lesson, _s: &[Lesson]| ReconcileDecision::Invalidate;
+        let _ = sediment_lessons_with_judge(tmp.path(), Some(&inval));
+        let rows = read_raw_lessons(tmp.path(), "quality-failures.jsonl");
+        assert_eq!(rows.len(), 2, "both rows kept on disk (never deleted)");
+        let old = rows.iter().find(|l| l.title == "OLD api lesson").unwrap();
+        assert!(old.invalidated, "INVALIDATE marks the contradicted prior");
+    }
+
+    #[test]
+    fn reconcile_skips_pitfalls() {
+        // Dev-error pitfalls are governed by their own efficacy loop — reconcile
+        // must never touch them, even with an aggressive INVALIDATE judge.
+        let tmp = TempDir::new().unwrap();
+        let err = vec!["Error: Cannot find module 'react-router-dom'".to_string()];
+        capture_dev_errors(tmp.path(), &err, "demo", "做一个博客");
+        let pairs = reconcile_candidates(tmp.path());
+        assert!(pairs.is_empty(), "pitfalls are excluded from reconcile");
+        let inval = |_f: &Lesson, _s: &[Lesson]| ReconcileDecision::Invalidate;
+        let _ = sediment_lessons_with_judge(tmp.path(), Some(&inval));
+        assert!(read_raw_lessons(tmp.path(), DEV_ERRORS_FILE)
+            .iter()
+            .all(|l| !l.invalidated));
+    }
+
+    #[test]
+    fn reconcile_decay_drops_ancient_unreinforced_lesson() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        // One ancient lesson (well past 5 half-lives) with a unique domain so it
+        // has no similar neighbour to reconcile against — only the decay pass can
+        // affect it.
+        let ancient = Lesson {
+            kind: LessonKind::Failure,
+            domain: "devops".into(),
+            title: "ancient devops lesson".into(),
+            body: String::new(),
+            fix: "f".into(),
+            root_cause: String::new(),
+            keywords: vec!["docker".into()],
+            source_requirement: "r".into(),
+            first_seen: "2000-01-01T00:00:00Z".into(),
+            signature: String::new(),
+            occurrences: 1,
+            context: Vec::new(),
+            efficacy: None,
+            invalidated: false,
+        };
+        write_raw_lessons(
+            root,
+            "quality-failures.jsonl",
+            std::slice::from_ref(&ancient),
+        );
+        // No-base path: decay is OFF, so the ancient lesson still sediments
+        // (behaviour preserved).
+        assert_eq!(sediment_lessons(root), 1, "no-base keeps ancient lesson");
+        // With a judge active, the decay pass drops the ancient, never-reinforced
+        // lesson from the sediment top-k (it stays in the raw ledger).
+        let noop = |_f: &Lesson, _s: &[Lesson]| ReconcileDecision::Noop;
+        let written = sediment_lessons_with_judge(root, Some(&noop));
+        assert_eq!(written, 0, "decay drops the ancient lesson from sediment");
+        // Still recoverable in the raw ledger (not physically removed).
+        assert_eq!(read_raw_lessons(root, "quality-failures.jsonl").len(), 1);
     }
 }
