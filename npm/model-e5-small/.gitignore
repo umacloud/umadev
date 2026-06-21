@@ -1,0 +1,4 @@
+# Model weights are fetched by the release CI (too large for git).
+*.safetensors
+config.json
+tokenizer.json

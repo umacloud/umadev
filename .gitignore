@@ -1,0 +1,54 @@
+# Rust build output
+target/
+**/*.rs.bk
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Workspace runtime state (per-project, not source) — all of .umadev/ is
+# generated/user data: workflow state, audit, checkpoints shadow-git, KB index.
+.umadev/
+# Legacy runtime-state dir from the pre-rename name — never commit
+.super-dev/
+.umadev/knowledge-stats.db
+.umadev/install-manifest.json
+.umadev/project.md
+.umadev/runs/
+.umadev/coach/
+.umadev/changes/
+.umadev/history/
+.umadev/input-history.txt
+.umadev/kb-index/
+# `.umadev` written anywhere (e.g. running `umadev` inside a crate dir)
+**/.umadev/
+# Per-workspace spec manifest, auto-written by `umadev init`
+umadev.yaml
+# Locally generated demo/example projects
+examples/
+
+# Per-platform npm sub-packages have their binaries populated at
+# release time; .gitkeep keeps the dir tracked but the actual binaries
+# never live in source control.
+npm/cli-*/bin/umadev
+npm/cli-*/bin/umadev.exe
+
+# Generated artifacts the user keeps locally
+output/
+
+# Node modules from the marketing site
+umadev-website/node_modules/
+umadev-website/.next/
+umadev-website/out/
+
+# Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key

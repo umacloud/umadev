@@ -1,0 +1,63 @@
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
+
+graph TD
+    T["触发入口<br/>umadev 需求 / init / run N"]
+
+    T --> S1
+
+    S1["1 Research<br/>PM + ARCHITECT 专家<br/>本地知识库 + 联网研究<br/>竞品分析 3-5 个"]
+
+    S1 --> S2
+
+    S2["2 PRD<br/>PM 专家主导<br/>10 行业定制生成<br/>用户画像 / 功能矩阵 / 验收标准"]
+
+    S2 --> S3
+
+    S3["3 Architecture<br/>ARCHITECT + DBA 专家<br/>系统分层 / 技术选型 / API 契约<br/>数据模型 / 安全策略"]
+
+    S3 --> S4
+
+    S4["4 UIUX<br/>UI + UX 专家<br/>119 配色 / 39 组件库<br/>Design Token / 页面骨架"]
+
+    S4 --> G1
+
+    G1{"用户确认门<br/>PRD + Architecture + UIUX"}
+    G1 -- 修改 --> S2
+    G1 -- 确认 --> S5
+
+    S5["5 Spec<br/>PM + CODE 专家<br/>任务分解 / 优先级 / 依赖"]
+
+    S5 --> S6
+
+    S6["6 Frontend<br/>CODE + UI 专家<br/>前端优先实现 + 运行验证"]
+
+    S6 --> G2
+
+    G2{"预览确认门<br/>前端可运行 + 可演示"}
+    G2 -- 改版 --> S4
+    G2 -- 确认 --> S7
+
+    S7["7 Backend<br/>CODE + DBA 专家<br/>API 实现 / 数据库迁移 / 认证"]
+
+    S7 --> S8
+
+    S8["8 Quality<br/>QA + SECURITY 专家<br/>红队审查 + 质量门禁 20 项<br/>A11y + 性能预算 + UI 审查"]
+
+    S8 -- 未通过 --> S7
+    S8 -- 通过 --> S9
+
+    S9["9 Delivery<br/>DEVOPS + QA 专家<br/>CI/CD 5 平台 + DB 迁移 6 ORM<br/>演练 + 证据包 + 就绪度"]
+
+    S9 --> DONE
+
+    DONE["交付完成"]
+
+    S9 -.- L1["UI 返工: UI+UX 重新审视"]
+    S9 -.- L2["架构返工: ARCHITECT 重新评估"]
+    S9 -.- L3["质量返工: QA+SECURITY 整改"]
+    S9 -.- L4["缺陷修复: RCA+CODE 协作"]
+
+    L1 -.-> S4
+    L2 -.-> S3
+    L3 -.-> S8
+    L4 -.-> S7

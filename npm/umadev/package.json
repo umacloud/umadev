@@ -1,0 +1,45 @@
+{
+  "name": "umadev",
+  "version": "1.0.0",
+  "description": "A project-director Agent for AI coding hosts — drives your logged-in Claude Code / Codex through a 9-phase commercial delivery pipeline with governance. No API key needed.",
+  "keywords": [
+    "ai",
+    "claude-code",
+    "codex",
+    "tui",
+    "rust",
+    "agent",
+    "orchestrator",
+    "spec-driven",
+    "audit"
+  ],
+  "homepage": "https://github.com/umacloud/umadev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/umacloud/umadev.git"
+  },
+  "bugs": {
+    "url": "https://github.com/umacloud/umadev/issues"
+  },
+  "license": "MIT",
+  "author": "Shangyan Technology <11964948@qq.com>",
+  "bin": {
+    "umadev": "bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@umadev/cli-darwin-arm64": "1.0.0",
+    "@umadev/cli-darwin-x64": "1.0.0",
+    "@umadev/cli-linux-x64": "1.0.0",
+    "@umadev/cli-linux-arm64": "1.0.0",
+    "@umadev/cli-win32-x64": "1.0.0",
+    "@umadev/model-e5-small": "1.0.0",
+    "@umadev/knowledge": "1.0.0"
+  }
+}

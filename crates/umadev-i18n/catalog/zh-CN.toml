@@ -1,0 +1,243 @@
+# UmaDev 简体中文 UI 文案（默认 / 回退语言）。
+# 键为带引号的扁平点分键；新增字符串请同步加到 zh-TW.toml 与 en.toml（parity 测试会校验）。
+
+# 首次进入 —— 语言选择
+"lang.picker.title" = "选择界面语言"
+"lang.picker.hint" = "↑↓ 选择 · Enter 确认 · 之后随时用 /lang 修改"
+"lang.changed" = "界面语言已切换为 {}"
+"lang.current" = "当前界面语言：{}"
+"lang.unknown" = "未知语言。可选：zh-CN（简体）/ zh-TW（繁體）/ en（English）"
+
+# 首次进入 —— 欢迎与配置
+"firstrun.welcome" = "欢迎使用 UmaDev —— 商业级交付的 AI 开发总监"
+"firstrun.configure" = "首次进入，先完成几项配置（之后都可在使用中修改）"
+
+# 工作底座选择
+"picker.title" = "选择你的工作底座（共享它的大模型作为大脑）"
+"picker.hint" = "↑↓ 选择 · Enter 确认"
+"picker.confirm" = "已选择：{}"
+"picker.footer" = "↑↓ 选择 · Enter 确认 · Esc 退出   ·   [ok]=已安装（未验证登录;若运行报未登录,先在终端跑一次该 CLI 登录）· 没有 AI 工具?选「接入外部模型/API」用自己的 key"
+"backend.claude" = "Claude Code（claude --print，用你已登录的订阅）"
+"backend.codex" = "Codex CLI（codex exec）"
+"backend.opencode" = "OpenCode（opencode run）"
+"backend.offline" = "离线模板（无 AI，演示 / CI）"
+
+# 通用
+"common.confirm" = "确认"
+"common.cancel" = "取消"
+"common.continue" = "继续"
+"common.back" = "返回"
+
+# 输入框占位提示（始终可见）
+"input.gate" = "输入修改意见,或 /continue 通过…"
+"input.finished" = "输入新需求,或 /quit 退出…"
+"input.running" = "运行中 — 直接输入会排队,空隙时发给底座;Esc 中断"
+"model.synced" = "已同步驱动模型 {}(来自 {})—— Agent 就用底座这个模型工作"
+"model.synced_default" = "{} 未在配置里固定模型 —— Agent 用它的登录/默认模型驱动(运行后可见真实模型)"
+"model.reasoning" = "思考强度 {}(底座配置,umadev 不覆盖)"
+"input.idle" = "问我任何事…（/help 查看命令）"
+
+# 状态
+"status.ready" = "就绪"
+"status.thinking" = "正在思考…"
+"status.esc_cancel" = "esc 取消"
+"mode.auto_chip" = "自动过门 (shift+Tab 转手动)"
+"mode.manual_chip" = "手动审核 (shift+Tab 转自动)"
+"status.running" = "运行中"
+"status.paused" = "已暂停，等待确认"
+
+# Gate 审核卡片
+"gate.clarify.title" = "clarify — 逐条回答澄清问题,帮助底座理解你的真实需求"
+"gate.clarify.checklist" = "每个问题尽量回答(或写 'skip' 跳过)\n不确定的可以写'你来建议'\n回答越具体,后续 PRD/代码越贴合预期"
+"gate.clarify.next" = "回答完后输入 c 继续(进入联网调研),或描述修改意见"
+"gate.docs.title" = "docs_confirm — three core docs are ready for review"
+"gate.docs.checklist" = "PRD: 目标 / 范围 / 验收标准是否覆盖你真正要做的事?\n架构: API 接口、数据模型、技术选型是否合理?\n设计: 配色 / 字体 / 组件 token 是否符合预期, 有无暗色模式?"
+"gate.docs.next" = "看不懂没关系 — 按 c 信任 AI 的方案直接继续。注意:输入任何文字都会按你的修改重做整个 block(几分钟;误触了可以 /cancel 停),只想通过就别输文字。"
+"gate.preview.title" = "preview_confirm — frontend preview is ready for review"
+"gate.preview.checklist" = "前端是否按 UIUX 设计系统实现(图标库 / token / 排版)?\n页面结构和交互流是否匹配 PRD 的用户故事?\nfetch 的接口地址是否和架构文档里的 API 一致?"
+"gate.preview.next" = "审核前端可运行预览。按 c 确认进入 backend / quality / delivery;输入文字会按你的修改重做前端(几分钟;误触可 /cancel)。"
+"gate.artifacts_header" = "工件摘要:"
+"gate.quality_warn_header" = "[warn] 质量提醒:"
+"gate.scaffold_warn" = "{}: offline scaffold — worker 超时或未配置, 用 /revise 重新生成"
+"gate.short_warn" = "{}: only {} lines — may be incomplete"
+"gate.suggest_revise" = "建议: 用 /revise '重新生成 architecture' 让 worker 补充"
+"gate.quality_line" = "质量: {} CSS tokens · dark mode: {}"
+"gate.checklist_header" = "审批清单(确认这些再通过):"
+"gate.actions_header" = "操作:"
+"gate.action.continue" = "/continue 或 c        -> 通过 gate"
+"gate.action.revise" = "/revise <修订说明>     -> worker 重做"
+"gate.action.diff_prd" = "/diff prd             -> 查看 PRD"
+"gate.action.diff_arch" = "/diff architecture    -> 查看架构"
+"gate.action.diff_uiux" = "/diff uiux            -> 查看设计系统"
+"gate.guide_prefix" = "指引: {}"
+"gate.auto_approved" = "[auto] 自主模式:已自动通过检查点 `{}`,继续推进…  (想逐步审核就输入 /manual)"
+
+# 运行时叙述
+"run.started" = "流水线启动:{}\n按 9 阶段流程交付,关键节点会停下让你审。"
+"run.phase_start" = "> phase {} 开始…"
+"run.artifact_written" = "  · [{}] 写入 {}"
+
+# 帮助
+"help.title" = "UmaDev 命令"
+"help.lang" = "/lang —— 切换界面语言（简体 / 繁體 / English）"
+
+# Provider / 预览 / 连通性
+"preview.already_running" = "预览已在运行,重新打开浏览器:{}"
+"preview.stopped" = "已停止预览 dev server。"
+"preview.none_running" = "没有正在运行的预览 server。"
+"init.failed" = "/init 失败:{}"
+"design.applied" = "设计系统: `{}`\n{}"
+"report.write_failed" = "[warn] 无法写入报告: {}"
+
+# 欢迎语（冷启动第一屏）
+"greeting.main" = "UmaDev — 把一句话需求,变成可上线的商业产品。\n你不用写一行代码:我驱动你登录的 AI 工人,按 研究 -> 设计 -> 开发 -> 预览 -> 上线 帮你交付,并自动套用商业级设计系统、留下质量与审计证据。\n当前工人:{}"
+"greeting.examples" = "直接输入你想做什么,例如(也可以照抄一条):\n\n  · 做一个带邮箱登录的 SaaS 数据分析仪表盘\n  · 做一个待办清单应用,支持分组和提醒\n  · 做一个博客系统,支持 Markdown 写作\n  · 做一个产品落地页,要能上架的那种\n\n接下来:回答几个澄清问题 -> 审核三份设计文档(c 通过)-> /preview 看效果 -> /deploy 上线。\n更多:/help 全部命令 · /design 换设计风格（默认已自动选）· /config 当前配置"
+
+# Provider preset labels (vendor menu in the external-API wizard)
+
+# External model/API setup wizard
+
+# Resume / session hints
+"session.completed" = "[session] workspace 上次跑完了流水线(需求:\"{}\")。\n  /diff 看上次产出 · 或直接输入新需求开新一轮。"
+"session.paused_at_gate" = "[session] workspace 上次会话停在 gate `{}`(需求:\"{}\")。\n  /continue 继续推进 · /diff 看产出 · 或开新需求(会重置 workflow state)。"
+"session.unfinished" = "[session] 检测到未完成的会话(phase={}, 需求:\"{}\")。\n  输入 /continue 推进上次 · 输入新需求会重新开始 · /status 查看详情"
+
+# Shared config write error
+"config.write_failed" = "(无法写入 {}: {})"
+
+# Chitchat replies (offline keyword heuristic)
+"chitchat.greeting" = "你好!我是 UmaDev — 你的 AI 编码项目总监 Agent。\n\n直接输入你要做的产品需求,我会启动 9 阶段流水线:\n  research -> docs -> spec -> frontend -> backend -> quality -> delivery\n\n例如:\n  做一个带邮箱登录的 SaaS 落地页\n  做一个 TODO 待办应用\n  做一个博客系统"
+"chitchat.thanks" = "不客气!有需求随时发给我。"
+"chitchat.who" = "我是 UmaDev — AI 编码的项目总监 Agent。\n\n我驱动你已登录的 claude code / codex / opencode,按 9 阶段商业交付流程\n把一句话需求变成完整产品(文档+前端+后端+部署)。\n\n直接输入需求即可开始,例如:\n  做一个带用户注册的论坛"
+"chitchat.fallback" = "收到!如果你想做一个产品,直接描述需求即可启动流水线。\n\n例如:\n  做一个带邮箱登录的 SaaS 落地页\n  做一个 TODO 应用\n\n或输入 /help 看全部命令。"
+
+# Delivery completion banner
+"delivery.latest_zip" = "\n  最新: {} ({} KiB)"
+"delivery.scorecard" = "\n  成绩单(可分享): release/{}"
+"delivery.complete_banner" = "[ok] 流水线完成,产品已就绪!{}\n\n上线:\n  · /preview -> 本地启动看实际效果\n  · /deploy -> 部署上线(执行底座记录的部署命令,拿到 live URL)\n\n证明(可分享给团队/客户/审计):\n  · 打开上面的 成绩单.html -> 独立质量分 + 治理 + 合规 + 防篡改哈希\n  · /export -> 查看交付物 / proof-pack 详情\n\n其它:\n  · /redo -> 重跑当前需求 · 输入新需求 -> 开新一轮\n  · /status -> 查看完整状态"
+
+# Build/verify failure next-step hints
+"verify.action.tool_missing" = "-> 构建工具缺失。用 /doctor 检查环境,或安装缺失的依赖后用 /redo 重跑。"
+"verify.action.deps_missing" = "-> 依赖未安装。先装依赖(npm/pnpm install、cargo fetch),再 /redo 重跑。"
+"verify.action.type_error" = "-> 类型/语法错误。用 /revise \"修复构建错误\" 让 worker 修,或手动改后 /redo。"
+"verify.action.generic" = "-> 用 /revise \"修复构建错误\" 让 worker 修复,或查看上方 worker 输出定位问题。"
+
+# Picker / quit / gate confirmation / run lifecycle
+"picker.unavailable" = "{} 不可用:{} — 上下选其他,或先装好底座再来"
+"quit.confirm_running" = "再按一次 Esc 退出 UmaDev(workflow state 已保存,下次 `umadev` 自动续上)。"
+"gate.clarify_saved" = "[ok] 澄清回答已保存,开始联网调研…"
+"gate.clarify_recorded" = "已记录(继续回答,或输入 c 提交)"
+"gate.confirmed_docs" = "已确认三份核心文档,继续生成 spec 与前端…"
+"gate.confirmed_preview" = "已确认前端预览,继续开发后端…"
+"gate.confirmed_generic" = "已确认,继续推进…"
+"gate.revision_received" = "收到修订:\"{}\"。重新跑当前 block…"
+"run.queued" = "[queued] 已排队 — 当前阶段跑完(下个 gate / 空隙)就把它作为修改发给底座。再按 Esc 可中断当前阶段。"
+"run.steer_applied" = "[steer] 应用你排队的消息,按它重做当前阶段…"
+"run.queued_unsent" = "[note] 流水线已结束,你排队的消息「{}」没赶上 gate、未发送 —— 直接重新发给我即可。"
+"run.classified_build" = "-> 判断为开发任务 · 进入 9 阶段流水线(想中途停用 /cancel)"
+"design.suggest_hint" = "提示: 你还没选设计系统。可用 /design <name> 在 run 前锁定视觉方向:\n  {}。\n  不选也行 — worker 会自动根据需求推荐一个。"
+"run.preflight_plan" = "收到需求:\"{}\"\n\n配置: worker `{}` · 设计系统 `{}` · 模板 `{}`\n\n9 阶段流水线:\n  1) research(竞品 + discovery) -> 2) docs(PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend(按 UIUX tokens 实现) -> [gate] preview_confirm\n  5) backend -> 6) quality(5 维审查) -> 7) delivery -> proof-pack\n\n两道 gate 默认自动通过(仅作为检查点显示);按 shift+Tab 可转手动逐门审稿。流水线启动中…"
+"run.cancelled" = "[已取消] 当前运行已停止,回到输入。已完成阶段的产物保留在 output/,下次 /continue 或输入新需求都可以。"
+
+# /init manifest
+"init.design_files" = "\n  设计基础设施: {} 文件写入 knowledge/"
+"init.manifest_written" = "[ok] umadev.yaml 写入 {}\n  level={} profile={} slug={}{}"
+"init.design_files_new" = "设计基础设施: {} 新文件写入 knowledge/"
+"init.already_exists" = "umadev.yaml 已存在。设计文件也已就绪。"
+
+# /continue and /revise hints
+"continue.running" = "流水线正在跑 — 等下一个 gate 暂停时再 /continue。"
+"continue.finished" = "流水线已完成。直接输入新需求开新一轮,或 /quit 退出。"
+"continue.not_started" = "还没启动流水线。直接输入需求一句话即可启动 9 阶段流水线。"
+"revise.usage" = "用法:/revise <修订说明>。\n  示例:/revise 去掉社交登录,只留邮箱密码"
+"revise.no_gate" = "目前没有打开的 gate,无法修订 — 要修改产出需要先等流水线停在 gate(docs_confirm / preview_confirm)。"
+
+# Pitfalls overlay / cancel / unknown command
+"pitfalls.overlay_title" = " 踩坑知识库 — Esc 关闭, ↑↓ 滚动 "
+"cancel.none_running" = "没有正在运行的流水线 — 无需取消。直接输入需求开新一轮,或 /quit 退出。"
+"slash.did_you_mean" = " 是想用 `/{}` 吗?"
+"slash.unknown" = "未知命令 `/{}`。{} 输入 /help 看完整列表。"
+
+# Common (extras)
+"common.none" = "(无)"
+
+# /backend and /model
+"backend.switched" = "已切换工人到 `{}` — 下一个 run 起用此 backend。"
+"model.base_default" = "(底座默认)"
+"model.menu.claude" = "  Claude(别名或完整 id 均可):\n    · /model opus —— 最强  · /model sonnet —— 均衡(默认)  · /model haiku —— 最快\n    · 完整 id 如 claude-opus-4-8 / claude-sonnet-4-6"
+"model.menu.codex" = "  Codex(OpenAI 模型 id):\n    · /model gpt-5.1-codex  · /model gpt-5  · /model o4-mini"
+"model.menu.opencode" = "  OpenCode(必须 provider/model 形式):\n    · /model anthropic/claude-sonnet-4-6  · /model openai/gpt-5"
+"model.menu.external" = "  当前为离线模板模式;/model 只对底座 CLI(claude-code/codex/opencode)生效。"
+"model.current" = "当前 model:{}\n切换:/model <id>\n{}\n  注意:必须填该底座支持的 id,填错会在下次 run 时由底座报错。"
+"model.switched" = "model 切换为 `{}` — 下一个 run 起用此 model。"
+
+
+# /design and /template
+"design.not_found" = "未找到设计系统 `{}`。可选: {}"
+"template.usage" = "用法:/template <name>。当前: {}。\n  可选: {}\n  示例:/template saas-landing · /template dashboard · /template blog-content"
+"template.not_found" = "未找到模板 `{}`。可选: {}"
+"template.switched" = "种子模板切换为 `{}` — 下一个 run 的 frontend 阶段将参考此模板的页面结构和质量标准。"
+
+# /run and /redo
+"run.busy_reopen" = "流水线正在跑 — 先 /cancel 停掉再重开,避免两个流水线同时写同一个工作区。"
+"run.usage" = "用法:/run [slug] <需求>\n  示例:/run my-app 做一个登录系统\n  示例:/run 做一个 todo list (slug 自动用目录名)"
+"run.slug_invalid" = "slug `{}` 包含非法字符。只允许字母、数字、`-`、`_`。"
+"redo.busy" = "流水线正在跑 — 先 /cancel 停掉再 /redo,避免两个流水线同时写同一个工作区。"
+"redo.no_requirement" = "还没有跑过任何需求 — 直接输入需求或用 /run 启动。"
+"redo.rerunning" = "重新跑需求:\"{}\"。流水线从 research 重新开始…"
+
+# /export proof-pack
+"export.no_release_dir" = "release/ 目录不存在 — 流水线需要跑到 delivery 才会生成 proof-pack。"
+"export.release_empty" = "release/ 目录为空 — 需要完成 delivery 阶段才会产出 proof-pack.zip。"
+"export.latest_proof_pack" = "[ok] 最新 proof-pack: {}\n  大小: {} KiB\n  路径: {}\n\n可直接分享给审核人员。用 `unzip -l {}` 查看内容。"
+
+# /diff fallback
+"diff.not_found" = "找不到 {} — 现有工件:\n\n"
+"diff.no_output_dir" = "  (output/ 还不存在,先跑一段流水线)\n"
+"diff.usage" = "\n用法:/diff prd · /diff architecture · /diff uiux · /diff frontend-notes …"
+
+# /preview
+"preview.detected" = "[preview] 检测到 {},启动预览…\n  命令:`{}` -> {}"
+"preview.starting" = "启动 dev server 并打开预览:{}\n  命令:`{}`"
+"preview.opened" = "已打开预览:{}\n  (未找到 Run command,如页面打不开请手动启动 dev server)"
+"preview.none_yet" = "还没有可预览的前端。先输入需求跑完到 frontend 阶段(会停在预览 gate),\n                   或确认底座已把 Preview URL 写进 output/xxx-frontend-notes.md。"
+"preview.gate_announce" = "[preview] 前端已生成,预览地址:{}\n                       在浏览器打开查看效果。满意就输入 c 继续(进入后端);\n                       要改就描述修改意见。也可 /preview 自动启动 dev server、/stop-preview 停止。"
+"preview.gate_no_url" = "前端已生成,但底座未记录 Preview URL。\n                   可手动打开项目运行 dev server 预览,或 /preview 尝试自动启动。"
+
+# /deploy
+"deploy.cli_missing" = "[warn] 未检测到部署 CLI(vercel/netlify/wrangler)。如果还没装:\n  npm install -g vercel && vercel login,然后再 /deploy。\n  (如果你已装好,直接继续 — /deploy 会执行底座记录的部署命令。)"
+"deploy.cli_ready" = "[ok] 检测到部署 CLI,可以部署。"
+"deploy.no_command" = "还没有部署指令。先跑完到 delivery 阶段(底座会把部署命令写进 output/xxx-delivery-notes.md),或确认底座已填 `## Deploy command`。"
+"deploy.starting" = "开始部署,执行:`{}`\n  (这可能需要登录平台 CLI,按提示操作)"
+
+# /auto and /manual
+"review.auto_on" = "[ok] 自主模式:已开启。文档与预览检查点将自动通过,直接交付。\n  (想逐步审核 -> /manual · 永久设置 -> .umadevrc 的 auto_approve_gates)"
+"review.manual_on" = "[ok] 审核模式:已开启。每个检查点都会停下,展示产出,等你输入 c 通过或打字修改。\n  (想全自动 -> /auto · 澄清问题始终会先问你)"
+
+# /animations
+"anim.on" = "开启"
+"anim.off" = "关闭"
+"anim.static" = "静态 …"
+"anim.toggled" = "动画已{}(spinner {})"
+
+# /doctor and picker external-API entry
+"doctor.report_written" = "[ok] 诊断报告已写入:{}\n  把这个文件发给开发者,帮我们定位问题。"
+
+# Picker first-screen + help overlay (ui.rs)
+"picker.logo_subtitle" = "· AI 编码的项目总监 Agent"
+"picker.tagline" = "  输入需求,自动调研 / 设计 / 开发 / 上线"
+"picker.group.language" = " 界面语言 / Language "
+"picker.group.host_cli" = " 已安装的 AI 工具 "
+"picker.group.custom_api" = " 外部模型/API "
+"picker.group.offline" = " 其他 "
+"picker.engine_title" = " 选择你的编码引擎 "
+"help.overlay_subtitle" = " UmaDev — AI 编码的项目总监 Agent"
+
+# 首启引导设置(分步)
+"setup.step.language" = "选择界面语言"
+"setup.step.base" = "选择已登录的底座 CLI"
+"setup.progress" = "第 {} / 3 步"
+"setup.back_hint" = "Esc 返回上一步"
+"setup.nav_hint" = "↑↓ 选择 · Enter 下一步 · Esc 返回/退出"
+"setup.more_above" = "↑ 上面还有 {} 项"
+"setup.more_below" = "↓ 下面还有 {} 项"

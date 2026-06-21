@@ -1,0 +1,243 @@
+# UmaDev English UI strings.
+# Keys must match zh-CN.toml / zh-TW.toml exactly (enforced by the parity test).
+
+# First run — language selection
+"lang.picker.title" = "Choose interface language"
+"lang.picker.hint" = "↑↓ select · Enter confirm · change anytime with /lang"
+"lang.changed" = "Interface language switched to {}"
+"lang.current" = "Current interface language: {}"
+"lang.unknown" = "Unknown language. Options: zh-CN (Simplified) / zh-TW (Traditional) / en (English)"
+
+# First run — welcome and configuration
+"firstrun.welcome" = "Welcome to UmaDev — your AI delivery director for commercial-grade software"
+"firstrun.configure" = "First run: a few quick settings (all changeable later while you work)"
+
+# Worker / backend selection
+"picker.title" = "Choose your worker base (UmaDev borrows its model as the brain)"
+"picker.hint" = "↑↓ select · Enter confirm"
+"picker.confirm" = "Selected: {}"
+"picker.footer" = "↑↓ select · Enter confirm · Esc quit   ·   [ok]=installed (login not verified; if a run reports not-logged-in, run that CLI once in your terminal to log in) · No AI tools? Pick \"External model/API\" and use your own key"
+"backend.claude" = "Claude Code (claude --print, uses your logged-in subscription)"
+"backend.codex" = "Codex CLI (codex exec)"
+"backend.opencode" = "OpenCode (opencode run)"
+"backend.offline" = "Offline templates (no AI, demo / CI)"
+
+# Common
+"common.confirm" = "Confirm"
+"common.cancel" = "Cancel"
+"common.continue" = "Continue"
+"common.back" = "Back"
+
+# Input box placeholders (always visible)
+"input.gate" = "Type revision, or /continue to approve…"
+"input.finished" = "New requirement, or /quit…"
+"input.running" = "running — type to queue a message (sent at the next gap); Esc to interrupt"
+"model.synced" = "synced driving model {} (from {}) — the agent runs on the base's own model"
+"model.synced_default" = "{} pins no model in config — the agent runs on its login/default model (the real model shows after a run)"
+"model.reasoning" = "reasoning effort {} (from the base config; UmaDev does not override)"
+"input.idle" = "Ask anything…  (/help for commands)"
+
+# Status
+"status.ready" = "Ready"
+"status.thinking" = "thinking…"
+"status.esc_cancel" = "esc to cancel"
+"mode.auto_chip" = "auto-approve (shift+Tab for manual)"
+"mode.manual_chip" = "manual review (shift+Tab for auto)"
+"status.running" = "Running"
+"status.paused" = "Paused, awaiting confirmation"
+
+# Gate review cards
+"gate.clarify.title" = "clarify — answer the questions so the base understands what you really want"
+"gate.clarify.checklist" = "Answer each question (or write 'skip')\nUnsure? write 'you decide'\nThe more specific, the better the PRD/code fits"
+"gate.clarify.next" = "When done, type c to continue (into web research), or describe changes"
+"gate.docs.title" = "docs_confirm — three core docs are ready for review"
+"gate.docs.checklist" = "PRD: do goals / scope / acceptance criteria cover what you actually want?\nArchitecture: are the API, data model and tech choices sound?\nDesign: do colors / fonts / component tokens match expectations, is there dark mode?"
+"gate.docs.next" = "Not sure? press c to trust the AI's plan. Note: typing ANY text re-runs the whole block per your change (minutes; /cancel to stop); to just approve, type nothing."
+"gate.preview.title" = "preview_confirm — frontend preview is ready for review"
+"gate.preview.checklist" = "Does the frontend follow the UIUX design system (icon lib / tokens / typography)?\nDo the page structure and flows match the PRD user stories?\nDo the fetch URLs match the architecture doc's API?"
+"gate.preview.next" = "Review the runnable frontend preview. Press c to proceed to backend / quality / delivery; typing text re-runs the frontend per your change (minutes; /cancel to undo)."
+"gate.artifacts_header" = "Artifacts:"
+"gate.quality_warn_header" = "[warn] Quality notes:"
+"gate.scaffold_warn" = "{}: offline scaffold — worker timed out or unconfigured, use /revise to regenerate"
+"gate.short_warn" = "{}: only {} lines — may be incomplete"
+"gate.suggest_revise" = "Tip: use /revise 'regenerate architecture' to have the worker fill it in"
+"gate.quality_line" = "Quality: {} CSS tokens · dark mode: {}"
+"gate.checklist_header" = "Approval checklist (confirm these before approving):"
+"gate.actions_header" = "Actions:"
+"gate.action.continue" = "/continue or c         -> approve gate"
+"gate.action.revise" = "/revise <notes>        -> worker redoes it"
+"gate.action.diff_prd" = "/diff prd              -> view the PRD"
+"gate.action.diff_arch" = "/diff architecture     -> view the architecture"
+"gate.action.diff_uiux" = "/diff uiux             -> view the design system"
+"gate.guide_prefix" = "Guide: {}"
+"gate.auto_approved" = "[auto] Autonomous mode: auto-approved checkpoint `{}`, continuing…  (type /manual to review each step)"
+
+# Runtime narration
+"run.started" = "Pipeline started: {}\nDelivering in 9 phases; it pauses at key checkpoints for your review."
+"run.phase_start" = "> phase {} starting…"
+"run.artifact_written" = "  · [{}] wrote {}"
+
+# Help
+"help.title" = "UmaDev commands"
+"help.lang" = "/lang — switch interface language (Simplified / Traditional / English)"
+
+# Provider / preview / connectivity
+"preview.already_running" = "Preview already running, reopening browser: {}"
+"preview.stopped" = "Preview dev server stopped."
+"preview.none_running" = "No preview server is running."
+"init.failed" = "/init failed: {}"
+"design.applied" = "Design system: `{}`\n{}"
+"report.write_failed" = "[warn] could not write report: {}"
+
+# Greeting (cold-start first screen)
+"greeting.main" = "UmaDev — turn a one-line idea into a shippable, commercial product.\nYou write zero code: I drive your logged-in AI worker through research -> design -> build -> preview -> ship, auto-applying a commercial design system and leaving quality + audit evidence.\nCurrent worker: {}"
+"greeting.examples" = "Just type what you want to build, for example (feel free to copy one):\n\n  · A SaaS analytics dashboard with email login\n  · A to-do app with groups and reminders\n  · A blog system with Markdown authoring\n  · A product landing page ready to ship\n\nNext: answer a few clarifying questions -> review the three design docs (c to approve) -> /preview to see it -> /deploy to ship.\nMore: /help all commands · /design change design style (auto-picked by default) · /config current settings"
+
+# Provider preset labels (vendor menu in the external-API wizard)
+
+# External model/API setup wizard
+
+# Resume / session hints
+"session.completed" = "[session] This workspace finished its last pipeline run (requirement: \"{}\").\n  /diff to view the last output · or just type a new requirement to start fresh."
+"session.paused_at_gate" = "[session] This workspace paused at gate `{}` last session (requirement: \"{}\").\n  /continue to proceed · /diff to view output · or start a new requirement (resets workflow state)."
+"session.unfinished" = "[session] Detected an unfinished session (phase={}, requirement: \"{}\").\n  Type /continue to resume · a new requirement restarts from scratch · /status for details"
+
+# Shared config write error
+"config.write_failed" = "(could not write {}: {})"
+
+# Chitchat replies (offline keyword heuristic)
+"chitchat.greeting" = "Hi! I'm UmaDev — your AI coding project-director Agent.\n\nJust type the product you want and I'll start the 9-phase pipeline:\n  research -> docs -> spec -> frontend -> backend -> quality -> delivery\n\nFor example:\n  A SaaS landing page with email login\n  A to-do app\n  A blog system"
+"chitchat.thanks" = "You're welcome! Send a requirement anytime."
+"chitchat.who" = "I'm UmaDev — the project-director Agent for AI coding.\n\nI drive your logged-in claude code / codex / opencode through a 9-phase commercial delivery flow\nto turn a one-line idea into a complete product (docs + frontend + backend + deploy).\n\nJust type a requirement to start, for example:\n  A forum with user registration"
+"chitchat.fallback" = "Got it! If you want to build a product, just describe the requirement to start the pipeline.\n\nFor example:\n  A SaaS landing page with email login\n  A to-do app\n\nOr type /help for all commands."
+
+# Delivery completion banner
+"delivery.latest_zip" = "\n  latest: {} ({} KiB)"
+"delivery.scorecard" = "\n  scorecard (shareable): release/{}"
+"delivery.complete_banner" = "[ok] Pipeline complete, your product is ready! {}\n\nGo live:\n  · /preview -> run it locally to see the real thing\n  · /deploy -> ship it (runs the deploy command the base recorded, returns a live URL)\n\nProof (shareable with team / client / audit):\n  · open the scorecard.html above -> independent quality score + governance + compliance + tamper-proof hash\n  · /export -> view deliverables / proof-pack details\n\nMore:\n  · /redo -> re-run the current requirement · type a new requirement -> start fresh\n  · /status -> view full status"
+
+# Build/verify failure next-step hints
+"verify.action.tool_missing" = "-> Build tool missing. Run /doctor to check the environment, or install the missing dependency and /redo."
+"verify.action.deps_missing" = "-> Dependencies not installed. Install them first (npm/pnpm install, cargo fetch), then /redo."
+"verify.action.type_error" = "-> Type/syntax error. Use /revise \"fix the build error\" to have the worker fix it, or edit by hand and /redo."
+"verify.action.generic" = "-> Use /revise \"fix the build error\" to have the worker fix it, or check the worker output above to locate the problem."
+
+# Picker / quit / gate confirmation / run lifecycle
+"picker.unavailable" = "{} unavailable: {} — pick another above, or install the base first and come back"
+"quit.confirm_running" = "Press Esc again to quit UmaDev (workflow state is saved; the next `umadev` resumes automatically)."
+"gate.clarify_saved" = "[ok] Clarification answers saved, starting web research…"
+"gate.clarify_recorded" = "Recorded (keep answering, or type c to submit)"
+"gate.confirmed_docs" = "Three core docs approved, generating spec and frontend…"
+"gate.confirmed_preview" = "Frontend preview approved, building the backend…"
+"gate.confirmed_generic" = "Approved, proceeding…"
+"gate.revision_received" = "Revision received: \"{}\". Re-running the current block…"
+"run.queued" = "[queued] Queued — it will be sent to the base as a revision at the next gap (gate / phase boundary). Press Esc to interrupt the current phase."
+"run.steer_applied" = "[steer] Applying your queued message — redoing the current phase with it…"
+"run.queued_unsent" = "[note] The pipeline finished before your queued message \"{}\" reached a gate, so it was not sent — just send it again."
+"run.classified_build" = "-> Classified as a build task · entering the 9-phase pipeline (/cancel to stop mid-way)"
+"design.suggest_hint" = "Tip: you haven't picked a design system. Use /design <name> to lock the visual direction before the run:\n  {}.\n  Skipping is fine — the worker will auto-pick one based on the requirement."
+"run.preflight_plan" = "Requirement received: \"{}\"\n\nConfig: worker `{}` · design system `{}` · template `{}`\n\n9-phase pipeline:\n  1) research (competitors + discovery) -> 2) docs (PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend (built from UIUX tokens) -> [gate] preview_confirm\n  5) backend -> 6) quality (5-dimension review) -> 7) delivery -> proof-pack\n\nThe two gates auto-approve by default (they show as checkpoints only); press shift+Tab for manual per-gate review. Starting the pipeline…"
+"run.cancelled" = "[cancelled] The current run is stopped, back to the prompt. Artifacts from completed phases stay in output/; you can /continue or type a new requirement next time."
+
+# /init manifest
+"init.design_files" = "\n  design infrastructure: {} files written to knowledge/"
+"init.manifest_written" = "[ok] umadev.yaml written to {}\n  level={} profile={} slug={}{}"
+"init.design_files_new" = "design infrastructure: {} new files written to knowledge/"
+"init.already_exists" = "umadev.yaml already exists. Design files are ready too."
+
+# /continue and /revise hints
+"continue.running" = "The pipeline is running — wait for the next gate to pause, then /continue."
+"continue.finished" = "The pipeline is complete. Type a new requirement to start fresh, or /quit to exit."
+"continue.not_started" = "No pipeline started yet. Just type a one-line requirement to launch the 9-phase pipeline."
+"revise.usage" = "Usage: /revise <revision notes>.\n  Example: /revise drop social login, keep only email + password"
+"revise.no_gate" = "No gate is open, nothing to revise — to change output, wait for the pipeline to pause at a gate (docs_confirm / preview_confirm)."
+
+# Pitfalls overlay / cancel / unknown command
+"pitfalls.overlay_title" = " Pitfall knowledge base — Esc to close, ↑↓ to scroll "
+"cancel.none_running" = "No pipeline is running — nothing to cancel. Type a requirement to start fresh, or /quit to exit."
+"slash.did_you_mean" = " did you mean `/{}`?"
+"slash.unknown" = "Unknown command `/{}`.{} Type /help for the full list."
+
+# Common (extras)
+"common.none" = "(none)"
+
+# /backend and /model
+"backend.switched" = "Switched worker to `{}` — the next run uses this backend."
+"model.base_default" = "(base default)"
+"model.menu.claude" = "  Claude (alias or full id both work):\n    · /model opus —— strongest  · /model sonnet —— balanced (default)  · /model haiku —— fastest\n    · full ids like claude-opus-4-8 / claude-sonnet-4-6"
+"model.menu.codex" = "  Codex (OpenAI model id):\n    · /model gpt-5.1-codex  · /model gpt-5  · /model o4-mini"
+"model.menu.opencode" = "  OpenCode (must be provider/model form):\n    · /model anthropic/claude-sonnet-4-6  · /model openai/gpt-5"
+"model.menu.external" = "  Running offline templates; /model only affects the base CLIs (claude-code/codex/opencode)."
+"model.current" = "Current model: {}\nSwitch: /model <id>\n{}\n  Note: you must use an id the base supports; a wrong id errors at the base on the next run."
+"model.switched" = "Model switched to `{}` — the next run uses this model."
+
+
+# /design and /template
+"design.not_found" = "Design system `{}` not found. Options: {}"
+"template.usage" = "Usage: /template <name>. Current: {}.\n  Options: {}\n  Example: /template saas-landing · /template dashboard · /template blog-content"
+"template.not_found" = "Template `{}` not found. Options: {}"
+"template.switched" = "Seed template switched to `{}` — the next run's frontend phase will follow this template's page structure and quality bar."
+
+# /run and /redo
+"run.busy_reopen" = "A pipeline is running — /cancel it before starting again, to avoid two pipelines writing the same workspace."
+"run.usage" = "Usage: /run [slug] <requirement>\n  Example: /run my-app build a login system\n  Example: /run build a todo list (slug auto-uses the directory name)"
+"run.slug_invalid" = "slug `{}` contains illegal characters. Only letters, digits, `-`, `_` are allowed."
+"redo.busy" = "A pipeline is running — /cancel it before /redo, to avoid two pipelines writing the same workspace."
+"redo.no_requirement" = "No requirement has been run yet — just type a requirement or use /run to start."
+"redo.rerunning" = "Re-running requirement: \"{}\". The pipeline restarts from research…"
+
+# /export proof-pack
+"export.no_release_dir" = "release/ does not exist — the pipeline must reach delivery to generate a proof-pack."
+"export.release_empty" = "release/ is empty — the delivery phase must complete to produce proof-pack.zip."
+"export.latest_proof_pack" = "[ok] latest proof-pack: {}\n  size: {} KiB\n  path: {}\n\nShare it directly with reviewers. Use `unzip -l {}` to inspect the contents."
+
+# /diff fallback
+"diff.not_found" = "Could not find {} — existing artifacts:\n\n"
+"diff.no_output_dir" = "  (output/ does not exist yet, run the pipeline first)\n"
+"diff.usage" = "\nUsage: /diff prd · /diff architecture · /diff uiux · /diff frontend-notes …"
+
+# /preview
+"preview.detected" = "[preview] Detected {}, starting preview…\n  command: `{}` -> {}"
+"preview.starting" = "Starting dev server and opening the preview: {}\n  command: `{}`"
+"preview.opened" = "Opened the preview: {}\n  (no Run command found; if the page won't open, start the dev server manually)"
+"preview.none_yet" = "No previewable frontend yet. Type a requirement and run through the frontend phase (it pauses at the preview gate),\n                   or confirm the base wrote a Preview URL into output/xxx-frontend-notes.md."
+"preview.gate_announce" = "[preview] Frontend generated, preview at: {}\n                       Open it in the browser to see the result. Happy? type c to continue (into the backend);\n                       to change it, describe your edits. You can also /preview to auto-start the dev server, /stop-preview to stop."
+"preview.gate_no_url" = "Frontend generated, but the base did not record a Preview URL.\n                   Open the project and run the dev server manually, or /preview to try auto-starting it."
+
+# /deploy
+"deploy.cli_missing" = "[warn] No deploy CLI detected (vercel/netlify/wrangler). If not installed yet:\n  npm install -g vercel && vercel login, then /deploy.\n  (If already installed, just continue — /deploy runs the deploy command the base recorded.)"
+"deploy.cli_ready" = "[ok] Deploy CLI detected, ready to deploy."
+"deploy.no_command" = "No deploy command yet. Run through the delivery phase first (the base writes the deploy command into output/xxx-delivery-notes.md), or confirm the base filled in `## Deploy command`."
+"deploy.starting" = "Starting deploy, running: `{}`\n  (this may require logging into the platform CLI; follow the prompts)"
+
+# /auto and /manual
+"review.auto_on" = "[ok] Autonomous mode: on. Doc and preview checkpoints auto-approve, delivering directly.\n  (to review step by step -> /manual · permanent setting -> auto_approve_gates in .umadevrc)"
+"review.manual_on" = "[ok] Review mode: on. Every checkpoint pauses, shows the output, and waits for you to type c to approve or text to revise.\n  (to go fully automatic -> /auto · clarifying questions always ask you first)"
+
+# /animations
+"anim.on" = "on"
+"anim.off" = "off"
+"anim.static" = "static …"
+"anim.toggled" = "Animations {} (spinner {})"
+
+# /doctor and picker external-API entry
+"doctor.report_written" = "[ok] Diagnostic report written to: {}\n  Send this file to the developers to help us locate the issue."
+
+# Picker first-screen + help overlay (ui.rs)
+"picker.logo_subtitle" = "· AI coding project-director Agent"
+"picker.tagline" = "  Type a requirement; auto research / design / build / ship"
+"picker.group.language" = " Interface language / Language "
+"picker.group.host_cli" = " Installed AI tools "
+"picker.group.custom_api" = " External model/API "
+"picker.group.offline" = " Other "
+"picker.engine_title" = " Choose your coding engine "
+"help.overlay_subtitle" = " UmaDev — AI coding project-director Agent"
+
+# First-run guided setup (stepped)
+"setup.step.language" = "Choose interface language"
+"setup.step.base" = "Choose a logged-in base CLI"
+"setup.progress" = "Step {} / 3"
+"setup.back_hint" = "Esc to go back"
+"setup.nav_hint" = "↑↓ select · Enter next · Esc back/quit"
+"setup.more_above" = "↑ {} more above"
+"setup.more_below" = "↓ {} more below"

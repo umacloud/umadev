@@ -1,0 +1,21 @@
+[package]
+name = "umadev-contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "UmaDev contract layer — OpenAPI 3.1 single source of truth, replacing Markdown API tables."
+
+[dependencies]
+umadev-spec = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"

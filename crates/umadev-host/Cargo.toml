@@ -1,0 +1,23 @@
+[package]
+name = "umadev-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "UmaDev host drivers — drive already-logged-in Claude Code / Codex / OpenCode CLIs as subprocesses."
+
+[dependencies]
+umadev-runtime = { workspace = true }
+umadev-spec = { workspace = true }
+
+async-trait = { workspace = true }
+futures = "0.3"
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

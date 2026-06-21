@@ -1,0 +1,53 @@
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '16px'}}}%%
+
+graph TD
+    U["开发者<br/>umadev 需求 / init / run 1-9"]
+
+    U --> HOST
+
+    HOST["25 宿主统一接入<br/>11 CLI + 14 IDE/扩展宿主<br/>规则 / Slash / Skills / AGENTS"]
+
+    HOST --> ENGINE
+
+    ENGINE["核心编排引擎<br/>9 阶段流水线<br/>Checkpoint / Resume / Timeout"]
+
+    ENGINE --> RESEARCH
+    ENGINE --> EXPERT
+    ENGINE --> POLICY
+
+    POLICY["策略治理<br/>default / balanced / enterprise"]
+
+    RESEARCH["深度研究模块<br/>本地知识库 194+ 文件<br/>联网研究 DuckDuckGo / Tavily<br/>知识缓存 TTL + 签名"]
+
+    EXPERT["10 专家 Agent 系统<br/>PM / ARCHITECT / UI / UX<br/>SECURITY / CODE / DBA<br/>QA / DEVOPS / RCA"]
+
+    RESEARCH --> DOCGEN
+    EXPERT --> DOCGEN
+
+    DOCGEN["文档生成引擎<br/>PRD + Architecture + UIUX<br/>10 行业定制<br/>AI 提示词 600+ 行专家注入"]
+
+    DOCGEN --> DESIGN
+
+    DESIGN["UI 智能设计系统<br/>119 配色 + 暗色模式<br/>39 组件库 / 17 字体预设<br/>Design Token / 24 美学方向"]
+
+    DOCGEN --> SPEC
+
+    SPEC["Spec 规范管理<br/>变更提案 / 任务分解<br/>优先级 / 依赖分析"]
+
+    SPEC --> IMPL
+
+    IMPL["代码实现<br/>前端实施蓝图 / 后端实施参考<br/>11 语言 / 6 ORM"]
+
+    IMPL --> QUALITY
+
+    QUALITY["质量审查层<br/>红队审查: 安全 / 性能 / 架构<br/>质量门禁: 20 项检查 + A11y + 性能预算<br/>UI 审查: 商业完成度 + 反模板<br/>代码审查: 前后端 + 领域定制"]
+
+    QUALITY --> DELIVERY
+
+    DELIVERY["交付部署层<br/>CI/CD: 5 平台配置<br/>迁移: 6 种 ORM<br/>演练: 回滚手册 + 冒烟清单<br/>证据包: 18 项 + 就绪度评分"]
+
+    DELIVERY --> OUTPUT
+
+    OUTPUT["最终产物<br/>output/ 文档 + 报告<br/>.umadev/ Spec + 任务<br/>部署配置 + 证据包"]
+
+    ANALYZER["代码库智能分析<br/>代码地图 / 依赖图<br/>影响分析 / 回归防护"] --> QUALITY

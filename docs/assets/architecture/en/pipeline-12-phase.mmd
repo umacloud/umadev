@@ -1,0 +1,63 @@
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '15px'}}}%%
+
+graph TD
+    T["Entry Point<br/>umadev requirement / init / run N"]
+
+    T --> S1
+
+    S1["1 Research<br/>PM + ARCHITECT Experts<br/>Local Knowledge + Web Research<br/>Competitor Analysis 3-5 Products"]
+
+    S1 --> S2
+
+    S2["2 PRD<br/>PM Expert<br/>10 Industry Customizations<br/>User Personas / Feature Matrix / Acceptance"]
+
+    S2 --> S3
+
+    S3["3 Architecture<br/>ARCHITECT + DBA Experts<br/>System Layers / Tech Stack / API Contracts<br/>Data Models / Security Strategy"]
+
+    S3 --> S4
+
+    S4["4 UIUX<br/>UI + UX Experts<br/>119 Palettes / 39 Component Libraries<br/>Design Tokens / Page Skeletons"]
+
+    S4 --> G1
+
+    G1{"Confirmation Gate<br/>PRD + Architecture + UIUX"}
+    G1 -- Revise --> S2
+    G1 -- Confirm --> S5
+
+    S5["5 Spec<br/>PM + CODE Experts<br/>Task Decomposition / Priority / Dependencies"]
+
+    S5 --> S6
+
+    S6["6 Frontend<br/>CODE + UI Experts<br/>Frontend-First Implementation + Runtime Verification"]
+
+    S6 --> G2
+
+    G2{"Preview Gate<br/>Frontend Runnable + Demonstrable"}
+    G2 -- Redesign --> S4
+    G2 -- Confirm --> S7
+
+    S7["7 Backend<br/>CODE + DBA Experts<br/>API Implementation / DB Migration / Auth"]
+
+    S7 --> S8
+
+    S8["8 Quality<br/>QA + SECURITY Experts<br/>Red Team + Quality Gate 20 Checks<br/>A11y + Perf Budget + UI Review"]
+
+    S8 -- Fail --> S7
+    S8 -- Pass --> S9
+
+    S9["9 Delivery<br/>DEVOPS + QA Experts<br/>CI/CD 5 Platforms + DB Migration 6 ORMs<br/>Rehearsal + Proof Pack + Readiness"]
+
+    S9 --> DONE
+
+    DONE["Delivery Complete"]
+
+    S9 -.- L1["UI Rework: UI+UX Experts Redesign"]
+    S9 -.- L2["Arch Rework: ARCHITECT Re-evaluate"]
+    S9 -.- L3["Quality Rework: QA+SECURITY Fix"]
+    S9 -.- L4["Bug Fix: RCA+CODE Collaborate"]
+
+    L1 -.-> S4
+    L2 -.-> S3
+    L3 -.-> S8
+    L4 -.-> S7

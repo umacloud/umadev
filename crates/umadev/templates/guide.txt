@@ -1,0 +1,143 @@
+UmaDev — 60-second walkthrough
+=================================
+
+WHAT IS UMADEV?
+------------------
+  UmaDev is the **project-director Agent** for AI coding. It does NOT call
+  any LLM and owns no model — it drives the base CLI you already logged into
+  (Claude Code / Codex / OpenCode), reusing that base's OWN login and model
+  (your subscription, or whatever third-party / local model you connected to
+  the base). Result: zero API key of its own, deterministic, fully audited.
+
+THE PIPELINE (9 phases, 2 gates)
+--------------------------------
+  research -> docs -> [gate] docs_confirm -> spec -> frontend -> [gate] preview_confirm
+                                              -> backend -> quality -> delivery
+
+  [gate] = UmaDev pauses, you review the artifacts, then approve to continue.
+
+YOUR ROLE
+---------
+  1. Type `umadev` to enter the chat TUI.
+  2. First time: pick the base CLI you logged into (claude-code / codex /
+       opencode). UmaDev drives it with ITS own model — nothing to configure.
+  3. Type naturally (or press Shift+Enter for multi-line). The base decides
+       whether to answer as chat or start the pipeline.
+  4. Watch the pipeline narrate. Worker output streams into the chat.
+  5. At the first gate (docs_confirm): read the PRD / architecture / UIUX.
+       - Happy?    `/continue` or just `c`
+       - Not yet?  `/revise <text>` keeps you at the gate
+  6. At preview_confirm: /preview to see the frontend in a browser.
+  7. Then backend -> quality -> delivery -> /deploy to ship -> proof-pack zip.
+
+THE COMMAND SURFACE
+-------------------
+  Inside the TUI (recommended):
+    umadev                          launch the chat
+    /claude /codex /opencode           switch base CLI (each uses its OWN model)
+    /status                            show the active base + its driving model
+    /model <id>                        override the base's model for this session
+    /preview                           start dev server + open browser
+    /checkpoint [label]                snapshot workspace files (a phase's work)
+    /rewind [id]                       list / rewind to a file checkpoint
+    /deploy                            preview the deploy command (/deploy confirm ships)
+    /continue                          approve gate
+    /revise <text>                     gate-local revision
+    /spec /verify /doctor              open scrollable overlays
+    /diff [name]                       show an artifact
+    /history /help /clear /quit
+    type freely                        a fresh requirement, or a revision at a gate
+
+  Workers (base CLIs you already installed + logged in; no API key):
+    claude-code  Anthropic Claude Code
+    codex        OpenAI Codex
+    opencode     OpenCode
+    offline      deterministic templates (no AI; internal CI / demo fallback)
+
+  Scripted form (when you don't want a TUI):
+    umadev init                     write umadev.yaml (run once per workspace)
+    umadev run <req>                non-interactive run, pauses at docs_confirm
+    umadev run <req> --backend X    drive real worker (claude-code or codex)
+    umadev continue                 approve active gate (auto-reuses --backend)
+    umadev continue --backend X     override worker for this block
+    umadev revise <text>            stay at gate, record a revision
+    umadev spec             print the spec
+    umadev verify           workspace conformance
+    umadev doctor           self-test
+    umadev report           SOC2/ISO27001/EU-AI-Act mapping
+    umadev examples         the cheat-sheet
+    umadev guide            this walkthrough
+
+WHAT GETS WRITTEN
+-----------------
+  ~/.umadev/config.toml   your selected base CLI (+ optional /model override)
+  umadev.yaml             this workspace's spec manifest (UD-META-001)
+
+  output/                    AI-generated artifacts
+    <slug>-prd.md
+    <slug>-architecture.md
+    <slug>-uiux.md
+    <slug>-execution-plan.md
+    <slug>-frontend-notes.md   (includes Preview URL + Run command)
+    <slug>-backend-notes.md
+    <slug>-delivery-notes.md   (includes Deploy command + live URL)
+    <slug>-quality-gate.json
+    <slug>-compliance-mapping.json
+
+  .umadev/                state + audit (do not edit by hand)
+    workflow-state.json         <- resumable on next launch
+    audit/tool-calls.jsonl
+    audit/verify.jsonl          <- cargo / npm / python verify results
+    decisions/<gate>.md         <- every revision request
+
+  release/                   final deliverable
+    proof-pack-<slug>-<ts>.zip   <- give this to your stakeholder
+
+GOVERNANCE RULES (always enforced)
+----------------------------------
+  UD-CODE-001  no emoji as functional icons (use Lucide/Heroicons/Tabler)
+  UD-CODE-002  no hardcoded colors — design tokens only
+  UD-CODE-003  frontend↔backend API path alignment
+  UD-CODE-004  tech-stack pre-research
+  UD-SEC-001   sensitive-path write protection (.git/.env/.ssh/credentials)
+  UD-FLOW-*    phase chain + 2 gates + revision semantics + session continuity
+  UD-ART-*     6 mandatory artifacts (PRD / architecture / UIUX / spec / tasks / ADR)
+  UD-EVID-*    5-piece evidence chain (audit + quality + compliance + proof-pack)
+  UD-META-*    spec manifest + version negotiation
+
+  Verify loop runs `cargo check` / `npm install` / `python3` after every
+  code-producing phase. On failure, the build error is fed back to the
+  worker for one automatic fix attempt. Failures land in
+  .umadev/audit/verify.jsonl so a non-technical user can ship stable
+  code without writing any.
+
+INPUT BOX FEATURES
+------------------
+  <- ->                cursor moves character-by-character (CJK-safe)
+  Home / End         jump to start / end
+  Backspace / Delete delete before / at cursor
+  Shift+Enter        insert newline (multi-line requirements)
+  UpDown (empty input)   recall previous prompts (last 100, de-duped)
+  /                  opens a typeahead popover for slash commands
+  Tab                autocomplete the highlighted slash verb
+  F1                 help overlay
+  Esc                close overlay (or quit, with confirmation
+                     when a pipeline is running)
+
+PRIVACY & TRUST
+---------------
+  - No telemetry, no phone-home, no analytics. UmaDev makes ZERO network
+    calls of its own — the only outbound traffic comes from the base CLI you
+    drive, using ITS own login / API. Offline mode makes no network calls.
+  - UmaDev never handles your API keys — the base owns its own auth. We inject
+    nothing into it; whatever you logged the base into (or connected to it) is
+    exactly what runs.
+  - Everything UmaDev writes stays in your project: `output/` (artifacts) and
+    `.umadev/` (state, audit, checkpoints) — both auto-gitignored by `init`.
+  - Run `umadev doctor` for a health check (backends, git, config validity).
+
+NEXT STEPS
+----------
+  umadev examples     # cheat-sheet
+  umadev spec         # the formal spec
+  umadev              # just start using it

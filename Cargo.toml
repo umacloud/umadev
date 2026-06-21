@@ -1,0 +1,99 @@
+# UmaDev — workspace manifest.
+#
+# UmaDev is a coach for AI coding hosts. One specification, one
+# binary, 23 host CLI backends. No API key — drives your already
+# logged-in coding CLI as a subprocess.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/umadev",
+    "crates/umadev-spec",
+    "crates/umadev-governance",
+    "crates/umadev-agent",
+    "crates/umadev-runtime",
+    "crates/umadev-host",
+    "crates/umadev-knowledge",
+    "crates/umadev-contract",
+    "crates/umadev-tui",
+    "crates/umadev-i18n",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.87"
+license = "MIT"
+authors = ["Shangyan Technology <11964948@qq.com>"]
+repository = "https://github.com/umacloud/umadev"
+homepage = "https://github.com/umacloud/umadev"
+description = "AI 编码的项目经理 — drives your logged-in Claude Code / Codex through a 9-phase commercial delivery pipeline. No API key needed."
+
+[workspace.dependencies]
+# --- runtime / async ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "process", "signal", "sync", "time"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# --- HTTP ---
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+eventsource-stream = "0.2"
+
+# --- serde / data ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# --- error handling ---
+anyhow = "1"
+thiserror = "2"
+
+# --- CLI ---
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# --- TUI ---
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# --- governance / parsing ---
+regex = "1.10"
+sha2 = "0.10"
+
+# --- time ---
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# --- logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# --- archive ---
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# --- testing ---
+insta = { version = "1.41", features = ["json", "yaml"] }
+pretty_assertions = "1"
+mockito = "1"
+
+# --- internal ---
+umadev-spec = { path = "crates/umadev-spec", version = "1.0.0" }
+umadev-governance = { path = "crates/umadev-governance", version = "1.0.0" }
+umadev-agent = { path = "crates/umadev-agent", version = "1.0.0" }
+umadev-runtime = { path = "crates/umadev-runtime", version = "1.0.0" }
+umadev-host = { path = "crates/umadev-host", version = "1.0.0" }
+umadev-knowledge = { path = "crates/umadev-knowledge", version = "1.0.0" }
+umadev-contract = { path = "crates/umadev-contract", version = "1.0.0" }
+umadev-tui = { path = "crates/umadev-tui", version = "1.0.0" }
+umadev-i18n = { path = "crates/umadev-i18n", version = "1.0.0" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+opt-level = 1

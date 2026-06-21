@@ -1,0 +1,41 @@
+[package]
+name = "umadev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "UmaDev — a coach for AI coding hosts. One spec, one binary, three SDK runtimes."
+
+[[bin]]
+name = "umadev"
+path = "src/main.rs"
+
+[dependencies]
+umadev-spec = { workspace = true }
+umadev-governance = { workspace = true }
+umadev-agent = { workspace = true, features = ["vector"] }
+umadev-runtime = { workspace = true }
+umadev-host = { workspace = true }
+umadev-tui = { workspace = true }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+# Bundle the local candle embedding model into the shipped binary. The release
+# CI builds with `--features vector-local` so `npm i -g umadev` gives offline
+# hybrid retrieval with zero user setup; dev/CI omit it to skip candle's heavy
+# compile. Fail-open: without the model the binary degrades to BM25.
+vector-local = ["umadev-agent/vector-local"]
+
+[dev-dependencies]
+tempfile = "3"
+zip = { workspace = true }

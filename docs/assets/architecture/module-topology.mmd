@@ -1,0 +1,96 @@
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '14px'}}}%%
+
+graph TD
+    subgraph A ["CLI 入口"]
+        A1["cli.py 38+ 命令"]
+        A2["web/api.py FastAPI"]
+    end
+
+    subgraph B ["中枢编排"]
+        B1["engine.py 流水线引擎<br/>9 阶段 + Checkpoint + Timeout"]
+        B2["experts.py 10 专家调度<br/>画像 + 思维框架 + 质量标准"]
+        B3["quality.py 13 维度评分"]
+        B4["contracts.py 阶段契约"]
+        B5["telemetry.py 遥测"]
+    end
+
+    subgraph C ["深度研究"]
+        C1["knowledge.py<br/>本地知识 194+ 文件<br/>联网检索 + 缓存"]
+        C2["requirement_parser.py<br/>需求解析 + 模式识别"]
+    end
+
+    subgraph D ["文档生成"]
+        D1["document_generator.py<br/>PRD / Arch / UIUX<br/>76 方法 + 10 行业"]
+        D2["prompt_generator.py<br/>AI 提示词 600+ 行"]
+        D3["spec_builder.py<br/>Spec 提案"]
+        D4["frontend_builder.py"]
+        D5["implementation_builder.py<br/>11 语言后端"]
+    end
+
+    subgraph E ["UI 智能引擎"]
+        E1["ui_intelligence.py<br/>119 配色 / 39 组件库<br/>17 字体 / 暗色模式"]
+        E2["aesthetics.py<br/>24 美学方向"]
+        E3["tokens.py<br/>Design Token 生成"]
+        E4["generator.py 设计系统"]
+        E5["codegen.py 组件代码"]
+        E6["charts.py 图表推荐"]
+        E7["landing.py Landing 设计"]
+        E8["ux_guide.py UX 指南"]
+    end
+
+    subgraph F ["质量审查"]
+        F1["quality_gate.py<br/>20 项 + A11y + 性能预算"]
+        F2["redteam.py<br/>安全/性能/架构 + CWE"]
+        F3["ui_review.py<br/>商业完成度 + 反模板"]
+        F4["code_review.py<br/>前后端 + 领域定制"]
+    end
+
+    subgraph G ["交付部署"]
+        G1["cicd.py 5 平台"]
+        G2["migration.py 6 ORM"]
+        G3["delivery.py 交付包"]
+        G4["rehearsal.py 演练文档"]
+        G5["rehearsal_runner.py 演练执行"]
+    end
+
+    subgraph H ["证据与发布"]
+        H1["proof_pack.py<br/>18 项证据汇总"]
+        H2["release_readiness.py<br/>8 项就绪度检查"]
+        H3["review_state.py<br/>5 种审查状态"]
+    end
+
+    subgraph I ["代码库分析"]
+        I1["repo_map.py 代码地图"]
+        I2["dependency_graph.py 依赖图"]
+        I3["impact.py 影响分析"]
+        I4["regression_guard.py 回归防护"]
+    end
+
+    subgraph J ["宿主集成"]
+        J1["integrations/manager.py<br/>20 宿主适配"]
+        J2["skills/manager.py<br/>Skill 安装/卸载"]
+        J3["catalogs.py 宿主目录"]
+    end
+
+    subgraph K ["配置与策略"]
+        K1["config/manager.py<br/>umadev.yaml"]
+        K2["policy/manager.py<br/>3 级策略预设"]
+    end
+
+    subgraph L ["Spec 管理"]
+        L1["specs/manager.py 变更管理"]
+        L2["specs/validator.py 规范验证"]
+    end
+
+    A --> B
+    B --> C
+    B --> D
+    B --> F
+    C --> D
+    D --> E
+    D --> L
+    F --> G
+    G --> H
+    I --> F
+    J --> A
+    K --> B

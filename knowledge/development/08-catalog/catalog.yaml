@@ -1,0 +1,122 @@
+version: 1
+sections:
+  - path: development
+    items:
+      - api-contract-and-versioning-guide.md
+      - api-governance-complete.md
+      - backend-engineering-complete.md
+      - code-review-quality-complete.md
+      - concurrency-reliability-complete.md
+      - database-engineering-complete.md
+      - engineering-effectiveness-complete.md
+      - engineering-standards-deep-dive.md
+      - frontend-engineering-complete.md
+      - performance-capacity-complete.md
+      - refactor-migration-complete.md
+      - refactoring-and-techdebt-playbook.md
+      - security-in-development-complete.md
+  - path: development/00-governance
+    items:
+      - document-template.md
+  - path: development/01-standards
+    items:
+      - api-versioning-strategies.md
+      - authentication-patterns-complete.md
+      - css-architecture-complete.md
+      - database-migration-strategies.md
+      - elasticsearch-complete.md
+      - git-complete.md
+      - golang-complete.md
+      - graphql-complete.md
+      - javascript-bundlers-complete.md
+      - javascript-typescript-complete.md
+      - jest-complete.md
+      - linux-complete.md
+      - logging-observability-complete.md
+      - microservices-communication.md
+      - mongodb-complete.md
+      - oauth2-complete.md
+      - performance-optimization-complete.md
+      - playwright-complete.md
+      - postgresql-complete.md
+      - pytest-complete.md
+      - python-async-programming.md
+      - python-complete.md
+      - python-decorators-complete.md
+      - python-design-patterns.md
+      - python-packaging-distribution.md
+      - python-testing-strategies.md
+      - python-web-frameworks-comparison.md
+      - redis-complete.md
+      - rest-api-complete.md
+      - rust-complete.md
+      - typescript-advanced-types.md
+      - web-security-complete.md
+  - path: development/02-playbooks
+    items:
+      - api-design-playbook.md
+      - database-migration-playbook.md
+      - debugging-playbook.md
+      - feature-delivery-playbook.md
+      - incident-hotfix-playbook.md
+      - performance-optimization-playbook.md
+      - performance-tuning-playbook.md
+      - refactor-playbook.md
+      - release-playbook.md
+  - path: development/03-checklists
+    items:
+      - architecture-review-checklist.md
+      - data-migration-checklist.md
+      - oncall-handover-checklist.md
+      - pr-checklist.md
+      - production-readiness-checklist.md
+      - release-readiness-checklist.md
+      - security-review-checklist.md
+  - path: development/04-antipatterns
+    items:
+      - api-antipatterns.md
+      - architecture-antipatterns.md
+      - backend-antipatterns.md
+      - cicd-antipatterns.md
+      - code-smell-antipatterns.md
+      - data-antipatterns.md
+      - database-antipatterns.md
+      - frontend-antipatterns.md
+      - reliability-antipatterns.md
+      - security-antipatterns.md
+  - path: development/05-cases
+    items:
+      - case-api-version-migration.md
+      - case-authorization-hardening.md
+      - case-bluegreen-rollback.md
+      - case-cache-snowball-protection.md
+      - case-ci-cd-pipeline.md
+      - case-database-scaling.md
+      - case-db-hotspot-optimization.md
+      - case-incident-mttr-reduction.md
+      - case-microservice-migration.md
+      - case-performance-optimization.md
+      - case-security-incident-response.md
+  - path: development/06-glossary
+    items:
+      - full-stack-glossary.md
+  - path: development/09-maturity
+    items:
+      - quarterly-audit-template.md
+  - path: development/11-ui-excellence
+    items:
+      - ui-aesthetic-system.md
+      - ui-engineering-excellence.md
+  - path: development/12-scenarios
+    items:
+      - development-scenarios-guide.md
+  - path: development/13-implementation-assets
+    items:
+      - implementation-toolkit.md
+      - knowledge-gates-execution.md
+  - path: development/14-full-lifecycle
+    items:
+      - software-lifecycle-gates.md
+  - path: development/15-lifecycle-templates
+    items:
+      - project-templates-collection.md

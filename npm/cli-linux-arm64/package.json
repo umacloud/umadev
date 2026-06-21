@@ -1,0 +1,21 @@
+{
+  "name": "@umadev/cli-linux-arm64",
+  "version": "1.0.0",
+  "description": "umadev prebuilt binary for Linux (aarch64 / gnu).",
+  "homepage": "https://github.com/umacloud/umadev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/umacloud/umadev.git"
+  },
+  "license": "MIT",
+  "files": [
+    "bin/"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "preferUnplugged": true
+}

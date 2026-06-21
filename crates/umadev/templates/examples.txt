@@ -1,0 +1,96 @@
+UmaDev — common workflows
+============================
+
+* First-time use (recommended)
+-------------------------------
+    umadev init                            # scaffold workspace (design systems + templates)
+    umadev                                 # launch the chat TUI
+                                              # first time: pick claude-code, codex, or opencode
+                                              # then /design modern-minimal (optional)
+                                              # type naturally -> the base decides chat vs pipeline
+                                              # at each gate press 'c' (or /continue)
+                                              # /preview to see the frontend, /deploy to ship
+                                              # done -> release/proof-pack-*.zip
+
+* Inside the TUI — chat & slash commands
+----------------------------------------
+    just type            send to the current base for chat-vs-run routing
+                         (or revision if a gate is open)
+    /claude /codex /opencode
+                         switch the base (saves to ~/.umadev/config.toml)
+    /offline             switch to deterministic templates (demo / CI)
+    /model plan <m> / build <m>     per-phase model tiers (plan cheap, code strong)
+    /preview             start the dev server + open the browser
+    /checkpoint [label]  snapshot workspace files; /rewind [id] to roll back
+    /deploy              preview the deploy command (/deploy confirm to ship)
+    /continue            approve the active gate
+    /revise <text>       stay at gate, request changes
+    /spec                show the full UMADEV_HOST_SPEC_V1 spec
+    /verify              workspace conformance report
+    /doctor              self-test (binary + manifest + probes)
+    /diff [name]         show an artifact (default: prd)
+    /history             show the full conversation history
+    /init                write umadev.yaml manifest
+    /clear               clear chat history
+    /help or F1          help overlay (all keybindings)
+    /quit or Esc         exit (workflow state is saved)
+
+* TUI keys
+----------
+    UpDown in palette       cycle slash-command matches
+    Tab                 autocomplete the selected slash command
+    UpDown in empty input    recall previous prompts (100-entry history)
+    Shift+Enter         insert a newline (build multi-line prompts)
+    <- ->                 move cursor character-by-character
+    Home / End          jump cursor to start / end
+    Backspace / Delete  delete before / at cursor (CJK-safe)
+    Esc (when overlay)  close overlay
+    Esc (twice)         confirm quit while a pipeline is running
+
+* Scripted / CI form (no TUI)
+------------------------------
+    umadev init                            # write umadev.yaml manifest
+    umadev run "做一个登录系统" \
+                --backend claude-code         # drive Claude Code (no API key)
+    umadev continue                        # approve docs_confirm (auto-reuses --backend)
+    umadev continue                        # approve preview_confirm
+    umadev verify                          # final workspace state + worker
+    umadev report                          # UD-EVID-004 compliance map
+
+    # explicit worker override at any continue (rarely needed):
+    umadev continue --backend claude-code  # force Claude Code for this block
+    umadev continue --backend codex        # switch worker partway through
+
+* Iterating at a gate (scripted)
+--------------------------------
+    umadev revise "把 OAuth 那段去掉,先做 MVP"
+    # re-run last block, then:
+    umadev continue                        # once happy
+
+* Switching the worker / model mid-conversation (TUI)
+------------------------------------------------------
+    /claude                                   # Anthropic Claude Code
+    /codex                                    # OpenAI Codex
+    /opencode                                 # OpenCode
+    /offline                                  # templates only (demo / CI)
+    /model <id>                               # override the base's model for this session
+
+* Inspecting state (no TUI needed)
+-----------------------------------
+    umadev verify                          # workflow state + evidence chain
+    umadev doctor                          # binary / workspace self-test
+    umadev spec --clauses                  # the clause table
+
+* Environment overrides
+-----------------------
+    UMADEV_CLAUDE_BIN          path to the `claude` binary       (default: claude)
+    UMADEV_CLAUDE_PRINT_FLAG   non-interactive flag for claude   (default: --print)
+    UMADEV_CODEX_BIN           path to the `codex` binary        (default: codex)
+    UMADEV_CODEX_EXEC_SUBCMD   non-interactive sub-command       (default: exec)
+    UMADEV_VERIFY_TIMEOUT_SECS verify-loop per-call timeout      (default: 120)
+    UMADEV_WORKER_TIMEOUT      per-call worker timeout seconds   (default: 300)
+    UMADEV_RETRY_BASE_MS       retry backoff base ms             (default: 2000)
+    XDG_CONFIG_HOME               base for umadev/config.toml    (default: $HOME)
+
+For the full spec: umadev spec
+For a guided walkthrough: umadev guide

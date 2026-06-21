@@ -1,0 +1,65 @@
+[package]
+name = "umadev-knowledge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "UmaDev knowledge base — BM25 + optional vector retrieval, replacing the flat-folder approach."
+
+[dependencies]
+umadev-spec = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+# Stable content hash for the corpus cache (truncated SHA-256). SHA-256 is
+# fixed by spec, so the cache survives Rust-stdlib hasher changes that would
+# otherwise invalidate the whole .umadev/kb-index/ between toolchain bumps.
+sha2 = { workspace = true }
+
+# Real embeddings HTTP transport (OpenAI-compatible /v1/embeddings + Ollama
+# local /api/embeddings). On by DEFAULT — the shipped binary already links
+# reqwest+tokio (runtime/host crates) so this is zero marginal cost, and a
+# first-class hybrid retriever (BM25 + vector RRF fusion) is the commercial
+# baseline. Build BM25-only/zero-network with `--no-default-features`.
+reqwest = { workspace = true, optional = true }
+# tokio is needed for the retry/backoff sleep in the vector transport; pulled
+# in with the `vector` feature (reqwest already depends on it, but we call
+# tokio::time::sleep directly).
+tokio = { workspace = true, optional = true }
+
+# Zero-install local embeddings: candle (pure Rust, no native ONNX/C++ runtime
+# on CPU) runs a small bilingual model bundled with the npm package. Optional +
+# off by default so the heavy ML dep never touches the standard build; enable
+# with `--features vector-local`.
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+tokenizers = { version = "0.20", optional = true, default-features = false, features = [
+    "onig",
+] }
+
+[features]
+# Vectors are first-class by default; opt OUT with --no-default-features for a
+# lean BM25-only offline build (e.g. embedded / air-gapped).
+default = ["vector"]
+# The real HTTP embeddings transport. Without it, `vector::is_enabled()` is a
+# compile-time false and the crate pulls in no HTTP dependency at all.
+vector = ["dep:reqwest", "dep:tokio"]
+# Bundled local embedding model via candle (pure Rust). Layers on top of
+# `vector`; the local backend is tried first, then HTTP, then BM25 (fail-open).
+vector-local = [
+    "vector",
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+]
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }

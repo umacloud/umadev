@@ -1,0 +1,20 @@
+[package]
+name = "umadev-i18n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Language detection + tri-lingual (zh-CN / zh-TW / en) string catalog for UmaDev's UI chrome."
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+# Cross-platform native locale detection (CFLocale on macOS,
+# GetUserDefaultLocaleName on Windows, LANG/LC_* on Linux). Thin OS-API
+# wrapper, no ICU / heavy transitive deps.
+sys-locale = "0.3"
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

@@ -1,0 +1,96 @@
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '14px'}}}%%
+
+graph TD
+    subgraph A ["CLI Entry"]
+        A1["cli.py 38+ Commands"]
+        A2["web/api.py FastAPI"]
+    end
+
+    subgraph B ["Core Orchestration"]
+        B1["engine.py Pipeline Engine<br/>9 Stages + Checkpoint + Timeout"]
+        B2["experts.py 10-Expert Dispatcher<br/>Profiles + Thinking Framework"]
+        B3["quality.py 13-Dimension Scoring"]
+        B4["contracts.py Stage Contracts"]
+        B5["telemetry.py Telemetry"]
+    end
+
+    subgraph C ["Deep Research"]
+        C1["knowledge.py<br/>Local Knowledge 194+ files<br/>Web Search + Cache"]
+        C2["requirement_parser.py<br/>Requirement Analysis"]
+    end
+
+    subgraph D ["Document Generation"]
+        D1["document_generator.py<br/>PRD / Arch / UIUX<br/>76 Methods + 10 Industries"]
+        D2["prompt_generator.py<br/>AI Prompt 600+ lines"]
+        D3["spec_builder.py"]
+        D4["frontend_builder.py"]
+        D5["implementation_builder.py<br/>11 Language Backends"]
+    end
+
+    subgraph E ["UI Intelligence Engine"]
+        E1["ui_intelligence.py<br/>119 Palettes / 39 Libraries<br/>17 Typography / Dark Mode"]
+        E2["aesthetics.py<br/>24 Aesthetic Directions"]
+        E3["tokens.py<br/>Design Token Generation"]
+        E4["generator.py Design System"]
+        E5["codegen.py Component Code"]
+        E6["charts.py Chart Recommendations"]
+        E7["landing.py Landing Design"]
+        E8["ux_guide.py UX Guide"]
+    end
+
+    subgraph F ["Quality Review"]
+        F1["quality_gate.py<br/>20 Checks + A11y + Perf Budget"]
+        F2["redteam.py<br/>Security/Performance/Arch + CWE"]
+        F3["ui_review.py<br/>Commercial Grade + Anti-Template"]
+        F4["code_review.py<br/>Frontend/Backend + Domain"]
+    end
+
+    subgraph G ["Delivery & Deploy"]
+        G1["cicd.py 5 Platforms"]
+        G2["migration.py 6 ORMs"]
+        G3["delivery.py Delivery Package"]
+        G4["rehearsal.py Rehearsal Docs"]
+        G5["rehearsal_runner.py Runner"]
+    end
+
+    subgraph H ["Evidence & Release"]
+        H1["proof_pack.py<br/>18 Evidence Items"]
+        H2["release_readiness.py<br/>8 Readiness Checks"]
+        H3["review_state.py<br/>5 Review States"]
+    end
+
+    subgraph I ["Codebase Analysis"]
+        I1["repo_map.py Code Map"]
+        I2["dependency_graph.py"]
+        I3["impact.py Impact Analysis"]
+        I4["regression_guard.py"]
+    end
+
+    subgraph J ["Host Integration"]
+        J1["integrations/manager.py<br/>20 Host Adapters"]
+        J2["skills/manager.py<br/>Skill Install/Uninstall"]
+        J3["catalogs.py Host Catalog"]
+    end
+
+    subgraph K ["Config & Policy"]
+        K1["config/manager.py<br/>umadev.yaml"]
+        K2["policy/manager.py<br/>3-Tier Policy Presets"]
+    end
+
+    subgraph L ["Spec Management"]
+        L1["specs/manager.py"]
+        L2["specs/validator.py"]
+    end
+
+    A --> B
+    B --> C
+    B --> D
+    B --> F
+    C --> D
+    D --> E
+    D --> L
+    F --> G
+    G --> H
+    I --> F
+    J --> A
+    K --> B

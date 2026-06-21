@@ -1,0 +1,324 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - navigation [ref=e3]:
+      - button "UmaDev logo UmaDev" [ref=e4] [cursor=pointer]:
+        - img "UmaDev logo" [ref=e5]
+        - generic [ref=e6]: UmaDev
+      - generic [ref=e7]:
+        - button "产品" [ref=e8] [cursor=pointer]
+        - button "文档中心" [ref=e9] [cursor=pointer]
+        - button "更新日志" [ref=e10] [cursor=pointer]
+      - generic [ref=e11]:
+        - generic "Language switcher" [ref=e12]:
+          - button "中" [ref=e13] [cursor=pointer]
+          - button "EN" [ref=e14] [cursor=pointer]
+        - link "GitHub" [ref=e15] [cursor=pointer]:
+          - /url: https://github.com/umacloud/umadev
+          - img [ref=e16]
+          - text: GitHub
+    - main [ref=e18]:
+      - generic [ref=e19]:
+        - generic [ref=e21]:
+          - generic [ref=e22]: v1.0.0 · MIT 开源 · Rust 单二进制
+          - generic [ref=e24]:
+            - generic [ref=e25]: RUN_MODE / LOCAL
+            - generic [ref=e26]: QUALITY_GATE / 90+
+            - generic [ref=e27]: HOSTS / 23
+          - heading "把 AI 编码工具 变成真正的 项目总监 Agent" [level=1] [ref=e28]:
+            - generic [ref=e29]: 把 AI 编码工具
+            - generic [ref=e30]: 变成真正的
+            - generic [ref=e31]: 项目总监 Agent
+          - paragraph [ref=e32]: 从一句需求，到 PRD、架构、UI/UX、代码、质量门、交付包。UmaDev 驱动你已登录的 Claude Code / Codex CLI / OpenCode，按真实团队流程交付可审计的商业项目。
+          - button "$ npm install -g umadev 复制" [ref=e33] [cursor=pointer]:
+            - generic [ref=e34]: $
+            - code [ref=e35]: npm install -g umadev
+            - generic [ref=e36]: 复制
+          - generic [ref=e37]:
+            - link "快速开始" [ref=e38] [cursor=pointer]:
+              - /url: https://github.com/umacloud/umadev
+              - text: 快速开始
+              - generic [ref=e39]: →
+            - button "阅读文档" [ref=e40] [cursor=pointer]
+          - generic [ref=e41]:
+            - generic [ref=e42]:
+              - term [ref=e43]: "9"
+              - definition [ref=e44]: 规范阶段
+            - generic [ref=e45]:
+              - term [ref=e46]: "112"
+              - definition [ref=e47]: 治理规则
+            - generic [ref=e48]:
+              - term [ref=e49]: "416"
+              - definition [ref=e50]: 知识库文档
+            - generic [ref=e51]:
+              - term [ref=e52]: "3"
+              - definition [ref=e53]: 运行模式
+        - generic [ref=e54]:
+          - img
+          - img "UmaDev mascot"
+          - generic [ref=e56]:
+            - generic [ref=e57]:
+              - generic [ref=e62]: umadev - booking-app
+              - button "↻ 重新播放" [ref=e63] [cursor=pointer]
+            - generic [ref=e65]: umadev >
+          - generic [ref=e67]:
+            - generic [ref=e68]: cargo test --workspace
+            - generic [ref=e69]: "quality_gate: 94 / 100"
+            - generic [ref=e70]: release/proof-pack.zip
+      - generic [ref=e71]:
+        - paragraph [ref=e72]: 驱动你已登录的本机编码底座
+        - generic [ref=e73]:
+          - generic [ref=e74]: Claude Code
+          - generic [ref=e75]: Codex CLI
+          - generic [ref=e76]: OpenCode
+      - generic [ref=e77]:
+        - generic [ref=e78]:
+          - generic [ref=e79]: // Uma 角色阵列
+          - heading "每一步交付，都有一个 Uma 在场" [level=2] [ref=e80]
+          - paragraph [ref=e81]: 把吉祥物从装饰变成产品语言：不同姿态对应不同阶段，让用户一眼看懂 UmaDev 正在做什么。
+        - generic [ref=e82]:
+          - article [ref=e83]:
+            - img "澄清官" [ref=e84]
+            - generic [ref=e85]:
+              - generic [ref=e86]: 01 / Clarify
+              - heading "澄清官" [level=3] [ref=e87]
+              - paragraph [ref=e88]: 先问清需求边界，避免 AI 一上来就乱写。
+          - article [ref=e89]:
+            - img "调研员" [ref=e90]
+            - generic [ref=e91]:
+              - generic [ref=e92]: 02 / Research
+              - heading "调研员" [level=3] [ref=e93]
+              - paragraph [ref=e94]: 拉起领域资料、竞品和风险，形成可追溯调研。
+          - article [ref=e95]:
+            - img "文档员" [ref=e96]
+            - generic [ref=e97]:
+              - generic [ref=e98]: 03 / Docs
+              - heading "文档员" [level=3] [ref=e99]
+              - paragraph [ref=e100]: 沉下来写 PRD、架构和 UI/UX，不只聊天。
+          - article [ref=e101]:
+            - img "执行导演" [ref=e102]
+            - generic [ref=e103]:
+              - generic [ref=e104]: 04 / Plan
+              - heading "执行导演" [level=3] [ref=e105]
+              - paragraph [ref=e106]: 拆任务、定顺序、把每一步和交付物对齐。
+          - article [ref=e107]:
+            - img "编码搭档" [ref=e108]
+            - generic [ref=e109]:
+              - generic [ref=e110]: 05 / Code
+              - heading "编码搭档" [level=3] [ref=e111]
+              - paragraph [ref=e112]: 驱动本机 CLI 读写真实文件，推进实现。
+          - article [ref=e113]:
+            - img "质量门" [ref=e114]
+            - generic [ref=e115]:
+              - generic [ref=e116]: 06 / Review
+              - heading "质量门" [level=3] [ref=e117]
+              - paragraph [ref=e118]: 盯住规则、契约、构建结果和证据链。
+          - article [ref=e119]:
+            - img "交付冲刺" [ref=e120]
+            - generic [ref=e121]:
+              - generic [ref=e122]: 07 / Ship
+              - heading "交付冲刺" [level=3] [ref=e123]
+              - paragraph [ref=e124]: 生成 proof pack、成绩单和可审计归档。
+          - article [ref=e125]:
+            - img "项目总监" [ref=e126]
+            - generic [ref=e127]:
+              - generic [ref=e128]: 08 / Director
+              - heading "项目总监" [level=3] [ref=e129]
+              - paragraph [ref=e130]: 总控流程，决定什么时候暂停、确认、继续。
+      - generic [ref=e131]:
+        - text: // 工作方式
+        - heading "不是聊完就算完成，而是留下真实文件" [level=2] [ref=e132]
+        - paragraph [ref=e133]: UmaDev 强制 AI 走一条更像真实团队的流程：先澄清，再调研，再写文档，再实现，再过质量门，最后交付证据包。
+      - generic [ref=e134]:
+        - article [ref=e135]:
+          - generic [ref=e136]: "01"
+          - heading "TUI / CLI" [level=3] [ref=e137]
+          - paragraph [ref=e138]: 你和 UmaDev 交流的地方：聊天界面 + 命令入口。
+        - article [ref=e139]:
+          - generic [ref=e140]: "02"
+          - heading "项目总监 Agent" [level=3] [ref=e141]
+          - paragraph [ref=e142]: 决定现在做哪个阶段、何时暂停、何时继续、何时过门。
+        - article [ref=e143]:
+          - generic [ref=e144]: "03"
+          - heading "Runtime / 底座" [level=3] [ref=e145]
+          - paragraph [ref=e146]: 把任务交给 Claude Code / Codex CLI / OpenCode 写真实代码。
+        - article [ref=e147]:
+          - generic [ref=e148]: "04"
+          - heading "治理 · 质量 · 证据" [level=3] [ref=e149]
+          - paragraph [ref=e150]: 检查产物是否合规，记录每次调用，最后打包交付。
+      - generic [ref=e151]:
+        - text: // 流水线设计
+        - heading "10 步交付闭环" [level=2] [ref=e152]
+        - paragraph [ref=e153]: 从需求澄清到交付包，每一步都有产物、确认点和可追溯记录。点击查看每一步做什么。
+      - generic [ref=e154]:
+        - generic [ref=e155]:
+          - button "0 澄清需求" [ref=e156] [cursor=pointer]:
+            - generic [ref=e157]: "0"
+            - strong [ref=e158]: 澄清需求
+          - button "1 调研" [ref=e159] [cursor=pointer]:
+            - generic [ref=e160]: "1"
+            - strong [ref=e161]: 调研
+          - button "2 文档" [ref=e162] [cursor=pointer]:
+            - generic [ref=e163]: "2"
+            - strong [ref=e164]: 文档
+          - button "3 文档确认 确认门" [ref=e165] [cursor=pointer]:
+            - generic [ref=e166]: "3"
+            - strong [ref=e167]: 文档确认
+            - emphasis [ref=e168]: 确认门
+          - button "4 执行计划" [ref=e169] [cursor=pointer]:
+            - generic [ref=e170]: "4"
+            - strong [ref=e171]: 执行计划
+          - button "5 前端" [ref=e172] [cursor=pointer]:
+            - generic [ref=e173]: "5"
+            - strong [ref=e174]: 前端
+          - button "6 预览确认 确认门" [ref=e175] [cursor=pointer]:
+            - generic [ref=e176]: "6"
+            - strong [ref=e177]: 预览确认
+            - emphasis [ref=e178]: 确认门
+          - button "7 后端" [ref=e179] [cursor=pointer]:
+            - generic [ref=e180]: "7"
+            - strong [ref=e181]: 后端
+          - button "8 质量门" [ref=e182] [cursor=pointer]:
+            - generic [ref=e183]: "8"
+            - strong [ref=e184]: 质量门
+          - button "9 交付" [ref=e185] [cursor=pointer]:
+            - generic [ref=e186]: "9"
+            - strong [ref=e187]: 交付
+        - article [ref=e188]:
+          - generic [ref=e191]:
+            - generic [ref=e192]: "0"
+            - generic [ref=e193]:
+              - generic [ref=e194]: clarify
+              - heading "澄清需求" [level=3] [ref=e195]
+          - paragraph [ref=e196]: 先把需求问清楚，可逐条确认或一键跳过
+          - heading "主要产物" [level=4] [ref=e197]
+          - generic [ref=e198]:
+            - code [ref=e199]: › output/<slug>-clarify.md
+            - code [ref=e200]: › output/<slug>-clarify-answers.md
+      - generic [ref=e201]:
+        - text: // 运行模式
+        - heading "三种本机 CLI，驱动它写真实代码" [level=2] [ref=e202]
+        - paragraph [ref=e203]: 当前支持 Claude Code、Codex CLI、OpenCode。UmaDev 复用你已登录的本机工具，不接管账号、不保存登录信息。
+      - generic [ref=e204]:
+        - article [ref=e205]:
+          - generic [ref=e206]:
+            - button "Claude Code" [ref=e207] [cursor=pointer]
+            - button "Codex CLI" [ref=e208] [cursor=pointer]
+            - button "OpenCode" [ref=e209] [cursor=pointer]
+          - generic [ref=e210]: UmaDev 如何调用
+          - code [ref=e211]: $ claude --print --output-format text
+          - generic [ref=e212]: 适合谁
+          - paragraph [ref=e213]: 已经在用 Claude Code 的用户
+        - generic [ref=e214]:
+          - article [ref=e215]:
+            - generic [ref=e216]:
+              - heading "复用本机登录态" [level=3] [ref=e217]
+              - code [ref=e218]: /claude · /codex · /opencode
+            - paragraph [ref=e219]: 继续使用你已经登录的 Claude Code、Codex CLI 或 OpenCode，让它们负责真实读写文件与运行命令。
+          - article [ref=e220]:
+            - generic [ref=e221]:
+              - heading "非交互命令驱动" [level=3] [ref=e222]
+              - code [ref=e223]: subprocess
+            - paragraph [ref=e224]: UmaDev 作为项目总监，只负责任务编排、阶段门、治理规则和证据链；代码执行交给本机 CLI。
+        - generic [ref=e225]:
+          - generic [ref=e226]: ✓ 仅支持三种本机 CLI
+          - generic [ref=e227]: ✓ 继续用你原来的账号与订阅
+          - generic [ref=e228]: ✓ 底座负责真实读写文件、运行命令
+          - generic [ref=e229]: ✓ UmaDev 负责流程、规则、质量门、证据链
+      - generic [ref=e230]:
+        - text: // 底座能力
+        - heading "治理、质量门、知识库——交付的底座" [level=2] [ref=e231]
+        - paragraph [ref=e232]: UmaDev 最早就是治理工具，这部分至今仍是核心。每一次交付，都带着规则、质量门和证据链。
+      - generic [ref=e233]:
+        - article [ref=e234]:
+          - generic [ref=e235]:
+            - strong [ref=e236]: "112"
+            - text: 条治理规则
+          - heading "治理" [level=3] [ref=e237]
+          - paragraph [ref=e238]: 规范层 25 条 clause，实现层 112 条规则。四个入口：写入前 hook、CI 扫描、MCP server、质量门补扫。
+          - list [ref=e239]:
+            - listitem [ref=e240]: ›不用 emoji 当图标 · 不写硬编码色
+            - listitem [ref=e241]: ›不写密钥 · 危险命令 · 注入代码
+            - listitem [ref=e242]: ›Rust unwrap · Go panic · Python bare except
+        - article [ref=e243]:
+          - generic [ref=e244]:
+            - strong [ref=e245]: "90"
+            - text: 分默认通过线
+          - heading "质量门" [level=3] [ref=e246]
+          - paragraph [ref=e247]: 交付前验收，不只看文件在不在，而是逐项检查证据。
+          - list [ref=e248]:
+            - listitem [ref=e249]: ›PRD 目标 / 范围 / 验收标准
+            - listitem [ref=e250]: ›前端调用与后端契约是否一致
+            - listitem [ref=e251]: ›构建 / 测试 / lint / typecheck 结果
+            - listitem [ref=e252]: ›审计日志与合规映射
+        - article [ref=e253]:
+          - generic [ref=e254]:
+            - strong [ref=e255]: "416"
+            - text: 份知识文档
+          - heading "知识库" [level=3] [ref=e256]
+          - paragraph [ref=e257]: 给 AI 看的工程标准库，BM25 + 可选向量混合检索，RRF 融合排序。
+          - list [ref=e258]:
+            - listitem [ref=e259]: ›产品 · 架构 · 前后端 · 数据库
+            - listitem [ref=e260]: ›安全 · 测试 · CI/CD · 运维
+            - listitem [ref=e261]: ›可加入团队自有知识库
+      - generic [ref=e262]:
+        - generic [ref=e263]: 合规映射
+        - code [ref=e264]: SOC 2
+        - code [ref=e265]: ISO 27001
+        - code [ref=e266]: EU AI Act
+      - generic [ref=e267]:
+        - generic [ref=e268]:
+          - text: UMA_DEV / IP_PROFILE
+          - generic [ref=e269]: IP 形象
+          - heading "认识 Uma —— 你的终端总监" [level=2] [ref=e270]
+          - paragraph [ref=e271]: 一颗会发光的终端头、一身机能风外套。Uma 是 UmaDev 的吉祥物，也是「让 AI 按流程交付」这件事的人格化。
+        - generic [ref=e272]:
+          - figure "代码轨道 · 知识检索" [ref=e273]:
+            - img "代码轨道 · 知识检索" [ref=e274]
+            - generic [ref=e275]: 代码轨道 · 知识检索
+          - figure "工作台 · 真实执行" [ref=e276]:
+            - img "工作台 · 真实执行" [ref=e277]
+            - generic [ref=e278]: 工作台 · 真实执行
+          - figure "发布现场 · 品牌角色" [ref=e279]:
+            - img "发布现场 · 品牌角色" [ref=e280]
+            - generic [ref=e281]: 发布现场 · 品牌角色
+      - generic [ref=e282]:
+        - generic [ref=e283]:
+          - heading "免费、开源，一句话就能开始" [level=2] [ref=e284]
+          - paragraph [ref=e285]: MIT 许可 · Rust 单二进制 · 本地运行。当前驱动 Claude Code / Codex CLI / OpenCode，不保存你的登录信息。
+          - generic [ref=e286]:
+            - link "在 GitHub 上开始 →" [ref=e287] [cursor=pointer]:
+              - /url: https://github.com/umacloud/umadev
+            - button "阅读文档" [ref=e288] [cursor=pointer]
+        - code [ref=e289]: npm install -g umadev
+    - contentinfo [ref=e290]:
+      - generic [ref=e291]:
+        - generic [ref=e292]:
+          - img "UmaDev logo" [ref=e293]
+          - strong [ref=e294]: UmaDev
+        - paragraph [ref=e295]: 把「AI 写代码」变成一个完整、可上线、可审计的交付过程。
+      - navigation [ref=e296]:
+        - heading "产品" [level=3] [ref=e297]
+        - button "流水线设计" [ref=e298] [cursor=pointer]
+        - button "运行模式" [ref=e299] [cursor=pointer]
+        - button "治理规则" [ref=e300] [cursor=pointer]
+        - button "质量门" [ref=e301] [cursor=pointer]
+        - button "知识库" [ref=e302] [cursor=pointer]
+      - navigation [ref=e303]:
+        - heading "文档" [level=3] [ref=e304]
+        - button "快速体验" [ref=e305] [cursor=pointer]
+        - button "命令大全" [ref=e306] [cursor=pointer]
+        - button "配置" [ref=e307] [cursor=pointer]
+        - button "Rust 架构" [ref=e308] [cursor=pointer]
+        - button "规范 SPEC" [ref=e309] [cursor=pointer]
+      - navigation [ref=e310]:
+        - heading "资源" [level=3] [ref=e311]
+        - button "更新日志" [ref=e312] [cursor=pointer]
+        - link "GitHub" [ref=e313] [cursor=pointer]:
+          - /url: https://github.com/umacloud/umadev
+        - link "npm" [ref=e314] [cursor=pointer]:
+          - /url: https://www.npmjs.com/package/umadev
+        - button "许可证 MIT" [ref=e315] [cursor=pointer]
+        - link "项目来源 super-dev" [ref=e316] [cursor=pointer]:
+          - /url: https://github.com/shangyankeji/super-dev
+      - generic [ref=e317]: MIT 许可 · 脱胎于 super-dev · © 2026 UmaDev
+  - alert [ref=e318]

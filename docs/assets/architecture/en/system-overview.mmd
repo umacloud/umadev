@@ -1,0 +1,53 @@
+%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '16px'}}}%%
+
+graph TD
+    U["Developer<br/>umadev requirement / init / run 1-9"]
+
+    U --> HOST
+
+    HOST["25 Unified Hosts<br/>11 CLI + 14 IDE/extended hosts<br/>Rules / Slash / Skills / AGENTS"]
+
+    HOST --> ENGINE
+
+    ENGINE["Core Orchestration Engine<br/>9-Stage Pipeline<br/>Checkpoint / Resume / Timeout"]
+
+    ENGINE --> RESEARCH
+    ENGINE --> EXPERT
+    ENGINE --> POLICY
+
+    POLICY["Policy Governance<br/>default / balanced / enterprise"]
+
+    RESEARCH["Deep Research Module<br/>Local Knowledge Base 194+ files<br/>Web Research DuckDuckGo / Tavily<br/>Knowledge Cache TTL + Signature"]
+
+    EXPERT["10-Expert Agent System<br/>PM / ARCHITECT / UI / UX<br/>SECURITY / CODE / DBA<br/>QA / DEVOPS / RCA"]
+
+    RESEARCH --> DOCGEN
+    EXPERT --> DOCGEN
+
+    DOCGEN["Document Generation Engine<br/>PRD + Architecture + UIUX<br/>10 Industry Customizations<br/>AI Prompt 600+ lines with Expert Injection"]
+
+    DOCGEN --> DESIGN
+
+    DESIGN["UI Design Intelligence<br/>119 Palettes + Dark Mode<br/>39 Component Libraries / 17 Typography<br/>Design Tokens / 24 Aesthetic Directions"]
+
+    DOCGEN --> SPEC
+
+    SPEC["Spec Management<br/>Change Proposals / Task Decomposition<br/>Priority / Dependency Analysis"]
+
+    SPEC --> IMPL
+
+    IMPL["Code Implementation<br/>Frontend Playbook / Backend Reference<br/>11 Languages / 6 ORMs"]
+
+    IMPL --> QUALITY
+
+    QUALITY["Quality Review Layer<br/>Red Team: Security / Performance / Architecture<br/>Quality Gate: 20 Checks + A11y + Perf Budget<br/>UI Review: Commercial Grade + Anti-Template<br/>Code Review: Frontend/Backend + Domain-Specific"]
+
+    QUALITY --> DELIVERY
+
+    DELIVERY["Delivery & Deployment<br/>CI/CD: 5 Platform Configs<br/>Migration: 6 ORMs<br/>Rehearsal: Rollback + Smoke Checklist<br/>Proof Pack: 18 Items + Readiness Score"]
+
+    DELIVERY --> OUTPUT
+
+    OUTPUT["Final Artifacts<br/>output/ Documents + Reports<br/>.umadev/ Specs + Tasks<br/>Deploy Configs + Evidence Pack"]
+
+    ANALYZER["Codebase Intelligence<br/>Repo Map / Dependency Graph<br/>Impact Analysis / Regression Guard"] --> QUALITY

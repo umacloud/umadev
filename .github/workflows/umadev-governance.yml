@@ -1,0 +1,45 @@
+# UmaDev governance gate — runs on every push / PR.
+#
+# Scans all source files for governance violations (emoji icons, hardcoded
+# secrets, dangerous commands, bare catches, missing input validation, etc.)
+# and FAILS the build if any are found. This is the CI equivalent of the
+# real-time PreToolUse hook — catching violations before they reach main.
+#
+# To use in YOUR project:
+#   1. Install umadev in CI (build from source or download a release).
+#   2. Copy this file to .github/workflows/umadev-governance.yml.
+#   3. Optionally add a .umadev/rules.toml to tune which clauses apply.
+name: UmaDev Governance
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  govern:
+    name: Governance Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for git-diff changed-file detection
+
+      - name: Install UmaDev
+        run: |
+          # Install the published CLI (prebuilt binary via npm).
+          npm install -g umadev
+
+      - name: Run governance scan
+        run: umadev ci --changed-only
+        # --changed-only scans just the files in this PR (faster than
+        # scanning the whole repo). Remove it to scan everything.
+
+      - name: Upload governance report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: governance-report
+          path: .umadev/audit/
+          if-no-files-found: ignore
