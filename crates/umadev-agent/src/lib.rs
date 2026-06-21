@@ -39,6 +39,7 @@ pub mod checkpoint;
 pub mod coach;
 pub mod config;
 pub mod coverage;
+pub mod critics;
 pub mod error_kb;
 pub mod events;
 pub mod experts;
@@ -54,6 +55,10 @@ pub mod state;
 pub mod tech_debt;
 pub mod verify;
 
+pub use critics::{
+    append_team_ledger, docs_team_for_kind, ArchitectureCritic, CriticArtifacts, CriticConsult,
+    PmCritic, RoleCritic, RoleVerdict,
+};
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{classify_reply, Gate, GateOutcome};
 pub use lessons::{

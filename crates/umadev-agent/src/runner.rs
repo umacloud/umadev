@@ -942,8 +942,18 @@ impl<R: Runtime> AgentRunner<R> {
         // Intelligent docs assessment — the shared brain reviews the foundation
         // and surfaces its judgment so the user confirms WITH a real opinion.
         if use_runtime {
-            self.surface_docs_assessment(&self.options.effective_slug())
-                .await;
+            let slug = self.options.effective_slug();
+            self.surface_docs_assessment(&slug).await;
+            // Role-critic TEAM cross-review (explicit, scaled to the task). The
+            // deterministic floor (coverage/contract in surface_docs_assessment)
+            // already ran as the HARD gate above; this adds the PM + architect
+            // cross-review opinions, records every verdict to the team ledger,
+            // and folds their union of blocking issues into the docs revision
+            // path ONCE (round-1, advisory) — never as loop control.
+            let blocking = self.run_docs_critic_team(&slug).await;
+            if !blocking.is_empty() {
+                self.revise_docs_for_critic_blocking(&slug, &blocking).await;
+            }
         }
         self.transition(Phase::DocsConfirm, gate.map_or("", Gate::id_str))?;
 
@@ -1800,10 +1810,24 @@ impl<R: Runtime> AgentRunner<R> {
         system: &str,
         user: String,
     ) -> Option<T> {
-        // No borrowed brain (offline) → no judgment. NB: gate on the runtime,
-        // not `backend` — external HTTP providers have a real brain but an empty
-        // backend-id (that field is a CLI-driver id only).
-        if self.runtime.is_offline() {
+        // Judge on the MAIN runtime — `consult_on` carries the offline gate,
+        // strict-JSON framing, and fail-open parse (NB: gate on the runtime, not
+        // `backend` — external HTTP providers have a real brain but an empty
+        // backend-id, which is a CLI-driver id only).
+        self.consult_on(&self.runtime, system, user).await
+    }
+
+    /// Like [`Self::consult`] but judges on a SPECIFIC runtime — used by the
+    /// role-critic team to think on an ISOLATED forked session (clean, no-resume,
+    /// read-only) so a cross-review judge can never collide with — or write
+    /// through — the main writer session. Same strict-JSON + fail-open contract.
+    async fn consult_on<T: serde::de::DeserializeOwned>(
+        &self,
+        runtime: &dyn umadev_runtime::Runtime,
+        system: &str,
+        user: String,
+    ) -> Option<T> {
+        if runtime.is_offline() {
             return None;
         }
         let prompt = Prompt {
@@ -1814,7 +1838,7 @@ impl<R: Runtime> AgentRunner<R> {
             user,
         };
         let req = prompt.into_request(&self.options.model, 1500);
-        let resp = self.runtime.complete(req).await.ok()?;
+        let resp = runtime.complete(req).await.ok()?;
         let json = extract_json_object(&resp.text)?;
         serde_json::from_str(&json).ok()
     }
@@ -2036,6 +2060,16 @@ impl<R: Runtime> AgentRunner<R> {
             // The DETERMINISTIC count governs the loop; this is advisory signal.
             if round == 1 {
                 if let Some(verdict) = self.judge_acceptance(slug).await {
+                    // Team hook-up (zero behavior change): ALSO record the
+                    // acceptance director's existing verdict in the team ledger.
+                    self.ledger_role_verdict(
+                        "acceptance",
+                        round,
+                        "acceptance-director",
+                        verdict.commercial_ready,
+                        verdict.unmet.clone(),
+                        Vec::new(),
+                    );
                     if !verdict.commercial_ready {
                         self.emit(EngineEvent::Note(
                             "[acceptance] 智能裁判:当前交付未达商业级,补齐未达标项…".to_string(),
@@ -2219,6 +2253,21 @@ impl<R: Runtime> AgentRunner<R> {
         let Some(v): Option<DocsVerdict> = self.consult(system, user).await else {
             return;
         };
+        // Team hook-up (zero behavior change): ALSO express this tech-lead judge's
+        // existing opinion as a RoleVerdict in the team ledger — missing items are
+        // blocking, the biggest risk is advisory, `ready` is the accept signal.
+        self.ledger_role_verdict(
+            "docs",
+            1,
+            "tech-lead",
+            v.ready,
+            v.missing.clone(),
+            if v.biggest_risk.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![v.biggest_risk.clone()]
+            },
+        );
         let mut msg = String::from("[docs] 智能评审(共享底座的脑子,确认前先看一眼):\n");
         if !v.biggest_risk.trim().is_empty() {
             msg.push_str(&format!("  · 最大风险:{}\n", v.biggest_risk.trim()));
@@ -2261,6 +2310,152 @@ impl<R: Runtime> AgentRunner<R> {
             }
         }
         self.emit(EngineEvent::Note(msg));
+    }
+
+    /// Record a verdict from one of the existing ad-hoc judges into the team
+    /// ledger as a [`RoleVerdict`] — WITHOUT changing that judge's behavior /
+    /// return type / flow. This is the zero-behavior-change team hook-up: the
+    /// intake / docs-assessment / acceptance / design judges already produce an
+    /// opinion; here we ALSO express it in the team's uniform shape and append it
+    /// to the audit trail. Fail-open: ledger IO never affects the run.
+    fn ledger_role_verdict(
+        &self,
+        phase: &str,
+        round: usize,
+        role: &str,
+        accepts: bool,
+        blocking: Vec<String>,
+        advisory: Vec<String>,
+    ) {
+        let v = crate::critics::RoleVerdict {
+            role: role.to_string(),
+            accepts,
+            blocking,
+            advisory,
+            evidence: Vec::new(),
+        }
+        .normalized(role);
+        crate::critics::append_team_ledger(&self.options.project_root, phase, round, &v);
+    }
+
+    /// Run the docs-stage role-critic TEAM — the explicit cross-review. After the
+    /// three core docs exist (and after the deterministic floor + the single
+    /// tech-lead assessment have run), a PM-critic and an architecture-critic each
+    /// review the docs from their own seat on an ISOLATED forked session and
+    /// return a [`RoleVerdict`]. Every verdict is recorded to the team ledger.
+    /// The union of their `blocking[]` is returned so the caller can fold it into
+    /// the EXISTING docs revision path — ADVISORY only (round-1 once, like the
+    /// existing single-judge design): the deterministic coverage/contract floor
+    /// stays the hard gate; an LLM verdict NEVER controls the loop.
+    ///
+    /// Team size scales with the task ([`crate::critics::docs_team_for_kind`]):
+    /// a lean / trivial task gets NO team (returns empty). Fully fail-open:
+    /// offline / fork-unavailable / parse-fail → empty verdicts → no blocking.
+    async fn run_docs_critic_team(&self, slug: &str) -> Vec<String> {
+        // No borrowed brain → no team (the deterministic floor stands).
+        if self.runtime.is_offline() {
+            return Vec::new();
+        }
+        // Scale the team to the task — reuse the planner's complexity tiering.
+        let kind = crate::planner::classify(&self.merged_requirement());
+        let team = crate::critics::docs_team_for_kind(kind);
+        if team.is_empty() {
+            return Vec::new();
+        }
+        let read = |name: &str| {
+            std::fs::read_to_string(
+                self.options
+                    .project_root
+                    .join(format!("output/{slug}-{name}.md")),
+            )
+            .unwrap_or_default()
+        };
+        let (prd, arch, uiux) = (read("prd"), read("architecture"), read("uiux"));
+        // Nothing substantive to review → skip (deterministic floor stands).
+        if prd.trim().is_empty() && arch.trim().is_empty() {
+            return Vec::new();
+        }
+        let requirement = self.options.requirement.clone();
+        let arts = crate::critics::CriticArtifacts {
+            requirement: &requirement,
+            prd: &prd,
+            architecture: &arch,
+            uiux: &uiux,
+        };
+
+        self.emit(EngineEvent::Note(format!(
+            "[team] 角色团队交叉评审(只读):{} 名 critic 各从本职审一遍文档…",
+            team.len()
+        )));
+        let mut blocking: Vec<String> = Vec::new();
+        for critic in &team {
+            // Each critic thinks on its OWN isolated forked session (clean,
+            // no-resume, read-only) — never the main writer session. If the base
+            // can't fork, the critic falls back to a fresh consult on the main
+            // runtime but STILL only reads (consult never writes). Either way the
+            // verdict is fail-open.
+            let fork = self.runtime.fork();
+            let consult: ForkedConsult<'_, R> = ForkedConsult {
+                runner: self,
+                fork: fork.as_deref(),
+            };
+            let verdict = critic.review(&consult, arts).await;
+            crate::critics::append_team_ledger(&self.options.project_root, "docs", 1, &verdict);
+            let seat = verdict.role.clone();
+            if verdict.accepts && verdict.blocking.is_empty() {
+                self.emit(EngineEvent::Note(format!("[team] {seat}:通过,无阻塞项。")));
+            } else if !verdict.blocking.is_empty() {
+                self.emit(EngineEvent::Note(format!(
+                    "[team] {seat}:提出 {} 个阻塞项(建议在确认前补强)。",
+                    verdict.blocking.len()
+                )));
+                for b in verdict.blocking {
+                    let item = format!("[{seat}] {}", b.trim());
+                    if item.len() > 6 && !blocking.contains(&item) {
+                        blocking.push(item);
+                    }
+                }
+            }
+        }
+        blocking
+    }
+
+    /// Fold the docs critic team's blocking issues into the EXISTING docs
+    /// revision path — ONE advisory round (round-1 once, mirroring the existing
+    /// single-judge design review's anti-oscillation design). Re-delegates to the
+    /// MAIN writer session to revise the affected `output/*-prd.md` /
+    /// `output/*-architecture.md` IN PLACE for the named gaps only. The critic
+    /// team is read-only; ONLY this main-session revision writes. Fail-open: a
+    /// base error/empty just leaves the docs as-is — the user still gates them.
+    async fn revise_docs_for_critic_blocking(&self, slug: &str, blocking: &[String]) {
+        let issues = blocking
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n- ");
+        if issues.is_empty() {
+            return;
+        }
+        self.emit(EngineEvent::Note(format!(
+            "[team] 把角色团队的阻塞项折进文档修订(1 轮,建议性)…\n- {issues}"
+        )));
+        let fix_p = Prompt {
+            system: format!(
+                "角色团队(PM / 架构师)交叉评审了 `output/{slug}-prd.md` 与 \
+                 `output/{slug}-architecture.md`,提出以下阻塞项。**只针对这些问题就地修订\
+                 对应文档文件**(补全缺口 / 对齐 PRD 与架构契约),不要重写正常部分、不要改\
+                 其它文件。修订后这两份文档应自洽。\n\n阻塞项:\n- {issues}"
+            ),
+            user: format!(
+                "按上面的阻塞项修订 {} 的 PRD / 架构文档。",
+                self.options.requirement
+            ),
+        };
+        // Docs phase tag → the persistent /goal directive is NOT applied (planning
+        // phase), and governance runs on the output exactly like the rest of docs.
+        let _ = self.try_generate(Phase::Docs, fix_p).await;
     }
 
     /// Intelligent preview assessment — before the user confirms the preview
@@ -2429,6 +2624,17 @@ impl<R: Runtime> AgentRunner<R> {
         let Some(verdict) = self.judge_design(slug).await else {
             return; // no brain / nothing built → skip (deterministic floor stands)
         };
+        // Team hook-up (zero behavior change): ALSO record the senior-designer's
+        // existing verdict in the team ledger — issues are blocking, the
+        // commercial-grade flag is the accept signal.
+        self.ledger_role_verdict(
+            "frontend",
+            1,
+            "senior-designer",
+            verdict.commercial_grade,
+            verdict.issues.clone(),
+            Vec::new(),
+        );
         if verdict.commercial_grade || verdict.issues.is_empty() {
             return;
         }
@@ -3625,6 +3831,36 @@ impl<R: Runtime> AgentRunner<R> {
     }
 }
 
+/// Adapter that lets a [`crate::critics::RoleCritic`] borrow the runner's
+/// strict-JSON judge mechanism while thinking on an ISOLATED forked session.
+///
+/// Holds the runner (for `consult_on` + the configured model) and an OPTIONAL
+/// forked runtime. When the fork exists, the judge call runs against it — a
+/// clean, no-resume, read-only session that can never collide with or write
+/// through the main writer session (single-writer invariant). When the base
+/// can't fork, it falls back to a fresh consult on the MAIN runtime, which is
+/// still read-only (`consult` only reads + parses, never writes). Either way the
+/// path is fail-open: any failure yields [`crate::critics::RoleVerdict::empty`].
+struct ForkedConsult<'a, R: Runtime> {
+    runner: &'a AgentRunner<R>,
+    fork: Option<&'a dyn umadev_runtime::Runtime>,
+}
+
+#[async_trait::async_trait]
+impl<R: Runtime> crate::critics::CriticConsult for ForkedConsult<'_, R> {
+    async fn judge(&self, role: &str, system: &str, user: String) -> crate::critics::RoleVerdict {
+        // Prefer the isolated fork; fall back to the main runtime's read-only
+        // consult when the base can't fork. Fail-open to the empty (accepting)
+        // verdict so an absent / broken critic NEVER blocks.
+        let runtime: &dyn umadev_runtime::Runtime = self.fork.unwrap_or(&self.runner.runtime);
+        let parsed: Option<crate::critics::RoleVerdict> =
+            self.runner.consult_on(runtime, system, user).await;
+        parsed
+            .map(|v| v.normalized(role))
+            .unwrap_or_else(|| crate::critics::RoleVerdict::empty(role))
+    }
+}
+
 /// Result of a verify pass — lets callers decide whether to auto-fix.
 #[derive(Debug, Clone)]
 struct VerifyOutcome {
@@ -4288,6 +4524,30 @@ not json at all
                     .into(),
                 id: "d".into(),
                 model: "d".into(),
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    /// A brain that replies with a RoleVerdict (for the critic-team test). Every
+    /// judge turn returns the same not-accepting verdict with one blocking item.
+    struct FakeRuntimeRoleCritic;
+
+    #[async_trait]
+    impl Runtime for FakeRuntimeRoleCritic {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<CompletionResponse, RuntimeError> {
+            Ok(CompletionResponse {
+                text: "```json\n{\"accepts\": false, \"blocking\": [\"验收标准未覆盖核心功能\"], \
+                       \"advisory\": [\"补充成功指标\"], \"evidence\": [\"prd.md\"]}\n```"
+                    .into(),
+                id: "rc".into(),
+                model: "rc".into(),
                 usage: Usage::default(),
             })
         }
@@ -5152,6 +5412,108 @@ error TS2304: Cannot find name 'Foo'
         assert!(notes.contains("[plan]") && notes.contains("SaaS 仪表盘"));
         assert!(notes.contains("[docs] 智能评审") && notes.contains("鉴权设计"));
         assert!(notes.contains("[preview] 智能评审"));
+        // Team hook-up: the docs-assessment judge ALSO wrote its verdict to the
+        // team ledger as a `tech-lead` RoleVerdict — zero behavior change above,
+        // an audit row below.
+        let ledger = std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl")).unwrap();
+        assert!(
+            ledger.contains("\"role\":\"tech-lead\""),
+            "the docs-assessment judge must also append a RoleVerdict to the ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_critic_team_blocks_and_ledgers_then_revises() {
+        use crate::events::RecordingSink;
+        let tmp = TempDir::new().unwrap();
+        set_retry_base_ms_for_tests(1);
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-prd.md"),
+            "# PRD\n## Goal\n登录系统\n## Acceptance criteria\n- [ ] FR-001 登录",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# Architecture\n## API surface\n| Method | Path |\n|---|---|\n| POST | /login |",
+        )
+        .unwrap();
+        // A greenfield requirement → the docs critic TEAM runs (PM + architect).
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into(); // a brain is present (not offline)
+        o.requirement = "做一个全新的登录系统产品".into();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntimeRoleCritic, o).with_event_sink(Arc::new(sink.clone()));
+        let blocking = runner.run_docs_critic_team("demo").await;
+        // The team surfaced blocking issues (advisory to the loop).
+        assert!(
+            !blocking.is_empty(),
+            "the critic team must surface the blocking items"
+        );
+        assert!(blocking
+            .iter()
+            .any(|b| b.contains("验收标准未覆盖核心功能")));
+        // Each verdict was recorded to the team ledger (2 critics → 2 rows).
+        let ledger = std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl")).unwrap();
+        let rows = ledger.lines().count();
+        assert_eq!(rows, 2, "PM + architect verdicts both recorded");
+        assert!(ledger.contains("\"role\":\"product-manager\""));
+        assert!(ledger.contains("\"role\":\"architect\""));
+        // The team-review note announced the cross-review.
+        let notes: String = sink
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(notes.contains("[team] 角色团队交叉评审"));
+        // Folding the blocking into the revision path is exercised (one round).
+        runner
+            .revise_docs_for_critic_blocking("demo", &blocking)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn docs_critic_team_is_empty_for_lean_task() {
+        // TaskKind scaling: a trivial/light task gets NO critic team — the
+        // deterministic floor stands. Returns empty, writes no ledger.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(tmp.path().join("output/demo-prd.md"), "# PRD\n登录").unwrap();
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into();
+        // A bug-fix requirement → planner classifies lean → no team.
+        o.requirement = "修复登录页的一个小 bug".into();
+        let runner = AgentRunner::new(FakeRuntimeRoleCritic, o);
+        let blocking = runner.run_docs_critic_team("demo").await;
+        assert!(
+            blocking.is_empty(),
+            "lean task → no critic team → no blocking"
+        );
+        assert!(
+            !tmp.path().join(".umadev/team-ledger.jsonl").exists(),
+            "no team ran → no ledger written"
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_critic_team_is_fail_open_offline() {
+        // Offline (no brain) → no team, no panic, empty blocking (fail-open).
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(tmp.path().join("output/demo-prd.md"), "# PRD\n登录").unwrap();
+        // FakeRuntime has an empty backend-id but is NOT offline; use the real
+        // OfflineRuntime to assert the offline fail-open path.
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            opts(tmp.path()),
+        );
+        let blocking = runner.run_docs_critic_team("demo").await;
+        assert!(blocking.is_empty(), "offline → fail-open → no blocking");
     }
 
     #[tokio::test]
