@@ -284,6 +284,7 @@ fn apply_provider_env(cmd: &mut Command, env: &[(String, String)]) {
 /// (modern Rust runs `.cmd`/`.bat` via cmd.exe with proper escaping). Returns
 /// the input unchanged off Windows, when it already looks like a path, or when
 /// nothing matches (so the spawn surfaces the real error).
+#[must_use]
 pub fn resolve_program(program: &str) -> String {
     if !cfg!(windows) || program.contains(std::path::is_separator) {
         return program.to_string();
@@ -307,11 +308,44 @@ pub fn resolve_program(program: &str) -> String {
     program.to_string()
 }
 
+/// Windows-aware spawn target for a base/tool CLI. `.cmd`/`.bat` shims (how npm
+/// installs `claude` / `codex` / `npm` on Windows) are NOT PE executables, so
+/// `CreateProcess` refuses them with os error 193 ("not a valid Win32
+/// application"). Route those through `cmd /c`. Returns `(program, leading
+/// args)`; callers append their own args after. No-op off Windows.
+#[must_use]
+pub fn spawn_parts(program: &str) -> (String, Vec<String>) {
+    let resolved = resolve_program(program);
+    let ext = std::path::Path::new(&resolved)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if cfg!(windows) && (ext == "cmd" || ext == "bat") {
+        ("cmd".to_string(), vec!["/c".to_string(), resolved])
+    } else {
+        (resolved, Vec::new())
+    }
+}
+
+/// A `std::process::Command` for a base/tool CLI, Windows-aware (`.cmd`/`.bat`
+/// routed through `cmd /c` -- see [`spawn_parts`]). Used by the binary's npm
+/// calls; the host's own async spawns use [`spawn_parts`] directly.
+#[must_use]
+pub fn std_command(program: &str) -> std::process::Command {
+    let (prog, lead) = spawn_parts(program);
+    let mut c = std::process::Command::new(prog);
+    c.args(lead);
+    c
+}
+
 /// Run a host CLI subprocess. Errors carry a human-readable string suitable for
 /// `RuntimeError::HostProcess`.
 pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<SubprocessOutput, String> {
     let started = Instant::now();
-    let mut cmd = Command::new(resolve_program(call.program));
+    let (program, lead) = spawn_parts(call.program);
+    let mut cmd = Command::new(program);
+    cmd.args(&lead);
     cmd.args(call.args);
     if matches!(call.channel, PromptChannel::Arg) {
         cmd.arg(call.prompt);
@@ -432,7 +466,9 @@ pub(crate) async fn run_subprocess_streaming(
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let started = Instant::now();
-    let mut cmd = Command::new(resolve_program(call.program));
+    let (program, lead) = spawn_parts(call.program);
+    let mut cmd = Command::new(program);
+    cmd.args(&lead);
     cmd.args(call.args);
     if matches!(call.channel, PromptChannel::Arg) {
         cmd.arg(call.prompt);

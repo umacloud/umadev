@@ -723,7 +723,7 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
         .as_ref()
         .is_some_and(|p| p.to_string_lossy().contains("node_modules"));
     if npm_managed {
-        match std::process::Command::new(umadev_host::resolve_program("npm"))
+        match umadev_host::std_command("npm")
             .args(["uninstall", "-g", "umadev"])
             .status()
         {
@@ -791,7 +791,7 @@ fn cmd_update(yes: bool) -> Result<()> {
         println!("Aborted.");
         return Ok(());
     }
-    match std::process::Command::new(umadev_host::resolve_program("npm"))
+    match umadev_host::std_command("npm")
         .args(["install", "-g", "umadev@latest"])
         .status()
     {

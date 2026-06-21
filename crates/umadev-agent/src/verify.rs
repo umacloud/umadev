@@ -326,6 +326,23 @@ fn resolve_program(program: &str) -> String {
     program.to_string()
 }
 
+/// Like [`resolve_program`] but Windows-aware: `.cmd`/`.bat` build tools are
+/// routed through `cmd /c` (CreateProcess rejects them with os error 193).
+/// Returns `(program, leading args)`.
+fn spawn_parts(program: &str) -> (String, Vec<String>) {
+    let resolved = resolve_program(program);
+    let ext = std::path::Path::new(&resolved)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if cfg!(windows) && (ext == "cmd" || ext == "bat") {
+        ("cmd".to_string(), vec!["/c".to_string(), resolved])
+    } else {
+        (resolved, Vec::new())
+    }
+}
+
 /// Check whether a PATH-resolvable binary exists. Used to decide whether a
 /// step is genuinely missing (→ skip) vs the project being broken (→ fail).
 ///
@@ -621,7 +638,9 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         // produced even when it times out. `wait_with_output` would own the
         // pipes and drop partial output on timeout; instead we detach the
         // readers, race wait() against the timer, then drain the buffers.
-        let mut child = match Command::new(resolve_program(&step.program))
+        let (vprog, vlead) = spawn_parts(&step.program);
+        let mut child = match Command::new(vprog)
+            .args(&vlead)
             .args(&step.args)
             .current_dir(workspace)
             .stdin(Stdio::null())

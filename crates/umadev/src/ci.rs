@@ -154,7 +154,7 @@ impl NpmAuditResult {
 /// Returns an error only if npm isn't available or the command fails; a
 /// successful run with zero vulns returns an all-zero result.
 fn npm_audit(project_root: &Path) -> std::io::Result<NpmAuditResult> {
-    let output = std::process::Command::new(umadev_host::resolve_program("npm"))
+    let output = umadev_host::std_command("npm")
         .args(["audit", "--json"])
         .current_dir(project_root)
         .output()?;
