@@ -316,6 +316,9 @@ mod tests {
             "deploy.failed",
             "deploy.exec_failed",
             "deploy.timeout",
+            "deploy.detected",
+            "deploy.proof_written",
+            "deploy.no_target",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

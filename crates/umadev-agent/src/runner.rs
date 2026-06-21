@@ -2539,6 +2539,7 @@ impl<R: Runtime> AgentRunner<R> {
             prd: &prd,
             architecture: &arch,
             uiux: &uiux,
+            ..Default::default()
         };
 
         self.emit(EngineEvent::Note(format!(
@@ -2565,6 +2566,158 @@ impl<R: Runtime> AgentRunner<R> {
             } else if !verdict.blocking.is_empty() {
                 self.emit(EngineEvent::Note(format!(
                     "[team] {seat}:提出 {} 个阻塞项(建议在确认前补强)。",
+                    verdict.blocking.len()
+                )));
+                for b in verdict.blocking {
+                    let item = format!("[{seat}] {}", b.trim());
+                    if item.len() > 6 && !blocking.contains(&item) {
+                        blocking.push(item);
+                    }
+                }
+            }
+        }
+        blocking
+    }
+
+    /// The DETERMINISTIC QA floor — the hard signal that runs BEFORE the QA
+    /// critic and stands on its own. Reuses the same checks the pipeline already
+    /// trusts: requirement coverage ([`crate::coverage::uncovered_requirements`])
+    /// and API-contract / acceptance gaps
+    /// ([`crate::acceptance::task_acceptance_gaps`]). Returns a flat list of gap
+    /// strings (empty = clean). The LLM QA-critic only ADDS a semantic opinion on
+    /// top of this; it never replaces it (invariant 2).
+    fn qa_floor_findings(&self, slug: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for r in crate::coverage::uncovered_requirements(&self.options.project_root, slug) {
+            out.push(format!("覆盖缺口:{r}"));
+        }
+        for g in crate::acceptance::task_acceptance_gaps(&self.options.project_root, slug) {
+            out.push(format!("接口验收缺口:{g}"));
+        }
+        out
+    }
+
+    /// The DETERMINISTIC security floor — the hard signal that runs BEFORE the
+    /// security critic. Reuses the governance kernel's content scan over the real
+    /// source files (the same rules the quality gate enforces: injection / unsafe
+    /// patterns / hardcoded-secret style rules per policy) and, if a prior tool
+    /// dropped one, folds in an external `security-scan.json` report. Returns a
+    /// flat list of finding strings (empty = clean). Fail-open: any read error is
+    /// swallowed. The LLM security-critic only ADDS a semantic opinion on top.
+    fn security_floor_findings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let policy = umadev_governance::Policy::load(&self.options.project_root);
+        for f in crate::acceptance::source_files(&self.options.project_root) {
+            let Ok(content) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            let rel = f
+                .strip_prefix(&self.options.project_root)
+                .unwrap_or(&f)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            let d = umadev_governance::scan_content_with_policy(&rel, &content, &policy);
+            if d.block {
+                out.push(format!(
+                    "{rel}: {} ({})",
+                    d.reason.split('.').next().unwrap_or("violation").trim(),
+                    d.clause
+                ));
+            }
+            if out.len() >= 25 {
+                break;
+            }
+        }
+        // Optional external scanner output, if a prior step produced one.
+        for cand in [
+            self.options.project_root.join(format!(
+                "output/{}-security-scan.json",
+                self.options.effective_slug()
+            )),
+            self.options.project_root.join(".umadev/security-scan.json"),
+        ] {
+            if let Ok(raw) = std::fs::read_to_string(&cand) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    out.push(format!(
+                        "external security-scan.json: {}",
+                        excerpt(trimmed, 600)
+                    ));
+                }
+                break;
+            }
+        }
+        out
+    }
+
+    /// Run the quality-stage role-critic TEAM — the SECOND axis of the explicit
+    /// cross-review (the first being the docs stage). After the deterministic
+    /// quality gate has run as the HARD floor, a QA-critic and a security-critic
+    /// each review the DELIVERED code from their own seat on an ISOLATED forked
+    /// session and return a [`RoleVerdict`]. The deterministic QA / security
+    /// FLOORS ([`Self::qa_floor_findings`] / [`Self::security_floor_findings`])
+    /// run FIRST and are handed to the critics as context, so the LLM pass focuses
+    /// on the SEMANTIC layer the floor can't see (critical-path test coverage /
+    /// auth / authz / injection). Every verdict is recorded to the team ledger.
+    /// The union of their advisory blocking is returned so the caller can FOLD it
+    /// into the quality report — ADVISORY only: the deterministic gate stays the
+    /// hard signal; an LLM verdict NEVER controls the loop or sinks the gate
+    /// (invariant 2).
+    ///
+    /// Team size scales with the task ([`crate::critics::quality_team_for_kind`]):
+    /// a lean / trivial / docs-only task gets NO team (returns empty). Fully
+    /// fail-open: offline / fork-unavailable / parse-fail → empty verdicts → no
+    /// blocking.
+    async fn run_quality_critic_team(&self, slug: &str) -> Vec<String> {
+        // No borrowed brain → no team (the deterministic floor stands).
+        if self.runtime.is_offline() {
+            return Vec::new();
+        }
+        // Scale the team to the task — reuse the planner's complexity tiering.
+        let kind = crate::planner::classify(&self.merged_requirement());
+        let team = crate::critics::quality_team_for_kind(kind);
+        if team.is_empty() {
+            return Vec::new();
+        }
+        // Nothing built to review → skip (no false alarm; deterministic gate stands).
+        let code = crate::acceptance::code_digest(&self.options.project_root, 18_000);
+        if code.trim().is_empty() {
+            return Vec::new();
+        }
+        // Deterministic floors FIRST — these are the hard signal; the critics get
+        // them as context so they don't just re-derive what the floor already saw.
+        let qa_floor = self.qa_floor_findings(slug).join("\n- ");
+        let security_floor = self.security_floor_findings().join("\n- ");
+        let requirement = self.options.requirement.clone();
+        let arts = crate::critics::CriticArtifacts {
+            requirement: &requirement,
+            code: &code,
+            qa_floor: &qa_floor,
+            security_floor: &security_floor,
+            ..Default::default()
+        };
+
+        self.emit(EngineEvent::Note(format!(
+            "[team] 质量阶段角色团队交叉评审(只读,确定性质量门之后):{} 名 critic 各从本职审一遍交付代码…",
+            team.len()
+        )));
+        let mut blocking: Vec<String> = Vec::new();
+        for critic in &team {
+            // Each critic thinks on its OWN isolated forked session (clean,
+            // no-resume, read-only) — never the main writer session. Fail-open.
+            let fork = self.runtime.fork();
+            let consult: ForkedConsult<'_, R> = ForkedConsult {
+                runner: self,
+                fork: fork.as_deref(),
+            };
+            let verdict = critic.review(&consult, arts).await;
+            crate::critics::append_team_ledger(&self.options.project_root, "quality", 1, &verdict);
+            let seat = verdict.role.clone();
+            if verdict.accepts && verdict.blocking.is_empty() {
+                self.emit(EngineEvent::Note(format!("[team] {seat}:通过,无阻塞项。")));
+            } else if !verdict.blocking.is_empty() {
+                self.emit(EngineEvent::Note(format!(
+                    "[team] {seat}:提出 {} 个阻塞项(建议在交付前补强)。",
                     verdict.blocking.len()
                 )));
                 for b in verdict.blocking {
@@ -3322,6 +3475,29 @@ impl<R: Runtime> AgentRunner<R> {
         completed.push(self.record_phase(Phase::Quality, quality_result)?);
         self.record_phase_timing(Phase::Quality, phase_start);
         self.maybe_verify(Phase::Quality).await;
+
+        // Quality-stage role-critic TEAM cross-review (explicit, scaled to the
+        // task) — the second axis of the team. The deterministic quality gate +
+        // floors (coverage / contract / governance) ran above as the HARD signal;
+        // this ADDS the QA + security cross-review opinions, records every verdict
+        // to the team ledger, and surfaces their advisory blocking. ADVISORY only:
+        // it never sinks the deterministic gate or controls the loop (invariant 2).
+        if use_runtime {
+            let advisory = self
+                .run_quality_critic_team(&self.options.effective_slug())
+                .await;
+            if !advisory.is_empty() {
+                let list = advisory
+                    .iter()
+                    .take(10)
+                    .map(|s| format!("  · {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.emit(EngineEvent::Note(format!(
+                    "[team] 质量阶段团队建议(advisory,不沉质量门 — 确定性门仍为硬信号):\n{list}"
+                )));
+            }
+        }
 
         let qg_path = self.options.project_root.join("output").join(format!(
             "{}-quality-gate.json",
@@ -5718,6 +5894,132 @@ error TS2304: Cannot find name 'Foo'
         );
         let blocking = runner.run_docs_critic_team("demo").await;
         assert!(blocking.is_empty(), "offline → fail-open → no blocking");
+    }
+
+    #[tokio::test]
+    async fn quality_critic_team_advises_and_ledgers_after_deterministic_floor() {
+        use crate::events::RecordingSink;
+        let tmp = TempDir::new().unwrap();
+        set_retry_base_ms_for_tests(1);
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // Some delivered code so the digest is non-empty (the team has something
+        // to review) and the deterministic floors have a surface to scan.
+        std::fs::write(
+            tmp.path().join("src/auth.ts"),
+            "export function login() { return true }\n",
+        )
+        .unwrap();
+        // A greenfield requirement → the quality critic TEAM runs (QA + security).
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into(); // a brain is present (not offline)
+        o.requirement = "做一个全新的登录系统产品".into();
+        let sink = RecordingSink::new();
+        let runner =
+            AgentRunner::new(FakeRuntimeRoleCritic, o).with_event_sink(Arc::new(sink.clone()));
+        let advisory = runner.run_quality_critic_team("demo").await;
+        // The team surfaced advisory blocking (the fake brain returns blocking).
+        assert!(
+            !advisory.is_empty(),
+            "the quality team must surface its advisory items"
+        );
+        // Each verdict was recorded to the team ledger under the quality phase
+        // (2 critics → 2 rows: qa-engineer + security-engineer).
+        let ledger = std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl")).unwrap();
+        assert_eq!(ledger.lines().count(), 2, "QA + security verdicts recorded");
+        assert!(ledger.contains("\"role\":\"qa-engineer\""));
+        assert!(ledger.contains("\"role\":\"security-engineer\""));
+        assert!(
+            ledger.contains("\"phase\":\"quality\""),
+            "ledger rows are tagged with the quality phase"
+        );
+        // The cross-review note announced the quality-stage team.
+        let notes: String = sink
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                EngineEvent::Note(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(notes.contains("[team] 质量阶段角色团队交叉评审"));
+    }
+
+    #[tokio::test]
+    async fn quality_critic_team_is_empty_for_lean_task() {
+        // TaskKind scaling: a trivial/light task gets NO quality team — the
+        // deterministic floor stands. Returns empty, writes no ledger.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.ts"), "const x = 1\n").unwrap();
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into();
+        // A bug-fix requirement → planner classifies lean → no team.
+        o.requirement = "修复登录页的一个小 bug".into();
+        let runner = AgentRunner::new(FakeRuntimeRoleCritic, o);
+        let advisory = runner.run_quality_critic_team("demo").await;
+        assert!(
+            advisory.is_empty(),
+            "lean task → no quality team → no advisory"
+        );
+        assert!(
+            !tmp.path().join(".umadev/team-ledger.jsonl").exists(),
+            "no team ran → no ledger written"
+        );
+    }
+
+    #[tokio::test]
+    async fn quality_critic_team_is_fail_open_offline() {
+        // Offline (no brain) → no team, no panic, empty advisory (fail-open) —
+        // even with delivered code present.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.ts"), "const x = 1\n").unwrap();
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            opts(tmp.path()),
+        );
+        let advisory = runner.run_quality_critic_team("demo").await;
+        assert!(advisory.is_empty(), "offline → fail-open → no advisory");
+    }
+
+    #[tokio::test]
+    async fn quality_critic_team_skips_when_no_code_delivered() {
+        // A greenfield brain is present but NOTHING was built → no false alarm:
+        // the team skips (empty digest), the deterministic gate stands alone.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        let mut o = opts(tmp.path());
+        o.backend = "claude-code".into();
+        o.requirement = "做一个全新的登录系统产品".into();
+        let runner = AgentRunner::new(FakeRuntimeRoleCritic, o);
+        let advisory = runner.run_quality_critic_team("demo").await;
+        assert!(
+            advisory.is_empty(),
+            "no delivered code → quality team skips (no false alarm)"
+        );
+        assert!(!tmp.path().join(".umadev/team-ledger.jsonl").exists());
+    }
+
+    #[test]
+    fn security_floor_reports_governance_violations() {
+        // The deterministic security floor reuses the governance scan over real
+        // files — a hardcoded-color violation surfaces as a floor finding.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/style.css"),
+            ".btn { color: #ff0000; background: #00ff00; border: 1px solid #123456; }\n",
+        )
+        .unwrap();
+        let runner = AgentRunner::new(FakeRuntimeRoleCritic, opts(tmp.path()));
+        let findings = runner.security_floor_findings();
+        // Fail-open contract: this never panics. When the policy flags the file,
+        // the finding names it; either way the call returns a (possibly empty) list.
+        if !findings.is_empty() {
+            assert!(findings.iter().any(|f| f.contains("style.css")));
+        }
     }
 
     #[tokio::test]

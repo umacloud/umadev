@@ -100,6 +100,12 @@ impl RoleVerdict {
 /// What a single role-critic reviews — the shared artifacts handed to the team.
 /// Borrowed strings so the runner can assemble a view without cloning whole
 /// documents per critic.
+///
+/// The doc fields (`prd` / `architecture` / `uiux`) feed the DOCS-stage team;
+/// the implementation fields (`code` / `qa_floor` / `security_floor`) feed the
+/// QUALITY-stage team. Each stage fills only the fields it has — the unused ones
+/// stay empty (`Default`), so the same struct serves both stages without forcing
+/// a critic to read something that isn't there.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CriticArtifacts<'a> {
     /// The original requirement (always present).
@@ -110,6 +116,18 @@ pub struct CriticArtifacts<'a> {
     pub architecture: &'a str,
     /// UI/UX document text (empty when not yet produced).
     pub uiux: &'a str,
+    /// Delivered source-code digest (empty at the docs stage — only the
+    /// quality-stage team reads it for a semantic review of the real code).
+    pub code: &'a str,
+    /// The DETERMINISTIC QA-floor findings already computed before the team runs
+    /// (uncovered requirements / contract gaps / acceptance gaps). The QA-critic
+    /// sees what the hard floor already caught so its semantic pass focuses on
+    /// what a deterministic check CAN'T see, not on re-deriving the floor.
+    pub qa_floor: &'a str,
+    /// The DETERMINISTIC security-floor findings already computed before the team
+    /// runs (governance scan / any `security-scan.json`). Same role as
+    /// `qa_floor` for the security-critic.
+    pub security_floor: &'a str,
 }
 
 /// A read-only role on the cross-review team. A critic does NOT act — it reads
@@ -224,6 +242,104 @@ impl RoleCritic for ArchitectureCritic {
     }
 }
 
+/// QA critic — reviews the DELIVERED code from the QA-engineer seat in the
+/// quality stage. The deterministic QA floor (uncovered requirements / contract
+/// gaps / acceptance gaps) has ALREADY run as the hard signal before this critic
+/// is consulted; the QA-critic's job is the SEMANTIC layer a deterministic check
+/// can't reach: do the tests actually exercise the critical paths (not just the
+/// happy line), are error / edge / boundary cases handled, is there meaningful
+/// coverage of the core feature rather than smoke tests. Advisory only — it
+/// NEVER sinks the deterministic quality gate (invariant 2).
+pub struct QaCritic;
+
+#[async_trait::async_trait]
+impl RoleCritic for QaCritic {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn role(&self) -> &str {
+        "qa-engineer"
+    }
+
+    async fn review(
+        &self,
+        consult: &dyn CriticConsult,
+        artifacts: CriticArtifacts<'_>,
+    ) -> RoleVerdict {
+        let system = "You are a STRICT senior QA engineer doing a pre-release review of a \
+             COMMERCIAL product's DELIVERED code. A deterministic floor already checked \
+             requirement coverage / API-contract gaps / acceptance gaps (listed below if \
+             any). Your job is the SEMANTIC layer it can't see: do the tests actually \
+             exercise the CRITICAL paths (not just the happy line), are error / edge / \
+             boundary cases handled, is the core feature meaningfully covered rather than \
+             smoke-tested. Only flag REAL test/quality gaps that would ship a broken or \
+             untested core path; ignore style. JSON shape: \
+             {\"accepts\": <true|false>, \"blocking\": [\"<must-fix gap>\", …], \
+             \"advisory\": [\"<nice-to-have>\", …], \"evidence\": [\"<where/why>\", …]}";
+        let floor = if artifacts.qa_floor.trim().is_empty() {
+            "(deterministic QA floor: no gaps found)".to_string()
+        } else {
+            format!(
+                "Deterministic QA floor ALREADY flagged (do not just repeat these):\n{}",
+                crate::experts::excerpt(artifacts.qa_floor, 1500)
+            )
+        };
+        let user = format!(
+            "## Requirement\n{}\n\n## {floor}\n\n## Delivered code (frontend + backend + tests)\n{}",
+            crate::experts::excerpt(artifacts.requirement, 1000),
+            crate::experts::excerpt(artifacts.code, 16_000),
+        );
+        consult.judge(self.role(), system, user).await
+    }
+}
+
+/// Security critic — reviews the DELIVERED code from the security-engineer seat
+/// in the quality stage. The deterministic security floor (governance scan /
+/// any `security-scan.json`) has ALREADY run before this critic is consulted;
+/// the security-critic's job is the SEMANTIC attack-surface review a static
+/// rule can't make: missing / broken authentication, authorization / IDOR
+/// (object-level access) holes, injection surfaces (SQL / command / template),
+/// secrets in source, unsafe input handling. Advisory only — it NEVER sinks the
+/// deterministic quality gate (invariant 2).
+pub struct SecurityCritic;
+
+#[async_trait::async_trait]
+impl RoleCritic for SecurityCritic {
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn role(&self) -> &str {
+        "security-engineer"
+    }
+
+    async fn review(
+        &self,
+        consult: &dyn CriticConsult,
+        artifacts: CriticArtifacts<'_>,
+    ) -> RoleVerdict {
+        let system = "You are a STRICT senior application-security engineer doing a \
+             pre-release review of a COMMERCIAL product's DELIVERED code. A deterministic \
+             governance/security floor already ran (its findings are listed below if any). \
+             Your job is the SEMANTIC attack-surface review it can't make: missing or \
+             broken AUTHENTICATION, AUTHORIZATION / object-level access (IDOR) holes, \
+             INJECTION surfaces (SQL / command / template / XSS), hardcoded secrets, and \
+             unsafe input / output handling. Name the file/function and the concrete risk. \
+             Only flag REAL exploitable gaps; ignore style. JSON shape: \
+             {\"accepts\": <true|false>, \"blocking\": [\"<must-fix risk>\", …], \
+             \"advisory\": [\"<harden later>\", …], \"evidence\": [\"<file/why>\", …]}";
+        let floor = if artifacts.security_floor.trim().is_empty() {
+            "(deterministic security floor: no violations found)".to_string()
+        } else {
+            format!(
+                "Deterministic security floor ALREADY flagged (do not just repeat these):\n{}",
+                crate::experts::excerpt(artifacts.security_floor, 1500)
+            )
+        };
+        let user = format!(
+            "## Requirement\n{}\n\n## {floor}\n\n## Delivered code (frontend + backend)\n{}",
+            crate::experts::excerpt(artifacts.requirement, 1000),
+            crate::experts::excerpt(artifacts.code, 16_000),
+        );
+        consult.judge(self.role(), system, user).await
+    }
+}
+
 /// The docs-stage cross-review team, scaled to the task. A lean task gets NO
 /// critic team (the deterministic floor + the existing single judge are enough);
 /// a heavyweight greenfield / full build gets the PM + architect cross-review.
@@ -242,6 +358,27 @@ pub fn docs_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn RoleCri
         | TaskKind::BackendOnly
         | TaskKind::DocsOnly => {
             vec![Box::new(PmCritic), Box::new(ArchitectureCritic)]
+        }
+    }
+}
+
+/// The quality-stage cross-review team, scaled to the task — the second axis of
+/// the critic team (the first being the docs stage). A lean task gets NO critic
+/// team (the deterministic quality floor + the existing single code review are
+/// enough); a real build gets the QA + security cross-review. Mirrors
+/// [`docs_team_for_kind`]'s tiering exactly so a one-line tweak never pays for a
+/// review team. A `DocsOnly` task produces no code, so it has nothing for a
+/// quality-stage team to review and gets none.
+#[must_use]
+pub fn quality_team_for_kind(kind: crate::planner::TaskKind) -> Vec<Box<dyn RoleCritic>> {
+    use crate::planner::TaskKind;
+    match kind {
+        // Lean / trivial / docs-only paths: no quality cross-review team. The
+        // deterministic quality floor plus the existing single code review stand.
+        TaskKind::Light | TaskKind::Bugfix | TaskKind::Refactor | TaskKind::DocsOnly => Vec::new(),
+        // Everything that delivers real code gets the quality cross-review team.
+        TaskKind::Greenfield | TaskKind::FrontendOnly | TaskKind::BackendOnly => {
+            vec![Box::new(QaCritic), Box::new(SecurityCritic)]
         }
     }
 }
@@ -373,10 +510,80 @@ mod tests {
             prd: "# PRD\n## Goal\n登录",
             architecture: "",
             uiux: "",
+            ..Default::default()
         };
         let v = PmCritic.review(&stub, arts).await;
         assert_eq!(v.role, "product-manager");
         assert!(!v.accepts);
         assert_eq!(v.blocking, vec!["缺验收标准".to_string()]);
+    }
+
+    #[test]
+    fn quality_team_scales_with_task_kind() {
+        use crate::planner::TaskKind;
+        // Lean / trivial / docs-only → NO quality team (deterministic floor stands).
+        assert!(quality_team_for_kind(TaskKind::Light).is_empty());
+        assert!(quality_team_for_kind(TaskKind::Bugfix).is_empty());
+        assert!(quality_team_for_kind(TaskKind::Refactor).is_empty());
+        assert!(
+            quality_team_for_kind(TaskKind::DocsOnly).is_empty(),
+            "docs-only delivers no code → nothing for a quality team to review"
+        );
+        // Real-code tasks → QA + security cross-review team.
+        let team = quality_team_for_kind(TaskKind::Greenfield);
+        assert_eq!(team.len(), 2);
+        let roles: Vec<&str> = team.iter().map(|c| c.role()).collect();
+        assert!(roles.contains(&"qa-engineer"));
+        assert!(roles.contains(&"security-engineer"));
+        // Frontend-only / backend-only also ship code → also get the team.
+        assert_eq!(quality_team_for_kind(TaskKind::FrontendOnly).len(), 2);
+        assert_eq!(quality_team_for_kind(TaskKind::BackendOnly).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn qa_critic_review_threads_verdict() {
+        // The QA-critic builds its prompt from the code + deterministic floor and
+        // threads the verdict through, tagged with the qa-engineer role.
+        let stub = StubConsult(RoleVerdict {
+            accepts: false,
+            blocking: vec!["登录失败路径无测试".into()],
+            evidence: vec!["auth.test.ts".into()],
+            ..Default::default()
+        });
+        let arts = CriticArtifacts {
+            requirement: "做一个登录系统",
+            code: "// auth.ts\nfn login() {}",
+            qa_floor: "FR-002 注销 无任务覆盖",
+            ..Default::default()
+        };
+        let v = QaCritic.review(&stub, arts).await;
+        assert_eq!(v.role, "qa-engineer");
+        assert!(!v.accepts);
+        assert_eq!(v.blocking, vec!["登录失败路径无测试".to_string()]);
+        assert_eq!(v.evidence, vec!["auth.test.ts".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn security_critic_review_threads_verdict() {
+        // The security-critic builds its prompt from the code + deterministic
+        // floor and threads the verdict through, tagged with the security role.
+        let stub = StubConsult(RoleVerdict {
+            accepts: false,
+            blocking: vec!["DELETE /api/todos/:id 无鉴权(IDOR)".into()],
+            ..Default::default()
+        });
+        let arts = CriticArtifacts {
+            requirement: "做一个待办系统",
+            code: "// api.ts\napp.delete('/api/todos/:id', handler)",
+            security_floor: "",
+            ..Default::default()
+        };
+        let v = SecurityCritic.review(&stub, arts).await;
+        assert_eq!(v.role, "security-engineer");
+        assert!(!v.accepts);
+        assert_eq!(
+            v.blocking,
+            vec!["DELETE /api/todos/:id 无鉴权(IDOR)".to_string()]
+        );
     }
 }
