@@ -1,6 +1,6 @@
 {
   "name": "umadev",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "A project-director Agent for AI coding hosts — drives your logged-in Claude Code / Codex through a 9-phase commercial delivery pipeline with governance. No API key needed.",
   "keywords": [
     "ai",

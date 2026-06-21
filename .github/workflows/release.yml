@@ -133,6 +133,7 @@ jobs:
           for d in npm-staging/npm-*; do
             platform="${d##*npm-}"
             cp -r "$d/." "npm/cli-${platform}/"
+            chmod +x "npm/cli-${platform}/bin/"* 2>/dev/null || true
           done
           # Sanity: every sub-package must have its binary.
           for plat in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do

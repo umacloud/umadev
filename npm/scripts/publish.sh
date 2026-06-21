@@ -55,7 +55,7 @@ done
 #     the main publish below).
 if [[ -f "$NPM_ROOT/model-e5-small/model.safetensors" ]]; then
   echo "publish.sh: npm publish model-e5-small..."
-  (cd "$NPM_ROOT/model-e5-small" && npm publish --access public $DRY_RUN)
+  (cd "$NPM_ROOT/model-e5-small" && npm publish --access public $DRY_RUN) || echo "publish.sh: model-e5-small publish failed (likely > npm size limit) -- skipping (optional)" >&2
 else
   echo "publish.sh: skipping model-e5-small (weights not fetched)" >&2
 fi

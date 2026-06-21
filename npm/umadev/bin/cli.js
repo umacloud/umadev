@@ -104,6 +104,13 @@ function findKnowledgeDir() {
 }
 
 const binary = findBinary();
+// npm artifact round-trips (upload/download-artifact in CI) can strip the
+// executable bit off the prebuilt binary; restore it defensively before exec.
+try {
+  fs.chmodSync(binary, 0o755);
+} catch (_) {
+  // read-only install dir or already +x — spawnSync below reports real errors
+}
 const extraEnv = {};
 const modelDir = findModelDir();
 if (modelDir && !process.env.UMADEV_EMBED_MODEL_DIR) {
