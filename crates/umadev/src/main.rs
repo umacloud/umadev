@@ -147,6 +147,76 @@ enum Command {
         #[arg(long, default_value = "")]
         slug: String,
     },
+    /// Lightweight fast track for a trivial task (skip the heavy phases).
+    #[command(
+        hide = true,
+        long_about = "Run the LIGHTWEIGHT fast track for a small / trivial task — a\n\
+                      one-line tweak, a tiny style nudge, a small script. The full\n\
+                      nine-phase pipeline is overkill for that, so `quick` runs a lean\n\
+                      single shot: clarify-lite (spec) -> implement -> quality verify.\n\
+                      \n\
+                      It SKIPS research, the three core documents, both confirmation\n\
+                      gates (docs_confirm / preview_confirm), and the delivery\n\
+                      proof-pack. Governance still applies on every write, and every\n\
+                      phase still leaves an auditable artifact — leaner, not invisible.\n\
+                      \n\
+                      Use plain `umadev run` for anything non-trivial; the planner also\n\
+                      auto-suggests this track when it classifies a requirement as\n\
+                      trivial, and you can always override by running the full pipeline.",
+        after_help = "EXAMPLES:\n  \
+                      umadev quick \"把页头文案改一下\"                     # offline\n  \
+                      umadev quick \"tweak the header copy\" --backend claude-code\n  \
+                      umadev quick \"rename the Foo button to Bar\" --backend codex"
+    )]
+    Quick {
+        /// Plain-text trivial task, e.g. "改个文案".
+        task: String,
+        /// Drive an already-logged-in base CLI as the worker. When
+        /// omitted, the lean pipeline runs offline with deterministic templates.
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
+        /// Optional model override (empty by default — never imposed).
+        #[arg(long, default_value = "")]
+        model: String,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+        /// Project slug used in artifact filenames.
+        #[arg(long, default_value = "")]
+        slug: String,
+    },
+    /// Re-run a single named phase (reuses the prior run's context).
+    #[command(
+        hide = true,
+        long_about = "Re-run ONE named phase of the current run, reusing the prior run's\n\
+                      context (requirement / slug / backend from\n\
+                      .umadev/workflow-state.json) so the inputs are identical.\n\
+                      \n\
+                      The headline use is recovering a phase that DEGRADED because the\n\
+                      base went offline mid-run — its artifact is an offline\n\
+                      placeholder marked with a sibling `.DEGRADED` file. Fix the base,\n\
+                      then `umadev redo <phase>` regenerates just that phase and clears\n\
+                      its `.DEGRADED` markers on success.\n\
+                      \n\
+                      Valid phases: research, docs, spec, frontend, backend, quality,\n\
+                      delivery (aliases like fe / be / qa / api also work). Unknown\n\
+                      names and a missing prior run produce a friendly error.",
+        after_help = "EXAMPLES:\n  \
+                      umadev redo frontend                       # re-run just frontend\n  \
+                      umadev redo backend --backend claude-code  # against a specific base\n  \
+                      umadev redo qa                             # alias for quality"
+    )]
+    Redo {
+        /// Phase to re-run (e.g. `frontend`, `backend`, `quality`).
+        phase: String,
+        /// Drive the re-run via an already-logged-in base CLI. When omitted,
+        /// falls back to whatever the original run recorded (or offline).
+        #[arg(long, value_enum)]
+        backend: Option<BackendArg>,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
+    },
     /// Approve the active gate and continue the pipeline.
     #[command(
         hide = true,
@@ -564,6 +634,27 @@ async fn main() -> Result<()> {
             })
             .await
         }
+        Command::Quick {
+            task,
+            backend,
+            model,
+            project_root,
+            slug,
+        } => {
+            cmd_quick(RunArgs {
+                requirement: task,
+                backend,
+                model,
+                project_root,
+                slug,
+            })
+            .await
+        }
+        Command::Redo {
+            phase,
+            backend,
+            project_root,
+        } => cmd_redo(phase, backend, project_root).await,
         Command::Continue {
             project_root,
             backend,
@@ -1763,6 +1854,254 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
 
     print_report(&project_root, &runtime_label, &report);
     Ok(())
+}
+
+/// `umadev quick "<task>"` — the lightweight fast track. Mirrors [`cmd_run`]
+/// but drives the lean single-shot [`AgentRunner::run_light`] (spec-lite ->
+/// implement -> quality, no gates) instead of the full pipeline.
+async fn cmd_quick(args: RunArgs) -> Result<()> {
+    if args.requirement.trim().is_empty() {
+        anyhow::bail!(
+            "empty task — describe the small change, e.g.\n  \
+             umadev quick \"把页头文案改一下\""
+        );
+    }
+    let project_root = resolve_root(args.project_root)?;
+    let opts = RunOptions {
+        project_root: project_root.clone(),
+        requirement: args.requirement,
+        slug: args.slug,
+        model: args.model,
+        backend: args
+            .backend
+            .as_ref()
+            .map_or(String::new(), |b| b.id().to_string()),
+        design_system: String::new(),
+        seed_template: String::new(),
+    };
+
+    let (report, runtime_label) = if let Some(backend) = args.backend {
+        let mut driver = umadev_host::driver_for(backend.id())
+            .ok_or_else(|| anyhow::anyhow!("unknown backend `{}`", backend.id()))?;
+        driver.set_workspace(project_root.clone());
+        match driver.probe().await {
+            umadev_host::ProbeResult::Ready { version } => {
+                println!("Backend {} ready ({version}).", driver.display_name());
+                if backend.id() == "claude-code" {
+                    if let Ok(p) = hook::install_claude_hook(&project_root) {
+                        eprintln!(
+                            "  [governance] real-time PreToolUse hook active ({})",
+                            p.display()
+                        );
+                    }
+                }
+            }
+            umadev_host::ProbeResult::NotInstalled { program } => {
+                anyhow::bail!(
+                    "backend `{}` not available: `{program}` is not on PATH. \
+                     Install / log in to the base CLI first, or omit --backend to run offline.",
+                    backend.id()
+                );
+            }
+            umadev_host::ProbeResult::Unhealthy { detail } => {
+                anyhow::bail!("backend `{}` is unhealthy: {detail}", backend.id());
+            }
+        }
+        let label = format!(
+            "Base CLI worker — {} ({}) · lightweight track",
+            driver.display_name(),
+            backend.id()
+        );
+        let runner = AgentRunner::new(driver, opts);
+        runner.start().context("failed to start agent")?;
+        let (runner, printer) = attach_live_sink(runner);
+        let report = runner.run_light(true).await.context("light run failure")?;
+        drop(runner);
+        let _ = printer.await;
+        (report, label)
+    } else {
+        let label = "Offline deterministic templates · lightweight track".to_string();
+        let runner = AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
+        runner.start().context("failed to start agent")?;
+        let (runner, printer) = attach_live_sink(runner);
+        let report = runner.run_light(false).await.context("light run failure")?;
+        drop(runner);
+        let _ = printer.await;
+        (report, label)
+    };
+
+    print_lean_report(
+        &project_root,
+        &runtime_label,
+        "lightweight task complete (spec -> implement -> quality, no gates)",
+        &report,
+    );
+    Ok(())
+}
+
+/// `umadev redo <phase>` — re-run a single named phase using the prior run's
+/// persisted context. Resolves the backend the same way `continue` does
+/// (explicit flag > persisted state > offline). Rejects an unknown phase name
+/// and a missing prior run with a friendly message.
+async fn cmd_redo(
+    phase_name: String,
+    backend_override: Option<BackendArg>,
+    project_root: Option<PathBuf>,
+) -> Result<()> {
+    let project_root = resolve_root(project_root)?;
+    // Parse the phase name first so a typo fails fast with the valid set.
+    let Some(phase) = umadev_agent::phase_from_id(&phase_name) else {
+        anyhow::bail!(
+            "unknown phase `{phase_name}`. Valid phases: {}",
+            umadev_agent::redoable_phase_ids().join(", ")
+        );
+    };
+    // Reuse the prior run's context (requirement / slug / backend) from state.
+    let state = match umadev_agent::read_workflow_state_diagnostic(&project_root) {
+        umadev_agent::ReadState::Ok(s) => s,
+        umadev_agent::ReadState::Missing => anyhow::bail!(
+            "no prior run found (.umadev/workflow-state.json missing) — start one \
+             with `umadev run` before re-running a single phase."
+        ),
+        umadev_agent::ReadState::Corrupt { path, error } => anyhow::bail!(
+            "workflow-state.json at {} is corrupt ({error}). \
+             Run `umadev rollback latest` or delete it, then `umadev run` again.",
+            path.display()
+        ),
+    };
+
+    let slug = if state.slug.is_empty() {
+        infer_slug(&project_root)
+    } else {
+        state.slug.clone()
+    };
+    let requirement = if state.requirement.is_empty() {
+        state
+            .note
+            .split_once(": ")
+            .map_or("(no requirement recorded)", |x| x.1)
+            .to_string()
+    } else {
+        state.requirement.clone()
+    };
+    // backend: explicit flag > persisted state > offline.
+    let backend_id: Option<String> = backend_override
+        .as_ref()
+        .map(|b| b.id().to_string())
+        .or_else(|| {
+            if state.backend.is_empty() {
+                None
+            } else {
+                Some(state.backend.clone())
+            }
+        });
+
+    let opts = RunOptions {
+        project_root: project_root.clone(),
+        requirement,
+        slug,
+        model: String::new(),
+        backend: backend_id.clone().unwrap_or_default(),
+        design_system: String::new(),
+        seed_template: String::new(),
+    };
+
+    let _ = record_tool_call(
+        &project_root,
+        "umadev/cli.redo",
+        "",
+        "redo",
+        "UD-FLOW-005",
+        &format!("user re-ran phase {}", phase.id()),
+        "",
+        None,
+    );
+
+    let (report, runtime_label) = if let Some(id) = backend_id {
+        let backend = BackendArg::from_id(&id)
+            .ok_or_else(|| anyhow::anyhow!("unknown backend `{id}` in workflow-state.json"))?;
+        let mut driver = umadev_host::driver_for(backend.id())
+            .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
+        driver.set_workspace(project_root.clone());
+        match driver.probe().await {
+            umadev_host::ProbeResult::Ready { version } => {
+                println!("Backend {} ready ({version}).", driver.display_name());
+                if backend.id() == "claude-code" {
+                    if let Ok(p) = hook::install_claude_hook(&project_root) {
+                        eprintln!(
+                            "  [governance] real-time PreToolUse hook active ({})",
+                            p.display()
+                        );
+                    }
+                }
+            }
+            umadev_host::ProbeResult::NotInstalled { program } => {
+                anyhow::bail!(
+                    "backend `{}` not available: `{program}` is not on PATH. \
+                     Omit --backend to re-run offline.",
+                    backend.id()
+                );
+            }
+            umadev_host::ProbeResult::Unhealthy { detail } => {
+                anyhow::bail!("backend `{}` is unhealthy: {detail}", backend.id());
+            }
+        }
+        let label = format!(
+            "Base CLI worker — {} ({}) · redo {}",
+            driver.display_name(),
+            backend.id(),
+            phase.id()
+        );
+        let runner = AgentRunner::new(driver, opts);
+        let (runner, printer) = attach_live_sink(runner);
+        let report = runner
+            .redo_phase(phase, true)
+            .await
+            .context("redo phase failure")?;
+        drop(runner);
+        let _ = printer.await;
+        (report, label)
+    } else {
+        let label = format!("Offline deterministic templates · redo {}", phase.id());
+        let runner = AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
+        let (runner, printer) = attach_live_sink(runner);
+        let report = runner
+            .redo_phase(phase, false)
+            .await
+            .context("redo phase failure")?;
+        drop(runner);
+        let _ = printer.await;
+        (report, label)
+    };
+
+    print_lean_report(
+        &project_root,
+        &runtime_label,
+        &format!("re-ran the `{}` phase", phase.id()),
+        &report,
+    );
+    Ok(())
+}
+
+/// Compact report for the lean entries (`quick` / `redo`). Unlike
+/// [`print_report`], these intentionally stop short of `delivery` (Light has no
+/// delivery phase; a single-phase redo runs exactly one phase), so the
+/// "stopped before delivery (quality gate blocked)" wording would be wrong here.
+fn print_lean_report(project_root: &Path, runtime_label: &str, headline: &str, report: &RunReport) {
+    println!("UmaDev — {headline}.");
+    println!("  workspace: {}", project_root.display());
+    println!("  runtime: {runtime_label}");
+    println!("  final phase: {}", report.final_phase.id());
+    println!("  artifacts:");
+    for phase_out in &report.completed {
+        for a in &phase_out.artifacts {
+            if let Ok(rel) = a.strip_prefix(project_root) {
+                println!("    - {}", rel.display());
+            } else {
+                println!("    - {}", a.display());
+            }
+        }
+    }
 }
 
 fn print_report(project_root: &Path, runtime_label: &str, report: &RunReport) {

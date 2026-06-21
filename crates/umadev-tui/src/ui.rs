@@ -1372,7 +1372,11 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("/auto", "auto-approve checkpoints (autonomous)"),
                     ("/diff [artifact]", "show an artifact (default: PRD)"),
                     ("/run [slug] <req>", "start a new run"),
-                    ("/redo", "re-run current requirement"),
+                    ("/quick <task>", "lightweight track for a trivial change"),
+                    (
+                        "/redo [phase]",
+                        "re-run all, or one phase (e.g. /redo frontend)",
+                    ),
                     ("/rewind [id]", "list/rewind file checkpoints"),
                     ("/init", "write umadev.yaml"),
                 ],

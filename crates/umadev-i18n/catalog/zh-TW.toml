@@ -186,6 +186,17 @@
 "redo.no_requirement" = "還沒有跑過任何需求 — 直接輸入需求或用 /run 啟動。"
 "redo.rerunning" = "重新跑需求:\"{}\"。流水線從 research 重新開始…"
 
+# /quick — 輕量快速檔
+"quick.busy" = "流水線正在跑 — 先 /cancel 停掉再 /quick,避免兩個流水線同時寫同一個工作區。"
+"quick.usage" = "用法:/quick <任務>\n  範例:/quick 把頁首文案改一下\n  輕量檔:釐清簡版 → 實作 → 驗證(跳過調研 / 三文件 / 兩道確認門 / 交付)。"
+"quick.starting" = "[light] 輕量檔:\"{}\"。按 spec → 實作 → quality 跑(無確認門)…"
+
+# /redo <階段> — 只重跑單個階段
+"redo.phase.usage" = "用法:/redo [階段]\n  /redo            從頭重跑整個需求\n  /redo <階段>     只重跑某一個階段(如 /redo frontend)— 適合底座掉線後補跑\n  可選階段:{}"
+"redo.phase.unknown" = "未知階段 `{}`。可選階段:{}"
+"redo.phase.no_run" = "沒有找到先前的 run — 請先用需求(或 /run)跑一次,再單獨重跑某個階段。"
+"redo.phase.rerunning" = "用先前 run 的上下文,只重跑 `{}` 階段…"
+
 # /export proof-pack
 "export.no_release_dir" = "release/ 目錄不存在 — 流水線需要跑到 delivery 才會產生 proof-pack。"
 "export.release_empty" = "release/ 目錄為空 — 需要完成 delivery 階段才會產出 proof-pack.zip。"

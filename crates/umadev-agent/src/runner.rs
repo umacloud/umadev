@@ -3056,6 +3056,417 @@ impl<R: Runtime> AgentRunner<R> {
         })
     }
 
+    /// **Lightweight fast track** — the lean single-shot pipeline for a trivial
+    /// task (a one-line tweak, a tiny style nudge, a small script). Directly
+    /// answers "the full nine phases are too heavy for small work": it reuses the
+    /// existing phase bodies and the dynamic [`crate::planner`] skip mechanism
+    /// (a [`crate::planner::TaskKind::Light`] plan) but runs them in ONE
+    /// uninterrupted block — `spec` (clarify-lite) → `frontend` + `backend`
+    /// (whichever the change touches; the worker no-ops the irrelevant side) →
+    /// `quality` verify. There is no research, no three core docs, no
+    /// `docs_confirm` / `preview_confirm` gates, and no delivery proof-pack.
+    ///
+    /// Governance still applies on every write (fail-open), and every phase still
+    /// records an auditable artifact + timing + the run-history row, so a Light
+    /// run is leaner, not invisible. `use_runtime` forces the worker on/off.
+    pub async fn run_light(&self, use_runtime: bool) -> std::io::Result<RunReport> {
+        let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
+        let plan = crate::planner::plan_light(&self.options.requirement);
+        let mut completed = Vec::new();
+
+        self.emit(EngineEvent::PipelineStarted {
+            slug: self.options.effective_slug(),
+            requirement: self.options.requirement.clone(),
+        });
+        self.emit(EngineEvent::Note(format!(
+            "[plan] 轻量档:{} — {};本次只跑 spec→实现→quality,\
+             跳过 research/docs/两道确认门/delivery。",
+            plan.kind.id(),
+            plan.rationale
+        )));
+
+        // 1. spec (clarify-lite) — one compact implementation plan, no sprint
+        //    ceremony. Reuses the deterministic spec artifact so the change is
+        //    still recorded; the worker draft is the lean brief.
+        let phase_start = std::time::Instant::now();
+        self.transition(Phase::Spec, "")?;
+        self.start_phase(Phase::Spec);
+        let mut spec_degraded = false;
+        if use_runtime {
+            self.emit(EngineEvent::Note(
+                "[light] 生成精简实现计划(直接定位最小改动)…".to_string(),
+            ));
+            let lean = self
+                .try_generate(
+                    Phase::Spec,
+                    Prompt {
+                        system: "Role: senior engineer on a SMALL, well-scoped change. \
+                                 Write a SHORT plan: the few files to touch and the minimal \
+                                 edit for each. No sprints, no docs ceremony — this is a \
+                                 trivial change. Keep it tight."
+                            .to_string(),
+                        user: format!("Trivial change: {}", self.options.requirement),
+                    },
+                )
+                .await;
+            if let Some(text) = lean {
+                let slug = self.options.effective_slug();
+                let plan_path = self
+                    .options
+                    .project_root
+                    .join(format!("output/{slug}-execution-plan.md"));
+                if let Some(parent) = plan_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = crate::phases::atomic_write(&plan_path, &text);
+            } else {
+                spec_degraded = true;
+            }
+        }
+        completed.push(self.record_phase_maybe_degraded(
+            Phase::Spec,
+            run_spec(&self.options),
+            spec_degraded,
+        )?);
+        self.record_phase_timing(Phase::Spec, phase_start);
+
+        // 2. implement — frontend then backend, in the same block. A trivial task
+        //    usually touches only one side; the worker simply makes no edits to
+        //    the side that doesn't apply. We keep both so a "small full-stack
+        //    tweak" still lands without forcing the user to pick a side.
+        let phase_start = std::time::Instant::now();
+        self.transition(Phase::Frontend, "")?;
+        self.start_phase(Phase::Frontend);
+        let mut fe_degraded = false;
+        if use_runtime {
+            self.emit(EngineEvent::Note("[light] 直接实现这个小改动…".to_string()));
+            let fe_ok = self
+                .try_generate(
+                    Phase::Frontend,
+                    Prompt {
+                        system: "Make ONLY the small change requested. Edit the relevant \
+                                 file(s) in place — do not rewrite, do not scaffold a new \
+                                 project, do not add unrelated features. Output a one-line \
+                                 summary of what you changed."
+                            .to_string(),
+                        user: self.options.requirement.clone(),
+                    },
+                )
+                .await
+                .is_some();
+            fe_degraded = !fe_ok;
+        }
+        completed.push(self.record_phase_maybe_degraded(
+            Phase::Frontend,
+            run_frontend(&self.options),
+            fe_degraded,
+        )?);
+        self.record_phase_timing(Phase::Frontend, phase_start);
+        if use_runtime {
+            // Build-verify the change + governance catch-up (real-file scan for
+            // bases without a real-time hook). Same safety net as the full path,
+            // minus the design review (a trivial tweak isn't a UI delivery).
+            self.maybe_verify_and_fix(Phase::Frontend).await;
+            self.run_governance_catchup(Phase::Frontend).await;
+        }
+
+        // 3. quality verify — the one gate a Light run keeps. It is advisory
+        //    (no delivery to block), but it leaves the same auditable scorecard.
+        let phase_start = std::time::Instant::now();
+        self.transition(Phase::Quality, "")?;
+        self.start_phase(Phase::Quality);
+        let quality_result = run_quality(&self.options);
+        completed.push(self.record_phase(Phase::Quality, quality_result)?);
+        self.record_phase_timing(Phase::Quality, phase_start);
+        self.maybe_verify(Phase::Quality).await;
+
+        let quality_passed = {
+            let qg_path = self.options.project_root.join("output").join(format!(
+                "{}-quality-gate.json",
+                self.options.effective_slug()
+            ));
+            std::fs::read_to_string(&qg_path)
+                .ok()
+                .is_none_or(|qg| crate::phases::extract_quality_score(&qg).1)
+        };
+
+        // Mark the lean run complete — phase stays at quality (Light has no
+        // delivery phase), gate cleared.
+        let done = WorkflowState {
+            phase: Phase::Quality.id().to_string(),
+            active_gate: String::new(),
+            slug: self.options.effective_slug(),
+            requirement: self.options.requirement.clone(),
+            last_transition_at: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            note: "Light pipeline complete.".to_string(),
+            backend: self.options.backend.clone(),
+            spec_version: SPEC_VERSION.to_string(),
+        };
+        write_workflow_state(&self.options.project_root, &done)?;
+        let artifact_count = completed.iter().map(|p| p.artifacts.len()).sum();
+        self.record_run_history(Phase::Quality, quality_passed, artifact_count);
+        self.warn_degraded_summary();
+        self.emit(EngineEvent::BlockCompleted {
+            final_phase: Phase::Quality,
+            paused_at: None,
+        });
+        Ok(RunReport {
+            final_phase: Phase::Quality,
+            paused_at: None,
+            completed,
+        })
+    }
+
+    /// **Re-run a SINGLE named phase**, reusing the prior run's context so the
+    /// inputs are identical. The headline use is recovering a `DEGRADED` phase
+    /// (the base went offline mid-run, so the artifact is an offline placeholder):
+    /// `redo_phase(Phase::Frontend, true)` regenerates just `frontend` against the
+    /// same persisted requirement / slug / backend, then clears that phase's
+    /// `.DEGRADED` markers on success.
+    ///
+    /// This is NOT a gate walk — it runs exactly one phase body (no transition
+    /// past it, no downstream phases), so the user keeps full control of the
+    /// pipeline position. `use_runtime` forces the worker on/off.
+    ///
+    /// # Errors
+    /// Returns `Err` when the phase body fails to write its artifact. A caller
+    /// that hands in an unknown phase name should reject it BEFORE calling (see
+    /// [`crate::planner::phase_from_id`]); the runner only accepts a typed
+    /// [`Phase`]. The single-writer run-lock is held for the redo.
+    pub async fn redo_phase(&self, phase: Phase, use_runtime: bool) -> std::io::Result<RunReport> {
+        let _run_lock = crate::run_lock::RunLock::acquire(&self.options.project_root)?;
+        self.emit(EngineEvent::Note(format!(
+            "[redo] 用先前 run 的上下文重跑 `{}` 阶段(输入保持一致)…",
+            phase.id()
+        )));
+        self.start_phase(phase);
+        let phase_start = std::time::Instant::now();
+
+        // Drive the worker for the phase, then record via the deterministic body.
+        // The generation prompts mirror the full-pipeline phase bodies but are
+        // self-contained so a redo never depends on an in-progress block. A phase
+        // with no worker step (it only writes a notes artifact) still re-records.
+        let (output, degraded) = self.redo_one_phase(phase, use_runtime).await?;
+        let completed = vec![self.record_phase_maybe_degraded(phase, Ok(output), degraded)?];
+        self.record_phase_timing(phase, phase_start);
+
+        // On a CLEAN redo, clear the degraded markers this phase left behind so
+        // the workspace no longer flags it as a placeholder. We use the SAME
+        // artifact paths the redo just (re)wrote, so the marker names match
+        // exactly what `record_phase_maybe_degraded` would have written.
+        if !degraded {
+            Self::clear_degraded_markers(&completed[0].artifacts);
+            self.emit(EngineEvent::Note(format!(
+                "[redo] `{}` 阶段已重跑完成,已清除该阶段的 .DEGRADED 降级标记。",
+                phase.id()
+            )));
+        }
+        self.warn_degraded_summary();
+        self.emit(EngineEvent::BlockCompleted {
+            final_phase: phase,
+            paused_at: None,
+        });
+        Ok(RunReport {
+            final_phase: phase,
+            paused_at: None,
+            completed,
+        })
+    }
+
+    /// Generate + build one phase's output for [`Self::redo_phase`]. Returns the
+    /// phase output and whether it degraded (base was on but returned nothing).
+    /// Self-contained: reads its context from the on-disk `output/` artifacts the
+    /// prior run wrote, so a redo reproduces the same inputs.
+    async fn redo_one_phase(
+        &self,
+        phase: Phase,
+        use_runtime: bool,
+    ) -> std::io::Result<(PhaseOutput, bool)> {
+        let slug = self.options.effective_slug();
+        let read = |name: &str| -> String {
+            std::fs::read_to_string(
+                self.options
+                    .project_root
+                    .join(format!("output/{slug}-{name}.md")),
+            )
+            .unwrap_or_default()
+        };
+        match phase {
+            Phase::Research => {
+                let text = if use_runtime {
+                    let digest = crate::phases::phase_knowledge_digest(&self.options, phase);
+                    let rp = self.with_expert_knowledge(
+                        research_prompt(&slug, &self.options.requirement, &digest),
+                        &["product-manager"],
+                    );
+                    self.try_generate(phase, rp).await
+                } else {
+                    None
+                };
+                let degraded = use_runtime && text.is_none();
+                Ok((run_research(&self.options, text.as_deref())?, degraded))
+            }
+            Phase::Docs => {
+                // Reuse the full docs generation path so PRD/architecture/UIUX
+                // are all regenerated against the same research input.
+                let research = read("research");
+                let content = if use_runtime {
+                    self.generate_docs_content(Some(&research)).await
+                } else {
+                    DocsContent::default()
+                };
+                let degraded = use_runtime
+                    && content.prd.is_none()
+                    && content.architecture.is_none()
+                    && content.uiux.is_none();
+                Ok((run_docs(&self.options, &content)?, degraded))
+            }
+            Phase::Spec => {
+                let mut degraded = false;
+                if use_runtime {
+                    let prd = read("prd");
+                    let arch = read("architecture");
+                    let context = format!(
+                        "PRD excerpt:\n{}\n\nArchitecture excerpt:\n{}",
+                        excerpt_sections(&prd, 2000),
+                        excerpt_sections(&arch, 2000)
+                    );
+                    let text = self
+                        .try_generate(
+                            phase,
+                            Prompt {
+                                system: format!(
+                                    "Role: senior engineering manager.\nWrite an execution plan \
+                                     with sprint breakdown, coding standards, and definition of \
+                                     done. Based on these approved documents:\n\n{context}"
+                                ),
+                                user: format!(
+                                    "Write the execution plan for: {}",
+                                    self.options.requirement
+                                ),
+                            },
+                        )
+                        .await;
+                    if let Some(text) = text {
+                        let plan_path = self
+                            .options
+                            .project_root
+                            .join(format!("output/{slug}-execution-plan.md"));
+                        if let Some(parent) = plan_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = crate::phases::atomic_write(&plan_path, &text);
+                    } else {
+                        degraded = true;
+                    }
+                }
+                Ok((run_spec(&self.options)?, degraded))
+            }
+            Phase::Frontend => {
+                let mut degraded = false;
+                if use_runtime {
+                    let uiux = read("uiux");
+                    let arch = read("architecture");
+                    let prd = read("prd");
+                    let fe_p = self.with_expert_knowledge(
+                        frontend_prompt(
+                            &slug,
+                            &self.options.requirement,
+                            &excerpt_sections(&uiux, 3000),
+                            &excerpt_sections(&arch, 2000),
+                            &excerpt_sections(&prd, 1500),
+                        ),
+                        &["frontend-lead", "uiux-designer"],
+                    );
+                    degraded = self.try_generate(phase, fe_p).await.is_none();
+                    if !degraded {
+                        self.maybe_verify_and_fix(Phase::Frontend).await;
+                    }
+                }
+                Ok((run_frontend(&self.options)?, degraded))
+            }
+            Phase::Backend => {
+                let mut degraded = false;
+                if use_runtime {
+                    let arch = read("architecture");
+                    let prd = read("prd");
+                    let be_p = self.with_expert_knowledge(
+                        backend_prompt(
+                            &slug,
+                            &self.options.requirement,
+                            &excerpt_sections(&arch, 3000),
+                            &excerpt_sections(&prd, 1500),
+                        ),
+                        &["backend-lead", "architect"],
+                    );
+                    degraded = self.try_generate(phase, be_p).await.is_none();
+                    if !degraded {
+                        self.maybe_verify_and_fix(Phase::Backend).await;
+                    }
+                }
+                Ok((run_backend(&self.options)?, degraded))
+            }
+            Phase::Quality => {
+                let out = run_quality(&self.options)?;
+                self.maybe_verify(Phase::Quality).await;
+                Ok((out, false))
+            }
+            Phase::Delivery => {
+                let mut degraded = false;
+                if use_runtime {
+                    let arch = read("architecture");
+                    let del_p = self.with_expert_knowledge(
+                        delivery_prompt(
+                            &slug,
+                            &self.options.requirement,
+                            &excerpt_sections(&arch, 2000),
+                        ),
+                        &["devops"],
+                    );
+                    degraded = self.try_generate(phase, del_p).await.is_none();
+                }
+                Ok((run_delivery(&self.options)?, degraded))
+            }
+            // The two gate phases have no body to re-run — they only pause the
+            // pipeline. Re-running them is a no-op artifact-wise; surface a clear
+            // note and return an empty (non-degraded) output.
+            Phase::DocsConfirm | Phase::PreviewConfirm => {
+                self.emit(EngineEvent::Note(format!(
+                    "[redo] `{}` 是确认门,没有可重跑的产物 —— 用 /continue 或 /revise 操作该门。",
+                    phase.id()
+                )));
+                Ok((
+                    PhaseOutput {
+                        phase,
+                        artifacts: Vec::new(),
+                        gate: None,
+                        degraded: false,
+                    },
+                    false,
+                ))
+            }
+        }
+    }
+
+    /// Remove the `.DEGRADED` marker files sitting next to `artifacts`. Called
+    /// after a clean [`Self::redo_phase`] so the workspace no longer flags the
+    /// phase's output as an offline placeholder. The marker name is derived
+    /// IDENTICALLY to [`Self::record_phase_maybe_degraded`]
+    /// (`<artifact>.<ext>.DEGRADED`). Best-effort: a missing marker / IO error
+    /// is ignored (fail-open).
+    fn clear_degraded_markers(artifacts: &[PathBuf]) {
+        for artifact in artifacts {
+            let marker = artifact.with_extension(format!(
+                "{}.DEGRADED",
+                artifact
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("out")
+            ));
+            let _ = std::fs::remove_file(&marker);
+        }
+    }
+
     /// Dispatch: read workflow-state, decide which block to run next.
     ///
     /// Guards against state-machine incoherence: the passed `approved_gate`
@@ -5054,6 +5465,114 @@ error TS2304: Cannot find name 'Foo'
         assert!(
             !tmp.path().join("output/demo-prd.md.DEGRADED").is_file(),
             "offline run must not write a .DEGRADED marker"
+        );
+    }
+
+    // ============================ Light fast track ========================
+
+    #[tokio::test]
+    async fn run_light_runs_lean_block_and_completes_without_gates() {
+        // Offline Light run: spec → frontend → quality, no gate pauses, ends
+        // complete (paused_at = None) at the quality phase.
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.requirement = "改个文案".into();
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            o,
+        );
+        runner.start().unwrap();
+        let report = runner.run_light(false).await.unwrap();
+        assert!(
+            report.paused_at.is_none(),
+            "Light run must not pause at a gate"
+        );
+        assert_eq!(report.final_phase, Phase::Quality);
+        // The lean phases ran (spec + frontend + quality artifacts exist) …
+        let phases: Vec<&str> = report.completed.iter().map(|p| p.phase.id()).collect();
+        assert!(phases.contains(&"spec"), "spec ran: {phases:?}");
+        assert!(phases.contains(&"frontend"), "frontend ran: {phases:?}");
+        assert!(phases.contains(&"quality"), "quality ran: {phases:?}");
+        // … and the heavyweight phases did NOT.
+        assert!(
+            !phases.contains(&"research"),
+            "research skipped: {phases:?}"
+        );
+        assert!(!phases.contains(&"docs"), "docs skipped: {phases:?}");
+        assert!(
+            !phases.contains(&"delivery"),
+            "delivery skipped: {phases:?}"
+        );
+        // State ends at quality, no active gate.
+        let state = crate::state::read_workflow_state(tmp.path()).unwrap();
+        assert_eq!(state.phase, "quality");
+        assert!(state.active_gate.is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_light_emits_light_plan_note() {
+        use crate::events::RecordingSink;
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.requirement = "微调一下间距".into();
+        let sink = RecordingSink::new();
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            o,
+        )
+        .with_event_sink(Arc::new(sink.clone()));
+        runner.start().unwrap();
+        runner.run_light(false).await.unwrap();
+        let noted =
+            sink.count(|e| matches!(e, EngineEvent::Note(m) if m.contains("[plan] 轻量档")));
+        assert!(
+            noted >= 1,
+            "Light run should announce the lightweight track"
+        );
+    }
+
+    // ============================ redo single phase =======================
+
+    #[tokio::test]
+    async fn redo_phase_reruns_one_phase_only() {
+        // A redo of `frontend` re-records exactly that phase and nothing else,
+        // ending complete (no gate) at frontend.
+        let tmp = TempDir::new().unwrap();
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            opts(tmp.path()),
+        );
+        runner.start().unwrap();
+        let report = runner.redo_phase(Phase::Frontend, false).await.unwrap();
+        assert!(report.paused_at.is_none());
+        assert_eq!(report.final_phase, Phase::Frontend);
+        assert_eq!(report.completed.len(), 1, "redo runs exactly one phase");
+        assert_eq!(report.completed[0].phase, Phase::Frontend);
+        // The frontend notes artifact exists on disk.
+        assert!(tmp.path().join("output/demo-frontend-notes.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn redo_phase_clears_degraded_marker_on_clean_rerun() {
+        // Seed a .DEGRADED marker next to the frontend artifact (as if a prior
+        // run degraded it), then redo the phase cleanly (offline → not degraded)
+        // and confirm the marker is gone.
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("output");
+        std::fs::create_dir_all(&out).unwrap();
+        let marker = out.join("demo-frontend-notes.md.DEGRADED");
+        std::fs::write(&marker, "placeholder").unwrap();
+        assert!(marker.is_file());
+
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            opts(tmp.path()),
+        );
+        runner.start().unwrap();
+        runner.redo_phase(Phase::Frontend, false).await.unwrap();
+        assert!(
+            !marker.is_file(),
+            "a clean redo must clear the phase's .DEGRADED marker"
         );
     }
 

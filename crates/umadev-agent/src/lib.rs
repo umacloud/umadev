@@ -64,7 +64,9 @@ pub use lessons::{
 };
 pub use manifest::{ConformanceLevel, Profile, SpecManifest};
 pub use phases::{knowledge_top_files, phase_knowledge_digest, PhaseOutput};
-pub use planner::{plan as plan_phases, PhasePlan, TaskKind};
+pub use planner::{
+    phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan, TaskKind,
+};
 pub use runner::{AgentRunner, RunOptions, RunReport};
 pub use state::{
     list_snapshots, read_workflow_state, read_workflow_state_diagnostic, restore_snapshot,

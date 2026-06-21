@@ -80,6 +80,12 @@ pub enum Action {
     Continue(Gate),
     /// User submitted a fresh requirement — start the initial pipeline block.
     StartRun(String),
+    /// `/quick <task>` — run the lightweight fast track (spec-lite -> implement
+    /// -> quality, no gates) for a trivial change instead of the full pipeline.
+    StartQuick(String),
+    /// `/redo <phase>` — re-run a single named phase using the prior run's
+    /// context (handy for a phase that degraded because the base went offline).
+    RedoPhase(Phase),
     /// User submitted natural language — ask the selected worker to decide
     /// whether this is normal chat or a pipeline requirement.
     Route(String),
@@ -892,12 +898,19 @@ impl App {
             "pick a seed template (e.g. /template dashboard)",
         ),
         ("run", "start a new run (/run [slug] <requirement>)"),
+        (
+            "quick",
+            "lightweight fast track for a trivial task (/quick <task>)",
+        ),
         ("runs", "view run history and phase timing"),
         (
             "cancel",
             "stop the running pipeline and return to the prompt",
         ),
-        ("redo", "re-run the current requirement from scratch"),
+        (
+            "redo",
+            "re-run the whole requirement, or one phase (/redo [phase])",
+        ),
         (
             "checkpoint",
             "snapshot workspace files (/checkpoint [label])",
@@ -2352,6 +2365,7 @@ impl App {
             "design" => self.slash_design(rest),
             "template" => self.slash_template(rest),
             "run" => self.slash_run(rest),
+            "quick" => self.slash_quick(rest),
             "status" => {
                 self.open_status_overlay();
                 Action::None
@@ -2397,7 +2411,7 @@ impl App {
                     Action::None
                 }
             }
-            "redo" => self.slash_redo(),
+            "redo" => self.slash_redo(rest),
             "checkpoint" | "snapshot" => self.slash_checkpoint(rest),
             "rewind" | "rollback-files" => self.slash_rewind(rest),
             "config" => {
@@ -3121,11 +3135,62 @@ impl App {
         Action::None
     }
 
-    fn slash_redo(&mut self) -> Action {
+    /// `/quick <task>` — the lightweight fast track. Skips the heavy phases and
+    /// runs a lean single shot (spec-lite -> implement -> quality, no gates) for
+    /// a trivial change. Mirrors [`Self::slash_run`]'s guards.
+    fn slash_quick(&mut self, arg: &str) -> Action {
+        if self.is_pipeline_active() {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "quick.busy"));
+            return Action::None;
+        }
+        let task = arg.trim();
+        if task.is_empty() {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "quick.usage"));
+            return Action::None;
+        }
+        if self.run_started {
+            self.reset_for_new_run();
+        }
+        self.push(
+            ChatRole::UmaDev,
+            umadev_i18n::tf(self.lang, "quick.starting", &[task]),
+        );
+        Action::StartQuick(task.to_string())
+    }
+
+    /// `/redo [phase]` — with NO argument, re-run the whole requirement from
+    /// scratch (the original behaviour). With a phase name, re-run just that ONE
+    /// phase using the prior run's context (e.g. recover a base-offline degrade).
+    fn slash_redo(&mut self, arg: &str) -> Action {
         if self.is_pipeline_active() {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "redo.busy"));
             return Action::None;
         }
+        let arg = arg.trim();
+        // Single-phase redo: `/redo frontend`, `/redo backend`, …
+        if !arg.is_empty() {
+            let valid = umadev_agent::redoable_phase_ids().join(", ");
+            let Some(phase) = umadev_agent::phase_from_id(arg) else {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::tf(self.lang, "redo.phase.unknown", &[arg, &valid]),
+                );
+                return Action::None;
+            };
+            if self.requirement.is_empty() && !self.run_started {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "redo.phase.no_run"),
+                );
+                return Action::None;
+            }
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::tf(self.lang, "redo.phase.rerunning", &[phase.id()]),
+            );
+            return Action::RedoPhase(phase);
+        }
+        // No phase → re-run the whole requirement from scratch (legacy behaviour).
         if self.requirement.is_empty() {
             self.push(
                 ChatRole::System,

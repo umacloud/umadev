@@ -186,6 +186,17 @@
 "redo.no_requirement" = "No requirement has been run yet — just type a requirement or use /run to start."
 "redo.rerunning" = "Re-running requirement: \"{}\". The pipeline restarts from research…"
 
+# /quick — lightweight fast track
+"quick.busy" = "A pipeline is running — /cancel it before /quick, to avoid two pipelines writing the same workspace."
+"quick.usage" = "Usage: /quick <task>\n  Example: /quick tweak the header copy\n  Lightweight track: clarify-lite → implement → verify (skips research / 3 docs / both gates / delivery)."
+"quick.starting" = "[light] Lightweight track: \"{}\". Running spec → implement → quality (no gates)…"
+
+# /redo <phase> — re-run a single phase
+"redo.phase.usage" = "Usage: /redo [phase]\n  /redo            re-run the whole requirement from scratch\n  /redo <phase>    re-run ONE phase (e.g. /redo frontend) — handy for a base that went offline\n  Valid phases: {}"
+"redo.phase.unknown" = "Unknown phase `{}`. Valid phases: {}"
+"redo.phase.no_run" = "No prior run found — start one with a requirement (or /run) before re-running a single phase."
+"redo.phase.rerunning" = "Re-running just the `{}` phase with the prior run's context…"
+
 # /export proof-pack
 "export.no_release_dir" = "release/ does not exist — the pipeline must reach delivery to generate a proof-pack."
 "export.release_empty" = "release/ is empty — the delivery phase must complete to produce proof-pack.zip."

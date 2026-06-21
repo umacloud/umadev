@@ -225,6 +225,12 @@ enum Block {
     /// On resume, `run_initial_block` runs.
     Clarify,
     Continue(Gate),
+    /// Lightweight fast track — a lean single shot (spec-lite -> implement ->
+    /// quality, no gates) for a trivial change. Drives `run_light`.
+    Light,
+    /// Re-run a single named phase using the prior run's context. Drives
+    /// `redo_phase`.
+    Redo(umadev_spec::Phase),
 }
 
 /// Set the terminal window/tab title to `UmaDev — <backend>` via an OSC
@@ -381,6 +387,19 @@ fn spawn_block(
                 runner.run_initial_block(use_runtime, None).await
             }
             Block::Continue(gate) => runner.continue_from_gate(gate).await,
+            Block::Light => {
+                if let Err(e) = runner.start() {
+                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "pipeline.start_failed",
+                        &[&e.to_string()],
+                    )));
+                    return;
+                }
+                runner.run_light(use_runtime).await
+            }
+            // A redo reuses the prior run's persisted state — it must NOT call
+            // `start()` (which would reset the workflow back to research).
+            Block::Redo(phase) => runner.redo_phase(phase, use_runtime).await,
         };
         if let Err(e) = outcome {
             let err_str = e.to_string();
@@ -1039,6 +1058,38 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     app.brain_spec(),
                                     sink.clone(),
                                     Block::Clarify,
+                                ));
+                            }
+                            Action::StartQuick(task) => {
+                                // Lightweight fast track — same RunOptions as a
+                                // normal start, but driven through the lean
+                                // single-shot Light block (no gates).
+                                let run_opts = RunOptions {
+                                    project_root: opts.project_root.clone(),
+                                    requirement: task,
+                                    slug: opts.slug.clone(),
+                                    model: app.effective_model(),
+                                    backend: app.backend.clone().unwrap_or_default(),
+                                    design_system: app.config.design_system.clone().unwrap_or_default(),
+                                    seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                                };
+                                run_task = Some(spawn_block(
+                                    run_opts,
+                                    app.brain_spec(),
+                                    sink.clone(),
+                                    Block::Light,
+                                ));
+                            }
+                            Action::RedoPhase(phase) => {
+                                // Re-run a single phase with the prior run's
+                                // context (current_run_options carries the
+                                // persisted requirement / slug / backend).
+                                let run_opts = current_run_options(app, &opts);
+                                run_task = Some(spawn_block(
+                                    run_opts,
+                                    app.brain_spec(),
+                                    sink.clone(),
+                                    Block::Redo(phase),
                                 ));
                             }
                             Action::Route(text) => {

@@ -39,6 +39,13 @@ pub enum TaskKind {
     Refactor,
     /// Docs / research / planning only — no code phases.
     DocsOnly,
+    /// A trivial change — a one-line tweak, a style nudge, a tiny script. The
+    /// LIGHTEST path of all: a lean clarify-spec → implement → verify, with no
+    /// research / docs / two confirm gates / delivery proof-pack. This is the
+    /// answer to "the full nine phases are too heavy for a small task": the
+    /// planner can auto-suggest it (see [`classify`]), and `umadev quick`
+    /// forces it regardless of classification.
+    Light,
 }
 
 impl TaskKind {
@@ -52,6 +59,7 @@ impl TaskKind {
             TaskKind::Bugfix => "bugfix",
             TaskKind::Refactor => "refactor",
             TaskKind::DocsOnly => "docs_only",
+            TaskKind::Light => "light",
         }
     }
 
@@ -101,7 +109,21 @@ impl TaskKind {
             // proof-pack — just plan the change, implement it, gate on quality.
             TaskKind::Bugfix | TaskKind::Refactor => vec![Spec, Frontend, Backend, Quality],
             TaskKind::DocsOnly => vec![Research, Docs, DocsConfirm],
+            // The lightest path — for a trivial change the full nine phases are
+            // pure overhead. A lean clarify-lite `Spec` → implement
+            // (`Frontend` + `Backend`, whichever the change touches) → `Quality`
+            // verify. No research, no three core docs, no two confirm gates, no
+            // delivery proof-pack. Governance still applies on every write.
+            TaskKind::Light => vec![Spec, Frontend, Backend, Quality],
         }
+    }
+
+    /// Whether this is the lightweight fast track (trivial work). The runner
+    /// drives a [`TaskKind::Light`] plan through [`crate::AgentRunner::run_light`]
+    /// in a single shot rather than the gate-anchored three-block walk.
+    #[must_use]
+    pub fn is_light(self) -> bool {
+        matches!(self, TaskKind::Light)
     }
 }
 
@@ -208,7 +230,44 @@ pub fn classify(requirement: &str) -> TaskKind {
     ]) {
         return TaskKind::DocsOnly;
     }
-    // 4. Frontend vs backend split (distinctive tokens only).
+    // 4. Trivial change — the lightest of all. A one-line tweak, a tiny style
+    //    nudge, a small script: the full nine phases are pure overhead. Needles
+    //    are deliberately NARROW (explicit "small/tiny/trivial" markers + tiny
+    //    artefacts) so a real feature never silently downgrades to Light; an
+    //    ambiguous request still falls through to the heavyweight default.
+    if has(&[
+        "小改",
+        "小修改",
+        "微调",
+        "改个文案",
+        "改文案",
+        "改个文字",
+        "改个颜色",
+        "改颜色",
+        "改个样式",
+        "改一行",
+        "加个日志",
+        "小脚本",
+        "写个脚本",
+        "small tweak",
+        "tiny tweak",
+        "minor tweak",
+        "quick change",
+        "trivial change",
+        "one-liner",
+        "one liner",
+        "small script",
+        "tiny script",
+        "tweak the copy",
+        "change the text",
+        "rename ",
+        "bump the version",
+        "typo",
+    ]) {
+        return TaskKind::Light;
+    }
+
+    // 5. Frontend vs backend split (distinctive tokens only).
     let frontend = has(&[
         "前端",
         "界面",
@@ -242,8 +301,59 @@ pub fn classify(requirement: &str) -> TaskKind {
         return TaskKind::BackendOnly;
     }
 
-    // 5. Default — a full product build.
+    // 6. Default — a full product build.
     TaskKind::Greenfield
+}
+
+/// Parse a user-supplied phase name into a typed [`Phase`], for `umadev redo
+/// <phase>` / `/redo <phase>`. Case-insensitive and whitespace-tolerant, and
+/// accepts the common friendly aliases a user is likely to type (`fe`/`ui` for
+/// frontend, `be`/`api` for backend, `qa` for quality, etc.) in addition to the
+/// canonical [`Phase::id`] strings. Returns `None` for anything unrecognised so
+/// the caller can show the valid set — fail-open, never panics.
+#[must_use]
+pub fn phase_from_id(name: &str) -> Option<Phase> {
+    match name
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_")
+        .as_str()
+    {
+        "research" => Some(Phase::Research),
+        "docs" | "doc" | "documents" => Some(Phase::Docs),
+        "docs_confirm" | "docsconfirm" => Some(Phase::DocsConfirm),
+        "spec" | "plan" => Some(Phase::Spec),
+        "frontend" | "fe" | "ui" | "front" => Some(Phase::Frontend),
+        "preview_confirm" | "previewconfirm" | "preview" => Some(Phase::PreviewConfirm),
+        "backend" | "be" | "api" | "back" => Some(Phase::Backend),
+        "quality" | "qa" | "quality_gate" => Some(Phase::Quality),
+        "delivery" | "deliver" | "release" => Some(Phase::Delivery),
+        _ => None,
+    }
+}
+
+/// The phase names a user can pass to `redo`, in canonical chain order — used
+/// to build a friendly "valid phases: …" error when [`phase_from_id`] rejects.
+#[must_use]
+pub fn redoable_phase_ids() -> Vec<&'static str> {
+    umadev_spec::PHASE_CHAIN.iter().map(|p| p.id()).collect()
+}
+
+/// Build a plan that FORCES the lightweight fast track regardless of how the
+/// requirement classifies. This is what `umadev quick` / `/quick` use: the user
+/// has explicitly asked for the lean path, so we skip classification and pin
+/// [`TaskKind::Light`]. The deterministic classifier still drives the default
+/// `umadev run` path, where a trivial requirement is auto-suggested into Light
+/// but the user can override by running the full pipeline instead.
+#[must_use]
+pub fn plan_light(requirement: &str) -> PhasePlan {
+    let _ = requirement; // reserved for future per-requirement light tailoring
+    let kind = TaskKind::Light;
+    PhasePlan {
+        kind,
+        phases: kind.phases(),
+        rationale: rationale_for(kind),
+    }
 }
 
 /// The subset of `plan`'s skipped phases that are safe to skip TODAY within the
@@ -276,6 +386,9 @@ fn rationale_for(kind: TaskKind) -> String {
         TaskKind::Bugfix => "小修复 — 聚焦定位与最小改动,文档从简".to_string(),
         TaskKind::Refactor => "重构 — 聚焦结构调整、保持行为不变".to_string(),
         TaskKind::DocsOnly => "文档/调研为主 — 在文档确认门停下,由你决定是否继续实现".to_string(),
+        TaskKind::Light => {
+            "轻量档 — 极简流程:澄清简版→实现→验证,跳过调研/三文档/两道确认门/交付物料包".to_string()
+        }
     }
 }
 
@@ -382,6 +495,74 @@ mod tests {
     }
 
     #[test]
+    fn classifies_trivial_as_light() {
+        assert_eq!(classify("帮我改个文案"), TaskKind::Light);
+        assert_eq!(classify("这里微调一下间距"), TaskKind::Light);
+        assert_eq!(classify("写个脚本批量重命名文件"), TaskKind::Light);
+        assert_eq!(
+            classify("a small tweak to the header copy"),
+            TaskKind::Light
+        );
+        assert_eq!(classify("just a typo in the readme"), TaskKind::Light);
+        // Ordering note: a request phrased as a "fix" matches the narrower
+        // Bugfix lean path FIRST — both are lean, so this is fine.
+        assert_eq!(classify("fix a typo in the readme"), TaskKind::Bugfix);
+    }
+
+    #[test]
+    fn non_trivial_does_not_downgrade_to_light() {
+        // A real feature / product must NOT silently become Light.
+        assert_eq!(classify("做一个待办事项应用"), TaskKind::Greenfield);
+        assert_eq!(classify("做一个前端落地页"), TaskKind::FrontendOnly);
+        assert_eq!(classify("写一个后端接口"), TaskKind::BackendOnly);
+    }
+
+    #[test]
+    fn light_plan_is_the_lean_subset_no_gates() {
+        // Whether reached by classification or forced via `plan_light`, a Light
+        // plan skips research/docs/both gates/delivery and keeps spec+quality.
+        for p in [plan("帮我改个文案"), plan_light("anything at all")] {
+            assert_eq!(p.kind, TaskKind::Light);
+            assert!(p.kind.is_light());
+            assert!(p.includes(Phase::Spec));
+            assert!(p.includes(Phase::Quality));
+            assert!(!p.includes(Phase::Research));
+            assert!(!p.includes(Phase::Docs));
+            assert!(!p.includes(Phase::DocsConfirm));
+            assert!(!p.includes(Phase::PreviewConfirm));
+            assert!(!p.includes(Phase::Delivery));
+        }
+    }
+
+    #[test]
+    fn phase_from_id_parses_canonical_and_aliases() {
+        assert_eq!(phase_from_id("frontend"), Some(Phase::Frontend));
+        assert_eq!(phase_from_id("  FE "), Some(Phase::Frontend));
+        assert_eq!(phase_from_id("backend"), Some(Phase::Backend));
+        assert_eq!(phase_from_id("api"), Some(Phase::Backend));
+        assert_eq!(phase_from_id("QA"), Some(Phase::Quality));
+        assert_eq!(
+            phase_from_id("preview-confirm"),
+            Some(Phase::PreviewConfirm)
+        );
+        assert_eq!(phase_from_id("plan"), Some(Phase::Spec));
+        // Every canonical id round-trips.
+        for p in umadev_spec::PHASE_CHAIN {
+            assert_eq!(phase_from_id(p.id()), Some(*p), "{}", p.id());
+        }
+        assert_eq!(phase_from_id("nonsense"), None);
+        assert_eq!(phase_from_id(""), None);
+    }
+
+    #[test]
+    fn plan_light_forces_light_for_any_requirement() {
+        // `plan_light` ignores classification — even a greenfield ask is pinned
+        // to Light when the user explicitly chose the fast track.
+        let p = plan_light("做一个完整的电商平台");
+        assert_eq!(p.kind, TaskKind::Light);
+    }
+
+    #[test]
     fn every_plan_preserves_canonical_order() {
         for req in [
             "做一个电商网站",
@@ -390,6 +571,7 @@ mod tests {
             "修复 bug",
             "重构代码",
             "写需求文档",
+            "改个文案",
         ] {
             let p = plan(req);
             // The plan's phases appear in the same relative order as PHASE_CHAIN.
