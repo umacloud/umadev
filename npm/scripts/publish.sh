@@ -62,12 +62,12 @@ fi
 
 # 2c) Publish the knowledge corpus package (main depends on it). Stage the
 #     repo's knowledge/ tree into it first (CI / ephemeral).
-echo "publish.sh: staging + npm publish @umadev/knowledge..."
+echo "publish.sh: staging + npm publish @umacloud/knowledge..."
 if [[ -d "$NPM_ROOT/../knowledge" ]]; then
   cp -R "$NPM_ROOT/../knowledge/." "$NPM_ROOT/knowledge-corpus/"
   (cd "$NPM_ROOT/knowledge-corpus" && npm publish --access public $DRY_RUN)
 else
-  echo "publish.sh: skipping @umadev/knowledge (knowledge/ not found)" >&2
+  echo "publish.sh: skipping @umacloud/knowledge (knowledge/ not found)" >&2
 fi
 
 # 3) Publish the main package last (so its optionalDependencies resolve

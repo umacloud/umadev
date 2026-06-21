@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // SPDX-License-Identifier: MIT
 //
-// umadev — thin JS shim. npm picks the matching `@umadev/cli-*`
+// umadev — thin JS shim. npm picks the matching `@umacloud/cli-*`
 // platform sub-package (via optionalDependencies + the `os` / `cpu`
 // fields in each sub-package). This shim resolves that sub-package's
 // prebuilt Rust binary and exec's it with the user's argv.
@@ -19,11 +19,11 @@ const path = require('node:path');
 
 // Node platform/arch → our sub-package name.
 const PLATFORM_PACKAGES = {
-  'darwin-arm64': '@umadev/cli-darwin-arm64',
-  'darwin-x64': '@umadev/cli-darwin-x64',
-  'linux-x64': '@umadev/cli-linux-x64',
-  'linux-arm64': '@umadev/cli-linux-arm64',
-  'win32-x64': '@umadev/cli-win32-x64',
+  'darwin-arm64': '@umacloud/cli-darwin-arm64',
+  'darwin-x64': '@umacloud/cli-darwin-x64',
+  'linux-x64': '@umacloud/cli-linux-x64',
+  'linux-arm64': '@umacloud/cli-linux-arm64',
+  'win32-x64': '@umacloud/cli-win32-x64',
 };
 
 function platformKey() {
@@ -81,7 +81,7 @@ function findBinary() {
 // Fail-open: if the model package is absent the binary degrades to BM25.
 function findModelDir() {
   try {
-    return path.dirname(require.resolve('@umadev/model-e5-small/package.json'));
+    return path.dirname(require.resolve('@umacloud/model-e5-small/package.json'));
   } catch (_) {
     const sibling = path.resolve(__dirname, '..', '..', 'model-e5-small');
     if (fs.existsSync(path.join(sibling, 'tokenizer.json'))) return sibling;
@@ -95,7 +95,7 @@ function findModelDir() {
 // own knowledge/ (if any) still wins. Fail-open: absent -> BM25 over nothing.
 function findKnowledgeDir() {
   try {
-    return path.dirname(require.resolve('@umadev/knowledge/package.json'));
+    return path.dirname(require.resolve('@umacloud/knowledge/package.json'));
   } catch (_) {
     const sibling = path.resolve(__dirname, '..', '..', '..', 'knowledge');
     if (fs.existsSync(path.join(sibling, 'frontend'))) return sibling;
