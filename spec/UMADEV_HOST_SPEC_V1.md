@@ -33,11 +33,12 @@ verifiable normative clauses. The user-facing CLI (`umadev install
 <host>`, `umadev verify <host>`, `umadev audit`) is the coach
 "handing over the playbook" and "watching from the sideline."
 
-Hosts (Claude Code, Codex CLI, Cursor, Windsurf, Cline, Continue, Codex
-App/Desktop, Droid CLI, Kiro, Trae, Qoder, Qwen Code, CodeBuddy, OpenCode,
-Copilot Agent, Replit Agent, ...) are independent products. They MAY meet
-this spec by adopting UmaDev's reference injectors, or by implementing
-the rules natively. Both paths produce a conformant host.
+Coding hosts are independent products. UmaDev's first-class drivers are
+**exactly three** base CLIs — `claude-code`, `codex`, and `opencode`
+(`umadev_host::BACKEND_IDS` is the authoritative list); everything else
+is out of first-class support. Any other host MAY still meet this spec by
+adopting UmaDev's reference injectors, or by implementing the rules
+natively. Both paths produce a conformant host.
 
 ## 1. Conformance and conventions
 
@@ -488,22 +489,24 @@ the pack — no host session required.
 ## 7. Host surface mapping
 
 Every clause in §3–§6 is layer-agnostic. This section is **non-normative
-guidance** showing how each layer is realized on UmaDev's three
+guidance** showing how each layer is realized on UmaDev's
 officially-supported host families. Other hosts MAY implement this spec
 independently; the reference implementation (`umadev install <host>`)
-ships plugin bundles only for the three families listed below.
+ships plugin bundles only for the families listed below.
 
 ### 7.1 Officially supported hosts
 
-The reference implementation ships first-party plugin bundles for the
-three host families that have an **official Agent SDK** as of
-UMADEV_HOST_SPEC_V1's draft date (May 2026):
+The reference implementation drives exactly **three** first-class base
+CLIs — `claude-code`, `codex`, and `opencode` — each an
+already-logged-in host CLI run as a subprocess (`umadev_host::BACKEND_IDS`
+is the authoritative id list). They resolve to the two host families that
+have an **official Agent SDK** as of UMADEV_HOST_SPEC_V1's draft date
+(May 2026):
 
 | Host family | Provider | SDK | Workspace install | User-scope install |
 |---|---|---|---|---|
 | **Claude Code** / Claude Desktop | Anthropic | Claude Agent SDK | `.claude/` | `~/.claude/` |
 | **Codex CLI** / Codex Desktop | OpenAI | OpenAI Agents SDK | `AGENTS.md` + `.codex/` | `~/.codex/` |
-| **Antigravity CLI** / Antigravity Desktop | Google | Antigravity SDK | `AGENTS.md` | `~/.antigravity/` |
 
 Hosts outside this set (Cursor, Windsurf, Cline / Roo, Continue, Droid
 CLI, Kiro IDE, Trae, Qoder, CodeBuddy, …) are explicitly **out of
@@ -514,19 +517,19 @@ shipped for them.
 
 ### 7.2 Reference surface inventory
 
-| Surface | Claude Code | Codex CLI / Desktop | Antigravity CLI / Desktop |
-|---|---|---|---|
-| Persistent rules | `.claude/skills/umadev/SKILL.md`, `CLAUDE.md` | `AGENTS.md`, `skills/umadev/SKILL.md` | `AGENTS.md`, `skills/umadev/SKILL.md` |
-| Slash command | `commands/umadev.md` | (host-defined; AGENTS.md guidance) | (host-defined; AGENTS.md guidance) |
-| Pre-write hook | `hooks.PreToolUse` matcher `Write\|Edit` | `[[hooks.PreToolUse]]` in `.codex/config.toml` | TBD (Antigravity 2.0 hook contract is stabilising) |
-| Post-write hook | `hooks.PostToolUse` matcher `Write\|Edit` | `[[hooks.PostToolUse]]` in `.codex/config.toml` | TBD |
-| Prompt hook | `hooks.UserPromptSubmit` | `[[hooks.UserPromptSubmit]]` | TBD |
-| Artifact dir | workspace `output/` | workspace `output/` | workspace `output/` |
-| Evidence dir | workspace `.umadev/audit/` | same | same |
+| Surface | Claude Code | Codex CLI / Desktop |
+|---|---|---|
+| Persistent rules | `.claude/skills/umadev/SKILL.md`, `CLAUDE.md` | `AGENTS.md`, `skills/umadev/SKILL.md` |
+| Slash command | `commands/umadev.md` | (host-defined; AGENTS.md guidance) |
+| Pre-write hook | `hooks.PreToolUse` matcher `Write\|Edit` | `[[hooks.PreToolUse]]` in `.codex/config.toml` |
+| Post-write hook | `hooks.PostToolUse` matcher `Write\|Edit` | `[[hooks.PostToolUse]]` in `.codex/config.toml` |
+| Prompt hook | `hooks.UserPromptSubmit` | `[[hooks.UserPromptSubmit]]` |
+| Artifact dir | workspace `output/` | workspace `output/` |
+| Evidence dir | workspace `.umadev/audit/` | same |
 
 ### 7.3 Reference clause → hook command
 
-All three host families invoke the **same** `umadev hook <subcommand>`
+All host families invoke the **same** `umadev hook <subcommand>`
 binary; only the host-specific config syntax differs. The binary itself
 implements every governance clause once.
 
@@ -540,9 +543,9 @@ implements every governance clause once.
 
 ### 7.4 Surface-not-available degradation
 
-Where a host lacks a surface required by a clause (e.g. Antigravity 2.0's
+Where a host lacks a surface required by a clause (e.g. a host whose
 hook contract is not yet GA), the conformant injector MUST substitute
-the next-best surface — for the Antigravity case, the bundled
+the next-best surface — for example, the bundled
 `AGENTS.md` instructs the host model to invoke the equivalent
 `umadev hook …` commands manually before committing UI source. The
 clause's *effect* is preserved; only the delivery pipe is host-specific.

@@ -381,7 +381,7 @@ pub fn clauses_in_layer(layer: Layer) -> Vec<&'static Clause> {
     CLAUSES.iter().filter(|c| c.layer == layer).collect()
 }
 
-/// Officially supported host runtimes — the three families with first-
+/// Officially supported host runtimes — the two families with first-
 /// party Agent SDKs.
 ///
 /// Hosts outside this enum are explicitly out of scope for UmaDev 3.x;
@@ -394,8 +394,6 @@ pub enum RuntimeKind {
     Anthropic,
     /// `OpenAI` Codex — `OpenAI` Agents SDK; surfaces: Codex CLI, Codex Desktop.
     Openai,
-    /// Google Antigravity — Antigravity SDK; surfaces: Antigravity CLI, Antigravity Desktop.
-    Antigravity,
 }
 
 impl RuntimeKind {
@@ -405,7 +403,6 @@ impl RuntimeKind {
         match self {
             Self::Anthropic => "anthropic",
             Self::Openai => "openai",
-            Self::Antigravity => "antigravity",
         }
     }
 
@@ -415,7 +412,6 @@ impl RuntimeKind {
         match self {
             Self::Anthropic => "Anthropic (Claude Agent SDK)",
             Self::Openai => "OpenAI (Agents SDK)",
-            Self::Antigravity => "Google (Antigravity SDK)",
         }
     }
 }
@@ -503,15 +499,11 @@ mod tests {
 
     #[test]
     fn runtime_ids_are_distinct() {
-        let ids: HashSet<_> = [
-            RuntimeKind::Anthropic,
-            RuntimeKind::Openai,
-            RuntimeKind::Antigravity,
-        ]
-        .iter()
-        .map(|r| r.id())
-        .collect();
-        assert_eq!(ids.len(), 3);
+        let ids: HashSet<_> = [RuntimeKind::Anthropic, RuntimeKind::Openai]
+            .iter()
+            .map(|r| r.id())
+            .collect();
+        assert_eq!(ids.len(), 2);
     }
 
     /// The normative prose, embedded at compile time. The relative path is
