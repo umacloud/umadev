@@ -47,6 +47,13 @@ pub const BELIEFS_FILE: &str = "beliefs.jsonl";
 /// base-generated correction strategies for pitfalls that recurred after a
 /// warning. One JSONL file per (normalised) signature.
 pub const REFLECTIONS_DIR: &str = ".umadev/reflections";
+/// Snapshot of the NON-pitfall / belief lesson identities surfaced into the most
+/// recent recall (the `(domain, title, first_seen)` triples). Written at
+/// injection time by [`relevant_lessons_for_prompt_ranked`] and consumed by the
+/// runner at the next verify pass/fail to feed [`apply_trust_for_identities`] —
+/// the trust reflux for failures / revisions / validated patterns / beliefs that
+/// the dev-error signature reflux does not cover. Lives under [`RAW_DIR`].
+pub const SURFACED_IDENTITIES_FILE: &str = "surfaced-identities.json";
 
 /// How many recent reflections to retain per signature. Small — we only need
 /// the latest distilled strategy plus a little history for context, not a full
@@ -2681,6 +2688,10 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
     // "injected" so a later capture can tell whether the warning actually
     // prevented recurrence. Fail-open — purely advisory state.
     record_pitfall_injections(project_root, &surfaced_signatures(&selected));
+    // Snapshot the surfaced NON-pitfall / belief identities so the runner's next
+    // verify pass/fail can feed THEIR trust (parity with the ranked API, since
+    // the runner's `with_context` injects via THIS String path). Fail-open.
+    record_surfaced_identities(project_root, &surfaced_identities(&selected));
 
     out
 }
@@ -2705,6 +2716,10 @@ pub fn relevant_lessons_for_prompt_ranked(
         return Vec::new();
     }
     record_pitfall_injections(project_root, &surfaced_signatures(&selected));
+    // Snapshot the NON-pitfall / belief identities too, so the runner can feed
+    // the verify pass/fail back into THEIR trust (the dev-error path already
+    // rides the signature reflux above). Fail-open: a write error is swallowed.
+    record_surfaced_identities(project_root, &surfaced_identities(&selected));
     selected.into_iter().enumerate().collect()
 }
 
@@ -2715,6 +2730,49 @@ fn surfaced_signatures(selected: &[Lesson]) -> Vec<String> {
         .filter(|l| l.kind == LessonKind::DevError && !l.signature.is_empty())
         .map(|l| l.signature.clone())
         .collect()
+}
+
+/// The `(domain, title, first_seen)` identities of every NON-pitfall lesson among
+/// `selected` — failures, revisions, validated patterns, and beliefs. Dev-error
+/// pitfalls are deliberately excluded: their trust is driven by the signature
+/// reflux (`apply_dev_error_trust`), not by identity. These identities are what
+/// [`apply_trust_for_identities`] adjusts, so capturing them at injection time is
+/// what lets a belief / non-pitfall lesson's trust actually move with the gate
+/// outcome (the previously-dead feedback path).
+fn surfaced_identities(selected: &[Lesson]) -> Vec<(String, String, String)> {
+    selected
+        .iter()
+        .filter(|l| l.kind != LessonKind::DevError)
+        .map(lesson_identity)
+        .collect()
+}
+
+/// Snapshot the surfaced non-pitfall identities to [`SURFACED_IDENTITIES_FILE`]
+/// so the runner can read them back at the next verify pass/fail and feed
+/// [`apply_trust_for_identities`]. Overwrites (not appends): only the MOST RECENT
+/// surfacing is the one a verify outcome can attribute to. Fail-open: an empty
+/// list clears the snapshot; any IO/serialize error is swallowed.
+fn record_surfaced_identities(project_root: &Path, identities: &[(String, String, String)]) {
+    let raw_dir = project_root.join(RAW_DIR);
+    let _ = fs::create_dir_all(&raw_dir);
+    let path = raw_dir.join(SURFACED_IDENTITIES_FILE);
+    if let Ok(json) = serde_json::to_string(identities) {
+        let _ = fs::write(&path, json);
+    }
+}
+
+/// Read the most recently surfaced non-pitfall identities (written by
+/// [`relevant_lessons_for_prompt_ranked`]). The runner consults this at a verify
+/// pass/fail to know WHICH belief / non-pitfall lessons were in front of the
+/// worker, then calls [`apply_trust_for_identities`]. Fail-open: a
+/// missing/corrupt snapshot yields an empty vec (no feedback, never an error).
+#[must_use]
+pub fn read_surfaced_identities(project_root: &Path) -> Vec<(String, String, String)> {
+    let path = project_root.join(RAW_DIR).join(SURFACED_IDENTITIES_FILE);
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
 }
 
 /// Shared selection core for both the String and structured lesson APIs: builds
@@ -4695,6 +4753,81 @@ mod tests {
             "a single lesson mints no belief"
         );
         assert!(read_raw_lessons(tmp.path(), BELIEFS_FILE).is_empty());
+    }
+
+    // ---- ③ non-pitfall / belief trust reflux (P1-C) --------------------
+
+    /// A surfaced NON-pitfall lesson's identity is snapshotted at recall time and
+    /// its trust then moves with a verify pass/fail through
+    /// `apply_trust_for_identities` — the feedback path that was dead because only
+    /// the dev-error signatures were ever collected/wired.
+    #[test]
+    fn surfaced_identity_snapshot_drives_non_pitfall_trust() {
+        let tmp = TempDir::new().unwrap();
+        // One quality-failure (non-pitfall) lesson whose keywords match the
+        // requirement so the recall selects it.
+        seed_cluster(tmp.path(), 1, &["dashboard", "tokens"], "frontend");
+
+        // Surfacing snapshots the non-pitfall identity (excludes dev-errors).
+        let ranked =
+            relevant_lessons_for_prompt_ranked(tmp.path(), "build a dashboard with tokens");
+        assert!(
+            ranked.iter().any(|(_, l)| l.kind == LessonKind::Failure),
+            "the non-pitfall lesson must be surfaced"
+        );
+        let snapshot = read_surfaced_identities(tmp.path());
+        assert!(
+            !snapshot.is_empty(),
+            "surfacing must snapshot the non-pitfall identity for later trust"
+        );
+
+        // A FAIL step penalises the surfaced lesson's trust (asymmetric, larger).
+        let before = read_raw_lessons(tmp.path(), "quality-failures.jsonl")[0].trust();
+        let adjusted = apply_trust_for_identities(tmp.path(), &snapshot, false);
+        assert!(adjusted >= 1, "at least the surfaced lesson is adjusted");
+        let after_fail = read_raw_lessons(tmp.path(), "quality-failures.jsonl")[0].trust();
+        assert!(
+            after_fail < before,
+            "fail must lower trust: {before} -> {after_fail}"
+        );
+
+        // A PASS step then nudges it back up (reward < penalty, but still moves).
+        let adjusted_pass = apply_trust_for_identities(tmp.path(), &snapshot, true);
+        assert!(adjusted_pass >= 1);
+        let after_pass = read_raw_lessons(tmp.path(), "quality-failures.jsonl")[0].trust();
+        assert!(
+            after_pass > after_fail,
+            "pass must raise trust: {after_fail} -> {after_pass}"
+        );
+    }
+
+    /// Dev-error pitfalls are NOT included in the identity snapshot (they ride the
+    /// separate signature reflux), and the snapshot is fail-open: a missing file
+    /// reads as empty.
+    #[test]
+    fn surfaced_identities_exclude_pitfalls_and_failopen_empty() {
+        let tmp = TempDir::new().unwrap();
+        // Nothing written yet → empty, never an error.
+        assert!(read_surfaced_identities(tmp.path()).is_empty());
+
+        let selected = vec![
+            Lesson {
+                kind: LessonKind::DevError,
+                signature: "ts/2307/module-not-found".into(),
+                ..seed_cluster_one_lesson()
+            },
+            Lesson {
+                kind: LessonKind::Failure,
+                title: "a non-pitfall lesson".into(),
+                ..seed_cluster_one_lesson()
+            },
+        ];
+        let ids = surfaced_identities(&selected);
+        assert_eq!(
+            ids.len(),
+            1,
+            "only the non-pitfall lesson contributes an id"
+        );
     }
 
     // ---- ② contradiction / staleness scan ------------------------------

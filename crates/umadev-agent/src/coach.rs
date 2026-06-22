@@ -1610,6 +1610,7 @@ mod tests {
                 },
                 body: body.to_string(),
                 tokens: vec![],
+                bigram_len: 0,
                 quality_score: None,
             },
             score: 1.0,

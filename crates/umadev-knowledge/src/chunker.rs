@@ -44,8 +44,21 @@ pub struct Chunk {
     /// The raw markdown body of this H2 section (or whole file).
     pub body: String,
     /// Pre-tokenised body — used by the BM25 index without re-tokenising.
+    /// Holds the bigram/ASCII tokens FOLLOWED BY the CJK-trigram tokens (the
+    /// latter only matchable by the separate trigram query channel).
     #[serde(default)]
     pub tokens: Vec<String>,
+    /// The count of BIGRAM/ASCII tokens only — the document length the BM25
+    /// length-normalisation must use. Because [`Self::tokens`] also carries the
+    /// appended CJK-trigram view (a separate channel), `tokens.len()` would
+    /// inflate `dl`/`avgdl` and perturb the bigram channel's BM25 scores; the
+    /// real bigram document length is recorded here so length normalisation is
+    /// over the bigram channel ONLY (the "bigram channel bytes unchanged"
+    /// invariant). `0` for legacy cached chunks written before this field
+    /// existed; [`Self::bm25_len`] falls back to `tokens.len()` then. `#[serde(default)]`
+    /// keeps those old cache blobs readable.
+    #[serde(default)]
+    pub bigram_len: usize,
     /// Quality score (0-100) from front-matter, used as a weak reranking
     /// signal in retrieval. `None` (treated as 50 = neutral) when absent.
     #[serde(default)]
@@ -53,6 +66,22 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    /// The BM25 document length: the bigram/ASCII token count, EXCLUDING the
+    /// appended CJK-trigram tokens. This is what the index uses for `dl`/`avgdl`
+    /// so the trigram view never perturbs the bigram channel's length
+    /// normalisation. Fail-open: a legacy cached chunk (written before
+    /// `bigram_len` existed, so it deserialises to `0`) falls back to the full
+    /// `tokens.len()` — the prior behaviour — rather than a length of `0` that
+    /// would divide-by-zero-guard into a degenerate score.
+    #[must_use]
+    pub fn bm25_len(&self) -> usize {
+        if self.bigram_len == 0 {
+            self.tokens.len()
+        } else {
+            self.bigram_len
+        }
+    }
+
     /// First `max_chars` of the body, with a trailing ellipsis if trimmed.
     /// Used when rendering chunk hits into a prompt digest.
     #[must_use]
@@ -163,6 +192,11 @@ pub fn chunk_text(rel_path: &str, body: &str) -> Vec<Chunk> {
             // ASCII tokens — skip them here so a chunk's Latin term-frequency
             // isn't silently doubled (which WOULD perturb bigram scoring).
             let mut tokens = tokenize(&indexed);
+            // Record the bigram-channel length BEFORE appending the trigram view,
+            // so BM25 length normalisation (`dl`/`avgdl`) is over the bigram
+            // tokens ONLY — the trigram tokens are a separate channel and must
+            // not inflate the bigram channel's document length.
+            let bigram_len = tokens.len();
             tokens.extend(cjk_trigrams_only(&indexed));
             Chunk {
                 meta: ChunkMeta {
@@ -175,6 +209,7 @@ pub fn chunk_text(rel_path: &str, body: &str) -> Vec<Chunk> {
                 },
                 body: trimmed,
                 tokens,
+                bigram_len,
                 quality_score,
             }
         })
@@ -536,5 +571,39 @@ mod tests {
         let chunk: Chunk = serde_json::from_str(json).unwrap();
         assert!(chunk.quality_score.is_none());
         assert!(chunk.meta.difficulty.is_none());
+        // A legacy blob has no `bigram_len` (deserialises to 0); `bm25_len` must
+        // fall back to the full token count so old caches keep scoring.
+        assert_eq!(chunk.bigram_len, 0);
+        assert_eq!(chunk.bm25_len(), chunk.tokens.len());
+    }
+
+    #[test]
+    fn bigram_len_excludes_appended_trigram_tokens() {
+        use crate::tokenizer::{cjk_trigrams_only, tokenize};
+        // A ≥3-char CJK run produces trigram tokens that get appended to
+        // `tokens` — so `tokens.len()` > the true bigram length. `bm25_len` must
+        // report ONLY the bigram length (the "bigram channel bytes unchanged"
+        // invariant), so the trigram view can never inflate `dl`/`avgdl`.
+        let md = "# 鉴权\n\n## 令牌\n\n用户鉴权码用于校验用户身份与会话令牌。";
+        let chunks = chunk_text("security/auth.md", md);
+        let c = &chunks[0];
+        // The indexed string is `"{title} {heading} {body}"`.
+        let indexed = format!("{} {} {}", c.meta.title, c.meta.section, c.body);
+        let trigram_count = cjk_trigrams_only(&indexed).len();
+        assert!(trigram_count > 0, "CJK body must yield trigram tokens");
+        assert_eq!(
+            c.bm25_len(),
+            tokenize(&indexed).len(),
+            "bm25_len is the bigram-only token count"
+        );
+        assert_eq!(
+            c.tokens.len(),
+            c.bm25_len() + trigram_count,
+            "tokens = bigram tokens + appended trigram tokens"
+        );
+        assert!(
+            c.bm25_len() < c.tokens.len(),
+            "trigram tokens must NOT count toward the BM25 document length"
+        );
     }
 }

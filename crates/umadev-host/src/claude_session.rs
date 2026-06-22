@@ -17,10 +17,18 @@
 //!
 //! Launch flags (from the headless stream-json contract):
 //! `claude --print --input-format stream-json --output-format stream-json
-//! --verbose --session-id <uuid> --permission-mode acceptEdits
+//! --verbose --session-id <uuid> --permission-mode <acceptEdits|default>
 //! --allowedTools "Read,Edit,Write,Bash"` (+ optional `--append-system-prompt`).
 //! We deliberately use `--append-system-prompt` (NOT `--system-prompt`, which
 //! would replace the tool guidance and degrade the base into a chat box).
+//!
+//! The permission mode tracks the autonomy tier so claude is consistent with the
+//! codex / opencode drivers: `autonomous` (auto tier) → `acceptEdits` (the base
+//! writes unattended), non-autonomous (guarded / plan tier) → `default` (claude
+//! raises a `can_use_tool` approval for each tool, which becomes a
+//! `NeedApproval` the orchestrator answers — the human-in-the-loop floor, so the
+//! irreversible-action gate is not bypassed). `UMADEV_CLAUDE_PERMISSION_MODE`
+//! overrides the derived default when set.
 //!
 //! Fail-open by contract: a garbled line is skipped, a dead session surfaces a
 //! [`TurnStatus::Failed`], never a panic.
@@ -61,26 +69,41 @@ impl ClaudeSession {
     /// (`UMADEV_CLAUDE_BIN` override honored), in `workspace`, optionally
     /// appending `append_system` to the base's system prompt. A fresh pinned
     /// session id is generated.
+    ///
+    /// `autonomous` selects the permission mode (see [`session_args`]): `true` →
+    /// `acceptEdits` (write unattended), `false` → `default` (claude asks before
+    /// each tool, surfaced as a `NeedApproval` — the guarded human-in-the-loop
+    /// tier). This mirrors the codex / opencode drivers' autonomy handling.
     pub async fn start(
         workspace: &Path,
         append_system: Option<&str>,
+        autonomous: bool,
     ) -> Result<Self, SessionError> {
         let program = std::env::var("UMADEV_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
-        Self::start_with_program(&program, workspace, append_system, &new_session_id()).await
+        Self::start_with_program(
+            &program,
+            workspace,
+            append_system,
+            &new_session_id(),
+            autonomous,
+        )
+        .await
     }
 
     /// Start a session against an explicit `program` + pinned `session_id`
     /// (mainly for tests, where `program` is a fake stream-json emitter).
+    /// `autonomous` chooses the permission mode (see [`session_args`]).
     pub async fn start_with_program(
         program: &str,
         workspace: &Path,
         append_system: Option<&str>,
         session_id: &str,
+        autonomous: bool,
     ) -> Result<Self, SessionError> {
         Self::spawn_with_args(
             program,
             workspace,
-            &session_args(session_id, append_system),
+            &session_args(session_id, append_system, autonomous),
             session_id,
         )
         .await
@@ -267,8 +290,20 @@ fn spawn_err(program: &str, e: &std::io::Error) -> String {
 
 /// The argument vector preceding any input — the stream-json continuous-session
 /// flags. Exposed for tests. `--append-system-prompt` (NOT `--system-prompt`).
+///
+/// `autonomous` picks the permission mode so claude tracks the trust tier like
+/// the codex / opencode drivers: `true` → `acceptEdits` (write unattended),
+/// `false` → `default` (claude raises a `can_use_tool` approval per tool, which
+/// the orchestrator answers — keeping the human-in-the-loop / irreversible-action
+/// floor live). `UMADEV_CLAUDE_PERMISSION_MODE`, when set, overrides the derived
+/// default for both tiers.
 #[must_use]
-pub fn session_args(session_id: &str, append_system: Option<&str>) -> Vec<String> {
+pub fn session_args(
+    session_id: &str,
+    append_system: Option<&str>,
+    autonomous: bool,
+) -> Vec<String> {
+    let permission_mode = claude_permission_mode(autonomous);
     let mut args = vec![
         "--print".to_string(),
         "--input-format".to_string(),
@@ -279,8 +314,7 @@ pub fn session_args(session_id: &str, append_system: Option<&str>) -> Vec<String
         "--session-id".to_string(),
         session_id.to_string(),
         "--permission-mode".to_string(),
-        std::env::var("UMADEV_CLAUDE_PERMISSION_MODE")
-            .unwrap_or_else(|_| "acceptEdits".to_string()),
+        permission_mode,
         "--allowedTools".to_string(),
         "Read,Edit,Write,Bash".to_string(),
     ];
@@ -289,6 +323,20 @@ pub fn session_args(session_id: &str, append_system: Option<&str>) -> Vec<String
         args.push(sys.to_string());
     }
     args
+}
+
+/// Resolve claude's `--permission-mode` for an autonomy tier. `autonomous` →
+/// `acceptEdits` (write unattended); otherwise `default` (claude asks before
+/// each tool → a `NeedApproval` the orchestrator answers, the guarded
+/// human-in-the-loop tier). `UMADEV_CLAUDE_PERMISSION_MODE` overrides both.
+fn claude_permission_mode(autonomous: bool) -> String {
+    std::env::var("UMADEV_CLAUDE_PERMISSION_MODE").unwrap_or_else(|_| {
+        if autonomous {
+            "acceptEdits".to_string()
+        } else {
+            "default".to_string()
+        }
+    })
 }
 
 /// The argument vector for a READ-ONLY critic fork: resume `main_session_id` and
@@ -537,13 +585,53 @@ mod tests {
 
     #[test]
     fn session_args_use_append_not_replace_system_prompt() {
-        let args = session_args("sid-1", Some("be terse"));
+        let args = session_args("sid-1", Some("be terse"), true);
         assert!(args.contains(&"--input-format".to_string()));
         assert!(args.contains(&"stream-json".to_string()));
         assert!(args.contains(&"sid-1".to_string()));
         assert!(args.contains(&"--append-system-prompt".to_string()));
         assert!(!args.contains(&"--system-prompt".to_string()));
         assert!(args.contains(&"be terse".to_string()));
+    }
+
+    /// The permission mode tracks the autonomy tier (claude consistent with
+    /// codex / opencode): autonomous → `acceptEdits` (write unattended), guarded
+    /// → `default` (claude asks per tool → a NeedApproval the orchestrator
+    /// answers, so the human-in-the-loop / irreversible-action floor is live).
+    #[test]
+    fn session_args_permission_mode_tracks_autonomy() {
+        // Guard against the env override leaking in from a sibling process.
+        let prior = std::env::var_os("UMADEV_CLAUDE_PERMISSION_MODE");
+        std::env::remove_var("UMADEV_CLAUDE_PERMISSION_MODE");
+
+        let auto = session_args("sid-a", None, true);
+        let auto_idx = auto.iter().position(|a| a == "--permission-mode").unwrap();
+        assert_eq!(auto[auto_idx + 1], "acceptEdits", "auto → acceptEdits");
+
+        let guarded = session_args("sid-g", None, false);
+        let g_idx = guarded
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .unwrap();
+        assert_eq!(
+            guarded[g_idx + 1],
+            "default",
+            "guarded → default (claude asks → NeedApproval, human in the loop)"
+        );
+
+        // The explicit override beats the derived default for either tier.
+        std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", "plan");
+        let overridden = session_args("sid-o", None, true);
+        let o_idx = overridden
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .unwrap();
+        assert_eq!(overridden[o_idx + 1], "plan", "env override wins");
+
+        match prior {
+            Some(v) => std::env::set_var("UMADEV_CLAUDE_PERMISSION_MODE", v),
+            None => std::env::remove_var("UMADEV_CLAUDE_PERMISSION_MODE"),
+        }
     }
 
     #[test]
@@ -580,7 +668,7 @@ mod tests {
              cat >/dev/null\n",
         );
         let mut main =
-            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-main")
+            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-main", true)
                 .await
                 .expect("start main");
         let mut fork = main
@@ -727,7 +815,7 @@ mod tests {
              cat >/dev/null\n",
         );
         let mut s =
-            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-test")
+            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-test", true)
                 .await
                 .expect("start");
         s.send_turn("build a todo page".to_string())
@@ -761,10 +849,15 @@ mod tests {
             &tmp,
             "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n",
         );
-        let mut s =
-            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-crash")
-                .await
-                .expect("start");
+        let mut s = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-crash",
+            true,
+        )
+        .await
+        .expect("start");
         let _ = s.send_turn("go".to_string()).await;
         let mut last = None;
         while let Some(ev) = s.next_event().await {

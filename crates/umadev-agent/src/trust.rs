@@ -244,21 +244,31 @@ fn path_touches_vcs(s: &str) -> bool {
         || s.contains("git checkout --")
 }
 
-/// The decision: given the trust mode and a candidate action, must the user
-/// confirm before it runs?
+/// The decision: given a candidate **mid-turn tool call**, must it be escalated
+/// to a confirmation before it runs?
 ///
-/// The reversibility floor wins **unconditionally** — an irreversible action
-/// is confirmed even in [`TrustMode::Auto`]. For reversible actions, the mode
-/// decides: `auto` lets them through, `guarded` / `plan` still pause (gate
-/// semantics). This is the single chokepoint the host should consult.
+/// This is the per-tool-call chokepoint the non-interactive driving loop
+/// consults (a base that asks `can_use_tool` mid-turn). The human gate lives at
+/// the pipeline's **confirm gates** (`docs_confirm` / `preview_confirm`), NOT on
+/// every mid-turn tool call — so the only thing this floor escalates is an
+/// **irreversible** action (`.git` internals, network, destructive shell verbs),
+/// which [`Reversibility::always_escalates`] flags. That floor is
+/// **mode-independent**: even [`TrustMode::Auto`] cannot skip it, and even
+/// [`TrustMode::Guarded`] / [`TrustMode::Plan`] do NOT escalate a *reversible*
+/// in-project write — otherwise a guarded run could never let the base edit a
+/// file (the base would be DENY'd on every write and spin doing nothing).
+///
+/// The gate-pause policy (guarded / plan pausing the *whole pipeline* for the
+/// user) is a separate concern handled by the gate machinery
+/// ([`TrustMode::gates_auto_approve`]); it is not this per-tool-call decision.
+///
+/// `mode` is retained in the signature so callers keep a single chokepoint and a
+/// future per-mode policy has a hook, but today the decision is mode-independent:
+/// it depends only on the action's reversibility class.
 #[must_use]
 pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) -> bool {
-    let class = reversibility_class(command, target_path);
-    if class.always_escalates() {
-        return true; // hard floor — overrides even auto
-    }
-    // Reversible action: only auto mode skips the gate.
-    !mode.gates_auto_approve()
+    let _ = mode; // mode-independent today: the floor escalates only irreversible actions
+    reversibility_class(command, target_path).always_escalates()
 }
 
 // ---------------------------------------------------------------------------
@@ -460,13 +470,22 @@ mod tests {
     }
 
     #[test]
-    fn reversible_action_follows_mode() {
-        // A plain in-project edit: auto skips the gate, guarded/plan pause.
-        assert!(!requires_confirmation(TrustMode::Auto, "", "src/app.tsx"));
-        assert!(requires_confirmation(TrustMode::Guarded, "", "src/app.tsx"));
-        assert!(requires_confirmation(TrustMode::Plan, "", "src/app.tsx"));
-        // Build/test commands are reversible too.
-        assert!(!requires_confirmation(TrustMode::Auto, "npm run build", ""));
+    fn reversible_in_project_write_is_never_escalated_mid_turn() {
+        // A plain in-project edit is reversible → it is NEVER escalated to a
+        // mid-turn confirmation, in ANY mode. The human gate is at the confirm
+        // gates, not on every tool call — so a GUARDED run must still let the base
+        // write files (else it would DENY every write and spin doing nothing).
+        for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+            assert!(
+                !requires_confirmation(mode, "", "src/app.tsx"),
+                "reversible in-project write must not be escalated in {mode:?}"
+            );
+            // Build/test commands are reversible too.
+            assert!(
+                !requires_confirmation(mode, "npm run build", ""),
+                "reversible build command must not be escalated in {mode:?}"
+            );
+        }
     }
 
     #[test]

@@ -1185,11 +1185,14 @@ pub async fn session_for(
 ) -> Result<Box<dyn umadev_runtime::BaseSession>, umadev_runtime::SessionError> {
     match backend_id {
         "claude-code" => {
-            // The continuous claude session opens with `--permission-mode
-            // acceptEdits` baked into `session_args`; `autonomous` is implicit in
-            // that mode. We append no extra system prompt here — the runner's
-            // directives carry the role + spec constraints per phase.
-            let s = ClaudeSession::start(workspace, None).await?;
+            // The continuous claude session tracks the autonomy tier like codex /
+            // opencode: `autonomous` → `--permission-mode acceptEdits` (write
+            // unattended), otherwise → `default` (claude raises a `can_use_tool`
+            // approval per tool → a `NeedApproval` the orchestrator answers, the
+            // guarded human-in-the-loop tier). We append no extra system prompt
+            // here — the runner's directives carry the role + spec constraints per
+            // phase.
+            let s = ClaudeSession::start(workspace, None, autonomous).await?;
             Ok(Box::new(s))
         }
         "codex" => {

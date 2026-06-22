@@ -1068,6 +1068,18 @@ impl<R: Runtime> AgentRunner<R> {
             std::slice::from_ref(&first.failure_detail),
             false,
         );
+        // The SAME asymmetric pass/fail signal for the NON-pitfall / belief
+        // lessons surfaced into this phase's prompt (failures / revisions /
+        // validated patterns / beliefs): the verify FAILED while they were in
+        // play → penalise their trust. The dev-error path above rides the
+        // signature reflux; this rides the identity snapshot the recall wrote at
+        // injection time. Fail-open + advisory-only.
+        let surfaced_ids = crate::lessons::read_surfaced_identities(&self.options.project_root);
+        let _ = crate::lessons::apply_trust_for_identities(
+            &self.options.project_root,
+            &surfaced_ids,
+            false,
+        );
         // Classify the failure and, when it's a recognised family, hand the
         // worker the root cause + proven fix playbook for THAT error class — so
         // the single repair attempt is informed, not a blind "here's stderr".
@@ -1147,6 +1159,17 @@ impl<R: Runtime> AgentRunner<R> {
             let _ = crate::lessons::apply_dev_error_trust(
                 &self.options.project_root,
                 std::slice::from_ref(&first.failure_detail),
+                true,
+            );
+            // The same small reward for the NON-pitfall / belief lessons that
+            // were in front of the worker for the successful fix — read from the
+            // identity snapshot the fix-attempt's recall refreshed. Together with
+            // the failure-site penalty this completes the asymmetric pass/fail
+            // signal for the previously-dead belief/non-pitfall feedback path.
+            let surfaced_ids = crate::lessons::read_surfaced_identities(&self.options.project_root);
+            let _ = crate::lessons::apply_trust_for_identities(
+                &self.options.project_root,
+                &surfaced_ids,
                 true,
             );
             let resolved = crate::lessons::mark_pitfalls_resolved(

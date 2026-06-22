@@ -64,7 +64,11 @@ impl Bm25Index {
     #[must_use]
     pub fn from_chunks(chunks: Vec<Chunk>) -> Self {
         let doc_count = u64::try_from(chunks.len()).unwrap_or(0);
-        let total_len: usize = chunks.iter().map(|c| c.tokens.len()).sum();
+        // Document length for BM25 length-normalisation is the BIGRAM-channel
+        // token count (`bm25_len`), NOT `tokens.len()`: the latter also includes
+        // the appended CJK-trigram view (a separate channel), which would inflate
+        // `avgdl` and perturb the bigram channel's per-term scores.
+        let total_len: usize = chunks.iter().map(Chunk::bm25_len).sum();
         let avg_doc_len = if chunks.is_empty() {
             0.0
         } else {
@@ -228,7 +232,11 @@ impl Bm25Index {
             let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
             for &(chunk_idx, tf) in &posting.docs {
                 let ci = chunk_idx as usize;
-                let dl = self.chunks[ci].tokens.len() as f64;
+                // BM25 length normalisation uses the BIGRAM document length
+                // (`bm25_len`), excluding the appended CJK-trigram tokens — so a
+                // chunk rich in trigrams is not falsely treated as "long" and
+                // down-weighted in the bigram channel.
+                let dl = self.chunks[ci].bm25_len() as f64;
                 // Standard BM25: tf*(k1+1) / (tf + k1*(1 - b + b*dl/avgdl)).
                 let denom = f64::from(tf) + K1 * (1.0 - B + B * (dl / self.avg_doc_len.max(1.0)));
                 let tf_component = (f64::from(tf) * (K1 + 1.0)) / denom;
@@ -1079,6 +1087,88 @@ B: {sb}"
         // A single (even common) term is returned as-is — masking it would
         // leave nothing useful to search.
         assert_eq!(idx.mask_low_idf_terms("login", 1.0), vec!["login"]);
+    }
+
+    #[test]
+    fn avg_doc_len_uses_bigram_length_not_trigram_inflated_tokens() {
+        // A CJK corpus produces trigram tokens appended to `tokens`. `avg_doc_len`
+        // must be the mean of the BIGRAM lengths (`bm25_len`), NOT of the
+        // trigram-inflated `tokens.len()` — else the bigram channel's length
+        // normalisation is perturbed.
+        let idx = idx_from(&[
+            (
+                "a.md",
+                "# 鉴权\n\n## 令牌\n\n用户鉴权码用于校验用户身份与会话令牌",
+            ),
+            (
+                "b.md",
+                "# 登录\n\n## 流程\n\n使用密码与验证码完成登录认证流程",
+            ),
+        ]);
+        let mean_bigram: f64 =
+            idx.chunks.iter().map(|c| c.bm25_len() as f64).sum::<f64>() / idx.chunks.len() as f64;
+        assert!(
+            (idx.avg_doc_len - mean_bigram).abs() < 1e-9,
+            "avg_doc_len must be the mean bigram length: {} vs {}",
+            idx.avg_doc_len,
+            mean_bigram
+        );
+        // And it must be strictly LESS than the trigram-inflated mean, proving the
+        // trigram tokens were excluded.
+        let mean_all: f64 = idx
+            .chunks
+            .iter()
+            .map(|c| c.tokens.len() as f64)
+            .sum::<f64>()
+            / idx.chunks.len() as f64;
+        assert!(
+            idx.avg_doc_len < mean_all,
+            "trigram tokens must not inflate avg_doc_len: {} !< {}",
+            idx.avg_doc_len,
+            mean_all
+        );
+    }
+
+    #[test]
+    fn bigram_scoring_is_unchanged_by_appended_trigram_tokens() {
+        // Build the REAL index (chunks carry appended trigram tokens) and a
+        // REFERENCE index over the same chunks with the trigram tokens stripped
+        // (so `tokens` == bigram tokens and `bigram_len` already matches). A
+        // bigram-channel query (`search`, which tokenises to bigrams/unigrams)
+        // must score IDENTICALLY against both — i.e. the trigram tokens never
+        // touch the bigram channel's `dl`/`avgdl`.
+        let real = idx_from(&[
+            (
+                "a.md",
+                "# 鉴权\n\n## 令牌\n\n用户鉴权码用于校验用户身份与会话令牌",
+            ),
+            (
+                "b.md",
+                "# 登录\n\n## 流程\n\n使用密码与验证码完成登录认证流程",
+            ),
+        ]);
+        // Reference: strip the trigram tail from each chunk, keeping ONLY the
+        // first `bigram_len` tokens (the bigram channel). `bm25_len` then equals
+        // `tokens.len()`, so this index has no trigram contamination at all.
+        let stripped: Vec<Chunk> = real
+            .chunks
+            .iter()
+            .map(|c| {
+                let mut c2 = c.clone();
+                c2.tokens.truncate(c.bm25_len());
+                c2
+            })
+            .collect();
+        let reference = Bm25Index::from_chunks(stripped);
+
+        // A pure-bigram CJK query must yield identical (idx, score) rankings.
+        let q = "登录认证";
+        let a = real.search(q, 10);
+        let b = reference.search(q, 10);
+        assert_eq!(
+            a, b,
+            "appended trigram tokens must not change bigram-channel BM25 scores"
+        );
     }
 
     #[test]
