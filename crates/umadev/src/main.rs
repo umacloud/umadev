@@ -433,6 +433,11 @@ enum Command {
         /// Override the deploy command (defaults to the detected platform's).
         #[arg(long)]
         command: Option<String>,
+        /// Skip the irreversible-action confirmation prompt (for scripts/CI).
+        /// A deploy is a network action the reversibility floor always gates;
+        /// `--yes` is the only way to bypass that gate non-interactively.
+        #[arg(long)]
+        yes: bool,
     },
     /// Emit the UD-EVID-004 compliance mapping document.
     #[command(
@@ -495,6 +500,11 @@ enum Command {
         /// Actually open the PR (default is a dry run: write body + print plan).
         #[arg(long)]
         create: bool,
+        /// Skip the irreversible-action confirmation prompt (for scripts/CI).
+        /// Pushing + opening a PR are network/VCS actions the reversibility
+        /// floor always gates; `--yes` bypasses that gate non-interactively.
+        #[arg(long)]
+        yes: bool,
     },
     /// Self-test: binary integrity, workspace permissions, manifest.
     #[command(
@@ -808,7 +818,8 @@ async fn main() -> Result<()> {
             project_root,
             run,
             command,
-        } => cmd_deploy(project_root, run, command).await,
+            yes,
+        } => cmd_deploy(project_root, run, command, yes).await,
         Command::Report {
             slug,
             project_root,
@@ -818,7 +829,8 @@ async fn main() -> Result<()> {
             slug,
             project_root,
             create,
-        } => cmd_pr(slug, project_root, create),
+            yes,
+        } => cmd_pr(slug, project_root, create, yes),
         Command::Doctor { project_root } => cmd_doctor(project_root),
         Command::Examples => cmd_examples(),
         Command::Guide => cmd_guide(),
@@ -2069,10 +2081,21 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         let runner = AgentRunner::new(driver, opts);
         runner.start().context("failed to start agent")?;
         let (runner, printer) = attach_live_sink(runner);
-        let report = runner
-            .run_clarify(true)
-            .await
-            .context("clarify phase failure")?;
+        // `auto` tier drives end-to-end headless (no gate pauses); `guarded` /
+        // `plan` pause at the first gate exactly as before. Without this, a
+        // headless `run --mode auto` stalled at `docs_confirm` waiting on a
+        // human who never arrives.
+        let report = if mode.gates_auto_approve() {
+            runner
+                .run_auto_to_completion(true)
+                .await
+                .context("pipeline failure")?
+        } else {
+            runner
+                .run_clarify(true)
+                .await
+                .context("clarify phase failure")?
+        };
         drop(runner);
         let _ = printer.await;
         (report, label)
@@ -2081,10 +2104,17 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         let runner = AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
         runner.start().context("failed to start agent")?;
         let (runner, printer) = attach_live_sink(runner);
-        let report = runner
-            .run_clarify(false)
-            .await
-            .context("clarify phase failure")?;
+        let report = if mode.gates_auto_approve() {
+            runner
+                .run_auto_to_completion(false)
+                .await
+                .context("pipeline failure")?
+        } else {
+            runner
+                .run_clarify(false)
+                .await
+                .context("clarify phase failure")?
+        };
         drop(runner);
         let _ = printer.await;
         (report, label)
@@ -3219,6 +3249,7 @@ async fn cmd_deploy(
     project_root: Option<PathBuf>,
     run: bool,
     command: Option<String>,
+    yes: bool,
 ) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     let lang = umadev_i18n::current();
@@ -3249,6 +3280,49 @@ async fn cmd_deploy(
     if !run {
         return Ok(());
     }
+
+    // Reversibility floor (fail-SAFE, the inverse of governance fail-open): a
+    // deploy reaches the network and ships outward — it is an irreversible
+    // action the trust floor escalates to a confirmation REGARDLESS of mode
+    // (even `auto` does not get to skip it). We protect the user's project, so
+    // when in doubt we confirm. `--yes` is the explicit script/CI bypass; the
+    // action is audited either way (UD-CODE-* governance trail).
+    let mode = umadev_agent::TrustMode::Auto; // the strictest caller; floor still gates
+                                              // Probe the floor on a `git push`-class string: a deploy publishes outward
+                                              // (network class), so it must be gated even for a recipe like `npx vercel
+                                              // --prod` that the generic classifier wouldn't flag on its own.
+    let deploy_probe = format!("git push (deploy) {recipe}");
+    if umadev_agent::requires_confirmation(mode, &deploy_probe, "") && !yes {
+        let prompt = format!(
+            "About to run an IRREVERSIBLE network deploy:\n  {recipe}\nProceed? \
+             即将执行不可逆的网络部署,确认继续?"
+        );
+        if !confirm(&prompt) {
+            println!("Deploy cancelled. 已取消部署。");
+            let _ = record_tool_call(
+                &project_root,
+                "umadev/cli.deploy",
+                "",
+                "block",
+                "UD-CODE-002",
+                &format!("user declined irreversible deploy: {recipe}"),
+                "",
+                None,
+            );
+            return Ok(());
+        }
+    }
+    // Audit the (now confirmed / --yes) irreversible action before spawning it.
+    let _ = record_tool_call(
+        &project_root,
+        "umadev/cli.deploy",
+        "",
+        "audit",
+        "UD-CODE-002",
+        &format!("running irreversible deploy command: {recipe}"),
+        "",
+        None,
+    );
 
     println!("{}", umadev_i18n::tf(lang, "deploy.running", &[&recipe]));
     let proof = umadev_agent::run_deploy(&project_root, command.as_deref()).await;
@@ -3437,7 +3511,12 @@ fn cmd_report(slug: Option<String>, project_root: Option<PathBuf>, review: bool)
 /// Fail-open throughout: any failing precondition or external-command error
 /// prints the manual recipe and returns Ok — never a crash, never a force-push,
 /// never a rewrite of the user's existing commits.
-fn cmd_pr(slug: Option<String>, project_root: Option<PathBuf>, create: bool) -> Result<()> {
+fn cmd_pr(
+    slug: Option<String>,
+    project_root: Option<PathBuf>,
+    create: bool,
+    yes: bool,
+) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     let slug = match slug {
         Some(s) if !s.is_empty() => s,
@@ -3508,6 +3587,38 @@ fn cmd_pr(slug: Option<String>, project_root: Option<PathBuf>, create: bool) -> 
         return Ok(());
     }
 
+    // Reversibility floor (fail-SAFE): a `git push` + `gh pr create` reach the
+    // network and publish work outward — irreversible actions the trust floor
+    // escalates to a confirmation REGARDLESS of mode (auto cannot skip it). We
+    // protect the user's repo, so in doubt we confirm. `--yes` is the explicit
+    // script/CI bypass; the push + PR-create are audited regardless.
+    let push_cmd = format!("git push -u origin {}", plan.head_branch);
+    let mode = umadev_agent::TrustMode::Auto; // strictest caller; floor still gates
+    if umadev_agent::requires_confirmation(mode, &push_cmd, "") && !yes {
+        let prompt = format!(
+            "About to push `{}` and open a PR (IRREVERSIBLE network action). Proceed? \
+             即将推送分支并开 PR(不可逆网络动作),确认继续?",
+            plan.head_branch
+        );
+        if !confirm(&prompt) {
+            println!("PR cancelled. 已取消开 PR。");
+            let _ = record_tool_call(
+                &project_root,
+                "umadev/cli.pr",
+                "",
+                "block",
+                "UD-CODE-002",
+                &format!(
+                    "user declined irreversible push/PR for branch {}",
+                    plan.head_branch
+                ),
+                "",
+                None,
+            );
+            return Ok(());
+        }
+    }
+
     // 4. Ready + --create → drive git + gh. Each step is fail-open: on the first
     //    error we stop and fall back to the manual recipe, leaving the repo as
     //    we found it (no force, no history rewrite).
@@ -3538,12 +3649,37 @@ fn cmd_pr(slug: Option<String>, project_root: Option<PathBuf>, create: bool) -> 
         "{}",
         umadev_i18n::tf(lang, "pr.pushing", &[&plan.head_branch])
     );
+    // Audit the irreversible network push before it runs.
+    let _ = record_tool_call(
+        &project_root,
+        "umadev/cli.pr.push",
+        "",
+        "audit",
+        "UD-CODE-002",
+        &push_cmd,
+        "",
+        None,
+    );
     if !run_pr_git(&project_root, &["push", "-u", "origin", &plan.head_branch]) {
         return pr_fallback(&readiness, &slug, &body_rel, lang);
     }
 
     // 5. Open the PR with the generated body. `gh` reads our own login.
     println!("{}", umadev_i18n::t(lang, "pr.opening"));
+    // Audit the irreversible PR-create before it runs.
+    let _ = record_tool_call(
+        &project_root,
+        "umadev/cli.pr.create",
+        "",
+        "audit",
+        "UD-CODE-002",
+        &format!(
+            "gh pr create --base {} --head {}",
+            plan.base_branch, plan.head_branch
+        ),
+        "",
+        None,
+    );
     let body_arg = body_path.to_string_lossy().to_string();
     let gh_out = std::process::Command::new("gh")
         .args([

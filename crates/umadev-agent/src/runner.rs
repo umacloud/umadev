@@ -275,6 +275,13 @@ pub struct AgentRunner<R: Runtime> {
     /// requires `Send`. The lock is only ever held inside synchronous helpers
     /// (never across an `.await`), so it can't deadlock the async runtime.
     degraded_phases: std::sync::Mutex<Vec<String>>,
+    /// Whether this workspace was adopted as a BROWNFIELD baseline (an existing
+    /// project, not a blank scaffold). Read once at construction from the
+    /// `.umadev/adopt.json` marker. When set, the build phases bias toward
+    /// **incremental change over a rewrite** and the spec/backend prompts get
+    /// real-code retrieval injected from the project-source index. Defaults to
+    /// `false` (greenfield) so a non-adopted workspace behaves exactly as before.
+    brownfield: bool,
 }
 
 impl<R: Runtime> AgentRunner<R> {
@@ -283,11 +290,17 @@ impl<R: Runtime> AgentRunner<R> {
     ///
     /// [`with_event_sink`]: AgentRunner::with_event_sink
     pub fn new(runtime: R, options: RunOptions) -> Self {
+        // Detect the brownfield baseline ONCE up front (cheap file-exists
+        // probe, fail-open). Threads through to planner/phases so an adopted
+        // repo gets incremental-change guidance + real-code retrieval instead
+        // of greenfield scaffolding.
+        let brownfield = crate::adopt::is_adopted(&options.project_root);
         Self {
             runtime,
             options,
             events: null_sink(),
             degraded_phases: std::sync::Mutex::new(Vec::new()),
+            brownfield,
         }
     }
 
@@ -822,6 +835,24 @@ impl<R: Runtime> AgentRunner<R> {
         // Best-effort — a user-customised umadev.yaml is left untouched.
         let _ = crate::manifest::SpecManifest::new(self.options.effective_slug())
             .write_to(&self.options.project_root, false);
+        // Brownfield baseline detected → announce the incremental-change mode so
+        // the user knows this run edits the existing repo (driven by the
+        // `.umadev/adopt.json` marker), with real-code retrieval feeding the
+        // build phases. Greenfield runs stay silent here.
+        if self.brownfield {
+            let detail = crate::adopt::read_adopt_marker(&self.options.project_root)
+                .map(|m| {
+                    format!(
+                        "栈 `{}`,已索引 {} 个源文件、{} 个 API 端点基线",
+                        m.stack, m.indexed_files, m.api_endpoints
+                    )
+                })
+                .unwrap_or_else(|| "存量项目基线".to_string());
+            self.emit(EngineEvent::Note(format!(
+                "[brownfield] 检测到存量项目基线({detail})。本次按增量改造推进:\
+                 编辑现有代码而非从零重建,spec/后端阶段会注入真实代码检索结果。"
+            )));
+        }
         Ok(state)
     }
 
@@ -883,6 +914,60 @@ impl<R: Runtime> AgentRunner<R> {
             paused_at: Some(Gate::ClarifyGate),
             completed: Vec::new(),
         })
+    }
+
+    /// Drive the pipeline end-to-end without pausing at any confirmation gate.
+    ///
+    /// The gate-anchored blocks (`run_clarify` → `continue_after_docs_confirm`
+    /// → `continue_after_preview_confirm`) each STOP at their gate so a human
+    /// can confirm. That is exactly right for `guarded` / `plan`, but the
+    /// `auto` tier promises "every gate auto-approves and the pipeline drives
+    /// end-to-end" — and that promise was only honoured inside the TUI event
+    /// loop. A headless `run --mode auto` therefore stalled at the first gate.
+    ///
+    /// This is the headless counterpart of the TUI's auto-continue: starting
+    /// from `run_clarify`, it walks `continue_from_gate` for whatever gate the
+    /// previous block paused at until the pipeline reaches a terminal state
+    /// (no gate to advance past). It only auto-advances when the active tier
+    /// says so ([`crate::trust::TrustMode::gates_auto_approve`]); for
+    /// `guarded` / `plan` it returns the first block's gated report unchanged,
+    /// so the existing human-in-the-loop and read-only behaviours are
+    /// untouched. The reversibility floor still governs any irreversible action
+    /// the executing phases attempt — auto only skips the *confirmation gates*,
+    /// not the safety floor.
+    ///
+    /// Determinism: the loop is bounded by the number of distinct gates in the
+    /// pipeline (a hard ceiling prevents a pathological non-terminating walk if
+    /// a future block ever re-paused at the same gate). Fail-open in spirit:
+    /// any block returning `Err` propagates exactly as the single-block paths
+    /// already do.
+    pub async fn run_auto_to_completion(&self, use_runtime: bool) -> std::io::Result<RunReport> {
+        let mut report = self.run_clarify(use_runtime).await?;
+        // Only the `auto` tier drives past gates. `guarded` pauses for a human;
+        // `plan` is read-only and stops at `docs_confirm` by design.
+        if !self.options.mode.gates_auto_approve() {
+            return Ok(report);
+        }
+        // Ceiling: clarify + docs_confirm + preview_confirm = 3 gate hops. A few
+        // extra iterations absorb a block that legitimately re-anchors a gate
+        // (e.g. the strict-coverage block re-pauses at `docs_confirm`); the cap
+        // guarantees termination regardless.
+        const MAX_GATE_HOPS: usize = 8;
+        for _ in 0..MAX_GATE_HOPS {
+            let Some(gate) = report.paused_at else {
+                // No gate to advance past → the pipeline reached delivery (or a
+                // lean plan with no further gates). Done.
+                return Ok(report);
+            };
+            self.emit(EngineEvent::Note(format!(
+                "[auto] 自动通过检查点 `{}`,继续推进流水线…",
+                gate.id_str()
+            )));
+            report = self.continue_from_gate(gate).await?;
+        }
+        // Hit the safety ceiling: return the last report rather than loop
+        // forever. In practice a healthy pipeline terminates in ≤3 hops.
+        Ok(report)
     }
 
     /// Run the initial block: research → docs, then pause at
@@ -2071,7 +2156,84 @@ impl<R: Runtime> AgentRunner<R> {
                 );
             }
         }
+        // Brownfield (adopted existing repo): bias EVERY build phase toward
+        // incremental change over a rewrite, and feed the spec/backend phases
+        // real code retrieved from the project-source index so the base edits
+        // what already exists instead of regenerating it. Greenfield runs
+        // (no adopt marker) inject nothing here — behaviour is unchanged.
+        if self.brownfield && matches!(phase, Phase::Spec | Phase::Frontend | Phase::Backend) {
+            append(&mut prompt.system, self.brownfield_context(phase));
+        }
         prompt
+    }
+
+    /// Build the brownfield context block injected into a build-phase prompt for
+    /// an ADOPTED workspace.
+    ///
+    /// Two parts, both fail-open (an empty string injects nothing):
+    /// 1. An **incremental-change directive** — tells the base this is an
+    ///    existing project so it edits the smallest surface, matches the
+    ///    in-repo conventions, and never regenerates files wholesale. This is
+    ///    the prompt-level counterpart of the `UMADEV.md` boundary brief
+    ///    `run_adopt` writes.
+    /// 2. **Real-code retrieval** (Spec / Backend only) — queries the
+    ///    project-source BM25 index (`load_project_source_index`, built by
+    ///    `run_adopt`) with the requirement and folds the top matching code
+    ///    excerpts in, so the base SEES the actual codebase instead of guessing
+    ///    at it. Absent / empty index → just the directive.
+    fn brownfield_context(&self, phase: Phase) -> String {
+        let mut out = String::from(
+            "## Brownfield project (existing codebase — work INCREMENTALLY)\n\
+             This workspace is an existing project adopted by the pipeline, NOT a blank \
+             scaffold. Change the SMALLEST surface that satisfies the requirement, match the \
+             conventions already present in this codebase, reuse existing modules/helpers \
+             before adding new ones, and NEVER regenerate or rewrite files wholesale. \
+             Keep public APIs and on-disk formats backward-compatible unless explicitly asked.",
+        );
+        // Real-code retrieval is most useful where the base writes code against
+        // the existing structure: the plan (Spec) and the backend implementation.
+        if matches!(phase, Phase::Spec | Phase::Backend) {
+            if let Some(snippets) = self.brownfield_code_snippets() {
+                out.push_str("\n\n");
+                out.push_str(&snippets);
+            }
+        }
+        out
+    }
+
+    /// Retrieve the most relevant existing-code excerpts for this run's
+    /// requirement from the project-source index and render them into a prompt
+    /// block. Returns `None` when the workspace has no index (or no hit), so the
+    /// caller injects only the incremental directive. Deterministic (BM25, no
+    /// network) and fail-open.
+    fn brownfield_code_snippets(&self) -> Option<String> {
+        let index = crate::adopt::load_project_source_index(&self.options.project_root)?;
+        // A handful of the strongest hits — enough to anchor the base in the
+        // real codebase without bloating the prompt (auto-context bloat
+        // measurably lowers task success, so we stay terse).
+        let hits = index.search(&self.options.requirement, 4);
+        if hits.is_empty() {
+            return None;
+        }
+        let mut block = String::from(
+            "## Relevant existing code (retrieved from THIS repo — edit these, don't recreate)\n",
+        );
+        let mut any = false;
+        for (idx, _score) in hits {
+            let Some(chunk) = index.chunks.get(idx) else {
+                continue;
+            };
+            let excerpt = chunk.excerpt(700);
+            if excerpt.trim().is_empty() {
+                continue;
+            }
+            any = true;
+            block.push_str(&format!(
+                "\n### {}\n```\n{}\n```\n",
+                chunk.meta.path, excerpt
+            ));
+        }
+        any.then_some(block)
     }
 
     /// A1 context engineering: once the three planning docs are approved, distill
@@ -5266,6 +5428,52 @@ error TS2304: Cannot find name 'Foo'
     }
 
     #[tokio::test]
+    async fn auto_mode_drives_headless_end_to_end_without_gate_pauses() {
+        // Gap 1: `auto` must run the whole pipeline in ONE headless call,
+        // auto-approving every gate, rather than stalling at docs_confirm.
+        let tmp = TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.mode = crate::trust::TrustMode::Auto;
+        let runner = AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic),
+            o,
+        );
+        runner.start().unwrap();
+        let r = runner.run_auto_to_completion(false).await.unwrap();
+        // Single call drove all the way to delivery, no gate left open.
+        assert_eq!(r.final_phase, Phase::Delivery);
+        assert_eq!(r.paused_at, None);
+        // Artifacts from every block exist — proof it didn't stop at docs.
+        assert!(tmp.path().join("output/demo-prd.md").is_file());
+        assert!(tmp.path().join("output/demo-backend-notes.md").is_file());
+        assert!(tmp.path().join("output/demo-quality-gate.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn auto_drive_respects_guarded_and_plan_pauses_at_first_gate() {
+        // The auto-driver MUST NOT advance past a gate in guarded / plan — it
+        // returns the first block's gated report unchanged (the clarify gate),
+        // preserving the human-in-the-loop and read-only contracts.
+        for mode in [
+            crate::trust::TrustMode::Guarded,
+            crate::trust::TrustMode::Plan,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let mut o = opts(tmp.path());
+            o.mode = mode;
+            let runner = AgentRunner::new(FakeRuntime, o);
+            runner.start().unwrap();
+            let r = runner.run_auto_to_completion(false).await.unwrap();
+            assert_eq!(
+                r.paused_at,
+                Some(Gate::ClarifyGate),
+                "{mode:?} must pause at the first gate, not drive through"
+            );
+            assert_eq!(r.final_phase, Phase::Research);
+        }
+    }
+
+    #[tokio::test]
     async fn worker_run_blocks_delivery_when_quality_gate_fails() {
         // UD-EVID-003: a worker-backed run whose quality gate emits
         // passed:false MUST refuse to advance to delivery. We simulate this
@@ -5722,6 +5930,90 @@ error TS2304: Cannot find name 'Foo'
             Phase::Research,
         );
         assert!(!research.system.contains("BINDING DESIGN CONTRACT"));
+    }
+
+    #[test]
+    fn brownfield_context_injects_incremental_directive_and_real_code() {
+        // Gap 2: an ADOPTED workspace must (a) flip the runner's brownfield flag
+        // and (b) inject an incremental-change directive + real-code retrieval
+        // into the spec/backend worker prompts.
+        let tmp = TempDir::new().unwrap();
+        // Populate a real source tree, then adopt it (writes the marker + the
+        // project-source index the retrieval reads).
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/login.rs"),
+            "pub fn login_page() {\n    // existing login page handler\n}\n",
+        )
+        .unwrap();
+        let report = crate::adopt::run_adopt(tmp.path());
+        assert!(report.indexed_files >= 1);
+
+        // Runner reads the marker at construction → brownfield = true.
+        let mut o = opts(tmp.path());
+        o.requirement = "login page".into();
+        let runner = AgentRunner::new(FakeRuntime, o);
+        assert!(runner.brownfield, "adopted workspace must set brownfield");
+
+        // Spec prompt: incremental directive + retrieved real code, original kept.
+        let spec = runner.with_context(
+            Prompt {
+                system: "BASE".into(),
+                user: "U".into(),
+            },
+            Phase::Spec,
+        );
+        assert!(spec.system.starts_with("BASE"));
+        assert!(
+            spec.system.contains("Brownfield project") && spec.system.contains("INCREMENTALLY"),
+            "spec prompt must carry the incremental directive"
+        );
+        assert!(
+            spec.system.contains("Relevant existing code") && spec.system.contains("src/login.rs"),
+            "spec prompt must inject retrieved real code: {}",
+            spec.system
+        );
+
+        // Frontend gets the directive but NOT the code-retrieval block (that's
+        // spec/backend only).
+        let fe = runner.with_context(
+            Prompt {
+                system: "BASE".into(),
+                user: "U".into(),
+            },
+            Phase::Frontend,
+        );
+        assert!(fe.system.contains("Brownfield project"));
+        assert!(!fe.system.contains("Relevant existing code"));
+
+        // Research (not a build phase) → no brownfield block at all.
+        let research = runner.with_context(
+            Prompt {
+                system: "BASE".into(),
+                user: "U".into(),
+            },
+            Phase::Research,
+        );
+        assert!(!research.system.contains("Brownfield project"));
+    }
+
+    #[test]
+    fn greenfield_workspace_injects_no_brownfield_context() {
+        // No adopt marker → brownfield stays false and the build prompts are
+        // unchanged (zero-regression guarantee for the greenfield path).
+        let tmp = TempDir::new().unwrap();
+        let runner = AgentRunner::new(FakeRuntime, opts(tmp.path()));
+        assert!(!runner.brownfield);
+        let spec = runner.with_context(
+            Prompt {
+                system: "BASE".into(),
+                user: "U".into(),
+            },
+            Phase::Spec,
+        );
+        assert!(!spec.system.contains("Brownfield project"));
+        assert!(!spec.system.contains("Relevant existing code"));
     }
 
     #[tokio::test]

@@ -4197,11 +4197,22 @@ impl App {
             );
             return Action::None;
         };
-        // Deploy is outward-facing and hard to reverse: show the exact command
-        // and a release checklist, and require an EXPLICIT confirm before it
-        // runs. `/deploy confirm` (or yes / go / 确认) actually deploys.
+        // Reversibility floor (fail-SAFE): a deploy reaches the network and
+        // ships outward, so it is irreversible BY NATURE — it must be confirmed
+        // REGARDLESS of the active trust tier (even `auto` cannot skip it). We
+        // consult the `trust::requires_confirmation` floor on a `git push`-class
+        // probe (a deploy is publish-outward, exactly the network class the floor
+        // escalates) so the gate is mode-independent even for a recipe the
+        // generic classifier wouldn't recognise on its own (e.g. `npx vercel
+        // --prod`). We protect the user's project — when in doubt, confirm.
+        // `/deploy confirm` (or yes / go / 确认) actually deploys.
+        let floor_requires_confirm = umadev_agent::requires_confirmation(
+            self.effective_trust_mode(),
+            &format!("git push (deploy) {cmd}"),
+            "",
+        );
         let confirmed = matches!(arg.trim(), "confirm" | "yes" | "go" | "y" | "确认" | "確認");
-        if !confirmed {
+        if floor_requires_confirm && !confirmed {
             self.push(
                 ChatRole::UmaDev,
                 umadev_i18n::tf(self.lang, "deploy.confirm_preflight", &[&cmd]),
@@ -6159,6 +6170,46 @@ mod tests {
         match action {
             Action::RunDeploy { command } => assert_eq!(command, "npx vercel --prod"),
             other => panic!("expected RunDeploy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_deploy_floor_requires_confirm_even_in_auto_mode() {
+        // Gap 3 reversibility floor: a deploy is an irreversible network action,
+        // so even in the AUTO trust tier bare /deploy must NOT fire — it
+        // previews and waits for an explicit confirm. `auto` does not get to
+        // skip the floor.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let slug = "demo";
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(
+            tmp.path()
+                .join("output")
+                .join(format!("{slug}-delivery-notes.md")),
+            "## Deploy command\n\nnpx vercel --prod\n",
+        )
+        .unwrap();
+        let mut app = App::new(
+            slug.to_string(),
+            UserConfig {
+                backend: Some("offline".into()),
+                ..Default::default()
+            },
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        // Force the strictest-skipping tier; the floor must still gate.
+        app.trust_mode_override = Some(umadev_agent::TrustMode::Auto);
+        assert!(app.effective_trust_mode() == umadev_agent::TrustMode::Auto);
+        let preview = app.slash_deploy("");
+        assert!(
+            matches!(preview, Action::None),
+            "auto mode must NOT skip the deploy confirmation floor"
+        );
+        // Explicit confirm still works.
+        match app.slash_deploy("confirm") {
+            Action::RunDeploy { command } => assert_eq!(command, "npx vercel --prod"),
+            other => panic!("expected RunDeploy after confirm, got {other:?}"),
         }
     }
 
