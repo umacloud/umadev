@@ -276,40 +276,249 @@ fn apply_provider_env(cmd: &mut Command, env: &[(String, String)]) {
     }
 }
 
-/// Resolve a bare program name to a spawnable path. On Windows the base CLIs
-/// installed via npm are `.cmd`/`.exe`/`.bat` shims, but `CreateProcess` (and
-/// thus `Command::new`) only auto-appends `.exe` to a bare name -- so a bare
-/// `claude` never finds `claude.cmd` and the base reads as "not installed". We
-/// search `PATH` over `PATHEXT` ourselves and return the first hit's full path
-/// (modern Rust runs `.cmd`/`.bat` via cmd.exe with proper escaping). Returns
-/// the input unchanged off Windows, when it already looks like a path, or when
-/// nothing matches (so the spawn surfaces the real error).
+/// Resolve a bare program name to a spawnable path — bullet-proof base
+/// detection that survives every install method (npm / native installer /
+/// Homebrew / pnpm / yarn / bun / deno / volta / nvm / asdf / standalone
+/// script / Windows Scoop / Chocolatey / winget).
+///
+/// Two failure modes this defends against:
+///
+/// 1. **On `PATH` but mis-shimmed (Windows).** npm installs a base as BOTH
+///    `codex` (a no-extension *nix shell shim) and `codex.cmd` (the Windows
+///    shim) in the same dir. `CreateProcess` (and thus `Command::new`) only
+///    auto-appends `.exe`, so a bare `codex` matched the shell shim — not a PE
+///    — and spawning it gave os error 193 ("not a valid Win32 application")
+///    → "not installed". We search `PATH` over `PATHEXT` with **extensions
+///    first** so `.cmd`/`.exe`/`.bat` win over the bare *nix shim.
+///
+/// 2. **Installed but not on the *process* `PATH`.** A login shell's `PATH`
+///    (with `~/.local/bin`, Homebrew, volta, asdf shims, …) is routinely
+///    richer than the env a GUI-launched or service-spawned process inherits.
+///    When `PATH` misses, we fail-open-scan every well-known install location
+///    for this binary so "installed but not on my PATH" still resolves.
+///
+/// Order is **`PATH` first, known install dirs second** — a `PATH` hit is
+/// authoritative and matches the user's shell. Returns the first hit's full
+/// path. Fail-open: a missing/unreadable dir is skipped, and when nothing
+/// matches we return the input unchanged so the spawn surfaces the real error
+/// (and `probe`'s `--version` stays the final installed-or-not arbiter — a
+/// wrong-dir hit just fails `--version`, never a false "installed").
 #[must_use]
 pub fn resolve_program(program: &str) -> String {
-    if !cfg!(windows) || program.contains(std::path::is_separator) {
+    // An explicit path (relative or absolute) is taken as-is — the caller
+    // already pinned the binary; we never second-guess it.
+    if program.contains(std::path::is_separator) {
         return program.to_string();
     }
-    let Ok(path_var) = std::env::var("PATH") else {
-        return program.to_string();
-    };
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    for dir in path_var.split(';') {
-        if dir.is_empty() {
-            continue;
+    // 0. Explicit override — the ultimate escape hatch when a base lives
+    //    somewhere no heuristic finds it. `UMADEV_<NAME>_BIN` (e.g.
+    //    UMADEV_CLAUDE_BIN / UMADEV_CODEX_BIN / UMADEV_OPENCODE_BIN) pins the
+    //    exact path; honored only when it points at a real file, so a stale
+    //    override falls through to normal detection instead of blocking it. A
+    //    `.cmd` is fine — spawn_parts still routes it through `cmd /c`.
+    let override_var = format!(
+        "UMADEV_{}_BIN",
+        program.to_ascii_uppercase().replace('-', "_")
+    );
+    if let Ok(p) = std::env::var(&override_var) {
+        if std::path::Path::new(p.trim()).is_file() {
+            return p.trim().to_string();
         }
-        // PATHEXT extensions FIRST, bare name LAST: npm installs a base as BOTH
-        // `codex` (a no-extension *nix shell shim) and `codex.cmd` (the Windows
-        // shim) in the same dir. Trying the bare name first matched the shell
-        // shim — not a PE — so spawning it gave os error 193 and the base read as
-        // "not installed". Preferring `.cmd`/`.exe`/`.bat` finds the runnable shim.
-        for ext in pathext.split(';').chain(std::iter::once("")) {
-            let candidate = std::path::Path::new(dir).join(format!("{program}{ext}"));
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
+    }
+    let exts = path_extensions();
+    // 1. PATH first — authoritative, matches the user's shell.
+    if let Ok(path_var) = std::env::var("PATH") {
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        for dir in path_var.split(sep) {
+            if let Some(hit) = match_in_dir(std::path::Path::new(dir), program, &exts) {
+                return hit;
             }
         }
     }
+    // 2. Known install locations second — "installed but not on this
+    //    process's PATH" (GUI/service launch, or a richer login-shell PATH).
+    for dir in known_install_dirs(program) {
+        if let Some(hit) = match_in_dir(&dir, program, &exts) {
+            return hit;
+        }
+    }
+    // Fail-open: nothing matched — hand back the bare name so the spawn (and,
+    // for probes, the subsequent `--version`) surfaces the real error.
     program.to_string()
+}
+
+/// Candidate file extensions to try for `program`, **most-specific first**.
+///
+/// On Windows we honor `PATHEXT` (defaulting to the standard set) and append a
+/// trailing empty extension so a bare-named file is the LAST resort: npm drops
+/// both `codex` (a *nix shell shim, not a PE → os error 193) and `codex.cmd`
+/// in the same dir, so `.cmd`/`.exe`/`.bat` MUST win over the bare name. Off
+/// Windows there are no extensions — just the bare name.
+fn path_extensions() -> Vec<String> {
+    if cfg!(windows) {
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        pathext
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .chain(std::iter::once(String::new()))
+            .collect()
+    } else {
+        vec![String::new()]
+    }
+}
+
+/// Return the full path of `program{ext}` for the first `ext` that names a
+/// real file in `dir`, or `None`. Fail-open: an empty/unreadable dir yields
+/// `None` (the `is_file` probe simply returns false). `exts` is ordered
+/// most-specific-first (see [`path_extensions`]).
+fn match_in_dir(dir: &std::path::Path, program: &str, exts: &[String]) -> Option<String> {
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    for ext in exts {
+        let candidate = dir.join(format!("{program}{ext}"));
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Read an environment variable into a non-empty `PathBuf`, or `None`. Empty
+/// values are treated as unset so we never join onto `""`.
+fn env_dir(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The user's home directory, derived without pulling in the `dirs` crate:
+/// `$HOME` on Unix, `%USERPROFILE%` (then `%HOMEDRIVE%%HOMEPATH%`) on Windows.
+fn home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        env_dir("USERPROFILE").or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            if drive.is_empty() || path.is_empty() {
+                return None;
+            }
+            let mut p = drive;
+            p.push(path);
+            Some(PathBuf::from(p))
+        })
+    } else {
+        env_dir("HOME")
+    }
+}
+
+/// Enumerate the immediate subdirectory `bin` dirs under `parent` — used for
+/// version-manager layouts like `~/.nvm/versions/node/<v>/bin` where the
+/// version segment is unpredictable. Fail-open: an unreadable `parent` yields
+/// an empty vec.
+fn versioned_node_bins(parent: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path().join("bin"))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+/// Every well-known install location for a base/tool CLI, across package
+/// managers and OSes. Each is tried (over [`path_extensions`]) only after a
+/// plain `PATH` lookup misses — so a normal install is unaffected and this is
+/// purely a fail-open safety net for "installed but not on my PATH".
+///
+/// `program` seeds the per-base standalone dirs (`~/.codex/bin`,
+/// `~/.opencode/bin`, `%LOCALAPPDATA%\Programs\codex`, …): standalone
+/// installers drop the binary under a dir named after the tool.
+///
+/// Covers (cross-platform HOME-relative): npm-global, volta, bun, deno, yarn
+/// (classic + berry global), pnpm, cargo, asdf shims, nvm node versions,
+/// `~/.local/bin`, `~/bin`. Unix system dirs: `/usr/local/bin`,
+/// `/opt/homebrew/bin` (+ `opt/*/bin` cellar links), `/usr/bin`, `/bin`, and
+/// the npm global prefix (`NPM_CONFIG_PREFIX` or common defaults). Windows:
+/// `%APPDATA%\npm`, `%LOCALAPPDATA%\Programs\{program}`, Program Files,
+/// Volta, Scoop shims, Chocolatey bin, and the winget Links shim dir.
+fn known_install_dirs(program: &str) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // ---- Cross-platform, HOME-relative (every package manager's user dir) ----
+    if let Some(home) = home_dir() {
+        let rel = [
+            ".local/bin",
+            "bin",
+            ".npm-global/bin",
+            ".volta/bin",
+            ".bun/bin",
+            ".deno/bin",
+            ".yarn/bin",
+            ".config/yarn/global/node_modules/.bin",
+            ".local/share/pnpm",
+            ".cargo/bin",
+            ".asdf/shims",
+        ];
+        for r in rel {
+            dirs.push(home.join(r));
+        }
+        // Per-base standalone installers: `~/.codex/bin`, `~/.opencode/bin`,
+        // `~/.claude/bin`, plus the bare `~/.{program}` dir some scripts use.
+        dirs.push(home.join(format!(".{program}/bin")));
+        dirs.push(home.join(format!(".{program}")));
+        // nvm: node lives under an unpredictable version segment — enumerate.
+        dirs.extend(versioned_node_bins(&home.join(".nvm/versions/node")));
+    }
+
+    if cfg!(windows) {
+        // ---- Windows: package-manager + installer locations ----
+        if let Some(appdata) = env_dir("APPDATA") {
+            dirs.push(appdata.join("npm")); // npm global on Windows
+        }
+        if let Some(local) = env_dir("LOCALAPPDATA") {
+            dirs.push(local.join(format!("Programs\\{program}")));
+            dirs.push(local.join(format!("Programs\\{program}\\bin")));
+            dirs.push(local.join("Volta\\bin"));
+            dirs.push(local.join("Microsoft\\WinGet\\Links")); // winget shims
+        }
+        for pf in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(p) = env_dir(pf) {
+                dirs.push(p.join(program));
+                dirs.push(p.join(format!("{program}\\bin")));
+            }
+        }
+        if let Some(profile) = env_dir("USERPROFILE") {
+            dirs.push(profile.join(".local\\bin"));
+            dirs.push(profile.join("scoop\\shims")); // Scoop
+        }
+        if let Some(choco) = env_dir("ChocolateyInstall") {
+            dirs.push(choco.join("bin"));
+        } else {
+            dirs.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin"));
+        }
+    } else {
+        // ---- Unix: system + Homebrew + npm-prefix locations ----
+        for d in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"] {
+            dirs.push(PathBuf::from(d));
+        }
+        // Homebrew cellar keg-only links: `/opt/homebrew/opt/*/bin`.
+        if let Ok(entries) = std::fs::read_dir("/opt/homebrew/opt") {
+            for e in entries.flatten() {
+                dirs.push(e.path().join("bin"));
+            }
+        }
+        // npm global prefix: explicit override, else the common bin dirs.
+        if let Some(prefix) = env_dir("NPM_CONFIG_PREFIX") {
+            dirs.push(prefix.join("bin"));
+        }
+        dirs.push(PathBuf::from("/usr/local/bin")); // common npm default prefix
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    }
+
+    dirs
 }
 
 /// Windows-aware spawn target for a base/tool CLI. `.cmd`/`.bat` shims (how npm
@@ -836,6 +1045,19 @@ mod tests {
     use super::*;
     use umadev_runtime::{CompletionRequest, Message};
 
+    /// Serializes tests that mutate process-global env vars (`PATH`/`HOME`/…)
+    /// so they don't race each other under the multi-threaded test harness.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restore an env var to its captured prior value (or remove it if it was
+    /// previously unset). Keeps env-mutating tests hermetic.
+    fn restore_env(key: &str, prior: Option<std::ffi::OsString>) {
+        match prior {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
     #[test]
     fn strip_ansi_removes_color_codes() {
         let painted = "\x1b[1;32mhello\x1b[0m world";
@@ -1126,6 +1348,153 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("code 3"));
         assert!(err.contains("boom"));
+    }
+
+    // ---- resolve_program: bullet-proof base detection ----
+
+    #[test]
+    fn resolve_program_returns_input_when_nothing_found() {
+        // Fail-open: a name that exists nowhere on PATH or in any known dir
+        // comes back unchanged, so the spawn surfaces the real "not found".
+        let got = resolve_program("umadev-definitely-not-installed-anywhere-xyz");
+        assert_eq!(got, "umadev-definitely-not-installed-anywhere-xyz");
+    }
+
+    #[test]
+    fn resolve_program_passes_through_explicit_paths() {
+        // An explicit path (has a separator) is taken as-is — never rewritten.
+        let sep = std::path::MAIN_SEPARATOR;
+        let p = format!("some{sep}dir{sep}codex");
+        assert_eq!(resolve_program(&p), p);
+    }
+
+    #[test]
+    fn match_in_dir_skips_empty_and_missing() {
+        // Fail-open building blocks: an empty dir name or a non-existent dir
+        // yields no hit rather than erroring.
+        let exts = path_extensions();
+        assert!(match_in_dir(std::path::Path::new(""), "codex", &exts).is_none());
+        assert!(
+            match_in_dir(
+                std::path::Path::new("/umadev/no/such/dir/at/all"),
+                "codex",
+                &exts
+            )
+            .is_none(),
+            "a missing dir must fail-open to None"
+        );
+    }
+
+    // On Unix the known-install scan locates a binary that is NOT on PATH but
+    // lives in a per-base standalone dir (`~/.codex/bin`). We point HOME at a
+    // temp dir and clear PATH so only the known-dir branch can match.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_program_finds_base_in_home_standalone_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bin = tmp.path().join(".mybase/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("mybase");
+        std::fs::write(&exe, "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // `mybase` is a unique name absent from the real PATH, so we only need
+        // to redirect HOME — the PATH lookup misses and the known-dir branch
+        // under our temp HOME is exercised. Not clobbering PATH keeps concurrent
+        // spawn-based tests (echo/cat/sh) safe.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let got = resolve_program("mybase");
+        // Restore before asserting so a failure can't poison sibling tests.
+        restore_env("HOME", saved_home);
+
+        assert_eq!(
+            got,
+            exe.to_string_lossy(),
+            "a base in ~/.mybase/bin must resolve even when absent from PATH"
+        );
+    }
+
+    // On Unix, PATH is authoritative and wins over a same-named known dir entry.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_program_prefers_path_over_known_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let on_path = tempfile::TempDir::new().unwrap();
+        let exe = on_path.path().join("dualbase");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let home = tempfile::TempDir::new().unwrap();
+        let known = home.path().join(".dualbase/bin");
+        std::fs::create_dir_all(&known).unwrap();
+        std::fs::write(known.join("dualbase"), "#!/bin/sh\n").unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_home = std::env::var_os("HOME");
+        let saved_path = std::env::var_os("PATH");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("PATH", on_path.path());
+        let got = resolve_program("dualbase");
+        restore_env("HOME", saved_home);
+        restore_env("PATH", saved_path);
+
+        assert_eq!(
+            got,
+            exe.to_string_lossy(),
+            "a PATH hit must win over the known-install-dir fallback"
+        );
+    }
+
+    // On Windows, when both `codex` (bare *nix shim) and `codex.cmd` exist in
+    // the same dir, the `.cmd` must win — the bare shim is not a PE (os 193).
+    #[cfg(windows)]
+    #[test]
+    fn resolve_program_prefers_cmd_over_bare_on_windows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("winbase"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(tmp.path().join("winbase.cmd"), b"@echo off\n").unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_path = std::env::var_os("PATH");
+        let saved_ext = std::env::var_os("PATHEXT");
+        std::env::set_var("PATH", tmp.path());
+        std::env::set_var("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        let got = resolve_program("winbase");
+        restore_env("PATH", saved_path);
+        restore_env("PATHEXT", saved_ext);
+
+        assert!(
+            got.to_ascii_lowercase().ends_with("winbase.cmd"),
+            "the .cmd shim must win over the bare *nix shim, got: {got}"
+        );
+    }
+
+    // On Windows, a base installed only under `%LOCALAPPDATA%\Programs\{prog}`
+    // (a standalone installer) resolves even when absent from PATH.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_program_finds_base_in_localappdata_programs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let progdir = tmp.path().join("Programs").join("winstandalone");
+        std::fs::create_dir_all(&progdir).unwrap();
+        std::fs::write(progdir.join("winstandalone.exe"), b"MZ").unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_local = std::env::var_os("LOCALAPPDATA");
+        let saved_path = std::env::var_os("PATH");
+        std::env::set_var("LOCALAPPDATA", tmp.path());
+        std::env::set_var("PATH", ""); // force the known-dir branch
+        let got = resolve_program("winstandalone");
+        restore_env("LOCALAPPDATA", saved_local);
+        restore_env("PATH", saved_path);
+
+        assert!(
+            got.to_ascii_lowercase().ends_with("winstandalone.exe"),
+            "a base under %LOCALAPPDATA%\\Programs must resolve off-PATH, got: {got}"
+        );
     }
 
     #[tokio::test]
