@@ -542,8 +542,8 @@ fn spawn_continuous_block(
                 Ok(s) => s,
                 Err(e) => {
                     sink.emit(EngineEvent::Note(format!(
-                        "{ABORT_SENTINEL}continuous session unavailable ({e}) — \
-                         clear UMADEV_CONTINUOUS to use the per-phase path."
+                        "{ABORT_SENTINEL}{}",
+                        umadev_i18n::tlf("continuous.tui_session_unavailable", &[&e.to_string()])
                     )));
                     return;
                 }
@@ -621,14 +621,11 @@ fn block_abort_note(e: &std::io::Error, label: &str) -> String {
         // run-execution lock semantics this should no longer reach a real
         // execution path, but if it ever does it is a transient hand-off race,
         // not a dead end — tell the user to retry in a beat.
-        ErrorKind::WouldBlock => format!(
-            "本轮已中止:本会话已有一个 run 占用工作区(底座 {label})。\
-             稍候片刻让上一轮收尾后重试,或先 /status 查看当前进度。"
-        ),
+        ErrorKind::WouldBlock => umadev_i18n::tlf("continuous.block_aborted_busy", &[label]),
         // A different, still-live run holds the workspace lock. The underlying
         // message already carries the `rm <path>` hint.
         ErrorKind::AlreadyExists => {
-            format!("本轮已中止:另一个 run 正占用该工作区(底座 {label})。\n{detail}")
+            umadev_i18n::tlf("continuous.block_aborted_locked", &[label, &detail])
         }
         // Any other IO failure: surface the concrete cause (disk full / read-only
         // fs / permission) so the user sees a real reason, not a frozen bar.
@@ -642,7 +639,7 @@ fn block_abort_note(e: &std::io::Error, label: &str) -> String {
             } else {
                 umadev_i18n::tl("pipeline.generic_error").to_string()
             };
-            format!("本轮已中止:{detail} — {hint}")
+            umadev_i18n::tlf("continuous.block_aborted_io", &[&detail, &hint])
         }
     }
 }

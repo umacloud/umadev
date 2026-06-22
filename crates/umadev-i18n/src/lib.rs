@@ -385,6 +385,31 @@ mod tests {
             "config.save_failed_note",
             "chat.claims_unverified",
             "gate.clarify_write_failed",
+            // Continuous long-session path: CLI prints + TUI block notes + the
+            // phase-progress and role-team review notes swept out of hard-coded
+            // (mostly zh-only) literals in main.rs / tui lib.rs / continuous.rs.
+            "continuous.session_active",
+            "continuous.session_unavailable",
+            "continuous.auto_gate_resumed",
+            "continuous.tui_session_unavailable",
+            "continuous.block_aborted_busy",
+            "continuous.block_aborted_locked",
+            "continuous.block_aborted_io",
+            "continuous.plan_mode_skip",
+            "continuous.phase_failed",
+            "continuous.no_source_hardstop",
+            "continuous.dangerous_action_denied",
+            "continuous.tool_call_blocked",
+            "continuous.phase_truncated",
+            "continuous.node.docs",
+            "continuous.node.preview",
+            "continuous.node.quality",
+            "continuous.team.passed_after_rework",
+            "continuous.team.unresolved_advisory",
+            "continuous.team.inject_rework",
+            "continuous.team.cross_review_header",
+            "continuous.team.seat_passed",
+            "continuous.team.seat_blocking",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

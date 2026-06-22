@@ -23,9 +23,10 @@
 //!
 //! 9 phases + both confirm gates + governance pre-write checks + the
 //! zero-source HARD STOP + tool-call audit (`UD-EVID-002`) + trust-tiered
-//! approval + the single-writer run lock. Critics route through the existing
-//! consult mechanism (a fork-based read-only critic is a follow-up — see the
-//! `TODO(fork-critic)` below).
+//! approval + the single-writer run lock. The role-critic team reviews on
+//! read-only `BaseSession::fork()` sessions at each review node (see
+//! `run_review_team` / `ForkConsult` below) — parallel, isolated, advisory-only,
+//! and fail-open, so a critic never drives loop termination.
 //!
 //! ## Fail-open, by contract
 //!
@@ -174,9 +175,7 @@ pub async fn run_block(
         // phases too so a resumed block can't slip past plan mode.
         if !options.mode.executes() && is_executing(phase) {
             events.emit(EngineEvent::Note(
-                "[plan] 计划模式(只读):不执行 spec/前端/后端,未写入真实代码。  \
-                 [plan] Plan mode (read-only): spec/frontend/backend not executed."
-                    .to_string(),
+                umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
             ));
             return RunOutcome::Completed;
         }
@@ -196,9 +195,9 @@ pub async fn run_block(
         match outcome {
             PhaseResult::Done => {}
             PhaseResult::Failed(reason) => {
-                events.emit(EngineEvent::Note(format!(
-                    "[fail] {} 阶段失败:{reason} —— 持续会话路径停止。",
-                    phase.id()
+                events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "continuous.phase_failed",
+                    &[phase.id(), &reason],
                 )));
                 return RunOutcome::HardStop(format!("phase {} failed: {reason}", phase.id()));
             }
@@ -220,11 +219,15 @@ pub async fn run_block(
         if phase == last_code_phase(&plan) && produces_code {
             let n = crate::acceptance::source_files(&options.project_root).len();
             if n == 0 {
-                let msg = "[fail] 未产出真实代码 — 流水线停止,未交付(持续会话路径硬门)。  \
-                     [fail] No real source files produced — pipeline stopped, nothing delivered."
-                    .to_string();
-                events.emit(EngineEvent::Note(msg.clone()));
-                return RunOutcome::HardStop(msg);
+                // The user-visible Note is localized; the HardStop reason is kept
+                // language-independent (it is a machine-read verdict string).
+                events.emit(EngineEvent::Note(
+                    umadev_i18n::tl("continuous.no_source_hardstop").to_string(),
+                ));
+                return RunOutcome::HardStop(
+                    "no real source files produced — pipeline stopped (continuous hard gate)"
+                        .to_string(),
+                );
             }
         }
     }
@@ -293,8 +296,9 @@ async fn drive_phase(
             } => {
                 let decision = approval_decision(options.mode, &action, &target);
                 if matches!(decision, ApprovalDecision::Deny) {
-                    events.emit(EngineEvent::Note(format!(
-                        "[gate] 危险动作需用户确认,本回合按拒绝处理:{action} → {target}"
+                    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "continuous.dangerous_action_denied",
+                        &[&action, &target],
                     )));
                 }
                 if let Err(e) = session.respond(&req_id, decision).await {
@@ -354,11 +358,9 @@ fn govern_tool_call(
     );
 
     if decision.block {
-        events.emit(EngineEvent::Note(format!(
-            "[gov] {} 阶段:底座工具调用触发 {} —— {} (target: {target})",
-            phase.id(),
-            decision.clause,
-            decision.reason,
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.tool_call_blocked",
+            &[phase.id(), &decision.clause, &decision.reason, &target],
         )));
     }
 }
@@ -426,9 +428,9 @@ fn finish_turn(events: &Arc<dyn EventSink>, phase: Phase, status: TurnStatus) ->
             // exists and move on (the hard gate / verify floor catches an
             // empty result downstream) — but flag it so the block boundary can
             // warn the output may be incomplete.
-            events.emit(EngineEvent::Note(format!(
-                "[warn] {} 阶段被截断(底座到达回合上限),保留已产出,继续。",
-                phase.id()
+            events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "continuous.phase_truncated",
+                &[phase.id()],
             )));
             PhaseResult::Done
         }
@@ -565,17 +567,30 @@ fn phase_directive(
         return lean_directive(&slug, req, phase, first, kind, no_ask);
     }
 
+    // Each phase opens by explicitly naming the senior ROLE that owns it (PM →
+    // architect → designer → engineers → QA/security → DevOps) so the base steps
+    // into that seat's professional standard, then the imperative body of the
+    // phase follows. Empty for the gate phases (which never get a directive). The
+    // Research+first case already carries the full role-priming `system` prompt,
+    // so it skips the prefix to avoid restating the seat twice.
+    let persona = crate::experts::phase_persona(phase);
+    let role = if persona.is_empty() {
+        String::new()
+    } else {
+        format!("{persona}\n\n")
+    };
+
     match phase {
         Phase::Research => {
             let p = crate::experts::research_prompt(&slug, req, "");
             if first {
                 format!("{}\n\n{}\n\n{no_ask}", p.system, p.user)
             } else {
-                format!("Now do the research phase.\n\n{}\n\n{no_ask}", p.user)
+                format!("{role}Now do the research phase.\n\n{}\n\n{no_ask}", p.user)
             }
         }
         Phase::Docs => format!(
-            "Now produce ALL THREE core documents for `{slug}`, writing each file directly:\n\
+            "{role}Now produce ALL THREE core documents for `{slug}`, writing each file directly:\n\
              - `output/{slug}-prd.md` (product requirements)\n\
              - `output/{slug}-architecture.md` (architecture + API surface table)\n\
              - `output/{slug}-uiux.md` (design system: tokens, typography, icon library)\n\
@@ -584,30 +599,30 @@ fn phase_directive(
              architecture API table).\n\n{no_ask}"
         ),
         Phase::Spec => format!(
-            "The user has APPROVED the three documents. Now translate them into an \
+            "{role}The user has APPROVED the three documents. Now translate them into an \
              implementation spec + a task breakdown for `{slug}` (write the spec/tasks \
              files). Cite the PRD's `FR-` ids so coverage maps 1:1.\n\n{no_ask}"
         ),
         Phase::Frontend => format!(
-            "Now IMPLEMENT THE FRONTEND for `{slug}` as REAL code files (components, pages, \
+            "{role}Now IMPLEMENT THE FRONTEND for `{slug}` as REAL code files (components, pages, \
              API client, design-token styles) from the UIUX + architecture docs you wrote. \
              Icons from the declared library only — never emoji. Wire every fetch URL to an \
              architecture API path. Run the build and fix errors. Write \
              `output/{slug}-frontend-notes.md` with the preview URL + run command.\n\n{no_ask}"
         ),
         Phase::Backend => format!(
-            "Now IMPLEMENT THE BACKEND for `{slug}` as REAL code files (routes, models, \
+            "{role}Now IMPLEMENT THE BACKEND for `{slug}` as REAL code files (routes, models, \
              middleware, tests) matching the architecture API surface. Validate inputs, \
              use the standard error envelope, write + run tests. Write \
              `output/{slug}-backend-notes.md`.\n\n{no_ask}"
         ),
         Phase::Quality => format!(
-            "Now run QUALITY for `{slug}`: run the project's real build + test + lint, fix \
+            "{role}Now run QUALITY for `{slug}`: run the project's real build + test + lint, fix \
              what fails, and do a security pass (no hardcoded secrets, input validation, \
              safe error handling). Summarize results.\n\n{no_ask}"
         ),
         Phase::Delivery => format!(
-            "Now produce the DELIVERY recipe for `{slug}`: verify the production build for \
+            "{role}Now produce the DELIVERY recipe for `{slug}`: verify the production build for \
              frontend + backend, and write exact deployment instructions. Do NOT deploy to \
              any remote system — only verify locally and write the recipe.\n\n{no_ask}"
         ),
@@ -652,6 +667,11 @@ fn lean_directive(
     } else {
         String::new()
     };
+    // A short, explicit ROLE line on EVERY lean phase (even the terse later ones)
+    // so the base still works as the right seat — "as an engineer, just implement
+    // this" — without the document-anchored heavyweight persona. Folded into the
+    // `prime` so the first-phase reminder and the role read as one preamble.
+    let prime = format!("{}{}\n\n", prime, crate::experts::lean_phase_role(phase));
     match phase {
         Phase::Spec => format!(
             "{prime}Task for `{slug}`:\n{req}\n\n\
@@ -769,9 +789,9 @@ async fn review_and_rework(
         //    exit; everything else is bounded rework.
         if blocking.is_empty() {
             if round > 0 {
-                events.emit(EngineEvent::Note(format!(
-                    "[team] {} 评审通过(返工 {round} 轮后无阻塞项),推进。",
-                    kind_label(kind)
+                events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "continuous.team.passed_after_rework",
+                    &[kind_label(kind), &round.to_string()],
                 )));
             }
             return;
@@ -783,10 +803,9 @@ async fn review_and_rework(
         //    proceed: the critic is advisory and must never wedge the run.
         let made_progress = blocking.len() < prev_blocking;
         if round == MAX_REWORK_ROUNDS || !made_progress {
-            events.emit(EngineEvent::Note(format!(
-                "[team] {} 仍有 {} 个阻塞项(返工已达上限/未见收敛),作为顾问意见保留,继续推进。",
-                kind_label(kind),
-                blocking.len()
+            events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "continuous.team.unresolved_advisory",
+                &[kind_label(kind), &blocking.len().to_string()],
             )));
             return;
         }
@@ -795,11 +814,13 @@ async fn review_and_rework(
         // 4. Fold every blocking finding into ONE imperative rework directive and
         //    inject it into the MAIN session — the base fixes the files in the
         //    SAME context, then the next loop iteration re-reviews.
-        events.emit(EngineEvent::Note(format!(
-            "[team] {} 评审提出 {} 个阻塞项 — 注入返工指令到主会话(第 {} 轮)…",
-            kind_label(kind),
-            blocking.len(),
-            round + 1
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.team.inject_rework",
+            &[
+                kind_label(kind),
+                &blocking.len().to_string(),
+                &(round + 1).to_string(),
+            ],
         )));
         let directive = rework_directive(kind, &blocking);
         if !drive_rework_turn(session, options, events, directive).await {
@@ -838,10 +859,9 @@ async fn run_review_team(
     let bb = Blackboard::read(options, kind);
     let arts = bb.artifacts(&options.requirement);
 
-    events.emit(EngineEvent::Note(format!(
-        "[team] {} 角色团队交叉评审(只读分叉,并行):{} 名 critic 各从本职审一遍…",
-        kind_label(kind),
-        team.len()
+    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+        "continuous.team.cross_review_header",
+        &[kind_label(kind), &team.len().to_string()],
     )));
 
     // PARALLEL: fork one read-only session per seat up front (each `fork()` is a
@@ -868,11 +888,14 @@ async fn run_review_team(
         crate::critics::append_team_ledger(&options.project_root, phase_label, round + 1, &verdict);
         let seat = verdict.role.clone();
         if verdict.accepts && verdict.blocking.is_empty() {
-            events.emit(EngineEvent::Note(format!("[team] {seat}:通过,无阻塞项。")));
+            events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "continuous.team.seat_passed",
+                &[&seat],
+            )));
         } else if !verdict.blocking.is_empty() {
-            events.emit(EngineEvent::Note(format!(
-                "[team] {seat}:提出 {} 个阻塞项。",
-                verdict.blocking.len()
+            events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "continuous.team.seat_blocking",
+                &[&seat, &verdict.blocking.len().to_string()],
             )));
             for b in verdict.blocking {
                 let item = format!("[{seat}] {}", b.trim());
@@ -1197,12 +1220,13 @@ fn review_turn_timeout() -> std::time::Duration {
         )
 }
 
-/// Short human label for a review node (for operator Notes).
+/// Short, LOCALIZED human label for a review node (for operator Notes). Routes
+/// through the i18n catalog so the node name follows the user's UI language.
 fn kind_label(kind: ReviewKind) -> &'static str {
     match kind {
-        ReviewKind::Docs => "文档门",
-        ReviewKind::Preview => "预览门",
-        ReviewKind::Quality => "质量",
+        ReviewKind::Docs => umadev_i18n::tl("continuous.node.docs"),
+        ReviewKind::Preview => umadev_i18n::tl("continuous.node.preview"),
+        ReviewKind::Quality => umadev_i18n::tl("continuous.node.quality"),
     }
 }
 
@@ -1593,6 +1617,62 @@ mod tests {
     }
 
     // ── Critic-team review + bounded rework (the §3.5 / §3.6 closure) ──────
+
+    // ── Role personas: each phase directive names its owning seat ───────────
+
+    #[test]
+    fn heavyweight_phase_directives_carry_their_role_persona() {
+        // A greenfield (non-lean) plan: every executing phase directive must open
+        // by naming the senior role that owns it, so the base works AS that seat.
+        let options = opts(
+            Path::new("/tmp"),
+            "build a SaaS dashboard app",
+            TrustMode::Auto,
+        );
+        let k = crate::planner::TaskKind::Greenfield;
+        // (phase, a keyword that must appear in its directive's role line)
+        let cases = [
+            (Phase::Docs, "product manager"),
+            (Phase::Spec, "architect"),
+            (Phase::Frontend, "frontend engineer"),
+            (Phase::Backend, "backend engineer"),
+            (Phase::Quality, "QA"),
+            (Phase::Delivery, "DevOps"),
+        ];
+        for (phase, kw) in cases {
+            // `first=false` → the lean per-phase role prefix is exercised (the
+            // first Research turn carries the full role-priming system prompt).
+            let d = phase_directive(&options, phase, false, k);
+            assert!(
+                d.contains(kw),
+                "{phase:?} directive must name its role ({kw}): {d}"
+            );
+            // Still command-style (writes files, doesn't ask) — persona augments,
+            // never replaces, the imperative body.
+            assert!(d.contains("do NOT ask me") || d.to_lowercase().contains("write"));
+        }
+        // Research+first keeps the full priming system prompt (which already names
+        // the product-research seat) rather than the short prefix.
+        let research = phase_directive(&options, Phase::Research, true, k);
+        assert!(research.to_lowercase().contains("product researcher"));
+    }
+
+    #[test]
+    fn lean_phase_directives_carry_an_engineer_role() {
+        // A lean (gateless) plan: each phase directive still steps the base into
+        // an engineer's seat, without referencing any (never-written) documents.
+        let options = opts(Path::new("/tmp"), "做一个待办单页应用", TrustMode::Auto);
+        let k = crate::planner::TaskKind::Light;
+        for phase in [Phase::Spec, Phase::Frontend, Phase::Backend, Phase::Quality] {
+            let d = phase_directive(&options, phase, false, k);
+            assert!(
+                d.to_lowercase().contains("engineer"),
+                "lean {phase:?} directive must name an engineer seat: {d}"
+            );
+            // No heavyweight doc anchoring on the lean path.
+            assert!(!d.to_lowercase().contains("approved the three documents"));
+        }
+    }
 
     #[test]
     fn gate_review_kind_maps_phases() {

@@ -2206,7 +2206,10 @@ async fn drive_continuous_run(
         match outcome {
             RunOutcome::PausedAtGate(gate) if mode.gates_auto_approve() => {
                 // Auto tier: approve the gate ourselves and resume the next block.
-                eprintln!("\n[auto] gate {} auto-approved — resuming.", gate.id_str());
+                eprintln!(
+                    "\n{}",
+                    umadev_i18n::tlf("continuous.auto_gate_resumed", &[gate.id_str()])
+                );
                 start_after = continuous_resume_phase(gate);
             }
             other => return Ok(other),
@@ -2317,7 +2320,10 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
             .await
             {
                 Ok(mut session) => {
-                    println!("Continuous session active ({}).", backend.id());
+                    println!(
+                        "{}",
+                        umadev_i18n::tlf("continuous.session_active", &[backend.id()])
+                    );
                     // The runner here is only an options + event-sink carrier for
                     // the continuous driver (which drives the session directly,
                     // not `R::complete`); the offline runtime is never invoked.
@@ -2337,8 +2343,8 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                 }
                 Err(e) => {
                     eprintln!(
-                        "  [continuous] session unavailable ({e}); falling back to the \
-                         single-shot per-phase path."
+                        "{}",
+                        umadev_i18n::tlf("continuous.session_unavailable", &[&e.to_string()])
                     );
                     // Fall through to the single-shot path below with `opts` intact.
                 }

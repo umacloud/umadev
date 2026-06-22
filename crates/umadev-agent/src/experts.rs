@@ -533,6 +533,89 @@ pub fn lean_priming() -> &'static str {
      do NOT scaffold a large multi-module app for a small task."
 }
 
+/// The explicit ROLE PERSONA line that opens a phase directive on the continuous
+/// path — "you are now working as a senior X; your remit is Y". Prepending it to
+/// each phase's imperative directive makes the base step into the matching seat
+/// (PM → architect → designer → engineers → QA/security → DevOps) so every phase
+/// reads like the right specialist is on it, not a generic assistant. These are
+/// BASE-FACING agent policy (kept here with the other prompts, not in the i18n UI
+/// catalog, which localizes the user-visible shell): the base then answers in
+/// whatever language the user wrote. Role wording is GENERALISED — it names a
+/// craft and a remit, never an external product or source.
+///
+/// Returns `""` for the gate phases (which never get a directive) so callers can
+/// prepend unconditionally.
+#[must_use]
+pub fn phase_persona(phase: umadev_spec::Phase) -> &'static str {
+    use umadev_spec::Phase;
+    match phase {
+        // Research is led by the product seat: scope the requirement into a real
+        // product definition before anyone designs or builds.
+        Phase::Research => {
+            "You are now working as a senior product manager. Your remit: turn \
+             the raw requirement into a clear product definition — who it's for, the core \
+             jobs to be done, the competitive landscape, and the non-negotiable patterns the \
+             build must honor. Think from the user's and the market's point of view first."
+        }
+        // Docs spans three seats; the directive that follows names which document
+        // each is — the persona here primes the whole authoring shift.
+        Phase::Docs => {
+            "You are now wearing three senior hats in turn — product manager (the \
+             PRD), software architect (the architecture + binding API contract), and UI/UX \
+             designer (the design system: tokens, typography, icon library, anti-template \
+             discipline). Author each document from THAT seat's professional standard."
+        }
+        Phase::Spec => {
+            "You are now working as a senior architect / tech lead. Your remit: \
+             translate the three approved documents into an executable implementation spec \
+             and a task breakdown — concrete, sequenced, and traceable back to the PRD's \
+             requirement ids so coverage maps 1:1."
+        }
+        Phase::Frontend => {
+            "You are now working as a senior frontend engineer. Your remit: \
+             implement the UI from the approved design system — a single source of truth for \
+             design tokens, the declared icon library only, every component state present, and \
+             every data call wired to the architecture's API contract."
+        }
+        Phase::Backend => {
+            "You are now working as a senior backend engineer. Your remit: \
+             implement the server in clean layers, with every endpoint matching the \
+             architecture's API table, inputs validated, a consistent error envelope, and \
+             tests that exercise each route."
+        }
+        Phase::Quality => {
+            "You are now working as a senior QA + security engineer. Your remit: \
+             run the project's REAL build / test / lint, fix what fails, and do a genuine \
+             security pass (secrets, input validation, safe error handling) — sign off only on \
+             what actually passes."
+        }
+        Phase::Delivery => {
+            "You are now working as a senior DevOps / release engineer. Your \
+             remit: verify the production build, capture the runtime evidence, and write the \
+             exact deployment recipe so this can ship — without mutating any remote system."
+        }
+        // Gate phases never receive a directive (the driver pauses before them).
+        Phase::DocsConfirm | Phase::PreviewConfirm => "",
+    }
+}
+
+/// The one-line ROLE PERSONA for a LEAN gateless phase (`Light` / `Bugfix` /
+/// `Refactor`). The lean fast-track has no document phases, so the role is a
+/// short "you are a senior engineer, just implement this" rather than the
+/// document-anchored [`phase_persona`] — keeping the lean path terse while still
+/// stepping the base into an engineer's seat. Generalised, no external source.
+#[must_use]
+pub fn lean_phase_role(phase: umadev_spec::Phase) -> &'static str {
+    use umadev_spec::Phase;
+    match phase {
+        Phase::Spec => "Working as a senior engineer, plan this small change directly.",
+        Phase::Backend => "Working as a senior engineer, implement the server-side part directly.",
+        Phase::Quality => "Working as a senior engineer, verify this change directly.",
+        // Frontend + any stray lean phase: the default "just implement it" seat.
+        _ => "Working as a senior engineer, implement this directly.",
+    }
+}
+
 /// Truncate `text` to at most `max_chars` characters, keeping head.
 /// Returns text with a trailing `…` marker when it had to cut.
 #[must_use]
@@ -746,6 +829,52 @@ mod tests {
         assert!(p.contains("NO research") || p.to_lowercase().contains("no research"));
         // Stays SHORT — the whole point is speed (a fraction of SPEC_PREAMBLE).
         assert!(p.len() < SPEC_PREAMBLE.len(), "lean priming must be terse");
+    }
+
+    #[test]
+    fn phase_persona_names_the_matching_role_per_phase() {
+        use umadev_spec::Phase;
+        // Each executing phase opens by naming its seat's craft.
+        assert!(phase_persona(Phase::Research).contains("product manager"));
+        let docs = phase_persona(Phase::Docs);
+        assert!(docs.contains("product manager"));
+        assert!(docs.contains("architect"));
+        assert!(docs.contains("UI/UX designer") || docs.contains("designer"));
+        assert!(phase_persona(Phase::Spec).contains("architect"));
+        assert!(phase_persona(Phase::Frontend).contains("frontend engineer"));
+        assert!(phase_persona(Phase::Backend).contains("backend engineer"));
+        let qa = phase_persona(Phase::Quality);
+        assert!(qa.contains("QA") && qa.contains("security"));
+        assert!(phase_persona(Phase::Delivery).contains("DevOps"));
+        // Every executing persona states an explicit role identity ("working as").
+        for p in [
+            Phase::Research,
+            Phase::Spec,
+            Phase::Frontend,
+            Phase::Backend,
+            Phase::Quality,
+            Phase::Delivery,
+        ] {
+            assert!(
+                phase_persona(p).to_lowercase().contains("working as")
+                    || phase_persona(p).to_lowercase().contains("wearing"),
+                "phase {p:?} persona must state a role identity"
+            );
+        }
+        // Gate phases never receive a directive → empty persona.
+        assert!(phase_persona(Phase::DocsConfirm).is_empty());
+        assert!(phase_persona(Phase::PreviewConfirm).is_empty());
+    }
+
+    #[test]
+    fn lean_phase_role_is_an_engineer_seat_and_terse() {
+        use umadev_spec::Phase;
+        for p in [Phase::Spec, Phase::Frontend, Phase::Backend, Phase::Quality] {
+            let r = lean_phase_role(p);
+            assert!(r.to_lowercase().contains("engineer"), "lean role for {p:?}");
+            // Terse: a single short line, not a paragraph.
+            assert!(r.len() < 120, "lean role must stay short");
+        }
     }
 
     #[test]
