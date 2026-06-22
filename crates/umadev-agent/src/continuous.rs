@@ -40,13 +40,25 @@
 
 use std::sync::Arc;
 
-use umadev_runtime::{ApprovalDecision, BaseSession, SessionEvent, StreamEvent, TurnStatus};
+use umadev_runtime::{
+    ApprovalDecision, BaseSession, SessionError, SessionEvent, StreamEvent, TurnStatus,
+};
 use umadev_spec::Phase;
 
+use crate::critics::{CriticArtifacts, CriticConsult, RoleCritic, RoleVerdict};
 use crate::events::{EngineEvent, EventSink};
 use crate::gates::Gate;
 use crate::runner::RunOptions;
 use crate::trust::{requires_confirmation, TrustMode};
+
+/// The hard ceiling on rework rounds at any single review node. The critic team
+/// is ADVISORY: it may fold blocking findings into ONE rework directive and
+/// re-review, but the loop is bounded so a base that can't satisfy a seat (or a
+/// flapping verdict) can NEVER spin forever. After this many rounds the node
+/// proceeds regardless — the deterministic floor + the user gate are the real
+/// stop signals, never a critic. Kept small (the docs/preview teams already cost
+/// N advisory base calls per round) so the wall-clock stays bounded.
+const MAX_REWORK_ROUNDS: usize = 2;
 
 /// Read the gradual-rollout switch for the continuous-session path.
 ///
@@ -118,16 +130,17 @@ pub async fn run_block(
         // A gate is a pause point, not a base turn: stop here, let the caller
         // wait for the user, and resume on the next block.
         if phase.is_gate() {
-            // TODO(fork-critic): the role-critic TEAM (PM / architect / UIUX at
-            // the docs gate; UIUX / frontend at the preview gate) belongs HERE —
-            // routed through a `BaseSession::fork()` read-only session so each
-            // seat reviews the main line's output in isolation (see design
-            // §3.5). `BaseSession` has no `fork()` yet, so until it lands the
-            // existing `ForkedConsult` consult path (`runner.rs`) carries the
-            // critic team; this driver gets the main loop right first. Critics
-            // are advisory + fail-open and NEVER drive loop termination, so the
-            // gate semantics above are already correct without them.
+            // The role-critic TEAM reviews the just-produced blackboard HERE,
+            // before we pause for the user: at the docs gate the PM / architect /
+            // UIUX seats review the three docs; at the preview gate the UIUX /
+            // frontend seats review the delivered frontend. Each seat reviews on
+            // its OWN `BaseSession::fork()` read-only session (parallel, isolated,
+            // never writes), and any blocking findings are folded into a bounded
+            // rework loop on the MAIN session (see §3.6). Fully advisory +
+            // fail-open: it NEVER drives the gate decision — the gate still pauses
+            // for the user exactly as before.
             let gate = gate_for_phase(phase);
+            review_and_rework(session, options, events, gate_review_kind(phase)).await;
             events.emit(EngineEvent::GateOpened { gate });
             events.emit(EngineEvent::BlockCompleted {
                 final_phase: phase,
@@ -171,6 +184,15 @@ pub async fn run_block(
             }
         }
         events.emit(EngineEvent::PhaseCompleted { phase });
+
+        // Quality is a REVIEW node too (not a confirm gate): after the quality
+        // phase runs the real build/test/lint, the QA / security / backend /
+        // DevOps seats review the delivered code on read-only forks, and any
+        // blocking findings drive a bounded rework on the main session before
+        // delivery. Advisory + fail-open; never blocks the run.
+        if phase == Phase::Quality {
+            review_and_rework(session, options, events, ReviewKind::Quality).await;
+        }
 
         // HARD STOP (git-independent): after the last code-producing phase, if
         // the plan was supposed to produce code and the workspace has ZERO real
@@ -518,6 +540,515 @@ fn phase_directive(options: &RunOptions, phase: Phase, first: bool) -> String {
     }
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Role-critic team review + bounded rework (see design §3.5 / §3.6)
+//
+// At each review node the director: (1) scales a team to the task, (2) reads the
+// on-disk blackboard the main session just wrote, (3) PARALLEL-forks one
+// read-only session per seat and collects N `RoleVerdict`s, (4) deterministically
+// decides — any `blocking[]` non-empty folds into ONE imperative rework directive
+// injected back into the MAIN session, then re-reviews; all-accept proceeds. The
+// loop is BOUNDED (`MAX_REWORK_ROUNDS` + a stall counter that stops when the
+// blocking count stops dropping). Fully fail-open + advisory: a base with no fork
+// / an offline brain / a parse failure yields empty accepting verdicts → no
+// blocking → proceed. A critic NEVER drives termination; the only hard stops are
+// the deterministic floor + the user gate elsewhere.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Which review node is running — selects the team + the blackboard surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewKind {
+    /// The docs gate: PM / architect / UIUX review the three core documents.
+    Docs,
+    /// The preview gate: UIUX / frontend review the delivered frontend.
+    Preview,
+    /// The quality node: QA / security / backend / DevOps review the code.
+    Quality,
+}
+
+/// Map a gate phase to its review node kind.
+fn gate_review_kind(phase: Phase) -> ReviewKind {
+    match phase {
+        Phase::PreviewConfirm => ReviewKind::Preview,
+        // DocsConfirm + any defensive other → docs review.
+        _ => ReviewKind::Docs,
+    }
+}
+
+/// Run the cross-review team for a node, then drive a BOUNDED rework loop on the
+/// main session. Deterministic control: the loop continues only while a seat
+/// reports a NEW blocking finding AND the round budget + stall counter allow it.
+/// Advisory + fail-open throughout — it never returns a verdict that blocks the
+/// run; the gate/floor decide that elsewhere.
+async fn review_and_rework(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    kind: ReviewKind,
+) {
+    // Scale the team to the task; an empty team (lean / no-UI / docs-only paths)
+    // means "no cross-review here" — return immediately, the floor stands.
+    let team = team_for(kind, &options.requirement);
+    if team.is_empty() {
+        return;
+    }
+
+    let mut prev_blocking = usize::MAX;
+    for round in 0..=MAX_REWORK_ROUNDS {
+        // 1. Read the blackboard FRESH each round (the rework may have rewritten
+        //    it) and run the team in parallel on read-only forks.
+        let blocking = run_review_team(session, options, events, kind, &team, round).await;
+
+        // 2. All-accept (or fail-open empty) → proceed. This is the only success
+        //    exit; everything else is bounded rework.
+        if blocking.is_empty() {
+            if round > 0 {
+                events.emit(EngineEvent::Note(format!(
+                    "[team] {} 评审通过(返工 {round} 轮后无阻塞项),推进。",
+                    kind_label(kind)
+                )));
+            }
+            return;
+        }
+
+        // 3. Deterministic stall / budget guard: stop reworking when we've spent
+        //    the round budget OR the blocking count did not DROP (no progress —
+        //    the base can't satisfy a seat, or a flapping verdict). Either way we
+        //    proceed: the critic is advisory and must never wedge the run.
+        let made_progress = blocking.len() < prev_blocking;
+        if round == MAX_REWORK_ROUNDS || !made_progress {
+            events.emit(EngineEvent::Note(format!(
+                "[team] {} 仍有 {} 个阻塞项(返工已达上限/未见收敛),作为顾问意见保留,继续推进。",
+                kind_label(kind),
+                blocking.len()
+            )));
+            return;
+        }
+        prev_blocking = blocking.len();
+
+        // 4. Fold every blocking finding into ONE imperative rework directive and
+        //    inject it into the MAIN session — the base fixes the files in the
+        //    SAME context, then the next loop iteration re-reviews.
+        events.emit(EngineEvent::Note(format!(
+            "[team] {} 评审提出 {} 个阻塞项 — 注入返工指令到主会话(第 {} 轮)…",
+            kind_label(kind),
+            blocking.len(),
+            round + 1
+        )));
+        let directive = rework_directive(kind, &blocking);
+        if !drive_rework_turn(session, options, events, directive).await {
+            // The rework turn failed / the session died — stop reworking (the
+            // outer loop's phase/turn handling already surfaced the failure path).
+            // Fail-open: leave the findings as advisory and proceed.
+            return;
+        }
+    }
+}
+
+/// The team for a review node, scaled to the task via the planner's tiering.
+fn team_for(kind: ReviewKind, requirement: &str) -> Vec<Box<dyn RoleCritic>> {
+    let tier = crate::planner::classify(requirement);
+    match kind {
+        ReviewKind::Docs => crate::critics::docs_team_for_kind(tier),
+        ReviewKind::Preview => crate::critics::preview_team_for_kind(tier),
+        ReviewKind::Quality => crate::critics::quality_team_for_kind(tier),
+    }
+}
+
+/// Run the whole team in PARALLEL — one read-only `BaseSession::fork()` per seat
+/// — and return the deduped union of every seat's `blocking[]`, tagged with the
+/// seat. Each verdict is recorded to the team ledger. Fully fail-open: a base
+/// that can't fork, an offline brain, or a parse failure yields empty accepting
+/// verdicts → no blocking.
+async fn run_review_team(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    kind: ReviewKind,
+    team: &[Box<dyn RoleCritic>],
+    round: usize,
+) -> Vec<String> {
+    // Read the on-disk blackboard ONCE (every seat reviews the same snapshot).
+    let bb = Blackboard::read(options, kind);
+    let arts = bb.artifacts(&options.requirement);
+
+    events.emit(EngineEvent::Note(format!(
+        "[team] {} 角色团队交叉评审(只读分叉,并行):{} 名 critic 各从本职审一遍…",
+        kind_label(kind),
+        team.len()
+    )));
+
+    // PARALLEL: fork one read-only session per seat up front (each `fork()` is a
+    // quick `&mut` borrow that returns an OWNED, independent session), then drive
+    // every critic concurrently — the reviews hold only their own forks, never
+    // the main session. `fork()` is independent per call, so the N reviews never
+    // collide and never touch the main writer (single-writer invariant). A fork
+    // failure is per-seat fail-open: that seat consults nothing and ACCEPTS.
+    let mut forks = Vec::with_capacity(team.len());
+    for _ in team {
+        forks.push(session.fork().await);
+    }
+    let reviews = team
+        .iter()
+        .zip(forks)
+        .map(|(critic, fork)| review_one(critic.as_ref(), fork, arts));
+    let verdicts = crate::runner::join_all_ordered(reviews).await;
+
+    // Sequentially (deterministic order) record + fold blocking — the seat order
+    // is the team order regardless of which fork finished first.
+    let phase_label = kind_phase_label(kind);
+    let mut blocking: Vec<String> = Vec::new();
+    for verdict in verdicts {
+        crate::critics::append_team_ledger(&options.project_root, phase_label, round + 1, &verdict);
+        let seat = verdict.role.clone();
+        if verdict.accepts && verdict.blocking.is_empty() {
+            events.emit(EngineEvent::Note(format!("[team] {seat}:通过,无阻塞项。")));
+        } else if !verdict.blocking.is_empty() {
+            events.emit(EngineEvent::Note(format!(
+                "[team] {seat}:提出 {} 个阻塞项。",
+                verdict.blocking.len()
+            )));
+            for b in verdict.blocking {
+                let item = format!("[{seat}] {}", b.trim());
+                if item.len() > 6 && !blocking.contains(&item) {
+                    blocking.push(item);
+                }
+            }
+        }
+    }
+    blocking
+}
+
+/// Drive ONE critic over its (possibly failed) fork, fail-open to an accepting
+/// empty verdict. The critic's `review` runs its strict-JSON judge turn through a
+/// [`ForkConsult`] that owns the fork; a fork that didn't open routes to a
+/// fail-open consult that simply ACCEPTS.
+async fn review_one(
+    critic: &dyn RoleCritic,
+    fork: Result<Box<dyn BaseSession>, SessionError>,
+    arts: CriticArtifacts<'_>,
+) -> RoleVerdict {
+    let consult = ForkConsult::new(fork);
+    let verdict = critic.review(&consult, arts).await;
+    // Best-effort close the fork session (release the process / HTTP session).
+    consult.end().await;
+    verdict
+}
+
+/// Inject the rework directive into the MAIN session and pump its turn through
+/// the SAME governance + audit + approval path a normal phase turn uses. Returns
+/// `true` when the turn finished (clean or truncated-but-accepted), `false` on a
+/// failed turn / a dead session (fail-open: the caller stops reworking).
+async fn drive_rework_turn(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+) -> bool {
+    if session.send_turn(directive).await.is_err() {
+        return false;
+    }
+    let policy = umadev_governance::Policy::load(&options.project_root);
+    loop {
+        let Some(ev) = session.next_event().await else {
+            return false; // session ended mid-rework → fail-open stop
+        };
+        match ev {
+            SessionEvent::TextDelta(text) => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::Text { delta: text },
+                });
+            }
+            SessionEvent::ToolCall { name, input } => {
+                // Rework writes real files — govern + audit them exactly like a
+                // phase turn (the rework runs on the main writer session).
+                govern_tool_call(options, events, &policy, Phase::Quality, &name, &input);
+            }
+            SessionEvent::ToolResult { ok, summary } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolResult { ok, summary },
+                });
+            }
+            SessionEvent::NeedApproval {
+                req_id,
+                action,
+                target,
+            } => {
+                let decision = approval_decision(options.mode, &action, &target);
+                if session.respond(&req_id, decision).await.is_err() {
+                    return false;
+                }
+            }
+            SessionEvent::TurnDone { status } => {
+                // Completed / Truncated → accept and re-review; Interrupted /
+                // Failed → stop reworking (fail-open, advisory).
+                return matches!(status, TurnStatus::Completed | TurnStatus::Truncated);
+            }
+        }
+    }
+}
+
+/// Build ONE imperative rework directive from the union of every seat's blocking
+/// findings. Command-style ("fix these now, edit the files directly") so the
+/// base acts in its live agentic loop rather than narrating.
+fn rework_directive(kind: ReviewKind, blocking: &[String]) -> String {
+    let surface = match kind {
+        ReviewKind::Docs => "the three core documents (PRD / architecture / UI-UX)",
+        ReviewKind::Preview => "the delivered frontend code",
+        ReviewKind::Quality => "the delivered code (frontend + backend + tests)",
+    };
+    let mut list = String::new();
+    for b in blocking {
+        list.push_str("- ");
+        list.push_str(b);
+        list.push('\n');
+    }
+    format!(
+        "The review team flagged MUST-FIX issues in {surface}. Fix EVERY one of them \
+         now by editing the files directly — do not ask me, do not narrate, just apply \
+         the fixes and re-run any build/test you already ran. Issues:\n{list}\nWhen all \
+         are fixed, end your turn."
+    )
+}
+
+/// The on-disk blackboard surface for a review node — the docs / code the main
+/// session wrote, read fresh so a rework round reviews the UPDATED files. Owns
+/// its strings so the borrowed [`CriticArtifacts`] can point into it.
+struct Blackboard {
+    prd: String,
+    architecture: String,
+    uiux: String,
+    code: String,
+    qa_floor: String,
+    security_floor: String,
+}
+
+impl Blackboard {
+    /// Read the surface a review node needs. Docs → the three `output/*.md`;
+    /// preview / quality → the architecture/UIUX context + a digest of the real
+    /// source files. All reads are fail-open (a missing file → empty string).
+    fn read(options: &RunOptions, kind: ReviewKind) -> Self {
+        let slug = options.effective_slug();
+        let root = &options.project_root;
+        let doc = |name: &str| {
+            std::fs::read_to_string(root.join(format!("output/{slug}-{name}.md")))
+                .unwrap_or_default()
+        };
+        let (prd, architecture, uiux) = (doc("prd"), doc("architecture"), doc("uiux"));
+        let code = if matches!(kind, ReviewKind::Preview | ReviewKind::Quality) {
+            source_digest(options)
+        } else {
+            String::new()
+        };
+        Self {
+            prd,
+            architecture,
+            uiux,
+            code,
+            // The deterministic floors are surfaced as CONTEXT to the QA /
+            // security seats (so their semantic pass focuses on what a static
+            // check can't see). Empty for the docs / preview nodes.
+            qa_floor: String::new(),
+            security_floor: String::new(),
+        }
+    }
+
+    /// Borrow the blackboard as the critic-facing [`CriticArtifacts`].
+    fn artifacts<'a>(&'a self, requirement: &'a str) -> CriticArtifacts<'a> {
+        CriticArtifacts {
+            requirement,
+            prd: &self.prd,
+            architecture: &self.architecture,
+            uiux: &self.uiux,
+            code: &self.code,
+            qa_floor: &self.qa_floor,
+            security_floor: &self.security_floor,
+        }
+    }
+}
+
+/// A bounded, newest-first digest of the real source files for the code-review
+/// seats — the same blackboard the QA / frontend / backend / DevOps critics read.
+/// Capped so a large tree can't blow the judge prompt (the critics also excerpt).
+fn source_digest(options: &RunOptions) -> String {
+    let files = crate::acceptance::source_files(&options.project_root);
+    let mut out = String::new();
+    for f in files.iter().take(40) {
+        let Ok(content) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let rel = f
+            .strip_prefix(&options.project_root)
+            .unwrap_or(f)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        out.push_str("\n// ===== ");
+        out.push_str(&rel);
+        out.push_str(" =====\n");
+        out.push_str(&crate::experts::excerpt(&content, 4000));
+        out.push('\n');
+        if out.len() >= 60_000 {
+            break;
+        }
+    }
+    out
+}
+
+/// A [`CriticConsult`] that routes a seat's strict-JSON judge turn to a READ-ONLY
+/// `BaseSession::fork()`. The fork is owned for the seat's lifetime; a fork that
+/// failed to open (or an offline brain) makes `judge` fail-open to the empty
+/// (accepting) verdict — an absent critic can NEVER block (invariant 1).
+struct ForkConsult {
+    /// The read-only fork, or the error that prevented opening one. `Mutex` so
+    /// the `&self` `judge` can drive the `&mut` session.
+    fork: tokio::sync::Mutex<Result<Box<dyn BaseSession>, SessionError>>,
+}
+
+impl ForkConsult {
+    fn new(fork: Result<Box<dyn BaseSession>, SessionError>) -> Self {
+        Self {
+            fork: tokio::sync::Mutex::new(fork),
+        }
+    }
+
+    /// Best-effort close the underlying fork session.
+    async fn end(&self) {
+        if let Ok(s) = self.fork.lock().await.as_mut() {
+            let _ = s.end().await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CriticConsult for ForkConsult {
+    async fn judge(&self, role: &str, system: &str, user: String) -> RoleVerdict {
+        let mut guard = self.fork.lock().await;
+        let Ok(fork) = guard.as_mut() else {
+            // No fork (unsupported / failed) → fail-open ACCEPT.
+            return RoleVerdict::empty(role);
+        };
+        // One strict-JSON judge turn on the read-only fork. The directive pins the
+        // role + the JSON shape (the critic's `system`) and carries the artifacts
+        // (`user`); we drain the fork's events for the assistant text, then parse.
+        let directive = format!(
+            "{system}\n\nReturn EXACTLY ONE JSON object and nothing else — no markdown, \
+             no code fence, no prose before or after.\n\n{user}"
+        );
+        if fork.send_turn(directive).await.is_err() {
+            return RoleVerdict::empty(role);
+        }
+        // Bound the judge turn so one wedged fork can't hang the whole gate.
+        match tokio::time::timeout(review_turn_timeout(), drain_review_text(fork)).await {
+            // A clean TurnDone with the collected text → parse the verdict.
+            Ok(Some(text)) => parse_verdict(role, &text),
+            // Timed out / session ended without a clean TurnDone → fail-open ACCEPT.
+            _ => RoleVerdict::empty(role),
+        }
+    }
+}
+
+/// Drain a read-only fork's events until its `TurnDone`, returning the collected
+/// assistant text (`Some`) — or `None` if the session ended first. Tool noise on
+/// a read-only fork is ignored. Split out of `judge` to keep nesting shallow.
+async fn drain_review_text(fork: &mut Box<dyn BaseSession>) -> Option<String> {
+    let mut text = String::new();
+    while let Some(ev) = fork.next_event().await {
+        match ev {
+            SessionEvent::TextDelta(t) => text.push_str(&t),
+            SessionEvent::TurnDone { .. } => return Some(text),
+            // A read-only fork should not write; ignore any tool noise.
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse a fork's judge reply into a [`RoleVerdict`], fail-open to the empty
+/// (accepting) verdict when no JSON object is found / it doesn't deserialize.
+fn parse_verdict(role: &str, text: &str) -> RoleVerdict {
+    let Some(json) = extract_json_object(text) else {
+        return RoleVerdict::empty(role);
+    };
+    serde_json::from_str::<RoleVerdict>(&json)
+        .map(|v| v.normalized(role))
+        .unwrap_or_else(|_| RoleVerdict::empty(role))
+}
+
+/// Extract the first balanced top-level JSON object from `text` (the judge reply
+/// may carry stray prose despite the strict-JSON instruction). Mirrors the
+/// runner's tolerant extractor — string/escape aware so a `}` inside a string
+/// can't close the object early.
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            in_str = in_string_step(b, &mut esc);
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(start..=i).map(str::to_string);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// One byte of in-string scanning: track the escape state and report whether the
+/// scanner is STILL inside the string after this byte. Split out so
+/// [`extract_json_object`] stays a flat single-level loop.
+fn in_string_step(b: u8, esc: &mut bool) -> bool {
+    if *esc {
+        *esc = false;
+        true // an escaped char never ends the string
+    } else if b == b'\\' {
+        *esc = true;
+        true
+    } else {
+        b != b'"' // a bare quote ends the string
+    }
+}
+
+/// Timeout for one read-only judge turn. Advisory reviews are discardable, so a
+/// wedged fork must never hang the gate — it fails open to ACCEPT. Overridable
+/// via `UMADEV_REVIEW_TURN_TIMEOUT_SECS` for slow machines / CI.
+fn review_turn_timeout() -> std::time::Duration {
+    std::env::var("UMADEV_REVIEW_TURN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or_else(
+            || std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs,
+        )
+}
+
+/// Short human label for a review node (for operator Notes).
+fn kind_label(kind: ReviewKind) -> &'static str {
+    match kind {
+        ReviewKind::Docs => "文档门",
+        ReviewKind::Preview => "预览门",
+        ReviewKind::Quality => "质量",
+    }
+}
+
+/// The phase id used in the team ledger for a review node.
+fn kind_phase_label(kind: ReviewKind) -> &'static str {
+    match kind {
+        ReviewKind::Docs => "docs",
+        ReviewKind::Preview => "preview",
+        ReviewKind::Quality => "quality",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +1075,14 @@ mod tests {
         responded: Arc<Mutex<Vec<(String, ApprovalDecision)>>>,
         /// When true, `next_event` yields `None` immediately (session death).
         die: bool,
+        /// Verdict JSON the SUCCESSIVE `fork()` calls hand back — one per call,
+        /// front-to-back. `Some(json)` → that fork emits the JSON as its judge
+        /// reply then `TurnDone`; `None` → that fork FAILS (`ForkUnsupported`),
+        /// exercising the per-seat fail-open path. Shared so a test can assert the
+        /// fork count and the main session can mutate it from `&self`-ish `fork`.
+        fork_script: Arc<Mutex<std::collections::VecDeque<Option<String>>>>,
+        /// How many forks were opened (asserted by tests).
+        forks_opened: Arc<Mutex<usize>>,
     }
 
     impl FakeBaseSession {
@@ -554,6 +1093,8 @@ mod tests {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 responded: Arc::new(Mutex::new(Vec::new())),
                 die: false,
+                fork_script: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+                forks_opened: Arc::new(Mutex::new(0)),
             }
         }
         fn dying() -> Self {
@@ -561,16 +1102,49 @@ mod tests {
             s.die = true;
             s
         }
+        /// Script the successive `fork()` calls with the given verdict replies
+        /// (`Some(json)` = a verdict-emitting fork, `None` = a failing fork).
+        fn with_fork_script(mut self, verdicts: Vec<Option<String>>) -> Self {
+            self.fork_script = Arc::new(Mutex::new(verdicts.into_iter().collect()));
+            self
+        }
         fn sent_handle(&self) -> Arc<Mutex<Vec<String>>> {
             Arc::clone(&self.sent)
         }
         fn responded_handle(&self) -> Arc<Mutex<Vec<(String, ApprovalDecision)>>> {
             Arc::clone(&self.responded)
         }
+        fn forks_handle(&self) -> Arc<Mutex<usize>> {
+            Arc::clone(&self.forks_opened)
+        }
+        /// A leaf fork session: emits `verdict` text then a clean TurnDone.
+        fn verdict_fork(verdict: &str) -> Self {
+            Self::new(vec![vec![
+                SessionEvent::TextDelta(verdict.to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                },
+            ]])
+        }
     }
 
     #[async_trait::async_trait]
     impl BaseSession for FakeBaseSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            *self.forks_opened.lock().unwrap() += 1;
+            // Pop the next scripted fork outcome. An empty script → a default
+            // accepting verdict (so a test that doesn't care still gets a clean,
+            // fail-open ACCEPT). `None` → this fork fails (fail-open path).
+            let next = self.fork_script.lock().unwrap().pop_front();
+            match next {
+                Some(Some(json)) => Ok(Box::new(Self::verdict_fork(&json))),
+                Some(None) => Err(SessionError::ForkUnsupported(
+                    "scripted fork failure".into(),
+                )),
+                None => Ok(Box::new(Self::verdict_fork(r#"{"accepts":true}"#))),
+            }
+        }
+
         async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
             self.sent.lock().unwrap().push(directive);
             // Load the next scripted turn (or an immediate clean TurnDone if the
@@ -850,5 +1424,248 @@ mod tests {
             sent.lock().unwrap().is_empty(),
             "plan mode sent no executing directive"
         );
+    }
+
+    // ── Critic-team review + bounded rework (the §3.5 / §3.6 closure) ──────
+
+    #[test]
+    fn gate_review_kind_maps_phases() {
+        assert_eq!(gate_review_kind(Phase::DocsConfirm), ReviewKind::Docs);
+        assert_eq!(gate_review_kind(Phase::PreviewConfirm), ReviewKind::Preview);
+    }
+
+    #[test]
+    fn team_for_scales_with_the_kind() {
+        // A greenfield requirement seats the full docs team; a one-line tweak
+        // seats none (the deterministic floor stands).
+        assert_eq!(
+            team_for(
+                ReviewKind::Docs,
+                "build a SaaS dashboard web app with login"
+            )
+            .len(),
+            3
+        );
+        assert!(team_for(ReviewKind::Docs, "fix a typo in the readme").is_empty());
+    }
+
+    #[test]
+    fn extract_json_object_is_string_aware() {
+        // A `}` inside a string must NOT close the object early.
+        let s = r#"prose {"blocking": ["a } b"], "accepts": false} trailing"#;
+        let j = extract_json_object(s).unwrap();
+        assert!(j.starts_with('{') && j.ends_with('}'));
+        let v: RoleVerdict = serde_json::from_str(&j).unwrap();
+        assert!(!v.accepts);
+        assert_eq!(v.blocking, vec!["a } b".to_string()]);
+        // No object at all → None.
+        assert!(extract_json_object("no json here").is_none());
+    }
+
+    #[test]
+    fn parse_verdict_fail_open_on_garbage() {
+        // Garbage / no JSON → the empty accepting verdict (fail-open).
+        let v = parse_verdict("architect", "the base rambled with no json");
+        assert!(v.accepts && v.blocking.is_empty());
+        assert_eq!(v.role, "architect");
+        // A real blocking verdict parses + is tagged with the role.
+        let v = parse_verdict(
+            "qa-engineer",
+            r#"{"accepts":false,"blocking":["no tests"]}"#,
+        );
+        assert!(!v.accepts);
+        assert_eq!(v.role, "qa-engineer");
+        assert_eq!(v.blocking, vec!["no tests".to_string()]);
+    }
+
+    #[test]
+    fn rework_directive_folds_every_blocking_item() {
+        let d = rework_directive(
+            ReviewKind::Docs,
+            &[
+                "[architect] no API table".into(),
+                "[product-manager] no KPIs".into(),
+            ],
+        );
+        assert!(d.contains("MUST-FIX"));
+        assert!(d.contains("no API table"));
+        assert!(d.contains("no KPIs"));
+        // Command-style: tells the base to edit directly + end the turn.
+        assert!(d.to_lowercase().contains("editing the files directly"));
+        assert!(d.to_lowercase().contains("end your turn"));
+    }
+
+    /// Write the three docs to the blackboard so the docs team has something
+    /// substantive to review (the team skips an empty blackboard).
+    fn seed_docs(root: &Path) {
+        let dir = root.join("output");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["prd", "architecture", "uiux"] {
+            std::fs::write(
+                dir.join(format!("demo-{name}.md")),
+                format!("# {name}\n## section\nsubstantive content for review\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn docs_gate_runs_parallel_review_all_accept_then_pauses() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        // research + docs turns, then the docs gate forks a 3-seat team — script
+        // all three to ACCEPT so the gate proceeds with no rework.
+        let mut session =
+            FakeBaseSession::new(vec![vec![done()], vec![done()]]).with_fork_script(vec![
+                Some(r#"{"accepts":true}"#.into()),
+                Some(r#"{"accepts":true}"#.into()),
+                Some(r#"{"accepts":true}"#.into()),
+            ]);
+        let forks = session.forks_handle();
+        let sent = session.sent_handle();
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+
+        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        // Three read-only forks opened (one per docs seat), run in parallel.
+        assert_eq!(*forks.lock().unwrap(), 3, "one fork per docs seat");
+        // All-accept → NO rework directive injected into the main session
+        // (research + docs only).
+        assert_eq!(sent.lock().unwrap().len(), 2, "no rework on all-accept");
+    }
+
+    #[tokio::test]
+    async fn docs_gate_blocking_injects_one_rework_then_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        // Round 0: one seat BLOCKS (3 forks). Round 1 (re-review after rework):
+        // all 3 accept (3 more forks). So 6 forks, ONE rework directive.
+        let mut session =
+            FakeBaseSession::new(vec![vec![done()], vec![done()]]).with_fork_script(vec![
+                Some(r#"{"accepts":false,"blocking":["no API surface table"]}"#.into()),
+                Some(r#"{"accepts":true}"#.into()),
+                Some(r#"{"accepts":true}"#.into()),
+                // re-review round → all accept
+                Some(r#"{"accepts":true}"#.into()),
+                Some(r#"{"accepts":true}"#.into()),
+                Some(r#"{"accepts":true}"#.into()),
+            ]);
+        let sent = session.sent_handle();
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+
+        let directives = sent.lock().unwrap();
+        // research + docs + exactly ONE rework directive.
+        assert_eq!(
+            directives.len(),
+            3,
+            "exactly one rework injected: {directives:?}"
+        );
+        assert!(
+            directives[2].contains("no API surface table"),
+            "rework folds the blocking finding: {}",
+            directives[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_gate_rework_is_bounded_when_blocking_never_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        // EVERY review round returns the SAME single blocking item (no progress).
+        // Plenty of scripted forks so the bound — not the script — stops the loop.
+        let blocking = || Some(r#"{"accepts":false,"blocking":["unfixable gap"]}"#.to_string());
+        let accept = || Some(r#"{"accepts":true}"#.to_string());
+        let mut script = Vec::new();
+        for _ in 0..6 {
+            // round: one blocks, two accept (count stays 1 → stall after round 0)
+            script.push(blocking());
+            script.push(accept());
+            script.push(accept());
+        }
+        let mut session =
+            FakeBaseSession::new(vec![vec![done()], vec![done()]]).with_fork_script(script);
+        let sent = session.sent_handle();
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+
+        // The blocking count never DROPS (stays 1), so the stall guard stops after
+        // the FIRST rework: research + docs + at most MAX_REWORK_ROUNDS reworks.
+        // It MUST be bounded — never spins on the unfixable gap.
+        let n = sent.lock().unwrap().len();
+        assert!(
+            (2..=2 + MAX_REWORK_ROUNDS).contains(&n),
+            "rework must be bounded, got {n} directives"
+        );
+    }
+
+    #[tokio::test]
+    async fn docs_gate_fork_failure_fails_open_to_accept() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        // EVERY fork FAILS (`None`) → each seat fail-opens to ACCEPT → no
+        // blocking → no rework → the gate proceeds normally.
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]])
+            .with_fork_script(vec![None, None, None]);
+        let forks = session.forks_handle();
+        let sent = session.sent_handle();
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        assert_eq!(
+            *forks.lock().unwrap(),
+            3,
+            "still attempts one fork per seat"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "fork-fail fail-open → no rework"
+        );
+    }
+
+    #[tokio::test]
+    async fn lean_tweak_seats_no_team_and_does_not_fork() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        // A trivial tweak → no docs team → no fork at the gate.
+        let options = opts(
+            tmp.path(),
+            "fix a typo in the footer text",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]]);
+        let forks = session.forks_handle();
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        assert_eq!(outcome, RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        assert_eq!(*forks.lock().unwrap(), 0, "lean task opens no review forks");
     }
 }

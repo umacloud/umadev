@@ -251,6 +251,32 @@ impl OpenCodeSession {
 
 #[async_trait]
 impl BaseSession for OpenCodeSession {
+    async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+        // A read-only critic fork: open a NEW, INDEPENDENT opencode session on
+        // the SAME resident server, but with a DENY ruleset so every tool call
+        // that would mutate the workspace is rejected (the single-writer
+        // invariant — only the main session writes the blackboard). A separate
+        // session id means it can never collide with the main writer's in-flight
+        // turn. The fork reads the same on-disk blackboard the main line wrote.
+        //
+        // Fail-open: a `create_session` failure surfaces as `Start`, which the
+        // caller treats exactly like `ForkUnsupported` (degrade, never block).
+        let session_id = self
+            .http
+            .create_readonly_session()
+            .await
+            .map_err(SessionError::Start)?;
+        // Its own SSE subscription, scoped to the fork session id.
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+        tokio::spawn(pump_sse(self.http.clone(), session_id.clone(), tx));
+        Ok(Box::new(OpenCodeForkSession {
+            http: self.http.clone(),
+            session_id,
+            events: rx,
+            turn_active: false,
+        }))
+    }
+
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
         // `prompt_async` returns immediately (202/NoContent) and the same
         // session retains context. Serial discipline: the runner only sends the
@@ -306,6 +332,74 @@ impl BaseSession for OpenCodeSession {
         // orphan `opencode serve` lingers (kill_on_drop is a backstop).
         let _ = self.http.delete_session(&self.session_id).await;
         let _ = self.child.start_kill();
+        Ok(())
+    }
+}
+
+/// A READ-ONLY critic fork of an [`OpenCodeSession`]: a SEPARATE opencode
+/// session (created with a deny ruleset) on the SAME resident `opencode serve`.
+///
+/// Unlike the main session it does NOT own the server child — the parent owns
+/// the `opencode serve` process lifetime — so `end()` only deletes its own
+/// session id and never kills the shared server. A critic seat drives it like
+/// any [`BaseSession`]: one strict-JSON judge directive, drain events for the
+/// verdict text, end. Its deny ruleset + its own session id keep it read-only
+/// and collision-free with the main writer (the single-writer invariant).
+pub struct OpenCodeForkSession {
+    http: HttpCtx,
+    session_id: String,
+    events: mpsc::Receiver<SessionEvent>,
+    turn_active: bool,
+}
+
+#[async_trait]
+impl BaseSession for OpenCodeForkSession {
+    async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
+        self.turn_active = true;
+        self.http
+            .prompt_async(&self.session_id, &directive)
+            .await
+            .map_err(SessionError::Send)
+    }
+
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        let ev = self.events.recv().await;
+        if matches!(ev, Some(SessionEvent::TurnDone { .. }) | None) {
+            self.turn_active = false;
+        }
+        ev
+    }
+
+    async fn respond(
+        &mut self,
+        req_id: &str,
+        decision: ApprovalDecision,
+    ) -> Result<(), SessionError> {
+        // A read-only fork should never need to approve a write, but honor the
+        // contract: Allow→`once`, Deny→`reject` (the deny ruleset means the base
+        // would already have rejected the mutating call).
+        let reply = match decision {
+            ApprovalDecision::Allow => "once",
+            ApprovalDecision::Deny => "reject",
+        };
+        self.http
+            .permission_reply(req_id, reply)
+            .await
+            .map_err(SessionError::Send)
+    }
+
+    async fn interrupt(&mut self) -> Result<(), SessionError> {
+        self.turn_active = false;
+        self.http
+            .abort(&self.session_id)
+            .await
+            .map_err(SessionError::Send)
+    }
+
+    async fn end(&mut self) -> Result<(), SessionError> {
+        // Delete ONLY this fork's session — NEVER the shared resident server
+        // (the parent OpenCodeSession owns that child's lifetime).
+        let _ = self.http.delete_session(&self.session_id).await;
         Ok(())
     }
 }
@@ -388,6 +482,34 @@ impl HttpCtx {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| "POST /session: response missing `id`".to_string())
+    }
+
+    /// `POST /session` with a DENY ruleset — a READ-ONLY session for a critic
+    /// fork. `*`/`*`/`deny` rejects every tool call that would mutate the
+    /// workspace, so the seat can read the blackboard but never writes it (the
+    /// single-writer invariant). Returns the created `session.id`.
+    async fn create_readonly_session(&self) -> Result<String, String> {
+        let body = json!({
+            "permission": [{ "permission": "*", "pattern": "*", "action": "deny" }],
+            "agent": "build",
+        });
+        let resp = self
+            .req(reqwest::Method::POST, "/session")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("POST /session (fork): {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("POST /session (fork): HTTP {}", resp.status()));
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("POST /session (fork) decode: {e}"))?;
+        v.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "POST /session (fork): response missing `id`".to_string())
     }
 
     /// `POST /session/:id/prompt_async` — inject a phase directive. Returns
@@ -1178,6 +1300,41 @@ mod tests {
             "last event must be a clean idle TurnDone: {got:?}"
         );
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn create_readonly_session_sends_deny_ruleset() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // The body must carry a DENY ruleset — the read-only fence.
+                assert!(
+                    req.contains("\"action\":\"deny\""),
+                    "fork session must request a deny ruleset: {req}"
+                );
+                let body = br#"{"id":"ses_fork"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, resp.as_bytes()).await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut sock, body).await;
+            }
+        });
+        let http = HttpCtx::new(format!("http://{addr}"), "pw", Path::new("/proj"));
+        let id = http
+            .create_readonly_session()
+            .await
+            .expect("read-only session created");
+        assert_eq!(id, "ses_fork");
         server.abort();
     }
 

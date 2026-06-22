@@ -125,6 +125,15 @@ pub struct CodexSession {
     /// `turn/start`'s result; needed for `turn/interrupt` / `turn/steer`.
     /// `Mutex` because the reader updates it while control methods read it.
     turn_id: TurnId,
+    /// The resolved `codex` program, kept so a read-only
+    /// [`fork`](BaseSession::fork) spawns the SAME binary (honoring a test fake /
+    /// `UMADEV_CODEX_BIN`).
+    program: String,
+    /// The workspace, so a fork resumes the thread in the same project dir.
+    workspace: std::path::PathBuf,
+    /// The model id this session was started with, forwarded to a fork's
+    /// `thread/resume` so the critic uses the same brain.
+    model: String,
     /// Keep the child handle so it is killed on drop (`kill_on_drop`).
     _child: tokio::process::Child,
 }
@@ -192,10 +201,84 @@ impl CodexSession {
             next_id: AtomicI64::new(1),
             thread_id: String::new(),
             turn_id,
+            program: program.to_string(),
+            workspace: workspace.to_path_buf(),
+            model: model.to_string(),
             _child: child,
         };
         session.handshake(workspace, model, autonomous).await?;
         Ok(session)
+    }
+
+    /// Start a READ-ONLY critic fork: a fresh, independent `codex app-server`
+    /// that RESUMES the main thread (`fork_thread_id`) in a read-only sandbox.
+    ///
+    /// Forking onto its OWN process means the critic can never collide with the
+    /// main writer session's in-flight turn (single-writer invariant), and
+    /// `sandbox:"readOnly"` + `approvalPolicy:"never"` fence it so it can read the
+    /// blackboard + the prior context but can NEVER write a file. Resuming the
+    /// main thread id gives the seat the main line's accumulated context.
+    ///
+    /// Fail-open: a spawn / handshake failure surfaces as [`SessionError::Start`],
+    /// which the caller treats exactly like `ForkUnsupported` (degrade, never
+    /// block).
+    async fn start_fork(
+        program: &str,
+        workspace: &Path,
+        model: &str,
+        fork_thread_id: &str,
+    ) -> Result<Self, SessionError> {
+        let mut child = spawn_app_server(program, workspace)?;
+        let stdin = take_pipe(child.stdin.take(), "stdin")?;
+        let stdout = take_pipe(child.stdout.take(), "stdout")?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(drain_stderr(stderr));
+        }
+        let stdin = Arc::new(Mutex::new(stdin));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        tokio::spawn(reader_loop(
+            stdout,
+            Arc::clone(&pending),
+            Arc::clone(&approvals),
+            Arc::clone(&turn_id),
+            event_tx,
+        ));
+        let session = Self {
+            stdin,
+            events: event_rx,
+            pending,
+            approvals,
+            next_id: AtomicI64::new(1),
+            thread_id: fork_thread_id.to_string(),
+            turn_id,
+            program: program.to_string(),
+            workspace: workspace.to_path_buf(),
+            model: model.to_string(),
+            _child: child,
+        };
+        session.fork_handshake(fork_thread_id).await?;
+        Ok(session)
+    }
+
+    /// Run `initialize → initialized → thread/resume` for a read-only fork.
+    async fn fork_handshake(&self, fork_thread_id: &str) -> Result<(), SessionError> {
+        self.request("initialize", &initialize_params())
+            .await
+            .map_err(|e| SessionError::Start(format!("codex fork initialize: {e}")))?;
+        self.notify("initialized", json!({}))
+            .await
+            .map_err(|e| SessionError::Start(format!("codex fork initialized: {e}")))?;
+        // Resume the main thread on this independent server, read-only.
+        self.request(
+            "thread/resume",
+            &thread_resume_params(fork_thread_id, &self.workspace, &self.model),
+        )
+        .await
+        .map_err(|e| SessionError::Start(format!("codex thread/resume: {e}")))?;
+        Ok(())
     }
 
     /// Run `initialize → initialized → thread/start` and capture `thread.id`.
@@ -321,6 +404,30 @@ fn thread_start_params(workspace: &Path, model: &str, autonomous: bool) -> Value
         params["model"] = json!(m);
     }
     params
+}
+
+/// Build the `thread/resume` params for a READ-ONLY critic fork: resume
+/// `thread_id` in `workspace` with `sandbox:"readOnly"` + `approvalPolicy:"never"`
+/// so the seat reads context + the blackboard but can NEVER write a file (the
+/// single-writer invariant). The model is forwarded only when codex-native.
+fn thread_resume_params(thread_id: &str, workspace: &Path, model: &str) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "cwd": workspace.to_string_lossy(),
+        "approvalPolicy": "never",
+        "sandbox": "readOnly",
+    });
+    if let Some(m) = codex_model(model) {
+        params["model"] = json!(m);
+    }
+    params
+}
+
+/// Build the `thread/fork` params: branch `thread_id` into an EPHEMERAL thread
+/// (`ephemeral:true`) for a read-only critic review — the new branch is
+/// throwaway and never mutates the main line.
+fn thread_fork_params(thread_id: &str) -> Value {
+    json!({ "threadId": thread_id, "ephemeral": true })
 }
 
 /// A JSON-RPC request envelope (the `"jsonrpc"` member is omitted on the wire).
@@ -730,6 +837,27 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[async_trait]
 impl BaseSession for CodexSession {
+    async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+        // Ask the live app-server to fork the main thread into an EPHEMERAL
+        // branch (`thread/fork {threadId, ephemeral:true}`), so the critic
+        // reviews a snapshot that never affects the main line. If the running
+        // base doesn't support `thread/fork`, fall back to resuming the main
+        // thread id directly — still read-only + on its own server, so still
+        // isolated. Either way the critic runs on a SEPARATE read-only process.
+        let fork_thread_id = match self
+            .request("thread/fork", &thread_fork_params(&self.thread_id))
+            .await
+        {
+            Ok(result) => extract_thread_id(&result).unwrap_or_else(|_| self.thread_id.clone()),
+            // `thread/fork` unsupported / errored → resume the main thread
+            // read-only instead (fail-open, still isolated + non-writing).
+            Err(_) => self.thread_id.clone(),
+        };
+        let s =
+            Self::start_fork(&self.program, &self.workspace, &self.model, &fork_thread_id).await?;
+        Ok(Box::new(s))
+    }
+
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
         // turn/start {threadId, input:[{type:"text", text}]}. Same thread =
         // context flows from the previous phase. We send it as a request so a
@@ -856,6 +984,27 @@ mod tests {
             gated.get("model").is_none(),
             "non-codex model must be dropped"
         );
+    }
+
+    #[test]
+    fn thread_fork_params_marks_ephemeral() {
+        let p = thread_fork_params("thr_main");
+        assert_eq!(p["threadId"], "thr_main");
+        assert_eq!(p["ephemeral"], true);
+    }
+
+    #[test]
+    fn thread_resume_params_is_read_only_sandbox() {
+        // A critic fork resumes the thread read-only: never-approve + readOnly
+        // sandbox so it can never write the workspace (single-writer invariant).
+        let p = thread_resume_params("thr_main", Path::new("/tmp/p"), "gpt-5-codex");
+        assert_eq!(p["threadId"], "thr_main");
+        assert_eq!(p["approvalPolicy"], "never");
+        assert_eq!(p["sandbox"], "readOnly");
+        assert_eq!(p["model"], "gpt-5-codex");
+        // A non-codex model is dropped (account default), same as thread/start.
+        let p2 = thread_resume_params("thr_main", Path::new("/tmp/p"), "claude-sonnet-4-6");
+        assert!(p2.get("model").is_none());
     }
 
     #[test]

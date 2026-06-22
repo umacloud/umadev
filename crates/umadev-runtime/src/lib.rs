@@ -417,6 +417,12 @@ pub enum SessionError {
     /// The session has ended (process exited / EOF) and can take no more turns.
     #[error("session closed")]
     Closed,
+    /// This base can't open a read-only fork (the underlying CLI has no native
+    /// fork / read-only-session form, or the fork attempt failed). **Fail-open
+    /// signal:** the caller degrades to the existing single-runtime consult path,
+    /// never blocks. The string is a human-readable reason.
+    #[error("session fork unsupported: {0}")]
+    ForkUnsupported(String),
 }
 
 /// A long-lived base session that the 9-phase runner drives one phase at a
@@ -437,6 +443,35 @@ pub enum SessionError {
 /// bug must never crash the host.
 #[async_trait]
 pub trait BaseSession: Send {
+    /// Open a READ-ONLY forked session for a review role (the critic team).
+    ///
+    /// The fork is a SEPARATE, isolated session a critic seat drives to review
+    /// the main line's on-disk output — it MUST never write the workspace and
+    /// MUST never collide with the main writer session (the single-writer
+    /// invariant). Each base implements it with its own native read-only form:
+    /// claude `--fork-session` + `--permission-mode plan`, codex
+    /// `thread/fork {ephemeral:true}`, opencode a fresh independent read-only
+    /// `POST /session`. The returned session is a normal [`BaseSession`]: the
+    /// caller injects one strict-JSON judge directive via
+    /// [`send_turn`](Self::send_turn), drains [`next_event`](Self::next_event)
+    /// for the verdict text, then [`end`](Self::end)s it.
+    ///
+    /// **Fail-open by contract:** a base with no fork form — or a fork that
+    /// fails to start — returns [`SessionError::ForkUnsupported`]. The caller
+    /// degrades to its existing single-runtime read-only consult path and NEVER
+    /// blocks. The default impl returns `ForkUnsupported` so a session that
+    /// hasn't implemented a fork still compiles and degrades safely.
+    ///
+    /// Takes `&mut self` (not `&self`) so the returned future is `Send` without
+    /// requiring `Self: Sync` — the host sessions hold non-`Sync` channels
+    /// (`mpsc::Receiver`). The fork is itself a fresh, independent session, so it
+    /// never aliases the parent; the `&mut` is just borrow plumbing.
+    async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+        Err(SessionError::ForkUnsupported(
+            "this base session does not support read-only forks".to_string(),
+        ))
+    }
+
     /// Inject one phase directive into the live session, starting a turn.
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError>;
 

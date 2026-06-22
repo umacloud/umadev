@@ -151,7 +151,7 @@ fn advisory_timeout() -> std::time::Duration {
 /// wall-clock without spawning (which the borrowed `&self` futures can't do
 /// anyway, being non-`'static`). Cooperative: it polls every not-yet-ready
 /// future on each wake, so a waker from any child advances the whole set.
-async fn join_all_ordered<F>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output>
+pub(crate) async fn join_all_ordered<F>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output>
 where
     F: std::future::Future,
 {

@@ -45,8 +45,15 @@ pub struct ClaudeSession {
     child: Child,
     stdin: ChildStdin,
     events: mpsc::Receiver<SessionEvent>,
-    /// The pinned conversation id (also usable for `--resume` on recovery).
+    /// The pinned conversation id (also usable for `--resume` on recovery, and
+    /// for `--resume <id> --fork-session` to open a read-only critic fork).
     session_id: String,
+    /// The resolved `claude` program string this session was spawned with, kept
+    /// so [`fork`](BaseSession::fork) re-spawns the SAME binary (honoring a test
+    /// fake / `UMADEV_CLAUDE_BIN` override).
+    program: String,
+    /// The workspace this session runs in, so a fork operates in the same dir.
+    workspace: std::path::PathBuf,
 }
 
 impl ClaudeSession {
@@ -64,19 +71,38 @@ impl ClaudeSession {
 
     /// Start a session against an explicit `program` + pinned `session_id`
     /// (mainly for tests, where `program` is a fake stream-json emitter).
-    // `tokio::process::Command::spawn` is sync; async kept for a uniform,
-    // forward-compatible session-start API the runner awaits.
-    #[allow(clippy::unused_async)]
     pub async fn start_with_program(
         program: &str,
         workspace: &Path,
         append_system: Option<&str>,
         session_id: &str,
     ) -> Result<Self, SessionError> {
+        Self::spawn_with_args(
+            program,
+            workspace,
+            &session_args(session_id, append_system),
+            session_id,
+        )
+        .await
+    }
+
+    /// Spawn a `claude` child with an explicit argument vector and wire up the
+    /// stdin / stdout-reader / stderr-drain plumbing. Shared by the main-session
+    /// start and the read-only [`fork`](BaseSession::fork) start so both paths
+    /// use identical, tested process wiring.
+    // `tokio::process::Command::spawn` is sync; async kept for a uniform,
+    // forward-compatible session-start API the runner awaits.
+    #[allow(clippy::unused_async)]
+    async fn spawn_with_args(
+        program: &str,
+        workspace: &Path,
+        args: &[String],
+        session_id: &str,
+    ) -> Result<Self, SessionError> {
         let (prog, lead) = spawn_parts(program);
         let mut cmd = Command::new(prog);
         cmd.args(&lead);
-        cmd.args(session_args(session_id, append_system));
+        cmd.args(args);
         cmd.current_dir(workspace);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -109,6 +135,8 @@ impl ClaudeSession {
             stdin,
             events: rx,
             session_id: session_id.to_string(),
+            program: program.to_string(),
+            workspace: workspace.to_path_buf(),
         })
     }
 
@@ -138,6 +166,20 @@ impl ClaudeSession {
 
 #[async_trait]
 impl BaseSession for ClaudeSession {
+    async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+        // A read-only critic fork: resume the MAIN session id and branch it with
+        // `--fork-session` (a new id, the main line untouched), in
+        // `--permission-mode plan` so the fork can READ the workspace + the prior
+        // context but can NEVER write (single-writer invariant — only the main
+        // session writes the blackboard). A fresh fork id is generated so the new
+        // branch gets its own pinned conversation. Fail-open: a spawn failure
+        // surfaces as `Start`, which the caller treats like `ForkUnsupported`.
+        let fork_id = new_session_id();
+        let args = fork_session_args(&self.session_id, &fork_id);
+        let s = Self::spawn_with_args(&self.program, &self.workspace, &args, &fork_id).await?;
+        Ok(Box::new(s))
+    }
+
     async fn send_turn(&mut self, directive: String) -> Result<(), SessionError> {
         self.write_line(&user_message_line(&directive)).await
     }
@@ -247,6 +289,36 @@ pub fn session_args(session_id: &str, append_system: Option<&str>) -> Vec<String
         args.push(sys.to_string());
     }
     args
+}
+
+/// The argument vector for a READ-ONLY critic fork: resume `main_session_id` and
+/// branch it with `--fork-session` (so the main line is never disturbed), pin the
+/// new branch to `fork_session_id`, and force `--permission-mode plan` so the
+/// fork can read context + the workspace but can NEVER write a file (the
+/// single-writer invariant). `--allowedTools "Read,Grep,Glob"` further fences it
+/// to read tools. Exposed for tests.
+#[must_use]
+pub fn fork_session_args(main_session_id: &str, fork_session_id: &str) -> Vec<String> {
+    vec![
+        "--print".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        // Branch off the main conversation; the new branch gets its own id.
+        "--resume".to_string(),
+        main_session_id.to_string(),
+        "--fork-session".to_string(),
+        "--session-id".to_string(),
+        fork_session_id.to_string(),
+        // Read-only: plan mode never applies an edit; the tool allowlist is
+        // read-only too. Two independent fences on the single-writer invariant.
+        "--permission-mode".to_string(),
+        "plan".to_string(),
+        "--allowedTools".to_string(),
+        "Read,Grep,Glob".to_string(),
+    ]
 }
 
 /// Build the stream-json `user` message line for a phase directive. This is the
@@ -472,6 +544,65 @@ mod tests {
         assert!(args.contains(&"--append-system-prompt".to_string()));
         assert!(!args.contains(&"--system-prompt".to_string()));
         assert!(args.contains(&"be terse".to_string()));
+    }
+
+    #[test]
+    fn fork_session_args_resume_branch_and_read_only() {
+        let args = fork_session_args("main-sid", "fork-sid");
+        // Branches off the main conversation without disturbing it.
+        assert!(args.contains(&"--resume".to_string()));
+        assert!(args.contains(&"main-sid".to_string()));
+        assert!(args.contains(&"--fork-session".to_string()));
+        // The new branch gets its own pinned id.
+        assert!(args.contains(&"--session-id".to_string()));
+        assert!(args.contains(&"fork-sid".to_string()));
+        // Read-only: plan mode + a read-only tool allowlist (no Write / Edit).
+        let perm = args.iter().position(|a| a == "--permission-mode").unwrap();
+        assert_eq!(args[perm + 1], "plan");
+        let tools = args.iter().position(|a| a == "--allowedTools").unwrap();
+        assert_eq!(args[tools + 1], "Read,Grep,Glob");
+        assert!(!args[tools + 1].contains("Write"));
+        assert!(!args[tools + 1].contains("Edit"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fork_spawns_a_read_only_branch_session() {
+        // The fork is a real, independent BaseSession the critic can drive: the
+        // fake `claude` replies to a judge directive with a JSON verdict and ends
+        // the turn. Proves fork() spawns a usable session and the verdict streams.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\nread _line\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"accepts\\\":true}\"}]}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
+             cat >/dev/null\n",
+        );
+        let mut main =
+            ClaudeSession::start_with_program(fake.to_str().unwrap(), &tmp, None, "sid-main")
+                .await
+                .expect("start main");
+        let mut fork = main
+            .fork()
+            .await
+            .expect("fork must spawn a read-only branch");
+        fork.send_turn("review from the architect seat, return JSON".to_string())
+            .await
+            .expect("fork send");
+        let mut text = String::new();
+        while let Some(ev) = fork.next_event().await {
+            match ev {
+                SessionEvent::TextDelta(t) => text.push_str(&t),
+                SessionEvent::TurnDone { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            text.contains("accepts"),
+            "fork relayed the verdict text: {text}"
+        );
+        let _ = fork.end().await;
     }
 
     #[test]
