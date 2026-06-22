@@ -114,7 +114,7 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
             let _ = child.start_kill();
         }
     }
-    restore_terminal(&mut terminal).ok();
+    restore_terminal(&mut terminal);
     // Reset terminal window title on exit.
     {
         use std::io::Write;
@@ -1148,6 +1148,22 @@ fn parse_osc_bg(s: &str) -> Option<bool> {
 }
 
 fn setup_terminal() -> Result<Term> {
+    // Best-effort teardown for a MID-SETUP failure. If raw mode is already on
+    // and a LATER step (alt screen, mouse capture, …) fails, a bare `?` would
+    // return WITHOUT restoring the terminal — leaving the user's shell stuck
+    // in raw/mouse-reporting mode until `reset`. So every fallible step routes
+    // its error through this, which undoes whatever was switched on before
+    // propagating. Errors during the undo are ignored (we're already failing).
+    fn fail(e: impl Into<anyhow::Error>) -> anyhow::Error {
+        let mut out = std::io::stdout();
+        let _ = out.execute(DisableMouseCapture);
+        let _ = out.execute(DisableBracketedPaste);
+        let _ = out.execute(LeaveAlternateScreen);
+        let _ = out.execute(crossterm::cursor::Show);
+        let _ = disable_raw_mode();
+        e.into()
+    }
+
     // Enter raw mode FIRST so the OSC 11 response isn't echoed to the screen
     // (raw mode disables input echo + canonical processing — the response
     // bytes come back through stdin silently). Then probe the background
@@ -1157,32 +1173,36 @@ fn setup_terminal() -> Result<Term> {
     ui::set_light_theme(is_light);
 
     let mut stdout = std::io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(EnterAlternateScreen).map_err(fail)?;
     // Turn on bracketed paste so multi-char bursts (clipboard paste AND CJK
     // IME commits, which most terminals deliver as a paste) arrive as one
     // atomic `Event::Paste` instead of a scrambled stream of `Char` events.
-    stdout.execute(EnableBracketedPaste)?;
+    stdout.execute(EnableBracketedPaste).map_err(fail)?;
     // Capture the mouse so the scroll wheel pages the transcript. This DOES
     // take over the terminal's native click-drag text selection; the user can
     // turn it back off with `/mouse` (releasing the wheel binding), and most
     // terminals still let Shift+drag select through the capture. Teardown +
     // the panic hook both DisableMouseCapture so the terminal is never left in
     // mouse-reporting mode.
-    stdout.execute(EnableMouseCapture)?;
+    stdout.execute(EnableMouseCapture).map_err(fail)?;
     // Show the terminal cursor so the user sees a blinking caret in the
     // input box (positioned via frame.set_cursor_position in render_prompt).
-    stdout.execute(crossterm::cursor::Show)?;
-    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    stdout.execute(crossterm::cursor::Show).map_err(fail)?;
+    let terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(fail)?;
     Ok(terminal)
 }
 
-fn restore_terminal(terminal: &mut Term) -> Result<()> {
-    disable_raw_mode()?;
+fn restore_terminal(terminal: &mut Term) {
+    // Every step is best-effort: a failure in one (e.g. disable_raw_mode on a
+    // half-closed TTY) must NOT short-circuit the rest, or the terminal could
+    // be left in mouse-reporting / alt-screen mode. DisableMouseCapture in
+    // particular must always run on the normal-exit path — it's the partner to
+    // EnableMouseCapture in setup_terminal and the panic hook.
+    let _ = disable_raw_mode();
     let _ = terminal.backend_mut().execute(DisableBracketedPaste);
     let _ = terminal.backend_mut().execute(DisableMouseCapture);
-    terminal.backend_mut().execute(LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
+    let _ = terminal.backend_mut().execute(LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
 }
 
 async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> Result<()> {
@@ -1600,6 +1620,20 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         )));
                                     }
                                 });
+                            }
+                            Action::SetMouseCapture(on) => {
+                                // `/mouse` toggle: actually flip mouse capture on
+                                // the LIVE terminal. ON re-enables the wheel→scroll
+                                // capture; OFF issues DisableMouseCapture so the
+                                // terminal's native click-drag text selection works
+                                // again — what the app message promised. Fail-open:
+                                // a write error is ignored, never blocking the loop.
+                                let backend = terminal.backend_mut();
+                                let _ = if on {
+                                    backend.execute(EnableMouseCapture)
+                                } else {
+                                    backend.execute(DisableMouseCapture)
+                                };
                             }
                         }
                     }

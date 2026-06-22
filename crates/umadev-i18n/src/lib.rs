@@ -372,6 +372,8 @@ mod tests {
             "slash.gate_approved",
             "slash.mcp_header",
             "slash.skill_header",
+            "slash.mouse_on",
+            "slash.mouse_off",
             "spec.overlay_title",
             "doctor.heading",
             "doctor.binary",

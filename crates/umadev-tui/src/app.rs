@@ -116,6 +116,13 @@ pub enum Action {
         /// The exact deploy command (e.g. `npx vercel --prod`).
         command: String,
     },
+    /// `/mouse` toggle — (de)activate mouse capture on the LIVE terminal. The
+    /// event loop owns the `terminal`, so the actual `EnableMouseCapture` /
+    /// `DisableMouseCapture` escape must be issued there, not from the app
+    /// model. `true` = capture on (wheel scrolls), `false` = capture off
+    /// (native click-drag text selection restored). Without this the toggle
+    /// only flipped a bool and never released the real capture.
+    SetMouseCapture(bool),
 }
 
 /// Status of one pipeline phase.
@@ -1797,6 +1804,11 @@ impl App {
         let has_palette = !self.palette_matches().is_empty();
         let shift = mods.contains(crossterm::event::KeyModifiers::SHIFT);
         let ctrl = mods.contains(crossterm::event::KeyModifiers::CONTROL);
+        let alt = mods.contains(crossterm::event::KeyModifiers::ALT);
+        // Ctrl+Alt half-page scroll keys are matched on the EXACT modifier set
+        // (CONTROL | ALT, nothing else) so they never collide with a bare
+        // CONTROL editing/shell key (Ctrl-U clears the line, Ctrl-D is EOF).
+        let ctrl_alt = ctrl && alt && !shift;
 
         match key {
             // ---- exit handling ----
@@ -1842,7 +1854,7 @@ impl App {
                 Action::None
             }
             // ---- transcript scrollback (review history without losing input) --
-            // PageUp/Down + Ctrl-U/D page the transcript; Shift+↑/↓ nudge it one
+            // PageUp/Down + Ctrl+Alt+U/D page the transcript; Shift+↑/↓ nudge it one
             // row. Any upward scroll un-pins the view from the bottom until End
             // (or scrolling back to 0).
             //
@@ -1971,24 +1983,25 @@ impl App {
                 self.input_cursor = self.input_len();
                 Action::None
             }
-            // Ctrl-U: half-page scroll UP through the transcript when the input
-            // is empty (the common "I just want to read back" case); with text
-            // in the box it keeps its editing meaning (delete to line start).
-            KeyCode::Char('u') if ctrl && self.input.is_empty() => {
+            // Ctrl+Alt+U / Ctrl+Alt+B: half-page scroll UP through the
+            // transcript. Moved off bare Ctrl-U (which is the shell "clear line"
+            // convention) so the editing key keeps its job. Matched on the exact
+            // CONTROL|ALT set (`ctrl_alt`) so it can't fire on a bare Ctrl-U.
+            KeyCode::Char('u' | 'b') if ctrl_alt => {
                 let half = self.transcript_half_page();
                 self.transcript_scroll_up(half);
                 Action::None
             }
-            KeyCode::Char('u') if ctrl => {
-                self.delete_to_line_start();
-                Action::None
-            }
-            // Ctrl-D: half-page scroll DOWN while reviewing history (scrolled
-            // up). Otherwise it keeps the shell convention below (quit on an
-            // empty input).
-            KeyCode::Char('d') if ctrl && self.input.is_empty() && self.transcript_scroll > 0 => {
+            // Ctrl+Alt+D / Ctrl+Alt+F: half-page scroll DOWN through the
+            // transcript. Moved off bare Ctrl-D (terminal EOF / quit convention).
+            KeyCode::Char('d' | 'f') if ctrl_alt => {
                 let half = self.transcript_half_page();
                 self.transcript_scroll_down(half);
+                Action::None
+            }
+            // Bare Ctrl-U keeps its line-editing meaning (delete to line start).
+            KeyCode::Char('u') if ctrl => {
+                self.delete_to_line_start();
                 Action::None
             }
             KeyCode::Char('k') if ctrl => {
@@ -4783,13 +4796,16 @@ impl App {
     /// Shift-held drag bypasses the capture in most terminals regardless.
     fn slash_toggle_mouse(&mut self) -> Action {
         self.mouse_scroll = !self.mouse_scroll;
-        let msg = if self.mouse_scroll {
-            "mouse-wheel scrolling on — Shift+drag for native text selection"
+        let key = if self.mouse_scroll {
+            "slash.mouse_on"
         } else {
-            "mouse-wheel scrolling off — native text selection restored"
+            "slash.mouse_off"
         };
-        self.push(ChatRole::System, msg);
-        Action::None
+        self.push(ChatRole::System, umadev_i18n::t(self.lang, key));
+        // Drive the real terminal: ON re-enables capture so the wheel pages the
+        // transcript; OFF actually issues DisableMouseCapture so native
+        // click-drag selection works again. The event loop owns `terminal`.
+        Action::SetMouseCapture(self.mouse_scroll)
     }
 
     fn slash_toggle_animations(&mut self) -> Action {
@@ -5699,12 +5715,90 @@ mod tests {
         // End re-pins to the bottom.
         let _ = app.apply_key(crossterm::event::KeyCode::End);
         assert_eq!(app.transcript_scroll, 0);
-        // Ctrl-U on empty input = half a page up.
+        // Ctrl+Alt+U = half a page up (the half-page scroll moved off bare
+        // Ctrl-U so the shell "clear line" key keeps its job).
+        let _ = app.apply_key_with_mods(
+            crossterm::event::KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT,
+        );
+        assert_eq!(app.transcript_scroll, 10);
+    }
+
+    #[test]
+    fn ctrl_alt_u_and_d_half_page_scroll_transcript() {
+        let mut app = fresh_app(Some("offline"));
+        app.transcript_max_scroll.set(100);
+        app.transcript_viewport_rows.set(20);
+        let cmd_alt = crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT;
+        // Ctrl+Alt+U → half a viewport up (20 / 2 = 10).
+        let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('u'), cmd_alt);
+        assert_eq!(
+            app.transcript_scroll, 10,
+            "Ctrl+Alt+U scrolls half a page up"
+        );
+        // Ctrl+Alt+D → half a viewport back down.
+        let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('d'), cmd_alt);
+        assert_eq!(
+            app.transcript_scroll, 0,
+            "Ctrl+Alt+D scrolls half a page down"
+        );
+        // Ctrl+Alt+B / Ctrl+Alt+F are paging aliases.
+        let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('b'), cmd_alt);
+        assert_eq!(app.transcript_scroll, 10, "Ctrl+Alt+B aliases scroll-up");
+        let _ = app.apply_key_with_mods(crossterm::event::KeyCode::Char('f'), cmd_alt);
+        assert_eq!(app.transcript_scroll, 0, "Ctrl+Alt+F aliases scroll-down");
+    }
+
+    #[test]
+    fn bare_ctrl_u_and_ctrl_d_no_longer_scroll_transcript() {
+        let mut app = fresh_app(Some("offline"));
+        app.transcript_max_scroll.set(100);
+        app.transcript_viewport_rows.set(20);
+        // Empty input + bare Ctrl-U: must NOT scroll (it's the line-clear key,
+        // and the input is empty so there is nothing to delete either).
         let _ = app.apply_key_with_mods(
             crossterm::event::KeyCode::Char('u'),
             crossterm::event::KeyModifiers::CONTROL,
         );
-        assert_eq!(app.transcript_scroll, 10);
+        assert_eq!(
+            app.transcript_scroll, 0,
+            "bare Ctrl-U must not move the transcript"
+        );
+        // Scroll up first, then bare Ctrl-D: it must NOT scroll back (Ctrl-D is
+        // the terminal EOF/quit convention, not a scroll key). On empty input
+        // it routes to quit, so assert via should_quit and a still-scrolled view.
+        app.transcript_scroll = 30;
+        let _ = app.apply_key_with_mods(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        assert_eq!(
+            app.transcript_scroll, 30,
+            "bare Ctrl-D must not move the transcript"
+        );
+        assert!(app.should_quit, "bare Ctrl-D on empty input quits (EOF)");
+    }
+
+    #[test]
+    fn slash_mouse_emits_set_capture_action_and_uses_i18n() {
+        let mut app = fresh_app(Some("offline"));
+        assert!(app.mouse_scroll, "wheel scroll defaults on");
+        // Turning OFF must emit SetMouseCapture(false) so the event loop issues
+        // the real DisableMouseCapture, not just flip a bool.
+        let action = app.slash_toggle_mouse();
+        assert_eq!(action, Action::SetMouseCapture(false));
+        assert!(!app.mouse_scroll);
+        // Toggling back ON emits SetMouseCapture(true).
+        let action = app.slash_toggle_mouse();
+        assert_eq!(action, Action::SetMouseCapture(true));
+        assert!(app.mouse_scroll);
+        // The pushed status line must be the i18n string, not a raw literal.
+        let last = app.history.back().expect("a status line was pushed");
+        assert_eq!(
+            last.body,
+            umadev_i18n::t(app.lang, "slash.mouse_on"),
+            "/mouse status text must come from the i18n catalog"
+        );
     }
 
     #[test]

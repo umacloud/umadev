@@ -531,6 +531,8 @@
 "slash.gate_approved" = "[ok] 已通过闸门 `{}` —— 继续…"
 "slash.mcp_header" = "[package] MCP 服务器:\n\n{}"
 "slash.skill_header" = "[skill] 技能包:\n\n{}"
+"slash.mouse_on" = "鼠标滚轮滚动已开启 —— Shift+拖拽可用终端原生文本选择"
+"slash.mouse_off" = "鼠标滚轮滚动已关闭 —— 已恢复终端原生文本选择"
 # /spec 浮层标题
 "spec.overlay_title" = " UMADEV_HOST_SPEC_V1 —— 按 Esc 关闭,↑↓ 滚动 "
 # /doctor 浮层正文 + 标题
