@@ -60,6 +60,7 @@ use tokio::process::Command;
 pub use claude::ClaudeCodeDriver;
 pub use claude_session::ClaudeSession;
 pub use codex::CodexDriver;
+pub use codex_session::CodexSession;
 pub use opencode::OpenCodeDriver;
 pub use opencode_session::OpenCodeSession;
 
@@ -1149,6 +1150,62 @@ pub fn driver_for(backend_id: &str) -> Option<Box<dyn HostDriver>> {
         "codex" => Some(Box::new(CodexDriver::default())),
         "opencode" => Some(Box::new(OpenCodeDriver::default())),
         _ => None,
+    }
+}
+
+/// Open a **continuous [`BaseSession`]** for the given backend id — the long-
+/// session model the runner's continuous path drives (see
+/// `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`). Returns a boxed trait object so
+/// the agent crate (which does NOT depend on this crate) can drive any of the
+/// three bases through `umadev_runtime::BaseSession` without naming the concrete
+/// type.
+///
+/// - `backend_id` — `claude-code` / `codex` / `opencode` (anything else →
+///   `SessionError::Start`, so the caller can fall back to the single-shot path).
+/// - `workspace`  — the project root the base operates inside.
+/// - `model`      — provider model id; empty falls back to the base's own
+///   configured default (UmaDev injects no model endpoint).
+/// - `autonomous` — the trust tier's autonomy: `true` lets the base write code
+///   unattended (governed by UmaDev's own rules); `false` raises approval
+///   requests at gates. Derived by the caller from [`TrustMode`].
+///
+/// [`BaseSession`]: umadev_runtime::BaseSession
+/// [`TrustMode`]: umadev_runtime
+///
+/// # Errors
+/// Returns [`umadev_runtime::SessionError`] when the id is unknown or the
+/// underlying base process / server fails to start. **Fail-open by contract:**
+/// the error is the caller's signal to degrade to the single-shot path, never a
+/// panic.
+pub async fn session_for(
+    backend_id: &str,
+    workspace: &std::path::Path,
+    model: &str,
+    autonomous: bool,
+) -> Result<Box<dyn umadev_runtime::BaseSession>, umadev_runtime::SessionError> {
+    match backend_id {
+        "claude-code" => {
+            // The continuous claude session opens with `--permission-mode
+            // acceptEdits` baked into `session_args`; `autonomous` is implicit in
+            // that mode. We append no extra system prompt here — the runner's
+            // directives carry the role + spec constraints per phase.
+            let s = ClaudeSession::start(workspace, None).await?;
+            Ok(Box::new(s))
+        }
+        "codex" => {
+            let s = CodexSession::start(workspace, model, autonomous).await?;
+            Ok(Box::new(s))
+        }
+        "opencode" => {
+            // `build` agent; pass the model through only when non-empty so the
+            // base falls back to its own configured default otherwise.
+            let model = (!model.is_empty()).then_some(model);
+            let s = OpenCodeSession::start(workspace, Some("build"), model).await?;
+            Ok(Box::new(s))
+        }
+        other => Err(umadev_runtime::SessionError::Start(format!(
+            "unknown backend id for continuous session: {other}"
+        ))),
     }
 }
 

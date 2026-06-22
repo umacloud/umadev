@@ -39,6 +39,7 @@ pub mod adopt;
 pub mod checkpoint;
 pub mod coach;
 pub mod config;
+pub mod continuous;
 pub mod coverage;
 pub mod critics;
 pub mod deploy;
@@ -67,6 +68,7 @@ pub use adopt::{
     is_adopted, load_project_source_index, read_adopt_marker, run_adopt, AdoptReport,
     DetectedCommand,
 };
+pub use continuous::{continuous_enabled_from_env, run_block as run_continuous_block, RunOutcome};
 pub use critics::{
     append_team_ledger, docs_team_for_kind, preview_team_for_kind, quality_team_for_kind,
     ArchitectureCritic, BackendCritic, CriticArtifacts, CriticConsult, DevOpsCritic,

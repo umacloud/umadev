@@ -1448,6 +1448,37 @@ impl<R: Runtime> AgentRunner<R> {
         Ok(report)
     }
 
+    /// Drive ONE block of the pipeline over a **continuous [`BaseSession`]** —
+    /// the long-session run path (see `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`),
+    /// living ALONGSIDE the single-shot [`run_initial_block`](Self::run_initial_block).
+    ///
+    /// The caller (binary / TUI) selects the path via
+    /// [`crate::continuous::continuous_enabled_from_env`] and constructs the
+    /// `session` with the host crate's `session_for(...)` factory; this method
+    /// owns the single-writer run lock + the deterministic moat (gates / audit /
+    /// hard stop) by delegating to [`crate::continuous::run_block`]. `start_after`
+    /// is the entry phase ([`Phase::Research`] fresh, [`Phase::Spec`] after the
+    /// docs gate, [`Phase::Backend`] after the preview gate).
+    ///
+    /// **Fail-open:** the run lock guards writer serialization exactly as the
+    /// single-shot path does; a session that dies mid-run surfaces a
+    /// [`crate::continuous::RunOutcome::HardStop`], never a panic. The `session`
+    /// stays the caller's to `end()` once the run settles (so it spans every
+    /// block of the run).
+    ///
+    /// # Errors
+    /// Propagates an IO error only from acquiring the run lock (a different live
+    /// run already holds this workspace). The drive itself never errors — it
+    /// returns a [`RunOutcome`](crate::continuous::RunOutcome).
+    pub async fn run_continuous_block(
+        &self,
+        session: &mut dyn umadev_runtime::BaseSession,
+        start_after: Phase,
+    ) -> std::io::Result<crate::continuous::RunOutcome> {
+        let _run_lock = crate::run_lock::RunLock::acquire_for_run(&self.options.project_root)?;
+        Ok(crate::continuous::run_block(session, &self.options, &self.events, start_after).await)
+    }
+
     /// Run the initial block: research → docs, then pause at
     /// [`Gate::DocsConfirm`]. `use_runtime` forces the worker on/off.
     /// `requirement_override` (when `Some`) replaces the stored requirement
