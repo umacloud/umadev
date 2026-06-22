@@ -183,6 +183,13 @@ enum Command {
         /// destructive shell) are always confirmed, even in `auto`.
         #[arg(long, default_value = "guarded")]
         mode: String,
+        /// Drive the run over ONE continuous base session (the long-session
+        /// model — see `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`) instead of a
+        /// fresh per-phase base process. Opt-in + gradual-rollout: also enabled
+        /// by `UMADEV_CONTINUOUS=1`. Fail-open: if the continuous session can't
+        /// start, the run falls back to the existing single-shot path.
+        #[arg(long)]
+        continuous: bool,
     },
     /// Lightweight fast track for a trivial task (skip the heavy phases).
     #[command(
@@ -772,6 +779,7 @@ async fn main() -> Result<()> {
             project_root,
             slug,
             mode,
+            continuous,
         } => {
             cmd_run(RunArgs {
                 requirement,
@@ -780,6 +788,7 @@ async fn main() -> Result<()> {
                 project_root,
                 slug,
                 mode,
+                continuous,
             })
             .await
         }
@@ -798,6 +807,9 @@ async fn main() -> Result<()> {
                 project_root,
                 slug,
                 mode,
+                // `quick` is the lean single-shot fast track — never the
+                // long-session pipeline path.
+                continuous: false,
             })
             .await
         }
@@ -2010,6 +2022,11 @@ struct RunArgs {
     /// Trust / autonomy tier string (`plan` / `guarded` / `auto`); parsed into
     /// [`umadev_agent::TrustMode`] at the boundary, fail-open to `guarded`.
     mode: String,
+    /// Opt-in to the continuous long-session run path (one base session for the
+    /// whole run). OR'd with [`umadev_agent::continuous_enabled_from_env`] at
+    /// the boundary; fail-open back to the single-shot path if the session
+    /// can't start. `quick` never sets this.
+    continuous: bool,
 }
 
 /// Attach a live event sink to the runner and spawn a background printer.
@@ -2106,6 +2123,98 @@ fn new_run_session_id() -> String {
     )
 }
 
+/// Derive the continuous session's autonomy flag from the trust tier: only
+/// `auto` lets the base write unattended end-to-end; `guarded` / `plan` keep
+/// the human-in-the-loop posture (the gate pauses do the gating, and the
+/// per-turn approval floor still denies irreversible actions). Mirrors how the
+/// single-shot path reads `mode.gates_auto_approve()`.
+fn continuous_autonomous(mode: umadev_agent::TrustMode) -> bool {
+    mode.gates_auto_approve()
+}
+
+/// Map the start phase of the NEXT continuous block from the gate the prior
+/// block paused at — the same gate-anchored block split the single-shot path
+/// uses (`run_initial_block` → docs gate → spec block → preview gate → backend
+/// block). A clarify gate (only emitted by the single-shot clarify phase) is
+/// not produced on the continuous path, so it never appears here.
+fn continuous_resume_phase(gate: umadev_agent::Gate) -> umadev_spec::Phase {
+    match gate {
+        umadev_agent::Gate::DocsConfirm => umadev_spec::Phase::Spec,
+        // ClarifyGate is never produced on the continuous path; fail-open to the
+        // post-preview tail so a stray value can't wedge.
+        umadev_agent::Gate::PreviewConfirm | umadev_agent::Gate::ClarifyGate => {
+            umadev_spec::Phase::Backend
+        }
+    }
+}
+
+/// Render a continuous [`umadev_agent::RunOutcome`] as the `RunReport` shape the
+/// CLI's [`print_report`] already understands, so the continuous and single-shot
+/// paths print identically. The continuous path emits its detailed progress over
+/// the live event sink; this report carries only the terminal phase + the gate
+/// it paused at (if any), which is all `print_report` needs.
+fn continuous_report(outcome: &umadev_agent::RunOutcome) -> RunReport {
+    use umadev_agent::RunOutcome;
+    match outcome {
+        RunOutcome::PausedAtGate(gate) => RunReport {
+            final_phase: match gate {
+                umadev_agent::Gate::DocsConfirm => umadev_spec::Phase::DocsConfirm,
+                umadev_agent::Gate::PreviewConfirm => umadev_spec::Phase::PreviewConfirm,
+                umadev_agent::Gate::ClarifyGate => umadev_spec::Phase::Research,
+            },
+            paused_at: Some(*gate),
+            completed: Vec::new(),
+        },
+        RunOutcome::Completed => RunReport {
+            final_phase: umadev_spec::Phase::Delivery,
+            paused_at: None,
+            completed: Vec::new(),
+        },
+        // A hard stop did NOT reach delivery and is NOT a gate pause — report the
+        // last code-ish phase with no gate so `print_report` prints the honest
+        // "stopped before delivery" line rather than "complete".
+        RunOutcome::HardStop(_) => RunReport {
+            final_phase: umadev_spec::Phase::Quality,
+            paused_at: None,
+            completed: Vec::new(),
+        },
+    }
+}
+
+/// Drive a continuous run over ONE live [`umadev_runtime::BaseSession`] to its
+/// first gate (or, under `auto`, all the way to completion / a hard stop). The
+/// `session` is owned here and `end()`-ed once the run settles, so it spans every
+/// block of the run with context retained.
+///
+/// `auto` walks across the gates by resuming the next block at the phase the
+/// prior block paused after; `guarded` / `plan` stop at the first gate exactly
+/// like the single-shot `run_clarify` path (the user then drives `continue`).
+async fn drive_continuous_run(
+    runner: &AgentRunner<OfflineRuntime>,
+    session: &mut dyn umadev_runtime::BaseSession,
+    mode: umadev_agent::TrustMode,
+) -> Result<umadev_agent::RunOutcome> {
+    use umadev_agent::RunOutcome;
+    let mut start_after = umadev_spec::Phase::Research;
+    // A finite hop ceiling: research→docs gate→spec→preview gate→backend covers
+    // at most three blocks; cap a touch higher so a defensive resume can't loop.
+    for _ in 0..6 {
+        let outcome = runner
+            .run_continuous_block(session, start_after)
+            .await
+            .context("continuous run block failed")?;
+        match outcome {
+            RunOutcome::PausedAtGate(gate) if mode.gates_auto_approve() => {
+                // Auto tier: approve the gate ourselves and resume the next block.
+                eprintln!("\n[auto] gate {} auto-approved — resuming.", gate.id_str());
+                start_after = continuous_resume_phase(gate);
+            }
+            other => return Ok(other),
+        }
+    }
+    Ok(RunOutcome::Completed)
+}
+
 async fn cmd_run(args: RunArgs) -> Result<()> {
     // Reject an empty / whitespace-only requirement up front with a helpful
     // message, rather than running the whole pipeline on nothing.
@@ -2188,6 +2297,54 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
             driver.display_name(),
             backend.id()
         );
+
+        // ── Continuous long-session path (opt-in, gradual rollout) ──────────
+        //
+        // When the user passed `--continuous` (or set `UMADEV_CONTINUOUS=1`),
+        // drive the WHOLE run over ONE live base session instead of a fresh
+        // per-phase base process. The two paths COEXIST and the switch picks
+        // between them. **Fail-open:** if the continuous session can't start, we
+        // fall through to the single-shot driver path below — the run never dies
+        // just because the long-session brain was unreachable.
+        let continuous = args.continuous || umadev_agent::continuous_enabled_from_env();
+        if continuous {
+            match umadev_host::session_for(
+                backend.id(),
+                &project_root,
+                &opts.model,
+                continuous_autonomous(mode),
+            )
+            .await
+            {
+                Ok(mut session) => {
+                    println!("Continuous session active ({}).", backend.id());
+                    // The runner here is only an options + event-sink carrier for
+                    // the continuous driver (which drives the session directly,
+                    // not `R::complete`); the offline runtime is never invoked.
+                    let runner =
+                        AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
+                    runner.start().context("failed to start agent")?;
+                    let (runner, printer) = attach_live_sink(runner);
+                    let outcome = drive_continuous_run(&runner, session.as_mut(), mode).await;
+                    // Always end the session (release the process / server),
+                    // regardless of how the drive finished.
+                    let _ = session.end().await;
+                    drop(runner);
+                    let _ = printer.await;
+                    let outcome = outcome?;
+                    print_report(&project_root, &label, &continuous_report(&outcome));
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  [continuous] session unavailable ({e}); falling back to the \
+                         single-shot per-phase path."
+                    );
+                    // Fall through to the single-shot path below with `opts` intact.
+                }
+            }
+        }
+
         let runner = AgentRunner::new(driver, opts);
         runner.start().context("failed to start agent")?;
         let (runner, printer) = attach_live_sink(runner);
@@ -4018,6 +4175,54 @@ mod tests {
                 BackendArg::from_id(id).unwrap_or_else(|| panic!("from_id({id}) returned None"));
             assert_eq!(var.id(), *id, "id()/from_id() not inverse for {id}");
         }
+    }
+
+    // ---- continuous long-session run path wiring ----
+
+    /// Only `auto` makes the continuous session autonomous; `guarded` / `plan`
+    /// keep the human-in-the-loop posture (gate pauses + the approval floor).
+    #[test]
+    fn continuous_autonomous_only_for_auto() {
+        assert!(continuous_autonomous(umadev_agent::TrustMode::Auto));
+        assert!(!continuous_autonomous(umadev_agent::TrustMode::Guarded));
+        assert!(!continuous_autonomous(umadev_agent::TrustMode::Plan));
+    }
+
+    /// The next continuous block resumes at the gate-anchored start phase — the
+    /// same block split the single-shot path uses.
+    #[test]
+    fn continuous_resume_phase_is_gate_anchored() {
+        assert_eq!(
+            continuous_resume_phase(Gate::DocsConfirm),
+            umadev_spec::Phase::Spec
+        );
+        assert_eq!(
+            continuous_resume_phase(Gate::PreviewConfirm),
+            umadev_spec::Phase::Backend
+        );
+    }
+
+    /// The continuous outcome → `RunReport` mapping `print_report` consumes:
+    /// a gate pause carries the gate, completion reaches delivery with no gate,
+    /// and a hard stop reports a pre-delivery phase with no gate (so it never
+    /// prints "complete").
+    #[test]
+    fn continuous_report_maps_each_outcome() {
+        use umadev_agent::RunOutcome;
+        let paused = continuous_report(&RunOutcome::PausedAtGate(Gate::DocsConfirm));
+        assert_eq!(paused.paused_at, Some(Gate::DocsConfirm));
+
+        let done = continuous_report(&RunOutcome::Completed);
+        assert_eq!(done.paused_at, None);
+        assert_eq!(done.final_phase, umadev_spec::Phase::Delivery);
+
+        let stopped = continuous_report(&RunOutcome::HardStop("no code".into()));
+        assert_eq!(stopped.paused_at, None);
+        assert_ne!(
+            stopped.final_phase,
+            umadev_spec::Phase::Delivery,
+            "a hard stop must NOT report as a completed delivery"
+        );
     }
 
     // ---- intra-phase resume recovery ----

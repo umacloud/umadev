@@ -460,6 +460,146 @@ fn spawn_block(
     })
 }
 
+/// The director's persistent base session — ONE continuous brain held across
+/// the whole TUI session so context flows research → docs → code → … without
+/// re-priming (the long-session model, see
+/// `docs/CONTINUOUS_SESSION_ARCHITECTURE.md` §1.5/1.6). `None` until the first
+/// continuous run lazily opens it; parked back here at every gate pause so the
+/// next `Continue` block reuses the SAME session. A `tokio::sync::Mutex` so the
+/// spawned block task can take it across `.await` points; shared `Arc` with the
+/// event loop. Empty (always `None`) unless the continuous path is enabled.
+type SessionHolder = Arc<tokio::sync::Mutex<Option<Box<dyn umadev_runtime::BaseSession>>>>;
+
+/// Read the gradual-rollout switch deciding whether the TUI's `run` intent flows
+/// through the **continuous long-session path** (one persistent director session)
+/// or the legacy per-phase single-shot path. Opt-in via `UMADEV_CONTINUOUS=1`
+/// (mirrors [`umadev_agent::continuous_enabled_from_env`]); the two paths coexist
+/// so this can be A/B-tested and reverted with no code change. Read at the spawn
+/// boundary so a run sees a stable snapshot.
+fn tui_continuous_enabled() -> bool {
+    umadev_agent::continuous_enabled_from_env()
+}
+
+/// The continuous start phase for the NEXT block after a gate pause — the same
+/// gate-anchored block split the single-shot path uses (docs gate → spec block,
+/// preview gate → backend block). A `ClarifyGate` is only produced by the
+/// single-shot clarify phase, never on the continuous path, so it fails open to
+/// the tail.
+fn continuous_resume_phase(gate: Gate) -> umadev_spec::Phase {
+    match gate {
+        Gate::DocsConfirm => umadev_spec::Phase::Spec,
+        // ClarifyGate never reaches the continuous path; fold it into the
+        // post-preview tail so a stray value can't wedge.
+        Gate::PreviewConfirm | Gate::ClarifyGate => umadev_spec::Phase::Backend,
+    }
+}
+
+/// The continuous session's autonomy flag from the trust tier: only `auto` lets
+/// the base write unattended; `guarded` / `plan` keep the human-in-the-loop
+/// posture (gate pauses + the per-turn approval floor). Mirrors the binary.
+fn continuous_autonomous(mode: umadev_agent::TrustMode) -> bool {
+    mode.gates_auto_approve()
+}
+
+/// Spawn ONE continuous-session block for the TUI's `run` intent — the long-
+/// session counterpart of [`spawn_block`]. Drives the held persistent
+/// [`umadev_runtime::BaseSession`] (the director's brain) over
+/// [`AgentRunner::run_continuous_block`], lazily opening the session on the first
+/// (`Research`) block and PARKING it back in `holder` at a gate pause so the next
+/// `Continue` block resumes the SAME session with full context.
+///
+/// All the surrounding TUI machinery is UNCHANGED: the block emits the same
+/// [`EngineEvent`]s (`PipelineStarted` / `PhaseStarted` / `GateOpened` /
+/// `BlockCompleted`) over the shared sink, so the gate cards, auto-continue,
+/// completion handling, queued-steer drain, run-lock single-writer guard, and
+/// `Ctrl-C` task-abort all work exactly as on the single-shot path.
+///
+/// **Fail-open:** if the session can't open (or a `Continue` arrives with no
+/// parked session and a fresh one can't open either), the block emits an
+/// `ABORT_SENTINEL` note (the same honest terminal-abort the single-shot path
+/// uses) and returns — the caller can retry, or the user falls back by clearing
+/// `UMADEV_CONTINUOUS`. It NEVER panics or wedges.
+fn spawn_continuous_block(
+    options: RunOptions,
+    sink: Arc<ChannelSink>,
+    holder: SessionHolder,
+    start_after: umadev_spec::Phase,
+    autonomous: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let backend = options.backend.clone();
+        let model = options.model.clone();
+        let root = options.project_root.clone();
+
+        // Take the parked session (a resume), or lazily open a fresh one (a new
+        // run, or a resume whose session was lost). The session is OWNED by this
+        // task for the block's duration; it goes back into `holder` only on a
+        // gate pause.
+        let mut guard = holder.lock().await;
+        let mut session = match guard.take() {
+            Some(s) => s,
+            None => match umadev_host::session_for(&backend, &root, &model, autonomous).await {
+                Ok(s) => s,
+                Err(e) => {
+                    sink.emit(EngineEvent::Note(format!(
+                        "{ABORT_SENTINEL}continuous session unavailable ({e}) — \
+                         clear UMADEV_CONTINUOUS to use the per-phase path."
+                    )));
+                    return;
+                }
+            },
+        };
+        drop(guard);
+
+        // The runner is an options + event-sink carrier; the offline runtime is
+        // never invoked (the continuous driver drives the session directly). It
+        // owns the single-writer run lock + the deterministic moat.
+        let runner = AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), options)
+            .with_event_sink(sink.clone());
+        if let Err(e) = runner.start() {
+            sink.emit(EngineEvent::Note(format!(
+                "{ABORT_SENTINEL}{}",
+                start_failed_note(&e)
+            )));
+            let _ = session.end().await;
+            return;
+        }
+
+        match runner
+            .run_continuous_block(session.as_mut(), start_after)
+            .await
+        {
+            Ok(umadev_agent::RunOutcome::PausedAtGate(_)) => {
+                // Natural pause point: park the LIVE session back so the next
+                // `Continue` block resumes it with context retained. The
+                // `GateOpened` event already drove the gate card.
+                *holder.lock().await = Some(session);
+            }
+            Ok(umadev_agent::RunOutcome::Completed) => {
+                // Run settled — close the session and clear the holder.
+                let _ = session.end().await;
+            }
+            Ok(umadev_agent::RunOutcome::HardStop(reason)) => {
+                // Honest terminal abort (zero real code / a failed phase) — the
+                // run_block already emitted the detailed Note; flag the terminal
+                // state so the bar shows an explicit abort, then close.
+                sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
+                let _ = session.end().await;
+            }
+            Err(e) => {
+                // The only error path is the run lock (a different live run holds
+                // the workspace). Surface it the same way the single-shot path
+                // does, then close the session — fail-open, never a panic.
+                sink.emit(EngineEvent::Note(format!(
+                    "{ABORT_SENTINEL}{}",
+                    block_abort_note(&e, &backend)
+                )));
+                let _ = session.end().await;
+            }
+        }
+    })
+}
+
 /// Marker prefixed onto the terminal-abort note emitted by [`spawn_block`] when
 /// a block ends with `Err` (zero phases produced). The TUI app recognises this
 /// prefix to flip the run into an explicit **aborted** terminal state — clearing
@@ -1577,6 +1717,18 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     // Handle to the in-flight pipeline task, so `/cancel` can abort it.
     let mut run_task: Option<tokio::task::JoinHandle<()>> = None;
+    // The director's persistent base session for the continuous run path — ONE
+    // brain held across the whole TUI session so context flows across gate
+    // blocks (see `spawn_continuous_block`). Always empty unless the continuous
+    // path is enabled; a parked session here is what makes a `Continue` block
+    // resume the SAME session rather than re-prime a fresh one.
+    let session_holder: SessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+    // Whether the in-flight run is on the continuous path, so the `Continue`
+    // (gate-approve) + auto-continue blocks resume the SAME persistent session
+    // (via `spawn_continuous_block`) rather than spawning a fresh single-shot
+    // `Block::Continue`. Set when a continuous `run` is dispatched; cleared on a
+    // terminal outcome / cancel. Local to the loop — no extra `App` state.
+    let mut continuous_run_active = false;
 
     loop {
         terminal.draw(|f| ui::render(f, app))?;
@@ -1643,12 +1795,27 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             // boundary; the runner reads this, not the live env.
                             strict_coverage: umadev_agent::strict_coverage_from_env(),
                         };
-                        run_task = Some(spawn_block(
-                            run_opts,
-                            app.brain_spec(),
-                            sink.clone(),
-                            Block::Clarify,
-                        ));
+                        // Continuous long-session path (opt-in): when enabled AND
+                        // the brain is a host CLI, the director's `run` intent
+                        // drives ONE persistent base session from research
+                        // (`spawn_continuous_block`) instead of a fresh per-phase
+                        // process. The gate cards / continue / completion all run
+                        // off the SAME events, so the rest of the loop is unchanged.
+                        // Offline / non-host brains stay on the single-shot path.
+                        let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
+                        continuous_run_active = tui_continuous_enabled() && host_cli;
+                        run_task = Some(if continuous_run_active {
+                            let autonomous = continuous_autonomous(run_opts.mode);
+                            spawn_continuous_block(
+                                run_opts,
+                                sink.clone(),
+                                session_holder.clone(),
+                                umadev_spec::Phase::Research,
+                                autonomous,
+                            )
+                        } else {
+                            spawn_block(run_opts, app.brain_spec(), sink.clone(), Block::Clarify)
+                        });
                     }
                     None => {}
                 }
@@ -1663,12 +1830,26 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     if let Some(gate) = app.pending_auto_continue.take() {
                         app.active_gate = None;
                         let run_opts = current_run_options(app, &opts);
-                        run_task = Some(spawn_block(
-                            run_opts,
-                            app.brain_spec(),
-                            sink.clone(),
-                            Block::Continue(gate),
-                        ));
+                        // A continuous run resumes the SAME parked session at the
+                        // gate-anchored next phase; the single-shot path spawns a
+                        // fresh `Block::Continue`.
+                        run_task = Some(if continuous_run_active {
+                            let autonomous = continuous_autonomous(run_opts.mode);
+                            spawn_continuous_block(
+                                run_opts,
+                                sink.clone(),
+                                session_holder.clone(),
+                                continuous_resume_phase(gate),
+                                autonomous,
+                            )
+                        } else {
+                            spawn_block(
+                                run_opts,
+                                app.brain_spec(),
+                                sink.clone(),
+                                Block::Continue(gate),
+                            )
+                        });
                     }
                     // A message the user QUEUED mid-phase is ready to fire at
                     // this gap: re-run the producing block with it folded in as
@@ -1740,16 +1921,43 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             }
                             Action::Continue(gate) => {
                                 let run_opts = current_run_options(app, &opts);
-                                run_task = Some(spawn_block(
-                                    run_opts,
-                                    app.brain_spec(),
-                                    sink.clone(),
-                                    Block::Continue(gate),
-                                ));
+                                // Continuous run: resume the parked session at the
+                                // next gate-anchored phase. Single-shot: fresh
+                                // `Block::Continue`.
+                                run_task = Some(if continuous_run_active {
+                                    let autonomous = continuous_autonomous(run_opts.mode);
+                                    spawn_continuous_block(
+                                        run_opts,
+                                        sink.clone(),
+                                        session_holder.clone(),
+                                        continuous_resume_phase(gate),
+                                        autonomous,
+                                    )
+                                } else {
+                                    spawn_block(
+                                        run_opts,
+                                        app.brain_spec(),
+                                        sink.clone(),
+                                        Block::Continue(gate),
+                                    )
+                                });
                             }
                             Action::Cancel => {
                                 if let Some(h) = run_task.take() {
                                     h.abort();
+                                }
+                                // A continuous run was just cancelled: close + drop
+                                // the parked director session so the NEXT run opens
+                                // a fresh brain (an aborted mid-turn session may be
+                                // wedged). Best-effort `end()` under a try_lock so
+                                // cancel never blocks; clear the active flag.
+                                if continuous_run_active {
+                                    if let Ok(mut g) = session_holder.try_lock() {
+                                        if let Some(mut s) = g.take() {
+                                            let _ = s.end().await;
+                                        }
+                                    }
+                                    continuous_run_active = false;
                                 }
                                 // Drain any events the aborted task already
                                 // queued (e.g. a buffered PipelineStarted /
@@ -2909,5 +3117,97 @@ mod tests {
         let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "boom");
         let note = start_failed_note(&e);
         assert_eq!(note, umadev_i18n::tlf("pipeline.start_failed", &["boom"]));
+    }
+
+    // ── Continuous long-session run path (TUI `run` intent unification) ──────
+
+    /// The next continuous block resumes at the gate-anchored start phase — the
+    /// same block split the single-shot path uses.
+    #[test]
+    fn continuous_resume_phase_is_gate_anchored() {
+        assert_eq!(
+            continuous_resume_phase(Gate::DocsConfirm),
+            umadev_spec::Phase::Spec
+        );
+        assert_eq!(
+            continuous_resume_phase(Gate::PreviewConfirm),
+            umadev_spec::Phase::Backend
+        );
+    }
+
+    /// Only `auto` makes the continuous session autonomous; `guarded` / `plan`
+    /// keep the human-in-the-loop posture.
+    #[test]
+    fn continuous_autonomous_only_for_auto() {
+        assert!(continuous_autonomous(umadev_agent::TrustMode::Auto));
+        assert!(!continuous_autonomous(umadev_agent::TrustMode::Guarded));
+        assert!(!continuous_autonomous(umadev_agent::TrustMode::Plan));
+    }
+
+    /// The rollout switch is OFF by default (the single-shot path stays the
+    /// default) — a missing/`0` env var keeps the legacy path.
+    #[test]
+    fn tui_continuous_disabled_without_env() {
+        // The process env is shared, so only assert the DEFAULT-off contract
+        // when the var is not set to an on-value (don't mutate global env here).
+        if std::env::var("UMADEV_CONTINUOUS").as_deref() != Ok("1") {
+            assert!(!tui_continuous_enabled());
+        }
+    }
+
+    /// Fail-open: when the persistent session can't open (an unknown backend id
+    /// → `session_for` errors deterministically, no real base process spawned),
+    /// `spawn_continuous_block` emits ONE honest terminal-abort note and the task
+    /// returns — never a panic, never a wedge, and the holder stays empty so a
+    /// retry can open fresh.
+    #[tokio::test]
+    async fn continuous_block_fails_open_when_session_cannot_start() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let holder: SessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+        let options = RunOptions {
+            project_root: tmp.path().to_path_buf(),
+            requirement: "build a dashboard".into(),
+            slug: "demo".into(),
+            model: String::new(),
+            // An id `session_for` rejects → deterministic `SessionError`, with NO
+            // real subprocess, so the test is hermetic on any machine.
+            backend: "nonexistent-backend".into(),
+            design_system: String::new(),
+            seed_template: String::new(),
+            mode: umadev_agent::TrustMode::Guarded,
+            strict_coverage: false,
+        };
+
+        let handle = spawn_continuous_block(
+            options,
+            sink.clone(),
+            holder.clone(),
+            umadev_spec::Phase::Research,
+            false,
+        );
+        // The task must FINISH (no hang) and not panic.
+        handle.await.expect("continuous block task must not panic");
+
+        // It emitted exactly the honest terminal-abort note (carrying the
+        // sentinel) — the same fail-open shape the single-shot path uses.
+        let mut saw_abort = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.contains(ABORT_SENTINEL) {
+                    saw_abort = true;
+                }
+            }
+        }
+        assert!(
+            saw_abort,
+            "a failed session start emits a terminal-abort note"
+        );
+        // The holder stays empty (no half-open session parked) → a retry opens fresh.
+        assert!(
+            holder.lock().await.is_none(),
+            "no session parked after a failed start"
+        );
     }
 }
