@@ -232,6 +232,29 @@ pub struct RunOptions {
     /// end-to-end. The mode only governs gate auto-pass policy — phase *content*
     /// stays deterministic.
     pub mode: crate::trust::TrustMode,
+    /// Strict spec-coverage enforcement for this run. When `true`, an uncovered
+    /// PRD functional requirement BLOCKS the pipeline at `spec` (pausing for a
+    /// docs/tasks revision) instead of merely warning. Captured **once** at the
+    /// app boundary — production callers OR this with the
+    /// `UMADEV_STRICT_COVERAGE=1` environment flag via
+    /// [`strict_coverage_from_env`] so the run reads a stable snapshot, never a
+    /// live process-global `env::var` mid-run (which races under parallel test
+    /// execution). The on-disk `[pipeline] strict_coverage = true` config flag
+    /// is OR'd in separately at the gate check (it's read from a file, so it's
+    /// deterministic per-project).
+    pub strict_coverage: bool,
+}
+
+/// Read the `UMADEV_STRICT_COVERAGE` opt-in once, at the app boundary.
+///
+/// Returns `true` when the env var is set to `1`. Call this exactly where a
+/// production [`RunOptions`] is constructed (the CLI / TUI boundary) and stash
+/// the result in [`RunOptions::strict_coverage`]; the runner then reads that
+/// captured field, never the live env, so parallel runs don't observe each
+/// other's transient env mutations.
+#[must_use]
+pub fn strict_coverage_from_env() -> bool {
+    std::env::var("UMADEV_STRICT_COVERAGE").as_deref() == Ok("1")
 }
 
 impl RunOptions {
@@ -3525,8 +3548,9 @@ impl<R: Runtime> AgentRunner<R> {
         //  - default (warn): emit an advisory note and continue — the
         //    implementation phases must close the gap. Fail-open behaviour
         //    unchanged from before.
-        //  - strict (`[pipeline] strict_coverage = true`, or env
-        //    `UMADEV_STRICT_COVERAGE=1`): a coverage gap is a BLOCK — we pause at
+        //  - strict (`[pipeline] strict_coverage = true`, or the per-run
+        //    `RunOptions::strict_coverage` flag captured from env at the app
+        //    boundary): a coverage gap is a BLOCK — we pause at
         //    `spec` so the user revises the docs/tasks before any code is
         //    written. This is opt-in so a partial breakdown never silently halts
         //    a default run.
@@ -3535,8 +3559,12 @@ impl<R: Runtime> AgentRunner<R> {
             &self.options.effective_slug(),
         );
         if !uncovered.is_empty() {
-            let strict = project_cfg.pipeline.strict_coverage
-                || std::env::var("UMADEV_STRICT_COVERAGE").as_deref() == Ok("1");
+            // Read the captured per-run flag (snapshotted at the app boundary
+            // from `UMADEV_STRICT_COVERAGE` via `strict_coverage_from_env`), never
+            // the live process-global env — a mid-run `env::var` read races under
+            // parallel test execution. OR with the on-disk config flag, which is
+            // read from a file and so is deterministic per-project.
+            let strict = project_cfg.pipeline.strict_coverage || self.options.strict_coverage;
             if strict {
                 self.emit(EngineEvent::Note(format!(
                     "[spec] 严格覆盖门:以下 PRD 需求无任务覆盖,已阻断流水线(strict_coverage=true)。\
@@ -5318,6 +5346,7 @@ not json at all
             design_system: String::new(),
             seed_template: String::new(),
             mode: crate::trust::TrustMode::Guarded,
+            strict_coverage: false,
         }
     }
 
@@ -7350,10 +7379,14 @@ error TS2304: Cannot find name 'Foo'
 
     #[tokio::test]
     async fn strict_coverage_blocks_at_spec_when_requirements_uncovered() {
-        // With strict_coverage on (via env), an uncovered PRD requirement blocks
-        // the pipeline at the spec phase instead of proceeding to frontend.
+        // With strict_coverage on (set per-run on RunOptions, NOT via a global
+        // env var — a process-global env mutation races with other pipeline tests
+        // running in parallel), an uncovered PRD requirement blocks the pipeline
+        // at the spec phase instead of proceeding to frontend.
         let tmp = TempDir::new().unwrap();
-        let runner = AgentRunner::new(FakeRuntime, opts(tmp.path()));
+        let mut run_opts = opts(tmp.path());
+        run_opts.strict_coverage = true;
+        let runner = AgentRunner::new(FakeRuntime, run_opts);
         runner.start().unwrap();
         runner.run_initial_block(false, None).await.unwrap();
         // Force a coverage gap: a PRD with a functional requirement, tasks with
@@ -7365,10 +7398,7 @@ error TS2304: Cannot find name 'Foo'
             "# PRD\n\n## Functional requirements\n\n- FR-1: 用户必须能用邮箱登录\n- FR-2: 用户能重置密码\n",
         )
         .unwrap();
-        std::env::set_var("UMADEV_STRICT_COVERAGE", "1");
-        let r = runner.continue_after_docs_confirm().await;
-        std::env::remove_var("UMADEV_STRICT_COVERAGE");
-        let r = r.unwrap();
+        let r = runner.continue_after_docs_confirm().await.unwrap();
         // If the coverage checker found gaps, strict mode pauses at spec. (When
         // no gap is detected the run proceeds — both are valid, but assert the
         // strict-block path is reachable by checking we did NOT reach frontend.)

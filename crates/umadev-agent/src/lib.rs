@@ -97,7 +97,7 @@ pub use review::{
     build_review_report, render_review_md, review_report_rel_path, scan_ci_weakening,
     write_review_report, ReviewClaim, ReviewReport, Verdict,
 };
-pub use runner::{AgentRunner, RunOptions, RunReport};
+pub use runner::{strict_coverage_from_env, AgentRunner, RunOptions, RunReport};
 pub use runtime_proof::{
     run_runtime_proof, runtime_proof_rel_path, write_runtime_proof, E2eResult, RouteProbe,
     RuntimeProof, RuntimeStatus,

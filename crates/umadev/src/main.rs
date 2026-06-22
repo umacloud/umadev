@@ -2030,6 +2030,9 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         design_system: String::new(),
         seed_template: String::new(),
         mode,
+        // Capture the strict-coverage opt-in ONCE here at the app boundary; the
+        // runner reads this snapshot, never the live env (which races in parallel).
+        strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
 
     // Two modes:
@@ -2148,6 +2151,9 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         design_system: String::new(),
         seed_template: String::new(),
         mode,
+        // Capture the strict-coverage opt-in ONCE here at the app boundary; the
+        // runner reads this snapshot, never the live env (which races in parallel).
+        strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
 
     let (report, runtime_label) = if let Some(backend) = args.backend {
@@ -2278,6 +2284,9 @@ async fn cmd_redo(
         // invoked `continue`); `plan` read-only gating only applies to the
         // initial `run`, so resume defaults to guarded.
         mode: umadev_agent::TrustMode::Guarded,
+        // Snapshot the strict-coverage opt-in here at the app boundary (read env
+        // once), not live in the runner — a mid-run env read races in parallel.
+        strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
 
     let _ = record_tool_call(
@@ -2559,6 +2568,9 @@ async fn drive_gate_block(
         seed_template: String::new(),
         // Resume paths default to guarded — see the `continue` path above.
         mode: umadev_agent::TrustMode::Guarded,
+        // Snapshot the strict-coverage opt-in here at the app boundary (read env
+        // once), not live in the runner — a mid-run env read races in parallel.
+        strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
 
     let use_runtime = backend_id.is_some();

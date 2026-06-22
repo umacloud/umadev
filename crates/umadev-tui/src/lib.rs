@@ -1285,6 +1285,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             design_system: app.config.design_system.clone().unwrap_or_default(),
                             seed_template: app.config.seed_template.clone().unwrap_or_default(),
                             mode: app.effective_trust_mode(),
+                            // Snapshot the strict-coverage opt-in once at the app
+                            // boundary; the runner reads this, not the live env.
+                            strict_coverage: umadev_agent::strict_coverage_from_env(),
                         };
                         run_task = Some(spawn_block(
                             run_opts,
@@ -1417,6 +1420,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     design_system: app.config.design_system.clone().unwrap_or_default(),
                                     seed_template: app.config.seed_template.clone().unwrap_or_default(),
                                     mode: app.effective_trust_mode(),
+                                    // Snapshot the strict-coverage opt-in once at
+                                    // the app boundary; the runner reads this, not
+                                    // the live env (which races in parallel).
+                                    strict_coverage: umadev_agent::strict_coverage_from_env(),
                                 };
                                 run_task = Some(spawn_block(
                                     run_opts,
@@ -1438,6 +1445,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     design_system: app.config.design_system.clone().unwrap_or_default(),
                                     seed_template: app.config.seed_template.clone().unwrap_or_default(),
                                     mode: app.effective_trust_mode(),
+                                    // Snapshot the strict-coverage opt-in once at
+                                    // the app boundary; the runner reads this, not
+                                    // the live env (which races in parallel).
+                                    strict_coverage: umadev_agent::strict_coverage_from_env(),
                                 };
                                 run_task = Some(spawn_block(
                                     run_opts,
@@ -1487,6 +1498,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     design_system: app.config.design_system.clone().unwrap_or_default(),
                                     seed_template: app.config.seed_template.clone().unwrap_or_default(),
                                     mode: app.effective_trust_mode(),
+                                    // Snapshot the strict-coverage opt-in once at
+                                    // the app boundary; the runner reads this, not
+                                    // the live env (which races in parallel).
+                                    strict_coverage: umadev_agent::strict_coverage_from_env(),
                                 };
                                 let block = match app.active_gate {
                                     Some(Gate::PreviewConfirm) => {
@@ -1669,6 +1684,9 @@ fn current_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
         design_system: app.config.design_system.clone().unwrap_or_default(),
         seed_template: app.config.seed_template.clone().unwrap_or_default(),
         mode: app.effective_trust_mode(),
+        // Snapshot the strict-coverage opt-in once at the app boundary; the runner
+        // reads this captured flag, never the live env (which races in parallel).
+        strict_coverage: umadev_agent::strict_coverage_from_env(),
     }
 }
 
