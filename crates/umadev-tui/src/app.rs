@@ -6148,10 +6148,12 @@ mod tests {
             matches!(preview, Action::None),
             "bare /deploy is preview-only"
         );
+        // Assert on the locale-independent command — the "not yet run" note is
+        // i18n'd, so it differs by resolved locale (zh-CN on dev, English on CI).
         assert!(app
             .history
             .iter()
-            .any(|m| m.body.contains("尚未执行") && m.body.contains("npx vercel --prod")));
+            .any(|m| m.body.contains("npx vercel --prod")));
         // /deploy confirm actually runs it.
         let action = app.slash_deploy("confirm");
         match action {

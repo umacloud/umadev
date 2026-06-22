@@ -936,7 +936,10 @@ mod tests {
         let script = dir.path().join("fake-claude");
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"the real answer\",\"usage\":{\"input_tokens\":1200,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":50,\"output_tokens\":42}}'\n",
+            // Drain stdin (the Arg-channel path closes the write half, so this is
+            // an immediate EOF) so the fake mirrors the codex fake's structure,
+            // which runs cleanly under dash on Linux CI where the no-drain form flaked.
+            "#!/bin/sh\ncat >/dev/null 2>&1\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"the real answer\",\"usage\":{\"input_tokens\":1200,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":50,\"output_tokens\":42}}'\n",
         )
         .unwrap();
         #[cfg(unix)]
