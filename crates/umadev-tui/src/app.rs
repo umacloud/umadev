@@ -358,6 +358,13 @@ pub struct App {
     pub thinking: bool,
     /// When the current thinking turn began — for the live elapsed readout.
     pub thinking_started: Option<std::time::Instant>,
+    /// A tools-enabled agentic execution call (the SECOND call after an
+    /// `agentic` route classification) is streaming — the base is reading /
+    /// running / editing in its own tool loop. Drives Ctrl-C: an interrupt
+    /// while this is set must ABORT the backing `run_task`, not just stop the
+    /// (fire-and-forget) chat-route spinner. Cleared on every terminal agentic
+    /// outcome (done / failed / cancel).
+    pub agentic_in_flight: bool,
     /// Session-level override for `auto_approve_gates` set via `/manual`
     /// (`Some(false)`) or `/auto` (`Some(true)`). `None` → use the project's
     /// `.umadevrc` value. Lets the user flip review mode mid-session without
@@ -528,6 +535,7 @@ impl App {
             run_started: false,
             thinking: false,
             thinking_started: None,
+            agentic_in_flight: false,
             auto_approve_override: None,
             trust_mode_override: None,
             trust_ledger: umadev_agent::TrustLedger::load(&project_root),
@@ -1981,6 +1989,16 @@ impl App {
                     self.clear_input();
                     return Action::Cancel;
                 }
+                if self.agentic_in_flight {
+                    // An agentic execution call is streaming in a real base
+                    // subprocess (parked in the event loop's `run_task`). Unlike
+                    // a fire-and-forget chat route, simply clearing the spinner
+                    // would leave the subprocess running — so route through
+                    // `Action::Cancel`, which aborts the task. `cancel_run`
+                    // clears `thinking` / `agentic_in_flight` and the queue.
+                    self.clear_input();
+                    return Action::Cancel;
+                }
                 if self.thinking {
                     // A routed chat turn is in flight. Stop the spinner and drop
                     // any chat turns parked behind it so the interrupt is clean;
@@ -2374,12 +2392,64 @@ impl App {
     /// [`record_chat_reply`] / [`record_run_started`] — it stops the
     /// "thinking…" status; otherwise the animation would spin forever on a
     /// route that already failed. The human-readable reason is surfaced as a
-    /// System note.
+    /// System note. Also clears `agentic_in_flight`: a failed agentic execution
+    /// call flows through here, so this is its terminal cleanup too.
     pub(crate) fn record_route_failed(&mut self, note: String) {
         self.thinking = false;
         self.thinking_started = None;
+        self.agentic_in_flight = false;
         self.refresh_status();
         self.push(ChatRole::System, note);
+    }
+
+    /// The base classified the turn as agentic (real work in THIS repo, short of
+    /// a full pipeline build) and the tools-enabled streaming call is about to
+    /// fire. Make the decision VISIBLE (the user is about to see live tool calls,
+    /// not a chat reply) and note it as an assistant turn so a follow-up like
+    /// "what did you find?" keeps context. `thinking` is left set by
+    /// `fire_agentic` — the stream keeps it alive until the turn ends.
+    pub(crate) fn record_agentic_started(&mut self, task: &str) {
+        let task = task.trim();
+        if task.is_empty() {
+            return;
+        }
+        self.push(
+            ChatRole::System,
+            "[agentic] inspecting the repo…".to_string(),
+        );
+        self.conversation.push(umadev_runtime::Message {
+            role: "assistant".to_string(),
+            content: format!("[agentic] working on: {task}"),
+        });
+        self.trim_conversation();
+    }
+
+    /// An agentic streaming turn finished cleanly. The body ALREADY streamed live
+    /// into the transcript (via `WorkerStream`), so we do NOT re-render it — we
+    /// only record it as the assistant turn for chat-memory continuity and clear
+    /// the waiting state. A TERMINAL agentic outcome, mirroring
+    /// [`record_chat_reply`] but without the duplicate render.
+    pub(crate) fn record_agentic_done(&mut self, reply: String) {
+        self.thinking = false;
+        self.thinking_started = None;
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
+        self.stream_text_active = false;
+        self.stream_tool_batch = None;
+        self.refresh_status();
+        let reply = reply.trim().to_string();
+        if reply.is_empty() {
+            // The base produced only tool calls / a side-effect with no closing
+            // prose. Still a clean finish — leave the streamed activity as the
+            // record, but drop a short marker so the turn reads as completed.
+            self.push(ChatRole::System, "[agentic] done.".to_string());
+            return;
+        }
+        self.conversation.push(umadev_runtime::Message {
+            role: "assistant".to_string(),
+            content: reply,
+        });
+        self.trim_conversation();
     }
 
     /// Pop the oldest chat turn parked by [`submit_text`] while a route was in
@@ -2479,6 +2549,10 @@ impl App {
         // interrupt with a route still notionally outstanding.
         self.thinking = false;
         self.thinking_started = None;
+        // An agentic execution call (if any) is the thing being aborted here —
+        // clear its flag so a later Ctrl-C doesn't think one is still running.
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
         // Drop chat turns parked behind the in-flight route so they can't fire
         // into a freshly-reset state.
         self.queued_chat.clear();

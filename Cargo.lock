@@ -3245,6 +3245,7 @@ name = "umadev-tui"
 version = "1.0.5"
 dependencies = [
  "anyhow",
+ "async-trait",
  "crossterm",
  "futures",
  "ratatui",

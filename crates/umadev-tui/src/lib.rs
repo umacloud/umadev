@@ -202,22 +202,36 @@ fn build_brain(
 const ROUTE_SYSTEM_PROMPT: &str = "\
 You are the brain behind UmaDev. The user talks to a thin shell, but it is you they are talking to.
 You are given the conversation so far. Respond to the user's LATEST message, using the earlier turns for context and continuity.
-Decide whether that latest message is normal conversation, or a concrete request to build/change software that should enter UmaDev's 9-phase delivery pipeline.
-Return exactly one JSON object and nothing else — no markdown, no code fence.
+Classify that latest message into exactly one of THREE modes, then return exactly one JSON object and nothing else — no markdown, no code fence.
 
-Normal conversation (greetings, follow-up questions, explanations, discussion, anything answerable by talking):
+1. Normal conversation (greetings, small talk, follow-up questions, explanations, discussion — anything answerable by just talking, without looking at the repository):
 {\"mode\":\"chat\",\"reply\":\"your direct reply, in the user's language, written as a natural continuation of the conversation\"}
 
-Concrete product/code work (build, implement, create, design, fix, refactor, deploy, or modify a project/product/codebase):
+2. A task that needs you to actually READ, INSPECT, or make a SMALL CHANGE to the code in THIS repository — but is NOT building a whole new project. Examples: review/audit a snippet or file for bugs, diagnose a failure, explain how existing code works, answer \"will this code break / leak / regress?\", trace a call path, apply a small fix or tweak:
+{\"mode\":\"agentic\",\"task\":\"a cleaned, self-contained instruction in the user's language that folds in any relevant detail from earlier turns — what to look at and what to produce\"}
+
+3. Concrete product/code work that should enter UmaDev's full 9-phase delivery pipeline (build, implement, create, design, or ship a whole feature / product / codebase from a requirement):
 {\"mode\":\"run\",\"requirement\":\"a cleaned, self-contained requirement in the user's language that folds in any relevant detail from earlier turns\"}
 
-When unsure, prefer chat and ask a brief clarifying question.
-In chat mode just reply conversationally — do NOT perform the task, edit files, run commands, call tools, or mutate the workspace.";
+Guidance: a plain greeting or opinion question is `chat`, never `agentic` — do not spend tool calls on small talk. If the user references THIS repo's code and wants it looked at, checked, explained, or minimally edited, that is `agentic`. Only a from-a-requirement build is `run`.
+When genuinely unsure between chat and agentic, prefer chat and ask a brief clarifying question.
+In chat mode just reply conversationally — do NOT perform the task, edit files, run commands, call tools, or mutate the workspace. (In agentic mode the shell makes a SEPARATE call where you ARE free to use your tools; this classification call must still only return the JSON.)";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum RouteDecision {
     Chat(String),
     Run(String),
+    /// The base classified the turn as needing real work in THIS repo (review,
+    /// diagnose, explain, small fix) but NOT a full pipeline build. Carries the
+    /// cleaned task to send back to the base in a SECOND, tools-enabled streaming
+    /// call (no tool-ban prompt, no `max_tokens` cap) so the base runs its own
+    /// agentic loop — reading files / running commands — with live streaming.
+    Agentic(String),
+    /// An agentic streaming turn finished. Carries the final assembled text so
+    /// the event loop records it as the assistant turn (chat memory continuity);
+    /// the body was ALREADY streamed live via `WorkerStream`, so it is NOT
+    /// re-rendered. A terminal outcome → clears the "thinking…" status.
+    AgenticDone(String),
     /// The route produced no usable reply (base init failed, an empty reply, or
     /// a hard error). Carries the human-readable reason. Routed through the same
     /// channel as `Chat` / `Run` — instead of a bare `EngineEvent::Note` — so
@@ -563,6 +577,125 @@ fn spawn_route(
     });
 }
 
+/// Everything the tools-enabled agentic execution call needs. Mirrors a subset
+/// of [`RouteTurn`] but for the SECOND call — the one that actually lets the
+/// base run its tool loop.
+struct AgenticTurn {
+    /// The cleaned task the base classified as agentic.
+    task: String,
+    /// Which base to drive (always a `HostCli` here — offline never reaches this).
+    spec: BrainSpec,
+    /// Resume the chat session so this turn shares memory with the conversation.
+    continue_session: bool,
+    /// Pinned chat session id (claude).
+    session_id: Option<String>,
+    /// Fallback model id when the spec carries none.
+    fallback_model: String,
+    /// Project root — the cwd the base subprocess runs in (it reads/writes here).
+    project_root: std::path::PathBuf,
+}
+
+/// Spawn the tools-enabled agentic execution call. UNLIKE [`spawn_route`], this
+/// sends the user's task to the base with NO tool-ban system prompt and NO
+/// `max_tokens` cap, then drives [`Runtime::complete_streaming`] so the base
+/// runs its OWN agentic loop (read files, `git diff`, run commands, analyse) and
+/// the tool calls + text stream live into the transcript via
+/// [`EngineEvent::WorkerStream`] — reusing the exact render pipeline the 9-phase
+/// run uses. The turn ends only when the base's stream ends (subprocess exit),
+/// not on the first preamble. The returned [`JoinHandle`] is parked in the event
+/// loop's `run_task` slot so Ctrl-C / `Action::Cancel` can abort it.
+///
+/// Fail-open: a base-init error or a hard streaming error is downgraded to a
+/// terminal [`RouteDecision::Failed`] (the user still gets a clear note, the
+/// shell never blocks). A clean finish sends [`RouteDecision::AgenticDone`] so
+/// the event loop records the assistant turn for chat-memory continuity.
+fn spawn_agentic(
+    turn: AgenticTurn,
+    sink: Arc<ChannelSink>,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+) -> tokio::task::JoinHandle<()> {
+    let AgenticTurn {
+        task,
+        spec,
+        continue_session,
+        session_id,
+        fallback_model,
+        project_root,
+    } = turn;
+    tokio::spawn(async move {
+        let label = spec.label();
+        let model = route_model_for_spec(&spec, fallback_model);
+        // Resume the SAME chat session the conversation already uses, so the
+        // agentic turn sees the prior dialogue (and leaves its work in the same
+        // session for follow-up chat). Mirrors `spawn_route`'s resume wiring.
+        let brain = match build_brain(&spec, continue_session, session_id, &project_root) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                    "base.init_failed",
+                    &[&label, &e.to_string()],
+                )));
+                return;
+            }
+        };
+        drive_agentic_stream(brain.as_ref(), &task, &model, &label, &sink, &route_tx).await;
+    })
+}
+
+/// Build the tools-unlocked execution request and drive the base's streaming
+/// tool loop, forwarding every event to the live render pipeline and sending the
+/// terminal [`RouteDecision`] when the stream ends. Split out of [`spawn_agentic`]
+/// so a fake [`Runtime`] can exercise it in a unit test (the spawn wrapper only
+/// adds the `tokio::spawn` + `build_brain`).
+async fn drive_agentic_stream(
+    brain: &dyn Runtime,
+    task: &str,
+    model: &str,
+    label: &str,
+    sink: &Arc<ChannelSink>,
+    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+) {
+    // The execution request: the user's raw task, tools UNLOCKED. No system
+    // prompt (so NONE of the chat-route tool-ban survives) and no max_tokens
+    // (so the base isn't cut off mid-loop). This is the whole point — the base
+    // CLI already has an agentic tool loop; here we simply stop forbidding it.
+    let request = CompletionRequest {
+        model: model.to_string(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: task.to_string(),
+        }],
+        max_tokens: None,
+        temperature: None,
+        system: None,
+    };
+    // Forward every stream event straight into the existing WorkerStream
+    // render pipeline (tool calls + text deltas show live).
+    let stream_sink = Arc::clone(sink);
+    let on_event = move |ev: umadev_runtime::StreamEvent| {
+        stream_sink.emit(EngineEvent::WorkerStream { event: ev });
+    };
+    match brain.complete_streaming(request, &on_event).await {
+        Ok(resp) => {
+            // The body already streamed live; hand the assembled text to the
+            // event loop ONLY to record it as the assistant turn. An empty body
+            // (the base emitted only tool calls / a side-effect) is still a clean
+            // finish — send AgenticDone with what we have so `thinking` clears
+            // uniformly.
+            let _ = route_tx.send(RouteDecision::AgenticDone(resp.text));
+        }
+        Err(e) => {
+            // Fail-open: the agentic call failed → a terminal Failed note (clears
+            // `thinking`), never a stuck spinner. The chat session is untouched,
+            // so the user can simply retry.
+            let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                "route.failed",
+                &[label, &e.to_string()],
+            )));
+        }
+    }
+}
+
 /// Build a [`RouteTurn`] from the current app state and spawn it. The single
 /// place a chat turn is dispatched — used both by the `Action::Route` key path
 /// and by the queue-drain that fires the next parked turn once the current
@@ -614,6 +747,51 @@ fn fire_route(
     }
 }
 
+/// Fire the tools-enabled agentic execution call from current app state, and
+/// return its `JoinHandle` so the event loop can park it in `run_task` (Ctrl-C
+/// aborts it). Keeps `thinking` set — the stream feeds `WorkerStream` events,
+/// which reset the stall clock just like a phase — and resumes the SAME chat
+/// session as `fire_route`, so the agentic turn shares conversation memory.
+/// Marks `agentic_in_flight` so Ctrl-C routes to a real task-abort instead of
+/// the fire-and-forget route interrupt.
+fn fire_agentic(
+    app: &mut App,
+    sink: &Arc<ChannelSink>,
+    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    task: String,
+) -> tokio::task::JoinHandle<()> {
+    let spec = app.brain_spec();
+    let host_cli = matches!(spec, BrainSpec::HostCli(_));
+    let continue_session = app.host_chat_session_active;
+    let session_id = if host_cli {
+        Some(app.ensure_chat_session_id())
+    } else {
+        None
+    };
+    // Keep the waiting state alive through the (potentially long) tool loop.
+    app.thinking = true;
+    app.thinking_started = Some(std::time::Instant::now());
+    app.last_output_at = None;
+    app.tool_in_progress = false;
+    app.agentic_in_flight = true;
+    let handle = spawn_agentic(
+        AgenticTurn {
+            task,
+            spec,
+            continue_session,
+            session_id,
+            fallback_model: app.effective_model(),
+            project_root: app.project_root.clone(),
+        },
+        sink.clone(),
+        route_tx.clone(),
+    );
+    if host_cli {
+        app.host_chat_session_active = true;
+    }
+    handle
+}
+
 /// After a TERMINAL chat route outcome (`Chat` / `Failed`), fire the next turn
 /// the user parked while the route was in flight, keeping same-session routing
 /// serial. Returns `true` if a parked turn was dispatched.
@@ -656,6 +834,18 @@ fn parse_route_decision(text: &str) -> Option<RouteDecision> {
                 None
             } else {
                 Some(RouteDecision::Chat(reply.to_string()))
+            }
+        }
+        "agentic" => {
+            let task = value
+                .get("task")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if task.is_empty() {
+                None
+            } else {
+                Some(RouteDecision::Agentic(task.to_string()))
             }
         }
         _ => None,
@@ -1022,10 +1212,28 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         app.record_chat_reply(reply);
                         drain_next_queued_chat(app, &sink, &route_tx);
                     }
+                    // The base chose agentic work: read/inspect/edit THIS repo
+                    // without entering the full pipeline. Fire the SECOND,
+                    // tools-enabled streaming call — its tool calls + text show
+                    // live, and it ends on the base's stream end (not the first
+                    // preamble). Parked in `run_task` so Ctrl-C aborts it.
+                    Some(RouteDecision::Agentic(task)) => {
+                        app.record_agentic_started(&task);
+                        run_task = Some(fire_agentic(app, &sink, &route_tx, task));
+                    }
+                    // An agentic turn finished cleanly: the body already streamed
+                    // live, so we only record it as the assistant turn (chat
+                    // memory), clear `thinking`, then drain the parked queue.
+                    Some(RouteDecision::AgenticDone(reply)) => {
+                        run_task = None;
+                        app.record_agentic_done(reply);
+                        drain_next_queued_chat(app, &sink, &route_tx);
+                    }
                     // The route produced no usable reply. `record_route_failed`
                     // clears `thinking`; then drain the parked queue so a failed
                     // turn doesn't strand the messages typed behind it.
                     Some(RouteDecision::Failed(note)) => {
+                        run_task = None;
                         app.record_route_failed(note);
                         drain_next_queued_chat(app, &sink, &route_tx);
                     }
@@ -1574,7 +1782,10 @@ mod tests {
             .expect("route channel should stay open until event");
         match route {
             RouteDecision::Chat(body) => assert!(body.contains("UmaDev")),
-            other @ (RouteDecision::Run(_) | RouteDecision::Failed(_)) => {
+            other @ (RouteDecision::Run(_)
+            | RouteDecision::Agentic(_)
+            | RouteDecision::AgenticDone(_)
+            | RouteDecision::Failed(_)) => {
                 panic!("expected local chat fallback, got {other:?}")
             }
         }
@@ -1623,6 +1834,160 @@ mod tests {
             ),
             Some(RouteDecision::Run("做一个登录系统".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_route_decision_reads_agentic_json() {
+        // The new third mode: "look at THIS repo's code" (review/diagnose/explain
+        // /small-fix) routes to Agentic, carrying the cleaned task.
+        assert_eq!(
+            parse_route_decision(r#"{"mode":"agentic","task":"审查 app.rs 看会不会出 bug"}"#),
+            Some(RouteDecision::Agentic(
+                "审查 app.rs 看会不会出 bug".to_string()
+            ))
+        );
+        // An agentic verdict with an empty task is not usable → None (falls back
+        // to a non-JSON / chat path upstream).
+        assert_eq!(
+            parse_route_decision(r#"{"mode":"agentic","task":""}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn route_prompt_offers_all_three_modes() {
+        // The classifier prompt must teach the base the three-way split so it can
+        // ever emit `agentic` (the W3-b fix). Lock the mode tokens in the prompt.
+        assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"chat\""));
+        assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"agentic\""));
+        assert!(ROUTE_SYSTEM_PROMPT.contains("\"mode\":\"run\""));
+    }
+
+    /// A fake runtime that records which entry point the agentic path used.
+    /// `complete` must NEVER be called by the agentic path (it would be a
+    /// one-shot, non-streaming, preamble-only turn — the exact bug being fixed);
+    /// `complete_streaming` is the contract. When `fail` is set, the streaming
+    /// call errors so the fail-open downgrade can be asserted.
+    struct StreamSpy {
+        complete_calls: Arc<std::sync::atomic::AtomicUsize>,
+        streaming_calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for StreamSpy {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            self.complete_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(umadev_runtime::CompletionResponse {
+                text: "ONE-SHOT".to_string(),
+                id: "spy".to_string(),
+                model: "spy".to_string(),
+                usage: umadev_runtime::Usage::default(),
+            })
+        }
+        async fn complete_streaming(
+            &self,
+            _req: CompletionRequest,
+            on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            self.streaming_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(umadev_runtime::RuntimeError::HostProcess(
+                    "boom".to_string(),
+                ));
+            }
+            // Emit a tool call + a text delta so the live render path is exercised.
+            on_event(umadev_runtime::StreamEvent::ToolUse {
+                name: "Read".to_string(),
+                detail: "app.rs".to_string(),
+            });
+            on_event(umadev_runtime::StreamEvent::Text {
+                delta: "no bug found".to_string(),
+            });
+            Ok(umadev_runtime::CompletionResponse {
+                text: "no bug found".to_string(),
+                id: "spy".to_string(),
+                model: "spy".to_string(),
+                usage: umadev_runtime::Usage::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_path_uses_streaming_not_one_shot() {
+        // The whole point of the W3-b fix: an agentic turn must drive the base's
+        // STREAMING tool loop — never the one-shot `complete` (which would stop
+        // at the first preamble without reading the code).
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let complete_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let streaming_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spy = StreamSpy {
+            complete_calls: Arc::clone(&complete_calls),
+            streaming_calls: Arc::clone(&streaming_calls),
+            fail: false,
+        };
+
+        drive_agentic_stream(&spy, "审一下", "m", "claude-code", &sink, &route_tx).await;
+
+        assert_eq!(
+            complete_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "agentic must NOT use one-shot complete"
+        );
+        assert_eq!(
+            streaming_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "agentic must drive complete_streaming"
+        );
+        // The stream events reached the live render pipeline as WorkerStream.
+        let mut saw_tool = false;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::ToolUse { .. },
+            } = ev
+            {
+                saw_tool = true;
+            }
+        }
+        assert!(saw_tool, "tool calls must stream live as WorkerStream");
+        // The terminal outcome records the assistant text for chat memory.
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone(text)) => assert_eq!(text, "no bug found"),
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_failure_fails_open_to_downgrade() {
+        // Fail-open: a streaming error must downgrade to a terminal `Failed`
+        // note (which clears `thinking` upstream), never hang or panic.
+        let (sink, _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spy = StreamSpy {
+            complete_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            streaming_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail: true,
+        };
+
+        drive_agentic_stream(&spy, "审一下", "m", "claude-code", &sink, &route_tx).await;
+
+        match route_rx.try_recv() {
+            Ok(RouteDecision::Failed(note)) => {
+                assert!(note.contains("boom") || !note.is_empty());
+            }
+            other => panic!("expected fail-open Failed downgrade, got {other:?}"),
+        }
     }
 
     #[test]
