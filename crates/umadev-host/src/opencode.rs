@@ -245,6 +245,10 @@ impl Runtime for OpenCodeDriver {
         let program = self.program.clone();
         let timeout = self.timeout;
 
+        // Accumulate the raw stream so a mid-stream failure can salvage whatever
+        // already arrived (opencode's answer IS its plain stdout) instead of
+        // cold-restarting a whole new run.
+        let stream_buf = std::sync::Mutex::new(String::new());
         let result = run_subprocess_streaming(
             SubprocessCall {
                 program: &program,
@@ -256,6 +260,10 @@ impl Runtime for OpenCodeDriver {
                 env: &[],
             },
             &|line: &str| {
+                if let Ok(mut b) = stream_buf.lock() {
+                    b.push_str(line);
+                    b.push('\n');
+                }
                 if let Some(ev) = parse_opencode_stream_line(line) {
                     on_event(ev);
                 }
@@ -272,9 +280,21 @@ impl Runtime for OpenCodeDriver {
             }),
             Err(e) => {
                 // Fail-open: drop to the non-streaming path so a streaming-only
-                // failure (no line-buffered stdout, format drift) never empties
-                // the phase. `complete` re-runs the same `opencode run`.
-                tracing::warn!(error = %e, "opencode streaming failed, falling back to non-streaming");
+                // failure (no line-buffered stdout, format drift, or the base
+                // being SIGTERM/SIGALRM'd — exit 143/142) never empties the
+                // phase. Routine self-healing → `debug!`, not a scary warning.
+                // Salvage what already streamed (opencode's text IS its stdout)
+                // before paying for a full `complete` re-run.
+                tracing::debug!(error = %e, "opencode streaming failed, falling back to non-streaming");
+                let partial = stream_buf.into_inner().unwrap_or_default();
+                if !partial.trim().is_empty() {
+                    return Ok(CompletionResponse {
+                        text: partial,
+                        id: "opencode-cli".to_string(),
+                        model,
+                        usage: Usage::default(),
+                    });
+                }
                 drop(args);
                 drop(prompt);
                 self.complete(req).await

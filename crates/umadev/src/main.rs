@@ -731,8 +731,17 @@ const BACKEND_ARG_IDS: &[&str] = &["claude-code", "codex", "opencode"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+
+    // The TUI owns the alternate screen, so a log line written to the terminal
+    // corrupts the display and sticks in the input box. Detect the TUI launch
+    // (no subcommand + a real TTY) and route logs to a file in that case;
+    // every CLI verb keeps logging to the terminal as before.
+    let is_tui = launches_tui(
+        cli.command.is_some(),
+        std::io::IsTerminal::is_terminal(&std::io::stdin()),
+    );
+    init_tracing(is_tui);
 
     // No subcommand → launch the TUI (the recommended interactive entry).
     // In a non-TTY environment (piped output, CI, docker), fall back to
@@ -1393,13 +1402,73 @@ async fn cmd_doctor(project_root: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+/// `true` when this invocation launches the interactive TUI — the only path
+/// that owns the alternate screen and must therefore NOT log to the terminal.
+/// The TUI launches with no subcommand on a real TTY; a piped/CI run (no TTY)
+/// prints help instead, and any subcommand is a plain CLI verb.
+fn launches_tui(has_subcommand: bool, stdin_is_tty: bool) -> bool {
+    !has_subcommand && stdin_is_tty
+}
+
+/// Initialize the tracing subscriber.
+///
+/// `to_file = true` (the TUI launch) routes every log line to
+/// `~/.umadev/logs/umadev.log` instead of the terminal, because the TUI owns
+/// the alternate screen and any stray stdout/stderr write corrupts the display
+/// and sticks in the input box. If the log file can't be opened we discard logs
+/// (`io::sink`) rather than ever fall back to the terminal while the TUI is up.
+/// `to_file = false` (every CLI verb) keeps the original terminal logging.
+fn init_tracing(to_file: bool) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,umadev=info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
+    if to_file {
+        match open_log_file() {
+            Some(file) => {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file))
+                    .try_init();
+            }
+            None => {
+                // No writable log file → discard logs entirely. NEVER write to
+                // the terminal here: that is the bug we are fixing.
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_target(false)
+                    .with_writer(std::io::sink)
+                    .try_init();
+            }
+        }
+    } else {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .try_init();
+    }
+}
+
+/// Best-effort open `~/.umadev/logs/umadev.log` for appending. Returns `None`
+/// on any failure (no home dir, unwritable path) so the caller discards logs
+/// rather than risk corrupting the TUI. Cross-platform home: `HOME` then
+/// `USERPROFILE` (Windows).
+fn open_log_file() -> Option<std::fs::File> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    open_log_file_in(&PathBuf::from(home))
+}
+
+/// Open `<home>/.umadev/logs/umadev.log` for appending, creating the directory
+/// tree. Returns `None` on any IO failure. Split out from [`open_log_file`] so
+/// it is testable without mutating the process-global `HOME`.
+fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
+    let dir = home.join(".umadev").join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("umadev.log"))
+        .ok()
 }
 
 fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) -> Result<()> {
@@ -3822,6 +3891,38 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launches_tui_only_on_no_subcommand_and_a_tty() {
+        // The only path that owns the alternate screen → must log to a file.
+        assert!(launches_tui(false, true), "no subcommand + TTY → TUI");
+        // A subcommand is a plain CLI verb (logs to terminal as before).
+        assert!(!launches_tui(true, true), "a subcommand is not the TUI");
+        // No TTY (piped / CI) prints help, never the TUI.
+        assert!(!launches_tui(false, false), "no TTY → not the TUI");
+        assert!(
+            !launches_tui(true, false),
+            "subcommand + no TTY → not the TUI"
+        );
+    }
+
+    #[test]
+    fn open_log_file_in_creates_the_tree_and_never_panics() {
+        // A writable home → ~/.umadev/logs/umadev.log is created. No global env
+        // mutation, so this can't flake other tests that read HOME.
+        let tmp = std::env::temp_dir().join(format!("umadev-logtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let f = open_log_file_in(&tmp);
+        assert!(f.is_some(), "a writable home yields a log file");
+        assert!(
+            tmp.join(".umadev")
+                .join("logs")
+                .join("umadev.log")
+                .is_file(),
+            "the log file is created on disk"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     /// BackendArg must cover EXACTLY the ids that umadev-host registers
     /// as drivers. If you add a host driver, you must add the selector

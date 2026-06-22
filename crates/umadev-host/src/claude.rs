@@ -286,6 +286,9 @@ impl Runtime for ClaudeCodeDriver {
         let program = self.program.clone();
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
 
+        // Accumulate the raw stream so a mid-stream failure can salvage whatever
+        // the base already produced instead of cold-restarting a whole new run.
+        let stream_buf = std::sync::Mutex::new(String::new());
         let result = run_subprocess_streaming(
             SubprocessCall {
                 program: &program,
@@ -297,6 +300,10 @@ impl Runtime for ClaudeCodeDriver {
                 env: &[],
             },
             &|line: &str| {
+                if let Ok(mut b) = stream_buf.lock() {
+                    b.push_str(line);
+                    b.push('\n');
+                }
                 if let Some(ev) = parse_claude_stream_line(line) {
                     on_event(ev);
                 }
@@ -334,13 +341,41 @@ impl Runtime for ClaudeCodeDriver {
                 })
             }
             Err(e) => {
-                // If streaming fails, fall back to non-streaming complete.
-                tracing::warn!(error = %e, "streaming failed, falling back to non-streaming");
+                // Streaming broke mid-flight (commonly the base subprocess being
+                // SIGTERM/SIGALRM'd — exit 143/142 — by its own environment).
+                // This is routine self-healing, so it's `debug!`, not a scary
+                // user-facing warning. First try to SALVAGE what already streamed
+                // (it was shown to the user live) before paying for a full
+                // cold-restart `complete` (worst case another whole timeout).
+                tracing::debug!(error = %e, "streaming failed, falling back to non-streaming");
+                let partial = stream_buf.into_inner().unwrap_or_default();
+                if let Some(text) = salvage_partial_stream(&partial) {
+                    let usage = extract_usage(&partial);
+                    return Ok(CompletionResponse {
+                        text,
+                        id: "claude-code-cli".to_string(),
+                        model,
+                        usage,
+                    });
+                }
                 drop(args);
                 drop(prompt);
                 self.complete(req).await
             }
         }
+    }
+}
+
+/// Recover usable assistant text from a partial stream-json buffer captured
+/// before a mid-stream failure. Returns `None` when nothing usable is present
+/// (so the caller cold-restarts via `complete`), `Some(text)` when there is
+/// real output worth keeping instead of re-running the whole turn.
+fn salvage_partial_stream(stdout: &str) -> Option<String> {
+    let text = extract_result_text(stdout).unwrap_or_else(|| extract_all_assistant_text(stdout));
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
@@ -639,6 +674,26 @@ mod tests {
         assert!(forked.is_some(), "a real base must fork for parallel work");
     }
     use umadev_runtime::StreamEvent;
+
+    #[test]
+    fn salvage_partial_stream_recovers_text_or_none() {
+        // A partial stream with an assistant text block → recoverable (so a
+        // mid-stream failure reuses it instead of a full cold restart).
+        let partial = concat!(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"half an answer"}]}}"#,
+            "\n",
+        );
+        assert_eq!(
+            salvage_partial_stream(partial).as_deref(),
+            Some("half an answer")
+        );
+        // Nothing usable (no assistant text, just noise) → None → cold restart.
+        assert_eq!(salvage_partial_stream(""), None);
+        assert_eq!(
+            salvage_partial_stream(r#"{"type":"system","subtype":"init"}"#),
+            None
+        );
+    }
 
     #[test]
     fn extract_usage_reads_tokens_from_result_line() {

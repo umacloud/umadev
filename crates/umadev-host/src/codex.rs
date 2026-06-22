@@ -271,6 +271,9 @@ impl Runtime for CodexDriver {
         let program = self.program.clone();
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
 
+        // Accumulate the raw stream so a mid-stream failure can salvage whatever
+        // already arrived instead of cold-restarting a whole new run.
+        let stream_buf = std::sync::Mutex::new(String::new());
         let result = run_subprocess_streaming(
             SubprocessCall {
                 program: &program,
@@ -282,6 +285,10 @@ impl Runtime for CodexDriver {
                 env: &[],
             },
             &|line: &str| {
+                if let Ok(mut b) = stream_buf.lock() {
+                    b.push_str(line);
+                    b.push('\n');
+                }
                 if let Some(ev) = parse_codex_stream_line(line) {
                     on_event(ev);
                 }
@@ -307,7 +314,21 @@ impl Runtime for CodexDriver {
                 })
             }
             Err(e) => {
-                tracing::warn!(error = %e, "codex streaming failed, falling back");
+                // Routine self-healing (often the base being SIGTERM/SIGALRM'd —
+                // exit 143/142 — by its own environment), so `debug!` not a scary
+                // warning. Salvage what already streamed before a full cold restart.
+                tracing::debug!(error = %e, "codex streaming failed, falling back");
+                let partial = stream_buf.into_inner().unwrap_or_default();
+                let salvaged = extract_codex_messages(&partial);
+                if !salvaged.trim().is_empty() {
+                    let usage = extract_codex_usage(&partial);
+                    return Ok(CompletionResponse {
+                        text: salvaged,
+                        id: "codex-cli".to_string(),
+                        model,
+                        usage,
+                    });
+                }
                 drop(args);
                 drop(prompt);
                 self.complete(req).await
