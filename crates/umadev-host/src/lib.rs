@@ -1573,7 +1573,9 @@ mod tests {
     /// `std::sync::Mutex` whose guard can't be held across an `.await`; these
     /// tests `.await` the subprocess while the env must stay set, so they need a
     /// `tokio::sync::Mutex` instead. Only these three tests touch this var, so
-    /// serialising them is sufficient.
+    /// serialising them is sufficient. Gated to `unix` like its only users, so
+    /// it isn't a dead `static` on Windows (`-D warnings` rejects that).
+    #[cfg(unix)]
     static IDLE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Write an executable `#!/bin/sh` fake into `dir` and return its path. The
