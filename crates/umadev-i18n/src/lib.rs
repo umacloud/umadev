@@ -379,6 +379,12 @@ mod tests {
             "doctor.binary",
             "doctor.worker_availability",
             "doctor.overlay_title",
+            // Wave 4 (tui): honest aborted-state + silent-failure surfaces.
+            "input.aborted",
+            "tui.hint.aborted",
+            "config.save_failed_note",
+            "chat.claims_unverified",
+            "gate.clarify_write_failed",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

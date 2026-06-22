@@ -394,9 +394,14 @@ fn spawn_block(
         let brain = match build_brain(&spec, false, None, &options.project_root) {
             Ok(b) => b,
             Err(e) => {
-                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                    "worker.init_failed",
-                    &[&label, &e.to_string()],
+                // build_brain failing (unknown backend / driver build error) is a
+                // ZERO-PHASE abort: the run never starts. A bare `Note` here would
+                // leave the bar reading idle "0/9" forever — so carry the
+                // `ABORT_SENTINEL` (like the other two terminal-abort paths) to
+                // flip `aborted` and paint an honest `[aborted]` status.
+                sink.emit(EngineEvent::Note(format!(
+                    "{ABORT_SENTINEL}{}",
+                    umadev_i18n::tlf("worker.init_failed", &[&label, &e.to_string()])
                 )));
                 return;
             }
@@ -811,11 +816,12 @@ fn changed_files_between(before: &str, after: &str) -> Vec<String> {
     changed.into_iter().collect()
 }
 
-/// Heuristic: does this base reply CLAIM it made code changes? Used only to
-/// decide whether to raise the "claimed-but-no-diff" warning when git shows the
-/// working tree is in fact unchanged. Deliberately broad and bilingual; a false
-/// positive only adds an advisory note, never blocks anything.
-fn claims_code_changes(text: &str) -> bool {
+/// Heuristic: does this base reply CLAIM it made code changes? Used to decide
+/// whether to raise the "claimed-but-no-diff" warning after an agentic turn, and
+/// to anchor a pure-chat reply that recites an edit it never made (a base that
+/// misclassified a status question as chat). Deliberately broad and bilingual; a
+/// false positive only adds an advisory note, never blocks anything.
+pub(crate) fn claims_code_changes(text: &str) -> bool {
     // English change verbs.
     const EN: &[&str] = &[
         "refactor",

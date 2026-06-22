@@ -36,6 +36,7 @@
 "model.synced_default" = "{} 未在設定裡固定模型 —— Agent 用它的登入/預設模型驅動(執行後可見真實模型)"
 "model.reasoning" = "思考強度 {}(底座設定,umadev 不覆寫)"
 "input.idle" = "問我任何事…（/help 查看指令）"
+"input.aborted" = "本輪已中止 —— 重新輸入需求再試"
 
 # 狀態
 "status.ready" = "就緒"
@@ -117,12 +118,14 @@
 
 # Shared config write error
 "config.write_failed" = "(無法寫入 {}: {})"
+"config.save_failed_note" = "[warn] 設定已對本工作階段生效,但未能持久化儲存(下次啟動會回退):{}"
 
 # Chitchat replies (offline keyword heuristic)
 "chitchat.greeting" = "你好!我是 UmaDev — 你的 AI 程式設計專案總監 Agent。\n\n直接輸入你要做的產品需求,我會啟動 9 階段流水線:\n  research -> docs -> spec -> frontend -> backend -> quality -> delivery\n\n例如:\n  做一個帶 Email 登入的 SaaS 登陸頁\n  做一個 TODO 待辦應用\n  做一個部落格系統"
 "chitchat.thanks" = "不客氣!有需求隨時發給我。"
 "chitchat.who" = "我是 UmaDev — AI 程式設計的專案總監 Agent。\n\n我驅動你已登入的 claude code / codex / opencode,按 9 階段商業交付流程\n把一句話需求變成完整產品(文件+前端+後端+部署)。\n\n直接輸入需求即可開始,例如:\n  做一個帶使用者註冊的論壇"
 "chitchat.fallback" = "收到!如果你想做一個產品,直接描述需求即可啟動流水線。\n\n例如:\n  做一個帶 Email 登入的 SaaS 登陸頁\n  做一個 TODO 應用\n\n或輸入 /help 看全部指令。"
+"chat.claims_unverified" = "[warn] 以上為對話內容,本輪未改動任何檔案。任何「已修改/已實作」的說法請用實際檔案 / `git status` 核對。"
 
 # Delivery completion banner
 "delivery.latest_zip" = "\n  最新: {} ({} KiB)"
@@ -140,6 +143,7 @@
 "quit.confirm_running" = "再按一次 Esc 退出 UmaDev(workflow state 已儲存,下次 `umadev` 自動續上)。"
 "gate.clarify_saved" = "[ok] 釐清回答已儲存,開始連網調研…"
 "gate.clarify_recorded" = "已記錄(繼續回答,或輸入 c 提交)"
+"gate.clarify_write_failed" = "[warn] 該回答未能寫入({}),未被記錄,請重新輸入。"
 "gate.confirmed_docs" = "已確認三份核心文件,繼續產生 spec 與前端…"
 "gate.confirmed_preview" = "已確認前端預覽,繼續開發後端…"
 "gate.confirmed_generic" = "已確認,繼續推進…"
@@ -441,6 +445,7 @@
 "tui.hint.finished" = "[ok] 已完成 —— 輸入新需求可重新開始"
 "tui.hint.running" = "[wait] 流水線執行中 —— 等待下一個閘門"
 "tui.hint.idle" = "Enter 提交 · /help 檢視全部命令"
+"tui.hint.aborted" = "[aborted] 本輪已停止 —— 重新輸入需求再啟動"
 # 斜線命令面板浮層標題
 "tui.palette.title" = "斜線命令"
 # 狀態列

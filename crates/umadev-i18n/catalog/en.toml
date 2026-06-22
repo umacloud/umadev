@@ -36,6 +36,7 @@
 "model.synced_default" = "{} pins no model in config — the agent runs on its login/default model (the real model shows after a run)"
 "model.reasoning" = "reasoning effort {} (from the base config; UmaDev does not override)"
 "input.idle" = "Ask anything…  (/help for commands)"
+"input.aborted" = "this round was aborted — type a new requirement to try again"
 
 # Status
 "status.ready" = "Ready"
@@ -117,12 +118,14 @@
 
 # Shared config write error
 "config.write_failed" = "(could not write {}: {})"
+"config.save_failed_note" = "[warn] Setting applied for this session, but could not be saved (it will revert on next launch): {}"
 
 # Chitchat replies (offline keyword heuristic)
 "chitchat.greeting" = "Hi! I'm UmaDev — your AI coding project-director Agent.\n\nJust type the product you want and I'll start the 9-phase pipeline:\n  research -> docs -> spec -> frontend -> backend -> quality -> delivery\n\nFor example:\n  A SaaS landing page with email login\n  A to-do app\n  A blog system"
 "chitchat.thanks" = "You're welcome! Send a requirement anytime."
 "chitchat.who" = "I'm UmaDev — the project-director Agent for AI coding.\n\nI drive your logged-in claude code / codex / opencode through a 9-phase commercial delivery flow\nto turn a one-line idea into a complete product (docs + frontend + backend + deploy).\n\nJust type a requirement to start, for example:\n  A forum with user registration"
 "chitchat.fallback" = "Got it! If you want to build a product, just describe the requirement to start the pipeline.\n\nFor example:\n  A SaaS landing page with email login\n  A to-do app\n\nOr type /help for all commands."
+"chat.claims_unverified" = "[warn] The reply above is chat only — no files were changed this turn. Verify any claimed edits against the actual files / `git status`."
 
 # Delivery completion banner
 "delivery.latest_zip" = "\n  latest: {} ({} KiB)"
@@ -140,6 +143,7 @@
 "quit.confirm_running" = "Press Esc again to quit UmaDev (workflow state is saved; the next `umadev` resumes automatically)."
 "gate.clarify_saved" = "[ok] Clarification answers saved, starting web research…"
 "gate.clarify_recorded" = "Recorded (keep answering, or type c to submit)"
+"gate.clarify_write_failed" = "[warn] Could not save that answer ({}) — it was NOT recorded; please retype it."
 "gate.confirmed_docs" = "Three core docs approved, generating spec and frontend…"
 "gate.confirmed_preview" = "Frontend preview approved, building the backend…"
 "gate.confirmed_generic" = "Approved, proceeding…"
@@ -441,6 +445,7 @@
 "tui.hint.finished" = "[ok] complete — new requirement to start again"
 "tui.hint.running" = "[wait] pipeline running — wait for the next gate"
 "tui.hint.idle" = "Enter submit · /help for all commands"
+"tui.hint.aborted" = "[aborted] this round stopped — type a new requirement to start again"
 # Slash-command palette popover title
 "tui.palette.title" = "slash commands"
 # Status row

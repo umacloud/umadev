@@ -1812,8 +1812,19 @@ impl App {
                     self.lang = lang;
                     umadev_i18n::set_lang(lang);
                     self.config.lang = Some(lang.code().to_string());
-                    let _ = crate::config::save_to(&self.config, &self.config_path);
+                    // Surface a persist failure (read-only HOME / full disk) so the
+                    // choice doesn't silently revert on the next launch while the UI
+                    // implied it stuck. `goto_picker_step` clears `picker_notice`,
+                    // so set it AFTER advancing — it then shows on the base picker.
+                    let save_err = crate::config::save_to(&self.config, &self.config_path).err();
                     self.goto_picker_step(PickerStep::BaseCli);
+                    if let Some(e) = save_err {
+                        self.picker_notice = Some(umadev_i18n::tf(
+                            self.lang,
+                            "config.save_failed_note",
+                            &[&e.to_string()],
+                        ));
+                    }
                     return Action::None;
                 }
                 // A base CLI must be installed/reachable before we commit to it.
@@ -2180,11 +2191,18 @@ impl App {
                     );
                     return Action::Continue(gate);
                 }
-                self.append_clarify_answer(&text);
-                self.push(
-                    ChatRole::UmaDev,
-                    umadev_i18n::t(self.lang, "gate.clarify_recorded").to_string(),
-                );
+                match self.append_clarify_answer(&text) {
+                    Ok(()) => self.push(
+                        ChatRole::UmaDev,
+                        umadev_i18n::t(self.lang, "gate.clarify_recorded").to_string(),
+                    ),
+                    // Persist failed — don't claim "recorded"; the resume path
+                    // would lose this answer. Tell the user the write failed.
+                    Err(e) => self.push(
+                        ChatRole::System,
+                        umadev_i18n::tf(self.lang, "gate.clarify_write_failed", &[&e.to_string()]),
+                    ),
+                }
                 return Action::None;
             }
             if matches!(text.trim(), "c" | "C") {
@@ -2468,10 +2486,22 @@ impl App {
             return;
         }
         self.push(ChatRole::Host, reply.clone());
+        // Reality-anchor a pure-chat reply: if the base RECITES an edit ("I
+        // changed / implemented / added …") in a chat turn — no pipeline run, no
+        // agentic tool calls, so nothing actually touched the tree — append a
+        // lightweight advisory telling the user to verify against real files /
+        // `git status`. Non-blocking; a false positive only adds one note.
+        let claims = crate::claims_code_changes(&reply);
         self.conversation.push(umadev_runtime::Message {
             role: "assistant".to_string(),
             content: reply,
         });
+        if claims {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.claims_unverified").to_string(),
+            );
+        }
         self.trim_conversation();
     }
 
@@ -3091,7 +3121,14 @@ impl App {
                 Some(value.to_string())
             };
             self.config.apply_model_tiers();
-            let _ = crate::config::save_to(&self.config, &self.config_path);
+            // Don't claim the change persisted if the write failed — the next
+            // launch would silently revert. Surface the reason as a System note.
+            if let Err(e) = crate::config::save_to(&self.config, &self.config_path) {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::tf(self.lang, "config.save_failed_note", &[&e.to_string()]),
+                );
+            }
             let default = umadev_i18n::t(self.lang, "model.tiers_default_paren");
             let plan = self.config.model_plan.as_deref().unwrap_or(default);
             let build = self.config.model_build.as_deref().unwrap_or(default);
@@ -4990,7 +5027,14 @@ impl App {
         self.lang = lang;
         umadev_i18n::set_lang(lang);
         self.config.lang = Some(lang.code().to_string());
-        let _ = crate::config::save_to(&self.config, &self.config_path);
+        // A failed persist means the language reverts on next launch — say so
+        // rather than letting the "changed" line below imply it stuck.
+        if let Err(e) = crate::config::save_to(&self.config, &self.config_path) {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(lang, "config.save_failed_note", &[&e.to_string()]),
+            );
+        }
         self.push(
             ChatRole::System,
             umadev_i18n::tf(lang, "lang.changed", &[lang.label()]),
@@ -5076,13 +5120,17 @@ impl App {
     /// Called during `ClarifyGate` so each answer is persisted; on resume
     /// `merged_requirement` reads this file and folds answers into the
     /// requirement for research.
-    fn append_clarify_answer(&self, answer: &str) {
+    /// Returns `Err` with the failure reason when the answer could NOT be
+    /// persisted, so the caller can show an honest write-error note instead of a
+    /// false "recorded" line. On a write failure the resume path would lose the
+    /// answer silently, so the user must be told.
+    fn append_clarify_answer(&self, answer: &str) -> std::io::Result<()> {
         let path = self
             .project_root
             .join("output")
             .join(format!("{}-clarify-answers.md", self.slug));
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent)?;
         }
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
         let updated = if existing.trim().is_empty() {
@@ -5090,7 +5138,7 @@ impl App {
         } else {
             format!("{existing}\n{answer}")
         };
-        let _ = std::fs::write(&path, updated);
+        std::fs::write(&path, updated)
     }
 
     /// Called by `apply_engine` when the preview gate opens: surface the
@@ -5150,20 +5198,31 @@ impl App {
     pub fn is_stalled(&self) -> bool {
         const STALL: std::time::Duration = std::time::Duration::from_secs(3);
         // Stall only makes sense while something is ACTIVELY running: a phase is
-        // in flight, or a chat turn is "thinking". At a gate (paused for the
-        // user) `phase_started_at` is cleared, so we never falsely go red there.
-        let active = self.phase_started_at.is_some() || self.thinking;
+        // in flight, a chat turn is "thinking", OR the run has STARTED but not
+        // yet entered its first `Running` phase. That last case is the structural
+        // backstop: between `PipelineStarted` and the first phase there is a
+        // silent window (cold index build / intake / vector build) where
+        // `phase_started_at` is `None` and `thinking` is `false`. Without it, any
+        // silent path that drops its heartbeat in that window would freeze with no
+        // spinner and never go red. A gate (paused for the user) and a finished /
+        // aborted run are NOT active, so we never falsely go red there.
+        let pre_phase =
+            self.run_started && !self.finished && !self.aborted && self.active_gate.is_none();
+        let active = self.phase_started_at.is_some() || self.thinking || pre_phase;
         if !active || self.tool_in_progress {
             return false;
         }
         match self.last_output_at {
             Some(t) => t.elapsed() >= STALL,
             // Nothing has arrived yet this turn: only call it a stall once the
-            // active block has been running > 3s (a just-started phase isn't
-            // stalled, it's spinning up).
+            // active block has been running > 3s (a just-started phase / a
+            // just-launched run isn't stalled, it's spinning up). The pre-phase
+            // window has no `phase_started_at`/`thinking_started`, so fall back to
+            // the run's own start instant.
             None => self
                 .phase_started_at
                 .or(self.thinking_started)
+                .or(self.run_started_at)
                 .is_some_and(|t| t.elapsed() >= STALL),
         }
     }
@@ -7840,6 +7899,162 @@ mod tests {
         // A brand-new app with nothing running is never stalled either.
         let idle = fresh_app(Some("offline"));
         assert!(!idle.is_stalled());
+    }
+
+    #[test]
+    fn pre_phase_window_stalls_after_three_seconds() {
+        // THE 0/9 WINDOW: a run has STARTED (PipelineStarted) but no `Running`
+        // phase has begun yet (cold index build / intake / vector build). Here
+        // `phase_started_at` is None and `thinking` is false — the old judge
+        // would NEVER go red, so a silent freeze in this window read as smooth.
+        // The structural backstop must paint it red past 3s.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "build it".into(),
+        });
+        assert!(a.phase_started_at.is_none(), "no Running phase yet (0/9)");
+        assert!(!a.thinking, "not a chat-thinking turn");
+        // Just launched → not stalled (spin-up grace).
+        assert!(!a.is_stalled(), "a just-launched run is not stalled");
+        // Backdate the run start past the 3s threshold (no output has arrived).
+        a.run_started_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(4));
+        assert!(
+            a.is_stalled(),
+            "a silent pre-phase 0/9 window past 3s MUST read as stalled"
+        );
+    }
+
+    #[test]
+    fn pre_phase_gate_pause_is_not_stalled() {
+        // The pre-phase backstop must NOT misfire at a gate: GateOpened clears
+        // run_started_at and sets active_gate, so a human pause never flashes red.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "build it".into(),
+        });
+        a.apply_engine(EngineEvent::GateOpened {
+            gate: umadev_agent::gates::Gate::DocsConfirm,
+        });
+        // Even with a very stale clock, a gate pause is not a stall.
+        a.run_started_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
+        assert!(
+            !a.is_stalled(),
+            "a gate pause in the pre-phase window must not read as stalled"
+        );
+        // A finished/aborted run is likewise never stalled.
+        let mut done = fresh_app(Some("offline"));
+        done.run_started = true;
+        done.aborted = true;
+        done.run_started_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(30));
+        assert!(!done.is_stalled(), "an aborted run is not stalled");
+    }
+
+    #[test]
+    fn build_brain_failure_drives_aborted_terminal_state() {
+        // Fix 3: a `build_brain` init failure (unknown backend / driver build
+        // error) carries the ABORT_SENTINEL like the other terminal paths, so the
+        // bar flips to `[aborted]` instead of sitting at a fake idle "0/9".
+        let mut app = fresh_app(Some("offline"));
+        app.run_started = true;
+        app.run_started_at = Some(std::time::Instant::now());
+        // Emulate the wrapped terminal note spawn_block now emits on init failure.
+        app.apply_engine(EngineEvent::Note(format!(
+            "{}{}",
+            crate::ABORT_SENTINEL,
+            umadev_i18n::tlf("worker.init_failed", &["claude", "not on PATH"])
+        )));
+        assert!(
+            app.aborted,
+            "an init-failure sentinel note flips to aborted"
+        );
+        assert!(
+            !app.is_pipeline_active(),
+            "the failed run is no longer active"
+        );
+        app.refresh_status();
+        assert!(
+            app.status.contains("aborted"),
+            "the bar shows [aborted], not a fake idle 0/9"
+        );
+    }
+
+    #[test]
+    fn config_save_failure_pushes_a_note_on_lang_change() {
+        // Fix 4: a persist failure on `/lang` must surface a note, not silently
+        // claim success and revert on next launch. Point config_path under a
+        // regular FILE so `create_dir_all(parent)` inside save_to fails.
+        let mut app = fresh_app(Some("offline"));
+        let blocker = std::env::temp_dir().join(format!("sd-cfg-blocker-{}", std::process::id()));
+        std::fs::write(&blocker, b"x").unwrap();
+        app.config_path = blocker.join("nested").join("config.toml");
+        let before = app.history.len();
+        let _ = app.slash_lang("en");
+        let pushed: Vec<String> = app
+            .history
+            .iter()
+            .skip(before)
+            .map(|m| m.body.clone())
+            .collect();
+        assert!(
+            pushed.iter().any(|b| b.contains("[warn]")),
+            "a config persist failure must push a warning note: {pushed:?}"
+        );
+        // The language still changed for this session (fail-open).
+        assert_eq!(app.lang, umadev_i18n::Lang::En);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn chat_reply_claiming_edits_gets_an_unverified_warning() {
+        // Fix 5: a pure-chat reply that recites an edit ("已修改…/新增了…") —
+        // with no run and no agentic tool calls — gets a reality-anchor note.
+        let mut app = fresh_app(Some("offline"));
+        app.record_chat_reply("我已修改了 app.rs 并新增了一个函数".to_string());
+        assert!(
+            app.history.iter().any(|m| m.body.contains("[warn]")),
+            "a chat reply claiming code changes must get a verify warning"
+        );
+        // A benign chat reply (no change claim) must NOT be warned.
+        let mut benign = fresh_app(Some("offline"));
+        benign.record_chat_reply("你好,有什么可以帮你的?".to_string());
+        assert!(
+            !benign.history.iter().any(|m| m.body.contains("[warn]")),
+            "a plain chat reply must not trigger the warning"
+        );
+    }
+
+    #[test]
+    fn clarify_answer_write_failure_does_not_claim_recorded() {
+        // Fix 6: when the clarify answer can't be persisted, the user must be
+        // told it was NOT recorded — never the false "已记录" line.
+        let mut app = fresh_app(Some("offline"));
+        // Point the project root at a regular FILE so the output/ dir can't be
+        // created and the answer write fails.
+        let blocker =
+            std::env::temp_dir().join(format!("sd-clarify-blocker-{}", std::process::id()));
+        std::fs::write(&blocker, b"x").unwrap();
+        app.project_root = blocker.clone();
+        app.active_gate = Some(Gate::ClarifyGate);
+        for c in "use postgres".chars() {
+            let _ = app.apply_key(KeyCode::Char(c));
+        }
+        let _ = app.apply_key(KeyCode::Enter);
+        let last = app.history.back().unwrap();
+        assert!(
+            !last.body.contains("已记录"),
+            "a failed write must NOT claim the answer was recorded: {}",
+            last.body
+        );
+        assert!(
+            last.body.contains("[warn]"),
+            "a failed clarify write must surface a warning: {}",
+            last.body
+        );
+        let _ = std::fs::remove_file(&blocker);
     }
 
     // ---- WorkerStream rendering tests ----

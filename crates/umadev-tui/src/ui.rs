@@ -1140,9 +1140,13 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // The `>_` is a terminal-window icon. The run/gate markers drop the trailing
     // `_` faux-cursor — with the real terminal cursor now sitting in the input
     // (you can type to queue while running), a second `_` read as a stray cursor.
+    // An aborted block is NOT "running": it bailed before any phase. Showing
+    // `[run]` there would contradict the `[aborted]` status bar and lie about a
+    // dead round. `is_pipeline_active()` already excludes both finished AND
+    // aborted, so the run marker only shows for a genuinely live run.
     let mode_icon = if app.active_gate.is_some() {
         "[gate]"
-    } else if app.run_started && !app.finished {
+    } else if app.is_pipeline_active() {
         "[run]"
     } else {
         ">_"
@@ -1162,6 +1166,11 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         umadev_i18n::t(app.lang, "input.gate")
     } else if app.finished {
         umadev_i18n::t(app.lang, "input.finished")
+    } else if app.aborted {
+        // The round bailed — tell the user to re-enter a requirement, NOT that a
+        // run is still in flight (which the bare `run_started` branch below would
+        // wrongly imply, since `run_started` stays set on an aborted block).
+        umadev_i18n::t(app.lang, "input.aborted")
     } else if app.run_started {
         umadev_i18n::t(app.lang, "input.running")
     } else {
@@ -1251,6 +1260,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         umadev_i18n::t(app.lang, "tui.hint.typed").into()
     } else if app.finished {
         umadev_i18n::t(app.lang, "tui.hint.finished").into()
+    } else if app.aborted {
+        // Aborted round — the hint must match the `[aborted]` status, not the
+        // "wait for the next gate" line a live run shows.
+        umadev_i18n::t(app.lang, "tui.hint.aborted").into()
     } else if app.run_started {
         umadev_i18n::t(app.lang, "tui.hint.running").into()
     } else {
