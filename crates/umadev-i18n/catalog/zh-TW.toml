@@ -40,6 +40,7 @@
 
 # 狀態
 "status.ready" = "就緒"
+"status.aborted" = "本輪已中止"
 "status.thinking" = "正在思考…"
 "status.esc_cancel" = "esc 取消"
 "mode.auto_chip" = "自動過門 (shift+Tab 轉手動)"
@@ -76,6 +77,12 @@
 "gate.short_warn" = "{}: only {} lines — may be incomplete"
 "gate.suggest_revise" = "建議: 用 /revise '重新產生 architecture' 讓 worker 補充"
 "gate.quality_line" = "品質: {} CSS tokens · dark mode: {}"
+"gate.detail.missing" = "[warn] 缺失"
+"gate.detail.scaffold" = "{} 行 [warn] 鷹架"
+"gate.detail.short" = "{} 行 [warn] 偏短"
+"gate.detail.ok" = "{} 行 [ok]"
+"gate.detail.dark_ok" = "[ok]"
+"gate.detail.dark_missing" = "[fail] 缺失"
 "gate.checklist_header" = "審批清單(確認這些再通過):"
 "gate.actions_header" = "操作:"
 "gate.action.continue" = "/continue 或 c        -> 通過 gate"
@@ -471,7 +478,7 @@
 "tui.help.nav.toggle" = "切換本說明"
 "tui.help.nav.quit" = "退出"
 # 說明浮層 —— 底座組動態列
-"tui.help.worker.offline" = "確定性模板(無底座)"
+"tui.help.worker.offline" = "確定性模板 — 內部兜底(demo / CI),非正式底座"
 "tui.help.worker.model" = "設定模型 id"
 # 說明浮層 —— 流水線與閘門
 "tui.help.pipe.enter" = "提交;非斜線 = 需求(在閘門處則為修改意見)"

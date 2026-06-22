@@ -40,6 +40,7 @@
 
 # Status
 "status.ready" = "Ready"
+"status.aborted" = "this round was aborted"
 "status.thinking" = "thinking…"
 "status.esc_cancel" = "esc to cancel"
 "mode.auto_chip" = "auto-approve (shift+Tab for manual)"
@@ -76,6 +77,12 @@
 "gate.short_warn" = "{}: only {} lines — may be incomplete"
 "gate.suggest_revise" = "Tip: use /revise 'regenerate architecture' to have the worker fill it in"
 "gate.quality_line" = "Quality: {} CSS tokens · dark mode: {}"
+"gate.detail.missing" = "[warn] MISSING"
+"gate.detail.scaffold" = "{} lines [warn] SCAFFOLD"
+"gate.detail.short" = "{} lines [warn] SHORT"
+"gate.detail.ok" = "{} lines [ok]"
+"gate.detail.dark_ok" = "[ok]"
+"gate.detail.dark_missing" = "[fail] missing"
 "gate.checklist_header" = "Approval checklist (confirm these before approving):"
 "gate.actions_header" = "Actions:"
 "gate.action.continue" = "/continue or c         -> approve gate"
@@ -471,7 +478,7 @@
 "tui.help.nav.toggle" = "toggle this help"
 "tui.help.nav.quit" = "quit"
 # Help overlay — worker group dynamic rows
-"tui.help.worker.offline" = "deterministic templates (no host)"
+"tui.help.worker.offline" = "deterministic templates — internal fallback (demo / CI), not a real base"
 "tui.help.worker.model" = "set the model id"
 # Help overlay — pipeline & gates
 "tui.help.pipe.enter" = "submit; non-slash = requirement (or revision at gate)"

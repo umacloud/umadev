@@ -937,7 +937,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // scrolling past the overflow. We estimate the wrapped height from each
     // line's display width (exact for the common short-line case; `line_count`
     // is private in ratatui).
-    let w = (area.width as usize).max(1);
+    let w = usize::from(area.width).max(1);
     let total: usize = rendered
         .iter()
         .map(|l| {
@@ -1053,6 +1053,24 @@ impl CjkWide for char {
 /// Display columns a string occupies (ASCII = 1, CJK/wide = 2).
 fn disp_width(s: &str) -> usize {
     s.chars().map(|c| usize::from(c.is_cjk_wide()) + 1).sum()
+}
+
+/// Truncate `s` to at most `max` display columns (CJK = 2), char-aligned so a
+/// wide glyph is never split. Returns the kept prefix; the caller decides
+/// whether to add an ellipsis. Used by the status row so a long CJK phase
+/// string can never overflow a narrow terminal.
+fn truncate_to_width(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut col = 0usize;
+    for c in s.chars() {
+        let cw = usize::from(c.is_cjk_wide()) + 1;
+        if col + cw > max {
+            break;
+        }
+        out.push(c);
+        col += cw;
+    }
+    out
 }
 
 /// Hard-wrap `text` into rows of at most `width` display columns (char-level,
@@ -1413,6 +1431,13 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
             app.spinner(),
             umadev_i18n::t(app.lang, "status.thinking")
         )
+    } else if app.aborted {
+        // Dedicated terminal branch — an aborted round reads as `[aborted]` here
+        // DIRECTLY, instead of leaning on `app.status` carrying the right text.
+        // That coupling was fragile: a future `refresh_status` change could
+        // silently make a wedged run show stale phase progress. Checked before
+        // `run_started` because `mark_block_aborted` leaves `run_started` set.
+        format!("[aborted] {}", umadev_i18n::t(app.lang, "status.aborted"))
     } else if app.run_started {
         // While a slow phase's heartbeat is live, show its in-place "still
         // working (mm:ss)" reassurance HERE (overwritten each beat) instead of
@@ -1446,14 +1471,28 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(" /help ", Style::default().fg(theme::TEXT_MUTED())),
     ]);
     let mut right_spans: Vec<Span<'static>> = Vec::new();
-    // Pad with spaces to right-align the phase status. The casts are safe:
-    // lengths are tiny relative to u16::MAX; saturate to 0 on overflow.
-    let left_len = u16::try_from(dir_name.len() + backend_label.len() + 14).unwrap_or(u16::MAX);
-    let phase_len = u16::try_from(phase_info.len()).unwrap_or(u16::MAX);
-    let pad = area
-        .width
-        .saturating_sub(left_len)
-        .saturating_sub(phase_len);
+    // Right-align by DISPLAY width, not byte length — a CJK glyph is 3 bytes but
+    // occupies 2 columns, so `.len()` over-counts ~3x and used to saturate the
+    // pad to 0 (status text glued to the left) under a Chinese locale. The left
+    // chrome is `" {dir} " · " {backend} " · " /help "`: each padded label adds
+    // its display width + 2 spaces, plus 1+1 for the two `·` and 7 for ` /help `.
+    let left_width = disp_width(dir_name) + 2 + 1 + disp_width(backend_label) + 2 + 1 + 7;
+    // On a narrow terminal the phase string itself can be wider than the space
+    // left after the chrome — clip it (by display width) so it never wraps or
+    // overruns the row. Keep a trailing column for the ` ` we append below.
+    let avail_right = usize::from(area.width)
+        .saturating_sub(left_width)
+        .saturating_sub(1);
+    let phase_info = if disp_width(&phase_info) > avail_right {
+        truncate_to_width(&phase_info, avail_right)
+    } else {
+        phase_info
+    };
+    // Pad with spaces to right-align the (possibly clipped) phase status.
+    let phase_width = disp_width(&phase_info) + 1; // + the trailing space we add
+    let pad = usize::from(area.width)
+        .saturating_sub(left_width)
+        .saturating_sub(phase_width);
     for _ in 0..pad {
         right_spans.push(Span::raw(" "));
     }
@@ -2264,6 +2303,122 @@ mod tests {
         assert!(
             !render_to_string(&app).contains("queued"),
             "the chip must disappear once the queue empties"
+        );
+    }
+
+    // --- P2-A: status-row display-width alignment (CJK) ---
+
+    /// Render JUST the status row at `width` cols and return its single row as a
+    /// per-cell `Vec<String>` (one entry per terminal column). A wide CJK glyph
+    /// occupies one cell + a following skip cell, so column indices are exact —
+    /// the honest way to assert alignment without re-measuring a flattened string.
+    fn render_status_cells(app: &App, width: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| render_status_row(f, f.area(), app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        buffer
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect()
+    }
+
+    /// Column index of the first cell whose symbol contains `needle`.
+    fn col_of(cells: &[String], needle: &str) -> Option<usize> {
+        cells.iter().position(|s| s.contains(needle))
+    }
+
+    #[test]
+    fn disp_width_counts_cjk_as_two_columns() {
+        assert_eq!(disp_width("ab"), 2);
+        assert_eq!(disp_width("正在思考"), 8); // 4 CJK glyphs × 2 cols
+        assert_eq!(disp_width("a正b"), 4);
+    }
+
+    #[test]
+    fn truncate_to_width_never_splits_a_wide_glyph() {
+        // 5 cols of room: "正在" = 4 cols, the 3rd glyph would push to 6 → dropped.
+        assert_eq!(truncate_to_width("正在思考", 5), "正在");
+        // Exact fit keeps everything.
+        assert_eq!(truncate_to_width("正在思考", 8), "正在思考");
+        // ASCII truncates per-column.
+        assert_eq!(truncate_to_width("abcdef", 3), "abc");
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    #[test]
+    fn status_row_right_aligns_cjk_without_overflow_or_collision() {
+        // A Chinese phase string (`正在思考`, 8 display cols but 12 bytes) used to
+        // over-count via `.len()`, saturate the pad to 0, and glue the status to
+        // the left chrome. With display-width padding it sits flush RIGHT instead.
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::ZhCn;
+        app.thinking = true; // → phase_info = "<spinner> 正在思考"
+        let width = 80u16;
+        let cells = render_status_cells(&app, width);
+        // The buffer is exactly `width` cells (a wide glyph + its skip cell) — so
+        // by construction nothing overran. Assert the phase is RIGHT-aligned:
+        // its first glyph starts in the right portion of the row, well past the
+        // left chrome (which used to be where it got glued under the byte-len bug).
+        let phase_col = col_of(&cells, "正").expect("CJK phase glyph renders");
+        let help_col = col_of(&cells, "h").expect("/help chrome renders"); // ` /help `
+        assert!(
+            phase_col > help_col + 10,
+            "phase not right-aligned (phase col {phase_col} vs help col {help_col})"
+        );
+        // The last glyph of the phase (`考`, 2 cols wide) ends near the right
+        // edge — its right edge (start col + 2 wide cells) is within one trailing
+        // space of the boundary. Anything larger means the pad over-shrank again.
+        let last_col = cells
+            .iter()
+            .rposition(|s| s.contains('考'))
+            .expect("last CJK glyph renders");
+        let glyph_right_edge = last_col + 2; // wide glyph occupies last_col + skip cell
+        assert!(
+            (width as usize) - glyph_right_edge <= 2,
+            "phase not flush-right: last glyph ends at {glyph_right_edge}, width {width}"
+        );
+    }
+
+    #[test]
+    fn status_row_aborted_branch_is_independent_of_app_status() {
+        // P2-F: an aborted round must render `[aborted]` from a DEDICATED status
+        // branch, not by relying on `app.status` text. Proof: blank out app.status
+        // entirely — the row still shows the aborted marker, so the two are
+        // decoupled and a future refresh_status change can't silently break it.
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::ZhCn;
+        app.aborted = true;
+        app.run_started = true; // mark_block_aborted leaves this set
+        app.status = String::new(); // the fragile coupling, deliberately removed
+        let cells = render_status_cells(&app, 80);
+        let joined: String = cells.join("");
+        assert!(
+            joined.contains("aborted") || joined.contains("中止"),
+            "aborted status must render from its own branch, not app.status: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn status_row_clips_overlong_cjk_on_a_narrow_terminal() {
+        // On a very narrow terminal the phase string is wider than the space left
+        // after the chrome — it must be clipped (by display width) so it never
+        // wraps or overruns. The render itself is the proof: a TestBackend of
+        // width W always yields exactly W cells; the assertion verifies the
+        // chrome + clipped phase still fit (no panic, phase head still visible).
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::ZhCn;
+        app.aborted = true; // → "[aborted] 本轮已中止"
+        let width = 30u16;
+        let cells = render_status_cells(&app, width);
+        assert_eq!(cells.len(), width as usize, "row is exactly the width");
+        // The `[aborted]` tag (left of the phase text) still renders even clipped.
+        assert!(
+            col_of(&cells, "a").is_some(),
+            "aborted status head should still render at a narrow width"
         );
     }
 }

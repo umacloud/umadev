@@ -381,10 +381,18 @@ mod tests {
             "doctor.overlay_title",
             // Wave 4 (tui): honest aborted-state + silent-failure surfaces.
             "input.aborted",
+            "status.aborted",
             "tui.hint.aborted",
             "config.save_failed_note",
             "chat.claims_unverified",
             "gate.clarify_write_failed",
+            // P2-D: gate-card artifact health labels (were hard-coded English).
+            "gate.detail.missing",
+            "gate.detail.scaffold",
+            "gate.detail.short",
+            "gate.detail.ok",
+            "gate.detail.dark_ok",
+            "gate.detail.dark_missing",
             // Continuous long-session path: CLI prints + TUI block notes + the
             // phase-progress and role-team review notes swept out of hard-coded
             // (mostly zh-only) literals in main.rs / tui lib.rs / continuous.rs.

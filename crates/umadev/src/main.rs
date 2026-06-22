@@ -140,21 +140,24 @@ enum Command {
     #[command(
         hide = true,
         long_about = "Run the pipeline non-interactively from `research` to the first\n\
-                      gate (`docs_confirm`). Workers:\n\
+                      gate (`docs_confirm`). Pick one of the three base CLIs:\n\
                       \n  \
                       --backend claude-code    Anthropic Claude Code\n  \
                       --backend codex          OpenAI Codex\n  \
-                      --backend opencode       OpenCode\n  \
-                      (default)                offline deterministic templates\n\
+                      --backend opencode       OpenCode\n\
                       \n\
-                      All base backends drive the user's already-installed,\n\
-                      already-logged-in CLI — no API key needed.\n\
+                      All three drive the user's already-installed, already-logged-in\n\
+                      CLI — no API key needed.\n\
+                      \n\
+                      Omitting --backend falls back to the internal offline templates\n\
+                      (deterministic, no network) — a demo / CI fallback, NOT a base you\n\
+                      pick for real delivery.\n\
                       \n\
                       After `run`, the pipeline pauses at the `docs_confirm` gate.\n\
                       Review `output/*-prd.md` etc., then run `umadev continue` to\n\
                       proceed, or `umadev revise \"...\"` to ask for changes.",
         after_help = "EXAMPLES:\n  \
-                      umadev run \"做一个登录系统\"                       # offline\n  \
+                      umadev run \"做一个登录系统\"                       # offline fallback\n  \
                       umadev run \"...\" --backend claude-code              # Claude Code\n  \
                       umadev run \"...\" --backend codex --slug my-mvp      # explicit slug\n  \
                       umadev run \"...\" --backend opencode                 # OpenCode"
@@ -248,9 +251,13 @@ enum Command {
                       then `umadev redo <phase>` regenerates just that phase and clears\n\
                       its `.DEGRADED` markers on success.\n\
                       \n\
-                      Valid phases: research, docs, spec, frontend, backend, quality,\n\
-                      delivery (aliases like fe / be / qa / api also work). Unknown\n\
-                      names and a missing prior run produce a friendly error.",
+                      Valid phases: research, docs, docs_confirm, spec, frontend,\n\
+                      preview_confirm, backend, quality, delivery (aliases like fe / be /\n\
+                      qa / api also work). The two gate phases (docs_confirm,\n\
+                      preview_confirm) are accepted but have no artifact to regenerate —\n\
+                      `redo` reports this and points you at `umadev continue` / `revise` to\n\
+                      act on the gate. Unknown names and a missing prior run produce a\n\
+                      friendly error.",
         after_help = "EXAMPLES:\n  \
                       umadev redo frontend                       # re-run just frontend\n  \
                       umadev redo backend --backend claude-code  # against a specific base\n  \
@@ -278,7 +285,11 @@ enum Command {
                       docs_confirm       (after research + docs)      → spec / frontend\n  \
                       preview_confirm    (after spec + frontend)       → backend / quality / delivery\n\
                       \n\
-                      `continue` is a no-op if no gate is active.",
+                      If no gate is recorded (e.g. the run was interrupted mid-phase),\n\
+                      `continue` infers the right block from the current phase and re-runs\n\
+                      it to recover. If it can't infer one (the pipeline already finished,\n\
+                      or the state is stale), it exits with an error telling you to start a\n\
+                      fresh `umadev run` — it is never a silent no-op.",
         after_help = "EXAMPLES:\n  \
                       umadev continue\n  \
                       umadev continue --backend claude-code\n  \
@@ -2976,7 +2987,7 @@ async fn drive_gate_block(
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
                     "backend `{}` not available: `{program}` is not on PATH. \
-                     Pass --backend offline (or no --backend) to fall back.",
+                     Install / log in to the base CLI first, or omit --backend to fall back to offline.",
                     backend.id()
                 );
             }
@@ -3100,11 +3111,12 @@ async fn cmd_continue(
     let project_root = resolve_root(project_root)?;
     let state = match umadev_agent::read_workflow_state_diagnostic(&project_root) {
         umadev_agent::ReadState::Ok(s) => s,
-        umadev_agent::ReadState::Missing => anyhow::bail!(
-            "no .umadev/workflow-state.json — run `umadev run` first"
-        ),
+        umadev_agent::ReadState::Missing => {
+            anyhow::bail!("no .umadev/workflow-state.json — run `umadev run` first")
+        }
         umadev_agent::ReadState::Corrupt { path, error } => anyhow::bail!(
-            "workflow-state.json at {} is corrupt ({error}).              Run `umadev rollback latest` or delete it, then `umadev run` again.",
+            "workflow-state.json at {} is corrupt ({error}). \
+             Run `umadev rollback latest` or delete it, then `umadev run` again.",
             path.display()
         ),
     };
@@ -3142,11 +3154,12 @@ async fn cmd_revise(text: String, project_root: Option<PathBuf>) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     let state = match umadev_agent::read_workflow_state_diagnostic(&project_root) {
         umadev_agent::ReadState::Ok(s) => s,
-        umadev_agent::ReadState::Missing => anyhow::bail!(
-            "no .umadev/workflow-state.json — run `umadev run` first"
-        ),
+        umadev_agent::ReadState::Missing => {
+            anyhow::bail!("no .umadev/workflow-state.json — run `umadev run` first")
+        }
         umadev_agent::ReadState::Corrupt { path, error } => anyhow::bail!(
-            "workflow-state.json at {} is corrupt ({error}).              Run `umadev rollback latest` or delete it, then `umadev run` again.",
+            "workflow-state.json at {} is corrupt ({error}). \
+             Run `umadev rollback latest` or delete it, then `umadev run` again.",
             path.display()
         ),
     };
@@ -4338,6 +4351,86 @@ mod tests {
                 BackendArg::from_id(id).unwrap_or_else(|| panic!("from_id({id}) returned None"));
             assert_eq!(var.id(), *id, "id()/from_id() not inverse for {id}");
         }
+    }
+
+    /// Pull a subcommand's `long_about` text out of the clap command tree so we
+    /// can assert the prose is accurate (P2-C / P2-E). Returns "" if absent.
+    fn long_about_of(sub: &str) -> String {
+        Cli::command()
+            .find_subcommand(sub)
+            .and_then(clap::Command::get_long_about)
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn continue_help_does_not_claim_a_false_no_op() {
+        // P2-C: `continue` with no active gate is NEVER a no-op — it infers the
+        // block and re-runs, or exits non-zero. The old "no-op if no gate active"
+        // line was a lie; the help must describe the real recovery behaviour.
+        let help = long_about_of("continue");
+        assert!(
+            !help.contains("no-op if no gate"),
+            "continue help must not claim a false no-op: {help}"
+        );
+        assert!(
+            help.contains("infers") && help.contains("re-run"),
+            "continue help should describe the infer-and-rerun recovery: {help}"
+        );
+    }
+
+    #[test]
+    fn redo_help_lists_the_gate_phases_it_accepts() {
+        // P2-C: `phase_from_id` accepts docs_confirm / preview_confirm, but the
+        // old "Valid phases" line omitted them. Help must match the real set.
+        let help = long_about_of("redo");
+        for p in ["docs_confirm", "preview_confirm"] {
+            assert!(
+                help.contains(p),
+                "redo help must list the gate phase `{p}` it accepts: {help}"
+            );
+        }
+        // Every phase the parser accepts is, in fact, named in the help.
+        for id in umadev_agent::redoable_phase_ids() {
+            assert!(
+                help.contains(id),
+                "redo help is missing accepted phase `{id}`: {help}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_help_does_not_advertise_offline_as_a_default_choice() {
+        // P2-E: offline is an internal fallback, not a base the customer picks.
+        // The help must not present "(default) offline" as a first-class worker.
+        let help = long_about_of("run");
+        assert!(
+            !help.contains("(default)                offline"),
+            "run help must not frame offline as the default worker: {help}"
+        );
+        assert!(
+            help.contains("fallback") && help.contains("NOT a base"),
+            "run help should mark offline as an internal fallback: {help}"
+        );
+        // The three real bases are still listed.
+        for id in umadev_host::BACKEND_IDS {
+            assert!(help.contains(id), "run help dropped base `{id}`: {help}");
+        }
+    }
+
+    #[test]
+    fn corrupt_state_message_has_no_stray_whitespace() {
+        // P2-C: the corrupt-state error used to splice an artifact across a line
+        // continuation, leaving `).              Run` — many literal spaces. The
+        // tidy single-space form is what users should see. We can't easily fire
+        // the bail!, so guard the source: no `).<many spaces>Run` pattern remains.
+        // Build the needle dynamically so the test's own literal can't match.
+        let needle = format!("){}Run", " ".repeat(14));
+        let src = include_str!("main.rs");
+        assert!(
+            !src.contains(&needle),
+            "the corrupt-state error still has stray inline whitespace"
+        );
     }
 
     // ---- continuous long-session run path wiring ----

@@ -399,6 +399,17 @@ pub struct App {
     /// The default tier is `guarded` (the existing human-in-the-loop behaviour).
     pub trust_mode_override: Option<umadev_agent::TrustMode>,
 
+    /// Process-local cache of the trust tier *derived from `.umadevrc`* (used
+    /// only when no session override is set). [`effective_trust_mode`] runs in
+    /// the render hot path (~12/s at the 80 ms tick); without this it would
+    /// `load_project_config` — i.e. read `.umadevrc` off disk — on every frame,
+    /// which stutters on a slow / network-mounted workspace. We read the config
+    /// once, memoise the result here, and only refresh when the config could
+    /// actually have changed (a `/mode` switch or an explicit reload). Interior
+    /// mutability keeps `effective_trust_mode` a `&self` reader. Fail-open: a
+    /// config read error resolves to `Guarded`, same as before.
+    config_trust_cache: std::cell::Cell<Option<umadev_agent::TrustMode>>,
+
     /// Per-project collaborative trust ledger (`.umadev/trust.json`). Records
     /// how many times in a row each gate passed; after a threshold it *suggests*
     /// (never auto-applies) letting that gate auto-advance. Fail-open.
@@ -574,6 +585,7 @@ impl App {
             agentic_in_flight: false,
             auto_approve_override: None,
             trust_mode_override: None,
+            config_trust_cache: std::cell::Cell::new(None),
             trust_ledger: umadev_agent::TrustLedger::load(&project_root),
             backends: Vec::new(),
             show_help: false,
@@ -777,7 +789,10 @@ impl App {
             " · [ok] delivered".to_string()
         } else if self.aborted {
             // Explicit terminal state — never let an aborted run read as idle.
-            " · [aborted] 本轮已中止".to_string()
+            format!(
+                " · [aborted] {}",
+                umadev_i18n::t(self.lang, "status.aborted")
+            )
         } else {
             String::new()
         };
@@ -1069,7 +1084,10 @@ impl App {
         ("claude", "switch worker to Claude Code CLI"),
         ("codex", "switch worker to Codex CLI"),
         ("opencode", "switch worker to OpenCode CLI"),
-        ("offline", "switch worker to offline templates"),
+        (
+            "offline",
+            "fall back to offline templates (demo / CI, not a real base)",
+        ),
         ("model", "set the model id (e.g. /model claude-opus-4-7)"),
         ("lang", "switch UI language: /lang [zh-CN|zh-TW|en]"),
         (
@@ -4874,14 +4892,33 @@ impl App {
                 umadev_agent::TrustMode::Guarded
             };
         }
+        // No session override → derive from `.umadevrc`, but serve it from the
+        // process-local cache so the render hot path never touches disk. The
+        // cache is invalidated whenever the config could have changed (see
+        // `invalidate_trust_cache`), so this stays correct. Fail-open: a read
+        // error inside `load_project_config` yields the default (`guarded`).
+        if let Some(cached) = self.config_trust_cache.get() {
+            return cached;
+        }
         let config_auto = umadev_agent::config::load_project_config(&self.project_root)
             .pipeline
             .auto_approve_gates;
-        if config_auto {
+        let mode = if config_auto {
             umadev_agent::TrustMode::Auto
         } else {
             umadev_agent::TrustMode::Guarded
-        }
+        };
+        self.config_trust_cache.set(Some(mode));
+        mode
+    }
+
+    /// Drop the cached config-derived trust tier so the next
+    /// [`effective_trust_mode`] re-reads `.umadevrc`. Call after anything that
+    /// could change the on-disk `auto_approve_gates` (a `/mode` switch is held
+    /// in `trust_mode_override` and wins outright, but clearing here keeps the
+    /// cache honest if the override is later removed). Cheap and fail-open.
+    fn invalidate_trust_cache(&self) {
+        self.config_trust_cache.set(None);
     }
 
     /// Whether gates currently auto-approve (true) or pause for review (false).
@@ -4949,6 +4986,10 @@ impl App {
     fn set_trust_mode(&mut self, mode: umadev_agent::TrustMode) {
         self.trust_mode_override = Some(mode);
         self.auto_approve_override = Some(mode.gates_auto_approve());
+        // A `/mode` switch may also have rewritten `.umadevrc`'s
+        // `auto_approve_gates` elsewhere; drop the cache so the fallback path
+        // re-reads fresh if the session override is ever cleared.
+        self.invalidate_trust_cache();
     }
 
     /// Record that a gate passed (auto or manual) into the per-project trust
@@ -5600,17 +5641,17 @@ fn gate_card(
         let lines = content.lines().count();
         let is_scaffold =
             content.contains("Offline scaffold") || content.contains("offline scaffold");
+        let ln = lines.to_string();
         let detail = if lines == 0 {
-            "[warn] MISSING".to_string()
+            t(lang, "gate.detail.missing").to_string()
         } else if is_scaffold {
             warnings.push(tf(lang, "gate.scaffold_warn", &[a.as_str()]));
-            format!("{lines} lines [warn] SCAFFOLD")
+            tf(lang, "gate.detail.scaffold", &[ln.as_str()])
         } else if lines < 30 {
-            let ln = lines.to_string();
             warnings.push(tf(lang, "gate.short_warn", &[a.as_str(), ln.as_str()]));
-            format!("{lines} lines [warn] SHORT")
+            tf(lang, "gate.detail.short", &[ln.as_str()])
         } else {
-            format!("{lines} lines [ok]")
+            tf(lang, "gate.detail.ok", &[ln.as_str()])
         };
         out.push_str(&format!("    - {a} ({detail})\n"));
     }
@@ -5629,7 +5670,11 @@ fn gate_card(
             let has_dark = content
                 .to_ascii_lowercase()
                 .contains("prefers-color-scheme");
-            let dark = if has_dark { "[ok]" } else { "[fail] missing" };
+            let dark = if has_dark {
+                t(lang, "gate.detail.dark_ok")
+            } else {
+                t(lang, "gate.detail.dark_missing")
+            };
             out.push_str(&format!(
                 "  {}\n",
                 tf(lang, "gate.quality_line", &[tokens.as_str(), dark])
@@ -8528,6 +8573,89 @@ mod tests {
         let a = fresh_app(Some("offline"));
         assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
         assert!(!a.auto_approve_on());
+    }
+
+    #[test]
+    fn config_trust_mode_is_cached_not_re_read_per_call() {
+        // P2-B: `effective_trust_mode` runs in the render hot path (~12/s). It
+        // must NOT `load_project_config` (a disk read) on every call. Proof: the
+        // first call memoises `Guarded`; rewriting `.umadevrc` to auto ON DISK is
+        // then IGNORED (cache still serves `Guarded`) — i.e. no per-call read.
+        // Only after an explicit invalidation does it pick up the new value.
+        let a = fresh_app(Some("offline"));
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+
+        // Flip the on-disk config behind the running app's back.
+        std::fs::write(
+            a.project_root.join(".umadevrc"),
+            "[pipeline]\nauto_approve_gates = true\n",
+        )
+        .unwrap();
+
+        // No session override is set, so without a cache this would re-read disk
+        // and flip to Auto. The cache means it stays Guarded — that is the proof
+        // the hot path no longer touches the filesystem.
+        assert_eq!(
+            a.effective_trust_mode(),
+            umadev_agent::TrustMode::Guarded,
+            "config-derived tier must come from the process cache, not a fresh disk read"
+        );
+
+        // After an explicit invalidation, the next call re-reads and sees Auto.
+        a.invalidate_trust_cache();
+        assert_eq!(
+            a.effective_trust_mode(),
+            umadev_agent::TrustMode::Auto,
+            "invalidation must let the next call pick up the new on-disk config"
+        );
+    }
+
+    #[test]
+    fn gate_card_health_labels_are_localized() {
+        // P2-D: the artifact health labels ([warn] MISSING / SCAFFOLD / SHORT /
+        // [ok], and the dark-mode marker) were hard-coded English, so a zh-CN
+        // user saw English jammed into an otherwise localized card. They now come
+        // from the catalog.
+        let app = fresh_app(Some("offline"));
+        // No output/ artifacts exist for this fresh workspace → every doc is
+        // MISSING, exercising the `lines == 0` label.
+        let card = gate_card(
+            Gate::DocsConfirm,
+            &app.slug,
+            &app.project_root,
+            umadev_i18n::Lang::ZhCn,
+        );
+        // Localized "missing" label is present; the old raw English is gone.
+        assert!(
+            card.contains("缺失"),
+            "zh-CN gate card should use the localized MISSING label: {card}"
+        );
+        assert!(
+            !card.contains("MISSING") && !card.contains("SCAFFOLD") && !card.contains("SHORT"),
+            "no hard-coded English health labels should leak into a zh-CN card: {card}"
+        );
+
+        // English locale still shows the English labels (round-trips the key).
+        let card_en = gate_card(
+            Gate::DocsConfirm,
+            &app.slug,
+            &app.project_root,
+            umadev_i18n::Lang::En,
+        );
+        assert!(
+            card_en.contains("MISSING"),
+            "en gate card should render the English MISSING label: {card_en}"
+        );
+    }
+
+    #[test]
+    fn session_override_wins_over_cache() {
+        // A `/mode` override always beats the cached config tier and the override
+        // path never consults the cache at all (it returns before the disk path).
+        let mut a = fresh_app(Some("offline"));
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded); // primes cache
+        a.set_trust_mode(umadev_agent::TrustMode::Plan);
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Plan);
     }
 
     #[test]

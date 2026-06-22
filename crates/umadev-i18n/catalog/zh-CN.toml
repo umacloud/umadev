@@ -40,6 +40,7 @@
 
 # 状态
 "status.ready" = "就绪"
+"status.aborted" = "本轮已中止"
 "status.thinking" = "正在思考…"
 "status.esc_cancel" = "esc 取消"
 "mode.auto_chip" = "自动过门 (shift+Tab 转手动)"
@@ -76,6 +77,12 @@
 "gate.short_warn" = "{}: only {} lines — may be incomplete"
 "gate.suggest_revise" = "建议: 用 /revise '重新生成 architecture' 让 worker 补充"
 "gate.quality_line" = "质量: {} CSS tokens · dark mode: {}"
+"gate.detail.missing" = "[warn] 缺失"
+"gate.detail.scaffold" = "{} 行 [warn] 脚手架"
+"gate.detail.short" = "{} 行 [warn] 偏短"
+"gate.detail.ok" = "{} 行 [ok]"
+"gate.detail.dark_ok" = "[ok]"
+"gate.detail.dark_missing" = "[fail] 缺失"
 "gate.checklist_header" = "审批清单(确认这些再通过):"
 "gate.actions_header" = "操作:"
 "gate.action.continue" = "/continue 或 c        -> 通过 gate"
@@ -471,7 +478,7 @@
 "tui.help.nav.toggle" = "切换本帮助"
 "tui.help.nav.quit" = "退出"
 # 帮助浮层 —— 底座组动态行
-"tui.help.worker.offline" = "确定性模板(无底座)"
+"tui.help.worker.offline" = "确定性模板 — 内部兜底(demo / CI),非正式底座"
 "tui.help.worker.model" = "设置模型 id"
 # 帮助浮层 —— 流水线与闸门
 "tui.help.pipe.enter" = "提交;非斜杠 = 需求(在闸门处则为修改意见)"

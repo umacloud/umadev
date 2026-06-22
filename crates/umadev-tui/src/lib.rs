@@ -3,14 +3,15 @@
 //!
 //! Two screens:
 //!
-//! 1. **Picker** (first launch only) — `↑↓` to choose a worker
-//!    (claude-code / codex / opencode / offline), Enter to save to
-//!    `~/.umadev/config.toml`.
+//! 1. **Picker** (first launch only) — `↑↓` to choose one of the three base
+//!    CLIs (claude-code / codex / opencode), Enter to save to
+//!    `~/.umadev/config.toml`. Offline is an internal demo / CI fallback, not
+//!    a picker choice.
 //! 2. **Chat** — persistent input box + scrolling conversation history.
 //!    Type a requirement, watch the pipeline narrate. Slash commands
-//!    (`/claude` `/codex` `/offline` `/init` `/continue` `/revise`
+//!    (`/claude` `/codex` `/opencode` `/init` `/continue` `/revise`
 //!    `/spec` `/verify` `/doctor` `/help` `/quit` `/clear`) switch
-//!    worker, drive gates, etc.
+//!    base, drive gates, etc. (`/offline` exists as the same fallback.)
 //!
 //! Pipeline blocks run in background `tokio` tasks; each emits
 //! [`EngineEvent`]s through a shared [`ChannelSink`]. The event loop
