@@ -1528,6 +1528,7 @@ mod tests {
             design_system: String::new(),
             seed_template: String::new(),
             mode: crate::trust::TrustMode::Guarded,
+            strict_coverage: false,
         }
     }
 
