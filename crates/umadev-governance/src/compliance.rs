@@ -41,6 +41,10 @@ fn s(slice: &[&str]) -> Vec<String> {
 ///
 /// Reviewed quarterly. Frameworks pinned to: SOC 2 2017 TSC, ISO/IEC
 /// 27001:2022, EU AI Act 2024/1689.
+// One arm per spec clause — a flat lookup table that necessarily grows with
+// `umadev_spec::CLAUSES`. Splitting it by layer would only scatter the table
+// and hurt auditability, so the line-count lint doesn't apply here.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
     match clause_id {
@@ -86,6 +90,20 @@ pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
             iso27001_annex_a: s(&["A.8.15"]),
             eu_ai_act_article: s(&["Article 12"]),
         },
+        // Role-critic team: structured multi-seat review = human/role oversight
+        // over the run before it lands.
+        "UD-FLOW-007" => ComplianceFrameworks {
+            soc2_cc: s(&["CC1.4", "CC8.1"]),
+            iso27001_annex_a: s(&["A.5.31", "A.8.28"]),
+            eu_ai_act_article: s(&["Article 14"]),
+        },
+        // Trust tiers + always-on irreversible-action floor: authorization and a
+        // human-in-the-loop gate for risky/irreversible operations.
+        "UD-FLOW-008" => ComplianceFrameworks {
+            soc2_cc: s(&["CC6.1", "CC8.1"]),
+            iso27001_annex_a: s(&["A.5.18", "A.8.2"]),
+            eu_ai_act_article: s(&["Article 14"]),
+        },
         // Layer 3 — artifacts
         "UD-ART-001" => ComplianceFrameworks {
             soc2_cc: s(&["CC2.2"]),
@@ -107,6 +125,12 @@ pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
             iso27001_annex_a: s(&["A.5.37"]),
             eu_ai_act_article: s(&["Article 17"]),
         },
+        // PR artifact: a documented change-request record for the delivered work.
+        "UD-ART-007" => ComplianceFrameworks {
+            soc2_cc: s(&["CC8.1"]),
+            iso27001_annex_a: s(&["A.5.37", "A.8.32"]),
+            eu_ai_act_article: s(&["Article 17"]),
+        },
         // Layer 4 — evidence
         "UD-EVID-001" | "UD-EVID-002" => ComplianceFrameworks {
             soc2_cc: s(&["CC7.2"]),
@@ -123,9 +147,41 @@ pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
             iso27001_annex_a: s(&["A.5.36"]),
             eu_ai_act_article: s(&["Article 11"]),
         },
+        // Runtime evidence: a recorded boot + route-probe proof = operational
+        // monitoring / test record.
+        "UD-EVID-006" => ComplianceFrameworks {
+            soc2_cc: s(&["CC7.2", "CC8.1"]),
+            iso27001_annex_a: s(&["A.8.15", "A.8.29"]),
+            eu_ai_act_article: s(&["Article 12"]),
+        },
+        // Deploy evidence: a tamper-evident record of the deployment change.
+        "UD-EVID-007" => ComplianceFrameworks {
+            soc2_cc: s(&["CC7.2", "CC8.1"]),
+            iso27001_annex_a: s(&["A.8.15", "A.8.32"]),
+            eu_ai_act_article: s(&["Article 12"]),
+        },
+        // Review-report evidence: an independent review record over the change.
+        "UD-EVID-008" => ComplianceFrameworks {
+            soc2_cc: s(&["CC4.1"]),
+            iso27001_annex_a: s(&["A.5.36"]),
+            eu_ai_act_article: s(&["Article 17"]),
+        },
         "UD-META-001" => ComplianceFrameworks {
             soc2_cc: s(&["CC1.1"]),
             iso27001_annex_a: s(&["A.5.36"]),
+            eu_ai_act_article: s(&["Article 11"]),
+        },
+        // Version negotiation + backward compatibility + profiles: spec/protocol
+        // governance — interoperability, change management, and documented
+        // configuration of the conformance surface.
+        "UD-META-002" | "UD-META-003" => ComplianceFrameworks {
+            soc2_cc: s(&["CC8.1"]),
+            iso27001_annex_a: s(&["A.5.37", "A.8.32"]),
+            eu_ai_act_article: s(&["Article 11"]),
+        },
+        "UD-META-004" => ComplianceFrameworks {
+            soc2_cc: s(&["CC1.1"]),
+            iso27001_annex_a: s(&["A.5.37"]),
             eu_ai_act_article: s(&["Article 11"]),
         },
         _ => ComplianceFrameworks::default(),
@@ -536,6 +592,27 @@ mod tests {
         assert_eq!(
             framework_for("UD-CODE-999"),
             ComplianceFrameworks::default()
+        );
+    }
+
+    /// Drift guard: every clause in the authoritative spec MUST have a
+    /// non-default framework mapping. `build_compliance_mapping` silently skips
+    /// any clause that maps to `default()` (the "unrecognised clause" defence),
+    /// so an unmapped clause = audit rows that never reach the compliance
+    /// evidence. This caught UD-FLOW-007/008, UD-ART-007, UD-EVID-006/007/008
+    /// (added later than the original table) being dropped — and stops the
+    /// table from drifting behind `umadev_spec::CLAUSES` again.
+    #[test]
+    fn every_spec_clause_has_a_framework_mapping() {
+        let unmapped: Vec<&str> = umadev_spec::CLAUSES
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| framework_for(id) == ComplianceFrameworks::default())
+            .collect();
+        assert!(
+            unmapped.is_empty(),
+            "these spec clauses have no compliance-framework mapping (their audit \
+             rows would be silently dropped): {unmapped:?}"
         );
     }
 

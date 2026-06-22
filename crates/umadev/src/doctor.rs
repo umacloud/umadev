@@ -55,14 +55,19 @@ impl Status {
 }
 
 /// Run every doctor check, returning the rows in a stable order.
-pub fn run_all(workspace: &Path) -> Vec<CheckResult> {
+///
+/// Async because the backend check now spawns a real `<base> --version` probe
+/// (via `umadev_host::probe_all`) so it agrees with the run path instead of a
+/// PATH-only heuristic. Fail-open: a probe error degrades to a Warning row,
+/// never a hard failure.
+pub async fn run_all(workspace: &Path) -> Vec<CheckResult> {
     let mut results = vec![
         check_binary_identity(),
         check_embedded_spec(),
         check_workspace_writable(workspace),
         check_spec_manifest(workspace),
     ];
-    results.push(check_ai_backends());
+    results.push(check_ai_backends().await);
     results.push(check_git());
     results.push(check_user_config());
     results.push(check_claude_hook(workspace));
@@ -185,46 +190,66 @@ fn check_spec_manifest(workspace: &Path) -> CheckResult {
     }
 }
 
-/// Check which host CLIs (claude-code, codex, opencode) are installed and usable.
-/// and usable. This is the most important doctor check for enterprise use —
+/// Check which host CLIs (claude-code, codex, opencode) are installed and
+/// usable. This is the most important doctor check for enterprise use —
 /// without a backend, UmaDev falls back to offline templates.
-fn check_ai_backends() -> CheckResult {
-    // Map backend IDs to the executable name(s) to look for on PATH.
-    // This list is kept in sync with umadev_host::BACKEND_IDS — the
-    // `backend_arg_ids_match_host` test in main.rs guards the selector,
-    // and `probe_all_reports_every_backend` in umadev-host guards the
-    // driver registry; this table is the doctor's fast PATH-only view.
-    // UmaDev drives exactly three host CLI bases. Kept in sync with
-    // umadev_host::BACKEND_IDS.
-    let probes: &[(&str, &[&str])] = &[
-        ("claude-code", &["claude"]),
-        ("codex", &["codex"]),
-        ("opencode", &["opencode"]),
-    ];
+///
+/// Uses `umadev_host::probe_all` — the SAME detection the run path and the TUI
+/// startup panel use — so the doctor never reports a false "not detected" for a
+/// base that `run` can actually drive. `probe_all` resolves each base via
+/// `umadev_host::resolve_program` (PATH first, then known install dirs:
+/// Homebrew / volta / `~/.<base>/bin` / `…/Programs`, plus the
+/// `UMADEV_<NAME>_BIN` override) and then runs a real `--version`, which is the
+/// final installed-or-not arbiter. Fail-open: an unhealthy probe is surfaced as
+/// detail, never a hard FAIL.
+async fn check_ai_backends() -> CheckResult {
+    let statuses = umadev_host::probe_all().await;
 
-    let mut found: Vec<&str> = Vec::new();
-    for (id, cmds) in probes {
-        if cmds.iter().any(|cmd| which_on_path(cmd)) {
-            found.push(id);
+    let ready: Vec<&str> = statuses
+        .iter()
+        .filter(|s| s.probe.is_ready())
+        .map(|s| s.id)
+        .collect();
+    // Found-but-broken bases (e.g. an old `--version` that errors): worth
+    // surfacing so the user fixes the install rather than thinking it's missing.
+    let unhealthy: Vec<&str> = statuses
+        .iter()
+        .filter(|s| matches!(s.probe, umadev_host::ProbeResult::Unhealthy { .. }))
+        .map(|s| s.id)
+        .collect();
+
+    if ready.is_empty() {
+        let mut detail = String::from(
+            "No base CLI (claude / codex / opencode) detected. Install one and log in — it brings its OWN model (your login or your own API). Without a base, UmaDev falls back to offline templates.",
+        );
+        if !unhealthy.is_empty() {
+            detail.push_str(&format!(
+                " Found but not responding to --version: {} (reinstall / check PATH, or set UMADEV_<NAME>_BIN).",
+                unhealthy.join(", ")
+            ));
         }
-    }
-
-    if found.is_empty() {
         CheckResult {
             name: "AI host backends".to_string(),
             status: Status::Warning,
-            detail: "No base CLI (claude / codex / opencode) detected on PATH. Install one and log in — it brings its OWN model (your login or your own API). Without a base, UmaDev falls back to offline templates.".to_string(),
+            detail,
         }
     } else {
+        let mut detail = format!(
+            "{} backend(s) detected: {}. Use --backend {} for real AI generation. (Login is verified when a run starts — make sure you've logged into the CLI.)",
+            ready.len(),
+            ready.join(", "),
+            ready[0]
+        );
+        if !unhealthy.is_empty() {
+            detail.push_str(&format!(
+                " Also found but unhealthy: {}.",
+                unhealthy.join(", ")
+            ));
+        }
         CheckResult {
             name: "AI host backends".to_string(),
             status: Status::Passed,
-            detail: format!(
-                "{} backend(s) on PATH: {}. Use --backend {} for real AI generation. (Login is verified when a run starts — make sure you've logged into the CLI.)",
-                found.len(),
-                found.join(", "),
-                found[0]
-            ),
+            detail,
         }
     }
 }
@@ -501,10 +526,10 @@ mod tests {
         assert_eq!(r.status, Status::Passed);
     }
 
-    #[test]
-    fn run_all_returns_ten_checks_on_empty_workspace() {
+    #[tokio::test]
+    async fn run_all_returns_ten_checks_on_empty_workspace() {
         let tmp = TempDir::new().unwrap();
-        let results = run_all(tmp.path());
+        let results = run_all(tmp.path()).await;
         assert_eq!(results.len(), 10);
         // No FAILs on a clean workspace — only a manifest WARN.
         assert!(results.iter().all(|r| r.status != Status::Failed));
@@ -521,13 +546,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_all_passes_clean_after_init() {
+    #[tokio::test]
+    async fn run_all_passes_clean_after_init() {
         let tmp = TempDir::new().unwrap();
         umadev_agent::SpecManifest::new("demo")
             .write_to(tmp.path(), false)
             .unwrap();
-        let results = run_all(tmp.path());
+        let results = run_all(tmp.path()).await;
         // Everything passes except the env-dependent backend check, which
         // warns when no base CLI is installed (e.g. in CI).
         let non_backend: Vec<_> = results
@@ -537,22 +562,22 @@ mod tests {
         assert!(all_passed(&non_backend));
     }
 
-    #[test]
-    fn render_report_includes_counts() {
+    #[tokio::test]
+    async fn render_report_includes_counts() {
         let tmp = TempDir::new().unwrap();
-        let results = run_all(tmp.path());
+        let results = run_all(tmp.path()).await;
         let report = render_report(tmp.path(), &results);
         assert!(report.contains("passed"));
         assert!(report.contains("failed"));
         assert!(report.contains("umadev doctor"));
     }
 
-    #[test]
-    fn claude_hook_warns_when_settings_exist_without_hook() {
+    #[tokio::test]
+    async fn claude_hook_warns_when_settings_exist_without_hook() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         fs::write(tmp.path().join(".claude/settings.json"), r#"{"hooks":{}}"#).unwrap();
-        let results = run_all(tmp.path());
+        let results = run_all(tmp.path()).await;
         let hook_check = results
             .iter()
             .find(|r| r.name == "Claude Code hook")
@@ -561,8 +586,8 @@ mod tests {
         assert!(hook_check.detail.contains("umadev install"));
     }
 
-    #[test]
-    fn claude_hook_passes_when_registered() {
+    #[tokio::test]
+    async fn claude_hook_passes_when_registered() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join(".claude")).unwrap();
         fs::write(
@@ -570,7 +595,7 @@ mod tests {
             r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"command":"umadev hook pre-write"}]}]}}"#,
         )
         .unwrap();
-        let results = run_all(tmp.path());
+        let results = run_all(tmp.path()).await;
         let hook_check = results
             .iter()
             .find(|r| r.name == "Claude Code hook")
@@ -578,9 +603,9 @@ mod tests {
         assert_eq!(hook_check.status, Status::Passed);
     }
 
-    #[test]
-    fn backend_check_runs_without_panic() {
-        let r = check_ai_backends();
+    #[tokio::test]
+    async fn backend_check_runs_without_panic() {
+        let r = check_ai_backends().await;
         assert!(!r.name.is_empty());
         // On a dev machine with CLIs installed it should pass; on CI it may warn.
         assert!(r.status == Status::Passed || r.status == Status::Warning);

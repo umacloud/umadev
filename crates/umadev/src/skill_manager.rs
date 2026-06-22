@@ -90,6 +90,18 @@ impl SkillRegistry {
         let dest = self.skills_dir().join(&manifest.name);
         std::fs::create_dir_all(&dest)?;
 
+        // Write the manifest FIRST, atomically, so the install is recoverable
+        // from the very first byte we commit: if any later step (knowledge
+        // copy, CLAUDE.md append) fails, the skill is still discoverable by
+        // `list()` and cleanable by `remove()` (which reads the manifest to
+        // know what to undo). A bare half-install with no manifest used to be
+        // invisible to both — impossible to recover except by hand.
+        let manifest_out = dest.join("manifest.json");
+        atomic_write(
+            &manifest_out,
+            &serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+        )?;
+
         // Copy knowledge docs.
         let mut knowledge_copied = 0;
         let knowledge_dest = self
@@ -112,13 +124,6 @@ impl SkillRegistry {
                 knowledge_copied += 1;
             }
         }
-
-        // Save the manifest so we can list/uninstall.
-        let manifest_out = dest.join("manifest.json");
-        std::fs::write(
-            &manifest_out,
-            serde_json::to_string_pretty(&manifest).unwrap_or_default(),
-        )?;
 
         // Append system prompt to CLAUDE.md.
         let prompt_updated = if manifest.system_prompt.is_empty() {
@@ -220,6 +225,23 @@ impl SkillRegistry {
         std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
+}
+
+/// Atomically write `content` to `path` (write a per-process temp file in the
+/// same dir, then rename). A same-filesystem rename is atomic on POSIX, so a
+/// crash mid-write never leaves a truncated manifest a later `list()` would
+/// choke on — readers see either the old file or the complete new one. Falls
+/// back to a direct write only if the rename itself fails (cross-device).
+fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        // Last resort: a direct write. Less crash-safe, but better than failing
+        // the install outright on a filesystem that rejects the rename.
+        std::fs::write(path, content).map_err(|_| e)?;
+    }
+    Ok(())
 }
 
 /// Reject a name that isn't a single safe path component (`..` / absolute /
@@ -327,6 +349,43 @@ mod tests {
         let claude_md = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
         assert!(claude_md.contains("<!-- skill:test-skill -->"));
         assert!(claude_md.contains("<!-- /skill:test-skill -->"));
+    }
+
+    #[test]
+    fn partial_install_is_recoverable_manifest_written_first() {
+        // If a mid-install copy fails, the manifest must already be on disk so
+        // the skill is visible to list() and cleanable by remove(). We force a
+        // copy failure by pointing a knowledge entry at a DIRECTORY (fs::copy of
+        // a dir errors on every platform).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        let source = tmp.path().join("bad-skill");
+        std::fs::create_dir_all(&source).unwrap();
+        // A knowledge entry that is itself a directory → copy fails.
+        std::fs::create_dir_all(source.join("a-dir")).unwrap();
+        let manifest = SkillManifest {
+            name: "half".into(),
+            description: "broken".into(),
+            version: "1.0".into(),
+            knowledge: vec!["a-dir".into()],
+            rules: vec![],
+            system_prompt: String::new(),
+        };
+        std::fs::write(
+            source.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // Install errors (the copy fails) ...
+        let res = registry.install(&source);
+        assert!(res.is_err(), "expected the dir-copy to fail the install");
+        // ... but the manifest was committed first, so the skill is now
+        // listable AND removable — no orphaned, unrecoverable half-install.
+        assert_eq!(registry.list().len(), 1);
+        assert_eq!(registry.list()[0].name, "half");
+        registry.remove("half").unwrap();
+        assert!(registry.list().is_empty());
     }
 
     #[test]

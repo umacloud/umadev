@@ -831,7 +831,7 @@ async fn main() -> Result<()> {
             create,
             yes,
         } => cmd_pr(slug, project_root, create, yes),
-        Command::Doctor { project_root } => cmd_doctor(project_root),
+        Command::Doctor { project_root } => cmd_doctor(project_root).await,
         Command::Examples => cmd_examples(),
         Command::Guide => cmd_guide(),
         Command::Hook { check } => cmd_hook(check),
@@ -1383,9 +1383,9 @@ fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_doctor(project_root: Option<PathBuf>) -> Result<()> {
+async fn cmd_doctor(project_root: Option<PathBuf>) -> Result<()> {
     let workspace = resolve_root(project_root)?;
-    let results = doctor::run_all(&workspace);
+    let results = doctor::run_all(&workspace).await;
     print!("{}", doctor::render_report(&workspace, &results));
     if results.iter().any(|r| r.status == doctor::Status::Failed) {
         anyhow::bail!("umadev doctor: one or more checks failed");
@@ -3304,7 +3304,7 @@ async fn cmd_deploy(
                 "umadev/cli.deploy",
                 "",
                 "block",
-                "UD-CODE-002",
+                "UD-FLOW-008",
                 &format!("user declined irreversible deploy: {recipe}"),
                 "",
                 None,
@@ -3318,7 +3318,7 @@ async fn cmd_deploy(
         "umadev/cli.deploy",
         "",
         "audit",
-        "UD-CODE-002",
+        "UD-FLOW-008",
         &format!("running irreversible deploy command: {recipe}"),
         "",
         None,
@@ -3607,7 +3607,7 @@ fn cmd_pr(
                 "umadev/cli.pr",
                 "",
                 "block",
-                "UD-CODE-002",
+                "UD-FLOW-008",
                 &format!(
                     "user declined irreversible push/PR for branch {}",
                     plan.head_branch
@@ -3655,7 +3655,7 @@ fn cmd_pr(
         "umadev/cli.pr.push",
         "",
         "audit",
-        "UD-CODE-002",
+        "UD-FLOW-008",
         &push_cmd,
         "",
         None,
@@ -3672,7 +3672,7 @@ fn cmd_pr(
         "umadev/cli.pr.create",
         "",
         "audit",
-        "UD-CODE-002",
+        "UD-FLOW-008",
         &format!(
             "gh pr create --base {} --head {}",
             plan.base_branch, plan.head_branch

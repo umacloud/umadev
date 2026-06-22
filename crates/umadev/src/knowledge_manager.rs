@@ -48,13 +48,25 @@ impl KnowledgeRegistry {
         }
     }
 
-    /// Save to `.umadev/knowledge.json`.
+    /// Save to `.umadev/knowledge.json` atomically (temp file + rename, like
+    /// `mcp_manager`). A bare `fs::write` could be interrupted mid-write,
+    /// leaving truncated JSON that `load`'s `unwrap_or_default()` then silently
+    /// discards — wiping the ENTIRE knowledge registry. A same-filesystem
+    /// rename is atomic on POSIX, so a reader sees either the old file or the
+    /// complete new one, never a half-written one.
     pub fn save(&self, project_root: &Path) -> std::io::Result<()> {
         let dir = project_root.join(".umadev");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("knowledge.json");
         let json = serde_json::to_string_pretty(self).unwrap_or_default();
-        std::fs::write(&path, json + "\n")?;
+        // Per-process temp name so concurrent writers can't share + clobber the
+        // same scratch file before the rename.
+        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, json + "\n")?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         Ok(())
     }
 }
@@ -335,5 +347,30 @@ mod tests {
     fn remove_nonexistent_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(remove_knowledge(tmp.path(), "nope").is_err());
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        // After an atomic save: the registry round-trips intact AND no `.tmp-*`
+        // scratch file is left behind in `.umadev/`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("guide.md");
+        std::fs::write(&src, "# Guide").unwrap();
+        add_knowledge(tmp.path(), &src, Some("kept")).unwrap();
+
+        let reloaded = KnowledgeRegistry::load(tmp.path());
+        assert!(reloaded.entries.contains_key("kept"));
+
+        let udir = tmp.path().join(".umadev");
+        let leftover: Vec<_> = std::fs::read_dir(&udir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("knowledge.json.tmp")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "atomic save left a temp file behind");
     }
 }
