@@ -38,6 +38,11 @@ pub const LEARNED_DIR: &str = ".umadev/learned";
 pub const GLOBAL_LEARNED_DIRNAME: &str = ".umadev/learned";
 /// Raw JSONL file holding captured development errors (the "踩坑" log).
 pub const DEV_ERRORS_FILE: &str = "dev-errors.jsonl";
+/// Raw JSONL file holding folded **beliefs** — higher-level rules distilled from
+/// N similar raw lessons (see [`fold_beliefs`]). Kept in its own file so the
+/// belief layer can be rebuilt/scanned without touching the raw ledgers, and so
+/// `read_all_raw_lessons` can include beliefs as first-class retrieval candidates.
+pub const BELIEFS_FILE: &str = "beliefs.jsonl";
 /// Where per-signature reflection logs live — the sliding window of
 /// base-generated correction strategies for pitfalls that recurred after a
 /// warning. One JSONL file per (normalised) signature.
@@ -62,6 +67,13 @@ pub enum LessonKind {
     /// non-zero build/test exit, a runtime stack trace — recognised by
     /// [`crate::error_kb`] and distilled into an avoid-next-time lesson.
     DevError,
+    /// A higher-level **belief**: one rule folded from N similar raw lessons (see
+    /// [`fold_beliefs`]). A belief is denser than the lessons it summarises and
+    /// carries an `evidence_count` (how many raw lessons support it) and a
+    /// `last_confirmed` freshness stamp (its [`Lesson::first_seen`] is reused for
+    /// the latter). Retrieval prefers beliefs and demotes their raw evidence, so
+    /// the prompt sees the distilled rule instead of several near-duplicates.
+    Belief,
 }
 
 /// One captured lesson — written to raw JSONL, later sedimented to .md.
@@ -119,7 +131,57 @@ pub struct Lesson {
     /// readable, and a row that has never been reconciled stays `false`.
     #[serde(default)]
     pub invalidated: bool,
+    /// Trust signal in `[0, 1]`, neutral [`NEUTRAL_TRUST`] until proven. This
+    /// upgrades "was this lesson reused?" into "did reusing it actually help?":
+    /// when a lesson is injected and the subsequent verify/quality gate PASSES it
+    /// earns a small reward; when it's injected and the build still FAILS it takes
+    /// a larger penalty (asymmetric — one bad outcome should cost more than one
+    /// good one earns). The score multiplies into [`lesson_decay_score`], so a
+    /// distrusted lesson sinks in recall and a trusted one floats up. `0` (the
+    /// numeric default) is remapped to [`NEUTRAL_TRUST`] via [`Lesson::trust`] so
+    /// pre-existing JSONL rows (written before this field existed, or never given
+    /// feedback) are treated as neutral, never as "fully distrusted".
+    #[serde(default)]
+    pub trust: f32,
+    /// For a [`LessonKind::Belief`]: how many raw lessons this belief folds. A
+    /// belief with `evidence_count = 5` summarises five near-duplicate lessons
+    /// into one denser rule. `0` for every non-belief row (and for legacy rows),
+    /// normalised to "no evidence beyond itself" by callers. The list of which
+    /// lessons it folds is tracked separately in [`Lesson::evidence`].
+    #[serde(default)]
+    pub evidence_count: u32,
+    /// For a [`LessonKind::Belief`]: the stable [`lesson_identity`]-style keys of
+    /// the raw lessons it folds, so retrieval can demote those exact originals as
+    /// "evidence" and re-folding can recognise already-covered lessons. Each entry
+    /// is `"domain\u{0}title"` (domain + title; `first_seen` is intentionally
+    /// omitted so a recurrence under a refreshed timestamp still matches). Empty
+    /// for non-belief rows. `#[serde(default)]` keeps older rows readable.
+    #[serde(default)]
+    pub evidence: Vec<String>,
 }
+
+/// The neutral starting trust for a lesson that has never received pass/fail
+/// feedback. Mid-scale so the first reward nudges it up and the first penalty
+/// nudges it down without either dominating.
+pub const NEUTRAL_TRUST: f32 = 0.5;
+
+/// Reward added to a lesson's trust when a verify/quality gate PASSES after that
+/// lesson was injected. Deliberately SMALL — accumulating evidence of "this
+/// helped" should be gradual.
+const TRUST_REWARD: f32 = 0.05;
+
+/// Penalty subtracted from a lesson's trust when the build/test still FAILS
+/// after that lesson was injected. Deliberately LARGER than the reward
+/// (asymmetric): a lesson whose advice coincided with a failure is more
+/// informative than one that coincided with a pass, so a single bad outcome
+/// moves it further than a single good one.
+const TRUST_PENALTY: f32 = 0.10;
+
+/// Lower clamp on trust — a lesson never reaches exactly 0 (which would zero out
+/// its whole decay score and make it un-recoverable even if it later proves
+/// useful). The floor keeps a heavily-distrusted lesson barely alive so a later
+/// reward can resurrect it.
+const TRUST_FLOOR: f32 = 0.05;
 
 /// Tracks whether a pitfall's fix actually works once we start warning about it.
 ///
@@ -178,6 +240,34 @@ impl Lesson {
     #[must_use]
     pub fn hits(&self) -> u32 {
         self.occurrences.max(1)
+    }
+
+    /// Trust in `[TRUST_FLOOR, 1]`, normalised so a legacy / never-rated row
+    /// (stored `0.0`) reads as [`NEUTRAL_TRUST`] rather than "fully distrusted".
+    /// Any non-positive or non-finite stored value (a hand-edited row) also maps
+    /// to neutral — fail-open: a corrupt trust never silently buries a lesson.
+    #[must_use]
+    pub fn trust(&self) -> f32 {
+        if self.trust.is_finite() && self.trust > 0.0 {
+            self.trust.clamp(TRUST_FLOOR, 1.0)
+        } else {
+            NEUTRAL_TRUST
+        }
+    }
+
+    /// Apply one trust feedback step IN PLACE: `passed` adds [`TRUST_REWARD`],
+    /// otherwise subtracts the larger [`TRUST_PENALTY`] (asymmetric). Starts from
+    /// the normalised [`Self::trust`] so a legacy `0.0` row starts at neutral, and
+    /// clamps to `[TRUST_FLOOR, 1.0]`. Pure mutation — saving the row is the
+    /// caller's job.
+    fn apply_trust_feedback(&mut self, passed: bool) {
+        let base = self.trust();
+        let next = if passed {
+            base + TRUST_REWARD
+        } else {
+            base - TRUST_PENALTY
+        };
+        self.trust = next.clamp(TRUST_FLOOR, 1.0);
     }
 
     /// `true` when this is a precisely-recognised pitfall (a classified error
@@ -266,6 +356,9 @@ pub fn capture_quality_failures(
             context: Vec::new(),
             efficacy: None,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         });
     }
     append_raw_lessons(project_root, "quality-failures.jsonl", &lessons);
@@ -334,6 +427,9 @@ pub fn capture_gate_revision(
         context: Vec::new(),
         efficacy: None,
         invalidated: false,
+        trust: NEUTRAL_TRUST,
+        evidence_count: 0,
+        evidence: Vec::new(),
     };
     append_raw_lessons(project_root, "gate-revisions.jsonl", &[lesson]);
 
@@ -422,6 +518,9 @@ pub fn capture_validated_patterns(
         context: Vec::new(),
         efficacy: None,
         invalidated: false,
+        trust: NEUTRAL_TRUST,
+        evidence_count: 0,
+        evidence: Vec::new(),
     };
     append_raw_lessons(project_root, "validated-decisions.jsonl", &[lesson]);
 }
@@ -519,6 +618,9 @@ pub fn capture_tech_debt(
             context: Vec::new(),
             efficacy: None,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         });
     }
     let written = lessons.len();
@@ -639,6 +741,9 @@ pub fn capture_dev_errors(
             context: context.clone(),
             efficacy: None,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         });
         new_count += 1;
         changed = true;
@@ -1013,7 +1118,11 @@ pub fn read_raw_lessons(project_root: &Path, filename: &str) -> Vec<Lesson> {
         .collect()
 }
 
-/// Read ALL raw lessons across all files.
+/// Read ALL raw lessons across all files. Deliberately EXCLUDES the derived
+/// belief ledger ([`BELIEFS_FILE`]) — beliefs are folded FROM these raw lessons,
+/// so the reconcile/sediment paths that call this must not see them as fresh
+/// input (that would re-fold a fold). Retrieval uses [`read_lessons_for_recall`]
+/// instead, which adds beliefs as first-class candidates.
 #[must_use]
 pub fn read_all_raw_lessons(project_root: &Path) -> Vec<Lesson> {
     let mut all = Vec::new();
@@ -1026,6 +1135,16 @@ pub fn read_all_raw_lessons(project_root: &Path) -> Vec<Lesson> {
     ] {
         all.extend(read_raw_lessons(project_root, f));
     }
+    all
+}
+
+/// Read the candidate set for RECALL: every raw lesson PLUS the folded beliefs.
+/// This is what [`select_relevant_lessons`] scores, so beliefs compete (and, via
+/// the belief-preference in selection, win over) their own raw evidence.
+#[must_use]
+fn read_lessons_for_recall(project_root: &Path) -> Vec<Lesson> {
+    let mut all = read_all_raw_lessons(project_root);
+    all.extend(read_raw_lessons(project_root, BELIEFS_FILE));
     all
 }
 
@@ -1439,6 +1558,405 @@ const RECONCILE_FILES: &[&str] = &[
     "tech-debt.jsonl",
 ];
 
+// =====================================================================
+// Belief layer (①): fold N similar raw lessons into one denser rule.
+//
+// The raw ledgers accumulate many near-duplicate lessons ("hardcoded color in
+// Foo.css", "hardcoded color in Bar.css", …). Retrieving the raw rows floods
+// the prompt with low-density repeats. A BELIEF folds a cluster of similar
+// lessons into ONE higher-level rule carrying `evidence_count` (how many raw
+// lessons back it) + a freshness stamp (`first_seen` = last confirmation).
+// Retrieval prefers the belief and demotes its raw evidence, so the worker sees
+// the distilled rule instead of the duplicates.
+//
+// Folding is DETERMINISTIC (a connected-components clustering over a fixed
+// keyword/domain similarity threshold) and template-built — NO base call — so
+// it runs every sediment with zero added latency and zero network. Fail-open:
+// any error leaves the belief ledger untouched and recall transparently falls
+// back to the raw lessons.
+// =====================================================================
+
+/// Minimum [`lesson_similarity`] for two raw lessons to be clustered into one
+/// belief. `3` ≈ "shares at least one keyword AND the same domain, or shares two
+/// keywords" — tight enough that only genuinely-about-the-same-thing lessons
+/// fold, loose enough to catch the near-duplicates the ledgers accumulate.
+const BELIEF_FOLD_THRESHOLD: i64 = 3;
+
+/// Minimum cluster size to MINT a belief. A pair (2) is enough signal that a
+/// pattern repeats; a lone lesson stays a lone lesson (no belief).
+const BELIEF_MIN_CLUSTER: usize = 2;
+
+/// Hard cap on beliefs kept, mirroring the pitfall cap so the belief ledger
+/// can't bloat a long-lived repo. Lowest-evidence, oldest beliefs evict first.
+const MAX_BELIEFS: usize = 200;
+
+/// The `"domain\u{0}title"` evidence key of a lesson — the stable identity a
+/// belief stores per folded lesson. `first_seen` is intentionally omitted so a
+/// recurrence under a refreshed timestamp still resolves to the same evidence.
+fn evidence_key(l: &Lesson) -> String {
+    format!("{}\u{0}{}", l.domain, l.title)
+}
+
+/// Fold the current raw lessons into the belief ledger: cluster similar
+/// non-pitfall, non-invalidated lessons (deterministic connected components over
+/// [`lesson_similarity`] ≥ [`BELIEF_FOLD_THRESHOLD`]) and, for every cluster of
+/// at least [`BELIEF_MIN_CLUSTER`], ADD a fresh belief or UPDATE the existing one
+/// that already covers those lessons.
+///
+/// Reuses the ADD/UPDATE posture of the reconcile machinery: a cluster whose
+/// evidence keys overlap an existing belief UPDATES that belief in place
+/// (refreshing `evidence` + `evidence_count` + `first_seen`/`last_confirmed`,
+/// and carrying its accumulated `trust` forward); a genuinely new cluster mints
+/// a new belief. Returns how many beliefs were written/updated. Pure-local +
+/// deterministic + fail-open (a write error leaves the ledger as it was). Called
+/// from the sediment path; recall then prefers these beliefs over their raw
+/// evidence.
+pub fn fold_beliefs(project_root: &Path) -> usize {
+    let raw = read_all_raw_lessons(project_root);
+    // Cluster only the curatable, still-valid, non-pitfall lessons: pitfalls have
+    // their own dedup/efficacy loop, and folding them would fight it.
+    let pool: Vec<&Lesson> = raw
+        .iter()
+        .filter(|l| {
+            l.kind != LessonKind::DevError && l.kind != LessonKind::Belief && !l.invalidated
+        })
+        .collect();
+    if pool.len() < BELIEF_MIN_CLUSTER {
+        return 0;
+    }
+
+    let clusters = cluster_lessons(&pool);
+    if clusters.is_empty() {
+        return 0;
+    }
+
+    // Load existing beliefs, indexed by the SET of evidence keys they cover, so a
+    // re-fold UPDATEs the matching belief instead of minting a duplicate.
+    let mut beliefs = read_raw_lessons(project_root, BELIEFS_FILE);
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut touched = 0usize;
+
+    for cluster in &clusters {
+        if cluster.len() < BELIEF_MIN_CLUSTER {
+            continue;
+        }
+        let members: Vec<&Lesson> = cluster.iter().map(|&i| pool[i]).collect();
+        let ev_keys: std::collections::BTreeSet<String> =
+            members.iter().map(|l| evidence_key(l)).collect();
+        // Does an existing belief already cover any of these lessons? If so,
+        // UPDATE it (supersede with the refreshed, possibly-larger evidence set).
+        let existing = beliefs
+            .iter_mut()
+            .find(|b| b.evidence.iter().any(|k| ev_keys.contains(k)));
+        let folded = fold_one_cluster(&members, &ev_keys, &now);
+        if let Some(b) = existing {
+            // Carry trust forward (accumulated belief reputation), refresh the
+            // rule + evidence set + freshness stamp.
+            let carried_trust = b.trust;
+            *b = folded;
+            b.trust = carried_trust;
+        } else {
+            beliefs.push(folded);
+        }
+        touched += 1;
+    }
+
+    if touched == 0 {
+        return 0;
+    }
+    prune_beliefs(&mut beliefs);
+    write_raw_lessons(project_root, BELIEFS_FILE, &beliefs);
+    touched
+}
+
+/// Build ONE belief lesson from a cluster of raw lessons. The belief's body is a
+/// deterministic, template-built distillation: the shared domain, the most
+/// common keywords, and the representative fix (the longest/richest member fix).
+/// `evidence_count` records the cluster size; `evidence` records the per-lesson
+/// keys so recall can demote those exact originals. `first_seen` is the most
+/// recent member timestamp (= last confirmation / freshness).
+fn fold_one_cluster(
+    members: &[&Lesson],
+    ev_keys: &std::collections::BTreeSet<String>,
+    now: &str,
+) -> Lesson {
+    let domain = members
+        .first()
+        .map_or_else(|| "general".to_string(), |l| l.domain.clone());
+    // Most recent member timestamp = the belief's last-confirmed freshness.
+    let last_confirmed = members
+        .iter()
+        .map(|l| l.first_seen.clone())
+        .max()
+        .unwrap_or_else(|| now.to_string());
+    // Representative fix = the richest (longest) member fix — the most actionable.
+    let rep_fix = members
+        .iter()
+        .map(|l| l.fix.as_str())
+        .max_by_key(|f| f.len())
+        .unwrap_or("")
+        .to_string();
+    let rep_root = members
+        .iter()
+        .map(|l| l.root_cause.as_str())
+        .max_by_key(|r| r.len())
+        .unwrap_or("")
+        .to_string();
+    // Union of member keywords, capped, most-shared first.
+    let keywords = top_shared_keywords(members, 12);
+    // A short, human title summarising the cluster.
+    let topic = keywords
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let title = if topic.is_empty() {
+        format!("Belief [{domain}] ({} lessons)", members.len())
+    } else {
+        format!("Belief: {topic} ({} lessons)", members.len())
+    };
+    let body = format!(
+        "A recurring rule distilled from {n} similar prior lessons in the \
+         `{domain}` domain. The pattern below held across all of them, so treat \
+         it as a confirmed rule, not a one-off:\n\n{rep_root}\n\nKeywords: {kw}",
+        n = members.len(),
+        kw = keywords.join(", "),
+    );
+    let source_requirement = members
+        .iter()
+        .map(|l| l.source_requirement.clone())
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    Lesson {
+        kind: LessonKind::Belief,
+        domain,
+        title,
+        body,
+        fix: rep_fix,
+        root_cause: rep_root,
+        keywords,
+        source_requirement,
+        first_seen: last_confirmed,
+        signature: String::new(),
+        occurrences: u32::try_from(members.len()).unwrap_or(u32::MAX),
+        context: Vec::new(),
+        efficacy: None,
+        invalidated: false,
+        trust: NEUTRAL_TRUST,
+        evidence_count: u32::try_from(members.len()).unwrap_or(u32::MAX),
+        evidence: ev_keys.iter().cloned().collect(),
+    }
+}
+
+/// The keywords shared across the most cluster members, most-common first,
+/// capped at `max`. Deterministic (count desc, then lexical) so a re-fold of the
+/// same cluster yields the same belief.
+fn top_shared_keywords(members: &[&Lesson], max: usize) -> Vec<String> {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for l in members {
+        // Count each keyword once per member (dedup within a member first).
+        let uniq: std::collections::HashSet<&str> = l.keywords.iter().map(String::as_str).collect();
+        for k in uniq {
+            *counts.entry(k).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<(&str, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ranked
+        .into_iter()
+        .take(max)
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
+/// Deterministic connected-components clustering of `pool` by
+/// [`lesson_similarity`] ≥ [`BELIEF_FOLD_THRESHOLD`]. Returns clusters as index
+/// lists into `pool`, each cluster's indices sorted ascending and the clusters
+/// ordered by their smallest index — fully deterministic. O(n²) over the pool
+/// with an upper bound so a huge ledger can't blow up (extra lessons are simply
+/// not clustered this pass).
+fn cluster_lessons(pool: &[&Lesson]) -> Vec<Vec<usize>> {
+    let n = pool.len().min(BELIEF_SCAN_LIMIT);
+    // Union-find over the first `n` lessons.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if lesson_similarity(pool[i], pool[j]) >= BELIEF_FOLD_THRESHOLD {
+                let ri = find(&mut parent, i);
+                let rj = find(&mut parent, j);
+                if ri != rj {
+                    parent[ri.max(rj)] = ri.min(rj);
+                }
+            }
+        }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        groups.entry(root).or_default().push(i);
+    }
+    groups
+        .into_values()
+        .filter(|g| g.len() >= BELIEF_MIN_CLUSTER)
+        .collect()
+}
+
+/// Upper bound on lessons scanned per fold/contradiction pass — the O(n²) guard.
+/// Generous; a real project's curatable ledger stays well under.
+const BELIEF_SCAN_LIMIT: usize = 500;
+
+/// Evict the lowest-value beliefs when the ledger exceeds [`MAX_BELIEFS`]: keep
+/// the best by `(evidence_count, recency)` — a belief backed by more evidence
+/// and confirmed more recently outranks a thin, stale one. Deterministic.
+fn prune_beliefs(beliefs: &mut Vec<Lesson>) {
+    if beliefs.len() <= MAX_BELIEFS {
+        return;
+    }
+    beliefs.sort_by(|a, b| {
+        b.evidence_count
+            .cmp(&a.evidence_count)
+            .then_with(|| b.first_seen.cmp(&a.first_seen))
+    });
+    beliefs.truncate(MAX_BELIEFS);
+}
+
+// =====================================================================
+// Contradiction / staleness hygiene scan (②).
+//
+// Two lessons that talk about the SAME thing (high topic/entity overlap) but
+// say DIFFERENT things (low text similarity) are a likely contradiction — the
+// ledger has accumulated conflicting advice. This pass finds such pairs
+// deterministically (O(n²), bounded by [`BELIEF_SCAN_LIMIT`]) and routes them
+// through the EXISTING INVALIDATE path: the OLDER of the conflicting pair is
+// marked invalid (kept on disk for provenance, dropped from sediment + recall).
+// Pure-local; no base call. Fail-open: any error marks nothing.
+// =====================================================================
+
+/// Minimum keyword/domain overlap ([`lesson_similarity`]) for two lessons to be
+/// "about the same thing" — the FIRST half of the contradiction test.
+const CONTRA_TOPIC_OVERLAP: i64 = 4;
+
+/// Maximum body text Jaccard (token-set overlap) for two same-topic lessons to
+/// count as CONTRADICTORY — the SECOND half. Below this, two lessons share the
+/// topic but phrase their advice so differently they likely disagree. `0.25`:
+/// the bodies share at most a quarter of their tokens.
+const CONTRA_TEXT_SIM_MAX: f64 = 0.25;
+
+/// Scan the raw ledgers for same-topic / different-text lesson pairs (likely
+/// contradictions) and route each hit through the INVALIDATE path, marking the
+/// OLDER lesson invalid. Returns how many lessons were invalidated. Bounded
+/// O(n²); deterministic; pure-local; fail-open.
+pub fn scan_contradictions(project_root: &Path) -> usize {
+    let raw = read_all_raw_lessons(project_root);
+    let pool: Vec<&Lesson> = raw
+        .iter()
+        .filter(|l| {
+            l.kind != LessonKind::DevError && l.kind != LessonKind::Belief && !l.invalidated
+        })
+        .take(BELIEF_SCAN_LIMIT)
+        .collect();
+    if pool.len() < 2 {
+        return 0;
+    }
+
+    let mut to_invalidate: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    for i in 0..pool.len() {
+        for j in (i + 1)..pool.len() {
+            let a = pool[i];
+            let b = pool[j];
+            // Same topic (high keyword/domain overlap) …
+            if lesson_similarity(a, b) < CONTRA_TOPIC_OVERLAP {
+                continue;
+            }
+            // … but the advice text barely overlaps → likely contradictory.
+            if body_token_jaccard(a, b) > CONTRA_TEXT_SIM_MAX {
+                continue;
+            }
+            // Mark the OLDER one stale (keep the fresher advice). Tie → keep `a`.
+            let older = if a.first_seen <= b.first_seen { a } else { b };
+            to_invalidate.insert(lesson_identity(older));
+        }
+    }
+    if to_invalidate.is_empty() {
+        return 0;
+    }
+    apply_invalidations(project_root, &to_invalidate)
+}
+
+/// Jaccard similarity of two lessons' fix+root_cause+body token sets in `[0,1]`.
+/// Tokenised the same way the trigger query is (alnum words, len ≥ 3, plus CJK
+/// bigrams) so CJK advice is comparable too. Empty-on-both → `1.0` (identical
+/// emptiness is not a contradiction).
+fn body_token_jaccard(a: &Lesson, b: &Lesson) -> f64 {
+    let ta = advice_tokens(a);
+    let tb = advice_tokens(b);
+    if ta.is_empty() && tb.is_empty() {
+        return 1.0;
+    }
+    let inter = ta.intersection(&tb).count();
+    let union = ta.union(&tb).count().max(1);
+    inter as f64 / union as f64
+}
+
+/// Token set of a lesson's advice text (fix + root_cause + body), for the
+/// contradiction Jaccard. ASCII words ≥ 3 chars + CJK bigrams.
+fn advice_tokens(l: &Lesson) -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let text = format!("{} {} {}", l.fix, l.root_cause, l.body).to_ascii_lowercase();
+    for w in text.split(|c: char| !c.is_alphanumeric()) {
+        if w.len() >= 3 && !is_cjk_char(w.chars().next().unwrap_or(' ')) {
+            set.insert(w.to_string());
+        }
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if is_cjk_char(chars[i]) && is_cjk_char(chars[i + 1]) {
+            set.insert(chars[i..=i + 1].iter().collect());
+        }
+        i += 1;
+    }
+    set
+}
+
+/// Mark the given lesson identities invalid across the reconcilable ledgers
+/// (the same per-file rewrite the reconcile path uses). Returns how many rows
+/// were newly invalidated. Fail-open per file.
+fn apply_invalidations(
+    project_root: &Path,
+    to_invalidate: &std::collections::HashSet<(String, String, String)>,
+) -> usize {
+    let mut marked = 0usize;
+    for file in RECONCILE_FILES {
+        let mut rows = read_raw_lessons(project_root, file);
+        if rows.is_empty() {
+            continue;
+        }
+        let mut file_changed = false;
+        for row in &mut rows {
+            if !row.invalidated && to_invalidate.contains(&lesson_identity(row)) {
+                row.invalidated = true;
+                file_changed = true;
+                marked += 1;
+            }
+        }
+        if file_changed {
+            write_raw_lessons(project_root, file, &rows);
+        }
+    }
+    marked
+}
+
 /// Build the reconcile candidate pairs `(fresh_lesson, its top-s older similar
 /// lessons)` for the current raw corpus. Each fresh lesson is paired with the
 /// most-similar OLDER non-pitfall lessons (zero-similarity neighbours dropped).
@@ -1605,6 +2123,19 @@ pub fn sediment_lessons_with_judge(project_root: &Path, judge: Option<ReconcileJ
         lessons = read_all_raw_lessons(project_root);
     }
 
+    // Memory hygiene (②) + belief fold (①) — both deterministic + pure-local, so
+    // they need NO base. Gated on `judge.is_some()` only to keep the no-base
+    // `sediment_lessons` byte-for-byte identical (contradiction-scan can mark
+    // rows invalid, which would change the sediment set). The contradiction scan
+    // runs first (it may invalidate stale/conflicting advice → re-read), then the
+    // surviving lessons are folded into the belief ledger.
+    if judge.is_some() {
+        if scan_contradictions(project_root) > 0 {
+            lessons = read_all_raw_lessons(project_root);
+        }
+        let _ = fold_beliefs(project_root);
+    }
+
     // Drop invalidated lessons from the sediment candidate set (they stay on
     // disk for provenance but never become retrievable markdown). No-op for the
     // no-base path, where nothing is ever marked invalid.
@@ -1696,6 +2227,7 @@ fn render_lesson_markdown(lesson: &Lesson) -> String {
         LessonKind::Revision => "[write] Revision",
         LessonKind::ValidatedPattern => "[ok] Validated pattern",
         LessonKind::DevError => "[pitfall] Dev error",
+        LessonKind::Belief => "[belief] Folded rule",
     };
     let keywords_inline = lesson.keywords.join(", ");
     format!(
@@ -1952,7 +2484,12 @@ fn lesson_decay_score(
     // scores never exceed ~20, so this only guards against pathological input.
     let raw_rel = f64::from(lesson_trigger_score(l, query).clamp(0, 1_000) as i32);
     let rel = 0.1 + (raw_rel / (raw_rel + 6.0)) * 0.9;
-    rel * lesson_importance(l) * recency_weight(&l.first_seen, now)
+    // Trust is the fourth axis: a lesson whose injected advice coincided with
+    // passing gates floats up; one that coincided with failures sinks. Folded in
+    // as a multiplicative factor (like the other axes) so it modulates, never
+    // dominates — and clamped above 0 by `Lesson::trust`, so it can damp a
+    // distrusted lesson hard without ever zeroing it out of recovery.
+    rel * lesson_importance(l) * recency_weight(&l.first_seen, now) * f64::from(l.trust())
 }
 
 /// Find the best-matching pitfall for `failure_detail` IFF it has TRULY recurred
@@ -2188,7 +2725,11 @@ fn surfaced_signatures(selected: &[Lesson]) -> Vec<String> {
 /// read — efficacy bookkeeping is the caller's responsibility so it happens
 /// exactly once per surfacing.
 fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson> {
-    let lessons = read_all_raw_lessons(project_root);
+    // Candidates = raw lessons PLUS the folded beliefs. Beliefs are denser
+    // summaries of clusters of raw lessons; the demotion step below hides the
+    // exact raw lessons a matched belief already covers, so the prompt shows the
+    // distilled rule instead of its near-duplicate evidence.
+    let mut lessons = read_lessons_for_recall(project_root);
     if lessons.is_empty() {
         return Vec::new();
     }
@@ -2206,6 +2747,22 @@ fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson
         .collect();
     for tok in project_context_tokens(project_root) {
         query.insert(tok);
+    }
+
+    // Belief preference (①): a belief that POSITIVELY matches the current query
+    // is preferred over its raw evidence. Collect the evidence keys of every
+    // matching belief and drop the raw lessons they cover from the candidate set,
+    // so the dense belief surfaces instead of several near-duplicate originals. A
+    // belief that does NOT match the query hides nothing (its evidence stays
+    // eligible on its own merits). Fail-open: with no beliefs this is a no-op and
+    // behaviour is byte-for-byte the prior raw-only selection.
+    let covered: std::collections::HashSet<String> = lessons
+        .iter()
+        .filter(|l| l.kind == LessonKind::Belief && lesson_trigger_score(l, &query) > 0)
+        .flat_map(|b| b.evidence.iter().cloned())
+        .collect();
+    if !covered.is_empty() {
+        lessons.retain(|l| l.kind == LessonKind::Belief || !covered.contains(&evidence_key(l)));
     }
 
     // Score each lesson on TWO axes:
@@ -2282,6 +2839,7 @@ fn render_one_lesson(lesson: &Lesson) -> String {
         LessonKind::Revision => "[write]",
         LessonKind::ValidatedPattern => "[ok]",
         LessonKind::DevError => "[pitfall]",
+        LessonKind::Belief => "[belief]",
     };
     // Dev errors carry their root cause too, so the worker understands WHY
     // to avoid the pitfall, not just the fix. The hit count signals how
@@ -2323,6 +2881,17 @@ fn render_one_lesson(lesson: &Lesson) -> String {
 
 ",
             lesson.title, lesson.root_cause, lesson.fix
+        )
+    } else if lesson.kind == LessonKind::Belief {
+        // A belief leads with its evidence weight so the worker reads it as a
+        // confirmed rule ("seen N times"), then the distilled fix.
+        let n = lesson.evidence_count.max(lesson.hits());
+        format!(
+            "{icon} **{}** (印证 {n} 次)
+   规则: {}
+
+",
+            lesson.title, lesson.fix
         )
     } else {
         format!(
@@ -2414,6 +2983,133 @@ pub fn mark_pitfalls_resolved(project_root: &Path, raw_errors: &[String]) -> usi
         write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
     }
     marked
+}
+
+// =====================================================================
+// Trust feedback (③): asymmetric pass/fail signal on injected lessons.
+//
+// The efficacy loop already answers "did this pitfall recur?". Trust answers
+// the broader, value-weighted question "when this lesson was put in front of
+// the worker, did the gate then PASS or FAIL?". A pass nudges the lesson's
+// trust up a little; a fail pushes it down harder (asymmetric). Trust folds
+// into `lesson_decay_score`, so a lesson that keeps coinciding with failures
+// quietly sinks in recall while a reliably-helpful one floats up — upgrading
+// "was it reused?" to "did reusing it actually help?".
+//
+// WIRING POINTS (where the runner feeds verify results back):
+//   - PASS  → `reward_trust_for_signatures(root, &surfaced_sigs)` after a
+//             verify/quality gate passes, OR `reward_injected_lessons(root,
+//             &injected_ids)` for non-pitfall lessons.
+//   - FAIL  → `penalize_trust_for_signatures(root, &surfaced_sigs)` after the
+//             gate fails with those lessons in the prompt.
+// The dev-error reflux can ride the EXISTING `mark_pitfalls_resolved` /
+// `apply_dev_error_trust` seam (see `apply_dev_error_trust`), which the runner
+// already calls at the verify-pass site (runner.rs ~L1135) and could call with
+// `passed=false` at the failure site (runner.rs ~L1057). Both are fail-open and
+// only ever adjust the trust float — they never gate the loop.
+// =====================================================================
+
+/// Apply a trust pass/fail step to every DEV-ERROR pitfall whose signature
+/// matches one of `raw_errors`, using the SAME signature normalisation the
+/// capture/resolve paths use. This is the dev-error reflux seam: the runner
+/// already classifies the failing error and (on a successful auto-fix) calls
+/// [`mark_pitfalls_resolved`]; pairing that call with `passed=true` here rewards
+/// the pitfall whose fix just worked, and a `passed=false` call at the failure
+/// site penalises a pitfall whose injected fix did NOT hold. Returns how many
+/// records were adjusted. Fail-open: unrecognised errors / empty store → 0.
+pub fn apply_dev_error_trust(project_root: &Path, raw_errors: &[String], passed: bool) -> usize {
+    let want: std::collections::HashSet<String> = raw_errors
+        .iter()
+        .filter(|e| crate::error_kb::looks_like_error(e))
+        .map(|e| normalize_signature(&crate::error_kb::classify_error(e).signature))
+        .collect();
+    if want.is_empty() {
+        return 0;
+    }
+    let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
+    if store.is_empty() {
+        return 0;
+    }
+    let mut adjusted = 0usize;
+    for l in &mut store {
+        if l.kind == LessonKind::DevError && want.contains(&l.signature) {
+            l.apply_trust_feedback(passed);
+            adjusted += 1;
+        }
+    }
+    if adjusted > 0 {
+        write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
+    }
+    adjusted
+}
+
+/// Apply a trust pass/fail step to the dev-error pitfalls whose normalised
+/// signature is in `signatures` (the signatures a recall surfaced into the
+/// prompt — see [`surfaced_signatures`]). Use this when the gate outcome is
+/// known but the raw error strings aren't on hand: pass the signatures captured
+/// at injection time. Returns how many records were adjusted. Fail-open.
+pub fn apply_trust_for_signatures(
+    project_root: &Path,
+    signatures: &[String],
+    passed: bool,
+) -> usize {
+    let want: std::collections::HashSet<String> =
+        signatures.iter().map(|s| normalize_signature(s)).collect();
+    if want.is_empty() {
+        return 0;
+    }
+    let mut store = read_raw_lessons(project_root, DEV_ERRORS_FILE);
+    if store.is_empty() {
+        return 0;
+    }
+    let mut adjusted = 0usize;
+    for l in &mut store {
+        if l.kind == LessonKind::DevError && want.contains(&normalize_signature(&l.signature)) {
+            l.apply_trust_feedback(passed);
+            adjusted += 1;
+        }
+    }
+    if adjusted > 0 {
+        write_raw_lessons(project_root, DEV_ERRORS_FILE, &store);
+    }
+    adjusted
+}
+
+/// Apply a trust pass/fail step to NON-pitfall lessons (failures / revisions /
+/// validated patterns / beliefs) identified by their [`lesson_identity`] triple
+/// — the identities a recall surfaced into the prompt. Operates per
+/// reconcilable file PLUS the belief ledger so a surfaced belief's trust is
+/// updated too. Returns how many records were adjusted. Fail-open.
+pub fn apply_trust_for_identities(
+    project_root: &Path,
+    identities: &[(String, String, String)],
+    passed: bool,
+) -> usize {
+    let want: std::collections::HashSet<&(String, String, String)> = identities.iter().collect();
+    if want.is_empty() {
+        return 0;
+    }
+    let mut adjusted = 0usize;
+    let mut files: Vec<&str> = RECONCILE_FILES.to_vec();
+    files.push(BELIEFS_FILE);
+    for file in files {
+        let mut rows = read_raw_lessons(project_root, file);
+        if rows.is_empty() {
+            continue;
+        }
+        let mut file_changed = false;
+        for row in &mut rows {
+            if want.contains(&lesson_identity(row)) {
+                row.apply_trust_feedback(passed);
+                file_changed = true;
+                adjusted += 1;
+            }
+        }
+        if file_changed {
+            write_raw_lessons(project_root, file, &rows);
+        }
+    }
+    adjusted
 }
 
 /// Summary of the pitfall KB's self-verification state, for reporting.
@@ -2927,6 +3623,9 @@ mod tests {
             context: vec!["react".into()],
             efficacy: None,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         };
         let with: std::collections::HashSet<String> =
             ["react-router-dom".to_string(), "react".to_string()]
@@ -2994,6 +3693,9 @@ mod tests {
             context: vec!["react".into()],
             efficacy: None,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         };
         let stale_lesson = Lesson {
             first_seen: stale,
@@ -3028,6 +3730,9 @@ mod tests {
             context: vec![],
             efficacy: eff,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         };
         let recurring = mk(Some(PitfallEfficacy {
             injected: 1,
@@ -3080,6 +3785,9 @@ mod tests {
                 next_strategy: String::new(),
             }),
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         };
         write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&recurring));
 
@@ -3196,6 +3904,9 @@ mod tests {
                 next_strategy: String::new(),
             }),
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         });
         // Fill past the cap with ancient, validated (handled) pitfalls.
         for n in 0..MAX_DEV_PITFALLS + 10 {
@@ -3221,6 +3932,9 @@ mod tests {
                     next_strategy: String::new(),
                 }),
                 invalidated: false,
+                trust: NEUTRAL_TRUST,
+                evidence_count: 0,
+                evidence: Vec::new(),
             });
         }
         prune_pitfalls(&mut store);
@@ -3250,6 +3964,9 @@ mod tests {
             context: vec![],
             efficacy: None,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         };
         assert!(group_is_global_worthy(&[&dev], 1));
 
@@ -3695,6 +4412,9 @@ mod tests {
             context: Vec::new(),
             efficacy: None,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         };
         let old = mk("OLD api lesson", "2026-06-01T00:00:00Z");
         let fresh = mk("FRESH api lesson", "2026-06-20T00:00:00Z");
@@ -3844,6 +4564,9 @@ mod tests {
             context: Vec::new(),
             efficacy: None,
             invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
         };
         write_raw_lessons(
             root,
@@ -3860,5 +4583,327 @@ mod tests {
         assert_eq!(written, 0, "decay drops the ancient lesson from sediment");
         // Still recoverable in the raw ledger (not physically removed).
         assert_eq!(read_raw_lessons(root, "quality-failures.jsonl").len(), 1);
+    }
+
+    // ---- ① belief layer ------------------------------------------------
+
+    /// Build `n` near-duplicate lessons (same domain + shared keywords) so they
+    /// cluster into one belief, written to the quality-failures ledger.
+    fn seed_cluster(root: &Path, n: usize, kw: &[&str], domain: &str) {
+        let mut rows = Vec::new();
+        for i in 0..n {
+            rows.push(Lesson {
+                kind: LessonKind::Failure,
+                domain: domain.into(),
+                title: format!("{domain} lesson {i}"),
+                body: format!("body about {} number {i}", kw.join(" ")),
+                fix: format!(
+                    "always use design tokens for {} (variant {i})",
+                    kw.join(" ")
+                ),
+                root_cause: format!("hardcoded {} caused the {domain} failure", kw.join(" ")),
+                keywords: kw.iter().map(|k| (*k).to_string()).collect(),
+                source_requirement: "做一个仪表盘".into(),
+                first_seen: format!("2026-06-{:02}T00:00:00Z", 10 + i),
+                signature: String::new(),
+                occurrences: 1,
+                context: Vec::new(),
+                efficacy: None,
+                invalidated: false,
+                trust: NEUTRAL_TRUST,
+                evidence_count: 0,
+                evidence: Vec::new(),
+            });
+        }
+        write_raw_lessons(root, "quality-failures.jsonl", &rows);
+    }
+
+    #[test]
+    fn fold_beliefs_collapses_n_similar_into_one_with_evidence_count() {
+        let tmp = TempDir::new().unwrap();
+        seed_cluster(tmp.path(), 4, &["color", "token", "frontend"], "frontend");
+        let touched = fold_beliefs(tmp.path());
+        assert_eq!(touched, 1, "four near-duplicates fold into ONE belief");
+
+        let beliefs = read_raw_lessons(tmp.path(), BELIEFS_FILE);
+        assert_eq!(beliefs.len(), 1);
+        let b = &beliefs[0];
+        assert_eq!(b.kind, LessonKind::Belief);
+        assert_eq!(
+            b.evidence_count, 4,
+            "belief records its N supporting lessons"
+        );
+        assert_eq!(b.evidence.len(), 4, "evidence keys recorded for demotion");
+        // Freshness = the most recent member's timestamp (last_confirmed).
+        assert_eq!(b.first_seen, "2026-06-13T00:00:00Z");
+    }
+
+    #[test]
+    fn fold_beliefs_updates_existing_belief_on_refold() {
+        let tmp = TempDir::new().unwrap();
+        seed_cluster(tmp.path(), 3, &["auth", "session", "token"], "api");
+        assert_eq!(fold_beliefs(tmp.path()), 1);
+        let before = read_raw_lessons(tmp.path(), BELIEFS_FILE);
+        assert_eq!(before[0].evidence_count, 3);
+
+        // Add a fourth member to the SAME cluster, re-fold → UPDATE in place (no
+        // duplicate belief), evidence_count grows.
+        let mut rows = read_raw_lessons(tmp.path(), "quality-failures.jsonl");
+        rows.push(Lesson {
+            evidence: Vec::new(),
+            title: "api lesson extra".into(),
+            first_seen: "2026-06-20T00:00:00Z".into(),
+            ..rows[0].clone()
+        });
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &rows);
+        assert_eq!(fold_beliefs(tmp.path()), 1, "re-fold updates, not appends");
+        let after = read_raw_lessons(tmp.path(), BELIEFS_FILE);
+        assert_eq!(after.len(), 1, "still exactly one belief (UPDATE, not ADD)");
+        assert_eq!(after[0].evidence_count, 4, "evidence grew on re-fold");
+    }
+
+    #[test]
+    fn belief_preferred_over_its_raw_evidence_in_recall() {
+        let tmp = TempDir::new().unwrap();
+        // Cluster of lessons whose keywords intersect the requirement so they
+        // positively match the trigger query.
+        seed_cluster(tmp.path(), 3, &["dashboard", "color", "token"], "frontend");
+        fold_beliefs(tmp.path());
+        // Requirement shares "dashboard" → the belief matches.
+        let selected = select_relevant_lessons(tmp.path(), "build a dashboard with color tokens");
+        assert!(
+            selected.iter().any(|l| l.kind == LessonKind::Belief),
+            "the dense belief must be selected: {:?}",
+            selected.iter().map(|l| &l.title).collect::<Vec<_>>()
+        );
+        // Its raw evidence lessons are demoted (not also surfaced).
+        assert!(
+            !selected
+                .iter()
+                .any(|l| l.kind == LessonKind::Failure && l.domain == "frontend"),
+            "raw evidence demoted in favour of the belief"
+        );
+    }
+
+    #[test]
+    fn fold_beliefs_is_noop_for_lone_lesson() {
+        let tmp = TempDir::new().unwrap();
+        seed_cluster(tmp.path(), 1, &["solo"], "api");
+        assert_eq!(
+            fold_beliefs(tmp.path()),
+            0,
+            "a single lesson mints no belief"
+        );
+        assert!(read_raw_lessons(tmp.path(), BELIEFS_FILE).is_empty());
+    }
+
+    // ---- ② contradiction / staleness scan ------------------------------
+
+    #[test]
+    fn scan_contradictions_invalidates_older_conflicting_advice() {
+        let tmp = TempDir::new().unwrap();
+        // Same topic (shared keywords + domain → high overlap) but the advice
+        // text barely overlaps → a likely contradiction.
+        let mk = |title: &str, fix: &str, root: &str, when: &str| Lesson {
+            kind: LessonKind::Failure,
+            domain: "database".into(),
+            title: title.into(),
+            body: String::new(),
+            fix: fix.into(),
+            root_cause: root.into(),
+            keywords: vec![
+                "database".into(),
+                "index".into(),
+                "query".into(),
+                "postgres".into(),
+            ],
+            source_requirement: "r".into(),
+            first_seen: when.into(),
+            signature: String::new(),
+            occurrences: 1,
+            context: Vec::new(),
+            efficacy: None,
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        };
+        let older = mk(
+            "indexing advice A",
+            "always add a btree index on every column for speed",
+            "missing indexes slowed reads",
+            "2026-06-01T00:00:00Z",
+        );
+        let newer = mk(
+            "indexing advice B",
+            "avoid over-indexing; drop redundant indexes to keep writes fast",
+            "too many indexes bloated writes",
+            "2026-06-20T00:00:00Z",
+        );
+        write_raw_lessons(tmp.path(), "quality-failures.jsonl", &[older, newer]);
+
+        let n = scan_contradictions(tmp.path());
+        assert_eq!(n, 1, "one older conflicting lesson invalidated");
+        let rows = read_raw_lessons(tmp.path(), "quality-failures.jsonl");
+        let a = rows
+            .iter()
+            .find(|l| l.title == "indexing advice A")
+            .unwrap();
+        let b = rows
+            .iter()
+            .find(|l| l.title == "indexing advice B")
+            .unwrap();
+        assert!(
+            a.invalidated,
+            "the OLDER conflicting advice is marked stale"
+        );
+        assert!(!b.invalidated, "the fresher advice survives");
+    }
+
+    #[test]
+    fn scan_contradictions_leaves_agreeing_lessons_alone() {
+        let tmp = TempDir::new().unwrap();
+        // Same topic AND the advice text strongly overlaps → NOT a contradiction.
+        seed_cluster(tmp.path(), 2, &["color", "token", "frontend"], "frontend");
+        let n = scan_contradictions(tmp.path());
+        assert_eq!(n, 0, "agreeing same-topic lessons are not invalidated");
+        assert!(read_raw_lessons(tmp.path(), "quality-failures.jsonl")
+            .iter()
+            .all(|l| !l.invalidated));
+    }
+
+    // ---- ③ trust score (asymmetric + folded into decay) ----------------
+
+    #[test]
+    fn trust_normalises_legacy_zero_to_neutral() {
+        let tmp = TempDir::new().unwrap();
+        let mut l = seed_cluster_one(tmp.path());
+        l.trust = 0.0; // legacy / never-rated row
+        assert!((l.trust() - NEUTRAL_TRUST).abs() < 1e-6, "0.0 → neutral");
+        // A corrupt (NaN / negative) trust also maps to neutral (fail-open).
+        l.trust = f32::NAN;
+        assert!((l.trust() - NEUTRAL_TRUST).abs() < 1e-6);
+        l.trust = -5.0;
+        assert!((l.trust() - NEUTRAL_TRUST).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trust_feedback_is_asymmetric() {
+        let tmp = TempDir::new().unwrap();
+        let mut l = seed_cluster_one(tmp.path());
+        l.trust = NEUTRAL_TRUST;
+        // One pass: small reward.
+        l.apply_trust_feedback(true);
+        assert!((l.trust - (NEUTRAL_TRUST + TRUST_REWARD)).abs() < 1e-6);
+        // One fail: larger penalty — the penalty must exceed the reward.
+        let after_pass = l.trust;
+        l.apply_trust_feedback(false);
+        let pass_delta = after_pass - NEUTRAL_TRUST;
+        let fail_delta = after_pass - l.trust;
+        assert!(
+            fail_delta > pass_delta,
+            "fail penalty ({fail_delta}) must exceed pass reward ({pass_delta})"
+        );
+        // Trust never drops to exactly 0 (floor keeps it recoverable).
+        for _ in 0..50 {
+            l.apply_trust_feedback(false);
+        }
+        assert!(
+            l.trust >= TRUST_FLOOR,
+            "trust floored above zero: {}",
+            l.trust
+        );
+        assert!(l.trust > 0.0);
+    }
+
+    #[test]
+    fn trust_multiplies_into_decay_score() {
+        let tmp = TempDir::new().unwrap();
+        let _ = tmp;
+        let base = seed_cluster_one_lesson();
+        let mut trusted = base.clone();
+        trusted.trust = 1.0;
+        let mut distrusted = base.clone();
+        distrusted.trust = TRUST_FLOOR;
+        let q: std::collections::HashSet<String> = ["color", "token"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let now = Utc::now();
+        let st = lesson_decay_score(&trusted, &q, now);
+        let sd = lesson_decay_score(&distrusted, &q, now);
+        assert!(
+            st > sd,
+            "a trusted lesson must outscore a distrusted one: {st} vs {sd}"
+        );
+        // The ratio tracks the trust ratio (multiplicative folding).
+        let ratio = st / sd;
+        let expected = 1.0_f64 / f64::from(TRUST_FLOOR);
+        assert!(
+            (ratio - expected).abs() < 1e-3,
+            "decay scales linearly with trust: ratio {ratio} ~ {expected}"
+        );
+    }
+
+    #[test]
+    fn apply_dev_error_trust_rewards_and_penalises() {
+        let tmp = TempDir::new().unwrap();
+        let err = vec!["Error: Cannot find module 'lodash'".to_string()];
+        capture_dev_errors(tmp.path(), &err, "demo", "需求");
+        let sig = "dependency/module-not-found/lodash";
+        let trust_of = |t: &std::path::Path| {
+            read_raw_lessons(t, DEV_ERRORS_FILE)
+                .into_iter()
+                .find(|l| l.signature == sig)
+                .map(|l| l.trust())
+        };
+        let start = trust_of(tmp.path()).unwrap();
+        // Gate passed with this pitfall's fix in play → reward.
+        assert_eq!(apply_dev_error_trust(tmp.path(), &err, true), 1);
+        assert!(trust_of(tmp.path()).unwrap() > start, "pass rewards trust");
+        // Gate failed with it in play → penalty (drops below the start).
+        apply_dev_error_trust(tmp.path(), &err, false);
+        apply_dev_error_trust(tmp.path(), &err, false);
+        assert!(
+            trust_of(tmp.path()).unwrap() < start,
+            "repeated fails sink trust below neutral"
+        );
+        // Unrecognised error → no-op.
+        assert_eq!(
+            apply_dev_error_trust(tmp.path(), &["vague noise".to_string()], true),
+            0
+        );
+    }
+
+    /// One persisted Failure lesson, returned by value for in-memory trust tests.
+    fn seed_cluster_one(root: &Path) -> Lesson {
+        seed_cluster(root, 1, &["color", "token"], "frontend");
+        read_raw_lessons(root, "quality-failures.jsonl")
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    /// A standalone in-memory Failure lesson (no disk) for pure scoring tests.
+    fn seed_cluster_one_lesson() -> Lesson {
+        Lesson {
+            kind: LessonKind::Failure,
+            domain: "frontend".into(),
+            title: "t".into(),
+            body: String::new(),
+            fix: "use color tokens".into(),
+            root_cause: String::new(),
+            keywords: vec!["color".into(), "token".into()],
+            source_requirement: "r".into(),
+            first_seen: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            signature: String::new(),
+            occurrences: 1,
+            context: Vec::new(),
+            efficacy: None,
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        }
     }
 }

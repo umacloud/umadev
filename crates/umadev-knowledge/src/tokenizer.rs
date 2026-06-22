@@ -13,6 +13,15 @@
 //! dictionary or segmentation model. Single CJK chars are also emitted as
 //! unigrams so a one-char query term still hits.
 //!
+//! Bigrams alone are coarse for longer phrases: a three-character term like
+//! "鉴权码" decomposes into "鉴权" + "权码", and a doc that merely contains
+//! "鉴权" + an unrelated "码" elsewhere matches on both bigrams as if it held
+//! the whole phrase. A character **trigram** captures one more character of
+//! local context, so substring / short-phrase matches land more precisely.
+//! [`tokenize_trigram`] emits the trigram view of a text; it is a SEPARATE
+//! retrieval channel (fused via RRF in `retrieve`), never mixed into the
+//! default bigram index — so existing bigram/English ranking is untouched.
+//!
 //! All tokens are lowercased ASCII / verbatim CJK — no stopword removal at
 //! this layer (BM25's IDF naturally downweights common tokens).
 
@@ -75,6 +84,71 @@ pub fn tokenize(text: &str) -> Vec<String> {
     }
     flush_ascii(&mut ascii_buf, &mut tokens);
     tokens
+}
+
+/// Tokenise `text` into a CJK **trigram** view for the separate trigram
+/// retrieval channel. ASCII runs are emitted unchanged (so a mixed query still
+/// carries its Latin identifiers into this channel), and every run of ≥ 3 CJK
+/// characters additionally emits its sliding 3-char windows ("登录系" / "录系统"
+/// for "登录系统"). A CJK run shorter than 3 chars emits nothing extra here —
+/// the bigram channel already covers 1- and 2-char terms, and this channel only
+/// adds the longer-context signal.
+///
+/// This is intentionally NOT a superset of [`tokenize`]: it is a parallel view
+/// fused by rank, so it deliberately omits CJK unigrams/bigrams (those are the
+/// bigram channel's job). Returning ASCII tokens keeps a mixed-script query
+/// (`"OAuth 鉴权码"`) productive in both channels. Pure; no I/O. Returns an empty
+/// vec when the text carries no ASCII run and no ≥3-char CJK run.
+#[must_use]
+pub fn tokenize_trigram(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut ascii_buf = String::new();
+
+    let flush_ascii = |buf: &mut String, out: &mut Vec<String>| {
+        if buf.len() >= MIN_ASCII_LEN {
+            out.push(buf.clone());
+        }
+        buf.clear();
+    };
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_ascii_alphanumeric() {
+            ascii_buf.push(c.to_ascii_lowercase());
+            i += 1;
+            continue;
+        }
+        flush_ascii(&mut ascii_buf, &mut tokens);
+        if is_cjk(c) && i + 2 < chars.len() && is_cjk(chars[i + 1]) && is_cjk(chars[i + 2]) {
+            // Sliding 3-char window. Emit only the window starting here; the
+            // loop advances one char at a time so every window is produced.
+            tokens.push(format!("{}{}{}", c, chars[i + 1], chars[i + 2]));
+        }
+        i += 1;
+    }
+    flush_ascii(&mut ascii_buf, &mut tokens);
+    tokens
+}
+
+/// The CJK-trigram-ONLY view of `text` (no ASCII tokens). Used doc-side by the
+/// chunker to append trigram terms onto the existing token stream WITHOUT
+/// doubling the ASCII term frequency (which would perturb the bigram channel's
+/// BM25 scores). Query-side, [`tokenize_trigram`] is used so a mixed-script
+/// query still carries its Latin identifiers into the trigram channel.
+#[must_use]
+pub fn cjk_trigrams_only(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 2 < chars.len() {
+        if is_cjk(chars[i]) && is_cjk(chars[i + 1]) && is_cjk(chars[i + 2]) {
+            out.push(format!("{}{}{}", chars[i], chars[i + 1], chars[i + 2]));
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Whether a character falls in the common CJK unified ideograph ranges.
@@ -168,5 +242,70 @@ mod tests {
         let t = tokenize("登录(OAuth)");
         assert!(t.contains(&"登录".to_string()));
         assert!(t.contains(&"oauth".to_string()));
+    }
+
+    #[test]
+    fn trigram_emits_sliding_three_char_windows() {
+        let t = tokenize_trigram("登录系统");
+        // "登录系" and "录系统" are the two 3-char windows.
+        assert!(t.contains(&"登录系".to_string()), "first window: {t:?}");
+        assert!(t.contains(&"录系统".to_string()), "second window: {t:?}");
+        // It does NOT emit bigrams/unigrams (that's the bigram channel's job).
+        assert!(
+            !t.contains(&"登录".to_string()),
+            "no bigrams in trigram view"
+        );
+        assert!(
+            !t.contains(&"登".to_string()),
+            "no unigrams in trigram view"
+        );
+    }
+
+    #[test]
+    fn trigram_short_cjk_run_emits_nothing() {
+        // A 2-char CJK run is too short for any trigram window.
+        assert!(tokenize_trigram("登录").is_empty());
+        assert!(cjk_trigrams_only("登录").is_empty());
+    }
+
+    #[test]
+    fn trigram_keeps_ascii_but_cjk_only_drops_it() {
+        // tokenize_trigram carries ASCII into the trigram channel for mixed queries.
+        let mixed = tokenize_trigram("oauth 鉴权码字");
+        assert!(
+            mixed.contains(&"oauth".to_string()),
+            "ascii kept: {mixed:?}"
+        );
+        assert!(mixed.contains(&"鉴权码".to_string()));
+        assert!(mixed.contains(&"权码字".to_string()));
+        // cjk_trigrams_only is the doc-side view: ASCII excluded (no double-count).
+        let doc = cjk_trigrams_only("oauth 鉴权码字");
+        assert!(
+            !doc.iter().any(|t| t == "oauth"),
+            "doc view drops ascii: {doc:?}"
+        );
+        assert!(doc.contains(&"鉴权码".to_string()));
+    }
+
+    #[test]
+    fn trigram_disambiguates_phrase_from_scattered_chars() {
+        // The precision case bigrams miss: "鉴权码" as a phrase vs. "鉴权" + a
+        // distant "码". Only the contiguous phrase yields the "鉴权码" trigram.
+        let phrase = cjk_trigrams_only("鉴权码生成");
+        assert!(phrase.contains(&"鉴权码".to_string()));
+        let scattered = cjk_trigrams_only("鉴权流程的状态码");
+        assert!(
+            !scattered.contains(&"鉴权码".to_string()),
+            "scattered chars must NOT form the phrase trigram: {scattered:?}"
+        );
+    }
+
+    #[test]
+    fn trigram_empty_and_ascii_only() {
+        assert!(tokenize_trigram("").is_empty());
+        assert!(cjk_trigrams_only("").is_empty());
+        // Pure ASCII: cjk_trigrams_only yields nothing; tokenize_trigram keeps words.
+        assert!(cjk_trigrams_only("hello world").is_empty());
+        assert_eq!(tokenize_trigram("hello world"), vec!["hello", "world"]);
     }
 }

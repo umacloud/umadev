@@ -1632,6 +1632,9 @@ mod tests {
             context: vec![],
             efficacy: None,
             invalidated: false,
+            trust: crate::lessons::NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: vec![],
         }
     }
 

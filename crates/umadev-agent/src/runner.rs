@@ -1059,6 +1059,15 @@ impl<R: Runtime> AgentRunner<R> {
             phase.id(),
             first.failure_detail
         )));
+        // Trust feedback (③): the build FAILED with this error class's prior
+        // lesson in play → penalise that lesson's trust (asymmetric, larger than
+        // a reward). Fail-open + advisory-only: it only nudges the recall score,
+        // never gates the loop.
+        let _ = crate::lessons::apply_dev_error_trust(
+            &self.options.project_root,
+            std::slice::from_ref(&first.failure_detail),
+            false,
+        );
         // Classify the failure and, when it's a recognised family, hand the
         // worker the root cause + proven fix playbook for THAT error class — so
         // the single repair attempt is informed, not a blind "here's stderr".
@@ -1132,6 +1141,14 @@ impl<R: Runtime> AgentRunner<R> {
         // effective, so the KB validates it immediately (strongest signal).
         let second = self.maybe_verify(phase).await;
         if second.passed && !second.skipped {
+            // Trust feedback (③): the gate PASSED after applying this pitfall's
+            // recorded fix → reward its trust (small). Pairs with the failure-site
+            // penalty above to form the asymmetric pass/fail signal.
+            let _ = crate::lessons::apply_dev_error_trust(
+                &self.options.project_root,
+                std::slice::from_ref(&first.failure_detail),
+                true,
+            );
             let resolved = crate::lessons::mark_pitfalls_resolved(
                 &self.options.project_root,
                 std::slice::from_ref(&first.failure_detail),

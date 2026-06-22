@@ -81,11 +81,13 @@ pub use deploy::{
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{classify_reply, Gate, GateOutcome};
 pub use lessons::{
+    apply_dev_error_trust, apply_trust_for_identities, apply_trust_for_signatures,
     capture_dev_errors, capture_gate_revision, capture_quality_failures,
-    capture_validated_patterns, lessons_report, list_sedimented_lessons, parse_reconcile_decision,
-    pitfall_efficacy_summary, pitfall_overview, reconcile_candidates, reconcile_prompt,
-    sediment_lessons, sediment_lessons_with_judge, Lesson, LessonsReport, PitfallEfficacySummary,
-    PitfallEntry, PitfallStatus, ReconcileDecision, ValidatedEntry,
+    capture_validated_patterns, fold_beliefs, lessons_report, list_sedimented_lessons,
+    parse_reconcile_decision, pitfall_efficacy_summary, pitfall_overview, reconcile_candidates,
+    reconcile_prompt, scan_contradictions, sediment_lessons, sediment_lessons_with_judge, Lesson,
+    LessonsReport, PitfallEfficacySummary, PitfallEntry, PitfallStatus, ReconcileDecision,
+    ValidatedEntry,
 };
 pub use manifest::{ConformanceLevel, Profile, SpecManifest};
 pub use phases::{knowledge_top_files, phase_knowledge_digest, PhaseOutput};

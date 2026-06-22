@@ -294,11 +294,12 @@ pub fn retrieve_with_vector_and_expansion(
     let over_fetch = config.top_k * 3;
     let masked_terms = index.mask_low_idf_terms(query, idf_floor());
     let bm25_masked = index.search_terms(&masked_terms, over_fetch);
-    let query_bm25 = if bm25_masked.is_empty() {
+    let query_bigram = if bm25_masked.is_empty() {
         index.search(query, over_fetch)
     } else {
         bm25_masked
     };
+    let query_bm25 = fuse_trigram_channel(&index, query, query_bigram, over_fetch);
     // HyDE fusion: when a hypothetical-answer expansion is present and itself
     // matches something, RRF-fuse its ranking with the query's. Empty / no-match
     // expansion → identity (just the query ranking), preserving prior behaviour.
@@ -636,6 +637,41 @@ fn normalise(index: &Bm25Index, hits: Vec<(usize, f64)>) -> Vec<ScoredChunk> {
         .filter(|(rank, sc)| *rank == 0 || sc.score >= min_score)
         .map(|(_, sc)| sc)
         .collect()
+}
+
+/// Fuse the CJK trigram channel into a bigram-channel ranking.
+///
+/// The trigram channel is a parallel BM25 ranking over the query's 3-char-CJK
+/// windows, matched against the trigram tokens the chunker appended to each
+/// chunk. Trigrams carry one more character of local context than bigrams, so
+/// substring / short-phrase CJK matches land more precisely. The two rankings
+/// are RRF-fused (the same rank fusion HyDE uses).
+///
+/// Fail-open / identity-preserving: a query with no 3-char-CJK window yields no
+/// trigram terms, and a trigram search that matches nothing both return the
+/// bigram ranking unchanged — so non-CJK and short-CJK queries are byte-for-byte
+/// the prior behaviour.
+fn fuse_trigram_channel(
+    index: &Bm25Index,
+    query: &str,
+    bigram: Vec<(usize, f64)>,
+    over_fetch: usize,
+) -> Vec<(usize, f64)> {
+    // Gate on a genuine CJK trigram: an ASCII-only (or short-CJK) query carries
+    // no 3-char-CJK window, so fusing would only re-rank on the SAME ASCII terms
+    // the bigram channel already used — a no-op for order but it would perturb
+    // scores. Keeping the gate makes non-CJK retrieval byte-for-byte unchanged.
+    let trigram_terms = crate::tokenizer::cjk_trigrams_only(query);
+    if trigram_terms.is_empty() {
+        return bigram;
+    }
+    // Search the FULL trigram view (CJK windows + any ASCII identifiers in the
+    // query) so a mixed-script phrase contributes both channels' signal.
+    let trigram = index.search_terms(&crate::tokenizer::tokenize_trigram(query), over_fetch);
+    if trigram.is_empty() {
+        return bigram;
+    }
+    rrf_fuse_bm25(&bigram, &trigram, RRF_K, over_fetch)
 }
 
 /// Reciprocal Rank Fusion of TWO BM25 ranked lists that share the same
@@ -1050,6 +1086,44 @@ mod tests {
         let a: Vec<_> = none.iter().map(|h| h.chunk.meta.path.clone()).collect();
         let b: Vec<_> = blank.iter().map(|h| h.chunk.meta.path.clone()).collect();
         assert_eq!(a, b, "whitespace expansion must be a no-op");
+    }
+
+    #[test]
+    fn trigram_channel_recalls_precise_cjk_phrase() {
+        // Two CJK docs: one is about the exact phrase "用户鉴权码", the other
+        // merely contains the characters scattered. The trigram channel should
+        // help the exact-phrase doc rank, and a CJK phrase query must retrieve.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = tmp.path().join("knowledge");
+        fs::create_dir_all(kd.join("security")).unwrap();
+        fs::write(
+            kd.join("security/auth.md"),
+            "# 鉴权\n\n## 令牌\n\n用户鉴权码用于校验用户身份与会话令牌。",
+        )
+        .unwrap();
+        let cfg = RetrievalConfig::default();
+        let hits = retrieve(tmp.path(), &kd, &cfg, "用户鉴权码生成", Phase::Research);
+        assert!(
+            !hits.is_empty(),
+            "CJK trigram phrase query must retrieve the phrase doc"
+        );
+        assert!(hits[0].chunk.meta.path.contains("auth"));
+    }
+
+    #[test]
+    fn trigram_channel_is_identity_for_ascii_query() {
+        // A non-CJK query produces no trigram terms → the trigram fusion is a
+        // no-op and results match the pre-trigram bigram-only behaviour.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kd = seed_corpus(tmp.path());
+        let index = load_or_build_index_multi(tmp.path(), std::slice::from_ref(&kd));
+        let over_fetch = 12;
+        let bigram = index.search("login oauth", over_fetch);
+        let fused = fuse_trigram_channel(&index, "login oauth", bigram.clone(), over_fetch);
+        assert_eq!(
+            bigram, fused,
+            "ASCII query trigram fusion must be byte-for-byte identity"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use crate::tokenizer::tokenize;
+use crate::tokenizer::{cjk_trigrams_only, tokenize};
 
 /// Per-chunk metadata parsed from front-matter + path.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -153,7 +153,17 @@ pub fn chunk_text(rel_path: &str, body: &str) -> Vec<Chunk> {
         .into_iter()
         .map(|(heading, section_body)| {
             let trimmed = section_body.trim().to_string();
-            let tokens = tokenize(&format!("{title} {heading} {trimmed}"));
+            let indexed = format!("{title} {heading} {trimmed}");
+            // Bigram + ASCII tokens (the default channel) PLUS the CJK trigram
+            // view. Trigram tokens are distinct 3-char-CJK strings that never
+            // collide with bigram/unigram/ASCII terms, so the bigram channel's
+            // per-term BM25 scores are unchanged; they only become matchable by
+            // the separate trigram query channel that `retrieve` RRF-fuses in.
+            // ASCII tokens from `tokenize_trigram` duplicate the bigram channel's
+            // ASCII tokens — skip them here so a chunk's Latin term-frequency
+            // isn't silently doubled (which WOULD perturb bigram scoring).
+            let mut tokens = tokenize(&indexed);
+            tokens.extend(cjk_trigrams_only(&indexed));
             Chunk {
                 meta: ChunkMeta {
                     path: rel_path.to_string(),

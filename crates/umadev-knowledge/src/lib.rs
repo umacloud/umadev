@@ -78,7 +78,7 @@ pub use retrieve::{
     retrieve_for_phase_with_vector, retrieve_with_vector, retrieve_with_vector_and_expansion,
     RetrievalConfig, RetrievalEngine, ScoredChunk,
 };
-pub use tokenizer::tokenize;
+pub use tokenizer::{cjk_trigrams_only, tokenize, tokenize_trigram};
 pub use vector::VectorStore;
 
 /// Knowledge base index storage location, relative to the project root.
