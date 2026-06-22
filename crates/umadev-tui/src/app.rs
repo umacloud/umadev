@@ -365,6 +365,11 @@ pub struct App {
     /// longer masquerades as idle "ready / 0/9". Cleared when a new run starts.
     pub aborted: bool,
 
+    /// Whether the cold-start greeting has already been shown this session.
+    /// Makes `push_greeting` idempotent so re-entering chat (e.g. picking a base
+    /// again via `/setup`) never stacks a second welcome banner on the transcript.
+    pub greeted: bool,
+
     /// A routed chat turn is in flight (message sent, waiting on the base's
     /// reply). Drives the animated "thinking…" status so a submit never looks
     /// frozen. Cleared when the reply / run decision / error lands.
@@ -551,6 +556,7 @@ impl App {
             finished: false,
             run_started: false,
             aborted: false,
+            greeted: false,
             thinking: false,
             thinking_started: None,
             agentic_in_flight: false,
@@ -689,6 +695,13 @@ impl App {
     }
 
     fn push_greeting(&mut self) {
+        // Idempotent: show the welcome banner at most once per session. Both the
+        // cold-start path and the picker-commit path (`/setup`) call this; without
+        // the guard a re-pick stacked a duplicate banner on the transcript.
+        if self.greeted {
+            return;
+        }
+        self.greeted = true;
         // Value-first: lead with the OUTCOME, not the architecture/config.
         // Localized (zh-CN / zh-TW / en) via the i18n catalog.
         self.push(
