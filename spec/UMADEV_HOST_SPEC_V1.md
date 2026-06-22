@@ -1,8 +1,8 @@
 # UmaDev Host Specification, Version 1 (UMADEV_HOST_SPEC_V1)
 
 > **Status:** Draft  
-> **Version:** 1.0.0-draft.1  
-> **Date:** 2026-05-20  
+> **Version:** 1.0.0-draft.3  
+> **Date:** 2026-06-22  
 > **Editor:** UmaDev maintainers (`<11964948@qq.com>`)  
 > **License:** MIT  
 
@@ -29,9 +29,9 @@ The reader's everyday mental model for UmaDev is this:
 > makes the result commercial-grade.
 
 The remainder of this document is the playbook, expressed as machine-
-verifiable normative clauses. The user-facing CLI (`umadev install
-<host>`, `umadev verify <host>`, `umadev audit`) is the coach
-"handing over the playbook" and "watching from the sideline."
+verifiable normative clauses. The user-facing CLI (`umadev install`,
+`umadev verify`, `umadev report`) is the coach "handing over the
+playbook" and "watching from the sideline."
 
 Coding hosts are independent products. UmaDev's first-class drivers are
 **exactly three** base CLIs — `claude-code`, `codex`, and `opencode`
@@ -284,6 +284,53 @@ On every model prompt, the conformant host **MUST**:
 The host **MUST NOT** rely on the user to repeat workflow state between
 turns.
 
+### 4.7 Role-critic team (`UD-FLOW-007`)
+
+> Level: **MUST**
+
+A conformant host **MUST** model its quality judgement as a *team*, not a
+single pass: a directing role drives the pipeline and one or more
+**read-only role critics** cross-review the shared artifacts from their own
+seat (e.g. product-manager, architect, qa-lead) and return structured
+verdicts. The team layer is bound by four hard invariants:
+
+1. **Deterministic floor is the gate.** A critic verdict is **advisory
+   only**. Loop termination and gate progression **MUST** stay governed by
+   the deterministic floor (coverage / contract / governance gap counts +
+   stall counter). A non-deterministic critic opinion **MUST NOT** drive
+   loop control. Critic findings MAY be fed back as advisory fixes.
+2. **Read-only / single-writer.** A critic **MUST NOT** write files or
+   mutate the workspace. It reviews artifacts on an isolated, no-resume
+   forked session; only the directing (main) session ever writes.
+3. **No new endpoint.** A critic **MUST** run over the *same* borrowed base
+   brain via the existing host-driver subprocess — no extra model endpoint
+   and no extra API key.
+4. **Fail-open.** A critic that errors, cannot be forked, or returns
+   unparseable output **MUST** yield an empty verdict that accepts; an
+   absent critic can never block the base.
+
+### 4.8 Trust tiers + irreversible-action floor (`UD-FLOW-008`)
+
+> Level: **MUST**
+
+A conformant host **MUST** expose a progressive-trust ladder controlling
+how much autonomy the run is granted at the confirmation gates:
+
+- `plan` — research + planning only; **read-only**, never executes real
+  code (stops at `docs_confirm`).
+- `guarded` — the **default**; every gate pauses for explicit confirmation
+  (the §4.2 / §4.3 human-in-the-loop behaviour).
+- `auto` — fully autonomous; every gate auto-approves.
+
+Riding on top of the ladder is a **hard reversibility floor**: any action
+that is irreversible or blast-radius-heavy — touching version-control
+internals, the **network**, a **push**, opening a **PR**, a **deploy**, or a
+destructive shell verb — **MUST** be escalated to an explicit confirmation
+**regardless of mode**. `auto` does **not** get to skip the floor; the only
+non-interactive bypass is an explicit `--yes`. The classifier is a pure,
+deterministic function of the action — it introduces no new model endpoint
+and no randomness.
+
 ## 5. Layer 3 — Delivery artifacts
 
 This layer governs **what files MUST land on disk** at each phase. Files
@@ -354,6 +401,21 @@ artifact as read-only once produced.
 A conformant host **MUST NOT** declare a phase complete based on chat
 output alone. The required artifact file(s) **MUST** exist in the
 workspace before the host advances.
+
+### 5.7 PR artifact (`UD-ART-007`)
+
+> Level: **SHOULD**
+
+When a finished run is handed off as a pull request, the conformant host
+**SHOULD** render the PR body from the run's **own evidence**, not a bare
+diff: the PR-ready review report (§6.8) followed by a proof-pack (§6.5)
+summary. The assembled body **SHOULD** be persisted to
+`output/<slug>-pr-body.md` so the same artifact backs both the dry-run
+preview and the opened PR. Opening the PR is a network/VCS action governed
+by the irreversibility floor (§4.8): the host **MUST NOT** push or open a
+PR without confirmation, **MUST NOT** commit on the default branch (it
+creates a feature branch first), and **MUST** degrade fail-open to printed
+manual steps when `git` / `gh` is missing or not logged in.
 
 ## 6. Layer 4 — Evidence chain
 
@@ -486,6 +548,44 @@ The proof pack is the **product output of a UmaDev–conformant run**.
 A reviewer SHOULD be able to verify spec conformance solely by inspecting
 the pack — no host session required.
 
+### 6.6 Runtime evidence (`UD-EVID-006`)
+
+> Level: **SHOULD** at L3
+
+Beyond proving the code *was written*, a conformant host **SHOULD** prove
+the app *actually runs*: boot the detected dev server, wait for it to
+answer, probe the documented routes over HTTP, and persist the result to
+`.umadev/audit/runtime-proof.json` (per-route status + the boot command),
+which is then folded into the delivery proof pack (§6.5). This clause is
+**fail-open**: a missing dev server, probe tool, or route table is recorded
+as `"not verified"`, never an error.
+
+### 6.7 Deploy evidence (`UD-EVID-007`)
+
+> Level: **SHOULD** at L3
+
+When the post-delivery handoff actually deploys, the conformant host
+**SHOULD** capture the deploy outcome — the detected target, the executed
+command, the resulting preview/live URL, and a log tail — into
+`.umadev/audit/deploy-proof.json`, folded into the delivery proof pack
+(§6.5). The deploy itself runs through the user's own logged-in platform
+CLI (UmaDev owns no credentials and injects nothing) and is gated by the
+irreversibility floor (§4.8). **Fail-open**: an unknown platform, missing
+CLI, or failed deploy is recorded as `"not deployed"` with a manual hint,
+never an error.
+
+### 6.8 Review-report evidence (`UD-EVID-008`)
+
+> Level: **SHOULD** at L3
+
+A conformant host **SHOULD** assemble the run's checks into a single
+PR-ready review report at `output/<slug>-review-report.md` — contract
+alignment (§3.3 / §6.1), acceptance, FR→task coverage, governance
+(§6.2), the pre-PR security scan, runtime evidence (§6.6), and the
+rollback/checkpoint story — each section degrading to an honest "not
+available" line rather than failing. This report is the human-readable
+case-for-merge that backs the PR artifact (§5.7).
+
 ## 7. Host surface mapping
 
 Every clause in §3–§6 is layer-agnostic. This section is **non-normative
@@ -568,7 +668,7 @@ spec:
   version: UMADEV_HOST_SPEC_V1
   level: L3
   profile: standard   # or "seeai" for competition mode
-  declared_by: umadev@4.4.0
+  declared_by: umadev@1.0.0
 ```
 
 A host MAY append **non-normative** blocks that its own tooling reads;
@@ -620,17 +720,20 @@ Profiles **MUST NOT** weaken any MUST clause in §3–§6.
 The UmaDev repository at <https://github.com/umacloud/umadev>
 ships a reference injector + orchestrator + verifier for this
 specification as a **single pure-Rust binary** (`umadev`). The
-workspace is seven crates:
+workspace is ten crates:
 
 | Crate | Role |
 |---|---|
 | `umadev` | The binary — clap CLI + the `tui` subcommand |
 | `umadev-spec` | This specification as Rust data (clauses, phases, gates) |
 | `umadev-governance` | Every enforceable rule in §3 / §6 — fail-open |
-| `umadev-agent` | 9-phase pipeline runner, gate semantics, event stream |
+| `umadev-agent` | 9-phase pipeline runner, gate semantics, role-critic team, trust tiers, runtime/deploy/review evidence |
 | `umadev-runtime` | Runtime trait + OfflineRuntime + RuntimeKind (the host drivers impl Runtime; UmaDev owns no HTTP/model endpoint) |
 | `umadev-host` | Drives a logged-in `claude` / `codex` / `opencode` CLI as a subprocess |
+| `umadev-knowledge` | Structured BM25 + CJK retrieval over the curated `knowledge/` corpus |
+| `umadev-contract` | Machine-verifiable frontend↔backend API contract (UD-CODE-003) |
 | `umadev-tui` | A ratatui terminal app over the engine event stream |
+| `umadev-i18n` | Trilingual (zh-CN / zh-TW / en) string catalogs + locale detection |
 
 ### 9.1 Execution modes
 
@@ -665,11 +768,13 @@ of the reference code.
 Items considered for the V2 promotion to `MUST`:
 
 - `UD-CODE-005` — accessibility token enforcement (alt text, aria-label, focus order)
-- `UD-FLOW-007` — multi-agent role declaration (PM / ARCHITECT / CODE / QA as named subagents)
-- `UD-EVID-006` — model provenance trail (which model + version generated which lines)
+- `UD-EVID-009` — model provenance trail (which model + version generated which lines)
 - `UD-META-005` — remote audit endpoint (host pushes audit logs to an external evaluator)
 
 These are explicitly **non-normative** in V1.
+
+(The former V2 candidates `UD-FLOW-007` — role-critic team — and the role/
+runtime evidence ideas have shipped and are now normative in §4.7 and §6.6.)
 
 ## Appendix A — Reserved keywords
 
@@ -687,4 +792,5 @@ The clause-ID prefix space `UD-*` is reserved for this specification.
 | Version | Date | Notes |
 |---|---|---|
 | 1.0.0-draft.1 | 2026-05-20 | Initial draft. Layers L1–L4 codified from the in-repo governance core and integration manager. |
-| 1.0.0-draft.2 | 2026-05-22 | §7 host map narrowed to the three official SDK families; §9 rewritten for the Rust 4.0 reference implementation (7 crates, three execution modes, TUI). No normative clause changed. |
+| 1.0.0-draft.2 | 2026-05-22 | §7 host map narrowed to the three official SDK families; §9 rewritten for the Rust reference implementation (three execution modes, TUI). No normative clause changed. |
+| 1.0.0-draft.3 | 2026-06-22 | Promoted shipped capabilities to normative clauses: `UD-FLOW-007` (role-critic team), `UD-FLOW-008` (trust tiers + irreversibility floor), `UD-ART-007` (PR artifact), `UD-EVID-006/007/008` (runtime / deploy / review-report evidence). §9 crate table updated to the ten-crate workspace; manifest `declared_by` synced to `umadev@1.0.x`. |

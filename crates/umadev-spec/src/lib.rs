@@ -259,6 +259,20 @@ pub const CLAUSES: &[Clause] = &[
         level: ClauseLevel::Must,
         section: "4.6",
     },
+    Clause {
+        id: "UD-FLOW-007",
+        layer: Layer::Flow,
+        title: "Role-critic team",
+        level: ClauseLevel::Must,
+        section: "4.7",
+    },
+    Clause {
+        id: "UD-FLOW-008",
+        layer: Layer::Flow,
+        title: "Trust tiers + irreversible-action floor",
+        level: ClauseLevel::Must,
+        section: "4.8",
+    },
     // --- Layer 3 — delivery artifacts (UD-ART-*) ---
     Clause {
         id: "UD-ART-001",
@@ -302,6 +316,13 @@ pub const CLAUSES: &[Clause] = &[
         level: ClauseLevel::Must,
         section: "5.6",
     },
+    Clause {
+        id: "UD-ART-007",
+        layer: Layer::Artifacts,
+        title: "PR artifact",
+        level: ClauseLevel::Should,
+        section: "5.7",
+    },
     // --- Layer 4 — evidence chain (UD-EVID-*) ---
     Clause {
         id: "UD-EVID-001",
@@ -337,6 +358,27 @@ pub const CLAUSES: &[Clause] = &[
         title: "Proof pack",
         level: ClauseLevel::Must, // at L3
         section: "6.5",
+    },
+    Clause {
+        id: "UD-EVID-006",
+        layer: Layer::Evidence,
+        title: "Runtime evidence",
+        level: ClauseLevel::Should, // at L3
+        section: "6.6",
+    },
+    Clause {
+        id: "UD-EVID-007",
+        layer: Layer::Evidence,
+        title: "Deploy evidence",
+        level: ClauseLevel::Should, // at L3
+        section: "6.7",
+    },
+    Clause {
+        id: "UD-EVID-008",
+        layer: Layer::Evidence,
+        title: "Review-report evidence",
+        level: ClauseLevel::Should, // at L3
+        section: "6.8",
     },
     // --- Cross-cutting meta (UD-META-*) ---
     Clause {

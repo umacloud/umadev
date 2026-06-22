@@ -37,12 +37,19 @@ THE COMMAND SURFACE
     /claude /codex /opencode           switch base CLI (each uses its OWN model)
     /status                            show the active base + its driving model
     /model <id>                        override the base's model for this session
+    /mode plan|guarded|auto            trust tier (plan = read-only, auto = autonomous)
+    /adopt                             adopt an EXISTING project into the pipeline
+    /quick <task>                      lightweight fast track for a trivial change
+    /redo [phase]                      re-run all, or one phase (e.g. /redo frontend)
     /preview                           start dev server + open browser
     /checkpoint [label]                snapshot workspace files (a phase's work)
     /rewind [id]                       list / rewind to a file checkpoint
     /deploy                            preview the deploy command (/deploy confirm ships)
+    /pr                                open a GitHub PR (review report + proof-pack body)
     /continue                          approve gate
     /revise <text>                     gate-local revision
+    /usage                             worker-call usage statistics
+    /lessons                           what UmaDev has learned (pitfalls + patterns)
     /spec /verify /doctor              open scrollable overlays
     /diff [name]                       show an artifact
     /history /help /clear /quit
@@ -56,17 +63,27 @@ THE COMMAND SURFACE
 
   Scripted form (when you don't want a TUI):
     umadev init                     write umadev.yaml (run once per workspace)
+    umadev adopt [path]             adopt an EXISTING repo (detect stack, derive contract)
     umadev run <req>                non-interactive run, pauses at docs_confirm
-    umadev run <req> --backend X    drive real worker (claude-code or codex)
+    umadev run <req> --backend X    drive real worker (claude-code / codex / opencode)
+    umadev run <req> --mode plan    trust tier: plan (read-only) | guarded (default) | auto
+    umadev quick <task>             lightweight fast track for a trivial change
+    umadev redo <phase>             re-run one phase (e.g. umadev redo frontend)
     umadev continue                 approve active gate (auto-reuses --backend)
     umadev continue --backend X     override worker for this block
     umadev revise <text>            stay at gate, record a revision
-    umadev spec             print the spec
-    umadev verify           workspace conformance
-    umadev doctor           self-test
-    umadev report           SOC2/ISO27001/EU-AI-Act mapping
-    umadev examples         the cheat-sheet
-    umadev guide            this walkthrough
+    umadev verify                   workspace conformance
+    umadev verify --runtime         + boot the app and prove it runs (route probes)
+    umadev deploy [--run]           detect deploy target (--run actually ships)
+    umadev report                   SOC2/ISO27001/EU-AI-Act mapping
+    umadev report --review          PR-ready review report (+ pre-PR security scan)
+    umadev pr [--create]            open a GitHub PR (review report + proof-pack body)
+    umadev usage                    worker token usage + rough cost estimate
+    umadev lessons                  what UmaDev has learned (pitfalls + proven patterns)
+    umadev spec                     print the spec
+    umadev doctor                   self-test
+    umadev examples                 the cheat-sheet
+    umadev guide                    this walkthrough
 
 WHAT GETS WRITTEN
 -----------------

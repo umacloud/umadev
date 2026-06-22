@@ -19,12 +19,19 @@ UmaDev — common workflows
     /claude /codex /opencode
                          switch the base (saves to ~/.umadev/config.toml)
     /offline             switch to deterministic templates (demo / CI)
-    /model plan <m> / build <m>     per-phase model tiers (plan cheap, code strong)
+    /model <id>          override the base's model for this session
+    /mode plan|guarded|auto   trust tier (plan = read-only, auto = autonomous)
+    /adopt               adopt an EXISTING project into the pipeline
+    /quick <task>        lightweight fast track for a trivial change
+    /redo [phase]        re-run all, or one phase (/redo frontend)
     /preview             start the dev server + open the browser
     /checkpoint [label]  snapshot workspace files; /rewind [id] to roll back
     /deploy              preview the deploy command (/deploy confirm to ship)
+    /pr                  open a GitHub PR (review report + proof-pack body)
     /continue            approve the active gate
     /revise <text>       stay at gate, request changes
+    /usage               worker-call usage statistics
+    /lessons             what UmaDev has learned (pitfalls + proven patterns)
     /spec                show the full UMADEV_HOST_SPEC_V1 spec
     /verify              workspace conformance report
     /doctor              self-test (binary + manifest + probes)
@@ -52,14 +59,33 @@ UmaDev — common workflows
     umadev init                            # write umadev.yaml manifest
     umadev run "做一个登录系统" \
                 --backend claude-code         # drive Claude Code (no API key)
+    umadev run "..." --mode plan           # trust tier: plan (read-only) / guarded / auto
     umadev continue                        # approve docs_confirm (auto-reuses --backend)
     umadev continue                        # approve preview_confirm
     umadev verify                          # final workspace state + worker
+    umadev verify --runtime                # + boot the app and probe its routes
     umadev report                          # UD-EVID-004 compliance map
+    umadev report --review                 # PR-ready review report + pre-PR security scan
 
     # explicit worker override at any continue (rarely needed):
     umadev continue --backend claude-code  # force Claude Code for this block
     umadev continue --backend codex        # switch worker partway through
+
+* Adopt / fast-track / ship (scripted)
+--------------------------------------
+    umadev adopt ./legacy-app              # adopt an EXISTING repo (no rewrite)
+    umadev quick "改个页头文案" \
+                --backend claude-code         # lightweight fast track for a trivial change
+    umadev redo frontend                   # re-run just one phase (reuses prior context)
+    umadev deploy                          # detect the deploy target + print the command
+    umadev deploy --run                    # actually deploy + write deploy-proof.json
+    umadev pr                              # dry run: write the PR body + show the plan
+    umadev pr --create                     # open the GitHub PR (review report + proof-pack)
+
+* What's been learned / how much it cost
+----------------------------------------
+    umadev usage                           # worker token usage + rough cost estimate
+    umadev lessons                         # pitfalls UmaDev now avoids + proven patterns
 
 * Iterating at a gate (scripted)
 --------------------------------

@@ -362,7 +362,7 @@ enum Command {
     #[command(
         hide = true,
         long_about = "Print the UMADEV_HOST_SPEC_V1 specification — the normative\n\
-                      contract UmaDev enforces (25 clauses across 4 layers + 9\n\
+                      contract UmaDev enforces (31 clauses across 4 layers + 9\n\
                       phases + 2 gates).",
         after_help = "EXAMPLES:\n  \
                       umadev spec               # full markdown\n  \
