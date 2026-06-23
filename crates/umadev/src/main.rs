@@ -2333,13 +2333,15 @@ enum DirectorOutcome {
     HardStop(String),
 }
 
-/// Drive an explicit `/run` (full product build) through the **director agentic
-/// path** — Wave 1 of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5 — instead of the
-/// legacy fixed 9-phase pipeline. ONE live [`umadev_runtime::BaseSession`] is the
-/// director's brain: it gets the goal framed as a complete commercial build
-/// ([`umadev_agent::experts::director_build_directive`]) and orchestrates its team
-/// however it judges fit (no fixed phase walk). The session is owned by the caller
-/// and `end()`-ed once the run settles.
+/// Drive an explicit `/run` (full product build) through the **director build loop**
+/// — the USB / smart-hardware model of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md`
+/// (simplified: no marker protocol) — instead of the legacy fixed 9-phase pipeline.
+/// ONE live [`umadev_runtime::BaseSession`] is the director's brain: the firmware
+/// (team identity + craft) is injected via
+/// [`umadev_agent::experts::director_build_directive`], the base's body builds the
+/// goal end to end with its own tools (the team lives in its head), and UmaDev runs
+/// a read-only honesty/QC pass with a bounded feedback-fix loop. The session is
+/// owned by the caller and `end()`-ed once the run settles.
 ///
 /// The floor is intact:
 /// - **single-writer run-lock** — held for the whole run (a director build
@@ -2378,11 +2380,11 @@ async fn drive_director_run(
     // orchestrates with its team however it judges fit (no fixed phase checklist).
     let directive = umadev_agent::experts::director_build_directive(&options.requirement);
 
-    // Wave 3: drive the goal through the REAL-TIME director loop — the director
-    // plans + delegates live by emitting team-lever markers (summon / review /
-    // verify / checkpoint) that the loop mediates and re-injects the results of, so
-    // it truly orchestrates its team on the spot. A base that emits no marker
-    // degrades to a plain agentic build (Wave 1 behaviour). Every floor invariant
+    // USB model (no marker protocol): drive the goal through the director build
+    // loop — the firmware (team identity + craft) is injected, the base's body
+    // builds the goal end to end with its OWN tools (the team lives in its head),
+    // then UmaDev runs a read-only honesty/QC pass and feeds any blocking findings
+    // back as a bounded fix directive the base acts on. Every floor invariant
     // (single-writer, governance, advisory review, fail-open) is preserved inside
     // the loop; the objective source-present hard-gate runs HERE, unchanged.
     let reply = match umadev_agent::drive_director_loop(session, options, events, directive).await {

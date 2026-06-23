@@ -717,30 +717,30 @@ pub fn agentic_engineering_rules() -> &'static str {
      project's real build / test / lint and report only what actually passes."
 }
 
-/// The director's TEAM-ORCHESTRATION capability preamble — Wave 2 of
-/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §4. Layers the team-tools capability
-/// block ([`crate::director::director_tools_capability`]) on top of the always-on
-/// team identity, so the director KNOWS it can delegate / cross-review /
-/// objectively check / pause for the user — and, crucially, that it decides WHEN
-/// to use each, like a real senior director, rather than walking a fixed phase
-/// chain.
+/// The director's build-turn preamble — the USB / smart-hardware model of
+/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` (simplified: NO marker protocol).
 ///
-/// This is the prompt-surface half of Wave 2 (the executable half is the
-/// `crate::director` tool API). It is a pure composition of existing wording — the
-/// short director identity plus the levers — so the capability description lives in
-/// exactly one place (`director.rs`) and the prompt assembly lives here with the
-/// other agent prompts. Surfaced for a director / work-class build turn; pure
-/// small-talk skips it (the levers are irrelevant to a greeting).
+/// In the USB model the base is already a complete Agent — its model is the brain,
+/// its CLI tools are the body that builds, writes, runs, tests, and fixes. UmaDev is
+/// pure FIRMWARE plugged in over the continuous session: it injects WHO you are (the
+/// senior team-director identity, [`agentic_team_identity`]) and HOW this team builds
+/// (its craft + taste, [`agentic_engineering_rules`]), then lets the base's body do
+/// all the work with the team living inside its own head. So this preamble carries
+/// the firmware (identity + craft) and **deliberately does NOT teach the base any
+/// scheduling protocol / lever syntax** — the base does not summon a team from the
+/// outside; UmaDev's QC (honesty floor + optional review) runs on UmaDev's side, in
+/// [`crate::director_loop`], after the base builds. Real-machine testing showed the
+/// base writes good multi-role code with ZERO markers when steered by this firmware.
+///
+/// Pure composition of existing wording so the identity + craft live in exactly one
+/// place. Surfaced for a director / work-class build turn; pure small-talk uses the
+/// lighter bare identity (craft is irrelevant to a greeting).
 #[must_use]
 pub fn director_with_team_tools() -> String {
     format!(
-        "{}\n\n{}\n\n{}",
+        "{}\n\n{}",
         agentic_team_identity(),
-        crate::director::director_tools_capability(),
-        // Wave 3 (`docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5): the marker syntax
-        // that turns the Wave 2 "you HAVE these levers" into "and here is how you
-        // CALL one, live" — UmaDev mediates each marker and re-injects the result.
-        crate::director_loop::director_loop_capability()
+        agentic_engineering_rules()
     )
 }
 
@@ -1028,21 +1028,24 @@ mod tests {
     }
 
     #[test]
-    fn director_with_team_tools_layers_levers_on_the_identity() {
-        // Wave 2: the director prompt carries BOTH the team identity AND the
-        // orchestration levers (delegate / review / verify / checkpoint), framed
-        // as the director's own judgement — not a fixed phase chain.
+    fn director_with_team_tools_carries_firmware_not_a_lever_protocol() {
+        // USB model: the director build prompt is pure FIRMWARE — the team identity
+        // PLUS the team's craft/taste — and deliberately teaches NO marker / lever
+        // scheduling protocol (the base builds with the team inside its own head).
         let p = director_with_team_tools();
         let lower = p.to_lowercase();
         // The always-on identity survives.
         assert!(lower.contains("umadev") && lower.contains("director"));
-        // All four levers are advertised.
-        assert!(lower.contains("delegate") || lower.contains("summon"));
-        assert!(lower.contains("review"));
-        assert!(lower.contains("verify"));
-        assert!(lower.contains("checkpoint") || lower.contains("pause"));
-        // Framed as the director's choice, not a forced sequence.
-        assert!(lower.contains("judgement") || lower.contains("decide the plan"));
+        // The craft block (anti-slop / icon library / design tokens) is layered on.
+        assert!(p.contains("emoji"));
+        assert!(p.contains("Lucide") || p.contains("icon library"));
+        assert!(lower.contains("token"));
+        // It does NOT teach the base any marker / lever syntax (the whole point of
+        // the simplification — no `<<<umadev:…>>>`, no "summon a seat" protocol).
+        assert!(
+            !p.contains("<<<umadev:"),
+            "no marker syntax is taught to the base"
+        );
     }
 
     #[test]

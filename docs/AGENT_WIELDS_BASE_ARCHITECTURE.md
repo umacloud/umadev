@@ -4,6 +4,23 @@
 > fixed-pipeline framing in `CONTINUOUS_SESSION_ARCHITECTURE.md`. The core model
 > here is **NOT a pipeline**. It is a **director Agent that improvises a team**.
 
+> **Simplification update (current):** the clean mental model is **USB / smart
+> hardware**. UmaDev is a smart device with its own FIRMWARE — a senior team-director
+> identity, engineering taste, accumulated knowledge, governance, and memory — but
+> **no compute of its own**. Plugged into a base (claude / codex / opencode) over the
+> continuous session, it borrows the base's intelligence and hands. The base is
+> already a complete Agent: its model is the brain, its CLI tools are the body that
+> builds, writes, runs, tests, fixes. Once the firmware is injected, the base ITSELF
+> plays PM / architect / frontend / QA internally and builds the goal end to end —
+> so UmaDev does **not** need an outside "marker scheduling protocol" to summon a
+> team. The earlier `<<<umadev:summon …>>>` marker channel (and any framing where
+> UmaDev grows its own build/run/fix machinery) is **retired**. UmaDev is pure
+> firmware + two tiny firmware-only acts: governance (a background safety net on the
+> base's writes) and a read-only honesty check (read disk to confirm real code
+> landed). What UmaDev runs after a build is its OWN read-only QC (honesty floor +
+> optional forked review); any blocking finding is fed back as a fix directive the
+> base's body acts on, bounded. See `crates/umadev-agent/src/director_loop.rs`.
+
 ## 0. The identity (the thing every design choice must serve)
 
 UmaDev is **a third-party Agent with agency of its own** — it thinks, judges,
@@ -146,27 +163,40 @@ trilingual i18n; the role roster + personas + knowledge + lessons as
   director-driven engine; `/run` becomes "the director, told to treat this as a
   full commercial build," not a different engine.
 
-## 4. The director's prompt + tools (how the base becomes the director)
+## 4. The director's prompt + UmaDev's own QC (the simplified USB model)
 
-The director is the base driven by a **director system prompt** that grants
-agency and a **set of orchestration tools** it can call:
+The director is the base driven by an injected **firmware** — identity + craft —
+and nothing else taught to it as a protocol:
 
-- Identity: extend `experts::agentic_team_identity` (experts.rs:636) — "You ARE
-  UmaDev, a senior director leading a team; YOU decide the plan, who to bring in,
-  and how much process this goal needs."
-- Orchestration tools the director may call (surfaced as base tools or as
-  UmaDev-mediated actions):
-  - `summon(role, instruction)` — drive/fork a team member with that role's
-    identity + craft + retrieved knowledge.
-  - `review(role…, artifacts)` — parallel fork reviewers, collect `RoleVerdict`s.
-  - `verify(kind)` — run an objective check (build/test, contract, coverage,
-    source-present) and get back a factual result.
-  - `checkpoint(question)` — pause and ask the user, when the director judges the
-    decision is the user's to make (bounded by trust tier).
-- The team's craft (ANTI_SLOP_LAW, design tokens, layering) is injected as the
-  team's *taste*, not a MUST-NOT list; governance enforces the floor silently.
+- Identity: `experts::agentic_team_identity` — "You ARE UmaDev, a senior director
+  leading a team; YOU decide the plan, who to bring in, and how much process this
+  goal needs."
+- Craft / taste: `experts::agentic_engineering_rules` (ANTI_SLOP_LAW distilled —
+  no emoji icons, a real icon library, design tokens, clean layering) injected as
+  the team's *taste*, not a MUST-NOT list; governance enforces the floor silently.
+- Knowledge: the requirement-scoped digest, retrieved on demand.
 
-The director plans and sequences these itself. No phase enum drives it.
+`experts::director_with_team_tools` composes exactly this firmware (identity +
+craft) for a `/run` build turn. The base is **not** taught any marker / lever
+syntax — it builds end to end with the team inside its own head.
+
+UmaDev's four levers (`summon` / `review` / `verify` / `checkpoint`) remain as
+**internal Rust capabilities** in `director.rs` — but they are UmaDev's OWN calls,
+not base-facing tools. After the base reports a build, `director_loop.rs` runs an
+UmaDev-side QC pass:
+
+- `verify(source-present)` — UmaDev reads disk to confirm real code landed (the
+  tiny deterministic honesty floor). Zero source after a claimed build is decisive.
+- `verify(build-test)` — an optional fact-read when a manifest is present; the FIX
+  (and re-running build/test) is the base's body's job, asked via the fix directive.
+- `review(quality)` — fork the cross-review team on read-only sessions; advisory
+  blocking findings seed the fix directive.
+- `checkpoint(question)` — pause for the user when the decision is theirs (trust
+  tier). Retained as a capability for any caller that needs it.
+
+Blocking findings fold into ONE fix directive fed back over the same session; the
+base's body fixes with its own tools; re-QC. Bounded by `MAX_QC_ROUNDS`. No phase
+enum drives it; UmaDev grows no "operating" machinery of its own.
 
 ## 5. Phased migration (incremental, each wave ships + verifies + reverts)
 

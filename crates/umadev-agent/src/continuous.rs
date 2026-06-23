@@ -183,10 +183,11 @@ fn persist_state(options: &RunOptions, phase: Phase, active_gate: &str) {
 /// [`BaseSession`], stopping at the first confirmation gate (or at delivery / a
 /// hard stop).
 ///
-/// **Wave 3 status (DEMOTED — `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §3/§5):**
+/// **Status (DEMOTED — `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §3/§5):**
 /// this fixed `block_phases` walk is **no longer the default route** for a `/run`.
-/// The default is the real-time director loop ([`crate::director_loop`]), where the
-/// director plans + delegates live and the planner/phases are only an advisory
+/// The default is the director build loop ([`crate::director_loop`], the USB model):
+/// the base's body builds end to end, then UmaDev runs a read-only honesty/QC pass
+/// and feeds bounded fix directives back — the planner/phases are only an advisory
 /// prior. `run_block` is retained UNTOUCHED behind the explicit
 /// `UMADEV_LEGACY_PIPELINE=1` opt-in ([`legacy_pipeline_from_env`]) so the field
 /// can revert with no code change. Its *capabilities* — [`review_and_rework`] /

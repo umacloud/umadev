@@ -84,13 +84,13 @@ pub use deploy::{
     DeployStatus, DeployTarget,
 };
 pub use director::{
-    checkpoint as director_checkpoint, director_tools_capability, review as director_review,
-    summon as director_summon, verify as director_verify, CheckpointDecision, ReviewResult,
-    SummonMode, SummonResult, VerifyKind, VerifyResult,
+    checkpoint as director_checkpoint, review as director_review, summon as director_summon,
+    verify as director_verify, CheckpointDecision, ReviewResult, SummonMode, SummonResult,
+    VerifyKind, VerifyResult,
 };
-pub use director_loop::{director_loop_capability, drive_director_loop, DirectorLoopOutcome};
+pub use director_loop::{drive_director_loop, DirectorLoopOutcome};
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
-pub use gates::{classify_reply, Gate, GateOutcome};
+pub use gates::{claims_code_changes, classify_reply, Gate, GateOutcome};
 pub use lessons::{
     apply_dev_error_trust, apply_trust_for_identities, apply_trust_for_signatures,
     capture_dev_errors, capture_gate_revision, capture_quality_failures,

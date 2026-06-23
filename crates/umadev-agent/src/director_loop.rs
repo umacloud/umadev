@@ -1,119 +1,121 @@
-//! Real-time director orchestration loop — Wave 3 of
-//! `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5 (+ §3).
+//! The director build loop — the USB / smart-hardware model of
+//! `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` (simplified: NO marker protocol).
 //!
-//! Wave 2 ([`crate::director`]) gave the director a clean Rust API for its four
-//! team levers — [`crate::director::summon`] / [`crate::director::review`] /
-//! [`crate::director::verify`] / [`crate::director::checkpoint`] — and described
-//! them in the director's prompt. But on the default agentic `/run` path the base
-//! ran its OWN internal tool loop inside a single `complete_streaming` call, so
-//! UmaDev could never INTERCEPT a tool request mid-turn — the levers were a
-//! capability the director could read about but not actually CALL.
+//! ## The model: UmaDev is firmware; the base is the brain + hands
 //!
-//! Wave 3 closes that gap. It moves `/run` onto a [`BaseSession`] **event pump**
-//! (the same `while let Some(ev) = session.next_event()` shape the continuous
-//! driver uses) so UmaDev sits between the director and its tools and can MEDIATE
-//! each lever request: execute the corresponding [`crate::director`] function and
-//! re-inject the factual result so the director keeps orchestrating — live,
-//! on-the-spot, exactly as a real senior director would.
+//! UmaDev is a smart device with its own firmware — a senior team-director
+//! identity, engineering taste, accumulated knowledge, governance, and memory —
+//! but **no compute of its own**. Plugged into a base (claude / codex / opencode)
+//! over the continuous session, it **borrows the base's intelligence and hands**
+//! to get work done, the way a smart peripheral borrows a host computer's CPU and
+//! storage. The firmware is injected into the base (via the directive + system
+//! prompt the caller built — `experts::director_build_directive` /
+//! `experts::director_with_team_tools`); the base then thinks, plans, and writes
+//! files with its OWN internal agentic tool loop.
 //!
-//! ## How a lever request travels (the mediation contract)
+//! **The key insight that retired the old marker protocol:** the base is already a
+//! whole brain. Once UmaDev's firmware is injected, the base ITSELF plays PM /
+//! architect / frontend / QA internally and builds the goal end to end. It does
+//! **not** need to emit `<<<umadev:summon …>>>` markers for UmaDev to "summon a
+//! team" from the outside — real-machine testing showed the base writes good,
+//! multi-role code with ZERO markers, because the team lives inside the base's
+//! head, steered by the firmware. So this loop no longer asks the base to speak a
+//! scheduling protocol, and no longer parses one.
 //!
-//! UmaDev does **not** vendor a host tool-registration SDK (the bases expose no
-//! uniform custom-tool/MCP surface we may touch — see the workspace anti-rules and
-//! the "don't touch the `*_session` internals" Wave 3 scope). So the director
-//! requests a lever through a **structured marker** it emits in its OWN text — a
-//! single line of the shape
+//! ## The boundary: UmaDev grows NO "operating" machinery of its own
 //!
-//! ```text
-//! <<<umadev:summon role="frontend-engineer" mode="serial" instruction="build the login page">>>
-//! <<<umadev:review kind="quality">>>
-//! <<<umadev:verify kind="build-test">>>
-//! <<<umadev:checkpoint question="ship to prod?">>>
-//! ```
+//! The base is a complete Agent already — its model is the brain, its CLI tools are
+//! the body that builds code, writes files, runs commands, runs tests, and fixes
+//! bugs. UmaDev is the EXTERNAL agent that plugs into that body and shares that
+//! brain. So **UmaDev never grows its own build/write/run/test/fix capability** —
+//! all of that work is the base's body using the base's own tools. The only two
+//! tiny things UmaDev does for itself (firmware business, not "operating"):
 //!
-//! The pump accumulates the director's text for the turn, and at
-//! [`SessionEvent::TurnDone`] it [`parse_markers`]es every marker the turn
-//! emitted. For each one it runs the matching [`crate::director`] function
-//! ([`mediate_one`]), formats a compact factual result ([`format_*_result`]), and
-//! — if any lever fired — re-injects ALL the results as the next turn's directive
-//! ([`results_directive`]) so the director reads what its team produced and
-//! decides the next move. A turn that emits NO marker is a normal end-of-build
-//! turn → the loop settles.
+//! - **Governance** — the background safety net riding on the base's file writes
+//!   (the existing PreToolUse hook). Untouched here.
+//! - **A read-only honesty check** — when the base says "built it", UmaDev reads the
+//!   disk to confirm real code actually exists ([`crate::acceptance::source_files`]
+//!   via [`crate::director::verify`] / [`VerifyKind::SourcePresent`]). Tiny,
+//!   deterministic, read-only — it just stops a hallucinated "done".
 //!
-//! Native base tool-mechanism note: surfacing the four levers as FIRST-CLASS base
-//! tools the base calls structurally (claude `can_use_tool` for a custom tool name
-//! / an MCP tool) is the long-term ideal, but no host CLI exposes a uniform,
-//! UmaDev-mediable custom-tool hook today without modifying the host sessions
-//! (out of Wave 3 scope). The structured-marker channel is the portable
-//! lowest-common-denominator that works identically on claude / codex / opencode,
-//! so Wave 3 ships real-time scheduling through it; a future wave may upgrade a
-//! base that grows a mediable native hook to channel ① with NO change to the
-//! [`crate::director`] functions this loop calls.
+//! Everything else — building, and FIXING what QC surfaces — the base's body does
+//! with its own tools, steered by a fix directive UmaDev feeds back. UmaDev reads
+//! objective facts and judges; it does not operate.
 //!
-//! ## Floor preserved (every Wave 2 invariant still holds — see [`crate::director`])
+//! ## The loop: end-to-end build → UmaDev honesty/QC read → bounded feedback-fix
 //!
-//! 1. **Single-writer.** Only a [`SummonMode::Serial`] summon mutates the
-//!    workspace, on the MAIN session under the run-lock the caller already holds;
-//!    parallel summons + every review run on isolated read-only forks. The pump
-//!    runs the levers SERIALLY (one at a time, in marker order) so two serial
-//!    doers can never write at once.
-//! 2. **Objective floor untouched.** [`crate::director::verify`] is a deterministic
-//!    reality check; review verdicts stay advisory. The source-present hard-gate
-//!    ([`crate::acceptance::source_files`]) still runs at the boundary in the
-//!    caller, unchanged.
-//! 3. **Governance + audit.** A serial summon drives [`crate::continuous::drive_rework_turn`],
-//!    which governs + audits every write exactly like a phase turn. The PreToolUse
-//!    hook still fires under everything.
-//! 4. **No new endpoint.** Every lever runs over the SAME borrowed brain.
-//! 5. **Fail-open.** A malformed marker is ignored (the director just gets no
-//!    result for it); a lever that errors re-injects an error line (the director
-//!    handles it); a base that emits no markers degrades to a plain agentic turn
-//!    (Wave 1 behaviour — the director works alone). The loop can NEVER wedge.
-//! 6. **Reversible.** This loop is reached only on the DEFAULT `/run` path; the
-//!    legacy fixed pipeline (`UMADEV_LEGACY_PIPELINE=1`) is untouched.
+//! 1. Drive the base end to end on the goal (one firmware-injected turn — its own
+//!    agentic tool loop runs PM→…→QA internally and writes real files).
+//! 2. When the turn settles, **UmaDev reads reality ITSELF** (it does not wait for
+//!    the base to ask, and it does not operate):
+//!    - **honesty hard floor (deterministic, read-only)** — did real source files
+//!      actually land ([`crate::acceptance::source_files`])? This is UmaDev's own
+//!      tiny check.
+//!    - **optional fork review (read-only, borrows the brain)** — for a build that
+//!      produced real code, fork the review team on isolated read-only sessions and
+//!      collect blocking findings ([`crate::director::review`]). UmaDev judges with
+//!      the borrowed brain; it writes nothing.
+//! 3. If QC found blocking problems, fold them into ONE fix directive and feed it
+//!    back to the base over the same session (the USB channel) — and the directive
+//!    tells the base's body to **run its own build/test and fix the cause with its
+//!    own tools**. Then re-read. **Bounded** by [`MAX_QC_ROUNDS`].
+//! 4. Clean (or no code claimed — a chat/plan answer) → done; report honestly.
 //!
-//! The loop is **bounded** by [`MAX_DIRECTOR_ROUNDS`] so a director that keeps
-//! emitting levers without ever finishing can't spin forever — after the cap the
-//! loop ends and the caller's objective hard-gate has the final say on reality.
+//! Note on build/test: UmaDev does NOT run the build itself as its gate — the base's
+//! body runs build/test (it has the tools), and the fix directive explicitly asks it
+//! to. The optional [`VerifyKind::BuildTest`] read is retained only as a cheap
+//! reuse of an EXISTING reader to surface an objective failure fact when a manifest
+//! is present; it is positioned as "read a fact", never as "UmaDev operates".
+//!
+//! ## Floor preserved (every invariant still holds)
+//!
+//! 1. **Single-writer.** Only the MAIN base turn mutates the workspace, under the
+//!    run-lock the caller holds. UmaDev's checks are read-only: the source floor
+//!    reads disk; the QC review runs on isolated read-only forks
+//!    ([`crate::director::review`]). Nothing UmaDev does writes the workspace.
+//! 2. **Objective floor untouched.** The source-present floor is a deterministic,
+//!    read-only reality check; review verdicts stay advisory (they only seed a fix
+//!    directive the base acts on, they never themselves decide "done"). The caller's
+//!    source-present hard-gate still runs at the boundary, unchanged.
+//! 3. **Governance + audit.** Every base turn (the first build and every fix pass)
+//!    drives the SAME governed/audited session; the PreToolUse hook still fires
+//!    under every write.
+//! 4. **No new endpoint.** Every QC review reads over the SAME borrowed brain + its
+//!    `fork()`; no extra model endpoint, no API key.
+//! 5. **Fail-open.** A QC read that can't run degrades to "no problem found" (a
+//!    review that can't fork accepts), never a false failure that wedges the loop. A
+//!    dead session is an honest `Failed`, never a panic.
+//! 6. **Reversible.** This loop is the DEFAULT `/run` path; the legacy fixed
+//!    pipeline (`UMADEV_LEGACY_PIPELINE=1`) is untouched.
 
 use std::sync::Arc;
 
 use umadev_runtime::{ApprovalDecision, BaseSession, SessionEvent, StreamEvent, TurnStatus};
 
-use crate::director::{
-    self, CheckpointDecision, ReviewResult, SummonMode, VerifyKind, VerifyResult,
-};
+use crate::director::{self, ReviewResult, VerifyKind, VerifyResult};
 use crate::events::{EngineEvent, EventSink};
 use crate::runner::RunOptions;
 use crate::trust::requires_confirmation;
 
-/// The hard ceiling on director↔team orchestration rounds in one `/run`. Each
-/// round is: the director drives a turn, it may fire team levers, we mediate them
-/// and re-inject the results, and the director continues. The director normally
-/// finishes well within this; the cap only stops a pathological loop where the
-/// director keeps requesting levers without ever calling the build done. After the
-/// cap the loop ends gracefully (the caller's source-present hard-gate is the
-/// objective backstop). Kept generous so a real multi-seat product build (PM →
-/// architect → frontend → backend → QA, each maybe a rework round) has room.
-const MAX_DIRECTOR_ROUNDS: usize = 24;
+/// The hard ceiling on auto-QC feedback-fix rounds in one `/run`. One round is: the
+/// base builds (or fixes) end to end, then UmaDev runs its objective QC pass. A
+/// clean pass ends the loop immediately, so a simple goal that builds correctly the
+/// first time spends ZERO fix rounds. The cap only bounds a goal that keeps failing
+/// QC — after it, the loop ends and the caller's source-present hard-gate has the
+/// final say. Mirrors the proven bounded-rework shape (`continuous::MAX_REWORK_ROUNDS`)
+/// at the build level: small + decisive, not an open-ended grind.
+const MAX_QC_ROUNDS: usize = 3;
 
-/// The marker prefix the director emits to request a team lever. Chosen to be
-/// visually distinct and extremely unlikely to occur in ordinary prose / code, so
-/// [`parse_markers`] never false-positives on the director's narration.
-const MARKER_OPEN: &str = "<<<umadev:";
-/// The marker close.
-const MARKER_CLOSE: &str = ">>>";
-
-/// How the director loop settled — mirrors the caller's existing director outcome
-/// but lives in the agent crate so both the CLI and the TUI share ONE loop.
+/// How the director loop settled. Mirrors the caller's existing director outcome but
+/// lives in the agent crate so both the CLI and the TUI share ONE loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectorLoopOutcome {
-    /// The director finished its build (its last turn emitted no team lever and
-    /// ended cleanly / truncated-but-accepted). The caller then runs the objective
-    /// source-present hard-gate to verify reality.
+    /// The build finished — the base built end to end and UmaDev's auto-QC either
+    /// passed or exhausted its bounded fix budget. The caller then runs the
+    /// objective source-present hard-gate to verify reality.
     Done {
-        /// The director's final assistant text — the caller reads it for a
-        /// "claimed a build" check against the real source files.
+        /// The base's final assistant text — the caller reads it for a "claimed a
+        /// build" check against the real source files.
         reply: String,
     },
     /// The session died / a turn failed — an honest hard stop, never disguised as
@@ -121,116 +123,89 @@ pub enum DirectorLoopOutcome {
     Failed(String),
 }
 
-/// One parsed team-lever request the director emitted via a structured marker.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LeverRequest {
-    /// Delegate a slice to a named seat (serial doer / parallel reviewer).
-    Summon {
-        role: String,
-        instruction: String,
-        mode: SummonMode,
-    },
-    /// Convene a cross-review team over the current blackboard.
-    Review { kind: crate::continuous::ReviewKind },
-    /// Run an objective reality check.
-    Verify { kind: VerifyKind },
-    /// Pause for the user when the decision is theirs (bounded by the trust tier).
-    Checkpoint { question: String },
-}
-
-/// Drive an explicit `/run` (full product build) through the **real-time director
-/// loop** — the Wave 3 engine. ONE live [`BaseSession`] is the director's brain;
-/// the director plans + delegates LIVE by emitting team-lever markers that this
-/// loop mediates (executing the matching [`crate::director`] function and
-/// re-injecting the factual result), so the director truly orchestrates its team
-/// on the spot rather than working alone.
+/// Drive an explicit `/run` (full product build) through the **director build loop**
+/// — the USB-model engine. ONE live [`BaseSession`] is the director's brain; the
+/// firmware (team identity + craft + knowledge) is already injected by the caller
+/// into `first_directive` (and, on the TUI path, the system prompt). The base builds
+/// the goal end to end with its OWN internal agentic loop; then UmaDev runs an
+/// objective QC pass ITSELF ([`run_auto_qc`]) and, if QC found blocking problems,
+/// feeds ONE fix directive back over the same session for another pass — bounded by
+/// [`MAX_QC_ROUNDS`].
 ///
 /// `first_directive` is the goal framing the caller already built (e.g.
-/// [`crate::experts::director_build_directive`]); the loop sends it as the opening
-/// turn, then pumps the director's events. The caller owns the session lifetime
-/// (and the run-lock) and `end()`s it after this returns.
+/// [`crate::experts::director_build_directive`]). The caller owns the session
+/// lifetime (and the run-lock) and `end()`s it after this returns.
 ///
 /// Floor preserved (see the module docs): single-writer, governance + audit,
-/// advisory review, objective verify, fail-open, no endpoint. The loop never
-/// blocks the host — every failure mode degrades to a graceful settle.
+/// advisory review, objective verify, fail-open, no endpoint. The loop never blocks
+/// the host — every failure mode degrades to a graceful settle.
 pub async fn drive_director_loop(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     first_directive: String,
 ) -> DirectorLoopOutcome {
-    // The opening turn carries the goal framing AND the marker-syntax capability,
-    // so the director knows HOW to call a team lever even on a path whose host
-    // session set no system prompt (the CLI `drive_director_run` path). On the TUI
-    // path the system prompt ALSO carries it (via `experts::director_with_team_tools`)
-    // — a harmless restatement, and the single source of the wording is this module.
-    let mut next_directive = format!("{first_directive}\n\n---\n{}", director_loop_capability());
+    let mut next_directive = first_directive;
     let mut last_reply = String::new();
 
-    for round in 0..MAX_DIRECTOR_ROUNDS {
-        // Drive ONE director turn, accumulating its text so we can parse the
-        // team-lever markers it emitted once the turn ends.
+    for round in 0..MAX_QC_ROUNDS {
+        // 1. Drive ONE end-to-end base turn (build, or fix-the-QC-findings). The
+        //    base runs its own agentic tool loop (PM→…→QA internally) and writes
+        //    real files under the run-lock the caller holds (single-writer).
         let turn = match drive_one_turn(session, options, events, next_directive).await {
             Ok(t) => t,
             Err(reason) => return DirectorLoopOutcome::Failed(reason),
         };
         last_reply = turn.text.clone();
 
-        // Parse every team-lever marker this turn emitted. None → a normal
-        // end-of-work turn: the director is done orchestrating, settle.
-        let levers = parse_markers(&turn.text);
-        if levers.is_empty() {
+        // 2. If the base didn't claim it built/changed code (a chat / plan / "I read
+        //    it" answer), there is nothing to QC — settle. This keeps a simple goal
+        //    that the base just answered directly from being forced through QC.
+        if !crate::gates::claims_code_changes(&turn.text) {
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
-        // Mediate each lever SERIALLY (in marker order) so two serial doers can
-        // never write at once (single-writer). Collect the factual results.
-        let mut results: Vec<String> = Vec::new();
-        let mut paused_for_user = false;
-        for lever in levers {
-            let (line, pause) = mediate_one(session, options, events, lever).await;
-            results.push(line);
-            if pause {
-                paused_for_user = true;
-            }
-        }
+        // 3. UmaDev runs its OWN objective QC pass — hard floor + verify + optional
+        //    fork review. NOTHING here is the base summoning a team; it is UmaDev
+        //    inspecting reality over the borrowed brain.
+        let qc = run_auto_qc(session, options, events).await;
 
-        // A checkpoint that genuinely paused for the user ends the loop here: the
-        // caller surfaces the question and the user drives the next step (a
-        // revise / continue re-enters with their answer). We still report Done so
-        // the boundary hard-gate runs over whatever was built so far.
-        if paused_for_user {
+        // 4. Clean QC → the build is genuinely done. Settle and report honestly.
+        if qc.is_clean() {
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
-        // Re-inject the team's results so the director reads what actually
-        // happened and decides its next move — the heart of real-time scheduling.
-        let _ = round; // (round is the loop bound; the directive itself is lean)
-        next_directive = results_directive(&results);
+        // 5. QC found blocking problems. Out of fix budget → settle (the caller's
+        //    source-present hard-gate is the objective backstop).
+        if round + 1 >= MAX_QC_ROUNDS {
+            events.emit(EngineEvent::Note(
+                "team · auto-QC reached its fix-round budget — settling (objective hard-gate decides reality)"
+                    .to_string(),
+            ));
+            return DirectorLoopOutcome::Done { reply: last_reply };
+        }
+
+        // 6. Fold the QC findings into ONE fix directive and feed it back over the
+        //    USB channel for another build pass → re-QC.
+        next_directive = qc.fix_directive();
     }
 
-    // Hit the round cap: the director kept orchestrating without settling. End
-    // gracefully — the caller's objective source-present hard-gate decides reality.
-    events.emit(EngineEvent::Note(
-        "team · director loop reached its round budget — settling (objective hard-gate decides reality)"
-            .to_string(),
-    ));
     DirectorLoopOutcome::Done { reply: last_reply }
 }
 
-/// One director turn's observable result.
+/// One base turn's observable result.
 struct TurnResult {
-    /// The accumulated assistant text (markers included — `parse_markers` strips
-    /// them out). The caller reads it for the "claimed a build" hard-gate.
+    /// The accumulated assistant text. The caller reads it for the "claimed a build"
+    /// hard-gate; this loop reads it to decide whether QC is even warranted.
     text: String,
 }
 
-/// Send one directive and pump the director's event stream to its `TurnDone`,
-/// forwarding tool calls + text to the live sink (the SAME `WorkerStream` render
-/// path the pipeline uses), answering approvals via the always-on irreversible
-/// floor, and accumulating the assistant text. Returns the turn's text, or `Err`
-/// with a machine-true reason on a failed / dead turn (fail-open: the caller maps
-/// it to a hard stop, never a panic).
+/// Send one directive and pump the base's event stream to its `TurnDone`, forwarding
+/// tool calls + text to the live sink (the SAME `WorkerStream` render path the
+/// pipeline uses), answering approvals via the always-on irreversible floor, and
+/// accumulating the assistant text. Returns the turn's text, or `Err` with a
+/// machine-true reason on a failed / dead turn (fail-open: the caller maps it to a
+/// hard stop, never a panic).
 async fn drive_one_turn(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -314,368 +289,136 @@ fn tool_call_target(input: &serde_json::Value) -> String {
     String::new()
 }
 
-/// Execute ONE mediated team lever and return `(result_line, paused_for_user)`.
-/// The result line is a compact, factual summary the director reads next round;
-/// `paused_for_user` is `true` only for a checkpoint that genuinely paused (the
-/// caller then surfaces the question and ends the loop). Every branch is fail-open:
-/// a lever that degrades returns a truthful "couldn't / not done" line, never an
-/// error that wedges the loop.
-async fn mediate_one(
+// ───────────────────────────────────────────────────────────────────────────
+// Auto-QC — UmaDev's objective quality pass (NOT the base summoning a team)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// What one auto-QC pass found. Empty `blocking` = clean (the build is genuinely
+/// done). Non-empty = the factual problems UmaDev folds into ONE fix directive for
+/// the base. Built fail-open: any QC step that can't run contributes nothing (a
+/// neutral skip), never a false blocking finding.
+#[derive(Debug, Clone, Default)]
+struct QcReport {
+    /// The deduped, source-tagged union of blocking problems (e.g. `verify build:
+    /// FAILED …`, `[security] no input validation`). Empty = clean.
+    blocking: Vec<String>,
+}
+
+impl QcReport {
+    /// Whether the build passed QC clean (no blocking problem found).
+    fn is_clean(&self) -> bool {
+        self.blocking.is_empty()
+    }
+
+    /// Fold the QC findings into ONE fix directive fed back to the base over the
+    /// same session. The BASE'S BODY does the fixing (and the build/test) with its
+    /// own tools — UmaDev only hands it the facts and asks it to act. Lean +
+    /// command-style so the base fixes rather than narrates; it already holds the
+    /// full build context in this one continuous session, so no role re-priming.
+    fn fix_directive(&self) -> String {
+        let mut body = String::new();
+        for b in &self.blocking {
+            body.push_str("- ");
+            body.push_str(b);
+            body.push('\n');
+        }
+        format!(
+            "An objective check of what you just built surfaced problems that must be \
+             fixed (these are real facts read from disk / review, not your memory):\n\
+             {body}\nFix the cause of each one yourself with your tools — edit/create \
+             the real files — then RUN the project's own build and tests to confirm \
+             they pass. When it is genuinely clean, end your turn and report honestly \
+             what you fixed."
+        )
+    }
+}
+
+/// Run UmaDev's READ-ONLY QC pass over what the base just built — UmaDev judges, it
+/// does not operate. The base's body did the building; here UmaDev only reads
+/// reality. Checks, cheapest-first, each fail-open:
+///
+/// 1. **Honesty hard floor (UmaDev's own deterministic, read-only check)** — real
+///    source files actually landed ([`crate::director::verify`] with
+///    [`VerifyKind::SourcePresent`], which just reads disk). Zero source after a
+///    claimed build is the decisive blocking finding (nothing was built) and short-
+///    circuits the rest.
+/// 2. **Build/test FACT read (optional, reuse of an existing reader)** — when a
+///    project manifest is present, [`VerifyKind::BuildTest`] surfaces an objective
+///    failure fact. This is positioned as reading a fact, NOT UmaDev's gate: the fix
+///    directive asks the BASE to run its own build/test. A skipped check is neutral.
+/// 3. **Optional fork review (read-only, borrows the brain)** — only when real code
+///    exists, fork the review team on read-only sessions and collect blocking
+///    findings ([`crate::director::review`]). Advisory: findings only seed the fix
+///    directive the base acts on.
+///
+/// Single-writer preserved: every step is read-only (disk read / build-test read /
+/// isolated read-only forks) — NOTHING here writes the workspace.
+async fn run_auto_qc(
     session: &mut dyn BaseSession,
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
-    lever: LeverRequest,
-) -> (String, bool) {
-    match lever {
-        LeverRequest::Summon {
-            role,
-            instruction,
-            mode,
-        } => {
-            let r = director::summon(session, options, events, &role, &instruction, mode).await;
-            (format_summon_result(&r), false)
-        }
-        LeverRequest::Review { kind } => {
-            let r = director::review(session, options, events, kind).await;
-            (format_review_result(kind, &r), false)
-        }
-        LeverRequest::Verify { kind } => {
-            let r = director::verify(options, events, kind).await;
-            (format_verify_result(kind, &r), false)
-        }
-        LeverRequest::Checkpoint { question } => {
-            let decision = director::checkpoint(options, events, &question);
-            match decision {
-                CheckpointDecision::AutoProceed => (
-                    format!("checkpoint(\"{question}\"): auto-approved (full-autonomy tier) — proceed."),
-                    false,
-                ),
-                CheckpointDecision::AskUser => (
-                    format!(
-                        "checkpoint(\"{question}\"): PAUSED for the user — the build stops here until \
-                         they answer; do not proceed past this decision on your own."
-                    ),
-                    true,
-                ),
-            }
-        }
-    }
-}
+) -> QcReport {
+    events.emit(EngineEvent::Note("team · honesty + QC read".to_string()));
+    let mut blocking: Vec<String> = Vec::new();
 
-/// Format a [`crate::director::summon`] result as a compact factual line.
-fn format_summon_result(r: &director::SummonResult) -> String {
-    match &r.verdict {
-        // A parallel (reviewing) seat returned an opinion.
-        Some(v) => {
-            let mut line = format!(
-                "summon {}({}): {} — accepts={}",
-                r.role,
-                SummonMode::Parallel.as_str(),
-                if r.done {
-                    "reviewed"
-                } else {
-                    "could not review (fail-open accept)"
-                },
-                v.accepts
-            );
-            if !v.blocking.is_empty() {
-                line.push_str(&format!("; must-fix: {}", v.blocking.join("; ")));
-            }
-            line
-        }
-        // A serial doer mutated the workspace.
-        None => format!(
-            "summon {}({}): {}",
-            r.role,
-            SummonMode::Serial.as_str(),
-            if r.done {
-                "did the work (turn completed — verify the files landed)"
-            } else {
-                "turn did not complete (degraded — decide whether to retry)"
-            }
-        ),
+    // 1. Honesty hard floor (UmaDev's own read-only check): did real source actually
+    //    land? A claimed build with zero source is the decisive blocking finding —
+    //    feed it back so the base's body actually writes the code.
+    let src = director::verify(options, events, VerifyKind::SourcePresent).await;
+    if src.available && !src.passed {
+        blocking.push(format!(
+            "source-present: FAILED — {} (the build claimed done but no real source \
+             files exist on disk; actually create the code with your tools)",
+            src.evidence.first().cloned().unwrap_or_default()
+        ));
+        // No source means nothing to build/test or review — return now with the
+        // decisive finding rather than reading over an empty tree.
+        return QcReport { blocking };
     }
-}
 
-/// Format a [`crate::director::review`] result as a compact factual line.
-fn format_review_result(kind: crate::continuous::ReviewKind, r: &ReviewResult) -> String {
-    let kind_id = review_kind_id(kind);
-    if r.seats == 0 {
-        return format!("review {kind_id}: no team convened for this task (lean / nothing to review) — proceed.");
+    // 2. Build/test FACT read (optional, when a manifest is present). UmaDev reads
+    //    the objective result; the FIX is the base's job (the fix directive tells it
+    //    to run its own build/test). A skipped check is neutral (fail-open).
+    let bt = director::verify(options, events, VerifyKind::BuildTest).await;
+    if let Some(line) = build_test_blocking(&bt) {
+        blocking.push(line);
     }
-    if r.blocking.is_empty() {
-        return format!(
-            "review {kind_id}: {} seat(s) reviewed, all accept — no must-fix.",
-            r.seats
-        );
-    }
-    format!(
-        "review {kind_id}: {} seat(s) reviewed, {} must-fix finding(s): {}",
-        r.seats,
-        r.blocking.len(),
-        r.blocking.join("; ")
+
+    // 3. Optional fork review (UmaDev's read-only QC over read-only forks). The team
+    //    scales to the task, so a lean goal convenes no team and this contributes
+    //    nothing. Advisory — the base's body acts on whatever it surfaces.
+    let review = director::review(
+        session,
+        options,
+        events,
+        crate::continuous::ReviewKind::Quality,
     )
+    .await;
+    for finding in review_blocking(&review) {
+        blocking.push(finding);
+    }
+
+    QcReport { blocking }
 }
 
-/// Format a [`crate::director::verify`] result as a compact factual line.
-fn format_verify_result(kind: VerifyKind, r: &VerifyResult) -> String {
-    let kind_id = kind.as_str();
-    if !r.available {
-        let why = r.evidence.first().cloned().unwrap_or_default();
-        return format!(
-            "verify {kind_id}: skipped (nothing to check){}.",
-            fmt_suffix(&why)
-        );
+/// Map a [`VerifyResult`] from a build/test check to a blocking line, or `None` when
+/// it passed / was skipped (an unavailable check is neutral — fail-open).
+fn build_test_blocking(r: &VerifyResult) -> Option<String> {
+    if !r.available || r.passed {
+        return None;
     }
-    let head = if r.passed {
-        format!("verify {kind_id}: PASSED")
-    } else {
-        format!("verify {kind_id}: FAILED")
-    };
-    if r.evidence.is_empty() {
-        format!("{head}.")
-    } else {
-        format!("{head} — {}", r.evidence.join("; "))
-    }
-}
-
-/// `" — <why>"` when `why` is non-empty, else empty — keeps the verify line tidy.
-fn fmt_suffix(why: &str) -> String {
-    if why.trim().is_empty() {
+    let detail = if r.evidence.is_empty() {
         String::new()
     } else {
-        format!(" — {}", why.trim())
-    }
-}
-
-/// Stable lowercase id for a review node kind (for the result line the director
-/// reads). Mirrors `continuous::kind_phase_label` without importing a private fn.
-fn review_kind_id(kind: crate::continuous::ReviewKind) -> &'static str {
-    use crate::continuous::ReviewKind::{Docs, Preview, Quality};
-    match kind {
-        Docs => "docs",
-        Preview => "preview",
-        Quality => "quality",
-    }
-}
-
-/// Build the next directive: the factual results of every lever the director just
-/// fired, framed as "here's what your team produced — decide the next move." Lean
-/// (no role priming — the director already holds the full build context in this
-/// one continuous session), command-style so the director keeps acting rather than
-/// narrating.
-fn results_directive(results: &[String]) -> String {
-    let mut body = String::new();
-    for r in results {
-        body.push_str("- ");
-        body.push_str(r);
-        body.push('\n');
-    }
-    format!(
-        "Your team reported back. Here is what actually happened (objective results, \
-         not your memory):\n{body}\nNow decide the next move as the director: if a \
-         reviewer raised must-fix issues, send the relevant seat back to fix them \
-         (summon again); if a verify failed, fix the cause; if everything checks out \
-         and the goal is met, finish and report honestly what was built. You may fire \
-         more team levers, or do work yourself, or call it done — your call. When the \
-         build is genuinely complete and verified, end your turn WITHOUT emitting any \
-         further marker."
-    )
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Marker parsing — the director→UmaDev request channel
-// ───────────────────────────────────────────────────────────────────────────
-
-/// Parse every team-lever marker the director emitted in `text`. A marker is a
-/// `<<<umadev:<verb> key="value" …>>>` line; unknown verbs / malformed markers are
-/// skipped (fail-open — the director simply gets no result for a garbled request).
-/// Returns the levers in emission order so the loop mediates them deterministically.
-fn parse_markers(text: &str) -> Vec<LeverRequest> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find(MARKER_OPEN) {
-        let after_open = &rest[open + MARKER_OPEN.len()..];
-        let Some(close_rel) = after_open.find(MARKER_CLOSE) else {
-            break; // an unterminated marker → stop (fail-open, ignore the tail)
-        };
-        let body = &after_open[..close_rel];
-        if let Some(lever) = parse_one_marker(body) {
-            out.push(lever);
-        }
-        // Advance past this marker's close.
-        rest = &after_open[close_rel + MARKER_CLOSE.len()..];
-    }
-    out
-}
-
-/// Parse ONE marker body (`<verb> key="value" …`) into a [`LeverRequest`].
-/// Returns `None` for an unknown verb or a request that lacks its required field,
-/// so a malformed marker fail-opens to "no lever" rather than a bogus action.
-fn parse_one_marker(body: &str) -> Option<LeverRequest> {
-    let body = body.trim();
-    // The verb is the first whitespace-delimited token.
-    let (verb, attrs_str) = match body.split_once(char::is_whitespace) {
-        Some((v, a)) => (v, a),
-        None => (body, ""),
+        format!(" — {}", r.evidence.join("; "))
     };
-    let attrs = parse_attrs(attrs_str);
-    let get = |k: &str| {
-        attrs
-            .iter()
-            .find(|(key, _)| key == k)
-            .map(|(_, v)| v.clone())
-    };
-
-    match verb.trim().to_ascii_lowercase().as_str() {
-        "summon" => {
-            let role = get("role")?;
-            if role.trim().is_empty() {
-                return None;
-            }
-            let instruction = get("instruction").unwrap_or_default();
-            let mode = match get("mode").as_deref().map(str::trim) {
-                Some("parallel" | "review") => SummonMode::Parallel,
-                // Default + "serial" / anything else → a serial doer (the common
-                // case: delegate work). Fail-open to the safe single-writer mode.
-                _ => SummonMode::Serial,
-            };
-            Some(LeverRequest::Summon {
-                role,
-                instruction,
-                mode,
-            })
-        }
-        "review" => {
-            let kind = parse_review_kind(get("kind").as_deref());
-            Some(LeverRequest::Review { kind })
-        }
-        "verify" => {
-            let kind = parse_verify_kind(get("kind").as_deref())?;
-            Some(LeverRequest::Verify { kind })
-        }
-        "checkpoint" => {
-            let question = get("question").or_else(|| get("q")).unwrap_or_default();
-            Some(LeverRequest::Checkpoint { question })
-        }
-        _ => None, // unknown verb → fail-open ignore
-    }
+    Some(format!("verify build-test: FAILED{detail}"))
 }
 
-/// Map a `kind="…"` to a [`crate::continuous::ReviewKind`]; defaults to Quality
-/// (the most common director review — vetting delivered code) on absence/unknown.
-fn parse_review_kind(kind: Option<&str>) -> crate::continuous::ReviewKind {
-    use crate::continuous::ReviewKind::{Docs, Preview, Quality};
-    match kind.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("docs") => Docs,
-        Some("preview" | "frontend") => Preview,
-        // "quality" / unknown / absent → Quality.
-        _ => Quality,
-    }
-}
-
-/// Map a `kind="…"` to a [`VerifyKind`]; `None` for an unknown kind so the verify
-/// marker is skipped rather than running an arbitrary check.
-fn parse_verify_kind(kind: Option<&str>) -> Option<VerifyKind> {
-    match kind.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("build-test" | "build" | "test" | "build_test") => Some(VerifyKind::BuildTest),
-        Some("contract" | "coverage") => Some(VerifyKind::Contract),
-        Some("source-present" | "source" | "source_present") => Some(VerifyKind::SourcePresent),
-        // Absent kind → default to the cheapest real reality check (source-present)
-        // so a bare `<<<umadev:verify>>>` still does something useful.
-        None | Some("") => Some(VerifyKind::SourcePresent),
-        _ => None,
-    }
-}
-
-/// Parse `key="value"` attribute pairs from a marker's attribute string. Tolerant:
-/// values are double-quoted; an unquoted bareword value is also accepted; a `>`
-/// inside a quoted value is fine (we only split on the marker close upstream).
-/// Returns pairs in source order. Pure + total — never panics.
-fn parse_attrs(s: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Skip whitespace.
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        // Read the key up to '=' or whitespace.
-        let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let key = s[key_start..i].trim().to_string();
-        // Skip whitespace before '='.
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'=' {
-            i += 1; // consume '='
-                    // Skip whitespace after '='.
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            let value = if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-                let quote = bytes[i];
-                i += 1; // consume opening quote
-                let val_start = i;
-                while i < bytes.len() && bytes[i] != quote {
-                    i += 1;
-                }
-                let v = s[val_start..i].to_string();
-                if i < bytes.len() {
-                    i += 1; // consume closing quote
-                }
-                v
-            } else {
-                // Bareword value up to whitespace.
-                let val_start = i;
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                s[val_start..i].to_string()
-            };
-            if !key.is_empty() {
-                out.push((key, value));
-            }
-        } else if !key.is_empty() {
-            // A bare flag with no value — record it with an empty value.
-            out.push((key, String::new()));
-        }
-    }
-    out
-}
-
-/// The director-loop capability block — the Wave 3 prompt surface. Tells the
-/// director EXACTLY how to actually CALL a team lever now (the marker syntax), on
-/// top of the Wave 2 capability description (which says WHAT the levers are). This
-/// is what turns the Wave 2 "you have these abilities" into Wave 3 "and here is how
-/// you invoke one, live." Framed as the director's own judgement — a small goal may
-/// need no marker at all (just do it), a real product several.
-#[must_use]
-pub fn director_loop_capability() -> &'static str {
-    "HOW TO ACTUALLY CALL A TEAM LEVER (real-time — you invoke it, the shell runs \
-     it and reports the result back to you next turn):\n\
-     Emit a single marker line of EXACTLY this form, then end your turn so the \
-     result comes back:\n\
-     - Delegate work to a seat (it writes the files, serially): \
-     <<<umadev:summon role=\"frontend-engineer\" mode=\"serial\" instruction=\"build the login page\">>>\n\
-     - Get a second opinion from a seat (read-only, returns a verdict): \
-     <<<umadev:summon role=\"security-engineer\" mode=\"parallel\" instruction=\"audit the auth surface\">>>\n\
-     - Convene the cross-review team: <<<umadev:review kind=\"quality\">>> (kinds: docs / preview / quality)\n\
-     - Objectively check reality: <<<umadev:verify kind=\"build-test\">>> (kinds: build-test / contract / source-present)\n\
-     - Pause for the user when the call is theirs: <<<umadev:checkpoint question=\"ship to prod?\">>>\n\
-     Roles: product-manager / architect / uiux-designer / frontend-engineer / \
-     backend-engineer / qa-engineer / security-engineer / devops-engineer. After you \
-     emit one or more markers, END YOUR TURN; the results come back and you decide the \
-     next move. When the build is genuinely done and verified, end your turn with NO \
-     marker. Use the levers like a real director — on YOUR judgement, proportionate; a \
-     trivial change may need none (just do it yourself)."
+/// Pull the blocking findings out of a [`ReviewResult`] (already seat-tagged +
+/// deduped by the review team). Empty when the team accepted or no team convened.
+fn review_blocking(r: &ReviewResult) -> Vec<String> {
+    r.blocking.clone()
 }
 
 #[cfg(test)]
@@ -705,8 +448,8 @@ mod tests {
     }
 
     // ── A scripted fake BaseSession: each `send_turn` loads the next scripted
-    // batch of events (a turn). Forks emit a fixed JSON verdict so a parallel
-    // summon / review gets a verdict. `next_event` drains the current batch. ──
+    // batch of events (a turn). Forks emit a fixed JSON verdict so a QC review gets
+    // a verdict. `next_event` drains the current batch. ──
     #[derive(Clone)]
     struct FakeSession {
         /// One event-batch per upcoming MAIN turn, consumed front-to-back.
@@ -804,168 +547,83 @@ mod tests {
         ]
     }
 
-    // ── Marker parsing ────────────────────────────────────────────────────
-
-    #[test]
-    fn parses_a_summon_marker_with_attrs() {
-        let levers = parse_markers(
-            "I'll delegate this.\n<<<umadev:summon role=\"frontend-engineer\" mode=\"serial\" instruction=\"build the login form\">>>\nDone for now.",
-        );
-        assert_eq!(levers.len(), 1);
-        assert_eq!(
-            levers[0],
-            LeverRequest::Summon {
-                role: "frontend-engineer".to_string(),
-                instruction: "build the login form".to_string(),
-                mode: SummonMode::Serial,
-            }
-        );
+    /// Write a minimal real source file so the source-present floor passes and QC
+    /// moves on to build/test + review (instead of stopping at the hard floor).
+    fn seed_source(root: &std::path::Path) {
+        std::fs::write(root.join("app.ts"), "export const x = 1;").unwrap();
     }
 
-    #[test]
-    fn parses_multiple_markers_in_order() {
-        let levers = parse_markers(
-            "<<<umadev:summon role=\"architect\" instruction=\"design it\">>> then \
-             <<<umadev:review kind=\"quality\">>> and \
-             <<<umadev:verify kind=\"build-test\">>>",
-        );
-        assert_eq!(levers.len(), 3);
-        assert!(matches!(levers[0], LeverRequest::Summon { .. }));
-        assert!(matches!(
-            levers[1],
-            LeverRequest::Review {
-                kind: crate::continuous::ReviewKind::Quality
-            }
-        ));
-        assert!(matches!(
-            levers[2],
-            LeverRequest::Verify {
-                kind: VerifyKind::BuildTest
-            }
-        ));
-    }
-
-    #[test]
-    fn summon_defaults_to_serial_and_parallel_is_recognised() {
-        let s = parse_markers("<<<umadev:summon role=\"qa\">>>");
-        assert_eq!(
-            s[0],
-            LeverRequest::Summon {
-                role: "qa".to_string(),
-                instruction: String::new(),
-                mode: SummonMode::Serial,
-            }
-        );
-        let p = parse_markers(
-            "<<<umadev:summon role=\"qa\" mode=\"parallel\" instruction=\"review\">>>",
-        );
-        assert!(matches!(
-            p[0],
-            LeverRequest::Summon {
-                mode: SummonMode::Parallel,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn unknown_verb_and_malformed_markers_are_skipped_fail_open() {
-        // Unknown verb → skipped.
-        assert!(parse_markers("<<<umadev:teleport role=\"x\">>>").is_empty());
-        // Summon with no role → skipped (required field).
-        assert!(parse_markers("<<<umadev:summon instruction=\"x\">>>").is_empty());
-        // Verify with an unknown kind → skipped.
-        assert!(parse_markers("<<<umadev:verify kind=\"vibes\">>>").is_empty());
-        // Unterminated marker → ignored, no panic.
-        assert!(parse_markers("<<<umadev:summon role=\"x\"").is_empty());
-        // Plain prose with no marker → no levers.
-        assert!(parse_markers("Just building the app, no markers here.").is_empty());
-    }
-
-    #[test]
-    fn verify_and_review_kinds_default_sensibly() {
-        // Bare verify → source-present (cheapest real check).
-        assert_eq!(
-            parse_markers("<<<umadev:verify>>>")[0],
-            LeverRequest::Verify {
-                kind: VerifyKind::SourcePresent
-            }
-        );
-        // Bare review → quality.
-        assert_eq!(
-            parse_markers("<<<umadev:review>>>")[0],
-            LeverRequest::Review {
-                kind: crate::continuous::ReviewKind::Quality
-            }
-        );
-    }
-
-    #[test]
-    fn checkpoint_marker_carries_the_question() {
-        let l = parse_markers("<<<umadev:checkpoint question=\"deploy to prod?\">>>");
-        assert_eq!(
-            l[0],
-            LeverRequest::Checkpoint {
-                question: "deploy to prod?".to_string()
-            }
-        );
-    }
-
-    // ── The real-time loop ────────────────────────────────────────────────
+    // ── The USB-model loop: base builds end to end → UmaDev auto-QC → bounded fix ──
 
     #[tokio::test]
-    async fn director_summons_a_serial_doer_in_real_time() {
-        // Turn 1: the director emits a serial summon. The loop mediates it (driving
-        // the doer turn), then re-injects the result. Turn 2 (the doer's): no
-        // marker → completes. Turn 3 (the director reads results): no marker → done.
+    async fn clean_build_passes_qc_with_no_markers_and_finishes() {
+        // The base builds end to end and ends WITHOUT any scheduling marker (the
+        // whole point: the team lives in the base's head). With real source on disk
+        // and no fork (no review team), auto-QC is clean → done in one base turn.
         let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
         let (events, _rec) = sink();
-        let turns = vec![
-            // director plan turn → fires a serial summon
-            text_turn(
-                "Planning. <<<umadev:summon role=\"frontend-engineer\" instruction=\"build it\">>>",
-            ),
-            // the summoned doer's turn (driven by director::summon) → completes
-            text_turn("built the login form"),
-            // director reads the result → no further marker → done
-            text_turn("All set — the login form is built and verified."),
-        ];
+        let turns = vec![text_turn(
+            "I created the login form, the route, and the tests — implemented it end \
+             to end. All done.",
+        )];
         let mut sess = FakeSession::new(turns, false, "");
         let sent = sess.sent_handle();
         let o = opts(tmp.path());
 
         let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
         match outcome {
-            DirectorLoopOutcome::Done { reply } => {
-                assert!(reply.contains("All set"), "final reply carried");
-            }
+            DirectorLoopOutcome::Done { reply } => assert!(reply.contains("created the login")),
             other @ DirectorLoopOutcome::Failed(_) => panic!("expected Done, got {other:?}"),
         }
         let sent = sent.lock().unwrap();
-        // The opening directive, then the doer directive (carries the role +
-        // instruction), then the results re-injection.
+        // Exactly ONE main directive: the opening build. Clean QC → no fix pass.
+        assert_eq!(sent.len(), 1, "clean QC → no feedback-fix turn: {sent:?}");
         assert!(sent[0].contains("GO"), "opening directive sent");
+    }
+
+    #[tokio::test]
+    async fn qc_finds_no_source_and_feeds_a_fix_directive_back() {
+        // The base CLAIMS a build but writes no source. UmaDev's hard-floor QC
+        // catches it and feeds a fix directive back over the USB channel; the next
+        // base turn writes real source → re-QC clean → done.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        // Turn 1 CLAIMS a build (a change verb) but writes no source → the hard-floor
+        // QC FAILS and a fix directive is fed back. Turn 2 claims done again (the
+        // tree stays empty in this scripted fake, but we only assert the fix
+        // directive was injected, which proves the feedback path fired).
+        let turns = vec![
+            text_turn("Implemented it. (but the fake wrote nothing to disk)"),
+            text_turn("Now created app.ts and the tests. Done."),
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let o = opts(tmp.path());
+
+        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        let sent = sent.lock().unwrap();
+        // The opening build, then a fix directive carrying the source-present finding.
         assert!(
             sent.iter()
-                .any(|d| d.contains("frontend-engineer") && d.contains("build it")),
-            "the serial doer was driven with the role + instruction: {sent:?}"
-        );
-        assert!(
-            sent.iter().any(|d| d.contains("Your team reported back")),
-            "the result was re-injected so the director could read it: {sent:?}"
+                .any(|d| d.contains("source-present") && d.contains("must be fixed")),
+            "the QC finding was fed back as a fix directive: {sent:?}"
         );
     }
 
     #[tokio::test]
-    async fn director_runs_a_review_and_gets_blocking_back() {
-        // The director convenes a quality review; a seat raises a blocking finding;
-        // the loop re-injects it as a factual must-fix line the director reads.
+    async fn qc_review_blocking_is_fed_back_as_a_fix_directive() {
+        // Real source exists, build/test is skipped (no manifest), but a forked
+        // review seat raises a blocking finding → UmaDev folds it into a fix
+        // directive over the same session.
         let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
         let (events, _rec) = sink();
         let reply = r#"{"accepts": false, "blocking": ["登录失败路径无测试"]}"#;
         let turns = vec![
-            text_turn("<<<umadev:review kind=\"quality\">>>"),
-            text_turn("Acknowledged — I'll address the gap."),
+            text_turn("Created the login form and route. Done."),
+            text_turn("Added the failure-path tests. Done."),
         ];
         let mut sess = FakeSession::new(turns, true, reply);
         let sent = sess.sent_handle();
@@ -976,89 +634,59 @@ mod tests {
         let sent = sent.lock().unwrap();
         assert!(
             sent.iter()
-                .any(|d| d.contains("登录失败路径无测试") && d.contains("must-fix")),
-            "the blocking finding was re-injected as a must-fix line: {sent:?}"
+                .any(|d| d.contains("登录失败路径无测试") && d.contains("must be fixed")),
+            "the review blocking finding was fed back as a fix directive: {sent:?}"
         );
     }
 
     #[tokio::test]
-    async fn director_verifies_reality_in_real_time() {
-        // The director fires a source-present verify; with no source on disk it
-        // comes back FAILED — a factual reality line the director reads.
+    async fn a_chat_answer_with_no_code_claim_skips_qc_entirely() {
+        // A goal the base just answers in prose (no claim of code changes) → no QC,
+        // settle after one turn. Keeps a simple ask from being forced through QC.
         let tmp = tempfile::TempDir::new().unwrap();
         let (events, _rec) = sink();
-        let turns = vec![
-            text_turn("<<<umadev:verify kind=\"source-present\">>>"),
-            text_turn("Right, nothing built yet — I'll implement it."),
-        ];
+        let turns = vec![text_turn(
+            "Here is how I would approach this conceptually, before any code — let me \
+             walk through the trade-offs first.",
+        )];
         let mut sess = FakeSession::new(turns, false, "");
         let sent = sess.sent_handle();
         let o = opts(tmp.path());
-
-        let _ = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        let sent = sent.lock().unwrap();
-        assert!(
-            sent.iter()
-                .any(|d| d.contains("verify source-present") && d.contains("FAILED")),
-            "the verify reality result was re-injected: {sent:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn checkpoint_pauses_for_the_user_and_ends_the_loop() {
-        // In a guarded tier, a checkpoint genuinely pauses: the loop ends (Done)
-        // so the caller surfaces the question, and does NOT keep driving turns.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let (events, rec) = sink();
-        let mut o = opts(tmp.path());
-        o.mode = TrustMode::Guarded;
-        let turns = vec![
-            text_turn("<<<umadev:checkpoint question=\"deploy to prod?\">>>"),
-            // This turn should NOT run (the loop paused). If it did, the test for
-            // the directive count below would see an extra send.
-            text_turn("should not reach here"),
-        ];
-        let mut sess = FakeSession::new(turns, false, "");
-        let sent = sess.sent_handle();
 
         let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
         assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
-        // Exactly ONE main directive was sent (the opening turn); the loop paused
-        // for the user instead of driving the next turn.
         assert_eq!(
             sent.lock().unwrap().len(),
             1,
-            "the loop paused, no further turn"
-        );
-        let evs = rec.events();
-        assert!(
-            evs.iter()
-                .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("checkpoint"))),
-            "the checkpoint surfaced a note: {evs:?}"
+            "a non-code answer skips QC → one turn, no re-injection"
         );
     }
 
     #[tokio::test]
-    async fn no_marker_first_turn_is_a_plain_agentic_build_fail_open() {
-        // A director (or a base that doesn't understand markers) that just builds
-        // and ends with no marker → the loop settles after one turn (Wave 1
-        // behaviour: the director worked alone). This is the fail-open degrade.
+    async fn fix_loop_is_bounded_by_max_qc_rounds() {
+        // The base keeps claiming a build but never writes source — QC keeps failing.
+        // The loop must STOP at MAX_QC_ROUNDS, never spin forever (bounded), and end
+        // gracefully (the caller's hard-gate decides reality).
         let tmp = tempfile::TempDir::new().unwrap();
         let (events, _rec) = sink();
-        let turns = vec![text_turn("I built the whole thing directly. Done.")];
+        // Every turn claims a build (a change verb) but the tree stays empty → the
+        // hard-floor QC fails every round, so the loop keeps feeding fix directives
+        // until it hits MAX_QC_ROUNDS.
+        let turns: Vec<Vec<SessionEvent>> = (0..MAX_QC_ROUNDS + 3)
+            .map(|_| text_turn("Implemented it (but still wrote nothing)."))
+            .collect();
         let mut sess = FakeSession::new(turns, false, "");
         let sent = sess.sent_handle();
         let o = opts(tmp.path());
 
         let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
-        match outcome {
-            DirectorLoopOutcome::Done { reply } => assert!(reply.contains("Done")),
-            other @ DirectorLoopOutcome::Failed(_) => panic!("expected Done, got {other:?}"),
-        }
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        // Exactly MAX_QC_ROUNDS base build turns were driven, then the loop settled
+        // gracefully — the fix loop is BOUNDED, never an open-ended grind.
         assert_eq!(
             sent.lock().unwrap().len(),
-            1,
-            "no marker → one turn, no re-injection (pure agentic)"
+            MAX_QC_ROUNDS,
+            "the fix loop is bounded by MAX_QC_ROUNDS"
         );
     }
 
@@ -1081,27 +709,75 @@ mod tests {
         );
     }
 
-    #[test]
-    fn capability_block_teaches_the_marker_syntax() {
-        let c = director_loop_capability();
-        assert!(c.contains("<<<umadev:summon"));
-        assert!(c.contains("<<<umadev:review"));
-        assert!(c.contains("<<<umadev:verify"));
-        assert!(c.contains("<<<umadev:checkpoint"));
-        // Frames it as the director's own judgement, not a forced chain.
-        let lower = c.to_lowercase();
-        assert!(lower.contains("your judgement") || lower.contains("real director"));
+    // ── Auto-QC units ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auto_qc_clean_when_source_present_and_no_review_team() {
+        // Real source on disk, no manifest (build/test skipped → neutral), no fork
+        // (no review) → QC clean.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        assert!(qc.is_clean(), "source present + nothing to fail → clean QC");
+    }
+
+    #[tokio::test]
+    async fn auto_qc_blocks_when_no_source_present() {
+        // No source on disk after a claimed build → the hard floor is the decisive
+        // blocking finding (and QC returns early without running build/review).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let qc = run_auto_qc(&mut sess, &o, &events).await;
+        assert!(!qc.is_clean(), "no source → blocking");
+        assert!(
+            qc.blocking.iter().any(|b| b.contains("source-present")),
+            "the hard-floor finding is present: {:?}",
+            qc.blocking
+        );
     }
 
     #[test]
-    fn parse_attrs_handles_quotes_whitespace_and_barewords() {
-        let a = parse_attrs("role=\"frontend\"  mode=serial  instruction=\"build it now\"");
-        assert_eq!(a.len(), 3);
-        assert_eq!(a[0], ("role".to_string(), "frontend".to_string()));
-        assert_eq!(a[1], ("mode".to_string(), "serial".to_string()));
-        assert_eq!(
-            a[2],
-            ("instruction".to_string(), "build it now".to_string())
-        );
+    fn build_test_blocking_is_none_when_skipped_or_passed() {
+        // An unavailable (skipped) check is neutral, not a false failure (fail-open).
+        let skipped = VerifyResult {
+            available: false,
+            passed: true,
+            evidence: vec![],
+        };
+        assert!(build_test_blocking(&skipped).is_none());
+        // A passing check is not blocking.
+        let ok = VerifyResult {
+            available: true,
+            passed: true,
+            evidence: vec!["build: ok".into()],
+        };
+        assert!(build_test_blocking(&ok).is_none());
+        // A real failure is blocking, carrying the evidence.
+        let bad = VerifyResult {
+            available: true,
+            passed: false,
+            evidence: vec!["build: FAILED (exit 1)".into()],
+        };
+        let line = build_test_blocking(&bad).expect("a failed step blocks");
+        assert!(line.contains("FAILED") && line.contains("exit 1"));
+    }
+
+    #[test]
+    fn fix_directive_lists_every_blocking_finding() {
+        let qc = QcReport {
+            blocking: vec![
+                "verify build-test: FAILED — build: FAILED (exit 1)".into(),
+                "[security] no input validation".into(),
+            ],
+        };
+        let d = qc.fix_directive();
+        assert!(d.contains("must be fixed"));
+        assert!(d.contains("build: FAILED"));
+        assert!(d.contains("no input validation"));
     }
 }

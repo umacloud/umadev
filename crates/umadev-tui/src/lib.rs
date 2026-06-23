@@ -600,17 +600,17 @@ fn spawn_continuous_block(
     })
 }
 
-/// Spawn the **real-time director loop** for an explicit `/run` (Wave 3 of
-/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5) — the TUI counterpart of the CLI's
-/// `drive_director_run`. It opens ONE live [`umadev_runtime::BaseSession`] (the
-/// director's brain) and drives [`umadev_agent::drive_director_loop`], so the
-/// director plans + delegates LIVE: it emits team-lever markers (summon / review /
-/// verify / checkpoint) that the loop mediates and re-injects the results of,
-/// instead of working alone inside a single opaque `complete_streaming` call (the
-/// Wave 1/2 limitation). Floor preserved exactly as the CLI path: the single-writer
-/// run-lock is held for the whole loop, the always-on irreversible floor + the
-/// governance hook still apply, and the objective source-present hard-gate runs
-/// after the loop reports done.
+/// Spawn the **director build loop** for an explicit `/run` (the USB / smart-
+/// hardware model of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md`, simplified — no marker
+/// protocol) — the TUI counterpart of the CLI's `drive_director_run`. It opens ONE
+/// live [`umadev_runtime::BaseSession`] (the director's brain) and drives
+/// [`umadev_agent::drive_director_loop`]: the firmware (team identity + craft) is
+/// injected, the base's body builds the goal end to end with its own tools, then
+/// UmaDev runs a read-only honesty/QC pass and feeds any blocking findings back as a
+/// bounded fix directive the base acts on. Floor preserved exactly as the CLI path:
+/// the single-writer run-lock is held for the whole loop, the always-on irreversible
+/// floor + the governance hook still apply, and the objective source-present hard-
+/// gate runs after the loop reports done.
 ///
 /// All the surrounding TUI machinery is UNCHANGED: tool calls + text stream live
 /// via [`EngineEvent::WorkerStream`] (the same render path), and a terminal
@@ -623,7 +623,7 @@ fn spawn_continuous_block(
 /// **Fail-open:** a session that can't open / the run-lock held by a DIFFERENT live
 /// run emits the honest `ABORT_SENTINEL` note and a terminal `Failed`; a session
 /// that dies mid-loop is a `Failed` outcome. It NEVER panics or wedges, and a base
-/// that emits no marker degrades to a plain agentic build (Wave 1 behaviour).
+/// whose first build passes QC clean settles immediately (no fix pass).
 fn spawn_director_loop(
     options: RunOptions,
     sink: Arc<ChannelSink>,
@@ -672,8 +672,8 @@ fn spawn_director_loop(
             }
         };
 
-        // Frame the goal for the director, then drive the real-time loop. The
-        // capability/marker syntax is folded into the first directive by the loop.
+        // Frame the goal for the director (the firmware framing), then drive the
+        // build loop: the base builds end to end, UmaDev runs its honesty/QC read.
         let directive = umadev_agent::experts::director_build_directive(&options.requirement);
         let sink_dyn: Arc<dyn EventSink> = sink.clone();
         let outcome =
@@ -965,50 +965,13 @@ fn changed_files_between(before: &str, after: &str) -> Vec<String> {
 /// to anchor a pure-chat reply that recites an edit it never made (a base that
 /// misclassified a status question as chat). Deliberately broad and bilingual; a
 /// false positive only adds an advisory note, never blocks anything.
+///
+/// Thin re-export of the canonical classifier in the agent crate
+/// ([`umadev_agent::claims_code_changes`]) so the director build loop and this TUI
+/// boundary share ONE source of truth — the wording lives in one place.
 #[must_use]
 pub fn claims_code_changes(text: &str) -> bool {
-    // English change verbs.
-    const EN: &[&str] = &[
-        "refactor",
-        "added",
-        "changed",
-        "edited",
-        "created",
-        "updated",
-        "modified",
-        "removed",
-        "deleted",
-        "implemented",
-        "renamed",
-        "rewrote",
-        "replaced",
-        "inserted",
-    ];
-    // Chinese change verbs (no case folding needed).
-    const ZH: &[&str] = &[
-        "重构",
-        "新增",
-        "删除",
-        "修改",
-        "实现",
-        "修复",
-        "改了",
-        "改动",
-        "更新",
-        "增加",
-        "移除",
-        "重命名",
-        "替换",
-        "已添加",
-        "已修改",
-        "写入",
-        "创建",
-    ];
-    let t = text.to_lowercase();
-    if EN.iter().any(|k| t.contains(k)) {
-        return true;
-    }
-    ZH.iter().any(|k| text.contains(k))
+    umadev_agent::claims_code_changes(text)
 }
 
 /// Build the reality-anchored fact line appended to the transcript AFTER each
@@ -1250,14 +1213,14 @@ fn agentic_system_prompt(
     // is: UmaDev's senior delivery team / director with full agency, not a generic
     // assistant. Reused from the agent crate so the wording lives in one place.
     //
-    // Wave 2 (`docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §4): for an explicit `/run`
-    // director-build turn, swap the bare identity for the identity PLUS the
-    // team-orchestration levers (delegate / cross-review / verify / checkpoint), so
-    // the director knows it can summon seats, convene a review, objectively check
-    // reality, and pause for the user — and that it decides WHEN to use each, like a
-    // real senior director, not a fixed phase chain. A normal free-text turn keeps
-    // the lighter bare identity (the levers are a full-build concern). The wording
-    // lives in the agent crate (`director::director_tools_capability`).
+    // USB model (`docs/AGENT_WIELDS_BASE_ARCHITECTURE.md`, simplified — no marker
+    // protocol): for an explicit `/run` director-build turn, swap the bare identity
+    // for the FIRMWARE (identity + the team's craft/taste), so the base builds to
+    // this team's bar with the team living inside its own head. It is NOT taught any
+    // lever/marker syntax — UmaDev's QC (honesty floor + optional review) runs on
+    // UmaDev's side after the base builds. A normal free-text turn keeps the lighter
+    // bare identity (the craft block is a full-build concern). The wording lives in
+    // the agent crate (`experts::director_with_team_tools`).
     let mut p = if director_build {
         umadev_agent::experts::director_with_team_tools()
     } else {
@@ -2101,19 +2064,18 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
                                 let legacy = umadev_agent::legacy_pipeline_from_env();
                                 if host_cli && !legacy {
-                                    // DEFAULT (Wave 3): the REAL-TIME director loop.
+                                    // DEFAULT (USB model): the director build loop.
                                     // `/run` opens a live base session and drives
-                                    // `drive_director_loop`, so the director plans +
-                                    // delegates LIVE — emitting team-lever markers
-                                    // (summon / review / verify / checkpoint) that
-                                    // UmaDev mediates mid-run — instead of working
-                                    // alone inside one opaque streaming call. No
-                                    // fixed-phase continuous run is in flight, so the
-                                    // gate-resume machinery stays dormant (the director
-                                    // pauses by emitting a checkpoint marker when it
-                                    // judges a decision is the user's). The run-lock +
-                                    // governance + source-present hard-gate are held
-                                    // inside the loop's task.
+                                    // `drive_director_loop`. The firmware (team
+                                    // identity + craft) is injected; the base's body
+                                    // builds the goal end to end with its OWN tools,
+                                    // then UmaDev runs a read-only honesty/QC pass and
+                                    // feeds any blocking findings back as a fix
+                                    // directive (bounded) — no marker protocol, no
+                                    // outside "summon". No fixed-phase continuous run
+                                    // is in flight, so the gate-resume machinery stays
+                                    // dormant. The run-lock + governance + source-
+                                    // present hard-gate are held inside the loop's task.
                                     continuous_run_active = false;
                                     app.thinking = true;
                                     app.thinking_started = Some(std::time::Instant::now());
@@ -2750,28 +2712,24 @@ mod tests {
     }
 
     #[test]
-    fn director_build_prompt_carries_the_team_orchestration_levers() {
-        // Wave 2: an explicit `/run` director-build turn carries the team-tools
-        // capability — the director knows it can delegate / cross-review / verify /
-        // checkpoint, framed as its own judgement (not a fixed phase chain). A
-        // normal free-text turn (director_build = false) does NOT carry the levers.
+    fn director_build_prompt_carries_the_firmware_not_a_lever_protocol() {
+        // USB model (no marker protocol): an explicit `/run` director-build turn
+        // carries the FIRMWARE — the team identity PLUS the team's craft/taste — so
+        // the base builds to this team's bar with the team inside its own head. It is
+        // taught NO marker / lever scheduling syntax.
         let build = agentic_system_prompt(None, None, true, "", true);
         let lower = build.to_lowercase();
         // The identity is still there.
         assert!(lower.contains("umadev") && lower.contains("director"));
-        // All four levers are advertised on a director-build turn.
-        assert!(lower.contains("delegate") || lower.contains("summon"));
-        assert!(lower.contains("cross-review") || lower.contains("review team"));
-        assert!(lower.contains("verify") || lower.contains("objectively check"));
-        assert!(lower.contains("checkpoint") || lower.contains("pause for the user"));
-        // Framed as the director's choice, not a forced sequence.
-        assert!(lower.contains("judgement") || lower.contains("not a fixed checklist"));
-
-        // A normal free-text turn omits the levers (they're a full-build concern).
-        let plain = agentic_system_prompt(None, None, true, "", false);
+        // The craft block (anti-slop: no emoji icons, a real icon library, tokens).
+        assert!(build.contains("emoji"));
+        assert!(build.contains("Lucide") || build.contains("icon library"));
+        assert!(lower.contains("token"));
+        // The base is taught NO marker/lever syntax — the whole point of the
+        // simplification (the QC levers live on UmaDev's side, in director_loop).
         assert!(
-            !plain.to_lowercase().contains("team-orchestration levers"),
-            "a non-director turn must not carry the orchestration levers"
+            !build.contains("<<<umadev:"),
+            "no marker syntax is taught to the base"
         );
     }
 

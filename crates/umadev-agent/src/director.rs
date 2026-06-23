@@ -1,20 +1,27 @@
-//! Director orchestration tools — Wave 2 of
-//! `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §4 + §5.
+//! Director team capabilities — the internal Rust levers UmaDev calls during its
+//! own QC pass (the USB / smart-hardware model of
+//! `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md`, simplified: NO marker protocol).
 //!
-//! Wave 1 made `/run` and the default input drive ONE director-shaped agentic
-//! engine: the base, wearing UmaDev's senior-director-plus-team identity,
-//! autonomously wields its tools to get the goal done. Wave 2 gives that director
-//! a small set of **explicit team-orchestration tools** so it can do what a real
-//! senior director does — *delegate* a slice of work to a named seat, *convene* a
-//! parallel cross-review, *objectively check* reality, and *stop to ask the user*
-//! when a decision is theirs — instead of only ever working alone.
+//! In the USB model the base is already a complete Agent — its body builds the goal
+//! end to end with the team living inside its own head, steered by UmaDev's injected
+//! firmware (identity + craft + knowledge). UmaDev does NOT ask the base to speak a
+//! scheduling protocol to "summon a team" from the outside. Instead, these four
+//! functions are **UmaDev's OWN internal Rust capabilities**, called by
+//! [`crate::director_loop`] AFTER the base builds, to read reality and judge it:
 //!
-//! These are **capabilities the director chooses to use, on its own judgement** —
-//! NOT a fixed phase chain. A trivial goal may take one [`summon`]; a real product
-//! the director may [`summon`] several seats, [`review`] the result, [`verify`] it,
-//! and [`checkpoint`] with the user — *because the director judged the goal needs
-//! it*, not because a state machine forced it. The orchestration权 stays with the
-//! director (thinking through the base); this module only provides the levers.
+//! - [`summon`] — drive/fork ONE seat (kept as a callable capability; the build loop
+//!   itself does not summon seats, but the lever is retained for QC composition and
+//!   any caller that wants a single-seat round-trip).
+//! - [`review`] — fork the cross-review team on read-only sessions and collect
+//!   verdicts (UmaDev's QC, NOT the base summoning anyone).
+//! - [`verify`] — read an objective reality fact (source-present / build-test /
+//!   contract) deterministically; never an opinion.
+//! - [`checkpoint`] — pause for the user when the decision is theirs (trust-tiered).
+//!
+//! Crucially these are **not advertised to the base as levers it must learn** — the
+//! marker/lever PROMPT surface is retired. They are pure Rust UmaDev calls. A
+//! trivial goal needs none; a real product's QC calls [`verify`] + [`review`] and
+//! feeds blocking findings back as a fix directive the base's body acts on.
 //!
 //! Everything here is a **thin wrapper over machinery that already exists** — it
 //! reuses, never reimplements:
@@ -53,19 +60,15 @@
 //! 4. **No new endpoint.** Every tool runs over the SAME borrowed brain (the live
 //!    [`BaseSession`] + its `fork()`); no extra model endpoint, no extra API key.
 //!
-//! ## What is Wave 3 (marked, not built here)
+//! ## Why no base-facing lever protocol
 //!
-//! On the TUI's DEFAULT agentic path the base runs its own internal tool loop via
-//! a single `complete_streaming` call, so UmaDev can't intercept the base's
-//! structured tool calls mid-turn there. Wave 2 therefore exposes these tools as
-//! (a) a clean Rust API any `BaseSession`-driven director loop calls directly, and
-//! (b) a capability DESCRIPTION ([`director_tools_capability`]) injected into the
-//! director's prompt so the base knows the team levers it has. Surfacing them as
-//! LIVE base-callable tools the base invokes mid-stream (with UmaDev mediating each
-//! call and re-injecting the result) is **Wave 3**: it needs `/run` moved fully
-//! onto the `BaseSession` event-pump path so the `ToolCall` / `NeedApproval` switch
-//! can mediate a `summon` / `review` / `verify` / `checkpoint` request the way
-//! `govern_tool_call` already mediates a write.
+//! An earlier design exposed these as a marker protocol the base emitted
+//! (`<<<umadev:summon …>>>`) that UmaDev parsed and mediated. That is retired: the
+//! base is already a whole brain that builds multi-role code internally once the
+//! firmware is injected, so making it speak a scheduling protocol to summon a team
+//! from the outside was over-design. These functions remain ONLY as UmaDev's own
+//! internal Rust calls (used by [`crate::director_loop`]'s QC pass); the base never
+//! learns or emits a lever syntax.
 
 use std::sync::Arc;
 
@@ -538,44 +541,6 @@ pub fn checkpoint(
     CheckpointDecision::AskUser
 }
 
-// ===================================================================
-// capability description — what the director's prompt advertises
-// ===================================================================
-
-/// The team-tools capability block injected into the director's system prompt so
-/// the base KNOWS the levers it has — framed as **available abilities it chooses
-/// when to use**, never a fixed sequence it must march through. This is the Wave 2
-/// prompt surface: it tells the director it can delegate, cross-review, objectively
-/// check, and pause for the user — exactly when a real senior director would —
-/// while leaving the orchestration plan entirely to the director's judgement.
-///
-/// GENERALISED wording (a craft + a remit, no external product / source named),
-/// matching the rest of `experts`. Kept compact so it can ride on the work-class
-/// turn without bloating chat.
-#[must_use]
-pub fn director_tools_capability() -> &'static str {
-    "YOUR TEAM-ORCHESTRATION LEVERS (use them like a real senior director — on \
-     YOUR judgement, not a fixed checklist; a small goal may need none, a real \
-     product several):\n\
-     - DELEGATE (summon a seat): hand a slice to the right specialist — a \
-     frontend / backend engineer to build it, a PM / architect to frame it. One \
-     seat does work serially (it writes the files); you stay the director who \
-     decides who and in what order.\n\
-     - CROSS-REVIEW (convene the review team): when a slice warrants a second \
-     pair of eyes, have the relevant seats (PM / architect / designer / QA / \
-     security / backend / frontend / DevOps) review it in parallel and report \
-     must-fix findings — then YOU decide whether to send it back for rework.\n\
-     - OBJECTIVELY CHECK (verify): before you call anything done, confirm REALITY \
-     — run the real build / test / lint, check the frontend↔backend contract \
-     lines up, and confirm real source actually landed on disk. Trust the check, \
-     not your memory.\n\
-     - PAUSE FOR THE USER (checkpoint): when a decision is genuinely the user's \
-     to make — a scope fork, an irreversible call — stop and ask, rather than \
-     guessing. (In full-autonomy mode you proceed; otherwise you wait.)\n\
-     Decide the plan yourself: which levers, in what order, how much process THIS \
-     goal truly warrants. Proportionate, never ceremony for its own sake."
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,22 +882,5 @@ mod tests {
         assert!(critic_for_role("frontend").is_some(), "alias resolves");
         assert!(critic_for_role("SECURITY").is_some(), "case-insensitive");
         assert!(critic_for_role("unknown-seat").is_none());
-    }
-
-    #[test]
-    fn capability_block_advertises_levers_as_choices_not_a_fixed_chain() {
-        let c = director_tools_capability();
-        let lower = c.to_lowercase();
-        // Names all four levers.
-        assert!(lower.contains("delegate") || lower.contains("summon"));
-        assert!(lower.contains("review"));
-        assert!(lower.contains("verify"));
-        assert!(lower.contains("checkpoint") || lower.contains("pause"));
-        // Frames them as the director's own judgement, not a forced sequence.
-        assert!(lower.contains("judgement") || lower.contains("decide the plan"));
-        assert!(
-            lower.contains("not a fixed checklist") || lower.contains("never ceremony"),
-            "tools are abilities, not a fixed chain"
-        );
     }
 }

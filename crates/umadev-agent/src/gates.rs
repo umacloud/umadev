@@ -83,9 +83,75 @@ pub fn classify_reply(reply: &str) -> GateOutcome {
     GateOutcome::Revise(reply.trim().to_string())
 }
 
+/// Heuristic: does this base reply CLAIM it made code changes? Used by the director
+/// build loop to decide whether an honesty/QC read is even warranted (a pure
+/// chat/plan answer that touched no files has nothing to QC), and — at the app
+/// boundary — to anchor a "claimed-but-no-diff" warning. Deliberately broad and
+/// bilingual; a false positive only adds an advisory check, never blocks anything
+/// (the source-present floor is itself fail-open). Lives here, the agent crate's
+/// reply-classification home, so the TUI's public wrapper has ONE source of truth.
+#[must_use]
+pub fn claims_code_changes(text: &str) -> bool {
+    // English change verbs.
+    const EN: &[&str] = &[
+        "refactor",
+        "added",
+        "changed",
+        "edited",
+        "created",
+        "updated",
+        "modified",
+        "removed",
+        "deleted",
+        "implemented",
+        "renamed",
+        "rewrote",
+        "replaced",
+        "inserted",
+    ];
+    // Chinese change verbs (no case folding needed).
+    const ZH: &[&str] = &[
+        "重构",
+        "新增",
+        "删除",
+        "修改",
+        "实现",
+        "修复",
+        "改了",
+        "改动",
+        "更新",
+        "增加",
+        "移除",
+        "重命名",
+        "替换",
+        "已添加",
+        "已修改",
+        "写入",
+        "创建",
+    ];
+    let t = text.to_lowercase();
+    if EN.iter().any(|k| t.contains(k)) {
+        return true;
+    }
+    ZH.iter().any(|k| text.contains(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claims_code_changes_detects_change_verbs_bilingually() {
+        assert!(claims_code_changes(
+            "I created app.ts and updated the route"
+        ));
+        assert!(claims_code_changes("已实现登录表单，新增了失败路径测试"));
+        // A pure chat / plan answer with no change verb → no claim.
+        assert!(!claims_code_changes(
+            "Here's how I'd approach it conceptually — nothing touched."
+        ));
+        assert!(!claims_code_changes("这是我的思路，我先和你确认一下方案"));
+    }
 
     #[test]
     fn approval_tokens_match() {
