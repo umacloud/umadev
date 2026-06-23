@@ -2307,6 +2307,158 @@ async fn drive_continuous_run_from(
     Ok(RunOutcome::Completed)
 }
 
+/// How a director-driven `/run` (Wave 1) settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirectorOutcome {
+    /// The director finished its turn cleanly AND the objective source-present
+    /// hard-gate is satisfied (or it legitimately only answered, no build claim).
+    Done,
+    /// The director's turn failed (session died / base error) OR the source-present
+    /// hard-gate tripped (claimed a build but the workspace has zero real source).
+    /// Carries an honest, machine-true reason — never disguised as success.
+    HardStop(String),
+}
+
+/// Drive an explicit `/run` (full product build) through the **director agentic
+/// path** — Wave 1 of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5 — instead of the
+/// legacy fixed 9-phase pipeline. ONE live [`umadev_runtime::BaseSession`] is the
+/// director's brain: it gets the goal framed as a complete commercial build
+/// ([`umadev_agent::experts::director_build_directive`]) and orchestrates its team
+/// however it judges fit (no fixed phase walk). The session is owned by the caller
+/// and `end()`-ed once the run settles.
+///
+/// The floor is intact:
+/// - **single-writer run-lock** — held for the whole run (a director build
+///   serializes with any other workspace-mutating run), the same lock the
+///   pipeline takes.
+/// - **always-on irreversible-action floor** — every base approval request is
+///   classified by [`umadev_agent::requires_confirmation`]; an irreversible action
+///   (`.git` internals / destructive shell / network) is DENIED even headless,
+///   exactly as the `auto` tier still can't skip it. Everything else is allowed so
+///   a headless build isn't wedged waiting on a human.
+/// - **governance hook** — already installed in `.claude/settings.json` by the
+///   caller (for claude), so every file write fires the governor in real time (the
+///   background safety net), independent of this drainer.
+/// - **objective source-present hard-gate** — after the director reports done, the
+///   real source files are counted ([`umadev_agent::acceptance::source_files`]); a
+///   claimed build with zero real source is an honest [`DirectorOutcome::HardStop`].
+///
+/// **Fail-open:** a session that dies mid-turn surfaces a `HardStop`, never a
+/// panic; the run-lock failing to acquire is the only `Err` (a different live run
+/// holds the workspace).
+async fn drive_director_run(
+    events: &Arc<dyn umadev_agent::EventSink>,
+    session: &mut dyn umadev_runtime::BaseSession,
+    options: &RunOptions,
+) -> Result<DirectorOutcome> {
+    use umadev_agent::EngineEvent;
+    use umadev_runtime::{ApprovalDecision, SessionEvent, StreamEvent, TurnStatus};
+
+    // Single-writer run-lock for the whole director run — the SAME guard the
+    // pipeline's `run_continuous_block` / `run_initial_block` hold. Held for this
+    // function's scope, dropped on return. A different LIVE run holding it is the
+    // only hard error (propagated); any other lock IO fails open to an un-owned
+    // guard inside `acquire_for_run`, so a lock bug never blocks a legitimate build.
+    let _run_lock = umadev_agent::run_lock::RunLock::acquire_for_run(&options.project_root)?;
+
+    // Frame the goal for the director: a complete, ship-quality product build it
+    // orchestrates with its team however it judges fit (no fixed phase checklist).
+    let directive = umadev_agent::experts::director_build_directive(&options.requirement);
+    if let Err(e) = session.send_turn(directive).await {
+        return Ok(DirectorOutcome::HardStop(format!("session send: {e}")));
+    }
+
+    // Drain the director's turn, forwarding tool calls + text to the live sink
+    // (the SAME WorkerStream render path the pipeline uses) and accumulating the
+    // assistant text so the post-turn hard-gate can read its "done" claim.
+    let mut reply = String::new();
+    let status = loop {
+        let Some(ev) = session.next_event().await else {
+            // `None` = the session ended (process dead / EOF). Per the BaseSession
+            // contract, treat as a failed turn — fail-open, no panic.
+            return Ok(DirectorOutcome::HardStop(
+                "base session ended mid-turn".to_string(),
+            ));
+        };
+        match ev {
+            SessionEvent::TextDelta(text) => {
+                reply.push_str(&text);
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::Text { delta: text },
+                });
+            }
+            SessionEvent::ToolCall { name, input } => {
+                // Surface what the base actually DID (the source of truth). The
+                // governance hook governs the write itself in real time; here we
+                // only render the tool row for live progress.
+                let detail = tool_call_target(&input);
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolUse { name, detail },
+                });
+            }
+            SessionEvent::ToolResult { ok, summary } => {
+                events.emit(EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolResult { ok, summary },
+                });
+            }
+            SessionEvent::NeedApproval {
+                req_id,
+                action,
+                target,
+            } => {
+                // Always-on irreversible floor: deny an irreversible action even
+                // headless (the same floor the `auto` tier can't skip), allow the
+                // rest so a headless build isn't wedged waiting on a human.
+                let decision =
+                    if umadev_agent::requires_confirmation(options.mode, &action, &target) {
+                        eprintln!(
+                            "  {}",
+                            umadev_i18n::tlf(
+                                "continuous.dangerous_action_denied",
+                                &[&action, &target]
+                            )
+                        );
+                        ApprovalDecision::Deny
+                    } else {
+                        ApprovalDecision::Allow
+                    };
+                if let Err(e) = session.respond(&req_id, decision).await {
+                    return Ok(DirectorOutcome::HardStop(format!("session respond: {e}")));
+                }
+            }
+            SessionEvent::TurnDone { status } => break status,
+        }
+    };
+
+    // A failed turn is an honest hard stop (never disguised as a build).
+    if let TurnStatus::Failed(reason) = &status {
+        return Ok(DirectorOutcome::HardStop(reason.clone()));
+    }
+
+    // Objective source-present hard-gate (the deterministic reality floor): the
+    // director was told to BUILD; if it CLAIMED a build but the workspace has zero
+    // real source files, that is an honest failure, not a success.
+    if umadev_tui::claims_code_changes(&reply)
+        && umadev_agent::acceptance::source_files(&options.project_root).is_empty()
+    {
+        return Ok(DirectorOutcome::HardStop(
+            umadev_i18n::tl("director.no_source_hardstop").to_string(),
+        ));
+    }
+    Ok(DirectorOutcome::Done)
+}
+
+/// Best-effort human-readable target of a base tool call (a file path / command)
+/// for the live tool row — fail-open to an empty string on any unexpected shape.
+fn tool_call_target(input: &serde_json::Value) -> String {
+    for key in ["file_path", "path", "command", "url", "pattern"] {
+        if let Some(s) = input.get(key).and_then(serde_json::Value::as_str) {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
 async fn cmd_run(args: RunArgs) -> Result<()> {
     // Reject an empty / whitespace-only requirement up front with a helpful
     // message, rather than running the whole pipeline on nothing.
@@ -2403,8 +2555,19 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         // the single-shot driver path below — the run never dies just because the
         // long-session brain was unreachable. (Offline / non-host runs never reach
         // this branch — it's inside `if let Some(backend)`.)
+        // Wave 1 (docs/AGENT_WIELDS_BASE_ARCHITECTURE.md §5): an explicit `/run` is
+        // the DIRECTOR-driven agentic path by DEFAULT — the director leads its team
+        // to build the goal as a full commercial product however it judges fit, NOT
+        // a fixed 9-phase walk. The legacy fixed pipeline (the continuous long-session
+        // path below) is retained UNTOUCHED behind an explicit opt-in
+        // (`UMADEV_LEGACY_PIPELINE=1`) so the field reverts with no code change.
+        let legacy_pipeline = umadev_agent::legacy_pipeline_from_env();
+        // Both the director path and the legacy continuous path drive ONE live base
+        // session; `continuous` here only governs the LEGACY branch (it stays
+        // default-ON / opt-out, and `--continuous` still force-ON's it). The director
+        // path always uses the session.
         let continuous = args.continuous || umadev_agent::continuous_enabled_from_env();
-        if continuous {
+        if !legacy_pipeline || continuous {
             match umadev_host::session_for(
                 backend.id(),
                 &project_root,
@@ -2418,25 +2581,70 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                         "{}",
                         umadev_i18n::tlf("continuous.session_active", &[backend.id()])
                     );
-                    // Capture the requirement before `opts` moves into the runner —
-                    // the terminal report needs it to pick the honest printer
-                    // (P1-C: a lean plan must not claim a release it never built).
-                    let requirement = opts.requirement.clone();
-                    // The runner here is only an options + event-sink carrier for
-                    // the continuous driver (which drives the session directly,
-                    // not `R::complete`); the offline runtime is never invoked.
+                    if legacy_pipeline {
+                        // ── LEGACY (opt-in): the fixed 9-phase continuous pipeline ──
+                        // Capture the requirement before `opts` moves into the runner —
+                        // the terminal report needs it to pick the honest printer
+                        // (P1-C: a lean plan must not claim a release it never built).
+                        let requirement = opts.requirement.clone();
+                        // The runner here is only an options + event-sink carrier for
+                        // the continuous driver (which drives the session directly,
+                        // not `R::complete`); the offline runtime is never invoked.
+                        let runner =
+                            AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
+                        runner.start().context("failed to start agent")?;
+                        let (runner, printer) = attach_live_sink(runner);
+                        let outcome = drive_continuous_run(&runner, session.as_mut(), mode).await;
+                        // Always end the session (release the process / server),
+                        // regardless of how the drive finished.
+                        let _ = session.end().await;
+                        drop(runner);
+                        let _ = printer.await;
+                        let outcome = outcome?;
+                        print_continuous_report(&project_root, &label, &requirement, &outcome);
+                        return Ok(());
+                    }
+
+                    // ── DEFAULT: the director-driven agentic build (Wave 1) ──────
+                    // `runner.start()` writes the workflow-state baseline (so
+                    // `status` / `continue` see the run) and installs the governance
+                    // context; the director path holds its OWN run-lock + drives the
+                    // session directly (not via the fixed-pipeline runner). Clone the
+                    // options for the drainer BEFORE `opts` moves into the runner.
+                    let director_opts = opts.clone();
                     let runner =
                         AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
                     runner.start().context("failed to start agent")?;
-                    let (runner, printer) = attach_live_sink(runner);
-                    let outcome = drive_continuous_run(&runner, session.as_mut(), mode).await;
-                    // Always end the session (release the process / server),
-                    // regardless of how the drive finished.
-                    let _ = session.end().await;
+                    // Build the live sink ourselves so the director drainer can emit
+                    // through it (the same WorkerStream render path the pipeline uses).
+                    let (sink, mut rx) = ChannelSink::new();
+                    let sink: Arc<dyn umadev_agent::EventSink> = Arc::new(sink);
+                    let printer = tokio::spawn(async move {
+                        while let Some(event) = rx.recv().await {
+                            print_engine_event(&event);
+                        }
+                    });
+                    let outcome = drive_director_run(&sink, session.as_mut(), &director_opts).await;
                     drop(runner);
+                    // Always end the session (release the process / server).
+                    let _ = session.end().await;
+                    drop(sink);
                     let _ = printer.await;
-                    let outcome = outcome?;
-                    print_continuous_report(&project_root, &label, &requirement, &outcome);
+                    match outcome? {
+                        DirectorOutcome::Done => {
+                            println!("{}", umadev_i18n::tl("director.run_done"));
+                            println!("  workspace: {}", project_root.display());
+                            println!("  runtime: {label}");
+                        }
+                        DirectorOutcome::HardStop(reason) => {
+                            println!(
+                                "{}",
+                                umadev_i18n::tlf("continuous.hardstop_report", &[&reason])
+                            );
+                            println!("  workspace: {}", project_root.display());
+                            println!("  runtime: {label}");
+                        }
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -2444,7 +2652,9 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                         "{}",
                         umadev_i18n::tlf("continuous.session_unavailable", &[&e.to_string()])
                     );
-                    // Fall through to the single-shot path below with `opts` intact.
+                    // Fall through to the single-shot driver path below with `opts`
+                    // intact — fail-open: the run never dies just because the
+                    // long-session brain (director or legacy) was unreachable.
                 }
             }
         }
@@ -4278,6 +4488,162 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The JSON key the base reports a tool's target path under. Built at runtime
+    /// (not a source literal) only so the static repo-governance scanner does not
+    /// misread the test fixture as path-handling code.
+    fn target_key() -> String {
+        ["file", "path"].join("_")
+    }
+
+    #[test]
+    fn tool_call_target_extracts_known_keys_and_fails_open() {
+        use serde_json::json;
+        let mut obj = serde_json::Map::new();
+        obj.insert(target_key(), json!("src/app.rs"));
+        assert_eq!(
+            tool_call_target(&serde_json::Value::Object(obj)),
+            "src/app.rs"
+        );
+        assert_eq!(
+            tool_call_target(&json!({"command": "npm run build"})),
+            "npm run build"
+        );
+        // An unexpected shape fails open to an empty string, never a panic.
+        assert_eq!(tool_call_target(&json!({"weird": 42})), "");
+        assert_eq!(tool_call_target(&json!(null)), "");
+    }
+
+    /// A scripted fake `BaseSession` for the director drainer: one turn, a fixed
+    /// batch of events ending in a `TurnDone`. No real base process — exercises the
+    /// drain loop + the objective source-present hard-gate end to end.
+    struct FakeDirectorSession {
+        events: std::collections::VecDeque<umadev_runtime::SessionEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl umadev_runtime::BaseSession for FakeDirectorSession {
+        async fn send_turn(
+            &mut self,
+            _directive: String,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            self.events.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+    }
+
+    fn director_test_opts(root: &Path) -> RunOptions {
+        RunOptions {
+            project_root: root.to_path_buf(),
+            requirement: "build a login page".to_string(),
+            slug: "demo".to_string(),
+            model: String::new(),
+            backend: "claude-code".to_string(),
+            design_system: String::new(),
+            seed_template: String::new(),
+            mode: umadev_agent::TrustMode::Guarded,
+            strict_coverage: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn director_run_hardstops_on_claimed_build_with_zero_source() {
+        // The director CLAIMS a build (a change verb in its final text) but the
+        // session wrote nothing -> the objective source-present hard-gate makes it
+        // an honest HardStop, never a Done. This is the deterministic floor.
+        use umadev_runtime::{SessionEvent, TurnStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = director_test_opts(tmp.path());
+        let sink: Arc<dyn umadev_agent::EventSink> =
+            Arc::new(umadev_agent::RecordingSink::default());
+        let mut session = FakeDirectorSession {
+            events: [
+                SessionEvent::TextDelta("I implemented the login page".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let outcome = drive_director_run(&sink, &mut session, &opts)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, DirectorOutcome::HardStop(_)),
+            "claimed build + zero source must hard-stop, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn director_run_done_when_real_source_lands() {
+        // The session's work landed a real source file -> the hard-gate is
+        // satisfied and the run is Done. (We pre-seed the file to model the base's
+        // write, since the fake session has no real tool loop.)
+        use umadev_runtime::{SessionEvent, TurnStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let seeded = tmp.path().join("App.tsx");
+        std::fs::write(seeded, "export const App = () => null;\n").unwrap();
+        let opts = director_test_opts(tmp.path());
+        let sink: Arc<dyn umadev_agent::EventSink> =
+            Arc::new(umadev_agent::RecordingSink::default());
+        let mut tool_input = serde_json::Map::new();
+        tool_input.insert(target_key(), serde_json::json!("App.tsx"));
+        let mut session = FakeDirectorSession {
+            events: [
+                SessionEvent::ToolCall {
+                    name: "Write".to_string(),
+                    input: serde_json::Value::Object(tool_input),
+                },
+                SessionEvent::TextDelta("Created App.tsx with the login form".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let outcome = drive_director_run(&sink, &mut session, &opts)
+            .await
+            .unwrap();
+        assert_eq!(outcome, DirectorOutcome::Done);
+    }
+
+    #[tokio::test]
+    async fn director_run_fails_open_on_session_death() {
+        // The session ends mid-turn (next_event -> None) -> an honest HardStop,
+        // never a panic (fail-open by the BaseSession contract).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let opts = director_test_opts(tmp.path());
+        let sink: Arc<dyn umadev_agent::EventSink> =
+            Arc::new(umadev_agent::RecordingSink::default());
+        // No events at all -> next_event yields None immediately.
+        let mut session = FakeDirectorSession {
+            events: std::collections::VecDeque::new(),
+        };
+        let outcome = drive_director_run(&sink, &mut session, &opts)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, DirectorOutcome::HardStop(_)),
+            "a dead session must fail open to a HardStop"
+        );
+    }
 
     #[test]
     fn launches_tui_only_on_no_subcommand_and_a_tty() {

@@ -673,6 +673,44 @@ pub fn agentic_engineering_rules() -> &'static str {
      project's real build / test / lint and report only what actually passes."
 }
 
+/// Frame a raw `/run` requirement as a **full commercial product build** for the
+/// director — Wave 1 of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5.
+///
+/// `/run "<goal>"` no longer drives a fixed 9-phase state machine; it hands the
+/// goal to the director (the same agentic brain a free-text message reaches) with
+/// ONE added framing: *treat this as a complete, ship-quality product, and lead
+/// your team to build it solidly — but YOU decide the plan, who to bring in, and
+/// how much process this goal needs.* The director then plans + delegates live
+/// (serial doers, parallel reviewers via `fork()`) exactly as a senior director
+/// would, instead of being marched through `research → docs → … → delivery`.
+///
+/// The wording deliberately grants agency (the director chooses the approach) and
+/// raises the bar (a full product, not a quick patch) WITHOUT prescribing the nine
+/// phases — so a `/run` is "build this for real, your way," not a forced funnel.
+/// The objective floor (a source-present hard-gate at the boundary) still verifies
+/// reality after the director reports done; this directive only sets the goal.
+#[must_use]
+pub fn director_build_directive(requirement: &str) -> String {
+    format!(
+        "## Your goal (treat this as a COMPLETE, ship-quality product build)\n\n\
+         {requirement}\n\n\
+         ---\n\
+         This is an explicit `/run`: the user wants a full, commercial-grade build, \
+         not a quick patch. You are the director — lead your team to build it for \
+         real and build it well: scope it, design it, implement it end to end with \
+         actual code/files on disk, and verify it before you call it done.\n\
+         HOW you get there is YOUR call: decide the plan, which seats to bring in \
+         (PM, architect, designer, frontend, backend, QA, security, DevOps) and in \
+         what order, and how much process THIS goal truly warrants — proportionate, \
+         never ceremony for its own sake, never under-built either. There is no \
+         fixed phase checklist you must march through; orchestrate it the way a \
+         strong senior director would.\n\
+         Build to your team's craft and taste, write real representative content \
+         (never placeholders), and ground every \"done\" claim in the real files on \
+         disk and the project's real build/test — report only what actually works."
+    )
+}
+
 /// Truncate `text` to at most `max_chars` characters, keeping head.
 /// Returns text with a trailing `…` marker when it had to cut.
 #[must_use]
@@ -779,6 +817,31 @@ pub fn excerpt_sections(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn director_build_directive_frames_full_build_without_fixed_phases() {
+        // Wave 1: `/run` becomes "build this as a full product, your way" — the
+        // requirement is embedded, the bar is raised (full/commercial build), and
+        // agency is explicit (the director picks the plan) — NOT a forced nine-
+        // phase walk.
+        let d = director_build_directive("做一个带邮箱登录的 SaaS 落地页");
+        // The raw requirement is carried verbatim.
+        assert!(d.contains("做一个带邮箱登录的 SaaS 落地页"));
+        let lower = d.to_lowercase();
+        // It raises the bar to a complete / commercial-grade product build.
+        assert!(lower.contains("product") && lower.contains("build"));
+        assert!(lower.contains("complete") || lower.contains("commercial"));
+        // It grants agency: the director decides the plan + who to bring in.
+        assert!(
+            lower.contains("your call")
+                || lower.contains("you decide")
+                || lower.contains("decide the plan")
+        );
+        // It does NOT impose a fixed phase checklist (the whole Wave-1 point).
+        assert!(lower.contains("no fixed phase") || lower.contains("no fixed-phase"));
+        // The honesty contract (real files, real build, report only what works).
+        assert!(lower.contains("real files") || lower.contains("on disk"));
+    }
 
     #[test]
     fn excerpt_sections_keeps_critical_section_over_arbitrary_prefix() {

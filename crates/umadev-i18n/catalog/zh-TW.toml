@@ -587,6 +587,8 @@
 "continuous.plan_mode_skip" = "[plan] 計畫模式(唯讀):不執行 spec/前端/後端,未寫入真實程式碼。"
 "continuous.phase_failed" = "[fail] {} 階段失敗:{} —— 持續會話路徑停止。"
 "continuous.no_source_hardstop" = "[fail] 未產出真實程式碼 —— 流水線停止,未交付(持續會話路徑硬關卡)。"
+"director.run_done" = "UmaDev —— 總監已完成本次建置。"
+"director.no_source_hardstop" = "UmaDev —— 總監聲稱完成了建置,但工作區沒有任何真實原始碼檔案:依客觀核對,本次建置判為未完成(總監路徑硬關卡)。"
 "continuous.dangerous_action_denied" = "[gate] 危險動作需使用者確認,本回合按拒絕處理:{} -> {}"
 "continuous.tool_call_blocked" = "[gov] {} 階段:底座工具呼叫觸發 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 階段被截斷(底座到達回合上限),保留已產出,繼續。"

@@ -192,6 +192,11 @@ fn run_with_backend_drives_a_fake_host_cli() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&fake, perms).unwrap();
 
+    // This test asserts on the FIXED-pipeline artifacts (`output/demo-research.md`
+    // etc.). Wave 1 made the DIRECTOR-driven agentic path the default for `/run`
+    // (it orchestrates freely and produces no fixed phase artifacts), so pin the
+    // legacy fixed pipeline explicitly with `UMADEV_LEGACY_PIPELINE=1` — this test
+    // is the legacy pipeline's coverage, and the director path has its own.
     let status = Command::new(bin())
         .args([
             "run",
@@ -203,6 +208,7 @@ fn run_with_backend_drives_a_fake_host_cli() {
         ])
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
+        .env("UMADEV_LEGACY_PIPELINE", "1")
         .status()
         .expect("umadev run --backend should be invocable");
     assert!(status.success(), "run --backend failed: {status}");
@@ -212,6 +218,7 @@ fn run_with_backend_drives_a_fake_host_cli() {
         .args(["continue", "--backend", "claude-code"])
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
+        .env("UMADEV_LEGACY_PIPELINE", "1")
         .status()
         .expect("continue should be invocable");
     assert!(status2.success(), "continue --backend failed: {status2}");
@@ -255,6 +262,10 @@ echo 'driven via fake claude across all phases'
     perms.set_mode(0o755);
     std::fs::set_permissions(&fake, perms).unwrap();
 
+    // Asserts on FIXED-pipeline artifacts + workflow-state phases, so it pins the
+    // legacy fixed pipeline (`UMADEV_LEGACY_PIPELINE=1`) — Wave 1 made the
+    // director-driven agentic path the default for `/run`, which produces no fixed
+    // phase artifacts. This test is the legacy pipeline's full-chain coverage.
     let run_with_host = |args: &[&str]| {
         let status = Command::new(bin())
             .args(args)
@@ -262,6 +273,7 @@ echo 'driven via fake claude across all phases'
             .env("UMADEV_CLAUDE_BIN", &fake)
             .env("UMADEV_RETRY_BASE_MS", "1")
             .env("UMADEV_WORKER_TIMEOUT", "30")
+            .env("UMADEV_LEGACY_PIPELINE", "1")
             .status()
             .expect("umadev should invoke");
         assert!(status.success(), "umadev {:?} failed: {status}", args);
@@ -325,6 +337,9 @@ fn backend_captures_stdout_and_tolerates_stderr() {
     perms.set_mode(0o755);
     std::fs::set_permissions(&fake, perms).unwrap();
 
+    // Asserts on the fixed-pipeline research artifact, so pin the legacy pipeline
+    // (`UMADEV_LEGACY_PIPELINE=1`) — the director-driven default produces no fixed
+    // phase artifacts (Wave 1). This is the legacy path's stdout/stderr coverage.
     let status = Command::new(bin())
         .args([
             "run",
@@ -336,6 +351,7 @@ fn backend_captures_stdout_and_tolerates_stderr() {
         ])
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
+        .env("UMADEV_LEGACY_PIPELINE", "1")
         .status()
         .expect("run --backend should invoke");
     assert!(
@@ -347,6 +363,7 @@ fn backend_captures_stdout_and_tolerates_stderr() {
         .args(["continue", "--backend", "claude-code"])
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
+        .env("UMADEV_LEGACY_PIPELINE", "1")
         .status()
         .expect("continue should work");
     assert!(s2.success(), "continue failed: {s2}");
@@ -392,6 +409,10 @@ fn backend_timeout_falls_back_without_hanging() {
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_WORKER_TIMEOUT", "1")
+        // Pins the legacy fixed pipeline: this asserts the pipeline's offline
+        // timeout-fallback artifact (`output/timeout-research.md`), which the
+        // director-driven default (Wave 1) does not produce.
+        .env("UMADEV_LEGACY_PIPELINE", "1")
         .status();
     // The process must have terminated (either success via fallback, or a
     // bounded exit) — the key assertion is "did not hang". A timeout of the

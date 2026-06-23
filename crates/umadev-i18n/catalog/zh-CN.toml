@@ -587,6 +587,8 @@
 "continuous.plan_mode_skip" = "[plan] 计划模式(只读):不执行 spec/前端/后端,未写入真实代码。"
 "continuous.phase_failed" = "[fail] {} 阶段失败:{} —— 持续会话路径停止。"
 "continuous.no_source_hardstop" = "[fail] 未产出真实代码 —— 流水线停止,未交付(持续会话路径硬门)。"
+"director.run_done" = "UmaDev —— 总监已完成本次构建。"
+"director.no_source_hardstop" = "UmaDev —— 总监声称完成了构建,但工作区没有任何真实源码文件:按客观核对,本次构建判为未完成(总监路径硬门)。"
 "continuous.dangerous_action_denied" = "[gate] 危险动作需用户确认,本回合按拒绝处理:{} -> {}"
 "continuous.tool_call_blocked" = "[gov] {} 阶段:底座工具调用触发 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 阶段被截断(底座到达回合上限),保留已产出,继续。"

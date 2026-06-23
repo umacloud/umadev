@@ -68,7 +68,10 @@ pub use adopt::{
     is_adopted, load_project_source_index, read_adopt_marker, run_adopt, AdoptReport,
     DetectedCommand,
 };
-pub use continuous::{continuous_enabled_from_env, run_block as run_continuous_block, RunOutcome};
+pub use continuous::{
+    continuous_enabled_from_env, legacy_pipeline_from_env, run_block as run_continuous_block,
+    RunOutcome,
+};
 pub use critics::{
     append_team_ledger, docs_team_for_kind, preview_team_for_kind, quality_team_for_kind,
     ArchitectureCritic, BackendCritic, CriticArtifacts, CriticConsult, DevOpsCritic,

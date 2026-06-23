@@ -430,6 +430,10 @@ mod tests {
             "continuous.governance_clean",
             "continuous.governance_remaining",
             "continuous.governance_rework_intro",
+            // Wave 1 (director-driven `/run`): the director path's terminal report
+            // + its objective source-present hard-stop.
+            "director.run_done",
+            "director.no_source_hardstop",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

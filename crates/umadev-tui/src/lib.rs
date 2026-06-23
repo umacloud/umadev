@@ -659,6 +659,17 @@ struct AgenticTurn {
     fallback_model: String,
     /// Project root — the cwd the base subprocess runs in (it reads/writes here).
     project_root: std::path::PathBuf,
+    /// **Director-build mode** (Wave 1 of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md`
+    /// §5): set when this turn is an explicit `/run` routed through the director
+    /// agentic path instead of the legacy fixed pipeline. When `true` the turn
+    /// (a) holds the single-writer run-lock for its whole duration (so a director
+    /// build serializes with any other workspace-mutating run), and (b) runs the
+    /// objective **source-present hard-gate** after the stream — if the director
+    /// reported a build but the workspace has zero real source files, an honest
+    /// abort note is emitted (the deterministic floor verifying reality, never
+    /// disguising "claimed done" as success). A normal free-text turn leaves this
+    /// `false` and keeps the lighter git-diff fact line only.
+    director_build: bool,
 }
 
 /// Spawn the tools-enabled agentic execution call. UNLIKE [`spawn_route`], this
@@ -687,10 +698,35 @@ fn spawn_agentic(
         session_id,
         fallback_model,
         project_root,
+        director_build,
     } = turn;
     tokio::spawn(async move {
         let label = spec.label();
         let model = route_model_for_spec(&spec, fallback_model);
+        // Director-build (`/run`): take the single-writer run-lock for the whole
+        // turn so a full product build serializes with any other workspace-mutating
+        // run, exactly like the legacy pipeline does (`run_continuous_block` /
+        // `run_initial_block` both hold it). The guard lives for the task's scope
+        // and drops on return. Fail-open: a lock held by a DIFFERENT live run is an
+        // honest terminal abort (the same `ABORT_SENTINEL` the pipeline uses); any
+        // other lock IO fails open inside `acquire_for_run` to an un-owned guard, so
+        // a lock bug never blocks a legitimate build. A normal free-text turn takes
+        // NO lock (it's a single serialized chat session, not a parallel writer).
+        let _run_lock = if director_build {
+            match umadev_agent::run_lock::RunLock::acquire_for_run(&project_root) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    sink.emit(EngineEvent::Note(format!(
+                        "{ABORT_SENTINEL}{}",
+                        block_abort_note(&e, &label)
+                    )));
+                    let _ = route_tx.send(RouteDecision::Failed(start_failed_note(&e)));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         // Resume the SAME chat session the conversation already uses, so the
         // agentic turn sees the prior dialogue (and leaves its work in the same
         // session for follow-up chat). Mirrors `spawn_route`'s resume wiring.
@@ -710,6 +746,7 @@ fn spawn_agentic(
             &model,
             &label,
             &project_root,
+            director_build,
             &sink,
             &route_tx,
         )
@@ -822,7 +859,8 @@ fn changed_files_between(before: &str, after: &str) -> Vec<String> {
 /// to anchor a pure-chat reply that recites an edit it never made (a base that
 /// misclassified a status question as chat). Deliberately broad and bilingual; a
 /// false positive only adds an advisory note, never blocks anything.
-pub(crate) fn claims_code_changes(text: &str) -> bool {
+#[must_use]
+pub fn claims_code_changes(text: &str) -> bool {
     // English change verbs.
     const EN: &[&str] = &[
         "refactor",
@@ -904,6 +942,44 @@ fn agentic_fact_line(changed: Option<&[String]>, claimed: bool) -> Option<String
             list.push_str(&format!(" ... (+{})", changed.len() - MAX));
         }
         Some(format!("[note] 本轮实际文件变更: {list}"))
+    }
+}
+
+/// The objective **source-present hard-gate** for a director-build (`/run`) turn —
+/// Wave 1 of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5.
+///
+/// An explicit `/run` told the director to BUILD a full product. After it reports
+/// done, this verifies the RESULT against reality: count the real source files in
+/// the workspace (`acceptance::source_files` — the SAME bounded scan the pipeline's
+/// no-source hard stop uses). When the director's reply CLAIMS it built / changed
+/// code (`claims_code_changes`) but the workspace has **zero** real source files,
+/// that is an honest failure — return a loud terminal-abort note (prefixed with
+/// [`ABORT_SENTINEL`] so the bar paints a real aborted state) instead of letting a
+/// no-op read as a clean success.
+///
+/// This checks RESULT, never route: a director that legitimately just answered
+/// (no build claim) returns `None` (no gate fires), and a build that produced even
+/// one real source file passes. **Fail-open:** never panics; the worst case is a
+/// missing advisory, never a blocked turn. Returns `None` when the gate is
+/// satisfied (or not applicable).
+fn director_source_hardgate(project_root: &std::path::Path, reply: &str) -> Option<String> {
+    // Only judge a reply that CLAIMS a build/change — a director that just
+    // answered (e.g. "this is already implemented") is not failing by producing
+    // no new source. This mirrors the agentic fact-line's claim heuristic so the
+    // two reality checks agree on what "claimed work" means.
+    if !claims_code_changes(reply) {
+        return None;
+    }
+    let source = umadev_agent::acceptance::source_files(project_root);
+    if source.is_empty() {
+        Some(format!(
+            "{ABORT_SENTINEL}[warn] 总监声称完成了构建,但工作区没有任何真实源码文件 —— \
+             按客观核对这一轮判为未完成,请核对 / the director reported a build but the \
+             workspace has ZERO real source files — objectively this run did not \
+             produce code; treated as not done"
+        ))
+    } else {
+        None
     }
 }
 
@@ -1142,12 +1218,20 @@ fn agentic_system_prompt(
 /// 3. **Truncation honesty** — a `Warning`/error stream finish carries an
 ///    "may be incomplete / not flushed to disk" caveat instead of reading as a
 ///    clean success.
+/// 4. **Director-build hard-gate** (only when `director_build`) — after the turn,
+///    an objective source-present check (`acceptance::source_files`): a `/run`
+///    that claimed a build but produced zero real source is reported honestly.
+// A cohesive internal driver: every parameter is load-bearing context for the
+// one streaming call + its four reality guards. Splitting it into a struct would
+// only obscure the data flow, so the arg-count lint is allowed here.
+#[allow(clippy::too_many_arguments)]
 async fn drive_agentic_stream(
     brain: &dyn Runtime,
     task: &str,
     model: &str,
     label: &str,
     project_root: &std::path::Path,
+    director_build: bool,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) {
@@ -1236,6 +1320,22 @@ async fn drive_agentic_stream(
                      / turn may be incomplete or not fully written — verify the working tree",
                 );
             }
+            // (4) Director-build hard-gate — the deterministic reality floor for
+            // an explicit `/run` (Wave 1). The director was told to BUILD a full
+            // product; after it reports done we OBJECTIVELY check whether real
+            // source actually landed on disk (`acceptance::source_files`). If the
+            // director claimed a build but the workspace has zero real source
+            // files, that is an honest FAILURE — not a success to celebrate — so we
+            // append a loud terminal abort note (carrying `ABORT_SENTINEL` so the
+            // bar shows a real aborted state, like the pipeline's no-source hard
+            // stop). This verifies RESULT, it does not dictate the route: a
+            // director that legitimately only answered a question (claimed no build)
+            // is left alone. Fail-open: skipped entirely for a non-director turn.
+            if director_build {
+                if let Some(note) = director_source_hardgate(project_root, &reply) {
+                    sink.emit(EngineEvent::Note(note));
+                }
+            }
             // The body already streamed live; hand the assembled text to the
             // event loop ONLY to record it as the assistant turn. An empty body
             // (the base emitted only tool calls / a side-effect) is still a clean
@@ -1290,6 +1390,61 @@ fn fire_agentic(
             session_id,
             fallback_model: app.effective_model(),
             project_root: app.project_root.clone(),
+            // A free-text turn is NOT a director build: no run-lock, no
+            // source-present hard-gate — just the lighter git-diff fact line.
+            director_build: false,
+        },
+        sink.clone(),
+        route_tx.clone(),
+    );
+    if host_cli {
+        app.host_chat_session_active = true;
+    }
+    handle
+}
+
+/// Fire an explicit `/run` (full product build) through the SAME director agentic
+/// engine a free-text message reaches (Wave 1 of
+/// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5) — NOT the legacy fixed 9-phase
+/// pipeline. The raw requirement is framed as a complete commercial build via
+/// [`experts::director_build_directive`], and the turn runs in **director-build
+/// mode**: it holds the single-writer run-lock and is checked by the objective
+/// source-present hard-gate after it reports done. Everything else (resume the
+/// chat session, the live `WorkerStream` render, Ctrl-C abort via `run_task`) is
+/// shared with [`fire_agentic`] — `/run` and a typed requirement now run ONE
+/// engine, differing only in the build framing + the build-mode floor.
+fn fire_director_build(
+    app: &mut App,
+    sink: &Arc<ChannelSink>,
+    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    requirement: String,
+) -> tokio::task::JoinHandle<()> {
+    let spec = app.brain_spec();
+    let host_cli = matches!(spec, BrainSpec::HostCli(_));
+    let continue_session = app.host_chat_session_active;
+    let session_id = if host_cli {
+        Some(app.ensure_chat_session_id())
+    } else {
+        None
+    };
+    // Keep the waiting state alive through the (potentially long) build loop.
+    app.thinking = true;
+    app.thinking_started = Some(std::time::Instant::now());
+    app.last_output_at = None;
+    app.tool_in_progress = false;
+    app.agentic_in_flight = true;
+    // Frame the goal for the director: a full, ship-quality product build it
+    // orchestrates with its team however it judges fit (no fixed phase walk).
+    let task = umadev_agent::experts::director_build_directive(&requirement);
+    let handle = spawn_agentic(
+        AgenticTurn {
+            task,
+            spec,
+            continue_session,
+            session_id,
+            fallback_model: app.effective_model(),
+            project_root: app.project_root.clone(),
+            director_build: true,
         },
         sink.clone(),
         route_tx.clone(),
@@ -1862,47 +2017,67 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 app.cancel_run();
                             }
                             Action::StartRun(req) => {
-                                let run_opts = RunOptions {
-                                    project_root: opts.project_root.clone(),
-                                    requirement: req,
-                                    slug: opts.slug.clone(),
-                                    model: app.effective_model(),
-                                    backend: app.backend.clone().unwrap_or_default(),
-                                    design_system: app.config.design_system.clone().unwrap_or_default(),
-                                    seed_template: app.config.seed_template.clone().unwrap_or_default(),
-                                    mode: app.effective_trust_mode(),
-                                    // Snapshot the strict-coverage opt-in once at
-                                    // the app boundary; the runner reads this, not
-                                    // the live env (which races in parallel).
-                                    strict_coverage: umadev_agent::strict_coverage_from_env(),
-                                };
-                                // P1-E: an explicit `/run` must drive the SAME engine
-                                // a direct-input run does — when continuous is on and
-                                // the brain is a host CLI, the director run goes
-                                // through the persistent session (`spawn_continuous_block`),
-                                // NOT a single-shot `Block::Clarify`. Otherwise the
-                                // same intent typed two ways (chat vs `/run`) would
-                                // run two different engines with two different gate
-                                // sets. Offline / non-host brains stay single-shot.
+                                // Wave 1 (docs/AGENT_WIELDS_BASE_ARCHITECTURE.md §5):
+                                // an explicit `/run` is now the DIRECTOR-driven agentic
+                                // path by default — the SAME engine a free-text message
+                                // reaches — with the goal framed as a full commercial
+                                // build the director orchestrates with its team however
+                                // it judges fit, NOT the fixed 9-phase pipeline. The
+                                // legacy pipeline is retained UNTOUCHED behind an
+                                // explicit opt-in (`UMADEV_LEGACY_PIPELINE=1`) so the
+                                // field reverts with no code change. A host CLI is
+                                // required for the director path (it drives a real base
+                                // session); offline / non-host brains and the legacy
+                                // flag both fall through to the pipeline below.
                                 let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
-                                continuous_run_active = tui_continuous_enabled() && host_cli;
-                                run_task = Some(if continuous_run_active {
-                                    let autonomous = continuous_autonomous(run_opts.mode);
-                                    spawn_continuous_block(
-                                        run_opts,
-                                        sink.clone(),
-                                        session_holder.clone(),
-                                        umadev_spec::Phase::Research,
-                                        autonomous,
-                                    )
+                                let legacy = umadev_agent::legacy_pipeline_from_env();
+                                if host_cli && !legacy {
+                                    // DEFAULT: the director build. No fixed-phase
+                                    // continuous run is in flight, so the gate-resume
+                                    // machinery stays dormant (the director pauses by
+                                    // asking the user inside its own turn when it judges
+                                    // a decision is theirs).
+                                    continuous_run_active = false;
+                                    run_task =
+                                        Some(fire_director_build(app, &sink, &route_tx, req));
                                 } else {
-                                    spawn_block(
-                                        run_opts,
-                                        app.brain_spec(),
-                                        sink.clone(),
-                                        Block::Clarify,
-                                    )
-                                });
+                                    // LEGACY (opt-in) or offline / non-host: drive the
+                                    // fixed pipeline exactly as before. Continuous is
+                                    // the default within the legacy pipeline itself; a
+                                    // non-host brain stays single-shot `Block::Clarify`.
+                                    let run_opts = RunOptions {
+                                        project_root: opts.project_root.clone(),
+                                        requirement: req,
+                                        slug: opts.slug.clone(),
+                                        model: app.effective_model(),
+                                        backend: app.backend.clone().unwrap_or_default(),
+                                        design_system: app.config.design_system.clone().unwrap_or_default(),
+                                        seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                                        mode: app.effective_trust_mode(),
+                                        // Snapshot the strict-coverage opt-in once at
+                                        // the app boundary; the runner reads this, not
+                                        // the live env (which races in parallel).
+                                        strict_coverage: umadev_agent::strict_coverage_from_env(),
+                                    };
+                                    continuous_run_active = tui_continuous_enabled() && host_cli;
+                                    run_task = Some(if continuous_run_active {
+                                        let autonomous = continuous_autonomous(run_opts.mode);
+                                        spawn_continuous_block(
+                                            run_opts,
+                                            sink.clone(),
+                                            session_holder.clone(),
+                                            umadev_spec::Phase::Research,
+                                            autonomous,
+                                        )
+                                    } else {
+                                        spawn_block(
+                                            run_opts,
+                                            app.brain_spec(),
+                                            sink.clone(),
+                                            Block::Clarify,
+                                        )
+                                    });
+                                }
                             }
                             Action::StartQuick(task) => {
                                 // Lightweight fast track — same RunOptions as a
@@ -2359,6 +2534,7 @@ mod tests {
             "m",
             "claude-code",
             tmp.path(),
+            false,
             &sink,
             &route_tx,
         )
@@ -2412,6 +2588,7 @@ mod tests {
             "m",
             "claude-code",
             tmp.path(),
+            false,
             &sink,
             &route_tx,
         )
@@ -2680,7 +2857,17 @@ mod tests {
             warn: false,
             effect: Box::new(move || std::fs::write(&target, "fn x").unwrap()),
         };
-        drive_agentic_stream(&spy, "do it", "m", "claude-code", &path, &sink, &route_tx).await;
+        drive_agentic_stream(
+            &spy,
+            "do it",
+            "m",
+            "claude-code",
+            &path,
+            false,
+            &sink,
+            &route_tx,
+        )
+        .await;
 
         let mut fact = None;
         while let Ok(ev) = engine_rx.try_recv() {
@@ -2716,6 +2903,7 @@ mod tests {
             "m",
             "claude-code",
             &path,
+            false,
             &sink,
             &route_tx,
         )
@@ -2749,7 +2937,17 @@ mod tests {
             warn: true,
             effect: Box::new(|| ()),
         };
-        drive_agentic_stream(&spy, "go", "m", "claude-code", &path, &sink, &route_tx).await;
+        drive_agentic_stream(
+            &spy,
+            "go",
+            "m",
+            "claude-code",
+            &path,
+            false,
+            &sink,
+            &route_tx,
+        )
+        .await;
 
         match route_rx.try_recv() {
             Ok(RouteDecision::AgenticDone(text)) => {
@@ -2777,7 +2975,17 @@ mod tests {
             warn: false,
             effect: Box::new(|| ()),
         };
-        drive_agentic_stream(&spy, "go", "m", "claude-code", &path, &sink, &route_tx).await;
+        drive_agentic_stream(
+            &spy,
+            "go",
+            "m",
+            "claude-code",
+            &path,
+            false,
+            &sink,
+            &route_tx,
+        )
+        .await;
 
         // No [warn]/fact Note despite a loud claim — git was unavailable.
         while let Ok(ev) = engine_rx.try_recv() {
@@ -2787,6 +2995,106 @@ mod tests {
             }
         }
         // The turn still finishes cleanly.
+        assert!(matches!(
+            route_rx.try_recv(),
+            Ok(RouteDecision::AgenticDone(_))
+        ));
+    }
+
+    // ── Wave 1: the director-build (`/run`) source-present hard-gate ───────
+
+    #[test]
+    fn director_hardgate_aborts_on_claimed_build_with_zero_source() {
+        // The deterministic floor: the director claims a build but the workspace
+        // has ZERO real source files -> an honest, loud terminal abort (carrying
+        // the ABORT_SENTINEL), never a clean success.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let note = director_source_hardgate(tmp.path(), "I implemented the whole login page")
+            .expect("a claimed build with no source must trip the hard-gate");
+        assert!(
+            note.starts_with(ABORT_SENTINEL),
+            "carries the abort sentinel"
+        );
+        assert!(note.contains("[warn]"));
+        assert!(note.contains("ZERO real source") || note.contains("没有任何真实源码"));
+    }
+
+    #[test]
+    fn director_hardgate_passes_when_real_source_exists() {
+        // A build that produced even one real source file passes — the gate
+        // checks RESULT (did code land), not the route the director took.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("app.tsx"),
+            "export const App = () => null;\n",
+        )
+        .unwrap();
+        assert!(
+            director_source_hardgate(tmp.path(), "Created app.tsx with the login form").is_none(),
+            "real source on disk satisfies the hard-gate"
+        );
+    }
+
+    #[test]
+    fn director_hardgate_ignores_a_pure_answer() {
+        // A director that just ANSWERED (no change-verb claim) is not failing by
+        // producing no new source — the gate only judges a claimed build. The
+        // phrase carries no change verb (EN or ZH), so `claims_code_changes` is
+        // false and the gate stays silent.
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(
+            !claims_code_changes("这段代码看起来没有问题,逻辑正确"),
+            "sanity: the answer carries no change verb"
+        );
+        assert!(
+            director_source_hardgate(tmp.path(), "这段代码看起来没有问题,逻辑正确").is_none(),
+            "a no-build answer never trips the hard-gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn director_build_stream_fires_hardgate_on_phantom_build() {
+        // End to end through the agentic stream in DIRECTOR-BUILD mode: the base
+        // claims a build but writes nothing -> the objective source-present
+        // hard-gate emits the ABORT_SENTINEL note, on TOP of the git phantom-change
+        // warning. (A non-director turn would only get the lighter git fact line.)
+        let tmp = init_git_repo();
+        let path = tmp.path().to_path_buf();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spy = EffectSpy {
+            // "implemented" / "created" are recognised change verbs, so this reply
+            // CLAIMS a build — which the hard-gate must then check against reality.
+            reply: "I implemented the entire dashboard and created the API routes".to_string(),
+            warn: false,
+            effect: Box::new(|| ()), // writes NOTHING
+        };
+        drive_agentic_stream(
+            &spy,
+            "build me a dashboard",
+            "m",
+            "claude-code",
+            &path,
+            true, // director_build
+            &sink,
+            &route_tx,
+        )
+        .await;
+
+        let mut saw_sentinel = false;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.starts_with(ABORT_SENTINEL) {
+                    saw_sentinel = true;
+                }
+            }
+        }
+        assert!(
+            saw_sentinel,
+            "a director-build that claimed code but wrote zero source must abort honestly"
+        );
+        // The turn still terminates cleanly (the gate is an honest note, not a panic).
         assert!(matches!(
             route_rx.try_recv(),
             Ok(RouteDecision::AgenticDone(_))

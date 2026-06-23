@@ -98,6 +98,39 @@ pub fn continuous_enabled_from_env() -> bool {
     !opted_out
 }
 
+/// Whether an explicit `/run` (full product build) should fall back to the
+/// **legacy fixed 9-phase pipeline** instead of the default **director-driven
+/// agentic** path (Wave 1 of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` §5).
+///
+/// The director path is now the DEFAULT for `/run`: a `/run "<goal>"` is handed
+/// to the director (the same agentic brain a free-text message reaches), framed
+/// as a full commercial build the director orchestrates with its team however it
+/// judges fit — NOT a state-machine walk of nine fixed phases. The fixed pipeline
+/// (`continuous::run_block` / the single-shot `run_initial_block`) is retained
+/// untouched behind this explicit opt-in so the field can revert with no code
+/// change:
+///
+/// - `UMADEV_LEGACY_PIPELINE=1` / `true` / `on`  → the legacy fixed pipeline
+/// - anything else (incl. unset)                 → the director-driven path
+///
+/// Read ONCE at the app boundary (CLI `cmd_run` / TUI `StartRun`), the same way
+/// [`continuous_enabled_from_env`] and [`crate::runner::strict_coverage_from_env`]
+/// are, so a run sees a stable snapshot rather than a live env read mid-run.
+///
+/// Fail-open by contract: this only SELECTS the route. The director path keeps the
+/// floor — single-writer run-lock, governance hook, audit, and an objective
+/// source-present hard-gate (did real code actually get written) — so a director
+/// who claimed "done" with zero source is reported honestly, never disguised as
+/// success. If the director path can't start, the boundary can fall back to the
+/// legacy pipeline.
+#[must_use]
+pub fn legacy_pipeline_from_env() -> bool {
+    matches!(
+        std::env::var("UMADEV_LEGACY_PIPELINE").as_deref(),
+        Ok("1" | "true" | "on")
+    )
+}
+
 /// How a single continuous run finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -2026,6 +2059,37 @@ mod tests {
     fn sink() -> (Arc<dyn EventSink>, crate::events::RecordingSink) {
         let rec = crate::events::RecordingSink::default();
         (Arc::new(rec.clone()), rec)
+    }
+
+    // ── Wave 1: the legacy-pipeline opt-out switch ─────────────────────────
+
+    #[test]
+    fn legacy_pipeline_flag_defaults_off_and_honours_explicit_on() {
+        // This is the ONLY test that touches `UMADEV_LEGACY_PIPELINE`, so it owns
+        // the var: set/clear in-test, no cross-test env race. Default (unset) is
+        // OFF (director path); only an explicit truthy value selects the legacy
+        // fixed pipeline.
+        std::env::remove_var("UMADEV_LEGACY_PIPELINE");
+        assert!(
+            !legacy_pipeline_from_env(),
+            "default (unset) is the director path, not legacy"
+        );
+        for on in ["1", "true", "on"] {
+            std::env::set_var("UMADEV_LEGACY_PIPELINE", on);
+            assert!(
+                legacy_pipeline_from_env(),
+                "`{on}` selects the legacy fixed pipeline"
+            );
+        }
+        // A non-truthy value stays on the director path (fail-open default).
+        for off in ["0", "false", "off", "nonsense", ""] {
+            std::env::set_var("UMADEV_LEGACY_PIPELINE", off);
+            assert!(
+                !legacy_pipeline_from_env(),
+                "`{off}` is NOT an opt-in → director path"
+            );
+        }
+        std::env::remove_var("UMADEV_LEGACY_PIPELINE");
     }
 
     // ── Phase advance + gate pause ─────────────────────────────────────────
