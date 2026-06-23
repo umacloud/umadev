@@ -601,6 +601,7 @@
 "continuous.team.seat_blocking" = "[team] {}:提出 {} 個阻塞項。"
 "continuous.verify_failed" = "[verify] 真實建置/測試/lint 有失敗步驟(已記入稽核,品質關卡會據此評分)。"
 "continuous.quality_gate_result" = "品質關卡結果:{}/100 · {}(確定性硬信號)"
+"continuous.quality_gate_advisory" = "品質評分:{}/100 —— 建議改進(輕量任務,不阻斷)"
 "continuous.quality_gate_findings" = "品質關卡 top 問題:\n{}"
 "continuous.quality_gate_blocked" = "[fail] 品質關卡未通過({}/100)—— 流水線停在品質階段,不進交付(持續會話確定性硬關卡)。"
 "continuous.governance_catchup" = "[gov] {} 個真實檔案有治理違規(底座無即時鉤子,事後掃描捕獲),打回修復…"

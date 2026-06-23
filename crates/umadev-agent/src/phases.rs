@@ -1542,6 +1542,25 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
         }
     }
 
+    // A LEAN plan (`Light` / `Bugfix` / `Refactor`) deliberately skips the
+    // research + three-doc + execution-plan ceremony and heads straight for
+    // spec → implement → verify. Penalising it for "missing PRD / architecture /
+    // UIUX" is the same mistake as the surface checks above — it is being failed
+    // for an artifact it was never asked to produce. So N/A those doc-bound
+    // checks for a lean plan (only when they are PENALISING; a doc that somehow
+    // exists and passes stays live). Code/floor/verify checks are untouched.
+    if !crate::planner::plan(&opts.requirement).includes(Phase::Docs) {
+        for c in &mut checks {
+            if DOC_BOUND_CHECKS.contains(&c.name.as_str()) && c.status != "passed" {
+                c.status = "n/a".to_string();
+                c.details = format!(
+                    "N/A — a lean build skips the research + three-doc phase. ({})",
+                    c.details
+                );
+            }
+        }
+    }
+
     let total_score = avg_score(&checks);
     let weighted_score = weighted_avg(&checks);
     let mut critical_failures: Vec<String> = checks
@@ -1778,6 +1797,20 @@ const SURFACE_BOUND_CHECKS: &[&str] = &[
     "API URL consistency",
     "Ops artifacts present",
     "Security scan",
+];
+
+/// Quality-gate checks that verify the research + three-doc + execution-plan
+/// artifacts. A LEAN plan (`Light`/`Bugfix`/`Refactor`) deliberately skips the
+/// docs phase, so [`run_quality`] marks these `n/a` for a lean build instead of
+/// failing it for documents it was never asked to produce. They stay LIVE for
+/// any plan that includes the Docs phase (Greenfield / FrontendOnly / …).
+const DOC_BOUND_CHECKS: &[&str] = &[
+    "Research content",
+    "Discovery section",
+    "PRD content",
+    "Architecture content",
+    "UI/UX content",
+    "Execution plan",
 ];
 
 /// `true` when a check is N/A (it guards an absent attack surface). N/A checks
@@ -4661,8 +4694,9 @@ mod tests {
         );
         for c in &na {
             assert!(
-                SURFACE_BOUND_CHECKS.contains(&c.name.as_str()),
-                "only surface-bound checks may be N/A, got `{}`",
+                SURFACE_BOUND_CHECKS.contains(&c.name.as_str())
+                    || DOC_BOUND_CHECKS.contains(&c.name.as_str()),
+                "only surface-bound or (for a lean plan) doc-bound checks may be N/A, got `{}`",
                 c.name
             );
         }

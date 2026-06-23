@@ -601,6 +601,7 @@
 "continuous.team.seat_blocking" = "[team] {}:提出 {} 个阻塞项。"
 "continuous.verify_failed" = "[verify] 真实构建/测试/lint 有失败步骤(已记入审计,质量门会据此打分)。"
 "continuous.quality_gate_result" = "质量门结果:{}/100 · {}(确定性硬信号)"
+"continuous.quality_gate_advisory" = "质量评分:{}/100 —— 建议改进(轻量任务,不阻断)"
 "continuous.quality_gate_findings" = "质量门 top 问题:\n{}"
 "continuous.quality_gate_blocked" = "[fail] 质量门未通过({}/100)—— 流水线停在质量阶段,不进交付(持续会话确定性硬门)。"
 "continuous.governance_catchup" = "[gov] {} 个真实文件有治理违规(底座无实时钩子,事后扫描捕获),打回修复…"

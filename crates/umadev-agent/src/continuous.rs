@@ -743,10 +743,27 @@ async fn run_quality_gate(
         None => return None,
     };
 
-    events.emit(EngineEvent::Note(umadev_i18n::tlf(
-        "continuous.quality_gate_result",
-        &[&score, if passed { "PASSED" } else { "BLOCKED" }],
-    )));
+    // Honest verdict wording: a HARD gate (heavyweight gated code run) that
+    // fails is "BLOCKED — deterministic hard signal" (it will stop the run); a
+    // lean / advisory gate that scores below the bar is NOT a block (the run
+    // already completed) — it's advisory feedback, so it must not masquerade as
+    // a hard BLOCK.
+    if passed {
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.quality_gate_result",
+            &[&score, "PASSED"],
+        )));
+    } else if hard_block {
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.quality_gate_result",
+            &[&score, "BLOCKED"],
+        )));
+    } else {
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "continuous.quality_gate_advisory",
+            &[&score],
+        )));
+    }
 
     // 4. HARD STOP only when the caller asked for hard-block semantics (a
     //    heavyweight gated code run) AND the gate actually failed. A lean /

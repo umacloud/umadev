@@ -423,6 +423,7 @@ mod tests {
             "continuous.team.seat_blocking",
             "continuous.verify_failed",
             "continuous.quality_gate_result",
+            "continuous.quality_gate_advisory",
             "continuous.quality_gate_findings",
             "continuous.quality_gate_blocked",
             "continuous.governance_catchup",

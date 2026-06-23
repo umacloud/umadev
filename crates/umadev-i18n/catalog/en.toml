@@ -601,6 +601,7 @@
 "continuous.team.seat_blocking" = "[team] {}: raised {} blocking item(s)."
 "continuous.verify_failed" = "[verify] Real build/test/lint had failing step(s) (recorded to the audit; the quality gate scores against it)."
 "continuous.quality_gate_result" = "Quality gate result: {}/100 · {} (deterministic hard signal)"
+"continuous.quality_gate_advisory" = "Quality score: {}/100 — advisory suggestions (a lean task; not a blocker)"
 "continuous.quality_gate_findings" = "Quality gate top findings:\n{}"
 "continuous.quality_gate_blocked" = "[fail] Quality gate failed ({}/100) — pipeline stopped at quality, not delivered (continuous deterministic hard gate)."
 "continuous.governance_catchup" = "[gov] {} real file(s) have governance violations (base has no real-time hook; caught by post-write scan), reworking…"
