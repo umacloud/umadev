@@ -95,6 +95,8 @@ use umadev_runtime::{ApprovalDecision, BaseSession, SessionEvent, StreamEvent, T
 
 use crate::director::{self, ReviewResult, VerifyKind, VerifyResult};
 use crate::events::{EngineEvent, EventSink};
+use crate::plan_state::{self, Plan, StepStatus};
+use crate::router::RoutePlan;
 use crate::runner::RunOptions;
 use crate::trust::requires_confirmation;
 
@@ -240,9 +242,84 @@ pub async fn drive_director_loop(
     events: &Arc<dyn EventSink>,
     first_directive: String,
 ) -> DirectorLoopOutcome {
+    // Backward-compatible entry: no route, no owned plan → today's behaviour
+    // unchanged (fail-open). New callers pass a route via
+    // [`drive_director_loop_routed`] to get the Wave 1 visible intent + plan.
+    drive_director_loop_routed(session, options, events, first_directive, None).await
+}
+
+/// Drive the director loop with a Wave 1 [`RoutePlan`] in hand — the routed entry.
+///
+/// When `route` is `Some`, this:
+/// 1. emits [`EngineEvent::IntentDecided`] so the user SEES the decision (chat vs
+///    build, depth, team, budget, one-line reason), and
+/// 2. before the build loop, synthesises an owned [`Plan`] over a read-only fork
+///    ([`plan_state::synthesize_plan`]), persists it to `.umadev/plan.json`, and
+///    emits [`EngineEvent::PlanPosted`] — the live checklist that replaces the
+///    frozen phase bar. As the build runs, [`EngineEvent::PlanStepStatus`] events
+///    tick the steps.
+///
+/// **Everything is fail-open and additive:** `route == None`, an offline brain, a
+/// fork that won't open, or an unparseable plan ALL leave the existing single-turn
+/// build behaviour exactly as it was. The QC feedback loop, hard floor, idle
+/// watchdog, and `MAX_QC_ROUNDS` are untouched. In Wave 1 the plan is *synthesised
+/// and shown*; the existing build loop still EXECUTES (driving the plan step-by-step
+/// via `summon` is Wave 2).
+pub async fn drive_director_loop_routed(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    first_directive: String,
+    route: Option<&RoutePlan>,
+) -> DirectorLoopOutcome {
+    // 1. Surface the routing decision so the user sees the intent (fail-open: no
+    //    route → no card, current behaviour).
+    if let Some(r) = route {
+        events.emit(EngineEvent::intent_decided(r));
+    }
+
+    // 2. Synthesise + persist + post the owned plan. Fail-open at every step: a
+    //    `None` plan (offline / no fork / unparseable) simply means no checklist —
+    //    the build loop below runs exactly as it does today. Plan synthesis runs on
+    //    a READ-ONLY fork (single-writer preserved); it never writes the workspace.
+    let plan = match route {
+        Some(r) => synthesize_and_post_plan(session, options, events, r).await,
+        None => None,
+    };
+
     // Read the idle watchdog window ONCE at the boundary (not per-wait), so a
     // mid-run env flip can't race the in-flight turns. Threaded into every turn.
-    drive_director_loop_with_idle(session, options, events, first_directive, idle_timeout()).await
+    drive_director_loop_with_idle(
+        session,
+        options,
+        events,
+        first_directive,
+        plan,
+        idle_timeout(),
+    )
+    .await
+}
+
+/// Synthesise the owned plan, persist it best-effort, and emit [`EngineEvent::PlanPosted`].
+/// Returns the plan when one was produced, else `None` (the caller then runs the
+/// existing single-turn build). Fully fail-open: synthesis / persistence failures
+/// degrade to `None` / a skipped write, never an error.
+async fn synthesize_and_post_plan(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+) -> Option<Plan> {
+    // Only a deliberate (plan-worthy) route warrants a plan — a fast chat / quick
+    // edit needs no DAG (and would just pay a fork round-trip for nothing).
+    if !route.depth.is_deliberate() {
+        return None;
+    }
+    let plan = plan_state::synthesize_plan(session, options, &options.requirement, route).await?;
+    // Persist best-effort; a failed write is ignored (fail-open — never blocks).
+    let _ = plan_state::save(&plan, &options.project_root);
+    events.emit(EngineEvent::plan_posted(&plan));
+    Some(plan)
 }
 
 /// [`drive_director_loop`] with an explicit idle window — the env read is hoisted
@@ -253,12 +330,22 @@ async fn drive_director_loop_with_idle(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     first_directive: String,
+    mut plan: Option<Plan>,
     idle: Duration,
 ) -> DirectorLoopOutcome {
     let mut next_directive = first_directive;
     let mut last_reply = String::new();
 
     for round in 0..MAX_QC_ROUNDS {
+        // Plan visibility (Wave 1): mark the ready BUILD steps Active before this
+        // turn drives the base over them, so the checklist shows live progress. The
+        // base still executes the whole goal in one turn this wave (step-by-step
+        // `summon` driving is Wave 2); here we surface the plan's motion. Fail-open:
+        // no plan → nothing emitted, current behaviour.
+        if round == 0 {
+            mark_ready_steps(&mut plan, events, StepStatus::Active);
+        }
+
         // 1. Drive ONE end-to-end base turn (build, or fix-the-QC-findings). The
         //    base runs its own agentic tool loop (PM→…→QA internally) and writes
         //    real files under the run-lock the caller holds (single-writer).
@@ -277,6 +364,8 @@ async fn drive_director_loop_with_idle(
         //    passes" (no change-verb) must not be mistaken for "nothing to check"
         //    and settle with the problems still unfixed. QC is read-only + cheap.
         if round == 0 && !crate::gates::claims_code_changes(&turn.text) {
+            // No code claimed → nothing the plan describes actually ran; leave the
+            // steps as-is (the caller decides) and settle.
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -287,6 +376,9 @@ async fn drive_director_loop_with_idle(
 
         // 4. Clean QC → the build is genuinely done. Settle and report honestly.
         if qc.is_clean() {
+            // Plan visibility (Wave 1): a clean pass means the work the plan
+            // describes landed — tick its steps Done + persist the final plan.
+            complete_plan(&mut plan, options, events);
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -297,6 +389,10 @@ async fn drive_director_loop_with_idle(
                 "team · auto-QC reached its fix-round budget — settling (objective hard-gate decides reality)"
                     .to_string(),
             ));
+            // The objective hard-gate decides reality; the plan steps stay where
+            // they are (Active), honestly reflecting that QC didn't fully clear.
+            // Persist the final state for resume.
+            persist_plan(&plan, options);
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -305,7 +401,63 @@ async fn drive_director_loop_with_idle(
         next_directive = qc.fix_directive();
     }
 
+    // Loop fell through (exhausted the bounded rounds) — persist the plan's final
+    // state for resume; reality is the caller's hard-gate.
+    persist_plan(&plan, options);
     DirectorLoopOutcome::Done { reply: last_reply }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Plan progress surface (Wave 1) — emit PlanStepStatus + persist as the build
+// moves. All helpers are fail-open no-ops when there is no plan.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Mark every ready BUILD step to `status` (typically `Active`) and emit a
+/// [`EngineEvent::PlanStepStatus`] for each. No-op when there's no plan (fail-open).
+/// Wave 1 surfaces the plan's motion around the existing single-turn build; Wave 2
+/// drives each step independently via `summon`.
+fn mark_ready_steps(plan: &mut Option<Plan>, events: &Arc<dyn EventSink>, status: StepStatus) {
+    let Some(plan) = plan.as_mut() else {
+        return;
+    };
+    // Snapshot the ready ids first (ready_steps borrows the plan immutably).
+    let ready: Vec<(String, String)> = plan
+        .ready_steps()
+        .iter()
+        .filter(|s| s.kind == plan_state::StepKind::Build)
+        .map(|s| (s.id.clone(), s.title.clone()))
+        .collect();
+    for (id, title) in ready {
+        if plan.mark(&id, status) {
+            events.emit(EngineEvent::plan_step_status(id, title, status));
+        }
+    }
+}
+
+/// On a clean settle: tick any non-Done step to `Done`, emit a status event for
+/// each transition, and persist the completed plan. No-op without a plan.
+fn complete_plan(plan: &mut Option<Plan>, options: &RunOptions, events: &Arc<dyn EventSink>) {
+    if let Some(p) = plan.as_mut() {
+        let transitions: Vec<(String, String)> = p
+            .steps
+            .iter()
+            .filter(|s| s.status != StepStatus::Done)
+            .map(|s| (s.id.clone(), s.title.clone()))
+            .collect();
+        for (id, title) in transitions {
+            p.mark(&id, StepStatus::Done);
+            events.emit(EngineEvent::plan_step_status(id, title, StepStatus::Done));
+        }
+    }
+    persist_plan(plan, options);
+}
+
+/// Best-effort persist the plan's current state to `.umadev/plan.json` (fail-open:
+/// a missing plan / a write error is ignored, never blocks the loop).
+fn persist_plan(plan: &Option<Plan>, options: &RunOptions) {
+    if let Some(p) = plan {
+        let _ = plan_state::save(p, &options.project_root);
+    }
 }
 
 /// One base turn's observable result.
@@ -977,6 +1129,7 @@ mod tests {
             &o,
             &events,
             "GO".to_string(),
+            None,
             Duration::from_millis(100),
         )
         .await;
@@ -1228,5 +1381,146 @@ mod tests {
         assert!(d.contains("must be fixed"));
         assert!(d.contains("build: FAILED"));
         assert!(d.contains("no input validation"));
+    }
+
+    // ── Wave 1: routed entry — visible intent + owned plan, fully fail-open ──
+
+    /// A deliberate Build route for the wiring tests.
+    fn build_route() -> crate::router::RoutePlan {
+        crate::router::RoutePlan {
+            class: crate::router::RouteClass::Build,
+            kind: crate::planner::TaskKind::Greenfield,
+            depth: crate::router::Depth::Standard,
+            team: vec![crate::critics::Seat::FrontendEngineer],
+            scope: vec![],
+            needs_clarify: None,
+            est_budget: crate::router::Budget::for_route(
+                crate::router::RouteClass::Build,
+                crate::router::Depth::Standard,
+            ),
+            confidence: 0.7,
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_loop_emits_intent_decided() {
+        // The routed entry surfaces the routing decision BEFORE any work, so the
+        // user sees "I'll BUILD this …". A non-forking session means no plan, which
+        // is fine — IntentDecided must still fire.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let turns = vec![text_turn("Built it end to end. Done.")];
+        let mut sess = FakeSession::new(turns, false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        assert!(
+            rec.count(
+                |e| matches!(e, EngineEvent::IntentDecided { class, .. } if class == "build")
+            ) == 1,
+            "exactly one IntentDecided(build) is emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_loop_synthesizes_and_posts_a_plan_when_the_brain_replies() {
+        // A forking session whose fork emits a valid plan JSON → the loop synthesises
+        // the plan, persists `.umadev/plan.json`, posts it, and ticks a step active.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let plan_json = r#"{"steps":[
+            {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
+            {"id":"ui","title":"Build the UI","seat":"frontend-engineer","kind":"build","depends_on":["scaffold"],"acceptance":"source-present"}
+        ],"risks":["state mgmt"],"open_questions":[]}"#;
+        let turns = vec![text_turn("Built the whole app end to end. Done.")];
+        // can_fork = true so the planning consult gets a fork that replies with JSON.
+        let mut sess = FakeSession::new(turns, true, plan_json);
+        let mut o = opts(tmp.path());
+        // A lean requirement would skip the heavy review but the plan path keys off
+        // the ROUTE's deliberate depth, not the requirement — keep it a real build.
+        o.requirement = "做一个完整的任务管理产品".to_string();
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+
+        // The plan was posted with both steps.
+        assert!(
+            rec.count(|e| matches!(e, EngineEvent::PlanPosted { total, .. } if *total == 2)) == 1,
+            "a 2-step plan was posted: {:?}",
+            rec.events()
+        );
+        // At least one step was surfaced as active (the ready scaffold step).
+        assert!(
+            rec.count(
+                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "active")
+            ) >= 1,
+            "a ready step ticked active"
+        );
+        // It was persisted to disk and is loadable.
+        let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
+        assert_eq!(loaded.steps.len(), 2);
+        // The plan-driven loop still drove the base build (single main turn here).
+        match outcome {
+            DirectorLoopOutcome::Done { reply } => assert!(reply.contains("Built the whole app")),
+            other @ DirectorLoopOutcome::Failed(_) => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_loop_fails_open_to_single_turn_when_plan_unparseable() {
+        // The fork replies with garbage (no JSON object) → synthesize_plan returns
+        // None → the loop behaves EXACTLY like today's single-turn build. No
+        // PlanPosted, but the build still completes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let turns = vec![text_turn("Built it. Done.")];
+        let mut sess = FakeSession::new(turns, true, "not json at all, sorry");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        // No plan could be parsed → none posted (fail-open to single-turn behaviour).
+        assert_eq!(
+            rec.count(|e| matches!(e, EngineEvent::PlanPosted { .. })),
+            0,
+            "an unparseable plan posts nothing — single-turn fallback"
+        );
+        // IntentDecided still fired (it never depends on the plan).
+        assert!(rec.count(|e| matches!(e, EngineEvent::IntentDecided { .. })) == 1);
+    }
+
+    #[tokio::test]
+    async fn non_routed_entry_is_unchanged_no_intent_or_plan() {
+        // The legacy entry (drive_director_loop) passes route = None → no
+        // IntentDecided, no plan, exactly today's behaviour. This guards the
+        // backward-compatible contract the TUI/CLI callers rely on.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let turns = vec![text_turn("Built it. Done.")];
+        let mut sess = FakeSession::new(turns, true, r#"{"steps":[]}"#);
+        let o = opts(tmp.path());
+
+        let outcome = drive_director_loop(&mut sess, &o, &events, "GO".into()).await;
+        assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
+        assert_eq!(
+            rec.count(|e| matches!(e, EngineEvent::IntentDecided { .. })),
+            0
+        );
+        assert_eq!(
+            rec.count(|e| matches!(e, EngineEvent::PlanPosted { .. })),
+            0
+        );
     }
 }

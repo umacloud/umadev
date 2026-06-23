@@ -151,6 +151,109 @@ pub enum EngineEvent {
         /// What kind of stream event this is.
         event: umadev_runtime::StreamEvent,
     },
+    /// **The router decided how to handle this turn** (Wave 1, L1). Emitted once,
+    /// before any work, so a UI can render an "intent card" — what UmaDev decided
+    /// (chat vs build), how deep, who it'll convene, the rough budget, and a
+    /// one-line reason. Pure summary strings so the event stays cheap + `Eq` (the
+    /// full typed `RoutePlan` lives in `router`).
+    IntentDecided {
+        /// Route class id (`chat` / `explain` / `quick_edit` / `debug` / `build`).
+        class: String,
+        /// Depth id (`fast` / `standard` / `deep`).
+        depth: String,
+        /// The seats UmaDev will convene (role ids), in order. Empty for a fast turn.
+        team: Vec<String>,
+        /// Rough expected tool-call ceiling for this turn.
+        est_tool_calls: u32,
+        /// A one-line human rationale (`RoutePlan::rationale`).
+        rationale: String,
+    },
+    /// **A plan was synthesised and is now owned by UmaDev** (Wave 1, L2). Emitted
+    /// after the planning turn so a UI can render the live checklist that replaces
+    /// the frozen phase bar. Each entry is a compact `id · title (seat)` summary.
+    PlanPosted {
+        /// One summary line per step (`Plan::step_summaries`).
+        steps: Vec<String>,
+        /// `done / total` at post time (always `0 / N` for a fresh plan).
+        done: usize,
+        /// Total step count.
+        total: usize,
+    },
+    /// **A plan step changed status** (Wave 1, L2) — drives the checklist ticking
+    /// off live (`[x] scaffold · [~] auth route · [ ] login form`).
+    PlanStepStatus {
+        /// The step id (matches a `PlanPosted` summary's leading id).
+        id: String,
+        /// Human-readable step title.
+        title: String,
+        /// New status id (`pending` / `active` / `done` / `blocked`).
+        status: String,
+    },
+    /// **A reviewing seat returned a structured verdict** (Wave 1, L1/L2). Replaces
+    /// the bland team `Note` so a UI can render a collapsible team-review panel with
+    /// each seat's accept/blocking/advisory. Advisory only — never drives the loop.
+    CriticVerdict {
+        /// The reviewing seat's role id (e.g. `architect`).
+        seat: String,
+        /// Whether the seat accepts the artifacts as-is.
+        accepts: bool,
+        /// Must-fix findings the seat raised (may be empty).
+        blocking: Vec<String>,
+        /// Nice-to-have notes (may be empty).
+        advisory: Vec<String>,
+    },
+}
+
+impl EngineEvent {
+    /// Build an [`EngineEvent::IntentDecided`] from a router [`crate::router::RoutePlan`]
+    /// — flattens the typed plan into the cheap summary the UI renders, so the
+    /// conversion lives in ONE place (the director just calls this).
+    #[must_use]
+    pub fn intent_decided(route: &crate::router::RoutePlan) -> Self {
+        Self::IntentDecided {
+            class: route.class.as_str().to_string(),
+            depth: route.depth.as_str().to_string(),
+            team: route.team.iter().map(|s| s.role_id().to_string()).collect(),
+            est_tool_calls: route.est_budget.max_tool_calls,
+            rationale: route.rationale(),
+        }
+    }
+
+    /// Build an [`EngineEvent::PlanPosted`] from an owned [`crate::plan_state::Plan`].
+    #[must_use]
+    pub fn plan_posted(plan: &crate::plan_state::Plan) -> Self {
+        let (done, total) = plan.progress();
+        Self::PlanPosted {
+            steps: plan.step_summaries(),
+            done,
+            total,
+        }
+    }
+
+    /// Build an [`EngineEvent::PlanStepStatus`] for one step transition.
+    #[must_use]
+    pub fn plan_step_status(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        status: crate::plan_state::StepStatus,
+    ) -> Self {
+        Self::PlanStepStatus {
+            id: id.into(),
+            title: title.into(),
+            status: status.as_str().to_string(),
+        }
+    }
+
+    /// Build an [`EngineEvent::CriticVerdict`] from a seat's [`crate::critics::RoleVerdict`].
+    #[must_use]
+    pub fn critic_verdict(verdict: &crate::critics::RoleVerdict) -> Self {
+        Self::CriticVerdict {
+            seat: verdict.role.clone(),
+            accepts: verdict.accepts,
+            blocking: verdict.blocking.clone(),
+            advisory: verdict.advisory.clone(),
+        }
+    }
 }
 
 /// Anything that consumes [`EngineEvent`]s. Implementations must be
@@ -299,5 +402,106 @@ mod tests {
         drop(rx);
         // Must not panic even though nobody is listening.
         sink.emit(EngineEvent::Note("nobody home".into()));
+    }
+
+    // ── Wave 1 visible-event constructors flatten the typed primitives ──
+
+    #[test]
+    fn intent_decided_flattens_route_plan() {
+        let route = crate::router::RoutePlan {
+            class: crate::router::RouteClass::Build,
+            kind: crate::planner::TaskKind::Greenfield,
+            depth: crate::router::Depth::Deep,
+            team: vec![
+                crate::critics::Seat::Architect,
+                crate::critics::Seat::BackendEngineer,
+            ],
+            scope: vec![],
+            needs_clarify: None,
+            est_budget: crate::router::Budget::for_route(
+                crate::router::RouteClass::Build,
+                crate::router::Depth::Deep,
+            ),
+            confidence: 0.9,
+        };
+        let ev = EngineEvent::intent_decided(&route);
+        let EngineEvent::IntentDecided {
+            class,
+            depth,
+            team,
+            est_tool_calls,
+            rationale,
+        } = ev
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(class, "build");
+        assert_eq!(depth, "deep");
+        assert_eq!(team, vec!["architect", "backend-engineer"]);
+        assert!(est_tool_calls > 0);
+        assert!(!rationale.is_empty());
+    }
+
+    #[test]
+    fn plan_posted_and_step_status_carry_summaries() {
+        let plan = crate::plan_state::Plan {
+            steps: vec![crate::plan_state::PlanStep {
+                id: "scaffold".to_string(),
+                title: "Scaffold the app".to_string(),
+                seat: crate::critics::Seat::FrontendEngineer,
+                kind: crate::plan_state::StepKind::Build,
+                depends_on: vec![],
+                acceptance: crate::plan_state::AcceptanceSpec::SourcePresent,
+                status: crate::plan_state::StepStatus::Pending,
+            }],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        let posted = EngineEvent::plan_posted(&plan);
+        let EngineEvent::PlanPosted { steps, done, total } = posted else {
+            panic!("wrong variant");
+        };
+        assert_eq!((done, total), (0, 1));
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].starts_with("scaffold"));
+
+        let st = EngineEvent::plan_step_status(
+            "scaffold",
+            "Scaffold the app",
+            crate::plan_state::StepStatus::Active,
+        );
+        assert_eq!(
+            st,
+            EngineEvent::PlanStepStatus {
+                id: "scaffold".into(),
+                title: "Scaffold the app".into(),
+                status: "active".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn critic_verdict_carries_seat_findings() {
+        let v = crate::critics::RoleVerdict {
+            role: "architect".to_string(),
+            accepts: false,
+            blocking: vec!["missing API table".to_string()],
+            advisory: vec!["consider rate limiting".to_string()],
+            evidence: vec!["architecture.md".to_string()],
+        };
+        let ev = EngineEvent::critic_verdict(&v);
+        let EngineEvent::CriticVerdict {
+            seat,
+            accepts,
+            blocking,
+            advisory,
+        } = ev
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(seat, "architect");
+        assert!(!accepts);
+        assert_eq!(blocking, vec!["missing API table".to_string()]);
+        assert_eq!(advisory.len(), 1);
     }
 }

@@ -2554,7 +2554,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         driver.set_session_id(Some(new_run_session_id()));
         driver.set_continue_session(true);
         match driver.probe().await {
-            umadev_host::ProbeResult::Ready { version } => {
+            umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
                 // Real-time governance: install the PreToolUse hook so the
                 // driven `claude` subprocess fires our governor on EVERY file
@@ -2795,7 +2795,7 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         driver.set_session_id(Some(new_run_session_id()));
         driver.set_continue_session(true);
         match driver.probe().await {
-            umadev_host::ProbeResult::Ready { version } => {
+            umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
                 if backend.id() == "claude-code" {
                     if let Ok(Some(p)) = hook::install_claude_hook(&project_root) {
@@ -2949,7 +2949,7 @@ async fn cmd_redo(
         driver.set_session_id(Some(new_run_session_id()));
         driver.set_continue_session(true);
         match driver.probe().await {
-            umadev_host::ProbeResult::Ready { version } => {
+            umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
                 if backend.id() == "claude-code" {
                     if let Ok(Some(p)) = hook::install_claude_hook(&project_root) {
@@ -3223,7 +3223,7 @@ async fn drive_gate_block(
             .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
         driver.set_workspace(project_root.to_path_buf());
         match driver.probe().await {
-            umadev_host::ProbeResult::Ready { version } => {
+            umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
                 // Real-time governance: install the PreToolUse hook so the
                 // driven `claude` subprocess fires our governor on EVERY file

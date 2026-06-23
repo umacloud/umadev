@@ -21,8 +21,8 @@ use umadev_runtime::{
 };
 
 use crate::{
-    default_workspace, govern_root_env, merge_prompt, model_args, run_subprocess,
-    run_subprocess_streaming, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
+    default_workspace, govern_root_env, merge_prompt, model_args, run_auth_status, run_subprocess,
+    run_subprocess_streaming, AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
 };
 
 /// Drives the `claude` CLI as a subprocess.
@@ -701,6 +701,16 @@ impl HostDriver for ClaudeCodeDriver {
         self.workspace = Some(workspace);
     }
 
+    fn install_hint(&self) -> Option<&'static str> {
+        Some("npm install -g @anthropic-ai/claude-code")
+    }
+
+    fn login_hint(&self) -> Option<&'static str> {
+        // `claude /login` is the in-app form; the headless equivalent is `claude
+        // auth login` (the `auth` subcommand confirmed via `claude auth --help`).
+        Some("claude auth login")
+    }
+
     async fn probe(&self) -> ProbeResult {
         let tmp = default_workspace();
         match run_subprocess(SubprocessCall {
@@ -714,14 +724,117 @@ impl HostDriver for ClaudeCodeDriver {
         })
         .await
         {
+            // Installed — now also resolve the honest auth state (gap G10) so the
+            // picker can tell "ready & logged in" from "installed, not logged in".
             Ok(out) => ProbeResult::Ready {
                 version: out.stdout.lines().next().unwrap_or("unknown").to_string(),
+                auth_state: self.probe_auth().await,
             },
             Err(e) if e.contains("not found on PATH") => ProbeResult::NotInstalled {
                 program: self.program.clone(),
             },
             Err(e) => ProbeResult::Unhealthy { detail: e },
         }
+    }
+
+    /// Cheapest authenticated no-op for Claude Code, in cost order — NO real
+    /// generation, NO tokens.
+    ///
+    /// Claude Code accepts several auth paths (see the official Authentication
+    /// docs: precedence list + credential storage), so a single file check would
+    /// be wrong on its own:
+    ///
+    /// 1. **Auth env vars** (instant, no subprocess): `ANTHROPIC_API_KEY`,
+    ///    `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, or a cloud-provider
+    ///    toggle (`CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`/`_FOUNDRY`) all make claude
+    ///    authenticated regardless of any stored login.
+    /// 2. **Credential file** on Linux/Windows: `~/.claude/.credentials.json`
+    ///    (or under `CLAUDE_CONFIG_DIR`). On **macOS** the credentials live in the
+    ///    Keychain — there is NO file — so its absence proves nothing there; we
+    ///    do not treat a missing file as NotLoggedIn, we fall through.
+    /// 3. **Authoritative subcommand** `claude auth status` — prints JSON
+    ///    `{"loggedIn": true|false, …}` (confirmed via `claude auth --help` /
+    ///    live output). This is the cross-platform truth (covers the macOS
+    ///    Keychain case) and the only path that can return a definitive
+    ///    NotLoggedIn. Bounded by the short auth-probe timeout.
+    ///
+    /// Fail-open: anything indeterminate → [`AuthState::Unknown`], never a false
+    /// `LoggedIn`.
+    async fn probe_auth(&self) -> AuthState {
+        // 1. Auth env vars — definitive and instant.
+        if crate::any_env_set(&[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ]) {
+            return AuthState::LoggedIn;
+        }
+        // 2. Credential FILE (Linux/Windows, or a custom CLAUDE_CONFIG_DIR). Its
+        //    presence proves login; its ABSENCE is NOT proof on macOS (Keychain),
+        //    so we only treat presence as positive and otherwise fall through.
+        if claude_credentials_file().is_some_and(|p| p.is_file()) {
+            return AuthState::LoggedIn;
+        }
+        // 3. Authoritative cross-platform check: `claude auth status` → JSON with
+        //    a `loggedIn` boolean (covers the macOS Keychain case). Fail-open.
+        match run_auth_status(
+            &self.program,
+            &["auth".to_string(), "status".to_string()],
+            // Don't require exit 0 — read whatever JSON/text the command prints
+            // so a non-zero "loggedIn: false" is still classified, not dropped.
+            false,
+        )
+        .await
+        {
+            Some(out) => parse_claude_auth_status(&out),
+            None => AuthState::Unknown,
+        }
+    }
+}
+
+/// The Claude Code credential FILE path on platforms that use one (Linux /
+/// Windows), honoring `CLAUDE_CONFIG_DIR`. Returns `None` when no home/config
+/// dir can be derived. On macOS the real store is the Keychain (no file), so a
+/// missing file here is not proof of logged-out — callers only treat its
+/// PRESENCE as positive.
+fn claude_credentials_file() -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::home_dir().map(|h| h.join(".claude")))?;
+    Some(dir.join(".credentials.json"))
+}
+
+/// Classify the output of `claude auth status`. The command prints JSON like
+/// `{"loggedIn": true, "authMethod": "claude.ai", …}` (verified against live
+/// output). We read the `loggedIn` boolean; a plain-text fallback matches a
+/// "logged in" / "not logged in" phrase. Anything unrecognised →
+/// [`AuthState::Unknown`] (fail-open — never a false positive).
+fn parse_claude_auth_status(out: &str) -> AuthState {
+    // Prefer the structured boolean.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(out.trim()) {
+        if let Some(b) = v.get("loggedIn").and_then(serde_json::Value::as_bool) {
+            return if b {
+                AuthState::LoggedIn
+            } else {
+                AuthState::NotLoggedIn
+            };
+        }
+    }
+    // Plain-text fallback (forward-compat if the format changes).
+    let lower = out.to_ascii_lowercase();
+    if lower.contains("not logged in")
+        || lower.contains("logged out")
+        || lower.contains("not authenticated")
+    {
+        AuthState::NotLoggedIn
+    } else if lower.contains("logged in") || lower.contains("authenticated") {
+        AuthState::LoggedIn
+    } else {
+        AuthState::Unknown
     }
 }
 
@@ -965,6 +1078,64 @@ mod tests {
         let probe = d.probe().await;
         assert!(matches!(probe, ProbeResult::NotInstalled { .. }));
         assert!(!probe.is_ready());
+        // A not-installed base is NotInstalled auth — never a false LoggedIn,
+        // and distinct from NotLoggedIn (gap G10).
+        assert_eq!(probe.auth_state(), AuthState::NotInstalled);
+        assert!(!probe.is_ready_and_authed());
+    }
+
+    #[test]
+    fn parse_claude_auth_status_reads_logged_in_json() {
+        // The live `claude auth status` JSON shape (verified against real output).
+        let logged_in =
+            r#"{"loggedIn": true, "authMethod": "claude.ai", "subscriptionType": "max"}"#;
+        assert_eq!(parse_claude_auth_status(logged_in), AuthState::LoggedIn);
+
+        let logged_out = r#"{"loggedIn": false}"#;
+        assert_eq!(parse_claude_auth_status(logged_out), AuthState::NotLoggedIn);
+
+        // Plain-text fallback (forward-compat if the format ever changes).
+        assert_eq!(
+            parse_claude_auth_status("You are not logged in"),
+            AuthState::NotLoggedIn
+        );
+        assert_eq!(
+            parse_claude_auth_status("Logged in as foo@bar.com"),
+            AuthState::LoggedIn
+        );
+        // Unrecognised output → Unknown (fail-open, never a false positive).
+        assert_eq!(parse_claude_auth_status("???"), AuthState::Unknown);
+        assert_eq!(parse_claude_auth_status(""), AuthState::Unknown);
+    }
+
+    #[test]
+    fn install_and_login_hints_are_actionable() {
+        let d = ClaudeCodeDriver::default();
+        assert!(d.install_hint().unwrap().contains("claude-code"));
+        assert!(d.login_hint().unwrap().contains("claude"));
+    }
+
+    // An auth env var makes claude authenticated regardless of any stored login —
+    // probe_auth must report LoggedIn instantly without spawning a subprocess.
+    #[tokio::test]
+    async fn probe_auth_logged_in_via_env_var() {
+        // Crate-wide lock so no sibling module's env-mutating test races us.
+        let _guard = crate::AUTH_ENV_TEST_LOCK.lock().await;
+        let saved = std::env::var_os("ANTHROPIC_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+        // Point at a missing binary so the ONLY way this returns LoggedIn is the
+        // env-var fast path (a real `claude auth status` couldn't run).
+        let d = ClaudeCodeDriver::with_program("umadev-fake-claude-xyz");
+        let state = d.probe_auth().await;
+        match saved {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        assert_eq!(
+            state,
+            AuthState::LoggedIn,
+            "an auth env var must short-circuit to LoggedIn"
+        );
     }
 
     #[test]

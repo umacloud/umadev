@@ -29,6 +29,122 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A schedulable seat on the delivery team — the unit the router and the plan
+/// reason about ("convene a backend engineer"). A seat is a STABLE identity, not a
+/// hand-coded heuristic: the same eight roles back the cross-review critic roster
+/// (so a [`Seat`] maps 1:1 to a [`RoleCritic`]'s `role()` id) AND name the doers a
+/// plan step is assigned to. Doing seats (frontend/backend/…) drive the main
+/// session serially under the run-lock; reviewing seats run on read-only forks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Seat {
+    /// Product manager — owns scope / requirements / acceptance.
+    ProductManager,
+    /// Software architect / tech lead — owns the API surface + data model.
+    Architect,
+    /// UI/UX designer — owns the design system + page hierarchy.
+    UiuxDesigner,
+    /// Frontend engineer — builds the UI (a doing seat).
+    FrontendEngineer,
+    /// Backend engineer — builds the API + data layer (a doing seat).
+    BackendEngineer,
+    /// QA engineer — owns test coverage + the acceptance floor.
+    QaEngineer,
+    /// Security engineer — owns the attack-surface review.
+    SecurityEngineer,
+    /// DevOps engineer — owns build / deploy / CI.
+    DevopsEngineer,
+}
+
+impl Seat {
+    /// The stable role id — identical to the matching [`RoleCritic::role`] so a
+    /// seat and its critic share ONE id across events, the ledger, and `summon`.
+    #[must_use]
+    pub const fn role_id(self) -> &'static str {
+        match self {
+            Self::ProductManager => "product-manager",
+            Self::Architect => "architect",
+            Self::UiuxDesigner => "uiux-designer",
+            Self::FrontendEngineer => "frontend-engineer",
+            Self::BackendEngineer => "backend-engineer",
+            Self::QaEngineer => "qa-engineer",
+            Self::SecurityEngineer => "security-engineer",
+            Self::DevopsEngineer => "devops-engineer",
+        }
+    }
+
+    /// Whether this seat DOES workspace-mutating work (drives the main session
+    /// serially) vs only reviews (runs on a read-only fork). The doers are the
+    /// engineering seats; the rest are reviewing/advisory seats.
+    #[must_use]
+    pub const fn is_doer(self) -> bool {
+        matches!(
+            self,
+            Self::FrontendEngineer | Self::BackendEngineer | Self::DevopsEngineer
+        )
+    }
+
+    /// Resolve a seat from a free-text role id / alias (the same alias set
+    /// `director::critic_for_role` accepts, kept in sync). `None` on an unknown
+    /// name so a caller fail-opens (an unknown seat is simply ignored).
+    #[must_use]
+    pub fn from_alias(name: &str) -> Option<Self> {
+        match name
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '_'], "-")
+            .as_str()
+        {
+            "product-manager" | "pm" | "product" => Some(Self::ProductManager),
+            "architect" | "architecture" | "tech-lead" | "techlead" => Some(Self::Architect),
+            "uiux-designer" | "uiux" | "designer" | "ui" | "ux" | "design" => {
+                Some(Self::UiuxDesigner)
+            }
+            "frontend-engineer" | "frontend" | "fe" => Some(Self::FrontendEngineer),
+            "backend-engineer" | "backend" | "be" => Some(Self::BackendEngineer),
+            "qa-engineer" | "qa" | "test" | "tester" => Some(Self::QaEngineer),
+            "security-engineer" | "security" | "sec" => Some(Self::SecurityEngineer),
+            "devops-engineer" | "devops" | "sre" | "release" | "ops" => Some(Self::DevopsEngineer),
+            _ => None,
+        }
+    }
+
+    /// The seats a [`crate::planner::TaskKind`] convenes — the roster scaled to the
+    /// task. Reuses the planner's complexity sense (a greenfield convenes the full
+    /// roster; a bugfix/refactor convenes none — the lean tiers want no team).
+    /// Deterministic; the router's reconciliation may widen it.
+    #[must_use]
+    pub fn team_for_kind(kind: crate::planner::TaskKind) -> Vec<Self> {
+        use crate::planner::TaskKind as K;
+        match kind {
+            K::Greenfield => vec![
+                Self::ProductManager,
+                Self::Architect,
+                Self::UiuxDesigner,
+                Self::FrontendEngineer,
+                Self::BackendEngineer,
+                Self::QaEngineer,
+                Self::SecurityEngineer,
+            ],
+            K::FrontendOnly => vec![
+                Self::ProductManager,
+                Self::UiuxDesigner,
+                Self::FrontendEngineer,
+                Self::QaEngineer,
+            ],
+            K::BackendOnly => vec![
+                Self::Architect,
+                Self::BackendEngineer,
+                Self::QaEngineer,
+                Self::SecurityEngineer,
+            ],
+            // The lean kinds convene no standing team — a bugfix / refactor / trivial
+            // build is single-writer + targeted verify, the team is pure overhead.
+            K::Bugfix | K::Refactor | K::DocsOnly | K::Light => Vec::new(),
+        }
+    }
+}
+
 /// One role's structured opinion on the shared artifacts — the team layer's
 /// unit of cross-review. Aligns with the runner's existing ad-hoc verdicts
 /// (`AcceptanceVerdict` / `DocsVerdict` / `DesignVerdict`) but generalises them

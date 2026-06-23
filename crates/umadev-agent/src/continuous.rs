@@ -1530,6 +1530,13 @@ pub(crate) async fn run_review_team(
     for verdict in verdicts {
         crate::critics::append_team_ledger(&options.project_root, phase_label, round + 1, &verdict);
         let seat = verdict.role.clone();
+        // Wave 1 (L1/L2 visibility): surface each seat's verdict as a STRUCTURED
+        // event so a UI can render a real team-review panel (accept + blocking +
+        // advisory), replacing the bland one-line Note as the source of truth. The
+        // human-readable Notes are kept too (today's TUI still renders Notes; W1-B
+        // switches to the panel) — both are observational, neither drives the loop
+        // (verdicts stay advisory — invariant 2).
+        events.emit(EngineEvent::critic_verdict(&verdict));
         if verdict.accepts && verdict.blocking.is_empty() {
             events.emit(EngineEvent::Note(umadev_i18n::tlf(
                 "continuous.team.seat_passed",
@@ -1807,6 +1814,40 @@ impl ForkConsult {
     pub(crate) async fn end(&self) {
         if let Ok(s) = self.fork.lock().await.as_mut() {
             let _ = s.end().await;
+        }
+    }
+
+    /// Run ONE strict-JSON consult on the read-only fork and return the extracted
+    /// JSON object text (NOT parsed into a [`RoleVerdict`]) — the generic primitive
+    /// the router / planner use to get a typed artifact of their OWN shape over the
+    /// borrowed brain. Same fork → judge-turn → `extract_json_object` path as
+    /// [`CriticConsult::judge`], same fail-open contract: a missing fork, an offline
+    /// brain, a timeout, or a reply with no JSON object yields `None`, so the caller
+    /// degrades to its deterministic floor.
+    ///
+    /// `label` is only used for the bounded-turn log line; `system` pins the schema,
+    /// `user` carries the payload. The caller `serde_json::from_str`s the result.
+    pub(crate) async fn judge_json(
+        &self,
+        label: &str,
+        system: &str,
+        user: String,
+    ) -> Option<String> {
+        let _ = label;
+        let mut guard = self.fork.lock().await;
+        let fork = guard.as_mut().ok()?; // no fork (offline / unsupported / failed) → None
+        let directive = format!(
+            "{system}\n\nReturn EXACTLY ONE JSON object and nothing else — no markdown, \
+             no code fence, no prose before or after.\n\n{user}"
+        );
+        if fork.send_turn(directive).await.is_err() {
+            return None;
+        }
+        // Bound the judge turn so one wedged fork can't hang the caller (same window
+        // the critic team uses). A timeout / dead session → None (fail-open).
+        match tokio::time::timeout(review_turn_timeout(), drain_review_text(fork)).await {
+            Ok(Some(text)) => extract_json_object(&text),
+            _ => None,
         }
     }
 }

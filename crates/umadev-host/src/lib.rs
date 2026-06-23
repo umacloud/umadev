@@ -88,13 +88,59 @@ pub fn govern_root_env(workspace: &std::path::Path) -> Vec<(String, String)> {
     )]
 }
 
+/// Whether a host CLI is actually **authenticated** — the honest signal the
+/// first-run picker needs (gap G10). `--version` only proves the binary is on
+/// `PATH`; it says nothing about login, so a not-logged-in base used to render a
+/// green "ready" and then fail mid-run. [`AuthState`] is the missing third axis.
+///
+/// **Fail-open by contract:** any probe that errors, times out, or can't make a
+/// confident call resolves to [`AuthState::Unknown`] — NEVER a false
+/// [`AuthState::LoggedIn`]. The picker shows a conservative "login may be
+/// required" hint for `Unknown` rather than a green light it can't back up.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum AuthState {
+    /// The CLI is installed AND has usable credentials (a logged-in
+    /// subscription/OAuth session, a credential file, or an auth env var).
+    LoggedIn,
+    /// The CLI is installed but has NO usable credentials — the user must run
+    /// the base's own login command (see [`ProbeResult::login_hint`]). This is
+    /// the case the picker must surface honestly instead of a false "ready".
+    NotLoggedIn,
+    /// The CLI binary is not on `PATH` / not installed — auth is moot until it
+    /// is installed (see [`ProbeResult::install_hint`]).
+    NotInstalled,
+    /// The auth state could not be determined confidently (probe errored, timed
+    /// out, the status subcommand is missing, or the output was unrecognised).
+    /// The picker shows a conservative "login may be required" hint. We choose
+    /// this over guessing `LoggedIn` so the first-run signal never lies.
+    Unknown,
+}
+
+impl AuthState {
+    /// `true` only when the base is confidently authenticated. Used by the
+    /// picker to decide whether to show the honest green "ready & logged in".
+    #[must_use]
+    pub fn is_logged_in(self) -> bool {
+        matches!(self, Self::LoggedIn)
+    }
+}
+
 /// Outcome of probing a host CLI for availability.
+///
+/// Carries BOTH the install/version signal AND the honest [`AuthState`] (gap
+/// G10): a base can be installed (`--version` works) yet not logged in, in which
+/// case it must NOT render as a green "ready". The picker reads `auth_state`
+/// (and the install/login hints) to show one of three truthful states.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ProbeResult {
     /// The CLI is installed and responded to `--version`.
     Ready {
         /// Raw version string the CLI reported.
         version: String,
+        /// Whether the CLI is actually authenticated. Installed-but-not-logged-in
+        /// is [`AuthState::NotLoggedIn`]; an indeterminate probe is
+        /// [`AuthState::Unknown`] (never a false `LoggedIn`).
+        auth_state: AuthState,
     },
     /// The CLI binary was not found on `PATH`.
     NotInstalled {
@@ -114,6 +160,27 @@ impl ProbeResult {
     pub fn is_ready(&self) -> bool {
         matches!(self, Self::Ready { .. })
     }
+
+    /// The honest auth state for this probe. `NotInstalled` maps to
+    /// [`AuthState::NotInstalled`]; an `Unhealthy` (`--version` failed for some
+    /// non-PATH reason) maps to [`AuthState::Unknown`] — we can't tell login
+    /// state from a broken binary, and `Unknown` is the conservative answer.
+    #[must_use]
+    pub fn auth_state(&self) -> AuthState {
+        match self {
+            Self::Ready { auth_state, .. } => *auth_state,
+            Self::NotInstalled { .. } => AuthState::NotInstalled,
+            Self::Unhealthy { .. } => AuthState::Unknown,
+        }
+    }
+
+    /// `true` only when the base is installed AND confidently logged in — the
+    /// single check the picker uses to show the honest green "ready" mark
+    /// (replacing the old `--version`-only `is_ready`, which lied about login).
+    #[must_use]
+    pub fn is_ready_and_authed(&self) -> bool {
+        self.auth_state().is_logged_in()
+    }
 }
 
 /// Extension trait every host driver implements on top of [`Runtime`].
@@ -127,8 +194,46 @@ pub trait HostDriver: umadev_runtime::Runtime {
     /// Human-facing name.
     fn display_name(&self) -> &'static str;
 
-    /// Check whether the underlying CLI is installed + reachable.
+    /// Check whether the underlying CLI is installed + reachable, AND whether it
+    /// is actually authenticated (gap G10). The returned [`ProbeResult`] carries
+    /// the honest [`AuthState`] so the first-run picker can tell "ready & logged
+    /// in" apart from "installed but not logged in" instead of showing a green
+    /// light that fails mid-run. Implementors run [`Self::probe_auth`] only when
+    /// the binary is confirmed installed (a `--version` success), so a missing
+    /// base never pays for an auth probe.
     async fn probe(&self) -> ProbeResult;
+
+    /// The cheapest **authenticated no-op** for this base — answers "is this CLI
+    /// logged in?" WITHOUT running a real generation (no tokens burned, no
+    /// model held). Each driver implements the base's own official mechanism
+    /// (a credential file / auth env var existence check, falling back to the
+    /// base's `auth status` / `login status` subcommand under a short timeout).
+    ///
+    /// **Fail-open by contract:** on ANY error, timeout, or unrecognised output
+    /// it returns [`AuthState::Unknown`] — NEVER a false [`AuthState::LoggedIn`].
+    /// The default returns `Unknown` so a non-first-class backend stays
+    /// conservative; the three host drivers override it.
+    ///
+    /// Called by [`Self::probe`] only after the binary is confirmed installed.
+    async fn probe_auth(&self) -> AuthState {
+        AuthState::Unknown
+    }
+
+    /// The command the user runs to **install** this base, for the picker to
+    /// show on a [`ProbeResult::NotInstalled`] (e.g.
+    /// `npm install -g @anthropic-ai/claude-code`). `None` for a backend with no
+    /// canonical install line; the three host drivers override it.
+    fn install_hint(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The command the user runs to **log in** to this base, for the picker to
+    /// show on an [`AuthState::NotLoggedIn`] (e.g. `claude` / `codex login` /
+    /// `opencode auth login`). `None` for a backend with no login step; the
+    /// three host drivers override it.
+    fn login_hint(&self) -> Option<&'static str> {
+        None
+    }
 
     /// Ask this driver to **continue its previous session** on the next
     /// `complete` call instead of starting a fresh one.
@@ -535,9 +640,18 @@ fn env_dir(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// `true` when ANY of `keys` names a non-empty environment variable. Used by the
+/// auth probes to honor the env-var auth paths a base accepts (e.g. claude's
+/// `ANTHROPIC_API_KEY` / cloud-provider toggles) as an instant, subprocess-free
+/// "logged in" signal. An empty value counts as unset (a base ignores `KEY=`).
+pub(crate) fn any_env_set(keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()))
+}
+
 /// The user's home directory, derived without pulling in the `dirs` crate:
 /// `$HOME` on Unix, `%USERPROFILE%` (then `%HOMEDRIVE%%HOMEPATH%`) on Windows.
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         env_dir("USERPROFILE").or_else(|| {
             let drive = std::env::var_os("HOMEDRIVE")?;
@@ -551,6 +665,28 @@ fn home_dir() -> Option<PathBuf> {
         })
     } else {
         env_dir("HOME")
+    }
+}
+
+/// The platform data directory a tool stores per-user state in, following the
+/// same resolution the three base CLIs use:
+///
+/// - Unix (Linux/macOS): `$XDG_DATA_HOME` if set, else `~/.local/share`.
+/// - Windows: `%XDG_DATA_HOME%` if set, else `%LOCALAPPDATA%`, else
+///   `~\AppData\Local`.
+///
+/// Used by the opencode auth probe to locate `…/opencode/auth.json` without
+/// pulling in the `dirs`/`directories` crates (the dependency-light contract).
+/// Returns `None` when no base directory can be derived (fail-open: the caller
+/// then falls through to the auth-status subcommand).
+fn data_dir() -> Option<PathBuf> {
+    if let Some(xdg) = env_dir("XDG_DATA_HOME") {
+        return Some(xdg);
+    }
+    if cfg!(windows) {
+        env_dir("LOCALAPPDATA").or_else(|| home_dir().map(|h| h.join("AppData").join("Local")))
+    } else {
+        home_dir().map(|h| h.join(".local").join("share"))
     }
 }
 
@@ -796,6 +932,75 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
         "host subprocess completed"
     );
     Ok(SubprocessOutput { stdout: cleaned })
+}
+
+/// Default hard ceiling for an **auth probe** subprocess (`<base> auth status`
+/// / `<base> login status`). Deliberately short (5s): an auth-status command is
+/// a local credential check, not a model call, so it returns in well under a
+/// second when healthy. A short ceiling keeps a hung/misbehaving status command
+/// from stalling the first-run picker — on timeout the probe fail-opens to
+/// [`AuthState::Unknown`]. Tunable via `UMADEV_AUTH_PROBE_SECS`.
+pub(crate) fn auth_probe_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("UMADEV_AUTH_PROBE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(5),
+    )
+}
+
+/// Run a base's auth-status subcommand (e.g. `claude auth status`) purely to
+/// read its output — a cheap authenticated no-op, NEVER a real generation.
+///
+/// Returns the combined `stdout` (and, on a clean exit, nothing else needed) so
+/// the caller can pattern-match the base's "logged in" wording. **Fail-open:**
+/// any spawn failure, non-zero exit, OR timeout returns `None` so the caller
+/// resolves to [`AuthState::Unknown`] rather than guessing. The prompt channel
+/// is unused (stdin is closed immediately) so a status command that peeks stdin
+/// can't hang. Bounded by [`auth_probe_timeout`].
+///
+/// `success_required`: when `true`, a non-zero exit yields `None` (the caller
+/// treats "command failed" as indeterminate); when `false`, the stdout is
+/// returned even on a non-zero exit so the caller can inspect a "Not logged in"
+/// message a base prints with a non-zero code. Cross-platform: spawns via
+/// [`spawn_parts`] so a Windows `.cmd` shim is routed through `cmd /c`.
+pub(crate) async fn run_auth_status(
+    program: &str,
+    args: &[String],
+    success_required: bool,
+) -> Option<String> {
+    let (prog, lead) = spawn_parts(program);
+    let mut cmd = Command::new(prog);
+    cmd.args(&lead);
+    cmd.args(args);
+    cmd.current_dir(default_workspace());
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd.spawn().ok()?;
+    // Close stdin immediately (EOF) so a status command that peeks stdin in a
+    // non-interactive context returns instead of blocking to the timeout.
+    drop(child.stdin.take());
+
+    let (status, stdout_buf, stderr_buf) =
+        drain_and_wait(&mut child, auth_probe_timeout(), program)
+            .await
+            .ok()?;
+
+    if success_required && !status.success() {
+        return None;
+    }
+    // Some bases print the status to stderr; fold both so the matcher sees it.
+    let mut out = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let err = String::from_utf8_lossy(&stderr_buf);
+    if !err.trim().is_empty() {
+        out.push('\n');
+        out.push_str(&err);
+    }
+    Some(out)
 }
 
 /// Run a host CLI subprocess in **streaming mode**.
@@ -1304,6 +1509,17 @@ pub(crate) fn default_workspace() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Process-wide lock serialising EVERY env-mutating auth test across the crate's
+/// modules (`lib` / `claude` / `codex` / `opencode`). Process env is global to
+/// all test threads, so a per-module mutex can't stop a sibling module's test
+/// from observing a half-set `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `CODEX_HOME`
+/// mid-mutation. A single shared `tokio::sync::Mutex` (the guard is held across
+/// `probe_auth().await`, where a `std` guard would trip clippy's
+/// `await_holding_lock`) makes those tests strictly serial and flake-proof.
+/// Test-only.
+#[cfg(test)]
+pub(crate) static AUTH_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1559,6 +1775,150 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.stdout, "hello-from-test");
+    }
+
+    // ---- AuthState / ProbeResult honest-auth surface (gap G10) ----
+
+    #[test]
+    fn auth_state_three_states_map_to_probe_result() {
+        // A Ready probe carries its auth_state through faithfully — the honest
+        // third axis the picker reads (installed AND logged in vs installed but
+        // not logged in vs indeterminate).
+        let logged_in = ProbeResult::Ready {
+            version: "1.2.3".to_string(),
+            auth_state: AuthState::LoggedIn,
+        };
+        assert_eq!(logged_in.auth_state(), AuthState::LoggedIn);
+        assert!(logged_in.is_ready());
+        assert!(logged_in.is_ready_and_authed());
+        assert!(logged_in.auth_state().is_logged_in());
+
+        let not_logged_in = ProbeResult::Ready {
+            version: "1.2.3".to_string(),
+            auth_state: AuthState::NotLoggedIn,
+        };
+        assert_eq!(not_logged_in.auth_state(), AuthState::NotLoggedIn);
+        // CRITICAL G10 fix: on PATH (is_ready) but NOT authed — must NOT show the
+        // green "ready & logged in" mark.
+        assert!(not_logged_in.is_ready());
+        assert!(!not_logged_in.is_ready_and_authed());
+
+        // Indeterminate auth never masquerades as logged in.
+        let unknown = ProbeResult::Ready {
+            version: "1.2.3".to_string(),
+            auth_state: AuthState::Unknown,
+        };
+        assert_eq!(unknown.auth_state(), AuthState::Unknown);
+        assert!(!unknown.is_ready_and_authed());
+    }
+
+    #[test]
+    fn probe_result_not_installed_vs_not_logged_in_are_distinct() {
+        // NotInstalled (binary absent → install hint) and NotLoggedIn (binary
+        // present, no creds → login hint) are different picker states.
+        let absent = ProbeResult::NotInstalled {
+            program: "codex".to_string(),
+        };
+        assert_eq!(absent.auth_state(), AuthState::NotInstalled);
+        assert!(!absent.is_ready());
+        assert!(!absent.is_ready_and_authed());
+
+        let present_no_creds = ProbeResult::Ready {
+            version: "0.1.0".to_string(),
+            auth_state: AuthState::NotLoggedIn,
+        };
+        assert_eq!(present_no_creds.auth_state(), AuthState::NotLoggedIn);
+        assert_ne!(absent.auth_state(), present_no_creds.auth_state());
+    }
+
+    #[test]
+    fn unhealthy_probe_is_unknown_not_a_false_logged_in() {
+        // A broken binary (version failed for a non-PATH reason) tells us nothing
+        // about login → Unknown, never a false LoggedIn (fail-open).
+        let broken = ProbeResult::Unhealthy {
+            detail: "exited with code 1".to_string(),
+        };
+        assert_eq!(broken.auth_state(), AuthState::Unknown);
+        assert!(!broken.is_ready_and_authed());
+    }
+
+    #[tokio::test]
+    async fn install_and_login_hints_present_for_every_backend() {
+        // The picker needs an install command (NotInstalled) and a login command
+        // (NotLoggedIn) string for each first-class base.
+        for id in BACKEND_IDS {
+            let d = driver_for(id).unwrap();
+            assert!(
+                d.install_hint().is_some_and(|h| !h.is_empty()),
+                "{id} must expose an install hint for the picker"
+            );
+            assert!(
+                d.login_hint().is_some_and(|h| !h.is_empty()),
+                "{id} must expose a login hint for the picker"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_auth_status_fail_opens_to_none_on_missing_binary() {
+        // The cheap auth-status no-op must fail-open (→ None → caller resolves
+        // Unknown) when the status command can't even spawn — never a panic,
+        // never a false positive.
+        let got = run_auth_status(
+            "umadev-definitely-not-a-real-binary-xyz",
+            &["status".to_string()],
+            true,
+        )
+        .await;
+        assert!(
+            got.is_none(),
+            "a missing status binary must fail-open to None"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_auth_status_times_out_to_none_fail_open() {
+        // A status command that hangs must be killed by the short auth-probe
+        // ceiling and fail-open to None (→ Unknown), never block the picker or
+        // wrongly report logged-in.
+        let _env = IDLE_ENV_LOCK.lock().await;
+        std::env::set_var("UMADEV_AUTH_PROBE_SECS", "1");
+        let started = Instant::now();
+        let got = run_auth_status(
+            "sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            // success not required, but a hang still must not return a value
+            false,
+        )
+        .await;
+        std::env::remove_var("UMADEV_AUTH_PROBE_SECS");
+        assert!(
+            got.is_none(),
+            "a hung auth-status command must fail-open to None"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "auth probe must honor the short ceiling, not hang the picker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_auth_status_returns_stdout_on_success() {
+        // A status command that prints its state and exits 0 → we get the text to
+        // pattern-match against (the "logged in" wording).
+        let got = run_auth_status(
+            "sh",
+            &[
+                "-c".to_string(),
+                "echo 'Logged in using ChatGPT'".to_string(),
+            ],
+            true,
+        )
+        .await
+        .expect("a clean status command must return its stdout");
+        assert!(got.contains("Logged in"));
     }
 
     #[test]

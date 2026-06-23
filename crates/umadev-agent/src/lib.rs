@@ -52,9 +52,11 @@ pub mod gates;
 pub mod lessons;
 pub mod manifest;
 pub mod phases;
+pub mod plan_state;
 pub mod planner;
 pub mod pr;
 pub mod review;
+pub mod router;
 pub mod run_lock;
 pub mod runner;
 pub mod runtime_proof;
@@ -77,7 +79,7 @@ pub use continuous::{
 pub use critics::{
     append_team_ledger, docs_team_for_kind, preview_team_for_kind, quality_team_for_kind,
     ArchitectureCritic, BackendCritic, CriticArtifacts, CriticConsult, DevOpsCritic,
-    FrontendCritic, PmCritic, QaCritic, RoleCritic, RoleVerdict, SecurityCritic, UiuxCritic,
+    FrontendCritic, PmCritic, QaCritic, RoleCritic, RoleVerdict, Seat, SecurityCritic, UiuxCritic,
 };
 pub use deploy::{
     deploy_proof_rel_path, detect_deploy_target, run_deploy, write_deploy_proof, DeployProof,
@@ -88,7 +90,7 @@ pub use director::{
     verify as director_verify, CheckpointDecision, ReviewResult, SummonMode, SummonResult,
     VerifyKind, VerifyResult,
 };
-pub use director_loop::{drive_director_loop, DirectorLoopOutcome};
+pub use director_loop::{drive_director_loop, drive_director_loop_routed, DirectorLoopOutcome};
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{claims_code_changes, classify_reply, Gate, GateOutcome};
 pub use lessons::{
@@ -104,6 +106,10 @@ pub use manifest::{ConformanceLevel, Profile, SpecManifest};
 pub use phases::{
     agentic_knowledge_digest, knowledge_top_files, phase_knowledge_digest, PhaseOutput,
 };
+pub use plan_state::{
+    load as load_plan, save as save_plan, synthesize_plan, AcceptanceSpec, Plan, PlanStep,
+    StepKind, StepStatus,
+};
 pub use planner::{
     advisory_prior, phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan,
     TaskKind,
@@ -115,6 +121,9 @@ pub use pr::{
 pub use review::{
     build_review_report, render_review_md, review_report_rel_path, scan_ci_weakening,
     write_review_report, ReviewClaim, ReviewReport, Verdict,
+};
+pub use router::{
+    looks_like_work_request, route, Budget, ClarifyQuestion, Depth, RouteClass, RoutePlan,
 };
 pub use runner::{strict_coverage_from_env, AgentRunner, RunOptions, RunReport};
 pub use runtime_proof::{

@@ -28,8 +28,8 @@ use umadev_runtime::{
 };
 
 use crate::{
-    default_workspace, merge_prompt, run_subprocess, run_subprocess_streaming, HostDriver,
-    ProbeResult, PromptChannel, SubprocessCall,
+    default_workspace, merge_prompt, run_auth_status, run_subprocess, run_subprocess_streaming,
+    AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
 };
 
 /// Drives the `opencode` CLI as a subprocess.
@@ -386,6 +386,14 @@ impl HostDriver for OpenCodeDriver {
         self.workspace = Some(workspace);
     }
 
+    fn install_hint(&self) -> Option<&'static str> {
+        Some("npm install -g opencode-ai")
+    }
+
+    fn login_hint(&self) -> Option<&'static str> {
+        Some("opencode auth login")
+    }
+
     async fn probe(&self) -> ProbeResult {
         let tmp = default_workspace();
         match run_subprocess(SubprocessCall {
@@ -399,14 +407,95 @@ impl HostDriver for OpenCodeDriver {
         })
         .await
         {
+            // Installed — resolve the honest auth state too (gap G10).
             Ok(out) => ProbeResult::Ready {
                 version: out.stdout.lines().next().unwrap_or("unknown").to_string(),
+                auth_state: self.probe_auth().await,
             },
             Err(e) if e.contains("not found on PATH") => ProbeResult::NotInstalled {
                 program: self.program.clone(),
             },
             Err(e) => ProbeResult::Unhealthy { detail: e },
         }
+    }
+
+    /// Cheapest authenticated no-op for `OpenCode`, in cost order — NO real
+    /// generation, NO tokens.
+    ///
+    /// `OpenCode` stores provider credentials in `auth.json` under its platform
+    /// data dir (`$XDG_DATA_HOME/opencode/auth.json`, default
+    /// `~/.local/share/opencode/auth.json` on Unix; `%LOCALAPPDATA%\opencode\…`
+    /// on Windows). The file is written by `opencode auth login` and holds one
+    /// entry per configured provider (verified live: `{"anthropic": {…}}`).
+    ///
+    /// 1. **`auth.json` exists AND is non-empty** (`{}` means "no providers")
+    ///    under the data dir → at least one provider is configured → LoggedIn.
+    /// 2. **Authoritative subcommand** `opencode auth list` — lists configured
+    ///    providers/credentials; output mentioning a credential count / provider
+    ///    means logged in, an explicit "no credentials" means not. Fallback when
+    ///    the file can't be read (custom dir); bounded by the short timeout.
+    ///
+    /// Unlike claude/codex there is NO single env var that authenticates
+    /// `OpenCode` globally (per-provider keys vary), so we don't guess from env.
+    /// Fail-open: anything indeterminate → [`AuthState::Unknown`].
+    async fn probe_auth(&self) -> AuthState {
+        // 1. Credential file: present AND carrying at least one provider.
+        if let Some(state) = opencode_auth_file().and_then(|p| classify_opencode_auth_file(&p)) {
+            return state;
+        }
+        // 2. Authoritative subcommand: `opencode auth list`.
+        match run_auth_status(
+            &self.program,
+            &["auth".to_string(), "list".to_string()],
+            true,
+        )
+        .await
+        {
+            Some(out) => classify_opencode_auth_list(&out),
+            None => AuthState::Unknown,
+        }
+    }
+}
+
+/// `OpenCode`'s credential file: `<data_dir>/opencode/auth.json`. Returns `None`
+/// when no data dir can be derived (fail-open → the caller tries the subcommand).
+fn opencode_auth_file() -> Option<std::path::PathBuf> {
+    crate::data_dir().map(|d| d.join("opencode").join("auth.json"))
+}
+
+/// Classify `OpenCode`'s `auth.json`: present + a non-empty JSON object (at least
+/// one configured provider) → [`AuthState::LoggedIn`]; present but `{}`/empty →
+/// [`AuthState::NotLoggedIn`]; unreadable/absent → `None` (fall through to the
+/// subcommand). Fail-open: a parse failure on a present file yields `None`, not a
+/// guess.
+fn classify_opencode_auth_file(path: &std::path::Path) -> Option<AuthState> {
+    if !path.is_file() {
+        return None;
+    }
+    let body = std::fs::read_to_string(path).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&body).ok()?;
+    let obj = v.as_object()?;
+    Some(if obj.is_empty() {
+        AuthState::NotLoggedIn
+    } else {
+        AuthState::LoggedIn
+    })
+}
+
+/// Classify the output of `opencode auth list`. Output naming a provider / a
+/// non-zero credential count → [`AuthState::LoggedIn`]; an explicit "0
+/// credentials" / "no credentials" → [`AuthState::NotLoggedIn`]; anything else →
+/// [`AuthState::Unknown`] (fail-open — never a false positive).
+fn classify_opencode_auth_list(out: &str) -> AuthState {
+    let lower = out.to_ascii_lowercase();
+    if lower.contains("0 credentials") || lower.contains("no credentials") {
+        AuthState::NotLoggedIn
+    } else if lower.contains("credential") {
+        // "N credentials" / "1 credential" with N>=1 (the 0 case is handled
+        // above), or a "Credentials" header followed by listed providers.
+        AuthState::LoggedIn
+    } else {
+        AuthState::Unknown
     }
 }
 
@@ -503,6 +592,67 @@ mod tests {
         let probe = d.probe().await;
         assert!(matches!(probe, ProbeResult::NotInstalled { .. }));
         assert!(!probe.is_ready());
+        // NotInstalled auth state — distinct from NotLoggedIn, never LoggedIn.
+        assert_eq!(probe.auth_state(), AuthState::NotInstalled);
+        assert!(!probe.is_ready_and_authed());
+    }
+
+    #[test]
+    fn install_and_login_hints_are_actionable() {
+        let d = OpenCodeDriver::default();
+        assert!(d.install_hint().unwrap().contains("opencode"));
+        assert!(d.login_hint().unwrap().contains("auth login"));
+    }
+
+    #[test]
+    fn classify_opencode_auth_file_three_states() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // A non-empty provider object → at least one credential → LoggedIn.
+        let logged_in = dir.path().join("auth_in.json");
+        std::fs::write(&logged_in, r#"{"anthropic":{"type":"api","key":"x"}}"#).unwrap();
+        assert_eq!(
+            classify_opencode_auth_file(&logged_in),
+            Some(AuthState::LoggedIn)
+        );
+
+        // An empty object `{}` → no providers configured → NotLoggedIn.
+        let empty = dir.path().join("auth_empty.json");
+        std::fs::write(&empty, "{}").unwrap();
+        assert_eq!(
+            classify_opencode_auth_file(&empty),
+            Some(AuthState::NotLoggedIn)
+        );
+
+        // Absent file → None (caller falls through to the subcommand).
+        let missing = dir.path().join("nope.json");
+        assert_eq!(classify_opencode_auth_file(&missing), None);
+
+        // Present but unparseable → None (fail-open, not a guess).
+        let garbage = dir.path().join("garbage.json");
+        std::fs::write(&garbage, "not json").unwrap();
+        assert_eq!(classify_opencode_auth_file(&garbage), None);
+    }
+
+    #[test]
+    fn classify_opencode_auth_list_three_states() {
+        // Live `opencode auth list` output naming a provider + "1 credentials".
+        let listed = "Credentials ~/.local/share/opencode/auth.json\nAnthropic api\n1 credentials";
+        assert_eq!(classify_opencode_auth_list(listed), AuthState::LoggedIn);
+
+        // No providers configured.
+        assert_eq!(
+            classify_opencode_auth_list("0 credentials"),
+            AuthState::NotLoggedIn
+        );
+        assert_eq!(
+            classify_opencode_auth_list("no credentials configured"),
+            AuthState::NotLoggedIn
+        );
+
+        // Unrecognised → Unknown (fail-open, never a false positive).
+        assert_eq!(classify_opencode_auth_list("???"), AuthState::Unknown);
+        assert_eq!(classify_opencode_auth_list(""), AuthState::Unknown);
     }
 
     #[test]

@@ -1365,6 +1365,15 @@ impl App {
                     umadev_i18n::tf(self.lang, "run.started", &[&requirement]),
                 );
             }
+            // Wave-1 router / plan / critic events. Placeholder arms for now so the
+            // foundation (router.rs + plan_state.rs + director-loop emission) compiles
+            // and ships; W1-B replaces these with the real intent card, the live plan
+            // checklist (which retires the frozen 0/9 bar on the director path), and a
+            // collapsible team-review panel.
+            EngineEvent::IntentDecided { .. }
+            | EngineEvent::PlanPosted { .. }
+            | EngineEvent::PlanStepStatus { .. }
+            | EngineEvent::CriticVerdict { .. } => {}
             EngineEvent::PhaseStarted { phase } => {
                 self.set_phase(phase, PhaseStatus::Running);
                 self.phase_started_at = Some(std::time::Instant::now());
@@ -6740,7 +6749,12 @@ mod tests {
         a.stream_text_active = true;
         a.cancel_run();
         let marker = umadev_i18n::t(a.lang, "chat.interrupted");
-        let last = a.history.iter().rev().find(|m| m.role == ChatRole::Host).unwrap();
+        let last = a
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::Host)
+            .unwrap();
         assert!(
             last.body.contains(marker.trim()),
             "an interrupted reply must be marked incomplete: {:?}",
@@ -6755,8 +6769,16 @@ mod tests {
         a.push(ChatRole::Host, "a finished reply".to_string());
         a.stream_text_active = false;
         a.seal_interrupted_stream();
-        let last = a.history.iter().rev().find(|m| m.role == ChatRole::Host).unwrap();
-        assert_eq!(last.body, "a finished reply", "no marker when nothing streamed");
+        let last = a
+            .history
+            .iter()
+            .rev()
+            .find(|m| m.role == ChatRole::Host)
+            .unwrap();
+        assert_eq!(
+            last.body, "a finished reply",
+            "no marker when nothing streamed"
+        );
     }
 
     #[test]

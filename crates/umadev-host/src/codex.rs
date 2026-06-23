@@ -49,8 +49,8 @@ use umadev_runtime::{
 };
 
 use crate::{
-    default_workspace, merge_prompt, model_args, run_subprocess, run_subprocess_streaming,
-    HostDriver, ProbeResult, PromptChannel, SubprocessCall,
+    default_workspace, merge_prompt, model_args, run_auth_status, run_subprocess,
+    run_subprocess_streaming, AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
 };
 
 /// Drives the `codex` CLI as a subprocess.
@@ -520,6 +520,14 @@ impl HostDriver for CodexDriver {
         self.workspace = Some(workspace);
     }
 
+    fn install_hint(&self) -> Option<&'static str> {
+        Some("npm install -g @openai/codex")
+    }
+
+    fn login_hint(&self) -> Option<&'static str> {
+        Some("codex login")
+    }
+
     async fn probe(&self) -> ProbeResult {
         let tmp = default_workspace();
         match run_subprocess(SubprocessCall {
@@ -533,8 +541,10 @@ impl HostDriver for CodexDriver {
         })
         .await
         {
+            // Installed — resolve the honest auth state too (gap G10).
             Ok(out) => ProbeResult::Ready {
                 version: out.stdout.lines().next().unwrap_or("unknown").to_string(),
+                auth_state: self.probe_auth().await,
             },
             Err(e) if e.contains("not found on PATH") => ProbeResult::NotInstalled {
                 program: self.program.clone(),
@@ -542,6 +552,67 @@ impl HostDriver for CodexDriver {
             Err(e) => ProbeResult::Unhealthy { detail: e },
         }
     }
+
+    /// Cheapest authenticated no-op for Codex, in cost order — NO real
+    /// generation, NO tokens.
+    ///
+    /// Codex's official auth paths (see the Codex Authentication docs): a cached
+    /// credential file at `$CODEX_HOME/auth.json` (defaults to `~/.codex`), OR
+    /// the `OPENAI_API_KEY` env var.
+    ///
+    /// 1. **`OPENAI_API_KEY` env** (instant): codex uses it when present.
+    /// 2. **`auth.json` exists** under `CODEX_HOME` (default `~/.codex`): the file
+    ///    `codex login` writes — its presence means a stored login. (Verified
+    ///    against the live file: keys `OPENAI_API_KEY` / `tokens` / `auth_mode`.)
+    /// 3. **Authoritative subcommand** `codex login status` — prints "Logged in
+    ///    using ChatGPT" (exit 0) when logged in (confirmed via `codex login
+    ///    --help` → `status` subcommand + live output). Used as the cross-check
+    ///    / fallback; bounded by the short auth-probe timeout.
+    ///
+    /// Fail-open: anything indeterminate → [`AuthState::Unknown`].
+    async fn probe_auth(&self) -> AuthState {
+        // 1. API-key env — definitive and instant.
+        if crate::any_env_set(&["OPENAI_API_KEY"]) {
+            return AuthState::LoggedIn;
+        }
+        // 2. Stored credential file (`$CODEX_HOME/auth.json`, default ~/.codex).
+        if codex_auth_file().is_some_and(|p| p.is_file()) {
+            return AuthState::LoggedIn;
+        }
+        // 3. Authoritative subcommand. `codex login status` exits 0 + prints
+        //    "Logged in …" when authenticated; require success so a non-zero
+        //    "Not logged in" (or any error) is classified / fail-open.
+        match run_auth_status(
+            &self.program,
+            &["login".to_string(), "status".to_string()],
+            false,
+        )
+        .await
+        {
+            Some(out) => {
+                let lower = out.to_ascii_lowercase();
+                if lower.contains("not logged in") || lower.contains("not authenticated") {
+                    AuthState::NotLoggedIn
+                } else if lower.contains("logged in") {
+                    AuthState::LoggedIn
+                } else {
+                    AuthState::Unknown
+                }
+            }
+            None => AuthState::Unknown,
+        }
+    }
+}
+
+/// The Codex credential file path: `$CODEX_HOME/auth.json`, where `CODEX_HOME`
+/// defaults to `~/.codex` (per the Codex auth docs). Returns `None` when no home
+/// dir can be derived (fail-open: the caller then tries `codex login status`).
+fn codex_auth_file() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| crate::home_dir().map(|h| h.join(".codex")))?;
+    Some(home.join("auth.json"))
 }
 
 #[cfg(test)]
@@ -772,7 +843,84 @@ mod tests {
     #[tokio::test]
     async fn probe_reports_not_installed_for_missing_binary() {
         let d = CodexDriver::with_program("umadev-fake-codex-xyz");
-        assert!(matches!(d.probe().await, ProbeResult::NotInstalled { .. }));
+        let probe = d.probe().await;
+        assert!(matches!(probe, ProbeResult::NotInstalled { .. }));
+        // NotInstalled auth state — distinct from NotLoggedIn, never LoggedIn.
+        assert_eq!(probe.auth_state(), AuthState::NotInstalled);
+        assert!(!probe.is_ready_and_authed());
+    }
+
+    #[test]
+    fn install_and_login_hints_are_actionable() {
+        let d = CodexDriver::default();
+        assert!(d.install_hint().unwrap().contains("codex"));
+        assert_eq!(d.login_hint().unwrap(), "codex login");
+    }
+
+    // `codex_auth_file` honors `$CODEX_HOME`, defaulting to `~/.codex/auth.json`.
+    #[test]
+    fn codex_auth_file_honors_codex_home() {
+        // Crate-wide auth-env lock; this sync test takes it via `blocking_lock`.
+        let _g = crate::AUTH_ENV_TEST_LOCK.blocking_lock();
+        let saved = std::env::var_os("CODEX_HOME");
+        std::env::set_var("CODEX_HOME", "/tmp/umadev-codex-home-test");
+        let p = codex_auth_file().unwrap();
+        match saved {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        assert!(p.ends_with("auth.json"));
+        assert!(p.to_string_lossy().contains("umadev-codex-home-test"));
+    }
+
+    // The `auth.json` existence path: an empty CODEX_HOME (no file) + no
+    // OPENAI_API_KEY + a missing binary → the only signals are absent, so a
+    // missing-binary `login status` fails → Unknown (fail-open, never LoggedIn).
+    #[tokio::test]
+    async fn probe_auth_unknown_when_no_creds_and_status_cmd_missing() {
+        let _g = crate::AUTH_ENV_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let saved_home = std::env::var_os("CODEX_HOME");
+        let saved_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::set_var("CODEX_HOME", tmp.path()); // empty → no auth.json
+        std::env::remove_var("OPENAI_API_KEY");
+        let d = CodexDriver::with_program("umadev-fake-codex-xyz");
+        let state = d.probe_auth().await;
+        match saved_home {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        if let Some(v) = saved_key {
+            std::env::set_var("OPENAI_API_KEY", v);
+        }
+        assert_eq!(
+            state,
+            AuthState::Unknown,
+            "no creds + no status command must fail-open to Unknown, not LoggedIn"
+        );
+    }
+
+    // `OPENAI_API_KEY` short-circuits to LoggedIn instantly (no subprocess), even
+    // with an empty CODEX_HOME and a missing binary.
+    #[tokio::test]
+    async fn probe_auth_logged_in_via_openai_api_key() {
+        let _g = crate::AUTH_ENV_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let saved_home = std::env::var_os("CODEX_HOME");
+        let saved_key = std::env::var_os("OPENAI_API_KEY");
+        std::env::set_var("CODEX_HOME", tmp.path());
+        std::env::set_var("OPENAI_API_KEY", "sk-test");
+        let d = CodexDriver::with_program("umadev-fake-codex-xyz");
+        let state = d.probe_auth().await;
+        match saved_home {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match saved_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        assert_eq!(state, AuthState::LoggedIn);
     }
 
     // The fake codex is a `#!/bin/sh` script, which Windows cannot exec; the

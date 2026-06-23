@@ -1598,7 +1598,7 @@ fn spawn_probe(sink: Arc<ChannelSink>) {
     tokio::spawn(async move {
         for status in umadev_host::probe_all().await {
             let (ready, detail) = match status.probe {
-                umadev_host::ProbeResult::Ready { version } => (true, version),
+                umadev_host::ProbeResult::Ready { version, .. } => (true, version),
                 umadev_host::ProbeResult::NotInstalled { program } => {
                     (false, format!("`{program}` not on PATH"))
                 }
