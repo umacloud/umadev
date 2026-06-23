@@ -200,10 +200,15 @@ async fn drive_director_loop_with_idle(
         };
         last_reply = turn.text.clone();
 
-        // 2. If the base didn't claim it built/changed code (a chat / plan / "I read
-        //    it" answer), there is nothing to QC — settle. This keeps a simple goal
-        //    that the base just answered directly from being forced through QC.
-        if !crate::gates::claims_code_changes(&turn.text) {
+        // 2. On the FIRST turn only: if the base didn't claim it built/changed code
+        //    (a chat / plan / "I read it" answer), there is nothing to QC — settle.
+        //    This keeps a simple goal the base just answered directly from being
+        //    forced through QC. A FIX turn (round >= 1) is NEVER short-circuited
+        //    here: the previous QC already proved there were blocking problems, so
+        //    the fix MUST be re-verified — a fix reply that only says "confirmed it
+        //    passes" (no change-verb) must not be mistaken for "nothing to check"
+        //    and settle with the problems still unfixed. QC is read-only + cheap.
+        if round == 0 && !crate::gates::claims_code_changes(&turn.text) {
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 

@@ -22,7 +22,16 @@ const SRC_EXT: &[&str] = &[
     "cs", "kt", "ex", "exs", "dart", "swift", "css", "scss", "sass", "less", "html",
 ];
 
-/// Directories never worth scanning (build output / vendored deps / VCS).
+/// Directories never worth scanning (build output / vendored deps / VCS /
+/// UmaDev's OWN artifact dirs).
+///
+/// `output` holds UmaDev's own deliverable DOCS (`output/<slug>-prd.md` etc.) —
+/// and crucially a base may drop an `output/preview.html` or `output/*.css`
+/// there. Those must NEVER count as "real delivered source": the source-present
+/// honesty hard-gate ("did the base actually build the product, or hallucinate
+/// 'done'?") would be fooled by a stray doc-dir HTML into passing a zero-code
+/// build. So `output` is skipped alongside the build-output / vendor dirs.
+/// (`.umadev` is already skipped via the leading-dot rule.)
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -31,9 +40,11 @@ const SKIP_DIRS: &[&str] = &[
     ".git",
     "vendor",
     "__pycache__",
+    ".pytest_cache",
     ".next",
     "out",
     "coverage",
+    "output",
 ];
 
 /// Recursively collect source files (bounded: depth 8, 600 files).
