@@ -4,6 +4,11 @@
 //! Documents are indexed with the existing BM25 + optional vector retrieval
 //! layer, making them citable by the host during research/generation phases.
 //!
+//! **Markdown only.** The runtime RAG walker indexes `.md` exclusively, so
+//! `add`/`search` accept only `.md`. A `.txt` would print "[ok] Added" yet the
+//! base would never index it — so we reject non-markdown up front with a clear
+//! message instead of staging a silent non-delivery.
+//!
 //! ## Usage
 //! ```bash
 //! umadev knowledge-manage add ./my-docs/        # add a directory of .md files
@@ -127,9 +132,14 @@ pub fn add_knowledge(
     std::fs::create_dir_all(&dest_dir)?;
 
     let mut files_copied = 0;
+    let mut skipped_non_md = 0;
     if source.is_dir() {
         for entry in walk_source(source) {
-            if entry.extension().is_some_and(|e| e == "md" || e == "txt") {
+            // ONLY `.md` is indexed: the runtime RAG walker is markdown-only, so
+            // copying a `.txt` would print "[ok] Added" and let our own search
+            // find it while the BASE never sees it — a silent non-delivery.
+            // Restrict here so what we accept is exactly what the base indexes.
+            if is_markdown(&entry) {
                 // Preserve the source's subdirectory structure — flattening to
                 // the basename would silently overwrite same-named files from
                 // different subdirs (a/x.md and b/x.md collide).
@@ -138,13 +148,39 @@ pub fn add_knowledge(
                 if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::copy(&entry, &dest)?;
+                copy_no_follow_symlink(&entry, &dest)?;
                 files_copied += 1;
+            } else if entry.extension().is_some() {
+                skipped_non_md += 1;
             }
         }
+        if files_copied == 0 {
+            // Don't leave an empty registered entry that the base will never
+            // index — tell the user plainly that only markdown is supported.
+            let _ = std::fs::remove_dir_all(&dest_dir);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "no .md files found under {} ({skipped_non_md} non-markdown file(s) skipped). \
+                     UmaDev only indexes Markdown (.md); convert .txt/other docs to .md first.",
+                    source.display()
+                ),
+            ));
+        }
     } else if source.is_file() {
+        if !is_markdown(source) {
+            let _ = std::fs::remove_dir_all(&dest_dir);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`{}` is not a Markdown file. UmaDev only indexes `.md` (the runtime RAG \
+                     walker is markdown-only); convert it to .md and retry.",
+                    source.display()
+                ),
+            ));
+        }
         let dest = dest_dir.join(source.file_name().unwrap_or_default());
-        std::fs::copy(source, &dest)?;
+        copy_no_follow_symlink(source, &dest)?;
         files_copied = 1;
     }
 
@@ -204,7 +240,9 @@ pub fn search_knowledge(project_root: &Path, query: &str, max_results: usize) ->
     let mut results: Vec<SearchResult> = Vec::new();
 
     for entry in walk_source(&custom_dir) {
-        if !entry.extension().is_some_and(|e| e == "md" || e == "txt") {
+        // Mirror `add`: only `.md` is indexed/searched, since only `.md` ever
+        // reaches the base's RAG walker.
+        if !is_markdown(&entry) {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(&entry) else {
@@ -247,7 +285,40 @@ pub struct SearchResult {
     pub preview: String,
 }
 
-/// Recursively walk a directory, yielding file paths.
+/// Is this a Markdown file? `.md` (case-insensitive) is the ONLY extension the
+/// runtime RAG walker indexes, so it's the only thing we accept.
+fn is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+}
+
+/// Copy `src` → `dst`, but REFUSE a symlinked source. A symlink with an
+/// innocuous `.md` name (and a `Normal` lexical path that clears the `..`
+/// component check) could otherwise point at any host file — `/etc/passwd`,
+/// `~/.ssh/id_rsa` — and `fs::copy` follows it, pulling that file into the RAG
+/// index. `symlink_metadata` does NOT follow the link, so we can detect and
+/// reject it before copying.
+fn copy_no_follow_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to index `{}`: it is a symbolic link (could point outside the source \
+                 tree at an arbitrary host file)",
+                src.display()
+            ),
+        ));
+    }
+    std::fs::copy(src, dst)?;
+    Ok(())
+}
+
+/// Recursively walk a directory, yielding file paths. Symlinked directories are
+/// NOT descended into and symlinked files are still YIELDED (so the caller's
+/// `copy_no_follow_symlink` can reject them with a clear message) — but the walk
+/// itself never follows a directory symlink out of the tree.
 fn walk_source(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -256,7 +327,11 @@ fn walk_source(dir: &Path) -> Vec<PathBuf> {
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
+        if ft.is_symlink() {
+            // A symlink (file or dir): yield it as a candidate file so the copy
+            // step rejects it; never descend a symlinked directory.
+            files.push(path);
+        } else if ft.is_dir() {
             files.extend(walk_source(&path));
         } else if ft.is_file() {
             files.push(path);
@@ -281,15 +356,67 @@ mod tests {
     }
 
     #[test]
-    fn add_directory() {
+    fn add_directory_indexes_only_markdown() {
         let tmp = tempfile::TempDir::new().unwrap();
         let src_dir = tmp.path().join("my-docs");
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::write(src_dir.join("a.md"), "# A").unwrap();
         std::fs::write(src_dir.join("b.md"), "# B").unwrap();
-        std::fs::write(src_dir.join("c.txt"), "text").unwrap();
+        std::fs::write(src_dir.join("c.txt"), "text").unwrap(); // skipped: not .md
         let result = add_knowledge(tmp.path(), &src_dir, Some("my-docs")).unwrap();
-        assert_eq!(result.files_copied, 3);
+        assert_eq!(result.files_copied, 2, "only the two .md files are indexed");
+    }
+
+    #[test]
+    fn add_single_txt_file_is_rejected_with_clear_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("notes.txt");
+        std::fs::write(&src, "plain text").unwrap();
+        let err = add_knowledge(tmp.path(), &src, Some("notes")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains(".md"));
+        // No half-staged entry left behind.
+        assert!(list_knowledge(tmp.path()).is_empty());
+        assert!(!tmp.path().join(CUSTOM_DIR).join("notes").exists());
+    }
+
+    #[test]
+    fn add_dir_with_no_markdown_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src_dir = tmp.path().join("txt-only");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("a.txt"), "x").unwrap();
+        std::fs::write(src_dir.join("b.rst"), "y").unwrap();
+        let err = add_knowledge(tmp.path(), &src_dir, Some("txt-only")).unwrap_err();
+        assert!(err.to_string().contains(".md"));
+        assert!(list_knowledge(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_rejects_symlinked_markdown_pointing_outside_tree() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A secret file OUTSIDE the source tree.
+        let secret = tmp.path().join("secret.md");
+        std::fs::write(&secret, "# host secret").unwrap();
+        // Source dir whose only "doc" is a symlink to the secret.
+        let src_dir = tmp.path().join("docs");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        symlink(&secret, src_dir.join("link.md")).unwrap();
+
+        let err = add_knowledge(tmp.path(), &src_dir, Some("docs")).unwrap_err();
+        // The symlink is rejected, so no .md is copied → "no .md files" error.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symbolic link") || msg.contains("no .md files"),
+            "symlink must be refused, got: {msg}"
+        );
+        // The secret content must NOT have landed in the index.
+        let copied = src_dir.join("link.md");
+        let _ = copied; // (sanity) the destination under CUSTOM_DIR holds nothing.
+        let dest = tmp.path().join(CUSTOM_DIR).join("docs").join("link.md");
+        assert!(!dest.exists(), "symlinked secret must not be copied in");
     }
 
     #[test]

@@ -446,20 +446,33 @@ fn check_delivery_readiness(workspace: &Path) -> CheckResult {
 /// the extension surface is available.
 pub fn check_ecosystem(workspace: &Path) -> CheckResult {
     let mut parts: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
-    // MCP servers.
+    // MCP servers. A file that EXISTS but won't parse is CORRUPT — don't fold
+    // it into a cheerful "0 servers" (which `unwrap_or(0)` did): a malformed
+    // `.mcp.json` means the host discovers NONE of the user's servers, so it's
+    // a Warning, not silently OK.
     let mcp_path = workspace.join(".mcp.json");
-    let mcp_count = std::fs::read_to_string(&mcp_path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| {
-            v.get("mcpServers")
-                .and_then(|s| s.as_object())
-                .map(serde_json::Map::len)
-        })
-        .unwrap_or(0);
-    if mcp_count > 0 {
-        parts.push(format!("{mcp_count} MCP server(s) configured (.mcp.json)"));
+    match std::fs::read_to_string(&mcp_path) {
+        Ok(text) if text.trim().is_empty() => {}
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => {
+                let mcp_count = v
+                    .get("mcpServers")
+                    .and_then(|s| s.as_object())
+                    .map_or(0, serde_json::Map::len);
+                if mcp_count > 0 {
+                    parts.push(format!("{mcp_count} MCP server(s) configured (.mcp.json)"));
+                }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    ".mcp.json exists but isn't valid JSON ({e}) — the host will load NO MCP \
+                     servers from it; fix or remove it"
+                ));
+            }
+        },
+        Err(_) => {} // missing file: nothing configured, not an error
     }
 
     // Skills.
@@ -475,27 +488,52 @@ pub fn check_ecosystem(workspace: &Path) -> CheckResult {
         ));
     }
 
-    // Custom knowledge.
+    // Custom knowledge registry (`{ "entries": { name: ... } }`). Same rule:
+    // a corrupt registry is a Warning, not a silent zero.
     let knowledge_reg = workspace.join(".umadev").join("knowledge.json");
-    let knowledge_count = std::fs::read_to_string(&knowledge_reg)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v.as_object().map(serde_json::Map::len))
-        .unwrap_or(0);
-    if knowledge_count > 0 {
-        parts.push(format!("{knowledge_count} custom knowledge set(s)"));
+    match std::fs::read_to_string(&knowledge_reg) {
+        Ok(text) if text.trim().is_empty() => {}
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => {
+                let knowledge_count = v
+                    .get("entries")
+                    .and_then(|s| s.as_object())
+                    .map_or(0, serde_json::Map::len);
+                if knowledge_count > 0 {
+                    parts.push(format!("{knowledge_count} custom knowledge set(s)"));
+                }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    ".umadev/knowledge.json is corrupt ({e}) — custom knowledge won't load; \
+                     fix or remove it"
+                ));
+            }
+        },
+        Err(_) => {}
     }
 
-    let detail = if parts.is_empty() {
-        "no extensions configured. Use `umadev mcp-manage install` / `skill install` / `knowledge-manage add` to extend."
-            .to_string()
+    // A corrupt config downgrades the whole check to Warning so the user is
+    // told their extensions are silently failing.
+    let (status, detail) = if warnings.is_empty() {
+        let detail = if parts.is_empty() {
+            "no extensions configured. Use `umadev mcp-manage install` / `skill install` / `knowledge-manage add` to extend."
+                .to_string()
+        } else {
+            parts.join("; ")
+        };
+        (Status::Passed, detail)
     } else {
-        parts.join("; ")
+        let mut detail = warnings.join("; ");
+        if !parts.is_empty() {
+            detail.push_str(&format!(" (working: {})", parts.join("; ")));
+        }
+        (Status::Warning, detail)
     };
 
     CheckResult {
         name: "Ecosystem (MCP/Skill/Knowledge)".to_string(),
-        status: Status::Passed,
+        status,
         detail,
     }
 }
@@ -654,5 +692,49 @@ mod tests {
         .unwrap();
         let r = check_delivery_readiness(tmp.path());
         assert!(r.detail.contains("deploy command"));
+    }
+
+    #[test]
+    fn ecosystem_empty_workspace_passes() {
+        let tmp = TempDir::new().unwrap();
+        let r = check_ecosystem(tmp.path());
+        assert_eq!(r.status, Status::Passed);
+        assert!(r.detail.contains("no extensions"));
+    }
+
+    #[test]
+    fn ecosystem_corrupt_mcp_json_warns_not_ok() {
+        // A malformed .mcp.json must WARN (the host loads zero servers), not be
+        // folded into a cheerful "0 servers / no extensions".
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".mcp.json"), "{not valid json,,,").unwrap();
+        let r = check_ecosystem(tmp.path());
+        assert_eq!(r.status, Status::Warning, "corrupt .mcp.json must warn");
+        assert!(r.detail.contains(".mcp.json"));
+        assert!(!r.detail.contains("no extensions configured"));
+    }
+
+    #[test]
+    fn ecosystem_valid_mcp_json_counts_servers() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".mcp.json"),
+            r#"{"mcpServers":{"gh":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let r = check_ecosystem(tmp.path());
+        assert_eq!(r.status, Status::Passed);
+        assert!(r.detail.contains("1 MCP server"));
+    }
+
+    #[test]
+    fn ecosystem_corrupt_knowledge_json_warns() {
+        let tmp = TempDir::new().unwrap();
+        let udir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&udir).unwrap();
+        std::fs::write(udir.join("knowledge.json"), "}{ broken").unwrap();
+        let r = check_ecosystem(tmp.path());
+        assert_eq!(r.status, Status::Warning);
+        assert!(r.detail.contains("knowledge.json"));
     }
 }

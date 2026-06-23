@@ -83,11 +83,16 @@ pub fn serve() -> io::Result<()> {
 }
 
 /// One JSON-RPC 2.0 request.
+///
+/// `id` is `Option<Value>` so a request with NO `id` member (a notification)
+/// is distinguishable from one carrying `"id": null`. Per JSON-RPC 2.0 a
+/// notification gets no response; only requests (with an id) do.
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
+    #[serde(default)]
     jsonrpc: String,
     #[serde(default)]
-    id: Value,
+    id: Option<Value>,
     method: String,
     #[serde(default)]
     params: Value,
@@ -112,12 +117,34 @@ struct JsonRpcError {
 }
 
 /// Dispatch a single JSON-RPC method. Returns `None` for notifications (no
-/// response expected).
+/// response expected) — including any request that omits `id`.
 fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcResponse> {
+    // A request with no `id` member is a NOTIFICATION: per JSON-RPC 2.0 the
+    // server MUST NOT reply (even on error). Drop it silently.
+    let id = req.id.clone()?;
+
+    // Validate the protocol version. A request that omits `jsonrpc` or sends a
+    // value other than "2.0" (e.g. "1.0") is an Invalid Request — answer with
+    // -32600 rather than treating it as a well-formed 2.0 call.
+    if req.jsonrpc != "2.0" {
+        return Some(JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: Some(id),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32600,
+                message: format!(
+                    "Invalid Request: jsonrpc must be \"2.0\" (got {:?})",
+                    req.jsonrpc
+                ),
+            }),
+        });
+    }
+
     match req.method.as_str() {
         "initialize" => Some(JsonRpcResponse {
             jsonrpc: "2.0".into(),
-            id: Some(req.id.clone()),
+            id: Some(id),
             result: Some(json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
@@ -131,7 +158,7 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
         "initialized" | "notifications/initialized" => None, // notification
         "tools/list" => Some(JsonRpcResponse {
             jsonrpc: "2.0".into(),
-            id: Some(req.id.clone()),
+            id: Some(id),
             result: Some(json!({
                 "tools": [
                     {
@@ -161,16 +188,16 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
             })),
             error: None,
         }),
-        "tools/call" => Some(handle_tool_call(req, policy)),
+        "tools/call" => Some(handle_tool_call(req, &id, policy)),
         "shutdown" => Some(JsonRpcResponse {
             jsonrpc: "2.0".into(),
-            id: Some(req.id.clone()),
+            id: Some(id),
             result: Some(json!({})),
             error: None,
         }),
         _ => Some(JsonRpcResponse {
             jsonrpc: "2.0".into(),
-            id: Some(req.id.clone()),
+            id: Some(id),
             result: None,
             error: Some(JsonRpcError {
                 code: -32601,
@@ -180,8 +207,9 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
     }
 }
 
-/// Handle a `tools/call` request.
-fn handle_tool_call(req: &JsonRpcRequest, policy: &Policy) -> JsonRpcResponse {
+/// Handle a `tools/call` request. `id` is the request id (already known to be
+/// present — `tools/call` is never a notification in this server).
+fn handle_tool_call(req: &JsonRpcRequest, id: &Value, policy: &Policy) -> JsonRpcResponse {
     let name = req
         .params
         .get("name")
@@ -203,7 +231,7 @@ fn handle_tool_call(req: &JsonRpcRequest, policy: &Policy) -> JsonRpcResponse {
         _ => {
             return JsonRpcResponse {
                 jsonrpc: "2.0".into(),
-                id: Some(req.id.clone()),
+                id: Some(id.clone()),
                 result: None,
                 error: Some(JsonRpcError {
                     code: -32602,
@@ -219,7 +247,7 @@ fn handle_tool_call(req: &JsonRpcRequest, policy: &Policy) -> JsonRpcResponse {
     };
     JsonRpcResponse {
         jsonrpc: "2.0".into(),
-        id: Some(req.id.clone()),
+        id: Some(id.clone()),
         result: Some(json!({
             "content": [{ "type": "text", "text": text }],
             "isError": blocked,
@@ -237,7 +265,7 @@ mod tests {
     fn initialize_returns_capabilities() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: json!(1),
+            id: Some(json!(1)),
             method: "initialize".into(),
             params: json!({}),
         };
@@ -252,7 +280,7 @@ mod tests {
     fn tools_list_exposes_govern_file_and_command() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: json!(2),
+            id: Some(json!(2)),
             method: "tools/list".into(),
             params: json!({}),
         };
@@ -267,7 +295,7 @@ mod tests {
     fn govern_file_blocks_emoji() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: json!(3),
+            id: Some(json!(3)),
             method: "tools/call".into(),
             params: json!({
                 "name": "govern_file",
@@ -289,7 +317,7 @@ mod tests {
     fn govern_file_passes_clean_code() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: json!(4),
+            id: Some(json!(4)),
             method: "tools/call".into(),
             params: json!({
                 "name": "govern_file",
@@ -310,7 +338,7 @@ mod tests {
     fn govern_command_blocks_rm_rf() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: json!(5),
+            id: Some(json!(5)),
             method: "tools/call".into(),
             params: json!({
                 "name": "govern_command",
@@ -328,7 +356,7 @@ mod tests {
     fn unknown_method_returns_error() {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: json!(6),
+            id: Some(json!(6)),
             method: "nonexistent".into(),
             params: json!({}),
         };
@@ -348,7 +376,7 @@ mod tests {
         };
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: json!(7),
+            id: Some(json!(7)),
             method: "tools/call".into(),
             params: json!({
                 "name": "govern_file",
@@ -365,10 +393,81 @@ mod tests {
 
     #[test]
     fn initialized_notification_returns_none() {
+        // A genuine notification carries NO id member.
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
-            id: json!(null),
+            id: None,
             method: "notifications/initialized".into(),
+            params: json!({}),
+        };
+        assert!(handle_request(&req, &Policy::default()).is_none());
+    }
+
+    #[test]
+    fn request_without_id_is_a_notification_and_gets_no_reply() {
+        // Even a NORMALLY-answered method (initialize) must be dropped when the
+        // caller omitted `id` — per JSON-RPC, that's a notification.
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: None,
+            method: "initialize".into(),
+            params: json!({}),
+        };
+        assert!(
+            handle_request(&req, &Policy::default()).is_none(),
+            "a request with no id must get no response"
+        );
+    }
+
+    #[test]
+    fn missing_or_null_id_both_parse_as_notification() {
+        // No `id` key → `id: None` → notification.
+        let req: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"initialize"}"#).unwrap();
+        assert!(req.id.is_none());
+        // serde maps an explicit `"id": null` to None too (Option treats JSON
+        // null as absent). The JSON-RPC spec discourages a null id anyway, so
+        // folding it into "notification → no reply" is a safe interpretation.
+        let req2: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":null,"method":"initialize"}"#).unwrap();
+        assert!(req2.id.is_none());
+        // A real id round-trips.
+        let req3: JsonRpcRequest =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#).unwrap();
+        assert_eq!(req3.id, Some(json!(7)));
+    }
+
+    #[test]
+    fn wrong_jsonrpc_version_is_invalid_request() {
+        // "1.0" (or anything != "2.0") on a request WITH an id → -32600.
+        let req = JsonRpcRequest {
+            jsonrpc: "1.0".into(),
+            id: Some(json!(9)),
+            method: "initialize".into(),
+            params: json!({}),
+        };
+        let resp = handle_request(&req, &Policy::default()).unwrap();
+        let err = resp.error.expect("wrong version must error");
+        assert_eq!(err.code, -32600);
+        assert_eq!(resp.id, Some(json!(9)));
+    }
+
+    #[test]
+    fn missing_jsonrpc_version_is_invalid_request() {
+        // serde default leaves jsonrpc empty when the key is absent → -32600.
+        let req: JsonRpcRequest =
+            serde_json::from_str(r#"{"id":3,"method":"initialize"}"#).unwrap();
+        let resp = handle_request(&req, &Policy::default()).unwrap();
+        assert_eq!(resp.error.expect("must error").code, -32600);
+    }
+
+    #[test]
+    fn wrong_version_notification_still_gets_no_reply() {
+        // No id → notification → dropped BEFORE the version check fires.
+        let req = JsonRpcRequest {
+            jsonrpc: "1.0".into(),
+            id: None,
+            method: "initialize".into(),
             params: json!({}),
         };
         assert!(handle_request(&req, &Policy::default()).is_none());

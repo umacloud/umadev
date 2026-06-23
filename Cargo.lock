@@ -3110,6 +3110,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml_edit 0.22.27",
  "tracing",
  "tracing-subscriber",
  "umadev-agent",
@@ -3263,6 +3264,7 @@ dependencies = [
  "umadev-i18n",
  "umadev-runtime",
  "umadev-spec",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

@@ -663,10 +663,18 @@ enum Command {
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
-    /// Manage MCP servers — install/list/remove MCP servers for the host.
+    /// Manage MCP servers — install/list/remove MCP servers for a base CLI.
     ///
-    /// Installed servers are written to `.mcp.json` so Claude Code / Codex / OpenCode
-    /// auto-discover them on launch.
+    /// Each base discovers MCP servers from its OWN config file, so pick the
+    /// base with `--backend`:
+    ///
+    /// - `claude-code` (default) → `.mcp.json`
+    /// - `codex` → `.codex/config.toml` (`[mcp_servers]`)
+    /// - `opencode` → `opencode.json` (`mcp`)
+    /// - `all` → write to all three at once
+    ///
+    /// Writers parse-merge (preserve your existing servers/keys/comments) and
+    /// write atomically, so installing never clobbers your config.
     #[command(name = "mcp-manage")]
     McpManage {
         /// Action: `install`, `list`, or `remove`.
@@ -676,7 +684,10 @@ enum Command {
         /// Server command (everything after `--`).
         /// e.g. `umadev mcp-manage install github -- npx -y @mcp/server-github`
         command: Vec<String>,
-        /// Workspace root; defaults to current directory.
+        /// Target base: `claude-code` (default) | `codex` | `opencode` | `all`.
+        #[arg(long, default_value = "claude-code")]
+        backend: String,
+        /// Workspace root; defaults to the project/git root above the cwd.
         #[arg(long)]
         project_root: Option<PathBuf>,
     },
@@ -886,8 +897,9 @@ async fn main() -> Result<()> {
             action,
             name,
             command,
+            backend,
             project_root,
-        } => cmd_mcp_manage(action, name, command, project_root),
+        } => cmd_mcp_manage(action, name, command, backend, project_root),
         Command::Skill {
             action,
             target,
@@ -1206,15 +1218,27 @@ fn cmd_mcp(transport: String) -> Result<()> {
     }
 }
 
-/// `umadev mcp-manage` — install/list/remove MCP servers.
+/// `umadev mcp-manage` — install/list/remove MCP servers for a chosen base.
+///
+/// `backend` is one of `claude-code` (default) / `codex` / `opencode` / `all`.
+/// Each base discovers MCP servers from a DIFFERENT config file in a DIFFERENT
+/// format; `mcp_manager` writes the right one (parse-merged + atomic).
 fn cmd_mcp_manage(
     action: String,
     name: Option<String>,
     command: Vec<String>,
+    backend: String,
     project_root: Option<PathBuf>,
 ) -> Result<()> {
-    let root = project_root.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-    let mut cfg = mcp_manager::McpConfig::load(&root)?;
+    let root = resolve_workspace_root(project_root);
+
+    // `all` fans out over the three bases; otherwise a single base.
+    let backends: Vec<mcp_manager::Backend> = if backend == "all" {
+        mcp_manager::Backend::ALL.to_vec()
+    } else {
+        vec![mcp_manager::Backend::parse(&backend)?]
+    };
+
     match action.as_str() {
         "install" | "add" => {
             let server_name = name.ok_or_else(|| {
@@ -1227,47 +1251,43 @@ fn cmd_mcp_manage(
                 anyhow::bail!("command required after --: e.g. `-- npx -y @mcp/server-github`");
             }
             let entry = mcp_manager::parse_command(&cmd_str);
-            cfg.install(&server_name, entry);
-            let path = cfg.save(&root)?;
-            println!("[ok] Installed MCP server '{server_name}'.");
-            println!("  → {}", path.display());
-            println!("  Claude Code will auto-discover this on next launch.");
+            for b in &backends {
+                let path = mcp_manager::install(*b, &root, &server_name, &entry)?;
+                println!("[ok] Installed MCP server '{server_name}' for {}.", b.id());
+                println!("  → {}", path.display());
+            }
+            println!("  The base discovers this from its config file on next launch.");
         }
         "list" | "ls" => {
-            let servers = cfg.list();
-            if servers.is_empty() {
-                println!("No MCP servers configured.");
-            } else {
-                println!("MCP servers ({}):", servers.len());
-                for (name, entry) in servers {
-                    let detail = if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
-                        let args = entry
-                            .get("args")
-                            .and_then(|v| v.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|x| x.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            })
-                            .unwrap_or_default();
-                        format!("{cmd} {args}")
-                    } else if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
-                        url.to_string()
-                    } else {
-                        "(no command)".into()
-                    };
-                    println!("  • {name}: {detail}");
+            for b in &backends {
+                let servers = mcp_manager::list(*b, &root)?;
+                println!(
+                    "{} MCP servers ({}) [{}]:",
+                    b.id(),
+                    servers.len(),
+                    b.config_rel_path()
+                );
+                if servers.is_empty() {
+                    println!("  (none configured)");
+                } else {
+                    for s in servers {
+                        println!("  • {}: {}", s.name, s.detail);
+                    }
                 }
             }
         }
         "remove" | "rm" | "delete" => {
             let server_name = name.ok_or_else(|| anyhow::anyhow!("server name required"))?;
-            if cfg.remove(&server_name) {
-                cfg.save(&root)?;
-                println!("[ok] Removed MCP server '{server_name}'.");
-            } else {
-                anyhow::bail!("MCP server '{server_name}' not found.");
+            let mut any_removed = false;
+            for b in &backends {
+                let (_, removed) = mcp_manager::remove(*b, &root, &server_name)?;
+                if removed {
+                    any_removed = true;
+                    println!("[ok] Removed MCP server '{server_name}' from {}.", b.id());
+                }
+            }
+            if !any_removed {
+                anyhow::bail!("MCP server '{server_name}' not found in the selected backend(s).");
             }
         }
         other => anyhow::bail!("unknown action: '{other}' (use install/list/remove)"),
@@ -1277,7 +1297,7 @@ fn cmd_mcp_manage(
 
 /// `umadev skill` — install/list/remove skill packages.
 fn cmd_skill(action: String, target: Option<String>, project_root: Option<PathBuf>) -> Result<()> {
-    let root = project_root.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let root = resolve_workspace_root(project_root);
     let registry = skill_manager::SkillRegistry::new(&root);
     match action.as_str() {
         "install" | "add" => {
@@ -1330,7 +1350,7 @@ fn cmd_knowledge(
     name: Option<String>,
     project_root: Option<PathBuf>,
 ) -> Result<()> {
-    let root = project_root.unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let root = resolve_workspace_root(project_root);
     match action.as_str() {
         "add" => {
             let source = target.ok_or_else(|| {
@@ -4505,6 +4525,39 @@ fn resolve_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
     std::env::current_dir().context("could not resolve project root (cwd unreadable)")
 }
 
+/// Resolve the workspace root for the extension managers (MCP / skill /
+/// knowledge). An explicit `--project-root` wins; otherwise walk UP from the
+/// cwd to the nearest ancestor that holds a `.git` or `.umadev` directory and
+/// use that. This is the directory a `umadev run` treats as the project, so
+/// the run path's `.mcp.json` / `knowledge/` / `.umadev/` readers see what the
+/// manager just wrote — running `mcp-manage install` from a subdirectory must
+/// NOT silently strand the server in that subdir where the run never looks.
+/// Fail-open: with no marker found, fall back to the bare cwd.
+fn resolve_workspace_root(project_root: Option<PathBuf>) -> PathBuf {
+    if let Some(root) = project_root {
+        return root;
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    find_workspace_root_from(&cwd)
+}
+
+/// Walk UP from `start` to the nearest ancestor holding a `.git` or `.umadev`
+/// directory; fall back to `start` if none is found. Pure (takes the start dir
+/// explicitly) so it's testable without mutating the process-global cwd.
+fn find_workspace_root_from(start: &Path) -> PathBuf {
+    let mut dir = start;
+    loop {
+        if dir.join(".git").exists() || dir.join(".umadev").exists() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+    start.to_path_buf()
+}
+
 fn infer_slug(project_root: &std::path::Path) -> String {
     project_root
         .file_name()
@@ -5006,5 +5059,52 @@ mod tests {
             hook::print_decision(&block);
         }))
         .is_ok());
+    }
+
+    #[test]
+    fn workspace_root_walks_up_to_git_marker() {
+        // A manager invoked from a SUBDIRECTORY must resolve to the project
+        // root (the `.git` ancestor), not the bare subdir — otherwise it writes
+        // config where the run path never looks.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let sub = root.join("packages").join("api");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Resolve canonical paths to dodge /var → /private/var symlink on macOS.
+        let resolved = find_workspace_root_from(&sub).canonicalize().unwrap();
+        assert_eq!(resolved, root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn workspace_root_honours_umadev_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        let sub = root.join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            find_workspace_root_from(&sub).canonicalize().unwrap(),
+            root.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn workspace_root_falls_back_to_start_when_no_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sub = tmp.path().join("loose");
+        std::fs::create_dir_all(&sub).unwrap();
+        // No .git/.umadev anywhere under tmp → fall back to the start dir.
+        assert_eq!(find_workspace_root_from(&sub), sub);
+    }
+
+    #[test]
+    fn workspace_root_explicit_override_wins() {
+        let explicit = PathBuf::from("/some/explicit/root");
+        assert_eq!(
+            resolve_workspace_root(Some(explicit.clone())),
+            explicit,
+            "an explicit --project-root must be used verbatim"
+        );
     }
 }
