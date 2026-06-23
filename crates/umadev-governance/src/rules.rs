@@ -71,13 +71,18 @@ impl Decision {
 /// surface might exist, so a project whose context we can't establish is
 /// governed at full strictness and a real backend/auth project is never
 /// under-governed by accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectContext {
     /// `true` only when the run is PROVABLY a static, frontend-only project with
     /// no server surface: no backend code, no auth, no token/session/data plane.
     /// When `true`, server/security-surface rules are skipped UNLESS the file
     /// being scanned itself shows server evidence. Defaults to `false`
     /// (conservative: assume a surface might exist).
+    ///
+    /// `#[serde(default)]`: when the persisted `.umadev/governance-context.json`
+    /// is missing this field, deserialize it to `false` — the conservative
+    /// strict posture, never an accidental skip.
+    #[serde(default)]
     pub static_frontend_only: bool,
 }
 
@@ -11991,6 +11996,21 @@ const x = 1;",
         assert_eq!(ProjectContext::default(), ProjectContext::unknown());
         assert!(!ProjectContext::default().static_frontend_only);
         assert!(ProjectContext::static_frontend().static_frontend_only);
+    }
+
+    /// `ProjectContext` survives a JSON round-trip so the runner can persist it
+    /// to `.umadev/governance-context.json` and the hook can read it back.
+    #[test]
+    fn project_context_json_round_trip() {
+        for ctx in [ProjectContext::static_frontend(), ProjectContext::unknown()] {
+            let json = serde_json::to_string(&ctx).unwrap();
+            let back: ProjectContext = serde_json::from_str(&json).unwrap();
+            assert_eq!(ctx, back);
+        }
+        // A missing field deserializes to the conservative strict default.
+        let from_empty: ProjectContext = serde_json::from_str("{}").unwrap();
+        assert_eq!(from_empty, ProjectContext::unknown());
+        assert!(!from_empty.static_frontend_only);
     }
 
     /// Disabled-clause policy still applies to the surface rules.

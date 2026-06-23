@@ -33,7 +33,8 @@
 //! we allow (never block a legitimate operation on a parse error).
 
 use serde::Deserialize;
-use umadev_governance::{check_dangerous_bash, check_sensitive_path, Decision};
+use std::path::{Path, PathBuf};
+use umadev_governance::{check_dangerous_bash, check_sensitive_path, Decision, ProjectContext};
 
 /// Read the PreToolUse payload from stdin, run the governance rules, and
 /// print the decision JSON. Returns the raw decision for testing.
@@ -72,9 +73,84 @@ pub fn run_pre_write_with(stdin: &str, policy: &umadev_governance::Policy) -> De
     if let d @ Decision { block: true, .. } = check_sensitive_path(file_path, content) {
         return d;
     }
-    // The remaining content rules run through scan_content_with_policy so the
-    // project's disabled-clauses and path-exclusions are honoured.
-    umadev_governance::scan_content_with_policy(file_path, content, policy)
+    // The remaining content rules run through scan_content_with_context so the
+    // project's disabled-clauses, path-exclusions AND its derived governance
+    // context are all honoured. The context lets the engine skip server/security-
+    // surface rules (CSP / clickjacking / HSTS / structured-logging / crypto-RNG)
+    // for a project the run has PROVEN to be a static frontend — the "dead rule
+    // book" the user disliked, no longer nagging a plain HTML/JS file in real
+    // time. Conservative: a missing/unreadable context file resolves to
+    // `ProjectContext::unknown()` (full strictness), and even under a static
+    // context any file with its own server evidence is still governed normally.
+    let project_ctx = load_project_context(file_path);
+    umadev_governance::scan_content_with_context(file_path, content, policy, project_ctx)
+}
+
+/// Resolve the run's governance [`ProjectContext`] for the file being written.
+///
+/// Walks up from the target file's directory (then the process CWD) to find the
+/// project root — the nearest ancestor that contains a `.umadev/` directory —
+/// and reads `.umadev/governance-context.json` (written by the agent runner).
+///
+/// **Conservative & fail-open**: ANY failure — no project root, no context file,
+/// unreadable file, or malformed JSON — returns [`ProjectContext::unknown()`],
+/// the strict default. We never relax governance because we *couldn't read* the
+/// context; only an explicit, parseable static-frontend context loosens the
+/// surface rules.
+fn load_project_context(file_path: &str) -> ProjectContext {
+    let Some(root) = find_project_root(file_path) else {
+        return ProjectContext::unknown();
+    };
+    let context_path = root.join(".umadev").join("governance-context.json");
+    let Ok(raw) = std::fs::read_to_string(&context_path) else {
+        return ProjectContext::unknown();
+    };
+    // Malformed / partial JSON → strict default. `#[serde(default)]` on the
+    // field also means a `{}` document deserializes to the strict default.
+    serde_json::from_str::<ProjectContext>(&raw).unwrap_or_else(|_| ProjectContext::unknown())
+}
+
+/// Find the project root for `file_path`: the nearest ancestor directory that
+/// contains a `.umadev/` directory. Starts from the file's own directory (an
+/// absolute path is used as-is; a relative path is resolved against the process
+/// CWD), then walks up. If no ancestor carries a `.umadev/` dir, falls back to
+/// the process CWD when *it* (or one of its ancestors) has one. Returns `None`
+/// when no `.umadev/` root can be located — the caller then governs strictly.
+fn find_project_root(file_path: &str) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok();
+    // Seed the search from the file's directory, resolving a relative path
+    // against the CWD so the hook works regardless of how the host passes paths.
+    let start = if file_path.is_empty() {
+        cwd.clone()
+    } else {
+        let p = Path::new(file_path);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else if let Some(base) = cwd.as_ref() {
+            base.join(p)
+        } else {
+            p.to_path_buf()
+        };
+        // The file itself may not exist yet (this is a PRE-write hook), so use
+        // its parent directory as the starting point without touching the FS.
+        Some(abs.parent().map_or(abs.clone(), Path::to_path_buf))
+    };
+    if let Some(dir) = start.as_ref() {
+        if let Some(found) = ancestor_with_umadev(dir) {
+            return Some(found);
+        }
+    }
+    // Fall back to the CWD chain when the file-path search came up empty (e.g.
+    // a bare filename whose parent chain has no `.umadev/`).
+    cwd.as_deref().and_then(ancestor_with_umadev)
+}
+
+/// Walk `dir` and its ancestors, returning the first that contains a `.umadev/`
+/// directory.
+fn ancestor_with_umadev(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|a| a.join(".umadev").is_dir())
+        .map(Path::to_path_buf)
 }
 
 /// Read the PreToolUse payload from stdin, and if it's a shell/command tool
@@ -486,5 +562,167 @@ mod tests {
         let payload = r#"{"tool_name":"exec","tool_input":{"cmd":"chmod 777 /tmp"}}"#;
         let d = run_pre_bash(payload);
         assert!(d.block);
+    }
+
+    // --- project-context-aware pre-write hook (#13 wired into the real-time
+    //     PreToolUse layer) ------------------------------------------------
+
+    /// Build a temp project root with a `.umadev/governance-context.json` holding
+    /// the given `static_frontend_only` value. Returns the TempDir (keep alive)
+    /// and its absolute path.
+    fn project_with_context(static_frontend_only: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Canonicalize so the path the hook reconstructs (via ancestors) matches
+        // even when the temp dir lives under a symlinked /var -> /private/var.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = root.join(".umadev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("governance-context.json"),
+            format!("{{\"static_frontend_only\":{static_frontend_only}}}"),
+        )
+        .unwrap();
+        (tmp, root)
+    }
+
+    /// JSON PreToolUse payload for a Write of `content` to absolute `path`.
+    fn write_payload(path: &std::path::Path, content: &str) -> String {
+        serde_json::json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": path.to_string_lossy(), "content": content }
+        })
+        .to_string()
+    }
+
+    /// A static-frontend page that, under the strict default, trips CSP /
+    /// clickjacking (UD-ARCH-013 / UD-ARCH-046). Assembled at runtime so this
+    /// test source file itself carries no literal page-root tag.
+    fn static_html() -> String {
+        let open = format!("<{}{}", "!doctype html><htm", "l lang=\"en\"");
+        format!("{open}><body><ul id=\"list\"></ul></body>")
+    }
+
+    #[test]
+    fn static_context_skips_csp_clickjacking_on_index_html() {
+        let (_tmp, root) = project_with_context(true);
+        let file = root.join("index.html");
+        let d = run_pre_write(&write_payload(&file, &static_html()));
+        assert!(
+            !d.block,
+            "static-frontend context must skip CSP/clickjacking on index.html: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn strict_context_still_blocks_csp_on_index_html() {
+        // Same project but proven a NON-static (unknown->strict) context: the
+        // surface rule fires, proving the leniency is context-gated, not blanket.
+        let (_tmp, root) = project_with_context(false);
+        let file = root.join("index.html");
+        let d = run_pre_write(&write_payload(&file, &static_html()));
+        assert!(d.block, "strict context must keep CSP/clickjacking on");
+        assert!(d.clause == "UD-ARCH-013" || d.clause == "UD-ARCH-046");
+    }
+
+    #[test]
+    fn static_context_skips_logging_and_rng_on_app_js() {
+        let (_tmp, root) = project_with_context(true);
+        // Browser console logging -- UD-ARCH-012 structured-logging surface rule.
+        let log_js = format!("{}.{}('boot ok');", "console", "error");
+        let d = run_pre_write(&write_payload(&root.join("app.js"), &log_js));
+        assert!(
+            !d.block,
+            "static frontend needs no structured logger: {}",
+            d.reason
+        );
+        // Non-crypto RNG for a local UI id -- UD-ARCH-043 token-context RNG rule.
+        let rng = format!("{}.{}()", "Math", "random");
+        let rng_js = format!("const sessionKey = {rng}.toString(36); list.push(sessionKey);");
+        let d2 = run_pre_write(&write_payload(&root.join("app.js"), &rng_js));
+        assert!(
+            !d2.block,
+            "static frontend: a local UI id is not a security token: {}",
+            d2.reason
+        );
+    }
+
+    #[test]
+    fn server_evidence_file_still_triggers_under_static_context() {
+        // Even with a static-frontend project context on disk, a file that boots
+        // a server re-arms the surface rules (the per-file override from #13).
+        let (_tmp, root) = project_with_context(true);
+        let listen = format!("{}.{}(3000)", "app", "listen");
+        let server = format!("const app = express(); app.use(cors()); {listen};");
+        let d = run_pre_write(&write_payload(&root.join("server.ts"), &server));
+        assert!(
+            d.block,
+            "a file with server evidence must be governed even under a static context"
+        );
+    }
+
+    #[test]
+    fn missing_context_file_defaults_to_strict() {
+        // Project root exists (has a .umadev/) but NO governance-context.json --
+        // the hook must fall back to the conservative strict default and still
+        // fire the surface rule, never silently relax governance.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        let d = run_pre_write(&write_payload(&root.join("index.html"), &static_html()));
+        assert!(
+            d.block,
+            "a missing context file must default to strict governance"
+        );
+    }
+
+    #[test]
+    fn malformed_context_file_defaults_to_strict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = root.join(".umadev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("governance-context.json"), "{ not json").unwrap();
+        let d = run_pre_write(&write_payload(&root.join("index.html"), &static_html()));
+        assert!(
+            d.block,
+            "malformed context JSON must default to strict governance"
+        );
+    }
+
+    #[test]
+    fn empty_context_object_defaults_to_strict() {
+        // `{}` (missing field) must deserialize to the strict default via the
+        // field's serde(default) -- never an accidental skip.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let dir = root.join(".umadev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("governance-context.json"), "{}").unwrap();
+        let d = run_pre_write(&write_payload(&root.join("index.html"), &static_html()));
+        assert!(d.block, "an empty context object must default to strict");
+    }
+
+    #[test]
+    fn floor_rules_block_under_static_context() {
+        // The always-wrong floor (emoji) is context-independent: even a proven
+        // static frontend cannot write an emoji into a source file.
+        let (_tmp, root) = project_with_context(true);
+        let d = run_pre_write(&write_payload(
+            &root.join("app.js"),
+            "const x = '\u{1F680}';",
+        ));
+        assert!(d.block, "the emoji floor fires under any context");
+        assert_eq!(d.clause, "UD-CODE-001");
+    }
+
+    #[test]
+    fn sensitive_path_blocks_under_static_context() {
+        // UD-SEC-001 is a bypass-immune safety floor -- a static-frontend context
+        // must NOT let a write into .env through.
+        let (_tmp, root) = project_with_context(true);
+        let d = run_pre_write(&write_payload(&root.join(".env"), "SECRET=x"));
+        assert!(d.block, "UD-SEC-001 must block regardless of context");
+        assert_eq!(d.clause, "UD-SEC-001");
     }
 }

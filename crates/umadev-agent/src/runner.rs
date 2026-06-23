@@ -629,11 +629,38 @@ impl<R: Runtime> AgentRunner<R> {
     /// (cheap file probes) so a project that grows a backend mid-run flips back
     /// to strict on the next phase — fail-open toward strict.
     fn project_context(&self) -> umadev_governance::ProjectContext {
-        crate::planner::derive_project_context(
+        let ctx = crate::planner::derive_project_context(
             &self.options.requirement,
             &self.options.project_root,
             &self.options.effective_slug(),
-        )
+        );
+        // Persist the derived context so the real-time PreToolUse hook
+        // (`umadev hook pre-write`), which runs as a separate process with no
+        // access to this run's in-memory state, can govern by the SAME project
+        // context instead of falling back to strict defaults and nagging a
+        // static frontend about CSP / structured logging / crypto-RNG. Fully
+        // fail-open: a write failure is swallowed and never blocks the run; if
+        // the file is absent or stale the hook re-derives the conservative
+        // strict default on its own. Recomputed (and so re-stamped) per phase,
+        // so a project that grows a backend mid-run flips the on-disk context
+        // back to strict on the next phase.
+        self.persist_project_context(ctx);
+        ctx
+    }
+
+    /// Best-effort write of the run's [`umadev_governance::ProjectContext`] to
+    /// `.umadev/governance-context.json` so the out-of-process PreToolUse hook
+    /// can read it. Fail-open: any IO/serialization error is swallowed (the hook
+    /// defaults to strict when the file is missing/unreadable, so a write failure
+    /// only costs the static-frontend leniency, never correctness).
+    fn persist_project_context(&self, ctx: umadev_governance::ProjectContext) {
+        let dir = self.options.project_root.join(".umadev");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&ctx) {
+            let _ = std::fs::write(dir.join("governance-context.json"), json);
+        }
     }
 
     /// Emit `event` to the attached sink (no-op for the null sink).
