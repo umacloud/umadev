@@ -4733,6 +4733,15 @@ mod tests {
         tool_input.insert(target_key(), serde_json::json!("App.tsx"));
         let mut session = FakeDirectorSession {
             events: [
+                // Turn 1 — the planning turn (main session) replies with a JSON plan.
+                SessionEvent::TextDelta(
+                    r#"{"steps":[{"id":"s1","title":"Build it","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}],"risks":[],"open_questions":[]}"#
+                        .to_string(),
+                ),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                },
+                // Turn 2 — the build writes a real source file.
                 SessionEvent::ToolCall {
                     name: "Write".to_string(),
                     input: serde_json::Value::Object(tool_input),
