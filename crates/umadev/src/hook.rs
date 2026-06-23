@@ -34,7 +34,10 @@
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use umadev_governance::{check_dangerous_bash, check_sensitive_path, Decision, ProjectContext};
+use umadev_governance::{
+    check_client_secret_leak, check_dangerous_bash, check_hardcoded_secret,
+    check_plaintext_password, check_sensitive_path, Decision, ProjectContext,
+};
 
 /// The env var UmaDev sets on a base subprocess when (and only when) it is
 /// itself driving a run/session — its value is the project root being governed.
@@ -162,12 +165,26 @@ fn run_pre_write_scoped(
         content
     };
 
-    // Bypass-immune safety guard (UD-SEC-001) runs FIRST and is exempt from
-    // any policy disable — it blocks writes into .git/, secret stores, and
-    // toolchain config regardless of `.umadev/rules.toml`. Mirrors Claude
+    // Bypass-immune IRREVERSIBLE FLOOR runs FIRST and is exempt from any policy
+    // disable — it blocks regardless of `.umadev/rules.toml`. Mirrors Claude
     // Code's bypass-immune safetyCheck (permissions.ts step 1f/1g).
-    if let d @ Decision { block: true, .. } = check_sensitive_path(file_path, content) {
-        return d;
+    //
+    // This is the WHOLE irreversible floor, not just the path guard: a secret /
+    // credential leaked into committed source (UD-SEC-003 / 018 / 026) is
+    // irreversible the instant it lands, so — like the sensitive-path guard — it
+    // must NOT be switchable off by a project's disabled-clause list. (Routing
+    // these through `scan_content_with_context` below would honor `is_disabled`,
+    // letting a rules.toml quietly turn off in-source secret detection — a real
+    // bypass of the "bypass-immune" floor.) Every check here is fail-open inside.
+    for floor_check in [
+        check_sensitive_path,
+        check_hardcoded_secret,
+        check_plaintext_password,
+        check_client_secret_leak,
+    ] {
+        if let d @ Decision { block: true, .. } = floor_check(file_path, content) {
+            return d;
+        }
     }
     // The remaining content rules run through scan_content_with_context so the
     // project's disabled-clauses, path-exclusions AND its derived governance
@@ -1019,6 +1036,33 @@ mod tests {
         assert!(
             pre_write_in(&write_payload(&r4.join("cfg.js"), &secret), &r4).block,
             "secret must block under an empty context object"
+        );
+    }
+
+    #[test]
+    fn secret_floor_is_immune_to_a_disabling_policy() {
+        // A project's `.umadev/rules.toml` can switch off craft clauses, but it must
+        // NOT be able to disable the irreversible SECRET floor (UD-SEC-003/018/026):
+        // a credential committed into source is un-leakable. The secret checks run
+        // floor-first, before the policy-honoring scan, so a disabling policy can't
+        // reach them. (Previously they flowed through `scan_content_with_context`,
+        // which honors `is_disabled` — a real bypass of the "bypass-immune" floor.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        std::fs::write(
+            root.join(".umadev/rules.toml"),
+            "[disabled]\nclauses = [\"UD-SEC-003\", \"UD-SEC-018\", \"UD-SEC-026\"]\n",
+        )
+        .unwrap();
+        let policy = umadev_governance::Policy::load(&root);
+        // Sanity: the policy really does mark the clause disabled.
+        assert!(policy.is_disabled("UD-SEC-003"));
+        let payload = write_payload(&root.join("cfg.js"), &secret_content());
+        let d = run_pre_write_scoped(&payload, &policy, Some(&root));
+        assert!(
+            d.block,
+            "the irreversible secret floor must be immune to a disabling policy"
         );
     }
 
