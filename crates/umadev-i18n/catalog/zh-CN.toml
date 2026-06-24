@@ -184,6 +184,17 @@
 "delivery.latest_zip" = "\n  最新: {} ({} KiB)"
 "delivery.scorecard" = "\n  成绩单(可分享): release/{}"
 "delivery.complete_banner" = "[ok] 流水线完成,产品已就绪!{}\n\n上线:\n  · /preview -> 本地启动看实际效果\n  · /deploy -> 部署上线(执行底座记录的部署命令,拿到 live URL)\n\n证明(可分享给团队/客户/审计):\n  · 打开上面的 成绩单.html -> 独立质量分 + 治理 + 合规 + 防篡改哈希\n  · /export -> 查看交付物 / proof-pack 详情\n\n其它:\n  · /redo -> 重跑当前需求 · 输入新需求 -> 开新一轮\n  · /status -> 查看完整状态"
+"delivery.preview_line" = "\n  预览: {} (/preview 本地启动)"
+
+# Build-complete card (every effective build: chat / Fast / Delivery)
+"build.complete.title" = "✅ 构建完成"
+"build.complete.files" = "**改动的文件**({} 个):\n{}"
+"build.complete.files_more" = "\n  …还有 {} 个"
+"build.complete.no_files" = "**产出目录**:{}"
+"build.complete.entry" = "**关键入口**:{}"
+"build.complete.run" = "**运行命令**:`{}`"
+"build.complete.preview_starting" = "**预览**:正在启动 dev server… 就绪后会显示地址"
+"build.complete.preview_line" = "**预览**:{}\n  (浏览器打开即可;/stop-preview 停止)"
 
 # Build/verify failure next-step hints
 "verify.action.tool_missing" = "-> 构建工具缺失。用 /doctor 检查环境,或安装缺失的依赖后用 /redo 重跑。"

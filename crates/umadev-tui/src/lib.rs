@@ -356,6 +356,127 @@ fn open_url(url: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Start a preview dev server in the background and surface its URL once the
+/// port is up. Shared by the manual `/preview` ([`Action::StartPreview`]) path
+/// and the automatic post-build preview, so both behave identically: the
+/// port-conflict guard, the background `wait_for_port` + browser-open, the
+/// `preview_server` child handle (parked for exit-cleanup), and all the
+/// `preview.*` notes are defined exactly once here.
+///
+/// **Fail-open / non-blocking by contract**: spawning the dev server is
+/// best-effort and never blocks the TUI — `wait_for_port` runs in a detached
+/// task, a spawn failure only emits a hint, and a busy port opens what is
+/// already running instead of starting a second server. The child is stored in
+/// `preview_server` so the run-exit cleanup (`run()`) kills it and no process
+/// leaks. `open_browser` controls whether the URL is auto-opened in a browser
+/// (the manual `/preview` opens it; the automatic post-build preview does NOT —
+/// it only surfaces the clickable URL so the build flow never steals focus).
+fn start_preview_server(
+    preview_server: &std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
+    sink: &Arc<ChannelSink>,
+    url: &str,
+    command: &str,
+    project_root: &std::path::Path,
+    open_browser: bool,
+) {
+    let (dir, prog, args) = parse_run_command(command, project_root);
+    let mut cmd = tokio::process::Command::new(prog);
+    cmd.args(&args)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // Port-conflict guard: if the port is already bound (the user's own
+    // Vite/Next/Express), DON'T spawn a second server — it would either fail or
+    // bind a different port while we open the wrong URL. Open / surface what's
+    // already running instead.
+    if port_is_free(url) {
+        match cmd.spawn() {
+            Ok(child) => {
+                if let Ok(mut g) = preview_server.lock() {
+                    *g = Some(child);
+                }
+                sink.emit(EngineEvent::Note(
+                    umadev_i18n::tl("preview.dev_starting").into(),
+                ));
+                let url2 = url.to_string();
+                let sink3 = sink.clone();
+                tokio::spawn(async move {
+                    let up = wait_for_port(&url2, std::time::Duration::from_secs(15)).await;
+                    if up {
+                        if open_browser {
+                            let _ = open_url(&url2);
+                        }
+                        sink3.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "preview.dev_ready",
+                            &[&url2],
+                        )));
+                    } else {
+                        sink3.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "preview.dev_not_ready",
+                            &[&url2],
+                        )));
+                    }
+                });
+            }
+            Err(e) => {
+                sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                    "preview.dev_spawn_failed",
+                    &[command, &e.to_string(), url],
+                )));
+            }
+        }
+    } else {
+        if open_browser {
+            let _ = open_url(url);
+        }
+        sink.emit(EngineEvent::Note(umadev_i18n::tlf("preview.port_busy", &[url])));
+    }
+}
+
+/// Post the **build-complete card** for a finished build and, for a web
+/// project, auto-start its dev server so a clickable preview URL surfaces — the
+/// "✅ done + what changed + here's the demo" finish that previously only the
+/// heavyweight Delivery path produced (and even there, without a localhost URL).
+/// Shared by the chat/Fast `AgenticDone` build path and the Delivery
+/// `BlockCompleted` banner.
+///
+/// **Fail-open / non-blocking**: a non-web project (no dev server detected) just
+/// gets the card with no preview line and starts no server; the dev server is
+/// best-effort and detached (`start_preview_server`), so nothing here blocks the
+/// completion or the TUI. The browser is NOT auto-opened on this path (only the
+/// explicit `/preview` opens it) — the URL is surfaced for the user to click.
+///
+/// **Honesty guard**: a celebratory "✅ build complete" card only fires when the
+/// workspace actually holds real source (`acceptance::source_files`). A phantom
+/// build — the director CLAIMED a build but produced zero source — already gets a
+/// loud `ABORT_SENTINEL` note from [`director_source_hardgate`]; we must NOT also
+/// crown it "done". This is the SAME bounded source scan the hardgate uses, so
+/// the two reality checks agree.
+fn finalize_build_completion(app: &mut App, sink: &Arc<ChannelSink>) {
+    if umadev_agent::acceptance::source_files(&app.project_root).is_empty() {
+        // Nothing real landed — leave the honest abort/fact notes as the record,
+        // don't paint a success card over a no-op build.
+        return;
+    }
+    // `post_build_completion_card` pushes the card (preview line is a "starting…"
+    // placeholder when a dev server was detected; the real URL is appended by
+    // `start_preview_server`'s `preview.dev_ready` note once up) and hands back
+    // the dev-server target — `None` for a non-web project (no server started).
+    let preview = app.post_build_completion_card();
+    if let Some((url, command)) = preview {
+        start_preview_server(
+            &app.preview_server,
+            sink,
+            &url,
+            &command,
+            &app.project_root,
+            false,
+        );
+    }
+}
+
 /// Build the user-facing note for a failed `runner.start()`.
 ///
 /// `WouldBlock` is NOT a hard error: it means THIS session already holds the
@@ -3124,6 +3245,17 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // handle is parked in `run_task` so Ctrl-C can abort it.
                     Some(RouteDecision::AgenticDone { reply, director_build }) => {
                         app.record_agentic_done(reply, director_build);
+                        // Build-complete experience: an EFFECTIVE build (a `/run`
+                        // build, a chat "build me X", or a chat turn the reactive
+                        // detector promoted to a build) gets the "✅ done + what
+                        // changed + here's the demo" card, and — for a web project —
+                        // an auto-started dev server surfacing a clickable localhost
+                        // URL. A plain chat / explain / quick-edit turn carries
+                        // `director_build = false` and gets NO card (it just streamed
+                        // its answer). Fail-open + non-blocking by contract.
+                        if director_build {
+                            finalize_build_completion(app, &sink);
+                        }
                         run_task = drain_next_queued_chat(app, &chat_session_holder, &sink, &route_tx);
                     }
                     // The turn produced no usable reply (base init / stream error).
@@ -3139,7 +3271,27 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             }
             maybe_event = engine_rx.recv() => {
                 if let Some(ev) = maybe_event {
+                    let was_finished = app.finished;
                     app.apply_engine(ev);
+                    // Delivery build just completed (the banner with its preview URL
+                    // line was pushed inside `apply_engine`): auto-start the dev
+                    // server too so the user gets a live, clickable demo — not just a
+                    // printed address. Mirrors the chat/Fast build's auto-preview,
+                    // but does NOT re-push a card (the Delivery banner already
+                    // covers the "✅ done + what changed" summary). Fail-open: a
+                    // non-web project detects no dev server and starts nothing.
+                    if !was_finished && app.finished {
+                        if let Some((url, command)) = app.auto_preview_target() {
+                            start_preview_server(
+                                &app.preview_server,
+                                &sink,
+                                &url,
+                                &command,
+                                &app.project_root,
+                                false,
+                            );
+                        }
+                    }
                     // P1-F: a continuous run that has reached a TERMINAL state
                     // (delivery completed, or an honest abort / hard-stop carrying
                     // the `ABORT_SENTINEL`) must drop the `continuous_run_active`
@@ -3674,68 +3826,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 });
                             }
                             Action::StartPreview { url, command } => {
-                                let (dir, prog, args) = parse_run_command(&command, &opts.project_root);
-                                let mut cmd = tokio::process::Command::new(prog);
-                                cmd.args(&args)
-                                    .current_dir(&dir)
-                                    .stdin(std::process::Stdio::null())
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .kill_on_drop(true);
-                                // Port-conflict guard: if the port is already bound
-                                // (the user's own Vite/Next/Express), DON'T spawn a
-                                // second server — it would either fail or bind a
-                                // different port while we open the wrong URL. Open
-                                // what's already running instead.
-                                if port_is_free(&url) {
-                                    match cmd.spawn() {
-                                        Ok(child) => {
-                                            if let Ok(mut g) = app.preview_server.lock() {
-                                                *g = Some(child);
-                                            }
-                                            sink.emit(EngineEvent::Note(
-                                                umadev_i18n::tl("preview.dev_starting").into(),
-                                            ));
-                                            let url2 = url.clone();
-                                            let sink3 = sink.clone();
-                                            tokio::spawn(async move {
-                                                let up = wait_for_port(
-                                                    &url2,
-                                                    std::time::Duration::from_secs(15),
-                                                )
-                                                .await;
-                                                if up {
-                                                    let _ = open_url(&url2);
-                                                    sink3.emit(EngineEvent::Note(
-                                                        umadev_i18n::tlf(
-                                                            "preview.dev_ready",
-                                                            &[&url2],
-                                                        ),
-                                                    ));
-                                                } else {
-                                                    sink3.emit(EngineEvent::Note(
-                                                        umadev_i18n::tlf(
-                                                            "preview.dev_not_ready",
-                                                            &[&url2],
-                                                        ),
-                                                    ));
-                                                }
-                                            });
-                                        }
-                                        Err(e) => {
-                                            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                                "preview.dev_spawn_failed",
-                                                &[&command, &e.to_string(), &url],
-                                            )));
-                                        }
-                                    }
-                                } else {
-                                    let _ = open_url(&url);
-                                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                        "preview.port_busy",
-                                        &[&url],
-                                    )));
-                                }
+                                // Manual `/preview`: start the server AND open the
+                                // browser (the user explicitly asked to preview).
+                                start_preview_server(
+                                    &app.preview_server,
+                                    &sink,
+                                    &url,
+                                    &command,
+                                    &opts.project_root,
+                                    true,
+                                );
                             }
                             Action::RunDeploy { command } => {
                                 // Deploy runs in a background task: the deploy
@@ -5089,6 +5189,112 @@ mod tests {
         assert_eq!(dir, root);
         assert_eq!(prog, "sh");
         assert_eq!(args, vec!["-c".to_string(), "npm run dev".into()]);
+    }
+
+    /// Build a chat-mode App rooted at a fresh temp dir for the build-complete
+    /// wiring tests.
+    #[cfg(test)]
+    fn build_test_app() -> (crate::app::App, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::UserConfig {
+            backend: Some("claude-code".to_string()),
+            lang: Some("zh-CN".to_string()),
+            ..Default::default()
+        };
+        let app = crate::app::App::new(
+            "demo",
+            cfg,
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        (app, tmp)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn start_preview_server_registers_child_and_take_kills_it() {
+        // The dev-server child must be parked in `preview_server` so the run-exit
+        // cleanup can kill it — no leaked process. Spawn a real long-lived process
+        // on a free ephemeral port, confirm it's registered, then take + kill it
+        // (exactly what `run()`'s exit cleanup does).
+        let (sink, _rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let preview: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        // A free ephemeral port → `port_is_free` is true → we DO spawn.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("http://127.0.0.1:{port}");
+        // `cd / && sleep 30` → parse_run_command resolves `sleep` directly (a real
+        // long-lived child) in `/`, so the test never depends on `sh` resolution.
+        start_preview_server(&preview, &sink, &url, "cd / && sleep 30", std::path::Path::new("/"), false);
+        // A child was registered (the build flow never blocks; this is sync).
+        assert!(
+            preview.lock().unwrap().is_some(),
+            "dev-server child must be parked for exit cleanup"
+        );
+        // Exit cleanup: take + kill — must not leak.
+        let killed = preview
+            .lock()
+            .unwrap()
+            .take()
+            .is_some_and(|mut c| c.start_kill().is_ok());
+        assert!(killed, "the parked child must be killable on exit");
+        assert!(
+            preview.lock().unwrap().is_none(),
+            "the slot is cleared after take()"
+        );
+    }
+
+    #[test]
+    fn phantom_build_with_zero_source_gets_no_completion_card() {
+        // Honesty guard: a build that produced NO real source (the director
+        // claimed a build the workspace doesn't show) must NOT get a celebratory
+        // "✅ done" card — the source hard-gate already flagged it as not done.
+        let (mut app, _tmp) = build_test_app();
+        let (sink, _rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let before = app.history.len();
+        // Empty workspace → `acceptance::source_files` is empty → guard fires.
+        finalize_build_completion(&mut app, &sink);
+        assert_eq!(
+            app.history.len(),
+            before,
+            "no completion card for a zero-source phantom build"
+        );
+        assert!(app.preview_server.lock().unwrap().is_none(), "no server started");
+    }
+
+    #[test]
+    fn real_build_with_source_gets_a_completion_card() {
+        // The positive case: a build that produced real source DOES get the card.
+        let (mut app, _tmp) = build_test_app();
+        let (sink, _rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        std::fs::create_dir_all(app.project_root.join("src")).unwrap();
+        std::fs::write(app.project_root.join("src").join("main.rs"), "fn main(){}").unwrap();
+        let before = app.history.len();
+        finalize_build_completion(&mut app, &sink);
+        assert_eq!(app.history.len(), before + 1, "exactly one completion card");
+        // Non-web (pure rust) → no dev server started.
+        assert!(app.preview_server.lock().unwrap().is_none(), "no server for a non-web build");
+    }
+
+    #[test]
+    fn non_web_build_completion_card_pushes_card_without_a_server() {
+        // A non-web effective build: the card is pushed (✅ done + what changed)
+        // but NO dev server target resolves → no preview line, and the caller
+        // starts nothing. Fail-open + non-blocking.
+        let (mut app, _tmp) = build_test_app();
+        std::fs::create_dir_all(app.project_root.join("src")).unwrap();
+        std::fs::write(app.project_root.join("src").join("main.rs"), "fn main(){}").unwrap();
+        let before = app.history.len();
+        // `post_build_completion_card` is what `finalize_build_completion` drives.
+        let target = app.post_build_completion_card();
+        assert!(target.is_none(), "non-web build resolves no preview target");
+        assert_eq!(app.history.len(), before + 1, "exactly one card is pushed");
+        assert!(app.preview_server.lock().unwrap().is_none(), "no server started");
     }
 
     #[test]

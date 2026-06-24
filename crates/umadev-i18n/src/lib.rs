@@ -310,6 +310,17 @@ mod tests {
             "preview.dev_not_ready",
             "preview.dev_spawn_failed",
             "preview.port_busy",
+            // Build-complete card + Delivery preview line (every build path:
+            // chat / Fast / Delivery) — the "✅ done + what changed + preview URL".
+            "delivery.preview_line",
+            "build.complete.title",
+            "build.complete.files",
+            "build.complete.files_more",
+            "build.complete.no_files",
+            "build.complete.entry",
+            "build.complete.run",
+            "build.complete.preview_starting",
+            "build.complete.preview_line",
             "deploy.running",
             "deploy.login_hint",
             "deploy.done",

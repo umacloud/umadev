@@ -2063,7 +2063,16 @@ impl App {
                             })
                         })
                         .unwrap_or_default();
-                    let zip_info = format!("{zip_info}{scorecard}");
+                    // Surface the local preview URL right in the completion
+                    // banner so a finished Delivery build doesn't "just stop" with
+                    // no demo address (the actual dev server is auto-started by the
+                    // event loop on the same transition). Fail-open: a non-web
+                    // project (no dev server detected) adds no line.
+                    let preview_line = self
+                        .effective_preview_url()
+                        .map(|u| umadev_i18n::tf(lang, "delivery.preview_line", &[&u]))
+                        .unwrap_or_default();
+                    let zip_info = format!("{zip_info}{scorecard}{preview_line}");
                     self.push(
                         ChatRole::UmaDev,
                         umadev_i18n::tf(lang, "delivery.complete_banner", &[&zip_info]),
@@ -5591,6 +5600,134 @@ impl App {
             .map(|ds| ds.default_url.to_string())
     }
 
+    /// Synthesize the **build-complete card** shown after EVERY effective build
+    /// (chat / Fast / Delivery): a `✅ done` headline + what changed + the key
+    /// entry point + the run command. Plain markdown (the transcript renderer
+    /// formats it) — no new data model. **Fail-open**: every section is
+    /// best-effort; a section whose signal is missing is simply omitted, and the
+    /// card never errors. The optional `preview_pending` flag adds a "starting
+    /// dev server…" line so the user knows a URL is coming (the real URL is
+    /// appended later, once `wait_for_port` confirms the server is up).
+    #[must_use]
+    pub(crate) fn build_completion_card(&self, preview_pending: bool) -> String {
+        // Recognizable app entry points, most-specific first — the first one that
+        // exists on disk is reported as the build's "key entry".
+        const ENTRIES: &[&str] = &[
+            "src/App.tsx",
+            "src/App.jsx",
+            "src/main.tsx",
+            "src/main.jsx",
+            "app/page.tsx",
+            "src/index.tsx",
+            "src/index.js",
+            "index.html",
+            "public/index.html",
+            "src/main.rs",
+            "main.py",
+            "app.py",
+        ];
+        let lang = self.lang;
+        let mut lines: Vec<String> = vec![umadev_i18n::t(lang, "build.complete.title").to_string()];
+
+        // Changed files — the real working-tree delta from `git status`. Capped
+        // for readability with a "+N more". Fail-open: a non-git workspace (or an
+        // empty delta) drops to listing the output directories that exist, so the
+        // card always shows SOMETHING concrete the build produced.
+        let changed: Vec<String> = crate::git_status_porcelain(&self.project_root)
+            .map(|snap| {
+                snap.lines()
+                    .filter_map(crate::porcelain_path)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if changed.is_empty() {
+            // No git delta → at least name the product directories that exist.
+            let dirs: Vec<&str> = ["src", "app", "public", "output", "release"]
+                .into_iter()
+                .filter(|d| self.project_root.join(d).is_dir())
+                .collect();
+            if !dirs.is_empty() {
+                lines.push(umadev_i18n::tf(
+                    lang,
+                    "build.complete.no_files",
+                    &[&dirs.join(" · ")],
+                ));
+            }
+        } else {
+            const CAP: usize = 12;
+            let shown = changed
+                .iter()
+                .take(CAP)
+                .map(|f| format!("  · {f}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut block = umadev_i18n::tf(
+                lang,
+                "build.complete.files",
+                &[&changed.len().to_string(), &shown],
+            );
+            if changed.len() > CAP {
+                block.push_str(&umadev_i18n::tf(
+                    lang,
+                    "build.complete.files_more",
+                    &[&(changed.len() - CAP).to_string()],
+                ));
+            }
+            lines.push(block);
+        }
+
+        // Key entry point — the first recognizable app entry that exists on disk.
+        if let Some(entry) = ENTRIES
+            .iter()
+            .find(|p| self.project_root.join(p).is_file())
+        {
+            lines.push(umadev_i18n::tf(lang, "build.complete.entry", &[entry]));
+        }
+
+        // Run command — worker-recorded, else self-detected dev server.
+        let run_cmd = self.run_command_from_notes().or_else(|| {
+            umadev_agent::verify::detect_dev_server(&self.project_root)
+                .map(|ds| ds.command.to_string())
+        });
+        if let Some(cmd) = run_cmd {
+            lines.push(umadev_i18n::tf(lang, "build.complete.run", &[&cmd]));
+        }
+
+        if preview_pending {
+            lines.push(umadev_i18n::t(lang, "build.complete.preview_starting").to_string());
+        }
+
+        lines.join("\n\n")
+    }
+
+    /// The auto-preview target for a finished build: the detected dev server's
+    /// command + the URL to open (worker-recorded port preferred, else the
+    /// framework default). Returns `None` for a non-web project / when no dev
+    /// server is detected — the caller then shows the card WITHOUT a preview line
+    /// and starts no server (**fail-open**, never blocks the completion).
+    #[must_use]
+    pub(crate) fn auto_preview_target(&self) -> Option<(String, String)> {
+        let ds = umadev_agent::verify::detect_dev_server(&self.project_root)?;
+        let url = self
+            .preview_url_from_notes()
+            .unwrap_or_else(|| ds.default_url.to_string());
+        Some((url, ds.command.to_string()))
+    }
+
+    /// Push the build-complete card into the transcript and return the
+    /// auto-preview target (dev-server URL + command) when this is a web project.
+    /// Called after EVERY effective build (chat / Fast / Delivery). The caller
+    /// (the event loop) uses the returned target to background-start the dev
+    /// server via the shared `/preview` machinery; `None` means non-web / no dev
+    /// server detected → the card is shown WITHOUT a preview line and no server
+    /// is started. **Fail-open**: both the card and the target are best-effort.
+    pub(crate) fn post_build_completion_card(&mut self) -> Option<(String, String)> {
+        let preview = self.auto_preview_target();
+        let card = self.build_completion_card(preview.is_some());
+        self.push(ChatRole::UmaDev, card);
+        preview
+    }
+
     /// `/stop-preview` — kill the background dev server if one is running.
     fn slash_stop_preview(&mut self) -> Action {
         let killed = self
@@ -7553,6 +7690,80 @@ mod tests {
             }
             other => panic!("expected StartPreview, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn web_build_completion_card_has_files_entry_run_and_pending_preview() {
+        // A finished web build's card shows what changed + the key entry + the
+        // run command, and (when a dev server is detected) a "starting preview"
+        // line — the "✅ done + here's the demo" finish.
+        let (app, _tmp) = temp_app();
+        let root = app.project_root.clone();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"dependencies":{"vite":"^5"},"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src").join("App.tsx"), "export default 1;").unwrap();
+
+        // A web project resolves a dev-server target (Vite) → preview is pending.
+        let target = app.auto_preview_target();
+        assert!(target.is_some(), "vite project must resolve a preview target");
+        let card = app.build_completion_card(target.is_some());
+        // Headline + the three substantive sections.
+        assert!(card.contains("构建完成"), "card carries the done headline");
+        assert!(
+            card.contains("App.tsx"),
+            "card names the key entry / a changed file"
+        );
+        assert!(
+            card.contains("vite") || card.contains("npm run dev"),
+            "card carries the run command: {card}"
+        );
+        // The "starting dev server…" placeholder shows because a server was found.
+        assert!(
+            card.contains(umadev_i18n::t(app.lang, "build.complete.preview_starting")),
+            "web card flags the pending preview"
+        );
+    }
+
+    #[test]
+    fn non_web_build_completion_card_has_no_preview_line_fail_open() {
+        // Fail-open: a non-web project detects no dev server → the card is still
+        // produced (✅ done + what changed) but carries NO preview line and the
+        // auto-preview target is None (so the event loop starts no server).
+        let (app, _tmp) = temp_app();
+        let root = app.project_root.clone();
+        // A pure-Rust project: a main.rs but no package.json / index.html.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("main.rs"), "fn main() {}").unwrap();
+
+        assert!(
+            app.auto_preview_target().is_none(),
+            "a non-web project resolves no preview target"
+        );
+        let card = app.build_completion_card(false);
+        assert!(card.contains("构建完成"), "card still shows the done headline");
+        assert!(card.contains("main.rs"), "card names the rust entry");
+        assert!(
+            !card.contains(umadev_i18n::t(app.lang, "build.complete.preview_starting")),
+            "non-web card must NOT show a preview-starting line"
+        );
+    }
+
+    #[test]
+    fn build_completion_card_falls_back_to_dirs_without_git_delta() {
+        // No git repo (no porcelain delta) → the card still names a concrete
+        // product directory instead of an empty "files changed" section.
+        let (app, _tmp) = temp_app();
+        std::fs::create_dir_all(app.project_root.join("src")).unwrap();
+        let card = app.build_completion_card(false);
+        assert!(card.contains("构建完成"));
+        assert!(
+            card.contains("src"),
+            "falls back to naming an output dir: {card}"
+        );
     }
 
     #[test]

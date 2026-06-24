@@ -184,6 +184,17 @@
 "delivery.latest_zip" = "\n  最新: {} ({} KiB)"
 "delivery.scorecard" = "\n  成績單(可分享): release/{}"
 "delivery.complete_banner" = "[ok] 流水線完成,產品已就緒!{}\n\n上線:\n  · /preview -> 本機啟動看實際效果\n  · /deploy -> 部署上線(執行底座記錄的部署指令,拿到 live URL)\n\n證明(可分享給團隊/客戶/稽核):\n  · 開啟上面的 成績單.html -> 獨立品質分 + 治理 + 合規 + 防篡改雜湊\n  · /export -> 檢視交付物 / proof-pack 詳情\n\n其它:\n  · /redo -> 重跑目前需求 · 輸入新需求 -> 開新一輪\n  · /status -> 檢視完整狀態"
+"delivery.preview_line" = "\n  預覽: {} (/preview 本機啟動)"
+
+# Build-complete card (every effective build: chat / Fast / Delivery)
+"build.complete.title" = "✅ 建置完成"
+"build.complete.files" = "**改動的檔案**({} 個):\n{}"
+"build.complete.files_more" = "\n  …還有 {} 個"
+"build.complete.no_files" = "**產出目錄**:{}"
+"build.complete.entry" = "**關鍵入口**:{}"
+"build.complete.run" = "**執行指令**:`{}`"
+"build.complete.preview_starting" = "**預覽**:正在啟動 dev server… 就緒後會顯示地址"
+"build.complete.preview_line" = "**預覽**:{}\n  (瀏覽器開啟即可;/stop-preview 停止)"
 
 # Build/verify failure next-step hints
 "verify.action.tool_missing" = "-> 建置工具缺失。用 /doctor 檢查環境,或安裝缺失的相依套件後用 /redo 重跑。"

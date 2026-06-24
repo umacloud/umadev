@@ -184,6 +184,17 @@
 "delivery.latest_zip" = "\n  latest: {} ({} KiB)"
 "delivery.scorecard" = "\n  scorecard (shareable): release/{}"
 "delivery.complete_banner" = "[ok] Pipeline complete, your product is ready! {}\n\nGo live:\n  · /preview -> run it locally to see the real thing\n  · /deploy -> ship it (runs the deploy command the base recorded, returns a live URL)\n\nProof (shareable with team / client / audit):\n  · open the scorecard.html above -> independent quality score + governance + compliance + tamper-proof hash\n  · /export -> view deliverables / proof-pack details\n\nMore:\n  · /redo -> re-run the current requirement · type a new requirement -> start fresh\n  · /status -> view full status"
+"delivery.preview_line" = "\n  preview: {} (/preview to start it locally)"
+
+# Build-complete card (every effective build: chat / Fast / Delivery)
+"build.complete.title" = "✅ Build complete"
+"build.complete.files" = "**Files changed** ({}):\n{}"
+"build.complete.files_more" = "\n  …and {} more"
+"build.complete.no_files" = "**Output dir**: {}"
+"build.complete.entry" = "**Key entry**: {}"
+"build.complete.run" = "**Run command**: `{}`"
+"build.complete.preview_starting" = "**Preview**: starting dev server… the URL appears once it's ready"
+"build.complete.preview_line" = "**Preview**: {}\n  (open it in your browser; /stop-preview to stop)"
 
 # Build/verify failure next-step hints
 "verify.action.tool_missing" = "-> Build tool missing. Run /doctor to check the environment, or install the missing dependency and /redo."
