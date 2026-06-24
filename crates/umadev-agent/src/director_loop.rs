@@ -139,6 +139,26 @@ pub(crate) fn idle_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Default wall-clock budget for a build loop — a generous 30 min, enough for a
+/// thorough deliberate build (plan → step scheduling → QC → acceptance rework) yet
+/// a hard ceiling so a build can never run unbounded.
+const DEFAULT_RUN_BUDGET_SECS: u64 = 1_800;
+
+/// The wall-clock budget for ONE build loop, read from `UMADEV_RUN_BUDGET_SECS`
+/// (falling back to [`DEFAULT_RUN_BUDGET_SECS`]). This is a GRACEFUL ceiling, not a
+/// kill switch: when it is reached the loop stops scheduling NEW work, runs the
+/// final gate on what's already built, and exits with an honest "budget reached"
+/// note — never a hard abort mid-write. A non-positive / unparseable value falls
+/// back to the default (fail-open: a bad env never removes the ceiling).
+pub(crate) fn run_budget() -> Duration {
+    let secs = std::env::var("UMADEV_RUN_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_RUN_BUDGET_SECS);
+    Duration::from_secs(secs)
+}
+
 /// A short, fixed ceiling on the best-effort `interrupt()` issued when the idle
 /// watchdog fires. A base that has wedged its event stream can also wedge the
 /// interrupt path (the same dead pipe), so the interrupt is ITSELF bounded —
@@ -287,8 +307,10 @@ pub async fn drive_director_loop_routed(
         None => None,
     };
 
-    // Read the idle watchdog window ONCE at the boundary (not per-wait), so a
-    // mid-run env flip can't race the in-flight turns. Threaded into every turn.
+    // Read the idle watchdog window + the wall-clock build budget ONCE at the
+    // boundary (not per-wait), so a mid-run env flip can't race the in-flight turns.
+    // The deadline is a GRACEFUL ceiling — the loop winds down (final gate on what's
+    // built) rather than aborting mid-write.
     drive_director_loop_with_idle(
         session,
         options,
@@ -297,6 +319,7 @@ pub async fn drive_director_loop_routed(
         plan,
         route,
         idle_timeout(),
+        std::time::Instant::now() + run_budget(),
     )
     .await
 }
@@ -343,6 +366,7 @@ async fn synthesize_and_post_plan(
 ///   end-to-end base turn + bounded auto-QC). Unchanged — a simple page stays ONE
 ///   fast turn; we never pay the per-step round-trips for a lean goal (Wave 1 speed
 ///   invariant).
+#[allow(clippy::too_many_arguments)]
 async fn drive_director_loop_with_idle(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -351,6 +375,7 @@ async fn drive_director_loop_with_idle(
     mut plan: Option<Plan>,
     route: Option<&RoutePlan>,
     idle: Duration,
+    deadline: std::time::Instant,
 ) -> DirectorLoopOutcome {
     // Wave 2: a DELIBERATE build with an owned plan is driven step-by-step (summon
     // per step + per-step acceptance + real checklist ticking). A lean/Fast build —
@@ -359,7 +384,9 @@ async fn drive_director_loop_with_idle(
     // first step (the caller then runs the single-turn loop, never losing the build).
     if let (Some(r), Some(p)) = (route, plan.as_mut()) {
         if r.depth.is_deliberate() {
-            if let Some(outcome) = drive_plan_steps(session, options, events, r, p, idle).await {
+            if let Some(outcome) =
+                drive_plan_steps(session, options, events, r, p, idle, deadline).await
+            {
                 return outcome;
             }
             // Step-driving could not start — fall through to the single-turn loop.
@@ -374,6 +401,17 @@ async fn drive_director_loop_with_idle(
     let mut last_reply = String::new();
 
     for round in 0..MAX_QC_ROUNDS {
+        // Wall-clock ceiling (graceful): a fix round past the budget is abandoned —
+        // the build so far stands on its own deterministic floor (the source-present
+        // hard-gate the caller runs). Round 0 (the build itself) always runs.
+        if round > 0 && std::time::Instant::now() >= deadline {
+            events.emit(EngineEvent::Note(
+                "team · time budget reached — settling with the current build (raise \
+                 UMADEV_RUN_BUDGET_SECS for more fix rounds)"
+                    .to_string(),
+            ));
+            break;
+        }
         // Plan visibility (Wave 1): mark the ready BUILD steps Active before this
         // turn drives the base over them, so the checklist shows live progress. The
         // base still executes the whole goal in one turn this wave (step-by-step
@@ -493,6 +531,7 @@ async fn drive_plan_steps(
     route: &RoutePlan,
     plan: &mut Plan,
     idle: Duration,
+    deadline: std::time::Instant,
 ) -> Option<DirectorLoopOutcome> {
     let _ = idle; // each summon turn reads the idle window itself (drive_rework_turn)
     events.emit(EngineEvent::Note(format!(
@@ -519,6 +558,19 @@ async fn drive_plan_steps(
         // Snapshot the next ready step's id (ready_steps borrows the plan immutably;
         // we drop the borrow before mutating). Drive ONE step per outer iteration so
         // dependents become ready only after their prerequisite actually accepted.
+        // Wall-clock ceiling (graceful): once the build budget is spent, stop
+        // scheduling NEW steps and fall through to the final gate on what's already
+        // built — a thorough deliberate build can never run unbounded, but we never
+        // abort mid-write. The first step always runs (a budget can't be so small it
+        // starves the very first doer turn).
+        if transitions > 0 && std::time::Instant::now() >= deadline {
+            events.emit(EngineEvent::Note(
+                "team · time budget reached — finalizing what's complete (raise \
+                 UMADEV_RUN_BUDGET_SECS for a longer run)"
+                    .to_string(),
+            ));
+            break;
+        }
         let Some(step_id) = plan.ready_steps().first().map(|s| s.id.clone()) else {
             break; // nothing ready (all Done / Blocked, or a satisfied DAG) → finish
         };
@@ -1887,6 +1939,7 @@ mod tests {
             None,
             None,
             Duration::from_millis(100),
+            std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;
         if let DirectorLoopOutcome::Failed(reason) = outcome {
@@ -2358,6 +2411,85 @@ mod tests {
             ),
             confidence: 0.7,
         }
+    }
+
+    #[test]
+    fn run_budget_reads_env_and_falls_back_safely() {
+        let prior = std::env::var_os("UMADEV_RUN_BUDGET_SECS");
+        std::env::set_var("UMADEV_RUN_BUDGET_SECS", "120");
+        assert_eq!(run_budget(), Duration::from_secs(120));
+        std::env::set_var("UMADEV_RUN_BUDGET_SECS", "0"); // non-positive → default
+        assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
+        std::env::set_var("UMADEV_RUN_BUDGET_SECS", "nonsense");
+        assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
+        std::env::remove_var("UMADEV_RUN_BUDGET_SECS");
+        assert_eq!(run_budget(), Duration::from_secs(DEFAULT_RUN_BUDGET_SECS));
+        if let Some(v) = prior {
+            std::env::set_var("UMADEV_RUN_BUDGET_SECS", v);
+        }
+    }
+
+    #[tokio::test]
+    async fn deliberate_build_winds_down_gracefully_at_the_time_budget() {
+        // A deliberate build whose wall-clock budget is ALREADY spent drives its
+        // first step, then stops scheduling new steps and settles via the final gate
+        // (graceful — never a mid-write abort, never unbounded). The honest budget
+        // note fires.
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mk = |id: &str| PlanStep {
+            id: id.to_string(),
+            title: format!("step {id}"),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::SourcePresent,
+            status: StepStatus::Pending,
+        };
+        let plan = Plan {
+            steps: vec![mk("a"), mk("b"), mk("c")],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        let turns = vec![
+            text_turn("step a done"),
+            text_turn("step b done"),
+            text_turn("step c done"),
+            text_turn("final gate ok"),
+        ];
+        let mut sess = FakeSession::new(turns, true, "");
+        let o = opts(tmp.path());
+        let route = build_route(); // deliberate Standard
+        // An already-spent budget (deadline in the past). `checked_sub` avoids the
+        // unchecked-Instant-subtraction lint; fall back to "now" (still ≤ now).
+        let already_past = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        let outcome = drive_director_loop_with_idle(
+            &mut sess,
+            &o,
+            &events,
+            "GO".into(),
+            Some(plan),
+            Some(&route),
+            Duration::from_millis(200),
+            already_past,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DirectorLoopOutcome::Done { .. }),
+            "the build settles cleanly (never hangs) at the budget: {outcome:?}"
+        );
+        assert!(
+            rec.events().iter().any(|e| matches!(
+                e,
+                EngineEvent::Note(n) if n.contains("time budget reached")
+            )),
+            "the graceful budget wind-down note fires: {:?}",
+            rec.events()
+        );
     }
 
     #[tokio::test]
