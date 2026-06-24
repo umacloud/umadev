@@ -2281,14 +2281,35 @@ impl App {
                             // whole reply stays visible and the transcript keeps
                             // pre-folding each segment correctly.
                             const SEGMENT_BYTES: usize = 4000;
+                            // Hard ceiling: never let a single segment grow past
+                            // this even mid-fence, so a runaway un-closed ``` can't
+                            // make one segment unbounded (the markdown renderer's
+                            // fail-open still applies). Comfortably above the soft
+                            // cap to span any realistic single code block.
+                            const SEGMENT_BYTES_MAX: usize = 24_000;
                             // Decide WHERE the delta goes without holding a
                             // mutable borrow across a `self.push` (which also
                             // borrows `self.history`): append to the live Host
                             // segment if it still has room, else roll over to a
                             // new segment. Returns whether we appended in place.
+                            //
+                            // Fence-safe rollover: a naive `len < 4000` cut could
+                            // land INSIDE a ```code fence```, splitting it across
+                            // two Host segments — and each segment renders markdown
+                            // independently, so the opening ``` is in segment A and
+                            // the closing ``` in segment B, scrambling BOTH. So we
+                            // only roll over at the soft cap when the live segment
+                            // has no open fence; inside a fence we keep appending
+                            // (up to the hard ceiling) until the fence closes.
                             let append_in_place = self.stream_text_active
                                 && self.history.back().is_some_and(|m| {
-                                    m.role == ChatRole::Host && m.body.len() < SEGMENT_BYTES
+                                    if m.role != ChatRole::Host {
+                                        return false;
+                                    }
+                                    if m.body.len() >= SEGMENT_BYTES_MAX {
+                                        return false;
+                                    }
+                                    m.body.len() < SEGMENT_BYTES || has_open_code_fence(&m.body)
                                 });
                             if append_in_place {
                                 if let Some(last) = self.history.back_mut() {
@@ -6291,6 +6312,23 @@ fn is_long_running_command(detail: &str) -> bool {
     ];
     let d = detail.to_ascii_lowercase();
     LONG.iter().any(|p| d.contains(p))
+}
+
+/// Whether `body` ends with an UNCLOSED ```code fence``` — an odd number of
+/// fence lines (a line whose first non-space run is ``` or ~~~). The streaming
+/// segmenter uses this to avoid rolling over to a new Host bubble mid-fence,
+/// which would split one code block across two independently-rendered segments
+/// and scramble both. Cheap line scan; fail-open (a malformed body just reads as
+/// "closed" and rolls over normally).
+pub(crate) fn has_open_code_fence(body: &str) -> bool {
+    let mut open = false;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            open = !open;
+        }
+    }
+    open
 }
 
 fn now_iso8601() -> String {

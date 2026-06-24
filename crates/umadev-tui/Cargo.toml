@@ -18,6 +18,12 @@ umadev-i18n = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
+# CommonMark pull parser — a pure-Rust, dependency-light event stream (no ICU,
+# no heavy parse tree). We compile the LIBRARY only (`default-features = false`
+# drops the `getopts`-backed `pulldown-cmark` binary) and feed its events into a
+# ratatui Line/Span compiler. The dependency-light constraint only binds the
+# spec / governance / contract crates, not the TUI.
+pulldown-cmark = { version = "0.13", default-features = false }
 tokio = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }

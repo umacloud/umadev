@@ -176,6 +176,107 @@ mod theme {
         pick(&PRIMARY_P)
     }
 
+    // ── Extra palette pairs for the syntax-role table ──
+    // Roles that don't map onto an existing UI token get their own (dark, light)
+    // pair here, drawn from the same Tailwind-family ramp as the rest of the
+    // theme so the highlighter reads as part of the brand, not a foreign scheme.
+    const SYN_NUMBER_P: Pair = Pair {
+        dark: rgb(0xf0, 0x9b, 0x4e),  // orange-400 — numeric literals
+        light: rgb(0xc2, 0x41, 0x0c), // orange-700
+    };
+    const SYN_TYPE_P: Pair = Pair {
+        dark: rgb(0x5e, 0xea, 0xd4),  // teal-300 — type names
+        light: rgb(0x0f, 0x76, 0x6e), // teal-700
+    };
+    const SYN_FUNCTION_P: Pair = Pair {
+        dark: rgb(0x82, 0xa9, 0xff),  // indigo-300 — function / method names
+        light: rgb(0x43, 0x38, 0xca), // indigo-700
+    };
+    const SYN_PUNCT_P: Pair = Pair {
+        dark: rgb(0xb8, 0xc1, 0xd4),  // slate-300 — punctuation/operators
+        light: rgb(0x47, 0x55, 0x69), // slate-600
+    };
+    const DIFF_ADD_P: Pair = Pair {
+        dark: rgb(0x4a, 0xde, 0x80),  // green-400 — diff +
+        light: rgb(0x15, 0x80, 0x3d), // green-700
+    };
+    const DIFF_DEL_P: Pair = Pair {
+        dark: rgb(0xf8, 0x71, 0x71),  // red-400 — diff -
+        light: rgb(0xb9, 0x1c, 0x1c), // red-700
+    };
+    /// Subtle background tint for fenced code blocks — distinct from the prose
+    /// background without shouting. Sits between BG_PANEL and BG_ELEMENT.
+    pub fn CODE_BG() -> Color {
+        if IS_LIGHT.load(Ordering::Relaxed) {
+            Color::Rgb(0xe7, 0xed, 0xf4)
+        } else {
+            Color::Rgb(0x18, 0x1a, 0x28)
+        }
+    }
+
+    /// One semantic syntax/markdown role. Both the markdown compiler and the
+    /// code tokenizer emit ONLY these tags — never a bare `Color` — so a theme
+    /// swap means editing exactly one table (`syn_color`). This is the "no naked
+    /// color" contract for rich text.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum SynRole {
+        /// Default prose / code identifier text.
+        Text,
+        /// Muted / secondary text.
+        Muted,
+        /// Language keyword (`fn`, `if`, `def`, `return`, …).
+        Keyword,
+        /// String / char literal.
+        StringLit,
+        /// Numeric literal.
+        Number,
+        /// Type / class / constructor name.
+        Type,
+        /// Function / method name.
+        Function,
+        /// Comment.
+        Comment,
+        /// Punctuation / operator.
+        Punctuation,
+        /// Markdown heading.
+        Heading,
+        /// Inline `code` span / fenced-code identifier text.
+        InlineCode,
+        /// Link / URL text.
+        Link,
+        /// Blockquote text + its left bar.
+        Blockquote,
+        /// List marker (bullet / number).
+        ListMarker,
+        /// Diff added line (`+ …`).
+        DiffAdd,
+        /// Diff removed line (`- …`).
+        DiffDel,
+    }
+
+    /// The single source of truth mapping a [`SynRole`] to a runtime-resolved
+    /// color. Change a theme by editing only this table. Resolves dark/light via
+    /// the same `pick` path as every other token.
+    pub fn syn_color(role: SynRole) -> Color {
+        match role {
+            SynRole::Text => TEXT(),
+            // Muted / comment / blockquote all read as secondary text.
+            SynRole::Muted | SynRole::Comment | SynRole::Blockquote => TEXT_MUTED(),
+            // Keywords + headings share the secondary (purple) accent.
+            SynRole::Keyword | SynRole::Heading => pick(&SECONDARY_P),
+            SynRole::StringLit => pick(&SUCCESS_P),
+            SynRole::Number => pick(&SYN_NUMBER_P),
+            SynRole::Type => pick(&SYN_TYPE_P),
+            SynRole::Function => pick(&SYN_FUNCTION_P),
+            SynRole::Punctuation => pick(&SYN_PUNCT_P),
+            // Inline code + links share the primary (cyan) brand color.
+            SynRole::InlineCode | SynRole::Link => pick(&PRIMARY_P),
+            SynRole::ListMarker => pick(&INFO_P),
+            SynRole::DiffAdd => pick(&DIFF_ADD_P),
+            SynRole::DiffDel => pick(&DIFF_DEL_P),
+        }
+    }
+
     /// Per-role left-bar color — brand cyan for `UmaDev` itself, semantic
     /// accents for the other speakers.
     pub fn role_bar(role: crate::app::ChatRole) -> Color {
@@ -293,161 +394,974 @@ fn render_scroll_overlay(frame: &mut Frame, ov: &crate::app::Overlay) {
     frame.render_widget(body, area);
 }
 
-/// Simple per-line code syntax highlighting (keywords=accent, strings=green,
-/// comments=muted, rest=green). Zero dependencies.
-fn colorize_code_line(line: &str) -> Vec<Span<'static>> {
-    let trimmed = line.trim_start();
-    // Comment lines.
-    if trimmed.starts_with("//") || (trimmed.starts_with('#') && !trimmed.starts_with("#{")) {
-        return vec![Span::styled(
-            line.to_string(),
-            Style::default().fg(theme::TEXT_MUTED()),
-        )];
-    }
-    // Default: green, but colorize string literals brighter.
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    for ch in line.chars() {
-        if ch == '"' {
-            if !buf.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut buf),
-                    Style::default().fg(theme::SUCCESS()),
-                ));
-            }
-            buf.push(ch);
-            spans.push(Span::styled(
-                std::mem::take(&mut buf),
-                Style::default().fg(theme::WARNING()),
-            ));
-        } else {
-            buf.push(ch);
+use theme::SynRole;
+
+/// Convenience: a styled [`Span`] whose color comes from the semantic role table
+/// (never a naked `Color`). `modifier` layers bold/italic/etc on top.
+fn role_span(text: impl Into<String>, role: SynRole, modifier: Modifier) -> Span<'static> {
+    Span::styled(
+        text.into(),
+        Style::default()
+            .fg(theme::syn_color(role))
+            .add_modifier(modifier),
+    )
+}
+
+// ─── Markdown → styled Lines ──────────────────────────────────────────────
+// A pulldown-cmark event stream compiled into ratatui `Line`/`Span`s. Replaces
+// the old per-line `strip_prefix` renderer (no tables, no nested lists, no
+// inline bold/italic, fence state per-message only). Every color is emitted as
+// a semantic [`SynRole`] tag — never a naked `Color` — so a theme swap edits one
+// table. CJK width is measured with `unicode-width` everywhere a column is laid
+// out (tables), so Chinese text never misaligns. Fail-open: ANY panic in the
+// compiler falls back to plain per-line text (see [`markdown_to_lines`]).
+
+/// One frame on the inline style stack — a `Modifier` set plus an optional
+/// role override (inline code / link recolor their text).
+#[derive(Clone, Copy)]
+struct StyleFrame {
+    modifier: Modifier,
+    role: Option<SynRole>,
+}
+
+/// Accumulates inline events (`Text`, `Code`, `Start(Strong)`, …) into a row of
+/// styled spans, applying the current style stack. Tables and prose both feed
+/// their inline content through one of these and then `take()` the spans.
+struct InlineBuilder {
+    spans: Vec<Span<'static>>,
+    stack: Vec<StyleFrame>,
+    base: SynRole,
+}
+
+impl InlineBuilder {
+    fn new(base: SynRole) -> Self {
+        Self {
+            spans: Vec::new(),
+            stack: Vec::new(),
+            base,
         }
     }
-    if !buf.is_empty() {
-        spans.push(Span::styled(buf, Style::default().fg(theme::SUCCESS())));
+
+    /// The effective `(modifier, role)` from the top of the stack down.
+    fn current(&self) -> (Modifier, SynRole) {
+        let mut modifier = Modifier::empty();
+        let mut role = self.base;
+        for frame in &self.stack {
+            modifier |= frame.modifier;
+            if let Some(r) = frame.role {
+                role = r;
+            }
+        }
+        (modifier, role)
+    }
+
+    fn push_text(&mut self, text: &str, role_override: Option<SynRole>) {
+        if text.is_empty() {
+            return;
+        }
+        let (modifier, role) = self.current();
+        let role = role_override.unwrap_or(role);
+        self.spans.push(Span::styled(
+            text.to_string(),
+            Style::default()
+                .fg(theme::syn_color(role))
+                .add_modifier(modifier),
+        ));
+    }
+
+    fn take(&mut self) -> Vec<Span<'static>> {
+        std::mem::take(&mut self.spans)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+}
+
+/// Ordered-list marker for `(depth, index)`: depth 0/1 → arabic, depth 2 →
+/// lowercase letters, depth ≥3 → lowercase roman. `index` is 1-based. Computed
+/// here so a model's own bullet/number text is never trusted for layout.
+fn ordered_marker(depth: usize, index: u64) -> String {
+    match depth {
+        0 | 1 => format!("{index}."),
+        2 => format!("{}.", alpha_marker(index)),
+        _ => format!("{}.", roman_marker(index)),
+    }
+}
+
+/// `1 → a, 2 → b, … 26 → z, 27 → aa` (bijective base-26).
+fn alpha_marker(mut n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        n -= 1;
+        out.push((b'a' + u8::try_from(n % 26).unwrap_or(0)) as char);
+        n /= 26;
+    }
+    out.iter().rev().collect()
+}
+
+/// Lowercase roman numerals for small `n` (1..=3999); falls back to the decimal
+/// for anything larger so a pathological list can't loop or panic.
+fn roman_marker(n: u64) -> String {
+    const TABLE: &[(u64, &str)] = &[
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    if n == 0 || n > 3999 {
+        return n.to_string();
+    }
+    let mut n = n;
+    let mut out = String::new();
+    for &(value, sym) in TABLE {
+        while n >= value {
+            out.push_str(sym);
+            n -= value;
+        }
+    }
+    out
+}
+
+/// What kind of list each open list level is (ordered + running index, or
+/// unordered).
+#[derive(Clone, Copy)]
+enum ListKind {
+    Ordered(u64),
+    Unordered,
+}
+
+/// Mutable state threaded through the event walk.
+struct MdState {
+    lines: Vec<Line<'static>>,
+    inline: InlineBuilder,
+    /// Open list levels (innermost last) — used for marker style + indent.
+    lists: Vec<ListKind>,
+    /// `true` right after `Start(Item)` so the FIRST flushed block on that item
+    /// gets the list marker prefix instead of a bare indent.
+    pending_item_marker: bool,
+    /// Heading level currently open (`Some(n)`), styling the inline text.
+    heading: Option<u8>,
+    /// Blockquote nesting depth — each level adds a `│ ` bar + italic.
+    blockquote: usize,
+    /// Pending table being assembled (header + rows), or `None` outside a table.
+    table: Option<TableBuf>,
+    /// `true` while inside a table cell so inline events route into the cell.
+    in_table_cell: bool,
+}
+
+/// A table accumulated cell-by-cell as pulldown-cmark walks it.
+struct TableBuf {
+    /// Column alignments from `Start(Table(aligns))`.
+    aligns: Vec<pulldown_cmark::Alignment>,
+    /// All rows (header first). Each cell is its already-styled spans.
+    rows: Vec<Vec<Vec<Span<'static>>>>,
+    /// `true` while the header row is being read.
+    in_header: bool,
+}
+
+impl MdState {
+    /// The left indent (in spaces) for body text at the current list depth.
+    /// Each list level indents by 2; the marker itself lives in this gutter.
+    fn list_indent(&self) -> usize {
+        self.lists.len().saturating_mul(2)
+    }
+
+    /// Emit the accumulated inline spans as one logical block line, prefixing the
+    /// list marker / indent / blockquote bar as needed, then reset the builder.
+    fn flush_block(&mut self) {
+        if self.inline.is_empty() && !self.pending_item_marker {
+            return;
+        }
+        let mut prefix: Vec<Span<'static>> = Vec::new();
+        // Blockquote bars first (outermost gutter).
+        for _ in 0..self.blockquote {
+            prefix.push(role_span("│ ", SynRole::Blockquote, Modifier::empty()));
+        }
+        // List indent + marker.
+        if self.lists.is_empty() {
+            // Top-level prose gets one leading space to match the old gutter.
+            prefix.push(Span::raw(" "));
+        } else {
+            let depth = self.lists.len() - 1;
+            let indent = depth.saturating_mul(2);
+            prefix.push(Span::raw(" ".repeat(indent + 1)));
+            if self.pending_item_marker {
+                let marker = match self.lists.last() {
+                    Some(ListKind::Ordered(idx)) => ordered_marker(depth, *idx),
+                    _ => "•".to_string(),
+                };
+                prefix.push(role_span(
+                    format!("{marker} "),
+                    SynRole::ListMarker,
+                    Modifier::empty(),
+                ));
+            } else {
+                // Continuation line under a list item: align under the text.
+                let marker_w = match self.lists.last() {
+                    Some(ListKind::Ordered(idx)) => ordered_marker(depth, *idx).len() + 1,
+                    _ => 2,
+                };
+                prefix.push(Span::raw(" ".repeat(marker_w)));
+            }
+        }
+        self.pending_item_marker = false;
+        let mut spans = prefix;
+        spans.extend(self.inline.take());
+        self.lines.push(Line::from(spans));
+    }
+
+    /// Insert a blank spacer line for vertical rhythm between blocks (collapsing
+    /// repeats so we never stack two blanks).
+    fn blank(&mut self) {
+        if self
+            .lines
+            .last()
+            .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+        {
+            return;
+        }
+        self.lines.push(Line::from(""));
+    }
+}
+
+/// Render an assembled table into aligned, CJK-safe rows and push them onto
+/// `state.lines`. Column widths are the max VISIBLE (style-stripped, `unicode-
+/// width`-measured, CJK = 2) cell width — never byte length — so Chinese columns
+/// line up. A muted separator row sits under the header.
+fn render_table(state: &mut MdState, table: &TableBuf) {
+    let cols = table
+        .rows
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0)
+        .max(table.aligns.len());
+    if cols == 0 {
+        return;
+    }
+    // Column widths from the visible width of every cell.
+    let mut widths = vec![0usize; cols];
+    for row in &table.rows {
+        for (c, cell) in row.iter().enumerate() {
+            let w = cell.iter().map(|s| disp_width(s.content.as_ref())).sum();
+            if w > widths[c] {
+                widths[c] = w;
+            }
+        }
+    }
+    let indent = " ".repeat(state.list_indent() + 1);
+    let empty: Vec<Span<'static>> = Vec::new();
+    for (r, row) in table.rows.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(indent.clone())];
+        for (c, &col_w) in widths.iter().enumerate() {
+            let cell = row.get(c).unwrap_or(&empty);
+            let cell_w: usize = cell.iter().map(|s| disp_width(s.content.as_ref())).sum();
+            let pad = col_w.saturating_sub(cell_w);
+            let align = table
+                .aligns
+                .get(c)
+                .copied()
+                .unwrap_or(pulldown_cmark::Alignment::None);
+            let (lpad, rpad) = match align {
+                pulldown_cmark::Alignment::Right => (pad, 0),
+                pulldown_cmark::Alignment::Center => (pad / 2, pad - pad / 2),
+                _ => (0, pad),
+            };
+            if lpad > 0 {
+                spans.push(Span::raw(" ".repeat(lpad)));
+            }
+            // Header cells render bold via the heading role for emphasis.
+            if r == 0 {
+                for s in cell {
+                    spans.push(Span::styled(
+                        s.content.to_string(),
+                        s.style.add_modifier(Modifier::BOLD),
+                    ));
+                }
+            } else {
+                spans.extend(cell.iter().cloned());
+            }
+            if rpad > 0 {
+                spans.push(Span::raw(" ".repeat(rpad)));
+            }
+            if c + 1 < cols {
+                spans.push(role_span("  │  ", SynRole::Punctuation, Modifier::empty()));
+            }
+        }
+        state.lines.push(Line::from(spans));
+        // Separator rule under the header row.
+        if r == 0 {
+            let mut sep: Vec<Span<'static>> = vec![Span::raw(indent.clone())];
+            for (c, w) in widths.iter().enumerate() {
+                sep.push(role_span("─".repeat(*w), SynRole::Muted, Modifier::empty()));
+                if c + 1 < cols {
+                    sep.push(role_span("──┼──", SynRole::Muted, Modifier::empty()));
+                }
+            }
+            state.lines.push(Line::from(sep));
+        }
+    }
+}
+
+/// Heading style for level `n`: all bold; H1/H2 underlined for stronger
+/// hierarchy. The color is the heading role.
+fn heading_modifier(level: u8) -> Modifier {
+    if level <= 2 {
+        Modifier::BOLD | Modifier::UNDERLINED
+    } else {
+        Modifier::BOLD
+    }
+}
+
+/// The fail-open public entry point. Renders `text` as styled markdown Lines; if
+/// the CommonMark walk panics for any reason, falls back to the plain per-line
+/// renderer so the transcript NEVER loses content or crashes. `base_color` is
+/// retained for signature compatibility (prose uses the `Text` role).
+fn markdown_to_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
+    let rendered =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| markdown_compile(text)));
+    match rendered {
+        Ok(lines) if !lines.is_empty() => lines,
+        // Empty input → empty; any panic OR an empty parse → plain fallback.
+        Ok(_) if text.trim().is_empty() => Vec::new(),
+        _ => plaintext_lines(text, base_color),
+    }
+}
+
+/// The plain per-line fallback (the old behavior): one styled Line per source
+/// line, no parsing. Used when CommonMark parsing fails. Never panics.
+fn plaintext_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
+    text.lines()
+        .map(|raw| {
+            if raw.trim().is_empty() {
+                Line::from("")
+            } else {
+                Line::from(Span::styled(
+                    format!(" {raw}"),
+                    Style::default().fg(base_color),
+                ))
+            }
+        })
+        .collect()
+}
+
+/// The real CommonMark → Lines compiler (wrapped by [`markdown_to_lines`] for
+/// fail-open). Walks the pulldown-cmark event stream with tables + strikethrough
+/// enabled, maintaining an inline style stack and block context.
+fn markdown_compile(text: &str) -> Vec<Line<'static>> {
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(text, options);
+
+    let mut state = MdState {
+        lines: Vec::new(),
+        inline: InlineBuilder::new(SynRole::Text),
+        lists: Vec::new(),
+        pending_item_marker: false,
+        heading: None,
+        blockquote: 0,
+        table: None,
+        in_table_cell: false,
+    };
+    // Fenced-code context: the language tag (for the tokenizer) + the buffered
+    // lines, so the whole block is highlighted and boxed together.
+    let mut code_lang: Option<String> = None;
+    let mut code_buf = String::new();
+    let mut in_code = false;
+
+    for event in parser {
+        match event {
+            // ── Block starts ──
+            Event::Start(Tag::Heading { level, .. }) => {
+                state.flush_block();
+                state.heading = Some(level as u8);
+            }
+            // A standalone paragraph flushes the previous block first; a
+            // paragraph that opens a list item keeps the item's pending marker
+            // line (so the marker and the first text share one row).
+            Event::Start(Tag::Paragraph) if !state.pending_item_marker => {
+                state.flush_block();
+            }
+            Event::Start(Tag::List(first)) => {
+                state.flush_block();
+                state.lists.push(match first {
+                    Some(n) => ListKind::Ordered(n),
+                    None => ListKind::Unordered,
+                });
+            }
+            Event::End(TagEnd::List(_)) => {
+                state.flush_block();
+                state.lists.pop();
+                if state.lists.is_empty() {
+                    state.blank();
+                }
+            }
+            Event::Start(Tag::Item) => {
+                state.flush_block();
+                state.pending_item_marker = true;
+            }
+            Event::End(TagEnd::Item) => {
+                state.flush_block();
+                // Advance the ordered-list counter for the next sibling.
+                if let Some(ListKind::Ordered(idx)) = state.lists.last_mut() {
+                    *idx += 1;
+                }
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                state.flush_block();
+                state.blockquote += 1;
+                state.inline.stack.push(StyleFrame {
+                    modifier: Modifier::ITALIC,
+                    role: Some(SynRole::Blockquote),
+                });
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                state.flush_block();
+                state.inline.stack.pop();
+                state.blockquote = state.blockquote.saturating_sub(1);
+                if state.blockquote == 0 {
+                    state.blank();
+                }
+            }
+            // ── Code blocks ──
+            Event::Start(Tag::CodeBlock(kind)) => {
+                state.flush_block();
+                in_code = true;
+                code_buf.clear();
+                code_lang = match kind {
+                    CodeBlockKind::Fenced(lang) if !lang.is_empty() => {
+                        Some(lang.split_whitespace().next().unwrap_or("").to_lowercase())
+                    }
+                    _ => None,
+                };
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                emit_code_block(&mut state, code_lang.as_deref(), &code_buf);
+                in_code = false;
+                code_buf.clear();
+                code_lang = None;
+                state.blank();
+            }
+            // ── Tables ──
+            Event::Start(Tag::Table(aligns)) => {
+                state.flush_block();
+                state.table = Some(TableBuf {
+                    aligns,
+                    rows: Vec::new(),
+                    in_header: false,
+                });
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(table) = state.table.take() {
+                    render_table(&mut state, &table);
+                }
+                state.blank();
+            }
+            Event::Start(Tag::TableHead) => {
+                if let Some(t) = state.table.as_mut() {
+                    t.in_header = true;
+                    t.rows.push(Vec::new());
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(t) = state.table.as_mut() {
+                    t.in_header = false;
+                }
+            }
+            Event::Start(Tag::TableRow) => {
+                if let Some(t) = state.table.as_mut() {
+                    if !t.in_header {
+                        t.rows.push(Vec::new());
+                    }
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                state.in_table_cell = true;
+            }
+            Event::End(TagEnd::TableCell) => {
+                let spans = state.inline.take();
+                if let Some(t) = state.table.as_mut() {
+                    if let Some(row) = t.rows.last_mut() {
+                        row.push(spans);
+                    }
+                }
+                state.in_table_cell = false;
+            }
+            // ── Inline emphasis ──
+            Event::Start(Tag::Strong) => state.inline.stack.push(StyleFrame {
+                modifier: Modifier::BOLD,
+                role: None,
+            }),
+            Event::Start(Tag::Emphasis) => state.inline.stack.push(StyleFrame {
+                modifier: Modifier::ITALIC,
+                role: None,
+            }),
+            Event::Start(Tag::Strikethrough) => state.inline.stack.push(StyleFrame {
+                modifier: Modifier::CROSSED_OUT,
+                role: None,
+            }),
+            Event::Start(Tag::Link { .. }) => state.inline.stack.push(StyleFrame {
+                modifier: Modifier::UNDERLINED,
+                role: Some(SynRole::Link),
+            }),
+            // Closing any inline-style tag pops one frame off the style stack.
+            Event::End(
+                TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link,
+            ) => {
+                state.inline.stack.pop();
+            }
+            // ── Leaf inline content ──
+            Event::Text(t) => {
+                if in_code {
+                    code_buf.push_str(&t);
+                } else if let Some(level) = state.heading {
+                    state.inline.spans.push(role_span(
+                        t.to_string(),
+                        SynRole::Heading,
+                        heading_modifier(level),
+                    ));
+                } else {
+                    state.inline.push_text(&t, None);
+                }
+            }
+            Event::Code(t) => {
+                // Inline `code` — recolor with the inline-code role, keeping any
+                // surrounding emphasis modifier.
+                state.inline.push_text(&t, Some(SynRole::InlineCode));
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if in_code {
+                    code_buf.push('\n');
+                } else if state.in_table_cell {
+                    state.inline.push_text(" ", None);
+                } else {
+                    // Soft/hard break inside prose ends the visual line.
+                    state.flush_block();
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                state.flush_block();
+                state.heading = None;
+                state.blank();
+            }
+            Event::End(TagEnd::Paragraph) => {
+                state.flush_block();
+                // Blank between top-level paragraphs only (inside a list the
+                // tight items already control spacing).
+                if state.lists.is_empty() && state.blockquote == 0 {
+                    state.blank();
+                }
+            }
+            Event::Rule => {
+                state.flush_block();
+                state.lines.push(Line::from(role_span(
+                    "─".repeat(24),
+                    SynRole::Muted,
+                    Modifier::empty(),
+                )));
+                state.blank();
+            }
+            _ => {}
+        }
+    }
+    state.flush_block();
+    // Trim a trailing blank for a tidy block.
+    while state
+        .lines
+        .last()
+        .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+    {
+        state.lines.pop();
+    }
+    state.lines
+}
+
+/// Emit a fenced code block: a subtle top/bottom rule + each content line run
+/// through the per-language tokenizer, on a faint code background. The language
+/// tag (if any) labels the opening rule.
+fn emit_code_block(state: &mut MdState, lang: Option<&str>, body: &str) {
+    let indent = state.list_indent();
+    let gutter = " ".repeat(indent + 2);
+    let label = lang.filter(|l| !l.is_empty()).unwrap_or("code");
+    // Opening rule with the language label.
+    state.lines.push(Line::from(vec![
+        Span::raw(" ".repeat(indent + 2)),
+        role_span(format!("┌── {label} "), SynRole::Muted, Modifier::empty()),
+    ]));
+    for raw in body.lines() {
+        let mut spans: Vec<Span<'static>> = vec![Span::styled(
+            gutter.clone(),
+            Style::default().bg(theme::CODE_BG()),
+        )];
+        for mut s in highlight_code_line(raw, lang) {
+            s.style = s.style.bg(theme::CODE_BG());
+            spans.push(s);
+        }
+        state.lines.push(Line::from(spans));
+    }
+    state.lines.push(Line::from(vec![
+        Span::raw(" ".repeat(indent + 2)),
+        role_span("└──────────", SynRole::Muted, Modifier::empty()),
+    ]));
+}
+
+/// Flush the pending identifier/text run from [`highlight_code_line`],
+/// classifying an identifier run as keyword / type / plain text and pushing it
+/// as a styled span. A no-op on an empty buffer.
+fn flush_run(spans: &mut Vec<Span<'static>>, buf: &mut String, is_ident: bool, keywords: &[&str]) {
+    if buf.is_empty() {
+        return;
+    }
+    let role = if is_ident {
+        classify_ident(buf, keywords)
+    } else {
+        SynRole::Text
+    };
+    spans.push(role_span(std::mem::take(buf), role, Modifier::empty()));
+}
+
+/// Per-language lightweight tokenizer → semantic-role spans. NOT a parser: a
+/// regex-free, allocation-light scan that recognises comments, string/char
+/// literals, numbers, keywords (per language family), type-ish identifiers
+/// (CamelCase / known primitives), and diff markers — emitting [`SynRole`] tags
+/// only. An unknown language falls back to plaintext with string/number/comment
+/// heuristics. Never panics (char-boundary safe).
+fn highlight_code_line(line: &str, lang: Option<&str>) -> Vec<Span<'static>> {
+    // Diff hunks: color the whole line by its first column (but NOT the
+    // `+++`/`---` file headers, which carry no add/del meaning).
+    let lang = lang.unwrap_or("");
+    let diffish =
+        matches!(lang, "diff" | "patch") || line.starts_with("+++") || line.starts_with("---");
+    if diffish && line.starts_with('+') && !line.starts_with("+++") {
+        return vec![role_span(
+            line.to_string(),
+            SynRole::DiffAdd,
+            Modifier::empty(),
+        )];
+    }
+    if diffish && line.starts_with('-') && !line.starts_with("---") {
+        return vec![role_span(
+            line.to_string(),
+            SynRole::DiffDel,
+            Modifier::empty(),
+        )];
+    }
+
+    let keywords = keywords_for(lang);
+    let (line_comment, mut chars) = (line_comment_for(lang), line.char_indices().peekable());
+    // Whole-line comment fast path.
+    let trimmed = line.trim_start();
+    if !line_comment.is_empty() && trimmed.starts_with(line_comment) {
+        return vec![role_span(
+            line.to_string(),
+            SynRole::Comment,
+            Modifier::empty(),
+        )];
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_is_ident = false;
+
+    while let Some((i, c)) = chars.next() {
+        // Line comment starting mid-line.
+        if !line_comment.is_empty() && line[i..].starts_with(line_comment) {
+            flush_run(&mut spans, &mut buf, buf_is_ident, &keywords);
+            spans.push(role_span(
+                line[i..].to_string(),
+                SynRole::Comment,
+                Modifier::empty(),
+            ));
+            return spans;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                flush_run(&mut spans, &mut buf, buf_is_ident, &keywords);
+                buf_is_ident = false;
+                let quote = c;
+                let mut lit = String::new();
+                lit.push(c);
+                let mut escaped = false;
+                for (_, sc) in chars.by_ref() {
+                    lit.push(sc);
+                    if escaped {
+                        escaped = false;
+                    } else if sc == '\\' {
+                        escaped = true;
+                    } else if sc == quote {
+                        break;
+                    }
+                }
+                spans.push(role_span(lit, SynRole::StringLit, Modifier::empty()));
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                if !buf_is_ident {
+                    flush_run(&mut spans, &mut buf, buf_is_ident, &keywords);
+                    buf_is_ident = true;
+                }
+                buf.push(c);
+            }
+            c if c.is_ascii_digit() && !buf_is_ident => {
+                flush_run(&mut spans, &mut buf, buf_is_ident, &keywords);
+                let mut num = String::new();
+                num.push(c);
+                while let Some(&(_, nc)) = chars.peek() {
+                    if nc.is_ascii_alphanumeric() || nc == '.' || nc == '_' || nc == 'x' {
+                        num.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                spans.push(role_span(num, SynRole::Number, Modifier::empty()));
+            }
+            c if c.is_ascii_digit() => {
+                // Digit inside an identifier (e.g. `utf8`).
+                buf.push(c);
+            }
+            c if "+-*/%=<>!&|^~?:.,;(){}[]".contains(c) => {
+                flush_run(&mut spans, &mut buf, buf_is_ident, &keywords);
+                buf_is_ident = false;
+                spans.push(role_span(
+                    c.to_string(),
+                    SynRole::Punctuation,
+                    Modifier::empty(),
+                ));
+            }
+            _ => {
+                // Whitespace or other: belongs to a text run, not an ident run.
+                if buf_is_ident {
+                    flush_run(&mut spans, &mut buf, buf_is_ident, &keywords);
+                    buf_is_ident = false;
+                }
+                buf.push(c);
+            }
+        }
+    }
+    flush_run(&mut spans, &mut buf, buf_is_ident, &keywords);
+    if spans.is_empty() {
+        spans.push(role_span(
+            line.to_string(),
+            SynRole::Text,
+            Modifier::empty(),
+        ));
     }
     spans
 }
 
-/// Lightweight markdown → styled Lines renderer. Handles the most common
-/// patterns the worker outputs: headings (#/##/###), code blocks (```...```),
-/// bullet lists (-/*/•), numbered lists, and inline `code`. No external
-/// dependency — just pattern matching per line. Returns styled Lines that
-/// the chat history renderer can splice in.
-fn markdown_to_lines(text: &str, base_color: Color) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut in_code_block = false;
-    for raw in text.lines() {
-        let trimmed = raw.trim();
-        // Code fence toggle.
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            lines.push(Line::from(Span::styled(
-                if in_code_block {
-                    "  ┌── code ──".to_string()
-                } else {
-                    "  └──────────".to_string()
-                },
-                Style::default().fg(theme::TEXT_MUTED()),
-            )));
-            continue;
-        }
-        if in_code_block {
-            // Simple syntax highlight: keywords (accent), strings (green),
-            // comments (muted), rest (green).
-            let colored = colorize_code_line(raw);
-            let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
-            spans.extend(colored);
-            lines.push(Line::from(spans));
-            continue;
-        }
-        // Headings — purple/magenta headings, like opencode's markdownHeading.
-        if let Some(h) = trimmed.strip_prefix("### ") {
-            lines.push(Line::from(Span::styled(
-                format!("  {h}"),
-                Style::default()
-                    .fg(theme::MD_HEADING())
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )));
-            continue;
-        }
-        if let Some(h) = trimmed.strip_prefix("## ") {
-            lines.push(Line::from(Span::styled(
-                format!(" {h}"),
-                Style::default()
-                    .fg(theme::MD_HEADING())
-                    .add_modifier(Modifier::BOLD),
-            )));
-            continue;
-        }
-        if let Some(h) = trimmed.strip_prefix("# ") {
-            lines.push(Line::from(Span::styled(
-                format!(" {h}"),
-                Style::default()
-                    .fg(theme::MD_HEADING())
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )));
-            continue;
-        }
-        // Bullet list. Use strip_prefix (not a hardcoded byte slice) — the `•`
-        // marker is 3 bytes, so `&trimmed[2..]` would slice mid-char and panic.
-        if let Some(content) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-            .or_else(|| trimmed.strip_prefix("• "))
-        {
-            lines.push(Line::from(vec![
-                Span::styled("  • ", Style::default().fg(theme::INFO())),
-                Span::styled(content.to_string(), Style::default().fg(base_color)),
-            ]));
-            continue;
-        }
-        // Numbered list (1. 2. etc).
-        if let Some(pos) = trimmed.find(". ") {
-            if pos <= 3 && trimmed[..pos].chars().all(|c| c.is_ascii_digit()) {
-                let num = &trimmed[..pos];
-                let content = &trimmed[pos + 2..];
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {num}. "), Style::default().fg(theme::INFO())),
-                    Span::styled(content.to_string(), Style::default().fg(base_color)),
-                ]));
-                continue;
-            }
-        }
-        // Inline code spans (simple: wrap `code` in the markdown-code color).
-        if trimmed.contains('`') {
-            let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-            let mut in_code = false;
-            for part in raw.split('`') {
-                if in_code {
-                    spans.push(Span::styled(
-                        part.to_string(),
-                        Style::default().fg(theme::MD_CODE()),
-                    ));
-                } else if !part.is_empty() {
-                    spans.push(Span::styled(
-                        part.to_string(),
-                        Style::default().fg(base_color),
-                    ));
-                }
-                in_code = !in_code;
-            }
-            lines.push(Line::from(spans));
-            continue;
-        }
-        // Empty line → spacer.
-        if trimmed.is_empty() {
-            lines.push(Line::from(""));
-            continue;
-        }
-        // Plain text.
-        lines.push(Line::from(Span::styled(
-            format!(" {raw}"),
-            Style::default().fg(base_color),
-        )));
+/// Classify a bare identifier: keyword (from the language set), a type-ish name
+/// (UpperCamelCase or a known primitive), else plain text.
+fn classify_ident(ident: &str, keywords: &[&str]) -> SynRole {
+    if keywords.contains(&ident) {
+        return SynRole::Keyword;
     }
-    lines
+    let first = ident.chars().next();
+    if first.is_some_and(char::is_uppercase) {
+        return SynRole::Type;
+    }
+    if matches!(
+        ident,
+        "int"
+            | "float"
+            | "double"
+            | "bool"
+            | "char"
+            | "str"
+            | "void"
+            | "byte"
+            | "string"
+            | "number"
+            | "boolean"
+            | "usize"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "f32"
+            | "f64"
+    ) {
+        return SynRole::Type;
+    }
+    SynRole::Text
+}
+
+/// The line-comment token for a language family (`//`, `#`, `--`). Empty when
+/// unknown (the tokenizer then skips comment detection).
+fn line_comment_for(lang: &str) -> &'static str {
+    match lang {
+        "rust" | "rs" | "c" | "cpp" | "c++" | "h" | "hpp" | "java" | "js" | "jsx" | "ts"
+        | "tsx" | "javascript" | "typescript" | "go" | "golang" | "swift" | "kotlin" | "kt"
+        | "scala" | "php" | "dart" | "json" | "json5" => "//",
+        "python" | "py" | "ruby" | "rb" | "sh" | "bash" | "zsh" | "shell" | "yaml" | "yml"
+        | "toml" | "ini" | "perl" | "r" | "makefile" | "dockerfile" => "#",
+        "sql" | "lua" | "haskell" | "hs" => "--",
+        _ => "",
+    }
+}
+
+/// The keyword set for a language family. Kept compact — enough to color the
+/// control-flow / declaration spine, not an exhaustive grammar.
+fn keywords_for(lang: &str) -> Vec<&'static str> {
+    const RUST: &[&str] = &[
+        "fn", "let", "mut", "pub", "use", "mod", "struct", "enum", "trait", "impl", "for", "while",
+        "loop", "if", "else", "match", "return", "self", "Self", "where", "async", "await", "move",
+        "ref", "const", "static", "type", "as", "in", "break", "continue", "dyn", "crate", "super",
+        "unsafe", "true", "false",
+    ];
+    const PY: &[&str] = &[
+        "def", "class", "return", "if", "elif", "else", "for", "while", "import", "from", "as",
+        "with", "try", "except", "finally", "raise", "yield", "lambda", "pass", "break",
+        "continue", "in", "is", "not", "and", "or", "None", "True", "False", "async", "await",
+        "global", "nonlocal", "del", "assert",
+    ];
+    const JS: &[&str] = &[
+        "function",
+        "const",
+        "let",
+        "var",
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "switch",
+        "case",
+        "break",
+        "continue",
+        "class",
+        "extends",
+        "new",
+        "this",
+        "import",
+        "export",
+        "from",
+        "default",
+        "async",
+        "await",
+        "yield",
+        "try",
+        "catch",
+        "finally",
+        "throw",
+        "typeof",
+        "instanceof",
+        "in",
+        "of",
+        "null",
+        "undefined",
+        "true",
+        "false",
+        "interface",
+        "type",
+        "enum",
+        "public",
+        "private",
+        "protected",
+        "readonly",
+    ];
+    const GO: &[&str] = &[
+        "func",
+        "package",
+        "import",
+        "var",
+        "const",
+        "type",
+        "struct",
+        "interface",
+        "map",
+        "chan",
+        "go",
+        "defer",
+        "return",
+        "if",
+        "else",
+        "for",
+        "range",
+        "switch",
+        "case",
+        "select",
+        "break",
+        "continue",
+        "fallthrough",
+        "nil",
+        "true",
+        "false",
+    ];
+    const SQL: &[&str] = &[
+        "select",
+        "from",
+        "where",
+        "insert",
+        "into",
+        "values",
+        "update",
+        "set",
+        "delete",
+        "create",
+        "table",
+        "drop",
+        "alter",
+        "join",
+        "left",
+        "right",
+        "inner",
+        "outer",
+        "on",
+        "group",
+        "by",
+        "order",
+        "having",
+        "limit",
+        "and",
+        "or",
+        "not",
+        "null",
+        "as",
+        "primary",
+        "key",
+        "foreign",
+        "references",
+        "index",
+    ];
+    match lang {
+        "rust" | "rs" => RUST.to_vec(),
+        "python" | "py" => PY.to_vec(),
+        "js" | "jsx" | "ts" | "tsx" | "javascript" | "typescript" => JS.to_vec(),
+        "go" | "golang" => GO.to_vec(),
+        "sql" => SQL.to_vec(),
+        // Unknown language: a broad union of common control-flow words so SOME
+        // structure shows, while strings/numbers/comments still highlight.
+        _ => {
+            let mut v = Vec::new();
+            v.extend_from_slice(&[
+                "function", "fn", "def", "class", "struct", "return", "if", "else", "for", "while",
+                "import", "from", "const", "let", "var", "true", "false", "null", "public",
+                "private",
+            ]);
+            v
+        }
+    }
 }
 
 // ---------- Picker (first launch) -----------------------------------------
@@ -2383,6 +3297,226 @@ mod tests {
             .collect();
         assert!(joined.contains("第一步"));
         assert!(joined.contains("第二步 with 中文"));
+    }
+
+    // Concatenate every span's text across all lines, for content assertions.
+    fn md_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // Does any span on any line carry the given semantic-role color?
+    fn has_role(lines: &[Line<'static>], role: theme::SynRole) -> bool {
+        let want = theme::syn_color(role);
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.fg == Some(want))
+    }
+
+    #[test]
+    fn markdown_inline_bold_emits_bold_span() {
+        // `**bold**` must produce a span carrying the BOLD modifier — not the
+        // literal asterisks dumped as text.
+        let lines = markdown_to_lines("plain **bold** tail", Color::White);
+        let txt = md_text(&lines);
+        assert!(txt.contains("bold"), "bold text preserved: {txt}");
+        assert!(!txt.contains("**"), "asterisks consumed, not dumped: {txt}");
+        let bold = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains("bold") && s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(bold, "the 'bold' run carries Modifier::BOLD");
+    }
+
+    #[test]
+    fn markdown_inline_italic_and_code() {
+        let lines = markdown_to_lines("an *em* and `code` here", Color::White);
+        let italic = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.content.contains("em") && s.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(italic, "italic run carries Modifier::ITALIC");
+        // Inline code recolors to the inline-code role.
+        let code = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.contains("code")
+                && s.style.fg == Some(theme::syn_color(theme::SynRole::InlineCode))
+        });
+        assert!(code, "inline code uses the inline-code role color");
+    }
+
+    #[test]
+    fn markdown_heading_is_bold_and_role_colored() {
+        let lines = markdown_to_lines("# Title\n\nbody", Color::White);
+        let heading = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.contains("Title")
+                && s.style.fg == Some(theme::syn_color(theme::SynRole::Heading))
+                && s.style.add_modifier.contains(Modifier::BOLD)
+        });
+        assert!(heading, "H1 'Title' is heading-colored + bold: {lines:?}");
+    }
+
+    #[test]
+    fn markdown_nested_list_markers_by_depth() {
+        // Marker style is COMPUTED from nesting depth (0/1→arabic, 2→alpha,
+        // 3→roman), never taken from the source text. The input below opens four
+        // ordered-list levels so every style band is exercised; each `1.` in the
+        // source must re-render with the marker for its DEPTH, not its literal.
+        let md = "\
+1. lvl0
+   1. lvl1
+      1. lvl2
+         1. lvl3
+- bullet";
+        let lines = markdown_to_lines(md, Color::White);
+        let txt = md_text(&lines);
+        assert!(txt.contains("1. lvl0"), "depth-0 arabic: {txt}");
+        assert!(txt.contains("1. lvl1"), "depth-1 arabic: {txt}");
+        // The doubly-nested ordered item uses a lowercase-alpha marker (the
+        // source `1.` becomes `a.`).
+        assert!(txt.contains("a. lvl2"), "depth-2 alpha marker: {txt}");
+        // The triply-nested uses lowercase roman (`1.` becomes `i.`).
+        assert!(txt.contains("i. lvl3"), "depth-3 roman marker: {txt}");
+        // The unordered item uses a bullet.
+        assert!(txt.contains("• bullet"), "unordered bullet: {txt}");
+    }
+
+    #[test]
+    fn ordered_marker_depth_styles() {
+        assert_eq!(ordered_marker(0, 1), "1.");
+        assert_eq!(ordered_marker(1, 3), "3.");
+        assert_eq!(ordered_marker(2, 1), "a.");
+        assert_eq!(ordered_marker(2, 27), "aa.");
+        assert_eq!(ordered_marker(3, 4), "iv.");
+        assert_eq!(ordered_marker(3, 9), "ix.");
+    }
+
+    #[test]
+    fn markdown_table_columns_align_cjk_safe() {
+        // A table with a CJK header column and ASCII values: every body row must
+        // pad to the SAME visible column width (CJK counted as 2), so the column
+        // separators line up. We assert by the visible width up to the first
+        // separator being equal across rows.
+        let md = "\
+| 名称 | Qty |
+| --- | --- |
+| 苹果 | 3 |
+| x | 100 |";
+        let lines = markdown_to_lines(md, Color::White);
+        let txt = md_text(&lines);
+        assert!(txt.contains("名称"), "header rendered: {txt}");
+        assert!(txt.contains("苹果"), "cjk cell rendered: {txt}");
+        assert!(txt.contains("100"), "value cell rendered: {txt}");
+        assert!(txt.contains('│'), "column separator present: {txt}");
+        // The visible width from line start to the first column separator must be
+        // identical on every table row (header + 2 body rows). This is the CJK
+        // alignment guarantee: byte alignment would desync 苹果 (6 bytes) vs x.
+        let sep_cols: Vec<usize> = txt
+            .lines()
+            .filter(|l| l.contains('│'))
+            .map(|l| {
+                let upto: String = l.chars().take_while(|&c| c != '│').collect();
+                disp_width(&upto)
+            })
+            .collect();
+        assert!(sep_cols.len() >= 3, "header + 2 body rows have a separator");
+        assert!(
+            sep_cols.windows(2).all(|w| w[0] == w[1]),
+            "first-column separator aligns by display width across rows: {sep_cols:?}\n{txt}"
+        );
+    }
+
+    #[test]
+    fn markdown_code_block_highlights_by_language() {
+        // A ```rust fence: the `fn` keyword gets the keyword role, the string
+        // literal gets the string role, the language label rides the open rule.
+        let md = "```rust\nfn main() {\n    let s = \"hi\";\n}\n```";
+        let lines = markdown_to_lines(md, Color::White);
+        let txt = md_text(&lines);
+        assert!(txt.contains("rust"), "language label on the rule: {txt}");
+        assert!(txt.contains("fn main"), "code preserved: {txt}");
+        assert!(has_role(&lines, theme::SynRole::Keyword), "keyword colored");
+        assert!(
+            has_role(&lines, theme::SynRole::StringLit),
+            "string literal colored"
+        );
+        // The fenced content carries the code background tint.
+        let has_bg = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .any(|s| s.style.bg == Some(theme::CODE_BG()));
+        assert!(has_bg, "code block has a distinct background tint");
+    }
+
+    #[test]
+    fn markdown_unknown_language_falls_back_to_plaintext_highlight() {
+        // An unknown fence language must not panic and still highlight strings.
+        let md = "```wat\nthing = \"value\" 42\n```";
+        let lines = markdown_to_lines(md, Color::White);
+        let txt = md_text(&lines);
+        assert!(txt.contains("value"), "content preserved: {txt}");
+        assert!(
+            has_role(&lines, theme::SynRole::StringLit),
+            "string still highlighted in unknown lang"
+        );
+        assert!(
+            has_role(&lines, theme::SynRole::Number),
+            "number highlighted"
+        );
+    }
+
+    #[test]
+    fn markdown_blockquote_has_bar_and_italic() {
+        let lines = markdown_to_lines("> quoted wisdom", Color::White);
+        let txt = md_text(&lines);
+        assert!(txt.contains('│'), "blockquote bar present: {txt}");
+        assert!(txt.contains("quoted wisdom"), "quote content: {txt}");
+        let italic = lines.iter().flat_map(|l| l.spans.iter()).any(|s| {
+            s.content.contains("quoted") && s.style.add_modifier.contains(Modifier::ITALIC)
+        });
+        assert!(italic, "blockquote text is italic");
+    }
+
+    #[test]
+    fn markdown_fail_open_never_panics_on_adversarial_input() {
+        // A pile of half-open constructs must NEVER panic; fail-open returns
+        // content (either parsed or plain), never empty for non-blank input.
+        let nasties = [
+            "```\nunterminated fence with 中文 and `inline",
+            "| broken | table\n| --- |",
+            "> > > deeply\n>nested **bold *mixed `code",
+            "###### h6 ####### h7-ish",
+            "1.\n2.\n   - \n",
+            "\u{0}\u{1}\u{7} control bytes 中文 mixed",
+        ];
+        for n in &nasties {
+            let lines = markdown_to_lines(n, Color::White);
+            assert!(
+                !lines.is_empty(),
+                "non-empty input renders something: {n:?}"
+            );
+        }
+        // Truly empty input → empty output (no spurious blank line).
+        assert!(markdown_to_lines("", Color::White).is_empty());
+        assert!(markdown_to_lines("   \n  ", Color::White).is_empty());
+    }
+
+    #[test]
+    fn has_open_code_fence_detects_unclosed() {
+        use crate::app::has_open_code_fence;
+        assert!(has_open_code_fence("text\n```rust\nfn x"));
+        assert!(!has_open_code_fence("text\n```rust\nfn x\n```\nmore"));
+        assert!(!has_open_code_fence("no fence at all"));
+        // Tilde fences count too.
+        assert!(has_open_code_fence("~~~\nopen"));
     }
 
     fn render_to_string(app: &App) -> String {
