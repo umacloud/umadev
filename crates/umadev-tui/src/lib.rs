@@ -211,7 +211,20 @@ enum RouteDecision {
     /// the event loop records it as the assistant turn (chat memory continuity);
     /// the body was ALREADY streamed live via `WorkerStream`, so it is NOT
     /// re-rendered. A terminal outcome → clears the "thinking…" status.
-    AgenticDone(String),
+    ///
+    /// `director_build` carries whether THIS turn was a Build-class director build
+    /// (run-lock + branch isolation + finalize). The chat surface now classifies
+    /// INSIDE the spawned task (the brain-router consult is 1-3s, so it cannot run
+    /// inline on the UI thread), which means the event loop no longer knows the
+    /// class before dispatch — so the build-ness is carried back HERE and drives
+    /// the Wave-5 session hand-back (`record_agentic_done`) instead of the
+    /// pre-spawn `director_run_in_flight` flag.
+    AgenticDone {
+        /// The final assembled assistant text (already streamed live).
+        reply: String,
+        /// `true` when this was a director build → hand the session back to chat.
+        director_build: bool,
+    },
     /// The turn produced no usable reply (base init failed, an empty reply, or a
     /// hard error). Carries the human-readable reason, routed through the same
     /// channel so the event loop clears the "thinking…" status on EVERY terminal
@@ -646,7 +659,34 @@ fn spawn_director_loop(
     conversation: Vec<Message>,
     route_override: Option<RoutePlan>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    tokio::spawn(run_director_loop(
+        options,
+        sink,
+        route_tx,
+        autonomous,
+        conversation,
+        route_override,
+    ))
+}
+
+/// The director build loop body — the non-spawning core of [`spawn_director_loop`].
+///
+/// Split out so the brain-routed chat dispatcher ([`run_routed_turn`]) can drive
+/// the director build INLINE from inside its OWN already-spawned classification
+/// task (a chat message classified `Build` must reuse this exact path — run-lock,
+/// branch isolation, firmware, the routed plan/step/finalize loop, source hard-gate
+/// — not a second copy). The `/run` entry + the queued-chat drain keep calling the
+/// spawning wrapper. The body is byte-for-byte the original; only the outer
+/// `tokio::spawn(async move { … })` moved up into the wrapper.
+async fn run_director_loop(
+    options: RunOptions,
+    sink: Arc<ChannelSink>,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    autonomous: bool,
+    conversation: Vec<Message>,
+    route_override: Option<RoutePlan>,
+) {
+    {
         let backend = options.backend.clone();
         let model = options.model.clone();
         let root = options.project_root.clone();
@@ -773,8 +813,12 @@ fn spawn_director_loop(
                     sink.emit(EngineEvent::Note(note));
                 }
                 // The body already streamed live; hand the assembled text to the
-                // event loop to record as the assistant turn + clear `thinking`.
-                let _ = route_tx.send(RouteDecision::AgenticDone(reply));
+                // event loop to record as the assistant turn + clear `thinking`. A
+                // director loop is ALWAYS a Build → the hand-back fires.
+                let _ = route_tx.send(RouteDecision::AgenticDone {
+                    reply,
+                    director_build: true,
+                });
             }
             umadev_agent::DirectorLoopOutcome::Failed(reason) => {
                 // An honest terminal abort (session died / a turn failed). Flag the
@@ -784,7 +828,7 @@ fn spawn_director_loop(
                 let _ = route_tx.send(RouteDecision::Failed(reason));
             }
         }
-    })
+    }
 }
 
 /// Marker prefixed onto the terminal-abort note emitted by [`spawn_block`] when
@@ -885,6 +929,21 @@ fn spawn_agentic(
     sink: Arc<ChannelSink>,
     route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_agentic(turn, sink, route_tx))
+}
+
+/// The light agentic turn body — the non-spawning core of [`spawn_agentic`].
+///
+/// Split out so the brain-routed chat dispatcher ([`run_routed_turn`]) can drive a
+/// non-build turn (chat / explain / quick-edit / debug) INLINE from inside its OWN
+/// already-spawned classification task, reusing this exact streaming path rather
+/// than a second copy. The body is byte-for-byte the original; only the outer
+/// `tokio::spawn(async move { … })` moved up into the wrapper.
+async fn run_agentic(
+    turn: AgenticTurn,
+    sink: Arc<ChannelSink>,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+) {
     let AgenticTurn {
         task,
         spec,
@@ -895,7 +954,7 @@ fn spawn_agentic(
         director_build,
         conversation,
     } = turn;
-    tokio::spawn(async move {
+    {
         let label = spec.label();
         let model = route_model_for_spec(&spec, fallback_model);
         // Director-build (`/run`): take the single-writer run-lock for the whole
@@ -963,7 +1022,7 @@ fn spawn_agentic(
             &route_tx,
         )
         .await;
-    })
+    }
 }
 
 /// Snapshot the working tree as a `git status --porcelain` string, run in
@@ -1640,8 +1699,12 @@ async fn drive_agentic_stream(
             // event loop ONLY to record it as the assistant turn. An empty body
             // (the base emitted only tool calls / a side-effect) is still a clean
             // finish — send AgenticDone with what we have so `thinking` clears
-            // uniformly.
-            let _ = route_tx.send(RouteDecision::AgenticDone(reply));
+            // uniformly. Carry the turn's `director_build` so the event loop can
+            // drive the Wave-5 hand-back without a pre-spawn flag.
+            let _ = route_tx.send(RouteDecision::AgenticDone {
+                reply,
+                director_build,
+            });
         }
         Err(e) => {
             // Fail-open: the agentic call failed → a terminal Failed note (clears
@@ -1655,46 +1718,34 @@ async fn drive_agentic_stream(
     }
 }
 
-/// Fire the tools-enabled agentic execution call from current app state, and
-/// return its `JoinHandle` so the event loop can park it in `run_task` (Ctrl-C
-/// aborts it). Keeps `thinking` set — the stream feeds `WorkerStream` events,
-/// which reset the stall clock just like a phase — and resumes the SAME chat
-/// session as `fire_route`, so the agentic turn shares conversation memory.
-/// Marks `agentic_in_flight` so Ctrl-C routes to a real task-abort instead of
-/// the fire-and-forget route interrupt.
+/// Fire a light tools-enabled agentic turn from current app state, and return its
+/// `JoinHandle` so the event loop can park it in `run_task` (Ctrl-C aborts it).
+/// Keeps `thinking` set — the stream feeds `WorkerStream` events, which reset the
+/// stall clock just like a phase — and resumes the SAME chat session, so the turn
+/// shares conversation memory. Marks `agentic_in_flight` so Ctrl-C routes to a real
+/// task-abort instead of the fire-and-forget route interrupt.
+///
+/// This is the **queued-chat drain** path: a turn the user parked while a previous
+/// turn was in flight. It is NOT re-classified through the brain-router (the parked
+/// text fires straight as a light turn — `director_build: false`); a fresh message
+/// the user types goes through `Action::Route` → [`run_routed_turn`], which DOES
+/// classify. Keeping the drain light avoids a second brain consult on already-queued
+/// input and matches the prior behaviour.
 fn fire_agentic(
     app: &mut App,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
     task: String,
 ) -> tokio::task::JoinHandle<()> {
-    // No pre-computed route → a non-deliberate free-text turn (the legacy
-    // behaviour, kept for callers like the queued-chat drain).
-    fire_agentic_routed(app, sink, route_tx, task, false)
-}
-
-/// Like [`fire_agentic`], but the caller has already routed the turn and decided
-/// whether it is a **director build** (a Build-class, deliberate-depth turn that
-/// must hold the single-writer run-lock + run the source-present hard-gate). This
-/// is what lets a plain chat message that says "build me an X" auto-promote into
-/// a real build instead of the old hardcoded `director_build: false`.
-fn fire_agentic_routed(
-    app: &mut App,
-    sink: &Arc<ChannelSink>,
-    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-    task: String,
-    director_build: bool,
-) -> tokio::task::JoinHandle<()> {
     let spec = app.brain_spec();
     let host_cli = matches!(spec, BrainSpec::HostCli(_));
-    // Wave 5 deliverable 2: if a finished `/run` director session was just handed
-    // back to chat, the FIRST follow-up chat turn resumes the base's MOST-RECENT
-    // session in this dir (`--continue`) — that session IS the director build, so
-    // "why did you build it that way?" continues the same session with full
-    // context. `--continue` needs `session_id = None` + `continue_session = true`
-    // (the driver maps no-id + resume → `--continue`), so we DON'T mint a fresh
-    // chat id this turn. Consumed here (one-shot); subsequent turns re-pin a stable
-    // chat id as usual. Fail-open: if the base can't `--continue`, it starts fresh.
+    // Wave 5 deliverable 2: if a finished director session was just handed back to
+    // chat, the FIRST follow-up chat turn resumes the base's MOST-RECENT session in
+    // this dir (`--continue`) — that session IS the build, so "why did you build it
+    // that way?" continues the same session with full context. `--continue` needs
+    // `session_id = None` + `continue_session = true` (the driver maps no-id + resume
+    // → `--continue`), so we DON'T mint a fresh chat id this turn. Consumed here
+    // (one-shot). Fail-open: if the base can't `--continue`, it starts fresh.
     let handing_back = host_cli && app.run_session_handed_to_chat;
     let continue_session = app.host_chat_session_active || handing_back;
     let session_id = if host_cli && !handing_back {
@@ -1713,10 +1764,8 @@ fn fire_agentic_routed(
     app.last_output_at = None;
     app.tool_in_progress = false;
     app.agentic_in_flight = true;
-    // Wave 5 deliverable 2: a director build (a Build-class deliberate turn) hands
-    // its session back to chat when it finishes — mark it so `record_agentic_done`
-    // knows this was a real build, not a plain chat turn.
-    app.director_run_in_flight = director_build;
+    // A drained queued turn is light (never a director build) → no hand-back.
+    app.director_run_in_flight = false;
     let handle = spawn_agentic(
         AgenticTurn {
             task,
@@ -1725,12 +1774,9 @@ fn fire_agentic_routed(
             session_id,
             fallback_model: app.effective_model(),
             project_root: app.project_root.clone(),
-            // Director-build is now ROUTED, not hardcoded: a Build-class
-            // deliberate turn takes the run-lock + the source-present hard-gate;
-            // a chat / explain / quick turn stays light (just the git-diff fact
-            // line). Fail-open: a routing failure leaves this `false` (today's
-            // behaviour).
-            director_build,
+            // The queued-drain turn is always light — a fresh message classifies via
+            // `run_routed_turn`; a parked one does not re-consult the brain.
+            director_build: false,
             conversation,
         },
         sink.clone(),
@@ -1742,57 +1788,137 @@ fn fire_agentic_routed(
     handle
 }
 
-/// The outcome of routing one free-text chat turn: the honest deterministic
-/// [`RoutePlan`] plus whether it auto-promotes to a **deliberate director build**.
-struct ChatRoute {
-    /// The honestly-classified route (NOT force-built like `/run`'s `for_run`) —
-    /// carried so a chat-originated build drives the director loop with the SAME
-    /// route the intent card showed, never a re-forced one.
-    route: RoutePlan,
-    /// `true` for ANY Build-class turn → the director-build path (visible plan +
-    /// finalize; step scheduling when deliberate), matching the CLI `umadev run`.
-    /// A QuickEdit / Debug / Chat stays on the light streaming turn.
-    director_build: bool,
+/// Everything the brain-routed chat dispatcher ([`run_routed_turn`]) needs, all
+/// snapshotted from `&mut App` on the UI thread BEFORE the task spawns — so the
+/// task never touches app state (it runs concurrently with the event loop).
+struct RoutedTurnInputs {
+    /// The user's free-text turn (already recorded into conversation memory).
+    text: String,
+    /// Which base drives the turn (always a `HostCli` when `host_cli` is true).
+    spec: BrainSpec,
+    /// `true` when a real base CLI is configured — REQUIRED to drive a director
+    /// build (it opens a live session). A non-host brain can only stream → the
+    /// light path, even for a Build-class verdict.
+    host_cli: bool,
+    /// Run options for the director-build path (requirement + slug + mode etc.).
+    options: RunOptions,
+    /// Trust-tier autonomy flag for the director session.
+    autonomous: bool,
+    /// UmaDev's OWN bounded conversation transcript (Wave 5 / G11) — threaded into
+    /// BOTH the director directive and the light request so memory is not cold.
+    conversation: Vec<Message>,
+    /// Resume the same chat session (light path) — `host_chat_session_active`
+    /// OR a just-handed-back director session.
+    continue_session: bool,
+    /// Pinned chat session id (light path; `None` when handing a `/run` back).
+    session_id: Option<String>,
+    /// Fallback model id for the light path when the spec carries none.
+    fallback_model: String,
+    /// Project root the base subprocess runs in.
+    project_root: PathBuf,
 }
 
-/// Route ONE free-text turn at the default chat entry and classify it.
+/// Dispatch ONE free-text chat turn by asking the **borrowed brain** to classify it
+/// — the brain-router (`route_via_brain`), NOT a keyword table. UmaDev borrows the
+/// base's brain to think; "is this a greeting / a small edit / a real build?" is a
+/// judgment the base's own model makes far better than any hardcoded keyword list,
+/// so there is **no deterministic keyword classifier** on this path (an unreachable
+/// brain degrades to [`RouteClass::Chat`], the lightest pass-through — see
+/// `route_via_brain`).
 ///
-/// Runs the deterministic Tier-0 router ([`umadev_agent::router::route`] with no
-/// session — the floor + fallback that never blocks; a brain-assisted Tier-1
-/// consult would need a forkable `BaseSession`, which the lightweight agentic
-/// path does not hold, so the entry stays on the fast deterministic floor).
-/// Returns the honest [`RoutePlan`] and whether this turn takes the **deliberate
-/// director-build** path. The caller owns emitting the intent card EXACTLY ONCE:
-/// the light path emits it directly, the director-build path lets the routed
-/// director loop emit it (so a build promoted from chat shows ONE card, never
-/// two). **Fail-open:** any surprise resolves to "not a director build" — the
-/// existing light agentic behaviour.
-async fn route_turn(app: &mut App, project_root: &std::path::Path, task: &str) -> ChatRoute {
-    let options = RunOptions {
-        project_root: project_root.to_path_buf(),
-        requirement: task.to_string(),
-        slug: app.slug.clone(),
-        model: app.effective_model(),
-        backend: app.backend.clone().unwrap_or_default(),
-        design_system: app.config.design_system.clone().unwrap_or_default(),
-        seed_template: app.config.seed_template.clone().unwrap_or_default(),
-        mode: app.effective_trust_mode(),
-        strict_coverage: umadev_agent::strict_coverage_from_env(),
+/// **Why this runs in a spawned task and classifies INSIDE it:** `route_via_brain`
+/// is a one-shot base consult (`claude --print` ≈ 1-3s). The event loop's
+/// `Action::Route` arm runs inline on the UI thread, so awaiting the consult there
+/// would FREEZE the terminal (no redraw, no input) for those seconds. The dispatcher
+/// therefore returns to the UI thread immediately (the arm only sets `thinking` +
+/// the aliveness clock); the classification + drive happen here, off the render path.
+///
+/// Then it drives one of the SAME two paths the rest of the TUI uses, never a third
+/// copy:
+/// - **`Build` + host CLI** → [`run_director_loop`] (run-lock + branch isolation +
+///   firmware + the routed plan / step-schedule / finalize loop + source hard-gate);
+///   the loop emits the ONE intent card, so we do NOT emit it here. Its terminal
+///   `AgenticDone` carries `director_build: true` → the Wave-5 session hand-back.
+/// - **everything else** (chat / explain / quick-edit / debug, or a build with no
+///   host CLI) → emit the intent card here, then [`run_agentic`] streams the turn on
+///   the light path. Its terminal `AgenticDone` carries the routed `director_build`.
+///
+/// **Fail-open throughout:** the classify brain failing to build degrades to a Chat
+/// route (light path); a session that can't open is the existing `ABORT_SENTINEL` +
+/// terminal `Failed` inside `run_director_loop`; a streaming error is a terminal
+/// `Failed` inside `run_agentic`. The shell never wedges.
+async fn run_routed_turn(
+    inputs: RoutedTurnInputs,
+    sink: Arc<ChannelSink>,
+    route_tx: tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+) {
+    let RoutedTurnInputs {
+        text,
+        spec,
+        host_cli,
+        mut options,
+        autonomous,
+        conversation,
+        continue_session,
+        session_id,
+        fallback_model,
+        project_root,
+    } = inputs;
+
+    // Build a STATELESS classification brain (no `--continue`, no pinned session id):
+    // the triage consult must not resume or pollute the chat session — it is a pure
+    // one-shot `complete()`. Fail-open: if the brain can't be built (an unknown
+    // backend should be impossible here, since `spec` came from the live app), classify
+    // against an offline runtime, which `route_via_brain` degrades to a Chat route.
+    let route = if let Ok(classify_brain) = build_brain(&spec, false, None, &project_root) {
+        umadev_agent::router::route_via_brain(&*classify_brain, &text).await
+    } else {
+        let offline = OfflineRuntime::new(RuntimeKind::Anthropic);
+        umadev_agent::router::route_via_brain(&offline, &text).await
     };
-    // Tier-0 (session = None): deterministic, zero-latency, never errors.
-    let route = umadev_agent::router::route(None, &options, task).await;
-    // ANY Build-class turn is the director-build path — consistent with the CLI
-    // `umadev run` (which `for_run`-forces Build and shows a plan for every build,
-    // Fast or deliberate). A small/Fast build still shows its visible plan (the
-    // flagship surface), then builds in a single proportional turn; a deliberate
-    // build additionally schedules the team step-by-step. A QuickEdit / Debug /
-    // Chat stays on the fast light streaming path (no plan, no run-lock). Without
-    // this, a "做一个待办单页" typed in chat silently lost the plan the same request
-    // shows under `umadev run` — the exact CLI/TUI inconsistency the audit flagged.
+    // The brain is AUTHORITATIVE: a `Build` verdict IS the director-build path
+    // (consistent with the CLI `umadev run`, which shows a plan for every build); a
+    // chat / explain / quick-edit / debug verdict stays on the light streaming path.
     let director_build = matches!(route.class, umadev_agent::RouteClass::Build);
-    ChatRoute {
-        route,
-        director_build,
+
+    if director_build && host_cli {
+        // Director build: reuse the EXACT `/run` loop (run-lock + isolation + firmware
+        // + routed plan/step/finalize + source hard-gate). It emits the ONE intent
+        // card itself (we pass the honest route, NOT a re-forced `for_run`), threads
+        // the conversation in for Wave-5 memory, and sends a terminal `AgenticDone`
+        // carrying `director_build: true` so the event loop hands the session back.
+        options.requirement.clone_from(&text);
+        run_director_loop(
+            options,
+            sink,
+            route_tx,
+            autonomous,
+            conversation,
+            Some(route),
+        )
+        .await;
+    } else {
+        // Light path: the director loop is NOT driving this turn, so we emit the ONE
+        // intent card here (through the sink → `apply_engine` in the event loop), then
+        // stream the turn. A non-host "would-be build" stays light but keeps its
+        // `director_build` so the source hard-gate still verifies reality. The terminal
+        // `AgenticDone` carries `director_build` for the hand-back decision.
+        sink.emit(EngineEvent::intent_decided(&route));
+        run_agentic(
+            AgenticTurn {
+                task: text,
+                spec,
+                continue_session,
+                session_id,
+                fallback_model,
+                project_root,
+                director_build,
+                conversation,
+            },
+            sink,
+            route_tx,
+        )
+        .await;
     }
 }
 
@@ -2189,8 +2315,8 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // the user parked while this turn was in flight (serial — one
                     // base session, never two turns at once). The drained turn's
                     // handle is parked in `run_task` so Ctrl-C can abort it.
-                    Some(RouteDecision::AgenticDone(reply)) => {
-                        app.record_agentic_done(reply);
+                    Some(RouteDecision::AgenticDone { reply, director_build }) => {
+                        app.record_agentic_done(reply, director_build);
                         run_task = drain_next_queued_chat(app, &sink, &route_tx);
                     }
                     // The turn produced no usable reply (base init / stream error).
@@ -2533,86 +2659,86 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                 ));
                             }
                             Action::Route(text) => {
-                                // Wave-1 routing: classify the turn FIRST (the
-                                // intelligent router), so the default chat entry
-                                // shows an intent pre-commitment card and a plain
-                                // "build me X" auto-promotes into a deliberate
-                                // director build — instead of every free-text turn
-                                // silently taking the same light path. Fail-open: the
-                                // deterministic Tier-0 floor never errors; a chat /
-                                // explain / quick turn stays light. `/run` remains
-                                // the explicit forced-Deep entry to the full pipeline.
-                                let chat_route =
-                                    route_turn(app, &opts.project_root, &text).await;
-                                // A host CLI is REQUIRED to drive the director build
-                                // loop (it opens a real base session via `session_for`).
-                                // An offline / non-host brain can't, so a chat-build
-                                // there fails open to the light streaming path below.
+                                // Brain-routed chat dispatch: ask the BORROWED BRAIN to
+                                // classify the turn (`route_via_brain`), NOT a keyword
+                                // table — the base's own model judges greeting vs. small
+                                // edit vs. real build far better than any hardcoded list.
+                                //
+                                // CRITICAL: that consult is a one-shot base call (≈1-3s).
+                                // This arm runs INLINE on the UI thread (the `keys.next()`
+                                // branch of the `tokio::select!`), so awaiting the consult
+                                // HERE would freeze the terminal — no redraw, no input —
+                                // for those seconds. Instead we (a) set the immediate UI
+                                // state here, (b) snapshot every `&mut App` input the turn
+                                // needs (the spawned task can't touch app state — it runs
+                                // concurrently with this loop), and (c) spawn ONE task
+                                // (`run_routed_turn`) that classifies, emits the intent
+                                // card, and drives the director / light path off the render
+                                // path. Dispatch returns instantly; the UI keeps redrawing
+                                // the "thinking…" state from `engine_rx` events.
                                 let host_cli =
                                     matches!(app.brain_spec(), BrainSpec::HostCli(_));
-                                if chat_route.director_build && host_cli {
-                                    // Blocker #2: a "build me X" said in plain CHAT now
-                                    // takes the SAME director loop as `/run` + the CLI
-                                    // — visible plan + step scheduling + finalize +
-                                    // acceptance + full firmware (repo-map / lessons /
-                                    // knowledge) — NOT the single-turn
-                                    // `drive_agentic_stream`. The honest route from
-                                    // `route_turn` is handed through (NOT re-forced via
-                                    // `for_run`), the live conversation is threaded in
-                                    // for Wave 5 memory, and `director_run_in_flight`
-                                    // makes `record_agentic_done` hand the build session
-                                    // back to chat on a clean finish. The routed loop
-                                    // emits the ONE intent card (so we DON'T emit it
-                                    // here — no double card). Same in-flight bookkeeping
-                                    // as `/run`'s `StartRun` arm: thinking + aliveness
-                                    // clock + agentic-in-flight + Ctrl-C handle in
-                                    // `run_task`.
-                                    continuous_run_active = false;
-                                    app.thinking = true;
-                                    app.thinking_started =
-                                        Some(std::time::Instant::now());
-                                    app.last_output_at = None;
-                                    app.tool_in_progress = false;
-                                    app.agentic_in_flight = true;
-                                    app.director_run_in_flight = true;
-                                    app.requirement.clone_from(&text);
-                                    let mut run_opts = current_run_options(app, &opts);
-                                    run_opts.requirement = text;
-                                    let autonomous =
-                                        continuous_autonomous(run_opts.mode);
-                                    let conversation = app.conversation_snapshot();
-                                    run_task = Some(spawn_director_loop(
-                                        run_opts,
-                                        sink.clone(),
-                                        route_tx.clone(),
-                                        autonomous,
-                                        conversation,
-                                        // Drive with the HONEST chat route (the intent
-                                        // card already classified it Build/deliberate),
-                                        // not a re-forced `for_run`.
-                                        Some(chat_route.route),
-                                    ));
+                                // Immediate UI state (same bookkeeping the `/run` arm sets):
+                                // thinking + aliveness clock + agentic-in-flight, and a
+                                // chat turn is never the continuous fixed-phase run.
+                                continuous_run_active = false;
+                                app.thinking = true;
+                                app.thinking_started = Some(std::time::Instant::now());
+                                app.last_output_at = None;
+                                app.tool_in_progress = false;
+                                app.agentic_in_flight = true;
+                                // The class is NOT known yet (the brain consult happens in
+                                // the task), so `director_run_in_flight` can't be set
+                                // truthfully here — it no longer drives the hand-back
+                                // anyway (that rides the terminal `AgenticDone`), so leave
+                                // it false. Record the goal for the status bar / a revise.
+                                app.director_run_in_flight = false;
+                                app.requirement.clone_from(&text);
+                                // ── Snapshot the session-continuity inputs on the UI
+                                // thread (formerly computed inside `fire_agentic_routed`).
+                                // Wave 5: a just-handed-back `/run` session continues via
+                                // `--continue` (no fresh id); otherwise pin the stable chat
+                                // id. Consume `run_session_handed_to_chat` here (one-shot).
+                                let handing_back =
+                                    host_cli && app.run_session_handed_to_chat;
+                                let continue_session =
+                                    app.host_chat_session_active || handing_back;
+                                let session_id = if host_cli && !handing_back {
+                                    Some(app.ensure_chat_session_id())
                                 } else {
-                                    // Light path (chat / explain / quick edit, or a
-                                    // build with no host CLI): the fast single-turn
-                                    // streaming turn, UNCHANGED. The intent card is
-                                    // emitted HERE (the director loop is not driving
-                                    // this turn), exactly as before.
-                                    app.apply_engine(EngineEvent::intent_decided(
-                                        &chat_route.route,
-                                    ));
-                                    run_task = Some(fire_agentic_routed(
-                                        app,
-                                        &sink,
-                                        &route_tx,
-                                        text,
-                                        // A non-host "would-be build" stays a light
-                                        // turn but still keeps the run-lock + source
-                                        // hard-gate semantics it had before (it can
-                                        // only stream, but the floor still verifies).
-                                        chat_route.director_build,
-                                    ));
+                                    None
+                                };
+                                app.run_session_handed_to_chat = false;
+                                // Conversation snapshot stays taken on the UI thread so
+                                // memory is never cold (Wave 5 / G11), passed into the task.
+                                let conversation = app.conversation_snapshot();
+                                let mut run_opts = current_run_options(app, &opts);
+                                run_opts.requirement.clone_from(&text);
+                                let autonomous = continuous_autonomous(run_opts.mode);
+                                let inputs = RoutedTurnInputs {
+                                    text,
+                                    spec: app.brain_spec(),
+                                    host_cli,
+                                    options: run_opts,
+                                    autonomous,
+                                    conversation,
+                                    continue_session,
+                                    session_id,
+                                    fallback_model: app.effective_model(),
+                                    project_root: app.project_root.clone(),
+                                };
+                                // Resuming the chat session means the NEXT turn must also
+                                // `--continue` it — set this now (the light path used to set
+                                // it after spawning); a director build hands its session back
+                                // via the terminal decision instead.
+                                if host_cli {
+                                    app.host_chat_session_active = true;
                                 }
+                                run_task = Some(tokio::spawn(run_routed_turn(
+                                    inputs,
+                                    sink.clone(),
+                                    route_tx.clone(),
+                                )));
                             }
                             Action::Revise(text) => {
                                 // Re-run the block that PRODUCED the current
@@ -3040,7 +3166,7 @@ mod tests {
         )
         .await;
         match route_rx.try_recv() {
-            Ok(RouteDecision::AgenticDone(reply)) => {
+            Ok(RouteDecision::AgenticDone { reply, .. }) => {
                 assert!(!reply.trim().is_empty(), "offline reply must not be empty");
                 assert!(reply.contains("帮我做个登录页"), "echoes the ask: {reply}");
             }
@@ -3230,72 +3356,107 @@ mod tests {
         assert!(saw_tool, "tool calls must stream live as WorkerStream");
         // The terminal outcome records the assistant text for chat memory.
         match route_rx.try_recv() {
-            Ok(RouteDecision::AgenticDone(text)) => assert_eq!(text, "no bug found"),
+            Ok(RouteDecision::AgenticDone { reply, .. }) => assert_eq!(reply, "no bug found"),
             other => panic!("expected AgenticDone, got {other:?}"),
         }
     }
 
-    // Build an offline App for routing tests (no host CLI is reached; the Tier-0
-    // router runs purely on the message text + the planner heuristics).
-    fn routing_app() -> App {
-        App::new(
-            "demo",
-            crate::config::UserConfig {
-                backend: Some("offline".into()),
-                ..Default::default()
-            },
-            std::env::temp_dir().join("umadev-route-test-config.toml"),
-            std::env::temp_dir(),
-        )
+    /// A minimal `Runtime` that plays the base's one-shot triage verdict for
+    /// [`umadev_agent::router::route_via_brain`] — its `complete()` returns a JSON
+    /// `BrainRoute` with the requested `class`, so a test can drive the brain-routed
+    /// dispatcher without a live base. Not offline (so the router actually consults
+    /// it); `complete_streaming` is unused on this path.
+    struct RouteSpy {
+        class: &'static str,
+    }
+
+    impl RouteSpy {
+        fn with_class(class: &'static str) -> Self {
+            Self { class }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Runtime for RouteSpy {
+        fn kind(&self) -> RuntimeKind {
+            RuntimeKind::Anthropic
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            // The exact JSON shape the router's `BrainRoute` parses (extra keys are
+            // ignored). A `build` class also carries a complexity so the route is a
+            // real deliberate build, not a degenerate one.
+            let text = format!(
+                "{{\"class\":\"{}\",\"kind\":\"greenfield\",\"complexity\":\"complex\",\
+                 \"needs\":[],\"scope\":[],\"confidence\":0.9}}",
+                self.class
+            );
+            Ok(umadev_runtime::CompletionResponse {
+                text,
+                id: "route-spy".to_string(),
+                model: "route-spy".to_string(),
+                usage: umadev_runtime::Usage::default(),
+            })
+        }
+        async fn complete_streaming(
+            &self,
+            _req: CompletionRequest,
+            _on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
+        ) -> Result<umadev_runtime::CompletionResponse, umadev_runtime::RuntimeError> {
+            unreachable!("RouteSpy is only used for the one-shot triage `complete`")
+        }
     }
 
     #[tokio::test]
-    async fn router_promotes_build_request_to_deliberate() {
-        // "build me a login app" → a Build-class, deliberate-depth route →
-        // director-build = true (the auto-promotion the hardcoded false killed).
-        // `route_turn` now CLASSIFIES only and returns the honest route; the intent
-        // card is emitted by the CALLER (the director loop for a build, the light
-        // path directly) so a chat-promoted build shows exactly ONE card, never two.
-        let mut app = routing_app();
-        let root = std::env::temp_dir();
-        let decided =
-            route_turn(&mut app, &root, "build me a full login app with email auth").await;
+    async fn director_build_is_decided_by_the_brain_class() {
+        // The chat surface now classifies via the BORROWED BRAIN
+        // (`route_via_brain`), NOT a keyword table. The `RouteSpy` plays the base's
+        // one-shot triage verdict; the dispatcher's rule is `director_build =
+        // class == Build`. A `build` verdict → director-build (the visible plan +
+        // run-lock path); a `chat` verdict → the light streaming path. This locks
+        // the brain-authoritative decision that replaces the old keyword `route_turn`.
+        let build_spy = RouteSpy::with_class("build");
+        let route = umadev_agent::router::route_via_brain(&build_spy, "做一个待办应用").await;
         assert!(
-            decided.director_build,
-            "a clear build must take the deliberate path"
-        );
-        // The honest route classified the turn as a Build (the director loop will
-        // drive with THIS route, not a re-forced `for_run`).
-        assert!(
-            decided.route.class.mutates_workspace(),
-            "the build route mutates the workspace"
+            matches!(route.class, umadev_agent::RouteClass::Build),
+            "the brain's `build` verdict is honoured authoritatively"
         );
         assert!(
-            decided.route.depth.is_deliberate(),
-            "the build route is deliberate-depth"
+            matches!(route.class, umadev_agent::RouteClass::Build),
+            "director_build = class == Build"
         );
-        // The card emission now happens at the call site (verified by the
-        // `Action::Route` branch), so `route_turn` itself no longer pushes it.
+
+        let chat_spy = RouteSpy::with_class("chat");
+        let route = umadev_agent::router::route_via_brain(&chat_spy, "你好，能帮我做什么？").await;
         assert!(
-            app.last_intent_class.is_none(),
-            "route_turn classifies only — card emission moved to the caller"
+            !matches!(route.class, umadev_agent::RouteClass::Build),
+            "a greeting / capability question the brain calls `chat` is NOT a build"
+        );
+        assert!(
+            !route.class.mutates_workspace(),
+            "a chat verdict does not take the run-lock / mutate the workspace"
         );
     }
 
     #[tokio::test]
-    async fn router_keeps_greeting_as_light_chat() {
-        // A greeting must NOT take the deliberate director path — it stays a light
-        // chat turn, and the caller (light path) emits the one intent card.
-        let mut app = routing_app();
-        let root = std::env::temp_dir();
-        let decided = route_turn(&mut app, &root, "你好，今天怎么样？").await;
+    async fn route_via_brain_fails_open_to_chat_when_brain_unavailable() {
+        // Fail-open by design: there is NO keyword fallback on this path. An
+        // unreachable brain (here: the offline runtime, which the router treats as
+        // "can't consult") degrades to the lightest path — `Chat`, a pass-through to
+        // the base — never a keyword guess that could mis-promote a greeting into a
+        // 7-seat build. `director_build` is therefore false.
+        let offline = OfflineRuntime::new(RuntimeKind::Anthropic);
+        let route =
+            umadev_agent::router::route_via_brain(&offline, "build me a full login app").await;
         assert!(
-            !decided.director_build,
-            "a greeting stays a light chat turn"
+            !matches!(route.class, umadev_agent::RouteClass::Build),
+            "an unreachable brain degrades to Chat, never a keyword-guessed Build"
         );
         assert!(
-            !decided.route.class.mutates_workspace(),
-            "a greeting does not mutate the workspace"
+            !route.class.mutates_workspace(),
+            "the fail-open Chat route does not mutate the workspace"
         );
     }
 
@@ -3707,11 +3868,11 @@ mod tests {
         .await;
 
         match route_rx.try_recv() {
-            Ok(RouteDecision::AgenticDone(text)) => {
-                let incomplete = text.contains("未完成") || text.contains("incomplete");
+            Ok(RouteDecision::AgenticDone { reply, .. }) => {
+                let incomplete = reply.contains("未完成") || reply.contains("incomplete");
                 assert!(
-                    text.contains("[warn]") && incomplete,
-                    "a truncated turn must flag possible incompleteness, got: {text}"
+                    reply.contains("[warn]") && incomplete,
+                    "a truncated turn must flag possible incompleteness, got: {reply}"
                 );
             }
             other => panic!("expected AgenticDone with caveat, got {other:?}"),
@@ -3752,10 +3913,14 @@ mod tests {
                 assert!(!leaked, "fail-open: no fact/warn line outside a git repo");
             }
         }
-        // The turn still finishes cleanly.
+        // The turn still finishes cleanly — a non-director turn carries
+        // `director_build: false` (no session hand-back).
         assert!(matches!(
             route_rx.try_recv(),
-            Ok(RouteDecision::AgenticDone(_))
+            Ok(RouteDecision::AgenticDone {
+                director_build: false,
+                ..
+            })
         ));
     }
 
@@ -3853,10 +4018,15 @@ mod tests {
             saw_sentinel,
             "a director-build that claimed code but wrote zero source must abort honestly"
         );
-        // The turn still terminates cleanly (the gate is an honest note, not a panic).
+        // The turn still terminates cleanly (the gate is an honest note, not a
+        // panic), and carries `director_build: true` back so the event loop drives
+        // the Wave-5 session hand-back.
         assert!(matches!(
             route_rx.try_recv(),
-            Ok(RouteDecision::AgenticDone(_))
+            Ok(RouteDecision::AgenticDone {
+                director_build: true,
+                ..
+            })
         ));
     }
 

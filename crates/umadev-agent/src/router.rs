@@ -6,20 +6,25 @@
 //! the turn. It performs NO work itself and owns NO model — it consults the borrowed
 //! brain over a read-only fork, exactly like the proven critic / intake patterns.
 //!
-//! ## Two tiers, both fail-open
+//! ## The chat surface: the BRAIN judges intent ([`route_via_brain`])
 //!
-//! - **Tier-0 (deterministic, zero-latency, the FLOOR and the FALLBACK):** the
-//!   existing [`crate::planner::classify`] keyword table + a bilingual work-request
-//!   detector ([`looks_like_work_request`]) catch the obvious — a greeting routes to
-//!   [`RouteClass::Chat`], a "改个文案" routes to [`RouteClass::QuickEdit`]. This
-//!   ALWAYS runs and ALWAYS produces a complete, safe [`RoutePlan`].
-//! - **Tier-1 (brain-assisted, optional):** for an ambiguous request, one strict-JSON
-//!   consult on a `fork()`ed read-only session (cloned from the critic team's
-//!   [`crate::continuous::ForkConsult`] mechanism) returns
-//!   `{class, kind, complexity, needs, scope, risks, confidence}`. It is reconciled
-//!   with the Tier-0 prior under one rule: **the brain may ESCALATE (raise depth,
-//!   widen the team) but may never DROP BELOW the deterministic safe floor** — it
-//!   cannot silently de-scope a request the keywords flagged as real work.
+//! UmaDev depends on the base ecosystem — the base's own model IS the brain. So the
+//! default chat surface routes a turn by ASKING THE BRAIN, not a keyword table:
+//! [`route_via_brain`] runs one stateless `complete()` triage (`claude --print` and
+//! equivalents — no fork, no session) and the brain decides
+//! chat / explain / quick_edit / debug / build. A model judges "你能帮我做什么?" is a
+//! greeting and "把标题改成 X" is a tweak far better than any word list could. There
+//! is **no deterministic keyword classifier** on this path by design: if the brain
+//! is unreachable the product can't run anyway, so a failed / garbage consult
+//! degrades to the lightest path ([`RouteClass::Chat`], pass-through to the base),
+//! never a keyword guess.
+//!
+//! ## The deterministic helpers (sizing + the explicit-run path)
+//!
+//! [`classify`] + [`looks_like_work_request`] + the fork-based [`route`] / [`reconcile`]
+//! still exist to SIZE a build (kind / depth / team) and serve the explicit `/run`
+//! path ([`for_run`], which already KNOWS the intent is a build). They are not the
+//! chat surface's intent judge — the brain is.
 //!
 //! ## Invariants (mirror `critics.rs` / `director.rs`)
 //!
@@ -550,8 +555,6 @@ pub fn looks_like_work_request(text: &str) -> bool {
     ZH.iter().any(|k| text.contains(k))
 }
 
-
-
 /// Cheap deterministic path hints — pull obvious file-ish tokens out of the
 /// requirement (anything with a path separator or a known source extension). These
 /// are advisory `scope` hints for later retrieval; an empty result is fine.
@@ -695,7 +698,10 @@ async fn consult_brain_oneshot(
         system: ROUTER_TRIAGE_SYSTEM.to_string(),
         user: format!("Request:\n{requirement}"),
     };
-    let resp = runtime.complete(prompt.into_request(String::new(), 400)).await.ok()?;
+    let resp = runtime
+        .complete(prompt.into_request(String::new(), 400))
+        .await
+        .ok()?;
     let json = crate::continuous::extract_json_object(&resp.text)?;
     serde_json::from_str::<BrainRoute>(&json).ok()
 }
@@ -1033,8 +1039,6 @@ mod tests {
         assert_eq!(p.class, RouteClass::Debug);
     }
 
-
-
     #[tokio::test]
     async fn small_create_request_is_a_build_not_a_quick_edit() {
         // "做一个待办单页" CREATES a new thing -> a (fast) Build that gets a visible
@@ -1173,4 +1177,3 @@ mod tests {
         assert!(!looks_like_work_request("nice, thanks"));
     }
 }
-

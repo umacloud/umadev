@@ -461,10 +461,16 @@ pub struct App {
     pub(crate) run_session_handed_to_chat: bool,
 
     /// `true` while an explicit `/run` **director build** is the in-flight agentic
-    /// turn (Wave 5 deliverable 2). Set when the director loop is launched, read
-    /// when its terminal `AgenticDone` lands so the finished build session is handed
-    /// back to chat (sets [`Self::run_session_handed_to_chat`]); a PLAIN chat turn
-    /// leaves it `false` so the handoff fires ONLY after a real build.
+    /// turn (Wave 5 deliverable 2). Set when the `/run` director loop is launched and
+    /// cleared on any terminal turn.
+    ///
+    /// It NO LONGER decides the Wave-5 session hand-back: the chat surface classifies
+    /// chat-vs-build INSIDE the spawned task (after the slow brain-router consult), so
+    /// the event loop can't know the class before dispatch and can't set this flag
+    /// truthfully pre-spawn. The build-ness now rides the terminal
+    /// [`crate::RouteDecision::AgenticDone`]'s `director_build` field and is what
+    /// [`Self::record_agentic_done`] keys the hand-back on. This flag is retained only
+    /// as the explicit-`/run` in-flight marker.
     pub(crate) director_run_in_flight: bool,
 
     /// Currently active backend id (matches `config.backend`).
@@ -3067,7 +3073,13 @@ impl App {
     /// only record it as the assistant turn for chat-memory continuity and clear
     /// the waiting state. A TERMINAL agentic outcome, mirroring the chat-reply
     /// recorder but without the duplicate render.
-    pub(crate) fn record_agentic_done(&mut self, reply: String) {
+    ///
+    /// `director_build` is carried back on the terminal `RouteDecision::AgenticDone`
+    /// (not read from `director_run_in_flight`): the chat surface now classifies the
+    /// turn INSIDE the spawned task — after the slow brain-router consult — so the
+    /// event loop no longer knows the class before dispatch. The build-ness rides
+    /// the terminal decision instead, and drives the Wave-5 session hand-back here.
+    pub(crate) fn record_agentic_done(&mut self, reply: String, director_build: bool) {
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
@@ -3075,14 +3087,16 @@ impl App {
         self.stream_text_active = false;
         self.stream_tool_batch = None;
         // Wave 5 deliverable 2 — unify chat ↔ /run memory. A finished director
-        // `/run` hands its session back to chat: the NEXT chat turn resumes the
+        // build hands its session back to chat: the NEXT chat turn resumes the
         // base's most-recent session in this dir (`--continue`) so "why did you
         // build it that way?" continues the SAME session that did the build, with
         // full context — instead of a disjoint cold chat session. Only fires after a
-        // real director build (a plain chat turn leaves `director_run_in_flight`
-        // false). Fail-open: if the base can't resume, it starts fresh.
-        if self.director_run_in_flight {
-            self.director_run_in_flight = false;
+        // real director build (a plain chat / explain / quick-edit turn carries
+        // `director_build = false`). Fail-open: if the base can't resume, it starts
+        // fresh. The in-flight marker is always cleared (it was only ever an
+        // aliveness/UI hint once the class moved into the task).
+        self.director_run_in_flight = false;
+        if director_build {
             self.run_session_handed_to_chat = true;
         }
         self.refresh_status();
@@ -7145,7 +7159,7 @@ mod tests {
         // Wave 5 / G11: a restart must reopen the SAME dialogue (no goldfish).
         let (mut app, tmp) = temp_app();
         app.record_user_turn("我在做一个看板应用");
-        app.record_agentic_done("好的,已经开始搭建。".to_string());
+        app.record_agentic_done("好的,已经开始搭建。".to_string(), false);
         let saved_id = app.chat_id.clone();
         assert_eq!(app.conversation.len(), 2);
 
@@ -7178,13 +7192,13 @@ mod tests {
         let (mut app, _tmp) = temp_app();
         // Chat A.
         app.record_user_turn("第一个对话");
-        app.record_agentic_done("reply A".to_string());
+        app.record_agentic_done("reply A".to_string(), false);
         let id_a = app.chat_id.clone();
         // `/clear` starts a FRESH persistent chat (A stays on disk).
         let _ = app.try_slash_command("/clear");
         assert_ne!(app.chat_id, id_a, "/clear mints a new chat id");
         app.record_user_turn("第二个对话");
-        app.record_agentic_done("reply B".to_string());
+        app.record_agentic_done("reply B".to_string(), false);
 
         // `/sessions` lists BOTH saved chats.
         let _ = app.try_slash_command("/sessions");
@@ -7223,7 +7237,7 @@ mod tests {
         let (mut app, _tmp) = temp_app();
         for i in 0..12 {
             app.record_user_turn(&format!("user message {i}"));
-            app.record_agentic_done(format!("assistant reply {i}"));
+            app.record_agentic_done(format!("assistant reply {i}"), false);
         }
         let before = app.conversation.len();
         let _ = app.try_slash_command("/compact");
@@ -7247,24 +7261,35 @@ mod tests {
 
     #[test]
     fn director_run_finish_hands_session_back_to_chat() {
-        // Wave 5 deliverable 2: a finished `/run` hands its session to chat so the
-        // next chat turn continues the SAME build session.
+        // Wave 5 deliverable 2: a finished director build hands its session to chat
+        // so the next chat turn continues the SAME build session. The build-ness now
+        // rides the terminal decision (`director_build: true`), NOT the pre-spawn
+        // `director_run_in_flight` flag — the chat surface classifies in the task.
         let (mut app, _tmp) = temp_app();
         app.director_run_in_flight = true;
-        app.record_agentic_done("built the app".to_string());
+        app.record_agentic_done("built the app".to_string(), true);
         assert!(
             app.run_session_handed_to_chat,
-            "a finished director run hands its session back to chat"
+            "a finished director build hands its session back to chat"
         );
         assert!(
             !app.director_run_in_flight,
             "the in-flight marker is cleared"
         );
 
-        // A PLAIN chat turn does NOT trigger the handoff.
+        // A PLAIN chat turn (`director_build: false`) does NOT trigger the handoff,
+        // even if the in-flight marker was left set.
         app.run_session_handed_to_chat = false;
-        app.record_agentic_done("just chatting".to_string());
-        assert!(!app.run_session_handed_to_chat);
+        app.director_run_in_flight = true;
+        app.record_agentic_done("just chatting".to_string(), false);
+        assert!(
+            !app.run_session_handed_to_chat,
+            "a non-build turn never hands a session back"
+        );
+        assert!(
+            !app.director_run_in_flight,
+            "the in-flight marker is always cleared on a terminal turn"
+        );
     }
 
     #[test]
