@@ -95,7 +95,9 @@ pub use director::{
     verify as director_verify, CheckpointDecision, ReviewResult, SummonMode, SummonResult,
     VerifyKind, VerifyResult,
 };
-pub use director_loop::{drive_director_loop, drive_director_loop_routed, DirectorLoopOutcome};
+pub use director_loop::{
+    drive_director_loop, drive_director_loop_routed, run_post_build_qc, DirectorLoopOutcome,
+};
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use gates::{claims_code_changes, classify_reply, Gate, GateOutcome};
 pub use lessons::{

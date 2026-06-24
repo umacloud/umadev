@@ -1138,12 +1138,16 @@ fn light_default_route() -> RoutePlan {
 /// `/run`), so the card reads "full build, fast" with no pre-committed roster.
 #[must_use]
 fn reactive_build_route() -> RoutePlan {
-    use umadev_agent::{Budget, Depth, RouteClass, TaskKind};
+    use umadev_agent::{Budget, Depth, RouteClass, Seat, TaskKind};
     RoutePlan {
         class: RouteClass::Build,
         kind: TaskKind::Light,
         depth: Depth::Fast,
-        team: Vec::new(),
+        // A chat-promoted build is a delivery: convene the MINIMAL UI review team
+        // (designer + frontend + QA) so the post-build QC (`run_post_build_qc`)
+        // actually forks critics over the output — not an empty roster that reviews
+        // nothing. The full kind-sized roster stays on a deliberate /run build.
+        team: vec![Seat::UiuxDesigner, Seat::FrontendEngineer, Seat::QaEngineer],
         scope: Vec::new(),
         needs_clarify: None,
         est_budget: Budget::for_route(RouteClass::Build, Depth::Fast),
@@ -2562,11 +2566,6 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         }
     };
 
-    // The turn finished cleanly. Park the LIVE session back into the holder as
-    // `Primed` so the next chat message reuses it BARE (resident base, MCP +
-    // firmware already loaded, native memory carries the dialogue).
-    *chat_session.lock().await = Some(ResidentChat::Primed(session));
-
     // Post-turn reality fact line — the real changed-file set, plus a `[warn]` when
     // the base CLAIMED changes the working tree does not show (fail-open: skipped if
     // git was unavailable for either snapshot). The SAME guard the light path runs.
@@ -2597,11 +2596,61 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
     let became_build = reactive
         .became_build
         .load(std::sync::atomic::Ordering::SeqCst);
+
+    // ARCHITECTURE UNIFICATION: a chat-build (`became_build`) earns the SAME flagship
+    // post-build QC the explicit `/run` path runs — governance/design-slop scan +
+    // critic-team review + bounded evidence-bearing rework (with the recalled
+    // knowledge digest + prior pitfalls front-loaded) + usage/lessons capture. It runs
+    // on the LIVE continuous session (BEFORE it is parked) so the fix turns drive the
+    // SAME base that built, keeping its accumulated context. A pure chat reply (no
+    // `became_build`) NEVER reaches here — it parks immediately below, staying light +
+    // fast (no QC latency on conversation). The whole pass is fail-open inside
+    // `run_post_build_qc` (a scan/fork/rework that can't run settles), and bounded by
+    // the wall-clock run budget, so a chat turn is never wedged or slowed by QC.
     if became_build {
+        // The deterministic source-present hard floor first (the objective "did
+        // anything actually land" check), exactly as the light path runs it.
         if let Some(note) = director_source_hardgate(&project_root, &reply) {
             sink.emit(EngineEvent::Note(note));
         }
+        // Build the run options for the QC pass from this chat turn's context (the
+        // `requirement` is the user's free-text ask; the slug defaults to the dir).
+        let qc_opts = RunOptions {
+            project_root: project_root.clone(),
+            requirement: text.clone(),
+            slug: String::new(),
+            model: model.clone(),
+            backend: backend.clone(),
+            design_system: String::new(),
+            seed_template: String::new(),
+            mode,
+            strict_coverage: umadev_agent::strict_coverage_from_env(),
+        };
+        // Size the QC team from the reactive build route (the same behaviour-derived
+        // `Build`/`Fast` route the intent card showed when the write was detected).
+        let qc_route = reactive_build_route();
+        let sink_dyn: Arc<dyn EventSink> = sink.clone();
+        let qc_reply = umadev_agent::run_post_build_qc(
+            session.as_mut(),
+            &qc_opts,
+            &sink_dyn,
+            &qc_route,
+            &reply,
+        )
+        .await;
+        // A non-empty fix reply means rework actually ran a fix turn — surface its
+        // final word as the turn's reply (the build + its corrections), like `/run`.
+        if !qc_reply.trim().is_empty() {
+            reply = qc_reply;
+        }
     }
+
+    // The turn finished cleanly (and any post-build QC ran on the live session). Park
+    // the LIVE session back into the holder as `Primed` so the next chat message
+    // reuses it BARE (resident base, MCP + firmware already loaded, native memory
+    // carries the dialogue + the just-completed build + its QC fixes).
+    *chat_session.lock().await = Some(ResidentChat::Primed(session));
+
     let _ = route_tx.send(RouteDecision::AgenticDone {
         reply,
         director_build: became_build,
@@ -5926,6 +5975,136 @@ mod tests {
             "the first write surfaces a Build intent card"
         );
         assert!(saw_write, "the write tool call streams live");
+    }
+
+    /// ARCHITECTURE UNIFICATION: a chat-build (`became_build`) runs the SAME flagship
+    /// post-build QC the `/run` path does — the `team · 构建完成 …` note proves the
+    /// governance/slop scan + team review pass fired. A clean lean build settles after
+    /// the scan (source present + no slop), so no needless fix turn slows the chat.
+    #[tokio::test]
+    async fn chat_build_runs_the_post_build_qc_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Pre-seed a real, slop-free source file so the source-present honesty floor
+        // PASSES and the governance scan is clean — the QC pass runs and settles clean.
+        std::fs::write(tmp.path().join("app.ts"), "export const x = 1;").unwrap();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // The base writes a file (flips to a build) then reports done.
+        let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::ToolCall {
+                name: "Write".into(),
+                input: serde_json::json!({ "file_path": "app.ts" }),
+            },
+            umadev_runtime::SessionEvent::TextDelta("built the page".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+            },
+        ]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "做个落地页",
+            holder.clone(),
+            sink.clone(),
+            route_tx,
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // The terminal decision is a build.
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone { director_build, .. }) => {
+                assert!(
+                    director_build,
+                    "a write reactively promotes the turn to a build"
+                );
+            }
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+        // The post-build QC pass fired its entry note — the same flagship pass `/run`
+        // runs (governance/slop scan + team review). This is the unification's proof.
+        let mut saw_qc = false;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                if n.contains("构建完成") || n.contains("honesty + QC") || n.contains("team ·")
+                {
+                    saw_qc = true;
+                }
+            }
+        }
+        assert!(
+            saw_qc,
+            "a chat-build runs the post-build QC pass (the team · … notes fired)"
+        );
+        // The live session is parked back for reuse after the QC pass.
+        assert!(
+            holder.lock().await.is_some(),
+            "the session is parked back after the post-build QC pass"
+        );
+    }
+
+    /// The other half of the unification invariant: a PURE chat reply (no write, no
+    /// `became_build`) must NOT run the post-build QC pass — it stays light + fast,
+    /// with no `team · …` QC notes and no extra fix directives. This guards the
+    /// latency: conversation is never slowed by the build-only QC machinery.
+    #[tokio::test]
+    async fn pure_chat_reply_skips_the_post_build_qc_pass() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // A pure text reply — no write tool, so `became_build` stays false.
+        let (fake, sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta("here is my answer".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+            },
+        ]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "你好,解释一下闭包",
+            holder.clone(),
+            sink.clone(),
+            route_tx,
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // Settles as a pure chat (not a build).
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone {
+                director_build,
+                reply,
+            }) => {
+                assert!(!director_build, "a pure reply is a chat, never a build");
+                assert_eq!(reply, "here is my answer");
+            }
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+        // NO post-build QC note fired — the conversation stayed on the light path.
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(n) = ev {
+                assert!(
+                    !(n.contains("构建完成") || n.contains("honesty + QC")),
+                    "a pure chat reply must NOT run the post-build QC pass: {n:?}"
+                );
+            }
+        }
+        // EXACTLY one directive was sent (the user turn) — no QC fix directive was
+        // ever folded back, so a pure chat is never slowed by rework.
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "a pure chat reply drives exactly one directive — no QC rework"
+        );
     }
 
     /// An interrupted turn (ESC reflected by the base as `TurnStatus::Interrupted`)

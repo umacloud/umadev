@@ -648,7 +648,8 @@ async fn drive_plan_steps(
     // does not re-drive here (each step was already verified); it folds any residual
     // finding into ONE last fix turn, bounded, then settles. This guarantees a
     // step-driven build is never held to a WEAKER bar than the single-turn build.
-    let final_reply = run_final_gate(session, options, events, route, &last_reply, deadline).await;
+    let final_reply =
+        run_final_gate(session, options, events, route, &last_reply, deadline, "").await;
     if !final_reply.is_empty() {
         last_reply = final_reply;
     }
@@ -939,6 +940,11 @@ async fn run_final_gate(
     route: &RoutePlan,
     seed_reply: &str,
     deadline: std::time::Instant,
+    // Optional CONTEXT prefix front-loaded onto every fix directive (the chat-build
+    // post-QC entry passes the recalled knowledge digest + prior pitfalls so a fix
+    // turn carries the team's standards + memory). `""` = the byte-for-byte original
+    // directive (the `/run` step-driver passes this), so existing callers are unchanged.
+    fix_prefix: &str,
 ) -> String {
     let mut last_reply = String::new();
     // The incremental-verify signal seeds from the LAST step's reply (the steps just
@@ -980,8 +986,17 @@ async fn run_final_gate(
             ));
             return last_reply;
         }
-        // Fold the residual findings into ONE fix turn on the main session.
-        match drive_one_turn(session, options, events, qc.fix_directive(), idle_timeout()).await {
+        // Fold the residual findings into ONE fix turn on the main session — with the
+        // optional context prefix (knowledge + pitfalls) front-loaded for a chat-build.
+        match drive_one_turn(
+            session,
+            options,
+            events,
+            qc.fix_directive_with_context(fix_prefix),
+            idle_timeout(),
+        )
+        .await
+        {
             Ok(t) => {
                 verify_signal = t.text.clone();
                 last_reply = t.text;
@@ -990,6 +1005,89 @@ async fn run_final_gate(
         }
     }
     last_reply
+}
+
+/// **The full post-build QC pass for a CHAT-ORIGINATED build** — the architecture
+/// unification (`became_build` chat surface earns the SAME flagship QC the explicit
+/// `/run` path runs). A plain "做个落地页" typed in chat, whose base reacted by
+/// writing files (`react_to_first_write` flipped it to a build), now gets:
+///
+/// 1. **governance / design-slop scan** (`run_auto_qc` runs `continuous::governance_scan`,
+///    which is the same emoji-as-icon / hardcoded-color / AI-slop / purple-gradient
+///    detection the `/run` path uses) + the build/test fact read + the deliberate
+///    acceptance floor,
+/// 2. **critic team review** (`run_auto_qc` → `review_with_seats` sized from
+///    `route.team`, fork-based read-only critics),
+/// 3. **bounded evidence-bearing rework** — blocking findings fold into ONE fix
+///    directive per round, bounded by [`MAX_QC_ROUNDS`] + the wall-clock deadline,
+///    fed back over the SAME continuous session (single-writer preserved), with the
+///    recalled **knowledge digest + prior pitfalls** front-loaded (`post_build_rework_context`)
+///    so the fix carries the team's commercial standards + memory,
+/// 4. **usage + lessons capture** — every fix turn runs through [`drive_one_turn`],
+///    which records the token estimate (`/usage`) and distils failed-tool pitfalls
+///    into the lessons KB (`/lessons`), so the chat build self-evolves like a `/run`.
+///
+/// Delegates the actual gate to [`run_final_gate`] (the exact same bounded pass the
+/// `/run` step-driver ends on) with the route's seats + the knowledge/lessons prefix,
+/// so a chat build is held to the IDENTICAL floor as `/run` — not a re-implementation
+/// that could drift. Returns the final fix-turn reply (empty when QC was already
+/// clean). **Fail-open throughout**: a scan / fork / rework that can't run contributes
+/// nothing and the build settles (a chat turn is never wedged by QC). The wall-clock
+/// budget ([`run_budget`]) bounds the extra fix turns exactly like `/run`.
+///
+/// `seed_reply` is the build turn's own reply (so the incremental build/test read can
+/// trust a green result the base already reported). Pure chat (no `became_build`) must
+/// NOT call this — it stays on the light streaming path, fast.
+pub async fn run_post_build_qc(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    route: &RoutePlan,
+    seed_reply: &str,
+) -> String {
+    // The wall-clock budget bounds the EXTRA fix turns (graceful ceiling), exactly as
+    // the `/run` loop reads it — a chat-build's post-QC rework can never run unbounded.
+    let deadline = std::time::Instant::now() + run_budget();
+    events.emit(EngineEvent::Note(
+        "team · 构建完成 — 自动上设计/质量扫描 + 团队评审(和 /run 同一套验收)".to_string(),
+    ));
+    // Recall the commercial-engineering knowledge digest + the project's prior pitfalls
+    // ONCE, to front-load onto every fix directive (deliverable 3). The chat session
+    // opened firmware-light (no JIT knowledge), so this is where a chat-build's fix gets
+    // the standards + memory. Fail-open: empty recall = the byte-for-byte plain directive.
+    let prefix = post_build_rework_context(options);
+    run_final_gate(
+        session, options, events, route, seed_reply, deadline, &prefix,
+    )
+    .await
+}
+
+/// Build the CONTEXT prefix front-loaded onto a chat-build's post-QC fix directives —
+/// the recalled commercial-engineering knowledge digest (`agentic_knowledge_digest`)
+/// plus the project's prior pitfalls (`relevant_lessons_for_prompt`). The chat session
+/// opens firmware-LIGHT (no JIT knowledge layer — that's the latency-saving default),
+/// so a fix turn would otherwise repair blind; this restores the standards + memory at
+/// the one point it matters (fixing real findings), without paying the full firmware
+/// cost on every chat message. Pure + fully fail-open: each contributor swallows its
+/// own errors into an empty string (the plain directive), never a panic or a block.
+fn post_build_rework_context(options: &RunOptions) -> String {
+    let mut out = String::new();
+    // Knowledge digest — small budget (3 chunks), matching the agentic light-turn size.
+    let digest =
+        crate::phases::agentic_knowledge_digest(&options.project_root, &options.requirement, 3);
+    if !digest.trim().is_empty() {
+        out.push_str(digest.trim());
+    }
+    // Prior pitfalls on this project (recalled lessons) — what already bit us before.
+    let lessons =
+        crate::lessons::relevant_lessons_for_prompt(&options.project_root, &options.requirement);
+    if !lessons.trim().is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(lessons.trim());
+    }
+    out
 }
 
 /// Distil a turn's failed-tool summaries into the lessons KB on the DEFAULT loop —
@@ -1382,14 +1480,29 @@ impl QcReport {
     /// command-style so the base fixes rather than narrates; it already holds the
     /// full build context in this one continuous session, so no role re-priming.
     fn fix_directive(&self) -> String {
+        self.fix_directive_with_context("")
+    }
+
+    /// [`Self::fix_directive`] with an optional CONTEXT prefix front-loaded before
+    /// the findings — used by the chat-build post-QC entry to inject the recalled
+    /// commercial-engineering knowledge digest plus the project's prior pitfalls
+    /// (`post_build_rework_context`) so the fix turn fixes WITH the team's standards
+    /// and memory, not blind. An empty prefix yields the byte-for-byte original
+    /// directive, so the `/run` callers are unchanged. Fail-open by construction.
+    fn fix_directive_with_context(&self, prefix: &str) -> String {
         let mut body = String::new();
         for b in &self.blocking {
             body.push_str("- ");
             body.push_str(b);
             body.push('\n');
         }
+        let lead = if prefix.trim().is_empty() {
+            String::new()
+        } else {
+            format!("{}\n\n", prefix.trim_end())
+        };
         format!(
-            "An objective check of what you just built surfaced problems that must be \
+            "{lead}An objective check of what you just built surfaced problems that must be \
              fixed (these are real facts read from disk / review, not your memory):\n\
              {body}\nFix the cause of each one yourself with your tools — edit/create \
              the real files — then RUN the project's own build and tests to confirm \
@@ -3290,6 +3403,175 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("[learned]"))),
             "the failed tool call was captured as a development pitfall"
+        );
+    }
+
+    // ── Architecture unification: a CHAT-build's post-build QC earns the same
+    //    flagship QC the `/run` path runs (governance/slop scan + team + bounded
+    //    rework + capture), via `run_post_build_qc`. ──
+
+    /// The behaviour-derived `Build`/`Light`/`Fast` route a chat-build carries — the
+    /// EXACT shape the TUI's `reactive_build_route()` builds when the base writes its
+    /// first file. `Light`/`Fast` means the QC takes the lean tier (source-present +
+    /// governance scan, then settle), mirroring a real chat "做个落地页".
+    fn chat_build_route() -> RoutePlan {
+        use crate::router::{Budget, Depth, RouteClass};
+        use crate::TaskKind;
+        RoutePlan {
+            class: RouteClass::Build,
+            kind: TaskKind::Light,
+            depth: Depth::Fast,
+            team: Vec::new(),
+            scope: Vec::new(),
+            needs_clarify: None,
+            est_budget: Budget::for_route(RouteClass::Build, Depth::Fast),
+            confidence: 0.6,
+        }
+    }
+
+    #[tokio::test]
+    async fn post_build_qc_folds_a_design_slop_violation_into_a_fix_turn() {
+        // A chat-build whose base wrote a UI file with emoji-as-icon (design slop)
+        // must get the SAME governance scan the `/run` path runs — folded into a
+        // bounded fix turn, exactly like a `/run` finding. This is the headline of the
+        // unification: chat "做个落地页" now auto-gets the design/slop floor.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A real UI source file with an emoji used as a functional icon (a button
+        // label) — `governance_scan` (the same emoji/slop detector) flags it.
+        std::fs::write(
+            tmp.path().join("App.tsx"),
+            "export const Btn = () => <button>🚀 Launch</button>;",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        // Turn 1 is the build reply (the base already claimed it built); turn 2 is the
+        // fix turn (it "removes" the emoji — the scripted fake doesn't rewrite the file,
+        // but we only assert the fix directive carried the governance finding).
+        let turns = vec![text_turn(
+            "Removed the emoji icon, used a Lucide icon. Done.",
+        )];
+        let mut sess = FakeSession::new(turns, true, r#"{"accepts": true, "blocking": []}"#);
+        let sent = sess.sent_handle();
+        let o = opts(tmp.path());
+        let route = chat_build_route();
+
+        let _ = run_post_build_qc(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            "Built the landing page end to end. Done.",
+        )
+        .await;
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter()
+                .any(|d| d.contains("[governance]") && d.contains("must be fixed")),
+            "the design-slop (emoji) finding was fed back as a fix directive: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_build_qc_on_a_clean_build_drives_no_fix_turn() {
+        // A clean chat-build (real source, no governance violation, lean goal) must
+        // settle with ZERO fix turns — the QC ran but found nothing, so the chat-build
+        // is not slowed by needless rework.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A clean, slop-free, non-UI source module — `seed_source` writes exactly the
+        // file the existing clean-build tests rely on (no emoji, no hardcoded color, no
+        // root-component / ErrorBoundary rule), so the governance scan is genuinely clean.
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], true, r#"{"accepts": true, "blocking": []}"#);
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        // A lean goal → the lean tier short-circuits after the governance scan (clean).
+        o.requirement = "做一个简单的纯前端落地页单页".to_string();
+        let route = chat_build_route();
+
+        let reply = run_post_build_qc(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            "Built the clean landing page. Done.",
+        )
+        .await;
+        assert!(
+            reply.trim().is_empty(),
+            "a clean post-build QC returns an empty reply (no fix turn ran): {reply:?}"
+        );
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            0,
+            "a clean chat-build drives no fix turn — chat stays fast"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_build_qc_with_no_source_feeds_the_honesty_floor_back() {
+        // A chat turn that claimed a build but wrote ZERO source: the source-present
+        // honesty floor (always run, every tier) catches it and folds it into a fix
+        // directive — the same decisive finding the `/run` path produces.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let turns = vec![text_turn("Now actually created the files. Done.")];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let o = opts(tmp.path());
+        let route = chat_build_route();
+
+        let _ = run_post_build_qc(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            "Built it end to end. Done. (but wrote nothing)",
+        )
+        .await;
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|d| d.contains("source-present") && d.contains("must be fixed")),
+            "the no-source honesty finding was fed back as a fix directive"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_build_qc_is_fail_open_on_a_dead_session() {
+        // A session that dies on the fix turn must NOT panic — `run_post_build_qc`
+        // settles fail-open (returns the empty/partial reply), never wedging the chat.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A governance violation so QC is NOT clean → it will try a fix turn.
+        std::fs::write(
+            tmp.path().join("App.tsx"),
+            "export const Btn = () => <button>🚀 Go</button>;",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        // The fix turn's batch has a text delta but NO TurnDone → next_event drains to
+        // None mid-turn (a dead session). `run_post_build_qc` must settle, not panic.
+        let turns = vec![vec![SessionEvent::TextDelta("partial fix".to_string())]];
+        let mut sess = FakeSession::new(turns, true, r#"{"accepts": true, "blocking": []}"#);
+        let o = opts(tmp.path());
+        let route = chat_build_route();
+
+        // Just reaching here without a panic is the assertion (fail-open). The reply is
+        // whatever landed before the session died (empty in this scripted case).
+        let _reply = run_post_build_qc(&mut sess, &o, &events, &route, "Built it. Done.").await;
+    }
+
+    #[test]
+    fn post_build_rework_context_is_fail_open_on_an_empty_project() {
+        // No knowledge dir + no lessons file → an empty prefix (never a panic). The
+        // fix directive then degrades to the byte-for-byte plain directive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let prefix = post_build_rework_context(&o);
+        assert!(
+            prefix.is_empty(),
+            "an empty project recalls no knowledge/lessons → empty prefix: {prefix:?}"
         );
     }
 }

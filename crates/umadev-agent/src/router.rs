@@ -408,8 +408,24 @@ fn floor_class_depth(kind: TaskKind, is_work: bool, requirement: &str) -> (Route
 /// a fast/light turn convenes NO team; a standard/deep build convenes the seats the
 /// kind needs. Deterministic; the brain may widen it during reconciliation.
 fn tier0_team(kind: TaskKind, class: RouteClass, depth: Depth) -> Vec<Seat> {
-    // Chat / Explain / any Fast turn → no team (the team is overhead there).
-    if matches!(class, RouteClass::Chat | RouteClass::Explain) || depth == Depth::Fast {
+    // Pure conversation / read-only explanation → no team (it's overhead there).
+    if matches!(class, RouteClass::Chat | RouteClass::Explain) {
+        return Vec::new();
+    }
+    // A real BUILD ALWAYS convenes a team — even a Fast one. A chat-built page is
+    // still a delivery and its UI/quality must be reviewed (the audit caught a Fast
+    // build convening ZERO critics → a landing page shipped un-reviewed). A Fast
+    // build gets a MINIMAL review team (designer + frontend + QA, the UI-quality
+    // core); a deliberate build gets the full kind-sized roster.
+    if matches!(class, RouteClass::Build) {
+        if depth == Depth::Fast {
+            return vec![Seat::UiuxDesigner, Seat::FrontendEngineer, Seat::QaEngineer];
+        }
+        return Seat::team_for_kind(kind);
+    }
+    // QuickEdit / Debug: a team only when deliberate (an edit / shallow diagnose is
+    // not a delivery that needs the roster).
+    if depth == Depth::Fast {
         return Vec::new();
     }
     Seat::team_for_kind(kind)
