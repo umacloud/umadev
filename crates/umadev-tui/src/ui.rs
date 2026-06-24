@@ -1777,9 +1777,14 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // Build the wrapped input: row 0 carries the `>_ ` mode prefix; wrapped
     // continuation rows are indented 3 cols so they align under the text.
     let lines: Vec<Line> = if app.input.is_empty() {
+        // Empty input: the terminal cursor sits at column `prefix_w` (where the first
+        // typed char will land). The placeholder used to start at that SAME column, so
+        // the cursor block overlapped its first character. Shift the placeholder one
+        // column right (an extra leading space) so the cursor gets its own cell and the
+        // hint reads cleanly beside it.
         vec![Line::from(vec![
             Span::styled(mode_icon, Style::default().fg(mode_color)),
-            Span::raw(" "),
+            Span::raw("  "),
             Span::styled(placeholder, Style::default().fg(theme::TEXT_MUTED())),
         ])]
     } else {
