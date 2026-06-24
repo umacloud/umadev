@@ -3566,6 +3566,9 @@ mod tests {
     fn post_build_rework_context_is_fail_open_on_an_empty_project() {
         // No knowledge dir + no lessons file → an empty prefix (never a panic). The
         // fix directive then degrades to the byte-for-byte plain directive.
+        // Isolate HOME/UMADEV_KNOWLEDGE_DIR so a corpus staged to ~/.umadev/knowledge
+        // (the bundled-knowledge home fallback) can't make this "empty" project recall.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let o = opts(tmp.path());
         let prefix = post_build_rework_context(&o);

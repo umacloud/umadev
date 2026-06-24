@@ -509,6 +509,9 @@ mod tests {
     async fn fail_open_when_no_knowledge_and_no_lessons() {
         // A bare project (no knowledge/ dir, no learned lessons) must still produce
         // a valid firmware — just the always-on layers, never an error/empty.
+        // Neutralise the bundled-corpus fallbacks so this holds even on a machine
+        // that has staged ~/.umadev/knowledge via a real binary run.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let r = route(RouteClass::Build, Depth::Deep, vec![Seat::FrontendEngineer]);
         let fw = compose_firmware(tmp.path(), &r, "build something").await;

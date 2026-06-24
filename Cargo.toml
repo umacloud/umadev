@@ -78,6 +78,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # --- archive ---
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Embed the curated `knowledge/` corpus into the shipped binary so end users get
+# the full commercial-engineering KB with zero setup (extracted to
+# ~/.umadev/knowledge on first run). Text-only corpus → fast compile, ~5.5M.
+include_dir = "0.7"
 
 # --- testing ---
 insta = { version = "1.41", features = ["json", "yaml"] }

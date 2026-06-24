@@ -7800,6 +7800,9 @@ error TS2304: Cannot find name 'Foo'
         use crate::events::{EngineEvent, RecordingSink};
         use std::sync::Arc;
 
+        // Isolate HOME/UMADEV_KNOWLEDGE_DIR so a corpus staged to ~/.umadev/knowledge
+        // (the bundled-knowledge home fallback) can't be discovered here.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
         let tmp = TempDir::new().unwrap();
         // No knowledge/ subdir at all.
         let sink = RecordingSink::new();

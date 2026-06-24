@@ -38,6 +38,7 @@
 mod ci;
 mod doctor;
 mod hook;
+mod knowledge_bundle;
 mod knowledge_manager;
 mod mcp;
 mod mcp_manager;
@@ -773,6 +774,14 @@ async fn main() -> Result<()> {
         std::io::IsTerminal::is_terminal(&std::io::stdin()),
     );
     init_tracing(is_tui);
+
+    // Stage the embedded `knowledge/` corpus to ~/.umadev/knowledge once per
+    // build and point UMADEV_KNOWLEDGE_DIR at it, so knowledge recall works in
+    // any user project with zero setup. Done BEFORE command dispatch (incl. the
+    // no-subcommand TUI path below) so every `knowledge_root` consumer — TUI,
+    // CLI, director loop — discovers the full curated KB. Fail-open: any error
+    // is swallowed and recall degrades to empty, never blocking startup.
+    knowledge_bundle::ensure_staged();
 
     // No subcommand → launch the TUI (the recommended interactive entry).
     // In a non-TTY environment (piped output, CI, docker), fall back to

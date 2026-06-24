@@ -22,6 +22,7 @@ umadev-tui = { workspace = true }
 umadev-i18n = { workspace = true }
 
 clap = { workspace = true }
+include_dir = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

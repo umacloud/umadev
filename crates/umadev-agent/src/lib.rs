@@ -69,6 +69,9 @@ pub mod tech_debt;
 pub mod trust;
 pub mod verify;
 
+#[cfg(test)]
+mod test_support;
+
 pub use adopt::{
     is_adopted, load_project_source_index, read_adopt_marker, run_adopt, AdoptReport,
     DetectedCommand,

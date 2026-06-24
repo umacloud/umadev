@@ -3210,10 +3210,13 @@ fn audit(opts: &RunOptions, tool_name: &str, target: &Path, clause: &str, reason
 
 /// Resolve the knowledge corpus directory. The project's own `knowledge/` wins
 /// when it has content (user customisations), otherwise fall back to the bundled
-/// corpus pointed to by `UMADEV_KNOWLEDGE_DIR` (the npm launcher sets this to the
-/// shipped `@umadev/knowledge` package) so end users get the full curated KB even
-/// when they run in a bare project. Fail-open: returns the local path regardless,
-/// and the index treats a missing dir as empty.
+/// corpus pointed to by `UMADEV_KNOWLEDGE_DIR` (the `umadev` binary stages the
+/// embedded corpus to `~/.umadev/knowledge` on first run and points this env var
+/// at it), and finally to `~/.umadev/knowledge` directly — so end users get the
+/// full curated KB with zero setup even when they run in a bare project, and even
+/// on a code path that didn't go through the binary's startup (downstream
+/// embedders, a cleared env). Fail-open: returns the local path regardless, and
+/// the index treats a missing dir as empty.
 pub fn knowledge_root(project_root: &Path) -> std::path::PathBuf {
     let local = project_root.join("knowledge");
     let has_content = std::fs::read_dir(&local)
@@ -3228,7 +3231,29 @@ pub fn knowledge_root(project_root: &Path) -> std::path::PathBuf {
             return bundled;
         }
     }
+    // Defense-in-depth: discover the staged corpus directly. The binary stages
+    // it here on startup; this branch covers a cleared env var or a path that
+    // bypassed `main` (e.g. a downstream crate driving the engine directly).
+    if let Some(staged) = staged_knowledge_dir() {
+        if staged.is_dir() {
+            return staged;
+        }
+    }
     local
+}
+
+/// The default staged-corpus location, `~/.umadev/knowledge`, resolved
+/// cross-platform (HOME on unix, USERPROFILE on Windows) to mirror the binary's
+/// other global-state lookups. `None` when no home dir is resolvable.
+fn staged_knowledge_dir() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".umadev")
+            .join("knowledge"),
+    )
 }
 
 fn summarise_knowledge_dir(dir: &Path) -> String {
@@ -3544,19 +3569,74 @@ fn render_tasks(slug: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::NoBundledCorpus;
     use std::fs;
     use tempfile::TempDir;
 
     #[test]
     fn agentic_knowledge_digest_fails_open_without_knowledge_dir() {
-        // No `knowledge/` dir in the workspace -> empty digest, never an error.
-        // (The agentic path must proceed unchanged when there's nothing to inject.)
+        // No `knowledge/` dir in the workspace AND no bundled corpus reachable
+        // -> empty digest, never an error. (The agentic path must proceed
+        // unchanged when there's nothing to inject.)
+        let _no_corpus = NoBundledCorpus::new();
         let tmp = TempDir::new().unwrap();
         let d = agentic_knowledge_digest(tmp.path(), "build a login page", 4);
         assert!(d.is_empty(), "no knowledge dir -> empty digest");
         // Empty requirement / zero budget also short-circuit to empty.
         assert!(agentic_knowledge_digest(tmp.path(), "   ", 4).is_empty());
         assert!(agentic_knowledge_digest(tmp.path(), "build it", 0).is_empty());
+    }
+
+    #[test]
+    fn knowledge_root_discovers_staged_home_corpus() {
+        // With no project-local `knowledge/` and no UMADEV_KNOWLEDGE_DIR, the
+        // `~/.umadev/knowledge` fallback must be discovered (the binary stages
+        // the embedded corpus there on startup). Zero-config recall for users.
+        let no_corpus = NoBundledCorpus::new();
+        // `NoBundledCorpus` already set HOME to a fresh temp dir; create the
+        // staged corpus under it so the home-dir fallback resolves to it.
+        let home = no_corpus.home().to_path_buf();
+        let staged = home.join(".umadev").join("knowledge").join("backend");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("layering.md"), "# layering\n\nservice layer\n").unwrap();
+
+        let project = TempDir::new().unwrap();
+        let resolved = knowledge_root(project.path());
+        assert_eq!(
+            resolved,
+            home.join(".umadev").join("knowledge"),
+            "bare project must fall back to the staged ~/.umadev/knowledge corpus"
+        );
+
+        // And recall over it is non-empty for a matching requirement.
+        let d = agentic_knowledge_digest(project.path(), "service layering", 4);
+        assert!(
+            !d.is_empty(),
+            "staged corpus must produce a non-empty digest for a matching ask"
+        );
+    }
+
+    #[test]
+    fn knowledge_root_prefers_env_then_local_over_home() {
+        let _no_corpus = NoBundledCorpus::new();
+        // Project-local `knowledge/` with content wins over everything.
+        let project = TempDir::new().unwrap();
+        let local = project.path().join("knowledge");
+        fs::create_dir_all(&local).unwrap();
+        fs::write(local.join("x.md"), "# local\n").unwrap();
+        assert_eq!(knowledge_root(project.path()), local, "local corpus wins");
+
+        // With no local corpus, UMADEV_KNOWLEDGE_DIR (if it points at a real
+        // dir) wins over the home fallback.
+        let bare = TempDir::new().unwrap();
+        let envdir = TempDir::new().unwrap();
+        std::env::set_var("UMADEV_KNOWLEDGE_DIR", envdir.path());
+        assert_eq!(
+            knowledge_root(bare.path()),
+            envdir.path(),
+            "UMADEV_KNOWLEDGE_DIR wins when local corpus is absent"
+        );
+        std::env::remove_var("UMADEV_KNOWLEDGE_DIR");
     }
 
     #[test]
@@ -4281,6 +4361,9 @@ mod tests {
 
     #[test]
     fn phase_knowledge_digest_returns_empty_without_dir() {
+        // Neutralise the bundled-corpus fallbacks so a bare project resolves to
+        // nothing even on a machine that has staged ~/.umadev/knowledge.
+        let _no_corpus = NoBundledCorpus::new();
         let tmp = TempDir::new().unwrap();
         let o = opts(tmp.path());
         let d = phase_knowledge_digest(&o, Phase::Research);
