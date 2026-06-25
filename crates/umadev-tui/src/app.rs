@@ -691,6 +691,14 @@ fn push_range(ranges: &mut WordRanges, start: usize, end: usize) {
     ranges.push((start, end));
 }
 
+/// True when every char of `needle` appears in `haystack` in order (a fuzzy
+/// subsequence match, case-sensitive — callers lowercase first). Powers the
+/// slash-command palette's fuzzy filter (`dpl` → `deploy`).
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut hay = haystack.chars();
+    needle.chars().all(|nc| hay.any(|hc| hc == nc))
+}
+
 /// True when `s` ends with a recognised raster-image extension (case-insensitive).
 /// The set mirrors what the bases accept as an image (`png` / `jpe?g` / `gif` /
 /// `webp`); a dragged-in image arrives as exactly such a path.
@@ -2184,17 +2192,55 @@ impl App {
         self.input.replace_range(from..end, "");
     }
 
+    /// Char index of the previous word boundary before the cursor: skip any spaces
+    /// to the left, then the word. Shared by Ctrl+W (delete word back) and the
+    /// word-left motion (Alt/Ctrl+←).
+    fn prev_word_boundary(&self) -> usize {
+        let mut c = self.input_cursor;
+        let ch_at = |i: usize| self.input[..self.byte_index(i + 1)].chars().last();
+        while c > 0 && ch_at(c - 1).is_some_and(char::is_whitespace) {
+            c -= 1;
+        }
+        while c > 0 && ch_at(c - 1).is_some_and(|ch| !ch.is_whitespace()) {
+            c -= 1;
+        }
+        c
+    }
+
+    /// Char index of the next word boundary after the cursor: skip the current word
+    /// to the right, then trailing spaces. For the word-right motion (Alt/Ctrl+→).
+    fn next_word_boundary(&self) -> usize {
+        let len = self.input_len();
+        let mut c = self.input_cursor;
+        let ch_at = |i: usize| self.input[..self.byte_index(i + 1)].chars().last();
+        while c < len && ch_at(c).is_some_and(|ch| !ch.is_whitespace()) {
+            c += 1;
+        }
+        while c < len && ch_at(c).is_some_and(char::is_whitespace) {
+            c += 1;
+        }
+        c
+    }
+
+    /// Move the caret to the previous / next word boundary (Alt/Ctrl+←/→) — the
+    /// readline word-motion every power user reaches for; UmaDev had Ctrl+W delete
+    /// but no word MOVE.
+    pub fn move_word_left(&mut self) {
+        self.input_cursor = self.prev_word_boundary();
+        self.input_history_idx = None;
+        self.palette_selected = 0;
+    }
+
+    /// See [`move_word_left`](Self::move_word_left).
+    pub fn move_word_right(&mut self) {
+        self.input_cursor = self.next_word_boundary();
+        self.input_history_idx = None;
+        self.palette_selected = 0;
+    }
+
     /// Delete the word before the cursor (Ctrl+W / Alt+Backspace).
     pub fn delete_word_back(&mut self) {
-        let mut c = self.input_cursor;
-        // Skip trailing spaces, then the word.
-        let ch_at = |app: &Self, i: usize| app.input[..app.byte_index(i + 1)].chars().last();
-        while c > 0 && ch_at(self, c - 1).is_some_and(char::is_whitespace) {
-            c -= 1;
-        }
-        while c > 0 && ch_at(self, c - 1).is_some_and(|ch| !ch.is_whitespace()) {
-            c -= 1;
-        }
+        let c = self.prev_word_boundary();
         let start = self.byte_index(c);
         let end = self.byte_index(self.input_cursor);
         self.input.replace_range(start..end, "");
@@ -2507,19 +2553,30 @@ impl App {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
+        // Match by SUBSEQUENCE (every typed char appears in order) so a fuzzy stub
+        // like `/dpl` finds `/deploy`, not just a literal prefix — but only once ≥2
+        // chars are typed, so a single `/r` doesn't explode into every verb that
+        // merely contains an 'r'. Prefix matches still rank first (stable sort).
+        let fuzzy = typed.chars().count() >= 2;
+        let hit = |verb: &str| {
+            verb.starts_with(typed.as_str()) || (fuzzy && is_subsequence(&typed, verb))
+        };
         let mut out: Vec<(&'static str, &'static str)> = Self::SLASH_VERBS
             .iter()
-            .filter(|(verb, _)| verb.starts_with(typed.as_str()))
+            .filter(|(verb, _)| hit(verb))
             .copied()
             .collect();
         // Skip ids already covered by the static list (the three first-class
         // base CLIs) to avoid duplicate palette rows.
         let known: std::collections::HashSet<&str> = out.iter().map(|(v, _)| *v).collect();
         for (id, hint) in backend_palette_verbs() {
-            if !known.contains(id) && id.starts_with(typed.as_str()) {
+            if !known.contains(id) && hit(id) {
                 out.push((id, hint));
             }
         }
+        // Prefix matches before looser subsequence matches (stable sort preserves
+        // the canonical verb order within each tier).
+        out.sort_by_key(|(v, _)| !v.starts_with(typed.as_str()));
         out
     }
 
@@ -3606,6 +3663,15 @@ impl App {
             KeyCode::Delete => {
                 self.pending_quit_confirm = false;
                 self.forward_delete();
+                Action::None
+            }
+            // Word-wise motion (Ctrl/Alt+←/→) must precede the bare char motion.
+            KeyCode::Left if ctrl || alt => {
+                self.move_word_left();
+                Action::None
+            }
+            KeyCode::Right if ctrl || alt => {
+                self.move_word_right();
                 Action::None
             }
             KeyCode::Left => {
@@ -10842,6 +10908,33 @@ mod tests {
     }
 
     // ---- palette ----
+
+    #[test]
+    fn palette_fuzzy_finds_deploy_from_dpl() {
+        let mut a = fresh_app(Some("offline"));
+        for c in "/dpl".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let verbs: Vec<&str> = a.palette_matches().iter().map(|(v, _)| *v).collect();
+        assert!(
+            verbs.contains(&"deploy"),
+            "fuzzy /dpl → deploy, got: {verbs:?}"
+        );
+    }
+
+    #[test]
+    fn word_motion_jumps_across_words() {
+        let mut a = fresh_app(Some("offline"));
+        for c in "hello world foo".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        a.move_word_left();
+        assert_eq!(a.input_cursor, 12, "→ start of last word 'foo'");
+        a.move_word_left();
+        assert_eq!(a.input_cursor, 6, "→ start of 'world'");
+        a.move_word_right();
+        assert_eq!(a.input_cursor, 12, "→ back to start of 'foo'");
+    }
 
     #[test]
     fn palette_matches_filter_by_prefix() {
