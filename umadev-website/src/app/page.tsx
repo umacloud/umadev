@@ -1,7 +1,6 @@
 "use client";
 
 import Image from "next/image";
-import type { PointerEvent as ReactPointerEvent } from "react";
 import { useEffect, useRef, useState } from "react";
 import { TerminalDemo } from "./TerminalDemo";
 import { asset, docs, gallery, i18n, releases, type DocBlock, type Lang, type View } from "./content";
@@ -15,17 +14,20 @@ const CHARS = "010101010101ABCDEF0123456789X%#$@";
 
 export function ScrambledHoverText({ text, className }: { text: string; className?: string }) {
   const [displayText, setDisplayText] = useState(text);
-  const intervalRef = useRef<any>(null);
+  const [prevText, setPrevText] = useState(text);
 
-  useEffect(() => {
+  if (text !== prevText) {
+    setPrevText(text);
     setDisplayText(text);
-  }, [text]);
+  }
+
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const handleMouseEnter = () => {
     let iteration = 0;
     if (intervalRef.current) clearInterval(intervalRef.current);
     
-    intervalRef.current = window.setInterval(() => {
+    intervalRef.current = setInterval(() => {
       setDisplayText(
         text
           .split("")
@@ -72,14 +74,12 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
 }
 
 export function FloatingDiagnosticTerminal({
-  lang,
   setLang,
   setView,
   setHeroSlideIndex,
   setMode,
   setStageIndex,
 }: {
-  lang: Lang;
   setLang: (l: Lang) => void;
   setView: (v: View) => void;
   setHeroSlideIndex: (s: number | ((prev: number) => number)) => void;
@@ -175,7 +175,9 @@ export function FloatingDiagnosticTerminal({
       } else if (cmd === "/stats" || cmd === "stats") {
         const res = typeof window !== "undefined" ? `${window.screen.width}x${window.screen.height}` : "Unknown";
         const ua = typeof navigator !== "undefined" ? navigator.userAgent.split(" ").slice(-2).join(" ") : "Unknown";
-        const conn = typeof navigator !== "undefined" && (navigator as any).connection ? `RTT: ${(navigator as any).connection.rtt}ms, Speed: ${(navigator as any).connection.downlink}Mbps` : "N/A";
+        const conn = typeof navigator !== "undefined" && (navigator as unknown as { connection?: { rtt?: number; downlink?: number } }).connection
+          ? `RTT: ${(navigator as unknown as { connection: { rtt: number } }).connection.rtt}ms, Speed: ${(navigator as unknown as { connection: { downlink: number } }).connection.downlink}Mbps`
+          : "N/A";
         setLogs((prev) => [
           ...prev,
           "--- Browser & System Diagnostics ---",
@@ -284,17 +286,19 @@ export default function Home() {
 
   // Auto language detection based on browser locale
   useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect */
     const savedLang = localStorage.getItem("umadev_lang") as Lang | null;
     if (savedLang === "zh" || savedLang === "en") {
       setLang(savedLang);
       return;
     }
-    const browserLang = navigator.language || (navigator as any).userLanguage || "";
+    const browserLang = navigator.language || (navigator as unknown as { userLanguage?: string }).userLanguage || "";
     if (browserLang.toLowerCase().includes("zh")) {
       setLang("zh");
     } else {
       setLang("en");
     }
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
   // Synchronize language selection to localStorage
@@ -310,7 +314,6 @@ export default function Home() {
   const [copiedMode, setCopiedMode] = useState<string | null>(null);
   const [showcaseIndex, setShowcaseIndex] = useState(0);
   const [heroSlideIndex, setHeroSlideIndex] = useState(0);
-  const [activeRole, setActiveRole] = useState<string>("Director");
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const modeCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stageButtonRefs = useRef<(HTMLButtonElement | null)[]>([]);
@@ -833,7 +836,7 @@ export default function Home() {
                 </div>
               </div>
               <div className={styles.showcaseScreen}>
-                <TerminalDemo slideIndex={showcaseIndex} lang={lang} />
+                <TerminalDemo key={showcaseIndex} slideIndex={showcaseIndex} lang={lang} />
                 <div className={styles.showcaseNote}>{lang === "zh" ? "项目总监模式" : "PROJECT DIRECTOR MODE"}</div>
                 <div className={styles.showcaseFiles}>
                   {showcase.files.map((file) => (
@@ -1236,7 +1239,6 @@ export default function Home() {
 
       {/* Floating System Diagnostic Console */}
       <FloatingDiagnosticTerminal
-        lang={lang}
         setLang={setLang}
         setView={setView}
         setHeroSlideIndex={setHeroSlideIndex}

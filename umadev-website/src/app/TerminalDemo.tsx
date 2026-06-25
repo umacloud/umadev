@@ -78,9 +78,6 @@ export function TerminalDemo({ slideIndex, lang }: { slideIndex: number, lang?: 
   const scripts = lang === "zh" ? scripts_zh : scripts_en;
   const lines = scripts[slideIndex] || scripts[0];
 
-  useEffect(() => {
-    setStep(0);
-  }, [slideIndex]);
 
   useEffect(() => {
     if (step >= lines.length) return;
