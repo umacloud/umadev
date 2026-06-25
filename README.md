@@ -59,13 +59,26 @@ npm install -g umadev
 
 The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64), and Windows (x86_64).
 
+The install also pulls a small local embedding model (`multilingual-e5-small`, f16, ~224 MB) as an optional dependency and wires it up automatically — it powers the offline vector search with no API key and no runtime network, no manual download step. If your registry or network skips the optional download, umadev still works: retrieval falls back to BM25-only, and re-running `npm install -g umadev` restores the vector channel.
+
 Build from source:
 
 ```bash
 git clone https://github.com/umacloud/umadev.git
-cd umadev && cargo build --release
+cd umadev && cargo build --release --features vector-local
 ./target/release/umadev --version
 ```
+
+> **Building from source? The embedding model is not in the repo (it's too large for git, ~224 MB).** A plain `cargo build --release` gives a **BM25-only** binary; the local vector channel needs the `--features vector-local` flag **and** the model on disk. The prebuilt binaries and `npm i` bundle both automatically — for a source build, download `multilingual-e5-small` into `~/.umadev/embed-model/` once:
+>
+> ```bash
+> mkdir -p ~/.umadev/embed-model && cd ~/.umadev/embed-model
+> for f in config.json tokenizer.json model.safetensors; do
+>   curl -fsSL "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/$f" -o "$f"
+> done
+> ```
+>
+> umadev auto-discovers it there (or point `UMADEV_EMBED_MODEL_DIR` at any directory with those three files). Without the model, umadev still works — retrieval just falls back to BM25-only.
 
 You also need one AI coding CLI installed and logged in — that's the brain umadev drives:
 

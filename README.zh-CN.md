@@ -109,6 +109,8 @@ npm install -g umadev
 
 npm 只是分发壳。真正运行的是 Rust 编译出的 `umadev` 二进制。
 
+安装时还会自动附带一个小型本地嵌入模型（`multilingual-e5-small`，f16，约 224MB，作为可选依赖）并自动接好——它驱动离线向量检索，无需 API key、运行时不联网，**无需手动下载**。若你的镜像源或网络跳过了这个可选下载，umadev 仍可用：检索降级为纯 BM25，重新执行 `npm install -g umadev` 即可恢复向量通道。
+
 支持的平台：
 
 - macOS Apple Silicon
@@ -122,9 +124,20 @@ npm 只是分发壳。真正运行的是 Rust 编译出的 `umadev` 二进制。
 ```bash
 git clone https://github.com/umacloud/umadev.git
 cd umadev
-cargo build --release
+cargo build --release --features vector-local
 ./target/release/umadev --version
 ```
+
+> **从源码构建？嵌入模型不在仓库里（太大，约 224MB，git 放不下）。** 普通 `cargo build --release` 出来的是**纯 BM25** 版；本地向量通道需要 `--features vector-local` **加上**磁盘上的模型。预编译二进制和 `npm i` 会自动带齐这两样——源码构建则需手动把 `multilingual-e5-small` 下到 `~/.umadev/embed-model/` 一次：
+>
+> ```bash
+> mkdir -p ~/.umadev/embed-model && cd ~/.umadev/embed-model
+> for f in config.json tokenizer.json model.safetensors; do
+>   curl -fsSL "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/$f" -o "$f"
+> done
+> ```
+>
+> umadev 会自动发现这个目录（或用 `UMADEV_EMBED_MODEL_DIR` 指向任意放着这三个文件的目录）。没有模型 umadev 仍可用——检索降级为纯 BM25。
 
 你还需要装好并登录一个 AI 编码 CLI——那就是 umadev 驱动的大脑：
 

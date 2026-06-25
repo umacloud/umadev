@@ -50,7 +50,11 @@ umadev 是一個命令列工具，它驅動你已經在用的 AI 編碼工具—
 npm install -g umadev
 ```
 
-npm 只是分發外殼。真正執行的是 Rust 編譯出的 `umadev` 二進位。預編譯二進位涵蓋：
+npm 只是分發外殼。真正執行的是 Rust 編譯出的 `umadev` 二進位。
+
+安裝時還會自動附帶一個小型本地嵌入模型（`multilingual-e5-small`，f16，約 224MB，作為可選依賴）並自動接好——它驅動離線向量檢索，無需 API key、執行時不連網，**無需手動下載**。若你的鏡像源或網路跳過了這個可選下載，umadev 仍可用：檢索降級為純 BM25，重新執行 `npm install -g umadev` 即可恢復向量通道。
+
+預編譯二進位涵蓋：
 
 - macOS Apple Silicon
 - macOS Intel
@@ -62,9 +66,20 @@ npm 只是分發外殼。真正執行的是 Rust 編譯出的 `umadev` 二進位
 
 ```bash
 git clone https://github.com/umacloud/umadev.git
-cd umadev && cargo build --release
+cd umadev && cargo build --release --features vector-local
 ./target/release/umadev --version
 ```
+
+> **從原始碼建置？嵌入模型不在儲存庫裡（太大，約 224MB，git 放不下）。** 普通 `cargo build --release` 出來的是**純 BM25** 版；本地向量通道需要 `--features vector-local` **加上**磁碟上的模型。預編譯二進位和 `npm i` 會自動帶齊這兩樣——原始碼建置則需手動把 `multilingual-e5-small` 下載到 `~/.umadev/embed-model/` 一次：
+>
+> ```bash
+> mkdir -p ~/.umadev/embed-model && cd ~/.umadev/embed-model
+> for f in config.json tokenizer.json model.safetensors; do
+>   curl -fsSL "https://huggingface.co/intfloat/multilingual-e5-small/resolve/main/$f" -o "$f"
+> done
+> ```
+>
+> umadev 會自動發現這個目錄（或用 `UMADEV_EMBED_MODEL_DIR` 指向任意放著這三個檔案的目錄）。沒有模型 umadev 仍可用——檢索降級為純 BM25。
 
 你還需要裝好並登入一個 AI 編碼 CLI——那就是 umadev 驅動的大腦：
 
