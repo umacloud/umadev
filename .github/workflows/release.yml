@@ -101,10 +101,30 @@ jobs:
           path: dist
           merge-multiple: true
           pattern: umadev-*
+      # The fp16 embedding model is too large for npm (~224MB > npm's limit), so
+      # it ships as a GitHub Release ASSET. The umadev npm wrapper (bin/cli.js)
+      # downloads it on first launch into ~/.umadev/embed-model — auto-installed,
+      # then fully local. Fetch + quantize f32→f16 here so the assets exist.
+      - name: Fetch + quantize embedding model (f16) for the Release
+        run: |
+          set -euo pipefail
+          mkdir -p model
+          BASE=https://huggingface.co/intfloat/multilingual-e5-small/resolve/main
+          curl -fsSL "$BASE/config.json"       -o model/config.json
+          curl -fsSL "$BASE/tokenizer.json"    -o model/tokenizer.json
+          curl -fsSL "$BASE/model.safetensors" -o model/model.f32.safetensors
+          python3 -m pip install --quiet safetensors numpy
+          python3 npm/scripts/quantize-model.py model/model.f32.safetensors model/model.safetensors
+          rm -f model/model.f32.safetensors
+          ls -la model
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/*
+            model/config.json
+            model/tokenizer.json
+            model/model.safetensors
           generate_release_notes: true
 
   publish-npm:
@@ -143,27 +163,10 @@ jobs:
             }
           done
 
-      # Fetch the bundled embedding model into the platform-independent model
-      # package so `@umadev/model-e5-small` ships the weights once for all OSes.
-      # The binary loads it via candle for offline, zero-setup retrieval; if this
-      # ever fails the binary still works (fail-open to BM25).
-      # TODO(maintainer): pin to a revision SHA + verify sha256 before first GA.
-      - name: Fetch bundled embedding model (quantized to f16)
-        run: |
-          set -euo pipefail
-          DIR=npm/model-e5-small
-          BASE=https://huggingface.co/intfloat/multilingual-e5-small/resolve/main
-          curl -fsSL "$BASE/config.json"       -o "$DIR/config.json"
-          curl -fsSL "$BASE/tokenizer.json"    -o "$DIR/tokenizer.json"
-          curl -fsSL "$BASE/model.safetensors" -o "$DIR/model.f32.safetensors"
-          # Quantize f32 -> f16: halves the package (~448MB -> ~224MB) with no
-          # practical retrieval-quality loss (the binary casts f16 back to f32 on
-          # load via candle), and keeps it under npm's size limit.
-          python3 -m pip install --quiet safetensors numpy
-          python3 npm/scripts/quantize-model.py "$DIR/model.f32.safetensors" "$DIR/model.safetensors"
-          rm -f "$DIR/model.f32.safetensors"
-          ls -la "$DIR"
-
+      # NOTE: the embedding model is NO LONGER published to npm — it's too large
+      # (~224MB > npm's limit, which returned 413). It now ships as a GitHub
+      # Release asset (see the release job) and is fetched on first launch by
+      # bin/cli.js. publish.sh therefore skips the model package.
       - name: npm publish (platforms + main)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

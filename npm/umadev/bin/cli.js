@@ -16,6 +16,8 @@
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const https = require('node:https');
+const os = require('node:os');
 
 // Node platform/arch → our sub-package name.
 const PLATFORM_PACKAGES = {
@@ -105,32 +107,158 @@ function findKnowledgeDir() {
   return null;
 }
 
-const binary = findBinary();
-// npm artifact round-trips (upload/download-artifact in CI) can strip the
-// executable bit off the prebuilt binary; restore it defensively before exec.
-try {
-  fs.chmodSync(binary, 0o755);
-} catch (_) {
-  // read-only install dir or already +x — spawnSync below reports real errors
+// ── Local embedding model — ensure it's on disk, else download it (with a
+// progress bar) from THIS version's GitHub Release. Checked on EVERY launch
+// (a cheap stat); the ~224MB fp16 model is too large for npm, so it's a
+// one-time fetch into ~/.umadev/embed-model. Fail-open: any failure launches
+// anyway and the binary degrades to BM25 lexical retrieval, retrying next time.
+function homeDir() {
+  return process.env.HOME || process.env.USERPROFILE || os.homedir();
 }
-const extraEnv = {};
-const modelDir = findModelDir();
-if (modelDir && !process.env.UMADEV_EMBED_MODEL_DIR) {
-  extraEnv.UMADEV_EMBED_MODEL_DIR = modelDir;
+function modelTargetDir() {
+  return path.join(homeDir(), '.umadev', 'embed-model');
 }
-const knowledgeDir = findKnowledgeDir();
-if (knowledgeDir && !process.env.UMADEV_KNOWLEDGE_DIR) {
-  extraEnv.UMADEV_KNOWLEDGE_DIR = knowledgeDir;
+const MODEL_FILES = ['config.json', 'tokenizer.json', 'model.safetensors'];
+function modelPresent(dir) {
+  return MODEL_FILES.every((f) => {
+    try {
+      return fs.statSync(path.join(dir, f)).size > 0;
+    } catch (_) {
+      return false;
+    }
+  });
 }
-const spawnOpts = { stdio: 'inherit' };
-if (Object.keys(extraEnv).length > 0) {
-  spawnOpts.env = { ...process.env, ...extraEnv };
+// Download one URL to `dest`, following redirects (GitHub → CDN), drawing a
+// progress bar when `withBar`. Resolves on success, rejects on any error.
+function downloadTo(url, dest, withBar, label) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      url,
+      { headers: { 'User-Agent': 'umadev-cli', Accept: 'application/octet-stream' } },
+      (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume();
+          downloadTo(res.headers.location, dest, withBar, label).then(resolve, reject);
+          return;
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          reject(new Error('HTTP ' + res.statusCode));
+          return;
+        }
+        const total = parseInt(res.headers['content-length'] || '0', 10);
+        let got = 0;
+        let lastPct = -1;
+        const tmp = dest + '.part';
+        const out = fs.createWriteStream(tmp);
+        res.on('data', (chunk) => {
+          got += chunk.length;
+          if (withBar && total > 0) {
+            const pct = Math.floor((got / total) * 100);
+            if (pct !== lastPct) {
+              lastPct = pct;
+              const w = 24;
+              const fill = Math.round((pct / 100) * w);
+              const bar = '#'.repeat(fill) + '-'.repeat(w - fill);
+              const mb = (got / 1048576).toFixed(0);
+              const tot = (total / 1048576).toFixed(0);
+              process.stderr.write(
+                '\r  ' + label + ' [' + bar + '] ' + pct + '%  (' + mb + '/' + tot + ' MB)',
+              );
+            }
+          }
+        });
+        res.pipe(out);
+        out.on('finish', () =>
+          out.close((e) => {
+            if (e) return reject(e);
+            try {
+              fs.renameSync(tmp, dest);
+            } catch (er) {
+              return reject(er);
+            }
+            if (withBar) process.stderr.write('\n');
+            resolve();
+          }),
+        );
+        out.on('error', reject);
+      },
+    );
+    req.on('error', reject);
+    req.setTimeout(120000, () => req.destroy(new Error('timeout')));
+  });
 }
-const result = spawnSync(binary, process.argv.slice(2), spawnOpts);
+async function ensureModel() {
+  const dir = modelTargetDir();
+  if (modelPresent(dir)) return dir; // already installed — fast path, no network
+  let version = '0.0.0';
+  try {
+    version = require('../package.json').version;
+  } catch (_) {
+    /* keep default */
+  }
+  const base = 'https://github.com/umacloud/umadev/releases/download/v' + version;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    process.stderr.write(
+      '\n  本地向量检索模型缺失,正在下载 (multilingual-e5-small · fp16 · ~224MB)…\n',
+    );
+    process.stderr.write(
+      '  一次性下载;之后完全本地、运行时无需联网。失败不影响使用(降级为 BM25)。\n',
+    );
+    await downloadTo(base + '/config.json', path.join(dir, 'config.json'), false, '');
+    await downloadTo(base + '/tokenizer.json', path.join(dir, 'tokenizer.json'), false, '');
+    await downloadTo(
+      base + '/model.safetensors',
+      path.join(dir, 'model.safetensors'),
+      true,
+      '下载向量模型',
+    );
+    process.stderr.write('  本地向量模型就绪 ✓\n\n');
+    return dir;
+  } catch (e) {
+    process.stderr.write(
+      '\n  [提示] 向量模型下载未完成 (' +
+        e.message +
+        ');本次用 BM25 检索,下次启动重试。\n\n',
+    );
+    return null;
+  }
+}
 
-if (result.error) {
-  console.error(`umadev: failed to exec binary: ${result.error.message}`);
-  process.exit(1);
+async function main() {
+  const binary = findBinary();
+  // npm artifact round-trips (upload/download-artifact in CI) can strip the
+  // executable bit off the prebuilt binary; restore it defensively before exec.
+  try {
+    fs.chmodSync(binary, 0o755);
+  } catch (_) {
+    // read-only install dir or already +x — spawnSync below reports real errors
+  }
+  const extraEnv = {};
+  // Prefer a bundled npm model package (dev / sibling layout); otherwise fetch
+  // it on demand into ~/.umadev/embed-model (the binary's model_dir() fallback).
+  let modelDir = findModelDir();
+  if (!modelDir) modelDir = await ensureModel();
+  if (modelDir && !process.env.UMADEV_EMBED_MODEL_DIR) {
+    extraEnv.UMADEV_EMBED_MODEL_DIR = modelDir;
+  }
+  const knowledgeDir = findKnowledgeDir();
+  if (knowledgeDir && !process.env.UMADEV_KNOWLEDGE_DIR) {
+    extraEnv.UMADEV_KNOWLEDGE_DIR = knowledgeDir;
+  }
+  const spawnOpts = { stdio: 'inherit' };
+  if (Object.keys(extraEnv).length > 0) {
+    spawnOpts.env = { ...process.env, ...extraEnv };
+  }
+  const result = spawnSync(binary, process.argv.slice(2), spawnOpts);
+
+  if (result.error) {
+    console.error(`umadev: failed to exec binary: ${result.error.message}`);
+    process.exit(1);
+  }
+
+  process.exit(result.status === null ? 1 : result.status);
 }
 
-process.exit(result.status === null ? 1 : result.status);
+main();

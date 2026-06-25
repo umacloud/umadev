@@ -1,6 +1,6 @@
 {
   "name": "umadev",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "A project-director Agent for AI coding hosts — drives your logged-in Claude Code / Codex through a 9-phase commercial delivery pipeline with governance. No API key needed.",
   "keywords": [
     "ai",
@@ -37,12 +37,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@umacloud/cli-darwin-arm64": "1.0.7",
-    "@umacloud/cli-darwin-x64": "1.0.7",
-    "@umacloud/cli-linux-x64": "1.0.7",
-    "@umacloud/cli-linux-arm64": "1.0.7",
-    "@umacloud/cli-win32-x64": "1.0.7",
-    "@umacloud/model-e5-small": "1.0.7",
-    "@umacloud/knowledge": "1.0.7"
+    "@umacloud/cli-darwin-arm64": "1.0.8",
+    "@umacloud/cli-darwin-x64": "1.0.8",
+    "@umacloud/cli-linux-x64": "1.0.8",
+    "@umacloud/cli-linux-arm64": "1.0.8",
+    "@umacloud/cli-win32-x64": "1.0.8",
+    "@umacloud/knowledge": "1.0.8"
   }
 }
