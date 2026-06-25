@@ -4228,11 +4228,15 @@ fn render_status_row(frame: &mut Frame, area: Rect, app: &App) {
         // is running (read / edit / a command), else a compact elapsed timer — so it
         // COMPLEMENTS the "正在思考" indicator above the input instead of repeating
         // it. Animated so a sent message never looks frozen while the base replies.
-        match &app.stream_tool_batch {
-            Some((tool, _)) => format!("{} {tool}", app.spinner()),
-            // No tool running → show nothing here (the "正在思考" indicator above the
-            // input already conveys aliveness + elapsed; a corner timer was redundant).
-            None => String::new(),
+        // Show the live tool ONLY while it's actually running (`tool_in_progress`,
+        // cleared the moment its ToolResult lands) — `stream_tool_batch` alone
+        // lingers after the tool finishes (it's the transcript-collapse label), so
+        // using it left a stale "⠦ Read" sitting in the corner after the read was
+        // long done. No tool running → nothing here (the "正在思考" indicator above
+        // the input already conveys aliveness).
+        match (app.tool_in_progress, &app.stream_tool_batch) {
+            (true, Some((tool, _))) => format!("{} {tool}", app.spinner()),
+            _ => String::new(),
         }
     } else if app.aborted {
         // Dedicated terminal branch — an aborted round reads as `[aborted]` here
