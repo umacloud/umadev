@@ -148,14 +148,20 @@ jobs:
       # The binary loads it via candle for offline, zero-setup retrieval; if this
       # ever fails the binary still works (fail-open to BM25).
       # TODO(maintainer): pin to a revision SHA + verify sha256 before first GA.
-      - name: Fetch bundled embedding model
+      - name: Fetch bundled embedding model (quantized to f16)
         run: |
           set -euo pipefail
           DIR=npm/model-e5-small
           BASE=https://huggingface.co/intfloat/multilingual-e5-small/resolve/main
           curl -fsSL "$BASE/config.json"       -o "$DIR/config.json"
           curl -fsSL "$BASE/tokenizer.json"    -o "$DIR/tokenizer.json"
-          curl -fsSL "$BASE/model.safetensors" -o "$DIR/model.safetensors"
+          curl -fsSL "$BASE/model.safetensors" -o "$DIR/model.f32.safetensors"
+          # Quantize f32 -> f16: halves the package (~448MB -> ~224MB) with no
+          # practical retrieval-quality loss (the binary casts f16 back to f32 on
+          # load via candle), and keeps it under npm's size limit.
+          python3 -m pip install --quiet safetensors numpy
+          python3 npm/scripts/quantize-model.py "$DIR/model.f32.safetensors" "$DIR/model.safetensors"
+          rm -f "$DIR/model.f32.safetensors"
           ls -la "$DIR"
 
       - name: npm publish (platforms + main)
