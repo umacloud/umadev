@@ -339,19 +339,32 @@ fn port_is_free(url: &str) -> bool {
 
 /// Cross-platform best-effort browser open (sync variant for the event loop).
 fn open_url(url: &str) -> std::io::Result<()> {
+    // REAP the launcher on a detached thread. The OS URL-launcher (`open` /
+    // `xdg-open` / `cmd start`) hands off to the browser and exits within ms;
+    // dropping the `Child` without `wait()` leaves a defunct (zombie) process on
+    // Unix that accumulates over every `/preview` / auto-open (P1).
+    #[allow(dead_code)]
+    fn reap(child: std::process::Child) {
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+    }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open").arg(url).spawn()?;
+        reap(std::process::Command::new("open").arg(url).spawn()?);
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::process::Command::new("xdg-open").arg(url).spawn()?;
+        reap(std::process::Command::new("xdg-open").arg(url).spawn()?);
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn()?;
+        reap(
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", url])
+                .spawn()?,
+        );
     }
     Ok(())
 }
@@ -3077,6 +3090,24 @@ fn theme_from_known_terminal() -> Option<bool> {
 /// OSC 11 query: send the background-color query, read the RGB response,
 /// classify by BT.709 luminance. Must run in raw mode (no echo).
 fn theme_from_osc11() -> Option<bool> {
+    // Bound the blocking OSC 11 probe with a timeout via a worker thread. The probe
+    // ends at the FIRST `stdin.read()`, whose deadline is only checked BETWEEN
+    // reads — so a terminal that enables raw mode but never answers OSC 11 (conhost,
+    // dumb terms, some SSH / screen / tmux) blocks that first read FOREVER, hanging
+    // the launch before the first draw (P0). With the timeout the launch proceeds
+    // with the default theme; the worker exits as soon as ANY byte arrives (on such
+    // a terminal it may swallow the user's first keystroke after launch — a far
+    // smaller cost than an indefinite hang, and only when OSC 11 went unanswered).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(theme_from_osc11_blocking());
+    });
+    rx.recv_timeout(Duration::from_millis(250)).ok().flatten()
+}
+
+/// The blocking OSC 11 background-color probe, run under a timeout by
+/// [`theme_from_osc11`]. Writes `OSC 11 ?` and reads the `rgb:…` reply.
+fn theme_from_osc11_blocking() -> Option<bool> {
     use std::io::{Read, Write};
     use std::time::Instant;
 
