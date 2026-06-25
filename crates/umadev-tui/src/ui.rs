@@ -3332,7 +3332,19 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     }
     let total = folded.len();
     let para = Paragraph::new(folded);
-    let hidden_above = total.saturating_sub(inner_height);
+    // The scroll-hint title (added below when content overflows) is a `Block` title
+    // row that `Block::inner` STEALS off the top — so whenever it's shown the real
+    // paintable viewport is one row shorter. Account for it: decide overflow against
+    // the full height, and if the title will be shown shrink the viewport by one.
+    // Without this, the newest (streaming) row is pushed off the bottom and the
+    // oldest row stays unreachable — a clip on the live chat surface.
+    let title_shown = total > inner_height;
+    let viewport = if title_shown {
+        inner_height.saturating_sub(1).max(1)
+    } else {
+        inner_height
+    };
+    let hidden_above = total.saturating_sub(viewport);
 
     // Publish the scroll bounds for the key handlers (Home/End, Page, Ctrl-U/D,
     // Shift+↑/↓, mouse wheel) — they clamp `transcript_scroll` against these
@@ -3340,7 +3352,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // ABOVE the bottom; clamp it here so a stale value (e.g. after the window
     // grew and content now fits) can't push the view off the end.
     app.transcript_max_scroll.set(hidden_above);
-    app.transcript_viewport_rows.set(inner_height);
+    app.transcript_viewport_rows.set(viewport);
 
     // **P5b — sticky-to-bottom + scroll-up anchor.** `transcript_scroll` is the
     // rows-from-bottom offset (`0` = pinned to the bottom). When the user is
@@ -5189,6 +5201,32 @@ mod tests {
             .unwrap()
             .trim();
         assert!(out.contains(suffix), "rendered: {out}");
+    }
+
+    #[test]
+    fn newest_row_not_clipped_when_scroll_hint_steals_the_top_row() {
+        let mut app = app_with(Some("offline"));
+        // Plenty of rows → the transcript overflows a short viewport → the
+        // scroll-hint title is shown, and that title row is stolen off the top by
+        // `Block::inner`. Pinned to the bottom (the default), the NEWEST row must
+        // still be on screen — the old code derived `hidden_above` from the FULL
+        // height, so the title row pushed the newest (streaming) line off the
+        // bottom. This locks the viewport-minus-one fix.
+        for i in 0..40 {
+            app.apply_engine(umadev_agent::EngineEvent::Note(format!("filler-line-{i}")));
+        }
+        app.apply_engine(umadev_agent::EngineEvent::Note("NEWESTMARKERROW".into()));
+        let out = render_chat_to_string(&app, 80, 12);
+        let suffix = umadev_i18n::t(app.lang, "tui.scroll.above")
+            .rsplit("{}")
+            .next()
+            .unwrap()
+            .trim();
+        assert!(out.contains(suffix), "scroll hint should be shown: {out}");
+        assert!(
+            out.contains("NEWESTMARKERROW"),
+            "newest row was clipped off the bottom by the stolen title row: {out}"
+        );
     }
 
     // Render the chat at a generous size and flatten the buffer to one string.
