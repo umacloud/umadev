@@ -176,12 +176,13 @@ impl Runtime for OpenCodeDriver {
     }
 
     fn capabilities(&self) -> umadev_runtime::BrainCapabilities {
-        // OpenCode supports a persistent `/goal` mode (keep working until the
-        // objective is met), so UmaDev frames a goal-driven build with the native
-        // `/goal` directive — same as claude / codex. It still has no structured
-        // stream-json (its `complete_streaming` forwards plain-text lines, no
-        // machine-readable event schema), no usage on stdout, and no PreToolUse hook
-        // — otherwise the most conservative of the three CLIs.
+        // `persistent_goal: true` means UmaDev FORWARDS a `/goal` directive to the
+        // base when the user runs `/goal` (the intended interaction). OpenCode has no
+        // native `/goal` slash command of its own (its CLI is `opencode run`; its
+        // slash set is /editor /export /help /models /new /sessions /status /themes
+        // /timeline /worktree), so it reads the directive as a strong "keep working
+        // until done" instruction — only Claude Code has a native `/goal` mode. It
+        // also has no usage on stdout and no PreToolUse hook.
         umadev_runtime::BrainCapabilities {
             persistent_goal: true,
             ..umadev_runtime::BrainCapabilities::default()

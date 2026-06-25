@@ -192,12 +192,13 @@ impl Runtime for CodexDriver {
     }
 
     fn capabilities(&self) -> umadev_runtime::BrainCapabilities {
-        // Codex streams (`--json`) AND reports real token usage on the terminal
-        // `turn.completed` line (parsed by `extract_codex_usage`), so `/usage`
-        // is truthful. It supports a persistent `/goal` mode (keep working until the
-        // objective is met), so UmaDev frames a goal-driven build with the native
-        // `/goal` directive — same as claude. It has no PreToolUse hook
-        // (`realtime_governance: false` → the after-turn governance scan applies).
+        // Codex streams (`--json`). `persistent_goal: true` means UmaDev FORWARDS a
+        // `/goal` directive to the base when the user runs `/goal` (the intended
+        // interaction). Codex has no native `/goal` slash command of its own (its
+        // CLI is `codex exec`), so it reads the directive as a strong "keep working
+        // until the objective is met" instruction — only Claude Code has a native
+        // `/goal` mode. It has no PreToolUse hook (`realtime_governance: false` → the
+        // after-turn governance scan applies).
         umadev_runtime::BrainCapabilities {
             persistent_goal: true,
             streaming: true,
