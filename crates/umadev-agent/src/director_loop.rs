@@ -300,19 +300,28 @@ pub async fn drive_director_loop_routed(
         events.emit(EngineEvent::intent_decided(r));
     }
 
+    // Read the idle watchdog window + the wall-clock build budget ONCE at the
+    // boundary (not per-wait), so a mid-run env flip can't race the in-flight turns.
+    // The deadline is a GRACEFUL ceiling — the loop winds down (final gate on what's
+    // built) rather than aborting mid-write.
+    //
+    // LOW #5: compute the `deadline` BEFORE plan synthesis so the WHOLE deliberate
+    // build — including the planning turn — shares ONE clock. Plan synthesis used to
+    // run before the deadline existed and bounded its own drain by a fixed 180s
+    // per-event timeout, so planning time was unattributed to the run budget (a slow
+    // plan could eat minutes the build then didn't account for). The drain is now
+    // bounded by this same deadline.
+    let deadline = std::time::Instant::now() + run_budget();
+
     // 2. Synthesise + persist + post the owned plan. Fail-open at every step: a
     //    `None` plan (offline / no fork / unparseable) simply means no checklist —
     //    the build loop below runs exactly as it does today. Plan synthesis runs on
     //    a READ-ONLY fork (single-writer preserved); it never writes the workspace.
     let plan = match route {
-        Some(r) => synthesize_and_post_plan(session, options, events, r).await,
+        Some(r) => synthesize_and_post_plan(session, options, events, r, deadline).await,
         None => None,
     };
 
-    // Read the idle watchdog window + the wall-clock build budget ONCE at the
-    // boundary (not per-wait), so a mid-run env flip can't race the in-flight turns.
-    // The deadline is a GRACEFUL ceiling — the loop winds down (final gate on what's
-    // built) rather than aborting mid-write.
     drive_director_loop_with_idle(
         session,
         options,
@@ -321,7 +330,7 @@ pub async fn drive_director_loop_routed(
         plan,
         route,
         idle_timeout(),
-        std::time::Instant::now() + run_budget(),
+        deadline,
     )
     .await
 }
@@ -335,6 +344,7 @@ async fn synthesize_and_post_plan(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
+    deadline: std::time::Instant,
 ) -> Option<Plan> {
     // A plan is warranted whenever there's a BUILD to make visible — every Build
     // route, even a lean single-page one, gets a (proportionally short) plan so the
@@ -351,7 +361,10 @@ async fn synthesize_and_post_plan(
     events.emit(EngineEvent::Note(
         umadev_i18n::tl("plan.synthesizing").to_string(),
     ));
-    let plan = plan_state::synthesize_plan(session, options, &options.requirement, route).await?;
+    // LOW #5: bound the planning drain by the SHARED run deadline so planning is
+    // attributed to the run budget (no separate fixed 180s clock).
+    let plan = plan_state::synthesize_plan(session, options, &options.requirement, route, deadline)
+        .await?;
     // Persist best-effort; a failed write is ignored (fail-open — never blocks).
     let _ = plan_state::save(&plan, &options.project_root);
     events.emit(EngineEvent::plan_posted(&plan));
@@ -587,12 +600,12 @@ async fn drive_plan_steps(
         transitions += 1;
 
         // Mark the step Active + surface it on the checklist BEFORE driving it.
-        let step = plan
-            .steps
-            .iter()
-            .find(|s| s.id == step_id)
-            .cloned()
-            .expect("ready id resolves");
+        // LOW #4: resolve the step fail-open — this is a fail-open module, so a
+        // ready id that no longer resolves (a concurrently-mutated plan) breaks the
+        // schedule cleanly to the final gate rather than panicking the host.
+        let Some(step) = plan.steps.iter().find(|s| s.id == step_id).cloned() else {
+            break;
+        };
         plan.mark(&step_id, StepStatus::Active);
         events.emit(EngineEvent::plan_step_status(
             step_id.clone(),
@@ -601,7 +614,7 @@ async fn drive_plan_steps(
         ));
         persist_plan_ref(plan, options);
 
-        let (accepted, reply, drove) = match step.kind {
+        let outcome = match step.kind {
             plan_state::StepKind::Build => {
                 drive_build_step(session, options, events, route, &step, deadline).await
             }
@@ -609,26 +622,50 @@ async fn drive_plan_steps(
                 drive_review_step(session, options, events, route, &step, deadline).await
             }
         };
+        let StepOutcome {
+            accepted,
+            reply,
+            drove,
+            made_progress,
+        } = outcome;
         if !reply.is_empty() {
             last_reply = reply;
         }
 
-        // Fail-open bail: if the FIRST step is a Build that could not drive a single
-        // turn (a dead session on the very first doer turn), the base can't be
-        // scheduled — return None so the caller runs the single end-to-end turn
-        // rather than silently marking a plan "done" over an empty build. A first
-        // Review step that no-ops (an empty team) does NOT bail: there's simply
-        // nothing to review yet, and the next (Build) step still gets its chance.
+        // MEDIUM #2 (first-step bail) — FIX: reset the just-marked Active step BEFORE
+        // bailing. If the FIRST step is a Build that could not drive a single turn (a
+        // dead session on the very first doer turn), the base can't be scheduled —
+        // return None so the caller runs the single end-to-end turn rather than
+        // silently marking a plan "done" over an empty build. But step 1 was already
+        // marked Active above; left as-is it strands the plan with a wedged `Active`
+        // step that a resume reads as in-flight. Reset it to Pending (+ emit + persist)
+        // so the fallback single-turn build starts from a clean plan. A first Review
+        // step that no-ops (an empty team) does NOT bail: there's simply nothing to
+        // review yet, and the next (Build) step still gets its chance.
         if transitions == 1 && step.kind == plan_state::StepKind::Build && !drove {
+            plan.mark(&step_id, StepStatus::Pending);
+            events.emit(EngineEvent::plan_step_status(
+                step_id,
+                step.title,
+                StepStatus::Pending,
+            ));
+            persist_plan_ref(plan, options);
             return None;
         }
 
-        let status = if accepted {
+        // MEDIUM #3 / HIGH #1 — a step that was "accepted" but made NO real progress
+        // (an empty-team ReviewClean neutral skip, or a Build step over a dead turn
+        // that only cleared a neutral-skip acceptance) must NOT advance the done
+        // count. Mark it Blocked (honest: nothing verifiable happened) rather than
+        // Done, so the checklist + conclusion don't overstate completion. A genuinely
+        // accepted step (real evidence) ticks Done as before.
+        let status = if accepted && made_progress {
             StepStatus::Done
         } else {
-            // Bounded: a step that exhausted its fix budget is Blocked (honest), so
-            // it no longer gates dependents but the plan records the gap. The final
-            // QC gate + the caller's hard-gate still decide overall reality.
+            // Bounded: a step that exhausted its fix budget — OR cleared only a
+            // neutral skip with no real work — is Blocked (honest), so it no longer
+            // gates dependents but the plan records the gap. The final QC gate + the
+            // caller's hard-gate still decide overall reality.
             StepStatus::Blocked
         };
         plan.mark(&step_id, status);
@@ -672,11 +709,30 @@ async fn drive_plan_steps(
     Some(DirectorLoopOutcome::Done { reply: last_reply })
 }
 
+/// The observable result of driving one plan step — what the scheduler reads to set
+/// the step's terminal status. `made_progress` is the MEDIUM #3 honesty signal: an
+/// "accepted" step that did NO real verifiable work (a dead Build turn that only
+/// cleared a neutral skip, or an empty-team ReviewClean) is accepted-but-not-progress,
+/// so the scheduler marks it Blocked rather than falsely ticking it Done.
+struct StepOutcome {
+    /// Whether the step's acceptance is satisfied (passed or fail-open neutral skip).
+    accepted: bool,
+    /// The step's last assistant reply text (empty when nothing ran).
+    reply: String,
+    /// Whether at least one real work turn actually ran (a live doer turn settled /
+    /// a review team convened). `false` = a dead/hung session or an empty team.
+    drove: bool,
+    /// Whether the step made REAL, verifiable progress — `accepted` resting on either
+    /// a turn that actually ran OR positive deterministic evidence (real source / a
+    /// green build / a seat that actually reviewed). `false` = a neutral skip that
+    /// must not count toward `Done`.
+    made_progress: bool,
+}
+
 /// Drive ONE Build step: `summon` the step's seat serially on the main session with
 /// a focused directive (recalled pitfalls injected), then verify against the step's
 /// `acceptance` on the deterministic floor. A failing acceptance folds its evidence
-/// into a bounded fix re-drive ([`MAX_STEP_FIX_ROUNDS`]). Returns
-/// `(accepted, last_reply, drove_at_least_one_turn)`.
+/// into a bounded fix re-drive ([`MAX_STEP_FIX_ROUNDS`]). Returns a [`StepOutcome`].
 ///
 /// Wall-clock ceiling (graceful): the `deadline` bounds the EXTRA fix rounds, not the
 /// real work — round 0 (the step's actual doer turn) ALWAYS runs, so a budget already
@@ -689,7 +745,7 @@ async fn drive_build_step(
     route: &RoutePlan,
     step: &plan_state::PlanStep,
     deadline: std::time::Instant,
-) -> (bool, String, bool) {
+) -> StepOutcome {
     let seat_id = step.seat.role_id();
     // The step's focused instruction + (fail-open) recalled stack pitfalls so the
     // doer pre-empts a known trap. relevant_lessons_for_prompt is empty on first
@@ -720,14 +776,23 @@ async fn drive_build_step(
         }
         // `instruction` carries the focused task on round 0 and is rewritten with
         // the failing acceptance evidence on each re-drive (see the loop tail).
-        let summoned = director::summon(
-            session,
-            options,
+        // FIX #7: emit a periodic in-turn heartbeat note while this (possibly
+        // minute-long) doer turn runs, so a long ACTIVE step visibly progresses on
+        // the TUI instead of a static spinner. The heartbeat races the summon future
+        // via `tokio::select!` — no refactor of the summon internals; it only adds a
+        // Note every HEARTBEAT_SECS until the turn settles.
+        let summoned = with_step_heartbeat(
             events,
-            seat_id,
-            &instruction,
-            director::SummonMode::Serial,
-            deadline,
+            &step.title,
+            director::summon(
+                session,
+                options,
+                events,
+                seat_id,
+                &instruction,
+                director::SummonMode::Serial,
+                deadline,
+            ),
         )
         .await;
         if summoned.done {
@@ -742,8 +807,23 @@ async fn drive_build_step(
         capture_turn_pitfalls(options, events, &summoned.pitfalls);
         // Verify against THIS step's acceptance on the deterministic floor.
         let verdict = verify_step_acceptance(session, options, events, route, step).await;
-        if verdict.accepted {
-            return (true, last_reply, drove);
+        // MEDIUM #3 — a dead/hung summon turn that never actually ran (`!drove`) must
+        // not "complete" a Build step on a NEUTRAL-SKIP acceptance (an unavailable
+        // check / a TurnSettled free pass). Require REAL evidence: either the doer
+        // turn actually ran, OR the floor produced positive evidence (real source on
+        // disk / a green build). Without either, a build step over a dead session is
+        // honestly left unaccepted (→ the caller marks it Blocked), so a dead session
+        // can't silently tick steps 2..N Done over an empty build.
+        if verdict.accepted && (drove || verdict.has_positive_evidence) {
+            return StepOutcome {
+                accepted: true,
+                reply: last_reply,
+                drove,
+                // A Build step makes real progress when its turn actually ran or the
+                // floor positively confirmed real work — exactly the (drove ||
+                // has_positive_evidence) condition that let it accept here.
+                made_progress: true,
+            };
         }
         // Out of fix budget → leave the step unaccepted (the caller marks it Blocked
         // and the final gate still has the last word). Bounded — never an open grind.
@@ -762,13 +842,23 @@ async fn drive_build_step(
             acceptance_label(&step.acceptance),
         );
     }
-    (false, last_reply, drove)
+    StepOutcome {
+        accepted: false,
+        reply: last_reply,
+        drove,
+        made_progress: false,
+    }
 }
 
 /// Drive ONE Review step: fork the cross-review team (read-only) over the current
 /// blackboard. A review step is "accepted" when no seat raises a blocking finding;
 /// blocking findings fold into ONE bounded fix turn on the MAIN session (the doer
-/// repairs), then we re-read. Returns `(accepted, last_reply, drove)`.
+/// repairs), then we re-read. Returns a [`StepOutcome`].
+///
+/// HIGH #1 / MEDIUM #3: an EMPTY-team review (the route convened no seats — 0 actually
+/// reviewed) is a NEUTRAL SKIP, NOT real progress: `made_progress == false`, so the
+/// scheduler does NOT tick it `Done` over a review that never happened. A team that
+/// actually convened (`seats > 0`) and accepted is real progress.
 ///
 /// Wall-clock ceiling (graceful): the read-only fork review ALWAYS runs (it's cheap
 /// and surfaces honest findings), but the minute-level main-session FIX turn it would
@@ -782,26 +872,40 @@ async fn drive_review_step(
     route: &RoutePlan,
     step: &plan_state::PlanStep,
     deadline: std::time::Instant,
-) -> (bool, String, bool) {
+) -> StepOutcome {
     let _ = step;
     // Wave 2 deliverable 3: size the review team from the ROUTE's seats (the seats
     // the router already chose for this turn), not from a re-derived requirement
     // classification. An empty route team → no cross-review (the floor stands).
     let review = director::review_with_seats(session, options, events, &route.team).await;
     if !review.has_blocking() {
-        return (true, String::new(), review.seats > 0);
+        // A team actually convened (seats > 0) ⇒ real review progress; an empty team
+        // (seats == 0) is a neutral skip that must NOT advance the done count.
+        let reviewed = review.seats > 0;
+        return StepOutcome {
+            accepted: true,
+            reply: String::new(),
+            drove: reviewed,
+            made_progress: reviewed,
+        };
     }
     // Wall-clock ceiling: the team found blocking issues, but the budget is already
     // spent — skip the (minute-level) fix turn and surface the findings honestly. A
     // review step is advisory, so we still "accept" it (the final gate / hard-gate
-    // own reality); we just don't grind another doer turn past the deadline.
+    // own reality); we just don't grind another doer turn past the deadline. A team
+    // DID convene + raised findings (seats > 0), so this is real review progress.
     if std::time::Instant::now() >= deadline {
         events.emit(EngineEvent::Note(
             "team · time budget reached — review findings left for the final gate \
              (raise UMADEV_RUN_BUDGET_SECS to repair them in this run)"
                 .to_string(),
         ));
-        return (true, String::new(), false);
+        return StepOutcome {
+            accepted: true,
+            reply: String::new(),
+            drove: false,
+            made_progress: true,
+        };
     }
     // The team found blocking issues — fold them into ONE bounded fix turn on the
     // main session (the doer repairs), then accept (advisory: the deterministic
@@ -834,7 +938,14 @@ async fn drive_review_step(
             recheck.blocking.len()
         )));
     }
-    (true, String::new(), drove)
+    // A team convened, raised findings, and a repair turn ran — real review progress
+    // regardless of whether the repair turn fully settled (`drove`).
+    StepOutcome {
+        accepted: true,
+        reply: String::new(),
+        drove,
+        made_progress: true,
+    }
 }
 
 /// The outcome of verifying one step against its declared acceptance.
@@ -842,6 +953,14 @@ struct StepVerdict {
     /// Whether the step's deterministic acceptance check passed (or was a neutral
     /// skip — an unavailable check is NOT a failure, fail-open).
     accepted: bool,
+    /// Whether `accepted` rests on POSITIVE evidence (a check that actually ran and
+    /// passed — e.g. real source on disk, a green build) rather than a NEUTRAL SKIP
+    /// (an unavailable check / a `TurnSettled` free pass). MEDIUM #3 uses this to
+    /// refuse to mark a Build step `Done` over a doer turn that never ran: a neutral
+    /// skip is fine when the turn DID run (the work just isn't mechanically
+    /// checkable), but a dead/hung session that produced no turn must not "complete"
+    /// a step on a free pass.
+    has_positive_evidence: bool,
     /// Concrete evidence lines from the check (failed-step names / drift / count).
     evidence: Vec<String>,
 }
@@ -873,6 +992,14 @@ async fn verify_step_acceptance(
     step: &plan_state::PlanStep,
 ) -> StepVerdict {
     use plan_state::AcceptanceSpec as A;
+    // HIGH #1 — the source-present honesty floor binds ANY step that CLAIMED to build
+    // (a Build step), regardless of how weak its declared acceptance is. A step that
+    // builds but whose acceptance is `ReviewClean`/`TurnSettled` would otherwise
+    // accept over a tree with zero source — "claimed done, wrote nothing" slipping
+    // through. So for a Build step, run the source floor FIRST and reject on a real
+    // empty-tree miss; a positive source pass becomes the verdict's positive evidence
+    // for the weaker criteria (review/turn-settled don't add their own).
+    let is_build = step.kind == plan_state::StepKind::Build;
     match &step.acceptance {
         A::SourcePresent => acceptance_from_verify(
             director::verify(options, events, VerifyKind::SourcePresent).await,
@@ -883,16 +1010,42 @@ async fn verify_step_acceptance(
             if src.available && !src.passed {
                 return acceptance_from_verify(src);
             }
-            acceptance_from_verify(director::verify(options, events, VerifyKind::BuildTest).await)
+            // A positive source floor (real source on disk) IS real evidence — carry it
+            // forward so a Build step whose build/test check is a neutral skip (no
+            // manifest) still counts as positive progress for the dead-summon guard.
+            let src_positive = src.available && src.passed;
+            with_source_evidence(
+                acceptance_from_verify(
+                    director::verify(options, events, VerifyKind::BuildTest).await,
+                ),
+                src_positive,
+            )
         }
         A::Contract => {
             let src = director::verify(options, events, VerifyKind::SourcePresent).await;
             if src.available && !src.passed {
                 return acceptance_from_verify(src);
             }
-            acceptance_from_verify(director::verify(options, events, VerifyKind::Contract).await)
+            let src_positive = src.available && src.passed;
+            with_source_evidence(
+                acceptance_from_verify(
+                    director::verify(options, events, VerifyKind::Contract).await,
+                ),
+                src_positive,
+            )
         }
         A::ReviewClean => {
+            // HIGH #1: a Build step that declares ReviewClean STILL honours the
+            // source-present floor — a build with no source can't be "review-clean".
+            let src_positive = if is_build {
+                let src = director::verify(options, events, VerifyKind::SourcePresent).await;
+                if src.available && !src.passed {
+                    return acceptance_from_verify(src); // empty tree ⇒ honest reject
+                }
+                src.available && src.passed
+            } else {
+                false
+            };
             // Route-team-aware (deliverable 3): the review seats come from the route.
             let review = director::review_with_seats(session, options, events, &route.team).await;
             StepVerdict {
@@ -900,32 +1053,54 @@ async fn verify_step_acceptance(
                 // and even then the final deterministic gate, not this verdict, owns
                 // overall termination. No team convened ⇒ accept (nothing to review).
                 accepted: !review.has_blocking(),
+                // HIGH #1: positive evidence only when a seat ACTUALLY reviewed and
+                // accepted (seats > 0), or a Build step's source floor positively
+                // passed. An EMPTY-team ReviewClean (0 seats) is a NEUTRAL SKIP — it
+                // must not count as real progress that marks a step Done over no work.
+                has_positive_evidence: src_positive || (review.seats > 0 && !review.has_blocking()),
                 evidence: review.blocking.clone(),
             }
         }
         A::TurnSettled => {
             // The weakest criterion: the work turn settled. Still honour the
             // source-present honesty floor for a Build step so "claimed done, wrote
-            // nothing" never slips through.
-            if step.kind == plan_state::StepKind::Build {
+            // nothing" never slips through — and surface its positive source pass as
+            // the verdict's evidence (the doer's turn ran AND wrote real files).
+            if is_build {
                 return acceptance_from_verify(
                     director::verify(options, events, VerifyKind::SourcePresent).await,
                 );
             }
+            // A non-Build TurnSettled (a Review step whose brain named nothing
+            // checkable) is a NEUTRAL SKIP, not positive progress.
             StepVerdict {
                 accepted: true,
+                has_positive_evidence: false,
                 evidence: Vec::new(),
             }
         }
     }
 }
 
+/// OR a positive source-floor pass into an already-computed verdict's positive
+/// evidence — so a Build step whose own check (build/test, contract) was a neutral
+/// skip still records POSITIVE evidence when real source landed on disk. Used by the
+/// BuildTest / Contract Build paths so the dead-summon guard (MEDIUM #3) treats real
+/// source as real progress even when the richer check couldn't run.
+fn with_source_evidence(mut v: StepVerdict, src_positive: bool) -> StepVerdict {
+    v.has_positive_evidence = v.has_positive_evidence || src_positive;
+    v
+}
+
 /// Fold a [`VerifyResult`] into a [`StepVerdict`]: an unavailable (skipped) check is
 /// a NEUTRAL accept (fail-open — never a false failure); a passed check accepts; a
-/// real failure rejects, carrying the evidence for the fix directive.
+/// real failure rejects, carrying the evidence for the fix directive. `accepted` via
+/// an unavailable check is a NEUTRAL SKIP (`has_positive_evidence == false`); only an
+/// available+passed check is POSITIVE evidence (MEDIUM #3).
 fn acceptance_from_verify(r: VerifyResult) -> StepVerdict {
     StepVerdict {
         accepted: !r.available || r.passed,
+        has_positive_evidence: r.available && r.passed,
         evidence: if r.available && !r.passed {
             r.evidence
         } else {
@@ -1137,13 +1312,76 @@ fn acceptance_label(spec: &plan_state::AcceptanceSpec) -> &'static str {
     }
 }
 
+/// How often (seconds) the in-turn step heartbeat emits a progress note while a long
+/// doer turn is still running — frequent enough that a multi-minute step visibly
+/// progresses on the TUI, infrequent enough not to spam the event stream.
+const HEARTBEAT_SECS: u64 = 45;
+
+/// Drive `fut` to completion while emitting a periodic [`EngineEvent::Note`] heartbeat
+/// (FIX #7) so a long ACTIVE step shows live progress instead of a static spinner.
+/// Delegates to [`with_step_heartbeat_every`] at the standard [`HEARTBEAT_SECS`]
+/// cadence. Purely additive — it never changes the future's result, only surfaces
+/// liveness.
+async fn with_step_heartbeat<F>(events: &Arc<dyn EventSink>, title: &str, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    with_step_heartbeat_every(events, title, Duration::from_secs(HEARTBEAT_SECS), fut).await
+}
+
+/// [`with_step_heartbeat`] with an explicit interval (so a test can drive it with a
+/// tiny window without a paused-clock harness). Each interval tick that fires before
+/// the future resolves emits "step '{title}' still building ({elapsed}s)"; when the
+/// future resolves, its value is returned. The first (immediate) interval tick is
+/// consumed so a sub-interval step emits nothing.
+async fn with_step_heartbeat_every<F>(
+    events: &Arc<dyn EventSink>,
+    title: &str,
+    every: Duration,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    let started = std::time::Instant::now();
+    let mut ticker = tokio::time::interval(every);
+    // The first `tick()` resolves immediately; consume it so the first REAL heartbeat
+    // fires one full interval in (a fast step never emits a heartbeat).
+    ticker.tick().await;
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return out,
+            _ = ticker.tick() => {
+                events.emit(EngineEvent::Note(format!(
+                    "team · step '{title}' still building ({}s)…",
+                    started.elapsed().as_secs()
+                )));
+            }
+        }
+    }
+}
+
 /// A short focus line appended to each step directive so the doer knows the overall
 /// goal + the build's depth (proportional craft) without re-priming the whole
 /// requirement every step (the base already holds it in the continuous session).
+///
+/// ROOT FIX (#6) — HARD-scope the per-turn ask to ONE step. Without this the base
+/// (which holds the full goal in-session) builds the WHOLE project in step 1's turn,
+/// and the plan sits at 0/N for an hour. The directive now explicitly constrains the
+/// base to THIS step only, forbids implementing other steps (they are scheduled
+/// separately and will fail their own acceptance if touched now), and tells it to
+/// STOP as soon as this step's acceptance is met — which is what makes the DAG
+/// actually walk step-by-step instead of one mega-turn. The base still has the full
+/// goal in its session context; only the per-turn ASK is constrained.
 fn route_focus_line(route: &RoutePlan) -> String {
     format!(
-        "this is one step of the overall build (depth: {}). Do THIS step's slice now \
-         with real files on disk; the rest of the plan is handled separately.",
+        "this is ONE step of a larger build (depth: {}) that is scheduled \
+         step-by-step. Implement ONLY this step now, with real files on disk. Do NOT \
+         implement any other part of the project in this turn — the other steps are \
+         scheduled separately and will fail their own acceptance checks if you build \
+         them here. STOP and end your turn as soon as THIS step's acceptance is met; \
+         do not run ahead.",
         route.depth.as_str()
     )
 }
@@ -3106,6 +3344,14 @@ mod tests {
             sent.iter().any(|d| d.contains("Build the UI")),
             "the ui step got its own focused directive: {sent:?}"
         );
+        // FIX #6: each per-step directive HARD-scopes the base to ONE step (the root
+        // fix for "the base builds the whole project in step 1's turn"). The focused
+        // directive must carry the single-step constraint phrasing.
+        assert!(
+            sent.iter().any(|d| d.contains("ONE step of a larger build")
+                && d.contains("Do NOT implement any other part of the project")),
+            "the per-step directive hard-scopes the base to ONE step: {sent:?}"
+        );
         // Persisted terminal plan is all-Done.
         let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
         assert!(loaded
@@ -3150,8 +3396,8 @@ mod tests {
             "a lean/Fast build is the plan turn + ONE build turn (no step scheduling): {sent:?}"
         );
         // The single build directive is the caller's "GO" framing, NOT a per-step
-        // focused directive (which would carry a step title + "one step of the
-        // overall build").
+        // focused directive (which would carry the HARD-scoped "ONE step of a larger
+        // build" phrasing from `route_focus_line`).
         assert!(
             sent.iter().any(|d| d.contains("GO")),
             "the build ran the caller's single directive: {sent:?}"
@@ -3159,7 +3405,7 @@ mod tests {
         assert!(
             !sent
                 .iter()
-                .any(|d| d.contains("one step of the overall build")),
+                .any(|d| d.contains("ONE step of a larger build")),
             "no per-step summon directive on a lean/Fast build: {sent:?}"
         );
     }
@@ -3495,6 +3741,289 @@ mod tests {
         assert!(
             note_seen(&rec, "因前置被阻塞而跳过"),
             "the stranded-scope Note is surfaced"
+        );
+    }
+
+    // ── HIGH #1 / MEDIUM #3: a step can no longer be marked Done over ZERO real work
+    //    (an empty-team ReviewClean, or a Build step over a dead summon turn). ──
+
+    /// A 1-step plan whose single Build step declares `ReviewClean` acceptance — the
+    /// weak criterion that, pre-fix, accepted over an empty team (no source check).
+    fn one_review_clean_build_plan() -> crate::plan_state::Plan {
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        Plan {
+            steps: vec![PlanStep {
+                id: "a".into(),
+                title: "Build with a weak review-clean acceptance".into(),
+                seat: crate::critics::Seat::FrontendEngineer,
+                kind: StepKind::Build,
+                depends_on: vec![],
+                acceptance: AcceptanceSpec::ReviewClean,
+                status: StepStatus::Pending,
+            }],
+            risks: vec![],
+            open_questions: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_settled_build_step_with_no_source_is_not_done() {
+        // HIGH #1: a Build step that declares the WEAKEST acceptance (TurnSettled)
+        // must STILL honour the source-present honesty floor — a turn that settled but
+        // wrote ZERO source must NOT mark the step Done. Verify the floor directly.
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source seeded → the honesty floor must reject.
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = PlanStep {
+            id: "a".into(),
+            title: "claimed done, wrote nothing".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::TurnSettled,
+            status: StepStatus::Active,
+        };
+        let verdict = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        assert!(
+            !verdict.accepted,
+            "a TurnSettled Build over an empty tree must NOT pass the honesty floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_team_review_clean_build_step_over_no_source_is_blocked_not_done() {
+        // HIGH #1 + MEDIUM #3 (combined): a Build step that declares ReviewClean but
+        // has an EMPTY route team (so 0 seats actually review) used to accept over zero
+        // work — the empty-team review found "no blocking", and there was no source
+        // floor on the ReviewClean path. Now: the source floor binds the Build step
+        // (no source → reject), AND an empty-team review is a NEUTRAL skip that is not
+        // positive progress. The step ends Blocked (honest), never Done.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source seeded.
+        let (events, rec) = sink();
+        // A single dead-ish doer turn (claims done, writes nothing). `fast_build_route`
+        // has an EMPTY team → the ReviewClean check convenes 0 seats (neutral skip).
+        let turns = vec![
+            text_turn("Worked on it. Done."),
+            text_turn("Tried again. Done."),
+            text_turn("Once more. Done."),
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        // A deliberate route but with NO standing team → the review is an empty skip.
+        let mut route = build_route();
+        route.team = vec![];
+        let mut plan = one_review_clean_build_plan();
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            Duration::from_millis(200),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+        // The step must NOT be Done over zero real work — it is honestly Blocked.
+        assert_eq!(
+            plan.steps[0].status,
+            crate::plan_state::StepStatus::Blocked,
+            "an empty-team ReviewClean Build over no source is Blocked, not Done"
+        );
+        assert_eq!(
+            rec.count(
+                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "done")
+            ),
+            0,
+            "no step ticked Done over zero work"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_summon_does_not_complete_a_later_step_via_a_neutral_skip() {
+        // MEDIUM #3: a dead/hung summon turn that never actually ran (`!drove`) must
+        // not "complete" a Build step on a NEUTRAL-SKIP acceptance. Here a Build step
+        // with ReviewClean acceptance + an empty team would (pre-fix) accept over a
+        // dead turn; now the (drove || positive-evidence) guard refuses it. Driven via
+        // `drive_build_step` directly so the dead turn + neutral acceptance are exact.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // NO source → no positive evidence; the doer turn is dead (no TurnDone).
+        let (events, _rec) = sink();
+        let turns = vec![
+            // A turn with text but NO TurnDone → summon's pump returns done=false.
+            vec![SessionEvent::TextDelta("partial, never settled".into())],
+            vec![SessionEvent::TextDelta("partial again".into())],
+            vec![SessionEvent::TextDelta("still partial".into())],
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let mut route = build_route();
+        route.team = vec![]; // empty team → the ReviewClean check is a neutral skip
+        let step = one_review_clean_build_plan()
+            .steps
+            .into_iter()
+            .next()
+            .unwrap();
+
+        let outcome = drive_build_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(
+            !outcome.accepted,
+            "a dead summon + neutral-skip acceptance must NOT accept the step"
+        );
+        assert!(
+            !outcome.drove,
+            "the doer turn never actually settled (dead session)"
+        );
+        assert!(
+            !outcome.made_progress,
+            "a dead turn over a neutral skip is not real progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_step_dead_summon_resets_the_step_to_pending_before_bailing() {
+        // MEDIUM #2 (strand fix): when the FIRST Build step can't drive (a dead summon
+        // on the very first doer turn), `drive_plan_steps` returns None to fall back to
+        // the single end-to-end turn. The just-marked Active step MUST be reset to
+        // Pending (not left wedged Active) so a resume reads a clean plan. Drive
+        // `drive_plan_steps` directly so we can inspect the plan after the None bail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        // The first (and only) step's doer turn has a text delta but NO TurnDone → the
+        // session drains to None mid-turn → summon returns done=false (didn't drive).
+        let turns = vec![vec![SessionEvent::TextDelta("partial, no TurnDone".into())]];
+        let mut sess = FakeSession::new(turns, false, "");
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = one_failing_build_plan(); // 1 Build step, id "a"
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            Duration::from_millis(200),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        // The step-driver bailed (None) so the caller runs the single end-to-end turn.
+        assert!(
+            outcome.is_none(),
+            "a first-step dead summon bails to the single-turn fallback"
+        );
+        // The just-marked Active step was RESET to Pending — never left wedged Active.
+        assert_eq!(
+            plan.steps[0].status,
+            crate::plan_state::StepStatus::Pending,
+            "the stranded first step is reset to Pending for a clean resume"
+        );
+        // A Pending status event was emitted for the reset (so the TUI un-sticks it).
+        assert!(
+            rec.count(
+                |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "pending")
+            ) >= 1,
+            "the reset-to-Pending transition is surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_team_review_step_is_a_neutral_skip_not_progress() {
+        // HIGH #1: a standalone Review step whose route convened NO team (0 seats) did
+        // zero real reviewing — it must be a NEUTRAL skip, NOT counted as progress that
+        // ticks the step Done. `drive_review_step` returns made_progress=false for it.
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], true, r#"{"accepts": true, "blocking": []}"#);
+        let o = opts(tmp.path());
+        let mut route = build_route();
+        route.team = vec![]; // empty team → no seat actually reviews
+        let step = PlanStep {
+            id: "review".into(),
+            title: "Cross-review".into(),
+            seat: crate::critics::Seat::QaEngineer,
+            kind: StepKind::Review,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::ReviewClean,
+            status: StepStatus::Active,
+        };
+        let outcome = drive_review_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(
+            outcome.accepted,
+            "an empty-team review accepts (nothing to block)"
+        );
+        assert!(
+            !outcome.made_progress,
+            "an empty-team review is a neutral skip, NOT real progress that marks Done"
+        );
+        assert!(!outcome.drove, "no review team actually convened (0 seats)");
+    }
+
+    #[tokio::test]
+    async fn step_heartbeat_passes_through_and_a_fast_turn_emits_no_note() {
+        // FIX #7: the heartbeat wrapper returns the wrapped future's value unchanged,
+        // and a sub-interval (fast) turn emits NO heartbeat (the immediate first tick
+        // is consumed) — so a quick step never spams the event stream.
+        let (events, rec) = sink();
+        let out = with_step_heartbeat(&events, "Quick step", async { 7u8 }).await;
+        assert_eq!(
+            out, 7,
+            "the wrapped future's value passes through unchanged"
+        );
+        assert!(
+            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("still building"))) == 0,
+            "a sub-interval step emits no heartbeat (the immediate first tick is consumed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_heartbeat_fires_on_a_turn_that_outlives_the_interval() {
+        // FIX #7 (the positive case): a future that out-lives the heartbeat interval
+        // yields at least one "still building" note — proof the heartbeat actually
+        // fires for a genuinely long turn. Drives the explicit-interval variant with a
+        // tiny real window (10ms) so the test stays fast without a paused-clock harness.
+        let (events, rec) = sink();
+        let slow = async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            42u8
+        };
+        let out =
+            with_step_heartbeat_every(&events, "Long step", Duration::from_millis(10), slow).await;
+        assert_eq!(out, 42);
+        assert!(
+            rec.count(
+                |e| matches!(e, EngineEvent::Note(n) if n.contains("Long step")
+                && n.contains("still building"))
+            ) >= 1,
+            "a turn that outlives the heartbeat interval emits at least one progress note"
         );
     }
 

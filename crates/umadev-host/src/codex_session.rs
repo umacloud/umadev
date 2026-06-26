@@ -78,6 +78,7 @@ use umadev_runtime::{
 };
 
 use crate::spawn_parts;
+use crate::stderr_tail::{drain_stderr_into, StderrTail};
 
 /// Program name for the codex base (overridable for tests / forward compat),
 /// mirroring [`crate::codex::CodexDriver`]'s `UMADEV_CODEX_BIN`.
@@ -89,6 +90,21 @@ fn codex_program() -> String {
 /// JSON-RPC host is launched as `codex app-server`.
 fn codex_app_server_subcmd() -> String {
     std::env::var("UMADEV_CODEX_APP_SERVER_SUBCMD").unwrap_or_else(|_| "app-server".to_string())
+}
+
+/// How long the `initialize` / `thread/start` (and fork `thread/resume`)
+/// handshake may take before [`start`](CodexSession::start) gives up. WITHOUT
+/// this bound a `codex app-server` that spawns but never replies (a wedged
+/// login / config) would hang `start()` forever; the bound surfaces it as a
+/// [`SessionError::Start`] instead. Mirrors opencode's `serve_start_timeout`:
+/// overridable via `UMADEV_CODEX_HANDSHAKE_TIMEOUT_SECS` for slow machines / CI;
+/// `0`/invalid falls back to the 30s default.
+fn handshake_timeout() -> Duration {
+    std::env::var("UMADEV_CODEX_HANDSHAKE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or_else(|| Duration::from_secs(30), Duration::from_secs)
 }
 
 /// How long [`interrupt`](CodexSession::interrupt) waits for the turn id to be
@@ -155,8 +171,16 @@ pub struct CodexSession {
     /// The model id this session was started with, forwarded to a fork's
     /// `thread/resume` so the critic uses the same brain.
     model: String,
-    /// Keep the child handle so it is killed on drop (`kill_on_drop`).
-    _child: tokio::process::Child,
+    /// The `codex app-server` child. Behind a [`std::sync::Mutex`] so the
+    /// `&self` [`BaseSession::try_exit_status`] can do a non-blocking
+    /// `try_wait()` peek without forcing the trait method to take `&mut self`.
+    /// Kept so it is killed on drop (`kill_on_drop`).
+    child: std::sync::Mutex<tokio::process::Child>,
+    /// Bounded tail of the app-server's STDERR, captured by the drain task,
+    /// surfaced via [`BaseSession::stderr_tail`] to explain *why* a base went
+    /// idle (a bad model / not logged in / a config error codex prints to stderr
+    /// before falling silent).
+    stderr: StderrTail,
 }
 
 impl CodexSession {
@@ -182,20 +206,42 @@ impl CodexSession {
     /// so tests can point at a fake `app-server` script without touching the
     /// process-global `UMADEV_CODEX_BIN` env var (which races under parallel
     /// test execution — a sibling test's `remove_var` could be observed first,
-    /// falling back to a real installed `codex` and a different error).
+    /// falling back to a real installed `codex` and a different error). Uses the
+    /// env-configured handshake timeout.
     async fn start_with_program(
         program: &str,
         workspace: &Path,
         model: &str,
         autonomous: bool,
     ) -> Result<Self, SessionError> {
+        Self::start_with_program_timeout(program, workspace, model, autonomous, handshake_timeout())
+            .await
+    }
+
+    /// Start with an explicit handshake `budget` — the testable core, so a test
+    /// passes its own generous bound instead of racing the process-global
+    /// handshake-timeout env var (mirrors opencode's
+    /// `start_with_program_timeout`). The handshake exercises a `/bin/sh` fake
+    /// whose first-line read can be arbitrarily slow under heavy CI load, so the
+    /// thing under test (id correlation / event translation) must not be coupled
+    /// to the new timeout bound.
+    async fn start_with_program_timeout(
+        program: &str,
+        workspace: &Path,
+        model: &str,
+        autonomous: bool,
+        handshake_budget: Duration,
+    ) -> Result<Self, SessionError> {
         let mut child = spawn_app_server(program, workspace)?;
         let stdin = take_pipe(child.stdin.take(), "stdin")?;
         let stdout = take_pipe(child.stdout.take(), "stdout")?;
         // Drain stderr on its own task so a chatty base can never fill (and then
-        // block on) its stderr pipe. We only log it at debug.
+        // block on) its stderr pipe — AND capture a bounded tail so a config
+        // error codex prints to stderr before falling silent can be surfaced as
+        // the idle reason.
+        let stderr_tail = StderrTail::new();
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_stderr(stderr));
+            tokio::spawn(drain_stderr_into(stderr, stderr_tail.clone()));
         }
 
         let stdin = Arc::new(Mutex::new(stdin));
@@ -227,9 +273,12 @@ impl CodexSession {
             program: program.to_string(),
             workspace: workspace.to_path_buf(),
             model: model.to_string(),
-            _child: child,
+            child: std::sync::Mutex::new(child),
+            stderr: stderr_tail,
         };
-        session.handshake(workspace, model, autonomous).await?;
+        session
+            .handshake(workspace, model, autonomous, handshake_budget)
+            .await?;
         Ok(session)
     }
 
@@ -250,12 +299,14 @@ impl CodexSession {
         workspace: &Path,
         model: &str,
         fork_thread_id: &str,
+        handshake_budget: Duration,
     ) -> Result<Self, SessionError> {
         let mut child = spawn_app_server(program, workspace)?;
         let stdin = take_pipe(child.stdin.take(), "stdin")?;
         let stdout = take_pipe(child.stdout.take(), "stdout")?;
+        let stderr_tail = StderrTail::new();
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_stderr(stderr));
+            tokio::spawn(drain_stderr_into(stderr, stderr_tail.clone()));
         }
         let stdin = Arc::new(Mutex::new(stdin));
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
@@ -282,27 +333,60 @@ impl CodexSession {
             program: program.to_string(),
             workspace: workspace.to_path_buf(),
             model: model.to_string(),
-            _child: child,
+            child: std::sync::Mutex::new(child),
+            stderr: stderr_tail,
         };
-        session.fork_handshake(fork_thread_id).await?;
+        session
+            .fork_handshake(fork_thread_id, handshake_budget)
+            .await?;
         Ok(session)
     }
 
+    /// A [`request`](Self::request) bounded by the handshake budget: if the
+    /// `codex app-server` spawned but never replies (a wedged login / config),
+    /// the request elapses instead of hanging `start()` forever. The elapse maps
+    /// to a single, actionable [`SessionError::Start`] (fail-open — never a
+    /// panic, never an unbounded wait). `label` names the step for the error.
+    async fn request_bounded(
+        &self,
+        method: &str,
+        params: &Value,
+        budget: Duration,
+        label: &str,
+    ) -> Result<Value, SessionError> {
+        match tokio::time::timeout(budget, self.request(method, params)).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(SessionError::Start(format!("{label}: {e}"))),
+            Err(_elapsed) => Err(SessionError::Start(
+                "codex handshake timed out — check codex login/config".to_string(),
+            )),
+        }
+    }
+
     /// Run `initialize → initialized → thread/resume` for a read-only fork.
-    async fn fork_handshake(&self, fork_thread_id: &str) -> Result<(), SessionError> {
-        self.request("initialize", &initialize_params())
-            .await
-            .map_err(|e| SessionError::Start(format!("codex fork initialize: {e}")))?;
+    async fn fork_handshake(
+        &self,
+        fork_thread_id: &str,
+        budget: Duration,
+    ) -> Result<(), SessionError> {
+        self.request_bounded(
+            "initialize",
+            &initialize_params(),
+            budget,
+            "codex fork initialize",
+        )
+        .await?;
         self.notify("initialized", json!({}))
             .await
             .map_err(|e| SessionError::Start(format!("codex fork initialized: {e}")))?;
         // Resume the main thread on this independent server, read-only.
-        self.request(
+        self.request_bounded(
             "thread/resume",
             &thread_resume_params(fork_thread_id, &self.workspace, &self.model),
+            budget,
+            "codex thread/resume",
         )
-        .await
-        .map_err(|e| SessionError::Start(format!("codex thread/resume: {e}")))?;
+        .await?;
         Ok(())
     }
 
@@ -312,12 +396,18 @@ impl CodexSession {
         workspace: &Path,
         model: &str,
         autonomous: bool,
+        budget: Duration,
     ) -> Result<(), SessionError> {
         // 1. initialize. `clientInfo` identifies us; we request no experimental
-        //    capabilities (the base default behaviour is what we drive).
-        self.request("initialize", &initialize_params())
-            .await
-            .map_err(|e| SessionError::Start(format!("codex initialize: {e}")))?;
+        //    capabilities (the base default behaviour is what we drive). Bounded:
+        //    a spawned-but-silent app-server elapses here, not forever.
+        self.request_bounded(
+            "initialize",
+            &initialize_params(),
+            budget,
+            "codex initialize",
+        )
+        .await?;
 
         // 2. initialized notification (client → server, no id, no result).
         self.notify("initialized", json!({}))
@@ -326,14 +416,15 @@ impl CodexSession {
 
         // 3. thread/start. `sandbox:"workspace-write"` + `approvalPolicy:"never"`
         //    is the autonomous "write code without asking" tier; the gate tier
-        //    uses `on-request` so the server raises `requestApproval`.
+        //    uses `on-request` so the server raises `requestApproval`. Bounded too.
         let started = self
-            .request(
+            .request_bounded(
                 "thread/start",
                 &thread_start_params(workspace, model, autonomous),
+                budget,
+                "codex thread/start",
             )
-            .await
-            .map_err(|e| SessionError::Start(format!("codex thread/start: {e}")))?;
+            .await?;
         self.thread_id = extract_thread_id(&started)?;
         Ok(())
     }
@@ -547,14 +638,6 @@ fn spawn_error(program: &str, e: &std::io::Error) -> SessionError {
         SessionError::Start(format!("`{program}` not found on PATH"))
     } else {
         SessionError::Start(format!("failed to spawn `{program} app-server`: {e}"))
-    }
-}
-
-/// Drain the child's stderr at debug level so it never backpressures the base.
-async fn drain_stderr(stderr: tokio::process::ChildStderr) {
-    let mut reader = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
-        tracing::debug!(target: "codex_app_server_stderr", "{line}");
     }
 }
 
@@ -1143,8 +1226,14 @@ impl BaseSession for CodexSession {
             // read-only instead (fail-open, still isolated + non-writing).
             Err(_) => self.thread_id.clone(),
         };
-        let s =
-            Self::start_fork(&self.program, &self.workspace, &self.model, &fork_thread_id).await?;
+        let s = Self::start_fork(
+            &self.program,
+            &self.workspace,
+            &self.model,
+            &fork_thread_id,
+            handshake_timeout(),
+        )
+        .await?;
         Ok(Box::new(s))
     }
 
@@ -1159,7 +1248,13 @@ impl BaseSession for CodexSession {
             "turn/start",
             &turn_start_params(&self.thread_id, &directive),
         );
-        self.write_line(&msg).await?;
+        // On a write failure the oneshot we just registered would otherwise leak
+        // in `pending` forever (the reader can never complete an id whose request
+        // never went out). Drop it on the error path, mirroring `request()`.
+        if let Err(e) = self.write_line(&msg).await {
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
         // F4: do NOT inline-await the `turn/start` RESULT here — that coupled the
         // send latency to the server's response timing (claude / opencode return
         // from `send_turn` immediately). The turn id is captured the moment the
@@ -1221,6 +1316,17 @@ impl BaseSession for CodexSession {
         // `kill_on_drop` reap the child. We never block the host on shutdown.
         let _ = self.interrupt().await;
         Ok(())
+    }
+
+    fn stderr_tail(&self) -> Option<String> {
+        self.stderr.snapshot()
+    }
+
+    fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+        // Non-blocking peek at the `codex app-server` child (lock + try_wait
+        // both never block); a contended lock / try_wait error fails open to
+        // None. `Ok(Some)` = the base process exited, `Ok(None)` = still alive.
+        self.child.try_lock().ok()?.try_wait().ok().flatten()
     }
 }
 
@@ -1922,11 +2028,15 @@ done
         let script = dir.path().join("codex");
         write_fake_codex(&script, FAKE_APP_SERVER);
 
-        let mut session = CodexSession::start_with_program(
+        // Generous handshake budget: the thing under test is id-correlation /
+        // event translation, NOT the timeout — a `/bin/sh` fake's first-line read
+        // can be arbitrarily slow under heavy parallel CI load.
+        let mut session = CodexSession::start_with_program_timeout(
             script.to_str().unwrap(),
             dir.path(),
             "gpt-5-codex",
             true,
+            Duration::from_secs(120),
         )
         .await
         .expect("handshake should succeed against the fake app-server");
@@ -1995,11 +2105,14 @@ done
         let script = dir.path().join("codex");
         write_fake_codex(&script, FAKE_APP_SERVER_NO_TURN_RESPONSE);
 
-        let mut session = CodexSession::start_with_program(
+        // Generous handshake budget (see the sibling test): the handshake is not
+        // what's under test here — the prompt send latency is.
+        let mut session = CodexSession::start_with_program_timeout(
             script.to_str().unwrap(),
             dir.path(),
             "gpt-5-codex",
             true,
+            Duration::from_secs(120),
         )
         .await
         .expect("handshake should succeed");
@@ -2048,6 +2161,42 @@ done
         )
         .await;
         assert!(res.is_err(), "a base that never handshakes must fail-open");
+    }
+
+    /// A fake `app-server` that spawns and stays alive but NEVER replies to
+    /// `initialize` (it just sleeps reading stdin). Without the handshake bound
+    /// `start()` would hang forever; the bound must surface a `Start` timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_times_out_when_handshake_never_replies() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("codex");
+        // Reads stdin forever, never writes a response line → no `initialize`
+        // result ever arrives. (Kept alive so this is the "spawned but silent"
+        // case, distinct from the immediate-exit EOF case above.)
+        write_fake_codex(
+            &script,
+            "#!/bin/sh\nwhile IFS= read -r _; do :; done\nsleep 60\n",
+        );
+
+        let res = CodexSession::start_with_program_timeout(
+            script.to_str().unwrap(),
+            dir.path(),
+            "gpt-5-codex",
+            true,
+            // Tiny bound so the test is fast; proves the elapse path, not the value.
+            Duration::from_millis(300),
+        )
+        .await;
+        // (CodexSession isn't Debug, so match on Ok(_) by hand rather than {res:?}.)
+        match res {
+            Ok(_) => panic!("a spawned-but-silent base must NOT start — expected a Start timeout"),
+            Err(SessionError::Start(msg)) => assert!(
+                msg.contains("timed out"),
+                "the idle reason must name the timeout: {msg}"
+            ),
+            Err(other) => panic!("expected a Start timeout, got a different error: {other}"),
+        }
     }
 
     #[tokio::test]

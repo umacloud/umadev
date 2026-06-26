@@ -39,22 +39,31 @@ use std::process::Stdio;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::mpsc;
 use umadev_runtime::{
     ApprovalDecision, BaseSession, SessionError, SessionEvent, TurnStatus, Usage,
 };
 
 use crate::spawn_parts;
+use crate::stderr_tail::{drain_stderr_into, StderrTail};
 
 /// How many events the stdout-reader task may buffer ahead of the consumer.
 const EVENT_CHANNEL_CAP: usize = 256;
 
 /// A live, long-lived `claude` stream-json session.
 pub struct ClaudeSession {
-    child: Child,
+    /// The base child. Behind a [`std::sync::Mutex`] so the `&self`
+    /// [`BaseSession::try_exit_status`] can do a non-blocking `try_wait()` peek
+    /// (which needs `&mut Child`) without forcing the whole trait method to take
+    /// `&mut self`. `kill_on_drop(true)` still fires when the struct (and so the
+    /// `Child`) drops; `end()` kills through the lock.
+    child: std::sync::Mutex<Child>,
     stdin: ChildStdin,
     events: mpsc::Receiver<SessionEvent>,
+    /// Bounded tail of the base's STDERR, captured by the drain task, surfaced
+    /// via [`BaseSession::stderr_tail`] to explain *why* a base went idle.
+    stderr: StderrTail,
     /// The pinned conversation id (also usable for `--resume` on recovery, and
     /// for `--resume <id> --fork-session` to open a read-only critic fork).
     session_id: String,
@@ -154,18 +163,22 @@ impl ClaudeSession {
             .take()
             .ok_or_else(|| SessionError::Start("child stdout not piped".to_string()))?;
         // stderr drains on its OWN task so a base that floods/holds stderr can
-        // never stall the stdout reader (the non-streaming-path lesson).
+        // never stall the stdout reader (the non-streaming-path lesson). The
+        // drain ALSO captures a bounded tail so a config error the base printed
+        // to stderr before falling silent can be surfaced as the idle reason.
+        let stderr_tail = StderrTail::new();
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_stderr(stderr));
+            tokio::spawn(drain_stderr_into(stderr, stderr_tail.clone()));
         }
 
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         tokio::spawn(pump_stdout(stdout, tx));
 
         Ok(Self {
-            child,
+            child: std::sync::Mutex::new(child),
             stdin,
             events: rx,
+            stderr: stderr_tail,
             session_id: session_id.to_string(),
             program: program.to_string(),
             workspace: workspace.to_path_buf(),
@@ -259,8 +272,21 @@ impl BaseSession for ClaudeSession {
     async fn end(&mut self) -> Result<(), SessionError> {
         // Best-effort: killing the child drops stdin (EOF) and tears down the
         // reader/stderr tasks. kill_on_drop is also set as a backstop.
-        let _ = self.child.start_kill();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.start_kill();
+        }
         Ok(())
+    }
+
+    fn stderr_tail(&self) -> Option<String> {
+        self.stderr.snapshot()
+    }
+
+    fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+        // Non-blocking peek (the lock + try_wait both never block): a contended
+        // lock or a try_wait error fails open to None; `Ok(Some(status))` = the
+        // base exited, `Ok(None)` = still alive.
+        self.child.try_lock().ok()?.try_wait().ok().flatten()
     }
 }
 
@@ -282,12 +308,6 @@ async fn pump_stdout(stdout: ChildStdout, tx: mpsc::Sender<SessionEvent>) {
             usage: None,
         })
         .await;
-}
-
-/// Drain stderr to nowhere so a noisy base can't stall the stdout reader.
-async fn drain_stderr(stderr: ChildStderr) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(_)) = lines.next_line().await {}
 }
 
 fn spawn_err(program: &str, e: &std::io::Error) -> String {
@@ -971,6 +991,57 @@ mod tests {
             }
         );
         let _ = s.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stderr_tail_captures_the_base_idle_reason_and_exit_is_observable() {
+        // A base that prints a config error to STDERR then exits (the "bad model
+        // / not logged in" shape). The driver must (1) capture that stderr line
+        // as the idle reason and (2) eventually observe the process exit — the
+        // two diagnostics the TUI needs to explain "base session idle".
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\n\
+             echo 'error: model gpt-bogus is not available' 1>&2\n\
+             exit 7\n",
+        );
+        let s = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-stderr",
+            true,
+        )
+        .await
+        .expect("start");
+
+        // Poll briefly for the child to exit + its stderr to be drained (fail-open
+        // bounded loop, never an unbounded wait).
+        let mut exited = false;
+        let mut tail = None;
+        // Generous bound (≈5s): tokio's Unix child reaper (which `try_wait` depends
+        // on) can be slow to get a worker when the whole test suite runs in parallel
+        // and saturates the cores — a tighter budget made this flake under load.
+        for _ in 0..250 {
+            if s.try_exit_status().is_some() {
+                exited = true;
+            }
+            if let Some(t) = s.stderr_tail() {
+                tail = Some(t);
+            }
+            if exited && tail.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(exited, "try_exit_status must observe the exited child");
+        let tail = tail.expect("stderr_tail must capture the base's stderr error");
+        assert!(
+            tail.contains("gpt-bogus is not available"),
+            "the captured tail must carry the base's idle reason: {tail}"
+        );
     }
 
     #[cfg(unix)]

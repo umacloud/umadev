@@ -306,11 +306,14 @@ fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> Stri
         directive.push_str("\n\n");
     }
     directive.push_str(&format!(
-        "You are now wearing the {role} seat on this team. Do THIS slice of the \
-         goal directly, with real files on disk — edit/create the files, run any \
-         build/test you need, and report only what actually landed. Do not ask me \
-         and do not just narrate; apply the work and end your turn when done.\n\n\
-         ## Your task\n{instruction}\n"
+        "You are now wearing the {role} seat on this team. Implement ONLY the task \
+         below — it is ONE scheduled step of a larger build, not the whole project. \
+         Do it directly, with real files on disk: edit/create the files, run any \
+         build/test you need, and report only what actually landed. Do NOT implement \
+         other parts of the project in this turn — the rest is scheduled separately \
+         and will fail its own acceptance if you build it now. Do not ask me and do \
+         not just narrate; apply ONLY this step's work and STOP — end your turn as \
+         soon as this step is done.\n\n## Your task\n{instruction}\n"
     ));
     let kd = knowledge.trim();
     if !kd.is_empty() {

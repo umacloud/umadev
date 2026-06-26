@@ -72,11 +72,12 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::mpsc;
 use umadev_runtime::{ApprovalDecision, BaseSession, SessionError, SessionEvent, TurnStatus};
 
 use crate::spawn_parts;
+use crate::stderr_tail::{drain_stderr_into, StderrTail};
 
 /// How many events the SSE-reader task may buffer ahead of the consumer.
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -96,8 +97,16 @@ fn serve_start_timeout() -> Duration {
 /// A live, long-lived `opencode serve` session: a resident HTTP/SSE server
 /// child + one opencode session id, driven over reqwest.
 pub struct OpenCodeSession {
-    /// The `opencode serve` child process (killed on drop / `end`).
-    child: Child,
+    /// The `opencode serve` child process (killed on drop / `end`). Behind a
+    /// [`std::sync::Mutex`] so the `&self` [`BaseSession::try_exit_status`] can
+    /// do a non-blocking `try_wait()` peek without forcing the trait method to
+    /// take `&mut self`; `kill_on_drop(true)` still fires on drop.
+    child: std::sync::Mutex<Child>,
+    /// Bounded tail of the server child's STDERR, captured by the drain task,
+    /// surfaced via [`BaseSession::stderr_tail`] to explain *why* a base went
+    /// idle (a bad model / not logged in / a config error opencode prints to
+    /// stderr before falling silent).
+    stderr: StderrTail,
     /// HTTP transport (base url + auth header baked into each call).
     http: HttpCtx,
     /// The opencode session id (`ses_...`) created at `start`.
@@ -212,8 +221,11 @@ impl OpenCodeSession {
             .stdout
             .take()
             .ok_or_else(|| SessionError::Start("opencode serve: no stdout pipe".to_string()))?;
+        // Drain stderr on its own task (so a noisy server can't stall on a full
+        // pipe) AND capture a bounded tail for idle diagnosis.
+        let stderr_tail = StderrTail::new();
         if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(drain_stderr(stderr));
+            tokio::spawn(drain_stderr_into(stderr, stderr_tail.clone()));
         }
 
         // Scrape the real bound base url from the server's stdout (port 0 = the
@@ -247,7 +259,8 @@ impl OpenCodeSession {
         tokio::spawn(pump_sse(stream_http, stream_session, tx));
 
         Ok(Self {
-            child,
+            child: std::sync::Mutex::new(child),
+            stderr: stderr_tail,
             http,
             session_id,
             events: rx,
@@ -352,8 +365,20 @@ impl BaseSession for OpenCodeSession {
         // Best-effort: delete the session, then kill the resident server so no
         // orphan `opencode serve` lingers (kill_on_drop is a backstop).
         let _ = self.http.delete_session(&self.session_id).await;
-        let _ = self.child.start_kill();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.start_kill();
+        }
         Ok(())
+    }
+
+    fn stderr_tail(&self) -> Option<String> {
+        self.stderr.snapshot()
+    }
+
+    fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+        // Non-blocking peek at the `opencode serve` child (lock + try_wait both
+        // never block); a contended lock / try_wait error fails open to None.
+        self.child.try_lock().ok()?.try_wait().ok().flatten()
     }
 }
 
@@ -1183,12 +1208,6 @@ fn spawn_err(program: &str, e: &std::io::Error) -> String {
     } else {
         format!("failed to spawn `{program}`: {e}")
     }
-}
-
-/// Drain stderr to nowhere so a noisy server can't stall on a full pipe.
-async fn drain_stderr(stderr: ChildStderr) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(_)) = lines.next_line().await {}
 }
 
 #[cfg(test)]

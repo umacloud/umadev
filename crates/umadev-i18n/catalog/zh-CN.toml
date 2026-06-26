@@ -41,6 +41,7 @@
 # 状态
 "status.ready" = "就绪"
 "status.aborted" = "本轮已中止"
+"status.stopping" = "正在停止…"
 "status.thinking" = "正在思考…"
 "status.using_tool" = "调用工具"
 "status.act.reading" = "正在读取"
@@ -139,6 +140,7 @@
 "plan.posted" = "计划已就绪——{} 步。下方清单会实时勾选;用 /plan 调整。"
 "plan.panel.title" = "计划"
 "plan.panel.collapsed" = "计划 {}/{} — /plan 展开"
+"plan.panel.active_step" = "步骤 {}/{} · 进行中"
 "plan.none" = "暂无计划。完整构建或一次深思熟虑的任务会在这里生成计划。"
 "plan.review.title" = "团队评审"
 "plan.review.accept" = "通过"

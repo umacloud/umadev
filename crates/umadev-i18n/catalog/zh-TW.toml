@@ -41,6 +41,7 @@
 # 狀態
 "status.ready" = "就緒"
 "status.aborted" = "本輪已中止"
+"status.stopping" = "正在停止…"
 "status.thinking" = "正在思考…"
 "status.using_tool" = "調用工具"
 "status.act.reading" = "正在讀取"
@@ -139,6 +140,7 @@
 "plan.posted" = "計畫已就緒——{} 步。下方清單會即時勾選;用 /plan 調整。"
 "plan.panel.title" = "計畫"
 "plan.panel.collapsed" = "計畫 {}/{} — /plan 展開"
+"plan.panel.active_step" = "步驟 {}/{} · 進行中"
 "plan.none" = "暫無計畫。完整建置或一次深思熟慮的任務會在這裡生成計畫。"
 "plan.review.title" = "團隊評審"
 "plan.review.accept" = "通過"

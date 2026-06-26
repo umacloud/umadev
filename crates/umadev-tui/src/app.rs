@@ -933,6 +933,10 @@ pub struct App {
     pub input_history: VecDeque<String>,
     /// Recall cursor into `input_history`; `None` = editing a fresh draft.
     pub input_history_idx: Option<usize>,
+    /// The in-progress draft stashed when history recall BEGINS (the
+    /// `None → Some(idx)` transition), so stepping forward past the newest
+    /// entry restores what the user was typing instead of clearing it.
+    pub input_history_draft: Option<String>,
     /// When `input` starts with `/` and matches command verbs, this is
     /// the highlight in the slash-command palette popover.
     pub palette_selected: usize,
@@ -999,11 +1003,25 @@ pub struct App {
 
     /// **Per-frame cache of the rendered transcript as plain text** — one
     /// `String` per wrapped visual row, in render order. Rebuilt every frame by
-    /// `ui::render_transcript` from the same folded `Vec<Line>` it paints, so a
-    /// `(content_row, col)` selection point indexes straight into it. This is
-    /// what [`crate::selection::extract`] reads the copied text out of. In a
-    /// `RefCell` because the renderer borrows `&App` (it can't take `&mut`).
+    /// `ui::render_transcript` from the same folded `Vec<Line>` it paints. The
+    /// cache holds the LOGICAL row text only: the leading role-spine / hang-indent
+    /// gutter is stripped and the trailing user-bubble background padding is
+    /// trimmed, so a drag-copy yields clean content (no `▎` glyphs, no leading
+    /// indent, no runs of trailing spaces). The dropped gutter width is recorded
+    /// per row in [`Self::transcript_gutters`] so a screen column still maps to the
+    /// right logical char index. This is what [`crate::selection::extract`] reads
+    /// the copied text out of. In a `RefCell` because the renderer borrows `&App`
+    /// (it can't take `&mut`).
     pub transcript_rows: std::cell::RefCell<Vec<String>>,
+
+    /// **Per-row leading-gutter width** (display columns) stripped from each
+    /// cached row in [`Self::transcript_rows`] — the role-spine glyph + hang
+    /// indent that decorates the painted line but must NOT be copied. The mouse
+    /// mapping subtracts it (a click in the gutter resolves to column 0 of the
+    /// logical text) and the highlight adds it back (it paints the DECORATED line,
+    /// whose char indices are shifted right by the gutter). One entry per row, in
+    /// lockstep with `transcript_rows`. In a `RefCell` for the same borrow reason.
+    pub transcript_gutters: std::cell::RefCell<Vec<usize>>,
 
     /// The transcript rectangle `(left, top, width, height)` from the last
     /// frame, published by `ui::render_transcript`. The event loop maps a mouse
@@ -1119,6 +1137,13 @@ pub struct App {
     pub thinking: bool,
     /// When the current thinking turn began — for the live elapsed readout.
     pub thinking_started: Option<std::time::Instant>,
+    /// `true` while a cancelled run/turn's aborted task is winding down (the
+    /// base subprocess is being killed + its session dropped). Set the instant
+    /// Esc/Ctrl-C fires so the loop keeps redrawing a live "stopping…" state —
+    /// the abort-drain runs OFF the render path, so the UI never freezes waiting
+    /// for it. Cleared by the loop once the drain completes and `cancel_run`
+    /// resets the rest of the state.
+    pub cancelling: bool,
 
     /// **P5c — reasoning-block collapse.** When the base emits a `Thinking`
     /// stream event we push ONE placeholder System line (live spinner) and stamp
@@ -1382,6 +1407,7 @@ impl App {
             attachments: Vec::new(),
             input_history: VecDeque::new(),
             input_history_idx: None,
+            input_history_draft: None,
             palette_selected: 0,
             history: VecDeque::new(),
             transcript_scroll: std::cell::Cell::new(0),
@@ -1398,6 +1424,7 @@ impl App {
             mouse_scroll: true,
             selection: None,
             transcript_rows: std::cell::RefCell::new(Vec::new()),
+            transcript_gutters: std::cell::RefCell::new(Vec::new()),
             transcript_area: std::cell::Cell::new((0, 0, 0, 0)),
             transcript_first_visible: std::cell::Cell::new(0),
             conversation: Vec::new(),
@@ -1421,6 +1448,7 @@ impl App {
             greeted: false,
             thinking: false,
             thinking_started: None,
+            cancelling: false,
             thinking_block_start: None,
             thinking_block_idx: None,
             agentic_in_flight: false,
@@ -2141,12 +2169,14 @@ impl App {
     /// Map the screen point against the last frame's cached geometry.
     fn map_mouse_point(&self, col: u16, row: u16) -> Option<crate::selection::Point> {
         let rows = self.transcript_rows.borrow();
+        let gutters = self.transcript_gutters.borrow();
         crate::selection::screen_to_content(
             col,
             row,
             self.transcript_area.get(),
             self.transcript_first_visible.get(),
             &rows,
+            &gutters,
         )
     }
 
@@ -2284,6 +2314,7 @@ impl App {
         let start = self.byte_index(self.input_cursor);
         let end = self.byte_index(self.input_cursor + 1);
         self.input.replace_range(start..end, "");
+        self.palette_selected = 0;
     }
 
     /// Delete from the cursor back to the start of the line (Ctrl+U).
@@ -2305,6 +2336,7 @@ impl App {
             .find('\n')
             .map_or(self.input.len(), |i| from + i);
         self.input.replace_range(from..end, "");
+        self.palette_selected = 0;
     }
 
     /// Char index of the previous word boundary before the cursor: skip any spaces
@@ -2420,6 +2452,7 @@ impl App {
         self.input.clear();
         self.input_cursor = 0;
         self.input_history_idx = None;
+        self.input_history_draft = None;
         self.attachments.clear();
     }
 
@@ -2513,7 +2546,12 @@ impl App {
             return;
         }
         let new_idx = match self.input_history_idx {
-            None => self.input_history.len() - 1,
+            None => {
+                // Recall is BEGINNING — stash whatever the user was typing so
+                // stepping forward past the newest entry can bring it back.
+                self.input_history_draft = Some(self.input.clone());
+                self.input_history.len() - 1
+            }
             Some(0) => 0,
             Some(i) => i - 1,
         };
@@ -2537,9 +2575,11 @@ impl App {
                 self.input_cursor = self.input_len();
             }
         } else {
+            // Stepped forward past the newest entry — restore the draft stashed
+            // when recall began instead of discarding what the user was typing.
             self.input_history_idx = None;
-            self.input.clear();
-            self.input_cursor = 0;
+            self.input = self.input_history_draft.take().unwrap_or_default();
+            self.input_cursor = self.input_len();
         }
     }
 
@@ -3611,7 +3651,11 @@ impl App {
                 Action::None
             }
             KeyCode::Enter => {
-                let chosen = self.picker_items[self.picker_selected].clone();
+                // Fail-open: a stale `picker_selected` past a now-shorter list must
+                // never index-panic — just no-op the Enter.
+                let Some(chosen) = self.picker_items.get(self.picker_selected).cloned() else {
+                    return Action::None;
+                };
                 // Step 1 - language: set it, then advance to the base picker.
                 if let Some(lang) = chosen.lang {
                     self.lang = lang;
@@ -3843,11 +3887,17 @@ impl App {
             }
 
             // ---- palette navigation (only when /-prefix has matches) ----
-            KeyCode::Up if has_palette => {
+            // EXCEPT while paging input history: once a recall surfaces a past
+            // `/command` (input now starts with `/`, so `has_palette` flips true),
+            // ↑/↓ must KEEP recalling, not hijack into palette nav — otherwise the
+            // user gets stuck on the first recalled slash command and ↑ "stops
+            // working" (reported). A fresh `/` the user is typing (idx == None) still
+            // drives the palette.
+            KeyCode::Up if has_palette && self.input_history_idx.is_none() => {
                 self.cycle_palette(-1);
                 Action::None
             }
-            KeyCode::Down if has_palette => {
+            KeyCode::Down if has_palette && self.input_history_idx.is_none() => {
                 self.cycle_palette(1);
                 Action::None
             }
@@ -3868,7 +3918,7 @@ impl App {
             // wiping the draft with a history recall. Only when the caret is
             // already on the FIRST visual row does ↑ fall through to history. This
             // is what stops the "↑ in a multi-line prompt destroys my draft" bug.
-            KeyCode::Up if !has_palette => {
+            KeyCode::Up if !has_palette || self.input_history_idx.is_some() => {
                 if self.caret_move_up_wrapped() {
                     return Action::None;
                 }
@@ -3883,7 +3933,7 @@ impl App {
             }
             // ↓ mirrors ↑: move the caret DOWN a visual row first; only recall
             // newer history (or restore the draft) when already on the last row.
-            KeyCode::Down if !has_palette => {
+            KeyCode::Down if !has_palette || self.input_history_idx.is_some() => {
                 if self.caret_move_down_wrapped() {
                     return Action::None;
                 }
@@ -4511,7 +4561,25 @@ impl App {
         // into a freshly-reset state.
         self.queued_chat.clear();
         self.pending_quit_confirm = false;
+        // The aborted task has now fully wound down — leave the "stopping…" state.
+        self.cancelling = false;
         self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.cancelled"));
+    }
+
+    /// Enter the **stopping** state the instant Esc/Ctrl-C cancels an in-flight
+    /// run/turn: keep the spinner alive and post a "stopping…" line so the UI
+    /// reads as in-progress while the aborted task winds down OFF the render path
+    /// (the actual drain + reset happens in the event loop's drain branch, which
+    /// calls [`Self::cancel_run`] once the task has released its session). This is
+    /// the public entry the loop calls so [`Self::push`] stays private.
+    pub fn begin_cancelling(&mut self) {
+        self.cancelling = true;
+        self.thinking = true;
+        self.thinking_started = Some(std::time::Instant::now());
+        self.push(
+            ChatRole::System,
+            umadev_i18n::t(self.lang, "status.stopping"),
+        );
     }
 
     #[cfg(test)]
@@ -12787,5 +12855,63 @@ mod tests {
         a.queued_chat.clear();
         a.queued_steer.clear();
         assert_eq!(a.queued_count(), 0, "clears back to zero");
+    }
+
+    #[test]
+    fn history_recall_preserves_the_in_progress_draft() {
+        let mut a = fresh_app(Some("offline"));
+        a.remember_submission("first prompt");
+        a.remember_submission("second prompt");
+        // The user is mid-way through typing a fresh line.
+        a.input = "draft I was typing".to_string();
+        a.input_cursor = a.input_len();
+        // Recall back through history…
+        a.input_history_back();
+        assert_eq!(a.input, "second prompt");
+        a.input_history_back();
+        assert_eq!(a.input, "first prompt");
+        // …then step forward past the newest entry → the DRAFT is restored, not
+        // cleared.
+        a.input_history_forward();
+        assert_eq!(a.input, "second prompt");
+        a.input_history_forward();
+        assert_eq!(
+            a.input, "draft I was typing",
+            "stepping forward past the newest entry restores the stashed draft"
+        );
+        assert_eq!(
+            a.input_cursor,
+            a.input_len(),
+            "cursor lands at the draft end"
+        );
+        assert!(a.input_history_idx.is_none(), "recall is over");
+    }
+
+    #[test]
+    fn picker_enter_with_stale_index_does_not_panic() {
+        let mut a = fresh_app(Some("offline"));
+        a.mode = AppMode::Picker;
+        // Force a selection index past the end of whatever the picker holds.
+        a.picker_selected = a.picker_items.len() + 5;
+        // Must fail-open to a no-op Action, never index-panic.
+        let act = a.apply_key_with_mods(KeyCode::Enter, crossterm::event::KeyModifiers::NONE);
+        assert!(matches!(act, Action::None));
+    }
+
+    #[test]
+    fn forward_delete_and_kill_to_eol_reset_palette_selected() {
+        let mut a = fresh_app(Some("offline"));
+        a.input = "abcdef".to_string();
+        a.input_cursor = 2;
+        a.palette_selected = 3;
+        a.forward_delete();
+        assert_eq!(a.palette_selected, 0, "forward_delete resets the palette");
+
+        a.palette_selected = 4;
+        a.delete_to_line_end();
+        assert_eq!(
+            a.palette_selected, 0,
+            "delete_to_line_end resets the palette"
+        );
     }
 }

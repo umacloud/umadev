@@ -2281,19 +2281,43 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
     if has_plan {
         let done = app.plan_steps.iter().filter(|s| s.status == "done").count();
         let total = app.plan_steps.len();
+        // The 1-based index of the step that's currently Active, if any. During a
+        // long single-step turn the done/total counter sits still (e.g. "0/5"),
+        // which reads as frozen; surfacing WHICH step is running ("步骤 2/5 ·
+        // 进行中") makes the live progress legible even when `done` hasn't moved.
+        let active_step = app
+            .plan_steps
+            .iter()
+            .position(|s| s.status == "active")
+            .map(|i| i + 1);
+        let active_suffix = active_step
+            .map(|n| {
+                format!(
+                    " · {}",
+                    umadev_i18n::tf(
+                        app.lang,
+                        "plan.panel.active_step",
+                        &[&n.to_string(), &total.to_string()],
+                    )
+                )
+            })
+            .unwrap_or_default();
         if app.plan_collapsed {
             lines.push(Line::from(Span::styled(
-                umadev_i18n::tf(
-                    app.lang,
-                    "plan.panel.collapsed",
-                    &[&done.to_string(), &total.to_string()],
+                format!(
+                    "{}{active_suffix}",
+                    umadev_i18n::tf(
+                        app.lang,
+                        "plan.panel.collapsed",
+                        &[&done.to_string(), &total.to_string()],
+                    )
                 ),
                 Style::default().fg(theme::TEXT_MUTED()),
             )));
         } else {
             lines.push(Line::from(Span::styled(
                 format!(
-                    " {} {done}/{total}",
+                    " {} {done}/{total}{active_suffix}",
                     umadev_i18n::t(app.lang, "plan.panel.title")
                 ),
                 Style::default()
@@ -3453,17 +3477,29 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
 
     // ── In-app text-selection layer (the Claude-Code drag-to-copy) ──
     // `folded` is the exact `Vec<Line>` about to be painted: its index IS the
-    // content-row coordinate the selection uses, and its plain text is what a
-    // copy extracts. Publish a plain-text snapshot of every row, the paintable
-    // transcript rectangle, and the index of the row painted at its top — the
-    // event loop maps a mouse `(col,row)` against these. When the scroll-hint
-    // title is shown it steals the top row, so content actually begins at
-    // `area.top + 1` with one row less height; publish that adjusted rect so a
-    // click lands on the right content row.
-    *app.transcript_rows.borrow_mut() = folded
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
-        .collect();
+    // content-row coordinate the selection uses. Publish a plain-text snapshot of
+    // every row, the paintable transcript rectangle, and the index of the row
+    // painted at its top — the event loop maps a mouse `(col,row)` against these.
+    // The cache holds the LOGICAL row text (leading role-spine / hang-indent
+    // gutter stripped, trailing bg padding trimmed) so a drag-copy is clean — no
+    // `▎`, no leading indent, no trailing-space runs polluting the clipboard. The
+    // stripped gutter width is published per row so a screen column still maps to
+    // the right logical char index. When the scroll-hint title is shown it steals
+    // the top row, so content actually begins at `area.top + 1` with one row less
+    // height; publish that adjusted rect so a click lands on the right content row.
+    {
+        let mut rows = app.transcript_rows.borrow_mut();
+        let mut gutters = app.transcript_gutters.borrow_mut();
+        rows.clear();
+        gutters.clear();
+        rows.reserve(folded.len());
+        gutters.reserve(folded.len());
+        for l in &folded {
+            let (logical, gutter) = logical_row_and_gutter(l);
+            rows.push(logical);
+            gutters.push(gutter);
+        }
+    }
     let content_top = if title_shown {
         area.y.saturating_add(1)
     } else {
@@ -3484,7 +3520,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // un-highlighted (never a panic).
     if let Some(sel) = app.selection {
         if !sel.is_empty() {
-            apply_selection_highlight(&mut folded, &sel);
+            apply_selection_highlight(&mut folded, &sel, &app.transcript_gutters.borrow());
         }
     }
 
@@ -3999,6 +4035,49 @@ fn prefold_line_filled(
     out
 }
 
+/// Reduce one painted (decorated) transcript row to the LOGICAL text a drag-copy
+/// should yield, plus the leading-gutter display width that was stripped.
+///
+/// The painted row is `[gutter][content][trailing bg padding]`, where the gutter
+/// is the role-spine glyph (`▎`) plus its hang-indent spaces (repainted down
+/// every wrapped continuation row), and the trailing padding is the bg-tinted
+/// spaces that fill a user bubble out to the full width. Neither is real content,
+/// so copying them pollutes the clipboard (the just-shipped selection feature's
+/// defect): spurious `▎` / indent prefixes and runs of trailing spaces.
+///
+/// This returns `(logical, gutter)`:
+/// - `logical` = the content with the leading spine-glyph gutter removed and any
+///   trailing whitespace trimmed (so a wrapped continuation row and a user-bubble
+///   row both copy clean — no `▎`, no leading indent, no trailing-space padding).
+/// - `gutter` = the display columns dropped from the front, so the caller can map
+///   a screen column to the right logical char index (`screen_to_content`
+///   subtracts it) and paint the highlight on the DECORATED line (whose char
+///   indices are shifted right by exactly this much).
+///
+/// The gutter is detected by the spine glyph: a leading `▎` plus the run of
+/// spaces immediately after it. A row with no spine glyph has gutter 0 and only
+/// its trailing whitespace trimmed. Pure + fail-open.
+fn logical_row_and_gutter(line: &Line<'static>) -> (String, usize) {
+    let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let spine = spine_glyph();
+    let mut chars = full.chars().peekable();
+    let mut gutter = 0usize;
+    if chars.peek() == Some(&spine) {
+        // Drop the spine glyph and the hang-indent spaces that follow it.
+        chars.next();
+        gutter += char_width(spine);
+        while chars.peek() == Some(&' ') {
+            chars.next();
+            gutter += 1;
+        }
+    }
+    let logical: String = chars.collect();
+    // Trim trailing whitespace (the user-bubble bg padding, and any incidental
+    // trailing spaces) — never copied.
+    let logical = logical.trim_end().to_string();
+    (logical, gutter)
+}
+
 /// Paint the in-app text-selection highlight onto the already-folded transcript
 /// rows. `folded` is the exact `Vec<Line>` about to be rendered (its index is
 /// the content-row coordinate); `sel` is the live selection. Only the rows in
@@ -4006,8 +4085,33 @@ fn prefold_line_filled(
 /// `[anchor.col, cursor.col)`, a multi-row one highlights the first row from
 /// `anchor.col` to its end, every middle row fully, and the last row up to
 /// `cursor.col`. Fail-open: an out-of-range row index is skipped, never a panic.
-fn apply_selection_highlight(folded: &mut [Line<'static>], sel: &crate::selection::Selection) {
+///
+/// `gutters[i]` is the leading-gutter width stripped from cached row `i` (see
+/// [`logical_row_and_gutter`]); the selection columns are in LOGICAL coordinates,
+/// so each is shifted right by the row's gutter to index the decorated line.
+fn apply_selection_highlight(
+    folded: &mut [Line<'static>],
+    sel: &crate::selection::Selection,
+    gutters: &[usize],
+) {
+    let g = |row: usize| gutters.get(row).copied().unwrap_or(0);
+    let shift = |row: usize, col: usize| col.saturating_add(g(row));
     let ((sr, sc), (er, ec)) = sel.normalized();
+    let sc = shift(sr, sc);
+    let ec = shift(er, ec);
+    apply_selection_highlight_cols(folded, sr, sc, er, ec);
+}
+
+/// The column-space-agnostic core of [`apply_selection_highlight`]: highlights
+/// `folded[sr][sc..]` … `folded[er][..ec]` where the columns are already in the
+/// DECORATED line's char-index space.
+fn apply_selection_highlight_cols(
+    folded: &mut [Line<'static>],
+    sr: usize,
+    sc: usize,
+    er: usize,
+    ec: usize,
+) {
     if sr == er {
         if let Some(row) = folded.get_mut(sr) {
             *row = highlight_row(row, sc, ec);
@@ -6215,7 +6319,7 @@ mod tests {
             anchor: (0, 6),
             cursor: (2, 4),
         };
-        apply_selection_highlight(&mut folded, &sel);
+        apply_selection_highlight(&mut folded, &sel, &[]);
         // Row 0: chars [6,end) highlighted ("line").
         assert_eq!(
             selected_mask(&folded[0]),
@@ -6228,6 +6332,66 @@ mod tests {
             selected_mask(&folded[2]),
             vec![true, true, true, true, false, false, false, false, false]
         );
+    }
+
+    #[test]
+    fn apply_selection_highlight_shifts_logical_cols_by_the_gutter() {
+        // The painted line carries a 2-col gutter ("xy") before "hello"; the
+        // selection cols are in LOGICAL space ([0,3) = "hel"), so the highlight
+        // must land on the decorated chars 2..5, leaving the gutter unselected.
+        let mut folded = vec![Line::from(Span::raw("xyhello"))];
+        let sel = crate::selection::Selection {
+            anchor: (0, 0),
+            cursor: (0, 3),
+        };
+        apply_selection_highlight(&mut folded, &sel, &[2]);
+        assert_eq!(
+            selected_mask(&folded[0]),
+            vec![false, false, true, true, true, false, false],
+            "logical [0,3) maps to decorated [2,5) — gutter stays unselected"
+        );
+    }
+
+    #[test]
+    fn logical_row_and_gutter_strips_spine_and_trailing_padding() {
+        // A wrapped continuation row: spine glyph + hang space, then content. The
+        // logical text drops the `▎`-gutter and the gutter width is 2.
+        let spine = spine_glyph();
+        let cont = Line::from(vec![
+            Span::raw(format!("{spine} ")),
+            Span::raw("wrapped tail"),
+        ]);
+        let (logical, gutter) = logical_row_and_gutter(&cont);
+        assert_eq!(logical, "wrapped tail");
+        assert_eq!(gutter, 2);
+        assert!(
+            !logical.contains(spine),
+            "no spine glyph leaks into the copy"
+        );
+        assert!(
+            !logical.starts_with(' '),
+            "no leading hang-indent in the copy"
+        );
+
+        // A user-bubble row: `▎ ` spine prefix + content + trailing bg padding.
+        let bubble = Line::from(vec![
+            Span::raw(format!("{spine} ")),
+            Span::raw("user said hi"),
+            Span::raw("      "), // the fill_bg padding out to full width
+        ]);
+        let (logical, gutter) = logical_row_and_gutter(&bubble);
+        assert_eq!(logical, "user said hi");
+        assert_eq!(gutter, 2);
+        assert!(
+            !logical.ends_with(' '),
+            "no trailing-space padding in the copy"
+        );
+
+        // A plain row with no spine: gutter 0, content kept, trailing trimmed.
+        let plain = Line::from(Span::raw("plain content   "));
+        let (logical, gutter) = logical_row_and_gutter(&plain);
+        assert_eq!(logical, "plain content");
+        assert_eq!(gutter, 0);
     }
 
     #[test]

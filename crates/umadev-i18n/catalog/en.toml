@@ -41,6 +41,7 @@
 # Status
 "status.ready" = "Ready"
 "status.aborted" = "this round was aborted"
+"status.stopping" = "stopping…"
 "status.thinking" = "thinking…"
 "status.using_tool" = "using"
 "status.act.reading" = "reading"
@@ -139,6 +140,7 @@
 "plan.posted" = "Plan posted — {} steps. Track them in the checklist; steer with /plan."
 "plan.panel.title" = "Plan"
 "plan.panel.collapsed" = "Plan {}/{} — /plan to expand"
+"plan.panel.active_step" = "step {}/{} · running"
 "plan.none" = "No active plan. A build or a deliberate turn posts one here."
 "plan.review.title" = "Team review"
 "plan.review.accept" = "accepts"

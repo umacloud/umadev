@@ -64,6 +64,8 @@ pub use codex_session::CodexSession;
 pub use opencode::OpenCodeDriver;
 pub use opencode_session::OpenCodeSession;
 
+pub mod stderr_tail;
+
 /// The env var UmaDev sets on a base subprocess to mark "UmaDev is driving this
 /// run/session" — its value is the project root being governed.
 ///

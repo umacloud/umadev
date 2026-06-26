@@ -661,6 +661,30 @@ pub trait BaseSession: Send {
 
     /// Close the session and release the underlying process / server.
     async fn end(&mut self) -> Result<(), SessionError>;
+
+    /// A bounded tail of the base's STDERR — the diagnostic the TUI surfaces to
+    /// tell the user *why* a base went idle (a bad model id, "not logged in", a
+    /// config error the base prints to stderr before falling silent). Without
+    /// this the user only ever sees "base session idle." with no cause.
+    ///
+    /// Returns the last few captured stderr lines (driver-bounded, e.g. ~20
+    /// lines / ~4KB), or `None` when nothing was captured. **Fail-open:** the
+    /// default returns `None`; capturing must never block the stdout reader or
+    /// the host, so a contended / empty buffer just yields `None`.
+    fn stderr_tail(&self) -> Option<String> {
+        None
+    }
+
+    /// The base child's exit status if it has already exited, else `None` (still
+    /// alive, or no child / unknown). Lets a caller distinguish "the base
+    /// process died" from "alive but silent" when a session goes idle.
+    ///
+    /// **Fail-open:** the default returns `None`; an implementation does a
+    /// non-blocking `try_wait()` and maps any error to `None` — it never blocks
+    /// and never reports a false exit.
+    fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+        None
+    }
 }
 
 #[cfg(test)]

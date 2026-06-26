@@ -423,15 +423,25 @@ struct BrainStep {
 /// session for the later fallback build. Cleanly denying ends the turn and leaves
 /// the session usable. Fail-open: a dead session / a timeout / an empty reply →
 /// `None` (the caller then runs the plain build on the still-usable session).
-async fn drain_plan_turn(session: &mut dyn BaseSession, directive: String) -> Option<String> {
+async fn drain_plan_turn(
+    session: &mut dyn BaseSession,
+    directive: String,
+    deadline: std::time::Instant,
+) -> Option<String> {
     use umadev_runtime::{ApprovalDecision, SessionEvent};
     if session.send_turn(directive).await.is_err() {
         return None;
     }
     let mut text = String::new();
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(180), session.next_event()).await
-        {
+        // LOW #5: bound each event wait by the SHARED run deadline (capped at the
+        // original 180s per-event idle window). The planning turn can never run past
+        // the whole-build budget, so planning time is attributed to the run clock.
+        // A spent budget yields a zero wait → the turn settles immediately (fail-open:
+        // a partial/empty reply degrades to `None`, i.e. the plain single-turn build).
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let wait = remaining.min(std::time::Duration::from_secs(180));
+        match tokio::time::timeout(wait, session.next_event()).await {
             Ok(Some(SessionEvent::TextDelta(t))) => text.push_str(&t),
             Ok(Some(SessionEvent::TurnDone { .. })) => break,
             // The plan turn forbids tools; an approval request means the base tried to
@@ -470,6 +480,10 @@ pub async fn synthesize_plan(
     options: &RunOptions,
     requirement: &str,
     route: &RoutePlan,
+    // LOW #5: the SHARED run deadline. The planning drain is bounded by it so the
+    // whole deliberate build (planning + build) shares one clock instead of the old
+    // fixed 180s-per-event timeout that left planning unattributed to the budget.
+    deadline: std::time::Instant,
 ) -> Option<Plan> {
     let _ = options; // reserved (model/trust already live on the session)
     let team: Vec<&str> = route.team.iter().map(|s| s.role_id()).collect();
@@ -510,7 +524,7 @@ pub async fn synthesize_plan(
          no code fence, no prose. Do NOT write any files or run any commands in this \
          turn; this is the PLAN only.\n\n{user}"
     );
-    let text = drain_plan_turn(session, directive).await?;
+    let text = drain_plan_turn(session, directive, deadline).await?;
     let json = crate::continuous::extract_json_object(&text)?;
     let raw: BrainPlan = serde_json::from_str(&json).ok()?;
     let plan = Plan {
@@ -794,7 +808,12 @@ mod tests {
             false,
         );
         let responded = std::sync::Arc::clone(&s.responded);
-        let out = drain_plan_turn(&mut s, "plan please".into()).await;
+        let out = drain_plan_turn(
+            &mut s,
+            "plan please".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+        .await;
         assert_eq!(
             out.as_deref(),
             Some("{\"steps\":[]}"),
@@ -824,12 +843,71 @@ mod tests {
             true, // respond fails
         );
         let interrupts = std::sync::Arc::clone(&s.interrupts);
-        let out = drain_plan_turn(&mut s, "plan please".into()).await;
+        let out = drain_plan_turn(
+            &mut s,
+            "plan please".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+        .await;
         assert!(out.is_none(), "a failed respond bails out fail-open");
         assert_eq!(
             *interrupts.lock().unwrap(),
             1,
             "the session was interrupted to un-wedge it for the fallback build"
+        );
+    }
+
+    /// A session whose `next_event` never resolves (the base hangs holding the pipe
+    /// open) — used to prove the LOW #5 deadline bound actually settles the drain.
+    struct HangingPlanSession;
+
+    #[async_trait::async_trait]
+    impl BaseSession for HangingPlanSession {
+        async fn send_turn(
+            &mut self,
+            _directive: String,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_plan_turn_is_bounded_by_the_shared_run_deadline() {
+        // LOW #5: the planning drain is bounded by the SHARED run deadline (capped at
+        // the per-event idle window), so planning shares the build's one clock instead
+        // of its own fixed 180s timeout. An ALREADY-SPENT deadline must settle the
+        // drain immediately (a near-zero wait → None), never block on a hung base for
+        // the full 180s. We assert it returns promptly under a generous test ceiling.
+        let mut s = HangingPlanSession;
+        let spent = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drain_plan_turn(&mut s, "plan please".into(), spent),
+        )
+        .await
+        .expect("the drain must settle on the spent deadline, not block 180s");
+        assert!(
+            settled.is_none(),
+            "a hung base under a spent deadline settles fail-open to None (the plain single-turn build)"
         );
     }
 

@@ -2427,6 +2427,35 @@ async fn next_chat_event_idle(
 /// never killed while it is still streaming, but a true silent hang settles.
 const CHAT_SESSION_IDLE: Duration = Duration::from_secs(300);
 
+/// Enrich a base-failure reason with the base's OWN stderr tail + exit status, so
+/// "base session idle" / "ended mid-turn" tells the user WHY. A broken base
+/// model/login config writes its error to stderr (previously discarded) and never
+/// to stdout, so the bare reason gave no diagnosis. Fail-open: a missing tail / exit
+/// → the bare reason. The tail is bounded (last 3 non-empty lines, ≤280 chars).
+fn enrich_base_failure(
+    base_msg: &str,
+    exit: Option<std::process::ExitStatus>,
+    stderr_tail: Option<String>,
+) -> String {
+    let mut msg = match exit {
+        Some(s) if !s.success() => format!("{base_msg}(base 进程已退出: {s})"),
+        _ => base_msg.to_string(),
+    };
+    if let Some(tail) = stderr_tail {
+        let lines: Vec<&str> = tail
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let start = lines.len().saturating_sub(3);
+        let snippet: String = lines[start..].join(" | ").chars().take(280).collect();
+        if !snippet.is_empty() {
+            msg = format!("{msg} — base stderr: {snippet}");
+        }
+    }
+    msg
+}
+
 /// A WARM resident chat session: the live base process paired with the firmware it
 /// was opened with (kept so a non-claude base — which has no native system slot —
 /// can re-prefix that firmware onto its FIRST directive). The session is spawned,
@@ -2662,21 +2691,36 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         let ev = match next_chat_event_idle(session.as_mut(), CHAT_SESSION_IDLE).await {
             Ok(Some(ev)) => ev,
             Ok(None) => {
-                // Session ended mid-turn (process dead / EOF) — drop it, report.
+                // Session ended mid-turn (process dead / EOF) — capture stderr + exit
+                // status before dropping so the user sees WHY (e.g. a base that
+                // crashed on a bad config), then report.
+                let tail = session.stderr_tail();
+                let exit = session.try_exit_status();
                 let _ = session.end().await;
+                let reason = enrich_base_failure("base session ended mid-turn", exit, tail);
                 let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                     "route.failed",
-                    &[&backend, "base session ended mid-turn"],
+                    &[&backend, &reason],
                 )));
                 return;
             }
             Err(()) => {
-                // Idle hang — interrupt + drop the session, settle honestly.
+                // Idle hang — capture the base's OWN stderr + exit status FIRST (a
+                // broken model/login config errors to stderr, never to stdout, so the
+                // bare "base session idle" hid the cause), then interrupt + drop the
+                // session and settle honestly with the diagnosis.
+                let tail = session.stderr_tail();
+                let exit = session.try_exit_status();
                 let _ = session.interrupt().await;
                 let _ = session.end().await;
+                let reason = enrich_base_failure(
+                    "base session idle(底座 300s 无输出 — 检查它的登录/模型配置)",
+                    exit,
+                    tail,
+                );
                 let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
                     "route.failed",
-                    &[&backend, "base session idle"],
+                    &[&backend, &reason],
                 )));
                 return;
             }
@@ -3311,6 +3355,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     // Handle to the in-flight pipeline task, so `/cancel` can abort it.
     let mut run_task: Option<tokio::task::JoinHandle<()>> = None;
+    // An aborted task that is winding down after a cancel. `abort()` only
+    // SCHEDULES cancellation — the base subprocess keeps generating until the
+    // task unwinds and drops its owned session (Child kill_on_drop / releases the
+    // session lock). We must wait for that BEFORE the post-cancel cleanup (which
+    // `try_lock`s the holders). But that wait must NOT block the render path, or
+    // the UI freezes for up to the drain budget. So the handle is parked here and
+    // drained in a dedicated `select!` branch while the loop keeps redrawing the
+    // live "stopping…" state. `Some` only between the Esc/Ctrl-C keypress and the
+    // drain completing.
+    let mut cancel_drain: Option<tokio::task::JoinHandle<()>> = None;
     // The director's persistent base session for the continuous run path — ONE
     // brain held across the whole TUI session so context flows across gate
     // blocks (see `spawn_continuous_block`). Always empty unless the continuous
@@ -3528,7 +3582,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             // is ignored, never blocking the loop.
                             MouseEventKind::Up(MouseButton::Left) => {
                                 if let Some(text) = app.selection_finish_copy() {
-                                    copy_to_clipboard(&text);
+                                    // The native clipboard helper spawns a child and
+                                    // blocks on its stdin write + `wait()`; a wedged
+                                    // pbcopy/xclip would otherwise stall this tokio
+                                    // worker mid-render. Push it to the blocking pool
+                                    // fire-and-forget (the OSC 52 fallback lives inside
+                                    // it). Fail-open: errors are ignored.
+                                    tokio::task::spawn_blocking(move || copy_to_clipboard(&text));
                                 }
                             }
                             _ => {}
@@ -3611,60 +3671,42 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             }
                             Action::Cancel => {
                                 if let Some(h) = run_task.take() {
+                                    // Schedule cancellation, then get the WAIT off the
+                                    // render path: park the aborting handle and let the
+                                    // dedicated `cancel_drain` branch await it (bounded)
+                                    // while the loop keeps drawing the "stopping…" state.
+                                    // The post-cancel cleanup runs there, AFTER the task
+                                    // has actually released its session lock — so the
+                                    // try_lock cleanup never races a still-held lock.
                                     h.abort();
-                                    // `abort()` only SCHEDULES cancellation — the base
-                                    // subprocess keeps generating until the task actually
-                                    // unwinds and drops its owned session (Child
-                                    // kill_on_drop) / releases the session_holder lock.
-                                    // AWAIT the handle (bounded) so the work is genuinely
-                                    // stopped BEFORE we show "已中止" and clean up — without
-                                    // this the UI said "aborted" while the base was still
-                                    // running (user-reported), and the continuous-run
-                                    // cleanup below `try_lock`ed against a still-held lock
-                                    // and silently skipped, leaking the session.
-                                    let _ =
-                                        tokio::time::timeout(Duration::from_secs(2), h).await;
-                                }
-                                // A continuous run was just cancelled: close + drop
-                                // the parked director session so the NEXT run opens
-                                // a fresh brain (an aborted mid-turn session may be
-                                // wedged). Best-effort `end()` under a try_lock so
-                                // cancel never blocks; clear the active flag.
-                                if continuous_run_active {
-                                    if let Ok(mut g) = session_holder.try_lock() {
-                                        if let Some(mut s) = g.take() {
-                                            let _ = s.end().await;
+                                    cancel_drain = Some(h);
+                                    // Keep the spinner alive + show an explicit
+                                    // "stopping…" line so the cancel reads as in-progress
+                                    // (not frozen) until the drain settles.
+                                    app.begin_cancelling();
+                                } else {
+                                    // Nothing in flight — cancel is an immediate reset
+                                    // (still drop any parked session + drain stale
+                                    // events so a buffered reply can't resurrect state).
+                                    if continuous_run_active {
+                                        if let Ok(mut g) = session_holder.try_lock() {
+                                            if let Some(mut s) = g.take() {
+                                                let _ = s.end().await;
+                                            }
                                         }
+                                        continuous_run_active = false;
                                     }
-                                    continuous_run_active = false;
+                                    let parked = chat_session_holder
+                                        .try_lock()
+                                        .ok()
+                                        .and_then(|mut g| g.take());
+                                    if let Some(s) = parked {
+                                        s.end().await;
+                                    }
+                                    while engine_rx.try_recv().is_ok() {}
+                                    while route_rx.try_recv().is_ok() {}
+                                    app.cancel_run();
                                 }
-                                // ESC / Ctrl-C on a chat turn: the aborted task OWNED
-                                // the resident chat session (it `take()`s it from the
-                                // holder for the turn), so `h.abort()` already dropped
-                                // it — the subprocess dies with the task. Best-effort
-                                // close + clear ANY session still parked in the holder
-                                // (the idle case, or a turn that hadn't taken it yet) so
-                                // a wedged session never lingers; the next chat message
-                                // re-opens a fresh one. `try_lock` so cancel never blocks.
-                                let parked = chat_session_holder
-                                    .try_lock()
-                                    .ok()
-                                    .and_then(|mut g| g.take());
-                                if let Some(s) = parked {
-                                    s.end().await;
-                                }
-                                // Drain any events the aborted task already
-                                // queued (e.g. a buffered PipelineStarted /
-                                // GateOpened) so they can't resurrect run state
-                                // after the reset below.
-                                while engine_rx.try_recv().is_ok() {}
-                                // Same for a route decision the aborted agentic
-                                // turn already emitted: a late `AgenticDone` /
-                                // `Failed` waiting in `route_rx` would otherwise
-                                // be picked up next tick and append a stale reply
-                                // AFTER the cancel reset.
-                                while route_rx.try_recv().is_ok() {}
-                                app.cancel_run();
                             }
                             Action::StartRun(req) | Action::StartGoal(req) => {
                                 // `/goal <objective>` and `/run` BOTH ride this one
@@ -4090,6 +4132,50 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         }
                     }
                 }
+            }
+            // Drain a cancelled task OFF the render path. The branch is only armed
+            // while `cancel_drain` holds an aborting handle; it awaits the handle
+            // (bounded so a wedged base can't hang the drain forever), then runs the
+            // post-cancel cleanup that the `Action::Cancel` arm deferred. Until this
+            // fires the loop keeps drawing the live "stopping…" state every tick.
+            () = async {
+                // SAFETY: the `if` guard guarantees `Some`.
+                let h = cancel_drain.as_mut().expect("guarded by cancel_drain.is_some()");
+                let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+            }, if cancel_drain.is_some() => {
+                cancel_drain = None;
+                // The aborted task has wound down (or the budget elapsed) — its
+                // session lock is released, so the cleanup `try_lock`s succeed.
+                // A continuous run was cancelled: close + drop the parked director
+                // session so the NEXT run opens a fresh brain.
+                if continuous_run_active {
+                    if let Ok(mut g) = session_holder.try_lock() {
+                        if let Some(mut s) = g.take() {
+                            let _ = s.end().await;
+                        }
+                    }
+                    continuous_run_active = false;
+                }
+                // ESC / Ctrl-C on a chat turn: the aborted task OWNED the resident
+                // chat session, so the abort already dropped it. Best-effort close +
+                // clear ANY session still parked (idle case, or a turn that hadn't
+                // taken it yet) so a wedged session never lingers.
+                let parked = chat_session_holder
+                    .try_lock()
+                    .ok()
+                    .and_then(|mut g| g.take());
+                if let Some(s) = parked {
+                    s.end().await;
+                }
+                // Drain any events the aborted task already queued (a buffered
+                // PipelineStarted / GateOpened) so they can't resurrect run state.
+                while engine_rx.try_recv().is_ok() {}
+                // Same for a route decision the aborted agentic turn already emitted:
+                // a late `AgenticDone` / `Failed` would otherwise append a stale reply
+                // AFTER the cancel reset.
+                while route_rx.try_recv().is_ok() {}
+                app.cancelling = false;
+                app.cancel_run();
             }
             _ = tick.tick() => app.tick(),
         }
