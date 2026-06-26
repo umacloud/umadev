@@ -283,6 +283,7 @@ export function FloatingDiagnosticTerminal({
 export default function Home() {
   const [lang, setLang] = useState<Lang>("zh");
   const [view, setView] = useState<View>("home");
+  const [wechatOpen, setWechatOpen] = useState(false);
 
   // Auto language detection based on browser locale
   useEffect(() => {
@@ -667,8 +668,45 @@ export default function Home() {
             <GitHubIcon />
             GitHub
           </a>
+          <button
+            className={styles.githubButton}
+            type="button"
+            onClick={() => setWechatOpen(true)}
+          >
+            {lang === "zh" ? "微信群" : "WeChat"}
+          </button>
         </div>
       </nav>
+      {wechatOpen && (
+        <div
+          className={styles.wechatOverlay}
+          onClick={() => setWechatOpen(false)}
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className={styles.wechatCard} onClick={(e) => e.stopPropagation()}>
+            <button
+              className={styles.wechatClose}
+              type="button"
+              onClick={() => setWechatOpen(false)}
+              aria-label={lang === "zh" ? "关闭" : "Close"}
+            >
+              ×
+            </button>
+            <h3 className={styles.wechatTitle}>{lang === "zh" ? "官方微信群" : "Official WeChat Group"}</h3>
+            <Image
+              src="/assets/wechat-qr.png"
+              alt={lang === "zh" ? "官方微信群二维码" : "Official WeChat group QR code"}
+              width={240}
+              height={240}
+              className={styles.wechatQr}
+            />
+            <p className={styles.wechatHint}>
+              {lang === "zh" ? "微信扫码加入官方交流群" : "Scan with WeChat to join the official group"}
+            </p>
+          </div>
+        </div>
+      )}
 
       <main className={styles.main}>
         {view === "home" && (

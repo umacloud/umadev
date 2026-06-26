@@ -839,3 +839,9 @@ Clippy 以 `pedantic` 層級全 workspace 執行；新程式碼必須以 `-D war
 ## 授權
 
 [MIT](LICENSE)。
+
+## 官方微信群
+
+掃碼加入官方交流群,獲取更新、回報問題、和其他使用者交流:
+
+<img src="docs/assets/wechat-qr.png" alt="官方微信群 QR Code" width="240">

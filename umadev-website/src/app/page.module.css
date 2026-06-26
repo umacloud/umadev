@@ -6254,3 +6254,68 @@
   }
 }
 
+
+/* ── Official WeChat group modal ───────────────────────────────────────── */
+.wechatOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(2, 8, 12, 0.78);
+  backdrop-filter: blur(6px);
+  animation: wechatFade 0.18s ease;
+}
+.wechatCard {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 30px 30px 22px;
+  border: 1px solid rgba(1, 203, 241, 0.42);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(8, 20, 26, 0.98), rgba(4, 12, 16, 0.98));
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.6), inset 0 0 32px rgba(1, 203, 241, 0.06);
+}
+.wechatClose {
+  position: absolute;
+  top: 10px;
+  right: 13px;
+  width: 28px;
+  height: 28px;
+  font-size: 21px;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.7);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: color 0.18s ease;
+}
+.wechatClose:hover {
+  color: rgba(1, 203, 241, 0.9);
+}
+.wechatTitle {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: #e8f6fb;
+}
+.wechatQr {
+  width: 240px;
+  height: 240px;
+  border-radius: 10px;
+  background: #fff;
+  padding: 10px;
+}
+.wechatHint {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(200, 230, 240, 0.7);
+}
+@keyframes wechatFade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
