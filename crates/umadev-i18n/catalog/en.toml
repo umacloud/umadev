@@ -532,6 +532,8 @@
 # Transcript scroll indicators (counts are placeholders; arrows are symbols)
 "tui.scroll.both" = "↑ {} · ↓ {} more — End to bottom"
 "tui.scroll.above" = "↑ {} lines above"
+# Toast after a drag-select copy ({} = number of characters copied to clipboard)
+"tui.copied" = "Copied {} characters"
 # Tool-call rows: merged read/grep batch headline + grep metric
 "tui.tool.batch" = "inspected {} files"
 "tui.tool.matches" = "{} matches"

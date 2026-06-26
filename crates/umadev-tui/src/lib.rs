@@ -31,6 +31,7 @@
 
 pub mod app;
 pub mod config;
+pub mod selection;
 pub mod ui;
 
 use std::io::Stdout;
@@ -41,7 +42,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind, MouseEventKind,
+    EventStream, KeyEventKind, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -3169,6 +3170,74 @@ fn parse_osc_bg(s: &str) -> Option<bool> {
     Some(luminance > 0.5)
 }
 
+/// Copy `text` to the system clipboard from inside the alternate screen, the way
+/// Claude Code does: three paths, most-compatible first.
+///
+/// 1. **native** (preferred on a LOCAL session) — shell out to the OS clipboard
+///    command, piping `text` to its stdin: `pbcopy` on macOS; on Linux/BSD try
+///    `wl-copy`, then `xclip -selection clipboard`, then `xsel --clipboard
+///    --input`. The first that spawns + exits cleanly wins. This is the path
+///    that works in **macOS Terminal.app**, which has no OSC 52 support.
+/// 2. **osc52** (fallback) — write the OSC 52 escape (`selection::osc52_sequence`)
+///    to stdout. Used when the session is **remote** (`SSH_CONNECTION` /
+///    `SSH_TTY` set — where a native command would target the far host, not the
+///    user's terminal) OR when no native command was found / succeeded.
+///
+/// Every step is best-effort / fail-open: a missing binary, a spawn error, or a
+/// non-zero exit silently falls through to OSC 52; nothing here panics or
+/// blocks the UI loop.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write as _;
+
+    // Pipe `text` to one native clipboard command's stdin; `true` only when it
+    // spawned AND exited successfully. stdout/stderr are discarded.
+    fn try_native(cmd: &str, args: &[&str], text: &str) -> bool {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        // (the outer `use` is for the OSC 52 fallback; this nested fn needs its own)
+        let Ok(mut child) = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            // Ignore a broken pipe — we still wait + check the exit status below.
+            let _ = stdin.write_all(text.as_bytes());
+            // Drop stdin so the child sees EOF and can finish.
+        }
+        child.wait().is_ok_and(|s| s.success())
+    }
+
+    let is_remote =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+
+    if !is_remote {
+        // LOCAL → prefer the native OS command (the path that works everywhere,
+        // including macOS Terminal.app). First success wins; return on it.
+        let native_ok = if cfg!(target_os = "macos") {
+            try_native("pbcopy", &[], text)
+        } else {
+            try_native("wl-copy", &[], text)
+                || try_native("xclip", &["-selection", "clipboard"], text)
+                || try_native("xsel", &["--clipboard", "--input"], text)
+        };
+        if native_ok {
+            return;
+        }
+    }
+
+    // REMOTE, or no native command available/succeeded → OSC 52 (the SSH-safe
+    // fallback, and the only path the terminal itself can honor here).
+    let seq = crate::selection::osc52_sequence(text);
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
 fn setup_terminal() -> Result<Term> {
     // Best-effort teardown for a MID-SETUP failure. If raw mode is already on
     // and a LATER step (alt screen, mouse capture, …) fails, a bare `?` would
@@ -3200,15 +3269,16 @@ fn setup_terminal() -> Result<Term> {
     // IME commits, which most terminals deliver as a paste) arrive as one
     // atomic `Event::Paste` instead of a scrambled stream of `Char` events.
     stdout.execute(EnableBracketedPaste).map_err(fail)?;
-    // Mouse capture is OFF by default so the terminal's native click-drag text
-    // SELECTION + copy keep working — the user requirement that scrolling must NOT
-    // break copy. The transcript scrolls via the keyboard (PageUp/PageDown,
-    // Home/End, Shift+↑/↓, Ctrl+Alt+U/D); `/mouse` opts INTO wheel-scroll (which
-    // then takes over selection). We're on the alternate screen (no native
-    // scrollback), so wheel-scroll AND native click-drag can't coexist here —
-    // getting BOTH needs an in-app selection layer (claude-code's approach over its
-    // own alt screen), tracked as a focused feature. Teardown + the panic hook
-    // DisableMouseCapture regardless.
+    // Mouse capture is ON by default. We're on the alternate screen (no native
+    // scrollback), where the terminal can't give us BOTH wheel-scroll AND native
+    // click-drag copy — so UmaDev runs its OWN selection layer (the Claude Code
+    // approach): capture the mouse, page the transcript on the wheel, render the
+    // drag-selection highlight ourselves, and copy via OSC 52. `/mouse` toggles
+    // capture OFF (DisableMouseCapture) for users who prefer the terminal's native
+    // click-drag selection. The transcript also scrolls via the keyboard
+    // (PageUp/PageDown, Home/End, Shift+↑/↓, Ctrl+Alt+U/D). Teardown + the panic
+    // hook DisableMouseCapture regardless.
+    stdout.execute(EnableMouseCapture).map_err(fail)?;
     // Show the terminal cursor so the user sees a blinking caret in the
     // input box (positioned via frame.set_cursor_position in render_prompt).
     stdout.execute(crossterm::cursor::Show).map_err(fail)?;
@@ -3430,14 +3500,37 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // resize repaint immediately instead of tearing until the next
                     // tick / keypress.
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
-                    // Wheel → transcript scrollback (~3 rows per notch, the usual
-                    // terminal step). Gated by `/mouse`; when off the wheel is
-                    // ignored so the terminal's native selection/copy works. Only
-                    // meaningful on the chat screen.
+                    // Mouse → wheel scrollback + the in-app drag-to-select/copy layer
+                    // (the Claude Code approach: WE render the selection highlight and
+                    // copy via OSC 52, so both work on the alternate screen). Gated by
+                    // `/mouse`; when capture is off these never arrive and the
+                    // terminal's native selection/copy takes over. Only meaningful on
+                    // the chat screen.
                     if app.mouse_scroll && matches!(app.mode, crate::app::AppMode::Chat) {
+                        let (col, row) = (me.column, me.row);
                         match me.kind {
+                            // Wheel → scroll ~3 rows per notch (the usual step).
                             MouseEventKind::ScrollUp => app.transcript_scroll_up(3),
                             MouseEventKind::ScrollDown => app.transcript_scroll_down(3),
+                            // Left-down: begin a selection at this point (or clear it
+                            // if the click is outside the transcript area).
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                app.selection_begin(col, row);
+                            }
+                            // Left-drag: extend the live selection's cursor.
+                            MouseEventKind::Drag(MouseButton::Left) => {
+                                app.selection_extend(col, row);
+                            }
+                            // Left-up: if a non-empty selection was made, copy its
+                            // text to the system clipboard via OSC 52 and toast. The
+                            // highlight is KEPT so the user sees what was copied; a
+                            // later Down elsewhere clears it. Fail-open: a write error
+                            // is ignored, never blocking the loop.
+                            MouseEventKind::Up(MouseButton::Left) => {
+                                if let Some(text) = app.selection_finish_copy() {
+                                    copy_to_clipboard(&text);
+                                }
+                            }
                             _ => {}
                         }
                     }

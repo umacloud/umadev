@@ -174,6 +174,20 @@ mod theme {
             Color::Rgb(42, 42, 52)
         }
     }
+    /// Background tint for the in-app text selection highlight (the rows the
+    /// user is dragging across). A muted brand-cyan wash — clearly distinct
+    /// from the user-message tint and the diff backgrounds, but not so loud it
+    /// drowns the text under it. Resolved here (no naked color at the call
+    /// site) so a theme swap re-skins the selection too.
+    pub fn SELECTION_BG() -> Color {
+        if IS_LIGHT.load(Ordering::Relaxed) {
+            // cyan mixed into the light panel bg — readable behind black text.
+            Color::Rgb(0xbf, 0xe3, 0xef)
+        } else {
+            // cyan mixed into the dark panel bg — visible behind light text.
+            Color::Rgb(0x1d, 0x4e, 0x5e)
+        }
+    }
     pub fn MD_HEADING() -> Color {
         pick(&SECONDARY_P)
     }
@@ -3388,7 +3402,6 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         folded = folded.split_off(folded.len() - MAX_RENDER_ROWS);
     }
     let total = folded.len();
-    let para = Paragraph::new(folded);
     // The scroll-hint title (added below when content overflows) is a `Block` title
     // row that `Block::inner` STEALS off the top — so whenever it's shown the real
     // paintable viewport is one row shorter. Account for it: decide overflow against
@@ -3437,7 +3450,45 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // auto-sticks to the newest line (the default).
     let scroll_rows = hidden_above.saturating_sub(user_offset);
     let scroll = u16::try_from(scroll_rows).unwrap_or(u16::MAX);
-    let para = para.scroll((scroll, 0));
+
+    // ── In-app text-selection layer (the Claude-Code drag-to-copy) ──
+    // `folded` is the exact `Vec<Line>` about to be painted: its index IS the
+    // content-row coordinate the selection uses, and its plain text is what a
+    // copy extracts. Publish a plain-text snapshot of every row, the paintable
+    // transcript rectangle, and the index of the row painted at its top — the
+    // event loop maps a mouse `(col,row)` against these. When the scroll-hint
+    // title is shown it steals the top row, so content actually begins at
+    // `area.top + 1` with one row less height; publish that adjusted rect so a
+    // click lands on the right content row.
+    *app.transcript_rows.borrow_mut() = folded
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    let content_top = if title_shown {
+        area.y.saturating_add(1)
+    } else {
+        area.y
+    };
+    let content_height = if title_shown {
+        area.height.saturating_sub(1)
+    } else {
+        area.height
+    };
+    app.transcript_area
+        .set((area.x, content_top, area.width, content_height));
+    app.transcript_first_visible.set(scroll_rows);
+
+    // Re-style the selected span(s) with the selection background. Only the rows
+    // inside the normalized selection range are rebuilt; everything else paints
+    // unchanged. Fail-open: a mapping error on any row just leaves that row
+    // un-highlighted (never a panic).
+    if let Some(sel) = app.selection {
+        if !sel.is_empty() {
+            apply_selection_highlight(&mut folded, &sel);
+        }
+    }
+
+    let para = Paragraph::new(folded).scroll((scroll, 0));
 
     // Two-way scroll indicator: how many rows are hidden ABOVE the current view
     // and BELOW it, so the user always knows there's more in either direction
@@ -3946,6 +3997,76 @@ fn prefold_line_filled(
     }
     push_padded(&mut out, cur, col);
     out
+}
+
+/// Paint the in-app text-selection highlight onto the already-folded transcript
+/// rows. `folded` is the exact `Vec<Line>` about to be rendered (its index is
+/// the content-row coordinate); `sel` is the live selection. Only the rows in
+/// the normalized range are rebuilt — a single-row selection highlights
+/// `[anchor.col, cursor.col)`, a multi-row one highlights the first row from
+/// `anchor.col` to its end, every middle row fully, and the last row up to
+/// `cursor.col`. Fail-open: an out-of-range row index is skipped, never a panic.
+fn apply_selection_highlight(folded: &mut [Line<'static>], sel: &crate::selection::Selection) {
+    let ((sr, sc), (er, ec)) = sel.normalized();
+    if sr == er {
+        if let Some(row) = folded.get_mut(sr) {
+            *row = highlight_row(row, sc, ec);
+        }
+        return;
+    }
+    // First row: from the anchor col to end of the row.
+    if let Some(row) = folded.get_mut(sr) {
+        *row = highlight_row(row, sc, usize::MAX);
+    }
+    // Full middle rows.
+    for r in (sr + 1)..er {
+        if let Some(row) = folded.get_mut(r) {
+            *row = highlight_row(row, 0, usize::MAX);
+        }
+    }
+    // Last row: start of the row up to the cursor col.
+    if let Some(row) = folded.get_mut(er) {
+        *row = highlight_row(row, 0, ec);
+    }
+}
+
+/// Rebuild one `Line`, applying the selection background to the chars whose
+/// (line-wide) char index falls in `[from, to)`. Char indices are counted
+/// across the concatenation of the line's span contents — the same coordinate
+/// space the cached plain-text row uses — so a multi-byte / CJK glyph is split
+/// on a char boundary, never a byte boundary. Each original span is sliced into
+/// up to three pieces (before / selected / after); the selected piece keeps the
+/// span's fg + modifiers and gains the selection bg. Fail-open: a `to <= from`
+/// or out-of-range range simply highlights nothing.
+fn highlight_row(line: &Line<'static>, from: usize, to: usize) -> Line<'static> {
+    let sel_bg = theme::SELECTION_BG();
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    let mut idx = 0usize; // running char index across the whole line
+    for span in &line.spans {
+        // Group this span's chars into selected / unselected runs, preserving
+        // the original style and adding the selection bg to the selected run.
+        let base = span.style;
+        let mut buf = String::new();
+        let mut buf_selected = false;
+        let flush = |buf: &mut String, selected: bool, out: &mut Vec<Span<'static>>| {
+            if buf.is_empty() {
+                return;
+            }
+            let style = if selected { base.bg(sel_bg) } else { base };
+            out.push(Span::styled(std::mem::take(buf), style));
+        };
+        for ch in span.content.chars() {
+            let in_sel = idx >= from && idx < to;
+            if !buf.is_empty() && in_sel != buf_selected {
+                flush(&mut buf, buf_selected, &mut out);
+            }
+            buf.push(ch);
+            buf_selected = in_sel;
+            idx += 1;
+        }
+        flush(&mut buf, buf_selected, &mut out);
+    }
+    Line::from(out)
 }
 
 /// Display width of the input's row-0 prefix (mode marker + one space):
@@ -6006,6 +6127,107 @@ mod tests {
         // A short line is one row, unchanged.
         let short = Line::from(Span::raw("hi"));
         assert_eq!(prefold_line(&short, 10, 0, None).len(), 1);
+    }
+
+    // ── In-app selection highlight (span-splitting by char index) ──
+    /// Reconstruct, char by char, whether each char of a line carries the
+    /// selection background — so a test can assert exactly which chars got
+    /// highlighted without depending on how the spans were chunked.
+    fn selected_mask(line: &Line<'static>) -> Vec<bool> {
+        let sel_bg = theme::SELECTION_BG();
+        let mut mask = Vec::new();
+        for span in &line.spans {
+            let on = span.style.bg == Some(sel_bg);
+            for _ in span.content.chars() {
+                mask.push(on);
+            }
+        }
+        mask
+    }
+
+    fn plain_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn highlight_row_marks_exactly_the_selected_char_range() {
+        // A line built from several spans (mixed styles) — the highlight must
+        // cut across span boundaries by char index, not span index.
+        let line = Line::from(vec![
+            Span::styled("foo", Style::default().fg(Color::Red)),
+            Span::raw("bar"),
+            Span::styled("baz", Style::default().fg(Color::Blue)),
+        ]); // "foobarbaz", indices 0..9
+        let hl = highlight_row(&line, 2, 7); // chars 2..7 = "obarb"
+        assert_eq!(plain_text(&hl), "foobarbaz", "text is preserved exactly");
+        assert_eq!(
+            selected_mask(&hl),
+            vec![false, false, true, true, true, true, true, false, false],
+            "exactly chars [2,7) carry the selection bg"
+        );
+        // The unselected pieces keep their original fg.
+        let first = hl.spans.first().expect("at least one span");
+        assert_eq!(first.style.fg, Some(Color::Red), "fg preserved on the head");
+    }
+
+    #[test]
+    fn highlight_row_cjk_splits_on_char_boundaries() {
+        // CJK chars are multi-byte; the range is char-indexed so a glyph is never
+        // split mid-byte. "你好世界" → highlight chars [1,3) = "好世".
+        let line = Line::from(Span::raw("你好世界"));
+        let hl = highlight_row(&line, 1, 3);
+        assert_eq!(plain_text(&hl), "你好世界");
+        assert_eq!(
+            selected_mask(&hl),
+            vec![false, true, true, false],
+            "only the middle two CJK glyphs are highlighted"
+        );
+    }
+
+    #[test]
+    fn highlight_row_fail_open_on_empty_or_reversed_range() {
+        let line = Line::from(Span::raw("hello"));
+        // to <= from → nothing highlighted, text intact.
+        let hl = highlight_row(&line, 3, 3);
+        assert_eq!(plain_text(&hl), "hello");
+        assert!(
+            selected_mask(&hl).iter().all(|&b| !b),
+            "an empty range highlights nothing"
+        );
+        // A range past the end clamps — only the in-range chars light up.
+        let tail = highlight_row(&line, 2, 999);
+        assert_eq!(
+            selected_mask(&tail),
+            vec![false, false, true, true, true],
+            "chars [2,end) highlighted, no panic on the over-long bound"
+        );
+    }
+
+    #[test]
+    fn apply_selection_highlight_spans_multiple_rows() {
+        let mut folded = vec![
+            Line::from(Span::raw("first line")),
+            Line::from(Span::raw("middle")),
+            Line::from(Span::raw("last line")),
+        ];
+        // From col 6 of row 0 to col 4 of row 2.
+        let sel = crate::selection::Selection {
+            anchor: (0, 6),
+            cursor: (2, 4),
+        };
+        apply_selection_highlight(&mut folded, &sel);
+        // Row 0: chars [6,end) highlighted ("line").
+        assert_eq!(
+            selected_mask(&folded[0]),
+            vec![false, false, false, false, false, false, true, true, true, true]
+        );
+        // Row 1 (a full middle row): all highlighted.
+        assert!(selected_mask(&folded[1]).iter().all(|&b| b));
+        // Row 2: chars [0,4) highlighted ("last").
+        assert_eq!(
+            selected_mask(&folded[2]),
+            vec![true, true, true, true, false, false, false, false, false]
+        );
     }
 
     #[test]

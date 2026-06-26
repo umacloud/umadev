@@ -978,13 +978,44 @@ pub struct App {
     /// until the first render — the handlers treat that as "no wrap info yet" and
     /// fall back to the plain history-recall behavior.
     pub input_text_cols: std::cell::Cell<u16>,
-    /// `true` when the mouse-wheel → transcript-scroll binding is active. A
-    /// `/mouse` toggle flips it: capturing the mouse takes over the terminal's
-    /// native text selection, so a user who wants to select/copy turns it off
-    /// (or holds Shift, which most terminals route around the capture). Default
-    /// on. Read by the event loop; the value itself lives here so it survives
-    /// across redraws.
+    /// `true` when the mouse-wheel → transcript-scroll binding is active (and,
+    /// with it, the in-app drag-to-select/copy layer). **Default ON**: mouse
+    /// capture is enabled at startup so the wheel pages the transcript AND a
+    /// left-drag selects text that we copy ourselves via OSC 52 — the Claude
+    /// Code approach to getting BOTH on the alternate screen (which has no
+    /// native scrollback). A `/mouse` toggle flips it OFF, which issues
+    /// `DisableMouseCapture` and hands selection back to the terminal's native
+    /// click-drag for users who prefer it. Read by the event loop; the value
+    /// lives here so it survives across redraws.
     pub mouse_scroll: bool,
+
+    /// **In-app text selection** over the transcript (the Claude-Code layer).
+    /// `Some` while the user has a live / just-copied drag selection; `None`
+    /// when there's nothing selected. Coordinates are `(content_row, col)` into
+    /// [`Self::transcript_rows`]. Set on mouse-down, extended on drag, kept on
+    /// mouse-up (so the copied span stays highlighted) and cleared on the next
+    /// down outside the selection. See [`crate::selection`].
+    pub selection: Option<crate::selection::Selection>,
+
+    /// **Per-frame cache of the rendered transcript as plain text** — one
+    /// `String` per wrapped visual row, in render order. Rebuilt every frame by
+    /// `ui::render_transcript` from the same folded `Vec<Line>` it paints, so a
+    /// `(content_row, col)` selection point indexes straight into it. This is
+    /// what [`crate::selection::extract`] reads the copied text out of. In a
+    /// `RefCell` because the renderer borrows `&App` (it can't take `&mut`).
+    pub transcript_rows: std::cell::RefCell<Vec<String>>,
+
+    /// The transcript rectangle `(left, top, width, height)` from the last
+    /// frame, published by `ui::render_transcript`. The event loop maps a mouse
+    /// `(col, row)` against this to decide inside/outside the transcript and to
+    /// compute the content row. `(0,0,0,0)` until the first render.
+    pub transcript_area: std::cell::Cell<(u16, u16, u16, u16)>,
+
+    /// Index into [`Self::transcript_rows`] of the row currently painted at the
+    /// top of the transcript area (`hidden_above - user_offset`, the renderer's
+    /// effective top scroll offset). Combined with [`Self::transcript_area`] this
+    /// turns a screen row into a content row. Published every frame.
+    pub transcript_first_visible: std::cell::Cell<usize>,
 
     /// **Conversation memory** — the multi-turn transcript handed to the base
     /// on every routed turn so chat is a real conversation, not a sequence of
@@ -1358,13 +1389,17 @@ impl App {
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
             input_text_cols: std::cell::Cell::new(0),
-            // OFF by default so the terminal's native click-drag text selection /
-            // copy keeps working (the user requirement: scroll must NOT break copy).
-            // The transcript scrolls via the keyboard (PageUp/PageDown, Home/End,
-            // Shift+↑/↓, Ctrl+Alt+U/D); `/mouse` opts into wheel-scroll. The proper
-            // "wheel-scroll AND mouse-copy both" needs an in-app selection layer
-            // (Claude Code's approach) — tracked as a focused feature.
-            mouse_scroll: false,
+            // ON by default: mouse capture is enabled at startup so the wheel pages
+            // the transcript AND a left-drag selects text that we copy ourselves via
+            // OSC 52 (the in-app selection layer below) — the Claude Code approach to
+            // getting BOTH wheel-scroll and drag-copy on the alternate screen (no
+            // native scrollback). `/mouse` toggles capture OFF for users who prefer
+            // the terminal's native click-drag selection.
+            mouse_scroll: true,
+            selection: None,
+            transcript_rows: std::cell::RefCell::new(Vec::new()),
+            transcript_area: std::cell::Cell::new((0, 0, 0, 0)),
+            transcript_first_visible: std::cell::Cell::new(0),
             conversation: Vec::new(),
             host_chat_session_active: false,
             chat_session_id: None,
@@ -2094,6 +2129,76 @@ impl App {
     /// PageUp / PageDown), for the page keys — at least one row.
     fn transcript_page(&self) -> usize {
         self.transcript_viewport_rows.get().saturating_sub(1).max(1)
+    }
+
+    // ---- in-app text selection (the Claude-Code drag-to-copy layer) ------
+    //
+    // The event loop turns raw mouse coordinates into these three calls; the
+    // pure mapping + extraction + OSC 52 encoding live in `crate::selection`.
+    // All three are fail-open: a point outside the transcript, an empty
+    // selection, or stale/empty cached rows simply clears or no-ops.
+
+    /// Map the screen point against the last frame's cached geometry.
+    fn map_mouse_point(&self, col: u16, row: u16) -> Option<crate::selection::Point> {
+        let rows = self.transcript_rows.borrow();
+        crate::selection::screen_to_content(
+            col,
+            row,
+            self.transcript_area.get(),
+            self.transcript_first_visible.get(),
+            &rows,
+        )
+    }
+
+    /// Mouse-down (left button) at screen `(col, row)`: begin a fresh selection
+    /// anchored at the mapped content point. A click OUTSIDE the transcript
+    /// clears any existing selection (so a copied span un-highlights once the
+    /// user clicks away).
+    pub fn selection_begin(&mut self, col: u16, row: u16) {
+        match self.map_mouse_point(col, row) {
+            Some(p) => self.selection = Some(crate::selection::Selection::at(p)),
+            None => self.selection = None,
+        }
+    }
+
+    /// Mouse-drag (left button held) at screen `(col, row)`: extend the live
+    /// selection's cursor to the mapped content point. No-op when there's no
+    /// active selection or the point doesn't map (e.g. dragged off the area —
+    /// the anchor + last good cursor are kept).
+    pub fn selection_extend(&mut self, col: u16, row: u16) {
+        if let Some(p) = self.map_mouse_point(col, row) {
+            if let Some(sel) = self.selection.as_mut() {
+                sel.cursor = p;
+            }
+        }
+    }
+
+    /// Mouse-up (left button) — finish the selection and copy it. When there is
+    /// a non-empty selection, extracts its text, pushes a "copied N chars" toast
+    /// (kept private to this module) and returns `Some(text)` for the caller to
+    /// hand to `copy_to_clipboard` (which owns the native-command-vs-OSC 52
+    /// decision). The selection is KEPT highlighted so the user sees what was
+    /// copied; a later mouse-down elsewhere clears it. Returns `None` (leaving
+    /// any single-click selection in place) when nothing is selected — fail-open.
+    #[must_use]
+    pub fn selection_finish_copy(&mut self) -> Option<String> {
+        let sel = self.selection?;
+        if sel.is_empty() {
+            return None;
+        }
+        let text = {
+            let rows = self.transcript_rows.borrow();
+            crate::selection::extract(&rows, &sel)
+        };
+        if text.is_empty() {
+            return None;
+        }
+        let count = text.chars().count();
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "tui.copied", &[&count.to_string()]),
+        );
+        Some(text)
     }
 
     // ---- input editing helpers (char-cursor over a UTF-8 String) ---------
@@ -7010,11 +7115,12 @@ impl App {
         self.trust_ledger.save(&self.project_root);
     }
 
-    /// Toggle mouse-wheel transcript scrolling. ON (default) lets the wheel
-    /// page the history; OFF releases the terminal's native text selection /
-    /// copy (which the mouse capture otherwise intercepts). The event loop reads
-    /// `mouse_scroll` each turn and only routes wheel events when it's on; a
-    /// Shift-held drag bypasses the capture in most terminals regardless.
+    /// Toggle mouse capture. ON (default) lets the wheel page the history AND
+    /// drives the in-app drag-to-select/copy layer (we render the highlight and
+    /// copy via OSC 52 ourselves). OFF issues `DisableMouseCapture`, handing
+    /// selection back to the terminal's native click-drag for users who prefer
+    /// it. The event loop reads `mouse_scroll` each turn and only routes mouse
+    /// events when it's on.
     fn slash_toggle_mouse(&mut self) -> Action {
         self.mouse_scroll = !self.mouse_scroll;
         let key = if self.mouse_scroll {
@@ -8455,25 +8561,26 @@ mod tests {
     fn slash_mouse_emits_set_capture_action_and_uses_i18n() {
         let mut app = fresh_app(Some("offline"));
         assert!(
-            !app.mouse_scroll,
-            "wheel scroll defaults OFF (native click-drag copy stays usable)"
+            app.mouse_scroll,
+            "mouse capture defaults ON (wheel-scroll + in-app drag-to-copy both work)"
         );
-        // Turning ON must emit SetMouseCapture(true) so the event loop issues the
-        // real EnableMouseCapture, not just flip a bool.
+        // Toggling OFF must emit SetMouseCapture(false) so the event loop issues the
+        // real DisableMouseCapture (handing selection back to the terminal), not just
+        // flip a bool.
         let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(true));
-        assert!(app.mouse_scroll);
+        assert_eq!(action, Action::SetMouseCapture(false));
+        assert!(!app.mouse_scroll);
         // The pushed status line must be the i18n string, not a raw literal.
         let last = app.history.back().expect("a status line was pushed");
         assert_eq!(
             last.body(),
-            umadev_i18n::t(app.lang, "slash.mouse_on"),
+            umadev_i18n::t(app.lang, "slash.mouse_off"),
             "/mouse status text must come from the i18n catalog"
         );
-        // Toggling back OFF emits SetMouseCapture(false).
+        // Toggling back ON emits SetMouseCapture(true).
         let action = app.slash_toggle_mouse();
-        assert_eq!(action, Action::SetMouseCapture(false));
-        assert!(!app.mouse_scroll);
+        assert_eq!(action, Action::SetMouseCapture(true));
+        assert!(app.mouse_scroll);
     }
 
     #[test]
@@ -8495,12 +8602,12 @@ mod tests {
     #[test]
     fn slash_mouse_toggles_wheel_scroll_flag() {
         let mut app = fresh_app(Some("offline"));
-        assert!(!app.mouse_scroll, "wheel scroll defaults off");
+        assert!(app.mouse_scroll, "mouse capture defaults on");
         for c in "/mouse".chars() {
             let _ = app.apply_key(crossterm::event::KeyCode::Char(c));
         }
         let _ = app.apply_key(crossterm::event::KeyCode::Enter);
-        assert!(app.mouse_scroll, "/mouse turns the wheel binding on");
+        assert!(!app.mouse_scroll, "/mouse turns the capture binding off");
     }
 
     #[test]
