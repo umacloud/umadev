@@ -853,6 +853,11 @@ export default function Home() {
                         target={partner.url === "#" ? undefined : "_blank"}
                         rel={partner.url === "#" ? undefined : "noopener noreferrer"}
                         className={styles.partnerCard}
+                        onClick={(e) => {
+                          if (partner.url === "#") {
+                            e.preventDefault();
+                          }
+                        }}
                         style={{
                           "--partner-glow": colors.glow,
                           "--partner-border": colors.border,
