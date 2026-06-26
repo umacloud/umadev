@@ -861,7 +861,7 @@ export default function Home() {
                         <div className={styles.partnerGlow} />
                         <div className={styles.partnerLogoContainer}>
                           <Image
-                            src={asset(`/assets/partners/${partner.logoName}.png`)}
+                            src={asset(`/assets/partners/${partner.logoName}.png?v=3`)}
                             alt={partner.name}
                             width={180}
                             height={80}
