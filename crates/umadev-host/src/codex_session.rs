@@ -238,7 +238,7 @@ impl CodexSession {
     ///
     /// Forking onto its OWN process means the critic can never collide with the
     /// main writer session's in-flight turn (single-writer invariant), and
-    /// `sandbox:"readOnly"` + `approvalPolicy:"never"` fence it so it can read the
+    /// `sandbox:"read-only"` + `approvalPolicy:"never"` fence it so it can read the
     /// blackboard + the prior context but can NEVER write a file. Resuming the
     /// main thread id gives the seat the main line's accumulated context.
     ///
@@ -324,7 +324,7 @@ impl CodexSession {
             .await
             .map_err(|e| SessionError::Start(format!("codex initialized: {e}")))?;
 
-        // 3. thread/start. `sandbox:"workspaceWrite"` + `approvalPolicy:"never"`
+        // 3. thread/start. `sandbox:"workspace-write"` + `approvalPolicy:"never"`
         //    is the autonomous "write code without asking" tier; the gate tier
         //    uses `on-request` so the server raises `requestApproval`.
         let started = self
@@ -455,7 +455,11 @@ fn thread_start_params(workspace: &Path, model: &str, autonomous: bool) -> Value
     let mut params = json!({
         "cwd": workspace.to_string_lossy(),
         "approvalPolicy": approval_policy,
-        "sandbox": "workspaceWrite",
+        // codex's sandbox enum is KEBAB-case (`read-only` / `workspace-write` /
+        // `danger-full-access`), matching its `--sandbox` CLI flag. We sent camelCase
+        // (`workspaceWrite`), which newer codex rejects with `unknown variant
+        // 'workspaceWrite'`, killing the continuous session (user-reported on Windows).
+        "sandbox": "workspace-write",
     });
     if let Some(m) = codex_model(model) {
         params["model"] = json!(m);
@@ -464,7 +468,7 @@ fn thread_start_params(workspace: &Path, model: &str, autonomous: bool) -> Value
 }
 
 /// Build the `thread/resume` params for a READ-ONLY critic fork: resume
-/// `thread_id` in `workspace` with `sandbox:"readOnly"` + `approvalPolicy:"never"`
+/// `thread_id` in `workspace` with `sandbox:"read-only"` + `approvalPolicy:"never"`
 /// so the seat reads context + the blackboard but can NEVER write a file (the
 /// single-writer invariant). The model is forwarded only when codex-native.
 fn thread_resume_params(thread_id: &str, workspace: &Path, model: &str) -> Value {
@@ -472,7 +476,8 @@ fn thread_resume_params(thread_id: &str, workspace: &Path, model: &str) -> Value
         "threadId": thread_id,
         "cwd": workspace.to_string_lossy(),
         "approvalPolicy": "never",
-        "sandbox": "readOnly",
+        // Kebab-case (see `thread_start_params`): `readOnly` → `read-only`.
+        "sandbox": "read-only",
     });
     if let Some(m) = codex_model(model) {
         params["model"] = json!(m);
@@ -1277,7 +1282,7 @@ mod tests {
     fn thread_start_params_sets_policy_and_drops_non_native_model() {
         let autonomous = thread_start_params(Path::new("/tmp/p"), "gpt-5-codex", true);
         assert_eq!(autonomous["approvalPolicy"], "never");
-        assert_eq!(autonomous["sandbox"], "workspaceWrite");
+        assert_eq!(autonomous["sandbox"], "workspace-write");
         assert_eq!(autonomous["model"], "gpt-5-codex");
         // Gate tier → on-request; claude model id dropped (absent key).
         let gated = thread_start_params(Path::new("/tmp/p"), "claude-sonnet-4-6", false);
@@ -1302,7 +1307,7 @@ mod tests {
         let p = thread_resume_params("thr_main", Path::new("/tmp/p"), "gpt-5-codex");
         assert_eq!(p["threadId"], "thr_main");
         assert_eq!(p["approvalPolicy"], "never");
-        assert_eq!(p["sandbox"], "readOnly");
+        assert_eq!(p["sandbox"], "read-only");
         assert_eq!(p["model"], "gpt-5-codex");
         // A non-codex model is dropped (account default), same as thread/start.
         let p2 = thread_resume_params("thr_main", Path::new("/tmp/p"), "claude-sonnet-4-6");
