@@ -5515,7 +5515,69 @@ impl App {
         Action::StartGoal(objective)
     }
 
+    /// Reconcile the in-memory phase vector with the furthest phase recorded in
+    /// `.umadev/workflow-state.json` so `/status` reflects the REAL
+    /// furthest-reached phase. The director-loop / plan build path drives the
+    /// workspace and advances the persisted state (commit c29c31b43) but emits
+    /// **no** `PhaseStarted` / `PhaseCompleted` events — only the legacy
+    /// continuous walk does — so `self.phases` can sit all-`Pending` after a
+    /// `/run` that actually wrote code, making the raw in-memory table lie.
+    ///
+    /// The reconciliation bumps the rendered status forward — **never** backward
+    /// — to the max (by canonical [`PHASE_CHAIN`] order) of (a) the furthest
+    /// phase the in-memory vector marks `Done`/`Running` and (b) `file_phase`
+    /// (the workflow-state phase). Every phase before that furthest renders
+    /// `Done`; the furthest renders `Running` when the in-memory vector is still
+    /// actively driving it (legacy walk) else `Done` (it has been reached); the
+    /// rest stay `Pending`. Fail-open: `file_phase = None` (missing / unparseable
+    /// state) returns the in-memory statuses verbatim.
+    fn reconcile_phase_statuses(rows: &[PhaseRow], file_phase: Option<Phase>) -> Vec<PhaseStatus> {
+        // Furthest index the in-memory vector has touched (Done or Running).
+        let mem_furthest = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r.status, PhaseStatus::Done | PhaseStatus::Running))
+            .map(|(i, _)| i)
+            .max();
+        // Index of the persisted workflow-state phase within `rows` (canonical
+        // chain order). `None` when the file is absent / its phase is unknown.
+        let file_idx = file_phase.and_then(|p| rows.iter().position(|r| r.phase == p));
+        // No signal from either source → in-memory statuses unchanged.
+        let furthest = match (mem_furthest, file_idx) {
+            (None, None) => return rows.iter().map(|r| r.status).collect(),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (Some(a), Some(b)) => a.max(b),
+        };
+        rows.iter()
+            .enumerate()
+            .map(|(i, r)| match i.cmp(&furthest) {
+                std::cmp::Ordering::Less => PhaseStatus::Done,
+                std::cmp::Ordering::Equal => {
+                    // The furthest reached phase: keep `Running` only while the
+                    // in-memory vector is actively driving it (legacy walk);
+                    // otherwise (file-derived, plan path) it has been reached.
+                    if r.status == PhaseStatus::Running {
+                        PhaseStatus::Running
+                    } else {
+                        PhaseStatus::Done
+                    }
+                }
+                std::cmp::Ordering::Greater => PhaseStatus::Pending,
+            })
+            .collect()
+    }
+
     fn open_status_overlay(&mut self) {
+        // Read the persisted workflow state ONCE and reconcile each section
+        // against it. The director-loop / plan path records the furthest-reached
+        // phase here (and slug / requirement / active_gate) without emitting the
+        // events that mutate the in-memory state, so the file is the more current
+        // source after such a run — and the only source at all in a fresh session
+        // reopened over a prior run. Every read below is fail-open (a missing /
+        // unparseable state → in-memory only, no panic, no block).
+        let ws = umadev_agent::read_workflow_state(&self.project_root);
+
         let mut body = String::from("Pipeline Status\n===============\n\n");
         body.push_str(&format!("worker:        {}\n", self.backend_label));
         body.push_str(&format!(
@@ -5526,34 +5588,56 @@ impl App {
             "seed template: {}\n",
             self.config.seed_template.as_deref().unwrap_or("(auto)")
         ));
-        body.push_str(&format!(
-            "slug:          {}\n",
-            if self.slug.is_empty() {
-                "(not set)"
-            } else {
-                &self.slug
-            }
-        ));
-        body.push_str(&format!(
-            "requirement:   {}\n",
-            if self.requirement.is_empty() {
-                "(none yet)"
-            } else {
-                &self.requirement
-            }
-        ));
+        // slug / requirement fall back to the persisted state when the in-memory
+        // value is empty (e.g. `/status` in a fresh session after a prior run).
+        let slug_display = if self.slug.is_empty() {
+            ws.as_ref()
+                .map(|s| s.slug.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "(not set)".to_string())
+        } else {
+            self.slug.clone()
+        };
+        body.push_str(&format!("slug:          {slug_display}\n"));
+        let req_display = if self.requirement.is_empty() {
+            ws.as_ref()
+                .map(|s| s.requirement.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "(none yet)".to_string())
+        } else {
+            self.requirement.clone()
+        };
+        body.push_str(&format!("requirement:   {req_display}\n"));
         body.push_str("\n## Pipeline phases\n\n");
         body.push_str("| # | Phase | Status |\n|---|---|---|\n");
+        // Reconcile the in-memory phase vector with the furthest phase the
+        // persisted state recorded — so a plan-path build that reached e.g.
+        // `backend` shows research..backend done instead of a frozen all-pending
+        // table. Fail-open: an unparseable / unknown phase → in-memory only.
+        let file_phase = ws
+            .as_ref()
+            .and_then(|s| umadev_agent::phase_from_id(&s.phase));
+        let statuses = Self::reconcile_phase_statuses(&self.phases, file_phase);
         for (i, row) in self.phases.iter().enumerate() {
-            let icon = match row.status {
+            let status = statuses.get(i).copied().unwrap_or(row.status);
+            let icon = match status {
                 PhaseStatus::Done => "[ok]",
                 PhaseStatus::Running => "[running]",
                 PhaseStatus::Pending => "[pending]",
             };
             body.push_str(&format!("| {} | {} | {} |\n", i + 1, row.phase.id(), icon));
         }
-        if let Some(gate) = self.active_gate {
-            body.push_str(&format!("\n[gate] Active gate: `{}`\n", gate.id_str()));
+        // Active gate — prefer the live in-memory gate, else the persisted one.
+        let gate_display = self
+            .active_gate
+            .map(|g| g.id_str().to_string())
+            .or_else(|| {
+                ws.as_ref()
+                    .map(|s| s.active_gate.clone())
+                    .filter(|g| !g.is_empty())
+            });
+        if let Some(gate) = gate_display {
+            body.push_str(&format!("\n[gate] Active gate: `{gate}`\n"));
         }
         if self.finished {
             body.push_str("\n[ok] Pipeline complete — proof-pack in release/\n");
@@ -13175,5 +13259,164 @@ mod tests {
             a.palette_selected, 0,
             "delete_to_line_end resets the palette"
         );
+    }
+
+    // ---- /status reconciles with the persisted workflow state ----
+
+    #[test]
+    fn reconcile_phase_statuses_advances_to_persisted_phase() {
+        // The plan / director-loop build emits no PhaseStarted/PhaseCompleted,
+        // so the in-memory vector is all-Pending. Reconciled against a
+        // workflow-state that reached `backend`, every phase up to and including
+        // backend must read Done and quality/delivery must stay Pending.
+        let rows: Vec<PhaseRow> = PHASE_CHAIN
+            .iter()
+            .map(|&phase| PhaseRow {
+                phase,
+                status: PhaseStatus::Pending,
+            })
+            .collect();
+        let statuses = App::reconcile_phase_statuses(&rows, Some(Phase::Backend));
+        let backend_i = PHASE_CHAIN
+            .iter()
+            .position(|&p| p == Phase::Backend)
+            .unwrap();
+        for (i, (row, status)) in rows.iter().zip(&statuses).enumerate() {
+            if i <= backend_i {
+                assert_eq!(
+                    *status,
+                    PhaseStatus::Done,
+                    "{} should be done",
+                    row.phase.id()
+                );
+            } else {
+                assert_eq!(
+                    *status,
+                    PhaseStatus::Pending,
+                    "{} should be pending",
+                    row.phase.id()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconcile_phase_statuses_fail_open_and_never_regresses() {
+        // Legacy walk: research/docs/docs_confirm done, spec actively Running.
+        let rows: Vec<PhaseRow> = PHASE_CHAIN
+            .iter()
+            .map(|&phase| {
+                let status = match phase {
+                    Phase::Research | Phase::Docs | Phase::DocsConfirm => PhaseStatus::Done,
+                    Phase::Spec => PhaseStatus::Running,
+                    _ => PhaseStatus::Pending,
+                };
+                PhaseRow { phase, status }
+            })
+            .collect();
+        let spec_i = PHASE_CHAIN.iter().position(|&p| p == Phase::Spec).unwrap();
+        let backend_i = PHASE_CHAIN
+            .iter()
+            .position(|&p| p == Phase::Backend)
+            .unwrap();
+        let quality_i = PHASE_CHAIN
+            .iter()
+            .position(|&p| p == Phase::Quality)
+            .unwrap();
+
+        // No persisted phase → in-memory statuses returned verbatim (fail-open).
+        let verbatim = App::reconcile_phase_statuses(&rows, None);
+        assert_eq!(
+            verbatim,
+            rows.iter().map(|r| r.status).collect::<Vec<_>>(),
+            "missing/unparseable state must fall back to in-memory only"
+        );
+
+        // File at the SAME furthest phase → keep spec's Running (active) marker.
+        let same = App::reconcile_phase_statuses(&rows, Some(Phase::Spec));
+        assert_eq!(same[spec_i], PhaseStatus::Running);
+
+        // File AHEAD (backend) → spec subsumed into Done, backend Done, quality
+        // still Pending.
+        let ahead = App::reconcile_phase_statuses(&rows, Some(Phase::Backend));
+        assert_eq!(ahead[spec_i], PhaseStatus::Done);
+        assert_eq!(ahead[backend_i], PhaseStatus::Done);
+        assert_eq!(ahead[quality_i], PhaseStatus::Pending);
+
+        // File BEHIND (docs) → never regress; spec stays Running.
+        let behind = App::reconcile_phase_statuses(&rows, Some(Phase::Docs));
+        assert_eq!(behind[spec_i], PhaseStatus::Running, "never goes backward");
+    }
+
+    #[test]
+    fn status_overlay_reflects_persisted_phase_after_plan_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state_dir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        // A director-loop / plan build reached `backend` (phase persisted by the
+        // run) but emitted no PhaseStarted/PhaseCompleted, so self.phases is
+        // all-Pending and the raw table would lie.
+        let state_json = r#"{
+            "phase": "backend",
+            "active_gate": "",
+            "slug": "shop",
+            "requirement": "做个电商后台",
+            "last_transition_at": "2026-06-27T10:00:00Z",
+            "note": "",
+            "spec_version": "UMADEV_HOST_SPEC_V1"
+        }"#;
+        std::fs::write(state_dir.join("workflow-state.json"), state_json).unwrap();
+
+        let cfg = UserConfig {
+            backend: Some("offline".into()),
+            model: None,
+            lang: Some("zh-CN".into()),
+            ..Default::default()
+        };
+        let mut app = App::new(
+            "shop",
+            cfg,
+            std::path::PathBuf::from("/tmp/sd-status-overlay-cfg.toml"),
+            tmp.path().to_path_buf(),
+        );
+        // Precondition: the in-memory phase vector is frozen all-Pending.
+        assert!(
+            app.phases.iter().all(|r| r.status == PhaseStatus::Pending),
+            "the plan path leaves self.phases all-Pending"
+        );
+
+        app.open_status_overlay();
+        let lines = app.overlay.as_ref().expect("overlay opened").lines.clone();
+        // The pipeline-phases table precedes the knowledge table, so `find`
+        // returns the pipeline row (the only one carrying a status icon).
+        let row = |phase: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(&format!("| {phase} |")))
+                .cloned()
+                .unwrap_or_default()
+        };
+        for done in [
+            "research",
+            "docs",
+            "docs_confirm",
+            "spec",
+            "frontend",
+            "preview_confirm",
+            "backend",
+        ] {
+            assert!(
+                row(done).contains("[ok]"),
+                "{done} row should be done, got: {:?}",
+                row(done)
+            );
+        }
+        for pending in ["quality", "delivery"] {
+            assert!(
+                row(pending).contains("[pending]"),
+                "{pending} row should be pending, got: {:?}",
+                row(pending)
+            );
+        }
     }
 }

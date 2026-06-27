@@ -177,12 +177,28 @@ pub(crate) enum IdleEvent {
     /// The base emitted an event (the idle timer is reset by the caller looping).
     Event(SessionEvent),
     /// `next_event()` returned `None` — the session ended (process dead / EOF).
-    /// The pump treats this as a failed turn (fail-open, no panic).
-    SessionEnded,
+    /// The pump treats this as a failed turn (fail-open, no panic). Carries the
+    /// base's OWN diagnosis captured at the settle (`try_exit_status` /
+    /// `stderr_tail`) so the caller can fold it into the user-visible reason via
+    /// [`enrich_idle_reason`] — the same WHY the chat path surfaces.
+    SessionEnded {
+        /// The base child's exit status if it had already exited (else `None`).
+        exit: Option<std::process::ExitStatus>,
+        /// A bounded tail of the base's stderr (else `None`) — the real cause a
+        /// broken base writes to stderr, never stdout.
+        stderr_tail: Option<String>,
+    },
     /// No event arrived within the idle window — the base is hung. The watchdog
     /// has already issued a best-effort (bounded) `interrupt()`; the pump settles
     /// the turn as a failure so `thinking` clears rather than blocking forever.
-    IdleTimedOut,
+    /// Carries the base's diagnosis captured AFTER the bounded interrupt (an
+    /// interrupt may have made a hung child exit, surfacing its status/stderr).
+    IdleTimedOut {
+        /// The base child's exit status if it had already exited (else `None`).
+        exit: Option<std::process::ExitStatus>,
+        /// A bounded tail of the base's stderr (else `None`).
+        stderr_tail: Option<String>,
+    },
 }
 
 /// Wait for the next session event under the idle watchdog — the ONE place the
@@ -201,7 +217,16 @@ pub(crate) enum IdleEvent {
 pub(crate) async fn next_event_idle(session: &mut dyn BaseSession, idle: Duration) -> IdleEvent {
     match tokio::time::timeout(idle, session.next_event()).await {
         Ok(Some(ev)) => IdleEvent::Event(ev),
-        Ok(None) => IdleEvent::SessionEnded,
+        Ok(None) => {
+            // The session ended — capture the base's OWN diagnosis NOW (we hold
+            // `&mut session` right here) so the caller can tell the user WHY
+            // instead of a bare "ended mid-turn". Fail-open: both default to
+            // `None`, never block (the run path mirrors the chat path's enrich).
+            IdleEvent::SessionEnded {
+                exit: session.try_exit_status(),
+                stderr_tail: session.stderr_tail(),
+            }
+        }
         Err(_) => {
             // No event within the idle window → the base is hung. Best-effort
             // interrupt to release the child, but bound the interrupt itself so a
@@ -211,7 +236,12 @@ pub(crate) async fn next_event_idle(session: &mut dyn BaseSession, idle: Duratio
                 session.interrupt(),
             )
             .await;
-            IdleEvent::IdleTimedOut
+            // Capture AFTER the interrupt — a hung child that the interrupt just
+            // killed now has an exit status / a final stderr line to surface.
+            IdleEvent::IdleTimedOut {
+                exit: session.try_exit_status(),
+                stderr_tail: session.stderr_tail(),
+            }
         }
     }
 }
@@ -224,6 +254,42 @@ pub(crate) fn idle_reason(idle: Duration) -> String {
          Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
         idle.as_secs()
     )
+}
+
+/// Fold the base's OWN diagnosis (exit status + stderr tail, captured at the idle /
+/// ended settle by [`next_event_idle`]) into the user-visible reason — so the RUN
+/// path tells the user WHY a base went idle / ended, exactly as the chat path's
+/// `enrich_base_failure` does (a broken model id / "not logged in" / a config error
+/// the base prints to STDERR, never stdout). Without this the run path settled with
+/// a bare "base went idle — …" and no cause — the original symptom on the path that
+/// matters most for a hung build.
+///
+/// Fail-open + bounded, mirroring the chat path: a non-success exit appends
+/// `(base 进程已退出: <status>)`; a present stderr tail appends ` — base stderr: …`
+/// using its last 3 non-empty lines, ≤280 chars. A `None` exit / tail → today's
+/// bare `base_reason` unchanged. Never panics, never blocks.
+pub(crate) fn enrich_idle_reason(
+    base_reason: &str,
+    exit: Option<std::process::ExitStatus>,
+    stderr_tail: Option<String>,
+) -> String {
+    let mut msg = match exit {
+        Some(s) if !s.success() => format!("{base_reason}(base 进程已退出: {s})"),
+        _ => base_reason.to_string(),
+    };
+    if let Some(tail) = stderr_tail {
+        let lines: Vec<&str> = tail
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let start = lines.len().saturating_sub(3);
+        let snippet: String = lines[start..].join(" | ").chars().take(280).collect();
+        if !snippet.is_empty() {
+            msg = format!("{msg} — base stderr: {snippet}");
+        }
+    }
+    msg
 }
 
 /// How the director loop settled. Mirrors the caller's existing director outcome but
@@ -1767,7 +1833,7 @@ async fn drive_one_turn(
         // protection can't be "fixed in one, forgotten in another".
         let ev = match next_event_idle(session, idle).await {
             IdleEvent::Event(ev) => ev,
-            IdleEvent::SessionEnded => {
+            IdleEvent::SessionEnded { exit, stderr_tail } => {
                 // `None` = the session ended (process dead / EOF). Per the
                 // BaseSession contract, treat as a failed turn — fail-open, no panic.
                 // LOW #2: an interrupted/dead turn still consumed tokens (the directive
@@ -1775,16 +1841,24 @@ async fn drive_one_turn(
                 // is honest about cost on a failed turn, not just a clean one. No
                 // `TurnDone` arrived → no real usage available, so estimate (F3).
                 record_turn_usage(options, events, None, est_tokens);
-                return Err("base session ended mid-turn".to_string());
+                // Surface the base's OWN stderr/exit (captured at the settle) so the
+                // user sees WHY it ended, not a bare literal — mirrors the chat path.
+                return Err(enrich_idle_reason(
+                    "base session ended mid-turn",
+                    exit,
+                    stderr_tail,
+                ));
             }
-            IdleEvent::IdleTimedOut => {
+            IdleEvent::IdleTimedOut { exit, stderr_tail } => {
                 // No event within the idle window → the base is hung. Settle as a
                 // Failed outcome so the loop ends and `thinking` clears, rather than
                 // blocking forever (the interrupt was already issued, bounded).
                 // LOW #2: record the tokens spent up to the hang (fail-open). The
                 // turn hung with no `TurnDone` → estimate (no real usage). F3.
                 record_turn_usage(options, events, None, est_tokens);
-                return Err(idle_reason(idle));
+                // Fold in the base's stderr tail / exit so a hung build no longer
+                // settles with a cause-less "base went idle — …".
+                return Err(enrich_idle_reason(&idle_reason(idle), exit, stderr_tail));
             }
         };
         match ev {
@@ -2804,6 +2878,106 @@ mod tests {
         } else {
             panic!("expected a Failed (idle) outcome, got {outcome:?}");
         }
+    }
+
+    /// A hung session that ALSO exposes a stderr tail — the broken-base case where
+    /// the real cause (a bad model id / "not logged in") was written to STDERR and
+    /// never stdout, so the bare idle reason gave no diagnosis. Used to prove the
+    /// run path now folds that stderr into the user-visible Failed reason (parity
+    /// with the chat path's `enrich_base_failure`).
+    struct HangingSessionWithStderr;
+
+    #[async_trait::async_trait]
+    impl BaseSession for HangingSessionWithStderr {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("hang".into()))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        fn stderr_tail(&self) -> Option<String> {
+            Some("error: model X not available".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_settle_folds_in_the_base_stderr_tail() {
+        // The gap this fix closes: on the run / director-loop path a hung build used
+        // to settle with a bare "base went idle — …" and NO cause. Now the watchdog
+        // captures the base's own `stderr_tail()` at the settle and folds it into the
+        // Failed reason, so the user sees WHY — exactly as the chat path does.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = HangingSessionWithStderr;
+        let o = opts(tmp.path());
+        let outcome = drive_director_loop_with_idle(
+            &mut sess,
+            &o,
+            &events,
+            "GO".to_string(),
+            None,
+            None,
+            Duration::from_millis(100),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        if let DirectorLoopOutcome::Failed(reason) = outcome {
+            assert!(
+                reason.contains("idle"),
+                "still settles as an idle Failed: {reason}"
+            );
+            assert!(
+                reason.contains("error: model X not available"),
+                "the run-path idle reason must now CONTAIN the base's stderr tail: {reason}"
+            );
+            assert!(
+                reason.contains("base stderr"),
+                "the stderr tail is labelled like the chat path: {reason}"
+            );
+        } else {
+            panic!("expected a Failed (idle) outcome, got {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn enrich_idle_reason_is_fail_open_and_bounded() {
+        // No exit, no tail → today's bare reason, unchanged (fail-open).
+        let base = idle_reason(Duration::from_secs(7));
+        assert_eq!(enrich_idle_reason(&base, None, None), base);
+        // A present tail is folded in, last 3 non-empty lines, joined (a 4th-from-end
+        // line and blank lines are dropped).
+        let enriched = enrich_idle_reason(
+            "base session ended mid-turn",
+            None,
+            Some("DROPPED\n\nmodel not found\nlogin required\nfinal line\n".to_string()),
+        );
+        assert!(enriched.contains("base stderr: model not found | login required | final line"));
+        assert!(
+            !enriched.contains("DROPPED"),
+            "only the last 3 lines: {enriched}"
+        );
+        // A long tail is bounded to ≤280 chars of snippet (never unbounded).
+        let long = "x".repeat(1_000);
+        let enriched = enrich_idle_reason("r", None, Some(long));
+        let tail = enriched.split("base stderr: ").nth(1).unwrap();
+        assert!(tail.chars().count() <= 280, "stderr tail is bounded");
     }
 
     #[test]

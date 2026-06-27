@@ -479,17 +479,27 @@ async fn drive_phase(
         }
         let ev = match crate::director_loop::next_event_idle(session, idle).await {
             crate::director_loop::IdleEvent::Event(ev) => ev,
-            crate::director_loop::IdleEvent::SessionEnded => {
+            crate::director_loop::IdleEvent::SessionEnded { exit, stderr_tail } => {
                 // `None` = the underlying session ended (process dead / EOF). Per
                 // the BaseSession contract, treat as a failed turn — fail-open, no
-                // panic.
-                return PhaseResult::Failed("session ended mid-turn".to_string());
+                // panic. Surface the base's OWN stderr/exit (captured at the settle)
+                // so the user sees WHY, not a bare literal — mirrors the chat path.
+                return PhaseResult::Failed(crate::director_loop::enrich_idle_reason(
+                    "session ended mid-turn",
+                    exit,
+                    stderr_tail,
+                ));
             }
-            crate::director_loop::IdleEvent::IdleTimedOut => {
+            crate::director_loop::IdleEvent::IdleTimedOut { exit, stderr_tail } => {
                 // The base hung mid-phase — settle as a failed turn (the interrupt
                 // was already issued, bounded) so the run ends honestly instead of
-                // freezing the phase forever.
-                return PhaseResult::Failed(crate::director_loop::idle_reason(idle));
+                // freezing the phase forever. Fold in the base's stderr tail / exit
+                // so a hung build no longer settles with a cause-less idle reason.
+                return PhaseResult::Failed(crate::director_loop::enrich_idle_reason(
+                    &crate::director_loop::idle_reason(idle),
+                    exit,
+                    stderr_tail,
+                ));
             }
         };
         match ev {
@@ -1756,9 +1766,28 @@ async fn drive_rework_turn_with_idle(
             // Session ended mid-rework, OR the base hung past the idle window
             // (interrupt already issued, bounded) → fail-open stop reworking.
             // A rework turn is advisory, so a settle here simply leaves the
-            // findings for the next gate rather than wedging the run.
-            crate::director_loop::IdleEvent::SessionEnded
-            | crate::director_loop::IdleEvent::IdleTimedOut => {
+            // findings for the next gate rather than wedging the run — but no
+            // longer SILENTLY: surface the base's OWN stderr/exit (captured at the
+            // settle) as a Note, since a `ReworkTurn` carries no reason string, so
+            // a hung rework reads the same WHY as the chat / phase paths.
+            crate::director_loop::IdleEvent::SessionEnded { exit, stderr_tail } => {
+                events.emit(EngineEvent::Note(crate::director_loop::enrich_idle_reason(
+                    "team · rework turn ended — base session ended mid-turn",
+                    exit,
+                    stderr_tail,
+                )));
+                return ReworkTurn {
+                    done: false,
+                    text,
+                    pitfalls,
+                };
+            }
+            crate::director_loop::IdleEvent::IdleTimedOut { exit, stderr_tail } => {
+                events.emit(EngineEvent::Note(crate::director_loop::enrich_idle_reason(
+                    &crate::director_loop::idle_reason(idle),
+                    exit,
+                    stderr_tail,
+                )));
                 return ReworkTurn {
                     done: false,
                     text,
