@@ -2228,6 +2228,7 @@ fn write_scorecard_html(
 
     let html = format!(
         "<!doctype html><html lang=\"zh\"><head><meta charset=\"utf-8\">\
+<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'none'; base-uri 'none'; form-action 'none'\">\
 <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <title>{slug} — 交付成绩单 · UmaDev</title><style>\
 :root{{--bg:#f7f8fa;--surface:#fff;--ink:#161a20;--muted:#6b7480;--line:#e6e9ee;--ok:#127a4b;--ok-bg:#e4f4ec;--warn:#9a6b00;--warn-bg:#fcf2da;--bad:#b3261e;--bad-bg:#fbe7e6;--accent:#1f6feb;--radius:14px}}\
@@ -3707,6 +3708,17 @@ mod tests {
         // Must itself be AI-slop-free (we preach it).
         assert!(!html.to_lowercase().contains("#7c3aed"));
         assert!(!html.to_lowercase().contains("#667eea"));
+        // Our OWN governance rule (UD-ARCH-013) must pass on our OWN output:
+        // the scorecard ships a Content-Security-Policy so it doesn't fail the
+        // very CSP rule UmaDev enforces on generated HTML.
+        assert!(html.contains("<meta http-equiv=\"Content-Security-Policy\""));
+        // The CSP permits the inline <style> the scorecard relies on.
+        assert!(html.contains("style-src 'self' 'unsafe-inline'"));
+        let csp = umadev_governance::rules::check_csp_required(card.to_str().unwrap(), &html);
+        assert!(
+            !csp.block,
+            "scorecard must pass UD-ARCH-013 with no post-hoc CSP fix"
+        );
     }
 
     #[test]
