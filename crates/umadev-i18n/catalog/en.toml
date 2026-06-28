@@ -656,6 +656,7 @@
 "slash.skill_header" = "[skill] Skills:\n\n{}"
 "slash.mouse_on" = "mouse-wheel scrolling on — Shift+drag for native text selection"
 "slash.mouse_off" = "mouse-wheel scrolling off — native text selection restored"
+"slash.redraw" = "screen repainted — cleared any stale or garbled cells"
 # /spec overlay title
 "spec.overlay_title" = " UMADEV_HOST_SPEC_V1 — press Esc to close, ↑↓ scroll "
 # /doctor overlay body + title

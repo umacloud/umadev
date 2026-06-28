@@ -3989,6 +3989,13 @@ fn prefold_line_filled(
     for span in &line.spans {
         let st = span.style;
         for ch in strip_control_chars(span.content.as_ref()).chars() {
+            // Normalize tabs to a single space. A tab has unicode-width 0, so the
+            // fold would count it as 0 columns — but a terminal expands it to a
+            // tab stop when painting, making the row WIDER than the viewport and
+            // triggering terminal auto-wrap (which desyncs ratatui's cursor and
+            // bleeds/overlaps content — the long-line garble). Folding what we
+            // actually paint keeps every row's display width ≤ the inner width.
+            let ch = if ch == '\t' { ' ' } else { ch };
             chars.push((ch, st));
         }
     }
@@ -6523,6 +6530,51 @@ mod tests {
         for r in &rows {
             assert!(line_width(r) <= 8, "no row overflows even mid-word");
         }
+    }
+
+    #[test]
+    fn prefold_normalizes_tabs_so_painted_width_matches_the_fold() {
+        // A tab has unicode-width 0, but a terminal expands it to a tab stop —
+        // so an un-normalized tab makes the painted row WIDER than the fold
+        // measured, the long-line desync. The fold converts tabs, so NO `\t`
+        // survives into the painted rows and every row stays within the width.
+        let line = Line::from(Span::raw("a\tb\tc\td\te\tf\tg\th".to_string()));
+        let rows = prefold_line(&line, 6, 0, None);
+        for r in &rows {
+            let joined: String = r.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                !joined.contains('\t'),
+                "no tab survives the fold: {joined:?}"
+            );
+            assert!(line_width(r) <= 6, "no folded row exceeds the width");
+        }
+    }
+
+    #[test]
+    fn prefold_hard_breaks_a_no_space_path_with_cjk_to_the_width() {
+        // The worst overflow case: a long unbroken path (no spaces, the way a
+        // full Windows path arrives) intermixed with a wide CJK glyph. Every
+        // produced row must stay within the inner width — hard-broken char by
+        // char, never splitting the wide glyph — so the terminal never auto-wraps
+        // and bleeds content.
+        let path = "C:\\Users\\weiyou\\项目\\long\\path\\to\\file.rs";
+        let line = Line::from(Span::raw(path.to_string()));
+        let w = 10;
+        let rows = prefold_line(&line, w, 0, None);
+        for r in &rows {
+            assert!(
+                line_width(r) <= w,
+                "no row overflows the inner width: got {}",
+                line_width(r)
+            );
+        }
+        // Lossless: nothing dropped while hard-breaking (no spaces to fold away).
+        let back: String = rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(back, path, "the path round-trips through the fold");
     }
 
     #[test]

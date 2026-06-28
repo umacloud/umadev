@@ -42,10 +42,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind, MouseButton, MouseEventKind,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
@@ -3277,6 +3278,222 @@ fn restore_terminal(terminal: &mut Term) {
     let _ = terminal.show_cursor();
 }
 
+/// Whether the terminal supports **DEC private mode 2026 (synchronized output)**
+/// — the BSU/ESU pair (`\x1b[?2026h` … `\x1b[?2026l`).
+///
+/// When supported, wrapping each frame write in
+/// [`BeginSynchronizedUpdate`] … [`EndSynchronizedUpdate`] makes the terminal
+/// buffer the WHOLE frame and swap it atomically, so a mid-paint flush can never
+/// surface a half-drawn / torn / garbled frame — the root fix for the "界面错乱
+/// after a while" symptom (the Ctrl+L / resize-clear / line-clip changes are the
+/// recovery + desync-source fixes; this stops corruption appearing in the first
+/// place).
+///
+/// Detection is by environment only — no terminal round-trip — so it is cheap,
+/// synchronous, and computed ONCE at startup (never per frame). Conservative: an
+/// unknown terminal returns `false` and simply draws exactly as before. Mirrors
+/// the terminal allow-list a capable host CLI uses.
+fn synchronized_output_supported() -> bool {
+    use std::env::{var, var_os};
+    // tmux proxies every byte but doesn't implement DEC 2026, and has already
+    // broken atomicity by chunking — BSU/ESU would just cost bytes. Skip it.
+    if var_os("TMUX").is_some() {
+        return false;
+    }
+    // Terminals with known DEC 2026 support, by TERM_PROGRAM.
+    if let Some(tp) = var_os("TERM_PROGRAM") {
+        if matches!(
+            tp.to_str(),
+            Some(
+                "iTerm.app"
+                    | "WezTerm"
+                    | "WarpTerminal"
+                    | "ghostty"
+                    | "contour"
+                    | "vscode"
+                    | "alacritty"
+            )
+        ) {
+            return true;
+        }
+    }
+    let term = var("TERM").unwrap_or_default();
+    // kitty sets TERM=xterm-kitty or KITTY_WINDOW_ID.
+    if term.contains("kitty") || var_os("KITTY_WINDOW_ID").is_some() {
+        return true;
+    }
+    // Ghostty may set TERM=xterm-ghostty without TERM_PROGRAM.
+    if term == "xterm-ghostty" {
+        return true;
+    }
+    // foot sets TERM=foot or foot-extra.
+    if term.starts_with("foot") {
+        return true;
+    }
+    // Alacritty may set TERM containing 'alacritty'.
+    if term.contains("alacritty") {
+        return true;
+    }
+    // Zed uses the alacritty_terminal crate (DEC 2026 capable).
+    if var_os("ZED_TERM").is_some() {
+        return true;
+    }
+    // Windows Terminal (important for the Windows console garble report).
+    if var_os("WT_SESSION").is_some() {
+        return true;
+    }
+    // VTE-based terminals (GNOME Terminal, Tilix, …) since VTE 0.68 (6800).
+    if var("VTE_VERSION")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .is_some_and(|v| v >= 6800)
+    {
+        return true;
+    }
+    false
+}
+
+/// How far into the `Esc [ < <num> ; <num> ; <num> (M|m)` SGR-mouse shape the
+/// [`MouseSeqFilter`] has matched so far. Each variant names the bytes already
+/// buffered.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum MouseSeqState {
+    /// Not inside a candidate sequence.
+    #[default]
+    Idle,
+    /// Saw a bare `Esc` — could be a real Esc keypress OR the lead byte of a
+    /// mis-split mouse report; undecided until the next key.
+    Esc,
+    /// Saw `Esc [` — still ambiguous.
+    Bracket,
+    /// Saw `Esc [ <` — confirmed an SGR mouse report; swallow the numeric body
+    /// until the `M`/`m` terminator.
+    Body,
+}
+
+/// Defensive filter for **leaked SGR mouse sequences**.
+///
+/// crossterm normally delivers a wheel/move report as one atomic
+/// [`Event::Mouse`]. Under load (bursts, a briefly frozen stdin, some Windows
+/// consoles) the byte run `ESC [ < <num> ; <num> ; <num> (M|m)` can be
+/// **mis-split** into discrete key events — a stray [`KeyCode::Esc`] followed by
+/// the literal `[<…;…;…M` chars. Untreated, that leaks raw text into the input
+/// box and the leading `Esc` fires a false interrupt/quit (the reported
+/// `>_ [<64;100;67M…` + repeated "press Esc again" symptom).
+///
+/// This is a tiny, bounded, fail-open state machine over the **key** stream: it
+/// recognizes that shape and DROPS the whole thing (including the leading Esc);
+/// anything that doesn't match flushes back through unchanged, so a real Esc and
+/// a user genuinely typing `[`, `<` or digits are never eaten. It is purely
+/// defensive — it stops the SYMPTOM regardless of why crossterm split the bytes.
+#[derive(Default)]
+struct MouseSeqFilter {
+    /// Keys buffered while a candidate sequence is undecided. Empty when
+    /// [`MouseSeqState::Idle`]. Bounded by [`MouseSeqFilter::MAX_BUF`].
+    buf: Vec<KeyEvent>,
+    /// How much of the `Esc [ < … M` shape has matched.
+    state: MouseSeqState,
+}
+
+impl MouseSeqFilter {
+    /// Hard cap on the buffered run. A real SGR mouse report is short
+    /// (`Esc [ < 64 ; 1000 ; 1000 M` ≈ 16 chars); anything longer is not a mouse
+    /// report, so we fail open and flush it as ordinary input rather than eating
+    /// unbounded keystrokes.
+    const MAX_BUF: usize = 40;
+
+    /// Whether `key` can be part of a leaked mouse sequence at all. Any
+    /// Ctrl/Alt/Super-modified key is a deliberate user action (never a leaked
+    /// mouse byte), so it breaks/flushes the candidate immediately. Shift is
+    /// allowed through — `<` arrives as Shift+`,` on many layouts.
+    fn plain(key: &KeyEvent) -> bool {
+        !key.modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    }
+
+    /// Drain the buffer and append `tail`, returning them in order and resetting
+    /// to [`MouseSeqState::Idle`]. Used when a candidate turns out NOT to be a
+    /// mouse report — the buffered keys (and the key that broke the match) flush
+    /// back through normal input handling.
+    fn flush_with(&mut self, tail: KeyEvent) -> Vec<KeyEvent> {
+        self.state = MouseSeqState::Idle;
+        let mut out = std::mem::take(&mut self.buf);
+        out.push(tail);
+        out
+    }
+
+    /// Feed one key. Returns the keys the caller should process now (in order):
+    /// empty = swallowed (part of a candidate / completed leak); one or more =
+    /// flush these through normal handling.
+    fn feed(&mut self, key: KeyEvent) -> Vec<KeyEvent> {
+        let plain = Self::plain(&key);
+        match self.state {
+            MouseSeqState::Idle => {
+                if plain && key.code == KeyCode::Esc {
+                    self.buf.push(key);
+                    self.state = MouseSeqState::Esc;
+                    Vec::new()
+                } else {
+                    vec![key]
+                }
+            }
+            MouseSeqState::Esc => {
+                if plain && key.code == KeyCode::Char('[') {
+                    self.buf.push(key);
+                    self.state = MouseSeqState::Bracket;
+                    Vec::new()
+                } else {
+                    // Not `Esc [` — a real Esc (alone or followed by other input):
+                    // flush the Esc and this key for normal processing.
+                    self.flush_with(key)
+                }
+            }
+            MouseSeqState::Bracket => {
+                if plain && key.code == KeyCode::Char('<') {
+                    self.buf.push(key);
+                    self.state = MouseSeqState::Body;
+                    Vec::new()
+                } else {
+                    self.flush_with(key)
+                }
+            }
+            MouseSeqState::Body => {
+                // Confirmed `Esc [ <` — swallow the numeric body; the `M`/`m`
+                // terminator ends (and DROPS) the whole leaked report.
+                match key.code {
+                    KeyCode::Char('M' | 'm') => {
+                        self.buf.clear();
+                        self.state = MouseSeqState::Idle;
+                        Vec::new()
+                    }
+                    KeyCode::Char(c) if c.is_ascii_digit() || c == ';' => {
+                        self.buf.push(key);
+                        if self.buf.len() > Self::MAX_BUF {
+                            // Runaway — not a real report. Fail open: flush as text.
+                            self.state = MouseSeqState::Idle;
+                            std::mem::take(&mut self.buf)
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    // Malformed body — fail open and flush everything as input.
+                    _ => self.flush_with(key),
+                }
+            }
+        }
+    }
+
+    /// Flush any buffered candidate that never completed — a lone `Esc` (or a
+    /// partial `Esc [`) the user pressed and then paused on. Called off the key
+    /// path (on the periodic tick) so a real Esc still acts within a frame even
+    /// when no following key arrives to break the candidate. A genuine leaked
+    /// burst completes inside [`Self::feed`] and never reaches here.
+    fn flush(&mut self) -> Vec<KeyEvent> {
+        self.state = MouseSeqState::Idle;
+        std::mem::take(&mut self.buf)
+    }
+}
+
 async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> Result<()> {
     let (sink, mut engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
@@ -3335,9 +3552,32 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // `Block::Continue`. Set when a continuous `run` is dispatched; cleared on a
     // terminal outcome / cancel. Local to the loop — no extra `App` state.
     let mut continuous_run_active = false;
+    // Defensive filter for leaked SGR mouse sequences that crossterm mis-split
+    // into discrete key events (a stray `Esc` + raw `[<…M` text). See
+    // [`MouseSeqFilter`]. Lives across iterations so a sequence split over
+    // several polls is still recognized.
+    let mut mouse_seq_filter = MouseSeqFilter::default();
+    // DEC 2026 synchronized-output (BSU/ESU) support, detected ONCE at startup
+    // (not per frame). When `true`, each frame write is wrapped so the terminal
+    // buffers the whole frame and swaps it atomically — no mid-paint tearing /
+    // garbling. See [`synchronized_output_supported`].
+    let sync_output = synchronized_output_supported();
 
     loop {
-        terminal.draw(|f| ui::render(f, app))?;
+        // Wrap the frame in a synchronized-output update when supported: the
+        // terminal holds back the paint until ESU, then swaps atomically, so a
+        // half-drawn frame can never surface (the root fix for mid-render
+        // garble). ESU is emitted UNCONDITIONALLY after the draw — even if it
+        // errored — so the terminal can never get stuck in synchronized mode.
+        // Both ends fail-open (`let _ =`): a write error never blocks the loop.
+        if sync_output {
+            let _ = std::io::stdout().execute(BeginSynchronizedUpdate);
+        }
+        let draw_result = terminal.draw(|f| ui::render(f, app));
+        if sync_output {
+            let _ = std::io::stdout().execute(EndSynchronizedUpdate);
+        }
+        draw_result?;
 
         tokio::select! {
             maybe_route = route_rx.recv() => {
@@ -3483,10 +3723,14 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             }
             maybe_key = keys.next() => {
                 if let Some(Ok(Event::Resize(..))) = &maybe_key {
-                    // Resize: do nothing but fall through to the loop top, which
-                    // redraws the whole frame at the new size. This makes a drag-
-                    // resize repaint immediately instead of tearing until the next
-                    // tick / keypress.
+                    // Resize: force a full clear + repaint. The loop top already
+                    // redraws at the new size, but some terminals (notably the
+                    // Windows console) leave STALE cells after a resize that
+                    // ratatui's incremental diff won't overwrite — content bleeds
+                    // and smears. `clear()` resets the back buffer so the next
+                    // draw repaints every cell. Fail-open: a backend write error is
+                    // ignored, never blocking the loop.
+                    let _ = terminal.clear();
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
                     // Mouse → wheel scrollback + the in-app drag-to-select/copy layer
                     // (the Claude Code approach: WE render the selection highlight and
@@ -3547,184 +3791,243 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // DROPPED those keystrokes → missing / out-of-order characters.
                     // `Release` is still ignored so every key fires exactly once.
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                        match app.apply_key_with_mods(key.code, key.modifiers) {
-                            Action::Quit => break,
-                            Action::None => {}
-                            Action::BackendChanged => {
-                                // A base was just chosen — either first-launch picker
-                                // completion (the `None`→host case) or a `/backend`
-                                // switch (both set `chat_session_dirty`). Close any
-                                // stale resident session pinned to the OLD base, clear
-                                // the dirty flag (so the bottom-of-loop close doesn't
-                                // also fire), and PRE-LOAD a fresh warm session against
-                                // the NEW base so the next chat message is hot. All
-                                // best-effort / fail-open: a switch mid-turn can't reach
-                                // here (rejected upstream), so this only closes a
-                                // parked/idle session.
-                                app.chat_session_dirty = false;
-                                if let Some(stale) =
-                                    chat_session_holder.lock().await.take()
-                                {
-                                    stale.end().await;
+                        // Run the key through the leaked-mouse-sequence filter
+                        // first (see `MouseSeqFilter`): a mis-split SGR wheel
+                        // report (`Esc [ < d;d;d M|m`) is DROPPED whole so its raw
+                        // `[<…M` text never leaks into the input and its stray Esc
+                        // never fires a false interrupt/quit. Everything else
+                        // flushes back through unchanged (possibly more than one
+                        // key, when a buffered candidate turns out to be real
+                        // input), so legitimate keystrokes are never eaten.
+                        for replay_key in mouse_seq_filter.feed(key) {
+                            match app.apply_key_with_mods(replay_key.code, replay_key.modifiers) {
+                                // Quit sets `app.should_quit`; the loop-bottom check
+                                // breaks. (No bare `break` here — it would only exit
+                                // the inner replay loop, not the event loop.) None is
+                                // likewise a no-op, so the two share an arm.
+                                Action::Quit | Action::None => {}
+                                Action::BackendChanged => {
+                                    // A base was just chosen — either first-launch picker
+                                    // completion (the `None`→host case) or a `/backend`
+                                    // switch (both set `chat_session_dirty`). Close any
+                                    // stale resident session pinned to the OLD base, clear
+                                    // the dirty flag (so the bottom-of-loop close doesn't
+                                    // also fire), and PRE-LOAD a fresh warm session against
+                                    // the NEW base so the next chat message is hot. All
+                                    // best-effort / fail-open: a switch mid-turn can't reach
+                                    // here (rejected upstream), so this only closes a
+                                    // parked/idle session.
+                                    app.chat_session_dirty = false;
+                                    if let Some(stale) =
+                                        chat_session_holder.lock().await.take()
+                                    {
+                                        stale.end().await;
+                                    }
+                                    spawn_chat_session_preload(
+                                        app.backend.as_deref(),
+                                        app.effective_model(),
+                                        app.project_root.clone(),
+                                        continuous_autonomous(app.effective_trust_mode()),
+                                        chat_session_holder.clone(),
+                                    );
                                 }
-                                spawn_chat_session_preload(
-                                    app.backend.as_deref(),
-                                    app.effective_model(),
-                                    app.project_root.clone(),
-                                    continuous_autonomous(app.effective_trust_mode()),
-                                    chat_session_holder.clone(),
-                                );
-                            }
-                            Action::Reconfigure => {
-                                // Re-opened the first-run guide — re-probe the
-                                // host CLIs so their ready-state is current.
-                                spawn_probe(sink.clone());
-                            }
-                            Action::Continue(gate) => {
-                                let run_opts = current_run_options(app, &opts);
-                                // Continuous run: resume the parked session at the
-                                // next gate-anchored phase. Single-shot: fresh
-                                // `Block::Continue`.
-                                run_task = Some(if continuous_run_active {
-                                    let autonomous = continuous_autonomous(run_opts.mode);
-                                    spawn_continuous_block(
-                                        run_opts,
-                                        sink.clone(),
-                                        session_holder.clone(),
-                                        continuous_resume_phase(gate),
-                                        autonomous,
-                                    )
-                                } else {
-                                    spawn_block(
-                                        run_opts,
-                                        app.brain_spec(),
-                                        sink.clone(),
-                                        Block::Continue(gate),
-                                    )
-                                });
-                            }
-                            Action::Cancel => {
-                                if let Some(h) = run_task.take() {
-                                    // Schedule cancellation, then get the WAIT off the
-                                    // render path: park the aborting handle and let the
-                                    // dedicated `cancel_drain` branch await it (bounded)
-                                    // while the loop keeps drawing the "stopping…" state.
-                                    // The post-cancel cleanup runs there, AFTER the task
-                                    // has actually released its session lock — so the
-                                    // try_lock cleanup never races a still-held lock.
-                                    h.abort();
-                                    cancel_drain = Some(h);
-                                    // Keep the spinner alive + show an explicit
-                                    // "stopping…" line so the cancel reads as in-progress
-                                    // (not frozen) until the drain settles.
-                                    app.begin_cancelling();
-                                } else {
-                                    // Nothing in flight — cancel is an immediate reset
-                                    // (still drop any parked session + drain stale
-                                    // events so a buffered reply can't resurrect state).
-                                    if continuous_run_active {
-                                        if let Ok(mut g) = session_holder.try_lock() {
-                                            if let Some(mut s) = g.take() {
-                                                let _ = s.end().await;
+                                Action::Reconfigure => {
+                                    // Re-opened the first-run guide — re-probe the
+                                    // host CLIs so their ready-state is current.
+                                    spawn_probe(sink.clone());
+                                }
+                                Action::Continue(gate) => {
+                                    let run_opts = current_run_options(app, &opts);
+                                    // Continuous run: resume the parked session at the
+                                    // next gate-anchored phase. Single-shot: fresh
+                                    // `Block::Continue`.
+                                    run_task = Some(if continuous_run_active {
+                                        let autonomous = continuous_autonomous(run_opts.mode);
+                                        spawn_continuous_block(
+                                            run_opts,
+                                            sink.clone(),
+                                            session_holder.clone(),
+                                            continuous_resume_phase(gate),
+                                            autonomous,
+                                        )
+                                    } else {
+                                        spawn_block(
+                                            run_opts,
+                                            app.brain_spec(),
+                                            sink.clone(),
+                                            Block::Continue(gate),
+                                        )
+                                    });
+                                }
+                                Action::Cancel => {
+                                    if let Some(h) = run_task.take() {
+                                        // Schedule cancellation, then get the WAIT off the
+                                        // render path: park the aborting handle and let the
+                                        // dedicated `cancel_drain` branch await it (bounded)
+                                        // while the loop keeps drawing the "stopping…" state.
+                                        // The post-cancel cleanup runs there, AFTER the task
+                                        // has actually released its session lock — so the
+                                        // try_lock cleanup never races a still-held lock.
+                                        h.abort();
+                                        cancel_drain = Some(h);
+                                        // Keep the spinner alive + show an explicit
+                                        // "stopping…" line so the cancel reads as in-progress
+                                        // (not frozen) until the drain settles.
+                                        app.begin_cancelling();
+                                    } else {
+                                        // Nothing in flight — cancel is an immediate reset
+                                        // (still drop any parked session + drain stale
+                                        // events so a buffered reply can't resurrect state).
+                                        if continuous_run_active {
+                                            if let Ok(mut g) = session_holder.try_lock() {
+                                                if let Some(mut s) = g.take() {
+                                                    let _ = s.end().await;
+                                                }
                                             }
+                                            continuous_run_active = false;
                                         }
-                                        continuous_run_active = false;
+                                        let parked = chat_session_holder
+                                            .try_lock()
+                                            .ok()
+                                            .and_then(|mut g| g.take());
+                                        if let Some(s) = parked {
+                                            s.end().await;
+                                        }
+                                        while engine_rx.try_recv().is_ok() {}
+                                        while route_rx.try_recv().is_ok() {}
+                                        app.cancel_run();
                                     }
-                                    let parked = chat_session_holder
-                                        .try_lock()
-                                        .ok()
-                                        .and_then(|mut g| g.take());
-                                    if let Some(s) = parked {
-                                        s.end().await;
-                                    }
-                                    while engine_rx.try_recv().is_ok() {}
-                                    while route_rx.try_recv().is_ok() {}
-                                    app.cancel_run();
                                 }
-                            }
-                            Action::StartRun(req) | Action::StartGoal(req) => {
-                                // `/goal <objective>` and `/run` BOTH ride this one
-                                // director-build path (the orchestration that owns the
-                                // plan / team / firmware / finalize). Both opt into goal
-                                // mode (the universal enhancement — Claude Code's native
-                                // persistent `/goal` is strictly stronger than a plain
-                                // prompt loop), so the base gets a persistent-`/goal`
-                                // framing — "keep working until the objective is met."
-                                // `StartGoal` is a distinct Action only so the `/goal`
-                                // command can carry its own usage / preflight in
-                                // `slash_goal`; from here the build branch is shared
-                                // byte-for-byte. The framing itself is applied inside
-                                // `run_director_loop`, gated by the brain's capability +
-                                // `UMADEV_NO_GOAL_MODE` (so it fully reverts).
-                                let goal_mode = true;
-                                // Wave 1 (docs/AGENT_WIELDS_BASE_ARCHITECTURE.md §5):
-                                // an explicit `/run` is now the DIRECTOR-driven agentic
-                                // path by default — the SAME engine a free-text message
-                                // reaches — with the goal framed as a full commercial
-                                // build the director orchestrates with its team however
-                                // it judges fit, NOT the fixed 9-phase pipeline. The
-                                // legacy pipeline is retained UNTOUCHED behind an
-                                // explicit opt-in (`UMADEV_LEGACY_PIPELINE=1`) so the
-                                // field reverts with no code change. A host CLI is
-                                // required for the director path (it drives a real base
-                                // session); offline / non-host brains and the legacy
-                                // flag both fall through to the pipeline below.
-                                let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
-                                let legacy = umadev_agent::legacy_pipeline_from_env();
-                                if host_cli && !legacy {
-                                    // DEFAULT (USB model): the director build loop.
-                                    // `/run` opens a live base session and drives
-                                    // `drive_director_loop`. The firmware (team
-                                    // identity + craft) is injected; the base's body
-                                    // builds the goal end to end with its OWN tools,
-                                    // then UmaDev runs a read-only honesty/QC pass and
-                                    // feeds any blocking findings back as a fix
-                                    // directive (bounded) — no marker protocol, no
-                                    // outside "summon". No fixed-phase continuous run
-                                    // is in flight, so the gate-resume machinery stays
-                                    // dormant. The run-lock + governance + source-
-                                    // present hard-gate are held inside the loop's task.
-                                    continuous_run_active = false;
-                                    app.thinking = true;
-                                    app.thinking_started = Some(std::time::Instant::now());
-                                    app.last_output_at = None;
-                                    app.tool_in_progress = false;
-                                    app.agentic_in_flight = true;
-                                    // Wave 5 deliverable 2: an explicit `/run` is a
-                                    // director build — its session is handed back to
-                                    // chat when it settles (see `record_agentic_done`).
-                                    app.director_run_in_flight = true;
-                                    // Remember the goal so the status bar + a later
-                                    // revise see it, then build the run options for
-                                    // this director build with the requirement set.
-                                    app.requirement.clone_from(&req);
-                                    let mut run_opts = current_run_options(app, &opts);
-                                    run_opts.requirement = req;
-                                    let autonomous = continuous_autonomous(run_opts.mode);
-                                    run_task = Some(spawn_director_loop(
-                                        run_opts,
-                                        sink.clone(),
-                                        route_tx.clone(),
-                                        autonomous,
-                                        // Explicit `/run` carries no prior chat to
-                                        // inherit — the director build starts from the
-                                        // goal alone (unchanged behaviour).
-                                        Vec::new(),
-                                        // `None` → `for_run` FORCES a Build (the
-                                        // explicit-run contract), unchanged.
-                                        None,
-                                        // `/goal` (and `/run`) → persistent-goal framing,
-                                        // gated by capability + opt-out inside the loop.
-                                        goal_mode,
-                                    ));
-                                } else {
-                                    // LEGACY (opt-in) or offline / non-host: drive the
-                                    // fixed pipeline exactly as before. Continuous is
-                                    // the default within the legacy pipeline itself; a
-                                    // non-host brain stays single-shot `Block::Clarify`.
+                                Action::StartRun(req) | Action::StartGoal(req) => {
+                                    // `/goal <objective>` and `/run` BOTH ride this one
+                                    // director-build path (the orchestration that owns the
+                                    // plan / team / firmware / finalize). Both opt into goal
+                                    // mode (the universal enhancement — Claude Code's native
+                                    // persistent `/goal` is strictly stronger than a plain
+                                    // prompt loop), so the base gets a persistent-`/goal`
+                                    // framing — "keep working until the objective is met."
+                                    // `StartGoal` is a distinct Action only so the `/goal`
+                                    // command can carry its own usage / preflight in
+                                    // `slash_goal`; from here the build branch is shared
+                                    // byte-for-byte. The framing itself is applied inside
+                                    // `run_director_loop`, gated by the brain's capability +
+                                    // `UMADEV_NO_GOAL_MODE` (so it fully reverts).
+                                    let goal_mode = true;
+                                    // Wave 1 (docs/AGENT_WIELDS_BASE_ARCHITECTURE.md §5):
+                                    // an explicit `/run` is now the DIRECTOR-driven agentic
+                                    // path by default — the SAME engine a free-text message
+                                    // reaches — with the goal framed as a full commercial
+                                    // build the director orchestrates with its team however
+                                    // it judges fit, NOT the fixed 9-phase pipeline. The
+                                    // legacy pipeline is retained UNTOUCHED behind an
+                                    // explicit opt-in (`UMADEV_LEGACY_PIPELINE=1`) so the
+                                    // field reverts with no code change. A host CLI is
+                                    // required for the director path (it drives a real base
+                                    // session); offline / non-host brains and the legacy
+                                    // flag both fall through to the pipeline below.
+                                    let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
+                                    let legacy = umadev_agent::legacy_pipeline_from_env();
+                                    if host_cli && !legacy {
+                                        // DEFAULT (USB model): the director build loop.
+                                        // `/run` opens a live base session and drives
+                                        // `drive_director_loop`. The firmware (team
+                                        // identity + craft) is injected; the base's body
+                                        // builds the goal end to end with its OWN tools,
+                                        // then UmaDev runs a read-only honesty/QC pass and
+                                        // feeds any blocking findings back as a fix
+                                        // directive (bounded) — no marker protocol, no
+                                        // outside "summon". No fixed-phase continuous run
+                                        // is in flight, so the gate-resume machinery stays
+                                        // dormant. The run-lock + governance + source-
+                                        // present hard-gate are held inside the loop's task.
+                                        continuous_run_active = false;
+                                        app.thinking = true;
+                                        app.thinking_started = Some(std::time::Instant::now());
+                                        app.last_output_at = None;
+                                        app.tool_in_progress = false;
+                                        app.agentic_in_flight = true;
+                                        // Wave 5 deliverable 2: an explicit `/run` is a
+                                        // director build — its session is handed back to
+                                        // chat when it settles (see `record_agentic_done`).
+                                        app.director_run_in_flight = true;
+                                        // Remember the goal so the status bar + a later
+                                        // revise see it, then build the run options for
+                                        // this director build with the requirement set.
+                                        app.requirement.clone_from(&req);
+                                        let mut run_opts = current_run_options(app, &opts);
+                                        run_opts.requirement = req;
+                                        let autonomous = continuous_autonomous(run_opts.mode);
+                                        run_task = Some(spawn_director_loop(
+                                            run_opts,
+                                            sink.clone(),
+                                            route_tx.clone(),
+                                            autonomous,
+                                            // Explicit `/run` carries no prior chat to
+                                            // inherit — the director build starts from the
+                                            // goal alone (unchanged behaviour).
+                                            Vec::new(),
+                                            // `None` → `for_run` FORCES a Build (the
+                                            // explicit-run contract), unchanged.
+                                            None,
+                                            // `/goal` (and `/run`) → persistent-goal framing,
+                                            // gated by capability + opt-out inside the loop.
+                                            goal_mode,
+                                        ));
+                                    } else {
+                                        // LEGACY (opt-in) or offline / non-host: drive the
+                                        // fixed pipeline exactly as before. Continuous is
+                                        // the default within the legacy pipeline itself; a
+                                        // non-host brain stays single-shot `Block::Clarify`.
+                                        let run_opts = RunOptions {
+                                            project_root: opts.project_root.clone(),
+                                            requirement: req,
+                                            slug: opts.slug.clone(),
+                                            model: app.effective_model(),
+                                            backend: app.backend.clone().unwrap_or_default(),
+                                            design_system: app.config.design_system.clone().unwrap_or_default(),
+                                            seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                                            mode: app.effective_trust_mode(),
+                                            // Snapshot the strict-coverage opt-in once at
+                                            // the app boundary; the runner reads this, not
+                                            // the live env (which races in parallel).
+                                            strict_coverage: umadev_agent::strict_coverage_from_env(),
+                                        };
+                                        continuous_run_active = tui_continuous_enabled() && host_cli;
+                                        run_task = Some(if continuous_run_active {
+                                            let autonomous = continuous_autonomous(run_opts.mode);
+                                            spawn_continuous_block(
+                                                run_opts,
+                                                sink.clone(),
+                                                session_holder.clone(),
+                                                umadev_spec::Phase::Research,
+                                                autonomous,
+                                            )
+                                        } else {
+                                            spawn_block(
+                                                run_opts,
+                                                app.brain_spec(),
+                                                sink.clone(),
+                                                Block::Clarify,
+                                            )
+                                        });
+                                    }
+                                }
+                                Action::StartQuick(task) => {
+                                    // Lightweight fast track — same RunOptions as a
+                                    // normal start, but driven through the lean
+                                    // single-shot Light block (no gates). P1-E note:
+                                    // `/quick` deliberately stays on the single-shot
+                                    // lean engine on BOTH invocation forms (there is only
+                                    // one `/quick`), so it is already self-consistent —
+                                    // the divergence P1-E fixes is `/run` vs direct-input
+                                    // general runs, which now share the continuous engine.
+                                    // The continuous path classifies via `planner::plan`
+                                    // (not `plan_light`), so routing `/quick` through it
+                                    // could silently run the FULL pipeline and break the
+                                    // forced-lean promise; we keep the forced-Light block.
                                     let run_opts = RunOptions {
                                         project_root: opts.project_root.clone(),
-                                        requirement: req,
+                                        requirement: task,
                                         slug: opts.slug.clone(),
                                         model: app.effective_model(),
                                         backend: app.backend.clone().unwrap_or_default(),
@@ -3736,333 +4039,298 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         // the live env (which races in parallel).
                                         strict_coverage: umadev_agent::strict_coverage_from_env(),
                                     };
-                                    continuous_run_active = tui_continuous_enabled() && host_cli;
+                                    run_task = Some(spawn_block(
+                                        run_opts,
+                                        app.brain_spec(),
+                                        sink.clone(),
+                                        Block::Light,
+                                    ));
+                                }
+                                Action::RedoPhase(phase) => {
+                                    // Re-run a single phase with the prior run's
+                                    // context (current_run_options carries the
+                                    // persisted requirement / slug / backend).
+                                    let run_opts = current_run_options(app, &opts);
+                                    run_task = Some(spawn_block(
+                                        run_opts,
+                                        app.brain_spec(),
+                                        sink.clone(),
+                                        Block::Redo(phase),
+                                    ));
+                                }
+                                Action::Route(text) => {
+                                    // Chat dispatch: drive the persistent session ONCE on the
+                                    // light path — NO up-front classification subprocess. The
+                                    // base HAS tools and IS the brain; it decides chat-vs-build
+                                    // by ACTING (a reply is chat; a file write is a build), and
+                                    // UmaDev reacts (`react_to_first_write`). This is the fix
+                                    // for the ~30s first reply: the old path cold-started a
+                                    // throwaway `claude --print` to classify, THEN cold-started
+                                    // a SECOND base to answer — two cold starts per message.
+                                    //
+                                    // This arm runs INLINE on the UI thread (the `keys.next()`
+                                    // branch of the `tokio::select!`), so any `.await` HERE
+                                    // would freeze the terminal — no redraw, no input. Instead
+                                    // we (a) set the immediate UI state here, (b) snapshot every
+                                    // `&mut App` input the turn needs (the spawned task can't
+                                    // touch app state — it runs concurrently with this loop),
+                                    // and (c) spawn ONE task (`run_routed_turn`) that emits the
+                                    // chat intent card + streams the turn off the render path.
+                                    // Dispatch returns instantly; the UI keeps redrawing the
+                                    // "thinking…" state from `engine_rx` events.
+                                    let host_cli =
+                                        matches!(app.brain_spec(), BrainSpec::HostCli(_));
+                                    // Immediate UI state (same bookkeeping the `/run` arm sets):
+                                    // thinking + aliveness clock + agentic-in-flight, and a
+                                    // chat turn is never the continuous fixed-phase run.
+                                    continuous_run_active = false;
+                                    app.thinking = true;
+                                    app.thinking_started = Some(std::time::Instant::now());
+                                    app.last_output_at = None;
+                                    app.tool_in_progress = false;
+                                    app.agentic_in_flight = true;
+                                    // The turn is NOT pre-classified anymore (the base
+                                    // decides chat-vs-build by acting — see
+                                    // `run_routed_turn`), so `director_run_in_flight` stays
+                                    // false; the hand-back rides the terminal `AgenticDone`'s
+                                    // effective build-ness. Record the goal for the status
+                                    // bar / a revise.
+                                    app.director_run_in_flight = false;
+                                    app.requirement.clone_from(&text);
+                                    // ── Snapshot the session-continuity inputs on the UI
+                                    // thread (formerly computed inside `fire_agentic_routed`).
+                                    // Wave 5: a just-handed-back `/run` session continues via
+                                    // `--continue` (no fresh id); otherwise pin the stable chat
+                                    // id. Consume `run_session_handed_to_chat` here (one-shot).
+                                    let handing_back =
+                                        host_cli && app.run_session_handed_to_chat;
+                                    let continue_session =
+                                        app.host_chat_session_active || handing_back;
+                                    let session_id = if host_cli && !handing_back {
+                                        Some(app.ensure_chat_session_id())
+                                    } else {
+                                        None
+                                    };
+                                    app.run_session_handed_to_chat = false;
+                                    // Conversation snapshot stays taken on the UI thread so
+                                    // memory is never cold (Wave 5 / G11), passed into the task.
+                                    let conversation = app.conversation_snapshot();
+                                    let inputs = RoutedTurnInputs {
+                                        text,
+                                        spec: app.brain_spec(),
+                                        host_cli,
+                                        conversation,
+                                        continue_session,
+                                        session_id,
+                                        fallback_model: app.effective_model(),
+                                        project_root: app.project_root.clone(),
+                                        mode: app.effective_trust_mode(),
+                                    };
+                                    // Resuming the chat session means the NEXT turn must also
+                                    // `--continue` it — set this now (the light path used to set
+                                    // it after spawning); a director build hands its session back
+                                    // via the terminal decision instead. (On the host-CLI path the
+                                    // RESIDENT `chat_session_holder` IS the live memory; this flag
+                                    // still gates the offline / `--continue` fallback.)
+                                    if host_cli {
+                                        app.host_chat_session_active = true;
+                                    }
+                                    run_task = Some(tokio::spawn(run_routed_turn(
+                                        inputs,
+                                        chat_session_holder.clone(),
+                                        sink.clone(),
+                                        route_tx.clone(),
+                                    )));
+                                }
+                                Action::Revise(text) => {
+                                    // Re-run the block that PRODUCED the current
+                                    // gate, with the revision feedback folded into
+                                    // the requirement so the worker actually
+                                    // incorporates it. Branch on the active gate:
+                                    //   - docs_confirm  → re-run Initial (regen docs)
+                                    //   - preview_confirm→ re-run Continue(DocsConfirm)
+                                    //     (regen spec → frontend), NOT the docs.
+                                    // Re-running Initial unconditionally was a bug:
+                                    // a UI revision at preview_confirm would have
+                                    // thrown away the approved docs and regenerated
+                                    // them instead of redoing the frontend.
+                                    sink.emit(EngineEvent::Note(format!("user revision: {text}")));
+                                    let revised_requirement = format!(
+                                        "{}\n\n## Revision request\n{text}",
+                                        app.requirement
+                                    );
+                                    let run_opts = RunOptions {
+                                        project_root: opts.project_root.clone(),
+                                        requirement: revised_requirement,
+                                        slug: opts.slug.clone(),
+                                        model: app.effective_model(),
+                                        backend: app.backend.clone().unwrap_or_default(),
+                                        design_system: app.config.design_system.clone().unwrap_or_default(),
+                                        seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                                        mode: app.effective_trust_mode(),
+                                        // Snapshot the strict-coverage opt-in once at
+                                        // the app boundary; the runner reads this, not
+                                        // the live env (which races in parallel).
+                                        strict_coverage: umadev_agent::strict_coverage_from_env(),
+                                    };
+                                    let gate = app.active_gate;
+                                    // The producing block is re-running, so the gate
+                                    // is no longer active — clear it so the status
+                                    // bar / prompt don't keep showing the old gate
+                                    // (and its timers) during the rework.
+                                    app.active_gate = None;
+                                    // P1-D: on a continuous run, feed the revision back
+                                    // into the SAME held director session by re-driving
+                                    // the producing block on the continuous engine —
+                                    // NOT a single-shot `spawn_block`, which would orphan
+                                    // the held session (leaked, never `end()`-ed) and
+                                    // silently swap to the per-phase re-feed engine.
                                     run_task = Some(if continuous_run_active {
                                         let autonomous = continuous_autonomous(run_opts.mode);
+                                        let start_after =
+                                            continuous_revise_phase(gate.unwrap_or(Gate::DocsConfirm));
                                         spawn_continuous_block(
                                             run_opts,
                                             sink.clone(),
                                             session_holder.clone(),
-                                            umadev_spec::Phase::Research,
+                                            start_after,
                                             autonomous,
                                         )
                                     } else {
-                                        spawn_block(
-                                            run_opts,
-                                            app.brain_spec(),
-                                            sink.clone(),
-                                            Block::Clarify,
-                                        )
+                                        let block = match gate {
+                                            Some(Gate::PreviewConfirm) => {
+                                                Block::Continue(Gate::DocsConfirm)
+                                            }
+                                            // A revise AT the clarify gate re-asks the
+                                            // clarifying questions with the new info —
+                                            // NOT a jump straight to research/docs
+                                            // (Block::Initial skips clarify entirely).
+                                            Some(Gate::ClarifyGate) => Block::Clarify,
+                                            // docs_confirm or unknown → regenerate docs
+                                            _ => Block::Initial,
+                                        };
+                                        spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
                                     });
                                 }
-                            }
-                            Action::StartQuick(task) => {
-                                // Lightweight fast track — same RunOptions as a
-                                // normal start, but driven through the lean
-                                // single-shot Light block (no gates). P1-E note:
-                                // `/quick` deliberately stays on the single-shot
-                                // lean engine on BOTH invocation forms (there is only
-                                // one `/quick`), so it is already self-consistent —
-                                // the divergence P1-E fixes is `/run` vs direct-input
-                                // general runs, which now share the continuous engine.
-                                // The continuous path classifies via `planner::plan`
-                                // (not `plan_light`), so routing `/quick` through it
-                                // could silently run the FULL pipeline and break the
-                                // forced-lean promise; we keep the forced-Light block.
-                                let run_opts = RunOptions {
-                                    project_root: opts.project_root.clone(),
-                                    requirement: task,
-                                    slug: opts.slug.clone(),
-                                    model: app.effective_model(),
-                                    backend: app.backend.clone().unwrap_or_default(),
-                                    design_system: app.config.design_system.clone().unwrap_or_default(),
-                                    seed_template: app.config.seed_template.clone().unwrap_or_default(),
-                                    mode: app.effective_trust_mode(),
-                                    // Snapshot the strict-coverage opt-in once at
-                                    // the app boundary; the runner reads this, not
-                                    // the live env (which races in parallel).
-                                    strict_coverage: umadev_agent::strict_coverage_from_env(),
-                                };
-                                run_task = Some(spawn_block(
-                                    run_opts,
-                                    app.brain_spec(),
-                                    sink.clone(),
-                                    Block::Light,
-                                ));
-                            }
-                            Action::RedoPhase(phase) => {
-                                // Re-run a single phase with the prior run's
-                                // context (current_run_options carries the
-                                // persisted requirement / slug / backend).
-                                let run_opts = current_run_options(app, &opts);
-                                run_task = Some(spawn_block(
-                                    run_opts,
-                                    app.brain_spec(),
-                                    sink.clone(),
-                                    Block::Redo(phase),
-                                ));
-                            }
-                            Action::Route(text) => {
-                                // Chat dispatch: drive the persistent session ONCE on the
-                                // light path — NO up-front classification subprocess. The
-                                // base HAS tools and IS the brain; it decides chat-vs-build
-                                // by ACTING (a reply is chat; a file write is a build), and
-                                // UmaDev reacts (`react_to_first_write`). This is the fix
-                                // for the ~30s first reply: the old path cold-started a
-                                // throwaway `claude --print` to classify, THEN cold-started
-                                // a SECOND base to answer — two cold starts per message.
-                                //
-                                // This arm runs INLINE on the UI thread (the `keys.next()`
-                                // branch of the `tokio::select!`), so any `.await` HERE
-                                // would freeze the terminal — no redraw, no input. Instead
-                                // we (a) set the immediate UI state here, (b) snapshot every
-                                // `&mut App` input the turn needs (the spawned task can't
-                                // touch app state — it runs concurrently with this loop),
-                                // and (c) spawn ONE task (`run_routed_turn`) that emits the
-                                // chat intent card + streams the turn off the render path.
-                                // Dispatch returns instantly; the UI keeps redrawing the
-                                // "thinking…" state from `engine_rx` events.
-                                let host_cli =
-                                    matches!(app.brain_spec(), BrainSpec::HostCli(_));
-                                // Immediate UI state (same bookkeeping the `/run` arm sets):
-                                // thinking + aliveness clock + agentic-in-flight, and a
-                                // chat turn is never the continuous fixed-phase run.
-                                continuous_run_active = false;
-                                app.thinking = true;
-                                app.thinking_started = Some(std::time::Instant::now());
-                                app.last_output_at = None;
-                                app.tool_in_progress = false;
-                                app.agentic_in_flight = true;
-                                // The turn is NOT pre-classified anymore (the base
-                                // decides chat-vs-build by acting — see
-                                // `run_routed_turn`), so `director_run_in_flight` stays
-                                // false; the hand-back rides the terminal `AgenticDone`'s
-                                // effective build-ness. Record the goal for the status
-                                // bar / a revise.
-                                app.director_run_in_flight = false;
-                                app.requirement.clone_from(&text);
-                                // ── Snapshot the session-continuity inputs on the UI
-                                // thread (formerly computed inside `fire_agentic_routed`).
-                                // Wave 5: a just-handed-back `/run` session continues via
-                                // `--continue` (no fresh id); otherwise pin the stable chat
-                                // id. Consume `run_session_handed_to_chat` here (one-shot).
-                                let handing_back =
-                                    host_cli && app.run_session_handed_to_chat;
-                                let continue_session =
-                                    app.host_chat_session_active || handing_back;
-                                let session_id = if host_cli && !handing_back {
-                                    Some(app.ensure_chat_session_id())
-                                } else {
-                                    None
-                                };
-                                app.run_session_handed_to_chat = false;
-                                // Conversation snapshot stays taken on the UI thread so
-                                // memory is never cold (Wave 5 / G11), passed into the task.
-                                let conversation = app.conversation_snapshot();
-                                let inputs = RoutedTurnInputs {
-                                    text,
-                                    spec: app.brain_spec(),
-                                    host_cli,
-                                    conversation,
-                                    continue_session,
-                                    session_id,
-                                    fallback_model: app.effective_model(),
-                                    project_root: app.project_root.clone(),
-                                    mode: app.effective_trust_mode(),
-                                };
-                                // Resuming the chat session means the NEXT turn must also
-                                // `--continue` it — set this now (the light path used to set
-                                // it after spawning); a director build hands its session back
-                                // via the terminal decision instead. (On the host-CLI path the
-                                // RESIDENT `chat_session_holder` IS the live memory; this flag
-                                // still gates the offline / `--continue` fallback.)
-                                if host_cli {
-                                    app.host_chat_session_active = true;
+                                Action::StartPreview { url, command } => {
+                                    // Manual `/preview`: start the server AND open the
+                                    // browser (the user explicitly asked to preview).
+                                    start_preview_server(
+                                        &app.preview_server,
+                                        &sink,
+                                        &url,
+                                        &command,
+                                        &opts.project_root,
+                                        true,
+                                    );
                                 }
-                                run_task = Some(tokio::spawn(run_routed_turn(
-                                    inputs,
-                                    chat_session_holder.clone(),
-                                    sink.clone(),
-                                    route_tx.clone(),
-                                )));
-                            }
-                            Action::Revise(text) => {
-                                // Re-run the block that PRODUCED the current
-                                // gate, with the revision feedback folded into
-                                // the requirement so the worker actually
-                                // incorporates it. Branch on the active gate:
-                                //   - docs_confirm  → re-run Initial (regen docs)
-                                //   - preview_confirm→ re-run Continue(DocsConfirm)
-                                //     (regen spec → frontend), NOT the docs.
-                                // Re-running Initial unconditionally was a bug:
-                                // a UI revision at preview_confirm would have
-                                // thrown away the approved docs and regenerated
-                                // them instead of redoing the frontend.
-                                sink.emit(EngineEvent::Note(format!("user revision: {text}")));
-                                let revised_requirement = format!(
-                                    "{}\n\n## Revision request\n{text}",
-                                    app.requirement
-                                );
-                                let run_opts = RunOptions {
-                                    project_root: opts.project_root.clone(),
-                                    requirement: revised_requirement,
-                                    slug: opts.slug.clone(),
-                                    model: app.effective_model(),
-                                    backend: app.backend.clone().unwrap_or_default(),
-                                    design_system: app.config.design_system.clone().unwrap_or_default(),
-                                    seed_template: app.config.seed_template.clone().unwrap_or_default(),
-                                    mode: app.effective_trust_mode(),
-                                    // Snapshot the strict-coverage opt-in once at
-                                    // the app boundary; the runner reads this, not
-                                    // the live env (which races in parallel).
-                                    strict_coverage: umadev_agent::strict_coverage_from_env(),
-                                };
-                                let gate = app.active_gate;
-                                // The producing block is re-running, so the gate
-                                // is no longer active — clear it so the status
-                                // bar / prompt don't keep showing the old gate
-                                // (and its timers) during the rework.
-                                app.active_gate = None;
-                                // P1-D: on a continuous run, feed the revision back
-                                // into the SAME held director session by re-driving
-                                // the producing block on the continuous engine —
-                                // NOT a single-shot `spawn_block`, which would orphan
-                                // the held session (leaked, never `end()`-ed) and
-                                // silently swap to the per-phase re-feed engine.
-                                run_task = Some(if continuous_run_active {
-                                    let autonomous = continuous_autonomous(run_opts.mode);
-                                    let start_after =
-                                        continuous_revise_phase(gate.unwrap_or(Gate::DocsConfirm));
-                                    spawn_continuous_block(
-                                        run_opts,
-                                        sink.clone(),
-                                        session_holder.clone(),
-                                        start_after,
-                                        autonomous,
-                                    )
-                                } else {
-                                    let block = match gate {
-                                        Some(Gate::PreviewConfirm) => {
-                                            Block::Continue(Gate::DocsConfirm)
-                                        }
-                                        // A revise AT the clarify gate re-asks the
-                                        // clarifying questions with the new info —
-                                        // NOT a jump straight to research/docs
-                                        // (Block::Initial skips clarify entirely).
-                                        Some(Gate::ClarifyGate) => Block::Clarify,
-                                        // docs_confirm or unknown → regenerate docs
-                                        _ => Block::Initial,
-                                    };
-                                    spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
-                                });
-                            }
-                            Action::StartPreview { url, command } => {
-                                // Manual `/preview`: start the server AND open the
-                                // browser (the user explicitly asked to preview).
-                                start_preview_server(
-                                    &app.preview_server,
-                                    &sink,
-                                    &url,
-                                    &command,
-                                    &opts.project_root,
-                                    true,
-                                );
-                            }
-                            Action::RunDeploy { command } => {
-                                // Deploy runs in a background task: the deploy
-                                // adapter (fail-open) runs the command in the
-                                // workspace, captures the live URL + log tail
-                                // into a structured DeployProof, and writes
-                                // `.umadev/audit/deploy-proof.json` so the deploy
-                                // is folded into the next proof-pack. We surface
-                                // success/failure + the live URL to the user.
-                                let sink2 = sink.clone();
-                                let root = opts.project_root.clone();
-                                tokio::spawn(async move {
-                                    sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                        "deploy.running",
-                                        &[&command],
-                                    )));
-                                    let login_hint = umadev_i18n::tl("deploy.login_hint");
-                                    // stdin = /dev/null inside run_deploy: the TUI
-                                    // owns the real terminal, so a deploy CLI that
-                                    // wants an interactive login must FAIL FAST on
-                                    // EOF rather than hang invisibly behind the
-                                    // alt-screen. A timeout is the final backstop.
-                                    let proof =
-                                        umadev_agent::run_deploy(&root, Some(&command)).await;
-                                    match &proof.status {
-                                        umadev_agent::DeployStatus::Deployed => {
-                                            let addr = proof.url.clone().unwrap_or_else(|| {
-                                                umadev_i18n::tl("deploy.done_no_url").into()
-                                            });
-                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                                "deploy.done",
-                                                &[&addr],
-                                            )));
-                                        }
-                                        umadev_agent::DeployStatus::NotDeployed(reason) => {
-                                            let exit = proof
-                                                .exit_code
-                                                .map_or_else(|| "-".to_string(), |c| c.to_string());
-                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                                "deploy.failed",
-                                                &[&exit, reason, login_hint],
-                                            )));
-                                        }
-                                    }
-                                    // Persist the proof (fail-open: a write error
-                                    // never blocks — just no proof-pack capture).
-                                    if let Ok(path) =
-                                        umadev_agent::write_deploy_proof(&root, &proof)
-                                    {
+                                Action::RunDeploy { command } => {
+                                    // Deploy runs in a background task: the deploy
+                                    // adapter (fail-open) runs the command in the
+                                    // workspace, captures the live URL + log tail
+                                    // into a structured DeployProof, and writes
+                                    // `.umadev/audit/deploy-proof.json` so the deploy
+                                    // is folded into the next proof-pack. We surface
+                                    // success/failure + the live URL to the user.
+                                    let sink2 = sink.clone();
+                                    let root = opts.project_root.clone();
+                                    tokio::spawn(async move {
                                         sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
-                                            "deploy.proof_written",
-                                            &[&path.display().to_string()],
+                                            "deploy.running",
+                                            &[&command],
                                         )));
-                                    }
-                                });
+                                        let login_hint = umadev_i18n::tl("deploy.login_hint");
+                                        // stdin = /dev/null inside run_deploy: the TUI
+                                        // owns the real terminal, so a deploy CLI that
+                                        // wants an interactive login must FAIL FAST on
+                                        // EOF rather than hang invisibly behind the
+                                        // alt-screen. A timeout is the final backstop.
+                                        let proof =
+                                            umadev_agent::run_deploy(&root, Some(&command)).await;
+                                        match &proof.status {
+                                            umadev_agent::DeployStatus::Deployed => {
+                                                let addr = proof.url.clone().unwrap_or_else(|| {
+                                                    umadev_i18n::tl("deploy.done_no_url").into()
+                                                });
+                                                sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                                    "deploy.done",
+                                                    &[&addr],
+                                                )));
+                                            }
+                                            umadev_agent::DeployStatus::NotDeployed(reason) => {
+                                                let exit = proof
+                                                    .exit_code
+                                                    .map_or_else(|| "-".to_string(), |c| c.to_string());
+                                                sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                                    "deploy.failed",
+                                                    &[&exit, reason, login_hint],
+                                                )));
+                                            }
+                                        }
+                                        // Persist the proof (fail-open: a write error
+                                        // never blocks — just no proof-pack capture).
+                                        if let Ok(path) =
+                                            umadev_agent::write_deploy_proof(&root, &proof)
+                                        {
+                                            sink2.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                                "deploy.proof_written",
+                                                &[&path.display().to_string()],
+                                            )));
+                                        }
+                                    });
+                                }
+                                Action::SetMouseCapture(on) => {
+                                    // `/mouse` toggle: actually flip mouse capture on
+                                    // the LIVE terminal. ON re-enables the wheel→scroll
+                                    // capture; OFF issues DisableMouseCapture so the
+                                    // terminal's native click-drag text selection works
+                                    // again — what the app message promised. Fail-open:
+                                    // a write error is ignored, never blocking the loop.
+                                    let backend = terminal.backend_mut();
+                                    let _ = if on {
+                                        backend.execute(EnableMouseCapture)
+                                    } else {
+                                        backend.execute(DisableMouseCapture)
+                                    };
+                                }
+                                Action::ForceRedraw => {
+                                    // Ctrl+L / `/redraw`: clear the screen and force a
+                                    // full repaint on the next frame (the loop top
+                                    // redraws). `clear()` resets the back buffer so the
+                                    // next draw repaints every cell — the escape hatch
+                                    // that recovers from any accumulated incremental-
+                                    // diff desync (stale cells, leftover left-margin
+                                    // prefixes, bled long lines). Fail-open: a backend
+                                    // write error is ignored, never blocking the loop.
+                                    let _ = terminal.clear();
+                                }
                             }
-                            Action::SetMouseCapture(on) => {
-                                // `/mouse` toggle: actually flip mouse capture on
-                                // the LIVE terminal. ON re-enables the wheel→scroll
-                                // capture; OFF issues DisableMouseCapture so the
-                                // terminal's native click-drag text selection works
-                                // again — what the app message promised. Fail-open:
-                                // a write error is ignored, never blocking the loop.
-                                let backend = terminal.backend_mut();
-                                let _ = if on {
-                                    backend.execute(EnableMouseCapture)
-                                } else {
-                                    backend.execute(DisableMouseCapture)
-                                };
+                            // The conversation context just changed (`/clear` set
+                            // `chat_session_dirty`; a backend switch is handled inline in the
+                            // `BackendChanged` arm, which clears the flag): close the RESIDENT
+                            // chat session so the next chat turn opens a fresh one against the
+                            // new context instead of carrying a stale live process. Best-effort
+                            // `try_lock` so this never blocks the UI; fail-open. A chat turn
+                            // that is mid-flight OWNS the session (holder is `None`), so this
+                            // only closes a parked/idle one. Same base after `/clear`, so we
+                            // PRE-LOAD a fresh warm session so the next message stays hot.
+                            if app.chat_session_dirty {
+                                app.chat_session_dirty = false;
+                                let parked = chat_session_holder
+                                    .try_lock()
+                                    .ok()
+                                    .and_then(|mut g| g.take());
+                                if let Some(s) = parked {
+                                    s.end().await;
+                                }
+                                spawn_chat_session_preload(
+                                    app.backend.as_deref(),
+                                    app.effective_model(),
+                                    app.project_root.clone(),
+                                    continuous_autonomous(app.effective_trust_mode()),
+                                    chat_session_holder.clone(),
+                                );
                             }
-                        }
-                        // The conversation context just changed (`/clear` set
-                        // `chat_session_dirty`; a backend switch is handled inline in the
-                        // `BackendChanged` arm, which clears the flag): close the RESIDENT
-                        // chat session so the next chat turn opens a fresh one against the
-                        // new context instead of carrying a stale live process. Best-effort
-                        // `try_lock` so this never blocks the UI; fail-open. A chat turn
-                        // that is mid-flight OWNS the session (holder is `None`), so this
-                        // only closes a parked/idle one. Same base after `/clear`, so we
-                        // PRE-LOAD a fresh warm session so the next message stays hot.
-                        if app.chat_session_dirty {
-                            app.chat_session_dirty = false;
-                            let parked = chat_session_holder
-                                .try_lock()
-                                .ok()
-                                .and_then(|mut g| g.take());
-                            if let Some(s) = parked {
-                                s.end().await;
-                            }
-                            spawn_chat_session_preload(
-                                app.backend.as_deref(),
-                                app.effective_model(),
-                                app.project_root.clone(),
-                                continuous_autonomous(app.effective_trust_mode()),
-                                chat_session_holder.clone(),
-                            );
                         }
                     }
                 }
@@ -4111,7 +4379,36 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 app.cancelling = false;
                 app.cancel_run();
             }
-            _ = tick.tick() => app.tick(),
+            _ = tick.tick() => {
+                // Flush any leaked-mouse-seq candidate that never completed — a
+                // lone `Esc` (or a partial `Esc [`) the user pressed and then
+                // paused on. Applying it now means a real Esc still arms the
+                // interrupt / quit-confirm within a frame even when no following
+                // key arrives to break the candidate. A genuine leaked burst
+                // completes inside `feed` and never reaches here. A buffered
+                // `Esc`/`[`/`<`/digit can only ever yield None / Cancel / Quit.
+                for replay_key in mouse_seq_filter.flush() {
+                    // A buffered prefix key (Esc / `[` / `<` / digit) can only ever
+                    // yield Cancel (a second armed Esc) — everything else (Quit sets
+                    // `app.should_quit`, handled at the loop bottom; None; a stray
+                    // text insert) needs no extra wiring here.
+                    if app.apply_key_with_mods(replay_key.code, replay_key.modifiers)
+                        == Action::Cancel
+                    {
+                        // Mirror the Esc/Ctrl-C cancel path: abort the in-flight task
+                        // off the render path (drained by `cancel_drain`), else an
+                        // immediate reset.
+                        if let Some(h) = run_task.take() {
+                            h.abort();
+                            cancel_drain = Some(h);
+                            app.begin_cancelling();
+                        } else {
+                            app.cancel_run();
+                        }
+                    }
+                }
+                app.tick();
+            }
         }
 
         if app.should_quit {
@@ -4162,6 +4459,174 @@ mod tests {
         Message {
             role: role.into(),
             content: content.into(),
+        }
+    }
+
+    /// A bare key event (no modifiers) — the shape a leaked mouse-report byte
+    /// arrives as when crossterm mis-splits it.
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn mouse_seq_filter_swallows_a_split_sgr_report() {
+        // A leaked `Esc [ < 64 ; 100 ; 67 M` burst (crossterm mis-split): EVERY
+        // byte is swallowed, NOTHING is emitted, so no raw `[<…M` text reaches the
+        // input and the leading `Esc` never fires a keypress (no false abort).
+        let mut f = MouseSeqFilter::default();
+        let burst = [
+            KeyCode::Esc,
+            KeyCode::Char('['),
+            KeyCode::Char('<'),
+            KeyCode::Char('6'),
+            KeyCode::Char('4'),
+            KeyCode::Char(';'),
+            KeyCode::Char('1'),
+            KeyCode::Char('0'),
+            KeyCode::Char('0'),
+            KeyCode::Char(';'),
+            KeyCode::Char('6'),
+            KeyCode::Char('7'),
+            KeyCode::Char('M'),
+        ];
+        for code in burst {
+            assert!(
+                f.feed(k(code)).is_empty(),
+                "every byte of a leaked SGR report is swallowed: {code:?}"
+            );
+        }
+        // No residue after the `M` terminator — the filter is back to idle.
+        assert!(
+            f.flush().is_empty(),
+            "nothing buffered after the terminator"
+        );
+    }
+
+    #[test]
+    fn mouse_seq_filter_passes_a_real_lone_esc() {
+        // A genuine lone Esc is buffered (undecided) on the key path, then the
+        // periodic flush replays it so it still does its normal thing — the
+        // filter never permanently eats a real Esc.
+        let mut f = MouseSeqFilter::default();
+        assert!(
+            f.feed(k(KeyCode::Esc)).is_empty(),
+            "buffered, not yet acted"
+        );
+        let flushed = f.flush();
+        assert_eq!(flushed.len(), 1, "the lone Esc is replayed exactly once");
+        assert_eq!(flushed[0].code, KeyCode::Esc);
+    }
+
+    #[test]
+    fn mouse_seq_filter_flushes_real_input_that_only_looks_like_a_prefix() {
+        // Esc immediately followed by a NON-`[` key is a real Esc + that key:
+        // both flush back as normal input (legitimate input is never eaten).
+        let mut f = MouseSeqFilter::default();
+        assert!(f.feed(k(KeyCode::Esc)).is_empty());
+        let out: Vec<KeyCode> = f
+            .feed(k(KeyCode::Char('a')))
+            .iter()
+            .map(|e| e.code)
+            .collect();
+        assert_eq!(out, vec![KeyCode::Esc, KeyCode::Char('a')]);
+
+        // A user typing `[` then `<` then `x` (no leading Esc) is plain text —
+        // each key passes straight through.
+        let mut g = MouseSeqFilter::default();
+        assert_eq!(g.feed(k(KeyCode::Char('['))), vec![k(KeyCode::Char('['))]);
+        assert_eq!(g.feed(k(KeyCode::Char('<'))), vec![k(KeyCode::Char('<'))]);
+        assert_eq!(g.feed(k(KeyCode::Char('x'))), vec![k(KeyCode::Char('x'))]);
+
+        // A real Esc the user FOLLOWS by typing `[<x` walks into the candidate
+        // body, but the non-numeric `x` proves it isn't a mouse report, so the
+        // whole run flushes back — Esc acts and `[<x` is inserted.
+        let mut h = MouseSeqFilter::default();
+        assert!(h.feed(k(KeyCode::Esc)).is_empty());
+        assert!(h.feed(k(KeyCode::Char('['))).is_empty());
+        assert!(h.feed(k(KeyCode::Char('<'))).is_empty());
+        let out: Vec<KeyCode> = h
+            .feed(k(KeyCode::Char('x')))
+            .iter()
+            .map(|e| e.code)
+            .collect();
+        assert_eq!(
+            out,
+            vec![
+                KeyCode::Esc,
+                KeyCode::Char('['),
+                KeyCode::Char('<'),
+                KeyCode::Char('x'),
+            ],
+        );
+    }
+
+    #[test]
+    fn mouse_seq_filter_ignores_modified_keys() {
+        // A Ctrl/Alt-modified key is a deliberate user action, never a leaked
+        // mouse byte — it passes straight through without being buffered.
+        let mut f = MouseSeqFilter::default();
+        let ctrl_esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL);
+        assert_eq!(f.feed(ctrl_esc), vec![ctrl_esc]);
+        assert!(f.flush().is_empty(), "modified key was not buffered");
+    }
+
+    #[test]
+    fn synchronized_output_supported_detects_known_terminals() {
+        // Env is process-global: snapshot every var the detector reads, force a
+        // clean slate for each case, then restore. (`set_var`/`remove_var` are
+        // safe on edition 2021 — the same pattern other tests here use.)
+        let keys = [
+            "TMUX",
+            "TERM_PROGRAM",
+            "TERM",
+            "KITTY_WINDOW_ID",
+            "ZED_TERM",
+            "WT_SESSION",
+            "VTE_VERSION",
+        ];
+        let saved: Vec<(&str, Option<String>)> =
+            keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let clear = || {
+            for k in keys {
+                std::env::remove_var(k);
+            }
+        };
+
+        clear();
+        // Unknown terminal → conservative false (just draws as before).
+        assert!(!synchronized_output_supported(), "unknown env → false");
+
+        // Windows Terminal (the reported Windows garble case) → true.
+        std::env::set_var("WT_SESSION", "session-id");
+        assert!(synchronized_output_supported(), "WT_SESSION → true");
+        clear();
+
+        // tmux disables it even when an otherwise-supported terminal is present.
+        std::env::set_var("TMUX", "/tmp/tmux-0/default,1,0");
+        std::env::set_var("TERM_PROGRAM", "iTerm.app");
+        assert!(!synchronized_output_supported(), "TMUX wins → false");
+        clear();
+
+        // A spread of known-supported signals.
+        std::env::set_var("TERM_PROGRAM", "WezTerm");
+        assert!(synchronized_output_supported(), "WezTerm → true");
+        clear();
+        std::env::set_var("TERM", "xterm-kitty");
+        assert!(synchronized_output_supported(), "kitty TERM → true");
+        clear();
+        std::env::set_var("VTE_VERSION", "6800");
+        assert!(synchronized_output_supported(), "VTE >= 6800 → true");
+        clear();
+        std::env::set_var("VTE_VERSION", "5400");
+        assert!(!synchronized_output_supported(), "old VTE < 6800 → false");
+        clear();
+
+        // Restore the original environment so parallel/later tests are unaffected.
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
         }
     }
 

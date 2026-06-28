@@ -656,6 +656,7 @@
 "slash.skill_header" = "[skill] 技能包:\n\n{}"
 "slash.mouse_on" = "滑鼠滾輪捲動已開啟 —— Shift+拖曳可用終端原生文字選取"
 "slash.mouse_off" = "滑鼠滾輪捲動已關閉 —— 已恢復終端原生文字選取"
+"slash.redraw" = "已重繪螢幕 —— 清除了殘留或錯亂的字元儲存格"
 # /spec 浮層標題
 "spec.overlay_title" = " UMADEV_HOST_SPEC_V1 —— 按 Esc 關閉,↑↓ 捲動 "
 # /doctor 浮層正文 + 標題

@@ -147,6 +147,12 @@ pub enum Action {
     /// (native click-drag text selection restored). Without this the toggle
     /// only flipped a bool and never released the real capture.
     SetMouseCapture(bool),
+    /// `Ctrl+L` / `/redraw` — clear the screen and force a full repaint on the
+    /// next frame. The escape hatch that recovers from any accumulated
+    /// incremental-diff desync (stale cells, leftover prefixes, bled long lines)
+    /// — worse on flaky Windows consoles. The event loop owns `terminal`, so the
+    /// actual `terminal.clear()` is issued there, not from the app model.
+    ForceRedraw,
 }
 
 /// Status of one pipeline phase.
@@ -2695,6 +2701,10 @@ impl App {
             "mouse",
             "toggle mouse-wheel scrolling (off = native text selection)",
         ),
+        (
+            "redraw",
+            "force a full repaint (clear stale / garbled cells)",
+        ),
         ("clear", "clear chat history"),
         ("quit", "exit"),
     ];
@@ -4155,6 +4165,12 @@ impl App {
                 self.toggle_last_collapsible();
                 Action::None
             }
+            // Ctrl+L: force a full repaint (shell / Claude-Code convention). The
+            // escape hatch that recovers from any accumulated incremental-diff
+            // desync — stale cells, leftover left-margin prefixes, bled long
+            // lines — without losing the conversation. The event loop owns the
+            // terminal, so it issues the real `terminal.clear()`.
+            KeyCode::Char('l') if ctrl => Action::ForceRedraw,
 
             // ---- printable char ----
             // Guard on `!ctrl && !alt`: without it, every Ctrl/Alt-modified letter
@@ -4906,6 +4922,13 @@ impl App {
             "usage" => self.slash_usage(),
             "animations" => self.slash_toggle_animations(),
             "mouse" => self.slash_toggle_mouse(),
+            "redraw" | "repaint" => {
+                // Force a full repaint to recover from any accumulated render
+                // desync (stale cells / bled long lines). The event loop owns the
+                // terminal and performs the actual `terminal.clear()`.
+                self.push(ChatRole::System, umadev_i18n::t(self.lang, "slash.redraw"));
+                Action::ForceRedraw
+            }
             "bug" => self.slash_bug(),
             "design" => self.slash_design(rest),
             "template" => self.slash_template(rest),
