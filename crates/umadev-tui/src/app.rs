@@ -7822,11 +7822,24 @@ impl App {
     /// docs/preview gates pause for review this session. The Clarify gate
     /// always pauses regardless. Session-level override; for a permanent
     /// default set `auto_approve_gates` in `.umadevrc`.
-    /// Shift+Tab cycles the gate-approval mode (auto <-> manual), Claude-Code
-    /// style. The current mode shows in the prompt meta row.
+    /// Shift+Tab cycles the full trust/autonomy tier Plan → Guarded → Auto →
+    /// Plan (Claude-Code style), so the Plan tier is reachable from the keyboard
+    /// — it used to flip only Auto <-> Guarded, leaving Plan reachable only via
+    /// `/mode plan`. Plan = read-only research + plan; Guarded (default) = pause
+    /// at every gate; Auto = run end-to-end. The current tier shows in the prompt
+    /// meta row; a brief confirmation line names the new tier.
     pub fn cycle_approval_mode(&mut self) {
-        let auto = matches!(self.effective_trust_mode(), umadev_agent::TrustMode::Auto);
-        self.slash_set_review_mode(!auto);
+        use umadev_agent::TrustMode;
+        let next = match self.effective_trust_mode() {
+            TrustMode::Plan => TrustMode::Guarded,
+            TrustMode::Guarded => TrustMode::Auto,
+            TrustMode::Auto => TrustMode::Plan,
+        };
+        self.set_trust_mode(next);
+        self.push(
+            ChatRole::UmaDev,
+            umadev_i18n::t(self.lang, next.desc_key()).to_string(),
+        );
     }
 
     /// Resolve the active trust tier: an explicit `/mode` (or `/auto` /
@@ -13922,6 +13935,24 @@ mod tests {
         let a = fresh_app(Some("offline"));
         assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
         assert!(!a.auto_approve_on());
+    }
+
+    #[test]
+    fn shift_tab_cycles_plan_guarded_auto() {
+        // BackTab/Shift+Tab now cycles the FULL tier Plan → Guarded → Auto → Plan
+        // (was a 2-state Auto<->Guarded flip that could never reach Plan).
+        let mut a = fresh_app(Some("offline"));
+        a.set_trust_mode(umadev_agent::TrustMode::Plan);
+        a.cycle_approval_mode();
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+        a.cycle_approval_mode();
+        assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Auto);
+        a.cycle_approval_mode();
+        assert_eq!(
+            a.effective_trust_mode(),
+            umadev_agent::TrustMode::Plan,
+            "cycle must wrap Auto → Plan so Plan is keyboard-reachable"
+        );
     }
 
     #[test]
