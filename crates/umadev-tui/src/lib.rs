@@ -31,6 +31,7 @@
 
 pub mod app;
 pub mod config;
+pub mod input;
 pub mod selection;
 pub mod ui;
 
@@ -42,14 +43,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
     EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
-use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -58,6 +58,7 @@ use umadev_host::driver_for;
 use umadev_runtime::{CompletionRequest, Message, OfflineRuntime, Runtime, RuntimeKind};
 
 use crate::app::{Action, App};
+use crate::input::InputSource;
 
 /// Launch parameters for [`run`].
 #[derive(Debug, Clone)]
@@ -3799,7 +3800,16 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // Probe in the background so the picker labels refresh as data arrives.
     spawn_probe(sink.clone());
 
-    let mut keys = EventStream::new();
+    // Input source: the owned byte tokenizer (DEFAULT — UX maturity roadmap §2,
+    // P1, the root fix for the leaked-mouse / phantom-Esc / Esc-latency bug
+    // class) or the legacy `crossterm::EventStream` behind `UMADEV_LEGACY_INPUT=1`
+    // (the de-risk escape hatch). The gate is a clean branch HERE at setup, never
+    // a per-event check. `use_owned` is snapshotted once so the key path can
+    // bypass the legacy `MouseSeqFilter` backstop on the owned path (the
+    // tokenizer subsumes it; re-buffering a tokenizer-resolved Esc through the
+    // filter would re-introduce the Esc latency the root fix removes).
+    let mut input = InputSource::from_env();
+    let use_owned = input.is_owned();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     // Handle to the in-flight pipeline task, so `/cancel` can abort it.
     let mut run_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -4082,7 +4092,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     }
                 }
             }
-            maybe_key = keys.next() => {
+            maybe_key = input.next() => {
                 // R5 — sleep-wake / stdin-gap self-heal. A key/mouse/resize/paste
                 // arriving after a long input gap looks like a resume from laptop
                 // sleep / tmux re-attach / ssh reconnect: the terminal may have
@@ -4221,7 +4231,20 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         // flushes back through unchanged (possibly more than one
                         // key, when a buffered candidate turns out to be real
                         // input), so legitimate keystrokes are never eaten.
-                        for replay_key in mouse_seq_filter.feed(key) {
+                        //
+                        // On the OWNED tokenizer path the byte stream is already
+                        // correctly framed (a leaked SGR report is impossible — it
+                        // is one atomic Sequence → a real Mouse event), so the
+                        // filter is bypassed: a tokenizer-resolved Esc applies
+                        // immediately instead of being re-buffered for a tick,
+                        // which is exactly the Esc latency the root fix removes.
+                        // The filter stays the backstop for the legacy path.
+                        let replay_keys = if use_owned {
+                            vec![key]
+                        } else {
+                            mouse_seq_filter.feed(key)
+                        };
+                        for replay_key in replay_keys {
                             match app.apply_key_with_mods(replay_key.code, replay_key.modifiers) {
                                 // Quit sets `app.should_quit`; the loop-bottom check
                                 // breaks. (No bare `break` here — it would only exit
@@ -4828,7 +4851,15 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 // key arrives to break the candidate. A genuine leaked burst
                 // completes inside `feed` and never reaches here. A buffered
                 // `Esc`/`[`/`<`/digit can only ever yield None / Cancel / Quit.
-                for replay_key in mouse_seq_filter.flush() {
+                // Owned path: the filter is bypassed (the tokenizer owns Esc
+                // timing via its own FD-aware flush), so it holds nothing and the
+                // tick flush is a no-op there.
+                let tick_flush = if use_owned {
+                    Vec::new()
+                } else {
+                    mouse_seq_filter.flush()
+                };
+                for replay_key in tick_flush {
                     // A buffered prefix key (Esc / `[` / `<` / digit) can only ever
                     // yield Cancel (a second armed Esc) — everything else (Quit sets
                     // `app.should_quit`, handled at the loop bottom; None; a stray
