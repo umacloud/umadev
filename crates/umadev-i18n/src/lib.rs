@@ -302,6 +302,11 @@ mod tests {
             "pipeline.generic_error",
             "pipeline.error_note",
             "base.init_failed",
+            // Idle-watchdog diagnosis (run + chat paths): the base went silent with no
+            // tool running (looks hung) OR the run budget was reached — while a tool
+            // runs UmaDev keeps waiting as long as the base is alive (liveness-based, no
+            // fixed cap). Phrased for that reality, not a misleading auth/login hint.
+            "base.fail.idle",
             "route.resume_retry",
             "base.empty_reply",
             "route.failed",

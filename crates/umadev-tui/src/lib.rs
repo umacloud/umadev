@@ -2507,27 +2507,73 @@ fn session_tool_target(input: &serde_json::Value) -> String {
     String::new()
 }
 
-/// Pull the next [`SessionEvent`], bounding the wait by `idle` so a base that HANGS
-/// (stops emitting but never exits) can't block the drain forever — pure silence
-/// past the window settles the turn instead of wedging `thinking`. ANY event resets
-/// the clock (a long compile/test turn survives as long as it emits SOMETHING). The
-/// local analogue of the agent crate's idle watchdog. `Ok(None)` = session ended,
-/// `Err(())` = idle-timed-out (caller settles), `Ok(Some(ev))` = a real event.
+/// Pull the next [`SessionEvent`] under the LIVENESS-based idle watchdog — the local
+/// analogue of the agent crate's [`umadev_agent::director_loop::next_event_idle`], so
+/// the chat path behaves identically to the /run pumps. A base that HANGS (stops
+/// emitting but never exits) can't block the drain forever; ANY event resets the clock
+/// (a long compile/test turn survives as long as it emits SOMETHING).
+///
+/// The window is picked from `budget` by `in_tool_call`:
+/// - **A tool is in flight**: the `tool` window is a liveness POLL, not a kill
+///   deadline. Each time it elapses with no event the base is re-checked — a DEAD base
+///   (`try_exit_status` is `Some`) settles as `Ok(None)` (session ended); a LIVE base
+///   means the tool is genuinely running (build / compile / install / long test / dev
+///   server), so it keeps waiting — bounded only by the optional run-budget `deadline`
+///   (`None` on the interactive chat path: the user controls via Esc, a dead base still
+///   settles). A tool of ANY duration with a live base survives.
+/// - **No tool in flight**: the `base` window IS the hang deadline — pure silence past
+///   it settles as `Err(())`, which the caller turns into the idle reason (it issues
+///   the interrupt + ends the session).
+///
+/// `Ok(None)` = session ended (incl. a base that died mid-tool), `Err(())` =
+/// idle-timed-out / budget-bound (caller settles), `Ok(Some(ev))` = a real event.
 #[allow(clippy::result_unit_err)]
 async fn next_chat_event_idle(
     session: &mut dyn umadev_runtime::BaseSession,
-    idle: Duration,
+    budget: umadev_agent::director_loop::IdleBudget,
+    in_tool_call: bool,
+    deadline: Option<std::time::Instant>,
 ) -> Result<Option<umadev_runtime::SessionEvent>, ()> {
-    match tokio::time::timeout(idle, session.next_event()).await {
-        Ok(ev) => Ok(ev),
-        Err(_) => Err(()),
+    let window = budget.window(in_tool_call);
+    loop {
+        match tokio::time::timeout(window, session.next_event()).await {
+            Ok(ev) => return Ok(ev),
+            Err(_) => {
+                // The window elapsed with no event.
+                if in_tool_call {
+                    // Liveness poll: a live base mid-tool keeps waiting (only a dead
+                    // base or the run deadline settles it).
+                    if session.try_exit_status().is_some() {
+                        // The base died under the tool → treat as session ended so the
+                        // caller surfaces its stderr/exit (the "ended mid-turn" path).
+                        return Ok(None);
+                    }
+                    if let Some(dl) = deadline {
+                        if std::time::Instant::now() >= dl {
+                            return Err(());
+                        }
+                    }
+                    continue;
+                }
+                // NOT in a tool → genuinely hung: settle (the caller interrupts + ends).
+                return Err(());
+            }
+        }
     }
 }
 
-/// Idle ceiling for one persistent-session chat turn — the same generous window the
-/// director loop uses, so a long agentic turn (deep web research, a big build) is
-/// never killed while it is still streaming, but a true silent hang settles.
-const CHAT_SESSION_IDLE: Duration = Duration::from_secs(300);
+/// Idle budget for one persistent-session chat turn — the SAME source the director
+/// loop uses ([`umadev_agent::director_loop::IdleBudget::from_env`], env
+/// `UMADEV_IDLE_TIMEOUT_SECS` / `UMADEV_TOOL_IDLE_TIMEOUT_SECS`), so the chat path and
+/// the build path behave identically: a long agentic turn (deep web research, a big
+/// build) is never killed while it is still streaming, a base mid-tool (a `docker
+/// build` / compile / install / a long test / a dev server that goes silent for
+/// minutes or hours) keeps waiting as long as the base stays alive (the liveness poll —
+/// see [`next_chat_event_idle`]), and only a TRULY silent non-tool hang settles. Read
+/// once per chat turn.
+fn chat_idle_budget() -> umadev_agent::director_loop::IdleBudget {
+    umadev_agent::director_loop::IdleBudget::from_env()
+}
 
 /// Enrich a base-failure reason with a classified, per-base, actionable diagnosis
 /// PLUS the base's OWN stderr tail + exit status, so "base session idle" /
@@ -2851,11 +2897,20 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
     let reactive = Arc::new(ReactiveBuild::new(true));
     let mut text_acc = String::new();
 
-    // Drain the turn. ANY event resets the idle clock; pure silence past the window
-    // settles (the base hung). A `None` / a `Failed` status is an honest terminal.
-    // The loop breaks with whether the finish was truncated (mid-stream cut-off).
+    // Tool-aware idle budget (parity with the /run path): the base window for a
+    // quiet/hung base, the liveness-poll interval while it is plausibly mid-tool. Read
+    // once per turn so a mid-turn env flip can't race.
+    let idle = chat_idle_budget();
+    let mut in_tool_call = false;
+
+    // Drain the turn. ANY event resets the idle clock; while a tool runs the path keeps
+    // waiting as long as the base stays alive (the liveness poll), so a long silent
+    // build is never killed; only a non-tool hang settles. A `None` / a `Failed` status
+    // is an honest terminal. The loop breaks with whether the finish was truncated
+    // (mid-stream cut-off). `deadline` is `None`: chat is interactive (the user controls
+    // via Esc) and a dead base still settles via the `Ok(None)` session-ended path.
     let truncated = loop {
-        let ev = match next_chat_event_idle(session.as_mut(), CHAT_SESSION_IDLE).await {
+        let ev = match next_chat_event_idle(session.as_mut(), idle, in_tool_call, None).await {
             Ok(Some(ev)) => ev,
             Ok(None) => {
                 // Session ended mid-turn (process dead / EOF) — capture stderr + exit
@@ -2873,16 +2928,24 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 return;
             }
             Err(()) => {
-                // Idle hang — capture the base's OWN stderr + exit status FIRST (a
-                // broken model/login config errors to stderr, never to stdout, so the
-                // bare "base session idle" hid the cause), then interrupt + drop the
-                // session and settle honestly with the diagnosis.
+                // Non-tool idle hang (deadline is None for chat, so an in-tool live base
+                // never lands here — it keeps waiting until the user hits Esc or it
+                // exits). Capture the base's OWN stderr + exit status FIRST, then
+                // interrupt + drop the session and settle honestly. The base message is
+                // the trilingual long-task diagnosis (NOT a misleading "check your
+                // login/model config") — `enrich_base_failure` still PREPENDS the
+                // auth/network classification when the base's own stderr actually
+                // indicates one. Report the BASE idle window (the
+                // `UMADEV_IDLE_TIMEOUT_SECS` knob the user would raise).
                 let tail = session.stderr_tail();
                 let exit = session.try_exit_status();
                 let _ = session.interrupt().await;
                 let _ = session.end().await;
                 let reason = enrich_base_failure(
-                    "base session idle(底座 300s 无输出 — 检查它的登录/模型配置)",
+                    &umadev_i18n::tlf(
+                        "base.fail.idle",
+                        &[&idle.window(false).as_secs().to_string()],
+                    ),
                     exit,
                     tail,
                     &backend,
@@ -2894,6 +2957,12 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 return;
             }
         };
+        // Arm/disarm the in-tool-call state from this event before handling it (parity
+        // with the /run pumps): a tool-use switches the next wait to the liveness poll,
+        // a tool-result restores the base window.
+        if let Some(t) = umadev_agent::director_loop::tool_phase_transition(&ev) {
+            in_tool_call = t;
+        }
         match ev {
             umadev_runtime::SessionEvent::TextDelta(delta) => {
                 text_acc.push_str(&delta);
@@ -7285,6 +7354,191 @@ mod tests {
         async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
             self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    /// Serializes the chat-path idle tests that mutate the process-global idle env
+    /// knobs, so they don't race each other's set/remove.
+    static CHAT_IDLE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A chat session that accepts `send_turn` then HANGS forever on `next_event`
+    /// (holds the pipe open, emits nothing, never exits) — the true-hang case the
+    /// chat-path idle watchdog must settle.
+    struct HangingChatSession;
+
+    #[async_trait::async_trait]
+    impl umadev_runtime::BaseSession for HangingChatSession {
+        async fn send_turn(&mut self, _d: String) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+    }
+
+    /// A chat session that emits ONE tool-use event then HANGS while staying ALIVE
+    /// (`try_exit_status` defaults to `None`) — the legitimate long-tool case (a build
+    /// kicks off, then runs silently for minutes or hours). Proves the chat path keeps
+    /// waiting on a live in-tool base (the liveness poll), never killing it on silence.
+    struct ToolThenHangChatSession {
+        emitted: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl umadev_runtime::BaseSession for ToolThenHangChatSession {
+        async fn send_turn(&mut self, _d: String) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            if self.emitted {
+                std::future::pending::<()>().await;
+                None
+            } else {
+                self.emitted = true;
+                Some(umadev_runtime::SessionEvent::ToolCall {
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "docker build ."}),
+                })
+            }
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn chat_idle_budget_uses_a_finite_poll_window_mid_tool() {
+        // Chat-path parity: the chat turn reads the SAME tool-aware budget the /run
+        // pumps use. Mid-tool the window is a liveness-POLL interval (a finite, positive
+        // re-check cadence — NOT a longer kill cap; it may even be shorter than the base
+        // window), and the not-in-tool window is the base idle window. The actual
+        // "a long silent build is not killed" behaviour is the liveness loop, covered by
+        // `chat_mid_tool_silence_survives_the_base_window`.
+        let budget = chat_idle_budget();
+        assert!(
+            budget.window(true) > Duration::ZERO && budget.window(false) > Duration::ZERO,
+            "both the poll window and the base window are finite, positive durations"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_idle_settle_reports_the_long_task_case_not_a_login_scare() {
+        // The user-reported bug: a real build went silent and the chat path settled
+        // with a misleading "base session idle — check your login/model config". The
+        // settle now reports the long-task framing (build/compile/install/test) and
+        // points at UMADEV_IDLE_TIMEOUT_SECS. Tiny base window (1s) so it settles fast.
+        let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+        let prior = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(HangingChatSession)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "build me a release",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        match route_rx.try_recv() {
+            Ok(RouteDecision::Failed(reason)) => {
+                assert!(
+                    reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
+                    "the idle settle must point at the env knob: {reason}"
+                );
+                assert!(
+                    !reason.contains("登录")
+                        && !reason.contains("登入")
+                        && !reason.to_lowercase().contains("log in"),
+                    "a silent build must NOT be framed as a login problem: {reason}"
+                );
+            }
+            other => panic!("expected a Failed idle settle, got {other:?}"),
+        }
+
+        match prior {
+            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_mid_tool_silence_survives_the_base_window() {
+        // Chat-path parity for the liveness poll: a base that fires a tool then goes
+        // silent must NOT be killed at the 1s base window — while a tool runs the chat
+        // path re-checks the (live) base every poll interval and keeps waiting. With a
+        // 1s base window AND a 1s poll, we cancel at 2s: the live in-tool base is still
+        // draining (timeout Err); without the liveness model it would have settled at ~1s.
+        let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+        let prior_base = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
+        let prior_tool = std::env::var_os("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
+        std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "1");
+        std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "1"); // 1s liveness poll
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut _route_rx) = tokio::sync::mpsc::unbounded_channel();
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(ToolThenHangChatSession { emitted: false })),
+        )));
+
+        let pumped = tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_chat_session_turn(chat_turn(
+                "build me a release",
+                holder.clone(),
+                sink.clone(),
+                route_tx.clone(),
+                tmp.path().to_path_buf(),
+            )),
+        )
+        .await;
+        assert!(
+            pumped.is_err(),
+            "a chat turn mid-tool must NOT settle at the 1s base window — the liveness \
+             poll keeps the live base alive (so the 2s cancel fires instead)"
+        );
+
+        match prior_base {
+            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
+        }
+        match prior_tool {
+            Some(v) => std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS"),
         }
     }
 

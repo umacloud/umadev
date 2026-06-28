@@ -219,10 +219,11 @@ pub async fn run_block(
     let plan = crate::planner::plan(&options.requirement);
     let produces_code = plan.includes(Phase::Frontend) || plan.includes(Phase::Backend);
 
-    // Read the idle watchdog window ONCE at the boundary (not per-wait), so a
+    // Read the idle watchdog windows ONCE at the boundary (not per-wait), so a
     // mid-run env flip can't race the in-flight phase pumps. Threaded into every
-    // `drive_phase` so each main-session phase pump is idle-guarded (P1-11).
-    let idle = crate::director_loop::idle_timeout();
+    // `drive_phase` so each main-session phase pump is idle-guarded (P1-11) AND
+    // tool-aware (the extended grace while the base is mid-tool — long silent build).
+    let idle = crate::director_loop::IdleBudget::from_env();
     // The run's wall-clock ceiling. The legacy phase walk has no `deadline` of its
     // own (the director loop owns one; this path predates it), so derive it the SAME
     // way here — `now + run_budget()` — and thread it into every phase / rework pump
@@ -440,9 +441,10 @@ async fn drive_phase(
     phase: Phase,
     first_directive: bool,
     kind: crate::planner::TaskKind,
-    // Idle watchdog window (P1-11), passed in so the env is read ONCE at the
-    // `run_block` boundary and the test can drive a tiny deterministic window.
-    idle: std::time::Duration,
+    // Idle watchdog windows (P1-11), passed in so the env is read ONCE at the
+    // `run_block` boundary and the test can drive a tiny deterministic window. The
+    // budget carries BOTH the base default and the extended tool-grace window.
+    idle: crate::director_loop::IdleBudget,
     // The run's wall-clock ceiling, checked at the TOP of the pump so an ACTIVE base
     // can't run ONE phase turn unbounded past the run budget (the legacy phase walk
     // otherwise had no mid-turn ceiling at all — it never re-checks a deadline once a
@@ -460,6 +462,10 @@ async fn drive_phase(
     // wedge the WHOLE phase forever on `next_event().await`. Reuse the SAME
     // shared idle primitive + window the director loop uses so every
     // main-session pump has identical zero-stall protection.
+    // Tool-aware grace: while the base is plausibly mid-tool (a tool-use seen, no
+    // result yet) a long task (build / compile / install / test) is legitimately
+    // silent for minutes, so the next wait uses the extended tool window.
+    let mut in_tool_call = false;
     loop {
         // Wall-clock budget reached DURING a phase turn. A base that stays ACTIVE
         // (keeps emitting, never trips the idle watchdog below) would otherwise run
@@ -482,13 +488,21 @@ async fn drive_phase(
             ));
             return PhaseResult::Done;
         }
-        let ev = match crate::director_loop::next_event_idle(session, idle).await {
+        let ev = match crate::director_loop::next_event_idle(
+            session,
+            idle,
+            in_tool_call,
+            Some(deadline),
+        )
+        .await
+        {
             crate::director_loop::IdleEvent::Event(ev) => ev,
             crate::director_loop::IdleEvent::SessionEnded { exit, stderr_tail } => {
-                // `None` = the underlying session ended (process dead / EOF). Per
-                // the BaseSession contract, treat as a failed turn — fail-open, no
-                // panic. Surface the base's OWN stderr/exit (captured at the settle)
-                // so the user sees WHY, not a bare literal — mirrors the chat path.
+                // `None` = the underlying session ended (process dead / EOF), OR a base
+                // that died mid-tool (caught by the liveness poll). Per the BaseSession
+                // contract, treat as a failed turn — fail-open, no panic. Surface the
+                // base's OWN stderr/exit (captured at the settle) so the user sees WHY,
+                // not a bare literal — mirrors the chat path.
                 return PhaseResult::Failed(crate::director_loop::enrich_idle_reason(
                     "session ended mid-turn",
                     exit,
@@ -497,18 +511,24 @@ async fn drive_phase(
                 ));
             }
             crate::director_loop::IdleEvent::IdleTimedOut { exit, stderr_tail } => {
-                // The base hung mid-phase — settle as a failed turn (the interrupt
-                // was already issued, bounded) so the run ends honestly instead of
-                // freezing the phase forever. Fold in the base's stderr tail / exit
-                // so a hung build no longer settles with a cause-less idle reason.
+                // A non-tool hang at the base window (interrupt already issued, bounded),
+                // OR the run budget reached while a tool was still running — settle as a
+                // failed turn so the run ends honestly instead of freezing the phase
+                // forever. Report the BASE idle window (the `UMADEV_IDLE_TIMEOUT_SECS`
+                // knob) and fold in the base's stderr tail / exit so a hung build no
+                // longer settles with a cause-less idle reason.
                 return PhaseResult::Failed(crate::director_loop::enrich_idle_reason(
-                    &crate::director_loop::idle_reason(idle),
+                    &crate::director_loop::idle_reason(idle.window(false)),
                     exit,
                     stderr_tail,
                     &options.backend,
                 ));
             }
         };
+        // Arm/disarm the tool-grace from this event before handling it.
+        if let Some(t) = crate::director_loop::tool_phase_transition(&ev) {
+            in_tool_call = t;
+        }
         match ev {
             SessionEvent::TextDelta(text) => {
                 // Stream the assistant's words to the TUI (alive-feel) — but
@@ -1704,7 +1724,7 @@ pub(crate) async fn drive_rework_turn_capturing(
         options,
         events,
         directive,
-        crate::director_loop::idle_timeout(),
+        crate::director_loop::IdleBudget::from_env(),
         deadline,
     )
     .await
@@ -1723,7 +1743,7 @@ async fn drive_rework_turn_with_idle(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     directive: String,
-    idle: std::time::Duration,
+    idle: crate::director_loop::IdleBudget,
     deadline: std::time::Instant,
 ) -> ReworkTurn {
     // Estimate this turn's token cost up front (the session stream carries no usage
@@ -1740,6 +1760,10 @@ async fn drive_rework_turn_with_idle(
     let policy = umadev_governance::Policy::load(&options.project_root);
     let mut text = String::new();
     let mut pitfalls: Vec<String> = Vec::new();
+    // Tool-aware grace (same as the build pump): a rework turn also runs tools (the
+    // base re-runs its build/test to fix the cause), which go silent for minutes, so
+    // an in-flight tool gets the extended window before the watchdog calls it a hang.
+    let mut in_tool_call = false;
     // Idle watchdog (P1-11): this rework pump (reused by `governance_catchup` /
     // `review_and_rework` / the director's `summon`) was a naked
     // `next_event().await` — a base that hangs mid-rework would freeze every
@@ -1775,15 +1799,23 @@ async fn drive_rework_turn_with_idle(
                 pitfalls,
             };
         }
-        let ev = match crate::director_loop::next_event_idle(session, idle).await {
+        let ev = match crate::director_loop::next_event_idle(
+            session,
+            idle,
+            in_tool_call,
+            Some(deadline),
+        )
+        .await
+        {
             crate::director_loop::IdleEvent::Event(ev) => ev,
-            // Session ended mid-rework, OR the base hung past the idle window
-            // (interrupt already issued, bounded) → fail-open stop reworking.
-            // A rework turn is advisory, so a settle here simply leaves the
-            // findings for the next gate rather than wedging the run — but no
-            // longer SILENTLY: surface the base's OWN stderr/exit (captured at the
-            // settle) as a Note, since a `ReworkTurn` carries no reason string, so
-            // a hung rework reads the same WHY as the chat / phase paths.
+            // Session ended mid-rework (incl. a base that died mid-tool, caught by the
+            // liveness poll), OR a non-tool hang past the base window (interrupt already
+            // issued, bounded), OR the run budget reached mid-tool → fail-open stop
+            // reworking. A rework turn is advisory, so a settle here simply leaves the
+            // findings for the next gate rather than wedging the run — but no longer
+            // SILENTLY: surface the base's OWN stderr/exit (captured at the settle) as a
+            // Note, since a `ReworkTurn` carries no reason string, so a hung rework reads
+            // the same WHY as the chat / phase paths.
             crate::director_loop::IdleEvent::SessionEnded { exit, stderr_tail } => {
                 events.emit(EngineEvent::Note(crate::director_loop::enrich_idle_reason(
                     "team · rework turn ended — base session ended mid-turn",
@@ -1799,7 +1831,7 @@ async fn drive_rework_turn_with_idle(
             }
             crate::director_loop::IdleEvent::IdleTimedOut { exit, stderr_tail } => {
                 events.emit(EngineEvent::Note(crate::director_loop::enrich_idle_reason(
-                    &crate::director_loop::idle_reason(idle),
+                    &crate::director_loop::idle_reason(idle.window(false)),
                     exit,
                     stderr_tail,
                     &options.backend,
@@ -1811,6 +1843,10 @@ async fn drive_rework_turn_with_idle(
                 };
             }
         };
+        // Arm/disarm the tool-grace from this event before handling it.
+        if let Some(t) = crate::director_loop::tool_phase_transition(&ev) {
+            in_tool_call = t;
+        }
         match ev {
             SessionEvent::TextDelta(delta) => {
                 est_tokens = est_tokens.saturating_add(crate::director_loop::approx_tokens(&delta));
@@ -3760,14 +3796,17 @@ mod tests {
             Phase::Frontend,
             false,
             crate::planner::TaskKind::Greenfield,
-            std::time::Duration::from_millis(80),
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(80),
+            ),
             std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
 
         match result {
             PhaseResult::Failed(reason) => assert!(
-                reason.contains("idle"),
+                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
                 "a hung base settles as an idle Failed: {reason}"
             ),
             PhaseResult::Done => panic!("a hung phase must settle as Failed, not Done"),
@@ -3796,7 +3835,10 @@ mod tests {
             &options,
             &events,
             "fix these".to_string(),
-            std::time::Duration::from_millis(80),
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(80),
+            ),
             std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await
@@ -3843,7 +3885,11 @@ mod tests {
                 &options,
                 &events,
                 "build it".to_string(),
-                std::time::Duration::from_secs(3600), // idle window that never trips
+                // idle window that never trips (base + tool both far past the deadline)
+                crate::director_loop::IdleBudget::new(
+                    std::time::Duration::from_secs(3600),
+                    std::time::Duration::from_secs(3600),
+                ),
                 past_deadline,
             ),
         )

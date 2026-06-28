@@ -428,6 +428,7 @@
 "base.fail.context" = "上下文超出底座上限 — 用 /compact 压缩,或换更大上下文的模型"
 "base.fail.exited" = "底座进程已退出(code {})"
 "base.fail.turn_failed" = "底座本轮失败(无更多信息)— 请重试,或换个底座"
+"base.fail.idle" = "底座 {}s 无输出且未在跑工具 — 疑似卡死,或已到运行预算上限。工具运行期间只要底座存活,UmaDev 会一直等待;非工具的空闲窗口可调高 UMADEV_IDLE_TIMEOUT_SECS,或重试 / 换底座"
 
 # 预览 dev server / 部署(后台任务,走进程级当前语言)
 "preview.dev_starting" = "[wait] dev server 启动中,等待端口就绪…"

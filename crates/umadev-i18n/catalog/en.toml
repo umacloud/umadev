@@ -428,6 +428,7 @@
 "base.fail.context" = "Context exceeded the base limit — /compact to shrink, or switch to a larger-context model"
 "base.fail.exited" = "Base process exited (code {})"
 "base.fail.turn_failed" = "Base turn failed (no further detail) — retry, or switch base"
+"base.fail.idle" = "Base produced no output for {}s with no tool running — it looks hung, or the run budget was reached. While a tool is running UmaDev keeps waiting as long as the base stays alive; for the no-tool idle window raise UMADEV_IDLE_TIMEOUT_SECS, or retry or switch base"
 
 # Preview dev server / deploy (background tasks, use the process-wide language)
 "preview.dev_starting" = "[wait] dev server starting, waiting for the port to be ready…"

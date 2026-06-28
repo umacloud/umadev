@@ -117,10 +117,36 @@ const MAX_QC_ROUNDS: usize = 3;
 /// no `TurnDone`, no settle, the TUI's `thinking` stuck and the queued input
 /// never drained. This is the regression the USB → continuous-session move
 /// introduced: the old single-shot `complete_streaming` path had exactly this
-/// watchdog (`umadev-host` keys the same env). 300s (5 min) is generous enough
-/// that a legitimately-long streaming compile/test turn survives as long as it
-/// emits ANY output (every event resets the timer), but a true hang settles.
-const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+/// watchdog (`umadev-host` keys the same env).
+///
+/// 600s (10 min) is the floor for a base that is NOT mid-tool. The old 300s
+/// default falsely killed legitimate long work: a base emits ONE tool-use event
+/// then the tool (a `docker build` / a compile / `npm install` / a long test run)
+/// runs SILENTLY for minutes, so the 300s window elapsed and the watchdog killed a
+/// base that was busy, not hung. The real protection for that case is the
+/// tool-aware LIVENESS POLL ([`tool_idle_timeout`] re-checked while a tool is in
+/// flight — see [`IdleBudget`] / [`next_event_idle`]): a tool of ANY duration with a
+/// LIVE base keeps waiting. This base default is the backstop for a TRULY silent base
+/// (no tool running), bumped to 600s so an ordinary slow turn is never mis-killed.
+/// Note this continuous-session watchdog has NO per-event hard ceiling (only the
+/// run budget), unlike the single-shot host path whose idle watchdog keeps its own
+/// 300s default below its 600s hard `timeout` ceiling.
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
+
+/// Default LIVENESS-POLL interval, in seconds, used while the base is plausibly
+/// executing a tool (see [`IdleBudget`] / [`tool_phase_transition`] / [`next_event_idle`]).
+/// This is NOT a grace cap on how long a tool may run: a long-running tool is
+/// legitimately silent for a long time — a clean release build, a cold `docker build`,
+/// a big `npm install`, or a full integration-test run can each emit NOTHING for tens
+/// of minutes, and a dev server / data job can run for hours — so capping the silence
+/// is the wrong model (the user rejected a fixed 30-min cap). Instead, every time this
+/// interval elapses with no event while a tool is in flight, the watchdog RE-CHECKS
+/// that the base process is still alive: a live base means the tool is genuinely
+/// running, so UmaDev keeps waiting; only a DEAD base (or the overall run-budget
+/// deadline) settles the turn. 5 min is a calm re-check cadence — short enough to
+/// notice a dead base promptly, long enough to add no measurable overhead. Overridable
+/// via `UMADEV_TOOL_IDLE_TIMEOUT_SECS`.
+const DEFAULT_TOOL_IDLE_TIMEOUT_SECS: u64 = 300;
 
 /// The idle watchdog window for one `next_event().await`, from
 /// `UMADEV_IDLE_TIMEOUT_SECS` (the SAME env the single-shot host watchdog reads —
@@ -129,16 +155,113 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 /// disables the watchdog, which would re-introduce the permanent hang). Read once
 /// per turn at the app boundary, not per wait, so a mid-turn env flip can't race.
 ///
-/// `pub(crate)` so every main-session event pump (this loop, plus
-/// [`crate::continuous`]'s `drive_phase` / `drive_rework_turn`) reads the SAME
+/// `pub` so every main-session event pump (this loop, plus [`crate::continuous`]'s
+/// `drive_phase` / `drive_rework_turn`, AND the TUI chat path) reads the SAME
 /// window from ONE place — the consistency the P1-11 fix depends on.
-pub(crate) fn idle_timeout() -> Duration {
+pub fn idle_timeout() -> Duration {
     let secs = std::env::var("UMADEV_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// The LIVENESS-POLL interval used while the base is plausibly mid-tool, from
+/// `UMADEV_TOOL_IDLE_TIMEOUT_SECS`, falling back to [`DEFAULT_TOOL_IDLE_TIMEOUT_SECS`]
+/// (5 min). It is how OFTEN the watchdog re-checks the base is alive while a tool runs,
+/// NOT a cap on how long the tool may take — a tool of any duration with a live base
+/// keeps waiting (see [`next_event_idle`]). A non-positive / unparseable value falls
+/// back to the default (fail-open: a bad env never disables the liveness re-check).
+/// Read once per turn at the pump boundary (folded into [`IdleBudget::from_env`]), not
+/// per wait, so a mid-turn env flip can't race. `pub` so the TUI chat path shares the
+/// exact same source.
+pub fn tool_idle_timeout() -> Duration {
+    let secs = std::env::var("UMADEV_TOOL_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TOOL_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// The two idle-watchdog windows for a base turn, read ONCE at the run / pump
+/// boundary (not per wait, so a mid-turn env flip can't race): the `base` window for a
+/// quiet-or-hung base that is NOT running a tool, and the `tool` LIVENESS-POLL interval
+/// used while the base is plausibly mid-tool.
+///
+/// The mechanism that fixes "a real build went silent and got killed": a base emits a
+/// tool-use event, then the tool itself (a `docker build` / a compile / `npm install` /
+/// a long test / a dev server / a data job) runs SILENTLY — for minutes or hours. While
+/// such a tool is in flight the watchdog does NOT cap the silence; it polls on the
+/// [`tool`](Self::tool) interval and, each time the interval elapses with no event,
+/// re-checks the base is alive — a live base keeps waiting, only a DEAD base (or the
+/// overall run-budget deadline) settles (see [`next_event_idle`]). When NO tool is in
+/// flight the `base` window applies, so a TRULY hung base (no tool running) STILL
+/// settles at the base window and the watchdog never becomes unbounded for a genuine
+/// hang. The caller flips the in-tool-call state with [`tool_phase_transition`] as it
+/// observes each event.
+#[derive(Debug, Clone, Copy)]
+pub struct IdleBudget {
+    /// Window for a base that is NOT mid-tool (quiet / hung) —
+    /// `UMADEV_IDLE_TIMEOUT_SECS`.
+    base: Duration,
+    /// Liveness-poll interval while a tool is plausibly executing —
+    /// `UMADEV_TOOL_IDLE_TIMEOUT_SECS`.
+    tool: Duration,
+}
+
+impl IdleBudget {
+    /// Read both windows from the environment once, fail-open to the defaults.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            base: idle_timeout(),
+            tool: tool_idle_timeout(),
+        }
+    }
+
+    /// Build an explicit budget (used by tests and the chat path, which want a
+    /// deterministic window without touching the process environment).
+    #[must_use]
+    pub fn new(base: Duration, tool: Duration) -> Self {
+        Self { base, tool }
+    }
+
+    /// The idle window for the NEXT `next_event_idle` wait, given whether a tool is
+    /// plausibly mid-flight: the `tool` liveness-poll interval while one is executing,
+    /// else the `base` window. Pure.
+    #[must_use]
+    pub fn window(self, in_tool_call: bool) -> Duration {
+        if in_tool_call {
+            self.tool
+        } else {
+            self.base
+        }
+    }
+}
+
+/// Whether an observed [`SessionEvent`] flips the "a tool is plausibly executing"
+/// state used to pick the idle window. A [`SessionEvent::ToolCall`] is the base
+/// kicking off a tool (claude's `tool_use` block, opencode's `running` frame, codex's
+/// completed command item) — the tool may then run SILENTLY for minutes or hours, so
+/// the next wait should switch to the liveness-poll window ⇒ `Some(true)`. A
+/// [`SessionEvent::ToolResult`] is a tool finishing ⇒ back to the base window
+/// (`Some(false)`). Any other event leaves the flag unchanged ⇒ `None`.
+///
+/// This gives TRUE mid-tool tracking on bases that mark tool start and finish
+/// distinctly (claude: `tool_use` then a later `tool_result`; opencode: a `running`
+/// then a `completed` frame), and the documented HEURISTIC on a base that only
+/// surfaces COMPLETED tool calls (codex emits the `ToolCall` + `ToolResult` together
+/// at item completion): there, a `ToolCall` still arms the liveness-poll window for the
+/// NEXT wait, on the assumption the base likely just kicked off something slow. Pure.
+#[must_use]
+pub fn tool_phase_transition(ev: &SessionEvent) -> Option<bool> {
+    match ev {
+        SessionEvent::ToolCall { .. } => Some(true),
+        SessionEvent::ToolResult { .. } => Some(false),
+        _ => None,
+    }
 }
 
 /// Default wall-clock budget for a build loop — a generous 30 min, enough for a
@@ -174,6 +297,7 @@ pub(crate) const INTERRUPT_TIMEOUT_SECS: u64 = 5;
 /// The result of ONE idle-guarded `next_event()` wait — the shared primitive
 /// every main-session event pump uses so the "stops emitting but never exits"
 /// hang can NEVER wedge a pump (the P0-3 / P1-11 zero-stall fix).
+#[derive(Debug)]
 pub(crate) enum IdleEvent {
     /// The base emitted an event (the idle timer is reset by the caller looping).
     Event(SessionEvent),
@@ -189,10 +313,15 @@ pub(crate) enum IdleEvent {
         /// broken base writes to stderr, never stdout.
         stderr_tail: Option<String>,
     },
-    /// No event arrived within the idle window — the base is hung. The watchdog
-    /// has already issued a best-effort (bounded) `interrupt()`; the pump settles
-    /// the turn as a failure so `thinking` clears rather than blocking forever.
-    /// Carries the base's diagnosis captured AFTER the bounded interrupt (an
+    /// The watchdog settled the turn without a real event — either a NON-tool hang
+    /// (no event for the base window with no tool in flight → genuinely hung, so the
+    /// watchdog issued a best-effort, bounded `interrupt()` before settling), OR a base
+    /// that was still mid-tool when the overall run-budget `deadline` was reached (the
+    /// liveness backstop: a live base running a tool keeps waiting only until the run
+    /// budget is exhausted, then settles WITHOUT an interrupt — the run finalization /
+    /// `session.end()` releases it). The pump settles the turn as a failure so
+    /// `thinking` clears rather than blocking forever. Carries the base's diagnosis
+    /// captured at the settle (for the hang case, AFTER the bounded interrupt — an
     /// interrupt may have made a hung child exit, surfacing its status/stderr).
     IdleTimedOut {
         /// The base child's exit status if it had already exited (else `None`).
@@ -208,53 +337,116 @@ pub(crate) enum IdleEvent {
 /// `drive_one_turn`, and [`crate::continuous`]'s `drive_phase` /
 /// `drive_rework_turn`) so the protection can't be "fixed in A, forgotten in B".
 ///
-/// Bounds the wait by `idle`; ANY event resets it (the caller loops, calling this
-/// again with the full window), so a legitimately-long streaming compile/test
-/// turn survives as long as it emits SOMETHING. Pure silence past the window
-/// issues a best-effort `interrupt()` — itself bounded by [`INTERRUPT_TIMEOUT_SECS`]
-/// so a wedged interrupt path can't re-introduce the hang — then returns
-/// [`IdleEvent::IdleTimedOut`]. Fail-open by contract: a bad/dead session always
-/// resolves to a settle, never a wedge.
-pub(crate) async fn next_event_idle(session: &mut dyn BaseSession, idle: Duration) -> IdleEvent {
-    match tokio::time::timeout(idle, session.next_event()).await {
-        Ok(Some(ev)) => IdleEvent::Event(ev),
-        Ok(None) => {
-            // The session ended — capture the base's OWN diagnosis NOW (we hold
-            // `&mut session` right here) so the caller can tell the user WHY
-            // instead of a bare "ended mid-turn". Fail-open: both default to
-            // `None`, never block (the run path mirrors the chat path's enrich).
-            IdleEvent::SessionEnded {
-                exit: session.try_exit_status(),
-                stderr_tail: session.stderr_tail(),
+/// The watchdog is LIVENESS-based while a tool runs, NOT a fixed kill timeout —
+/// legitimate tasks (big builds, long test suites, dev servers, data jobs) can run for
+/// hours, so a fixed cap is the wrong model. The window is picked from `budget` by
+/// `in_tool_call`:
+///
+/// - **A tool is in flight** (`in_tool_call == true`): the `budget.tool` window is a
+///   liveness-POLL interval, not a deadline. Each time it elapses with no event the
+///   watchdog re-checks the base process: a DEAD base (`try_exit_status` is `Some`)
+///   settles as [`IdleEvent::SessionEnded`] within one poll window; a LIVE base means
+///   the tool is genuinely running, so it keeps waiting — indefinitely, bounded ONLY by
+///   the optional run-budget `deadline` (when that is reached it settles as
+///   [`IdleEvent::IdleTimedOut`]). A tool of ANY duration with a live base survives.
+/// - **No tool in flight** (`in_tool_call == false`): the `budget.base` window IS the
+///   hang deadline — pure silence past it means the base is genuinely hung, so the
+///   watchdog issues a best-effort `interrupt()` (itself bounded by
+///   [`INTERRUPT_TIMEOUT_SECS`] so a wedged interrupt path can't re-introduce the hang)
+///   and settles as [`IdleEvent::IdleTimedOut`]. The non-tool case is NEVER unbounded.
+///
+/// ANY real event returns immediately ([`IdleEvent::Event`]); the caller loops, calling
+/// this again, so the next wait re-reads the window for the (possibly changed)
+/// in-tool-call state. `deadline` is the run's wall-clock ceiling (`Some` on the /run
+/// pumps, `None` on the interactive chat path where the user controls via Esc and a
+/// dead base still settles via [`IdleEvent::SessionEnded`]). Fail-open by contract: a
+/// bad/dead session always resolves to a settle, never a wedge.
+pub(crate) async fn next_event_idle(
+    session: &mut dyn BaseSession,
+    budget: IdleBudget,
+    in_tool_call: bool,
+    deadline: Option<std::time::Instant>,
+) -> IdleEvent {
+    let window = budget.window(in_tool_call);
+    loop {
+        match tokio::time::timeout(window, session.next_event()).await {
+            Ok(Some(ev)) => return IdleEvent::Event(ev),
+            Ok(None) => {
+                // The session ended — capture the base's OWN diagnosis NOW (we hold
+                // `&mut session` right here) so the caller can tell the user WHY
+                // instead of a bare "ended mid-turn". Fail-open: both default to
+                // `None`, never block (the run path mirrors the chat path's enrich).
+                return IdleEvent::SessionEnded {
+                    exit: session.try_exit_status(),
+                    stderr_tail: session.stderr_tail(),
+                };
             }
-        }
-        Err(_) => {
-            // No event within the idle window → the base is hung. Best-effort
-            // interrupt to release the child, but bound the interrupt itself so a
-            // dead pipe can't wedge it (the watchdog must always make progress).
-            let _ = tokio::time::timeout(
-                Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
-                session.interrupt(),
-            )
-            .await;
-            // Capture AFTER the interrupt — a hung child that the interrupt just
-            // killed now has an exit status / a final stderr line to surface.
-            IdleEvent::IdleTimedOut {
-                exit: session.try_exit_status(),
-                stderr_tail: session.stderr_tail(),
+            Err(_) => {
+                // The window elapsed with no event.
+                if in_tool_call {
+                    // A tool is plausibly mid-flight: the window is a liveness POLL, not
+                    // a kill deadline. Re-check whether the base is still alive instead
+                    // of killing a busy build. The base process exited under the tool
+                    // (the tool's child, or the base itself, died, surfacing a status) →
+                    // settle as SessionEnded promptly (within one poll window), carrying
+                    // the base's own diagnosis.
+                    if let Some(status) = session.try_exit_status() {
+                        return IdleEvent::SessionEnded {
+                            exit: Some(status),
+                            stderr_tail: session.stderr_tail(),
+                        };
+                    }
+                    // Base still ALIVE → the tool is genuinely running (a build /
+                    // compile / install / long test / dev server / data job that is
+                    // legitimately silent). Keep waiting, bounded ONLY by the overall run
+                    // budget: if the run deadline is exhausted, settle as IdleTimedOut
+                    // (the run finalization / `session.end()` releases the still-live
+                    // base — no interrupt issued here, the caller's graceful budget path
+                    // owns that). Otherwise poll again.
+                    if let Some(dl) = deadline {
+                        if std::time::Instant::now() >= dl {
+                            return IdleEvent::IdleTimedOut {
+                                exit: session.try_exit_status(),
+                                stderr_tail: session.stderr_tail(),
+                            };
+                        }
+                    }
+                    continue;
+                }
+                // NOT in a tool → pure silence past the base window means the base is
+                // genuinely hung. Best-effort interrupt to release the child, bounded
+                // so a dead pipe can't wedge it (the watchdog must always make
+                // progress), then settle. Capture AFTER the interrupt — a hung child
+                // the interrupt just killed now has an exit status / final stderr line.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
+                    session.interrupt(),
+                )
+                .await;
+                return IdleEvent::IdleTimedOut {
+                    exit: session.try_exit_status(),
+                    stderr_tail: session.stderr_tail(),
+                };
             }
         }
     }
 }
 
-/// The machine-true reason string for an idle-watchdog settle — shared so every
-/// pump reports the hang identically (and the TUI / tests match on `"idle"`).
+/// The user-facing reason for an idle-watchdog [`IdleEvent::IdleTimedOut`] settle —
+/// shared so every pump reports it identically. Trilingual (`base.fail.idle`). With the
+/// liveness model an IdleTimedOut means one of two things, and the message covers both:
+/// the base went silent with NO tool running (it looks genuinely hung — raise
+/// `UMADEV_IDLE_TIMEOUT_SECS` for that non-tool idle window, or retry / switch base), OR
+/// the overall run budget was reached while a tool was still running. It explicitly does
+/// NOT frame this as a login/config problem (the auth/network classification is folded
+/// in by [`enrich_idle_reason`] only when the base's own stderr actually indicates one).
+/// `idle` is the base idle window (the knob the user would raise), so the reported
+/// seconds match `UMADEV_IDLE_TIMEOUT_SECS`. Note a base that genuinely DIED mid-tool
+/// settles as [`IdleEvent::SessionEnded`] with its own "ended mid-turn" reason, NOT this
+/// one. The stable, locale-independent marker `UMADEV_IDLE_TIMEOUT_SECS` is present in
+/// every language (tests key off it).
 pub(crate) fn idle_reason(idle: Duration) -> String {
-    format!(
-        "base went idle — no output for {}s (possible hang); settled. \
-         Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
-        idle.as_secs()
-    )
+    umadev_i18n::tlf("base.fail.idle", &[&idle.as_secs().to_string()])
 }
 
 /// Fold the base's OWN diagnosis (exit status + stderr tail, captured at the idle /
@@ -421,7 +613,7 @@ pub async fn drive_director_loop_routed(
         first_directive,
         plan,
         route,
-        idle_timeout(),
+        IdleBudget::from_env(),
         deadline,
     )
     .await
@@ -544,7 +736,7 @@ pub async fn drive_director_loop_resume(
 
     // One shared clock for the resumed build (same as a fresh routed run).
     let deadline = std::time::Instant::now() + run_budget();
-    let idle = idle_timeout();
+    let idle = IdleBudget::from_env();
     // Drive ONLY the remaining steps. `drive_plan_steps` schedules by readiness, so
     // the already-Done steps are skipped and only the Pending ones drive; it persists
     // the plan + finalizes exactly as a fresh deliberate build does. A first-step
@@ -617,7 +809,7 @@ async fn drive_director_loop_with_idle(
     first_directive: String,
     mut plan: Option<Plan>,
     route: Option<&RoutePlan>,
-    idle: Duration,
+    idle: IdleBudget,
     deadline: std::time::Instant,
 ) -> DirectorLoopOutcome {
     // Wave 2: a DELIBERATE build with an owned plan is driven step-by-step (summon
@@ -794,7 +986,7 @@ async fn drive_plan_steps(
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
     plan: &mut Plan,
-    idle: Duration,
+    idle: IdleBudget,
     deadline: std::time::Instant,
 ) -> Option<DirectorLoopOutcome> {
     let _ = idle; // each summon turn reads the idle window itself (drive_rework_turn)
@@ -1467,7 +1659,7 @@ async fn run_final_gate(
             options,
             events,
             qc.fix_directive_with_context(fix_prefix),
-            idle_timeout(),
+            IdleBudget::from_env(),
             deadline,
         )
         .await
@@ -1994,7 +2186,7 @@ async fn drive_one_turn(
     options: &RunOptions,
     events: &Arc<dyn EventSink>,
     directive: String,
-    idle: Duration,
+    idle: IdleBudget,
     deadline: std::time::Instant,
 ) -> Result<TurnResult, String> {
     // Estimate the directive's token cost up front (the session stream carries no
@@ -2006,6 +2198,11 @@ async fn drive_one_turn(
     }
     let mut text = String::new();
     let mut pitfalls: Vec<String> = Vec::new();
+    // Tool-aware idle grace: while the base is plausibly mid-tool (a tool-use event
+    // seen, no result yet) it is legitimately SILENT for minutes (a docker build / a
+    // compile / npm install / a long test), so the next wait uses the extended tool
+    // window; otherwise the base default — so a truly hung base still settles.
+    let mut in_tool_call = false;
     loop {
         // Wall-clock budget reached DURING a turn (not just between steps/rounds). A
         // base that stays ACTIVE — keeps emitting tool-calls / text deltas (e.g.
@@ -2036,12 +2233,15 @@ async fn drive_one_turn(
         // Idle watchdog (P0-3 / P1-11): a base that HANGS (stops emitting stdout
         // but never exits) would leave `next_event()` blocked forever — no
         // `TurnDone`, no settle, `thinking` stuck. The shared [`next_event_idle`]
-        // bounds each wait by `idle` (ANY event resets it, so a long streaming
-        // compile/test turn survives as long as it emits SOMETHING) and converts
-        // pure silence into a settle. The SAME primitive guards every main-session
-        // pump (here + `continuous::drive_phase` / `drive_rework_turn`), so the
-        // protection can't be "fixed in one, forgotten in another".
-        let ev = match next_event_idle(session, idle).await {
+        // converts pure silence into a settle (ANY event resets it, so a long
+        // streaming compile/test turn survives as long as it emits SOMETHING). It is
+        // LIVENESS-based while a tool runs: a tool of any duration with a live base
+        // keeps waiting (only a dead base or the run `deadline` settles it), while a
+        // non-tool hang still settles at the base window. The SAME primitive guards
+        // every main-session pump (here + `continuous::drive_phase` /
+        // `drive_rework_turn`), so the protection can't be "fixed in one, forgotten in
+        // another".
+        let ev = match next_event_idle(session, idle, in_tool_call, Some(deadline)).await {
             IdleEvent::Event(ev) => ev,
             IdleEvent::SessionEnded { exit, stderr_tail } => {
                 // `None` = the session ended (process dead / EOF). Per the
@@ -2068,15 +2268,22 @@ async fn drive_one_turn(
                 // turn hung with no `TurnDone` → estimate (no real usage). F3.
                 record_turn_usage(options, events, None, est_tokens);
                 // Fold in the base's stderr tail / exit so a hung build no longer
-                // settles with a cause-less "base went idle — …".
+                // settles with a cause-less "base went idle — …". Report the BASE idle
+                // window (the `UMADEV_IDLE_TIMEOUT_SECS` knob), since IdleTimedOut now
+                // means a non-tool hang at that window, or the run budget reached mid-tool.
                 return Err(enrich_idle_reason(
-                    &idle_reason(idle),
+                    &idle_reason(idle.window(false)),
                     exit,
                     stderr_tail,
                     &options.backend,
                 ));
             }
         };
+        // Update the mid-tool state from this event BEFORE handling it: a tool-use
+        // arms the extended grace for the next wait, a tool-result disarms it.
+        if let Some(t) = tool_phase_transition(&ev) {
+            in_tool_call = t;
+        }
         match ev {
             SessionEvent::TextDelta(delta) => {
                 est_tokens = est_tokens.saturating_add(approx_tokens(&delta));
@@ -2657,6 +2864,12 @@ fn review_blocking(r: &ReviewResult) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the tests that mutate the process-global `UMADEV_IDLE_TIMEOUT_SECS`
+    /// / `UMADEV_TOOL_IDLE_TIMEOUT_SECS` env (read by `IdleBudget::from_env`):
+    /// `set_var` / `remove_var` are process-wide, so without this lock concurrent env
+    /// tests race and flake. Poison-tolerant so one failing test can't cascade.
+    static IDLE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use crate::events::RecordingSink;
     use crate::trust::TrustMode;
     use umadev_runtime::{SessionError, SessionEvent, TurnStatus};
@@ -2836,7 +3049,10 @@ mod tests {
             &opts(tmp.path()),
             &events,
             "build it".to_string(),
-            std::time::Duration::from_secs(5),
+            IdleBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
+            ),
             std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
@@ -3082,13 +3298,13 @@ mod tests {
             "GO".to_string(),
             None,
             None,
-            Duration::from_millis(100),
+            IdleBudget::new(Duration::from_millis(100), Duration::from_millis(100)),
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;
         if let DirectorLoopOutcome::Failed(reason) = outcome {
             assert!(
-                reason.contains("idle"),
+                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
                 "a hung base settles as an idle Failed: {reason}"
             );
         } else {
@@ -3150,13 +3366,13 @@ mod tests {
             "GO".to_string(),
             None,
             None,
-            Duration::from_millis(100),
+            IdleBudget::new(Duration::from_millis(100), Duration::from_millis(100)),
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;
         if let DirectorLoopOutcome::Failed(reason) = outcome {
             assert!(
-                reason.contains("idle"),
+                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
                 "still settles as an idle Failed: {reason}"
             );
             assert!(
@@ -3226,6 +3442,9 @@ mod tests {
 
     #[test]
     fn idle_timeout_reads_env_and_falls_back_safely() {
+        let _env = IDLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
         // A valid positive value is honoured.
         std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", "42");
@@ -3251,6 +3470,433 @@ mod tests {
             Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
             None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
         }
+    }
+
+    #[test]
+    fn tool_idle_timeout_reads_env_and_falls_back_safely() {
+        let _env = IDLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The EXTENDED tool-grace window honours its own env knob and is fail-open:
+        // a non-positive / unparseable value falls back to the default (a bad env
+        // never DISABLES the grace, and because the default is finite it can never
+        // make the watchdog unbounded).
+        let prior = std::env::var_os("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
+        std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "2400");
+        assert_eq!(tool_idle_timeout(), Duration::from_secs(2400));
+        std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "0");
+        assert_eq!(
+            tool_idle_timeout(),
+            Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
+        );
+        std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", "garbage");
+        assert_eq!(
+            tool_idle_timeout(),
+            Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
+        );
+        std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
+        assert_eq!(
+            tool_idle_timeout(),
+            Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
+        );
+        match prior {
+            Some(v) => std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS"),
+        }
+    }
+
+    #[test]
+    fn idle_defaults_dont_kill_ordinary_builds() {
+        // The base default is 600s so an ordinary slow non-tool turn is not mis-killed.
+        // The tool default is now a 300s LIVENESS-POLL interval (a re-check cadence, NOT
+        // a grace cap), so a tool of any duration with a live base is never killed on
+        // silence — only the run budget bounds it.
+        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 600);
+        assert_eq!(DEFAULT_TOOL_IDLE_TIMEOUT_SECS, 300);
+        // Compile-time invariant: the poll interval is a positive, finite cadence (a
+        // poll of 0 would busy-spin). A `const` block keeps the check at build time (and
+        // satisfies clippy's `assertions_on_constants`, which forbids a runtime assert
+        // over constants).
+        const {
+            assert!(
+                DEFAULT_TOOL_IDLE_TIMEOUT_SECS > 0,
+                "the liveness-poll interval must be a positive cadence"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_phase_transition_maps_tool_start_and_finish() {
+        // A tool-use arms the liveness poll; a tool-result disarms it; everything
+        // else leaves the flag unchanged (so text streaming never resets it).
+        assert_eq!(
+            tool_phase_transition(&SessionEvent::ToolCall {
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "docker build ."}),
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            tool_phase_transition(&SessionEvent::ToolResult {
+                ok: true,
+                summary: "built".into(),
+            }),
+            Some(false)
+        );
+        assert_eq!(
+            tool_phase_transition(&SessionEvent::TextDelta("…".into())),
+            None
+        );
+        assert_eq!(
+            tool_phase_transition(&SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: None,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn idle_budget_picks_the_poll_window_only_while_in_a_tool_call() {
+        let _env = IDLE_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // `window` picks the `tool` liveness-POLL interval while a tool is mid-flight,
+        // and the `base` window otherwise (so a truly hung base — no tool running —
+        // settles at the base window). Note the poll interval is no longer a "longer"
+        // grace cap: with the defaults it is SHORTER than the base window (300s vs
+        // 600s), because it is a re-check cadence, not a deadline.
+        let budget = IdleBudget::new(Duration::from_secs(600), Duration::from_secs(300));
+        assert_eq!(budget.window(false), Duration::from_secs(600));
+        assert_eq!(budget.window(true), Duration::from_secs(300));
+        // `from_env` wires the two env knobs (defaults here, no override set).
+        let prior_base = std::env::var_os("UMADEV_IDLE_TIMEOUT_SECS");
+        let prior_tool = std::env::var_os("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
+        std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS");
+        std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS");
+        let env_budget = IdleBudget::from_env();
+        assert_eq!(
+            env_budget.window(false),
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            env_budget.window(true),
+            Duration::from_secs(DEFAULT_TOOL_IDLE_TIMEOUT_SECS)
+        );
+        match prior_base {
+            Some(v) => std::env::set_var("UMADEV_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_IDLE_TIMEOUT_SECS"),
+        }
+        match prior_tool {
+            Some(v) => std::env::set_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS", v),
+            None => std::env::remove_var("UMADEV_TOOL_IDLE_TIMEOUT_SECS"),
+        }
+    }
+
+    #[test]
+    fn idle_reason_names_the_long_task_case_not_a_login_problem() {
+        // The misleading "check your login/model config" framing is gone: an idle
+        // settle now leads with the long-task case (build/compile/install/test) and
+        // points at the env knob — and carries the stable, locale-independent marker
+        // the pumps/tests key off.
+        let reason = idle_reason(Duration::from_secs(600));
+        assert!(
+            reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
+            "names the env knob to raise: {reason}"
+        );
+        assert!(
+            reason.contains("600"),
+            "reports the elapsed window: {reason}"
+        );
+        // Not a login/auth scare line (the old chat-path framing).
+        assert!(
+            !reason.contains("登录") && !reason.to_lowercase().contains("log in"),
+            "must not frame a silent build as a login problem: {reason}"
+        );
+    }
+
+    /// A session that emits ONE tool-use event then HANGS forever while staying ALIVE
+    /// (`try_exit_status` is the default `None`) — the legitimate-long-tool case (a
+    /// `docker build` kicks off, then runs silently for minutes or hours). Used to prove
+    /// the liveness watchdog keeps such a base alive INDEFINITELY past the base idle
+    /// window: each poll re-checks the (live) base and keeps waiting, never settling on
+    /// silence alone.
+    struct ToolThenHangSession {
+        emitted: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for ToolThenHangSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("hang".into()))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            if self.emitted {
+                // The tool is running silently — never resolves.
+                std::future::pending::<()>().await;
+                None
+            } else {
+                self.emitted = true;
+                Some(SessionEvent::ToolCall {
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "docker build ."}),
+                })
+            }
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_tool_silence_survives_the_base_window_but_a_bare_hang_settles() {
+        // The regression this fixes: a base that fires a tool then goes silent for the
+        // tool's whole duration must NOT be killed. With a TINY base window (50ms) and a
+        // tiny tool POLL interval (20ms), the liveness watchdog re-checks the (live)
+        // ToolCall-then-hang base every 20ms and keeps waiting — so it is still draining
+        // well past the base window (we cancel at 300ms to keep the test fast), proof
+        // the silence was never capped while the base stayed alive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = ToolThenHangSession { emitted: false };
+        let o = opts(tmp.path());
+        let budget = IdleBudget::new(Duration::from_millis(50), Duration::from_millis(20));
+        let pumped = tokio::time::timeout(
+            Duration::from_millis(300),
+            drive_one_turn(
+                &mut sess,
+                &o,
+                &events,
+                "build it".to_string(),
+                budget,
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            ),
+        )
+        .await;
+        assert!(
+            pumped.is_err(),
+            "a base mid-tool must NOT settle on silence — the liveness poll keeps the \
+             live base alive (so the outer 300ms cancel fires instead)"
+        );
+
+        // Control: the SAME tiny windows, but a base that hangs with NO tool in flight
+        // settles promptly at the base window (the watchdog still catches a true hang —
+        // the liveness model did not make the non-tool case unbounded).
+        let mut hung = HangingSession;
+        let bare = tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_one_turn(
+                &mut hung,
+                &o,
+                &events,
+                "build it".to_string(),
+                budget,
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            ),
+        )
+        .await
+        .expect("a bare hang (no tool running) must settle at the base window");
+        match bare {
+            Err(reason) => assert!(
+                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
+                "a true hang still settles as an idle reason: {reason}"
+            ),
+            Ok(_) => panic!("a hung base must settle as an Err, not Ok"),
+        }
+    }
+
+    /// A real, already-exited `ExitStatus` for the "base died mid-tool" fixtures —
+    /// constructed by running a trivial process, so no platform-specific / unsafe
+    /// `from_raw`. Deterministic on every Unix-like CI / dev box.
+    fn a_real_exit_status() -> std::process::ExitStatus {
+        std::process::Command::new("true")
+            .status()
+            .expect("spawn `true` to obtain a real ExitStatus")
+    }
+
+    /// A base whose `next_event` never resolves (a tool runs silently) with a
+    /// configurable `try_exit_status` (alive = `None`, dead = `Some`) and an interrupt
+    /// counter — the fixture for the liveness watchdog's three in-tool / non-tool settle
+    /// paths. `next_event_idle` is driven directly so the four behaviours are asserted
+    /// without going through a whole turn.
+    struct ProbeSession {
+        exit: Option<std::process::ExitStatus>,
+        interrupts: Arc<std::sync::Mutex<u32>>,
+    }
+
+    impl ProbeSession {
+        fn new(exit: Option<std::process::ExitStatus>) -> Self {
+            Self {
+                exit,
+                interrupts: Arc::new(std::sync::Mutex::new(0)),
+            }
+        }
+        fn interrupts(&self) -> Arc<std::sync::Mutex<u32>> {
+            Arc::clone(&self.interrupts)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for ProbeSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("probe".into()))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            // A silently-running tool: never resolves.
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            *self.interrupts.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+            self.exit
+        }
+    }
+
+    #[tokio::test]
+    async fn next_event_idle_in_tool_with_a_live_base_keeps_waiting_past_the_poll_window() {
+        // (a) The crux of the liveness refinement: a tool in flight + a LIVE base
+        // (try_exit_status None) must NOT settle just because the poll window elapsed —
+        // it keeps re-checking and waiting. With a 20ms poll and a far-future deadline,
+        // `next_event_idle` should still be running well past several poll windows (we
+        // cancel at 250ms), i.e. it did NOT return an IdleTimedOut on silence alone.
+        let mut sess = ProbeSession::new(None);
+        let budget = IdleBudget::new(Duration::from_millis(50), Duration::from_millis(20));
+        let out = tokio::time::timeout(
+            Duration::from_millis(250),
+            next_event_idle(
+                &mut sess,
+                budget,
+                true,
+                Some(std::time::Instant::now() + Duration::from_secs(3_600)),
+            ),
+        )
+        .await;
+        assert!(
+            out.is_err(),
+            "an in-tool LIVE base must keep waiting past the poll window, never settle on \
+             silence (the outer 250ms cancel must fire instead)"
+        );
+        assert_eq!(
+            *sess.interrupts().lock().unwrap(),
+            0,
+            "a live in-tool base is never interrupted by the watchdog"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_event_idle_in_tool_with_a_dead_base_settles_as_session_ended() {
+        // (b) A base that died mid-tool (try_exit_status Some, no event) is caught by
+        // the liveness poll within ONE poll window and settles as SessionEnded — NOT an
+        // unbounded wait, and NOT a misleading idle-hang.
+        let mut sess = ProbeSession::new(Some(a_real_exit_status()));
+        let budget = IdleBudget::new(Duration::from_millis(50), Duration::from_millis(20));
+        let ev = tokio::time::timeout(
+            Duration::from_secs(2),
+            next_event_idle(
+                &mut sess,
+                budget,
+                true,
+                Some(std::time::Instant::now() + Duration::from_secs(3_600)),
+            ),
+        )
+        .await
+        .expect("a dead in-tool base must settle within one poll window, not hang");
+        match ev {
+            IdleEvent::SessionEnded { exit, .. } => {
+                assert!(
+                    exit.is_some(),
+                    "the base's exit status is surfaced: {exit:?}"
+                );
+            }
+            other => panic!("expected SessionEnded for a dead in-tool base, got {other:?}"),
+        }
+        assert_eq!(
+            *sess.interrupts().lock().unwrap(),
+            0,
+            "an already-dead base is not interrupted (it has already exited)"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_event_idle_non_tool_hang_settles_at_the_base_window_with_a_bounded_interrupt() {
+        // (c) A genuinely hung base that is NOT in a tool still settles at the base
+        // window (the non-tool case is never made unbounded), and the watchdog issues
+        // its ONE best-effort bounded interrupt before settling.
+        let mut sess = ProbeSession::new(None);
+        let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
+        let ev = tokio::time::timeout(
+            Duration::from_secs(2),
+            next_event_idle(&mut sess, budget, false, None),
+        )
+        .await
+        .expect("a non-tool hang must settle at the base window, not run forever");
+        assert!(
+            matches!(ev, IdleEvent::IdleTimedOut { .. }),
+            "a non-tool hang settles as IdleTimedOut: {ev:?}"
+        );
+        assert_eq!(
+            *sess.interrupts().lock().unwrap(),
+            1,
+            "the non-tool hang path issues exactly one best-effort interrupt"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_event_idle_in_tool_live_base_settles_when_the_run_budget_is_exhausted() {
+        // (d) The outer backstop: a LIVE base mid-tool keeps waiting, but only until the
+        // overall run-budget deadline. A deadline already in the PAST settles the very
+        // first poll as IdleTimedOut — the run budget is the single bound on the
+        // otherwise-indefinite in-tool wait. No interrupt here (the run finalization /
+        // session.end() owns releasing the still-live base).
+        let mut sess = ProbeSession::new(None);
+        let budget = IdleBudget::new(Duration::from_millis(50), Duration::from_millis(20));
+        let past = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        let ev = tokio::time::timeout(
+            Duration::from_secs(2),
+            next_event_idle(&mut sess, budget, true, Some(past)),
+        )
+        .await
+        .expect("an in-tool live base past its run budget must settle promptly");
+        assert!(
+            matches!(ev, IdleEvent::IdleTimedOut { .. }),
+            "the run-budget deadline settles an in-tool live base as IdleTimedOut: {ev:?}"
+        );
+        assert_eq!(
+            *sess.interrupts().lock().unwrap(),
+            0,
+            "the in-tool budget backstop does not interrupt (the run finalization does)"
+        );
     }
 
     // ── Auto-QC units ─────────────────────────────────────────────────────
@@ -3746,7 +4392,7 @@ mod tests {
             "GO".into(),
             Some(plan),
             Some(&route),
-            Duration::from_millis(200),
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
             already_past,
         )
         .await;
@@ -4393,7 +5039,7 @@ mod tests {
             &events,
             &route,
             &mut plan,
-            Duration::from_millis(200),
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
             spent_deadline(),
         )
         .await;
@@ -4444,7 +5090,7 @@ mod tests {
             &events,
             &route,
             &mut plan,
-            Duration::from_millis(200),
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
             spent_deadline(),
         )
         .await;
@@ -4563,7 +5209,7 @@ mod tests {
             &events,
             &route,
             &mut plan,
-            Duration::from_millis(200),
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;
@@ -4665,7 +5311,7 @@ mod tests {
             &events,
             &route,
             &mut plan,
-            Duration::from_millis(200),
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;
@@ -4760,7 +5406,7 @@ mod tests {
             &events,
             &route,
             &mut plan,
-            Duration::from_millis(200),
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
             std::time::Instant::now() + Duration::from_secs(3_600),
         )
         .await;
