@@ -13,17 +13,17 @@ export const i18n = {
     nav: { product: "产品首页", docs: "文档中心", gallery: "形象相册", changelog: "更新日志", contributors: "特别贡献" },
     hero: {
       badge: "v1.0.7 · MIT 开源 · Rust 单二进制",
-      title1: "把 AI 编码工具，变成",
-      titleHi: "真正的项目总监",
-      title2: " Agent",
-      sub: "用自然语言说你要做什么，UmaDev 驱动你已登录的 Claude Code / Codex / OpenCode 把它做出来：规划工作、写代码、召集角色团队评审、跑质量与治理检查，交还可运行的代码和一份交付证明。一个常驻持续会话，启动即预载。",
+      title1: "把一句需求，交给",
+      titleHi: "一支 AI 开发团队",
+      title2: "做成能上线的应用",
+      sub: "产品经理、架构师、设计师、前端、后端、QA、安全、DevOps —— 八个专家角色像真实团队一样分工协作，借你已登录的 Claude Code / Codex / OpenCode 大脑，把一句需求做成能上线、能交付、能审计的商业级应用。独立开发者，也瞬间拥有一整支有工程纪律的团队。",
       cta1: "快速开始",
       cta2: "阅读文档",
       copy: "复制",
       copied: "已复制",
       stats: [
+        ["8", "专家角色"],
         ["112", "治理规则"],
-        ["8", "角色团队席位"],
         ["418", "知识库文档"],
         ["3", "本机底座"],
       ],
@@ -31,73 +31,87 @@ export const i18n = {
     trust: "驱动你已登录的本机编码底座",
     backends: ["Claude Code", "Codex CLI", "OpenCode"],
     mascots: {
-      eyebrow: "仿真开发团队 (Simulation Dev Team)",
-      title: "每一步交付，都有一位 Uma 专家在场",
-      desc: "把吉祥物从纯装饰重塑为真实干活的开发岗位：1位项目总监带领8大技术席位。Doers 串行写入主干，Critics 则基于 Verdict Engine 在隔离的只读分叉 (Read-only forks) 上并行评审。全员共享主底座 subprocess 交互会话，免除您配置或购买多份 API Key 的高昂成本，保障工程级的高效安全交付。",
+      eyebrow: "认识你的 AI 开发团队 (Your AI Dev Team)",
+      title: "八个专家角色，各自交付真实产物",
+      desc: "不是一个黑盒，而是一支分工的团队：产品经理拆需求、架构师定契约、设计师立设计系统、前后端真建真测、QA 出运行时证明、安全审攻击面、DevOps 出部署证明。实干角色（Doer）串行写主干，评审角色（Critic）在只读分叉上并行把关，全员只通过黑板交接、绝不互聊——既拿到并行红利，又躲开多 Agent 的脆弱。八个角色共用你已登录的同一个底座大脑，无需多买一份 API Key。",
+      deliversLabel: "产物",
+      lead: {
+        img: "/assets/umadev/mascot-thumb-lead.png",
+        role: "技术负责人 · 协调者",
+        desc: "团队的协调者（不是头牌）：路由意图、拆计划、按步调度这八个角色、把关每道确认门、留下完整审计证据。",
+      },
       cards: [
         {
-          img: "/assets/umadev/mascot-thumb-lead.png",
-          role: "Director",
-          type: "director",
-          title: "项目总监 Agent",
-          desc: "总控流程，路由意图，管理动态计划，人在环确认及流程纠错自愈。",
-          details: ["路由用户构建意图", "可视化执行计划管理", "人在环双重确认门控", "编译异常回滚自愈"]
-        },
-        {
           img: "/assets/umadev/mascot-wave.png",
-          role: "PM (Critic)",
+          role: "产品经理 / PM",
           type: "critic",
           title: "产品经理 Agent",
-          desc: "只读分叉并行评审。把关业务功能与验收指标，防止 AI 需求漂移。",
+          produces: "output/*-prd.md",
+          desc: "把需求拆清、写 PRD、定验收标准，防止 AI 需求漂移。",
           details: ["核对 PRD 验收标准", "防范功能范围漂移", "评审用户交互文案"]
         },
         {
           img: "/assets/umadev/mascot-hud-panel.png",
-          role: "Architect (Critic)",
+          role: "架构师 / Architect",
           type: "critic",
           title: "系统架构师 Agent",
-          desc: "只读分叉并行评审。审计 API 设计、接口契约和深层依赖树。",
+          produces: ".umadev/contracts/openapi.*",
+          desc: "定分层、服务边界与 API 契约——前后端的交接基准，由它锁定。",
           details: ["维护清晰模块化架构", "强校验前后端 API 契约", "依赖树循环导入审计"]
         },
         {
           img: "/assets/umadev/mascot-laptop-chair.png",
-          role: "UI/UX (Critic)",
+          role: "UI/UX 设计师 / Designer",
           type: "critic",
-          title: "视觉设计师 Agent",
-          desc: "只读分叉并行评审。严苛推行 ANTI_SLOP_LAW，阻断 Emoji 与裸色乱用。",
-          details: ["强制实施反垃圾设计律", "审核亮暗 Design Tokens", "杜绝 AI 痕迹色彩渐变"]
+          title: "UI/UX 设计师 Agent",
+          produces: "output/*-uiux.md · design tokens",
+          desc: "立设计系统（字体 / 令牌 / 组件 / 页面骨架），强制反 AI 模板审美。",
+          details: ["强制实施反 AI-slop 设计律", "审核亮暗 Design Tokens", "杜绝 AI 痕迹色彩渐变"]
         },
         {
           img: "/assets/umadev/mascot-point.png",
-          role: "FE (Doer)",
+          role: "前端工程师 / Frontend",
           type: "doer",
           title: "前端工程师 Agent",
-          desc: "主会话串行写入。驱动本地 CLI 开发组件，实现交互及设计对齐。",
+          produces: "src/ 组件 · 页面",
+          desc: "主会话串行写入。按设计系统与契约真建前端，跑通运行时。",
           details: ["开发交互式前端页面", "绑定 CSS 变量 Tokens", "保障前端编译与静态导出"]
         },
         {
           img: "/assets/umadev/mascot-sit-code.png",
-          role: "BE (Doer)",
+          role: "后端工程师 / Backend",
           type: "doer",
           title: "后端工程师 Agent",
-          desc: "主会话串行写入。设计 DB Schema 迁移，编写 API 与单元测试。",
+          produces: "API · 数据模型 · 迁移",
+          desc: "主会话串行写入。建数据模型、API 与业务逻辑，对齐架构契约。",
           details: ["实现 RESTful/GraphQL API", "设计稳健 DB 迁移脚本", "编写单元与集成测试"]
         },
         {
           img: "/assets/umadev/mascot-city-dashboard.png",
-          role: "QA & Security (Critic)",
+          role: "QA 工程师 / QA",
           type: "critic",
-          title: "测试与安全专家 Agent",
-          desc: "只读分叉并行评审。渗透与注入审计，执行编译校验，卡死 90% 覆盖率门槛。",
-          details: ["拦截覆盖率 < 90% 提交", "代码漏洞静态扫描", "阻断危险 shell 命令注入"]
+          title: "QA 工程师 Agent",
+          produces: "runtime-proof.json",
+          desc: "真跑构建 / 测试、核对覆盖、产出运行时证明，卡死 90% 覆盖率门槛。",
+          details: ["拦截覆盖率 < 90% 提交", "真跑构建与测试", "启动应用、探测路由 200"]
+        },
+        {
+          img: "/assets/umadev/peace-agent.png",
+          role: "安全工程师 / Security",
+          type: "critic",
+          title: "安全工程师 Agent",
+          produces: "安全基线 · SAST",
+          desc: "语义攻击面审查：鉴权、越权、注入、密钥，PR 前基线无新高危才放行。",
+          details: ["代码漏洞静态扫描 (SAST)", "鉴权 / 越权 / 注入审查", "阻断危险 shell 命令注入"]
         },
         {
           img: "/assets/umadev/mascot-run.png",
-          role: "DevOps (Doer)",
+          role: "DevOps / DevOps",
           type: "doer",
-          title: "运维交付工程师 Agent",
-          desc: "主会话串行写入。拉起 dev server 拨测，沉淀坑位记忆并打包 Proof Pack。",
-          details: ["本地 dev server 动态就绪拨测", "捕获报错蒸馏 Lessons 记忆", "打包 SOC 2 可审计交付包"]
+          title: "DevOps 工程师 Agent",
+          produces: "deploy-proof.json",
+          desc: "主会话串行写入。构建、发布、部署，沉淀坑位记忆并打包交付证明。",
+          details: ["CI 与本地 dev server 拨测", "捕获报错蒸馏 Lessons 记忆", "打包 SOC 2 可审计交付包"]
         }
       ]
     },
@@ -107,7 +121,7 @@ export const i18n = {
       desc: "借一个常驻持续会话当大脑：它先路由这句话——闲聊 / 解释 / 小改 / 调试 / 构建。非构建快速回复；真实构建（聊天里随手提，或 /run、/goal）则自动拥有可见计划、角色团队评审、设计系统、知识库与交付证明。固定 9 阶段只是重型从零构建时它路由到的「最深打法」，不是每句话都被塞进的漏斗。",
       layers: [
         { k: "TUI / CLI", d: "你和 UmaDev 交流的地方：聊天界面 + 命令入口。" },
-        { k: "项目总监 Agent", d: "由底座的模型判断这一步，拥有并驱动可见计划，按步调度角色团队。" },
+        { k: "团队调度（含协调者）", d: "由底座的模型判断这一步，协调者拥有并驱动可见计划，按步调度八个角色团队。" },
         { k: "Runtime / 底座", d: "把任务交给 Claude Code / Codex CLI / OpenCode 写真实代码。" },
         { k: "治理 · 质量 · 证据", d: "L0 固件常驻注入设计系统 / 知识库 / 踩坑记忆，每次调用留下审计。" },
       ],
@@ -115,7 +129,7 @@ export const i18n = {
     pipe: {
       eyebrow: "最深打法",
       title: "重型从零构建的最深打法",
-      desc: "这条阶段链不是每句话的漏斗，而是总监为重型从零构建路由到、并由计划展开成的「最深打法」。每一步都有产物、确认点和可追溯记录。点击查看每一步做什么。",
+      desc: "这条阶段链不是每句话的漏斗，而是团队为重型从零构建路由到、并由计划展开成的「最深打法」。每一步都有负责的角色、产物、确认点和可追溯记录。点击查看每一步做什么。",
       filesLabel: "主要产物",
       gate: "确认门",
     },
@@ -144,15 +158,15 @@ export const i18n = {
       ],
       cards: [
         { title: "复用本机登录态", cmd: "/claude · /codex · /opencode", desc: "继续使用你已经登录的 Claude Code、Codex CLI 或 OpenCode，让它们负责真实读写文件与运行命令。" },
-        { title: "非交互命令驱动", cmd: "subprocess", desc: "UmaDev 作为项目总监，只负责任务编排、阶段门、治理规则和证据链；代码执行交给本机 CLI。" },
+        { title: "非交互命令驱动", cmd: "subprocess", desc: "UmaDev 作为团队协调者，只负责分工编排、阶段门、治理规则和证据链；代码执行交给本机 CLI。" },
       ],
       notes: ["仅支持三种本机 CLI", "继续用你原来的账号与订阅", "底座负责真实读写文件、运行命令", "UmaDev 负责流程、规则、质量门、证据链"],
     },
     demo: { replay: "重新播放" },
     gov: {
-      eyebrow: "底座能力",
-      title: "治理、质量门、知识库——交付的底座",
-      desc: "UmaDev 最早就是治理工具，这部分至今仍是核心。每一次交付，都带着规则、质量门和证据链。",
+      eyebrow: "团队凭什么交付商业级",
+      title: "治理、质量门、知识库——团队交付的底座",
+      desc: "光有分工还不够商业级。团队的每一次交付，都带着规则、质量门和证据链——这是它和「让 AI 随手写一段」的根本区别。",
       blocks: [
         { stat: "112", unit: "条治理规则", title: "治理", desc: "规范层 25 条 clause，实现层 112 条规则。四个入口：写入前 hook、CI 扫描、MCP server、质量门补扫。", bullets: ["不用 emoji 当图标 · 不写硬编码色", "不写密钥 · 危险命令 · 注入代码", "Rust unwrap · Go panic · Python bare except"] },
         { stat: "90", unit: "分默认通过线", title: "质量门", desc: "交付前验收，不只看文件在不在，而是逐项检查证据。", bullets: ["PRD 目标 / 范围 / 验收标准", "前端调用与后端契约是否一致", "构建 / 测试 / lint / typecheck 结果", "审计日志与合规映射"] },
@@ -163,8 +177,8 @@ export const i18n = {
     },
     ip: {
       eyebrow: "IP 形象",
-      title: "认识 Uma —— 你的终端总监",
-      desc: "一颗会发光的终端头、一身机能风外套。Uma 是 UmaDev 的吉祥物，也是「让 AI 按流程交付」这件事的人格化。",
+      title: "认识 Uma —— 你的 AI 队友",
+      desc: "一颗会发光的终端头、一身机能风外套。Uma 是 UmaDev 的吉祥物，也是这支 AI 开发团队每个角色的人格化。",
       cards: [
         { img: "/assets/umadev/code-orbit-agent.png", cap: "代码轨道 · 知识检索" },
         { img: "/assets/umadev/workbench-agent.png", cap: "工作台 · 真实执行" },
@@ -172,8 +186,8 @@ export const i18n = {
       ],
     },
     cta: {
-      title: "免费、开源，一句话就能开始",
-      sub: "MIT 许可 · Rust 单二进制 · 本地运行。当前驱动 Claude Code / Codex CLI / OpenCode，不保存你的登录信息。",
+      title: "免费、开源，一句话召集你的团队",
+      sub: "MIT 许可 · Rust 单二进制 · 本地运行。八个角色共用你已登录的 Claude Code / Codex CLI / OpenCode，不保存你的登录信息。",
       btn1: "在 GitHub 上开始",
       btn2: "阅读文档",
       note: "npm install -g umadev",
@@ -182,7 +196,7 @@ export const i18n = {
     galleryPage: { title: "形象相册", sub: "UmaDev 的 IP 形象集 —— 点击任意一张放大查看。" },
     logPage: { title: "更新日志", sub: "UmaDev 各版本的新增、改进与安全更新。", current: "当前版本" },
     footer: {
-      blurb: "把「AI 写代码」变成一个完整、可上线、可审计的交付过程。",
+      blurb: "一支 AI 开发团队，把一句需求做成能上线、可审计的商业级应用。",
       cols: [
         { h: "产品", links: [{ t: "流水线设计" }, { t: "运行模式" }, { t: "治理规则" }, { t: "质量门" }, { t: "知识库" }] },
         { h: "文档", links: [{ t: "快速体验" }, { t: "命令大全" }, { t: "配置" }, { t: "Rust 架构" }, { t: "规范 SPEC" }] },
@@ -244,17 +258,17 @@ export const i18n = {
     nav: { product: "Home", docs: "Docs", gallery: "Gallery", changelog: "Changelog", contributors: "Contributors" },
     hero: {
       badge: "v1.0.7 · MIT licensed · Single Rust binary",
-      title1: "Turn your AI coding tool into a",
-      titleHi: "real project director",
-      title2: " agent",
-      sub: "Tell UmaDev what you want in plain language, and it drives the Claude Code / Codex / OpenCode you already logged into to build it: plan the work, write the code, convene a role team for review, run quality and governance checks, and hand back runnable code plus a delivery proof. One resident session, pre-warmed at launch.",
+      title1: "Hand one idea to",
+      titleHi: "a whole AI development team",
+      title2: "and get a shippable app",
+      sub: "Product manager, architect, designer, frontend, backend, QA, security, DevOps — eight specialists collaborate like a real team, borrowing the Claude Code / Codex / OpenCode brain you already logged into, to turn one idea into a shippable, deliverable, auditable commercial-grade app. A solo dev gets a full, disciplined team in an instant.",
       cta1: "Get started",
       cta2: "Read the docs",
       copy: "Copy",
       copied: "Copied",
       stats: [
+        ["8", "Specialist roles"],
         ["112", "Governance rules"],
-        ["8", "Role-team seats"],
         ["418", "Knowledge docs"],
         ["3", "Local backends"],
       ],
@@ -262,73 +276,87 @@ export const i18n = {
     trust: "Drives the local coding CLI you already logged into",
     backends: ["Claude Code", "Codex CLI", "OpenCode"],
     mascots: {
-      eyebrow: "Simulation Dev Team",
-      title: "An Uma Expert Present for Every Delivery",
-      desc: "Mascots transformed from decoration into a real-working team: 1 Project Director leading 8 Expert Seats. Doers write code serially, while Critics run parallel reviews on read-only forks via the Verdict Engine. All roles share the primary subprocess session, eliminating the need for multiple API Keys or extra costs while securing robust delivery.",
+      eyebrow: "Meet Your AI Dev Team",
+      title: "Eight specialists, each shipping a real artifact",
+      desc: "Not a black box — a team with a division of labor: the PM scopes the need, the architect locks the contract, the designer stands up the design system, frontend and backend really build and test, QA produces the runtime proof, security audits the attack surface, DevOps ships the deploy proof. Doers write the trunk serially; critics review in parallel on read-only forks; everyone hands off through the blackboard and never chats peer-to-peer — so you get the parallel upside without multi-agent fragility. All eight roles share the one base brain you already logged into — no extra API key to buy.",
+      deliversLabel: "Ships",
+      lead: {
+        img: "/assets/umadev/mascot-thumb-lead.png",
+        role: "Tech lead · coordinator",
+        desc: "The team's coordinator (not the headline): routes intent, breaks down the plan, schedules these eight roles step by step, guards every confirm gate, and leaves a full audit trail.",
+      },
       cards: [
         {
-          img: "/assets/umadev/mascot-thumb-lead.png",
-          role: "Director",
-          type: "director",
-          title: "Project Director Agent",
-          desc: "Controls workflow, routes intent, manages dynamic plans, guides gates and triggers self-correction.",
-          details: ["Routes user intent", "Manages execution plans", "Enforces Human-in-the-Loop gates", "Self-corrects and rolls back"]
-        },
-        {
           img: "/assets/umadev/mascot-wave.png",
-          role: "PM (Critic)",
+          role: "Product Manager / PM",
           type: "critic",
           title: "Product Manager Agent",
-          desc: "Concurrently reviews features on read-only forks to prevent AI scope creep.",
+          produces: "output/*-prd.md",
+          desc: "Scopes the need, writes the PRD and acceptance criteria, and blocks AI scope creep.",
           details: ["Checks PRD acceptance criteria", "Blocks scope creep", "Audits interactive copy"]
         },
         {
           img: "/assets/umadev/mascot-hud-panel.png",
-          role: "Architect (Critic)",
+          role: "Architect / Architect",
           type: "critic",
           title: "System Architect Agent",
-          desc: "Concurrently reviews API contracts and modules to ensure clean modular patterns.",
+          produces: ".umadev/contracts/openapi.*",
+          desc: "Sets the layers, service boundaries and API contract — the handoff baseline FE & BE build to.",
           details: ["Maintains modular architecture", "Enforces contract schemas", "Checks dependency tree loops"]
         },
         {
           img: "/assets/umadev/mascot-laptop-chair.png",
-          role: "UI/UX (Critic)",
+          role: "UI/UX Designer / Designer",
           type: "critic",
           title: "UI/UX Designer Agent",
-          desc: "Concurrently reviews visuals to block hardcoded colors or emojis under ANTI_SLOP_LAW.",
+          produces: "output/*-uiux.md · design tokens",
+          desc: "Stands up the design system (type / tokens / components / page skeleton) and enforces anti-AI-slop taste.",
           details: ["Enforces anti-slop rules", "Checks css variables & tokens", "Rejects generic AI gradients"]
         },
         {
           img: "/assets/umadev/mascot-point.png",
-          role: "FE (Doer)",
+          role: "Frontend / Frontend",
           type: "doer",
           title: "Frontend Developer Agent",
-          desc: "Serially writes components on the primary session, implementing pages and design tokens.",
+          produces: "src/ components · pages",
+          desc: "Writes serially on the main session: real components against the design system and the contract, runtime verified.",
           details: ["Implements interactive pages", "Aligns CSS Design Tokens", "Ensures build and export success"]
         },
         {
           img: "/assets/umadev/mascot-sit-code.png",
-          role: "BE (Doer)",
+          role: "Backend / Backend",
           type: "doer",
           title: "Backend Developer Agent",
-          desc: "Serially writes backend API endpoints, migrations, and unit tests on the primary session.",
+          produces: "API · data model · migrations",
+          desc: "Writes serially on the main session: data model, API and business logic, aligned to the architect's contract.",
           details: ["Implements REST/GraphQL APIs", "Designs migration scripts", "Writes unit and integration tests"]
         },
         {
           img: "/assets/umadev/mascot-city-dashboard.png",
-          role: "QA & Security (Critic)",
+          role: "QA / QA",
           type: "critic",
-          title: "QA & Security Expert Agent",
-          desc: "Concurrently audits coverage floors, codes static vulnerability scans, and command injections.",
-          details: ["Enforces 90% coverage limits", "Performs vulnerability checks", "Blocks shell command injection"]
+          title: "QA Engineer Agent",
+          produces: "runtime-proof.json",
+          desc: "Really runs build / tests, checks coverage and produces the runtime proof — and holds the 90% coverage floor.",
+          details: ["Blocks coverage < 90%", "Runs real build & tests", "Boots the app, probes routes 200"]
+        },
+        {
+          img: "/assets/umadev/peace-agent.png",
+          role: "Security / Security",
+          type: "critic",
+          title: "Security Engineer Agent",
+          produces: "security baseline · SAST",
+          desc: "Semantic attack-surface review: auth, privilege escalation, injection, secrets — ships only when the pre-PR baseline has no new highs.",
+          details: ["Static vulnerability scan (SAST)", "Auth / privilege / injection review", "Blocks shell command injection"]
         },
         {
           img: "/assets/umadev/mascot-run.png",
-          role: "DevOps (Doer)",
+          role: "DevOps / DevOps",
           type: "doer",
-          title: "DevOps Developer Agent",
-          desc: "Serially pings dev servers for HTTP status, learns pitfalls, and packages SOC 2 Proof Packs.",
-          details: ["Runs runtime dev server pings", "Captures and refines DevErrors", "Assembles SOC 2 Proof Packs"]
+          title: "DevOps Engineer Agent",
+          produces: "deploy-proof.json",
+          desc: "Writes serially on the main session: build, release, deploy — distills pitfall memory and packages the delivery proof.",
+          details: ["CI + local dev-server pings", "Captures and refines DevErrors", "Assembles SOC 2 Proof Packs"]
         }
       ]
     },
@@ -338,7 +366,7 @@ export const i18n = {
       desc: "Borrow one resident persistent session as the brain: it routes the turn first — chat / explain / quick-edit / debug / build. A non-build turn streams a fast reply; a real build (mentioned in chat, or via /run / /goal) automatically gets a visible plan, the role-team review, the design system, the knowledge base and a delivery proof. The fixed 9-phase chain is just the deepest play the director routes to for a heavyweight greenfield build — not a funnel every message is forced through.",
       layers: [
         { k: "TUI / CLI", d: "Where you talk to UmaDev — a chat interface plus command entry." },
-        { k: "Project director agent", d: "Lets the base's model judge the turn, owns and drives a visible plan, schedules the role team step by step." },
+        { k: "Team orchestration (+ coordinator)", d: "Lets the base's model judge the turn; the coordinator owns and drives a visible plan and schedules the eight-role team step by step." },
         { k: "Runtime / backend", d: "Hands tasks to Claude Code / Codex CLI / OpenCode to write real code." },
         { k: "Governance · quality · evidence", d: "L0 firmware always injects the design system / knowledge / pitfall memory; every call leaves an audit trail." },
       ],
@@ -346,7 +374,7 @@ export const i18n = {
     pipe: {
       eyebrow: "Deepest play",
       title: "The deepest play for a heavyweight greenfield build",
-      desc: "This chain is not a funnel for every message — it is the deepest play the director routes to, and the one a plan expands into, for a heavyweight greenfield build. Every step leaves artifacts, gates and traceable records. Tap a step to see what it does.",
+      desc: "This chain is not a funnel for every message — it is the deepest play the team routes to, and the one a plan expands into, for a heavyweight greenfield build. Every step has an owning role, artifacts, gates and traceable records. Tap a step to see what it does.",
       filesLabel: "Key artifacts",
       gate: "Confirm gate",
     },
@@ -375,15 +403,15 @@ export const i18n = {
       ],
       cards: [
         { title: "Reuse local login state", cmd: "/claude · /codex · /opencode", desc: "Keep using the Claude Code, Codex CLI or OpenCode account you already logged into; those tools do the real file writes and commands." },
-        { title: "Non-interactive command driving", cmd: "subprocess", desc: "UmaDev acts as the project director for phases, gates, governance and evidence; code execution stays in the local CLI." },
+        { title: "Non-interactive command driving", cmd: "subprocess", desc: "UmaDev acts as the team's coordinator for the division of labor, gates, governance and evidence; code execution stays in the local CLI." },
       ],
       notes: ["Only three local CLIs are supported", "Keep your existing account & subscription", "The backend reads/writes real files & runs commands", "UmaDev owns flow, rules, quality gate & evidence"],
     },
     demo: { replay: "Replay" },
     gov: {
-      eyebrow: "Platform power",
-      title: "Governance, quality gate, knowledge — the floor under delivery",
-      desc: "UmaDev started as a governance tool, and that’s still core. Every delivery ships with rules, a quality gate and an evidence chain.",
+      eyebrow: "How the team ships commercial-grade",
+      title: "Governance, quality gate, knowledge — the floor under the team's delivery",
+      desc: "A division of labor alone isn't commercial-grade. Every delivery from the team ships with rules, a quality gate and an evidence chain — the difference between this and “let the AI knock something out.”",
       blocks: [
         { stat: "112", unit: "governance rules", title: "Governance", desc: "25 spec clauses, 112 implementation rules. Four entry points: pre-write hook, CI scan, MCP server, quality-gate sweep.", bullets: ["No emoji icons · no hardcoded colors", "No secrets · dangerous commands · injection", "Rust unwrap · Go panic · Python bare except"] },
         { stat: "90", unit: "default pass score", title: "Quality gate", desc: "Pre-delivery acceptance — not just “does the file exist”, but evidence checked item by item.", bullets: ["PRD goals / scope / acceptance criteria", "Frontend calls match the backend contract", "Build / test / lint / typecheck results", "Audit logs and compliance mapping"] },
@@ -394,8 +422,8 @@ export const i18n = {
     },
     ip: {
       eyebrow: "Brand IP",
-      title: "Meet Uma — your terminal director",
-      desc: "A glowing terminal head and a techwear jacket. Uma is UmaDev’s mascot, and the personification of “make the AI deliver by the process.”",
+      title: "Meet Uma — your AI teammate",
+      desc: "A glowing terminal head and a techwear jacket. Uma is UmaDev’s mascot, and the personification of every role on this AI development team.",
       cards: [
         { img: "/assets/umadev/code-orbit-agent.png", cap: "Code orbit · retrieval" },
         { img: "/assets/umadev/workbench-agent.png", cap: "Workbench · real execution" },
@@ -403,8 +431,8 @@ export const i18n = {
       ],
     },
     cta: {
-      title: "Free, open source, one sentence to start",
-      sub: "MIT licensed · single Rust binary · runs locally. Currently drives Claude Code / Codex CLI / OpenCode and stores no logins.",
+      title: "Free, open source — one sentence to assemble your team",
+      sub: "MIT licensed · single Rust binary · runs locally. All eight roles share the Claude Code / Codex CLI / OpenCode you already logged into, and it stores no logins.",
       btn1: "Start on GitHub",
       btn2: "Read the docs",
       note: "npm install -g umadev",
@@ -413,7 +441,7 @@ export const i18n = {
     galleryPage: { title: "Mascot gallery", sub: "The UmaDev IP mascot set — click any image to enlarge." },
     logPage: { title: "Changelog", sub: "Every UmaDev release — what was added, improved and secured.", current: "Latest" },
     footer: {
-      blurb: "Turn “AI writes code” into a complete, shippable, auditable delivery process.",
+      blurb: "A whole AI development team that turns one idea into a shippable, auditable, commercial-grade app.",
       cols: [
         { h: "Product", links: [{ t: "Pipeline" }, { t: "Run modes" }, { t: "Governance" }, { t: "Quality gate" }, { t: "Knowledge base" }] },
         { h: "Docs", links: [{ t: "Quick start" }, { t: "Command reference" }, { t: "Configuration" }, { t: "Rust architecture" }, { t: "Spec" }] },
@@ -482,7 +510,7 @@ export const docs = {
           id: "quickstart",
           title: "快速开始",
           blocks: [
-            { p: "UmaDev 是一个本地运行的 AI 编码项目总监 Agent。推荐用 npm 安装预编译二进制，npm 只是分发壳，真正运行的是 Rust 编译出的 umadev 二进制。" },
+            { p: "UmaDev 是一支本地运行的 AI 开发团队 Agent —— 八个专家角色由一个协调者调度。推荐用 npm 安装预编译二进制，npm 只是分发壳，真正运行的是 Rust 编译出的 umadev 二进制。" },
             { c: "npm install -g umadev" },
             { p: "支持 macOS（Apple Silicon / Intel）、Linux（x86_64 / ARM64）、Windows x86_64。也可以从源码构建：" },
             { c: "git clone https://github.com/umacloud/umadev.git\ncd umadev\ncargo build --release\n./target/release/umadev --version" },
@@ -510,7 +538,7 @@ export const docs = {
     {
       cat: "核心概念",
       items: [
-        { id: "how", title: "UmaDev 如何工作", blocks: [{ p: "整体架构可以理解成四层：TUI/CLI 是你和 UmaDev 交流的地方；项目总监 Agent 决定现在做哪个阶段、何时暂停继续；Runtime/底座把任务交给 Claude Code / Codex CLI / OpenCode 写真实代码；治理/质量/证据检查产物是否合规并打包交付。" }] satisfies DocBlock[] },
+        { id: "how", title: "UmaDev 如何工作", blocks: [{ p: "整体架构可以理解成四层：TUI/CLI 是你和 UmaDev 交流的地方；团队协调者决定现在哪个角色做哪个阶段、何时暂停继续；Runtime/底座把任务交给 Claude Code / Codex CLI / OpenCode 写真实代码；治理/质量/证据检查产物是否合规并打包交付。" }] satisfies DocBlock[] },
         { id: "quality", title: "质量门是什么", blocks: [{ p: "质量门是交付前验收，不只是看文件是否存在，而是检查 PRD、架构、UI/UX、前后端契约、构建测试结果、密钥泄露风险、审计日志和合规映射。" }, { c: "[quality]\nthreshold = 90\nskip_checks = []" }] satisfies DocBlock[] },
         { id: "knowledge", title: "知识库是什么", blocks: [{ p: "UmaDev 内置 416 份 markdown 知识文件，覆盖产品、架构、前后端、数据库、安全、测试、CI/CD、运维、移动端、行业和专家方法论。" }, { c: "umadev knowledge-manage add ./team-docs --name team-docs\numadev knowledge-manage search \"支付 webhook 幂等\"" }] satisfies DocBlock[] },
       ],
@@ -564,7 +592,7 @@ export const docs = {
           id: "quickstart",
           title: "Quick start",
           blocks: [
-            { p: "UmaDev is a locally-run AI coding project-director agent. Install the prebuilt binary with npm; npm is just the distribution shell, while the actual binary is Rust-compiled." },
+            { p: "UmaDev is a locally-run AI development team agent — eight specialists scheduled by one coordinator. Install the prebuilt binary with npm; npm is just the distribution shell, while the actual binary is Rust-compiled." },
             { c: "npm install -g umadev" },
             { p: "Supports macOS Apple Silicon / Intel, Linux x86_64 / ARM64, and Windows x86_64. Or build from source:" },
             { c: "git clone https://github.com/umacloud/umadev.git\ncd umadev\ncargo build --release\n./target/release/umadev --version" },
@@ -581,7 +609,7 @@ export const docs = {
     {
       cat: "Concepts",
       items: [
-        { id: "how", title: "How UmaDev works", blocks: [{ p: "Think of it as four layers: TUI/CLI, project-director agent, runtime/backend, and governance/quality/evidence. The backend writes real code while UmaDev owns flow, gates, rules and delivery evidence." }] satisfies DocBlock[] },
+        { id: "how", title: "How UmaDev works", blocks: [{ p: "Think of it as four layers: TUI/CLI, the team coordinator, runtime/backend, and governance/quality/evidence. The backend writes real code while UmaDev owns the division of labor, gates, rules and delivery evidence." }] satisfies DocBlock[] },
         { id: "quality", title: "What the quality gate is", blocks: [{ p: "The quality gate verifies PRD, architecture, UI/UX, FE/BE contract alignment, build/test/lint/typecheck results, secret leaks, audit logs and compliance mapping." }, { c: "[quality]\nthreshold = 90\nskip_checks = []" }] satisfies DocBlock[] },
         { id: "knowledge", title: "What the knowledge base is", blocks: [{ p: "UmaDev ships 416 markdown knowledge files: product, architecture, frontend, backend, data, security, testing, CI/CD, operations, industries and expert methodologies." }, { c: "umadev knowledge-manage add ./team-docs --name team-docs\numadev knowledge-manage search \"payment webhook idempotency\"" }] satisfies DocBlock[] },
       ],

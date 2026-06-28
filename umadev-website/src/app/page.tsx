@@ -370,26 +370,26 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     let title = "";
     if (view === "home") {
       title = lang === "zh"
-        ? "UmaDev - AI 编码项目总监 Agent"
-        : "UmaDev - AI coding project director";
+        ? "UmaDev - 一支 AI 开发团队 Agent"
+        : "UmaDev - a whole AI development team";
     } else if (view === "docs") {
       title = lang === "zh"
-        ? "文档中心 | UmaDev - AI 编码项目总监 Agent"
-        : "Documentation | UmaDev - AI coding project director";
+        ? "文档中心 | UmaDev - 一支 AI 开发团队 Agent"
+        : "Documentation | UmaDev - a whole AI development team";
     } else if (view === "gallery") {
       title = lang === "zh"
-        ? "形象相册 | UmaDev - AI 编码项目总监 Agent"
-        : "Mascot Gallery | UmaDev - AI coding project director";
+        ? "形象相册 | UmaDev - 一支 AI 开发团队 Agent"
+        : "Mascot Gallery | UmaDev - a whole AI development team";
     } else if (view === "changelog") {
       title = lang === "zh"
-        ? "更新日志 | UmaDev - AI 编码项目总监 Agent"
-        : "Changelog | UmaDev - AI coding project director";
+        ? "更新日志 | UmaDev - 一支 AI 开发团队 Agent"
+        : "Changelog | UmaDev - a whole AI development team";
     } else if (view === "contributors") {
       title = lang === "zh"
-        ? "特别贡献荣誉殿堂 | UmaDev - AI 编码项目总监 Agent"
-        : "Special Contributors | UmaDev - AI coding project director";
+        ? "特别贡献荣誉殿堂 | UmaDev - 一支 AI 开发团队 Agent"
+        : "Special Contributors | UmaDev - a whole AI development team";
     }
-    
+
     document.title = title;
 
     const descMeta = document.querySelector('meta[name="description"]');
@@ -397,8 +397,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
       descMeta.setAttribute(
         "content",
         lang === "zh"
-          ? "把 Claude Code、Codex 或 OpenCode 变成项目总监 Agent，交付 PRD、架构、UI/UX、代码、质量门和交付包。"
-          : "Turn Claude Code, Codex, or OpenCode into a project-director agent that ships PRD, architecture, UI/UX, code, quality gates and proof packs."
+          ? "UmaDev 是一支 AI 开发团队：产品经理、架构师、设计师、前端、后端、QA、安全、DevOps 八个角色分工协作，借你已登录的 Claude Code / Codex / OpenCode 大脑，把一句需求做成能上线的商业级应用。"
+          : "UmaDev is a whole AI development team — eight specialists collaborating like a real team — that borrows your logged-in Claude Code / Codex / OpenCode brain to turn one idea into a shippable, commercial-grade app."
       );
     }
   }, [lang, view]);
@@ -446,40 +446,40 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     lang === "zh"
       ? [
           {
-            key: "director",
-            overline: "在你的项目中交付",
+            key: "team",
+            overline: "一句需求，交给一支团队",
             lines: [
-              { text: "把 AI 编码工具", accent: false },
-              { text: "变成真正的", accent: false },
-              { text: "项目总监 Agent", accent: true },
+              { text: "把一句需求，交给", accent: false },
+              { text: "一支 AI 开发团队", accent: true },
+              { text: "做成能上线的商业级应用", accent: false },
             ],
             sub: t.hero.sub,
             visual: "/assets/1_v2.png",
-            hud: ["运行模式 / 本地", "质量门槛 / 90+", "支持底座 / 23"],
-            ticker: ["cargo test --workspace", "quality_gate: 94 / 100", "release/proof-pack.zip"],
+            hud: ["专家角色 / 8", "质量门槛 / 90+", "共用底座 / 1"],
+            ticker: ["seat: architect → openapi.json", "seat: frontend → src/", "release/proof-pack.zip"],
           },
           {
             key: "workflow",
-            overline: "从需求到交付凭证",
+            overline: "团队跑完整条交付",
             lines: [
-              { text: "从一句需求", accent: false },
-              { text: "自动调度", accent: false },
-              { text: "10 步交付闭环", accent: true },
+              { text: "产品 · 架构 · 设计 · 前后端", accent: false },
+              { text: "QA · 安全 · DevOps", accent: false },
+              { text: "一条交付闭环跑通", accent: true },
             ],
-            sub: "澄清、调研、文档、前端、后端、质量门、交付包按流程推进。每一步都有状态、产物和可追溯证据。",
+            sub: "需求拆清、契约对齐、设计立稳、真建真测、安全审查、打包交付——每个角色交付真实产物，每一步都有状态和可追溯证据。",
             visual: "/assets/2_v2.png",
-            hud: ["标准流程 / 10步", "核心门槛 / 3", "交付证据 / 开启"],
+            hud: ["交付闭环 / 10步", "确认门 / 2", "交付证据 / 开启"],
             ticker: ["phase: docs_confirm", "output/prd.md + architecture.md", ".umadev/audit/session.jsonl"],
           },
           {
             key: "runtime",
-            overline: "自带编码底座",
+            overline: "团队共用你已登录的大脑",
             lines: [
-              { text: "连接你已登录的", accent: false },
+              { text: "全队借你已登录的", accent: false },
               { text: "Claude Code", accent: true },
               { text: "Codex CLI OpenCode", accent: false },
             ],
-            sub: "UmaDev 负责流程、治理、质量门和证据链；真实读写文件和运行命令，交给你本机已经登录的编码底座。",
+            sub: "八个角色共用同一个已登录的底座大脑做思考与写码——无需多买一份 API。UmaDev 负责分工、治理、质量门和证据链。",
             visual: "/assets/3_v2.png",
             hud: ["CLAUDE CODE", "CODEX CLI", "OPENCODE"],
             ticker: ["driver: codex exec", "sandbox: workspace-write", "secrets: local only"],
@@ -487,40 +487,40 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
         ]
       : [
           {
-            key: "director",
-            overline: "Code Where You Ship",
+            key: "team",
+            overline: "One idea, handed to a team",
             lines: [
-              { text: "Turn AI coding tools into", accent: false },
-              { text: "real project director", accent: true },
-              { text: "agents", accent: false },
+              { text: "A whole", accent: false },
+              { text: "AI development team", accent: true },
+              { text: "ships your idea, commercial-grade", accent: false },
             ],
             sub: t.hero.sub,
             visual: "/assets/1_v2.png",
-            hud: ["RUN_MODE / LOCAL", "QUALITY_GATE / 90+", "HOSTS / 23"],
-            ticker: ["cargo test --workspace", "quality_gate: 94 / 100", "release/proof-pack.zip"],
+            hud: ["SPECIALISTS / 8", "QUALITY_GATE / 90+", "SHARED BASE / 1"],
+            ticker: ["seat: architect → openapi.json", "seat: frontend → src/", "release/proof-pack.zip"],
           },
           {
             key: "workflow",
-            overline: "From Prompt To Proof",
+            overline: "The team runs the whole delivery",
             lines: [
-              { text: "From one prompt", accent: false },
-              { text: "to a governed", accent: false },
-              { text: "10-step delivery loop", accent: true },
+              { text: "PM · architect · design · FE/BE", accent: false },
+              { text: "QA · security · DevOps", accent: false },
+              { text: "one delivery loop, end to end", accent: true },
             ],
-            sub: "Clarify, research, docs, frontend, backend, quality gates and proof packs move as one traceable workflow.",
+            sub: "Clarify the need, align the contract, lock the design system, build it, test it, audit it, package it — each role ships a real artifact, every step leaves status and traceable proof.",
             visual: "/assets/2_v2.png",
-            hud: ["FLOW / 10 STEPS", "GATES / 3", "PROOF / ON"],
+            hud: ["DELIVERY / 10 STEPS", "GATES / 2", "PROOF / ON"],
             ticker: ["phase: docs_confirm", "output/prd.md + architecture.md", ".umadev/audit/session.jsonl"],
           },
           {
             key: "runtime",
-            overline: "Bring Your Coding Base",
+            overline: "The team shares your logged-in brain",
             lines: [
-              { text: "Connect your logged-in", accent: false },
+              { text: "The whole team borrows your", accent: false },
               { text: "Claude Code", accent: true },
               { text: "Codex CLI OpenCode", accent: false },
             ],
-            sub: "UmaDev owns orchestration, governance, gates and proof. Your local coding base does the real file edits and commands.",
+            sub: "All eight roles share the one base brain you already logged into to think and write code — no extra API to buy. UmaDev owns the division of labor, governance, gates and proof.",
             visual: "/assets/3_v2.png",
             hud: ["CLAUDE CODE", "CODEX CLI", "OPENCODE"],
             ticker: ["driver: codex exec", "sandbox: workspace-write", "secrets: local only"],
@@ -530,7 +530,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
   const heroTitle = activeHeroSlide.lines.map((line) => line.text).join(" ");
   const titleLines = activeHeroSlide.lines;
   const heroSlideLabels =
-    lang === "zh" ? ["主视觉", "交付闭环", "编码底座"] : ["Hero", "Workflow", "Runtime"];
+    lang === "zh" ? ["团队", "交付", "底座"] : ["Team", "Delivery", "Runtime"];
   const showcaseItems =
     lang === "zh"
       ? [
@@ -977,7 +977,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
               </div>
               <div className={styles.showcaseScreen}>
                 <TerminalDemo key={showcaseIndex} slideIndex={showcaseIndex} lang={lang} />
-                <div className={styles.showcaseNote}>{lang === "zh" ? "项目总监模式" : "PROJECT DIRECTOR MODE"}</div>
+                <div className={styles.showcaseNote}>{lang === "zh" ? "团队协作模式" : "TEAM AT WORK"}</div>
                 <div className={styles.showcaseFiles}>
                   {showcase.files.map((file) => (
                     <code key={file}>{file}</code>
@@ -1000,15 +1000,25 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                 <span>{`// ${t.mascots.eyebrow}`}</span>
                 <h2>{t.mascots.title}</h2>
                 <p>{t.mascots.desc}</p>
+                <div className={styles.mascotLead}>
+                  <Image
+                    src={asset(t.mascots.lead.img)}
+                    alt=""
+                    width={56}
+                    height={56}
+                    aria-hidden="true"
+                  />
+                  <div>
+                    <small>{t.mascots.lead.role}</small>
+                    <p>{t.mascots.lead.desc}</p>
+                  </div>
+                </div>
               </div>
               <div className={styles.mascotRail}>
                 {t.mascots.cards.map((card, index) => (
                   <article className={styles.mascotCard} key={card.title}>
                     <div className={styles.mascotImageWrapper}>
                       <Image src={asset(card.img)} alt={card.title} width={360} height={360} />
-                      {card.type === "director" && (
-                        <span className={styles.mascotTypeTagDirector}>L0 Director</span>
-                      )}
                       {card.type === "doer" && (
                         <span className={styles.mascotTypeTagDoer}>Doer · Serial Write</span>
                       )}
@@ -1021,6 +1031,10 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                         {String(index + 1).padStart(2, "0")} / {card.role}
                       </small>
                       <h3>{card.title}</h3>
+                      <div className={styles.mascotProduces}>
+                        <span>{t.mascots.deliversLabel}</span>
+                        <code>{card.produces}</code>
+                      </div>
                       <p>{card.desc}</p>
                       {card.details && (
                         <ul className={styles.mascotDetails}>

@@ -2952,7 +2952,7 @@
     filter 260ms ease;
 }
 
-.mascotCard div {
+.mascotCard > div {
   position: absolute;
   right: 12px;
   bottom: 12px;
@@ -6191,7 +6191,7 @@
   transition: transform 260ms ease;
 }
 
-.mascotCard div {
+.mascotCard > div {
   position: relative !important;
   inset: auto !important;
   margin: 0 !important;
@@ -6266,7 +6266,82 @@
   font-size: 10px;
 }
 
+/* ── Team roster: per-role deliverable chip ("what each role ships") ─────── */
+.mascotProduces {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  align-self: flex-start;
+  max-width: 100%;
+  margin: 12px 0 2px;
+  padding: 6px 9px;
+  background: rgba(0, 210, 255, 0.07);
+  border: 1px solid rgba(0, 210, 255, 0.22);
+  border-radius: 8px;
+}
 
+.mascotProduces span {
+  flex-shrink: 0;
+  color: var(--magenta);
+  font-family: var(--font-mono), monospace;
+  font-size: 9.5px;
+  font-weight: 900;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.mascotProduces code {
+  min-width: 0;
+  color: var(--cyan);
+  font-family: var(--font-mono), monospace;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+  word-break: break-all;
+}
+
+/* ── Team roster: coordinator strip inside the sticky intro panel ────────── */
+.mascotLead {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-top: 26px;
+  padding: 14px;
+  background: rgba(242, 184, 75, 0.06);
+  border: 1px solid rgba(242, 184, 75, 0.24);
+  border-radius: 12px;
+}
+
+.mascotLead img {
+  width: 54px;
+  height: 54px;
+  flex-shrink: 0;
+  object-fit: contain;
+  border-radius: 9px;
+  background: rgba(2, 8, 12, 0.55);
+  border: 1px solid rgba(242, 184, 75, 0.22);
+}
+
+.mascotLead small {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--gold);
+  font-family: var(--font-mono), monospace;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.mascotLead p {
+  max-width: none;
+  margin: 0;
+  color: rgba(190, 205, 214, 0.82);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
 
 @media (max-width: 960px) {
   .mascotRail {
