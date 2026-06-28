@@ -2171,6 +2171,37 @@ impl App {
         self.transcript_scroll.set(0);
     }
 
+    /// Route one mouse-wheel notch (`up` = `ScrollUp`) to the right surface.
+    ///
+    /// Precedence: a modal **overlay**, when open, owns the viewport and scrolls
+    /// regardless of the `/mouse` wheel-capture toggle — it is content the user is
+    /// actively reading, so the wheel must move IT, not the transcript hidden
+    /// behind it (the reported "overlay won't scroll" was the wheel scrolling that
+    /// hidden transcript). With no overlay open, the wheel scrolls the chat
+    /// transcript, but only when wheel-capture is enabled (`/mouse`) and we're on
+    /// the chat screen, matching the existing chat-mode gating. Returns `true` if
+    /// the notch was consumed. Fail-open: an out-of-range notch is clamped by the
+    /// underlying scroll helpers, never panics.
+    pub fn mouse_wheel(&mut self, up: bool, step: usize) -> bool {
+        if let Some(ov) = self.overlay.as_mut() {
+            if up {
+                ov.scroll_up(step);
+            } else {
+                ov.scroll_down(step);
+            }
+            return true;
+        }
+        if self.mouse_scroll && matches!(self.mode, AppMode::Chat) {
+            if up {
+                self.transcript_scroll_up(step);
+            } else {
+                self.transcript_scroll_down(step);
+            }
+            return true;
+        }
+        false
+    }
+
     /// Half the transcript viewport, for Ctrl-U / Ctrl-D — at least one row so a
     /// tiny window still scrolls.
     fn transcript_half_page(&self) -> usize {
@@ -6027,8 +6058,15 @@ impl App {
 
     /// Render the live plan + team review as a chat note (for `/plan` with no
     /// args). Falls back to a friendly "no active plan" hint.
+    ///
+    /// Unlike the collapsible live panel (which clips the verdict tail to "… +N"),
+    /// this prints the FULL team-review section — every reviewing seat's verdict
+    /// and, for a blocking seat, ALL of its must-fix findings — so the panel's
+    /// "/plan for all" affordance is truthful and nothing is hidden.
     fn show_plan_status(&mut self) {
-        if self.plan_steps.is_empty() {
+        let has_plan = !self.plan_steps.is_empty();
+        let has_review = !self.critic_verdicts.is_empty();
+        if !has_plan && !has_review {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "plan.none"));
             self.push(
                 ChatRole::System,
@@ -6036,25 +6074,61 @@ impl App {
             );
             return;
         }
-        let (done, total) = (
-            self.plan_steps
-                .iter()
-                .filter(|s| s.status == "done")
-                .count(),
-            self.plan_steps.len(),
-        );
-        let mut body = format!(
-            "{} {done}/{total}\n",
-            umadev_i18n::t(self.lang, "plan.panel.title")
-        );
-        for step in &self.plan_steps {
-            let mark = match step.status.as_str() {
-                "done" => "[x]",
-                "active" => "[~]",
-                "blocked" => "[!]",
-                _ => "[ ]",
-            };
-            body.push_str(&format!("  {mark} {} · {}\n", step.id, step.title));
+        let mut body = String::new();
+        if has_plan {
+            let (done, total) = (
+                self.plan_steps
+                    .iter()
+                    .filter(|s| s.status == "done")
+                    .count(),
+                self.plan_steps.len(),
+            );
+            body.push_str(&format!(
+                "{} {done}/{total}\n",
+                umadev_i18n::t(self.lang, "plan.panel.title")
+            ));
+            for step in &self.plan_steps {
+                let mark = match step.status.as_str() {
+                    "done" => "[x]",
+                    "active" => "[~]",
+                    "blocked" => "[!]",
+                    _ => "[ ]",
+                };
+                body.push_str(&format!("  {mark} {} · {}\n", step.id, step.title));
+            }
+        }
+        // Full team-review section: EVERY seat's verdict + a blocking seat's
+        // complete findings. Mirrors the live panel's "[seat] accepts / N must-fix"
+        // wording, but never clips the findings list.
+        if has_review {
+            let accepts = self.critic_verdicts.iter().filter(|c| c.accepts).count();
+            let blocking = self.critic_verdicts.len() - accepts;
+            body.push_str(&umadev_i18n::tf(
+                self.lang,
+                "plan.review.section",
+                &[&accepts.to_string(), &blocking.to_string()],
+            ));
+            body.push('\n');
+            for c in &self.critic_verdicts {
+                let verdict = if c.accepts {
+                    umadev_i18n::t(self.lang, "plan.review.accept").to_string()
+                } else {
+                    umadev_i18n::tf(
+                        self.lang,
+                        "plan.review.block",
+                        &[&c.blocking.len().max(1).to_string()],
+                    )
+                };
+                body.push_str(&format!("  [{}] {verdict}\n", c.seat));
+                if !c.accepts {
+                    for b in &c.blocking {
+                        let item = b.trim();
+                        if !item.is_empty() {
+                            body.push_str(&format!("    - {item}\n"));
+                        }
+                    }
+                }
+            }
         }
         body.push_str(umadev_i18n::t(self.lang, "plan.steer.usage"));
         self.push(ChatRole::UmaDev, body);
@@ -11695,6 +11769,102 @@ mod tests {
         // End jumps to the published last reachable row (not a logical-line guess).
         let _ = a.apply_key(KeyCode::End);
         assert_eq!(a.overlay.as_ref().unwrap().scroll, 100);
+    }
+
+    #[test]
+    fn overlay_wheel_scrolls_overlay_not_transcript() {
+        let mut a = fresh_app(Some("offline"));
+        // A tall transcript so a mis-routed wheel WOULD visibly move it.
+        a.transcript_max_scroll.set(100);
+        a.set_transcript_scroll(0);
+        // Open an overlay (taller than the viewport — publish a non-zero max).
+        for c in "/spec".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        assert!(a.overlay.is_some());
+        a.overlay.as_ref().unwrap().max_scroll.set(100);
+        // Wheel DOWN with the overlay open scrolls the OVERLAY, not the transcript.
+        assert!(a.mouse_wheel(false, 3));
+        assert_eq!(a.overlay.as_ref().unwrap().scroll, 3);
+        assert_eq!(
+            a.transcript_scroll(),
+            0,
+            "transcript stays pinned while an overlay is open"
+        );
+        // PageDown (key path) advances further; End clamps to the published last row.
+        let _ = a.apply_key(KeyCode::PageDown);
+        assert!(a.overlay.as_ref().unwrap().scroll > 3);
+        let _ = a.apply_key(KeyCode::End);
+        assert_eq!(a.overlay.as_ref().unwrap().scroll, 100, "End clamps to max");
+        // Wheeling past the end stays clamped — never overruns the last visual row.
+        assert!(a.mouse_wheel(false, 50));
+        assert_eq!(a.overlay.as_ref().unwrap().scroll, 100);
+        // The modal owns the wheel even when the `/mouse` toggle is OFF.
+        a.mouse_scroll = false;
+        let _ = a.apply_key(KeyCode::Home);
+        assert_eq!(a.overlay.as_ref().unwrap().scroll, 0);
+        a.overlay.as_ref().unwrap().max_scroll.set(100);
+        assert!(a.mouse_wheel(false, 5));
+        assert_eq!(
+            a.overlay.as_ref().unwrap().scroll,
+            5,
+            "overlay scrolls regardless of the /mouse wheel-capture toggle"
+        );
+        // With the overlay CLOSED, the wheel falls back to the transcript.
+        a.overlay = None;
+        a.mouse_scroll = true;
+        a.transcript_max_scroll.set(100);
+        a.set_transcript_scroll(0);
+        assert!(a.mouse_wheel(true, 4));
+        assert_eq!(
+            a.transcript_scroll(),
+            4,
+            "no overlay → the wheel scrolls the transcript"
+        );
+    }
+
+    #[test]
+    fn slash_plan_includes_full_team_review_section() {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold (frontend)".into(),
+                "s2 · login route (backend)".into(),
+            ],
+            done: 1,
+            total: 2,
+        });
+        a.apply_engine(EngineEvent::CriticVerdict {
+            seat: "architect".into(),
+            accepts: true,
+            blocking: vec![],
+            advisory: vec!["consider a cache".into()],
+        });
+        a.apply_engine(EngineEvent::CriticVerdict {
+            seat: "qa".into(),
+            accepts: false,
+            blocking: vec!["no tests for login".into(), "no error handling".into()],
+            advisory: vec![],
+        });
+        assert_eq!(a.critic_verdicts.len(), 2);
+        let before = a.history.len();
+        let action = a.try_slash_command("/plan").unwrap();
+        assert_eq!(action, Action::None);
+        let out: String = a
+            .history
+            .iter()
+            .skip(before)
+            .map(|m| m.body().clone())
+            .collect();
+        // Plan steps still render.
+        assert!(out.contains("s1") && out.contains("s2"), "plan steps shown");
+        // EVERY seat's verdict is listed (truthful "/plan for all").
+        assert!(out.contains("[architect]"), "accepting seat shown: {out}");
+        assert!(out.contains("[qa]"), "blocking seat shown: {out}");
+        // A blocking seat's FULL findings are listed, not just the first.
+        assert!(out.contains("no tests for login"), "first finding: {out}");
+        assert!(out.contains("no error handling"), "second finding: {out}");
     }
 
     #[test]

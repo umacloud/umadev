@@ -150,6 +150,7 @@
 "plan.review.note.accept" = "团队评审 · [{}] 通过"
 "plan.review.note.block" = "团队评审 · [{}] {} 个必改:"
 "plan.review.note.summary" = "团队评审已收敛 — {} 通过 · {} 拦截(完整评审见上)。"
+"plan.review.section" = "团队评审 — {} 通过 · {} 拦截"
 "plan.steer.usage" = "/plan — 查看计划 · /plan skip <id> · /plan add <文本> · /plan veto <id> · /plan up <id> · /plan down <id> · /plan collapse"
 "plan.steer.skip" = "跳过步骤 `{}`——折进下一条指令。"
 "plan.steer.veto" = "否决步骤 `{}`——折进下一条指令。"
@@ -570,6 +571,7 @@
 # 可滚动内容浮层进度
 "tui.overlay.empty" = "(空)"
 "tui.overlay.progress" = " 第 {}-{} 行 / 共 {} 行 · {}% "
+"tui.overlay.scroll_hint" = "↑↓/PgUp PgDn 滚动"
 # 帮助浮层 —— 标题
 "tui.help.header_picker" = " 帮助 —— 首次启动选择器 "
 "tui.help.header_chat" = " 帮助 —— 斜杠命令与按键 "

@@ -150,6 +150,7 @@
 "plan.review.note.accept" = "團隊評審 · [{}] 通過"
 "plan.review.note.block" = "團隊評審 · [{}] {} 個必改:"
 "plan.review.note.summary" = "團隊評審已收斂 — {} 通過 · {} 攔截(完整評審見上)。"
+"plan.review.section" = "團隊評審 — {} 通過 · {} 攔截"
 "plan.steer.usage" = "/plan — 檢視計畫 · /plan skip <id> · /plan add <文字> · /plan veto <id> · /plan up <id> · /plan down <id> · /plan collapse"
 "plan.steer.skip" = "跳過步驟 `{}`——折進下一條指令。"
 "plan.steer.veto" = "否決步驟 `{}`——折進下一條指令。"
@@ -570,6 +571,7 @@
 # 可捲動內容浮層進度
 "tui.overlay.empty" = "(空)"
 "tui.overlay.progress" = " 第 {}-{} 行 / 共 {} 行 · {}% "
+"tui.overlay.scroll_hint" = "↑↓/PgUp PgDn 捲動"
 # 說明浮層 —— 標題
 "tui.help.header_picker" = " 說明 —— 首次啟動選擇器 "
 "tui.help.header_chat" = " 說明 —— 斜線命令與按鍵 "

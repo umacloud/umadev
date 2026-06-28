@@ -150,6 +150,7 @@
 "plan.review.note.accept" = "Team review · [{}] accepts"
 "plan.review.note.block" = "Team review · [{}] {} must-fix:"
 "plan.review.note.summary" = "Team review settled — {} accept · {} blocking (full verdicts above)."
+"plan.review.section" = "Team review — {} accept · {} blocking"
 "plan.steer.usage" = "/plan — show plan · /plan skip <id> · /plan add <text> · /plan veto <id> · /plan up <id> · /plan down <id> · /plan collapse"
 "plan.steer.skip" = "Skipping step `{}` — folded into the next directive."
 "plan.steer.veto" = "Vetoing step `{}` — folded into the next directive."
@@ -570,6 +571,7 @@
 # Scrollable content overlay progress
 "tui.overlay.empty" = "(empty)"
 "tui.overlay.progress" = " {}-{} of {} · {}% "
+"tui.overlay.scroll_hint" = "↑↓/PgUp PgDn scroll"
 # Help overlay — headers
 "tui.help.header_picker" = " Help — first-launch picker "
 "tui.help.header_chat" = " Help — slash commands & keys "

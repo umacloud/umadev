@@ -3763,42 +3763,63 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
                     // Mouse → wheel scrollback + the in-app drag-to-select/copy layer
                     // (the Claude Code approach: WE render the selection highlight and
-                    // copy via OSC 52, so both work on the alternate screen). Gated by
-                    // `/mouse`; when capture is off these never arrive and the
-                    // terminal's native selection/copy takes over. Only meaningful on
-                    // the chat screen.
-                    if app.mouse_scroll && matches!(app.mode, crate::app::AppMode::Chat) {
-                        let (col, row) = (me.column, me.row);
-                        match me.kind {
-                            // Wheel → scroll ~3 rows per notch (the usual step).
-                            MouseEventKind::ScrollUp => app.transcript_scroll_up(3),
-                            MouseEventKind::ScrollDown => app.transcript_scroll_down(3),
-                            // Left-down: begin a selection at this point (or clear it
-                            // if the click is outside the transcript area).
-                            MouseEventKind::Down(MouseButton::Left) => {
-                                app.selection_begin(col, row);
-                            }
-                            // Left-drag: extend the live selection's cursor.
-                            MouseEventKind::Drag(MouseButton::Left) => {
-                                app.selection_extend(col, row);
-                            }
-                            // Left-up: if a non-empty selection was made, copy its
-                            // text to the system clipboard via OSC 52 and toast. The
-                            // highlight is KEPT so the user sees what was copied; a
-                            // later Down elsewhere clears it. Fail-open: a write error
-                            // is ignored, never blocking the loop.
-                            MouseEventKind::Up(MouseButton::Left) => {
-                                if let Some(text) = app.selection_finish_copy() {
-                                    // The native clipboard helper spawns a child and
-                                    // blocks on its stdin write + `wait()`; a wedged
-                                    // pbcopy/xclip would otherwise stall this tokio
-                                    // worker mid-render. Push it to the blocking pool
-                                    // fire-and-forget (the OSC 52 fallback lives inside
-                                    // it). Fail-open: errors are ignored.
-                                    tokio::task::spawn_blocking(move || copy_to_clipboard(&text));
+                    // copy via OSC 52, so both work on the alternate screen).
+                    match me.kind {
+                        // Wheel → scroll ~3 rows per notch (the usual step). Routed
+                        // through `mouse_wheel`, which gives a modal OVERLAY priority
+                        // (it scrolls regardless of the `/mouse` toggle, since it's
+                        // content the user is actively reading) and otherwise scrolls
+                        // the chat transcript when wheel-capture is on. Without this the
+                        // wheel scrolled the transcript hidden BEHIND an open overlay and
+                        // the overlay looked "stuck".
+                        MouseEventKind::ScrollUp => {
+                            app.mouse_wheel(true, 3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            app.mouse_wheel(false, 3);
+                        }
+                        // The drag-to-select/copy layer is chat-only, gated by `/mouse`,
+                        // and suppressed while a modal overlay is up (the overlay owns the
+                        // screen). When capture is off these never arrive and the
+                        // terminal's native selection/copy takes over.
+                        _ => {
+                            if app.mouse_scroll
+                                && app.overlay.is_none()
+                                && matches!(app.mode, crate::app::AppMode::Chat)
+                            {
+                                let (col, row) = (me.column, me.row);
+                                match me.kind {
+                                    // Left-down: begin a selection at this point (or
+                                    // clear it if the click is outside the transcript).
+                                    MouseEventKind::Down(MouseButton::Left) => {
+                                        app.selection_begin(col, row);
+                                    }
+                                    // Left-drag: extend the live selection's cursor.
+                                    MouseEventKind::Drag(MouseButton::Left) => {
+                                        app.selection_extend(col, row);
+                                    }
+                                    // Left-up: if a non-empty selection was made, copy its
+                                    // text to the system clipboard via OSC 52 and toast.
+                                    // The highlight is KEPT so the user sees what was
+                                    // copied; a later Down elsewhere clears it. Fail-open:
+                                    // a write error is ignored, never blocking the loop.
+                                    MouseEventKind::Up(MouseButton::Left) => {
+                                        if let Some(text) = app.selection_finish_copy() {
+                                            // The native clipboard helper spawns a child
+                                            // and blocks on its stdin write + `wait()`; a
+                                            // wedged pbcopy/xclip would otherwise stall
+                                            // this tokio worker mid-render. Push it to the
+                                            // blocking pool fire-and-forget (the OSC 52
+                                            // fallback lives inside it). Fail-open: errors
+                                            // are ignored.
+                                            tokio::task::spawn_blocking(move || {
+                                                copy_to_clipboard(&text);
+                                            });
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-                            _ => {}
                         }
                     }
                 } else if let Some(Ok(Event::Paste(pasted))) = &maybe_key {

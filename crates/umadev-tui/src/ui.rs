@@ -447,7 +447,18 @@ fn render_scroll_overlay(frame: &mut Frame, ov: &crate::app::Overlay) {
             ],
         )
     };
-    let title_full = format!("{}{progress}", ov.title);
+    // When the body is taller than the viewport, surface the scroll affordance in
+    // the title so the user knows the overlay scrolls (the close hint is already in
+    // each opener's title). `max_scroll == 0` means everything fits, so no hint.
+    let title_full = if max_scroll > 0 {
+        format!(
+            "{}{progress}{} ",
+            ov.title,
+            umadev_i18n::t(lang, "tui.overlay.scroll_hint")
+        )
+    } else {
+        format!("{}{progress}", ov.title)
+    };
 
     // No `.wrap()` — the body is already folded to the inner width, so the painted
     // rows and the scroll offset agree exactly.
