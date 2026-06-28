@@ -3284,6 +3284,7 @@ dependencies = [
  "async-trait",
  "crossterm",
  "futures",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "serde",

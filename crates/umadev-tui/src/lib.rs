@@ -37,7 +37,7 @@ pub mod ui;
 use std::io::Stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -254,6 +254,11 @@ enum Block {
 /// terminal tabs open can tell which one is driving which base. Cleared again
 /// on exit in [`run`]. Best-effort: failures (e.g. a terminal that ignores
 /// OSC 0) are swallowed — the title is cosmetic and must never block launch.
+///
+/// R3 single-writer note: this (and the exit-time title reset in [`run`]) is
+/// written via a raw `std::io::stdout()` handle, but it runs ONLY at launch /
+/// exit — BEFORE the event loop's first frame and AFTER its last — never
+/// concurrently with a `terminal.draw`, so it can never interleave mid-frame.
 fn set_terminal_title(backend: &str) {
     // OSC 0 = set both the window title and the icon (tab) title. Safe to
     // write to stdout — crossterm raw mode is already on by this point, so the
@@ -3178,31 +3183,33 @@ fn theme_from_osc11() -> Option<bool> {
     None
 }
 
-/// Copy `text` to the system clipboard from inside the alternate screen, the way
-/// Claude Code does: three paths, most-compatible first.
+/// Whether this is a REMOTE session — `SSH_CONNECTION` / `SSH_TTY` set — where a
+/// native OS clipboard command would target the FAR host, not the user's
+/// terminal, so the copy must go via OSC 52 instead. Cheap env-only check.
+fn clipboard_is_remote() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
+/// Copy `text` to the system clipboard via the **native OS command** (the path
+/// that works even in macOS Terminal.app, which has no OSC 52): `pbcopy` on
+/// macOS; on Linux/BSD try `wl-copy`, then `xclip -selection clipboard`, then
+/// `xsel --clipboard --input`. The first that spawns + exits cleanly wins;
+/// returns `true` on success.
 ///
-/// 1. **native** (preferred on a LOCAL session) — shell out to the OS clipboard
-///    command, piping `text` to its stdin: `pbcopy` on macOS; on Linux/BSD try
-///    `wl-copy`, then `xclip -selection clipboard`, then `xsel --clipboard
-///    --input`. The first that spawns + exits cleanly wins. This is the path
-///    that works in **macOS Terminal.app**, which has no OSC 52 support.
-/// 2. **osc52** (fallback) — write the OSC 52 escape (`selection::osc52_sequence`)
-///    to stdout. Used when the session is **remote** (`SSH_CONNECTION` /
-///    `SSH_TTY` set — where a native command would target the far host, not the
-///    user's terminal) OR when no native command was found / succeeded.
+/// This pipes `text` to a CHILD process's stdin and **never writes to our own
+/// stdout**, so it carries no mid-frame interleave risk (R3) and is safe to run
+/// on the blocking pool fire-and-forget — a wedged `pbcopy`/`xclip` can't stall
+/// the render loop. The OSC 52 path (for remote sessions) is written separately
+/// on the UI thread through the render's single backend writer, never here.
 ///
 /// Every step is best-effort / fail-open: a missing binary, a spawn error, or a
-/// non-zero exit silently falls through to OSC 52; nothing here panics or
-/// blocks the UI loop.
-fn copy_to_clipboard(text: &str) {
-    use std::io::Write as _;
-
+/// non-zero exit returns `false`; nothing here panics or blocks the UI loop.
+fn copy_to_clipboard_native(text: &str) -> bool {
     // Pipe `text` to one native clipboard command's stdin; `true` only when it
     // spawned AND exited successfully. stdout/stderr are discarded.
     fn try_native(cmd: &str, args: &[&str], text: &str) -> bool {
         use std::io::Write as _;
         use std::process::{Command, Stdio};
-        // (the outer `use` is for the OSC 52 fallback; this nested fn needs its own)
         let Ok(mut child) = Command::new(cmd)
             .args(args)
             .stdin(Stdio::piped())
@@ -3220,30 +3227,13 @@ fn copy_to_clipboard(text: &str) {
         child.wait().is_ok_and(|s| s.success())
     }
 
-    let is_remote =
-        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
-
-    if !is_remote {
-        // LOCAL → prefer the native OS command (the path that works everywhere,
-        // including macOS Terminal.app). First success wins; return on it.
-        let native_ok = if cfg!(target_os = "macos") {
-            try_native("pbcopy", &[], text)
-        } else {
-            try_native("wl-copy", &[], text)
-                || try_native("xclip", &["-selection", "clipboard"], text)
-                || try_native("xsel", &["--clipboard", "--input"], text)
-        };
-        if native_ok {
-            return;
-        }
+    if cfg!(target_os = "macos") {
+        try_native("pbcopy", &[], text)
+    } else {
+        try_native("wl-copy", &[], text)
+            || try_native("xclip", &["-selection", "clipboard"], text)
+            || try_native("xsel", &["--clipboard", "--input"], text)
     }
-
-    // REMOTE, or no native command available/succeeded → OSC 52 (the SSH-safe
-    // fallback, and the only path the terminal itself can honor here).
-    let seq = crate::selection::osc52_sequence(text);
-    let mut out = std::io::stdout();
-    let _ = out.write_all(seq.as_bytes());
-    let _ = out.flush();
 }
 
 fn setup_terminal() -> Result<Term> {
@@ -3523,6 +3513,140 @@ impl MouseSeqFilter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rendering self-heal (UX maturity roadmap §1, R1/R3/R4/R5).
+//
+// ratatui's diff compares its OWN prev-buffer vs next-buffer and never
+// reconciles against terminal reality, so any drift (a mid-paint tear, a width
+// disagreement, a concurrent external write, a resize, a sleep/wake) persists
+// silently until a manual `clear()`. These small, pure helpers drive a periodic
+// scrub + atomic resize erase + resume-from-gap reassert so that drift heals
+// WITHOUT the user pressing Ctrl+L. All callers are fail-open; behavior is
+// identical when no drift is present (the flag simply stays `false`).
+// ---------------------------------------------------------------------------
+
+/// R1 scrub cadence — how often a *live* turn forces a self-healing full
+/// repaint. Env-overridable via `UMADEV_SCRUB_SECS`; clamped to a `>= 1s` floor
+/// so a misconfigured `0` can't busy-clear every frame. Default 2s.
+fn scrub_interval() -> Duration {
+    let secs = std::env::var("UMADEV_SCRUB_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(2);
+    Duration::from_secs(secs)
+}
+
+/// R5 resume-gap threshold — an input event arriving after a gap this long looks
+/// like a resume from laptop sleep / tmux re-attach / ssh reconnect, so the
+/// terminal modes are re-asserted + the screen repainted. Env
+/// `UMADEV_RESUME_GAP_SECS`, clamped to `>= 1s`, default 5s.
+fn resume_gap() -> Duration {
+    let secs = std::env::var("UMADEV_RESUME_GAP_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v >= 1)
+        .unwrap_or(5);
+    Duration::from_secs(secs)
+}
+
+/// Whether a self-healing scrub repaint is due (R1). Only while a turn is live
+/// — so a fully idle screen is never scrubbed every couple seconds — AND the
+/// cadence has elapsed. Pure, so the gating is unit-testable.
+fn scrub_due(live: bool, elapsed: Duration, interval: Duration) -> bool {
+    live && elapsed >= interval
+}
+
+/// Whether a resize event needs an atomic full-clear repaint (R4): `true` unless
+/// the new dimensions equal the last drawn ones (debounce a duplicate Resize so
+/// we don't double-clear). Pure, for unit-testing the debounce.
+fn resize_needs_repaint(new: (u16, u16), last: Option<(u16, u16)>) -> bool {
+    last != Some(new)
+}
+
+/// Whether an input gap is long enough to look like a sleep/wake / re-attach,
+/// so the terminal modes should be re-asserted + the screen repainted (R5).
+/// Pure, for unit-testing the threshold.
+fn resume_gap_elapsed(gap: Duration, threshold: Duration) -> bool {
+    gap >= threshold
+}
+
+/// Whether there is LIVE output on screen — a turn thinking, a tool running, or
+/// an active (unfinished, un-aborted) pipeline run. R1 gates the self-healing
+/// scrub on this so a fully idle conversation is never repainted every couple
+/// seconds. `continuous_active` is the loop-local continuous-run flag.
+fn app_is_live(app: &App, continuous_active: bool) -> bool {
+    app.thinking
+        || app.tool_in_progress
+        || continuous_active
+        || (app.run_started && !app.finished && !app.aborted)
+}
+
+/// Re-emit the terminal-mode setup escapes (idempotent) after a long input gap
+/// or a job-control resume (R5), healing a dead mouse / stale alt-screen after a
+/// laptop sleep, tmux re-attach, or ssh reconnect. Re-enters the alternate
+/// screen (a no-op if already in alt), re-enables bracketed paste, and re-asserts
+/// the *current* intended mouse-capture state (so a `/mouse`-off preference is
+/// preserved). The caller also sets `force_full_repaint` so the next frame
+/// repaints every cell. Writes go through the render's single backend writer,
+/// BETWEEN frames; every write is best-effort, never blocking the loop.
+fn reassert_terminal_modes(terminal: &mut Term, mouse_on: bool) {
+    let backend = terminal.backend_mut();
+    let _ = backend.execute(EnterAlternateScreen);
+    let _ = backend.execute(EnableBracketedPaste);
+    let _ = if mouse_on {
+        backend.execute(EnableMouseCapture)
+    } else {
+        backend.execute(DisableMouseCapture)
+    };
+}
+
+/// Unix job-control resume signal (SIGCONT) the event loop selects on (R5). On
+/// non-unix platforms there is no such signal, so the alias is `()` and the
+/// select! arm stays inert via [`next_resume_signal`].
+#[cfg(unix)]
+type ResumeSignal = tokio::signal::unix::Signal;
+/// See [`ResumeSignal`] — the non-unix placeholder (the arm never fires).
+#[cfg(not(unix))]
+type ResumeSignal = ();
+
+/// Register the SIGCONT (job-control resume — `Ctrl-Z` then `fg`, or
+/// `kill -CONT`) listener for R5. tokio installs the handler safely (no
+/// `unsafe`); the event-loop arm does the actual reassert + repaint on the loop
+/// thread, never in signal context. Returns `None` on non-unix or if
+/// registration fails (fail-open: the loop just runs without resume-on-CONT).
+fn register_resume_signal() -> Option<ResumeSignal> {
+    #[cfg(unix)]
+    {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::from_raw(libc::SIGCONT)).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Await the next SIGCONT (R5). On unix this resolves when the process is
+/// continued after a suspend; on every other platform — or when registration
+/// failed — it never resolves, so the select! arm is inert. Used as a select!
+/// branch so a resume WAKES the loop (rather than waiting on an unrelated event).
+async fn next_resume_signal(sig: &mut Option<ResumeSignal>) {
+    #[cfg(unix)]
+    {
+        match sig.as_mut() {
+            Some(s) => {
+                let _ = s.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sig;
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> Result<()> {
     let (sink, mut engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
@@ -3592,21 +3716,85 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // garbling. See [`synchronized_output_supported`].
     let sync_output = synchronized_output_supported();
 
+    // --- Rendering self-heal state (R1/R4/R5) ---------------------------------
+    // When `true`, the next frame clears the screen + back buffer INSIDE the
+    // BSU/ESU block (so the scrub swaps atomically and is invisible on a
+    // sync-capable terminal), healing any drift ratatui's prev-vs-next diff
+    // can't see. Set by: the periodic scrub (R1), a real resize (R4), a
+    // resume-from-gap or SIGCONT (R5), and Ctrl+L / `/redraw`. Cleared after
+    // each draw. Always starts `false`, so behavior is identical when no drift.
+    let mut force_full_repaint = false;
+    // R1 scrub cadence + the last time we scrubbed (only advanced while live).
+    let scrub_int = scrub_interval();
+    let mut last_scrub = Instant::now();
+    // R5 resume-gap threshold + the last time any input event arrived. A long
+    // gap before the next event looks like a sleep/wake / re-attach.
+    let resume_threshold = resume_gap();
+    let mut last_input = Instant::now();
+    // R4 resize debounce — the (w, h) of the last frame we actually drew, so a
+    // duplicate same-dimension Resize event doesn't trigger a second clear.
+    let mut last_drawn_size: Option<(u16, u16)> = None;
+    // R5 SIGCONT listener (Unix job-control resume). `None` on non-unix / if
+    // registration failed — the select! arm is then inert (fail-open).
+    let mut resume_sig = register_resume_signal();
+
     loop {
+        // R1 — periodic self-healing scrub. While a turn is LIVE (thinking /
+        // tool running / active run), force a full clear+repaint on a low
+        // cadence so any drift ratatui's prev-vs-next diff can't see (a
+        // mid-paint tear, a width disagreement, a concurrent external write)
+        // heals WITHOUT the user pressing Ctrl+L. Gated on live output so a
+        // fully idle screen is never scrubbed every couple seconds.
+        if scrub_due(
+            app_is_live(app, continuous_run_active),
+            last_scrub.elapsed(),
+            scrub_int,
+        ) {
+            force_full_repaint = true;
+            last_scrub = Instant::now();
+        }
+
         // Wrap the frame in a synchronized-output update when supported: the
         // terminal holds back the paint until ESU, then swaps atomically, so a
         // half-drawn frame can never surface (the root fix for mid-render
         // garble). ESU is emitted UNCONDITIONALLY after the draw — even if it
         // errored — so the terminal can never get stuck in synchronized mode.
         // Both ends fail-open (`let _ =`): a write error never blocks the loop.
+        //
+        // R3 — BSU/ESU go through ratatui's OWN backend writer
+        // (`terminal.backend_mut()`), NOT a separate `std::io::stdout()` handle,
+        // so the synchronized-update brackets share buffering + flush ordering
+        // with the cell writes (no interleave between the wrapper and the frame).
         if sync_output {
-            let _ = std::io::stdout().execute(BeginSynchronizedUpdate);
+            let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
         }
-        let draw_result = terminal.draw(|f| ui::render(f, app));
+        // R1/R4/R5 — a self-heal repaint was requested (periodic scrub, an
+        // atomic resize erase, a resume-from-gap / SIGCONT reassert, or Ctrl+L).
+        // Clear the screen + back buffer so the next draw repaints EVERY cell,
+        // done INSIDE the BSU/ESU block so the clear+draw swap atomically and the
+        // scrub is invisible on a sync-capable terminal. Old content stays on
+        // screen until the new frame swaps in. Fail-open: a clear error never
+        // blocks the draw.
+        if force_full_repaint {
+            let _ = terminal.clear();
+        }
+        // `.map(|f| f.area)` drops the `CompletedFrame`'s borrow of `terminal`
+        // (keeping only the Copy `Rect`), so the ESU write through
+        // `backend_mut()` below doesn't conflict with that borrow. The drawn
+        // size feeds the R4 resize debounce.
+        let draw_result = terminal.draw(|f| ui::render(f, app)).map(|f| f.area);
         if sync_output {
-            let _ = std::io::stdout().execute(EndSynchronizedUpdate);
+            let _ = terminal.backend_mut().execute(EndSynchronizedUpdate);
         }
-        draw_result?;
+        // The scrub/resize/resume repaint (if any) has now been painted.
+        force_full_repaint = false;
+        let drawn = draw_result?;
+        // Record the dimensions we just drew at for the R4 resize debounce. Only
+        // write on a real change (this also READS the prior value, so the initial
+        // `None` isn't a dead assignment).
+        if last_drawn_size != Some((drawn.width, drawn.height)) {
+            last_drawn_size = Some((drawn.width, drawn.height));
+        }
 
         tokio::select! {
             maybe_route = route_rx.recv() => {
@@ -3751,15 +3939,35 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 }
             }
             maybe_key = keys.next() => {
-                if let Some(Ok(Event::Resize(..))) = &maybe_key {
-                    // Resize: force a full clear + repaint. The loop top already
-                    // redraws at the new size, but some terminals (notably the
-                    // Windows console) leave STALE cells after a resize that
-                    // ratatui's incremental diff won't overwrite — content bleeds
-                    // and smears. `clear()` resets the back buffer so the next
-                    // draw repaints every cell. Fail-open: a backend write error is
-                    // ignored, never blocking the loop.
-                    let _ = terminal.clear();
+                // R5 — sleep-wake / stdin-gap self-heal. A key/mouse/resize/paste
+                // arriving after a long input gap looks like a resume from laptop
+                // sleep / tmux re-attach / ssh reconnect: the terminal may have
+                // dropped mouse-reporting + bracketed-paste modes and the screen
+                // is stale. Re-assert the modes + force a full repaint BEFORE
+                // handling the event so the very next frame heals it. Debounced by
+                // the gap threshold so normal typing never triggers it. Fail-open.
+                if matches!(&maybe_key, Some(Ok(_))) {
+                    let now = Instant::now();
+                    if resume_gap_elapsed(now.duration_since(last_input), resume_threshold) {
+                        reassert_terminal_modes(terminal, app.mouse_scroll);
+                        force_full_repaint = true;
+                    }
+                    last_input = now;
+                }
+                if let Some(Ok(Event::Resize(w, h))) = &maybe_key {
+                    // R4 — atomic resize erase. DON'T `clear()` immediately (that
+                    // blanks the screen for a frame → flicker). Instead request a
+                    // full clear+repaint for the NEXT frame, which happens
+                    // back-to-back inside the loop-top BSU/ESU so old content stays
+                    // visible until the new-size frame swaps in atomically. This
+                    // also heals the STALE cells some terminals (notably the
+                    // Windows console) leave after a resize that ratatui's
+                    // incremental diff won't overwrite. Debounce a duplicate Resize
+                    // whose dimensions equal the last drawn size so we don't
+                    // double-clear. Fail-open.
+                    if resize_needs_repaint((*w, *h), last_drawn_size) {
+                        force_full_repaint = true;
+                    }
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
                     // Mouse → wheel scrollback + the in-app drag-to-select/copy layer
                     // (the Claude Code approach: WE render the selection highlight and
@@ -3805,16 +4013,36 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     // a write error is ignored, never blocking the loop.
                                     MouseEventKind::Up(MouseButton::Left) => {
                                         if let Some(text) = app.selection_finish_copy() {
-                                            // The native clipboard helper spawns a child
-                                            // and blocks on its stdin write + `wait()`; a
-                                            // wedged pbcopy/xclip would otherwise stall
-                                            // this tokio worker mid-render. Push it to the
-                                            // blocking pool fire-and-forget (the OSC 52
-                                            // fallback lives inside it). Fail-open: errors
-                                            // are ignored.
-                                            tokio::task::spawn_blocking(move || {
-                                                copy_to_clipboard(&text);
-                                            });
+                                            if clipboard_is_remote() {
+                                                // SSH: a native command would target the
+                                                // FAR host, so OSC 52 is the only path the
+                                                // user's terminal can honor. Write it
+                                                // through the render's SINGLE backend writer
+                                                // (`terminal.backend_mut()`), on the UI
+                                                // thread, BETWEEN frames (this arm runs after
+                                                // the loop-top draw completed) — so the
+                                                // escape bytes can NEVER interleave mid-frame
+                                                // the way a `spawn_blocking` stdout write
+                                                // could (R3 single-writer). Fail-open.
+                                                use std::io::Write as _;
+                                                let seq = crate::selection::osc52_sequence(&text);
+                                                let backend = terminal.backend_mut();
+                                                let _ = backend.write_all(seq.as_bytes());
+                                                let _ = backend.flush();
+                                            } else {
+                                                // LOCAL: the native OS command spawns a
+                                                // child + blocks on its stdin write +
+                                                // `wait()`; a wedged pbcopy/xclip would
+                                                // otherwise stall this tokio worker
+                                                // mid-render. It pipes to a CHILD's stdin,
+                                                // never our stdout, so it carries no
+                                                // mid-frame interleave risk — push it to the
+                                                // blocking pool fire-and-forget. Fail-open:
+                                                // errors are ignored.
+                                                tokio::task::spawn_blocking(move || {
+                                                    copy_to_clipboard_native(&text);
+                                                });
+                                            }
                                         }
                                     }
                                     _ => {}
@@ -4361,15 +4589,17 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     };
                                 }
                                 Action::ForceRedraw => {
-                                    // Ctrl+L / `/redraw`: clear the screen and force a
-                                    // full repaint on the next frame (the loop top
-                                    // redraws). `clear()` resets the back buffer so the
-                                    // next draw repaints every cell — the escape hatch
-                                    // that recovers from any accumulated incremental-
-                                    // diff desync (stale cells, leftover left-margin
-                                    // prefixes, bled long lines). Fail-open: a backend
-                                    // write error is ignored, never blocking the loop.
-                                    let _ = terminal.clear();
+                                    // Ctrl+L / `/redraw`: request a full clear+repaint on
+                                    // the next frame. Routed through the SAME
+                                    // `force_full_repaint` flag as the R1 scrub / R4 resize
+                                    // / R5 resume, so the clear+draw happens back-to-back
+                                    // INSIDE the loop-top BSU/ESU and swaps atomically
+                                    // (no blank flash) instead of an immediate bare
+                                    // `clear()`. The manual escape hatch that recovers from
+                                    // any accumulated incremental-diff desync (stale cells,
+                                    // leftover left-margin prefixes, bled long lines) — now
+                                    // mostly pre-empted by the automatic self-heal. Fail-open.
+                                    force_full_repaint = true;
                                 }
                             }
                             // The conversation context just changed (`/clear` set
@@ -4475,6 +4705,18 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     }
                 }
                 app.tick();
+            }
+            // R5 — job-control resume (Unix SIGCONT: `Ctrl-Z` then `fg`, or
+            // `kill -CONT`). The process was just continued after a suspend, so
+            // the terminal may have dropped mouse-reporting + bracketed-paste
+            // modes and the screen is stale. tokio delivered the signal SAFELY
+            // (no `unsafe`, no work in signal context) — here, on the loop thread
+            // and between frames, we re-assert the modes + flag a full repaint so
+            // the next frame heals it. Inert on non-unix / if registration failed
+            // (`next_resume_signal` then never resolves). Fail-open.
+            () = next_resume_signal(&mut resume_sig) => {
+                reassert_terminal_modes(terminal, app.mouse_scroll);
+                force_full_repaint = true;
             }
         }
 
@@ -7364,5 +7606,119 @@ mod tests {
             primed_ended.load(std::sync::atomic::Ordering::SeqCst),
             "ending a primed resident closes its base"
         );
+    }
+
+    // --- Rendering self-heal (R1/R4/R5) ---------------------------------------
+
+    #[test]
+    fn r1_scrub_fires_only_while_live_and_after_the_cadence() {
+        let interval = Duration::from_secs(2);
+        // Live + cadence elapsed → scrub due (the self-heal repaint).
+        assert!(
+            scrub_due(true, Duration::from_secs(2), interval),
+            "live + cadence elapsed → scrub"
+        );
+        assert!(
+            scrub_due(true, Duration::from_secs(5), interval),
+            "live + well past cadence → scrub"
+        );
+        // Live but the cadence hasn't elapsed yet → no scrub (don't busy-clear
+        // every frame).
+        assert!(
+            !scrub_due(true, Duration::from_millis(1900), interval),
+            "live but before the cadence → no scrub"
+        );
+        // NOT live → never scrub, even after a long time (a fully idle screen is
+        // never repainted every couple seconds).
+        assert!(
+            !scrub_due(false, Duration::from_secs(60), interval),
+            "idle screen is never scrubbed regardless of elapsed time"
+        );
+    }
+
+    #[test]
+    fn r4_resize_debounce_skips_identical_dimensions() {
+        // First resize ever (no last-drawn size) → repaint.
+        assert!(
+            resize_needs_repaint((120, 40), None),
+            "first resize forces a repaint"
+        );
+        // A real size change → repaint (heal stale cells some terminals leave).
+        assert!(
+            resize_needs_repaint((100, 30), Some((120, 40))),
+            "different dimensions force a repaint"
+        );
+        // A duplicate Resize with the SAME dimensions as the last drawn frame →
+        // debounced, no second clear.
+        assert!(
+            !resize_needs_repaint((120, 40), Some((120, 40))),
+            "identical dimensions are debounced (no double-clear)"
+        );
+        // Only one axis changing still counts as a change.
+        assert!(
+            resize_needs_repaint((120, 41), Some((120, 40))),
+            "a height-only change still forces a repaint"
+        );
+    }
+
+    #[test]
+    fn r5_gap_detection_trips_only_past_the_threshold() {
+        let threshold = Duration::from_secs(5);
+        // A long gap (sleep/wake / re-attach) → reassert.
+        assert!(
+            resume_gap_elapsed(Duration::from_secs(5), threshold),
+            "a gap at the threshold trips the reassert"
+        );
+        assert!(
+            resume_gap_elapsed(Duration::from_secs(30), threshold),
+            "a long gap trips the reassert"
+        );
+        // Normal typing cadence → no reassert.
+        assert!(
+            !resume_gap_elapsed(Duration::from_millis(200), threshold),
+            "normal typing never trips the reassert"
+        );
+        assert!(
+            !resume_gap_elapsed(Duration::from_secs(4), threshold),
+            "a sub-threshold gap never trips the reassert"
+        );
+    }
+
+    #[test]
+    fn scrub_and_resume_intervals_honor_env_overrides_and_floor() {
+        // Defaults when unset.
+        std::env::remove_var("UMADEV_SCRUB_SECS");
+        std::env::remove_var("UMADEV_RESUME_GAP_SECS");
+        assert_eq!(scrub_interval(), Duration::from_secs(2), "default scrub 2s");
+        assert_eq!(
+            resume_gap(),
+            Duration::from_secs(5),
+            "default resume gap 5s"
+        );
+        // Valid overrides are honored.
+        std::env::set_var("UMADEV_SCRUB_SECS", "3");
+        std::env::set_var("UMADEV_RESUME_GAP_SECS", "10");
+        assert_eq!(
+            scrub_interval(),
+            Duration::from_secs(3),
+            "scrub override 3s"
+        );
+        assert_eq!(resume_gap(), Duration::from_secs(10), "resume override 10s");
+        // A `0` (or garbage) is rejected by the `>= 1` floor → falls back to the
+        // default, so a misconfig can't busy-clear every frame.
+        std::env::set_var("UMADEV_SCRUB_SECS", "0");
+        std::env::set_var("UMADEV_RESUME_GAP_SECS", "nonsense");
+        assert_eq!(
+            scrub_interval(),
+            Duration::from_secs(2),
+            "a `0` scrub floors back to the default"
+        );
+        assert_eq!(
+            resume_gap(),
+            Duration::from_secs(5),
+            "garbage resume gap floors back to the default"
+        );
+        std::env::remove_var("UMADEV_SCRUB_SECS");
+        std::env::remove_var("UMADEV_RESUME_GAP_SECS");
     }
 }

@@ -35,6 +35,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 
+# Unix-only: the raw SIGCONT signal number for the job-control-resume self-heal
+# (R5). Pure-Rust bindings only (not a host SDK), and already in the tree via
+# tokio — so this adds no extra compile cost. tokio installs the handler safely,
+# so no `unsafe` is introduced.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 async-trait = { workspace = true }
