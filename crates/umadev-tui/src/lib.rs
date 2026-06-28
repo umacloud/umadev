@@ -227,6 +227,14 @@ enum RouteDecision {
         reply: String,
         /// `true` when this was a director build → hand the session back to chat.
         director_build: bool,
+        /// The base's OWN resumable session id, captured off the LIVE resident chat
+        /// session before it is parked (claude's pinned `--session-id` / codex's
+        /// `thread.id`; `None` for opencode / offline / the non-resident paths). The
+        /// event loop stores it onto `App` (`record_agentic_done`) so the saved chat
+        /// points at the real base conversation a relaunch can `--resume` — the deep
+        /// cross-session memory fix. `None` is fail-open (degrades to a fresh session
+        /// + the replayed transcript).
+        base_session_id: Option<String>,
     },
     /// The turn produced no usable reply (base init failed, an empty reply, or a
     /// hard error). Carries the human-readable reason, routed through the same
@@ -1106,6 +1114,11 @@ async fn run_director_loop(
                 let _ = route_tx.send(RouteDecision::AgenticDone {
                     reply,
                     director_build: true,
+                    // A `/run` director build hands its session back to chat via the
+                    // `--continue` path (`run_session_handed_to_chat`), NOT the chat
+                    // session id; it persists its OWN resume pointer into
+                    // `WorkflowState.base_session_id`. So nothing to carry here.
+                    base_session_id: None,
                 });
             }
             umadev_agent::DirectorLoopOutcome::Failed(reason) => {
@@ -2210,6 +2223,10 @@ async fn drive_agentic_stream(
             let _ = route_tx.send(RouteDecision::AgenticDone {
                 reply,
                 director_build: effective_build,
+                // The non-resident light path (offline brain) owns no resumable base
+                // session id — the resident host chat path carries one (see
+                // `drive_chat_session_turn`); fail-open `None` here.
+                base_session_id: None,
             });
         }
         Err(e) => {
@@ -2255,6 +2272,11 @@ fn fire_agentic(
     // (one-shot). Fail-open: if the base can't `--continue`, it starts fresh.
     let handing_back = host_cli && app.run_session_handed_to_chat;
     let continue_session = app.host_chat_session_active || handing_back;
+    // The base's OWN resumable session id we already hold (restored from a saved chat,
+    // or captured off a prior turn) — snapshot BEFORE `ensure_chat_session_id` would
+    // mint a fresh one, so a brand-new chat carries `None` (fresh open) and only a real
+    // prior base session drives the fallback lazy-open resume.
+    let resume_session_id = app.chat_session_id.clone();
     let session_id = if host_cli && !handing_back {
         Some(app.ensure_chat_session_id())
     } else {
@@ -2293,6 +2315,7 @@ fn fire_agentic(
             conversation,
             mode,
             autonomous,
+            resume_session_id,
             chat_session: chat_session.clone(),
             sink: sink.clone(),
             route_tx: route_tx.clone(),
@@ -2346,6 +2369,12 @@ struct RoutedTurnInputs {
     continue_session: bool,
     /// Pinned chat session id (light path; `None` when handing a `/run` back).
     session_id: Option<String>,
+    /// The base's OWN resumable session id we already hold (restored from a saved
+    /// chat, or captured off a prior turn) — used ONLY by the resident host path's
+    /// fallback lazy-open to RESUME the base's deep context. `None` for a fresh chat /
+    /// offline → fresh open (fail-open). Snapshotted BEFORE `ensure_chat_session_id`
+    /// mints, so it is never a spurious freshly-minted id.
+    resume_session_id: Option<String>,
     /// Fallback model id for the light path when the spec carries none.
     fallback_model: String,
     /// Project root the base subprocess runs in.
@@ -2408,6 +2437,7 @@ async fn run_routed_turn(
         conversation,
         continue_session,
         session_id,
+        resume_session_id,
         fallback_model,
         project_root,
         mode,
@@ -2430,6 +2460,7 @@ async fn run_routed_turn(
             conversation,
             mode,
             autonomous,
+            resume_session_id,
             chat_session,
             sink,
             route_tx,
@@ -2483,6 +2514,13 @@ struct ChatSessionTurn {
     /// Whether the session opens autonomous (`auto` tier writes unattended) — the
     /// base still raises a `NeedApproval` for an irreversible action regardless.
     autonomous: bool,
+    /// The base's OWN resumable session id this chat is pinned to (restored from the
+    /// saved chat on launch / `/resume`), used ONLY by the FALLBACK lazy-open (when
+    /// the pre-load missed and the holder is empty) so it RESUMES the base's deep
+    /// context instead of cold-starting. `None` for a fresh chat / opencode / offline
+    /// → fresh open (fail-open). The common path reuses the pre-loaded resident
+    /// session and never consults this.
+    resume_session_id: Option<String>,
     /// The resident chat session, held across the whole conversation. `None` until
     /// the pre-load (or the first turn's lazy-open) lands it; parked back after each
     /// `TurnDone`.
@@ -2536,29 +2574,28 @@ async fn next_chat_event_idle(
 ) -> Result<Option<umadev_runtime::SessionEvent>, ()> {
     let window = budget.window(in_tool_call);
     loop {
-        match tokio::time::timeout(window, session.next_event()).await {
-            Ok(ev) => return Ok(ev),
-            Err(_) => {
-                // The window elapsed with no event.
-                if in_tool_call {
-                    // Liveness poll: a live base mid-tool keeps waiting (only a dead
-                    // base or the run deadline settles it).
-                    if session.try_exit_status().is_some() {
-                        // The base died under the tool → treat as session ended so the
-                        // caller surfaces its stderr/exit (the "ended mid-turn" path).
-                        return Ok(None);
-                    }
-                    if let Some(dl) = deadline {
-                        if std::time::Instant::now() >= dl {
-                            return Err(());
-                        }
-                    }
-                    continue;
-                }
-                // NOT in a tool → genuinely hung: settle (the caller interrupts + ends).
-                return Err(());
-            }
+        // A real event (or `Ok(None)` session-end) landed inside the window → return it.
+        if let Ok(ev) = tokio::time::timeout(window, session.next_event()).await {
+            return Ok(ev);
         }
+        // The window elapsed with no event.
+        if in_tool_call {
+            // Liveness poll: a live base mid-tool keeps waiting (only a dead
+            // base or the run deadline settles it).
+            if session.try_exit_status().is_some() {
+                // The base died under the tool → treat as session ended so the
+                // caller surfaces its stderr/exit (the "ended mid-turn" path).
+                return Ok(None);
+            }
+            if let Some(dl) = deadline {
+                if std::time::Instant::now() >= dl {
+                    return Err(());
+                }
+            }
+            continue;
+        }
+        // NOT in a tool → genuinely hung: settle (the caller interrupts + ends).
+        return Err(());
     }
 }
 
@@ -2704,6 +2741,7 @@ async fn open_warm_chat_session(
     model: &str,
     project_root: &std::path::Path,
     autonomous: bool,
+    resume_session_id: Option<&str>,
 ) -> Result<WarmChatSession, umadev_runtime::SessionError> {
     // The firmware is keyed off the project + the light route only — NOT the user's
     // message — so it is identical whether composed at pre-load (no message yet) or
@@ -2712,6 +2750,26 @@ async fn open_warm_chat_session(
     let route = light_default_route();
     let firmware = umadev_agent::compose_firmware(project_root, &route, "").await;
     let firmware = (!firmware.trim().is_empty()).then_some(firmware);
+    // Deep cross-session memory: when a prior chat persisted the base's OWN session id
+    // (restored into `App.chat_session_id` on launch / `/resume`), RESUME that base
+    // conversation so the base re-supplies its full accumulated transcript instead of
+    // cold-starting and only seeing the replayed ≤16-message recap. Fail-open by
+    // contract: a resume that errors (opencode has no cross-process resume; the base
+    // rejects a stale id) degrades to a FRESH session — never blocks, never panics.
+    if let Some(id) = resume_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(session) = umadev_host::session_for_resume(
+            backend,
+            project_root,
+            model,
+            autonomous,
+            firmware.as_deref(),
+            id,
+        )
+        .await
+        {
+            return Ok(WarmChatSession { session, firmware });
+        }
+    }
     let session = umadev_host::session_for(
         backend,
         project_root,
@@ -2770,6 +2828,7 @@ fn spawn_chat_session_preload(
     model: String,
     project_root: PathBuf,
     autonomous: bool,
+    resume_session_id: Option<String>,
     holder: ChatSessionHolder,
 ) {
     // Only a real host CLI keeps a resident session (offline owns no process). The
@@ -2783,9 +2842,17 @@ fn spawn_chat_session_preload(
         // Open OUTSIDE the lock so the (slow) MCP/firmware load never holds the
         // mutex a live turn might need — then take the lock only to park it.
         // Fail-open: a failed open is dropped here (the `if let` skips it), leaving
-        // the holder empty so the first turn lazily re-opens. No error surfaced.
-        if let Ok(mut warm) =
-            open_warm_chat_session(&backend, &model, &project_root, autonomous).await
+        // the holder empty so the first turn lazily re-opens. No error surfaced. When
+        // a prior chat's base session id is known (a relaunch / `/resume`), the warm
+        // open RESUMES that base conversation (deep memory); fail-open to fresh.
+        if let Ok(mut warm) = open_warm_chat_session(
+            &backend,
+            &model,
+            &project_root,
+            autonomous,
+            resume_session_id.as_deref(),
+        )
+        .await
         {
             let mut guard = holder.lock().await;
             // Don't clobber a session that arrived first (another pre-load) or a live
@@ -2835,6 +2902,7 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         conversation,
         mode,
         autonomous,
+        resume_session_id,
         chat_session,
         sink,
         route_tx,
@@ -2863,7 +2931,15 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 first_chat_directive(w.firmware.as_deref(), &backend, &conversation, &text);
             (w.session, directive)
         }
-        None => match open_warm_chat_session(&backend, &model, &project_root, autonomous).await {
+        None => match open_warm_chat_session(
+            &backend,
+            &model,
+            &project_root,
+            autonomous,
+            resume_session_id.as_deref(),
+        )
+        .await
+        {
             Ok(w) => {
                 let directive =
                     first_chat_directive(w.firmware.as_deref(), &backend, &conversation, &text);
@@ -3022,13 +3098,16 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 // accept what landed but flag the "may be incomplete" caveat below.
                 umadev_runtime::TurnStatus::Truncated => break true,
                 umadev_runtime::TurnStatus::Interrupted => {
-                    // ESC / abort. The session is still alive and primed — park it
-                    // back so the next turn reuses it, and settle this turn as a
-                    // (non-build) chat so `thinking` clears.
+                    // ESC / abort. The session is still alive and primed — capture its
+                    // resumable id (for the saved chat) BEFORE parking it back so the
+                    // next turn reuses it, and settle this turn as a (non-build) chat so
+                    // `thinking` clears.
+                    let base_session_id = session.session_id().map(str::to_string);
                     *chat_session.lock().await = Some(ResidentChat::Primed(session));
                     let _ = route_tx.send(RouteDecision::AgenticDone {
                         reply: String::new(),
                         director_build: false,
+                        base_session_id,
                     });
                     return;
                 }
@@ -3134,15 +3213,21 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         }
     }
 
-    // The turn finished cleanly (and any post-build QC ran on the live session). Park
-    // the LIVE session back into the holder as `Primed` so the next chat message
-    // reuses it BARE (resident base, MCP + firmware already loaded, native memory
-    // carries the dialogue + the just-completed build + its QC fixes).
+    // The turn finished cleanly (and any post-build QC ran on the live session).
+    // Capture the base's OWN resumable session id (claude's pinned `--session-id` /
+    // codex's `thread.id`; `None` for opencode) BEFORE parking the session, so the
+    // saved chat points at the real base conversation a relaunch can `--resume` —
+    // the deep cross-session memory fix. Then park the LIVE session back into the
+    // holder as `Primed` so the next chat message reuses it BARE (resident base, MCP
+    // + firmware already loaded, native memory carries the dialogue + the
+    // just-completed build + its QC fixes).
+    let base_session_id = session.session_id().map(str::to_string);
     *chat_session.lock().await = Some(ResidentChat::Primed(session));
 
     let _ = route_tx.send(RouteDecision::AgenticDone {
         reply,
         director_build: became_build,
+        base_session_id,
     });
 }
 
@@ -3919,6 +4004,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             app.effective_model(),
             app.project_root.clone(),
             continuous_autonomous(app.effective_trust_mode()),
+            // A relaunch that reopened a saved chat carries the base's OWN session id
+            // (restored by `load_chat_for_launch`): RESUME it so the pre-loaded
+            // resident session re-attaches the base's deep context. `None` (a fresh
+            // chat / opencode / old file) → fresh open (fail-open).
+            app.chat_session_id.clone(),
             chat_session_holder.clone(),
         );
     }
@@ -4028,8 +4118,8 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // the user parked while this turn was in flight (serial — one
                     // base session, never two turns at once). The drained turn's
                     // handle is parked in `run_task` so Ctrl-C can abort it.
-                    Some(RouteDecision::AgenticDone { reply, director_build }) => {
-                        app.record_agentic_done(reply, director_build);
+                    Some(RouteDecision::AgenticDone { reply, director_build, base_session_id }) => {
+                        app.record_agentic_done(reply, director_build, base_session_id);
                         // Build-complete experience: an EFFECTIVE build (a `/run`
                         // build, a chat "build me X", or a chat turn the reactive
                         // detector promoted to a build) gets the "✅ done + what
@@ -4342,6 +4432,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         app.effective_model(),
                                         app.project_root.clone(),
                                         continuous_autonomous(app.effective_trust_mode()),
+                                        // A backend switch cleared `chat_session_id`
+                                        // (the OLD base's id is invalid for the NEW
+                                        // base) → `None` → a fresh resident open.
+                                        app.chat_session_id.clone(),
                                         chat_session_holder.clone(),
                                     );
                                 }
@@ -4637,6 +4731,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         host_cli && app.run_session_handed_to_chat;
                                     let continue_session =
                                         app.host_chat_session_active || handing_back;
+                                    // The base session id we already hold (restored from a
+                                    // saved chat / captured off a prior turn) — snapshot it
+                                    // BEFORE `ensure_chat_session_id` would mint a fresh one,
+                                    // so a brand-new chat carries `None` (fresh open) and only
+                                    // a REAL prior base session drives the resident fallback
+                                    // lazy-open resume (the deep cross-session memory fix).
+                                    let resume_session_id = app.chat_session_id.clone();
                                     let session_id = if host_cli && !handing_back {
                                         Some(app.ensure_chat_session_id())
                                     } else {
@@ -4653,6 +4754,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         conversation,
                                         continue_session,
                                         session_id,
+                                        resume_session_id,
                                         fallback_model: app.effective_model(),
                                         project_root: app.project_root.clone(),
                                         mode: app.effective_trust_mode(),
@@ -4861,6 +4963,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     app.effective_model(),
                                     app.project_root.clone(),
                                     continuous_autonomous(app.effective_trust_mode()),
+                                    // `/clear` cleared `chat_session_id` (→ `None` →
+                                    // fresh); `/resume` restored the saved chat's base
+                                    // id (→ RESUME its deep context). Fail-open either
+                                    // way.
+                                    app.chat_session_id.clone(),
                                     chat_session_holder.clone(),
                                 );
                             }
@@ -7297,6 +7404,10 @@ mod tests {
         sent: Arc<std::sync::Mutex<Vec<String>>>,
         /// Bumped on `interrupt()` / `end()` so a test can assert lifecycle.
         ended: Arc<std::sync::atomic::AtomicBool>,
+        /// The base's resumable session id this fake exposes via
+        /// [`BaseSession::session_id`] (`None` by default → mirrors opencode / a base
+        /// with no captured id). Set via [`Self::with_id`] to test the capture path.
+        id: Option<String>,
     }
 
     impl FakeChatSession {
@@ -7315,10 +7426,18 @@ mod tests {
                     current: std::collections::VecDeque::new(),
                     sent: Arc::clone(&sent),
                     ended: Arc::clone(&ended),
+                    id: None,
                 },
                 sent,
                 ended,
             )
+        }
+
+        /// Give the fake a resumable session id so [`BaseSession::session_id`] returns
+        /// it — exercises the per-turn id-capture path (claude / codex behaviour).
+        fn with_id(mut self, id: &str) -> Self {
+            self.id = Some(id.to_string());
+            self
         }
     }
 
@@ -7354,6 +7473,9 @@ mod tests {
         async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
             self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
+        }
+        fn session_id(&self) -> Option<&str> {
+            self.id.as_deref()
         }
     }
 
@@ -7557,6 +7679,7 @@ mod tests {
             conversation: Vec::new(),
             mode: umadev_agent::TrustMode::Guarded,
             autonomous: false,
+            resume_session_id: None,
             chat_session,
             sink,
             route_tx,
@@ -7617,6 +7740,7 @@ mod tests {
             Ok(RouteDecision::AgenticDone {
                 reply,
                 director_build,
+                ..
             }) => {
                 assert_eq!(reply, "hi there");
                 assert!(!director_build, "a pure reply is a chat, never a build");
@@ -7659,6 +7783,78 @@ mod tests {
             !saw_intent,
             "a pure chat turn emits NO intent card (chat card removed)"
         );
+    }
+
+    /// Cross-session base memory (step 2): a host chat turn captures the LIVE base's
+    /// OWN resumable session id and carries it back on the terminal `AgenticDone`, so
+    /// the event loop can persist it onto the saved chat (a relaunch then `--resume`s
+    /// the base's deep context). A base WITHOUT a resumable id (opencode) carries
+    /// `None` — fail-open to today's fresh-session behavior.
+    #[tokio::test]
+    async fn chat_turn_carries_back_the_base_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // A primed session that exposes a resumable id (claude / codex behaviour).
+        let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta("ok".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake.with_id("base-sess-42"))),
+        )));
+        drive_chat_session_turn(chat_turn(
+            "你好",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone {
+                base_session_id, ..
+            }) => assert_eq!(
+                base_session_id.as_deref(),
+                Some("base-sess-42"),
+                "the live base session id rides back on the terminal decision"
+            ),
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
+
+        // A base with NO resumable id (opencode / default) carries `None` — fail-open.
+        let (fake2, _s2, _e2) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta("ok".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let holder2: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake2)),
+        )));
+        drive_chat_session_turn(chat_turn(
+            "再来",
+            holder2.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone {
+                base_session_id, ..
+            }) => assert_eq!(
+                base_session_id, None,
+                "a base with no resumable id is fail-open (None)"
+            ),
+            other => panic!("expected AgenticDone, got {other:?}"),
+        }
     }
 
     /// The API-error surfacing fix: a chat turn whose base reports a `Failed` status
@@ -7909,6 +8105,7 @@ mod tests {
             Ok(RouteDecision::AgenticDone {
                 director_build,
                 reply,
+                ..
             }) => {
                 assert!(!director_build, "a pure reply is a chat, never a build");
                 assert_eq!(reply, "here is my answer");
@@ -8051,6 +8248,7 @@ mod tests {
             Ok(RouteDecision::AgenticDone {
                 reply,
                 director_build,
+                ..
             }) => {
                 assert_eq!(reply, "warm reply");
                 assert!(!director_build);
@@ -8096,6 +8294,7 @@ mod tests {
             String::new(),
             tmp.path().to_path_buf(),
             false,
+            None,
             holder.clone(),
         );
         // Also a `None` backend (no base configured) — both must leave the holder empty.
@@ -8104,6 +8303,7 @@ mod tests {
             String::new(),
             tmp.path().to_path_buf(),
             false,
+            None,
             holder.clone(),
         );
         // Give any (wrongly-)spawned task a chance to run, then assert nothing landed.

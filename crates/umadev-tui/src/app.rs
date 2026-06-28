@@ -1713,6 +1713,11 @@ impl App {
             id: self.chat_id.clone(),
             updated_at: now_iso8601(),
             backend: self.backend.clone().unwrap_or_default(),
+            // Persist the base's OWN resumable session id (the LIVE one captured back
+            // off each host chat turn — see `record_agentic_done`) so a relaunch can
+            // resume the base's deep context, not just replay the transcript. `None`
+            // (opencode / offline / no host turn yet) writes `null` — fail-open.
+            base_session_id: self.chat_session_id.clone(),
             messages: self.conversation.clone(),
         };
         let Ok(body) = serde_json::to_string_pretty(&session) else {
@@ -1790,6 +1795,16 @@ impl App {
         self.conversation = session.messages;
         self.trim_conversation();
         self.chat_id = session.id;
+        // Restore the base's OWN resumable session id so the NEXT host chat turn
+        // RESUMES the base's deep context (the resident pre-load opens it via
+        // `--resume <id>` / `thread/resume`) instead of cold-starting and replaying
+        // only the ≤16-message transcript. Fail-open: an old chat file (or an
+        // opencode / offline chat) has `None` here — leave `host_chat_session_active`
+        // untouched so it degrades cleanly to today's fresh-session behavior.
+        self.chat_session_id = session.base_session_id;
+        if self.chat_session_id.is_some() {
+            self.host_chat_session_active = true;
+        }
         true
     }
 
@@ -4834,13 +4849,30 @@ impl App {
     /// turn INSIDE the spawned task — after the slow brain-router consult — so the
     /// event loop no longer knows the class before dispatch. The build-ness rides
     /// the terminal decision instead, and drives the Wave-5 session hand-back here.
-    pub(crate) fn record_agentic_done(&mut self, reply: String, director_build: bool) {
+    pub(crate) fn record_agentic_done(
+        &mut self,
+        reply: String,
+        director_build: bool,
+        base_session_id: Option<String>,
+    ) {
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
         self.tool_in_progress = false;
         self.stream_text_active = false;
         self.stream_tool_batch = None;
+        // Capture the base's OWN resumable session id off this host chat turn so the
+        // SAVED chat (persisted below + on every later turn) points at the real base
+        // conversation a relaunch can `--resume`. claude's pinned `--session-id` /
+        // codex's `thread.id` ride back here on the terminal decision; opencode /
+        // offline carry `None`. Fail-open: a `None` / empty id leaves the prior value
+        // (degrades to today's fresh-session + transcript-replay behavior).
+        if let Some(id) = base_session_id {
+            if !id.trim().is_empty() {
+                self.chat_session_id = Some(id);
+                self.host_chat_session_active = true;
+            }
+        }
         // P5c: a turn that ends still inside a reasoning block collapses it now.
         self.collapse_thinking_block();
         // P5a: the streamed turn is settled — drop the stable-prefix cache so the
@@ -5584,11 +5616,16 @@ impl App {
             );
             return Action::None;
         }
-        // The transcript is back; pin the base session to this chat id so a
-        // host CLI resumes ITS OWN conversation for this chat (claude `--resume
-        // <id>`), and clear any pending run-handoff (we explicitly chose a chat).
-        self.chat_session_id = Some(id.to_string());
-        self.host_chat_session_active = true;
+        // The transcript is back. `load_chat` already restored the BASE session id
+        // (`chat_session_id`, the resumable pointer the base actually created) and
+        // flagged `host_chat_session_active` — so a host CLI resumes ITS OWN
+        // conversation (claude `--resume <base_id>` / codex `thread/resume`), NOT the
+        // chat FILE id (a DIFFERENT id the base never created, which is the bug this
+        // fixes). The RESIDENT session the event loop is holding belongs to the chat
+        // we're LEAVING, so flag it dirty: the loop closes it and re-opens the
+        // resident session against the resumed base id. Clear any pending run-handoff
+        // (we explicitly chose a chat).
+        self.chat_session_dirty = true;
         self.run_session_handed_to_chat = false;
         let n = self.conversation.len();
         self.push(
@@ -8340,6 +8377,18 @@ pub(crate) struct ChatSession {
     /// Backend id that produced this chat (advisory; for the listing).
     #[serde(default)]
     pub backend: String,
+    /// The base's OWN resumable session pointer for this chat (claude's pinned
+    /// `--session-id` / codex's `thread.id`; `None` for opencode, an offline chat,
+    /// or a chat that never took a host turn). Persisted so reopening UmaDev can
+    /// `--resume <id>` / `thread/resume` the SAME base conversation — restoring the
+    /// base's DEEP accumulated context — instead of cold-starting a fresh brain that
+    /// only sees the replayed ≤16-message transcript. `#[serde(default)]` for
+    /// back-compat: an older chat file without the field loads as `None` (fail-open
+    /// → today's fresh-session + transcript-replay behavior). Distinct from
+    /// [`Self::id`] (the chat FILE id) — they are DIFFERENT ids and resuming the file
+    /// id targets a base session that was never created.
+    #[serde(default)]
+    pub base_session_id: Option<String>,
     /// The conversation transcript, oldest → newest.
     pub messages: Vec<umadev_runtime::Message>,
 }
@@ -9589,7 +9638,14 @@ mod tests {
         // Wave 5 / G11: a restart must reopen the SAME dialogue (no goldfish).
         let (mut app, tmp) = temp_app();
         app.record_user_turn("我在做一个看板应用");
-        app.record_agentic_done("好的,已经开始搭建。".to_string(), false);
+        // A host chat turn captured the base's OWN resumable session id (claude's
+        // pinned `--session-id`) — it must survive the restart so the base resumes its
+        // DEEP context, not just the replayed transcript.
+        app.record_agentic_done(
+            "好的,已经开始搭建。".to_string(),
+            false,
+            Some("base-sess-kanban".to_string()),
+        );
         let saved_id = app.chat_id.clone();
         assert_eq!(app.conversation.len(), 2);
 
@@ -9610,6 +9666,18 @@ mod tests {
         assert_eq!(app2.conversation.len(), 2);
         assert_eq!(app2.conversation[0].content, "我在做一个看板应用");
         assert_eq!(app2.conversation[1].role, "assistant");
+        // The base session id is restored so the NEXT host chat turn RESUMES the base's
+        // deep context (the resident pre-load opens it via `--resume <id>`), and the
+        // session is flagged active. This is the cross-session base-memory fix.
+        assert_eq!(
+            app2.chat_session_id.as_deref(),
+            Some("base-sess-kanban"),
+            "restart restores the base's resumable session id, not the chat file id"
+        );
+        assert!(
+            app2.host_chat_session_active,
+            "a restored base session id flags the chat session active"
+        );
         // The restore note is surfaced so the user knows context was kept.
         assert!(app2
             .history
@@ -9620,15 +9688,15 @@ mod tests {
     #[test]
     fn slash_sessions_lists_saved_chats_and_resume_reopens_one() {
         let (mut app, _tmp) = temp_app();
-        // Chat A.
+        // Chat A — capture its OWN base session id (claude's pinned `--session-id`).
         app.record_user_turn("第一个对话");
-        app.record_agentic_done("reply A".to_string(), false);
+        app.record_agentic_done("reply A".to_string(), false, Some("base-A".to_string()));
         let id_a = app.chat_id.clone();
         // `/clear` starts a FRESH persistent chat (A stays on disk).
         let _ = app.try_slash_command("/clear");
         assert_ne!(app.chat_id, id_a, "/clear mints a new chat id");
         app.record_user_turn("第二个对话");
-        app.record_agentic_done("reply B".to_string(), false);
+        app.record_agentic_done("reply B".to_string(), false, Some("base-B".to_string()));
 
         // `/sessions` lists BOTH saved chats.
         let _ = app.try_slash_command("/sessions");
@@ -9637,13 +9705,22 @@ mod tests {
             .iter()
             .any(|m| m.body().contains(&id_a) && m.body().contains("已保存")));
 
-        // `/resume <id_a>` reopens chat A's transcript.
+        // `/resume <id_a>` reopens chat A's transcript. Clear the dirty flag first so
+        // the assertion below proves `/resume` (not the earlier `/clear`) set it.
+        app.chat_session_dirty = false;
         let _ = app.try_slash_command(&format!("/resume {id_a}"));
         assert_eq!(app.chat_id, id_a);
         assert_eq!(app.conversation[0].content, "第一个对话");
-        // The base session is pinned to the resumed chat so it continues its own.
-        assert_eq!(app.chat_session_id.as_deref(), Some(id_a.as_str()));
+        // The base session is pinned to chat A's OWN persisted base session id
+        // (`base-A`), NOT the chat FILE id (`id_a`) — the bug fix: a host CLI resumes
+        // the conversation IT created, not an id it never saw. The resident session
+        // is flagged dirty so the loop re-opens against the resumed base id.
+        assert_eq!(app.chat_session_id.as_deref(), Some("base-A"));
         assert!(app.host_chat_session_active);
+        assert!(
+            app.chat_session_dirty,
+            "/resume flags the resident session for re-open against the resumed base id"
+        );
     }
 
     #[test]
@@ -9660,6 +9737,92 @@ mod tests {
             .any(|m| m.role == ChatRole::System && m.body().contains("没找到")));
     }
 
+    /// (a) `ChatSession` round-trips `base_session_id`, and an OLD chat file written
+    /// before the field existed deserializes to `None` (back-compat / fail-open).
+    #[test]
+    fn chat_session_round_trips_base_session_id_and_is_back_compat() {
+        // New schema → the base session id survives a serialize/deserialize cycle.
+        let s = ChatSession {
+            id: "chat-1".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            backend: "claude-code".to_string(),
+            base_session_id: Some("base-xyz".to_string()),
+            messages: vec![umadev_runtime::Message {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ChatSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.base_session_id.as_deref(), Some("base-xyz"));
+
+        // OLD file (no `base_session_id` key) → `#[serde(default)]` yields `None`.
+        let legacy = r#"{"id":"old","updated_at":"x","backend":"codex",
+            "messages":[{"role":"user","content":"hi"}]}"#;
+        let parsed: ChatSession = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            parsed.base_session_id, None,
+            "an old chat file without the field loads as None (back-compat)"
+        );
+        assert_eq!(parsed.messages.len(), 1, "the transcript still loads");
+    }
+
+    /// (c) `persist_chat` writes the LIVE `chat_session_id` into the saved
+    /// `base_session_id`; (b) `load_chat` restores it into `chat_session_id` and flags
+    /// the host chat session active.
+    #[test]
+    fn persist_writes_and_load_restores_the_base_session_id() {
+        let (mut app, _tmp) = temp_app();
+        app.record_user_turn("第一句");
+        // The live base session id (captured off a host turn) is persisted.
+        app.chat_session_id = Some("base-live".to_string());
+        app.persist_chat();
+        let saved_id = app.chat_id.clone();
+
+        // (c) The on-disk record carries the base session id.
+        let path = app.chat_path(&saved_id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let on_disk: ChatSession = serde_json::from_str(&text).unwrap();
+        assert_eq!(on_disk.base_session_id.as_deref(), Some("base-live"));
+
+        // (b) A fresh App with the id cleared, then `load_chat`, restores it + flags.
+        app.chat_session_id = None;
+        app.host_chat_session_active = false;
+        assert!(app.load_chat(&saved_id), "the saved chat loads");
+        assert_eq!(
+            app.chat_session_id.as_deref(),
+            Some("base-live"),
+            "load_chat restores the base session id"
+        );
+        assert!(
+            app.host_chat_session_active,
+            "a restored base session id flags the host chat session active"
+        );
+    }
+
+    /// (b, fail-open) Loading a chat whose `base_session_id` is `None` (an old file /
+    /// opencode / offline) leaves `chat_session_id` `None` and does NOT force the
+    /// session active — degrading cleanly to today's fresh-session behavior.
+    #[test]
+    fn load_chat_with_no_base_session_id_is_fail_open() {
+        let (mut app, _tmp) = temp_app();
+        app.record_user_turn("仅文本");
+        app.chat_session_id = None; // no base id captured (e.g. opencode)
+        app.persist_chat();
+        let saved_id = app.chat_id.clone();
+
+        app.host_chat_session_active = false;
+        assert!(app.load_chat(&saved_id));
+        assert_eq!(
+            app.chat_session_id, None,
+            "no base session id → stays None (fresh session next turn)"
+        );
+        assert!(
+            !app.host_chat_session_active,
+            "a None base session id never force-flags the session active"
+        );
+    }
+
     #[test]
     fn slash_compact_folds_the_conversation_within_budget() {
         // Wave 5 / G11: /compact summarize-and-folds instead of FIFO-dropping, so a
@@ -9667,7 +9830,7 @@ mod tests {
         let (mut app, _tmp) = temp_app();
         for i in 0..12 {
             app.record_user_turn(&format!("user message {i}"));
-            app.record_agentic_done(format!("assistant reply {i}"), false);
+            app.record_agentic_done(format!("assistant reply {i}"), false, None);
         }
         let before = app.conversation.len();
         let _ = app.try_slash_command("/compact");
@@ -9697,7 +9860,7 @@ mod tests {
         // `director_run_in_flight` flag — the chat surface classifies in the task.
         let (mut app, _tmp) = temp_app();
         app.director_run_in_flight = true;
-        app.record_agentic_done("built the app".to_string(), true);
+        app.record_agentic_done("built the app".to_string(), true, None);
         assert!(
             app.run_session_handed_to_chat,
             "a finished director build hands its session back to chat"
@@ -9711,7 +9874,7 @@ mod tests {
         // even if the in-flight marker was left set.
         app.run_session_handed_to_chat = false;
         app.director_run_in_flight = true;
-        app.record_agentic_done("just chatting".to_string(), false);
+        app.record_agentic_done("just chatting".to_string(), false, None);
         assert!(
             !app.run_session_handed_to_chat,
             "a non-build turn never hands a session back"
