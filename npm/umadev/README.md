@@ -1,11 +1,11 @@
 # UmaDev
 
-> **A whole AI development team** — product manager, architect, UI/UX designer,
-> frontend, backend, QA, security, and DevOps, each doing its own specialty on a
-> shared blackboard — wrapped around the Claude Code / Codex / OpenCode you
-> already logged into. A **coordinator** seat schedules the team and enforces the
-> gates (it routes, plans, and gates — it is not the headline); the base writes
-> the code. You don't hire a director — you hire the whole team.
+> **UmaDev: A coding agent that works like a real dev team** — product manager,
+> architect, UI/UX designer, frontend, backend, QA, security, and DevOps, each doing
+> its own specialty on a shared blackboard, borrowing the Claude Code / Codex /
+> OpenCode you already logged into as the brain. A **coordinator** seat schedules the
+> team and enforces the gates (it routes, plans, and gates — it is not the headline);
+> the base writes the code. You don't hire a director — you hire the whole team.
 > **No API key needed.**
 
 ## Install

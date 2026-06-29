@@ -23,17 +23,17 @@ const jetBrainsMono = JetBrains_Mono({
 
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000"),
-  title: "UmaDev - a whole AI development team",
+  title: "UmaDev — a coding agent that works like a real dev team",
   description:
-    "UmaDev is a whole AI development team — product manager, architect, designer, frontend, backend, QA, security, DevOps — that borrows your logged-in Claude Code / Codex / OpenCode brain to turn one idea into a shippable, commercial-grade app.",
+    "UmaDev is a coding agent that works like a real dev team — product manager, architect, designer, frontend, backend, QA, security, DevOps — borrowing your logged-in Claude Code / Codex / OpenCode brain to turn one idea into a shippable, commercial-grade app.",
   icons: {
     icon: asset("/assets/umadev-icon.png"),
     apple: asset("/assets/umadev-icon.png"),
   },
   openGraph: {
-    title: "UmaDev - a whole AI development team",
+    title: "UmaDev — a coding agent that works like a real dev team",
     description:
-      "Eight specialists collaborating like a real team to turn your idea into a shippable, commercial-grade app — PRD, API contract, design system, build, tests, security audit and a delivery proof pack.",
+      "A coding agent that works like a real dev team — eight specialists collaborating to turn your idea into a shippable, commercial-grade app — PRD, API contract, design system, build, tests, security audit and a delivery proof pack.",
     type: "website",
     images: [{ url: asset("/assets/wide-1.png"), width: 1672, height: 941 }],
   },

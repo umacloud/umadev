@@ -12,10 +12,10 @@ export const i18n = {
   zh: {
     nav: { product: "产品首页", docs: "文档中心", gallery: "形象相册", changelog: "更新日志", contributors: "特别贡献" },
     hero: {
-      badge: "v1.0.7 · MIT 开源 · Rust 单二进制",
-      title1: "把一句需求，交给",
-      titleHi: "一支 AI 开发团队",
-      title2: "做成能上线的应用",
+      badge: "v1.0.x · MIT 开源 · Rust 单二进制",
+      title1: "一个模拟真实开发团队",
+      titleHi: "来工作",
+      title2: "的 Coding Agent",
       sub: "产品经理、架构师、设计师、前端、后端、QA、安全、DevOps —— 八个专家角色像真实团队一样分工协作，借你已登录的 Claude Code / Codex / OpenCode 大脑，把一句需求做成能上线、能交付、能审计的商业级应用。独立开发者，也瞬间拥有一整支有工程纪律的团队。",
       cta1: "快速开始",
       cta2: "阅读文档",
@@ -196,7 +196,7 @@ export const i18n = {
     galleryPage: { title: "形象相册", sub: "UmaDev 的 IP 形象集 —— 点击任意一张放大查看。" },
     logPage: { title: "更新日志", sub: "UmaDev 各版本的新增、改进与安全更新。", current: "当前版本" },
     footer: {
-      blurb: "一支 AI 开发团队，把一句需求做成能上线、可审计的商业级应用。",
+      blurb: "一个模拟真实开发团队来工作的 Coding Agent，把一句需求做成能上线、可审计的商业级应用。",
       cols: [
         { h: "产品", links: [{ t: "流水线设计" }, { t: "运行模式" }, { t: "治理规则" }, { t: "质量门" }, { t: "知识库" }] },
         { h: "文档", links: [{ t: "快速体验" }, { t: "命令大全" }, { t: "配置" }, { t: "Rust 架构" }, { t: "规范 SPEC" }] },
@@ -257,10 +257,10 @@ export const i18n = {
   en: {
     nav: { product: "Home", docs: "Docs", gallery: "Gallery", changelog: "Changelog", contributors: "Contributors" },
     hero: {
-      badge: "v1.0.7 · MIT licensed · Single Rust binary",
-      title1: "Hand one idea to",
-      titleHi: "a whole AI development team",
-      title2: "and get a shippable app",
+      badge: "v1.0.x · MIT licensed · Single Rust binary",
+      title1: "A coding agent that",
+      titleHi: "works like a real dev team",
+      title2: "ships your idea, commercial-grade",
       sub: "Product manager, architect, designer, frontend, backend, QA, security, DevOps — eight specialists collaborate like a real team, borrowing the Claude Code / Codex / OpenCode brain you already logged into, to turn one idea into a shippable, deliverable, auditable commercial-grade app. A solo dev gets a full, disciplined team in an instant.",
       cta1: "Get started",
       cta2: "Read the docs",
@@ -441,7 +441,7 @@ export const i18n = {
     galleryPage: { title: "Mascot gallery", sub: "The UmaDev IP mascot set — click any image to enlarge." },
     logPage: { title: "Changelog", sub: "Every UmaDev release — what was added, improved and secured.", current: "Latest" },
     footer: {
-      blurb: "A whole AI development team that turns one idea into a shippable, auditable, commercial-grade app.",
+      blurb: "A coding agent that works like a real dev team, turning one idea into a shippable, auditable, commercial-grade app.",
       cols: [
         { h: "Product", links: [{ t: "Pipeline" }, { t: "Run modes" }, { t: "Governance" }, { t: "Quality gate" }, { t: "Knowledge base" }] },
         { h: "Docs", links: [{ t: "Quick start" }, { t: "Command reference" }, { t: "Configuration" }, { t: "Rust architecture" }, { t: "Spec" }] },

@@ -4,14 +4,14 @@
 
 <img src="docs/assets/umadev-logo.png" alt="umadev" width="760">
 
-### 你已有的編碼 CLI 之上，一支 AI 開發團隊
+### UmaDev:一個模擬真實開發團隊來工作的Coding Agent。
 
 **產品經理 · 架構師 · UI/UX 設計師 · 前端 · 後端 · QA · 安全 · DevOps——八個角色像真實團隊一樣分工協作，把一句需求做成能上線、能交付、能稽核的商業級應用。底座是大腦，團隊替你交付；總監只是團隊裡的協調者。**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)
 [![Spec](https://img.shields.io/badge/Spec-UMADEV__HOST__SPEC__V1-blue)](spec/UMADEV_HOST_SPEC_V1.md)
-[![Version](https://img.shields.io/badge/Version-1.0.7-success)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.0.x-success)](CHANGELOG.md)
 
 [English](README.md) | [简体中文](README.zh-CN.md) | 繁體中文
 
@@ -42,7 +42,7 @@
 
 ## 簡介
 
-umadev 是一個命令列工具，它驅動你已經在用的 AI 編碼工具——Claude Code、Codex、OpenCode——作為一個持續的工作階段來運作。它自己不接任何模型：你的底座接入的模型，就是它的大腦。
+umadev 是**一個模擬真實開發團隊來工作的 Coding Agent**。它驅動你已經在用的 AI 編碼工具——Claude Code、Codex、OpenCode——作為一個持續的工作階段來運作；它自己不接任何模型：你的底座接入的模型，就是它的大腦。
 
 你用自然語言描述你想要什麼，**一支 AI 開發團隊**替你把它做出來——產品經理拆需求、架構師定契約、設計師出設計系統、前後端真寫程式碼、QA 跑測試、安全審攻擊面、DevOps 管交付。八個角色像真實團隊一樣分工協作，借你已登入的底座大腦（Claude Code / Codex / OpenCode），把一句需求做成能上線、能交付、能稽核的商業級應用。它按任務大小自動伸縮：小改動就只是小改動，完整專案才召集整支團隊。
 

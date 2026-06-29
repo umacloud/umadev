@@ -4,12 +4,12 @@
 
 <img src="docs/assets/umadev-logo-en.png" alt="umadev" width="760">
 
-### A whole AI development team for the coding CLI you already use.
+### UmaDev: A coding agent that works like a real dev team.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)
 [![Spec](https://img.shields.io/badge/Spec-UMADEV__HOST__SPEC__V1-blue)](spec/UMADEV_HOST_SPEC_V1.md)
-[![Version](https://img.shields.io/badge/Version-1.0.7-success)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.0.x-success)](CHANGELOG.md)
 
 English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
@@ -17,7 +17,7 @@ English | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md)
 
 ---
 
-umadev is a single command-line tool that drives an AI coding CLI you already have — Claude Code, Codex, or OpenCode — as one continuous session. It owns no model of its own: the model your base is connected to is the brain.
+umadev is **a coding agent that works like a real dev team**. It drives an AI coding CLI you already have — Claude Code, Codex, or OpenCode — as one continuous session, and owns no model of its own: the model your base is connected to is the brain.
 
 What you get is **a whole AI development team**. Eight specialists — product manager, architect, UI/UX designer, frontend engineer, backend engineer, QA, security, and DevOps — plan, build, review, and sign off the way a real team does, borrowing your already-logged-in base as their shared brain. You describe what you want in plain language, and the team turns it into runnable, shippable, auditable software: it researches, writes the PRD, architecture, and UI/UX, builds the frontend and backend, runs the quality and governance checks, and hands back the code plus a delivery proof. It sizes itself to the task — a small edit stays a small edit; a full project convenes the full roster.
 
@@ -153,12 +153,12 @@ umadev evolved from the original [shangyankeji/super-dev](https://github.com/sha
 
 Early `super-dev` was closer to an AI coding governance tool. It focused on what AI-generated code must not contain: emoji icons, hardcoded colors, unsafe patterns.
 
-umadev has grown that into a whole AI development team wrapped around the base CLI:
+umadev has grown that into a coding agent that works like a real dev team:
 
 - **From single-point governance to whole-pipeline governance.** It no longer only checks code; every phase from requirement to delivery is brought under the process and its gates.
 - **From loose scripts to a spec-driven system.** The source of truth is [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md), 25 clauses, ~112 governance rules.
 - **Rewritten in Rust.** One binary, fast startup, low dependency surface, cross-platform distribution.
-- **From blocking bad output to driving the base through the process.** Claude Code / Codex / OpenCode are the brain and hands; umadev is the development team — and the governance rail — wrapped around them.
+- **From blocking bad output to delivering like a team.** Claude Code / Codex / OpenCode are the brain and hands; umadev is the coding agent that works like a real dev team, with governance as its safety net rather than the whole product.
 
 > `super-dev` asked: "how do we stop AI from writing bad code?" umadev asks: "how do we make AI deliver a complete, shippable, auditable project — the way a real software team would?"
 

@@ -2,13 +2,13 @@
 
 > **Status:** authoritative. This document supersedes scattered direction notes and
 > the aspirational `AGENT_WIELDS_BASE_ARCHITECTURE.md` migration-wave language.
-> It defines the target — a **whole AI development team** (a product manager,
-> architect, UI/UX designer, frontend, backend, QA, security, and DevOps — eight
-> specialists, coordinated by a director seat) — an honest gap analysis against the
-> current code, and an executable, impact-ordered roadmap to launch. The headline
-> repositioning (team as the product, the director demoted to the team's
-> coordinator) frames this whole document; the layered architecture below is how
-> that team is wired.
+> It defines the target — **UmaDev: a coding agent that works like a real dev team**
+> (a product manager, architect, UI/UX designer, frontend, backend, QA, security, and
+> DevOps — eight specialists, coordinated by a scheduling seat) — an honest gap
+> analysis against the current code, and an executable, impact-ordered roadmap to
+> launch. The headline (a coding agent that works like a real dev team — the team is
+> how it works; the coordinator seat is the glue, not the star) frames this whole
+> document; the layered architecture below is how that team is wired.
 >
 > **The product is the team, not the director.** A solo developer or a small team
 > instantly gets a full, disciplined development team — eight role specialists that

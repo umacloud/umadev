@@ -370,24 +370,24 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     let title = "";
     if (view === "home") {
       title = lang === "zh"
-        ? "UmaDev - 一支 AI 开发团队 Agent"
-        : "UmaDev - a whole AI development team";
+        ? "UmaDev - 模拟真实开发团队来工作的 Coding Agent"
+        : "UmaDev — a coding agent that works like a real dev team";
     } else if (view === "docs") {
       title = lang === "zh"
-        ? "文档中心 | UmaDev - 一支 AI 开发团队 Agent"
-        : "Documentation | UmaDev - a whole AI development team";
+        ? "文档中心 | UmaDev - 模拟真实开发团队来工作的 Coding Agent"
+        : "Documentation | UmaDev — a coding agent that works like a real dev team";
     } else if (view === "gallery") {
       title = lang === "zh"
-        ? "形象相册 | UmaDev - 一支 AI 开发团队 Agent"
-        : "Mascot Gallery | UmaDev - a whole AI development team";
+        ? "形象相册 | UmaDev - 模拟真实开发团队来工作的 Coding Agent"
+        : "Mascot Gallery | UmaDev — a coding agent that works like a real dev team";
     } else if (view === "changelog") {
       title = lang === "zh"
-        ? "更新日志 | UmaDev - 一支 AI 开发团队 Agent"
-        : "Changelog | UmaDev - a whole AI development team";
+        ? "更新日志 | UmaDev - 模拟真实开发团队来工作的 Coding Agent"
+        : "Changelog | UmaDev — a coding agent that works like a real dev team";
     } else if (view === "contributors") {
       title = lang === "zh"
-        ? "特别贡献荣誉殿堂 | UmaDev - 一支 AI 开发团队 Agent"
-        : "Special Contributors | UmaDev - a whole AI development team";
+        ? "特别贡献荣誉殿堂 | UmaDev - 模拟真实开发团队来工作的 Coding Agent"
+        : "Special Contributors | UmaDev — a coding agent that works like a real dev team";
     }
 
     document.title = title;
@@ -397,8 +397,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
       descMeta.setAttribute(
         "content",
         lang === "zh"
-          ? "UmaDev 是一支 AI 开发团队：产品经理、架构师、设计师、前端、后端、QA、安全、DevOps 八个角色分工协作，借你已登录的 Claude Code / Codex / OpenCode 大脑，把一句需求做成能上线的商业级应用。"
-          : "UmaDev is a whole AI development team — eight specialists collaborating like a real team — that borrows your logged-in Claude Code / Codex / OpenCode brain to turn one idea into a shippable, commercial-grade app."
+          ? "UmaDev 是一个模拟真实开发团队来工作的 Coding Agent：产品经理、架构师、设计师、前端、后端、QA、安全、DevOps 八个角色分工协作，借你已登录的 Claude Code / Codex / OpenCode 大脑，把一句需求做成能上线的商业级应用。"
+          : "UmaDev is a coding agent that works like a real dev team — eight specialists collaborating to turn one idea into a shippable, commercial-grade app, borrowing your logged-in Claude Code / Codex / OpenCode brain."
       );
     }
   }, [lang, view]);
@@ -449,9 +449,9 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
             key: "team",
             overline: "一句需求，交给一支团队",
             lines: [
-              { text: "把一句需求，交给", accent: false },
-              { text: "一支 AI 开发团队", accent: true },
-              { text: "做成能上线的商业级应用", accent: false },
+              { text: "一个 Coding Agent", accent: false },
+              { text: "模拟真实开发团队来工作", accent: true },
+              { text: "把需求做成能上线的商业级应用", accent: false },
             ],
             sub: t.hero.sub,
             visual: "/assets/1_v2.png",
@@ -490,8 +490,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
             key: "team",
             overline: "One idea, handed to a team",
             lines: [
-              { text: "A whole", accent: false },
-              { text: "AI development team", accent: true },
+              { text: "A coding agent that", accent: false },
+              { text: "works like a real dev team", accent: true },
               { text: "ships your idea, commercial-grade", accent: false },
             ],
             sub: t.hero.sub,
