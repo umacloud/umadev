@@ -4066,11 +4066,19 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
         // mid-paint tear, a width disagreement, a concurrent external write)
         // heals WITHOUT the user pressing Ctrl+L. Gated on live output so a
         // fully idle screen is never scrubbed every couple seconds.
-        if scrub_due(
-            app_is_live(app, continuous_run_active),
-            last_scrub.elapsed(),
-            scrub_int,
-        ) {
+        // GATED ON `sync_output`: the periodic scrub is only INVISIBLE when the
+        // frame is wrapped in a synchronized update (BSU/ESU). On a terminal
+        // WITHOUT DEC-2026 sync output the clear+repaint would be a visible ~2s
+        // flicker — so we skip the periodic scrub there entirely (the one-shot
+        // R4 resize / R5 resume / Ctrl+L repaints still run; they're infrequent
+        // and necessary). Fixes the "工作状态下屏幕刷新闪烁" report.
+        if sync_output
+            && scrub_due(
+                app_is_live(app, continuous_run_active),
+                last_scrub.elapsed(),
+                scrub_int,
+            )
+        {
             force_full_repaint = true;
             last_scrub = Instant::now();
         }
