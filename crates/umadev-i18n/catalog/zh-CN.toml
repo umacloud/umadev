@@ -606,6 +606,9 @@
 "tui.hint.aborted" = "[aborted] 本轮已停止 —— 重新输入需求再启动"
 # 斜杠命令面板浮层标题
 "tui.palette.title" = "斜杠命令"
+# @文件引用 输入联想浮层标题 + 提示
+"tui.mention.title" = "文件"
+"tui.hint.mention" = "↑↓ 选择 · Tab/Enter 插入 · Esc 关闭"
 # 状态栏
 "tui.status.complete" = "[ok] 已完成"
 # 可滚动内容浮层进度

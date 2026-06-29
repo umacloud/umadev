@@ -2271,11 +2271,18 @@ fn render_chat(frame: &mut Frame, app: &App) {
     // this gap costs no net vertical space.
     render_prompt(frame, chunks[4], app);
 
-    // Slash-command palette popover floats above the prompt when the user is
-    // typing a `/`-prefixed command with at least one match.
-    let palette = app.palette_matches();
-    if !palette.is_empty() {
-        render_palette_popover(frame, chunks[4], app, &palette);
+    // A popover floats above the prompt: the `@`-file-mention typeahead takes
+    // precedence over the slash palette so the two are mutually exclusive — only
+    // one opens, chosen by what is under the cursor.
+    let mention = app.mention_matches();
+    if mention.is_empty() {
+        // Slash-command palette popover when typing a `/`-prefixed command.
+        let palette = app.palette_matches();
+        if !palette.is_empty() {
+            render_palette_popover(frame, chunks[4], app, &palette);
+        }
+    } else {
+        render_mention_popover(frame, chunks[4], app, &mention);
     }
 }
 
@@ -4423,7 +4430,9 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     let status = status_text_and_color(app);
     // Context line beneath the input box: model / backend / hints.
     let backend = app.backend.as_deref().unwrap_or("offline");
-    let hint: String = if app.input.starts_with('/') {
+    let hint: String = if !app.mention_matches().is_empty() {
+        umadev_i18n::t(app.lang, "tui.hint.mention").into()
+    } else if app.input.starts_with('/') {
         umadev_i18n::t(app.lang, "tui.hint.palette").into()
     } else if let Some(gate) = app.active_gate {
         return meta_row(
@@ -4631,6 +4640,86 @@ fn render_palette_popover(
     let title = format!(
         " {} · {}/{} · ↑↓ ",
         umadev_i18n::t(app.lang, "tui.palette.title"),
+        selected + 1,
+        total
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            title,
+            Style::default().fg(theme::BORDER_STRONG()),
+        ))
+        .border_style(Style::default().fg(theme::BORDER()));
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+/// A popover above the input box listing the repo files matching the
+/// `@`-mention partial under the cursor — the `@`-file typeahead, a sibling of
+/// [`render_palette_popover`]. Windowed around the selection with the same
+/// `N/M · ↑↓` position indicator, and it reuses the palette popover's theme so
+/// the two read as one family. Each row is the candidate's repo-relative path,
+/// shown with its `@` prefix (what gets inserted).
+fn render_mention_popover(frame: &mut Frame, input_area: Rect, app: &App, matches: &[String]) {
+    let total = matches.len();
+    if total == 0 {
+        return;
+    }
+    // Window the list around the selection so ↑↓ can reach every candidate (the
+    // same upward-floating, ≤12-row treatment the slash palette uses).
+    let avail_above = usize::from(input_area.y).saturating_sub(2);
+    let max_rows = total.min(avail_above).clamp(1, 12);
+    let selected = app.mention_selected.min(total - 1);
+    let win_start = if total > max_rows {
+        selected.saturating_sub(max_rows / 2).min(total - max_rows)
+    } else {
+        0
+    };
+    let win_end = (win_start + max_rows).min(total);
+
+    let rows = u16::try_from(win_end - win_start).unwrap_or(6);
+    let height = rows + 2; // borders
+    let width = input_area.width.min(56);
+    let x = input_area.x;
+    let y = input_area.y.saturating_sub(height);
+    // CLAMP to the frame (hand-built Rect): on a short/narrow terminal an
+    // unclamped Rect would make `Clear` index out of bounds and panic the TUI.
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+    .intersection(frame.area());
+    if area.is_empty() {
+        return;
+    }
+    frame.render_widget(Clear, area);
+
+    let items: Vec<ListItem> = matches[win_start..win_end]
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let idx = win_start + i;
+            let arrow = if idx == selected { "›" } else { " " };
+            let row_style = if idx == selected {
+                Style::default()
+                    .fg(theme::PRIMARY())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::TEXT())
+            };
+            let spans = vec![
+                Span::styled(format!(" {arrow} "), row_style),
+                Span::styled(format!("@{path}"), row_style),
+            ];
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    // Title carries the position + total (e.g. "files · 3/altogether") so the
+    // user knows the list is windowed.
+    let title = format!(
+        " {} · {}/{} · ↑↓ ",
+        umadev_i18n::t(app.lang, "tui.mention.title"),
         selected + 1,
         total
     );

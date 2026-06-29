@@ -608,6 +608,9 @@
 "tui.hint.aborted" = "[aborted] this round stopped — type a new requirement to start again"
 # Slash-command palette popover title
 "tui.palette.title" = "slash commands"
+# @-file-mention typeahead popover title + prompt hint
+"tui.mention.title" = "files"
+"tui.hint.mention" = "↑↓ choose · Tab/Enter insert · Esc close"
 # Status row
 "tui.status.complete" = "[ok] complete"
 # Scrollable content overlay progress

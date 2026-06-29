@@ -606,6 +606,9 @@
 "tui.hint.aborted" = "[aborted] 本輪已停止 —— 重新輸入需求再啟動"
 # 斜線命令面板浮層標題
 "tui.palette.title" = "斜線命令"
+# @檔案引用 輸入聯想浮層標題 + 提示
+"tui.mention.title" = "檔案"
+"tui.hint.mention" = "↑↓ 選擇 · Tab/Enter 插入 · Esc 關閉"
 # 狀態列
 "tui.status.complete" = "[ok] 已完成"
 # 可捲動內容浮層進度

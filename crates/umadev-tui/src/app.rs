@@ -823,6 +823,66 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
     needle.chars().all(|nc| hay.any(|hc| hc == nc))
 }
 
+/// True for a char allowed inside an `@`-file-mention token (`[\w./-]`, plus any
+/// Unicode alphanumeric so a non-ASCII path component still matches): word chars,
+/// underscore, dot, slash, dash. The `@`-typeahead reads the contiguous run of
+/// these immediately before the cursor as the partial path being filtered.
+fn is_mention_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-')
+}
+
+/// Maximum number of repo files offered as `@`-mention candidates (bounds both
+/// the one-time scan and the per-frame filter cost).
+const MENTION_FILE_CAP: usize = 2000;
+/// Maximum directory depth the `@`-mention scan descends (a guard against a
+/// pathological tree; the user's files of interest are shallow).
+const MENTION_SCAN_DEPTH: usize = 12;
+/// Maximum number of ranked candidates shown in the `@`-mention popover at once.
+const MENTION_MATCH_CAP: usize = 50;
+
+/// Walk `root` and collect up to [`MENTION_FILE_CAP`] repo-relative file paths
+/// (`/`-separated, sorted) for the `@`-mention typeahead. Skips the noisy
+/// build / VCS / hidden directories (`target`, `node_modules`, and anything
+/// whose name starts with `.` — which covers `.git`, `.umadev`, dotfiles).
+/// Fail-open: an unreadable directory is skipped (never panics); a missing root
+/// yields an empty list. Uses an explicit work stack so a deep tree can't
+/// overflow the call stack, and `DirEntry::file_type` (no symlink follow) so a
+/// symlink loop can't make the walk diverge.
+fn collect_repo_files(root: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        if out.len() >= MENTION_FILE_CAP {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue; // unreadable dir → skip (fail-open)
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < MENTION_SCAN_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if ft.is_file() {
+                if let Ok(rel) = entry.path().strip_prefix(root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                    if out.len() >= MENTION_FILE_CAP {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// True when `s` ends with a recognised raster-image extension (case-insensitive).
 /// The set mirrors what the bases accept as an image (`png` / `jpe?g` / `gif` /
 /// `webp`); a dragged-in image arrives as exactly such a path.
@@ -1064,6 +1124,19 @@ pub struct App {
     /// When `input` starts with `/` and matches command verbs, this is
     /// the highlight in the slash-command palette popover.
     pub palette_selected: usize,
+    /// Highlight index in the `@`-file-mention typeahead popover (parallel to
+    /// [`Self::palette_selected`]). Always clamped against the live match count.
+    pub mention_selected: usize,
+    /// `true` once the user pressed Esc to dismiss the open `@`-mention popover;
+    /// it stays closed until the next input edit re-opens it. Lets Esc close the
+    /// popover WITHOUT mutating the prompt text.
+    pub mention_dismissed: bool,
+    /// Lazily-built, cached list of repo-relative file paths (`/`-separated,
+    /// sorted) — the `@`-mention candidate source. `None` until the first
+    /// `@`-token is typed, then built once by [`Self::ensure_mention_files`] and
+    /// reused (the filesystem scan is NOT re-run per keystroke). Interior-mutable
+    /// so the pure `&App` renderer can populate it on first use.
+    pub mention_files: std::cell::RefCell<Option<Vec<String>>>,
 
     /// Bounded scrolling chat history (older lines roll off).
     pub history: VecDeque<ChatMessage>,
@@ -1552,6 +1625,9 @@ impl App {
             input_history_idx: None,
             input_history_draft: None,
             palette_selected: 0,
+            mention_selected: 0,
+            mention_dismissed: false,
+            mention_files: std::cell::RefCell::new(None),
             history: VecDeque::new(),
             transcript_scroll: std::cell::Cell::new(0),
             transcript_prev_hidden: std::cell::Cell::new(0),
@@ -2471,6 +2547,10 @@ impl App {
         // The slash palette re-filters as you type — reset the highlight to the
         // best (first) match so Enter runs a predictable command.
         self.palette_selected = 0;
+        // Editing re-opens a dismissed `@`-mention popover and resets its
+        // highlight (the candidate set just changed).
+        self.mention_selected = 0;
+        self.mention_dismissed = false;
     }
 
     /// Insert a whole string at the cursor (bracketed paste / CJK IME commit).
@@ -2504,6 +2584,8 @@ impl App {
         }
         self.input_history_idx = None;
         self.palette_selected = 0;
+        self.mention_selected = 0;
+        self.mention_dismissed = false;
     }
 
     /// Delete the character BEFORE the cursor (Backspace).
@@ -2516,6 +2598,8 @@ impl App {
         self.input.replace_range(start..end, "");
         self.input_cursor -= 1;
         self.palette_selected = 0;
+        self.mention_selected = 0;
+        self.mention_dismissed = false;
     }
 
     /// Delete the character AT the cursor (forward Delete).
@@ -2666,6 +2750,8 @@ impl App {
         self.input_history_idx = None;
         self.input_history_draft = None;
         self.attachments.clear();
+        self.mention_selected = 0;
+        self.mention_dismissed = false;
     }
 
     /// The chip token shown in the input box for image attachment `n` (1-based),
@@ -3276,6 +3362,156 @@ impl App {
             let fwd = delta as usize;
             self.palette_selected = (self.palette_selected + fwd) % count;
         }
+    }
+
+    // ---- @-file-mention typeahead ----------------------------------------
+
+    /// If the cursor sits inside an `@`-file-mention token, return
+    /// `(at_char, partial)`: `at_char` is the char index of the `@`, and
+    /// `partial` is the text between the `@` and the cursor (the live filter).
+    ///
+    /// `None` when there is no active mention — there is no `@` to the left over
+    /// an unbroken run of `[\w./-]` chars, OR the `@` is glued to a preceding
+    /// non-space (so an email like `a@b` never opens the popover). Mirrors the
+    /// slash palette's "is it open?" decision, but for a token ANYWHERE under the
+    /// cursor instead of a `/` prefix on the whole input.
+    #[must_use]
+    fn mention_token(&self) -> Option<(usize, String)> {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cur = self.input_cursor.min(chars.len());
+        let mut i = cur;
+        while i > 0 {
+            let c = chars[i - 1];
+            if c == '@' {
+                // `@` must start the input or follow whitespace, else it is part
+                // of a larger token (an email address), not a file mention.
+                if i == 1 || chars[i - 2].is_whitespace() {
+                    let partial: String = chars[i..cur].iter().collect();
+                    return Some((i - 1, partial));
+                }
+                return None;
+            }
+            if is_mention_char(c) {
+                i -= 1;
+                continue;
+            }
+            return None; // a non-mention, non-`@` char before any `@`
+        }
+        None
+    }
+
+    /// Build (once) + cache the repo-relative file list backing the `@`-mention
+    /// typeahead. The scan runs lazily on the first `@` and is then reused, so
+    /// typing stays fast (no per-keystroke filesystem walk). Fail-open.
+    fn ensure_mention_files(&self) {
+        if self.mention_files.borrow().is_some() {
+            return;
+        }
+        let files = collect_repo_files(&self.project_root);
+        *self.mention_files.borrow_mut() = Some(files);
+    }
+
+    /// The ranked `@`-mention candidates for the partial currently under the
+    /// cursor: repo-relative paths filtered by prefix / subsequence (basename
+    /// first, then full path), capped at [`MENTION_MATCH_CAP`].
+    ///
+    /// Empty when no `@`-token is active, the popover was dismissed (Esc), or
+    /// nothing matches — so this is the single "is the `@`-popover open?"
+    /// predicate. The caller keeps it mutually exclusive with the slash palette
+    /// (the `@` popover wins when a token is under the cursor).
+    #[must_use]
+    pub fn mention_matches(&self) -> Vec<String> {
+        if self.mention_dismissed {
+            return Vec::new();
+        }
+        let Some((_, partial)) = self.mention_token() else {
+            return Vec::new();
+        };
+        self.ensure_mention_files();
+        let files = self.mention_files.borrow();
+        let Some(files) = files.as_ref() else {
+            return Vec::new();
+        };
+        let p = partial.to_lowercase();
+        // Subsequence (fuzzy) only kicks in at ≥2 typed chars, so a lone `@a`
+        // doesn't explode into every path containing an 'a' (mirrors the palette).
+        let fuzzy = p.chars().count() >= 2;
+        let mut ranked: Vec<(u8, &String)> = Vec::new();
+        for f in files {
+            let path_l = f.to_lowercase();
+            let base_l = f.rsplit('/').next().unwrap_or(f).to_lowercase();
+            // Rank: basename prefix (best) → path prefix → fuzzy subsequence.
+            let rank = if p.is_empty() || base_l.starts_with(&p) {
+                0
+            } else if path_l.starts_with(&p) {
+                1
+            } else if fuzzy && (is_subsequence(&p, &base_l) || is_subsequence(&p, &path_l)) {
+                2
+            } else {
+                continue;
+            };
+            ranked.push((rank, f));
+        }
+        // Stable sort → alphabetical order preserved within each rank tier.
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked
+            .into_iter()
+            .take(MENTION_MATCH_CAP)
+            .map(|(_, f)| f.clone())
+            .collect()
+    }
+
+    /// Move the `@`-mention highlight up/down (wrap-around), like
+    /// [`Self::cycle_palette`].
+    pub fn cycle_mention(&mut self, delta: isize) {
+        let count = self.mention_matches().len();
+        if count == 0 {
+            return;
+        }
+        if delta < 0 {
+            let back = delta.unsigned_abs() % count;
+            self.mention_selected = (self.mention_selected + count - back) % count;
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            let fwd = delta as usize;
+            self.mention_selected = (self.mention_selected + fwd) % count;
+        }
+    }
+
+    /// Insert the highlighted `@`-mention candidate: replace the `@partial`
+    /// token under the cursor with `@<path> ` (trailing space) and place the
+    /// caret after it. Also consumes any mention-char tail to the RIGHT of the
+    /// cursor so editing mid-token replaces the whole reference. No-op when the
+    /// popover is empty. The trailing space ends the token, so the popover closes.
+    pub fn accept_mention(&mut self) {
+        let matches = self.mention_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let Some((at_char, _)) = self.mention_token() else {
+            return;
+        };
+        let sel = self.mention_selected.min(matches.len() - 1);
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut end = self.input_cursor.min(chars.len());
+        while end < chars.len() && is_mention_char(chars[end]) {
+            end += 1;
+        }
+        let start_b = self.byte_index(at_char);
+        let end_b = self.byte_index(end);
+        let replacement = format!("@{} ", matches[sel]);
+        let added = replacement.chars().count();
+        self.input.replace_range(start_b..end_b, &replacement);
+        self.input_cursor = at_char + added;
+        self.mention_selected = 0;
+        self.mention_dismissed = false;
+    }
+
+    /// Esc while the `@`-mention popover is open closes it WITHOUT inserting —
+    /// the prompt text is untouched and the popover stays closed until the next
+    /// edit re-opens it.
+    pub fn dismiss_mention(&mut self) {
+        self.mention_dismissed = true;
     }
 
     fn set_phase(&mut self, phase: Phase, status: PhaseStatus) {
@@ -4310,7 +4546,13 @@ impl App {
                 _ => return Action::None,
             }
         }
-        let has_palette = !self.palette_matches().is_empty();
+        // The `@`-file-mention popover and the `/` slash palette are mutually
+        // exclusive: when an `@`-token is under the cursor the mention popover
+        // owns ↑↓/Tab/Enter/Esc, and the slash palette is suppressed (it can only
+        // co-fire on a line like `/run … @src`). Otherwise the palette behaves
+        // exactly as before — no regression to the `/` path.
+        let has_mention = !self.mention_matches().is_empty();
+        let has_palette = !has_mention && !self.palette_matches().is_empty();
         let shift = mods.contains(crossterm::event::KeyModifiers::SHIFT);
         let ctrl = mods.contains(crossterm::event::KeyModifiers::CONTROL);
         let alt = mods.contains(crossterm::event::KeyModifiers::ALT);
@@ -4320,6 +4562,14 @@ impl App {
         let ctrl_alt = ctrl && alt && !shift;
 
         match key {
+            // ---- @-mention popover: Esc closes it WITHOUT inserting ----
+            // Higher precedence than the interrupt / quit-confirm Esc below, so a
+            // user dismissing the file typeahead never accidentally arms a quit.
+            KeyCode::Esc if has_mention => {
+                self.dismiss_mention();
+                Action::None
+            }
+
             // ---- exit handling ----
             KeyCode::Esc => {
                 // Running → Esc INTERRUPTS (like Claude Code), but require a
@@ -4424,6 +4674,23 @@ impl App {
                 Action::None
             }
 
+            // ---- @-mention navigation (only when the file popover is open) ----
+            // Owns ↑↓/Tab while an `@`-token is under the cursor — placed BEFORE
+            // the palette + history arms so it wins (and `has_palette` is already
+            // false whenever `has_mention` is true, keeping the two exclusive).
+            KeyCode::Up if has_mention => {
+                self.cycle_mention(-1);
+                Action::None
+            }
+            KeyCode::Down if has_mention => {
+                self.cycle_mention(1);
+                Action::None
+            }
+            KeyCode::Tab if has_mention => {
+                self.accept_mention();
+                Action::None
+            }
+
             // ---- palette navigation (only when /-prefix has matches) ----
             // EXCEPT while paging input history: once a recall surfaces a past
             // `/command` (input now starts with `/`, so `has_palette` flips true),
@@ -4480,6 +4747,15 @@ impl App {
                 }
                 Action::None
             }
+            // ---- enter: accept the highlighted @-mention (popover open) ----
+            // Wins over submit so Enter on the file typeahead inserts the path
+            // instead of sending the half-typed `@partial`. Shift+Enter still
+            // falls through to insert a literal newline.
+            KeyCode::Enter if has_mention && !shift => {
+                self.accept_mention();
+                Action::None
+            }
+
             // ---- enter: submit, or insert newline with Shift ----
             KeyCode::Enter => {
                 if shift {
@@ -12534,6 +12810,157 @@ mod tests {
         }
         let _ = a.apply_key(KeyCode::Tab);
         assert_eq!(a.input, "/claude ");
+    }
+
+    // ---- @-file-mention typeahead ----
+
+    /// Seed a few files into the test workspace so the `@`-typeahead has real
+    /// candidates to rank: `src/main.rs`, `src/lib.rs`, `README.md`.
+    fn seed_mention_files(a: &App) {
+        let root = &a.project_root;
+        let _ = std::fs::create_dir_all(root.join("src"));
+        let _ = std::fs::write(root.join("src/main.rs"), "fn main() {}\n");
+        let _ = std::fs::write(root.join("src/lib.rs"), "// lib\n");
+        let _ = std::fs::write(root.join("README.md"), "# readme\n");
+    }
+
+    #[test]
+    fn mention_detects_partial_under_cursor() {
+        let mut a = fresh_app(Some("offline"));
+        for c in "look at @sr".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(
+            a.mention_token(),
+            Some((8, "sr".to_string())),
+            "the `@sr` token under the cursor is detected with its partial"
+        );
+    }
+
+    #[test]
+    fn mention_inactive_without_at_token() {
+        let mut a = fresh_app(Some("offline"));
+        for c in "hello world".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(a.mention_token(), None, "no `@` → no mention context");
+        assert!(a.mention_matches().is_empty(), "no `@` → no candidates");
+        // An `@` glued to a preceding non-space (an email) must NOT open it.
+        let mut b = fresh_app(Some("offline"));
+        for c in "ping a@host".chars() {
+            let _ = b.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(b.mention_token(), None, "`a@host` is not a file mention");
+    }
+
+    #[test]
+    fn mention_candidates_filter_by_partial() {
+        let mut a = fresh_app(Some("offline"));
+        seed_mention_files(&a);
+        for c in "@main".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let m = a.mention_matches();
+        assert!(
+            m.iter().any(|p| p == "src/main.rs"),
+            "`@main` ranks src/main.rs, got {m:?}"
+        );
+        assert!(
+            !m.iter().any(|p| p == "README.md"),
+            "`README.md` is filtered out by the `main` partial, got {m:?}"
+        );
+    }
+
+    #[test]
+    fn mention_accept_inserts_path_and_replaces_partial() {
+        let mut a = fresh_app(Some("offline"));
+        seed_mention_files(&a);
+        for c in "@main".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Tab);
+        assert_eq!(
+            a.input, "@src/main.rs ",
+            "Tab replaced `@main` with the path"
+        );
+        assert_eq!(
+            a.input_cursor,
+            a.input_len(),
+            "caret lands after the insert"
+        );
+        assert!(
+            a.mention_matches().is_empty(),
+            "the trailing space closes the popover"
+        );
+    }
+
+    #[test]
+    fn mention_enter_inserts_selected_path() {
+        let mut a = fresh_app(Some("offline"));
+        seed_mention_files(&a);
+        for c in "@README".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        let _ = a.apply_key(KeyCode::Enter);
+        assert_eq!(a.input, "@README.md ", "Enter accepted the mention");
+    }
+
+    #[test]
+    fn mention_popover_suppresses_slash_palette() {
+        // A line that is BOTH a slash command and carries an `@`-token: the
+        // mention popover wins, so Tab inserts the file path — not the slash
+        // completion. Proves the two popovers are mutually exclusive.
+        let mut a = fresh_app(Some("offline"));
+        seed_mention_files(&a);
+        for c in "/run @main".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert!(
+            !a.mention_matches().is_empty(),
+            "the `@main` token is active"
+        );
+        assert!(
+            !a.palette_matches().is_empty(),
+            "`/run` still matches the palette registry"
+        );
+        let _ = a.apply_key(KeyCode::Tab);
+        assert_eq!(
+            a.input, "/run @src/main.rs ",
+            "Tab accepted the mention, not the slash autocomplete"
+        );
+    }
+
+    #[test]
+    fn mention_esc_closes_without_inserting() {
+        let mut a = fresh_app(Some("offline"));
+        seed_mention_files(&a);
+        for c in "@main".chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert!(!a.mention_matches().is_empty(), "popover open before Esc");
+        let _ = a.apply_key(KeyCode::Esc);
+        assert!(a.mention_dismissed, "Esc dismissed the popover");
+        assert!(a.mention_matches().is_empty(), "popover closed after Esc");
+        assert_eq!(a.input, "@main", "Esc left the prompt text untouched");
+        // A further edit re-opens the popover (dismissal is not sticky).
+        let _ = a.apply_key(KeyCode::Char('.'));
+        assert!(
+            !a.mention_matches().is_empty(),
+            "editing re-opened the popover"
+        );
+    }
+
+    #[test]
+    fn mention_arrow_down_cycles_selection() {
+        let mut a = fresh_app(Some("offline"));
+        seed_mention_files(&a);
+        // A bare `@` lists every file (≥2), so ↓ can move the highlight.
+        let _ = a.apply_key(KeyCode::Char('@'));
+        let count = a.mention_matches().len();
+        assert!(count >= 2, "expected ≥2 candidates, got {count}");
+        assert_eq!(a.mention_selected, 0, "starts on the first candidate");
+        let _ = a.apply_key(KeyCode::Down);
+        assert_eq!(a.mention_selected, 1, "↓ moved the mention highlight");
     }
 
     #[test]
