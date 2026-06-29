@@ -62,4 +62,4 @@ last_updated: 2026-06-19
 - [ ] locale 检测+切换持久化；后端邮件/通知可本地化；多语言 SEO(hreflang)。
 
 ---
-**参考**：ICU MessageFormat、`Intl` API、react-i18next/vue-i18n、CLDR 复数规则、RTL 逻辑属性、hreflang。
+**参考**：ICU MessageFormat、`Intl` API、react-i18next/vue-i18n、CLDR 复数规则、RTL 逻辑属性、hreflang。数据导出/生成文档（CSV/Excel/PDF）的中文不乱码见 `backend/01-standards/cjk-in-exports-and-documents.md`。
