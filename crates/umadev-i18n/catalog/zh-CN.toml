@@ -587,6 +587,8 @@
 # 工具调用行:连续只读工具合并后的标题 + grep 命中计数
 "tui.tool.batch" = "读取 {} 个文件"
 "tui.tool.matches" = "{} 处匹配"
+# 被中断结算的工具行标签(本轮已中止/取消,工具结果未返回)——停止转圈,显示为已停止而非成功
+"tui.tool.aborted" = "[已中止]"
 # 长输出折叠:折叠摘要行 + 每条消息的展开提示
 "tui.fold.collapsed" = "… 还有 {} 行 · {}"
 "tui.fold.expand_hint" = "Ctrl+O 展开全部"

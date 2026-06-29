@@ -587,6 +587,9 @@
 # Tool-call rows: merged read/grep batch headline + grep metric
 "tui.tool.batch" = "inspected {} files"
 "tui.tool.matches" = "{} matches"
+# Dim tag on a tool row settled by an interrupt (run aborted/cancelled before
+# the tool's result arrived) — spinner stops, row reads as stopped, not success.
+"tui.tool.aborted" = "[aborted]"
 # Long-output folding: collapsed-summary line + the per-message expand hint.
 # The hint names the GLOBAL reveal-all key (Ctrl+O) so a folded row that is not
 # the most recent (which Ctrl+R toggles) still advertises a working gesture.

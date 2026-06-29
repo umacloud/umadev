@@ -587,6 +587,8 @@
 # 工具呼叫列:連續唯讀工具合併後的標題 + grep 命中計數
 "tui.tool.batch" = "讀取 {} 個檔案"
 "tui.tool.matches" = "{} 處符合"
+# 被中斷結算的工具列標籤(本輪已中止/取消,工具結果未返回)——停止轉圈,顯示為已停止而非成功
+"tui.tool.aborted" = "[已中止]"
 # 長輸出摺疊:摺疊摘要列 + 每則訊息的展開提示
 "tui.fold.collapsed" = "… 還有 {} 行 · {}"
 "tui.fold.expand_hint" = "Ctrl+O 展開全部"

@@ -355,14 +355,24 @@ pub enum ToolStatus {
     Ok,
     /// Completed with an error.
     Fail,
+    /// Settled by an interrupt: the run/turn ended (idle settle, Cancel, base
+    /// error) before the tool's matching result arrived, so the call never
+    /// reported Ok/Fail. Terminal + NEUTRAL — rendered dim with an `[aborted]`
+    /// tag, never a fake success — so a stack of base tool rows can't keep
+    /// spinning forever after the run is over.
+    Aborted,
 }
 
 impl ToolStatus {
     /// `true` once the call has reached a terminal state (used by the
-    /// auto-collapse policy: only a finished call may collapse).
+    /// auto-collapse policy: only a finished call may collapse). `Aborted` is
+    /// terminal — an interrupted call is settled, just without a result.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(self, ToolStatus::Ok | ToolStatus::Fail)
+        matches!(
+            self,
+            ToolStatus::Ok | ToolStatus::Fail | ToolStatus::Aborted
+        )
     }
 }
 
@@ -958,6 +968,7 @@ impl MessageBody {
                     ToolStatus::Queued | ToolStatus::Running => tool_tag(&t.name),
                     ToolStatus::Ok => "[ok]",
                     ToolStatus::Fail => "[fail]",
+                    ToolStatus::Aborted => "[aborted]",
                 };
                 let count = if t.count > 1 {
                     format!(" ({})", t.count)
@@ -5310,13 +5321,44 @@ impl App {
     /// live). Called when a run is reset for a fresh start AND when a run reaches
     /// a terminal state (finished / aborted) — a settled run must not keep a
     /// stale "计划 N/M · 进行中" / half-finished verdict list hanging on screen.
-    /// Fail-open: pure state reset, never touches the transcript or panics.
+    ///
+    /// This is the SINGLE run-terminal chokepoint: every abort source
+    /// (`mark_block_aborted` ← idle settle / base error, `cancel_run` ←
+    /// `reset_for_new_run` ← user Cancel) AND the clean-finish path
+    /// (`finalize_live_panels`) converge here, so settling the in-flight
+    /// tool-call rows from one place can't be "fixed in one path, missed in
+    /// another." Fail-open: pure state flips, never panics.
     fn clear_live_panels(&mut self) {
         self.plan_steps.clear();
         self.plan_collapsed = false;
         self.critic_verdicts.clear();
         self.critics_collapsed = false;
         self.critic_round_open = false;
+        // A terminal/reset transition must also settle any tool-call row still
+        // showing a spinner: on abort/cancel the base's matching ToolResult
+        // never arrives, so without this a stack of in-flight rows (TaskCreate /
+        // Agent / Bash / Read / TaskUpdate) keeps spinning forever after the run
+        // is over (user-reported). Done here so it covers EVERY abort source.
+        self.settle_dangling_tool_rows();
+    }
+
+    /// Settle every still-in-progress tool-call row in the transcript to the
+    /// terminal [`ToolStatus::Aborted`] state. Only `Queued`/`Running` rows are
+    /// touched — a genuinely finished `Ok`/`Fail` row keeps its REAL terminal
+    /// status (never downgraded to a fake success/abort). Fail-open: a pure
+    /// status flip over `self.history`, never panics.
+    fn settle_dangling_tool_rows(&mut self) {
+        for msg in &mut self.history {
+            if let MessageBody::Tool(t) = &mut msg.kind {
+                if !t.status.is_terminal() {
+                    t.status = ToolStatus::Aborted;
+                }
+            }
+        }
+        // The in-flight low-signal merge target (if any) is now settled — the
+        // next tool starts a fresh batch row rather than folding into (and
+        // re-animating) an already-aborted row.
+        self.stream_tool_batch = None;
     }
 
     /// Settle the live panels at a CLEAN terminal (a finished delivery): if the
@@ -14369,6 +14411,114 @@ mod tests {
         };
         assert_eq!(t.status, ToolStatus::Fail);
         assert!(!t.collapsed, "a failed call must never hide its error");
+    }
+
+    /// Helper: a tool row whose `status` is whatever the caller passes, so the
+    /// settle tests can stand up a mix of in-flight + already-finished rows.
+    fn push_tool_row(a: &mut App, name: &str, status: ToolStatus) {
+        a.history.push_back(ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Tool(ToolCall {
+                name: name.to_string(),
+                arg: String::new(),
+                status,
+                result: None,
+                merged: false,
+                count: 1,
+                collapsed: false,
+            }),
+            collapsed: false,
+        });
+    }
+
+    fn tool_statuses(a: &App) -> Vec<ToolStatus> {
+        a.history
+            .iter()
+            .filter_map(|m| match &m.kind {
+                MessageBody::Tool(t) => Some(t.status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn abort_settles_in_flight_tool_rows_but_keeps_finished_ones() {
+        // The user-reported bug: after the run aborts (idle settle / base error,
+        // both arrive as an ABORT_SENTINEL note), a stack of base tool rows
+        // (TaskCreate / Agent / Bash / Read / TaskUpdate) kept spinning forever
+        // because the matching ToolResult never landed. They must now settle.
+        let mut a = fresh_app(Some("offline"));
+        a.run_started = true;
+        push_tool_row(&mut a, "TaskCreate", ToolStatus::Running);
+        push_tool_row(&mut a, "Read", ToolStatus::Ok); // already finished — keep it
+        push_tool_row(&mut a, "Agent", ToolStatus::Running);
+        push_tool_row(&mut a, "TaskUpdate", ToolStatus::Queued);
+
+        a.apply_engine(EngineEvent::Note(format!(
+            "{}本轮已中止:磁盘写入失败",
+            crate::ABORT_SENTINEL
+        )));
+
+        assert!(a.aborted, "the sentinel flips the run into aborted");
+        let statuses = tool_statuses(&a);
+        // Every in-flight row is settled; NONE is left in-progress.
+        assert!(
+            statuses.iter().all(|s| s.is_terminal()),
+            "no tool row may stay in-progress after an abort: {statuses:?}"
+        );
+        // The genuinely-finished Ok row is NOT downgraded to a fake abort.
+        assert_eq!(
+            statuses,
+            vec![
+                ToolStatus::Aborted,
+                ToolStatus::Ok,
+                ToolStatus::Aborted,
+                ToolStatus::Aborted,
+            ],
+            "in-flight rows -> Aborted, the Ok row keeps its real success: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn cancel_settles_in_flight_tool_rows() {
+        // The user Cancel path (Esc/Ctrl-C -> cancel_run -> reset_for_new_run ->
+        // clear_live_panels) must also stop any spinning tool row.
+        let mut a = fresh_app(Some("offline"));
+        a.run_started = true;
+        push_tool_row(&mut a, "Bash", ToolStatus::Running);
+        push_tool_row(&mut a, "Edit", ToolStatus::Fail); // finished — keep it
+
+        a.cancel_run();
+
+        let statuses = tool_statuses(&a);
+        assert!(
+            statuses.iter().all(|s| s.is_terminal()),
+            "cancel must settle every in-flight tool row: {statuses:?}"
+        );
+        assert_eq!(
+            statuses,
+            vec![ToolStatus::Aborted, ToolStatus::Fail],
+            "the Running row -> Aborted, the Fail row keeps its failure: {statuses:?}"
+        );
+    }
+
+    #[test]
+    fn clean_finish_closes_dangling_in_flight_tool_row() {
+        // Defensive: even a CLEAN delivery finish (finalize_live_panels, reached
+        // here via the chat/Fast build completion card) must close any tool row
+        // left dangling in-progress, so a settled run never keeps a spinner.
+        let mut a = fresh_app(Some("offline"));
+        push_tool_row(&mut a, "Write", ToolStatus::Running);
+        push_tool_row(&mut a, "Read", ToolStatus::Ok);
+
+        a.finalize_live_panels();
+
+        let statuses = tool_statuses(&a);
+        assert_eq!(
+            statuses,
+            vec![ToolStatus::Aborted, ToolStatus::Ok],
+            "a clean finish closes the dangling Running row, keeps the Ok row: {statuses:?}"
+        );
     }
 
     #[test]

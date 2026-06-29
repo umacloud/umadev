@@ -472,6 +472,7 @@ mod tests {
             // and the collapse/expand hints.
             "tui.tool.batch",
             "tui.tool.matches",
+            "tui.tool.aborted",
             "tui.fold.collapsed",
             "tui.fold.expand_hint",
             "tui.diff.collapsed",

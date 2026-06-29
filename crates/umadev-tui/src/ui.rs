@@ -2680,8 +2680,13 @@ fn welcome_lines(app: &App) -> Vec<Line<'static>> {
 /// styles it consistently.
 fn tool_status_glyph(status: ToolStatus, spinner: char) -> (char, Color) {
     match status {
-        // Hollow circle U+25CB, dimmed.
-        ToolStatus::Queued => (char::from_u32(0x25CB).unwrap_or('o'), theme::TEXT_MUTED()),
+        // Hollow circle U+25CB, dimmed — `Queued` (not started yet) and
+        // `Aborted` (settled by an interrupt: neither succeeded nor failed, the
+        // run just ended first) both read as a neutral, non-spinning dot, so
+        // neither is mistaken for a green success or a red error.
+        ToolStatus::Queued | ToolStatus::Aborted => {
+            (char::from_u32(0x25CB).unwrap_or('o'), theme::TEXT_MUTED())
+        }
         ToolStatus::Running => (spinner, theme::ACCENT()),
         // Filled circle U+25CF.
         ToolStatus::Ok => (char::from_u32(0x25CF).unwrap_or('*'), theme::SUCCESS()),
@@ -3058,6 +3063,15 @@ fn render_tool_row(
     if !tool.arg.is_empty() {
         head.push(Span::styled(
             format!(" ({})", tool.arg),
+            Style::default().fg(theme::TEXT_MUTED()),
+        ));
+    }
+    // A row settled by an interrupt carries an explicit dim `[aborted]` tag so
+    // the user reads it as stopped-mid-flight (not a silent neutral dot), mirror
+    // of how a failed row's red glyph signals failure — no emoji, theme colour.
+    if tool.status == ToolStatus::Aborted {
+        head.push(Span::styled(
+            format!(" {}", umadev_i18n::t(lang, "tui.tool.aborted")),
             Style::default().fg(theme::TEXT_MUTED()),
         ));
     }
