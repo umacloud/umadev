@@ -2,7 +2,7 @@
 id: auth-system
 title: Seed Template: Authentication System
 domain: seed-templates
-category: auth-system.md
+category: seed-templates
 difficulty: intermediate
 tags: [auth, component, gates, page, patterns, quality, seed-templates, structure]
 quality_score: 70

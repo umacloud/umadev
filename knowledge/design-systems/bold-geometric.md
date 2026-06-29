@@ -2,7 +2,7 @@
 id: bold-geometric
 title: Bold Geometric
 domain: design-systems
-category: bold-geometric.md
+category: design-systems
 difficulty: intermediate
 tags: [bold, color, component, design-systems, geometric, layout, palette, patterns]
 quality_score: 70

@@ -1,16 +1,14 @@
 ---
 id: ui-aesthetic-system
-title: ui-aesthetic-system
+title: UI美学系统总册
 domain: development
 category: 11-ui-excellence
 difficulty: intermediate
-tags: [aesthetic, development, system, ui美学系统总册]
+tags: [ui, 美学系统, aesthetic, 设计系统, 视觉规范, 前端, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ui-aesthetic-system
-
-## UI美学系统总册
+# UI美学系统总册
 
 ### 目标
 - 让界面同时满足“好看、好用、好做、可持续演进”。

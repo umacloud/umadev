@@ -1,16 +1,14 @@
 ---
 id: refactoring-and-techdebt-playbook
-title: refactoring-and-techdebt-playbook
+title: 重构与技术债治理手册
 domain: development
-category: refactoring-and-techdebt-playbook.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [and, development, playbook, refactoring, techdebt, 重构与技术债治理手册]
+tags: [重构, refactoring, 技术债, tech-debt, 治理, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# refactoring-and-techdebt-playbook
-
-## 重构与技术债治理手册
+# 重构与技术债治理手册
 
 ### 目标
 - 在不影响业务连续性的前提下，持续降低系统复杂度与维护成本。

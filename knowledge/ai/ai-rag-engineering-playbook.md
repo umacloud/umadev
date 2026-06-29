@@ -1,16 +1,14 @@
 ---
 id: ai-rag-engineering-playbook
-title: ai-rag-engineering-playbook
+title: AI RAG工程作战手册
 domain: ai
-category: ai-rag-engineering-playbook.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [ai, engineering, playbook, rag, rag工程作战手册]
+tags: [rag, 检索增强, retrieval, 召回, 重排序, 向量检索, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-rag-engineering-playbook
-
-## AI RAG工程作战手册
+# AI RAG工程作战手册
 
 ### 目标
 - 构建高召回、高精度、低幻觉的检索增强生成系统。

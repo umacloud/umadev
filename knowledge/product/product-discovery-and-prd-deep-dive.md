@@ -1,16 +1,14 @@
 ---
 id: product-discovery-and-prd-deep-dive
-title: product-discovery-and-prd-deep-dive
+title: 产品环节深度知识库
 domain: product
-category: product-discovery-and-prd-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [and, deep, discovery, dive, prd, product, 产品环节深度知识库]
+tags: [产品, prd, 需求发现, discovery, 产品设计, product]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# product-discovery-and-prd-deep-dive
-
-## 产品环节深度知识库
+# 产品环节深度知识库
 
 ### 目标
 - 把业务目标转化为可执行需求，保证“价值、可行性、可验收”一致。

@@ -2,7 +2,7 @@
 id: service-governance
 title: 服务治理完全指南
 domain: architecture
-category: service-governance.md
+category: 01-standards
 difficulty: intermediate
 tags: [architecture, governance, service, 服务注册与发现, 核心能力, 概述, 熔断与降级, 负载均衡]
 quality_score: 70

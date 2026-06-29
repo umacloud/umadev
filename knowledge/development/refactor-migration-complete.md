@@ -1,16 +1,14 @@
 ---
 id: refactor-migration-complete
-title: refactor-migration-complete
+title: 重构与迁移完整知识库
 domain: development
-category: refactor-migration-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [complete, development, migration, refactor, 重构与迁移完整知识库]
+tags: [重构, refactor, 迁移, migration, 技术债, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# refactor-migration-complete
-
-## 重构与迁移完整知识库
+# 重构与迁移完整知识库
 
 ### 1. 重构触发条件
 - 缺陷密度持续偏高。

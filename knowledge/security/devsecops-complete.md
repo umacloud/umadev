@@ -2,7 +2,7 @@
 id: devsecops-complete
 title: DevSecOps 完整实践指南
 domain: security
-category: devsecops-complete.md
+category: 01-standards
 difficulty: intermediate
 tags: [complete, devsecops, security, 安全工具链, 安全度量指标, 实施路径, 常见反模式, 最佳实践]
 quality_score: 70

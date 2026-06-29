@@ -1,16 +1,14 @@
 ---
 id: cicd-blueprint-deep-dive
-title: cicd-blueprint-deep-dive
+title: CI/CD 环节深度知识库
 domain: cicd
-category: cicd-blueprint-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [blueprint, cicd, deep, dive, 环节深度知识库]
+tags: [cicd, 流水线, pipeline, 持续集成, 持续交付, 发布, devops]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# cicd-blueprint-deep-dive
-
-## CI/CD 环节深度知识库
+# CI/CD 环节深度知识库
 
 ### 目标
 - 让每次发布都具备可重复、可审计、可回滚能力。

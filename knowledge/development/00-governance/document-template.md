@@ -1,14 +1,14 @@
 ---
 id: document-template
-title: document-template
+title: 知识库标准文档模板
 domain: development
 category: 00-governance
 difficulty: intermediate
-tags: [development, document, template, 失败模式, 执行步骤, 检查清单, 目标, 适用范围]
+tags: [文档模板, template, 知识库, 写作规范, standard, governance, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# document-template
+# 知识库标准文档模板
 
 ```yaml
 id: KB-DEV-XXXX

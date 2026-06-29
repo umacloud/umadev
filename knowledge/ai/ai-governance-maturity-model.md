@@ -1,16 +1,14 @@
 ---
 id: ai-governance-maturity-model
-title: ai-governance-maturity-model
+title: AI治理成熟度模型
 domain: ai
-category: ai-governance-maturity-model.md
+category: 01-standards
 difficulty: intermediate
-tags: [ai, ai治理成熟度模型, governance, maturity, model]
+tags: [治理, 成熟度模型, maturity, governance, 能力评估, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-governance-maturity-model
-
-## AI治理成熟度模型
+# AI治理成熟度模型
 
 ### 目标
 - 用统一量表评估AI研发和运营能力，指导分阶段治理提升。

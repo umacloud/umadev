@@ -1,14 +1,14 @@
 ---
 id: aiops-anomaly-detection
-title: aiops-anomaly-detection
+title: AIOps 异常检测体系
 domain: operations
-category: aiops-anomaly-detection.md
+category: 01-standards
 difficulty: intermediate
-tags: [aiops, anomaly, detection, operations, 告警降噪, 实施架构, 常见失败模式, 异常检测算法]
+tags: [aiops, 异常检测, anomaly-detection, 告警降噪, 时序, 根因, operations]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# aiops-anomaly-detection
+# AIOps 异常检测体系
 
 ## 目标
 建立 AIOps 异常检测体系,通过机器学习算法自动识别系统异常、减少告警噪音、加速根因定位、实现智能运维。

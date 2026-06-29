@@ -2,7 +2,7 @@
 id: 00-craft-rules
 title: Craft Rules — Universal Visual Quality Standards
 domain: design-systems
-category: 00-craft-rules.md
+category: design-systems
 difficulty: intermediate
 tags: [auto-checked, cardinal, catch, craft, design-systems, governance, reviewer, rules]
 quality_score: 70

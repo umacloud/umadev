@@ -1,16 +1,14 @@
 ---
 id: ai-red-team-and-safety-evaluation
-title: ai-red-team-and-safety-evaluation
+title: AI红队测试与安全评估
 domain: ai
-category: ai-red-team-and-safety-evaluation.md
+category: 01-standards
 difficulty: intermediate
-tags: [ai, ai红队测试与安全评估, and, evaluation, red, safety, team]
+tags: [红队, red-team, 安全评估, safety, 提示注入, 越权, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-red-team-and-safety-evaluation
-
-## AI红队测试与安全评估
+# AI红队测试与安全评估
 
 ### 目标
 - 在上线前识别提示注入、越权调用、敏感泄漏、内容安全等高风险问题。

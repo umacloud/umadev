@@ -1,16 +1,14 @@
 ---
 id: concurrency-reliability-complete
-title: concurrency-reliability-complete
+title: 并发与稳定性完整知识库
 domain: development
-category: concurrency-reliability-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [complete, concurrency, development, reliability, 并发与稳定性完整知识库]
+tags: [并发, concurrency, 稳定性, reliability, 线程, 锁, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# concurrency-reliability-complete
-
-## 并发与稳定性完整知识库
+# 并发与稳定性完整知识库
 
 ### 1. 并发模型
 - 共享资源必须定义并发访问策略。

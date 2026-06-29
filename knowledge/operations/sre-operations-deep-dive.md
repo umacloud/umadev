@@ -1,16 +1,14 @@
 ---
 id: sre-operations-deep-dive
-title: sre-operations-deep-dive
+title: 运维环节深度知识库
 domain: operations
-category: sre-operations-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [deep, dive, operations, sre, 运维环节深度知识库]
+tags: [sre, 运维, 可观测, 应急, 容量, operations]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# sre-operations-deep-dive
-
-## 运维环节深度知识库
+# 运维环节深度知识库
 
 ### 目标
 - 构建可观测、可响应、可恢复的生产运行体系。

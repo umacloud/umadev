@@ -1,16 +1,14 @@
 ---
 id: ai-domain-index-and-checklist
-title: ai-domain-index-and-checklist
+title: AI领域索引与执行清单
 domain: ai
-category: ai-domain-index-and-checklist.md
+category: 03-checklists
 difficulty: intermediate
-tags: [ai, ai领域索引与执行清单, and, checklist, domain, index]
+tags: [索引, checklist, 执行清单, 上线门禁, ai, llm, rag, 核查清单]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-domain-index-and-checklist
-
-## AI领域索引与执行清单
+# AI领域索引与执行清单
 
 ### 目标
 - 为AI需求、方案、上线、运行提供统一入口和核查清单。

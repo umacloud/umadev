@@ -1,16 +1,14 @@
 ---
 id: engineering-standards-deep-dive
-title: engineering-standards-deep-dive
+title: 开发环节深度知识库
 domain: development
-category: engineering-standards-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [deep, development, dive, engineering, standards, 开发环节深度知识库]
+tags: [工程规范, engineering-standards, 开发规范, 分层, 编码标准, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# engineering-standards-deep-dive
-
-## 开发环节深度知识库
+# 开发环节深度知识库
 
 ### 目标
 - 让实现质量稳定、可回归、可协作，避免“个人风格驱动”。

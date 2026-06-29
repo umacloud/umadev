@@ -2,7 +2,7 @@
 id: saas-landing
 title: Seed Template: SaaS Landing Page
 domain: seed-templates
-category: saas-landing.md
+category: seed-templates
 difficulty: intermediate
 tags: [bottom, gates, into, landing, page, paste, quality, root]
 quality_score: 70

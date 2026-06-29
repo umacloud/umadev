@@ -1,16 +1,14 @@
 ---
 id: prompt-and-tool-guardrails
-title: prompt-and-tool-guardrails
+title: Prompt 与工具调用护栏规范
 domain: ai
-category: prompt-and-tool-guardrails.md
+category: 01-standards
 difficulty: intermediate
-tags: [ai, and, guardrails, prompt, tool, 与工具调用护栏规范]
+tags: [prompt, 护栏, guardrails, 工具调用, 安全边界, 结构化输出, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# prompt-and-tool-guardrails
-
-## Prompt 与工具调用护栏规范
+# Prompt 与工具调用护栏规范
 
 ### 目标
 - 防止模型越权操作、错误调用工具或输出不可信内容。

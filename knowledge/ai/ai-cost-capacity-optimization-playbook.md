@@ -1,16 +1,14 @@
 ---
 id: ai-cost-capacity-optimization-playbook
-title: ai-cost-capacity-optimization-playbook
+title: AI成本与容量优化手册
 domain: ai
-category: ai-cost-capacity-optimization-playbook.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [ai, ai成本与容量优化手册, capacity, cost, optimization, playbook]
+tags: [成本优化, cost, capacity, 容量规划, 模型路由, prompt压缩, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-cost-capacity-optimization-playbook
-
-## AI成本与容量优化手册
+# AI成本与容量优化手册
 
 ### 目标
 - 在保证业务效果的前提下，实现可持续的AI成本与容量治理。

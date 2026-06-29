@@ -1,16 +1,14 @@
 ---
 id: security-in-development-complete
-title: security-in-development-complete
+title: 开发安全完整知识库
 domain: development
-category: security-in-development-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [complete, development, security, 开发安全完整知识库]
+tags: [安全, security, 安全左移, 开发安全, 漏洞, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# security-in-development-complete
-
-## 开发安全完整知识库
+# 开发安全完整知识库
 
 ### 1. 安全左移
 - 在需求与设计阶段完成威胁建模。

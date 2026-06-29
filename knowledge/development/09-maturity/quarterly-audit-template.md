@@ -1,16 +1,14 @@
 ---
 id: quarterly-audit-template
-title: quarterly-audit-template
+title: 季度审计模板
 domain: development
 category: 09-maturity
 difficulty: intermediate
-tags: [audit, development, quarterly, template, 季度审计模板]
+tags: [审计, audit, 季度审计, 模板, 成熟度, 治理, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# quarterly-audit-template
-
-## 季度审计模板
+# 季度审计模板
 
 ### 审计概览
 - 审计周期：

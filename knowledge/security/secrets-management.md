@@ -2,7 +2,7 @@
 id: secrets-management
 title: 密钥管理完整方案
 domain: security
-category: secrets-management.md
+category: 01-standards
 difficulty: intermediate
 tags: [kubernetes, management, secrets, security, 中的使用, 密钥在, 密钥生命周期管理, 密钥管理]
 quality_score: 70

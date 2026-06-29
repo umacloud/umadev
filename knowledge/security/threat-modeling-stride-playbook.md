@@ -1,16 +1,14 @@
 ---
 id: threat-modeling-stride-playbook
-title: threat-modeling-stride-playbook
+title: STRIDE 威胁建模手册
 domain: security
-category: threat-modeling-stride-playbook.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [modeling, playbook, security, stride, threat, 威胁建模手册]
+tags: [威胁建模, threat-modeling, stride, 攻击面, 安全设计, security]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# threat-modeling-stride-playbook
-
-## STRIDE 威胁建模手册
+# STRIDE 威胁建模手册
 
 ### 目标
 - 在需求与设计阶段提前识别安全风险，降低上线后高危漏洞暴露概率。

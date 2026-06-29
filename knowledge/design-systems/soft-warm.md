@@ -2,7 +2,7 @@
 id: soft-warm
 title: Soft Warm
 domain: design-systems
-category: soft-warm.md
+category: design-systems
 difficulty: intermediate
 tags: [borders, color, component, design-systems, palette, patterns, radius, soft]
 quality_score: 70

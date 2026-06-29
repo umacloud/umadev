@@ -1,16 +1,14 @@
 ---
 id: ai-model-selection-and-routing-strategy
-title: ai-model-selection-and-routing-strategy
+title: AI模型选型与路由策略
 domain: ai
-category: ai-model-selection-and-routing-strategy.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [ai, ai模型选型与路由策略, and, model, routing, selection, strategy]
+tags: [模型选型, 路由, routing, model-selection, 多模型, 灰度, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-model-selection-and-routing-strategy
-
-## AI模型选型与路由策略
+# AI模型选型与路由策略
 
 ### 目标
 - 在准确率、时延、成本和稳定性之间取得可量化最优平衡。

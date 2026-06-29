@@ -1,16 +1,14 @@
 ---
 id: frontend-engineering-complete
-title: frontend-engineering-complete
+title: 前端工程完整知识库
 domain: development
-category: frontend-engineering-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [complete, development, engineering, frontend, 前端工程完整知识库]
+tags: [前端, frontend, 组件化, 模块边界, 工程规范, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# frontend-engineering-complete
-
-## 前端工程完整知识库
+# 前端工程完整知识库
 
 ### 1. 分层与模块边界
 - 页面层负责编排，组件层负责复用，服务层负责数据访问。

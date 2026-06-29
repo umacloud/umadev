@@ -1,16 +1,14 @@
 ---
 id: ai-observability-and-oncall-runbook
-title: ai-observability-and-oncall-runbook
+title: AI可观测性与值班Runbook
 domain: ai
-category: ai-observability-and-oncall-runbook.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [ai, ai可观测性与值班runbook, and, observability, oncall, runbook]
+tags: [可观测性, observability, oncall, runbook, 值班, 告警, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-observability-and-oncall-runbook
-
-## AI可观测性与值班Runbook
+# AI可观测性与值班Runbook
 
 ### 目标
 - 建立AI系统运行态监控、告警、处置、复盘的标准流程。

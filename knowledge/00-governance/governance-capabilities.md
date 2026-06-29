@@ -2,7 +2,7 @@
 id: governance-capabilities
 title: UmaDev 治理能力全景图
 domain: 00-governance
-category: governance-capabilities.md
+category: 00-governance
 difficulty: intermediate
 tags: [00-governance, capabilities, engine, governance, knowledge, rule, tracker, validation]
 quality_score: 70

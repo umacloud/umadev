@@ -1,16 +1,14 @@
 ---
 id: api-governance-complete
-title: api-governance-complete
+title: API治理完整知识库
 domain: development
-category: api-governance-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [api, api治理完整知识库, complete, development, governance]
+tags: [api, 治理, governance, 契约优先, 版本, 网关, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# api-governance-complete
-
-## API治理完整知识库
+# API治理完整知识库
 
 ### 1. 契约优先
 - 接口先定义契约，再进入实现。

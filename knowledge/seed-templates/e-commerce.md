@@ -2,7 +2,7 @@
 id: e-commerce
 title: Seed Template: E-Commerce Product Page
 domain: seed-templates
-category: e-commerce.md
+category: seed-templates
 difficulty: intermediate
 tags: [commerce, gates, page, quality, seed-templates, structure]
 quality_score: 70

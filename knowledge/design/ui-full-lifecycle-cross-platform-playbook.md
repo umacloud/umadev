@@ -2,7 +2,7 @@
 id: ui-full-lifecycle-cross-platform-playbook
 title: UI 全生命周期跨平台设计手册（商业级）
 domain: design
-category: ui-full-lifecycle-cross-platform-playbook.md
+category: 02-playbooks
 difficulty: intermediate
 tags: [cross, design, full, lifecycle, platform, playbook, token, 官方优先来源]
 quality_score: 70

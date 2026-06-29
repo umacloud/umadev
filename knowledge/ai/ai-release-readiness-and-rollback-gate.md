@@ -1,16 +1,14 @@
 ---
 id: ai-release-readiness-and-rollback-gate
-title: ai-release-readiness-and-rollback-gate
+title: AI发布就绪与回滚门禁
 domain: ai
-category: ai-release-readiness-and-rollback-gate.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [ai, ai发布就绪与回滚门禁, and, gate, readiness, release, rollback]
+tags: [发布门禁, 回滚, rollback, release-gate, 灰度, 就绪评估, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-release-readiness-and-rollback-gate
-
-## AI发布就绪与回滚门禁
+# AI发布就绪与回滚门禁
 
 ### 目标
 - 将AI能力发布纳入可量化门禁，确保上线可控与可回退。

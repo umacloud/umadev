@@ -1,16 +1,14 @@
 ---
 id: backend-engineering-complete
-title: backend-engineering-complete
+title: 后端工程完整知识库
 domain: development
-category: backend-engineering-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [backend, complete, development, engineering, 后端工程完整知识库]
+tags: [后端, backend, 分层架构, 服务设计, 工程规范, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# backend-engineering-complete
-
-## 后端工程完整知识库
+# 后端工程完整知识库
 
 ### 1. 分层架构
 - 路由层只做协议适配与参数接收。

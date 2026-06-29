@@ -1,16 +1,14 @@
 ---
 id: api-contract-and-versioning-guide
-title: api-contract-and-versioning-guide
+title: API 契约与版本治理指南
 domain: development
-category: api-contract-and-versioning-guide.md
+category: 01-standards
 difficulty: intermediate
-tags: [and, api, contract, development, guide, versioning, 契约与版本治理指南]
+tags: [api, 契约, contract, 版本治理, versioning, 兼容性, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# api-contract-and-versioning-guide
-
-## API 契约与版本治理指南
+# API 契约与版本治理指南
 
 ### 目标
 - 保证前后端与外部调用方在接口演进中保持稳定兼容。

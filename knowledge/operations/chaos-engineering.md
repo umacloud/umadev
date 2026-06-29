@@ -1,14 +1,14 @@
 ---
 id: chaos-engineering
-title: chaos-engineering
+title: 混沌工程实践
 domain: operations
-category: chaos-engineering.md
+category: 01-standards
 difficulty: intermediate
-tags: [chaos, engineering, operations, 分钟, 实施流程, 实验信息, 实验概况, 核心原则]
+tags: [混沌工程, chaos-engineering, 故障注入, 韧性, 演练, operations]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# chaos-engineering
+# 混沌工程实践
 
 ## 目标
 建立混沌工程实践体系,通过受控的故障注入实验,验证系统在生产环境真实负载下的韧性,提前发现和修复潜在问题,提升服务可靠性。

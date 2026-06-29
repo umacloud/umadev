@@ -2,7 +2,7 @@
 id: tech-utility
 title: Tech Utility
 domain: design-systems
-category: tech-utility.md
+category: design-systems
 difficulty: intermediate
 tags: [color, component, design-systems, motion, palette, patterns, spacing, tech]
 quality_score: 70

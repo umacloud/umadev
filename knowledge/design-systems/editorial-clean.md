@@ -2,7 +2,7 @@
 id: editorial-clean
 title: Editorial Clean
 domain: design-systems
-category: editorial-clean.md
+category: design-systems
 difficulty: intermediate
 tags: [clean, color, component, design-systems, editorial, motion, palette, patterns]
 quality_score: 70

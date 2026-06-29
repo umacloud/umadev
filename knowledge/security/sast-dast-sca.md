@@ -2,7 +2,7 @@
 id: sast-dast-sca
 title: SAST/DAST/SCA 完整指南
 domain: security
-category: sast-dast-sca.md
+category: 01-standards
 difficulty: intermediate
 tags: [dast, sast, sca, security, 三者对比, 动态应用安全测试, 报告和度量, 概述]
 quality_score: 70

@@ -1,14 +1,14 @@
 ---
 id: capacity-planning
-title: capacity-planning
+title: 容量规划体系
 domain: operations
-category: capacity-planning.md
+category: 01-standards
 difficulty: intermediate
-tags: [capacity, operations, planning, 容量规划报告, 容量规划流程, 当前状态, 执行摘要, 核心概念]
+tags: [容量规划, capacity-planning, 资源预测, 扩容, 成本, operations]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# capacity-planning
+# 容量规划体系
 
 ## 目标
 建立科学的容量规划体系,预测业务增长带来的资源需求,提前规划扩容,避免性能瓶颈和资源浪费,实现成本与性能的最优平衡。

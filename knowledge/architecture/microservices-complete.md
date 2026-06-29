@@ -2,7 +2,7 @@
 id: microservices-complete
 title: 微服务架构完整指南
 domain: architecture
-category: microservices-complete.md
+category: 01-standards
 difficulty: intermediate
 tags: [architecture, complete, microservices, 可观测性, 数据管理, 服务发现, 服务拆分策略, 核心原则]
 quality_score: 70

@@ -1,16 +1,14 @@
 ---
 id: llm-agent-engineering-deep-dive
-title: llm-agent-engineering-deep-dive
+title: LLM 与 Agent 工程深度知识库
 domain: ai
-category: llm-agent-engineering-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [agent, ai, deep, dive, engineering, llm, 工程深度知识库]
+tags: [llm, agent, 工程化, prompt, 工具调用, 编排, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# llm-agent-engineering-deep-dive
-
-## LLM 与 Agent 工程深度知识库
+# LLM 与 Agent 工程深度知识库
 
 ### 目标
 - 建立可控、可测、可审计的 AI 研发与运行标准。

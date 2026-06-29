@@ -1,16 +1,14 @@
 ---
 id: ai-agent-memory-context-management
-title: ai-agent-memory-context-management
+title: AI Agent上下文与记忆管理
 domain: ai
-category: ai-agent-memory-context-management.md
+category: 01-standards
 difficulty: intermediate
-tags: [agent, agent上下文与记忆管理, ai, context, management, memory]
+tags: [agent, 记忆管理, memory, context, 上下文压缩, 多轮对话, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-agent-memory-context-management
-
-## AI Agent上下文与记忆管理
+# AI Agent上下文与记忆管理
 
 ### 目标
 - 在成本可控前提下提升多轮任务连续性与决策一致性。

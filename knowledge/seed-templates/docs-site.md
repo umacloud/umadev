@@ -2,7 +2,7 @@
 id: docs-site
 title: Seed Template: Documentation Site
 domain: seed-templates
-category: docs-site.md
+category: seed-templates
 difficulty: intermediate
 tags: [component, docs, gates, page, patterns, quality, seed-templates, site]
 quality_score: 70

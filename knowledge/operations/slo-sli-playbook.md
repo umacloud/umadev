@@ -1,14 +1,14 @@
 ---
 id: slo-sli-playbook
-title: slo-sli-playbook
+title: SLO/SLI 实践手册
 domain: operations
-category: slo-sli-playbook.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [budget, operations, playbook, sli, slo, 实施流程, 核心概念, 目标]
+tags: [slo, sli, 可靠性, 错误预算, error-budget, 服务质量, operations]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# slo-sli-playbook
+# SLO/SLI 实践手册
 
 ## 目标
 建立以 SLO 为中心的可靠性工程体系,量化服务质量,平衡功能交付与稳定性,实现数据驱动的故障响应和容量规划。

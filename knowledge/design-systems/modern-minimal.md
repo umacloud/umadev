@@ -2,7 +2,7 @@
 id: modern-minimal
 title: Modern Minimal
 domain: design-systems
-category: modern-minimal.md
+category: design-systems
 difficulty: intermediate
 tags: [borders, color, component, design-systems, minimal, modern, palette, patterns]
 quality_score: 70

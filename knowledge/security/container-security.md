@@ -2,7 +2,7 @@
 id: container-security
 title: 容器安全完整指南
 domain: security
-category: container-security.md
+category: 01-standards
 difficulty: intermediate
 tags: [container, layer, security, 主机安全, 容器安全分层, 概述, 编排安全, 网络安全]
 quality_score: 70

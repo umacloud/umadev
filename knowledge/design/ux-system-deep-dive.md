@@ -1,16 +1,14 @@
 ---
 id: ux-system-deep-dive
-title: ux-system-deep-dive
+title: 设计环节深度知识库
 domain: design
-category: ux-system-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [deep, design, dive, system, 设计环节深度知识库]
+tags: [ux, 用户体验, 交互设计, 设计流程, 可用性, design]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ux-system-deep-dive
-
-## 设计环节深度知识库
+# 设计环节深度知识库
 
 ### 目标
 - 建立可扩展、可复用、可验证的交互与视觉规范体系。

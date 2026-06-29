@@ -2,7 +2,7 @@
 id: dashboard
 title: Seed Template: Dashboard
 domain: seed-templates
-category: dashboard.md
+category: seed-templates
 difficulty: intermediate
 tags: [component, dashboard, gates, layout, page, patterns, quality, rules]
 quality_score: 70

@@ -1,16 +1,14 @@
 ---
 id: agent-evaluation-benchmark
-title: agent-evaluation-benchmark
+title: Agent 评测与基准体系
 domain: ai
-category: agent-evaluation-benchmark.md
+category: 01-standards
 difficulty: intermediate
-tags: [agent, ai, benchmark, evaluation, 评测与基准体系]
+tags: [agent, 评测, benchmark, evaluation, 基准集, 发布门禁, 回归评测, ai]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# agent-evaluation-benchmark
-
-## Agent 评测与基准体系
+# Agent 评测与基准体系
 
 ### 目标
 - 让 Agent 能力可量化、可回归、可持续优化。

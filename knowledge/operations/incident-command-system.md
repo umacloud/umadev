@@ -1,16 +1,14 @@
 ---
 id: incident-command-system
-title: incident-command-system
+title: 事故指挥体系（ICS）手册
 domain: operations
-category: incident-command-system.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [command, incident, operations, system]
+tags: [事故指挥, incident-command, ics, 应急响应, 值班, operations]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# incident-command-system
-
-## 事故指挥体系（ICS）手册
+# 事故指挥体系（ICS）手册
 
 ### 目标
 - 在生产事故中实现统一指挥、快速止损、清晰协同。

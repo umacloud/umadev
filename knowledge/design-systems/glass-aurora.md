@@ -2,7 +2,7 @@
 id: glass-aurora
 title: Glass Aurora
 domain: design-systems
-category: glass-aurora.md
+category: design-systems
 difficulty: intermediate
 tags: [glassmorphism, aurora, frosted, depth, ai, modern, gradient-controlled, design-systems, palette, patterns]
 quality_score: 72

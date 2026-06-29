@@ -2,7 +2,7 @@
 id: settings-page
 title: Seed Template: Settings / Account Page
 domain: seed-templates
-category: settings-page.md
+category: seed-templates
 difficulty: intermediate
 tags: [gates, page, quality, seed-templates, settings, structure]
 quality_score: 70

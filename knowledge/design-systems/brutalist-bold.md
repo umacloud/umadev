@@ -2,7 +2,7 @@
 id: brutalist-bold
 title: Brutalist Bold
 domain: design-systems
-category: brutalist-bold.md
+category: design-systems
 difficulty: intermediate
 tags: [brutalist, swiss, editorial, mono, high-contrast, oversized-type, design-systems, palette, patterns]
 quality_score: 72

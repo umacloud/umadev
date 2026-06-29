@@ -1,16 +1,14 @@
 ---
 id: data-governance-and-modeling-deep-dive
-title: data-governance-and-modeling-deep-dive
+title: 数据环节深度知识库
 domain: data
-category: data-governance-and-modeling-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [and, data, deep, dive, governance, modeling, 数据环节深度知识库]
+tags: [数据治理, data-governance, 数据建模, modeling, 数据质量, 元数据, data]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# data-governance-and-modeling-deep-dive
-
-## 数据环节深度知识库
+# 数据环节深度知识库
 
 ### 目标
 - 构建从数据采集、建模、质量、消费到治理的闭环体系。

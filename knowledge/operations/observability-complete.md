@@ -1,14 +1,14 @@
 ---
 id: observability-complete
-title: observability-complete
+title: 可观测性完整知识库
 domain: operations
-category: observability-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [complete, dashboard, observability, operations, 告警设计, 实施清单, 常见失败模式, 技术选型]
+tags: [可观测性, observability, 监控, 追踪, 日志, 告警, operations]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# observability-complete
+# 可观测性完整知识库
 
 ## 目标
 建立生产环境全链路可观测能力,实现故障快速定位、性能瓶颈精准识别、用户体验量化评估。

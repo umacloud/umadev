@@ -1,16 +1,14 @@
 ---
 id: adr-template-and-examples
-title: adr-template-and-examples
+title: ADR 模板与示例规范
 domain: architecture
-category: adr-template-and-examples.md
+category: 01-standards
 difficulty: intermediate
-tags: [adr, and, architecture, examples, template, 模板与示例规范]
+tags: [adr, 架构决策, decision-record, 模板, 技术选型, architecture]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# adr-template-and-examples
-
-## ADR 模板与示例规范
+# ADR 模板与示例规范
 
 ### 目标
 - 对关键架构决策形成可追溯记录，降低后续误解与返工。

@@ -1,16 +1,14 @@
 ---
 id: security-architecture-deep-dive
-title: security-architecture-deep-dive
+title: 安全环节深度知识库
 domain: security
-category: security-architecture-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [architecture, deep, dive, security, 安全环节深度知识库]
+tags: [安全架构, security-architecture, 纵深防御, 威胁建模, 零信任, security]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# security-architecture-deep-dive
-
-## 安全环节深度知识库
+# 安全环节深度知识库
 
 ### 目标
 - 形成从设计到运行期的全链路安全防护体系。

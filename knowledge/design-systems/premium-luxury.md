@@ -2,7 +2,7 @@
 id: premium-luxury
 title: Premium Luxury
 domain: design-systems
-category: premium-luxury.md
+category: design-systems
 difficulty: intermediate
 tags: [luxury, premium, refined, elegant, serif, dark, single-accent, generous-space, design-systems, palette, patterns]
 quality_score: 72

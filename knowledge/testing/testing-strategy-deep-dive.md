@@ -1,16 +1,14 @@
 ---
 id: testing-strategy-deep-dive
-title: testing-strategy-deep-dive
+title: 测试环节深度知识库
 domain: testing
-category: testing-strategy-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [deep, dive, strategy, testing, 测试环节深度知识库]
+tags: [测试策略, testing-strategy, 测试体系, 自动化测试, 质量, testing]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# testing-strategy-deep-dive
-
-## 测试环节深度知识库
+# 测试环节深度知识库
 
 ### 目标
 - 建立“快速反馈 + 高风险覆盖”的测试体系。

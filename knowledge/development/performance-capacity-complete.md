@@ -1,16 +1,14 @@
 ---
 id: performance-capacity-complete
-title: performance-capacity-complete
+title: 性能与容量完整知识库
 domain: development
-category: performance-capacity-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [capacity, complete, development, performance, 性能与容量完整知识库]
+tags: [性能, performance, 容量, capacity, 性能预算, 压测, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# performance-capacity-complete
-
-## 性能与容量完整知识库
+# 性能与容量完整知识库
 
 ### 1. 性能预算
 - 定义核心接口 P95、P99、吞吐量目标。

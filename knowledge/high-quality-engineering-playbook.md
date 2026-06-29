@@ -1,15 +1,13 @@
 ---
 id: high-quality-engineering-playbook
-title: high-quality-engineering-playbook
-domain: high-quality-engineering-playbook.md
+title: 高质量工程知识库（Web 全栈版）
+domain: development
 difficulty: intermediate
-tags: [engineering, high, high-quality-engineering-playbook.md, playbook, quality, 全栈版]
+tags: [高质量工程, engineering, web全栈, 工程规范, 全栈, development, 商业级]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# high-quality-engineering-playbook
-
-## 高质量工程知识库（Web 全栈版）
+# 高质量工程知识库（Web 全栈版）
 
 ### 1. 目标与范围
 - 本知识库面向商业级 Web 应用，覆盖需求澄清、架构设计、交互体验、工程质量、上线运维与复盘。

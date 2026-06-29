@@ -1,16 +1,14 @@
 ---
 id: engineering-effectiveness-complete
-title: engineering-effectiveness-complete
+title: 工程效能完整知识库
 domain: development
-category: engineering-effectiveness-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [complete, development, effectiveness, engineering, 工程效能完整知识库]
+tags: [工程效能, effectiveness, 研发效率, 流程标准化, devex, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# engineering-effectiveness-complete
-
-## 工程效能完整知识库
+# 工程效能完整知识库
 
 ### 1. 流程标准化
 - 从需求到发布定义统一流程节点。

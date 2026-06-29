@@ -1,16 +1,14 @@
 ---
 id: postmortem-and-response-deep-dive
-title: postmortem-and-response-deep-dive
+title: 事故响应与复盘深度知识库
 domain: incident
-category: postmortem-and-response-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [and, deep, dive, incident, postmortem, response, 事故响应与复盘深度知识库]
+tags: [事故响应, postmortem, 复盘, incident-response, 根因分析, incident]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# postmortem-and-response-deep-dive
-
-## 事故响应与复盘深度知识库
+# 事故响应与复盘深度知识库
 
 ### 目标
 - 把每次故障转化为可复用的组织能力，持续降低重复事故概率。

@@ -1,16 +1,14 @@
 ---
 id: knowledge-map
-title: knowledge-map
+title: 知识库地图（全环节）
 domain: 00-governance
-category: knowledge-map.md
+category: 00-governance
 difficulty: intermediate
-tags: [00-governance, knowledge, map]
+tags: [知识库, knowledge-base, 知识地图, index, 全环节, 治理, governance, 检索]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# knowledge-map
-
-## 知识库地图（全环节）
+# 知识库地图（全环节）
 
 ### 1. 目标
 - 建立可持续演进的项目知识系统，减少“只靠人记忆”带来的交付风险。

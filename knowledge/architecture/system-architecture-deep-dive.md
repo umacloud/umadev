@@ -1,16 +1,14 @@
 ---
 id: system-architecture-deep-dive
-title: system-architecture-deep-dive
+title: 架构环节深度知识库
 domain: architecture
-category: system-architecture-deep-dive.md
+category: 01-standards
 difficulty: intermediate
-tags: [architecture, deep, dive, system, 架构环节深度知识库]
+tags: [架构, system-architecture, 架构设计, 拆分, 演进, 技术选型, architecture]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# system-architecture-deep-dive
-
-## 架构环节深度知识库
+# 架构环节深度知识库
 
 ### 目标
 - 在性能、稳定性、可维护性与演进成本之间建立可持续平衡。

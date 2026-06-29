@@ -1,16 +1,14 @@
 ---
 id: knowledge-gates-execution
-title: knowledge-gates-execution
+title: 知识门禁执行手册
 domain: development
 category: 13-implementation-assets
 difficulty: intermediate
-tags: [development, execution, gates, knowledge, 知识门禁执行手册]
+tags: [知识门禁, gates, 执行, 落地, 治理, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# knowledge-gates-execution
-
-## 知识门禁执行手册
+# 知识门禁执行手册
 
 ### 目标
 - 把开发知识规则接入发布链路，避免知识与交付脱节。

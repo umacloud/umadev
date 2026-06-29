@@ -1,16 +1,14 @@
 ---
 id: database-engineering-complete
-title: database-engineering-complete
+title: 数据库工程完整知识库
 domain: development
-category: database-engineering-complete.md
+category: 01-standards
 difficulty: intermediate
-tags: [complete, database, development, engineering, 数据库工程完整知识库]
+tags: [数据库, database, 数据模型, 索引, 事务, 性能, development]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# database-engineering-complete
-
-## 数据库工程完整知识库
+# 数据库工程完整知识库
 
 ### 1. 数据模型设计
 - 核心表必须定义主键、唯一约束、审计字段。

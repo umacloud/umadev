@@ -1,16 +1,14 @@
 ---
 id: ai-data-security-and-compliance-playbook
-title: ai-data-security-and-compliance-playbook
+title: AI数据安全与合规作战手册
 domain: ai
-category: ai-data-security-and-compliance-playbook.md
+category: 02-playbooks
 difficulty: intermediate
-tags: [ai, ai数据安全与合规作战手册, and, compliance, data, playbook, security]
+tags: [数据安全, compliance, 合规, 脱敏, 审计日志, 数据治理, ai, security]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# ai-data-security-and-compliance-playbook
-
-## AI数据安全与合规作战手册
+# AI数据安全与合规作战手册
 
 ### 目标
 - 确保AI系统在数据采集、处理、存储、传输全链路满足安全与合规要求。
