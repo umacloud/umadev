@@ -5,8 +5,8 @@ domain: development
 category: 01-standards
 difficulty: intermediate
 tags: [agent, checklist, design, development, patterns, python, python特有模式, 创建型模式]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 92
+last_updated: 2026-06-29
 ---
 # Python设计模式完整知识体系
 

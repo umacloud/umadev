@@ -5,8 +5,8 @@ domain: frontend
 category: 01-standards
 difficulty: intermediate
 tags: [complete, frontend, hooks, react, typescript, 常见陷阱, 性能优化, 最佳实践]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 90
+last_updated: 2026-06-29
 ---
 # React Hooks 深度指南
 
@@ -327,12 +327,12 @@ function Parent() {
   const [count, setCount] = useState(0);
   const [text, setText] = useState('');
   
-  // ❌ 不好:每次渲染都创建新函数
+  // [避免] 不好:每次渲染都创建新函数
   // const handleClick = () => {
   //   console.log('Clicked');
   // };
   
-  // ✅ 好:缓存函数引用
+  // [推荐] 好:缓存函数引用
   const handleClick = useCallback(() => {
     console.log('Clicked');
   }, []);
@@ -360,12 +360,12 @@ function Parent() {
 import React, { useState, useMemo } from 'react';
 
 function ProductList({ products, filter, sortBy }) {
-  // ❌ 不好:每次渲染都重新计算
+  // [避免] 不好:每次渲染都重新计算
   // const filteredProducts = products
   //   .filter(p => p.name.includes(filter))
   //   .sort((a, b) => a[sortBy] - b[sortBy]);
   
-  // ✅ 好:缓存计算结果
+  // [推荐] 好:缓存计算结果
   const filteredProducts = useMemo(() => {
     console.log('重新计算过滤和排序');
     return products
@@ -837,26 +837,26 @@ function LoginForm() {
 ### 规则 1: 只在顶层调用 Hooks
 
 ```javascript
-// ❌ 错误:在循环中调用
+// [避免] 错误:在循环中调用
 function BadComponent({ items }) {
   items.forEach(item => {
     const [state, setState] = useState(item); // 错误!
   });
 }
 
-// ✅ 正确:在顶层调用
+// [推荐] 正确:在顶层调用
 function GoodComponent({ items }) {
   const [states, setStates] = useState(items);
 }
 
-// ❌ 错误:在条件语句中调用
+// [避免] 错误:在条件语句中调用
 function BadComponent({ condition }) {
   if (condition) {
     const [value, setValue] = useState(0); // 错误!
   }
 }
 
-// ✅ 正确:条件逻辑在 Hook 内部
+// [推荐] 正确:条件逻辑在 Hook 内部
 function GoodComponent({ condition }) {
   const [value, setValue] = useState(0);
   
@@ -871,12 +871,12 @@ function GoodComponent({ condition }) {
 ### 规则 2: 只在 React 函数中调用
 
 ```javascript
-// ❌ 错误:在普通函数中调用
+// [避免] 错误:在普通函数中调用
 function handleClick() {
   const [count, setCount] = useState(0); // 错误!
 }
 
-// ✅ 正确:在组件或自定义 Hook 中调用
+// [推荐] 正确:在组件或自定义 Hook 中调用
 function MyComponent() {
   const [count, setCount] = useState(0);
   
@@ -918,12 +918,12 @@ const ChildComponent = memo(({ data, onClick }) => {
 ### 2. 正确使用依赖数组
 
 ```javascript
-// ❌ 缺少依赖
+// [避免] 缺少依赖
 useEffect(() => {
   fetchData(userId);
 }, []); // 缺少 userId 依赖
 
-// ✅ 完整依赖
+// [推荐] 完整依赖
 useEffect(() => {
   fetchData(userId);
 }, [userId]);
@@ -932,7 +932,7 @@ useEffect(() => {
 ### 3. 避免内联函数和对象
 
 ```javascript
-// ❌ 每次渲染都创建新函数/对象
+// [避免] 每次渲染都创建新函数/对象
 function Parent() {
   const [count, setCount] = useState(0);
   
@@ -944,7 +944,7 @@ function Parent() {
   );
 }
 
-// ✅ 使用 useCallback 和 useMemo
+// [推荐] 使用 useCallback 和 useMemo
 function Parent() {
   const [count, setCount] = useState(0);
   
@@ -988,7 +988,7 @@ function VirtualizedList({ items }) {
 ### 陷阱 1: 闭包陷阱
 
 ```javascript
-// ❌ 错误:闭包捕获旧值
+// [避免] 错误:闭包捕获旧值
 function Counter() {
   const [count, setCount] = useState(0);
   
@@ -1000,7 +1000,7 @@ function Counter() {
   }, []);
 }
 
-// ✅ 正确:使用函数式更新
+// [推荐] 正确:使用函数式更新
 function Counter() {
   const [count, setCount] = useState(0);
   
@@ -1015,7 +1015,7 @@ function Counter() {
   }, []);
 }
 
-// ✅ 或使用 ref
+// [推荐] 或使用 ref
 function Counter() {
   const [count, setCount] = useState(0);
   const countRef = useRef(count);
@@ -1034,7 +1034,7 @@ function Counter() {
 ### 陷阱 2: 无限循环
 
 ```javascript
-// ❌ 错误:导致无限循环
+// [避免] 错误:导致无限循环
 function BadComponent() {
   const [items, setItems] = useState([]);
   
@@ -1043,7 +1043,7 @@ function BadComponent() {
   }, [items]); // 依赖 items,导致循环
 }
 
-// ✅ 正确:使用函数式更新
+// [推荐] 正确:使用函数式更新
 function GoodComponent() {
   const [items, setItems] = useState([]);
   
@@ -1056,11 +1056,11 @@ function GoodComponent() {
 ### 陷阱 3: 直接修改状态
 
 ```javascript
-// ❌ 错误:直接修改状态
+// [避免] 错误:直接修改状态
 const [user, setUser] = useState({ name: 'Alice' });
 user.name = 'Bob'; // 不会触发重新渲染
 
-// ✅ 正确:创建新对象
+// [推荐] 正确:创建新对象
 setUser({ ...user, name: 'Bob' });
 ```
 
@@ -1068,16 +1068,16 @@ setUser({ ...user, name: 'Bob' });
 
 ## 最佳实践
 
-1. **✅ 使用函数式更新**: `setCount(prev => prev + 1)`
-2. **✅ 保持依赖数组完整**: 使用 eslint-plugin-react-hooks
-3. **✅ 拆分复杂状态**: 多个 useState 而非一个巨大对象
-4. **✅ 自定义 Hook 复用逻辑**: 避免复制粘贴
-5. **✅ 命名规范**: use 开头的自定义 Hook
-6. **✅ 合理使用 useMemo/useCallback**: 不要过度优化
-7. **✅ 错误边界**: 处理渲染错误
-8. **✅ 清理副作用**: useEffect 返回清理函数
-9. **✅ 测试 Hooks**: 使用 @testing-library/react-hooks
-10. **✅ TypeScript 支持**: 为 Hook 添加类型
+1. **[推荐] 使用函数式更新**: `setCount(prev => prev + 1)`
+2. **[推荐] 保持依赖数组完整**: 使用 eslint-plugin-react-hooks
+3. **[推荐] 拆分复杂状态**: 多个 useState 而非一个巨大对象
+4. **[推荐] 自定义 Hook 复用逻辑**: 避免复制粘贴
+5. **[推荐] 命名规范**: use 开头的自定义 Hook
+6. **[推荐] 合理使用 useMemo/useCallback**: 不要过度优化
+7. **[推荐] 错误边界**: 处理渲染错误
+8. **[推荐] 清理副作用**: useEffect 返回清理函数
+9. **[推荐] 测试 Hooks**: 使用 @testing-library/react-hooks
+10. **[推荐] TypeScript 支持**: 为 Hook 添加类型
 
 ---
 

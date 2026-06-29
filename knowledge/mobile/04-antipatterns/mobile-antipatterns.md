@@ -2,17 +2,15 @@
 title: 移动开发反模式库
 category: mobile/antipatterns
 version: 1.0.0
-last_updated: 2026-03-20
-maintainer: Excellent（）
+last_updated: 2026-06-29
 knowledge_score: 9.0/10
 domain: mobile
 difficulty: intermediate
-quality_score: 70
+quality_score: 88
 ---
 
 # 移动开发反模式库
 
-## 移动开发反模式库
 
 ### 1. 性能反模式
 

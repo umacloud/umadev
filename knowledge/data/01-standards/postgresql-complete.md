@@ -5,8 +5,8 @@ domain: data
 category: 01-standards
 difficulty: intermediate
 tags: [complete, data, postgresql, 备份与恢复, 安全, 数据建模, 查询优化, 核心概念]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 92
+last_updated: 2026-06-29
 ---
 # PostgreSQL 数据工程完整指南
 
@@ -20,12 +20,12 @@ PostgreSQL 是世界上最先进的开源关系型数据库管理系统，具备
 
 | 场景 | 推荐度 | 说明 |
 |------|--------|------|
-| OLTP 业务系统 | ★★★★★ | 事务完整性、行级锁、外键约束 |
-| JSONB 文档存储 | ★★★★☆ | 替代部分 MongoDB 场景 |
-| 地理信息系统 | ★★★★★ | PostGIS 扩展 |
-| 全文搜索 | ★★★★☆ | tsvector/tsquery，中小规模可替代 ES |
-| 大规模 OLAP | ★★★☆☆ | 需配合 Citus / TimescaleDB 或分区表 |
-| 时序数据 | ★★★★☆ | TimescaleDB 扩展 |
+| OLTP 业务系统 | 5/5 | 事务完整性、行级锁、外键约束 |
+| JSONB 文档存储 | 4/5 | 替代部分 MongoDB 场景 |
+| 地理信息系统 | 5/5 | PostGIS 扩展 |
+| 全文搜索 | 4/5 | tsvector/tsquery，中小规模可替代 ES |
+| 大规模 OLAP | 3/5 | 需配合 Citus / TimescaleDB 或分区表 |
+| 时序数据 | 4/5 | TimescaleDB 扩展 |
 
 ### 1.2 版本选择
 

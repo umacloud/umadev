@@ -5,8 +5,8 @@ domain: data
 category: 01-standards
 difficulty: intermediate
 tags: [complete, data, redis, 分布式锁, 持久化, 核心数据结构, 概述, 消息队列]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 89
+last_updated: 2026-06-29
 ---
 # Redis 数据领域完整指南
 
@@ -1419,8 +1419,8 @@ def check_fragmentation():
 
 ```python
 # 1. KEYS 命令（生产禁用，用 SCAN 替代）
-# ❌ KEYS user:*           # O(N) 全量扫描，阻塞
-# ✅ SCAN 0 MATCH user:* COUNT 100
+# [避免] KEYS user:*           # O(N) 全量扫描，阻塞
+# [推荐] SCAN 0 MATCH user:* COUNT 100
 
 def scan_keys(pattern: str, count: int = 100):
     """安全扫描 key"""
@@ -1434,10 +1434,10 @@ def scan_keys(pattern: str, count: int = 100):
     return keys
 
 # 2. 连接泄漏（务必使用连接池）
-# ❌
+# [避免]
 r = redis.Redis(host="localhost")  # 每次新建连接
 
-# ✅
+# [推荐]
 pool = redis.ConnectionPool(host="localhost", port=6379, max_connections=50)
 r = redis.Redis(connection_pool=pool)
 
@@ -1445,20 +1445,20 @@ r = redis.Redis(connection_pool=pool)
 import json
 import pickle
 
-# ❌ pickle（安全风险 + 不可跨语言）
+# [避免] pickle（安全风险 + 不可跨语言）
 r.set("data", pickle.dumps(obj))
 
-# ✅ JSON（安全 + 可跨语言）
+# [推荐] JSON（安全 + 可跨语言）
 r.set("data", json.dumps(obj))
 
-# ✅ msgpack（更紧凑）
+# [推荐] msgpack（更紧凑）
 import msgpack
 r.set("data", msgpack.packb(obj))
 
 # 4. 过期时间丢失
 r.set("key", "value", ex=3600)
-r.set("key", "new_value")       # ⚠️ TTL 被清除！
-r.set("key", "new_value", keepttl=True)  # ✅ 保留 TTL (Redis 6.0+)
+r.set("key", "new_value")       # [注意] TTL 被清除！
+r.set("key", "new_value", keepttl=True)  # [推荐] 保留 TTL (Redis 6.0+)
 ```
 
 ---

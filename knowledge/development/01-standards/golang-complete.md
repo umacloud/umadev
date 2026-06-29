@@ -5,8 +5,8 @@ domain: development
 category: 01-standards
 difficulty: intermediate
 tags: [complete, development, golang, 并发模型, 性能优化, 接口设计, 标准库精选, 核心语法]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 91
+last_updated: 2026-06-29
 ---
 # Go 语言完整工程指南
 

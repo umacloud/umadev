@@ -5,8 +5,8 @@ domain: frontend
 category: 01-standards
 difficulty: intermediate
 tags: [complete, frontend, pinia, router, vue3, 响应式系统原理, 性能优化, 概述]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 91
+last_updated: 2026-06-29
 ---
 # Vue 3 完整知识体系
 

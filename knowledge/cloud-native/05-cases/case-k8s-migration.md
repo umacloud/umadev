@@ -11,10 +11,6 @@ quality_score: 70
 ---
 
 # 案例：Kubernetes 迁移
-# 功能：Kubernetes 迁移实战案例
-# 作用：分享传统应用到 Kubernetes 的迁移经验
-# 创建时间：2025-03-20
-# 最后修改：2025-03-20
 
 ## 背景
 

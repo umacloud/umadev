@@ -11,10 +11,6 @@ quality_score: 70
 ---
 
 # Serverless 模式作战手册
-# 功能：Serverless 架构模式作战手册
-# 作用：指导 Knative、云函数等 Serverless 实践
-# 创建时间：2025-03-20
-# 最后修改：2025-03-20
 
 ## 目标
 

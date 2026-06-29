@@ -5,8 +5,8 @@ domain: security
 category: 01-standards
 difficulty: intermediate
 tags: [access, broken, complete, contents, control, cryptographic, failures, injection]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 93
+last_updated: 2026-06-29
 ---
 # OWASP Top 10 (2021) Complete Security Standards
 

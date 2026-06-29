@@ -5,8 +5,8 @@ domain: data-engineering
 category: 01-standards
 difficulty: intermediate
 tags: [complete, connect, data-engineering, kafka, schema管理, streams, 核心概念, 概述]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 90
+last_updated: 2026-06-29
 ---
 # Apache Kafka完整指南
 
@@ -672,12 +672,12 @@ message OrderEvent {
 └──────────────────┴──────────────────────────────────────────┘
 
 安全的Schema演进操作:
-✅ 添加带默认值的字段(BACKWARD兼容)
-✅ 删除带默认值的字段(FORWARD兼容)
-✅ 添加可选字段(FULL兼容)
-❌ 删除必需字段(破坏BACKWARD)
-❌ 修改字段类型(破坏所有兼容性)
-❌ 重命名字段(破坏所有兼容性)
+[推荐] 添加带默认值的字段(BACKWARD兼容)
+[推荐] 删除带默认值的字段(FORWARD兼容)
+[推荐] 添加可选字段(FULL兼容)
+[避免] 删除必需字段(破坏BACKWARD)
+[避免] 修改字段类型(破坏所有兼容性)
+[避免] 重命名字段(破坏所有兼容性)
 ```
 
 ```bash
@@ -1339,11 +1339,11 @@ kafka-reassign-partitions.sh --bootstrap-server localhost:9092 \
   4. 检查下游依赖(DB/缓存/HTTP)的响应时间
 
 解决方案:
-  ✅ 增加消费者实例(不超过分区数)
-  ✅ 减小max.poll.records, 增大max.poll.interval.ms
-  ✅ 异步处理: poll后放入本地队列, 多线程处理
-  ✅ 优化下游调用(批量写DB/连接池/缓存)
-  ❌ 盲目增加分区数(需要同时增加消费者才有效)
+  [推荐] 增加消费者实例(不超过分区数)
+  [推荐] 减小max.poll.records, 增大max.poll.interval.ms
+  [推荐] 异步处理: poll后放入本地队列, 多线程处理
+  [推荐] 优化下游调用(批量写DB/连接池/缓存)
+  [避免] 盲目增加分区数(需要同时增加消费者才有效)
 ```
 
 ### 2. Rebalance风暴
@@ -1357,11 +1357,11 @@ kafka-reassign-partitions.sh --bootstrap-server localhost:9092 \
   - GC暂停超过session.timeout.ms
 
 解决方案:
-  ✅ 使用CooperativeStickyAssignor(增量Rebalance)
-  ✅ 增大session.timeout.ms(30-60s)
-  ✅ 增大max.poll.interval.ms(5-10min)
-  ✅ 减小max.poll.records, 确保处理时间可控
-  ✅ 设置group.instance.id启用静态成员(避免重启触发Rebalance)
+  [推荐] 使用CooperativeStickyAssignor(增量Rebalance)
+  [推荐] 增大session.timeout.ms(30-60s)
+  [推荐] 增大max.poll.interval.ms(5-10min)
+  [推荐] 减小max.poll.records, 确保处理时间可控
+  [推荐] 设置group.instance.id启用静态成员(避免重启触发Rebalance)
 
 # 静态成员配置(Kafka 2.3+)
 group.instance.id=consumer-host-1  # 每个实例唯一
@@ -1381,10 +1381,10 @@ session.timeout.ms=60000           # 可以设更长(静态成员离开不立即
   - 生产者内存增加(每分区一个RecordBatch缓冲)
 
 建议:
-  ✅ 单集群分区总数 < 200,000(KRaft模式可更多)
-  ✅ 单Broker分区数 < 4,000
-  ✅ 根据实际吞吐需求规划, 预留20-30%余量
-  ❌ 不要盲目设置大量分区(分区数只增不减)
+  [推荐] 单集群分区总数 < 200,000(KRaft模式可更多)
+  [推荐] 单Broker分区数 < 4,000
+  [推荐] 根据实际吞吐需求规划, 预留20-30%余量
+  [避免] 不要盲目设置大量分区(分区数只增不减)
 ```
 
 ### 4. 消息丢失

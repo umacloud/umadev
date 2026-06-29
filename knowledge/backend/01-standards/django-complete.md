@@ -5,8 +5,8 @@ domain: backend
 category: 01-standards
 difficulty: intermediate
 tags: [backend, complete, django, framework, rest, 中间件, 数据库迁移, 概述]
-quality_score: 70
-last_updated: 2026-06-15
+quality_score: 91
+last_updated: 2026-06-29
 ---
 # Django 完整指南
 

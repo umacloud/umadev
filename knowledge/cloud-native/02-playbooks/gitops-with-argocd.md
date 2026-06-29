@@ -11,10 +11,6 @@ quality_score: 70
 ---
 
 # GitOps ArgoCD 作战手册
-# 功能：GitOps 与 ArgoCD 实施作战手册
-# 作用：指导使用 ArgoCD 实现声明式持续部署
-# 创建时间：2025-03-20
-# 最后修改：2025-03-20
 
 ## 目标
 

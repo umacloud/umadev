@@ -2,17 +2,15 @@
 title: 移动应用发布检查清单
 category: mobile/checklists
 version: 1.0.0
-last_updated: 2026-03-20
-maintainer: Excellent（）
+last_updated: 2026-06-29
 knowledge_score: 9.1/10
 domain: mobile
 difficulty: intermediate
-quality_score: 70
+quality_score: 85
 ---
 
 # 移动应用发布检查清单
 
-## 移动应用发布检查清单
 
 ### 一、功能完整性检查
 
