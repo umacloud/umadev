@@ -2929,13 +2929,10 @@ impl App {
     /// the palette + help are localized from one string per command.
     pub const COMMANDS: &'static [SlashCommand] = &[
         // ── Worker / brain ────────────────────────────────────────────────
-        Self::cmd(
-            "claude",
-            &["claude-code"],
-            None,
-            CmdGroup::Worker,
-            "tui.cmd.claude",
-        ),
+        // `/claude` switches to the claude-code base. No `claude-code` alias — it
+        // was redundant with the shorter `/claude` (the backend id stays
+        // "claude-code" internally; a mistyped `/claude-code` gets did-you-mean).
+        Self::cmd("claude", &[], None, CmdGroup::Worker, "tui.cmd.claude"),
         Self::cmd("codex", &[], None, CmdGroup::Worker, "tui.cmd.codex"),
         Self::cmd("opencode", &[], None, CmdGroup::Worker, "tui.cmd.opencode"),
         Self::cmd(
