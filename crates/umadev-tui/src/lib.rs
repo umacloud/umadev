@@ -4654,6 +4654,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         // revise see it, then build the run options for
                                         // this director build with the requirement set.
                                         app.requirement.clone_from(&req);
+                                        // Register the director build as a background task
+                                        // the instant it starts (the director path emits no
+                                        // `PipelineStarted`), so `/tasks` shows it and the
+                                        // second-run guard sees it before the plan posts.
+                                        app.register_run_task(&req);
                                         let mut run_opts = current_run_options(app, &opts);
                                         run_opts.requirement = req;
                                         let autonomous = continuous_autonomous(run_opts.mode);
@@ -4728,6 +4733,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     // (not `plan_light`), so routing `/quick` through it
                                     // could silently run the FULL pipeline and break the
                                     // forced-lean promise; we keep the forced-Light block.
+                                    // Surface the fast track as a background task too
+                                    // (idempotent if the Light block also emits
+                                    // `PipelineStarted`).
+                                    app.register_run_task(&task);
                                     let run_opts = RunOptions {
                                         project_root: opts.project_root.clone(),
                                         requirement: task,

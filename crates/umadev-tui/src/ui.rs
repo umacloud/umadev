@@ -4759,6 +4759,24 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         ("·".into(), theme::BORDER()),
         (mode_chip.into(), mode_color),
     ];
+    // Compact background-run chip — the active mutating run surfaced as a
+    // manageable task, so a `/run` reads as a steerable background task (`/tasks`
+    // to manage) rather than a modal lock-out. `[run X/Y]` once a plan posts, else
+    // a plain `[run]` while the brain is still synthesising the plan. Emoji-free
+    // bracket-tag style matching the [gate] / [queued] markers.
+    if let Some(task) = app.active_task() {
+        parts.push(("·".into(), theme::BORDER()));
+        let chip = if task.total > 0 {
+            umadev_i18n::tf(
+                app.lang,
+                "tui.chip.run",
+                &[&task.done.to_string(), &task.total.to_string()],
+            )
+        } else {
+            umadev_i18n::t(app.lang, "tui.chip.run_indeterminate").into()
+        };
+        parts.push((chip, theme::INFO()));
+    }
     // Persistent "queued N" chip — stays visible the whole time input is parked
     // (a routed turn still in flight, or a steer waiting on a gate), so the user
     // never has to remember a one-off System note that has since scrolled away.

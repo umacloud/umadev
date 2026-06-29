@@ -542,6 +542,25 @@ mod tests {
             "constitution.edit_hint",
             "constitution.generated",
             "tui.cmd.constitution",
+            // Background-run task registry + `/tasks` management surface: the
+            // second-run guard, the list/stop/resume prose, the per-row status
+            // labels, the command desc, and the compact `[run X/Y]` meta chip.
+            "run.already_active",
+            "tasks.empty",
+            "tasks.header",
+            "tasks.untitled",
+            "tasks.actions_hint",
+            "tasks.none_active",
+            "tasks.already_running",
+            "tasks.nothing_to_resume",
+            "tasks.usage",
+            "tasks.status.running",
+            "tasks.status.done",
+            "tasks.status.failed",
+            "tasks.status.stopped",
+            "tui.cmd.tasks",
+            "tui.chip.run",
+            "tui.chip.run_indeterminate",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

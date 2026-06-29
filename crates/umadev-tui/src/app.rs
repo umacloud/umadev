@@ -31,6 +31,10 @@ use crate::config::UserConfig;
 
 /// Max lines kept in the chat history (older lines roll off).
 const HISTORY_CAP: usize = 1000;
+/// Max background-run tasks kept in the registry. Single-writer means at most one
+/// is live; the rest are recent finished/stopped history rows shown by `/tasks`.
+/// The oldest settled task is dropped once the registry exceeds this.
+const TASKS_CAP: usize = 12;
 /// A Host/UmaDev text body (or a tool result) past this many SOURCE lines is
 /// foldable: the renderer shows a head-N preview + a `… N more lines` summary
 /// until the user expands it (Ctrl+R). This is what stops a single 998-line base
@@ -295,6 +299,62 @@ pub struct PlanStepRow {
     /// Current status id: `pending` / `active` / `done` / `blocked`. Any other
     /// value renders as a neutral pending dot (fail-open).
     pub status: String,
+}
+
+/// Lifecycle status of a background run task tracked by the [`App`] task
+/// registry. A workspace-mutating run is single-writer, so at most one task is
+/// [`Running`](Self::Running) at a time; the rest are settled history rows.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum TaskStatus {
+    /// The run is in flight (driving the base session / paused at a gate).
+    Running,
+    /// The run reached a clean terminal outcome (delivery / agentic build done).
+    Done,
+    /// The run ended by aborting / hard-stopping (an error, not a user cancel).
+    Failed,
+    /// The user cancelled the run (`/cancel`, `/tasks stop`, Esc/Ctrl-C).
+    Stopped,
+}
+
+impl TaskStatus {
+    /// i18n key for the localized one-word status label rendered by `/tasks`.
+    #[must_use]
+    pub fn label_key(self) -> &'static str {
+        match self {
+            TaskStatus::Running => "tasks.status.running",
+            TaskStatus::Done => "tasks.status.done",
+            TaskStatus::Failed => "tasks.status.failed",
+            TaskStatus::Stopped => "tasks.status.stopped",
+        }
+    }
+
+    /// Whether this is a live (non-settled) status — exactly [`Running`](Self::Running).
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        matches!(self, TaskStatus::Running)
+    }
+}
+
+/// One background run in the task registry — the manageable surface that turns a
+/// `/run` from a modal "pipeline running" lock-out into a steerable task the user
+/// can list, stop, and resume via `/tasks` while they keep scrolling / chatting.
+///
+/// Single-writer (the run-lock) means only one mutating run is `Running` at a
+/// time; finished tasks are kept as a short history (capped by [`TASKS_CAP`]).
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BackgroundTask {
+    /// Stable, short display id (`t1`, `t2`, …) minted when the run registers.
+    pub id: String,
+    /// The run's requirement, trimmed to a one-line summary for the list.
+    pub requirement: String,
+    /// Current lifecycle status.
+    pub status: TaskStatus,
+    /// When the run was registered — for the live elapsed readout.
+    pub started_at: std::time::Instant,
+    /// Completed plan steps (the `X` in `X/Y`); `0` until a plan posts.
+    pub done: usize,
+    /// Total plan steps (the `Y` in `X/Y`); `0` until a plan posts.
+    pub total: usize,
 }
 
 /// One reviewing seat's verdict in the collapsible team-review panel (Wave 1
@@ -1409,6 +1469,17 @@ pub struct App {
     /// longer masquerades as idle "ready / 0/9". Cleared when a new run starts.
     pub aborted: bool,
 
+    /// Background-run **task registry**: the active mutating run (if any) plus a
+    /// short history of recent finished/stopped ones. A `/run` registers a
+    /// [`TaskStatus::Running`] task here so it reads as a manageable background
+    /// task (listed / stopped / resumed via `/tasks`) instead of a modal
+    /// lock-out. Single-writer (the run-lock) keeps at most one `Running` task;
+    /// the rest are settled rows, capped to [`TASKS_CAP`]. Newest is last.
+    pub tasks: Vec<BackgroundTask>,
+    /// Monotonic counter minting the short display id (`t1`, `t2`, …) for each
+    /// registered task. Never reset within a session.
+    pub task_seq: u64,
+
     /// **Feature A — completion notification.** When `false`, the terminal bell
     /// is silenced (env `UMADEV_BELL=0` / `false` / `off` / `no`). Default `true`.
     /// Read once at construction so a test can flip the field directly without
@@ -1782,6 +1853,8 @@ impl App {
             finished: false,
             run_started: false,
             aborted: false,
+            tasks: Vec::new(),
+            task_seq: 0,
             bell_enabled: bell_enabled_from_env(std::env::var("UMADEV_BELL").ok().as_deref()),
             bell_pending: false,
             bell_count: 0,
@@ -2449,6 +2522,122 @@ impl App {
         self.run_started && !self.finished && !self.aborted
     }
 
+    // ---- background-run task registry ------------------------------------
+
+    /// `true` when a workspace-mutating run is in flight by ANY path: the legacy
+    /// pipeline (`is_pipeline_active`), the director/agentic build
+    /// (`agentic_in_flight`), or a live registry task. The single source of truth
+    /// for the second-run guard (`/run` / `/goal` / `/quick` while one is active)
+    /// and `/tasks stop`. Fail-open: a stale flag only over-reports "busy", which
+    /// politely rejects rather than risking two writers on the workspace.
+    #[must_use]
+    pub fn has_active_run(&self) -> bool {
+        self.is_pipeline_active() || self.agentic_in_flight || self.active_task().is_some()
+    }
+
+    /// The live (`Running`) registry task, if any. At most one exists at a time
+    /// (single-writer).
+    #[must_use]
+    pub fn active_task(&self) -> Option<&BackgroundTask> {
+        self.tasks.iter().rev().find(|t| t.status.is_active())
+    }
+
+    /// Mutable handle to the live (`Running`) registry task, if any.
+    fn active_task_mut(&mut self) -> Option<&mut BackgroundTask> {
+        self.tasks.iter_mut().rev().find(|t| t.status.is_active())
+    }
+
+    /// **Ensure** a live background-run task exists for the run that's starting.
+    /// Idempotent: if a `Running` task is already live (e.g. a `/run` that posted
+    /// its plan, then a gate-anchored `Continue` block re-emits `PipelineStarted`)
+    /// it is REUSED — its summary is filled in if it was empty — so one logical
+    /// run is one task. Otherwise a fresh task is minted with a new id and the
+    /// oldest settled row is dropped past [`TASKS_CAP`]. Fail-open: pure state.
+    pub fn register_run_task(&mut self, requirement: &str) {
+        let summary = task_summary(requirement);
+        if let Some(active) = self.active_task_mut() {
+            if active.requirement.is_empty() && !summary.is_empty() {
+                active.requirement = summary;
+            }
+            return;
+        }
+        self.task_seq += 1;
+        self.tasks.push(BackgroundTask {
+            id: format!("t{}", self.task_seq),
+            requirement: summary,
+            status: TaskStatus::Running,
+            started_at: std::time::Instant::now(),
+            done: 0,
+            total: 0,
+        });
+        // Drop the oldest SETTLED row(s) once over cap — never evict the live one.
+        while self.tasks.len() > TASKS_CAP {
+            if let Some(pos) = self.tasks.iter().position(|t| !t.status.is_active()) {
+                self.tasks.remove(pos);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Refresh the live task's `done/total` from the current plan checklist so
+    /// `/tasks` and the compact `[run X/Y]` chip track real progress. No-op when
+    /// no task is live (fail-open).
+    fn sync_active_task_progress(&mut self) {
+        let done = self
+            .plan_steps
+            .iter()
+            .filter(|s| s.status == "done")
+            .count();
+        let total = self.plan_steps.len();
+        if let Some(active) = self.active_task_mut() {
+            active.done = done;
+            active.total = total;
+        }
+    }
+
+    /// Settle the live task to a terminal `status` (Done / Failed / Stopped). The
+    /// single chokepoint every run-terminal path funnels through. No-op when no
+    /// task is live, so a plain chat turn's terminal cleanup never invents one.
+    fn mark_active_task(&mut self, status: TaskStatus) {
+        if let Some(active) = self.active_task_mut() {
+            active.status = status;
+        }
+    }
+
+    /// Render the `/tasks` list body: the live run (if any) plus recent settled
+    /// rows, each `[status] id · requirement · X/Y · elapsed`. Empty registry →
+    /// the localized "no tasks yet" line.
+    #[must_use]
+    fn render_tasks(&self) -> String {
+        if self.tasks.is_empty() {
+            return umadev_i18n::t(self.lang, "tasks.empty").to_string();
+        }
+        let mut body = umadev_i18n::t(self.lang, "tasks.header").to_string();
+        // Newest first so the live run is on top.
+        for t in self.tasks.iter().rev() {
+            let label = umadev_i18n::t(self.lang, t.status.label_key());
+            let progress = if t.total > 0 {
+                format!(" · {}/{}", t.done, t.total)
+            } else {
+                String::new()
+            };
+            let elapsed = fmt_elapsed(t.started_at.elapsed().as_secs());
+            let req = if t.requirement.is_empty() {
+                umadev_i18n::t(self.lang, "tasks.untitled").to_string()
+            } else {
+                t.requirement.clone()
+            };
+            body.push_str(&format!(
+                "\n  [{label}] {} · {req}{progress} · {elapsed}",
+                t.id
+            ));
+        }
+        body.push('\n');
+        body.push_str(umadev_i18n::t(self.lang, "tasks.actions_hint"));
+        body
+    }
+
     /// `true` when the interrupt is ARMED (a first Esc landed recently) — a second
     /// Esc within the window cancels the run. The window auto-expires so a stray
     /// single Esc just shows the hint briefly and is forgotten.
@@ -2470,6 +2659,8 @@ impl App {
         // timers are cleared, gated on how long the run had been going.
         self.arm_completion_bell(self.run_started_at.or(self.thinking_started));
         self.aborted = true;
+        // The run errored out (not a user cancel) → its task is a Failed row.
+        self.mark_active_task(TaskStatus::Failed);
         self.active_gate = None;
         self.run_started_at = None;
         self.phase_started_at = None;
@@ -3197,6 +3388,13 @@ impl App {
             CmdGroup::Pipeline,
             "tui.cmd.cancel",
         ),
+        Self::cmd(
+            "tasks",
+            &["task"],
+            Some("[stop|resume]"),
+            CmdGroup::Pipeline,
+            "tui.cmd.tasks",
+        ),
         Self::cmd("init", &[], None, CmdGroup::Pipeline, "tui.help.pipe.init"),
         Self::cmd("adopt", &[], None, CmdGroup::Pipeline, "tui.cmd.adopt"),
         Self::cmd(
@@ -3824,6 +4022,13 @@ impl App {
         // and seals any open review round (a re-plan starts a clean review cycle).
         self.plan_collapsed = false;
         self.critic_round_open = false;
+        // The director path posts a plan WITHOUT a `PipelineStarted` (it set
+        // `agentic_in_flight` directly in the event loop), so a posted plan is the
+        // reliable "a build is live" signal here — ensure a task exists and seed
+        // its progress. Idempotent: a task already registered for this run is
+        // reused, never duplicated.
+        self.register_run_task(&self.requirement.clone());
+        self.sync_active_task_progress();
         if total > 0 {
             self.push(
                 ChatRole::UmaDev,
@@ -3859,6 +4064,8 @@ impl App {
                 status: status.to_string(),
             });
         }
+        // Reflect the tick into the live registry task's X/Y progress.
+        self.sync_active_task_progress();
     }
 
     /// Record one reviewing seat's verdict for the **collapsible team-review
@@ -3943,6 +4150,9 @@ impl App {
                 self.slug = slug;
                 self.requirement.clone_from(&requirement);
                 self.run_started = true;
+                // Surface the run as a manageable background task (idempotent — a
+                // gate-anchored `Continue` block re-emits this and REUSES the task).
+                self.register_run_task(&requirement);
                 // A fresh block clears any prior aborted terminal state — this
                 // run is live again.
                 self.aborted = false;
@@ -4130,6 +4340,8 @@ impl App {
                     // (gated on the run's elapsed, before the timer is cleared).
                     self.arm_completion_bell(self.run_started_at);
                     self.finished = true;
+                    // The run delivered cleanly → settle its task as Done.
+                    self.mark_active_task(TaskStatus::Done);
                     // A message queued during a late phase (after both gates)
                     // never hit a gap — surface it rather than silently drop it,
                     // so the user knows to resend now that the run is done.
@@ -5471,6 +5683,9 @@ impl App {
         // A failed director run does NOT hand a session back to chat (there is no
         // settled build session to continue) — just clear the in-flight marker.
         self.director_run_in_flight = false;
+        // Settle the live task as Failed (a no-op for a plain chat-route failure,
+        // which never registered a task).
+        self.mark_active_task(TaskStatus::Failed);
         self.refresh_status();
         self.push(ChatRole::System, note);
     }
@@ -5531,6 +5746,8 @@ impl App {
         self.director_run_in_flight = false;
         if director_build {
             self.run_session_handed_to_chat = true;
+            // The director build settled cleanly → mark its task Done.
+            self.mark_active_task(TaskStatus::Done);
         }
         self.refresh_status();
         let reply = reply.trim().to_string();
@@ -5868,6 +6085,8 @@ impl App {
         self.pending_quit_confirm = false;
         // The aborted task has now fully wound down — leave the "stopping…" state.
         self.cancelling = false;
+        // A user cancel settles the live task as Stopped (resumable via /tasks).
+        self.mark_active_task(TaskStatus::Stopped);
         self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.cancelled"));
     }
 
@@ -6293,6 +6512,7 @@ impl App {
                 }
             }
             "redo" => self.slash_redo(rest),
+            "tasks" => self.slash_tasks(rest),
             "checkpoint" => self.slash_checkpoint(rest),
             "rewind" => self.slash_rewind(rest),
             "config" => {
@@ -6774,10 +6994,15 @@ impl App {
     }
 
     fn slash_run(&mut self, arg: &str) -> Action {
-        if self.is_pipeline_active() {
+        // Single-writer guard: only ONE workspace-mutating run at a time. A second
+        // `/run` while one is live is politely rejected (never silently starts a
+        // second writer / leaks the running task) and points at the `/tasks`
+        // surface to see + stop it. Covers BOTH the legacy pipeline and the
+        // director/agentic build via `has_active_run`.
+        if self.has_active_run() {
             self.push(
                 ChatRole::System,
-                umadev_i18n::t(self.lang, "run.busy_reopen"),
+                umadev_i18n::t(self.lang, "run.already_active"),
             );
             return Action::None;
         }
@@ -6821,6 +7046,76 @@ impl App {
         Action::StartRun(req)
     }
 
+    /// `/tasks [stop|resume]` — the background-run management surface.
+    ///
+    /// - bare `/tasks` lists the live run (if any) plus a short history of recent
+    ///   finished/stopped runs with their status + `X/Y` progress + elapsed.
+    /// - `/tasks stop` cancels the live run (reuses the canonical `/cancel`
+    ///   path → [`Action::Cancel`], so the single-writer drain/cleanup is
+    ///   identical; the task settles to `Stopped`).
+    /// - `/tasks resume` re-attaches to a persisted, resumable run (reuses the
+    ///   `/continue` resume path → [`Action::ResumeRun`]).
+    ///
+    /// Fail-open: an unknown subcommand shows usage; stop/resume with nothing to
+    /// act on report it instead of erroring.
+    fn slash_tasks(&mut self, arg: &str) -> Action {
+        let sub = arg
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match sub.as_str() {
+            "" => {
+                let body = self.render_tasks();
+                self.push(ChatRole::System, body);
+                Action::None
+            }
+            "stop" | "cancel" => {
+                // Reuse the canonical interrupt path so the run-lock drain +
+                // cleanup are byte-for-byte the cancel behaviour (the event loop
+                // aborts the run task; `cancel_run` settles the task to Stopped).
+                if self.has_active_run() {
+                    Action::Cancel
+                } else {
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "tasks.none_active"),
+                    );
+                    Action::None
+                }
+            }
+            "resume" | "continue" => {
+                if self.has_active_run() {
+                    // A run is already live — resuming would be a second writer.
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "tasks.already_running"),
+                    );
+                    Action::None
+                } else if !self.finished && umadev_agent::has_resumable_run(&self.project_root) {
+                    // Re-attach to the persisted plan + drive the remaining steps
+                    // (the same RESUME the `/continue` cross-session path uses).
+                    let req = self.resume_run_requirement();
+                    self.push(
+                        ChatRole::UmaDev,
+                        umadev_i18n::t(self.lang, "continue.resuming"),
+                    );
+                    Action::ResumeRun(req)
+                } else {
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "tasks.nothing_to_resume"),
+                    );
+                    Action::None
+                }
+            }
+            _ => {
+                self.push(ChatRole::System, umadev_i18n::t(self.lang, "tasks.usage"));
+                Action::None
+            }
+        }
+    }
+
     /// `/goal <objective>` — start a GOAL-DRIVEN director build: drive the borrowed
     /// brain toward `<objective>` until it's met (Claude Code's native persistent
     /// `/goal` mode on a capable base; a "don't stop early" prompt fallback on the
@@ -6833,10 +7128,10 @@ impl App {
     /// `/run`, so the hardened interaction (streaming / alive / ESC / queue / memory)
     /// is identical.
     fn slash_goal(&mut self, arg: &str) -> Action {
-        if self.is_pipeline_active() {
+        if self.has_active_run() {
             self.push(
                 ChatRole::System,
-                umadev_i18n::t(self.lang, "goal.busy_reopen"),
+                umadev_i18n::t(self.lang, "run.already_active"),
             );
             return Action::None;
         }
@@ -7229,8 +7524,11 @@ impl App {
     /// runs a lean single shot (spec-lite -> implement -> quality, no gates) for
     /// a trivial change. Mirrors [`Self::slash_run`]'s guards.
     fn slash_quick(&mut self, arg: &str) -> Action {
-        if self.is_pipeline_active() {
-            self.push(ChatRole::System, umadev_i18n::t(self.lang, "quick.busy"));
+        if self.has_active_run() {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "run.already_active"),
+            );
             return Action::None;
         }
         let task = arg.trim();
@@ -10459,6 +10757,25 @@ fn fmt_elapsed(secs: u64) -> String {
     }
 }
 
+/// Trim a (possibly multi-line) run requirement to a single-line summary for the
+/// `/tasks` list + the compact run chip: the first non-empty line, clipped to a
+/// readable length on a char boundary (CJK-safe) with an ellipsis when cut.
+fn task_summary(requirement: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let first = requirement
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim();
+    if first.chars().count() > MAX_CHARS {
+        let head: String = first.chars().take(MAX_CHARS).collect();
+        format!("{head}…")
+    } else {
+        first.to_string()
+    }
+}
+
 fn walkdir_count_md_inner(d: &std::path::Path, c: &mut usize, depth: usize) {
     if depth > 6 {
         return;
@@ -11740,6 +12057,202 @@ mod tests {
         });
         assert_eq!(app.plan_steps.len(), 4);
         assert_eq!(app.plan_steps[3].id, "s9");
+    }
+
+    // ---- background-run task registry + /tasks ----------------------------
+
+    #[test]
+    fn run_registers_a_running_task_and_tracks_step_progress() {
+        let mut app = fresh_app(Some("offline"));
+        // A started run (legacy path emits PipelineStarted) registers a live task.
+        app.apply_engine(EngineEvent::PipelineStarted {
+            slug: "demo".into(),
+            requirement: "build a todo app with login".into(),
+        });
+        let t = app.active_task().expect("a Running task is registered");
+        assert_eq!(t.status, TaskStatus::Running);
+        assert!(t.requirement.contains("todo app"));
+        assert_eq!((t.done, t.total), (0, 0));
+        // A posted plan + a step tick drive the X/Y progress.
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec![
+                "s1 · scaffold (frontend)".into(),
+                "s2 · login route (backend)".into(),
+                "s3 · login form (frontend)".into(),
+            ],
+            done: 0,
+            total: 3,
+        });
+        let t = app.active_task().unwrap();
+        assert_eq!((t.done, t.total), (0, 3), "total seeded from the plan");
+        app.apply_engine(EngineEvent::PlanStepStatus {
+            id: "s1".into(),
+            title: "scaffold".into(),
+            status: "done".into(),
+        });
+        let t = app.active_task().unwrap();
+        assert_eq!((t.done, t.total), (1, 3), "a done step advances progress");
+        // Still exactly ONE task (idempotent: PipelineStarted + PlanPosted reuse it).
+        assert_eq!(app.tasks.len(), 1);
+    }
+
+    #[test]
+    fn director_path_registers_a_task_from_a_posted_plan() {
+        // The director build emits NO PipelineStarted — a posted plan is the
+        // "a build is live" signal that must still register the task.
+        let mut app = fresh_app(Some("offline"));
+        app.requirement = "做一个登录页".into();
+        app.apply_engine(EngineEvent::PlanPosted {
+            steps: vec!["s1 · 登录页 (frontend)".into()],
+            done: 0,
+            total: 1,
+        });
+        let t = app.active_task().expect("plan post registers a task");
+        assert_eq!(t.status, TaskStatus::Running);
+        assert!(t.requirement.contains("登录页"));
+    }
+
+    #[test]
+    fn tasks_command_lists_the_active_run() {
+        let mut app = fresh_app(Some("offline"));
+        app.register_run_task("build a blog engine");
+        let before = app.history.len();
+        let action = app.slash_tasks("");
+        assert!(matches!(action, Action::None));
+        assert!(
+            app.history
+                .iter()
+                .skip(before)
+                .any(|m| m.body().contains("build a blog engine")),
+            "the list names the active run"
+        );
+    }
+
+    #[test]
+    fn tasks_stop_cancels_the_active_run_then_marks_it_stopped() {
+        let mut app = fresh_app(Some("offline"));
+        app.register_run_task("build a wiki");
+        // The director run set this; has_active_run sees it.
+        app.agentic_in_flight = true;
+        let action = app.slash_tasks("stop");
+        assert_eq!(action, Action::Cancel, "/tasks stop reuses the cancel path");
+        // The event loop's cancel completes via cancel_run, settling the task.
+        app.cancel_run();
+        let t = app.tasks.last().unwrap();
+        assert_eq!(t.status, TaskStatus::Stopped);
+        assert!(app.active_task().is_none(), "no live task after a stop");
+    }
+
+    #[test]
+    fn tasks_resume_with_a_resumable_run_triggers_resume_run() {
+        let mut app = fresh_app(Some("claude-code"));
+        // Persist a plan + workflow-state exactly as an interrupted /run leaves.
+        let plan = umadev_agent::Plan {
+            steps: vec![umadev_agent::PlanStep {
+                id: "a".into(),
+                title: "build the login page".into(),
+                seat: umadev_agent::Seat::FrontendEngineer,
+                kind: umadev_agent::StepKind::Build,
+                depends_on: vec![],
+                acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+                status: umadev_agent::StepStatus::Pending,
+            }],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.slug = "demo".into();
+        state.requirement = "做一个登录页".into();
+        state.backend = "claude-code".into();
+        umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+
+        let action = app.slash_tasks("resume");
+        assert_eq!(
+            action,
+            Action::ResumeRun("做一个登录页".to_string()),
+            "/tasks resume re-attaches to the persisted run"
+        );
+    }
+
+    #[test]
+    fn second_run_while_one_is_active_is_guarded() {
+        let mut app = fresh_app(Some("offline"));
+        // A first run is live (registered + agentic in flight).
+        app.register_run_task("build app one");
+        app.agentic_in_flight = true;
+        assert!(app.has_active_run());
+        let before_tasks = app.tasks.len();
+        let action = app
+            .try_slash_command("/run build app two")
+            .expect("/run is a slash command");
+        assert!(
+            matches!(action, Action::None),
+            "a second /run is rejected, not started"
+        );
+        assert_eq!(app.tasks.len(), before_tasks, "no second task registered");
+        // The guard names the /tasks surface.
+        assert!(app.history.iter().any(|m| m.body().contains("/tasks")));
+        // The original task is untouched (still Running).
+        assert_eq!(app.active_task().unwrap().requirement, "build app one");
+    }
+
+    #[test]
+    fn tasks_is_fail_open_with_no_active_task() {
+        let mut app = fresh_app(Some("offline"));
+        // Empty registry: list shows the empty hint, no panic.
+        let action = app.slash_tasks("");
+        assert!(matches!(action, Action::None));
+        // stop / resume with nothing to act on are polite no-ops, never a panic.
+        assert!(matches!(app.slash_tasks("stop"), Action::None));
+        assert!(matches!(app.slash_tasks("resume"), Action::None));
+        // Progress + terminal hooks with no task are pure no-ops.
+        app.sync_active_task_progress();
+        app.mark_active_task(TaskStatus::Done);
+        assert!(app.tasks.is_empty());
+        assert!(!app.has_active_run());
+    }
+
+    #[test]
+    fn terminal_transitions_settle_the_task_status() {
+        // Done on a delivered build.
+        let mut app = fresh_app(Some("offline"));
+        app.register_run_task("ship it");
+        app.apply_engine(EngineEvent::BlockCompleted {
+            final_phase: Phase::Delivery,
+            paused_at: None,
+        });
+        assert_eq!(app.tasks.last().unwrap().status, TaskStatus::Done);
+
+        // Failed on an aborted run.
+        let mut app = fresh_app(Some("offline"));
+        app.register_run_task("build x");
+        app.mark_block_aborted("boom".into());
+        assert_eq!(app.tasks.last().unwrap().status, TaskStatus::Failed);
+
+        // Done on a clean director build hand-back.
+        let mut app = fresh_app(Some("offline"));
+        app.register_run_task("build y");
+        app.record_agentic_done("done".into(), true, None);
+        assert_eq!(app.tasks.last().unwrap().status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn task_registry_caps_history_without_evicting_the_live_run() {
+        let mut app = fresh_app(Some("offline"));
+        // Fill past the cap with settled tasks.
+        for i in 0..(TASKS_CAP + 4) {
+            app.register_run_task(&format!("run {i}"));
+            app.mark_active_task(TaskStatus::Done);
+        }
+        // Now a live one.
+        app.register_run_task("the live run");
+        assert!(app.tasks.len() <= TASKS_CAP);
+        assert_eq!(
+            app.active_task().unwrap().requirement,
+            "the live run",
+            "the live run is never evicted"
+        );
     }
 
     #[test]
