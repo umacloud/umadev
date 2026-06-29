@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：E2E 测试全流程作战手册
 # 作用：指导团队建立和维护高质量的 E2E 测试体系
 # 创建时间：2026-03-28

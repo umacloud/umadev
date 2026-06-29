@@ -12,6 +12,8 @@ last_updated: 2026-06-14
 
 # 可观测性标准（日志 / 指标 / 追踪）
 
+> 本页是**具体配置片段速查**（日志字段示例、PromQL、告警表、健康检查 JSON）。可观测性的权威规范——埋点契约、三信号关联、基数纪律、SLI/SLO 与错误预算——见 `observability/01-standards/observability-and-slo-operations`，两者配合使用。
+
 ## 三柱可观测性
 
 ### 1. 结构化日志

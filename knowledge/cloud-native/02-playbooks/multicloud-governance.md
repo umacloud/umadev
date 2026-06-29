@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：多云环境治理作战手册
 # 作用：指导多云架构的统一管理、成本优化和风险控制
 # 创建时间：2025-03-20

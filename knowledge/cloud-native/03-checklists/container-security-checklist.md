@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：容器安全全面检查清单
 # 作用：确保容器镜像和运行时满足安全标准
 # 创建时间：2025-03-20

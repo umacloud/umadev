@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：系统迁移全流程作战手册
 # 作用：指导团队完成系统迁移的评估、规划、执行、验证与切换
 # 创建时间：2026-03-28

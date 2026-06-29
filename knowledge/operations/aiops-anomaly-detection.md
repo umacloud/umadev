@@ -8,7 +8,7 @@ tags: [aiops, anomaly, detection, operations, 告警降噪, 实施架构, 常见
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：AIOps 异常检测实践指南
 # 作用：利用机器学习和 AI 技术自动化检测和诊断系统异常
 # 创建时间：2026-03-20

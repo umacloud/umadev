@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：渗透测试全流程作战手册
 # 作用：指导安全团队完成 Web 应用、API、基础设施的渗透测试及报告编写
 # 创建时间：2026-03-28

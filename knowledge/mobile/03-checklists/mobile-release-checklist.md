@@ -3,14 +3,14 @@ title: 移动应用发布检查清单
 category: mobile/checklists
 version: 1.0.0
 last_updated: 2026-03-20
-maintainer: Excellent（11964948@qq.com）
+maintainer: Excellent（）
 knowledge_score: 9.1/10
 domain: mobile
 difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## 移动应用发布检查清单
 

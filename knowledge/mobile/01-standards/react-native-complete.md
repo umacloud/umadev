@@ -3,14 +3,14 @@ title: React Native 完整开发标准
 category: mobile/standards
 version: 1.0.0
 last_updated: 2026-03-20
-maintainer: Excellent（11964948@qq.com）
+maintainer: Excellent（）
 knowledge_score: 9.2/10
 domain: mobile
 difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## React Native 完整开发标准
 
@@ -79,7 +79,7 @@ quality_score: 70
 ### TypeScript 组件示例
 ```typescript
 /**
- * 开发：Excellent（11964948@qq.com）
+ * 开发：Excellent（）
  * 功能：用户头像组件
  * 作用：展示用户头像，支持默认头像和加载状态
  * 创建时间：2026-03-20
@@ -138,7 +138,7 @@ const styles = StyleSheet.create({
 ### 网络请求封装示例
 ```typescript
 /**
- * 开发：Excellent（11964948@qq.com）
+ * 开发：Excellent（）
  * 功能：API 客户端封装
  * 作用：统一管理网络请求，包含认证和错误处理
  * 创建时间：2026-03-20
@@ -201,7 +201,7 @@ export const apiClient = new ApiClient();
 ### FlatList 优化示例
 ```typescript
 /**
- * 开发：Excellent（11964948@qq.com）
+ * 开发：Excellent（）
  * 功能：用户列表组件
  * 作用：高性能渲染用户列表，支持下拉刷新和加载更多
  * 创建时间：2026-03-20

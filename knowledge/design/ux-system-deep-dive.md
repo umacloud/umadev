@@ -8,7 +8,7 @@ tags: [deep, design, dive, system, 设计环节深度知识库]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## 设计环节深度知识库
 

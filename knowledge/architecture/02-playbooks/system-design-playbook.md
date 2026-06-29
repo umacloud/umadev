@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：系统设计全流程作战手册
 # 作用：指导架构师完成从需求分析到详细设计的系统设计全过程
 # 创建时间：2026-03-28

@@ -8,7 +8,7 @@ tags: [ai, ai数据安全与合规作战手册, and, compliance, data, playbook,
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## AI数据安全与合规作战手册
 

@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：Kubernetes 迁移实战案例
 # 作用：分享传统应用到 Kubernetes 的迁移经验
 # 创建时间：2025-03-20

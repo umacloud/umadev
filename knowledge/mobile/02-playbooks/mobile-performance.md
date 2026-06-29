@@ -3,14 +3,14 @@ title: 移动应用性能优化手册
 category: mobile/playbooks
 version: 1.0.0
 last_updated: 2026-03-20
-maintainer: Excellent（11964948@qq.com）
+maintainer: Excellent（）
 knowledge_score: 9.0/10
 domain: mobile
 difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## 移动应用性能优化手册
 
@@ -88,7 +88,7 @@ quality_score: 70
 #### React Native 优化
 ```typescript
 /**
- * 开发：Excellent（11964948@qq.com）
+ * 开发：Excellent（）
  * 功能：优化 FlatList 性能
  * 作用：通过配置优化参数提升长列表渲染性能
  * 创建时间：2026-03-20
@@ -165,7 +165,7 @@ export default OptimizedList;
 
 #### Flutter 优化
 ```dart
-// 开发：Excellent（11964948@qq.com）
+// 开发：Excellent（）
 // 功能：优化 ListView 性能
 // 作用：通过 const 和 builder 提升长列表渲染性能
 // 创建时间：2026-03-20
@@ -231,7 +231,7 @@ class _ItemTile extends StatelessWidget {
 #### React Native 性能监控
 ```typescript
 /**
- * 开发：Excellent（11964948@qq.com）
+ * 开发：Excellent（）
  * 功能：性能监控工具
  * 作用：记录和上报关键性能指标
  * 创建时间：2026-03-20
@@ -326,7 +326,7 @@ export const performanceMonitor = PerformanceMonitor.getInstance();
 
 #### Flutter 性能监控
 ```dart
-// 开发：Excellent（11964948@qq.com）
+// 开发：Excellent（）
 // 功能：性能监控工具
 // 作用：记录和上报关键性能指标
 // 创建时间：2026-03-20

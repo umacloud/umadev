@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：Kubernetes 安全事件响应实战案例
 # 作用：分享 K8s 安全事件的处理经验
 # 创建时间：2025-03-20

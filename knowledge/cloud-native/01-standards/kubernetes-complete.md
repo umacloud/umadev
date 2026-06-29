@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：Kubernetes 完整开发与运维标准
 # 作用：为 K8s 集群管理、应用部署、安全治理提供统一规范
 # 创建时间：2025-03-20

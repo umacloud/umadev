@@ -8,7 +8,7 @@ tags: [and, deep, dive, incident, postmortem, response, 事故响应与复盘深
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## 事故响应与复盘深度知识库
 

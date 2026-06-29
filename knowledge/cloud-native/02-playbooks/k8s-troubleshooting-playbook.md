@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：Kubernetes 全场景故障排查作战手册
 # 作用：指导 K8s 集群各类故障的诊断、根因分析与修复
 # 创建时间：2026-03-28

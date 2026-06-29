@@ -8,7 +8,7 @@ tags: [development, document, template, 失败模式, 执行步骤, 检查清单
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ```yaml
 id: KB-DEV-XXXX

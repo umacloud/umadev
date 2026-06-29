@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：容器安全完整标准
 # 作用：为容器镜像、运行时、编排提供安全规范
 # 创建时间：2025-03-20

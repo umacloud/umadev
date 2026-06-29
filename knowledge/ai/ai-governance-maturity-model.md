@@ -8,7 +8,7 @@ tags: [ai, ai治理成熟度模型, governance, maturity, model]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## AI治理成熟度模型
 

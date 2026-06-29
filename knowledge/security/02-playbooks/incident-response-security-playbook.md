@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：安全事件响应全流程作战手册
 # 作用：指导安全团队完成安全事件的检测、遏制、取证、修复、通报与复盘
 # 创建时间：2026-03-28

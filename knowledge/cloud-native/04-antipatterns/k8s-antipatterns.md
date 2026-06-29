@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：Kubernetes 常见反模式识别与修正
 # 作用：帮助团队避免常见错误，建立正确实践
 # 创建时间：2025-03-20

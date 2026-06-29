@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：容器常见反模式识别与修正
 # 作用：帮助团队避免容器化常见错误
 # 创建时间：2025-03-20

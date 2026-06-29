@@ -3,14 +3,14 @@ title: Flutter 完整开发标准
 category: mobile/standards
 version: 1.0.0
 last_updated: 2026-03-20
-maintainer: Excellent（11964948@qq.com）
+maintainer: Excellent（）
 knowledge_score: 9.3/10
 domain: mobile
 difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## Flutter 完整开发标准
 
@@ -79,7 +79,7 @@ quality_score: 70
 
 ### Widget 组件示例
 ```dart
-// 开发：Excellent（11964948@qq.com）
+// 开发：Excellent（）
 // 功能：用户头像组件
 // 作用：展示用户头像，支持默认头像和加载状态
 // 创建时间：2026-03-20
@@ -150,7 +150,7 @@ class UserAvatar extends StatelessWidget {
 
 ### 网络请求封装示例
 ```dart
-// 开发：Excellent（11964948@qq.com）
+// 开发：Excellent（）
 // 功能：API 客户端封装
 // 作用：统一管理网络请求，包含认证和错误处理
 // 创建时间：2026-03-20
@@ -230,7 +230,7 @@ final apiClient = ApiClient();
 
 ### 状态管理示例（Provider）
 ```dart
-// 开发：Excellent（11964948@qq.com）
+// 开发：Excellent（）
 // 功能：用户状态管理
 // 作用：管理用户登录状态和用户信息
 // 创建时间：2026-03-20

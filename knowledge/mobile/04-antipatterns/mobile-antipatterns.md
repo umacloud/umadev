@@ -3,14 +3,14 @@ title: 移动开发反模式库
 category: mobile/antipatterns
 version: 1.0.0
 last_updated: 2026-03-20
-maintainer: Excellent（11964948@qq.com）
+maintainer: Excellent（）
 knowledge_score: 9.0/10
 domain: mobile
 difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## 移动开发反模式库
 

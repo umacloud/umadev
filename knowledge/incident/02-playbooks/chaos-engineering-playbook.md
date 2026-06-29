@@ -10,7 +10,7 @@ difficulty: intermediate
 quality_score: 70
 ---
 
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 # 功能：混沌工程全流程作战手册
 # 作用：指导团队安全地实施混沌实验以验证系统韧性
 # 创建时间：2026-03-28

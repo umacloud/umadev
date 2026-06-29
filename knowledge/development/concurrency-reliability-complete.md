@@ -8,7 +8,7 @@ tags: [complete, concurrency, development, reliability, 并发与稳定性完整
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## 并发与稳定性完整知识库
 

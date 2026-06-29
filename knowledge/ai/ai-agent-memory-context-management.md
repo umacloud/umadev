@@ -8,7 +8,7 @@ tags: [agent, agent上下文与记忆管理, ai, context, management, memory]
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## AI Agent上下文与记忆管理
 

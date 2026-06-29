@@ -8,7 +8,7 @@ tags: [ai, ai发布就绪与回滚门禁, and, gate, readiness, release, rollbac
 quality_score: 70
 last_updated: 2026-06-15
 ---
-# 开发：Excellent（11964948@qq.com）
+# 开发：Excellent（）
 
 ## AI发布就绪与回滚门禁
 
