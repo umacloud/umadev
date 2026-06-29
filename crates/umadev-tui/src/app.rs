@@ -47,10 +47,34 @@ pub(crate) const FOLD_HEAD_GENERAL: usize = 3;
 /// Head lines kept when a long SHELL (Bash) tool result is folded — shell output
 /// gets a deeper preview (the tail of a build log is usually the signal).
 pub(crate) const FOLD_HEAD_SHELL: usize = 10;
-/// Max conversation-memory messages handed to the base per routed turn.
-/// Bounds prompt growth (≈ the last 8 user/assistant exchanges) while keeping
-/// enough context for the base to follow a multi-turn dialogue.
+/// FIFO **fail-open floor** for the in-memory working transcript: when a
+/// token-budgeted compaction can't run (the summary `complete()` failed / the
+/// base is offline / the circuit breaker is tripped), the working view falls back
+/// to dropping the oldest down to this many messages — the original
+/// pre-compaction behaviour. The FULL transcript on disk is never trimmed, so a
+/// FIFO drop here only bounds the live prompt, it never loses durable history.
 const CONVERSATION_CAP: usize = 16;
+/// Absolute anti-unbounded safety net on the in-memory working transcript,
+/// applied **synchronously** after every recorded turn. Real compaction triggers
+/// at [`COMPACTION_TOKEN_BUDGET`] (well under this), so this is only ever hit when
+/// compaction is impossible (offline / breaker tripped) — it guarantees the live
+/// buffer can't grow without bound while the full transcript on disk keeps
+/// everything. Generous so it never fights the token-budget compactor.
+const CONVERSATION_HARD_CAP: usize = 64;
+/// Approximate-token threshold that TRIGGERS auto-compaction: when the working
+/// transcript's estimated cost (chars/4) crosses this, the older turns are folded
+/// into one structured summary and the recent tail kept verbatim. Deterministic
+/// trigger; only the summary text comes from the base.
+const COMPACTION_TOKEN_BUDGET: usize = 3_000;
+/// Token budget for the verbatim RECENT tail kept un-folded during compaction —
+/// the most-recent suffix within this cost stays word-for-word, everything older
+/// is summarised. Smaller than [`COMPACTION_TOKEN_BUDGET`] so a fold actually
+/// reclaims context.
+const COMPACTION_TAIL_BUDGET: usize = 1_200;
+/// Minimum number of most-recent messages always kept verbatim through a
+/// compaction, regardless of the tail token budget (so the immediate context is
+/// never folded away).
+const COMPACTION_MIN_TAIL: usize = 4;
 /// Max chars in the input box.
 const INPUT_CAP: usize = 8192;
 
@@ -140,6 +164,22 @@ impl PickerStep {
     }
 }
 
+/// A spawned token-budgeted compaction job — everything the async summary task
+/// needs, snapshotted off `&mut App` so the task never touches app state. The
+/// task forks the base, summarises [`Self::folded`], and reports the outcome
+/// back; the event loop applies it via [`App::apply_compaction`] /
+/// [`App::fail_compaction`].
+#[derive(Debug, Clone)]
+pub(crate) struct CompactionJob {
+    /// The older prefix of the working transcript to fold into one summary.
+    pub(crate) folded: Vec<umadev_runtime::Message>,
+    /// How many leading working-view messages the summary replaces.
+    pub(crate) fold_count: usize,
+    /// The conversation generation this job started under — an apply with a stale
+    /// generation (a `/clear` / `/resume` happened meanwhile) is dropped.
+    pub(crate) generation: u64,
+}
+
 /// What the event loop should do after a key press.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Action {
@@ -177,6 +217,11 @@ pub enum Action {
     /// User submitted text while a gate was active — record as a revision and
     /// re-run the most recent block.
     Revise(String),
+    /// `/compact` — fold the older conversation turns into one structured summary
+    /// via a forked base `complete()`. The event loop drives the async summary
+    /// (and falls back to FIFO if the base is unreachable); the slash handler only
+    /// validated there is enough to fold and signalled intent.
+    Compact,
     /// `/cancel` — abort the in-flight pipeline task and return to the prompt
     /// (without quitting the app). The event loop owns the run task handle.
     Cancel,
@@ -1579,8 +1624,40 @@ pub struct App {
     /// amnesiac one-shots. Holds ONLY genuine chat turns (user message + base
     /// reply), never pipeline progress noise, so the base sees a clean dialogue
     /// when it decides "chat vs. run" and when it answers conversationally.
-    /// Bounded to the most recent [`CONVERSATION_CAP`] turns.
+    ///
+    /// This is the **working view**: token-budgeted auto-compaction folds the
+    /// older turns into one structured summary block here (the base then sees
+    /// `[summary] + [recent verbatim tail]`), while the FULL transcript lives
+    /// untouched in [`Self::full_transcript`] (persisted to disk). Bounded by
+    /// [`COMPACTION_TOKEN_BUDGET`] (the compaction trigger) with a
+    /// [`CONVERSATION_HARD_CAP`] FIFO safety net.
     pub conversation: Vec<umadev_runtime::Message>,
+
+    /// **Full, append-only transcript** — every recorded chat turn (user + base
+    /// reply) in send order, NEVER folded or FIFO-dropped. This is the durable
+    /// record persisted to `.umadev/chat/<id>.json`; compaction mutates only the
+    /// [`Self::conversation`] working view, so the on-disk history is preserved
+    /// in full and a `/resume` reopens the complete conversation.
+    pub full_transcript: Vec<umadev_runtime::Message>,
+
+    /// Circuit breaker for the auto-compaction summary call: after
+    /// [`umadev_agent::compaction::Breaker::LIMIT`] consecutive summary failures
+    /// it trips and auto-compaction stops being attempted (the deterministic FIFO
+    /// floor takes over) until a later success resets it. Bounds wasted base calls
+    /// when the base is down.
+    pub(crate) compaction_breaker: umadev_agent::compaction::Breaker,
+
+    /// `true` while a summary `complete()` is in flight, so a second compaction is
+    /// never spawned concurrently (one folder at a time; the trigger is re-checked
+    /// after each turn settles).
+    pub(crate) compaction_in_flight: bool,
+
+    /// Monotonic generation of [`Self::conversation`], bumped whenever the
+    /// conversation identity changes (`/clear`, `/resume`, a fresh load). An
+    /// in-flight compaction job carries the generation it started under; a result
+    /// that arrives after a `/clear` or `/resume` (stale generation) is dropped so
+    /// it can never splice a summary into the wrong conversation.
+    pub(crate) conversation_generation: u64,
 
     /// `true` once a host-CLI base has handled at least one chat turn in the
     /// current session. Tells the next routed turn to **resume** that base's
@@ -2080,6 +2157,10 @@ impl App {
             transcript_area: std::cell::Cell::new((0, 0, 0, 0)),
             transcript_first_visible: std::cell::Cell::new(0),
             conversation: Vec::new(),
+            full_transcript: Vec::new(),
+            compaction_breaker: umadev_agent::compaction::Breaker::new(),
+            compaction_in_flight: false,
+            conversation_generation: 0,
             host_chat_session_active: false,
             chat_session_id: None,
             chat_session_dirty: false,
@@ -2249,7 +2330,7 @@ impl App {
     /// must never block a chat turn or crash the TUI. Called after every recorded
     /// turn (user + assistant) so the saved transcript tracks the live one.
     pub(crate) fn persist_chat(&self) {
-        if self.conversation.is_empty() {
+        if self.full_transcript.is_empty() {
             return;
         }
         let session = ChatSession {
@@ -2261,7 +2342,10 @@ impl App {
             // resume the base's deep context, not just replay the transcript. `None`
             // (opencode / offline / no host turn yet) writes `null` — fail-open.
             base_session_id: self.chat_session_id.clone(),
-            messages: self.conversation.clone(),
+            // The FULL, append-only transcript — never the compacted working view —
+            // so the on-disk history survives in full and is never mutated by
+            // compaction. `/resume` reopens the complete conversation.
+            messages: self.full_transcript.clone(),
         };
         let Ok(body) = serde_json::to_string_pretty(&session) else {
             return;
@@ -2335,8 +2419,15 @@ impl App {
         if session.messages.is_empty() {
             return false;
         }
+        // Restore the full durable transcript AND the working view from it. A new
+        // generation invalidates any in-flight compaction from the prior chat, and
+        // the safety net bounds the working view; the next turn re-triggers
+        // token-budgeted compaction if the restored conversation is over budget.
+        self.full_transcript = session.messages.clone();
         self.conversation = session.messages;
-        self.trim_conversation();
+        self.enforce_conversation_safety_net();
+        self.conversation_generation = self.conversation_generation.wrapping_add(1);
+        self.compaction_in_flight = false;
         self.chat_id = session.id;
         // Restore the base's OWN resumable session id so the NEXT host chat turn
         // RESUMES the base's deep context (the resident pre-load opens it via
@@ -6155,20 +6246,31 @@ impl App {
         }
     }
 
+    /// Append one chat turn to BOTH the working view ([`App::conversation`]) and
+    /// the durable full transcript ([`App::full_transcript`]), then apply the
+    /// synchronous safety net. The working view is what the base sees (and is
+    /// later compacted); the full transcript is the append-only durable record
+    /// that compaction never touches. Both grow together until compaction folds
+    /// the working view's older turns into a summary.
+    fn record_turn(&mut self, role: &str, content: String) {
+        let msg = umadev_runtime::Message {
+            role: role.to_string(),
+            content,
+        };
+        self.conversation.push(msg.clone());
+        self.full_transcript.push(msg);
+        self.enforce_conversation_safety_net();
+    }
+
     /// Record a user turn into [`App::conversation`] (the memory handed to the
-    /// base on the next routed turn). Trims to the most recent
-    /// [`CONVERSATION_CAP`] messages so the prompt stays bounded.
+    /// base on the next routed turn) and the durable [`App::full_transcript`].
     pub(crate) fn record_user_turn(&mut self, text: &str) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
-        self.conversation.push(umadev_runtime::Message {
-            role: "user".to_string(),
-            content: text.to_string(),
-        });
-        self.trim_conversation();
-        // Wave 5 / G11: mirror the live buffer to disk so a restart reopens it.
+        self.record_turn("user", text.to_string());
+        // Wave 5 / G11: mirror the FULL transcript to disk so a restart reopens it.
         self.persist_chat();
     }
 
@@ -6191,17 +6293,13 @@ impl App {
         // lightweight advisory telling the user to verify against real files /
         // `git status`. Non-blocking; a false positive only adds one note.
         let claims = crate::claims_code_changes(&reply);
-        self.conversation.push(umadev_runtime::Message {
-            role: "assistant".to_string(),
-            content: reply,
-        });
+        self.record_turn("assistant", reply);
         if claims {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "chat.claims_unverified").to_string(),
             );
         }
-        self.trim_conversation();
     }
 
     /// The route ended without a usable reply (base init failed, an empty
@@ -6305,11 +6403,7 @@ impl App {
             );
             return;
         }
-        self.conversation.push(umadev_runtime::Message {
-            role: "assistant".to_string(),
-            content: reply,
-        });
-        self.trim_conversation();
+        self.record_turn("assistant", reply);
         // Wave 5 / G11: persist after the assistant turn lands so the saved chat
         // holds complete user→assistant exchanges.
         self.persist_chat();
@@ -6356,8 +6450,140 @@ impl App {
         self.chat_session_id.clone().unwrap_or_default()
     }
 
-    /// Keep only the most recent [`CONVERSATION_CAP`] messages.
-    fn trim_conversation(&mut self) {
+    /// Synchronous anti-unbounded safety net on the working view: drop the oldest
+    /// messages beyond [`CONVERSATION_HARD_CAP`]. Real compaction triggers far
+    /// below this (at [`COMPACTION_TOKEN_BUDGET`]), so this only ever fires when
+    /// compaction is impossible (offline / breaker tripped). The full transcript
+    /// on disk is never trimmed, so this bounds the live prompt without losing
+    /// durable history.
+    fn enforce_conversation_safety_net(&mut self) {
+        // Never drop from the FRONT while a fold is in flight: the in-flight job
+        // summarises a snapshot of the leading prefix and splices by count, so the
+        // prefix indices must stay stable until it lands. The job always reports
+        // back (and shrinks the buffer on apply / FIFO-falls-back on failure), so
+        // this temporary overflow is short-lived and bounded.
+        if self.compaction_in_flight {
+            return;
+        }
+        let len = self.conversation.len();
+        if len > CONVERSATION_HARD_CAP {
+            self.conversation.drain(0..len - CONVERSATION_HARD_CAP);
+        }
+    }
+
+    /// Whether the working transcript is over the compaction token budget and a
+    /// fold of at least [`umadev_agent::compaction::MIN_FOLD`] older messages is
+    /// available — the deterministic auto-compaction trigger. Pure read.
+    #[must_use]
+    pub(crate) fn should_auto_compact(&self) -> bool {
+        if self.compaction_in_flight || self.compaction_breaker.tripped() {
+            return false;
+        }
+        umadev_agent::compaction::plan(
+            &self.conversation,
+            COMPACTION_TOKEN_BUDGET,
+            COMPACTION_TAIL_BUDGET,
+            COMPACTION_MIN_TAIL,
+        )
+        .is_some()
+    }
+
+    /// Begin an **auto** compaction if the working transcript is over budget:
+    /// snapshot the older prefix to summarise, mark a job in flight, and return it
+    /// for the event loop to drive on a forked base. `None` when not over budget,
+    /// already compacting, or the breaker is tripped (the deterministic FIFO floor
+    /// keeps the buffer bounded in that case).
+    pub(crate) fn begin_auto_compaction(&mut self) -> Option<CompactionJob> {
+        if !self.should_auto_compact() {
+            return None;
+        }
+        let plan = umadev_agent::compaction::plan(
+            &self.conversation,
+            COMPACTION_TOKEN_BUDGET,
+            COMPACTION_TAIL_BUDGET,
+            COMPACTION_MIN_TAIL,
+        )?;
+        Some(self.start_compaction(plan.fold_count))
+    }
+
+    /// Begin a **manual** (`/compact`) compaction: fold everything except the
+    /// recent verbatim tail regardless of the token budget, as long as there is a
+    /// worthwhile prefix to fold. `None` when already compacting or there is too
+    /// little to fold (the caller surfaces `compact.too_short`).
+    pub(crate) fn begin_manual_compaction(&mut self) -> Option<CompactionJob> {
+        if self.compaction_in_flight {
+            return None;
+        }
+        let len = self.conversation.len();
+        let tail = COMPACTION_MIN_TAIL.min(len);
+        let fold_count = len.saturating_sub(tail);
+        if fold_count < umadev_agent::compaction::MIN_FOLD {
+            return None;
+        }
+        Some(self.start_compaction(fold_count))
+    }
+
+    /// Snapshot the fold prefix + generation and mark a compaction in flight.
+    fn start_compaction(&mut self, fold_count: usize) -> CompactionJob {
+        self.compaction_in_flight = true;
+        CompactionJob {
+            folded: self.conversation[..fold_count].to_vec(),
+            fold_count,
+            generation: self.conversation_generation,
+        }
+    }
+
+    /// Apply a SUCCESSFUL structured summary: replace the folded older prefix in
+    /// the working view with one summary block (a `user`-role grounding note +
+    /// the "full history preserved" marker), keeping the recent tail verbatim. The
+    /// full transcript on disk is untouched. Resets the breaker.
+    ///
+    /// Stale-guarded: a job whose generation no longer matches (a `/clear` /
+    /// `/resume` happened since it started) is dropped without mutating anything.
+    pub(crate) fn apply_compaction(&mut self, summary: &str, fold_count: usize, generation: u64) {
+        self.compaction_in_flight = false;
+        self.compaction_breaker.record_success();
+        if generation != self.conversation_generation {
+            return; // stale — the conversation was cleared / resumed meanwhile.
+        }
+        if fold_count < umadev_agent::compaction::MIN_FOLD || fold_count > self.conversation.len() {
+            return;
+        }
+        let header = umadev_i18n::tf(
+            self.lang,
+            "compact.summary_block",
+            &[&fold_count.to_string()],
+        );
+        let marker = umadev_i18n::t(self.lang, "compact.full_history_preserved");
+        let block = umadev_runtime::Message {
+            role: "user".to_string(),
+            content: format!("{header}\n{}\n\n{marker}", summary.trim()),
+        };
+        // Keep the recent tail; replace the folded prefix with the single block.
+        let tail = self.conversation.split_off(fold_count);
+        self.conversation = std::iter::once(block).chain(tail).collect();
+        // NB: `full_transcript` (the on-disk record) is deliberately NOT touched.
+        // `persist_chat` writes the full transcript, so re-persisting is harmless
+        // and keeps the saved base-session id / timestamp fresh.
+        self.persist_chat();
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(
+                self.lang,
+                "compact.compacted_notice",
+                &[&fold_count.to_string()],
+            ),
+        );
+    }
+
+    /// Fail-open path when the summary `complete()` failed / was empty / the base
+    /// was offline: advance the circuit breaker and fall back to the original FIFO
+    /// behaviour — drop the oldest down to [`CONVERSATION_CAP`] so the working
+    /// prompt stays bounded. The full transcript on disk is untouched, so nothing
+    /// durable is lost; the conversation is never corrupted.
+    pub(crate) fn fail_compaction(&mut self) {
+        self.compaction_in_flight = false;
+        self.compaction_breaker.record_failure();
         let len = self.conversation.len();
         if len > CONVERSATION_CAP {
             self.conversation.drain(0..len - CONVERSATION_CAP);
@@ -6750,6 +6976,12 @@ impl App {
             "clear" => {
                 self.history.clear();
                 self.conversation.clear();
+                // Drop the durable transcript too (a cleared chat starts a fresh
+                // persisted file) and invalidate any in-flight compaction so a late
+                // summary can never splice into the new conversation.
+                self.full_transcript.clear();
+                self.conversation_generation = self.conversation_generation.wrapping_add(1);
+                self.compaction_in_flight = false;
                 // A cleared session starts metering from zero — the persistent
                 // token/cost gauge resets with the transcript.
                 self.session_tokens = 0;
@@ -7191,65 +7423,36 @@ impl App {
         Action::None
     }
 
-    /// `/compact` — token-budgeted summarize-and-fold of the conversation (Wave 5
-    /// / G11), replacing the blunt FIFO-drop-at-16 with a deterministic, fail-open
-    /// fold: collapse the older half of the transcript into ONE compact summary
-    /// message, keeping the recent tail verbatim, so long chats stay within budget
-    /// WITHOUT silently losing the whole early context. Deterministic (no brain
-    /// call, so it never blocks or depends on a base); the base still sees the
-    /// recent turns verbatim + a labelled digest of what came before.
+    /// `/compact` — fold the older turns into ONE **structured** summary via the
+    /// SAME base-driven path as auto-compaction (intent / files / decisions /
+    /// errors / pending / current work), keeping the recent tail verbatim, instead
+    /// of the old lossy 160-char digest. The summary `complete()` is async (it
+    /// forks the base), so this slash handler only validates + signals intent
+    /// ([`Action::Compact`]); the event loop drives the fork and applies the result
+    /// ([`App::apply_compaction`]), falling back to FIFO if the base is unreachable.
     fn slash_compact(&mut self) -> Action {
-        let before = self.conversation.len();
-        if before <= 4 {
+        if self.compaction_in_flight {
             self.push(
                 ChatRole::System,
-                umadev_i18n::t(self.lang, "compact.too_short"),
+                umadev_i18n::t(self.lang, "compact.in_progress").to_string(),
             );
             return Action::None;
         }
-        // Keep the most-recent quarter (at least 4) verbatim; fold the rest.
-        let keep = (before / 4).max(4).min(before);
-        let split = before - keep;
-        let folded: Vec<umadev_runtime::Message> = self.conversation.drain(0..split).collect();
-        // Build a compact, role-tagged digest of the folded prefix, capped so the
-        // summary itself can't reintroduce the bloat we just removed.
-        let mut digest = String::new();
-        for m in &folded {
-            let line: String = m.content.split_whitespace().collect::<Vec<_>>().join(" ");
-            let snippet = match line.char_indices().nth(160) {
-                Some((i, _)) => format!("{}…", &line[..i]),
-                None => line,
-            };
-            if !snippet.is_empty() {
-                digest.push_str(&format!("- {}: {snippet}\n", m.role));
-            }
+        let len = self.conversation.len();
+        let tail = COMPACTION_MIN_TAIL.min(len);
+        let fold_count = len.saturating_sub(tail);
+        if fold_count < umadev_agent::compaction::MIN_FOLD {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "compact.too_short").to_string(),
+            );
+            return Action::None;
         }
-        let summary = umadev_i18n::tf(
-            self.lang,
-            "compact.summary",
-            &[&folded.len().to_string(), &digest],
-        );
-        // Prepend the summary as a `user`-role context note (the base treats it as
-        // grounding it must honour, like a recap). Then re-bound to the cap.
-        self.conversation.insert(
-            0,
-            umadev_runtime::Message {
-                role: "user".to_string(),
-                content: summary,
-            },
-        );
-        self.trim_conversation();
-        self.persist_chat();
-        let after = self.conversation.len();
         self.push(
             ChatRole::System,
-            umadev_i18n::tf(
-                self.lang,
-                "compact.done",
-                &[&before.to_string(), &after.to_string()],
-            ),
+            umadev_i18n::t(self.lang, "compact.in_progress").to_string(),
         );
-        Action::None
+        Action::Compact
     }
 
     fn slash_backend(&mut self, backend: Option<&str>) -> Action {
@@ -12157,13 +12360,25 @@ mod tests {
             .iter()
             .any(|m| m.role == ChatRole::Host && m.body() == "你好,我是底座"));
 
-        // Memory stays bounded to the most recent CONVERSATION_CAP messages.
+        // The in-memory working view stays bounded by the safety net, while the
+        // durable full transcript keeps EVERY recorded turn (compaction / the FIFO
+        // fallback only ever touch the working view, never the on-disk history).
+        let full_before = app.full_transcript.len();
         for i in 0..CONVERSATION_CAP * 2 {
             app.record_user_turn(&format!("msg {i}"));
         }
-        assert!(app.conversation.len() <= CONVERSATION_CAP);
+        assert!(app.conversation.len() <= CONVERSATION_HARD_CAP);
+        assert_eq!(
+            app.full_transcript.len(),
+            full_before + CONVERSATION_CAP * 2,
+            "the full transcript keeps every recorded turn"
+        );
         assert_eq!(
             app.conversation.last().unwrap().content,
+            format!("msg {}", CONVERSATION_CAP * 2 - 1)
+        );
+        assert_eq!(
+            app.full_transcript.last().unwrap().content,
             format!("msg {}", CONVERSATION_CAP * 2 - 1)
         );
     }
@@ -12417,31 +12632,175 @@ mod tests {
     }
 
     #[test]
-    fn slash_compact_folds_the_conversation_within_budget() {
-        // Wave 5 / G11: /compact summarize-and-folds instead of FIFO-dropping, so a
-        // long chat shrinks WITHOUT losing the whole early context.
+    fn slash_compact_runs_the_structured_summary_path() {
+        // `/compact` now folds via the SAME structured-summary path as
+        // auto-compaction (a forked base `complete()`), NOT the old lossy 160-char
+        // digest. The slash handler validates + signals `Action::Compact`; the
+        // event loop drives the fork; `apply_compaction` splices the result.
         let (mut app, _tmp) = temp_app();
         for i in 0..12 {
             app.record_user_turn(&format!("user message {i}"));
             app.record_agentic_done(format!("assistant reply {i}"), false, None);
         }
+        // The slash handler signals intent (and pushes the "compacting…" note).
+        let action = app.try_slash_command("/compact").expect("a slash command");
+        assert!(matches!(action, Action::Compact));
+        // A manual job folds everything except the recent verbatim tail.
+        let job = app.begin_manual_compaction().expect("enough to fold");
+        assert!(job.fold_count >= umadev_agent::compaction::MIN_FOLD);
         let before = app.conversation.len();
-        let _ = app.try_slash_command("/compact");
+        // Apply a stand-in structured summary — the same call the event loop makes
+        // when the fork returns its summary.
+        app.apply_compaction(
+            "## Intent / Goal\nBuild a kanban board.",
+            job.fold_count,
+            job.generation,
+        );
         let after = app.conversation.len();
         assert!(
             after < before,
-            "compact must shrink the buffer: {before}->{after}"
+            "compact must shrink the working view: {before}->{after}"
         );
-        // The fold keeps a leading summary message that references the folded count.
+        // The leading block is the structured summary (a user-role grounding note)
+        // and carries both the localized header and the model's section text.
         assert_eq!(app.conversation[0].role, "user");
         assert!(
             app.conversation[0].content.contains("摘要"),
-            "first message after compact is the folded summary"
+            "the summary block carries the localized header"
+        );
+        assert!(
+            app.conversation[0].content.contains("Intent / Goal"),
+            "the structured summary body is preserved"
         );
         // The most-recent turn is preserved verbatim.
         assert_eq!(
             app.conversation.last().unwrap().content,
             "assistant reply 11"
+        );
+        // The on-disk FULL transcript is untouched — every turn still present.
+        assert_eq!(app.full_transcript.len(), 24);
+        assert_eq!(
+            app.full_transcript.last().unwrap().content,
+            "assistant reply 11"
+        );
+    }
+
+    /// Build a conversation whose estimated token cost is comfortably over
+    /// [`COMPACTION_TOKEN_BUDGET`], so the auto-compaction trigger fires.
+    fn fill_over_budget(app: &mut App, exchanges: usize) {
+        for i in 0..exchanges {
+            app.record_user_turn(&format!("u{i} {}", "alpha ".repeat(80)));
+            app.record_agentic_done(format!("a{i} {}", "beta ".repeat(80)), false, None);
+        }
+    }
+
+    #[test]
+    fn auto_compaction_triggers_near_budget_and_keeps_tail_verbatim() {
+        // The token-budgeted trigger fires once the working transcript crosses the
+        // budget; applying the summary replaces the older prefix with ONE block and
+        // keeps the recent tail word-for-word.
+        let (mut app, _tmp) = temp_app();
+        fill_over_budget(&mut app, 16); // 32 messages of long content
+        assert!(
+            app.should_auto_compact(),
+            "a transcript over the token budget triggers compaction"
+        );
+        let total = app.conversation.len();
+        let last_user = app.conversation[total - 2].content.clone();
+        let last_asst = app.conversation[total - 1].content.clone();
+        let full_before = app.full_transcript.len();
+
+        let job = app.begin_auto_compaction().expect("a job near budget");
+        assert!(app.compaction_in_flight, "a job is now in flight");
+        assert!(job.fold_count >= umadev_agent::compaction::MIN_FOLD);
+        assert!(
+            job.fold_count < total,
+            "the recent tail must survive the fold"
+        );
+
+        app.apply_compaction(
+            "## Current work\nWiring the API.",
+            job.fold_count,
+            job.generation,
+        );
+        assert!(!app.compaction_in_flight, "the job settled");
+        // [structured summary] + [recent verbatim tail].
+        assert_eq!(app.conversation[0].role, "user");
+        assert!(app.conversation[0].content.contains("Current work"));
+        assert!(app.conversation[0].content.contains("摘要"));
+        assert_eq!(
+            app.conversation.last().unwrap().content,
+            last_asst,
+            "the most-recent reply is kept verbatim"
+        );
+        assert_eq!(
+            app.conversation[app.conversation.len() - 2].content,
+            last_user,
+            "the most-recent user turn is kept verbatim"
+        );
+        // The compacted working view is strictly smaller than the full history.
+        assert!(app.conversation.len() < full_before);
+        // The on-disk FULL transcript is untouched by compaction.
+        assert_eq!(app.full_transcript.len(), full_before);
+        assert_eq!(app.full_transcript.last().unwrap().content, last_asst);
+    }
+
+    #[test]
+    fn failed_summary_falls_back_to_fifo_without_losing_history() {
+        // Fail-open: a failed / empty / offline summary must NOT lose or corrupt the
+        // conversation — it falls back to the original FIFO drop on the working view,
+        // and the full transcript on disk is untouched.
+        let (mut app, _tmp) = temp_app();
+        for i in 0..40 {
+            app.record_user_turn(&format!("m{i}"));
+        }
+        let full_before = app.full_transcript.len();
+        // Pretend a summary was in flight and then failed.
+        app.compaction_in_flight = true;
+        app.fail_compaction();
+        assert!(!app.compaction_in_flight, "the failed job is cleared");
+        // Working view FIFO-bounded; the most-recent turn is still there (no corruption).
+        assert!(app.conversation.len() <= CONVERSATION_CAP);
+        assert_eq!(app.conversation.last().unwrap().content, "m39");
+        // The full transcript on disk kept EVERY message — nothing lost.
+        assert_eq!(app.full_transcript.len(), full_before);
+        assert_eq!(app.full_transcript.last().unwrap().content, "m39");
+    }
+
+    #[test]
+    fn circuit_breaker_suppresses_auto_compaction_while_tripped() {
+        // The breaker bounds retries: after N consecutive summary failures the
+        // trigger is suppressed (no more wasted base calls) until a success resets it.
+        let (mut app, _tmp) = temp_app();
+        fill_over_budget(&mut app, 16);
+        assert!(app.should_auto_compact(), "over budget → would compact");
+        for _ in 0..umadev_agent::compaction::Breaker::LIMIT {
+            app.compaction_breaker.record_failure();
+        }
+        assert!(
+            !app.should_auto_compact(),
+            "a tripped breaker suppresses the trigger even while over budget"
+        );
+        assert!(app.begin_auto_compaction().is_none());
+        // A later success un-trips it → compaction resumes.
+        app.compaction_breaker.record_success();
+        assert!(app.should_auto_compact());
+    }
+
+    #[test]
+    fn stale_compaction_result_is_dropped_after_clear() {
+        // A summary that returns AFTER a `/clear` carries a stale generation and must
+        // be dropped — it can never splice into the fresh conversation.
+        let (mut app, _tmp) = temp_app();
+        fill_over_budget(&mut app, 16);
+        let job = app.begin_auto_compaction().expect("a job");
+        // `/clear` happens while the summary is in flight → generation bumps.
+        let _ = app.try_slash_command("/clear");
+        let convo_after_clear = app.conversation.clone();
+        app.apply_compaction("late summary", job.fold_count, job.generation);
+        assert_eq!(
+            app.conversation, convo_after_clear,
+            "a stale summary is dropped, not spliced into the cleared conversation"
         );
     }
 

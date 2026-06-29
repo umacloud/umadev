@@ -57,7 +57,7 @@ use umadev_agent::{AgentRunner, ChannelSink, EngineEvent, EventSink, Gate, Route
 use umadev_host::driver_for;
 use umadev_runtime::{CompletionRequest, Message, OfflineRuntime, Runtime, RuntimeKind};
 
-use crate::app::{Action, App};
+use crate::app::{Action, App, CompactionJob};
 use crate::input::InputSource;
 
 /// Launch parameters for [`run`].
@@ -3300,6 +3300,78 @@ fn drain_next_queued_chat(
     Some(fire_agentic(app, chat_session, sink, route_tx, text))
 }
 
+/// The terminal outcome of a spawned token-budgeted compaction job, sent back to
+/// the event loop which applies it (`apply_compaction` / `fail_compaction`).
+#[derive(Debug, Clone)]
+enum CompactionOutcome {
+    /// The fork produced a structured summary — splice it into the working view.
+    Done {
+        /// The bounded structured summary text.
+        summary: String,
+        /// How many older messages it folds (the prefix length to replace).
+        fold_count: usize,
+        /// The conversation generation the job started under (stale-guard).
+        generation: u64,
+    },
+    /// The summary failed / was empty / the base was offline — fail open to FIFO.
+    Failed,
+}
+
+/// Drive ONE compaction job: build a FRESH fork brain (no resume, no session pin
+/// — a read-only one-shot, never the live chat session) and ask it for the
+/// structured summary. Fail-open: an unbuildable brain or an empty/failed summary
+/// yields [`CompactionOutcome::Failed`], never an error. Pure async (no app
+/// state), so the event loop spawns it freely.
+async fn run_compaction(
+    spec: BrainSpec,
+    project_root: PathBuf,
+    job: CompactionJob,
+) -> CompactionOutcome {
+    let Ok(brain) = build_brain(&spec, false, None, &project_root) else {
+        return CompactionOutcome::Failed;
+    };
+    match umadev_agent::compaction::summarize(brain.as_ref(), &job.folded).await {
+        Some(summary) => CompactionOutcome::Done {
+            summary,
+            fold_count: job.fold_count,
+            generation: job.generation,
+        },
+        None => CompactionOutcome::Failed,
+    }
+}
+
+/// Spawn a compaction job onto the runtime, reporting its outcome back over
+/// `compaction_tx`. Detached (no `run_task` slot): it runs on a separate forked
+/// base process and never blocks the resident chat session or a queued turn.
+fn spawn_compaction(
+    spec: BrainSpec,
+    project_root: PathBuf,
+    job: CompactionJob,
+    compaction_tx: &tokio::sync::mpsc::UnboundedSender<CompactionOutcome>,
+) {
+    let tx = compaction_tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(run_compaction(spec, project_root, job).await);
+    });
+}
+
+/// After a turn settles, start an auto-compaction if the working transcript has
+/// crossed the token budget (deterministic trigger; the breaker / in-flight flag
+/// gate it). No-op otherwise. The brain is only borrowed for the summary text.
+fn maybe_spawn_auto_compaction(
+    app: &mut App,
+    compaction_tx: &tokio::sync::mpsc::UnboundedSender<CompactionOutcome>,
+) {
+    if let Some(job) = app.begin_auto_compaction() {
+        spawn_compaction(
+            app.brain_spec(),
+            app.project_root.clone(),
+            job,
+            compaction_tx,
+        );
+    }
+}
+
 fn route_model_for_spec(_spec: &BrainSpec, fallback_model: String) -> String {
     fallback_model
 }
@@ -4027,6 +4099,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     let (sink, mut engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Token-budgeted auto-compaction reports its summary outcome over this channel
+    // (the summary runs on a forked base, off the resident chat session).
+    let (compaction_tx, mut compaction_rx) =
+        tokio::sync::mpsc::unbounded_channel::<CompactionOutcome>();
 
     // Probe in the background so the picker labels refresh as data arrives.
     spawn_probe(sink.clone());
@@ -4273,6 +4349,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             finalize_build_completion(app, &sink);
                         }
                         run_task = drain_next_queued_chat(app, &chat_session_holder, &sink, &route_tx);
+                        // The exchange just landed — if the working transcript has
+                        // crossed the token budget, fold the older turns into one
+                        // structured summary on a forked base (the recent tail stays
+                        // verbatim). Deterministic trigger; fail-open to FIFO.
+                        maybe_spawn_auto_compaction(app, &compaction_tx);
                     }
                     // The turn produced no usable reply (base init / stream error).
                     // `record_route_failed` clears `thinking`; then fire the next
@@ -4282,6 +4363,21 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         app.record_route_failed(note);
                         run_task = drain_next_queued_chat(app, &chat_session_holder, &sink, &route_tx);
                     }
+                    None => {}
+                }
+            }
+            maybe_compaction = compaction_rx.recv() => {
+                // A spawned compaction job settled. Applying it changes the working
+                // transcript (a summary block replaces the folded prefix) — mark the
+                // frame dirty. The full transcript on disk is untouched either way.
+                needs_redraw = true;
+                match maybe_compaction {
+                    Some(CompactionOutcome::Done { summary, fold_count, generation }) => {
+                        app.apply_compaction(&summary, fold_count, generation);
+                    }
+                    // Fail-open: the summary failed / was empty / the base was
+                    // offline — advance the breaker + FIFO-trim the working view.
+                    Some(CompactionOutcome::Failed) => app.fail_compaction(),
                     None => {}
                 }
             }
@@ -5097,6 +5193,22 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                     } else {
                                         backend.execute(DisableMouseCapture)
                                     };
+                                }
+                                Action::Compact => {
+                                    // `/compact`: fold the older turns into one
+                                    // structured summary via a forked base (the SAME
+                                    // path as auto-compaction). The slash handler
+                                    // already validated there is enough to fold and
+                                    // pushed the "compacting…" note; drive it here.
+                                    // Fail-open: an unreachable base → FIFO fallback.
+                                    if let Some(job) = app.begin_manual_compaction() {
+                                        spawn_compaction(
+                                            app.brain_spec(),
+                                            app.project_root.clone(),
+                                            job,
+                                            &compaction_tx,
+                                        );
+                                    }
                                 }
                                 Action::ForceRedraw => {
                                     // Ctrl+L / `/redraw`: request a full clear+repaint on

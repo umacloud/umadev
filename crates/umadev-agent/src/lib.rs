@@ -40,6 +40,7 @@ pub mod agents;
 pub mod base_error;
 pub mod checkpoint;
 pub mod coach;
+pub mod compaction;
 pub mod config;
 pub mod constitution;
 pub mod context;
