@@ -893,6 +893,26 @@ fn collect_repo_files(root: &std::path::Path) -> Vec<String> {
     out
 }
 
+/// True for a RECOVERABLE, mid-turn base hiccup (rate-limit / overloaded / retry)
+/// that should surface as a transient live status line rather than a permanent
+/// `[warn]` transcript row — so a flurry of retries doesn't spam the region next
+/// to the still-running thinking timer and read like the turn is erroring (it
+/// isn't; the turn keeps running, only a terminal ABORT settles it).
+fn is_transient_warning(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("rate limit")
+        || m.contains("rate-limit")
+        || m.contains("429")
+        || m.contains("529")
+        || m.contains("overloaded")
+        || m.contains("retry")
+        || m.contains("retrying")
+        || m.contains("too many requests")
+        || m.contains("capacity")
+        || m.contains("temporarily")
+        || m.contains("server is busy")
+}
+
 /// True when `s` ends with a recognised raster-image extension (case-insensitive).
 /// The set mirrors what the bases accept as an image (`png` / `jpe?g` / `gif` /
 /// `webp`); a dragged-in image arrives as exactly such a path.
@@ -4299,7 +4319,19 @@ impl App {
                         // P5c: a warning closes any open reasoning block.
                         self.collapse_thinking_block();
                         self.stream_text_active = false;
-                        self.push(ChatRole::System, format!("[warn] {message}"));
+                        if is_transient_warning(&message) {
+                            // A RECOVERABLE mid-turn hiccup (rate-limit / overloaded /
+                            // retry) — show it as ONE muted live status line that the
+                            // next beat overwrites, NOT a permanent "[warn]" transcript
+                            // row. Otherwise a flurry of retries spams the region next
+                            // to the still-running "正在思考 (Ns)" timer and reads like
+                            // the turn is failing — but the turn keeps running; only a
+                            // terminal ABORT settles it. (The timer is correct; this is
+                            // the "时间会乱弹错误" report.)
+                            self.transient_status = Some(format!("· {message}"));
+                        } else {
+                            self.push(ChatRole::System, format!("[warn] {message}"));
+                        }
                     }
                     umadev_runtime::StreamEvent::Thinking => {
                         // P5c: open (once) a reasoning block. A burst of `Thinking`
@@ -5674,6 +5706,24 @@ impl App {
                         umadev_i18n::t(self.lang, "continue.resuming"),
                     );
                     Action::ResumeRun(req)
+                } else if !self.run_started
+                    && !self.finished
+                    && self.host_chat_session_active
+                    && self.chat_session_id.is_some()
+                {
+                    // No director-run plan on disk, but the prior progress was a
+                    // CHAT-driven agentic loop (the base built reactively and
+                    // persisted only its OWN session — no plan.json /
+                    // workflow-state.json, which is all `has_resumable_run` reads).
+                    // Resume the CONVERSATION: a routed turn re-attaches the same base
+                    // session (`continue_session = host_chat_session_active`), so the
+                    // base picks up its full context where it left off, instead of
+                    // wrongly telling the user "no pipeline started".
+                    self.push(
+                        ChatRole::UmaDev,
+                        umadev_i18n::t(self.lang, "continue.resuming_chat"),
+                    );
+                    Action::Route(umadev_i18n::t(self.lang, "continue.chat_directive").to_string())
                 } else {
                     let hint = if self.run_started && !self.finished {
                         umadev_i18n::t(self.lang, "continue.running")
@@ -14745,15 +14795,43 @@ mod tests {
     }
 
     #[test]
-    fn warning_shows_in_chat() {
+    fn transient_warning_goes_to_status_not_transcript() {
+        // A RECOVERABLE hiccup (rate-limit / retry / overloaded) surfaces as ONE
+        // muted live status line, NOT a permanent transcript row — so a flurry of
+        // retries doesn't read like the turn is erroring next to the thinking timer
+        // ("时间会乱弹错误"). The turn keeps running; only a terminal ABORT settles it.
         let mut a = fresh_app(Some("offline"));
+        let before = a.history.len();
         a.apply_engine(EngineEvent::WorkerStream {
             event: umadev_runtime::StreamEvent::Warning {
                 message: "rate limited".into(),
             },
         });
+        assert_eq!(
+            a.history.len(),
+            before,
+            "a transient warning must not be pushed to the transcript"
+        );
+        assert!(
+            a.transient_status
+                .as_deref()
+                .unwrap_or("")
+                .contains("rate limited"),
+            "it surfaces as a transient live status line instead"
+        );
+    }
+
+    #[test]
+    fn notable_warning_still_shows_in_transcript() {
+        // A non-transient warning stays a transcript row as before.
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::Warning {
+                message: "disk almost full".into(),
+            },
+        });
         let last = a.history.back().unwrap();
-        assert!(last.body().contains("rate limited"));
+        assert!(last.body().contains("disk almost full"));
     }
 
     #[test]

@@ -293,6 +293,8 @@
 "continue.finished" = "The pipeline is complete. Type a new requirement to start fresh, or /quit to exit."
 "continue.not_started" = "No pipeline started yet. Just type a one-line requirement to launch the 9-phase pipeline."
 "continue.resuming" = "Resuming your previous run — re-attaching to the saved plan and picking up the remaining steps (the finished ones stay done)."
+"continue.resuming_chat" = "Resuming the previous conversation — the base picks up with full context."
+"continue.chat_directive" = "Continue the work from where we left off."
 "continue.resuming_plan" = "team · resuming the saved plan ({}/{} steps already done) — driving only what's left"
 "revise.usage" = "Usage: /revise <revision notes>.\n  Example: /revise drop social login, keep only email + password"
 "revise.no_gate" = "No gate is open, nothing to revise — to change output, wait for the pipeline to pause at a gate (docs_confirm / preview_confirm)."

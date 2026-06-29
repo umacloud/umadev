@@ -293,6 +293,8 @@
 "continue.finished" = "流水线已完成。直接输入新需求开新一轮,或 /quit 退出。"
 "continue.not_started" = "还没启动流水线。直接输入需求一句话即可启动 9 阶段流水线。"
 "continue.resuming" = "正在续跑上次的任务 — 重新挂回已保存的计划,接着跑剩下的步骤(已完成的步骤保持完成)。"
+"continue.resuming_chat" = "继续上次的对话 —— 底座带着完整上下文接着干。"
+"continue.chat_directive" = "继续完成我们上次未完成的工作。"
 "continue.resuming_plan" = "团队 · 续跑已保存的计划(已完成 {}/{} 步)— 只跑剩下的部分"
 "revise.usage" = "用法:/revise <修订说明>。\n  示例:/revise 去掉社交登录,只留邮箱密码"
 "revise.no_gate" = "目前没有打开的 gate,无法修订 — 要修改产出需要先等流水线停在 gate(docs_confirm / preview_confirm)。"
