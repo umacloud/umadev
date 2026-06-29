@@ -726,16 +726,30 @@
 "tui.help.inspect.bug" = "收集診斷資訊以回報問題"
 # 說明浮層 —— 編輯與退出
 "tui.help.edit.newline" = "插入換行(多行需求 / 修改意見)"
-"tui.help.edit.recall" = "調取輸入歷史"
+"tui.help.edit.recall" = "調取輸入歷史 · 瀏覽命令面板 / 檔案引用"
 "tui.help.edit.autocomplete" = "從斜線面板補全"
 "tui.help.edit.compact" = "壓縮並摺疊對話以釋放上下文"
 "tui.help.edit.expand" = "摺疊 / 展開最近一條長回覆或工具輸出"
 "tui.help.key.expand_all" = "一次展開 / 收起所有摺疊輸出"
+"tui.help.key.mention" = "引用一個檔案路徑"
+"tui.help.key.shell" = "在專案根目錄執行 shell 命令"
+"tui.help.key.trust" = "切換信任模式:計畫 · 守護 · 自動"
+"tui.help.key.search" = "搜尋對話記錄"
+"tui.help.key.redraw" = "強制全螢幕重繪(修復花屏)"
+"tui.help.key.scroll" = "上下翻頁查看記錄"
+"tui.help.key.jump" = "跳到記錄頂部 / 底部(輸入為空時)"
+"tui.help.key.wheel" = "滾動 · 拖曳時擴展選區"
 "tui.help.edit.clear" = "清空對話歷史(設定保留)"
 "tui.help.edit.help" = "本浮層"
 "tui.help.edit.quit" = "退出"
 "tui.help.edit.toggle" = "切換本浮層"
-"tui.help.edit.esc" = "關閉浮層 / 退出"
+"tui.help.edit.esc" = "中斷執行 · 閒置時連按兩次回退 / 退出"
+# `!` 前綴的本地便捷 shell(在專案根目錄執行,不發給底座)。
+"tui.bang.exit" = "退出碼 {}"
+"tui.bang.failed" = "命令執行失敗"
+"tui.bang.spawn_failed" = "無法執行:{}"
+"tui.bang.timeout" = "命令逾時"
+"tui.bang.no_output" = "(無輸出)"
 # 說明浮層 + 命令面板共用的斜線命令描述(單一來源)。
 # 多數命令沿用上面的 tui.help.* 文案;以下涵蓋此前只有英文面板提示(或沒有提示)、
 # 現在改由註冊表統一管理的命令。

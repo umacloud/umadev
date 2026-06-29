@@ -5129,8 +5129,10 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                 );
             }
             // Keyboard shortcuts are KEYS, not slash commands, so they stay
-            // hand-listed (the registry only owns `/`-verbs). Ctrl+O is the
-            // global reveal-all; Ctrl+R folds just the latest row.
+            // hand-listed (the registry only owns `/`-verbs). Every row here is a
+            // REAL binding handled in `app.rs` key dispatch — Ctrl+O is the global
+            // reveal-all, Ctrl+R folds just the latest, Shift+Tab cycles the trust
+            // tier, `@` opens the file-mention popover, `!` runs a local shell.
             push_help_group(
                 &mut items,
                 umadev_i18n::t(lang, "tui.help.group.editing"),
@@ -5139,8 +5141,16 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("Shift+Enter", umadev_i18n::t(lang, "tui.help.edit.newline")),
                     ("↑ / ↓", umadev_i18n::t(lang, "tui.help.edit.recall")),
                     ("Tab", umadev_i18n::t(lang, "tui.help.edit.autocomplete")),
+                    ("@", umadev_i18n::t(lang, "tui.help.key.mention")),
+                    ("!", umadev_i18n::t(lang, "tui.help.key.shell")),
+                    ("Shift+Tab", umadev_i18n::t(lang, "tui.help.key.trust")),
                     ("Ctrl+O", umadev_i18n::t(lang, "tui.help.key.expand_all")),
                     ("Ctrl+R", umadev_i18n::t(lang, "tui.help.edit.expand")),
+                    ("Ctrl+F", umadev_i18n::t(lang, "tui.help.key.search")),
+                    ("Ctrl+L", umadev_i18n::t(lang, "tui.help.key.redraw")),
+                    ("PgUp / PgDn", umadev_i18n::t(lang, "tui.help.key.scroll")),
+                    ("Home / End", umadev_i18n::t(lang, "tui.help.key.jump")),
+                    ("Wheel", umadev_i18n::t(lang, "tui.help.key.wheel")),
                     ("F1", umadev_i18n::t(lang, "tui.help.edit.toggle")),
                     ("Esc", umadev_i18n::t(lang, "tui.help.edit.esc")),
                 ],
@@ -6313,6 +6323,50 @@ mod tests {
         assert!(out.contains("/model"));
         assert!(out.contains("/version"));
         assert!(out.contains("Shift+Enter"));
+    }
+
+    #[test]
+    fn help_overlay_lists_real_keyboard_shortcuts() {
+        // The "Keys" group is a hand-listed cheatsheet of the REAL bindings the
+        // app.rs key dispatch handles — assert the distinctive labels render so a
+        // row can't silently drop, and that the `@`/`!`/Shift+Tab descriptions
+        // are wired (their text comes from the catalog).
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        let _ = app.apply_key(KeyCode::F(1));
+        // Tall enough that the whole overlay (including the bottom Keys group)
+        // renders without scrolling.
+        let backend = TestBackend::new(120, 320);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| crate::ui::render(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        assert!(out.contains(umadev_i18n::t(app.lang, "tui.help.group.editing").trim()));
+        for label in [
+            "Shift+Tab",
+            "Ctrl+O",
+            "Ctrl+R",
+            "Ctrl+F",
+            "Ctrl+L",
+            "Wheel",
+            "PgUp / PgDn",
+            "Home / End",
+        ] {
+            assert!(
+                out.contains(label),
+                "the keys cheatsheet must list `{label}`"
+            );
+        }
+        // The `!`-shell and Shift+Tab trust-mode descriptions confirm those rows
+        // are wired from the catalog (not just bare key labels).
+        assert!(out.contains(umadev_i18n::t(app.lang, "tui.help.key.shell")));
+        assert!(out.contains(umadev_i18n::t(app.lang, "tui.help.key.trust")));
     }
 
     #[test]

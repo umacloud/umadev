@@ -732,16 +732,30 @@
 "tui.help.inspect.bug" = "collect diagnostics to report a bug"
 # Help overlay — editing & exit
 "tui.help.edit.newline" = "insert newline (multi-line requirement / revision)"
-"tui.help.edit.recall" = "recall input history"
+"tui.help.edit.recall" = "recall input history · navigate palette / file mentions"
 "tui.help.edit.autocomplete" = "autocomplete from slash palette"
 "tui.help.edit.compact" = "summarize-and-fold the chat to free up context"
 "tui.help.edit.expand" = "fold / unfold the latest long reply or tool output"
 "tui.help.key.expand_all" = "reveal / hide ALL collapsed output at once"
+"tui.help.key.mention" = "mention a file path"
+"tui.help.key.shell" = "run a shell command in the project root"
+"tui.help.key.trust" = "cycle trust mode: Plan · Guarded · Auto"
+"tui.help.key.search" = "search the transcript"
+"tui.help.key.redraw" = "force a full redraw (fix a garbled screen)"
+"tui.help.key.scroll" = "page the transcript up / down"
+"tui.help.key.jump" = "jump transcript to top / bottom (empty input)"
+"tui.help.key.wheel" = "scroll · extend selection while dragging"
 "tui.help.edit.clear" = "clear chat history (config stays)"
 "tui.help.edit.help" = "this overlay"
 "tui.help.edit.quit" = "exit"
 "tui.help.edit.toggle" = "toggle this overlay"
-"tui.help.edit.esc" = "close overlay / quit"
+"tui.help.edit.esc" = "interrupt a run · double-tap to rewind / quit when idle"
+# `!`-prefixed local convenience shell (run in the project root, NOT routed to the base).
+"tui.bang.exit" = "exited with code {}"
+"tui.bang.failed" = "command failed"
+"tui.bang.spawn_failed" = "failed to run: {}"
+"tui.bang.timeout" = "command timed out"
+"tui.bang.no_output" = "(no output)"
 # Slash-command descriptions that the help overlay + palette share (one source).
 # Most commands reuse the tui.help.* strings above; these cover the verbs that
 # previously had only an English palette hint (or none) and are now registry-owned.

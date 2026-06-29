@@ -383,6 +383,22 @@ mod tests {
             "tui.help.ship.preview",
             "tui.help.inspect.design",
             "tui.help.edit.newline",
+            // P2 polish: the keyboard-shortcut cheatsheet rows added to the
+            // /help overlay's "Keys" group (real bindings only), plus the
+            // `!`-prefixed local convenience-shell runtime strings.
+            "tui.help.key.mention",
+            "tui.help.key.shell",
+            "tui.help.key.trust",
+            "tui.help.key.search",
+            "tui.help.key.redraw",
+            "tui.help.key.scroll",
+            "tui.help.key.jump",
+            "tui.help.key.wheel",
+            "tui.bang.exit",
+            "tui.bang.failed",
+            "tui.bang.spawn_failed",
+            "tui.bang.timeout",
+            "tui.bang.no_output",
             "event.phase_done",
             "event.verify_started",
             "event.verify_skipped",

@@ -5091,6 +5091,13 @@ impl App {
                 if let Some(action) = self.try_slash_command(&raw) {
                     return action;
                 }
+                // `!cmd` runs a one-off local shell in the project root (Claude
+                // Code's `!` convenience-shell convention) — NOT routed to the
+                // borrowed brain. Checked after the slash dispatch so it can't
+                // shadow a command; a bare `!` is a consumed no-op.
+                if let Some(action) = self.try_bang_command(&raw) {
+                    return action;
+                }
                 self.submit_text(raw)
             }
 
@@ -5892,6 +5899,58 @@ impl App {
         self.chat_session_id = None;
         self.maybe_suggest_design();
         self.push_preflight(requirement);
+    }
+
+    /// `Some(action)` if `raw` was a `!`-prefixed local shell command; `None`
+    /// means "not a bang command, treat as ordinary input".
+    ///
+    /// `!cmd` runs `cmd` once in the project root and renders its output as a
+    /// `Bash` tool row — the SAME surface a base-issued `Bash` uses, so the
+    /// command and its folded output read consistently with the rest of the
+    /// transcript. It is deliberately NOT routed to the borrowed brain (Claude
+    /// Code's `!` convenience-shell convention), so it never touches the base
+    /// session. A bare `!` (or `!` + only whitespace) is a consumed no-op — it
+    /// neither runs anything nor leaks the literal `!` to the base. Fully
+    /// fail-open: a spawn error / nonzero exit / >10s hang all surface as a
+    /// finished row with an explanatory line, never a panic or a frozen UI.
+    fn try_bang_command(&mut self, raw: &str) -> Option<Action> {
+        let cmd = raw.strip_prefix('!')?.trim();
+        if cmd.is_empty() {
+            // Bare `!` — do nothing, but still CONSUME it so the literal `!`
+            // is not handed to the base as a chat turn.
+            return Some(Action::None);
+        }
+        let (ok, output) = run_bang_command(&self.project_root, cmd, self.lang);
+        self.push_shell_row(cmd, ok, output);
+        Some(Action::None)
+    }
+
+    /// Append a finished `Bash` tool row for a one-off `!`-shell run: the command
+    /// as the row arg, its (already-bounded) output folded into the result
+    /// gutter. An OK run auto-collapses (long output folds to a head-N preview the
+    /// global Ctrl+O / latest-row Ctrl+R reveals); a failed run stays expanded so
+    /// the error is never hidden — mirroring the base-issued tool-row policy.
+    fn push_shell_row(&mut self, cmd: &str, ok: bool, output: String) {
+        // A one-off shell row is its own row; never fold it into a low-signal
+        // read batch.
+        self.stream_tool_batch = None;
+        let arg: String = cmd.chars().take(80).collect();
+        self.history.push_back(ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Tool(ToolCall {
+                name: "Bash".to_string(),
+                arg,
+                status: if ok { ToolStatus::Ok } else { ToolStatus::Fail },
+                result: (!output.trim().is_empty()).then_some(output),
+                merged: false,
+                count: 1,
+                collapsed: ok,
+            }),
+            collapsed: false,
+        });
+        while self.history.len() > HISTORY_CAP {
+            self.history.pop_front();
+        }
     }
 
     /// `Some(action)` if `raw` was a recognised slash command; `None`
@@ -9932,6 +9991,88 @@ fn new_chat_session_id() -> String {
     )
 }
 
+/// Run a one-off `!`-prefixed shell command in `root` and return
+/// `(success, combined_output)`. stdout + stderr are merged and bounded
+/// ([`bound_shell_output`]); a nonzero exit appends its code, a killed process a
+/// generic failure note, a spawn error an error line, and a >10s hang a timeout
+/// note — so the call ALWAYS returns and never panics or freezes the UI. The
+/// command is run via the platform shell (`sh -c` on unix, `cmd /C` on Windows)
+/// inside a worker thread with a bounded wait, so even a runaway command (e.g.
+/// `sleep 1000`) frees the UI after the deadline (the orphan thread simply ends
+/// when its child does). NOT routed to the base — a local convenience shell.
+fn run_bang_command(root: &std::path::Path, cmd: &str, lang: umadev_i18n::Lang) -> (bool, String) {
+    let root = root.to_path_buf();
+    let cmd_owned = cmd.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        let out = std::process::Command::new("cmd")
+            .args(["/C", &cmd_owned])
+            .current_dir(&root)
+            .output();
+        #[cfg(not(windows))]
+        let out = std::process::Command::new("sh")
+            .args(["-c", &cmd_owned])
+            .current_dir(&root)
+            .output();
+        // The receiver may already be gone (we timed out) — ignore the error.
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(Ok(output)) => {
+            let mut body = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.trim().is_empty() {
+                if !body.is_empty() && !body.ends_with('\n') {
+                    body.push('\n');
+                }
+                body.push_str(&stderr);
+            }
+            let bounded = bound_shell_output(&body);
+            let ok = output.status.success();
+            if ok {
+                let text = if bounded.trim().is_empty() {
+                    umadev_i18n::t(lang, "tui.bang.no_output").to_string()
+                } else {
+                    bounded
+                };
+                return (true, text);
+            }
+            // A nonzero exit reports its code (or a generic note when the process
+            // was killed by a signal and has no code), keeping any output above it.
+            let note = match output.status.code() {
+                Some(code) => umadev_i18n::tf(lang, "tui.bang.exit", &[&code.to_string()]),
+                None => umadev_i18n::t(lang, "tui.bang.failed").to_string(),
+            };
+            let text = if bounded.trim().is_empty() {
+                note
+            } else {
+                format!("{bounded}\n{note}")
+            };
+            (false, text)
+        }
+        Ok(Err(e)) => (
+            false,
+            umadev_i18n::tf(lang, "tui.bang.spawn_failed", &[&e.to_string()]),
+        ),
+        Err(_) => (false, umadev_i18n::t(lang, "tui.bang.timeout").to_string()),
+    }
+}
+
+/// Cap a one-off shell command's output so a chatty command can't flood the
+/// transcript: at most 300 lines, then a hard 16k-char ceiling. The folded
+/// tool-row renderer still applies its own head-N preview on top — this is the
+/// storage bound, not the display fold.
+fn bound_shell_output(body: &str) -> String {
+    const MAX_LINES: usize = 300;
+    const MAX_CHARS: usize = 16_000;
+    let mut out: String = body.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n");
+    if out.chars().count() > MAX_CHARS {
+        out = out.chars().take(MAX_CHARS).collect();
+    }
+    out
+}
+
 fn which_on_path(program: &str) -> bool {
     #[cfg(unix)]
     {
@@ -10578,6 +10719,76 @@ mod tests {
         // (where `animations_enabled_default` would otherwise pick `false`).
         app.animations = true;
         app
+    }
+
+    #[test]
+    fn bang_prefix_runs_a_local_shell_and_shows_output() {
+        let mut app = fresh_app(Some("offline"));
+        let before = app.history.len();
+        // `!echo <marker>` runs once in the project root and renders as a
+        // finished Bash tool row whose result holds the command's output — it is
+        // NOT routed to the base, so this works with no live session.
+        let action = app.try_bang_command("!echo umadev_bang_marker").unwrap();
+        assert!(matches!(action, Action::None));
+        assert_eq!(
+            app.history.len(),
+            before + 1,
+            "exactly one tool row is appended"
+        );
+        let last = app.history.back().unwrap();
+        assert_eq!(last.role, ChatRole::Host);
+        let MessageBody::Tool(t) = &last.kind else {
+            panic!(
+                "a bang command must render as a tool row, got {:?}",
+                last.kind
+            );
+        };
+        assert_eq!(t.name, "Bash");
+        assert_eq!(t.status, ToolStatus::Ok);
+        assert!(
+            t.result
+                .as_deref()
+                .unwrap_or_default()
+                .contains("umadev_bang_marker"),
+            "the shell output must be shown in the row: {:?}",
+            t.result
+        );
+    }
+
+    #[test]
+    fn bare_bang_is_a_consumed_no_op() {
+        let mut app = fresh_app(Some("offline"));
+        let before = app.history.len();
+        // A bare `!` (and `!` followed by only whitespace) CONSUMES the input so
+        // the literal `!` never reaches the base, but runs nothing + appends no row.
+        assert!(matches!(app.try_bang_command("!"), Some(Action::None)));
+        assert!(matches!(app.try_bang_command("!   "), Some(Action::None)));
+        assert_eq!(
+            app.history.len(),
+            before,
+            "an empty bang must not append any row"
+        );
+        // Non-`!` input is not a bang command at all (falls through to routing).
+        assert!(app.try_bang_command("echo hi").is_none());
+        assert!(app.try_bang_command("/help").is_none());
+    }
+
+    #[test]
+    fn bang_nonzero_exit_surfaces_the_code_and_stays_expanded() {
+        let mut app = fresh_app(Some("offline"));
+        // A failing command marks the row Fail (kept expanded so the error is
+        // never hidden) and surfaces its nonzero exit code in the result.
+        let _ = app.try_bang_command("!exit 3").unwrap();
+        let MessageBody::Tool(t) = &app.history.back().unwrap().kind else {
+            panic!("expected a tool row");
+        };
+        assert_eq!(t.status, ToolStatus::Fail);
+        assert!(!t.collapsed, "a failed shell row stays expanded");
+        assert!(
+            t.result.as_deref().unwrap_or_default().contains('3'),
+            "the nonzero exit code must be shown: {:?}",
+            t.result
+        );
     }
 
     #[test]
