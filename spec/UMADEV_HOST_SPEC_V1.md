@@ -265,8 +265,8 @@ commercial delivery build and is **out of this clause's scope** (see the
 team-scaling rule in §9.4 and the lightweight `seeai` profile in §8.4). The
 reference implementation reaches the phase chain by **routing** a turn to
 the deliberate path and synthesizing a plan whose deepest form *is* this
-chain (§9.5) — the chain is the deep play the directing Agent selects for a
-full build, not a funnel every message is forced through.
+chain (§9.5) — the chain is the deep play the coordinator routes the team
+into for a full build, not a funnel every message is forced through.
 
 ### 4.2 Docs confirmation gate (`UD-FLOW-002`)
 
@@ -774,7 +774,7 @@ workspace is ten crates:
 | `umadev` | The binary — clap CLI + the `tui` subcommand |
 | `umadev-spec` | This specification as Rust data (clauses, phases, gates) |
 | `umadev-governance` | Every enforceable rule in §3 / §6 — fail-open |
-| `umadev-agent` | The director engine — intent router + owned plan DAG + step scheduling + firmware injection, with the full commercial phase chain as its deepest play; gate semantics, role-critic team, trust tiers, runtime/deploy/review evidence |
+| `umadev-agent` | The team engine — intent router + owned plan DAG + a coordinator seat that schedules the role team (PM, architect, designer, frontend, backend, QA, security, DevOps) step by step + firmware injection, with the full commercial phase chain as its deepest play; gate semantics, role-critic team, trust tiers, runtime/deploy/review evidence |
 | `umadev-runtime` | Runtime trait + OfflineRuntime + RuntimeKind (the host drivers impl Runtime; UmaDev owns no HTTP/model endpoint) |
 | `umadev-host` | Drives a logged-in `claude` / `codex` / `opencode` CLI as a subprocess |
 | `umadev-knowledge` | Structured BM25 + CJK retrieval over the curated `knowledge/` corpus |
@@ -784,8 +784,8 @@ workspace is ten crates:
 
 ### 9.1 Execution modes
 
-The reference implementation drives a turn through the director-driven
-runtime of §9.5 — routing it, and for a full commercial build expanding the
+The reference implementation drives a turn through the team runtime of §9.5
+— a coordinator seat routing it, and for a full commercial build expanding the
 plan into the §4 phase chain — with one of two interchangeable backends. The
 choice does **not** affect which clauses fire, only where the generative
 work happens:
@@ -826,7 +826,7 @@ artifacts they leave on disk* — never on the wire mechanism underneath.
 
 In the reference driver the model is this:
 
-- **One session = the directing Agent's working context.** A run opens a
+- **One session = the team's shared working context.** A run opens a
   single base session, hands it the `research` directive, and then drives
   the *same* session through `docs`, `spec`, `frontend`, `backend`,
   `quality`, and `delivery`. The base keeps the accumulated context across
@@ -848,8 +848,8 @@ In the reference driver the model is this:
   proves the result actually boots.
 - **All intents share the session.** A casual question, an ad-hoc
   read/inspect/small-fix task, and a full pipeline run are not three
-  separate code paths but three ways the directing Agent steers the *same*
-  session. The base classifies which one a turn is and the shell drives
+  separate code paths but three ways the coordinator steers the *same*
+  team session. The base classifies which one a turn is and the shell drives
   accordingly; only work that mutates the workspace takes the single-writer
   run lock and the full gate machinery, while chat and read-only review do
   not.
@@ -864,14 +864,16 @@ In the reference driver the model is this:
 ### 9.4 The team-of-roles collaboration model
 
 The role-critic team required by `UD-FLOW-007` is realized in the
-reference implementation as a **full project team led by a directing
-Agent** — the everyday mental model is a project director who does not
-type code, but who decomposes the requirement, schedules a top-tier team
-(product manager, architect, UI/UX designer, frontend, backend, QA,
-security, DevOps), and signs off at each gate. Each seat is a *persona*
-that drives the borrowed base brain from that seat's point of view; none
-is a hand-coded heuristic. The team obeys the four hard invariants of
-`UD-FLOW-007` and is organized along two axes:
+reference implementation as a **full project team** — product manager,
+architect, UI/UX designer, frontend, backend, QA, security, and DevOps,
+each a seat doing its own specialty on a shared blackboard. The everyday
+mental model is the *team*, not one seat: the team decomposes the
+requirement, builds it, and reviews it. A **coordinator** seat (the
+team's technical lead) schedules those seats and signs off at each gate;
+it does not type code and it is not the headline — it is the glue. Each
+seat is a *persona* that drives the borrowed base brain from that seat's
+point of view; none is a hand-coded heuristic. The team obeys the four
+hard invariants of `UD-FLOW-007` and is organized along two axes:
 
 - **Doing roles vs. reviewing roles.** Doing roles (the frontend and
   backend engineers, the PM writing the spec) drive the *main* session
@@ -909,7 +911,7 @@ is a hand-coded heuristic. The team obeys the four hard invariants of
   lightweight path allowed for simple requirements (the spec profile of
   §8.4 governs the time-boxed `seeai` variant).
 
-### 9.5 Director-driven turn model — route, plan, schedule, deliver
+### 9.5 Team turn model — route, plan, schedule, deliver (coordinator-scheduled)
 
 This section describes the **canonical shape of the reference
 implementation's runtime**. It is **non-normative**: it adds no clause and
@@ -935,7 +937,7 @@ five layers:
   the layer that makes a UmaDev turn behave like a senior delivery team
   rather than a bare base; governance (§3 / §6) remains the silent floor
   under it.
-- **L1 — Intent router.** The directing Agent classifies the turn into a
+- **L1 — Intent router.** The coordinator seat classifies the turn into a
   typed route — its class (chat / explain / quick-edit / debug / build), its
   task kind, the depth warranted, and the team to convene — using a
   deterministic tier as the floor and an optional cheap forked brain consult
@@ -959,7 +961,7 @@ five layers:
   episodes feed the self-evolving memory.
 
 **Relation to `UD-FLOW-001`.** The §4 phase chain is the **deepest play the
-directing Agent selects** — its plan for a full commercial greenfield build
+coordinator routes the team into** — its plan for a full commercial greenfield build
 *expands into* `research → docs → docs_confirm → spec → frontend →
 preview_confirm → backend → quality → delivery`, with the gates of §4.2 /
 §4.3 honored exactly. The chain is therefore canonical for that build, but

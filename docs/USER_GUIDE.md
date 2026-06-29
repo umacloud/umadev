@@ -5,9 +5,9 @@
 
 ## What is UmaDev?
 
-UmaDev is a **project-director Agent that wraps the AI coding base you already use** — it is *firmware over a borrowed brain*. It drives your already-logged-in base CLI — exactly three are first-class: **Claude Code, Codex, OpenCode** — to **route** your request, show you a **plan**, inject its team **firmware** (engineering craft + anti-AI-slop taste + your project's knowledge + a map of your existing code), **schedule a team** step by step with a deterministic acceptance floor, and hand back a **proof-pack**. (Want a different model? That is the base's job — route it to a third-party / local model in the base's own config; UmaDev does not add new drivers for that.)
+UmaDev is **a whole AI development team** — product manager, architect, UI/UX designer, frontend, backend, QA, security, and DevOps, each doing its own specialty on a shared blackboard — wrapped around the AI coding base you already use. It is *firmware over a borrowed brain*. A **coordinator** seat (the team's technical lead — it schedules and gates, it is not the headline) drives your already-logged-in base CLI — exactly three are first-class: **Claude Code, Codex, OpenCode** — to **route** your request, show you a **plan**, inject the team's **firmware** (engineering craft + anti-AI-slop taste + your project's knowledge + a map of your existing code), **schedule the team** step by step with a deterministic acceptance floor, and hand back a **proof-pack**. You don't hire a director — you hire the whole team. (Want a different model? That is the base's job — route it to a third-party / local model in the base's own config; UmaDev does not add new drivers for that.)
 
-UmaDev itself does NOT write code: the brain stays in the base; UmaDev decides WHAT to produce and HOW deeply to engage, checks the result against a floor that can say no, and leaves an evidence trail. It owns **no model endpoint** and does not re-implement the base's agentic loop. Governance (no emoji icons, no hardcoded colors, no AI-template slop, contract alignment) is the **silent safety net under** the director, not the whole product. Best validated on real projects.
+UmaDev itself does NOT write code: the brain stays in the base; the team decides WHAT to produce and HOW deeply to engage, checks the result against a floor that can say no, and leaves an evidence trail. It owns **no model endpoint** and does not re-implement the base's agentic loop. Governance (no emoji icons, no hardcoded colors, no AI-template slop, contract alignment) is the **silent safety net under** the team, not the whole product. Best validated on real projects.
 
 ## Quick Start
 
@@ -27,7 +27,7 @@ On first launch, pick your base (one of the three AI coding CLIs you've already 
 
 ## The 9-Phase Pipeline (the deep play, not every turn)
 
-This chain is the **deepest play the director routes to** for a full commercial greenfield build — not a funnel every message walks. A greeting stays chat, a one-line edit takes the fast path, a bugfix convenes no team; only a full product requirement expands the plan into this chain. (See the intent router in "What is UmaDev?" above, and spec §4.1 / §9.5.)
+This chain is the **deepest play the coordinator routes to** for a full commercial greenfield build — not a funnel every message walks. A greeting stays chat, a one-line edit takes the fast path, a bugfix convenes no team; only a full product requirement expands the plan into this chain. (See the intent router in "What is UmaDev?" above, and spec §4.1 / §9.5.)
 
 ```
 research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_confirm → backend → quality → delivery

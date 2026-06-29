@@ -1,9 +1,12 @@
 # UmaDev
 
-> **A governance rail around your AI coding base** — drives the Claude Code /
-> Codex / OpenCode you already logged into through a 9-phase commercial
-> delivery pipeline. The base writes the code; UmaDev runs the process.
-> **No API key needed.** Early-stage and governance-first.
+> **A whole AI development team** — product manager, architect, UI/UX designer,
+> frontend, backend, QA, security, and DevOps, each doing its own specialty on a
+> shared blackboard — wrapped around the Claude Code / Codex / OpenCode you
+> already logged into. A **coordinator** seat schedules the team and enforces the
+> gates (it routes, plans, and gates — it is not the headline); the base writes
+> the code. You don't hire a director — you hire the whole team.
+> **No API key needed.**
 
 ## Install
 
@@ -33,10 +36,15 @@ umadev report                     # emit UD-EVID-004 compliance map
 ## Why this exists
 
 UmaDev is **not** an LLM client. It does not call any AI API.
-Instead it **drives** one of the three first-class base CLIs you already
-use (`claude`, `codex`, `opencode`) through a deterministic 9-phase
-pipeline — the brain stays in the base. Wider model coverage is the base's
-job (route it to a third-party / local model), not a new UmaDev driver:
+Instead it convenes a development team — eight role specialists that plan,
+build, review, and sign off like a real team — over one of the three
+first-class base CLIs you already use (`claude`, `codex`, `opencode`); the
+brain stays in the base. Wider model coverage is the base's job (route it to
+a third-party / local model), not a new UmaDev driver.
+
+The coordinator routes each request: a chat stays chat, a one-line edit takes
+the fast path, and only a full product requirement expands into the team's
+deepest play — the deterministic commercial delivery chain:
 
 ```
 research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_confirm → backend → quality → delivery
