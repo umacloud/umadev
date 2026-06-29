@@ -294,6 +294,34 @@ pub(crate) fn run_budget() -> Duration {
 /// bounded-interrupt grace on its mid-turn budget settle (no second constant).
 pub(crate) const INTERRUPT_TIMEOUT_SECS: u64 = 5;
 
+/// The hard ceiling on bounded, VISIBLE retries of a TRANSIENT base failure (a 429
+/// rate limit, an overloaded base, a network blip — [`crate::base_error::is_transient`])
+/// within ONE turn before it fails honestly. Small + decisive, mirroring the
+/// bounded-rework philosophy: a transient hiccup earns a few backoff-and-retry
+/// attempts, but a base that is genuinely down still fails promptly rather than
+/// grinding. A HARD failure (auth / context / a non-zero exit) is NOT retried at all.
+const MAX_TRANSIENT_RETRIES: u32 = 3;
+
+/// The base unit of the exponential transient backoff (attempt 1 → 1×, 2 → 2×, 3 →
+/// 4× this, capped at [`TRANSIENT_BACKOFF_CAP`]). 2s keeps a single retry quick yet
+/// gives a rate limit room to clear before the next attempt.
+const TRANSIENT_BACKOFF_BASE: Duration = Duration::from_secs(2);
+
+/// The cap on any single transient backoff wait, so the schedule stays bounded even
+/// if [`MAX_TRANSIENT_RETRIES`] grows. 30s is the longest a transient retry ever waits.
+const TRANSIENT_BACKOFF_CAP: Duration = Duration::from_secs(30);
+
+/// The backoff wait before transient-retry `attempt` (1-based): exponential off `base`,
+/// capped at `cap` — attempt 1 → `base`, 2 → 2×`base`, 3 → 4×`base`, … never exceeding
+/// `cap`. Pure + total + bounded: the shift is clamped (so it can never overflow) and a
+/// multiply overflow saturates at `cap`, so the schedule is deterministic and can never
+/// balloon. `base`/`cap` are parameters so the test drives a tiny, fast window.
+fn transient_backoff_wait(base: Duration, cap: Duration, attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(16);
+    let mult = 1u32 << shift; // shift ≤ 16 ⇒ ≤ 65 536, never overflows a u32
+    base.checked_mul(mult).map_or(cap, |d| d.min(cap))
+}
+
 /// The result of ONE idle-guarded `next_event()` wait — the shared primitive
 /// every main-session event pump uses so the "stops emitting but never exits"
 /// hang can NEVER wedge a pump (the P0-3 / P1-11 zero-stall fix).
@@ -2362,6 +2390,21 @@ struct TurnResult {
 /// accumulating the assistant text. Returns the turn's text, or `Err` with a
 /// machine-true reason on a failed / dead turn (fail-open: the caller maps it to a
 /// hard stop, never a panic).
+///
+/// **Two bounded, VISIBLE self-heals layer on the bare pump, both fail-open:**
+/// - A base **turn-failure** the [`crate::base_error`] classifier reads as TRANSIENT
+///   (a 429 / overloaded / a network blip) is BACKED OFF and re-driven — emitting a
+///   COUNTDOWN Note before each wait (never a silent backoff) — bounded by
+///   [`MAX_TRANSIENT_RETRIES`] and the run `deadline`. A HARD failure (auth / context /
+///   exit) is returned verbatim with no retry.
+/// - A **non-tool silent hang on a still-alive base** (the watchdog's
+///   [`IdleEvent::IdleTimedOut`] with no tool in flight and no captured exit — the base
+///   may have silently dropped its stream) is re-driven ONCE before failing. It never
+///   fires for the legitimate long-tool wait (that keeps `in_tool_call` true) or for a
+///   dead base.
+///
+/// The thin wrapper supplies the real backoff schedule; the `_with_backoff` core takes
+/// it as parameters so the test drives a tiny, fast window.
 async fn drive_one_turn(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -2370,15 +2413,48 @@ async fn drive_one_turn(
     idle: IdleBudget,
     deadline: std::time::Instant,
 ) -> Result<TurnResult, String> {
+    drive_one_turn_with_backoff(
+        session,
+        options,
+        events,
+        directive,
+        idle,
+        deadline,
+        TRANSIENT_BACKOFF_BASE,
+        TRANSIENT_BACKOFF_CAP,
+    )
+    .await
+}
+
+/// [`drive_one_turn`] with the transient-backoff schedule injected (so the test drives
+/// a tiny, deterministic window). See [`drive_one_turn`] for the two self-heals.
+#[allow(clippy::too_many_arguments)]
+async fn drive_one_turn_with_backoff(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    directive: String,
+    idle: IdleBudget,
+    deadline: std::time::Instant,
+    backoff_base: Duration,
+    backoff_cap: Duration,
+) -> Result<TurnResult, String> {
     // Estimate the directive's token cost up front (the session stream carries no
     // usage on `TurnDone`, unlike the single-shot path), so `/usage` is real on the
     // default loop for ALL three bases — not just claude in the legacy runner.
     let mut est_tokens: u64 = approx_tokens(&directive);
-    if let Err(e) = session.send_turn(directive).await {
+    // Keep the directive OWNED (clone for the send) so a transient backoff-retry or a
+    // silent-hang watchdog re-drive can re-send the SAME directive on this session.
+    if let Err(e) = session.send_turn(directive.clone()).await {
         return Err(format!("session send: {e}"));
     }
     let mut text = String::new();
     let mut pitfalls: Vec<String> = Vec::new();
+    // Bounded counters for the two self-heals (see the fn docs): how many transient
+    // backoff-retries this turn has already spent, and whether the silent-hang watchdog
+    // re-drive has already fired (a SINGLE re-drive).
+    let mut transient_retries: u32 = 0;
+    let mut watchdog_retried = false;
     // Tool-aware idle grace: while the base is plausibly mid-tool (a tool-use event
     // seen, no result yet) it is legitimately SILENT for minutes (a docker build / a
     // compile / npm install / a long test), so the next wait uses the extended tool
@@ -2442,6 +2518,35 @@ async fn drive_one_turn(
                 ));
             }
             IdleEvent::IdleTimedOut { exit, stderr_tail } => {
+                // Watchdog re-drive (bounded SINGLE retry): a NON-tool silent hang on a
+                // base that is STILL ALIVE (no exit captured even after the watchdog's
+                // bounded interrupt) may be a SILENTLY DROPPED stream, not a dead base —
+                // so re-drive the SAME directive ONCE before failing. Strictly gated so
+                // it never fights the legitimate long-tool wait: it fires ONLY when no
+                // tool was in flight (`!in_tool_call`, so the in-tool budget-reached
+                // settle is excluded), the base is alive (`exit.is_none()`), and we have
+                // not already re-driven. Fail-open: a re-send error, a second hang, or a
+                // dead base all fall through to the honest failure below.
+                if !in_tool_call && exit.is_none() && !watchdog_retried {
+                    watchdog_retried = true;
+                    // The abandoned (hung) attempt still spent its tokens — record the
+                    // estimate (F3) before the fresh drive.
+                    record_turn_usage(options, events, None, est_tokens);
+                    events.emit(EngineEvent::Note(
+                        umadev_i18n::tl("tui.retry.silent_redrive").to_string(),
+                    ));
+                    // Re-send the SAME directive on the still-live session. A send error
+                    // means the session really is broken → fail honestly.
+                    if let Err(e) = session.send_turn(directive.clone()).await {
+                        return Err(format!("session send: {e}"));
+                    }
+                    // Fresh turn: reset the accumulators (the hang produced no output).
+                    est_tokens = approx_tokens(&directive);
+                    text.clear();
+                    pitfalls.clear();
+                    in_tool_call = false;
+                    continue;
+                }
                 // No event within the idle window → the base is hung. Settle as a
                 // Failed outcome so the loop ends and `thinking` clears, rather than
                 // blocking forever (the interrupt was already issued, bounded).
@@ -2563,6 +2668,43 @@ async fn drive_one_turn(
                 }
                 TurnStatus::Failed(reason) => {
                     record_turn_usage(options, events, usage, est_tokens);
+                    // Visible bounded backoff-retry on a TRANSIENT base failure (a 429
+                    // rate limit, an overloaded base, a network blip): the base hit a
+                    // RECOVERABLE hiccup, so emit a COUNTDOWN Note (never a silent wait),
+                    // back off, and re-drive the SAME directive — bounded by
+                    // `MAX_TRANSIENT_RETRIES` AND the run `deadline`. A HARD failure
+                    // (auth / context / a non-zero exit / unclassifiable) is returned
+                    // verbatim with NO retry (retrying is futile → fail at once). The
+                    // classifier reads the base's OWN error text only (this `reason`),
+                    // never an idle/ended settle, so an idle hang is never mistaken for a
+                    // transient API error. Fail-open: the caller still NAMES the fix.
+                    let failure = crate::base_error::classify(None, None, Some(&reason));
+                    if crate::base_error::is_transient(&failure)
+                        && transient_retries < MAX_TRANSIENT_RETRIES
+                        && std::time::Instant::now() < deadline
+                    {
+                        transient_retries += 1;
+                        let wait =
+                            transient_backoff_wait(backoff_base, backoff_cap, transient_retries);
+                        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "tui.retry.countdown",
+                            &[
+                                &wait.as_secs().to_string(),
+                                &transient_retries.to_string(),
+                                &MAX_TRANSIENT_RETRIES.to_string(),
+                            ],
+                        )));
+                        tokio::time::sleep(wait).await;
+                        // Re-drive the SAME directive on the still-live session.
+                        if let Err(e) = session.send_turn(directive.clone()).await {
+                            return Err(format!("session send: {e}"));
+                        }
+                        est_tokens = approx_tokens(&directive);
+                        text.clear();
+                        pitfalls.clear();
+                        in_tool_call = false;
+                        continue;
+                    }
                     return Err(reason);
                 }
             },
@@ -4091,6 +4233,325 @@ mod tests {
             *sess.interrupts().lock().unwrap(),
             0,
             "the in-tool budget backstop does not interrupt (the run finalization does)"
+        );
+    }
+
+    // ── Visible retry + silent-hang watchdog re-drive ──────────────────────
+
+    /// A failed-turn batch carrying the base's OWN error text (the transient/hard
+    /// failure the `TurnStatus::Failed` retry path classifies).
+    fn fail_turn(reason: &str) -> Vec<SessionEvent> {
+        vec![SessionEvent::TurnDone {
+            status: TurnStatus::Failed(reason.to_string()),
+            usage: None,
+        }]
+    }
+
+    /// A base whose every turn is a NON-tool silent hang (`next_event` never resolves)
+    /// while it stays ALIVE (`try_exit_status` defaults to `None`), counting each
+    /// `send_turn` — the fixture for the silent-hang WATCHDOG RE-DRIVE (a live base that
+    /// may have dropped its stream is re-driven once before failing).
+    struct CountingHangSession {
+        sends: Arc<std::sync::Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for CountingHangSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("hang".into()))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            *self.sends.lock().unwrap() += 1;
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    /// A base that emits ONE `ToolCall` per turn then hangs silently while staying ALIVE
+    /// — the IN-TOOL case the watchdog must NOT re-drive (a long-running tool is
+    /// legitimately silent). Counts each `send_turn` so a spurious re-drive is caught.
+    struct CountingToolHangSession {
+        sends: Arc<std::sync::Mutex<u32>>,
+        emitted_tool: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for CountingToolHangSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("hang".into()))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            *self.sends.lock().unwrap() += 1;
+            self.emitted_tool = false;
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            if self.emitted_tool {
+                std::future::pending::<()>().await;
+                None
+            } else {
+                self.emitted_tool = true;
+                Some(SessionEvent::ToolCall {
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "docker build ."}),
+                })
+            }
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transient_backoff_is_exponential_capped_and_bounded() {
+        // Exponential off the base, capped — deterministic + never unbounded.
+        let base = Duration::from_secs(2);
+        let cap = Duration::from_secs(30);
+        assert_eq!(transient_backoff_wait(base, cap, 1), Duration::from_secs(2));
+        assert_eq!(transient_backoff_wait(base, cap, 2), Duration::from_secs(4));
+        assert_eq!(transient_backoff_wait(base, cap, 3), Duration::from_secs(8));
+        // A large attempt saturates at the cap, never overflows.
+        assert_eq!(transient_backoff_wait(base, cap, 50), cap);
+        // attempt 0 is total (yields the base), never a panic.
+        assert_eq!(transient_backoff_wait(base, cap, 0), base);
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_emits_a_countdown_note_then_recovers() {
+        // Part 1: a base turn-failure the classifier reads as TRANSIENT (a 429) is backed
+        // off and re-driven, and the wait is VISIBLE — a countdown Note is emitted BEFORE
+        // the backoff. The second turn completes, so the turn recovers.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, rec) = sink();
+        let turns = vec![
+            fail_turn("API Error: Request rejected (429) — rate limit"),
+            text_turn("recovered"),
+        ];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let out = drive_one_turn_with_backoff(
+            &mut sess,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+            // Tiny, fast backoff window so the test never really waits seconds.
+            Duration::from_millis(2),
+            Duration::from_millis(20),
+        )
+        .await;
+        match out {
+            Ok(r) => assert_eq!(r.text, "recovered", "the turn recovered after one backoff"),
+            Err(e) => panic!("a transient 429 must be retried to recovery: {e}"),
+        }
+        // Re-driven once: the initial directive + one retry = 2 sends.
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "the transient failure is re-driven once"
+        );
+        // The backoff is VISIBLE — a countdown Note with the stable, locale-independent
+        // "(attempt 1/3)" marker was surfaced before recovery.
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("1/3"))),
+            "a countdown Note is surfaced before the backoff wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_retries_are_bounded_and_fail_open() {
+        // Part 1 boundedness: a base that ALWAYS fails transiently is retried only a
+        // bounded number of times, then fails honestly with the raw reason intact
+        // (fail-open) — never an infinite retry loop.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, rec) = sink();
+        let turns = vec![fail_turn("429 too many requests"); 6];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let out = drive_one_turn_with_backoff(
+            &mut sess,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        match out {
+            Err(reason) => assert!(
+                reason.contains("429"),
+                "the base's raw error survives the bounded retry: {reason}"
+            ),
+            Ok(_) => {
+                panic!("a base that always fails transiently must still fail, not loop forever")
+            }
+        }
+        // Bounded: the initial send + EXACTLY `MAX_TRANSIENT_RETRIES` retries.
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            (MAX_TRANSIENT_RETRIES + 1) as usize,
+            "transient retries are bounded by MAX_TRANSIENT_RETRIES"
+        );
+        // One visible countdown per retry (the "/3" max is locale-independent).
+        let countdowns = rec
+            .events()
+            .iter()
+            .filter(|e| matches!(e, EngineEvent::Note(n) if n.contains("/3")))
+            .count();
+        assert_eq!(
+            countdowns, MAX_TRANSIENT_RETRIES as usize,
+            "one visible countdown Note per bounded retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hard_failure_is_not_retried() {
+        // A HARD failure (auth) is returned at once — retrying it is futile, so NO
+        // backoff, NO countdown, exactly ONE send.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, rec) = sink();
+        let turns = vec![fail_turn("401 Unauthorized — not logged in")];
+        let mut sess = FakeSession::new(turns, false, "");
+        let sent = sess.sent_handle();
+        let out = drive_one_turn_with_backoff(
+            &mut sess,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert!(out.is_err(), "an auth failure fails honestly");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "a hard (auth) failure is never retried"
+        );
+        assert_eq!(
+            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("/3"))),
+            0,
+            "a hard failure emits no countdown Note"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_tool_silent_hang_on_a_live_base_redrives_once_then_fails() {
+        // Part 2: a NON-tool silent hang on a STILL-ALIVE base (it may have dropped its
+        // stream) is re-driven EXACTLY once before failing — a bounded single retry, not
+        // an infinite re-drive.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, rec) = sink();
+        let sends = Arc::new(std::sync::Mutex::new(0u32));
+        let mut sess = CountingHangSession {
+            sends: Arc::clone(&sends),
+        };
+        // Tiny base window so the non-tool hang settles fast.
+        let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
+        let out = tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_one_turn(
+                &mut sess,
+                &opts(tmp.path()),
+                &events,
+                "build it".to_string(),
+                budget,
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            ),
+        )
+        .await
+        .expect("the bounded re-drive must settle, never hang forever");
+        match out {
+            Err(reason) => assert!(
+                reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
+                "a second hang fails honestly as an idle settle: {reason}"
+            ),
+            Ok(_) => panic!("a base that only ever hangs must fail, not succeed"),
+        }
+        // Re-driven EXACTLY once: the initial send + one watchdog re-drive = 2 sends.
+        assert_eq!(
+            *sends.lock().unwrap(),
+            2,
+            "the silent-hang watchdog re-drives exactly once (bounded)"
+        );
+        // The re-drive is VISIBLE.
+        let redrive = umadev_i18n::tl("tui.retry.silent_redrive");
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n == redrive)),
+            "the silent-hang re-drive emits a visible Note"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_tool_silent_hang_on_a_live_base_never_redrives() {
+        // Part 2 guard: an IN-TOOL live base (a long `docker build`) goes silent but must
+        // NOT be re-driven — the liveness watchdog keeps waiting, so the only base call is
+        // the original send. Proves the re-drive never fights the legitimate long-tool
+        // wait (no spurious retry).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let sends = Arc::new(std::sync::Mutex::new(0u32));
+        let mut sess = CountingToolHangSession {
+            sends: Arc::clone(&sends),
+            emitted_tool: false,
+        };
+        let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
+        let pumped = tokio::time::timeout(
+            Duration::from_millis(300),
+            drive_one_turn(
+                &mut sess,
+                &opts(tmp.path()),
+                &events,
+                "build it".to_string(),
+                budget,
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            ),
+        )
+        .await;
+        assert!(
+            pumped.is_err(),
+            "an in-tool live base keeps waiting (no settle, no re-drive — the outer cancel fires)"
+        );
+        // Driven exactly ONCE — the in-tool wait never re-drives (no spurious retry).
+        assert_eq!(
+            *sends.lock().unwrap(),
+            1,
+            "an in-tool live hang is never re-driven"
         );
     }
 

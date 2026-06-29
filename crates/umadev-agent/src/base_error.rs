@@ -115,6 +115,21 @@ pub fn classify(
     BaseFailure::Unknown
 }
 
+/// Whether a [`BaseFailure`] is **transient** — a recoverable hiccup that a bounded
+/// backoff-and-retry can clear (a rate limit, an overloaded base, a network blip), as
+/// opposed to a HARD failure where retrying is futile (auth, context-length, a
+/// non-zero exit, or an unclassifiable error). The visible-retry backoff in the
+/// director loop (`UD-CODE` resilience) keys off this: only a transient failure earns
+/// a countdown-backed retry; everything else fails honestly on the first hit so a base
+/// that is genuinely misconfigured/down is reported at once, never ground on. Pure.
+#[must_use]
+pub fn is_transient(f: &BaseFailure) -> bool {
+    matches!(
+        f,
+        BaseFailure::RateLimit | BaseFailure::Overloaded | BaseFailure::Network { .. }
+    )
+}
+
 /// The per-base, actionable, localized diagnosis for a [`BaseFailure`].
 ///
 /// Returns a short imperative line that names the fix for THIS base (so a `claude`
@@ -499,6 +514,21 @@ mod tests {
             classify(None, Some("quota exceeded"), None),
             BaseFailure::RateLimit
         );
+    }
+
+    #[test]
+    fn is_transient_only_for_recoverable_hiccups() {
+        // Transient (backoff-and-retry can clear it): rate limit / overloaded / network.
+        assert!(is_transient(&BaseFailure::RateLimit));
+        assert!(is_transient(&BaseFailure::Overloaded));
+        assert!(is_transient(&BaseFailure::Network { ssl: false }));
+        assert!(is_transient(&BaseFailure::Network { ssl: true }));
+        // HARD (retrying is futile → fail honestly on the first hit): auth / context /
+        // a non-zero exit / unclassifiable.
+        assert!(!is_transient(&BaseFailure::Auth));
+        assert!(!is_transient(&BaseFailure::Context));
+        assert!(!is_transient(&BaseFailure::Exited(2)));
+        assert!(!is_transient(&BaseFailure::Unknown));
     }
 
     #[test]
