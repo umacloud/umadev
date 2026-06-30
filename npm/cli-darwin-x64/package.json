@@ -1,6 +1,6 @@
 {
   "name": "@umacloud/cli-darwin-x64",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "description": "umadev prebuilt binary for macOS (Intel / x86_64).",
   "homepage": "https://github.com/umacloud/umadev",
   "repository": {

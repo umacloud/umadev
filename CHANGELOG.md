@@ -2,6 +2,51 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.20] — 全面自审硬化 · Windows 全修(预览 / 信任 / 渲染 / 退出 / 路径)· 定位升级 · 安全 / RAG / 并发
+
+这一版是一轮**全面的自审硬化** —— 对 Windows 端到端、核心主流程、本地 RAG、自有安全扫描、CLI/MCP、并发各做了一遍逐条排雷,并把定位标语收得更凝练。其中 **Windows 此前多处实际不可用**(预览开发服务器根本起不来、信任地板对破坏性命令失明、控制台花屏、退出后 PowerShell 不可用、拖入的图片路径被吞)这次一次性修齐;主流程上堵住了两处 **HIGH** —— 未完成的有意构建**伪装成功**的交付证明包、断言**被掏空**当绿过;随包**本地 fp16 语义层**不再在任何长段落上静默全死;并新增 **PTY 启动冒烟**,杜绝启动崩溃再次静默发布。
+
+### 变更 — 定位
+
+- **更凝练的定位标语:UmaDev 指挥你已经在用的 Claude Code / Codex / OpenCode**。标语补上一个具体的第二分句(机制 + 不增成本):'一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活'(英文:A coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use;含 zh-TW 繁体)。一致铺开到 README ×3 hero 标题、文档(`PRODUCT_VISION_AND_ROADMAP` / `ARCHITECTURE`)标题语、官网 `<title>` + openGraph 标题 + 本地化 `document.title` + 页脚短语(中英)、`npm`/umadev 包描述 + README hero;滚动 hero 短句保持精简,meta description 已点名 CLI 故完整标语放进 `<title>` 避免重复。官网构建通过(Next 16.2.9,全 8 页)。
+
+### 修复 — Windows
+
+- **预览开发服务器在 Windows 上能起来了(High)**:`parse_run_command` 硬编码 `sh -c`、cd 路径又用 `Command::new(npm)`,于是 `/preview` 与 web 构建后的自动预览在 Windows 上**从不启动**(没有 `sh`;`npm.cmd` 找不到);cd 路径现经 `umadev_host::spawn_parts`(解析二进制 + 给 `.cmd`/`.bat` 垫片走 `cmd /c`),兜底在 Windows 走 `cmd /c`、unix 走 `sh -c`。
+- **不可逆动作信任地板认得 Windows 动词了(Auto 档下的安全地板曾退化)**:`BARE_DESTRUCTIVE_VERBS` 此前只知 unix 动词(`rm -rf`/`dd`/`mkfs`/`mv`/`unlink`),Windows/PowerShell 的破坏性命令在 `TrustMode::Auto` 下绕过了始终在场的确认;新增 `del`/`erase`/`rd`(rmdir 别名)/`format`/`remove-item`/`ri`(PowerShell Remove-Item)/`clear-disk`,经既有 `verb_at_command_position` 整 token 匹配(大小写不敏感、非子串,故 `deliver`/`format-output`/`cargo build`/`npm ci`/含 `del` 的路径不误伤)→ 归类 Destructive → `always_escalates()` → **每一档都确认**。
+- **历史召回 / `clear` 后控制台不再花屏**:ratatui 的 `CrosstermBackend` 按增量 diff 重绘(只写变化的格子),布局**高度**变化后陈旧格子在 conhost 上幸存 → 重叠(`/sessions` 重复、`/cleaeaclaer` 之类残字);历史召回与 `/clear` 此前都返回 `Action::None`、从不抬起既有的 `force_full_repaint` 杠杆。新增 `App::force_repaint` 标志,逐轮 OR 进 `force_full_repaint`;输入框渲染高度变化时(以及任意输入框高度跨帧增量)强制整帧重绘。
+- **`/exit` 与 `/quit` 不再让 PowerShell 不可用**:两者本就走正常拆除(无提前 `process::exit`),但 `restore_terminal` 在 `LeaveAlternateScreen` **之前**就 `DisableBracketedPaste`/`DisableMouseCapture`、从不关同步输出、从不复位 SGR → conhost 上未完全还原的备用屏 / 模式 / 颜色让 PowerShell 残废;现统一为一段共享的 `restore_sequence`(`disable_raw_mode` → `LeaveAlternateScreen` → `DisableMouseCapture` → `DisableBracketedPaste` → `EndSynchronizedUpdate` → 显示光标 → `ResetColor`),贯穿 `restore_terminal` + panic hook + setup-fail 路径,与 setup 对称、幂等、跨平台。
+- **拖入的图片路径 `C:\…` 不再被反斜杠当转义吞掉**:`umadev-tui` 的 `unquote_unescape` 把每个反斜杠当 shell 转义剥掉,于是拖入的 Windows 图片路径 `C:\Users\…\shot.png` 变成 `C:Users…shot.png` → canonicalize 失败 → 没有 chip / 没有附件;现在 Windows 上原样透传(反斜杠是那里的路径分隔符),unix 转义行为不变。
+- **CI windows 测试转绿**:把 1 个 unix-gated 测试 helper(`with_exit_status`,其唯一调用方是 unix-gated 测试)用 `#[cfg(unix)]` 圈住,杜绝 `-D warnings` 下的"method is never used";另把 7 个假设 unix 路径语义的测试跨平台化(开头 `/` 在 Windows 上非绝对;`C:\nonexistent` 可创建;反斜杠是分隔符非转义),用 per-OS 的 `out_of_tree_abs()` / `real_root()` 与"文件当父目录"的不可写根,让分类器真正生效。
+- **新增 CI 启动冒烟(PTY)—— 启动崩溃再也无法静默发布**:单元套件从不跑真正的 TUI 事件循环,故一处启动崩溃(空闲时 `.expect()` panic 的 `tokio::select!` 分支)在 1.0.17 **与** 1.0.18 都未被发现(`cargo test` 两次全绿)。build-release(Linux)现写一个最小 `~/.umadev/config.toml`(`backend=offline`)跳过首启选择器、经 `script` PTY 拉起 release 二进制进入主聊天循环(停留 ~6s 后 EOF 干净退出,超时兜底),输出含 `panicked at` 即让构建失败。
+
+### 修复 — TUI
+
+- **图片 / 粘贴 chip 作为一个整体删除与编辑**(用户实测:macOS 输入"删不掉"):`[图片 N]` / `[粘贴 N 行]` chip 以**字面文本**(6 字符)存在输入缓冲、真实路径在 attachments、提交时展开成 `@<path>`。`backspace()` 此前逐字素剥(`[图片 1` 这样的残 token)= 用户看着像"退格没反应"、且坏 token 不再匹配 `image_chip(n)` → 提交时**静默丢图**;另插入路径(`insert_at_cursor`/`insert_str_at_cursor`)无 chip 感知,在 chip **内部**打字也会损坏 token 同样丢图。现 `chip_spans()` 给出每个完整 chip 的 char-range;`backspace()`/`forward_delete()`/`Ctrl+W`/`U`/`K` 紧贴光标时把整个 chip 当一个单位删除并 `reconcile_attachments()`(按缓冲顺序重建、连续重编号,删中间也保持 `[图片 K]`↔attachments 耦合);插入点严格落在 chip 内部时也 reconcile(边缘插入保持完整)。
+- **聊天轮进行中切底座(`/codex` 等)不再泄漏旧会话**:`slash_backend` 此前只守 `is_pipeline_active()`,但一个流式**聊天**轮是 `agentic_in_flight==true` / `is_pipeline_active()==false`,于是轮中 `/codex`/`/claude`/`/opencode`/`/offline` 让旧底座会话停泊与新底座预载相竞(泄漏会话 / 静默 UI 与底座不一致);现守 `is_pipeline_active() || agentic_in_flight`(is_busy),与 `/cancel` 对齐。
+- **未终结的括号粘贴不再卡死输入**:一个未终结的括号粘贴(有 CSI 200~ 无 CSI 201~)此前永远 `in_paste==true` 并吞掉之后所有键;共享的 `after_in_paste_append` 在超过 `PASTE_BUF_CAP`(8 MiB)时强制闭合(把缓冲作为一次 Paste 交付),输入不会再卡死。
+
+### 修复 — 核心流程
+
+- **未完成的有意构建不再发出干净的交付证明包(H1)、断言被掏空不再当绿过(H2),外加 8 个路由 / 门 / 覆盖正确性修复**:H1 —— `run_final_gate` 的干净/脏结果**被丢弃**了:每步 Done 但最终门**脏**(掉了 FR / 契约漂移 / 运行时证明未验证)的分步构建照样 `finalize(clean=true)` = 一份把未完成构建包装成成功的证明包;现 `run_final_gate` 返回 `FinalGateOutcome{reply,clean}` 并 AND 进 finalize 门。H2 —— 断言**掏空**此前只数数没发现:`expect(add(1,2)).toEqual(3)` → `expect(true).toBe(true)` 保持计数;`count_trivial_true_asserts` 现在在计数恒定时也能发现 trivially-true 断言上升。另 8 处:重型 Bugfix/Refactor 在 lean 动词下的欠路由、`run_auto_qc` lean 短路按已执行 depth 而非重分类、跳地板要机器级运行证据(exit-0 / 具名 runner)、`impl_surface` 先 strip 项目根再判测试文件、`plan_state` 用 `id.trim()` 建 id 集(避免空白 padding 丢依赖边)、欠规格的证据条目保留为 Malformed→Gap 而非静默降级、PreviewConfirm 门按已执行计划是否含该步、`run_quality` 读已执行的 kind 等。
+
+### 修复 — RAG(本地语义层)
+
+- **随包本地 fp16 向量层不再静默全死 + 6 处检索修复**:HIGH —— `embed_inner` 未设截断,任一 curated 段超 512 token 就让 candle Err → `embed_texts` 返回 None,而 `embed_batch` 把整个语料发一次调用 → 一个长段落让整批为空 → 回落 HTTP → 默认安装无 key → 宣传的**本地 fp16 层只要任一段超 512 token 就静默关闭**(只剩 BM25,标准文档很常见);现 token id 先按模型 `max_position_embeddings`(读 `config.json`,兜底 512)截断,且每条文本**独立**嵌入、失败行零填充,只有整批全败才返回 None。另:向量通道做**阶段过滤**(融合后再 `filter_by_phase`);`quality_score` 加权后**重排**(此前附了不排序);chunk 下标 BM25↔向量缓存**错位**用稳定路径排序 + 语料指纹解决(签名不符则跳过向量融合,降级 BM25 绝不误 attribute 命中);chunker 识别**代码围栏**(围栏内的 `##` 不再劈段 / 伪造标题);repomap 跳块注释 / docstring 内的声明行;BM25 过取后截断对称化。
+
+### 安全
+
+- **自有 SAST 密钥检测器现在抓得到人们真正泄漏的密钥**:始终在场的自有基线密钥扫描(没有 gitleaks 也让 UmaDev 不失明的地板)此前有大量漏报。补齐:空格 / JSON-key 形式的赋值(`const API_KEY = "x"`、`"apiKey": "x"`)+ 真正的 Shannon **熵兜底**(20+ 字符高熵引号字面量,跳过 hex/UUID/URL/SRI/占位);OpenAI `sk-` key;PEM 私钥;对 config/IaC/env 文件(`.env`/`.json`/`.yaml`/`.toml`/`.tf`/`Dockerfile`/`.ini`/`.properties` —— 泄漏重灾区)的第二遍扫描;更多 token 家族(`ghs_`/`ghu_`/`ghr_`/`github_pat_`/`glpat-`/`AIza`/`xox[bpars]-`/`SG.`/`npm_`/`ASIA`);硬编码长效 JWT。`scan_owned_sast` 在 0 文件时报 **Skipped** 而非"扫了个空也算 Clean"。治理仍 fail-open(从不报错 / panic),但**安全扫描绝不在空 / 错时报 Clean**;审计仍只记长度 + 名/前缀标签,绝不记原值。
+
+### 修复 — CLI/MCP
+
+- **关掉 6 个 CLI/MCP 审计 bug(含 `pr --create` 的 `git add -A` footgun)**:`pr --create` 此前 `git add -A` 把整个脏树(无关 WIP / 误入的密钥 / 构建垃圾)都扫进推送的提交、且 `--yes` 下完全无提示;现 `pr_artifact_paths` 只返回本次运行自有交付物(`output/`、`release/`)的白名单,`git add -- <白名单>`(pathspec 限定,够不到脏树),确认列出确切要提交的内容,`--yes` 下同样生效。`ci --changed-only` 改扫**暂存索引**(`git diff --name-only --cached` + `git show :file`)而非工作树(一个未暂存的违规不再中止一个不含它的提交,这正是它驱动的 pre-commit 钩子该有的范围);MCP `contract_check` 的 slug 加单 Normal 组件守卫(`../../../etc/foo` 逃逸 `output/`);`check_claude_hook` 改解析 JSON、确认精确是 UmaDev 的 PreToolUse matcher 且磁盘可解析(否则 Warn,不再凭子串就 PASS);`is_umadev_hook_command` 精确匹配程序 token(不再把用户的 `my-wrapper hook pre-write` 当 UmaDev 的悄悄剥掉);`add_knowledge` 跳过软链接 `.md`(`symlink_metadata` 不跟随)、不再因一个就 `?` 中止整个 add。
+
+### 修复 — 并发
+
+- **一处 HIGH UB 数据竞争换成线程安全共享状态**:TUI 在**运行时**从 `/logs`/`/model`/`/sandbox` 改进程全局 env(`std::env::set_var`/`remove_var`),而进程内底座驱动的 tokio 任务并发 `std::env::var` 同样的变量 —— setenv/getenv **非线程安全**(glibc 数据竞争 / UB,可 segfault 或读到已释放的 environ 槽),一个普通切换在流式时就能触发。3 个 live-config 变量改成**线程安全共享状态**,启动时从 env 播种一次(外部启动覆盖仍生效)、运行时再不 set:过程日志 flag → `OnceLock<AtomicBool>`;codex 沙箱 → `OnceLock<RwLock<Option<String>>>`;模型档 → `OnceLock<RwLock<ModelTiers>>`;fail-open(锁中毒 → no-op/默认)。
+- **自学习记忆文件的丢失更新竞争收口**:`dev-errors.jsonl` 被 `lessons.rs` 里 6 个函数读-改-写,锁却**不一致**(`capture_dev_errors` 与 `record_pitfall_strategy` 各持**不同**的函数局部静态锁、互不排斥,另 4 个**完全无锁**);原子 temp+rename 防住了撕裂文件却防不住**丢失更新**(两个并发读-改-写各读状态 S、各自变更、后写的 rename 盖掉前者 → 静默丢课程 / 失效更新,并行文档扇出的两个 fork 让这竞争真实存在)。现一把模块级 `DEV_ERRORS_LOCK` 在 `read_raw_lessons` 前获取、贯穿到 `write_raw_lessons`,使整段读-改-写在 6 个 mutator 间**跨函数原子**;经 `PoisonError::into_inner` fail-open(锁中毒可恢复,绝不 panic 进宿主),只读召回路径不动、守卫从不跨 await。
+
 ## [1.0.19] — 紧急修复:1.0.17/1.0.18 启动即崩溃的致命退化
 
 **1.0.17 与 1.0.18 一启动就 panic、应用完全无法运行**(用户实测 macOS / Windows 均复现)。`tokio::select!` 的分支表达式**每轮都会被求值** —— `if` 守卫只决定是否 poll、不阻止求值。取消-drain 分支在 1.0.17 的 M1 修复里被从惰性 `async {}` 块改成了直接函数调用 `drain_cancelled_task(cancel_drain.as_mut().expect(…), …)`,于是空闲时 `cancel_drain` 为 `None`、启动第一轮循环即 `.expect()` panic。现改回惰性 `async {}` 块,只有真正 poll(守卫为真)时才访问 `cancel_drain`,并新增 PTY 启动冒烟验证以杜绝同类退化。**请所有 1.0.17 / 1.0.18 用户升级到 1.0.19。**
