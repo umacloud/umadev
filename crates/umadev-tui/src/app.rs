@@ -4016,14 +4016,35 @@ impl App {
             return;
         }
         self.snapshot_for_undo();
-        let start_char = self.prev_grapheme(self.input_cursor);
-        let end = self.byte_index(self.input_cursor);
-        let start = self.byte_index(start_char);
-        self.input.replace_range(start..end, "");
-        self.input_cursor = start_char;
+        // Chip-aware: a `[图片 N]` / `[粘贴 N 行]` chip flush against the caret is
+        // removed as ONE unit (and its backing image / paste ref dropped via
+        // `reconcile_attachments`) instead of being peeled one char at a time —
+        // which left a corrupt partial token (`[图片 1`) that looked like Backspace
+        // "did nothing" and orphaned the attachment so it mis-expanded on submit.
+        if let Some((start_char, _)) = self.chip_span_ending_at(self.input_cursor) {
+            self.remove_char_range(start_char, self.input_cursor);
+            self.input_cursor = start_char;
+            self.reconcile_attachments();
+        } else {
+            let start_char = self.prev_grapheme(self.input_cursor);
+            self.remove_char_range(start_char, self.input_cursor);
+            self.input_cursor = start_char;
+        }
         self.palette_selected = 0;
         self.mention_selected = 0;
         self.mention_dismissed = false;
+    }
+
+    /// Remove the half-open char range `[start_char, end_char)` from `input`.
+    /// Char→byte conversion is done here so callers stay in char units. Fail-open:
+    /// a reversed or out-of-range pair is clamped to a no-op.
+    fn remove_char_range(&mut self, start_char: usize, end_char: usize) {
+        if start_char >= end_char {
+            return;
+        }
+        let start = self.byte_index(start_char);
+        let end = self.byte_index(end_char);
+        self.input.replace_range(start..end, "");
     }
 
     /// Delete the GRAPHEME CLUSTER at the cursor (forward Delete) — the mirror of
@@ -4033,10 +4054,15 @@ impl App {
             return;
         }
         self.snapshot_for_undo();
-        let start = self.byte_index(self.input_cursor);
-        let end_char = self.next_grapheme(self.input_cursor);
-        let end = self.byte_index(end_char);
-        self.input.replace_range(start..end, "");
+        // Chip-aware mirror of `backspace`: a chip starting at the caret is removed
+        // whole (and its backing ref dropped) rather than one corrupting char.
+        if let Some((_, end_char)) = self.chip_span_starting_at(self.input_cursor) {
+            self.remove_char_range(self.input_cursor, end_char);
+            self.reconcile_attachments();
+        } else {
+            let end_char = self.next_grapheme(self.input_cursor);
+            self.remove_char_range(self.input_cursor, end_char);
+        }
         self.palette_selected = 0;
     }
 
@@ -4055,6 +4081,9 @@ impl App {
         self.snapshot_for_undo();
         self.input.replace_range(start..end, "");
         self.input_cursor = start_char;
+        // A line-kill can take whole chips with it — drop any now-orphaned ref so
+        // a removed chip never silently mis-expands on submit.
+        self.reconcile_attachments();
         self.palette_selected = 0;
         self.push_kill(&killed, KillDir::Backward);
     }
@@ -4072,6 +4101,9 @@ impl App {
         let killed = self.input[from..end].to_string();
         self.snapshot_for_undo();
         self.input.replace_range(from..end, "");
+        // Mirror of `delete_to_line_start`: a kill-to-EOL may swallow whole chips,
+        // so drop any orphaned backing ref.
+        self.reconcile_attachments();
         self.palette_selected = 0;
         self.push_kill(&killed, KillDir::Forward);
     }
@@ -4125,7 +4157,14 @@ impl App {
     /// Delete the word before the cursor (Ctrl+W / Alt+Backspace). The removed
     /// text is PUSHED to the kill-ring (recoverable with Ctrl+Y), not destroyed.
     pub fn delete_word_back(&mut self) {
-        let c = self.prev_word_boundary();
+        // A chip flush against the caret is one word-unit: kill the WHOLE chip
+        // (and drop its backing ref) so Ctrl+W never bisects `[图片 1]` on its
+        // inner space and orphans the attachment.
+        let c = if let Some((start_char, _)) = self.chip_span_ending_at(self.input_cursor) {
+            start_char
+        } else {
+            self.prev_word_boundary()
+        };
         if c == self.input_cursor {
             return;
         }
@@ -4135,6 +4174,7 @@ impl App {
         self.snapshot_for_undo();
         self.input.replace_range(start..end, "");
         self.input_cursor = c;
+        self.reconcile_attachments();
         self.palette_selected = 0;
         self.push_kill(&killed, KillDir::Backward);
     }
@@ -4475,6 +4515,154 @@ impl App {
             }
         }
         out
+    }
+
+    /// Locate every composed-turn chip currently intact in `input`, returning each
+    /// as a `(start_char, end_char)` half-open char range. Both chip families are
+    /// detected exactly the way [`Self::expand_attachments`] resolves them on
+    /// submit, so a chip the user can SEE is the same span this reports:
+    ///
+    /// - an `[图片 N]` image chip (the token embeds its unique 1-based number);
+    /// - a `[粘贴 N 行]` large-paste chip, claimed in buffer order so two pastes
+    ///   that share a line count (and thus a token) each map to their OWN position
+    ///   instead of collapsing onto one.
+    ///
+    /// Pure read (fail-open): a chip whose token is no longer intact in the buffer
+    /// — e.g. half-peeled by an older build — is simply omitted.
+    fn chip_spans(&self) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut push_token = |input: &str, byte_pos: usize, token: &str| {
+            let start = input[..byte_pos].chars().count();
+            let end = start + token.chars().count();
+            spans.push((start, end));
+        };
+        // Image chips: unique token per attachment number.
+        for i in 0..self.attachments.len() {
+            let token = self.image_chip(i + 1);
+            if let Some(byte_pos) = self.input.find(&token) {
+                push_token(&self.input, byte_pos, &token);
+            }
+        }
+        // Large-paste chips: claim the next UNCLAIMED occurrence of each stash
+        // entry's token, in stash order, so same-line-count duplicates resolve to
+        // distinct buffer positions (mirrors expand's sequential `find`).
+        let mut claimed: Vec<usize> = Vec::new();
+        for stash in &self.text_stash {
+            let token = self.text_chip(stash);
+            let mut search = 0;
+            while let Some(rel) = self.input[search..].find(&token) {
+                let pos = search + rel;
+                if claimed.contains(&pos) {
+                    search = pos + token.len().max(1);
+                    continue;
+                }
+                claimed.push(pos);
+                push_token(&self.input, pos, &token);
+                break;
+            }
+        }
+        spans
+    }
+
+    /// The chip span whose RIGHT edge sits exactly at char `cursor` — i.e. the
+    /// chip immediately before the caret, the one a Backspace should swallow whole
+    /// instead of peeling one corrupting char at a time. `None` when the caret
+    /// isn't flush against a chip.
+    fn chip_span_ending_at(&self, cursor: usize) -> Option<(usize, usize)> {
+        self.chip_spans()
+            .into_iter()
+            .find(|&(_, end)| end == cursor)
+    }
+
+    /// The chip span whose LEFT edge sits exactly at char `cursor` — the chip
+    /// immediately after the caret, the one a forward Delete should swallow whole.
+    fn chip_span_starting_at(&self, cursor: usize) -> Option<(usize, usize)> {
+        self.chip_spans()
+            .into_iter()
+            .find(|&(start, _)| start == cursor)
+    }
+
+    /// Re-sync `attachments` / `text_stash` to the chips that survive in `input`
+    /// after an edit, so a removed chip never leaves an orphaned backing ref that
+    /// would be silently dropped (image) or wrongly inlined (paste) on submit.
+    ///
+    /// Image chips are rebuilt in **buffer order** and the buffer is **renumbered**
+    /// to a contiguous `1..=N`, keeping the `[图片 K]` ↔ `attachments[K-1]` coupling
+    /// that [`Self::expand_attachments`] relies on intact even when a MIDDLE chip is
+    /// deleted (a naive `Vec::remove` would shift every later index and submit the
+    /// wrong path / drop one). Large-paste entries whose token no longer has an
+    /// unclaimed occurrence are dropped, by buffer order. Fail-open: pure
+    /// bookkeeping, never panics; the caret is clamped into the rebuilt buffer.
+    fn reconcile_attachments(&mut self) {
+        // ---- image chips: rebuild in buffer order + renumber to 1..=N ----
+        if !self.attachments.is_empty() {
+            // (byte_pos, old 1-based number) for every intact image chip present.
+            let mut hits: Vec<(usize, usize)> = Vec::new();
+            for k in 1..=self.attachments.len() {
+                if let Some(p) = self.input.find(&self.image_chip(k)) {
+                    hits.push((p, k));
+                }
+            }
+            hits.sort_by_key(|&(p, _)| p);
+            // Surviving paths in buffer order become the new contiguous Vec.
+            let new_attachments: Vec<std::path::PathBuf> = hits
+                .iter()
+                .map(|&(_, k)| self.attachments[k - 1].clone())
+                .collect();
+            // Renumber the buffer tokens to 1..=len by rebuilding the string once
+            // over the sorted, non-overlapping spans — collision-free regardless
+            // of how old and new numbers overlap (an in-place rename could clash).
+            let needs_rewrite = new_attachments.len() != self.attachments.len()
+                || hits.iter().enumerate().any(|(j, &(_, k))| k != j + 1);
+            if needs_rewrite {
+                let mut edits: Vec<(usize, usize, String)> = hits
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &(p, k))| {
+                        let old = self.image_chip(k);
+                        (p, p + old.len(), self.image_chip(j + 1))
+                    })
+                    .collect();
+                edits.sort_by_key(|e| e.0);
+                let mut out = String::with_capacity(self.input.len());
+                let mut last = 0;
+                for (s, e, repl) in edits {
+                    out.push_str(&self.input[last..s]);
+                    out.push_str(&repl);
+                    last = e;
+                }
+                out.push_str(&self.input[last..]);
+                self.input = out;
+            }
+            self.attachments = new_attachments;
+        }
+        // ---- large-paste chips: drop entries whose token vanished ----
+        if !self.text_stash.is_empty() {
+            let mut claimed: Vec<usize> = Vec::new();
+            let mut keep: Vec<String> = Vec::new();
+            for stash in &self.text_stash {
+                let token = self.text_chip(stash);
+                let mut search = 0;
+                let mut found = false;
+                while let Some(rel) = self.input[search..].find(&token) {
+                    let pos = search + rel;
+                    if claimed.contains(&pos) {
+                        search = pos + token.len().max(1);
+                        continue;
+                    }
+                    claimed.push(pos);
+                    found = true;
+                    break;
+                }
+                if found {
+                    keep.push(stash.clone());
+                }
+            }
+            self.text_stash = keep;
+        }
+        // The renumber may have shortened a multi-digit token before the caret;
+        // clamp so the cursor can never index past the rebuilt buffer.
+        self.input_cursor = self.input_cursor.min(self.input_len());
     }
 
     /// Push a submitted line onto the input-history ring. De-dups
@@ -13982,6 +14170,160 @@ mod tests {
         a.clear_input();
         assert!(a.text_stash.is_empty(), "clear_input drops the stash");
         assert!(a.input.is_empty());
+    }
+
+    // ---- chip-aware deletion (user-reported: backspace "does nothing" on a chip) -
+
+    /// Attach a throwaway PNG so `handle_paste(path)` produces an `[图片 N]` chip
+    /// backed by a real `attachments` entry. Returns the temp dir (keep it alive).
+    fn attach_one_image(app: &mut App) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, b"\x89PNG\r\n\x1a\n").unwrap();
+        app.handle_paste(img.to_str().unwrap());
+        dir
+    }
+
+    #[test]
+    fn backspace_after_a_chip_removes_the_whole_chip_and_drops_its_ref() {
+        let mut app = fresh_app(Some("offline"));
+        let _dir = attach_one_image(&mut app);
+        // Buffer is now "[图片 1] " — caret right after the trailing space.
+        let chip = app.image_chip(1);
+        assert!(app.input.contains(&chip));
+        assert_eq!(app.attachments.len(), 1);
+        // First Backspace eats the space the paste appended (normal char delete).
+        app.backspace();
+        assert!(
+            app.input.ends_with(']'),
+            "space gone, chip intact: {:?}",
+            app.input
+        );
+        assert_eq!(app.attachments.len(), 1, "the space is not a chip");
+        // Caret is now flush against `]` → ONE Backspace removes the entire chip
+        // (not just the bracket) and drops the backing attachment.
+        app.backspace();
+        assert!(
+            !app.input.contains('图') && !app.input.contains('['),
+            "the whole chip is gone in one stroke, got: {:?}",
+            app.input
+        );
+        assert!(app.attachments.is_empty(), "backing image ref dropped");
+        assert_eq!(app.input_cursor, app.input_len());
+    }
+
+    #[test]
+    fn chip_delete_works_with_cjk_around_it_screenshot_shape() {
+        // The exact reported buffer: "shiyong的[图片 1] 出".
+        let mut app = fresh_app(Some("offline"));
+        app.insert_str_at_cursor("shiyong的");
+        let _dir = attach_one_image(&mut app); // appends "[图片 1] "
+        app.insert_str_at_cursor("出");
+        assert_eq!(app.input, format!("shiyong的{} 出", app.image_chip(1)));
+        // Peel the trailing CJK + the space (plain deletes, no panic).
+        app.backspace(); // 出
+        app.backspace(); // space
+        assert_eq!(app.input, format!("shiyong的{}", app.image_chip(1)));
+        assert_eq!(app.attachments.len(), 1, "chip still present, ref kept");
+        // Caret flush against the chip → one stroke clears it as a unit.
+        app.backspace();
+        assert_eq!(app.input, "shiyong的", "chip removed atomically");
+        assert!(app.attachments.is_empty(), "ref dropped");
+        // The CJK before the chip still deletes normally afterward.
+        app.backspace();
+        assert_eq!(app.input, "shiyong");
+    }
+
+    #[test]
+    fn char_immediately_before_a_chip_deletes_normally() {
+        let mut app = fresh_app(Some("offline"));
+        app.insert_str_at_cursor("ab");
+        let _dir = attach_one_image(&mut app); // "ab[图片 1] "
+                                               // Move the caret to just before the `[` of the chip (after "ab").
+        app.input_cursor = 2;
+        app.backspace(); // deletes 'b', NOT the chip
+        assert_eq!(app.input, format!("a{} ", app.image_chip(1)));
+        assert_eq!(app.attachments.len(), 1, "chip untouched, ref kept");
+    }
+
+    #[test]
+    fn forward_delete_on_a_chip_removes_it_as_a_unit() {
+        let mut app = fresh_app(Some("offline"));
+        let _dir = attach_one_image(&mut app); // "[图片 1] "
+        app.input_cursor = 0; // caret at the chip's left edge
+        app.forward_delete();
+        assert_eq!(app.input, " ", "chip gone, trailing space remains");
+        assert!(app.attachments.is_empty(), "backing ref dropped");
+    }
+
+    #[test]
+    fn middle_chip_delete_renumbers_remaining_chips_in_lockstep() {
+        // Two images: deleting the FIRST must renumber the second to `[图片 1]`
+        // and keep it bound to its OWN path (a naive Vec::remove would submit the
+        // wrong file or drop one).
+        let mut app = fresh_app(Some("offline"));
+        let dir = tempfile::TempDir::new().unwrap();
+        let img1 = dir.path().join("one.png");
+        let img2 = dir.path().join("two.png");
+        std::fs::write(&img1, b"\x89PNG\r\n\x1a\n1").unwrap();
+        std::fs::write(&img2, b"\x89PNG\r\n\x1a\n2").unwrap();
+        app.handle_paste(img1.to_str().unwrap()); // "[图片 1] "
+        app.handle_paste(img2.to_str().unwrap()); // "[图片 1] [图片 2] "
+        assert_eq!(app.attachments.len(), 2);
+        let abs2 = std::fs::canonicalize(&img2).unwrap();
+        // Delete the FIRST chip: caret right after its `]` (char index = chip len).
+        let first_end = app.image_chip(1).chars().count();
+        app.input_cursor = first_end;
+        app.backspace();
+        assert_eq!(app.attachments.len(), 1, "one image left");
+        // The survivor renumbered to `[图片 1]` and still expands to img2's path.
+        assert!(
+            app.input.contains(&app.image_chip(1)) && !app.input.contains(&app.image_chip(2)),
+            "survivor renumbered to chip 1, got: {:?}",
+            app.input
+        );
+        let expanded = app.expand_attachments(app.input.trim());
+        assert!(
+            expanded.contains(&format!("@{}", abs2.display())),
+            "survivor still bound to its OWN path, got: {expanded}"
+        );
+    }
+
+    #[test]
+    fn ctrl_w_swallows_a_chip_flush_against_the_caret() {
+        let mut app = fresh_app(Some("offline"));
+        app.insert_str_at_cursor("hi ");
+        let _dir = attach_one_image(&mut app); // "hi [图片 1] "
+                                               // Trim the trailing space so the caret is flush against `]`.
+        app.backspace();
+        assert!(app.input.ends_with(']'));
+        app.delete_word_back(); // Ctrl+W
+        assert_eq!(app.input, "hi ", "the whole chip is one word-kill unit");
+        assert!(app.attachments.is_empty(), "ref dropped by Ctrl+W");
+    }
+
+    #[test]
+    fn ctrl_u_clears_chips_and_drops_all_refs_no_orphan() {
+        let mut app = fresh_app(Some("offline"));
+        let _dir = attach_one_image(&mut app); // "[图片 1] "
+        app.insert_str_at_cursor("tail");
+        app.delete_to_line_start(); // Ctrl+U from end → wipes the line
+        assert!(app.input.is_empty(), "line cleared");
+        assert!(
+            app.attachments.is_empty(),
+            "no orphaned image ref after Ctrl+U"
+        );
+    }
+
+    #[test]
+    fn chip_delete_is_fail_open_on_a_cursor_past_the_buffer() {
+        // A desynced caret must never panic the editing helpers.
+        let mut app = fresh_app(Some("offline"));
+        let _dir = attach_one_image(&mut app);
+        app.input_cursor = app.input_len() + 5; // bogus, out of range
+        app.backspace(); // must not panic
+        app.forward_delete(); // must not panic
+        assert!(app.input_cursor <= app.input_len());
     }
 
     #[test]
