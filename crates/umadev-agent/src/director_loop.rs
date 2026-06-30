@@ -2705,7 +2705,18 @@ async fn drive_one_turn_with_backoff(
                 // (UD-EVID-002) so the audit is honest on the DEFAULT loop for every
                 // base — not just claude in the legacy runner. Fail-open: a recording
                 // error is swallowed and never blocks the turn.
-                let detail = tool_call_target(&input);
+                let mut detail = tool_call_target(&input);
+                // The base asked the user a structured multiple-choice question via
+                // its OWN `AskUserQuestion` tool. Driven non-interactively, that call
+                // can't render its picker and auto-cancels — was a bare optionless
+                // stub read as cancelled. Surface the question + numbered options as a
+                // Note + give the tool row a real detail, so the user sees what's asked
+                // and that the base awaits their choice (relayed next turn — see
+                // `crate::ask_question`). Fail-open: a non-question call → None.
+                if let Some(surface) = crate::ask_question::surface(&name, &input) {
+                    detail = surface.detail;
+                    events.emit(EngineEvent::Note(surface.note));
+                }
                 record_tool_call_audit(options, &name, &detail);
                 // P1: forward the structured before/after for a Write/Edit so the
                 // TUI can draw a live diff card on the DEFAULT loop (the user hit

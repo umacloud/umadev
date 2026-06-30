@@ -3112,7 +3112,20 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 if is_workspace_write_tool(&name) {
                     react_to_first_write(Some(&reactive), &project_root, &sink);
                 }
-                let detail = session_tool_target(&input);
+                let mut detail = session_tool_target(&input);
+                // The base asked the user a structured multiple-choice question via
+                // its OWN `AskUserQuestion` tool. UmaDev drives the base
+                // non-interactively, so that call can't pop up its picker and
+                // auto-cancels — it used to render as a bare optionless stub and read
+                // as cancelled. Surface the question + numbered options as a Note +
+                // give the tool row a real detail, so the user sees what's asked and
+                // can answer it (the reply flows back into THIS same session — the
+                // base kept the question in its own context). Fail-open: a
+                // non-question / unreadable call → None → the plain tool row.
+                if let Some(surface) = umadev_agent::ask_question_surface(&name, &input) {
+                    detail = surface.detail;
+                    sink.emit(EngineEvent::Note(surface.note));
+                }
                 // P1: forward the structured before/after for a Write/Edit so the
                 // TUI draws a live diff card on the reactive session path too.
                 // Fail-open: non-edit / unreadable input → None → plain row.
@@ -8310,6 +8323,71 @@ mod tests {
             sent.lock().unwrap().len(),
             2,
             "both turns drove the ONE resident session (no re-open)"
+        );
+    }
+
+    /// The base calls its OWN interactive AskUserQuestion while UmaDev drives it
+    /// non-interactively (the resident chat path). It must surface the question +
+    /// every numbered option as a prominent Note — NOT a bare optionless stub read
+    /// as a silent cancel — so the user can answer it (the reply flows back into the
+    /// SAME resident session the base asked from).
+    #[tokio::test]
+    async fn chat_ask_user_question_surfaces_question_and_options() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut _route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let ask = umadev_runtime::SessionEvent::ToolCall {
+            name: "AskUserQuestion".into(),
+            input: serde_json::json!({
+                "questions": [{
+                    "header": "Auth",
+                    "question": "Which auth method should the app use?",
+                    "options": [
+                        {"label": "Email + password"},
+                        {"label": "OAuth (Google)"}
+                    ]
+                }]
+            }),
+        };
+        let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+            ask,
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "set up auth",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // A Note carries the question AND every numbered option.
+        let mut note = None;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(s) = ev {
+                if s.contains("Which auth method") {
+                    note = Some(s);
+                }
+            }
+        }
+        let note = note.expect("the chat path must surface the AskUserQuestion as a Note");
+        assert!(
+            note.contains("1. Email + password"),
+            "numbered options: {note}"
+        );
+        assert!(
+            note.contains("2. OAuth (Google)"),
+            "every option present: {note}"
         );
     }
 

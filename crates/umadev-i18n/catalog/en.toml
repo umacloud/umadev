@@ -135,6 +135,13 @@
 "gate.choice.revise.prompt" = "Okay — describe what you'd like changed."
 "gate.choice.add_more.prompt" = "Okay — tell me what to add."
 
+# Base AskUserQuestion bridge — the base asked the user a structured
+# multiple-choice question, but UmaDev drives it non-interactively, so the
+# question + options are surfaced here (instead of a bare stub) and the user's
+# reply is relayed back to the base on the next turn of the same session.
+"ask.prompt.header" = "[question] The base is asking you to choose:"
+"ask.prompt.relay_hint" = "Reply with the option number (or text) and I'll pass your choice to the base in this same conversation — it could not pop up its own picker, so it's waiting on your answer, not cancelled."
+
 # Runtime narration
 "run.started" = "Pipeline started: {}\nDelivering in 9 phases; it pauses at key checkpoints for your review."
 "run.phase_start" = "> phase {} starting…"

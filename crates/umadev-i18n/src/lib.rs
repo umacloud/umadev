@@ -616,6 +616,11 @@ mod tests {
             "gate.choice.hint",
             "gate.choice.revise.prompt",
             "gate.choice.add_more.prompt",
+            // Base AskUserQuestion bridge: the base asked a structured multiple-choice
+            // question while driven non-interactively — the question + options are
+            // surfaced (not a bare stub) and the user's reply is relayed back.
+            "ask.prompt.header",
+            "ask.prompt.relay_hint",
         ];
         let cats = catalogs();
         for lang in Lang::ALL {

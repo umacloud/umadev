@@ -134,6 +134,12 @@
 "gate.choice.revise.prompt" = "好的,请描述要修改的地方。"
 "gate.choice.add_more.prompt" = "好的,请补充你想增加的内容。"
 
+# 底座 AskUserQuestion 桥接 —— 底座向你发起了结构化的多选提问,但 UmaDev 以非交互
+# 方式驱动底座,于是把问题和选项在此完整呈现(而不是只显示一个空壳),你的回复会在
+# 同一会话的下一轮转交给底座。
+"ask.prompt.header" = "[提问] 底座请你做出选择:"
+"ask.prompt.relay_hint" = "回复选项编号(或直接输入文字),我会在同一对话里把你的选择转交给底座 —— 它无法弹出自己的选择框,所以是在等你的回答,并未被取消。"
+
 # 运行时叙述
 "run.started" = "流水线启动:{}\n按 9 阶段流程交付,关键节点会停下让你审。"
 "run.phase_start" = "> phase {} 开始…"

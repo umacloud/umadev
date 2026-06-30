@@ -269,6 +269,250 @@ impl ToolEdit {
     }
 }
 
+/// One labeled option the base offered inside an `AskUserQuestion` call.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AskOption {
+    /// The short label the user picks — what the base expects back as the answer.
+    pub label: String,
+    /// Optional one-line description of the option (may be empty).
+    pub description: String,
+}
+
+/// One question inside a base `AskUserQuestion` call: the prompt + its options.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AskQuestion {
+    /// Short header (e.g. "Database"). May be empty.
+    pub header: String,
+    /// The full question text the base wants answered. May be empty if only a
+    /// header was supplied.
+    pub question: String,
+    /// Whether the base allows more than one option to be chosen.
+    pub multi_select: bool,
+    /// The labeled options (typically 2–4).
+    pub options: Vec<AskOption>,
+}
+
+/// The parsed input of a base's **`AskUserQuestion`** tool call — the
+/// interactive multiple-choice question(s) the base asks the user.
+///
+/// UmaDev drives the base **non-interactively** (claude `--print` / the
+/// continuous stream-json session), so the base cannot render its own
+/// interactive picker and its `AskUserQuestion` auto-cancels mid-turn. UmaDev
+/// only observes the tool-call event — so without this parser the question +
+/// its options are never shown and the turn silently reads as "cancelled". This
+/// type lifts the question + options out of the raw tool input so the surface
+/// layers can render them and relay the user's choice back as the next turn.
+///
+/// **Fail-open by construction:** [`from_tool_input`](Self::from_tool_input)
+/// tolerates both the `{"questions":[…]}` shape and a single top-level question,
+/// tolerates string-or-object options, and returns `None` on any shape it can't
+/// read — never a panic, never a fabricated question.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AskUserQuestion {
+    /// The question(s) the base asked (usually one).
+    pub questions: Vec<AskQuestion>,
+}
+
+impl AskUserQuestion {
+    /// Whether `name` is the base's interactive question tool. Case-insensitive
+    /// so a normalized (`ask_user_question`) or canonical (`AskUserQuestion`)
+    /// name both match.
+    #[must_use]
+    pub fn is_tool_name(name: &str) -> bool {
+        let n = name.replace(['_', '-', ' '], "").to_ascii_lowercase();
+        n == "askuserquestion"
+    }
+
+    /// Parse a base `AskUserQuestion` tool-call input. Returns `None` when the
+    /// call is not an `AskUserQuestion` or the input has no readable question, so
+    /// the caller keeps its existing (non-question) tool-row rendering.
+    #[must_use]
+    pub fn from_tool_input(name: &str, input: &serde_json::Value) -> Option<Self> {
+        if !Self::is_tool_name(name) {
+            return None;
+        }
+        Self::parse_value(input)
+    }
+
+    /// Parse just the input value (no tool-name guard) — the shared body of
+    /// [`from_tool_input`], also handy when the name was already matched upstream.
+    #[must_use]
+    pub fn parse_value(input: &serde_json::Value) -> Option<Self> {
+        let questions: Vec<AskQuestion> =
+            if let Some(arr) = input.get("questions").and_then(|q| q.as_array()) {
+                arr.iter().filter_map(parse_ask_question).collect()
+            } else {
+                // Older / flattened single-question shape at the top level.
+                parse_ask_question(input).into_iter().collect()
+            };
+        if questions.is_empty() {
+            return None;
+        }
+        Some(Self { questions })
+    }
+
+    /// A compact, single-line summary for the tool-row `detail` arg (the row is
+    /// one line, so this never contains a newline). Prefers the first question's
+    /// header, then its text, and appends a `(+N)` when more questions follow.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let Some(first) = self.questions.first() else {
+            return String::new();
+        };
+        let head = if first.header.is_empty() {
+            first.question.as_str()
+        } else {
+            first.header.as_str()
+        };
+        let head = one_line_clip(head, 72);
+        let extra = self.questions.len().saturating_sub(1);
+        if extra > 0 {
+            format!("{head} (+{extra})")
+        } else {
+            head
+        }
+    }
+
+    /// A readable MULTI-LINE block: each question followed by its numbered
+    /// options (`1. label — description`). Neutral structural text only (no UI
+    /// verbs, no localized words) so a localized framing can wrap it.
+    #[must_use]
+    pub fn prompt_block(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let multi = self.questions.len() > 1;
+        for (qi, q) in self.questions.iter().enumerate() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            let title = match (q.header.is_empty(), q.question.is_empty()) {
+                (false, false) => format!("{}: {}", q.header, q.question),
+                (true, false) => q.question.clone(),
+                (false, true) => q.header.clone(),
+                (true, true) => String::new(),
+            };
+            // `write!` to a String is infallible — the `let _ =` keeps clippy's
+            // `format_push_string` happy without an extra allocation.
+            if multi {
+                let _ = write!(out, "Q{}. {title}", qi + 1);
+            } else {
+                out.push_str(&title);
+            }
+            for (oi, opt) in q.options.iter().enumerate() {
+                out.push('\n');
+                if opt.description.is_empty() {
+                    let _ = write!(out, "  {}. {}", oi + 1, opt.label);
+                } else {
+                    let _ = write!(out, "  {}. {} — {}", oi + 1, opt.label, opt.description);
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve a user's free-text reply to the answer to relay back to the base.
+    ///
+    /// - A bare option **number** (1-based, against the FIRST question's options
+    ///   — the common single-question case) resolves to that option's label.
+    /// - A reply that case-insensitively equals an option label resolves to that
+    ///   option's canonical label.
+    /// - Anything else passes through trimmed (free-text is always honored).
+    ///
+    /// Pure + fail-open: an out-of-range number or an empty option list just
+    /// returns the trimmed reply.
+    #[must_use]
+    pub fn resolve_reply(&self, reply: &str) -> String {
+        let trimmed = reply.trim();
+        let opts = self.questions.first().map(|q| &q.options);
+        if let Some(opts) = opts.filter(|o| !o.is_empty()) {
+            if let Ok(n) = trimmed.parse::<usize>() {
+                if n >= 1 && n <= opts.len() {
+                    return opts[n - 1].label.clone();
+                }
+            }
+            if let Some(hit) = opts.iter().find(|o| o.label.eq_ignore_ascii_case(trimmed)) {
+                return hit.label.clone();
+            }
+        }
+        trimmed.to_string()
+    }
+}
+
+/// Parse one question object into an [`AskQuestion`], or `None` when it carries
+/// neither a question text nor any option (nothing to ask).
+fn parse_ask_question(v: &serde_json::Value) -> Option<AskQuestion> {
+    let obj = v.as_object()?;
+    let get = |k: &str| obj.get(k).and_then(|s| s.as_str()).unwrap_or("").trim();
+    let question = {
+        let q = get("question");
+        if q.is_empty() {
+            get("prompt")
+        } else {
+            q
+        }
+    }
+    .to_string();
+    let header = get("header").to_string();
+    let multi_select = obj
+        .get("multiSelect")
+        .or_else(|| obj.get("multi_select"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let options = obj
+        .get("options")
+        .and_then(|o| o.as_array())
+        .map(|arr| arr.iter().filter_map(parse_ask_option).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if question.is_empty() && header.is_empty() && options.is_empty() {
+        return None;
+    }
+    Some(AskQuestion {
+        header,
+        question,
+        multi_select,
+        options,
+    })
+}
+
+/// Parse one option — a bare string OR a `{label, description}` object — into an
+/// [`AskOption`], or `None` when it carries no usable label.
+fn parse_ask_option(v: &serde_json::Value) -> Option<AskOption> {
+    match v {
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| AskOption {
+                label: s.to_string(),
+                description: String::new(),
+            })
+        }
+        serde_json::Value::Object(_) => {
+            let pick = |k: &str| v.get(k).and_then(|s| s.as_str()).map(str::trim);
+            let label = pick("label")
+                .or_else(|| pick("value"))
+                .or_else(|| pick("text"))
+                .unwrap_or("");
+            if label.is_empty() {
+                return None;
+            }
+            Some(AskOption {
+                label: label.to_string(),
+                description: pick("description").unwrap_or("").to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Collapse whitespace + clip a string to `max` chars (char-boundary safe), for
+/// a single-line summary that never wraps or splits a multibyte codepoint.
+fn one_line_clip(s: &str, max: usize) -> String {
+    let one = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one.char_indices().nth(max) {
+        Some((idx, _)) => format!("{}…", &one[..idx]),
+        None => one,
+    }
+}
+
 /// A single real-time event from a streaming worker.
 ///
 /// Host CLI drivers (Claude Code `--output-format stream-json`, Codex
@@ -820,5 +1064,113 @@ mod tests {
         let rt = OfflineRuntime::default();
         let resp = rt.complete(req(vec![("user", "hi")])).await.unwrap();
         assert!(resp.text.is_empty());
+    }
+
+    // ── AskUserQuestion parsing / rendering / reply-resolution ──────────────
+
+    #[test]
+    fn ask_user_question_parses_questions_and_options() {
+        let input = serde_json::json!({
+            "questions": [{
+                "header": "Database",
+                "question": "Which database should the API use?",
+                "multiSelect": false,
+                "options": [
+                    {"label": "Postgres", "description": "Relational, strong consistency"},
+                    {"label": "MongoDB", "description": "Document store"},
+                    {"label": "SQLite"}
+                ]
+            }]
+        });
+        let q = AskUserQuestion::from_tool_input("AskUserQuestion", &input)
+            .expect("AskUserQuestion input must parse");
+        assert_eq!(q.questions.len(), 1);
+        let only = &q.questions[0];
+        assert_eq!(only.header, "Database");
+        assert_eq!(only.question, "Which database should the API use?");
+        assert_eq!(only.options.len(), 3);
+        assert_eq!(only.options[0].label, "Postgres");
+        assert_eq!(
+            only.options[0].description,
+            "Relational, strong consistency"
+        );
+        assert_eq!(only.options[2].label, "SQLite");
+        assert!(only.options[2].description.is_empty());
+
+        // The multi-line block shows the question AND every numbered option — the
+        // fix for the bare "no options visible" stub.
+        let block = q.prompt_block();
+        assert!(block.contains("Which database"), "block: {block}");
+        assert!(block.contains("1. Postgres"), "numbered options: {block}");
+        assert!(block.contains("3. SQLite"), "every option present: {block}");
+        // The one-line tool-row summary is never empty and never multi-line.
+        let summary = q.summary();
+        assert!(!summary.is_empty());
+        assert!(!summary.contains('\n'));
+    }
+
+    #[test]
+    fn ask_user_question_tolerates_string_options_and_flat_shape() {
+        // String options + a single top-level question (no `questions` array).
+        let input = serde_json::json!({
+            "question": "Pick a framework",
+            "options": ["Next.js", "Remix"]
+        });
+        let q = AskUserQuestion::parse_value(&input).expect("flat shape parses");
+        assert_eq!(q.questions[0].options.len(), 2);
+        assert_eq!(q.questions[0].options[1].label, "Remix");
+    }
+
+    #[test]
+    fn ask_user_question_name_match_and_fail_open() {
+        assert!(AskUserQuestion::is_tool_name("AskUserQuestion"));
+        assert!(AskUserQuestion::is_tool_name("ask_user_question"));
+        assert!(!AskUserQuestion::is_tool_name("Write"));
+        // A non-question tool / unreadable input fails open to None (callers keep
+        // their existing tool-row detail; never a panic, never a fake question).
+        assert!(
+            AskUserQuestion::from_tool_input("Write", &serde_json::json!({"file_path":"a"}))
+                .is_none()
+        );
+        assert!(AskUserQuestion::from_tool_input(
+            "AskUserQuestion",
+            &serde_json::json!({"questions":[]})
+        )
+        .is_none());
+        assert!(
+            AskUserQuestion::from_tool_input("AskUserQuestion", &serde_json::Value::Null).is_none()
+        );
+    }
+
+    #[test]
+    fn ask_user_question_resolve_reply_maps_number_and_label() {
+        let q = AskUserQuestion {
+            questions: vec![AskQuestion {
+                header: "DB".into(),
+                question: "Which?".into(),
+                multi_select: false,
+                options: vec![
+                    AskOption {
+                        label: "Postgres".into(),
+                        description: String::new(),
+                    },
+                    AskOption {
+                        label: "MongoDB".into(),
+                        description: String::new(),
+                    },
+                ],
+            }],
+        };
+        // A bare option number resolves to the option label (the picker shortcut).
+        assert_eq!(q.resolve_reply("1"), "Postgres");
+        assert_eq!(q.resolve_reply(" 2 "), "MongoDB");
+        // An exact (case-insensitive) label resolves to the canonical label.
+        assert_eq!(q.resolve_reply("postgres"), "Postgres");
+        // Out-of-range / free-text passes through trimmed (free-text always honored).
+        assert_eq!(q.resolve_reply("9"), "9");
+        assert_eq!(
+            q.resolve_reply("  use whichever is cheaper "),
+            "use whichever is cheaper"
+        );
     }
 }

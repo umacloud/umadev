@@ -737,6 +737,15 @@ fn summarize_tool_input(name: &str, input: Option<&serde_json::Value>) -> String
         }
         "WebSearch" | "WebFetch" => get_str("query").to_string(),
         "Task" | "Agent" => get_str("description").to_string(),
+        // The base's interactive multiple-choice tool. Driven non-interactively
+        // it can't render its own picker, so at minimum show the question header
+        // instead of a bare stub. Fail-open: an unparseable input → the generic
+        // first-string fallback below.
+        _ if umadev_runtime::AskUserQuestion::is_tool_name(name) => {
+            umadev_runtime::AskUserQuestion::parse_value(input)
+                .map(|q| q.summary())
+                .unwrap_or_default()
+        }
         _ => {
             // Generic: show first string value.
             input
@@ -1026,6 +1035,26 @@ mod tests {
                 assert_eq!(name, "Read");
                 assert_eq!(detail, "/tmp/Cargo.toml");
                 assert!(edit.is_none(), "a Read carries no structured edit");
+            }
+            _ => panic!("expected ToolUse, got {ev:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_user_question_has_a_real_detail_not_a_bare_stub() {
+        // The base's interactive AskUserQuestion, driven non-interactively, used to
+        // render with an EMPTY detail (the generic first-string fallback can't read
+        // a `questions` array). It must now carry the question header.
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"AskUserQuestion","input":{"questions":[{"header":"Database","question":"Which database?","options":[{"label":"Postgres"},{"label":"MySQL"}]}]}}]}}"#;
+        let ev = parse_claude_stream_line(line).expect("should parse tool_use");
+        match ev {
+            StreamEvent::ToolUse { name, detail, .. } => {
+                assert_eq!(name, "AskUserQuestion");
+                assert!(
+                    !detail.is_empty(),
+                    "AskUserQuestion must not render an empty stub"
+                );
+                assert!(!detail.contains('\n'), "the tool-row detail is one line");
             }
             _ => panic!("expected ToolUse, got {ev:?}"),
         }

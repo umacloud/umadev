@@ -630,7 +630,20 @@ fn govern_tool_call(
     // file re-arms strict) AND make this in-process scan context-aware.
     persist_project_context(options);
     let ctx = project_context_for(options);
-    let (target, decision) = evaluate_tool_call(policy, ctx, name, input);
+    let (mut target, decision) = evaluate_tool_call(policy, ctx, name, input);
+
+    // The base asked the user a structured multiple-choice question via its OWN
+    // `AskUserQuestion` tool. UmaDev drives the base non-interactively, so that
+    // call can't pop up a picker and auto-cancels — previously surfaced as a bare
+    // "AskUserQuestion" stub with NO options, silently treated as cancelled. Now
+    // we render the question + numbered options as a prominent Note and give the
+    // tool row a real one-line detail, so the user SEES what's asked and that the
+    // base is awaiting their choice (relayed on the next turn — see
+    // `crate::ask_question`). Fail-open: a non-question / unreadable call → None.
+    if let Some(surface) = crate::ask_question::surface(name, input) {
+        target = surface.detail;
+        events.emit(EngineEvent::Note(surface.note));
+    }
 
     // TUI tool row — "正在写 src/App.tsx…". This is the SOURCE OF TRUTH for what
     // the base actually did. P1: a Write/Edit also forwards its structured
@@ -2663,6 +2676,56 @@ mod tests {
                 event: StreamEvent::ToolUse { .. }
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_renders_question_and_options_not_a_bare_stub() {
+        // The base calls its OWN interactive AskUserQuestion while UmaDev drives it
+        // non-interactively. It must NOT render a bare optionless stub / silent
+        // cancel: the question + every numbered option are surfaced as a Note, and
+        // the tool row gets a real one-line detail.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Guarded);
+        let (events, rec) = sink();
+        let ask = SessionEvent::ToolCall {
+            name: "AskUserQuestion".to_string(),
+            input: serde_json::json!({
+                "questions": [{
+                    "header": "Database",
+                    "question": "Which database should the API use?",
+                    "options": [
+                        {"label": "Postgres", "description": "Relational"},
+                        {"label": "MongoDB"}
+                    ]
+                }]
+            }),
+        };
+        let mut session = FakeBaseSession::new(vec![vec![done()], vec![ask, done()]]);
+
+        let _ = run_block(&mut session, &options, &events, Phase::Research).await;
+
+        let evs = rec.events();
+        // A prominent Note carries the question AND every numbered option.
+        let note = evs.iter().find_map(|e| match e {
+            EngineEvent::Note(s) if s.contains("Which database") => Some(s.clone()),
+            _ => None,
+        });
+        let note = note.expect("AskUserQuestion must surface the question as a Note");
+        assert!(note.contains("1. Postgres"), "numbered options: {note}");
+        assert!(note.contains("2. MongoDB"), "every option present: {note}");
+        // The tool row's detail is non-empty (was a bare stub before the fix).
+        let detail_nonempty = evs.iter().any(|e| {
+            matches!(
+                e,
+                EngineEvent::WorkerStream {
+                    event: StreamEvent::ToolUse { name, detail, .. }
+                } if name == "AskUserQuestion" && !detail.is_empty()
+            )
+        });
+        assert!(
+            detail_nonempty,
+            "the AskUserQuestion tool row has a real detail"
+        );
     }
 
     #[tokio::test]
