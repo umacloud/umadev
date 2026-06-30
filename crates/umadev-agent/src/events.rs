@@ -479,6 +479,7 @@ mod tests {
                 kind: crate::plan_state::StepKind::Build,
                 depends_on: vec![],
                 acceptance: crate::plan_state::AcceptanceSpec::SourcePresent,
+                evidence: Vec::new(),
                 status: crate::plan_state::StepStatus::Pending,
             }],
             risks: vec![],

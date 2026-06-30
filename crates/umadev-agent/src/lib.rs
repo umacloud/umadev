@@ -146,8 +146,8 @@ pub use phases::{
     agentic_knowledge_digest, knowledge_top_files, phase_knowledge_digest, PhaseOutput,
 };
 pub use plan_state::{
-    load as load_plan, save as save_plan, synthesize_plan, AcceptanceSpec, Plan, PlanStep,
-    StepKind, StepStatus,
+    load as load_plan, save as save_plan, synthesize_plan, AcceptanceSpec, EvidenceContract, Plan,
+    PlanStep, StepKind, StepStatus,
 };
 pub use planner::{
     advisory_prior, phase_from_id, plan as plan_phases, plan_light, redoable_phase_ids, PhasePlan,

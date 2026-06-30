@@ -978,6 +978,7 @@ mod tests {
                     kind: StepKind::Build,
                     depends_on: vec![],
                     acceptance: AcceptanceSpec::SourcePresent,
+                    evidence: Vec::new(),
                     status: StepStatus::Done,
                 },
                 PlanStep {
@@ -987,6 +988,7 @@ mod tests {
                     kind: StepKind::Build,
                     depends_on: vec!["scaffold".into()],
                     acceptance: AcceptanceSpec::Contract,
+                    evidence: Vec::new(),
                     status: StepStatus::Pending,
                 },
             ],

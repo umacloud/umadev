@@ -153,6 +153,241 @@ impl AcceptanceSpec {
     }
 }
 
+/// A TYPED EVIDENCE CONTRACT for one plan step — an explicit, machine-checkable
+/// declaration of *what concrete evidence proves the step is done*, so "done" is
+/// **falsifiable per step** instead of trusted from the base's "looks done"
+/// narration. This is the deterministic-subset companion to [`AcceptanceSpec`]:
+/// where `AcceptanceSpec` selects a coarse WORKSPACE-level check (does ANY source
+/// exist / is the WHOLE build green), an `EvidenceContract` names the SPECIFIC
+/// artifact a step must produce — *this* file, containing *this* string, *this*
+/// named test passing, *this* route answering. Every variant maps to a check
+/// UmaDev can run on its existing deterministic floor (no new probing infra):
+///
+/// - [`Self::FileExists`] / [`Self::FileContains`] — a named path on disk (and,
+///   for `FileContains`, a substring it must hold). The most direct falsifiable
+///   proof a concrete deliverable landed.
+/// - [`Self::SourcePresent`] — real source files exist (the honesty floor;
+///   reuses [`crate::acceptance::source_files`] via `VerifyKind::SourcePresent`).
+/// - [`Self::BuildClean`] — the project's real build/test/lint is green (reuses
+///   `VerifyKind::BuildTest`).
+/// - [`Self::TestPasses`] — a NAMED test is present in the codebase AND the test
+///   floor is green (reuses the build/test floor + a bounded source scan). A
+///   `None` name degrades to "the suite passes".
+/// - [`Self::RouteResponds`] — an HTTP route answers with the expected status
+///   (reuses [`crate::runtime_proof`] — boot the app + probe the route).
+/// - [`Self::ContractMatches`] — the frontend↔backend API contract holds (reuses
+///   `umadev-contract` via `VerifyKind::Contract`).
+///
+/// **UmaDev parses + OWNS the contract; the base never self-grades.** The brain
+/// PROPOSES per-step evidence in the plan JSON; UmaDev validates it into this typed
+/// form (dropping anything unparseable), then the verifier checks it on the floor
+/// before a step ticks [`StepStatus::Done`]. An unsatisfied contract leaves the step
+/// not-done and folds the typed gap into the rework directive. Where the brain
+/// supplies none, the step falls back to its [`AcceptanceSpec`] (fail-open — a
+/// missing/uncheckable contract never blocks).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum EvidenceContract {
+    /// Real source files exist on disk (the honesty floor).
+    SourcePresent,
+    /// The project's real build/test/lint passes.
+    BuildClean,
+    /// The frontend↔backend API contract + requirement coverage holds.
+    ContractMatches,
+    /// A named file exists on disk (relative to the project root).
+    FileExists {
+        /// Repo-relative path that must exist.
+        path: String,
+    },
+    /// A named file exists AND contains a substring needle (e.g. a route literal,
+    /// an exported symbol) — proof the file holds the specific thing it should.
+    FileContains {
+        /// Repo-relative path that must exist.
+        path: String,
+        /// Substring the file's contents must contain.
+        needle: String,
+    },
+    /// A named test is present in the codebase and the test floor is green. A
+    /// `None` name means "the test suite passes" (no specific test named).
+    TestPasses {
+        /// Substring of the test's name/path that must appear in source; `None`
+        /// degrades the check to "the suite passes".
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// An HTTP route answers with the expected status (probed via the runtime
+    /// proof — boot the app + `curl` the path). `status == 0` means "any non-error
+    /// (`< 400`) response". `method` is recorded for the declaration/gap text; the
+    /// reused probe transport is path+status based.
+    RouteResponds {
+        /// HTTP method (recorded for the contract/gap text), e.g. `GET`.
+        method: String,
+        /// Route path relative to the base URL, e.g. `/api/login`.
+        path: String,
+        /// Expected HTTP status; `0` = any non-error (`< 400`) response.
+        status: u16,
+    },
+}
+
+impl EvidenceContract {
+    /// A short human label of this contract, for the rework directive so the doer
+    /// knows the exact mechanical bar this step must clear.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::SourcePresent => "real source files exist on disk".to_string(),
+            Self::BuildClean => "the build/test is clean".to_string(),
+            Self::ContractMatches => "the frontend↔backend API contract holds".to_string(),
+            Self::FileExists { path } => format!("`{path}` exists"),
+            Self::FileContains { path, needle } => format!("`{path}` contains \"{needle}\""),
+            Self::TestPasses { name } => match name {
+                Some(n) => format!("test \"{n}\" is present and passing"),
+                None => "the test suite passes".to_string(),
+            },
+            Self::RouteResponds {
+                method,
+                path,
+                status,
+            } => {
+                if *status == 0 {
+                    format!("{method} {path} responds OK")
+                } else {
+                    format!("{method} {path} responds {status}")
+                }
+            }
+        }
+    }
+
+    /// Tolerantly build ONE contract from a brain-supplied JSON value — either a
+    /// bareword string (`"build-clean"`, `"source-present"`, `"contract-matches"`)
+    /// or an object `{"kind": "...", ...}` with the variant's fields. Returns
+    /// `None` for anything unrecognised or under-specified (an empty path, a
+    /// `file-contains` with no needle) so the entry is dropped rather than poisoning
+    /// the whole plan parse (fail-open). Field reads are tolerant: a missing field
+    /// is empty, a numeric-or-string status is accepted, the method is upper-cased.
+    fn parse_value(v: &serde_json::Value) -> Option<Self> {
+        // Bareword form: a plain string names a no-argument contract.
+        if let Some(s) = v.as_str() {
+            return Self::parse_kind_only(s);
+        }
+        let obj = v.as_object()?;
+        let kind = obj
+            .get("kind")
+            .or_else(|| obj.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '_'], "-");
+        let str_field = |k: &str| -> String {
+            obj.get(k)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        match kind.as_str() {
+            "source-present" | "source" | "files-exist" => Some(Self::SourcePresent),
+            "build-clean" | "build-test" | "build" | "test" | "tests" | "lint" => {
+                Some(Self::BuildClean)
+            }
+            "contract-matches" | "contract" | "api-contract" | "api" => Some(Self::ContractMatches),
+            "file-exists" | "file" => {
+                let path = str_field("path");
+                (!path.is_empty()).then_some(Self::FileExists { path })
+            }
+            "file-contains" | "contains" => {
+                let path = str_field("path");
+                let needle = {
+                    let n = str_field("needle");
+                    if n.is_empty() {
+                        str_field("contains")
+                    } else {
+                        n
+                    }
+                };
+                (!path.is_empty() && !needle.is_empty())
+                    .then_some(Self::FileContains { path, needle })
+            }
+            "test-passes" | "test-present" | "named-test" => {
+                let n = str_field("name");
+                Some(Self::TestPasses {
+                    name: (!n.is_empty()).then_some(n),
+                })
+            }
+            "route-responds" | "route" | "endpoint" | "http" => {
+                let path = str_field("path");
+                if path.is_empty() {
+                    return None;
+                }
+                let method = {
+                    let m = str_field("method").to_ascii_uppercase();
+                    if m.is_empty() {
+                        "GET".to_string()
+                    } else {
+                        m
+                    }
+                };
+                Some(Self::RouteResponds {
+                    method,
+                    path,
+                    status: value_to_status(obj.get("status")),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Map a bareword kind string to a no-argument contract; `None` for a kind that
+    /// needs fields (a `file-exists` cannot be formed from a bare word).
+    fn parse_kind_only(s: &str) -> Option<Self> {
+        match s
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '_'], "-")
+            .as_str()
+        {
+            "source-present" | "source" | "files-exist" => Some(Self::SourcePresent),
+            "build-clean" | "build-test" | "build" | "test" | "tests" | "lint" => {
+                Some(Self::BuildClean)
+            }
+            "contract-matches" | "contract" | "api-contract" | "api" => Some(Self::ContractMatches),
+            "test-passes" => Some(Self::TestPasses { name: None }),
+            _ => None,
+        }
+    }
+}
+
+/// Read a JSON status value as a `u16`, accepting both a number (`200`) and a
+/// string (`"200"`); anything else / absent → `0` (interpreted as "any non-error
+/// response"). Clamps an out-of-range number to `u16::MAX`. Fail-open, never panics.
+fn value_to_status(v: Option<&serde_json::Value>) -> u16 {
+    match v {
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .map(|x| x.min(u64::from(u16::MAX)) as u16)
+            .unwrap_or(0),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<u16>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Parse + normalise a brain-supplied list of evidence values into owned typed
+/// contracts: drop anything unparseable/under-specified, then dedupe (preserving
+/// first-seen order). An empty result means the step carries NO typed contract and
+/// will fall back to its [`AcceptanceSpec`] at verify time (fail-open).
+fn parse_brain_evidence(values: &[serde_json::Value]) -> Vec<EvidenceContract> {
+    let mut out: Vec<EvidenceContract> = Vec::new();
+    for v in values {
+        if let Some(c) = EvidenceContract::parse_value(v) {
+            if !out.contains(&c) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
 /// One node in the plan DAG. Owns its dependencies (`depends_on`) so independent
 /// nodes are parallelisable and the director can schedule by readiness, not a flat
 /// list.
@@ -172,6 +407,16 @@ pub struct PlanStep {
     pub depends_on: Vec<String>,
     /// The mechanical criterion that flips this step to done.
     pub acceptance: AcceptanceSpec,
+    /// The step's TYPED EVIDENCE CONTRACT(s) — explicit, machine-checkable proof
+    /// the step is done (a file exists/contains X, a named test passes, a route
+    /// responds, the contract matches). When non-empty, the verifier checks THESE
+    /// specific facts on the deterministic floor before the step ticks
+    /// [`StepStatus::Done`]; an unsatisfied contract leaves the step not-done and
+    /// folds the typed gap into rework. Empty (the brain named nothing checkable,
+    /// or a persisted plan predates this field) ⇒ fall back to `acceptance`
+    /// (fail-open). `#[serde(default)]` so older `plan.json` files still load.
+    #[serde(default)]
+    pub evidence: Vec<EvidenceContract>,
     /// Lifecycle status (persisted, so the plan resumes).
     pub status: StepStatus,
 }
@@ -588,6 +833,14 @@ struct BrainStep {
     depends_on: Vec<String>,
     #[serde(default)]
     acceptance: String,
+    /// The brain's PROPOSED per-step evidence — a tolerant array of values (each a
+    /// bareword like `"build-clean"` or an object `{"kind":"file-exists","path":…}`).
+    /// Parsed as raw [`serde_json::Value`]s so one malformed entry can never fail the
+    /// whole plan parse; [`parse_brain_evidence`] then validates them into owned
+    /// [`EvidenceContract`]s (dropping the unparseable). Absent ⇒ empty ⇒ the step
+    /// falls back to its [`AcceptanceSpec`].
+    #[serde(default)]
+    evidence: Vec<serde_json::Value>,
 }
 
 /// Synthesise a [`Plan`] by borrowing the base's brain for ONE forked, read-only,
@@ -695,6 +948,17 @@ pub async fn synthesize_plan(
          backend-engineer, qa-engineer, security-engineer, devops-engineer. \
          `kind`: build | review. \
          `acceptance`: source-present | build-test | contract | design-tokens | review-clean. \
+         `evidence` (OPTIONAL but STRONGLY preferred): an array declaring the SPECIFIC, \
+         machine-checkable proof this step is done — UmaDev verifies it deterministically \
+         before marking the step done, so make `done` falsifiable. Each entry is an object \
+         {{\"kind\":…, …}}; kinds: \
+         {{\"kind\":\"file-exists\",\"path\":\"src/foo.tsx\"}}, \
+         {{\"kind\":\"file-contains\",\"path\":\"src/api.ts\",\"needle\":\"/api/login\"}}, \
+         {{\"kind\":\"test-passes\",\"name\":\"login\"}}, {{\"kind\":\"build-clean\"}}, \
+         {{\"kind\":\"route-responds\",\"method\":\"POST\",\"path\":\"/api/login\",\"status\":200}}, \
+         {{\"kind\":\"contract-matches\"}}, {{\"kind\":\"source-present\"}}. Prefer the most \
+         specific evidence the step actually produces (a concrete file/route over a generic \
+         build-clean). \
          Team-deliverable rules (UmaDev ALSO enforces these structurally, so honour them): \
          (a) when there is a UI surface, the uiux-designer has a BUILD step that writes the \
          design system as real `design-tokens.{{json,css}}` files (acceptance=design-tokens) \
@@ -706,7 +970,8 @@ pub async fn synthesize_plan(
          the test-author must not be the code-author (de-biasing); a QA review step is \
          separate. \
          JSON shape: {{\"steps\":[{{\"id\":\"scaffold\",\"title\":\"…\",\"seat\":\"…\",\
-         \"kind\":\"build\",\"depends_on\":[],\"acceptance\":\"source-present\"}}],\
+         \"kind\":\"build\",\"depends_on\":[],\"acceptance\":\"source-present\",\
+         \"evidence\":[{{\"kind\":\"file-exists\",\"path\":\"src/App.tsx\"}}]}}],\
          \"risks\":[\"…\"],\"open_questions\":[\"…\"]}}",
         class = route.class.as_str(),
         kind = route.kind.id(),
@@ -747,6 +1012,10 @@ pub async fn synthesize_plan(
                     kind,
                     depends_on: b.depends_on,
                     acceptance: AcceptanceSpec::parse(&b.acceptance, kind),
+                    // Parse + OWN the brain's proposed per-step evidence (dropping
+                    // anything unparseable); empty ⇒ the step falls back to its
+                    // acceptance criterion at verify time (fail-open).
+                    evidence: parse_brain_evidence(&b.evidence),
                     status: StepStatus::Pending,
                 }
             })
@@ -769,6 +1038,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status: StepStatus::Pending,
         }
     }
@@ -789,6 +1059,7 @@ mod tests {
             kind,
             depends_on: deps.iter().map(|s| (*s).to_string()).collect(),
             acceptance,
+            evidence: Vec::new(),
             status: StepStatus::Pending,
         }
     }
@@ -1498,5 +1769,147 @@ mod tests {
             deps_of(&p, "qa-review").contains(&"fe".to_string()),
             "a QA review step keeps its code dependency (it reads the code)"
         );
+    }
+
+    // ── Evidence-contract-per-step: parsing + ownership ──────────────────────
+
+    #[test]
+    fn evidence_contract_parses_object_and_bareword_forms() {
+        use serde_json::json;
+        // Object forms with their fields.
+        assert_eq!(
+            EvidenceContract::parse_value(&json!({"kind":"file-exists","path":"src/a.tsx"})),
+            Some(EvidenceContract::FileExists {
+                path: "src/a.tsx".into()
+            })
+        );
+        assert_eq!(
+            EvidenceContract::parse_value(
+                &json!({"kind":"file-contains","path":"x.ts","needle":"/api/login"})
+            ),
+            Some(EvidenceContract::FileContains {
+                path: "x.ts".into(),
+                needle: "/api/login".into()
+            })
+        );
+        // Method is upper-cased; numeric status is read.
+        assert_eq!(
+            EvidenceContract::parse_value(
+                &json!({"kind":"route-responds","method":"post","path":"/api/login","status":200})
+            ),
+            Some(EvidenceContract::RouteResponds {
+                method: "POST".into(),
+                path: "/api/login".into(),
+                status: 200
+            })
+        );
+        // A string status + a missing method (defaults to GET).
+        assert_eq!(
+            EvidenceContract::parse_value(&json!({"kind":"route","path":"/x","status":"201"})),
+            Some(EvidenceContract::RouteResponds {
+                method: "GET".into(),
+                path: "/x".into(),
+                status: 201
+            })
+        );
+        assert_eq!(
+            EvidenceContract::parse_value(&json!({"kind":"test-passes","name":"login"})),
+            Some(EvidenceContract::TestPasses {
+                name: Some("login".into())
+            })
+        );
+        assert_eq!(
+            EvidenceContract::parse_value(&json!({"kind":"test-passes"})),
+            Some(EvidenceContract::TestPasses { name: None })
+        );
+        // Bareword (no-argument) kinds.
+        assert_eq!(
+            EvidenceContract::parse_value(&json!("build-clean")),
+            Some(EvidenceContract::BuildClean)
+        );
+        assert_eq!(
+            EvidenceContract::parse_value(&json!("source-present")),
+            Some(EvidenceContract::SourcePresent)
+        );
+        assert_eq!(
+            EvidenceContract::parse_value(&json!("contract-matches")),
+            Some(EvidenceContract::ContractMatches)
+        );
+        // Under-specified / unknown → None (the entry is dropped, never a panic).
+        assert!(EvidenceContract::parse_value(&json!({"kind":"file-exists"})).is_none());
+        assert!(
+            EvidenceContract::parse_value(&json!({"kind":"file-contains","path":"x"})).is_none()
+        );
+        assert!(EvidenceContract::parse_value(&json!({"kind":"bogus"})).is_none());
+        assert!(EvidenceContract::parse_value(&json!("file-exists")).is_none());
+        assert!(EvidenceContract::parse_value(&json!(123)).is_none());
+    }
+
+    #[test]
+    fn brain_step_evidence_is_parsed_owned_and_malformed_dropped() {
+        // A brain step JSON whose evidence array mixes a good object, an under-specified
+        // object (dropped), a duplicate (deduped), and a bareword. UmaDev PARSES + OWNS
+        // the typed contracts — the base does not self-grade.
+        let raw: BrainStep = serde_json::from_str(
+            r#"{
+                "id":"login","title":"login route","seat":"backend-engineer","kind":"build",
+                "evidence":[
+                    {"kind":"file-exists","path":"src/login.ts"},
+                    {"kind":"file-exists"},
+                    {"kind":"file-exists","path":"src/login.ts"},
+                    "build-clean"
+                ]
+            }"#,
+        )
+        .expect("brain step parses");
+        let evidence = parse_brain_evidence(&raw.evidence);
+        assert_eq!(
+            evidence,
+            vec![
+                EvidenceContract::FileExists {
+                    path: "src/login.ts".into()
+                },
+                EvidenceContract::BuildClean,
+            ],
+            "good entries are owned; the under-specified entry + the duplicate are dropped"
+        );
+    }
+
+    #[test]
+    fn one_malformed_evidence_entry_never_fails_the_whole_plan_parse() {
+        // A wrong-typed evidence entry (a bare number) must NOT break the tolerant
+        // Value-based parse: the plan still parses and the bad entry is simply dropped.
+        let bp: BrainPlan = serde_json::from_str(
+            r#"{"steps":[{"id":"a","title":"t","evidence":[123,{"kind":"build-clean"}]}]}"#,
+        )
+        .expect("plan stays parseable despite a malformed evidence entry");
+        let ev = parse_brain_evidence(&bp.steps[0].evidence);
+        assert_eq!(ev, vec![EvidenceContract::BuildClean]);
+    }
+
+    #[test]
+    fn plan_step_with_evidence_round_trips_through_save_load() {
+        let dir = std::env::temp_dir().join(format!("umadev-ev-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = step("a", &[]);
+        s.evidence = vec![
+            EvidenceContract::FileExists {
+                path: "src/App.tsx".into(),
+            },
+            EvidenceContract::RouteResponds {
+                method: "GET".into(),
+                path: "/".into(),
+                status: 0,
+            },
+        ];
+        let p = plan(vec![s]);
+        save(&p, &dir).expect("save ok");
+        let loaded = load(&dir).expect("load ok");
+        assert_eq!(
+            loaded, p,
+            "the typed evidence contract survives persistence"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

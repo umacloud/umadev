@@ -1619,7 +1619,7 @@ async fn drive_build_step(
             step.title,
             route_focus_line(route),
             verdict.evidence_line(),
-            acceptance_label(&step.acceptance),
+            step_criterion_label(step),
         );
     }
     // FIRST-PASS ACCEPTANCE signal (advisory, fail-open): the cheap path never
@@ -1840,6 +1840,15 @@ async fn verify_step_acceptance(
     // empty-tree miss; a positive source pass becomes the verdict's positive evidence
     // for the weaker criteria (review/turn-settled don't add their own).
     let is_build = step.kind == plan_state::StepKind::Build;
+    // EVIDENCE CONTRACT (per-step, the #1 falsifiability upgrade): if the step
+    // declares a TYPED, deterministically-checkable evidence contract, verify THAT
+    // specific evidence on the floor — UmaDev owns + checks it; the base never
+    // self-grades. An empty contract (the brain named nothing checkable, or a
+    // persisted plan predates the field) falls through to the acceptance check below
+    // (fail-open — a missing/uncheckable contract never blocks).
+    if !step.evidence.is_empty() {
+        return verify_step_evidence(options, events, step, is_build).await;
+    }
     match &step.acceptance {
         A::SourcePresent => acceptance_from_verify(
             director::verify(options, events, VerifyKind::SourcePresent).await,
@@ -1957,6 +1966,310 @@ fn acceptance_from_verify(r: VerifyResult) -> StepVerdict {
             Vec::new()
         },
     }
+}
+
+/// The outcome of checking ONE [`plan_state::EvidenceContract`] on the deterministic
+/// floor — the per-contract atom [`verify_step_evidence`] aggregates.
+enum EvidenceOutcome {
+    /// The declared evidence was found / the check ran and passed — POSITIVE,
+    /// falsifiable proof the step did its specific job.
+    Pass,
+    /// The check genuinely could not run (no manifest to build, no dev server to
+    /// boot, no contract to compare) — a NEUTRAL skip, fail-open: an uncheckable
+    /// contract never blocks a step (it just adds no positive evidence).
+    Skip,
+    /// The declared evidence is ABSENT / the check ran and FAILED — a typed,
+    /// diagnosed gap line ("step declared X but Y") the verifier folds into rework.
+    Gap(String),
+}
+
+/// Verify a step's TYPED EVIDENCE CONTRACT(s) on the DETERMINISTIC floor — the per-
+/// step falsifiability check. Each declared [`plan_state::EvidenceContract`] is
+/// checked SPECIFICALLY (this file exists / contains X, this named test is present +
+/// passing, this route answers, the contract matches) by REUSING UmaDev's existing
+/// evidence producers ([`director::verify`] / [`crate::acceptance`] /
+/// [`crate::runtime_proof`] / `umadev-contract`) — no new probing infra. ALL declared
+/// contracts must be satisfied (or be a neutral skip) for the step to accept; ANY
+/// unsatisfied one leaves the step not-done and surfaces a typed evidence-gap line.
+///
+/// A `Build` step ALSO always honours the source-present honesty floor FIRST (so a
+/// "claimed done, wrote nothing" step is caught even if its declared evidence is a
+/// route/contract that happens to skip). Fail-open throughout: an uncheckable
+/// contract is a neutral skip, never a false failure. The expensive producers (the
+/// build/test floor, the runtime boot, the contract floor) are each run AT MOST ONCE
+/// per step regardless of how many contracts reference them.
+async fn verify_step_evidence(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    step: &plan_state::PlanStep,
+    is_build: bool,
+) -> StepVerdict {
+    use plan_state::EvidenceContract as E;
+    let root = &options.project_root;
+
+    // Build-step honesty floor first (same bar the acceptance path enforces): a real
+    // empty tree is an honest reject regardless of the declared evidence. A positive
+    // source pass becomes baseline positive evidence (so a Build step whose only
+    // contract is an unrunnable route still counts the real source it wrote).
+    let src = director::verify(options, events, VerifyKind::SourcePresent).await;
+    if is_build && src.available && !src.passed {
+        return acceptance_from_verify(src);
+    }
+    let mut any_positive = is_build && src.available && src.passed;
+
+    // Precompute the SHARED, expensive producers at most once — only when a declared
+    // contract actually needs them — so multiple contracts of the same kind don't
+    // re-run the build / re-boot the app / re-diff the contract.
+    let needs_build = step
+        .evidence
+        .iter()
+        .any(|c| matches!(c, E::BuildClean | E::TestPasses { .. }));
+    let build = if needs_build {
+        Some(director::verify(options, events, VerifyKind::BuildTest).await)
+    } else {
+        None
+    };
+    let needs_contract = step
+        .evidence
+        .iter()
+        .any(|c| matches!(c, E::ContractMatches));
+    let contract = if needs_contract {
+        Some(director::verify(options, events, VerifyKind::Contract).await)
+    } else {
+        None
+    };
+    let needs_runtime = step
+        .evidence
+        .iter()
+        .any(|c| matches!(c, E::RouteResponds { .. }));
+    let runtime = if needs_runtime {
+        Some(crate::runtime_proof::run_runtime_proof(root).await)
+    } else {
+        None
+    };
+
+    let mut gaps: Vec<String> = Vec::new();
+    for c in &step.evidence {
+        let outcome = match c {
+            E::SourcePresent => source_present_outcome(&src),
+            E::FileExists { path } => file_exists_outcome(root, path),
+            E::FileContains { path, needle } => file_contains_outcome(root, path, needle),
+            E::TestPasses { name } => test_passes_outcome(root, name.as_deref(), build.as_ref()),
+            E::BuildClean => build_clean_outcome(build.as_ref()),
+            E::ContractMatches => contract_outcome(contract.as_ref()),
+            E::RouteResponds {
+                method,
+                path,
+                status,
+            } => route_responds_outcome(runtime.as_ref(), method, path, *status),
+        };
+        match outcome {
+            EvidenceOutcome::Pass => any_positive = true,
+            EvidenceOutcome::Skip => {}
+            EvidenceOutcome::Gap(line) => gaps.push(line),
+        }
+    }
+
+    StepVerdict {
+        // Accept iff NO declared contract is unsatisfied. (A neutral-skip-only step on
+        // a Build path still has the honesty floor's positive source evidence; a
+        // non-Build step with only skips is a neutral accept, matching the acceptance
+        // path's fail-open posture.)
+        accepted: gaps.is_empty(),
+        has_positive_evidence: any_positive,
+        evidence: gaps,
+    }
+}
+
+/// `SourcePresent` contract → reuse the already-computed source floor: positive when
+/// real source exists, a typed gap on a confirmed empty tree, neutral otherwise.
+fn source_present_outcome(src: &VerifyResult) -> EvidenceOutcome {
+    if src.available && src.passed {
+        EvidenceOutcome::Pass
+    } else if src.available && !src.passed {
+        EvidenceOutcome::Gap(
+            "declared source-present evidence but no real source files exist on disk".to_string(),
+        )
+    } else {
+        EvidenceOutcome::Skip
+    }
+}
+
+/// `FileExists` contract → the named repo-relative path exists on disk.
+fn file_exists_outcome(root: &std::path::Path, path: &str) -> EvidenceOutcome {
+    if step_path_exists(root, path) {
+        EvidenceOutcome::Pass
+    } else {
+        EvidenceOutcome::Gap(format!(
+            "declared file-exists `{path}` but that path is absent on disk"
+        ))
+    }
+}
+
+/// `FileContains` contract → the named path exists AND its contents hold `needle`.
+fn file_contains_outcome(root: &std::path::Path, path: &str, needle: &str) -> EvidenceOutcome {
+    let full = root.join(path);
+    match std::fs::read_to_string(&full) {
+        Ok(content) if content.contains(needle) => EvidenceOutcome::Pass,
+        Ok(_) => EvidenceOutcome::Gap(format!(
+            "declared `{path}` contains \"{needle}\" but the file does not contain it"
+        )),
+        Err(_) => EvidenceOutcome::Gap(format!(
+            "declared `{path}` contains \"{needle}\" but the file is absent/unreadable"
+        )),
+    }
+}
+
+/// `TestPasses` contract → the named test is PRESENT in the codebase (a source file
+/// mentions it — falsifiable: a test that doesn't exist can't pass) AND the project's
+/// real test floor is green. A `None` name degrades to "the suite passes". The build
+/// floor being unavailable (no manifest) is a neutral skip for that half; the name-
+/// presence half is independent of the toolchain (a pure source scan), so a declared
+/// but absent named test is a gap even with no manifest.
+fn test_passes_outcome(
+    root: &std::path::Path,
+    name: Option<&str>,
+    build: Option<&VerifyResult>,
+) -> EvidenceOutcome {
+    // Name-presence half: a named test that appears NOWHERE in the source is absent —
+    // a falsifiable gap regardless of whether the suite can run.
+    if let Some(n) = name {
+        let needle = n.trim();
+        if needle.len() >= 3 && !source_mentions(root, needle) {
+            return EvidenceOutcome::Gap(format!(
+                "declared test \"{n}\" passes but no test by that name is present in the codebase"
+            ));
+        }
+    }
+    // Suite half: the real build/test floor must be green when it can run.
+    match build {
+        Some(b) if b.available && !b.passed => EvidenceOutcome::Gap(match name {
+            Some(n) => format!("declared test \"{n}\" passes but the test floor is failing"),
+            None => "declared the test suite passes but the test floor is failing".to_string(),
+        }),
+        Some(b) if b.available && b.passed => EvidenceOutcome::Pass,
+        // No manifest / nothing to build: the suite half is a neutral skip. If a name
+        // was given and present, that presence is still positive evidence.
+        _ => {
+            if name.is_some() {
+                EvidenceOutcome::Pass
+            } else {
+                EvidenceOutcome::Skip
+            }
+        }
+    }
+}
+
+/// `BuildClean` contract → reuse the already-run build/test floor: green = positive,
+/// red = a typed gap, no-manifest = a neutral skip.
+fn build_clean_outcome(build: Option<&VerifyResult>) -> EvidenceOutcome {
+    match build {
+        Some(b) if b.available && b.passed => EvidenceOutcome::Pass,
+        Some(b) if b.available && !b.passed => {
+            let detail = if b.evidence.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", b.evidence.join("; "))
+            };
+            EvidenceOutcome::Gap(format!(
+                "declared build-clean but the build/test failed{detail}"
+            ))
+        }
+        _ => EvidenceOutcome::Skip,
+    }
+}
+
+/// `ContractMatches` contract → reuse the already-run contract floor: clean = a
+/// positive pass, drift = a typed gap, nothing-to-compare = a neutral skip.
+fn contract_outcome(contract: Option<&VerifyResult>) -> EvidenceOutcome {
+    match contract {
+        Some(c) if c.available && c.passed => EvidenceOutcome::Pass,
+        Some(c) if c.available && !c.passed => {
+            let detail = if c.evidence.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", c.evidence.join("; "))
+            };
+            EvidenceOutcome::Gap(format!(
+                "declared contract-matches but the frontend↔backend contract drifted{detail}"
+            ))
+        }
+        _ => EvidenceOutcome::Skip,
+    }
+}
+
+/// `RouteResponds` contract → reuse the already-run runtime proof: if the app booted
+/// (Verified), the named path must have answered with the expected status (`status ==
+/// 0` ⇒ any non-error). A route that wasn't probed / answered wrong is a typed gap; a
+/// runtime that could NOT be verified at all (no dev server / no curl) is a neutral
+/// skip (fail-open — an unbootable app never blocks a step on this contract).
+fn route_responds_outcome(
+    runtime: Option<&crate::runtime_proof::RuntimeProof>,
+    method: &str,
+    path: &str,
+    status: u16,
+) -> EvidenceOutcome {
+    let Some(proof) = runtime else {
+        return EvidenceOutcome::Skip;
+    };
+    if !proof.status.is_verified() {
+        // The app couldn't be booted/probed at all — neutral, not a false failure.
+        return EvidenceOutcome::Skip;
+    }
+    let want = normalize_route(path);
+    let Some(probe) = proof
+        .routes
+        .iter()
+        .find(|r| normalize_route(&r.path) == want)
+    else {
+        return EvidenceOutcome::Gap(format!(
+            "declared {method} {path} responds but that route was not among the probed routes"
+        ));
+    };
+    let ok = if status == 0 {
+        probe.ok
+    } else {
+        probe.status == status
+    };
+    if ok {
+        EvidenceOutcome::Pass
+    } else if status == 0 {
+        EvidenceOutcome::Gap(format!(
+            "declared {method} {path} responds OK but it returned status {}",
+            probe.status
+        ))
+    } else {
+        EvidenceOutcome::Gap(format!(
+            "declared {method} {path} responds {status} but it returned status {}",
+            probe.status
+        ))
+    }
+}
+
+/// Resolve whether a repo-relative `path` exists under `root`. A blank path is never
+/// "present". Reads disk only; fail-open (a stat error ⇒ absent).
+fn step_path_exists(root: &std::path::Path, path: &str) -> bool {
+    let p = path.trim();
+    !p.is_empty() && root.join(p).exists()
+}
+
+/// Normalise a route path for comparison: trim, ensure a single leading `/`, drop a
+/// trailing `/` (except the root). So `api/users/` and `/api/users` compare equal.
+fn normalize_route(path: &str) -> String {
+    let t = path.trim();
+    let t = t.strip_prefix('/').unwrap_or(t);
+    let trimmed = t.trim_end_matches('/');
+    format!("/{trimmed}")
+}
+
+/// Whether any of the project's source files mentions `needle` — the deterministic
+/// "this named test actually exists" signal for [`test_passes_outcome`]. Reuses the
+/// bounded source scan ([`crate::acceptance::source_files`]); fail-open (an unreadable
+/// file is skipped). Bounded by the scan's own depth/file caps.
+fn source_mentions(root: &std::path::Path, needle: &str) -> bool {
+    crate::acceptance::source_files(root)
+        .iter()
+        .any(|f| std::fs::read_to_string(f).is_ok_and(|c| c.contains(needle)))
 }
 
 /// The final whole-build QC gate run once a step-driven plan has walked its DAG —
@@ -2160,6 +2473,23 @@ fn acceptance_label(spec: &plan_state::AcceptanceSpec) -> &'static str {
         A::DesignTokensPresent => "the design-tokens.{json,css} design system exists on disk",
         A::ReviewClean => "the review team raises no blocking issue",
         A::TurnSettled => "the work turn completes",
+    }
+}
+
+/// The mechanical bar a step must clear, for the fix directive — the TYPED EVIDENCE
+/// CONTRACT summary when the step declares one (so the doer is told exactly which
+/// specific files/tests/routes must check out), else the generic
+/// [`acceptance_label`]. Keeps the directive truthful about what UmaDev will actually
+/// verify before it ticks the step done.
+fn step_criterion_label(step: &plan_state::PlanStep) -> String {
+    if step.evidence.is_empty() {
+        acceptance_label(&step.acceptance).to_string()
+    } else {
+        step.evidence
+            .iter()
+            .map(plan_state::EvidenceContract::label)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -5296,6 +5626,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: vec![],
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status: StepStatus::Pending,
         };
         let plan = Plan {
@@ -5722,6 +6053,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: vec![],
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status,
         };
 
@@ -5942,6 +6274,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status: StepStatus::Pending,
         };
         Plan {
@@ -6266,6 +6599,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status: StepStatus::Pending,
         };
         let mut plan = Plan {
@@ -6322,6 +6656,7 @@ mod tests {
                 kind: StepKind::Build,
                 depends_on: vec![],
                 acceptance: AcceptanceSpec::SourcePresent,
+                evidence: Vec::new(),
                 status: StepStatus::Pending,
             }],
             risks: vec![],
@@ -6457,6 +6792,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status,
         };
         let mut plan = Plan {
@@ -6517,6 +6853,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status: StepStatus::Pending,
         };
         let mut plan = Plan {
@@ -6582,6 +6919,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: vec![], // all independent → all ready, all driven in turn
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status: StepStatus::Pending,
         };
         let mut plan = Plan {
@@ -6644,6 +6982,7 @@ mod tests {
                 kind: StepKind::Build,
                 depends_on: vec![],
                 acceptance: AcceptanceSpec::ReviewClean,
+                evidence: Vec::new(),
                 status: StepStatus::Pending,
             }],
             risks: vec![],
@@ -6670,12 +7009,271 @@ mod tests {
             kind: StepKind::Build,
             depends_on: vec![],
             acceptance: AcceptanceSpec::TurnSettled,
+            evidence: Vec::new(),
             status: StepStatus::Active,
         };
         let verdict = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
         assert!(
             !verdict.accepted,
             "a TurnSettled Build over an empty tree must NOT pass the honesty floor"
+        );
+    }
+
+    // ── Evidence-contract-per-step: deterministic verify wiring ──────────────
+
+    /// A Build step carrying a typed evidence contract (for the verify tests).
+    fn evidence_step(evidence: Vec<crate::plan_state::EvidenceContract>) -> plan_state::PlanStep {
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+        PlanStep {
+            id: "a".into(),
+            title: "deliver the thing".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: vec![],
+            // Acceptance is the FALLBACK; the typed evidence is what's actually checked.
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence,
+            status: StepStatus::Active,
+        }
+    }
+
+    #[tokio::test]
+    async fn evidence_file_exists_satisfied_marks_the_step_accepted() {
+        use crate::plan_state::EvidenceContract as E;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/App.tsx"),
+            "export const App = () => null;",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = evidence_step(vec![E::FileExists {
+            path: "src/App.tsx".into(),
+        }]);
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        assert!(v.accepted, "the declared file exists → the step is done");
+        assert!(v.has_positive_evidence);
+        assert!(v.evidence.is_empty(), "no gap: {:?}", v.evidence);
+    }
+
+    #[tokio::test]
+    async fn evidence_file_exists_absent_stays_not_done_with_a_typed_gap() {
+        use crate::plan_state::EvidenceContract as E;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Real source present (so the honesty floor passes) but NOT the declared file.
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/other.tsx"), "export const X = 1;").unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = evidence_step(vec![E::FileExists {
+            path: "src/App.tsx".into(),
+        }]);
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        assert!(
+            !v.accepted,
+            "the declared file is absent → the step is NOT done"
+        );
+        let line = v.evidence_line();
+        assert!(
+            line.contains("file-exists `src/App.tsx`") && line.contains("absent"),
+            "a typed evidence-gap directive is surfaced: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_file_contains_checks_the_specific_substring() {
+        use crate::plan_state::EvidenceContract as E;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/api.ts"), "export const base = '/api';").unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        // The file exists but does NOT contain the declared needle → a typed gap.
+        let miss = evidence_step(vec![E::FileContains {
+            path: "src/api.ts".into(),
+            needle: "/api/login".into(),
+        }]);
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &miss).await;
+        assert!(!v.accepted);
+        assert!(
+            v.evidence_line().contains("does not contain"),
+            "{}",
+            v.evidence_line()
+        );
+        // Now it contains the needle → satisfied.
+        std::fs::write(
+            tmp.path().join("src/api.ts"),
+            "fetch('/api/login', { method: 'POST' });",
+        )
+        .unwrap();
+        let hit = evidence_step(vec![E::FileContains {
+            path: "src/api.ts".into(),
+            needle: "/api/login".into(),
+        }]);
+        let v2 = verify_step_acceptance(&mut sess, &o, &events, &route, &hit).await;
+        assert!(v2.accepted && v2.has_positive_evidence);
+    }
+
+    #[tokio::test]
+    async fn step_with_no_evidence_falls_back_to_the_current_acceptance() {
+        // Fail-open: an empty evidence contract uses the step's AcceptanceSpec EXACTLY as
+        // before — source present + SourcePresent acceptance accepts; an empty tree is
+        // rejected by the SAME honesty floor (the acceptance path still governs).
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind, StepStatus};
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let route = build_route();
+        let mk = |status| PlanStep {
+            id: "a".into(),
+            title: "t".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(), // ← no typed contract → fall back to acceptance
+            status,
+        };
+        // With real source → accepted.
+        let with_src = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(with_src.path().join("src")).unwrap();
+        std::fs::write(with_src.path().join("src/a.ts"), "export const x = 1;").unwrap();
+        let v = verify_step_acceptance(
+            &mut sess,
+            &opts(with_src.path()),
+            &events,
+            &route,
+            &mk(StepStatus::Active),
+        )
+        .await;
+        assert!(
+            v.accepted,
+            "no-evidence step accepts via SourcePresent acceptance"
+        );
+        // Empty tree → the acceptance honesty floor rejects (unchanged behaviour).
+        let empty = tempfile::TempDir::new().unwrap();
+        let v2 = verify_step_acceptance(
+            &mut sess,
+            &opts(empty.path()),
+            &events,
+            &route,
+            &mk(StepStatus::Active),
+        )
+        .await;
+        assert!(
+            !v2.accepted,
+            "no-evidence step over an empty tree still rejects"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_route_responds_is_fail_open_skip_when_app_cannot_boot() {
+        use crate::plan_state::EvidenceContract as E;
+        // A Build step with real source + a RouteResponds contract, but the tmp tree has
+        // no dev server → the runtime proof degrades to NotVerified → the route check is
+        // a NEUTRAL skip (fail-open), so the step accepts on the source floor's evidence
+        // rather than being falsely blocked.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.ts"), "export const x = 1;").unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = evidence_step(vec![E::RouteResponds {
+            method: "GET".into(),
+            path: "/api/x".into(),
+            status: 200,
+        }]);
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        assert!(
+            v.accepted,
+            "an unbootable route check is a neutral skip, never a false block"
+        );
+        assert!(v.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn evidence_test_passes_flags_a_declared_but_absent_named_test() {
+        use crate::plan_state::EvidenceContract as E;
+        // Source present (so the honesty floor passes) but NO test mentions "checkout" →
+        // the named test is absent from the codebase → a typed gap, not done.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/app.ts"), "export const x = 1;").unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = evidence_step(vec![E::TestPasses {
+            name: Some("checkout".into()),
+        }]);
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        assert!(!v.accepted);
+        assert!(
+            v.evidence_line().contains("checkout")
+                && v.evidence_line().contains("no test by that name"),
+            "{}",
+            v.evidence_line()
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_test_passes_accepts_a_present_named_test_when_suite_unavailable() {
+        use crate::plan_state::EvidenceContract as E;
+        // A test file mentions "login"; no manifest → the suite half is a neutral skip,
+        // but the named test IS present → positive evidence, accepted.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/login.test.ts"),
+            "test('login flow works', () => { expect(1).toBe(1); });",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = evidence_step(vec![E::TestPasses {
+            name: Some("login".into()),
+        }]);
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        assert!(v.accepted && v.has_positive_evidence);
+    }
+
+    #[tokio::test]
+    async fn evidence_all_contracts_must_hold_one_gap_blocks_the_step() {
+        use crate::plan_state::EvidenceContract as E;
+        // Two contracts: one satisfied (file exists), one not (a missing file). ALL must
+        // hold → the step stays not-done and the single typed gap is surfaced.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/a.tsx"), "export const A = 1;").unwrap();
+        let (events, _rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let route = build_route();
+        let step = evidence_step(vec![
+            E::FileExists {
+                path: "src/a.tsx".into(),
+            },
+            E::FileExists {
+                path: "src/b.tsx".into(),
+            },
+        ]);
+        let v = verify_step_acceptance(&mut sess, &o, &events, &route, &step).await;
+        assert!(!v.accepted, "one unmet contract blocks the whole step");
+        assert!(v.evidence_line().contains("src/b.tsx"));
+        assert!(
+            !v.evidence_line().contains("src/a.tsx"),
+            "the met one is not a gap"
         );
     }
 
@@ -7005,6 +7603,7 @@ mod tests {
             kind: StepKind::Review,
             depends_on: vec![],
             acceptance: AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
             status: StepStatus::Active,
         };
         let outcome = drive_review_step(
@@ -7309,6 +7908,7 @@ mod tests {
             kind: StepKind::Build,
             depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
             acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
             status,
         }
     }
