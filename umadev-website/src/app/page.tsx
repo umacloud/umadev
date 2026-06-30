@@ -370,24 +370,24 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     let title = "";
     if (view === "home") {
       title = lang === "zh"
-        ? "UmaDev - 模拟真实开发团队来工作的 Coding Agent"
-        : "UmaDev — a coding agent that works like a real dev team";
+        ? "UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
+        : "UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
     } else if (view === "docs") {
       title = lang === "zh"
-        ? "文档中心 | UmaDev - 模拟真实开发团队来工作的 Coding Agent"
-        : "Documentation | UmaDev — a coding agent that works like a real dev team";
+        ? "文档中心 | UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
+        : "Documentation | UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
     } else if (view === "gallery") {
       title = lang === "zh"
-        ? "形象相册 | UmaDev - 模拟真实开发团队来工作的 Coding Agent"
-        : "Mascot Gallery | UmaDev — a coding agent that works like a real dev team";
+        ? "形象相册 | UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
+        : "Mascot Gallery | UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
     } else if (view === "changelog") {
       title = lang === "zh"
-        ? "更新日志 | UmaDev - 模拟真实开发团队来工作的 Coding Agent"
-        : "Changelog | UmaDev — a coding agent that works like a real dev team";
+        ? "更新日志 | UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
+        : "Changelog | UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
     } else if (view === "contributors") {
       title = lang === "zh"
-        ? "特别贡献荣誉殿堂 | UmaDev - 模拟真实开发团队来工作的 Coding Agent"
-        : "Special Contributors | UmaDev — a coding agent that works like a real dev team";
+        ? "特别贡献荣誉殿堂 | UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
+        : "Special Contributors | UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
     }
 
     document.title = title;

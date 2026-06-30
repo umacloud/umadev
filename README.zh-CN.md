@@ -4,7 +4,7 @@
 
 <img src="docs/assets/umadev-logo.png" alt="umadev" width="760">
 
-### UmaDev:一个模拟真实开发团队来工作的Coding Agent。
+### UmaDev:一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活。
 
 **产品经理 · 架构师 · UI/UX 设计师 · 前端 · 后端 · QA · 安全 · DevOps——八个角色像真实团队一样分工协作，把一句需求做成能上线、能交付、能审计的商业级应用。底座是大脑，团队替你交付；总监只是团队里的协调者。**
 

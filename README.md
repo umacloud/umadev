@@ -4,7 +4,7 @@
 
 <img src="docs/assets/umadev-logo-en.png" alt="umadev" width="760">
 
-### UmaDev: A coding agent that works like a real dev team.
+### UmaDev: A coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.87%2B-orange)](https://www.rust-lang.org/)

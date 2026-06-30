@@ -2,7 +2,7 @@
 
 > **Status:** authoritative. This document supersedes scattered direction notes and
 > the aspirational `AGENT_WIELDS_BASE_ARCHITECTURE.md` migration-wave language.
-> It defines the target — **UmaDev: a coding agent that works like a real dev team**
+> It defines the target — **UmaDev: a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use**
 > (a product manager, architect, UI/UX designer, frontend, backend, QA, security, and
 > DevOps — eight specialists, coordinated by a scheduling seat) — an honest gap
 > analysis against the current code, and an executable, impact-ordered roadmap to

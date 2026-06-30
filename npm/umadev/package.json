@@ -1,7 +1,7 @@
 {
   "name": "umadev",
   "version": "1.0.19",
-  "description": "UmaDev: A coding agent that works like a real dev team — PM, architect, designer, frontend, backend, QA, security, DevOps — borrowing your logged-in Claude Code / Codex / OpenCode brain to turn one requirement into a shippable, commercial-grade app, coordinated by a scheduling seat. No API key needed.",
+  "description": "UmaDev: A coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use — PM, architect, designer, frontend, backend, QA, security, DevOps — borrowing that logged-in base as the brain to turn one requirement into a shippable, commercial-grade app, coordinated by a scheduling seat. No API key needed.",
   "keywords": [
     "ai",
     "claude-code",

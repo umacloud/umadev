@@ -196,7 +196,7 @@ export const i18n = {
     galleryPage: { title: "形象相册", sub: "UmaDev 的 IP 形象集 —— 点击任意一张放大查看。" },
     logPage: { title: "更新日志", sub: "UmaDev 各版本的新增、改进与安全更新。", current: "最新", more: "展开其余 {n} 项", less: "收起" },
     footer: {
-      blurb: "一个模拟真实开发团队来工作的 Coding Agent，把一句需求做成能上线、可审计的商业级应用。",
+      blurb: "一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活，把一句需求做成能上线、可审计的商业级应用。",
       cols: [
         { h: "产品", links: [{ t: "流水线设计" }, { t: "运行模式" }, { t: "治理规则" }, { t: "质量门" }, { t: "知识库" }] },
         { h: "文档", links: [{ t: "快速体验" }, { t: "命令大全" }, { t: "配置" }, { t: "Rust 架构" }, { t: "规范 SPEC" }] },
@@ -441,7 +441,7 @@ export const i18n = {
     galleryPage: { title: "Mascot gallery", sub: "The UmaDev IP mascot set — click any image to enlarge." },
     logPage: { title: "Changelog", sub: "Every UmaDev release — what was added, improved and secured.", current: "Latest", more: "Show {n} more", less: "Show less" },
     footer: {
-      blurb: "A coding agent that works like a real dev team, turning one idea into a shippable, auditable, commercial-grade app.",
+      blurb: "A coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use, turning one idea into a shippable, auditable, commercial-grade app.",
       cols: [
         { h: "Product", links: [{ t: "Pipeline" }, { t: "Run modes" }, { t: "Governance" }, { t: "Quality gate" }, { t: "Knowledge base" }] },
         { h: "Docs", links: [{ t: "Quick start" }, { t: "Command reference" }, { t: "Configuration" }, { t: "Rust architecture" }, { t: "Spec" }] },
