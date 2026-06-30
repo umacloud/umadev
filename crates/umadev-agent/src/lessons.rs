@@ -2923,9 +2923,37 @@ fn render_failed_fixes(l: &Lesson) -> String {
     out
 }
 
-/// Render the most relevant prior-run lessons for the current phase's prompt.
-/// Returns a formatted markdown block (empty string when no lessons exist —
-/// so the prompt is unchanged for first-ever runs).
+/// Hard cap on how many corrective deltas the injected playbook carries — the
+/// COUNT side of the bound (the byte side is [`MEMORY_PLAYBOOK_BUDGET`]). A
+/// delta-playbook is, by definition, a SMALL curated set: a handful of
+/// high-signal "next time do X instead of Y" rules, not the ledger. Three is
+/// enough to cover the top on-stack match(es) plus the most chronic recent
+/// pitfall while staying compact. [`select_relevant_lessons`] fills at most this
+/// many slots (the top positively-matched first, then recent pitfalls as the
+/// universal fallback).
+const MEMORY_PLAYBOOK_MAX_DELTAS: usize = 3;
+
+/// Hard character budget for the injected delta-playbook block (the rendered
+/// memory digest). The selection is already COUNT-capped to a small ranked set
+/// (see [`select_relevant_lessons`] — at most [`MEMORY_PLAYBOOK_MAX_DELTAS`]),
+/// but an individual distilled delta's body is not itself byte-bounded: a
+/// belief's representative fix is the LONGEST member fix (see
+/// [`fold_one_cluster`]) and a captured pitfall's `fix`/`root_cause` are
+/// whatever the classifier produced. Without a block-level ceiling, a few fat
+/// deltas could still crowd the firmware budget / dilute signal — the exact
+/// context-collapse a delta-playbook exists to avoid. This caps the whole
+/// assembled block so EVERY caller (the firmware path is additionally bounded by
+/// the `FirmwareBuilder`, but the runner / director-loop inject this string
+/// directly) gets a compact playbook, never a wall of detail. ~3K chars ≈ a few
+/// hundred tokens — room for the ranked deltas (incl. one reflective escalation
+/// strategy) while staying a small, high-signal overlay.
+const MEMORY_PLAYBOOK_BUDGET: usize = 3_000;
+
+/// Render the most relevant prior-run lessons for the current phase's prompt —
+/// the compact DELTA PLAYBOOK: a small, ranked, deduplicated set of high-level
+/// corrective deltas (not raw episodes). Returns a formatted markdown block
+/// (empty string when no lessons exist — so the prompt is unchanged for
+/// first-ever runs).
 ///
 /// Triggering matches the pitfall against the project's real tech-stack
 /// fingerprint (see [`lesson_trigger_score`]), not just the requirement prose,
@@ -2935,6 +2963,14 @@ fn render_failed_fixes(l: &Lesson) -> String {
 /// circular dependency between the agent and knowledge crates at prompt-assembly
 /// time — the BM25 index already picks up learned/ files during
 /// `phase_knowledge_digest`.
+///
+/// **Bounded by construction (count AND bytes):** the selection is count-capped
+/// to [`MEMORY_PLAYBOOK_MAX_DELTAS`] ranked deltas (near-duplicates already
+/// merged into beliefs upstream, see [`fold_beliefs`]), and the assembled block
+/// is capped to [`MEMORY_PLAYBOOK_BUDGET`] characters here — a lower-rank delta
+/// that would overflow is dropped, and the single top delta is head-truncated as
+/// a hard backstop so the block can never exceed the budget. Fail-open: an empty
+/// or unreadable store yields an empty string, never a panic.
 #[must_use]
 pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> String {
     let selected = select_relevant_lessons(project_root, requirement);
@@ -2953,8 +2989,26 @@ pub fn relevant_lessons_for_prompt(project_root: &Path, requirement: &str) -> St
 
 ",
     );
+    // Assemble the ranked deltas under the hard char budget. The deltas arrive
+    // highest-rank first; append each while it fits, then stop — a lower-rank
+    // delta that would overflow is dropped (it is, by construction, the least
+    // important). If the FIRST (top-ranked) delta alone overflows, head-keep a
+    // truncated copy so the block is never just a header. This bounds the block
+    // for direct callers (runner / director-loop); the firmware path is bounded
+    // again by the `FirmwareBuilder`.
+    let mut any_delta = false;
     for lesson in &selected {
-        out.push_str(&render_one_lesson(lesson));
+        let frag = render_one_lesson(lesson);
+        let remaining = MEMORY_PLAYBOOK_BUDGET.saturating_sub(out.chars().count());
+        if frag.chars().count() <= remaining {
+            out.push_str(&frag);
+            any_delta = true;
+        } else {
+            if !any_delta && remaining > 0 {
+                out.push_str(&truncate(&frag, remaining));
+            }
+            break;
+        }
     }
 
     // Efficacy bookkeeping: mark the dev-error pitfalls we just surfaced as
@@ -3131,22 +3185,26 @@ fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson
     // Tier 1: positively-matched (the current situation hit a recorded one).
     // `s` is the raw relevance; `> 0` means the query/stack actually intersected
     // this lesson. They're already ordered by the composite decay score above.
+    // Reserve one slot for the universal-fallback pitfall tier below, so a strong
+    // match never fully crowds out the most chronic recent pitfall.
+    let tier1_cap = MEMORY_PLAYBOOK_MAX_DELTAS.saturating_sub(1);
     let mut top_idx: Vec<usize> = scored
         .iter()
         .enumerate()
         .filter(|(_, (s, _, _))| *s > 0)
-        .take(2)
+        .take(tier1_cap)
         .map(|(i, _)| i)
         .collect();
     // Tier 2: universal fallback — recent pitfalls apply regardless of overlap.
     // Dev errors (real "踩坑") are the highest-value avoid-next-time signal, so
-    // they fill the remaining slots FIRST, then quality failures.
+    // they fill the remaining slots FIRST, then quality failures. The total is
+    // hard-capped at MEMORY_PLAYBOOK_MAX_DELTAS so the playbook stays compact.
     for want_kind in [LessonKind::DevError, LessonKind::Failure] {
-        if top_idx.len() >= 3 {
+        if top_idx.len() >= MEMORY_PLAYBOOK_MAX_DELTAS {
             break;
         }
         for (i, (s, _, l)) in scored.iter().enumerate() {
-            if top_idx.len() >= 3 {
+            if top_idx.len() >= MEMORY_PLAYBOOK_MAX_DELTAS {
                 break;
             }
             if *s == 0 && l.kind == want_kind && !top_idx.contains(&i) {
@@ -5252,6 +5310,224 @@ mod tests {
                 .any(|l| l.kind == LessonKind::Failure && l.domain == "frontend"),
             "raw evidence demoted in favour of the belief"
         );
+    }
+
+    // ── Delta-playbook bound invariants ──────────────────────────────────────
+    // The injected memory block is a COMPACT, capped, deduped, ranked playbook —
+    // never a context-collapsing wall of raw episodes. These lock the four
+    // invariants: (1) count-capped, (2) byte-bounded, (3) near-dups merged,
+    // (4) ranked by frequency × recency, (5) fail-open.
+
+    /// A dev-error pitfall lesson with explicit signature/fix/recency/frequency —
+    /// the unit for the playbook-bound tests.
+    fn mk_pitfall(sig: &str, fix: &str, root: &str, when: &str, occ: u32) -> Lesson {
+        Lesson {
+            kind: LessonKind::DevError,
+            domain: "dependency".into(),
+            title: format!("踩坑 [{sig}]"),
+            body: String::new(),
+            fix: fix.into(),
+            root_cause: root.into(),
+            keywords: vec!["zzznomatch".into()],
+            source_requirement: String::new(),
+            first_seen: when.into(),
+            signature: sig.into(),
+            occurrences: occ,
+            context: Vec::new(),
+            efficacy: None,
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn injected_playbook_is_count_capped_under_many_lessons() {
+        // Many recorded pitfalls must still inject at most MEMORY_PLAYBOOK_MAX_DELTAS
+        // deltas — the playbook is a small curated set, not the whole ledger.
+        let tmp = TempDir::new().unwrap();
+        let rows: Vec<Lesson> = (0..40)
+            .map(|i| {
+                mk_pitfall(
+                    &format!("dependency/module-not-found/pkg{i}"),
+                    &format!("install pkg{i}"),
+                    &format!("pkg{i} was missing"),
+                    &format!("2026-06-{:02}T00:00:00Z", 1 + (i % 28)),
+                    1,
+                )
+            })
+            .collect();
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &rows);
+
+        // A requirement that shares no keyword with any pitfall → Tier-2 fallback.
+        let block = relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本占位");
+        let deltas = block.matches("[pitfall]").count();
+        assert!(
+            deltas >= 1,
+            "some pitfall surfaces from 40 recorded: {block}"
+        );
+        assert!(
+            deltas <= MEMORY_PLAYBOOK_MAX_DELTAS,
+            "injected playbook is count-capped at {MEMORY_PLAYBOOK_MAX_DELTAS}, got {deltas}"
+        );
+        assert!(
+            block.chars().count() <= MEMORY_PLAYBOOK_BUDGET,
+            "small deltas stay well within the byte budget"
+        );
+    }
+
+    #[test]
+    fn injected_playbook_is_byte_bounded_under_huge_deltas() {
+        // A single fat delta (e.g. a belief's longest-member fix, or a verbose
+        // captured fix) must NOT blow the block: the byte budget head-truncates so
+        // the playbook can never crowd the firmware / dilute signal. This is the
+        // unbounded-path guard — count cap alone (≤3) doesn't bound bytes.
+        let tmp = TempDir::new().unwrap();
+        let fat_fix = "x".repeat(8_000);
+        let fat_root = "y".repeat(8_000);
+        let rows: Vec<Lesson> = (0..5)
+            .map(|i| {
+                mk_pitfall(
+                    &format!("dependency/module-not-found/big{i}"),
+                    &fat_fix,
+                    &fat_root,
+                    &format!("2026-06-{:02}T00:00:00Z", 1 + i),
+                    1,
+                )
+            })
+            .collect();
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &rows);
+
+        let block = relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本占位");
+        assert!(
+            block.chars().count() <= MEMORY_PLAYBOOK_BUDGET,
+            "injected playbook stays within the byte budget even with fat deltas: {} > {MEMORY_PLAYBOOK_BUDGET}",
+            block.chars().count()
+        );
+        // …and it is NOT degraded to a header-only block — the top delta survives.
+        assert!(
+            block.contains("[pitfall]"),
+            "the top delta is head-kept (truncated), never dropped to header-only: {block}"
+        );
+    }
+
+    #[test]
+    fn near_duplicate_deltas_are_deduped_in_injected_playbook() {
+        // Near-duplicate raw lessons fold into ONE belief; the injected block then
+        // shows the single distilled delta, NOT the N near-duplicate originals —
+        // the dedup that keeps the playbook compact and high-signal.
+        let tmp = TempDir::new().unwrap();
+        seed_cluster(tmp.path(), 5, &["dashboard", "color", "token"], "frontend");
+        fold_beliefs(tmp.path());
+        let block = relevant_lessons_for_prompt(tmp.path(), "build a dashboard with color tokens");
+        assert_eq!(
+            block.matches("[belief]").count(),
+            1,
+            "exactly one distilled belief delta surfaces: {block}"
+        );
+        // The 5 raw frontend evidence lessons ([warn]) must be demoted, not also
+        // listed alongside the belief that already covers them.
+        assert!(
+            !block.contains("[warn]"),
+            "raw near-duplicate evidence is deduped away in favour of the belief: {block}"
+        );
+    }
+
+    #[test]
+    fn playbook_decay_score_favors_frequency_and_recency() {
+        // The ranking axis: a more-recent and a more-frequent pitfall each outscore
+        // an older / rarer one (frequency × recency), so the compact set keeps the
+        // deltas that matter most.
+        let now = Utc::now();
+        let q = std::collections::HashSet::new(); // no query match → pure freq×recency floor
+
+        let recent = mk_pitfall("d/x/recent", "f", "r", &iso(now), 1);
+        let old = mk_pitfall(
+            "d/x/old",
+            "f",
+            "r",
+            &iso(now - chrono::Duration::days(120)),
+            1,
+        );
+        assert!(
+            lesson_decay_score(&recent, &q, now) > lesson_decay_score(&old, &q, now),
+            "a more RECENT pitfall outranks an older one at equal frequency"
+        );
+
+        let frequent = mk_pitfall("d/x/freq", "f", "r", &iso(now), 8);
+        let rare = mk_pitfall("d/x/rare", "f", "r", &iso(now), 1);
+        assert!(
+            lesson_decay_score(&frequent, &q, now) > lesson_decay_score(&rare, &q, now),
+            "a more FREQUENT pitfall outranks a rarer one at equal recency"
+        );
+    }
+
+    #[test]
+    fn injected_playbook_orders_recent_frequent_delta_first() {
+        // End-to-end: the recent + frequent pitfall is rendered BEFORE the old +
+        // rare one in the injected block (the ranking actually drives surfacing).
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        let rows = vec![
+            mk_pitfall(
+                "dependency/module-not-found/hot",
+                "install hot",
+                "hot missing",
+                &iso(now),
+                9,
+            ),
+            mk_pitfall(
+                "dependency/module-not-found/cold",
+                "install cold",
+                "cold missing",
+                &iso(now - chrono::Duration::days(120)),
+                1,
+            ),
+        ];
+        write_raw_lessons(tmp.path(), DEV_ERRORS_FILE, &rows);
+        let block = relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本占位");
+        let hot_at = block.find("hot").expect("hot delta present");
+        let cold_at = block.find("cold").expect("cold delta present");
+        assert!(
+            hot_at < cold_at,
+            "recent+frequent delta is surfaced before the old+rare one: {block}"
+        );
+    }
+
+    #[test]
+    fn relevant_lessons_for_prompt_is_fail_open_on_a_corrupt_store() {
+        // A corrupt / unreadable ledger must degrade to an empty (or still-bounded)
+        // block — never a panic. Memory failure can't break a turn.
+        let tmp = TempDir::new().unwrap();
+        let raw_dir = tmp.path().join(RAW_DIR);
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        // Garbage lines + one valid pitfall: the parser skips the bad rows.
+        let valid = serde_json::to_string(&mk_pitfall(
+            "dependency/module-not-found/ok",
+            "fix it",
+            "why",
+            "2026-06-10T00:00:00Z",
+            1,
+        ))
+        .unwrap();
+        std::fs::write(
+            raw_dir.join(DEV_ERRORS_FILE),
+            format!("{{not json at all\n\n[]\n{valid}\n"),
+        )
+        .unwrap();
+        // Must not panic, and whatever it returns stays within the budget.
+        let block = relevant_lessons_for_prompt(tmp.path(), "完全无关的需求文本占位");
+        assert!(
+            block.chars().count() <= MEMORY_PLAYBOOK_BUDGET,
+            "fail-open recall is still bounded"
+        );
+    }
+
+    /// Format a `DateTime<Utc>` as the `%Y-%m-%dT%H:%M:%SZ` stamp every capture
+    /// site writes (so `recency_weight` parses it).
+    fn iso(t: chrono::DateTime<Utc>) -> String {
+        t.format("%Y-%m-%dT%H:%M:%SZ").to_string()
     }
 
     #[test]
