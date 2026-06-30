@@ -5428,15 +5428,30 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             // (bounded so a wedged base can't hang the drain forever), then runs the
             // post-cancel cleanup that the `Action::Cancel` arm deferred. Until this
             // fires the loop keeps drawing the live "stopping…" state every tick.
-            () = drain_cancelled_task(
-                // SAFETY: the `if` guard guarantees `Some`.
-                cancel_drain.as_mut().expect("guarded by cancel_drain.is_some()"),
-                // M1 — the FIXED absolute deadline set alongside `cancel_drain`;
-                // fail-open to a fresh budget if somehow unset so the drain still
-                // self-bounds rather than waiting on the handle forever.
-                cancel_deadline
-                    .unwrap_or_else(|| tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET),
-            ), if cancel_drain.is_some() => {
+            // P0: `tokio::select!` EVALUATES a branch's `<async expression>` every
+            // loop iteration — the `if` guard only gates POLLING, not evaluation. The
+            // old form was a direct `drain_cancelled_task(cancel_drain.as_mut().expect(..), ..)`
+            // call, so its args were evaluated eagerly with `cancel_drain == None` on
+            // every idle turn -> `.expect()` panicked the instant the TUI launched.
+            // Wrapping in an `async` block makes the `cancel_drain` access LAZY (it runs
+            // only when the future is polled, which the precondition restricts to the
+            // armed state), so an idle loop never touches it.
+            () = async {
+                match cancel_drain.as_mut() {
+                    Some(handle) => {
+                        // M1 — the FIXED absolute deadline set alongside `cancel_drain`;
+                        // fail-open to a fresh budget if somehow unset so the drain still
+                        // self-bounds rather than waiting on the handle forever.
+                        let deadline = cancel_deadline.unwrap_or_else(|| {
+                            tokio::time::Instant::now() + CANCEL_DRAIN_BUDGET
+                        });
+                        drain_cancelled_task(handle, deadline).await;
+                    }
+                    // Unreachable while the `if` guard holds; never resolves, so even a
+                    // spurious poll can't fire the cleanup with no drain in flight.
+                    None => std::future::pending::<()>().await,
+                }
+            }, if cancel_drain.is_some() => {
                 // R3 — the post-cancel cleanup flips visible state; draw promptly.
                 draw_now = true;
                 cancel_drain = None;

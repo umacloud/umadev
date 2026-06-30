@@ -1,6 +1,6 @@
 {
   "name": "@umacloud/cli-win32-x64",
-  "version": "1.0.18",
+  "version": "1.0.19",
   "description": "umadev prebuilt binary for Windows (x86_64 / msvc).",
   "homepage": "https://github.com/umacloud/umadev",
   "repository": {

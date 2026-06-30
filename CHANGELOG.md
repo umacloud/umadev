@@ -2,6 +2,13 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.19] — 紧急修复:1.0.17/1.0.18 启动即崩溃的致命退化
+
+**1.0.17 与 1.0.18 一启动就 panic、应用完全无法运行**(用户实测 macOS / Windows 均复现)。`tokio::select!` 的分支表达式**每轮都会被求值** —— `if` 守卫只决定是否 poll、不阻止求值。取消-drain 分支在 1.0.17 的 M1 修复里被从惰性 `async {}` 块改成了直接函数调用 `drain_cancelled_task(cancel_drain.as_mut().expect(…), …)`,于是空闲时 `cancel_drain` 为 `None`、启动第一轮循环即 `.expect()` panic。现改回惰性 `async {}` 块,只有真正 poll(守卫为真)时才访问 `cancel_drain`,并新增 PTY 启动冒烟验证以杜绝同类退化。**请所有 1.0.17 / 1.0.18 用户升级到 1.0.19。**
+
+### 修复
+- **致命:启动即 panic(`crates/umadev-tui/src/lib.rs`)** —— `tokio::select!` 分支表达式被急切求值,空闲时(`cancel_drain == None`)`cancel_drain.as_mut().expect(...)` 立即 panic;改回惰性 `async {}` 块,仅在守卫为真、真正 poll 时才访问 `cancel_drain`。新增 PTY 启动冒烟检查。
+
 ## [1.0.18] — 前沿强化五连(每步可证伪 / 不确定即失败关闭 / 记忆字节有界 / 缓存稳定固件 / 裁判全新会话)· 用户反馈全修(端口冲突 / 过程日志尾部 / 信任 / 提问桥接)
 
 把"真 Agent 化"的五项前沿能力(F1–F5)各自从"大体已对"夯到"可证伪 / 失败关闭 / 有界 / 钉死",其中最深的一项是 **F2 裁判独立性的根因修复**:只读裁判此前在宿主层就继承了 doer 的全部推敲,现改为开一个**全新独立只读会话**,在真正干净的上下文上评审。配套把用户实测反馈(@Excellent)一次性修齐:**预览端口冲突卡死**、**长构建过程日志保留尾部**、**信任档误拦校验管道**、**AskUserQuestion 真接线**。最后给发布工作流加上 HuggingFace 下载重试,杜绝瞬时 429 打断 GitHub Release。
