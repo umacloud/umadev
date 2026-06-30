@@ -1020,6 +1020,21 @@ async fn drive_director_loop_with_idle(
                     crate::sizing_calibration::SizeRank::Heavy
                 },
             );
+            // ACTIVE FACT-RECORDING BACKSTOP (single-turn path): this clean build
+            // turn changed code (it passed `claims_code_changes` on round 0), so it
+            // is a real work turn — extract its durable facts ourselves and persist
+            // them to `.umadev/memory/facts.jsonl` so the store reliably populates
+            // without depending on the base writing it. Once per clean single-turn
+            // build (count 1 → the throttle always fires the first work turn); a
+            // pure-chat/explain route is skipped inside; fully fail-open.
+            crate::fact_extract::maybe_extract_facts(
+                session,
+                &options.project_root,
+                route,
+                1,
+                events,
+            )
+            .await;
             return DirectorLoopOutcome::Done { reply: last_reply };
         }
 
@@ -1132,6 +1147,9 @@ async fn drive_plan_steps(
 
     let mut last_reply = String::new();
     let mut transitions = 0usize;
+    // The running count of completed BUILD steps — the "work turn" tally that the
+    // active fact-extraction backstop throttles on (see `crate::fact_extract`).
+    let mut work_turns = 0usize;
 
     // Walk the DAG by readiness: drive each ready step, mark it, repeat. A step that
     // can't be accepted (after its bounded fix budget) is marked Blocked so it stops
@@ -1256,6 +1274,27 @@ async fn drive_plan_steps(
         // a step that actually ticked Done moves the phase; a Blocked step leaves it.
         // Fail-open. This is what keeps `/status` honest as the build progresses.
         sync_phase_from_plan(plan, options);
+
+        // ACTIVE FACT-RECORDING BACKSTOP — after a Build step that did REAL work,
+        // extract this turn's durable facts ourselves (a read-only fork asking the
+        // brain for `key: value` lines) and persist them to `.umadev/memory/facts.jsonl`,
+        // so the store reliably populates instead of relying on the base voluntarily
+        // writing it (the user-reported gap). A step's completion is the natural hook
+        // point; the call is THROTTLED (only a bounded subset of build steps) and
+        // fully fail-open — a failed fork / `none` reply / unwritable store records
+        // nothing and never affects the schedule. Only a step that actually ticked
+        // Done counts as a work turn (a Blocked/empty step never extracts).
+        if step.kind == plan_state::StepKind::Build && status == StepStatus::Done {
+            work_turns += 1;
+            crate::fact_extract::maybe_extract_facts(
+                session,
+                &options.project_root,
+                Some(route),
+                work_turns,
+                events,
+            )
+            .await;
+        }
     }
 
     // MEDIUM #2 — honest scope: a Blocked step permanently strands its dependents as

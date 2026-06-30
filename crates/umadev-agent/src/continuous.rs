@@ -2137,6 +2137,34 @@ impl ForkConsult {
             _ => None,
         }
     }
+
+    /// Run ONE consult turn on the read-only fork and return the RAW assistant
+    /// text (NOT parsed / NOT JSON-extracted) — the generic text primitive for a
+    /// caller whose reply is free-form rather than a JSON object (e.g. the active
+    /// fact-extraction backstop's `key: value` lines, see [`crate::fact_extract`]).
+    /// Unlike [`judge_json`](Self::judge_json) it sends `directive` verbatim (no
+    /// "return one JSON object" suffix) and does no extraction, so the caller owns
+    /// the wording and the parse. Same fork → turn → bounded-drain path + fail-open
+    /// contract: a missing fork (offline / unsupported / failed handshake), a send
+    /// error, a timeout, or a dead session yields `None`, so the caller degrades to
+    /// "nothing extracted" and never blocks the turn.
+    ///
+    /// `label` is only used for the bounded-turn log line; `directive` is the
+    /// fully-composed prompt.
+    pub(crate) async fn judge_text(&self, label: &str, directive: String) -> Option<String> {
+        let _ = label;
+        let mut guard = self.fork.lock().await;
+        let fork = guard.as_mut().ok()?; // no fork (offline / unsupported / failed) → None
+        if fork.send_turn(directive).await.is_err() {
+            return None;
+        }
+        // Bound the judge turn so one wedged fork can't hang the caller (same window
+        // the critic team + judge_json use). A timeout / dead session → None.
+        match tokio::time::timeout(review_turn_timeout(), drain_review_text(fork)).await {
+            Ok(Some(text)) => Some(text),
+            _ => None,
+        }
+    }
 }
 
 /// Maker-checker INDEPENDENCE firewall — the clean-room preamble prepended to

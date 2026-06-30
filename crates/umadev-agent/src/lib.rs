@@ -55,6 +55,7 @@ pub mod director_loop;
 pub mod error_kb;
 pub mod events;
 pub mod experts;
+pub mod fact_extract;
 pub mod first_pass;
 pub mod gates;
 pub mod lessons;
