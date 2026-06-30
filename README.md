@@ -156,7 +156,7 @@ Early `super-dev` was closer to an AI coding governance tool. It focused on what
 umadev has grown that into a coding agent that works like a real dev team:
 
 - **From single-point governance to whole-pipeline governance.** It no longer only checks code; every phase from requirement to delivery is brought under the process and its gates.
-- **From loose scripts to a spec-driven system.** The source of truth is [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md), 25 clauses, ~112 governance rules.
+- **From loose scripts to a spec-driven system.** The source of truth is [UMADEV_HOST_SPEC_V1](spec/UMADEV_HOST_SPEC_V1.md), 32 clauses, ~112 governance rules.
 - **Rewritten in Rust.** One binary, fast startup, low dependency surface, cross-platform distribution.
 - **From blocking bad output to delivering like a team.** Claude Code / Codex / OpenCode are the brain and hands; umadev is the coding agent that works like a real dev team, with governance as its safety net rather than the whole product.
 
@@ -200,10 +200,13 @@ flowchart LR
 - **Plans the work and shows it.** A build becomes a dependency plan (`.umadev/plan.json`) rendered as a live checklist you can steer with `/plan`. Steps are driven step by step; the coordinator owns the plan, not the base.
 - **A build in chat is a real build.** A build typed in the chat UI earns the same planning, team scheduling, governance, and delivery proof as `umadev run`. There is no weaker chat path.
 - **Ships a delivery proof.** PRD, architecture, and UI/UX docs, a scorecard, and a proof pack — scaled to the task, so a one-page change doesn't get an enterprise dossier.
-- **Carries engineering standards into the base — with a fully-local dual-channel RAG.** 418 curated knowledge files (commercial-grade engineering standards, design rules) plus a map of your existing code are compiled into the binary and retrieved on every working turn by a two-channel hybrid engine: pure-Rust BM25 + a local vector model (`multilingual-e5-small`, f16, via candle) fused with RRF, HyDE query expansion on top. No API key, no network, millisecond recall over your own standards and business docs. Zero config.
+- **Carries engineering standards into the base — with a fully-local dual-channel RAG.** 459 curated knowledge files (commercial-grade engineering standards, design rules) plus a map of your existing code are compiled into the binary and retrieved on every working turn by a two-channel hybrid engine: pure-Rust BM25 + a local vector model (`multilingual-e5-small`, f16, via candle) fused with RRF, HyDE query expansion on top. No API key, no network, millisecond recall over your own standards and business docs. Zero config.
 - **Self-evolving memory — it learns from each run.** Mistakes the base hits are recorded with a frequency signal to a local store; a genuine recurrence triggers a higher-level corrective *reflection*. Both are recalled into later prompts, so the same pitfall isn't repeated — umadev gets better on your codebase the more you use it.
-- **A real terminal UI.** Markdown, syntax-highlighted code, live diff cards as files change (word-level highlighting), folding tool rows, a build-completion card with a clickable preview URL, and slash commands throughout.
-- **Governance you can audit.** A trust dial (`plan` / `guarded` / `auto`), irreversible actions always confirm on every tier, an MCP server (`umadev mcp serve`) that exposes the governor to other tools, and compliance mapping (SOC 2 / ISO 27001 / EU AI Act).
+- **Remembers your project's facts.** Stable facts the base discovers — the JDK path, the real build / test / lint commands, environment constraints — are written to `.umadev/memory/facts.jsonl` and re-injected every turn, so the team never re-discovers what it already knows even after the transcript is trimmed.
+- **Surfaces the base's clarifying questions.** When the base asks a question mid-build (its `AskUserQuestion` tool), umadev renders the prompt and its options inline and relays your answer back into the same session — instead of the question silently auto-cancelling.
+- **Your app's runtime model is yours to pick.** The base you borrow to *write* the code and the model your *built* AI app calls at runtime are kept separate: umadev treats the app's runtime provider, model id, and key as user-configurable env, instead of silently hardcoding the dev base's vendor into the generated product.
+- **A real terminal UI.** Markdown, syntax-highlighted code, live diff cards as files change (word-level highlighting), folding tool rows, a build-completion card with a clickable preview URL, slash commands throughout, and `/logs` to surface the base's live build output for long-running commands.
+- **Governance you can audit.** A trust dial (`plan` / `guarded` / `auto`), irreversible actions always confirm on every tier — including a fail-closed boundary for obfuscated commands — plus an MCP server (`umadev mcp serve`) that exposes the governor to other tools, and compliance mapping (SOC 2 / ISO 27001 / EU AI Act).
 - **Goal-until-met builds.** `/goal <objective>` drives the base to keep working until the objective is met — native `/goal` on all three bases; `UMADEV_NO_GOAL_MODE=1` opts out.
 
 ---
@@ -218,8 +221,8 @@ flowchart TB
 
     UI --> Director["umadev-agent<br/>Router · Plan · Schedule · Verify · Finalize"]
 
-    Director --> Spec["umadev-spec<br/>UMADEV_HOST_SPEC_V1 · 25 clauses"]
-    Director --> Knowledge["umadev-knowledge<br/>418 files · BM25 + vector · repo-map"]
+    Director --> Spec["umadev-spec<br/>UMADEV_HOST_SPEC_V1 · 32 clauses"]
+    Director --> Knowledge["umadev-knowledge<br/>459 files · BM25 + vector · repo-map"]
     Director --> Governance["umadev-governance<br/>~112 rules · audit · compliance"]
     Director --> Contract["umadev-contract<br/>OpenAPI · frontend↔backend path check"]
 
@@ -244,7 +247,7 @@ The five layers in plain English:
 4. **Verify and self-correct.** Each step is checked against its acceptance criteria on a deterministic floor — coverage, contract, build/test, hard gates — not by the model self-assessing "good enough." Blocking findings come back as one fix directive with evidence attached. The loop is bounded by a gap counter and stall counter; it ends cleanly when done or genuinely stuck.
 5. **Finalize.** Once the floor is clean, umadev produces the delivery artifacts and proof pack. The run's episodes feed the lessons store for future runs.
 
-Underneath every path, a curated system prompt — identity, engineering and design standards, the relevant slice of the knowledge base, recalled pitfalls from past runs, and an outline of your existing code — is injected into the base on every working turn.
+Underneath every path, a curated system prompt — identity, engineering and design standards, the relevant slice of the knowledge base, recalled pitfalls from past runs, your project's remembered facts, and an outline of your existing code — is injected into the base on every working turn. The stable part of that prompt is byte-stable across turns so the base's prompt cache stays warm.
 
 The firmware is pre-loaded once at launch, so the first reply doesn't pay the 30–60s per-message cold start that re-priming from scratch would cost.
 
@@ -339,7 +342,7 @@ Tool calls, verification runs, and critic verdicts are written to `.umadev/audit
 
 ### The base brings its own model — umadev has none
 
-umadev connects to no model API and stores no credentials of its own. The base uses its own configured model — your logged-in subscription, or whatever third-party / local model you routed through the base. By default umadev passes no `--model` flag; the base runs on its own configuration. Use `/model <id>` to override a session, or change the model in the base's own config.
+umadev connects to no model API and stores no credentials of its own. The base uses its own configured model — your logged-in subscription, or whatever third-party / local model you routed through the base. By default umadev passes no `--model` flag; the base runs on its own configuration. To override, set `model` in `~/.umadev/config.toml` or pass `umadev run --model <id>`; otherwise change the model in the base's own config. The TUI `/model` command does not switch anything — it just shows where the model lives, because UmaDev never imposes one.
 
 umadev reads and surfaces the base's current model and reasoning effort in `/status` — it reads `~/.claude/settings.json` for Claude Code, `~/.codex/config.toml` for Codex, and `opencode.json` for OpenCode — but never overrides those values unless you explicitly ask it to.
 
@@ -368,7 +371,7 @@ flowchart LR
     Q --> L["delivery"]
 ```
 
-Small tasks have a lightweight path — the router routes to the right depth, and the plan expands to fit. Declare the task type with `/kind` (fullstack / frontend-only / backend-only / bugfix / refactor) and the plan trims accordingly.
+Small tasks have a lightweight path — the router classifies the request and routes to the right depth, and the plan expands or trims to fit. A bugfix convenes no team; a greeting stays chat; only a full product requirement expands into the chain above. Force the light path for a trivial change with `/quick`.
 
 ### Phase outputs
 
@@ -427,7 +430,7 @@ skip_checks = []
 
 umadev started as a governance tool and that remains a core capability.
 
-The spec layer has 25 clauses. The implementation includes ~112 governance checks across UI quality, security, frontend architecture, backend engineering, and language-specific hazards. Every check is configurable in `.umadev/rules.toml` — each rule can be disabled, path-excluded, or tuned. They exist to backstop the base's output, not to make the final engineering call for you.
+The spec layer has 32 clauses. The implementation includes ~112 governance checks across UI quality, security, frontend architecture, backend engineering, and language-specific hazards. Every check is configurable in `.umadev/rules.toml` — each rule can be disabled, path-excluded, or tuned. They exist to backstop the base's output, not to make the final engineering call for you.
 
 Governance entry points:
 
@@ -462,7 +465,7 @@ The compliance mapping (`umadev report`) maps the evidence chain to SOC 2 / ISO 
 
 ## Knowledge Base
 
-umadev ships with 418 curated markdown knowledge files bundled directly into the binary and auto-extracted to `~/.umadev/knowledge` on first launch. They are not generic documentation — they are commercial-grade engineering standards formatted for injection into an AI coding CLI.
+umadev ships with 459 curated markdown knowledge files bundled directly into the binary and auto-extracted to `~/.umadev/knowledge` on first launch. They are not generic documentation — they are commercial-grade engineering standards formatted for injection into an AI coding CLI.
 
 The corpus covers: product design, PRD methodology, system architecture, frontend engineering, backend engineering, database design, security, testing, CI/CD, operations, mobile, desktop, mini programs, HarmonyOS, cross-platform development, domain verticals, UI/UX, design systems, and engineering playbooks.
 
@@ -557,23 +560,28 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `/claude` · `/codex` · `/opencode` | Switch the base being driven (saved to `~/.umadev/config.toml`) |
 | `/offline` | Switch to deterministic offline templates (demo / CI, no network) |
 | `/status` | Active base, its current model, and reasoning effort (read from the base's own config) |
-| `/model <id>` | Override the model for this session only (default: umadev passes none, base uses its own) |
-| `/kind <type>` | Set task type (`fullstack` / `frontend-only` / `backend-only` / `bugfix` / `refactor`) to trim the plan |
+| `/model [id]` | Show where the model lives — the base owns it; UmaDev imposes none (set `model` in config or `run --model` to override) |
+| `/sandbox [tier]` | View / change the Codex base's launch sandbox (`read-only` · `workspace-write` · `danger-full-access`) |
 
 **Drive the flow**
 
 | Command | What it does |
 |---|---|
 | just type | Routes to the right path; a build typed here gets the same systems as `/run` |
-| `/run <requirement>` | Start a full build explicitly |
+| `/run [slug] <req>` | Start a full build explicitly |
 | `/goal <objective>` | Keep the base working until the objective is met (native on all three bases; `UMADEV_NO_GOAL_MODE=1` opts out) |
 | `/quick <task>` | Force the light path for a trivial one-off change |
 | `/plan [skip\|add\|veto\|up\|down <id>]` | View or steer the live dependency plan |
 | `/continue` (or `c` at a gate) | Approve the current gate and advance |
 | `/revise <feedback>` | Stay at the gate, redo the current phase with feedback |
+| `/redo [phase]` | Re-run a phase block |
+| `/mode <plan\|guarded\|auto>` | Set the trust / autonomy tier |
 | `/manual` · `/auto` | Per-gate confirmation vs. fully automatic (`shift+Tab` also toggles) |
-| `/redo` | Re-run the previous phase block |
-| `/abort` · `/stop` | Abort the current run (on-disk state kept, resumable later) |
+| `/cancel` · `/abort` | Abort the current run (on-disk state kept, resumable later) |
+| `/tasks [stop\|resume]` | List / manage background runs |
+| `/adopt` | Onboard an existing (brownfield) repo: detect stack, index source, derive the contract |
+| `/init` | Write the `umadev.yaml` manifest |
+| `/diff [artifact]` | Show an artifact (`prd` · `architecture` · `uiux` · …) |
 
 **Preview and delivery**
 
@@ -581,8 +589,9 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 |---|---|
 | `/preview` | Start the frontend dev server and open the browser |
 | `/stop-preview` | Stop the preview server |
-| `/deploy` | Preview the deploy command (look, don't run) |
-| `/deploy confirm` | Run the deploy |
+| `/deploy` | Detect the target and preview the deploy command (the deploy itself runs via `umadev deploy --run`) |
+| `/pr [create]` | Dry-run the PR (review report + proof-pack as the body); `/pr create` opens it |
+| `/export` | Export the current session |
 
 **Checkpoints and rewind** (shadow git — never touches your `.git`)
 
@@ -596,15 +605,18 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | Command | What it does |
 |---|---|
 | `/spec` | Print the full `UMADEV_HOST_SPEC_V1` spec |
-| `/diff [name]` | Show an artifact (`prd` · `architecture` · `uiux` · …) |
 | `/verify` | Workspace conformance report and evidence chain |
 | `/doctor` | Self-test (binary / manifest / probes) |
 | `/status` | Current phase, gate, and run state |
-| `/history` | Full conversation history |
-| `/usage` | Token and usage statistics |
+| `/team` · `/constitution` | The live team roster · the team's operating charter |
+| `/lessons` · `/pitfalls` | What umadev has learned here (proven patterns · recurring pitfalls) |
 | `/knowledge` | Knowledge-base hits for this run |
+| `/usage` | Token and usage statistics |
+| `/history` · `/runs` | Past gate snapshots · past runs |
+| `/sessions` · `/resume <id>` · `/compact` | List · reopen · compress the persisted chat |
 | `/skill` · `/mcp` | Installed Skills / MCP servers |
 | `/config` | Effective configuration |
+| `/version` · `/changelog` | Build version · release notes |
 
 **Design and project**
 
@@ -612,16 +624,18 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 |---|---|
 | `/design <direction>` | Lock the design-system direction (`modern-minimal` · `editorial-clean` · …) |
 | `/template <name>` | Pick a scaffold template |
-| `/name <name>` | Set the project slug |
-| `/init` | Write the `umadev.yaml` manifest |
 
-**General**
+**General and UI**
 
 | Command | What it does |
 |---|---|
 | `/help` (or F1) | Help overlay with all keybindings |
+| `/lang [zh-CN\|zh-TW\|en]` | Switch the UI language |
+| `/setup` | Re-run the first-launch base picker |
+| `/logs` | Toggle visibility of the base's live process output (off by default) |
+| `/mouse` · `/animations` · `/redraw` | Toggle mouse capture · animations · force a repaint |
+| `/bug` | Open a pre-filled bug report |
 | `/clear` | Clear the chat |
-| `/export` | Export the current session |
 | `/quit` (or Esc) | Exit (workflow state is saved, resumable) |
 
 ### Terminal CLI subcommands
@@ -631,10 +645,13 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | Command | What it does |
 |---|---|
 | `umadev init` | Scaffold the workspace (`umadev.yaml` + design system / knowledge seeds) |
+| `umadev adopt [path]` | Onboard an existing repo: detect stack, index source, reverse-derive the API contract |
 | `umadev` | Launch the chat TUI |
 | `umadev doctor` | Self-test |
 | `umadev verify` | Workspace conformance and evidence chain; `--runtime` boots the app and hits its routes |
-| `umadev report` | Compliance mapping (SOC 2 / ISO 27001 / EU AI Act) |
+| `umadev report` | Compliance mapping (SOC 2 / ISO 27001 / EU AI Act); `--review` writes a PR-ready review report + runs the pre-PR security scan |
+| `umadev usage` | Per-run / per-phase token usage + a rough cost estimate |
+| `umadev lessons` | What this project has learned: high-frequency pitfalls + proven patterns |
 | `umadev history` | List rollback snapshots |
 | `umadev rollback latest` | Roll back to a snapshot |
 | `umadev update` | Upgrade umadev via npm |
@@ -644,10 +661,19 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 
 | Command | What it does |
 |---|---|
-| `umadev run "<requirement>" --backend <id>` | Run a pipeline, pausing at the `docs_confirm` gate |
+| `umadev run "<requirement>" --backend <id>` | Run a pipeline, pausing at the `docs_confirm` gate (`--mode plan\|guarded\|auto` sets the trust tier) |
+| `umadev quick "<task>" --backend <id>` | Lean fast track for a trivial change (skips the heavy phases + gates) |
 | `umadev continue [--backend <id>]` | Approve the current gate |
 | `umadev revise "<feedback>"` | Stay at the gate, record a revision, rerun the block |
+| `umadev redo <phase> [--backend <id>]` | Re-run one phase, reusing the prior run's context |
 | `umadev spec [--clauses]` | Print the spec (`--clauses` for the clause table) |
+
+**Delivery and PR**
+
+| Command | What it does |
+|---|---|
+| `umadev deploy [--run]` | Detect the deploy target and print the command; `--run` deploys + writes `deploy-proof.json` |
+| `umadev pr [--create]` | Dry-run the PR (review report + proof-pack body); `--create` commits on a feature branch, pushes, and opens it |
 
 **Governance / CI**
 
@@ -679,8 +705,10 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `UMADEV_CLAUDE_BIN` / `UMADEV_CODEX_BIN` | Path to the `claude` / `codex` binary | `claude` / `codex` |
 | `UMADEV_WORKER_TIMEOUT` | Per-call worker timeout in seconds | `300` |
 | `UMADEV_VERIFY_TIMEOUT_SECS` | Verify-loop per-call timeout in seconds | `120` |
-| `UMADEV_MODEL_PLAN` / `UMADEV_MODEL_BUILD` | Per-phase model tiers (same as `/model plan\|build`) | — |
+| `UMADEV_MODEL_PLAN` / `UMADEV_MODEL_BUILD` | Per-phase model tier override (plan phases / code phases) | — |
 | `UMADEV_NO_GOAL_MODE` | Disable `/goal` mode if set to `1` | — |
+| `UMADEV_SHOW_PROCESS_LOGS` | Seed the base's live process-log visibility (also toggled in-app with `/logs`) | off |
+| `UMADEV_CONTINUOUS` | Set to `0` (or `UMADEV_LEGACY_RUN=1`) to opt out of the continuous single-session path | on |
 | `OPENAI_EMBED_KEY` | Enable remote vector embeddings (else bundled local model + BM25) | — |
 | `XDG_CONFIG_HOME` | Base directory for `config.toml` | `$HOME` |
 
@@ -695,7 +723,7 @@ User config:
 backend = "claude-code"
 lang = "en"
 # model is empty by default — the base uses its own configured model.
-# Set it (or use /model <id>) only to override a session.
+# Set it here (or pass `umadev run --model <id>`) only to override.
 # model = "opus"
 ```
 
@@ -734,9 +762,9 @@ flowchart TB
     Binary --> TUI["umadev-tui<br/>ratatui · markdown · live diffs · build cards"]
     Binary --> I18N["umadev-i18n<br/>zh-CN · zh-TW · en"]
 
-    Agent --> Spec["umadev-spec<br/>UMADEV_HOST_SPEC_V1 · 25 clauses"]
+    Agent --> Spec["umadev-spec<br/>UMADEV_HOST_SPEC_V1 · 32 clauses"]
     Agent --> Governance["umadev-governance<br/>~112 rules · audit · compliance"]
-    Agent --> Knowledge["umadev-knowledge<br/>418 files · BM25 · vector · repo-map"]
+    Agent --> Knowledge["umadev-knowledge<br/>459 files · BM25 · vector · repo-map"]
     Agent --> Contract["umadev-contract<br/>OpenAPI · path reconciliation"]
     Agent --> Runtime["umadev-runtime<br/>Runtime trait · OfflineRuntime"]
 

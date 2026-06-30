@@ -45,7 +45,7 @@ research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_con
 | quality | 17 automated checks + 5-dimension visual review | QA Lead |
 | delivery | Proof-pack zip with README + compliance mapping | Release Engineer |
 
-> The 9 phases target a full commercial-grade delivery. Small tasks have a lighter path: declare the task type with `/kind` (full-stack / frontend-only / backend-only / bugfix / refactor) and UmaDev trims the phases — a bugfix is not pushed through the whole PRD / architecture / UIUX chain.
+> The 9 phases target a full commercial-grade delivery. Small tasks have a lighter path: the router classifies the request and the coordinator trims or expands the plan to fit — a bugfix convenes no team and is not pushed through the whole PRD / architecture / UIUX chain. Force the light path for a trivial change with `/quick`.
 
 ## TUI Commands
 
@@ -63,7 +63,7 @@ research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_con
 | `/design` | Browse available design systems |
 | `/design <name>` | Select a design system |
 | `/template <name>` | Select a seed template |
-| `/model <id>` | Set the AI model |
+| `/model` | Show where the model lives — the base owns it; UmaDev imposes none |
 
 ### Pipeline
 | Command | Description |
@@ -136,7 +136,9 @@ custom_knowledge = "team-standards/"  # additional knowledge directory
 
 ```toml
 backend = "claude-code"
-model = "claude-sonnet-4-6"
+# model is empty by default — the base uses its own configured model.
+# Set it (or pass `umadev run --model <id>`) only to override.
+# model = "opus"
 design_system = "modern-minimal"
 seed_template = "dashboard"
 ```

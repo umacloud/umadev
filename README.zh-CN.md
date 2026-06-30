@@ -238,7 +238,7 @@ flowchart TB
 
 **② 可视计划（plan）。** 一个完整 build 开工前，协调者把目标拆成一份**它自己解析并持有**的依赖 DAG（落 `.umadev/plan.json`），在界面上渲染成一张**实时勾选的清单**（`[✓] 脚手架 · [~] 登录路由 · [ ] 登录表单  3/8`）。`/plan skip|add|veto|up|down <id>` 让你重排 / 跳过 / 否决 / 新增某一步，折回下一条指令同会话生效。
 
-**③ 注入规范 + 你的代码库理解（compose_firmware + repo-map）。** 每条干活路径开跑前，umadev 给底座注入一段精选、有 token 预算的系统提示：团队**身份** + 工程**规范 / 反 AI 模板**品味 + 按需检索的**知识**摘要 + 按技术栈指纹召回的**踩坑**教训 + 你现有代码的 **repo-map 切片**（符号轮廓，按路由命中的文件排序）。知识库（418 份 markdown 文件）已编译进二进制，启动时自动解压到 `~/.umadev/knowledge`，首次回复不需要额外的冷启动时间。底座带着这些规范和对你代码库的理解干活，而不是一颗空白大脑。
+**③ 注入规范 + 你的代码库理解（compose_firmware + repo-map）。** 每条干活路径开跑前，umadev 给底座注入一段精选、有 token 预算的系统提示：团队**身份** + 工程**规范 / 反 AI 模板**品味 + 按需检索的**知识**摘要 + 按技术栈指纹召回的**踩坑**教训 + 你现有代码的 **repo-map 切片**（符号轮廓，按路由命中的文件排序）。知识库（459 份 markdown 文件）已编译进二进制，启动时自动解压到 `~/.umadev/knowledge`，首次回复不需要额外的冷启动时间。底座带着这些规范和对你代码库的理解干活，而不是一颗空白大脑。
 
 **④ 逐步调度团队 + 每步验收（director_loop）。** 协调者沿 DAG 一步步驱动：每个就绪的 build 步在主会话上串行执行，并对照它自己的验收标准在**确定性地板**（源码在不在 / 构建测试 / 契约 / 评审）上验证——过则勾掉清单，不过则有界返工。评审步分叉出团队并行交叉审。运行有 30 分钟墙钟预算上限；gap-count 和 stall-count 确保循环有界收敛。
 
@@ -280,7 +280,7 @@ flowchart TB
 - **协调者引擎（umadev-agent）**：路由意图、拆出可视计划、注入规范、调度哪些角色、逐步驱动并每步验收、汇总裁决推进或返工、最后 finalize 交付。完整商业级交付时会展开成 9 阶段主链（见下文"流水线设计"）。
 - **持续会话 / 底座**：整条流水线复用你登录的底座（Claude Code / Codex / OpenCode）的一个会话——底座用它自己的登录和模型连续干活（调研、设计、真写代码、评审）；umadev 不注入、不覆盖任何模型或 key。
 - **治理 / 质量**：底座每写一个文件就实时拦截不合规内容；交付前再跑一遍质量门补扫。
-- **知识库（全本地双通道 RAG）**：418 个精选知识文件 + 你现有代码的地图编进二进制，每个工作回合由双通道混合引擎检索——纯 Rust BM25 + 本地向量模型（multilingual-e5-small, f16, candle）RRF 融合 + HyDE；无 key、无网络、零配置，把工程标准、设计系统、领域知识注入给当前阶段的角色。
+- **知识库（全本地双通道 RAG）**：459 个精选知识文件 + 你现有代码的地图编进二进制，每个工作回合由双通道混合引擎检索——纯 Rust BM25 + 本地向量模型（multilingual-e5-small, f16, candle）RRF 融合 + HyDE；无 key、无网络、零配置，把工程标准、设计系统、领域知识注入给当前阶段的角色。
 - **证据**：把每次工具调用、每份裁决、每道门记录下来，最后打包成交付证明。
 
 ## 团队怎么协作
@@ -303,7 +303,7 @@ umadev 是**一支八角色的开发团队**，外加一个协调者统筹全程
 
 ```mermaid
 flowchart TB
-    User["你<br/>需求 / 确认"] --> Director["协调者<br/>确定性编排核 · 唯一决策者"]
+    User["你<br/>需求 / 确认"] --> Director["协调者席位<br/>确定性编排 · 调度团队 · 汇总裁决（地板说了算）"]
     Director -->|"send_turn · 观察事件 · 纠偏"| Main["主持续会话（底座模型）"]
     Main -->|"写代码角色串行写"| Board["黑板<br/>output/*.md · 源码"]
     Director -->|"fork() 只读分叉"| Critics["评审角色 × 8<br/>产品经理 · 架构师 · UI/UX 设计师 · 前端 · 后端 · QA · 安全 · DevOps"]
@@ -352,7 +352,9 @@ flowchart TB
 - **确定性控环**：底座和评审角色都是 advisory。真正决定"过门 / 返工 / 硬停"的是确定性信号：FR→任务覆盖、前后端契约对照、真跑 verify 的退出码、质量门阈值，以及**零代码硬门**（计划要产出代码却没有真实源码 = 判失败，绝不把空骨架伪装成"完成"）。
 - **不持有模型端点**：umadev 用你已登录的底座，不自带模型、不接第三方 API、不存你的 key。底座用谁的模型、什么思考强度，umadev 只读出来显示、绝不覆盖。
 - **审计证据**：每次工具调用、每份角色裁决、每道门的状态都落盘（`.umadev/audit/*`、`team-ledger.jsonl`）；交付时打包成 proof-pack + 成绩单 + 合规映射（SOC 2 / ISO 27001 / EU AI Act），可直接发给团队、客户或审计方。
-- **自进化记忆**：构建中底座踩的坑带频率信号记到本地存储 → 真复发触发更高层的 reflection（纠正策略）→ 召回进后续提示，同样的坑不再犯，用得越久越懂你的代码库。
+- **自进化记忆 + 记住项目事实**：构建中底座踩的坑带频率信号记到本地存储 → 真复发触发更高层的 reflection（纠正策略）→ 召回进后续提示，同样的坑不再犯；底座发现的稳定事实（JDK 路径、真实的构建 / 测试 / lint 命令、环境约束）写进 `.umadev/memory/facts.jsonl` 每轮回灌，转录被裁也不丢，用得越久越懂你的代码库。
+- **App 运行时模型你说了算**：借来写代码的底座 ≠ 你做出来的 AI 应用运行时调的模型——umadev 把应用的运行时 provider / model id / key 当作用户可配的 env，绝不把开发底座的厂商悄悄写死进产物。
+- **转达底座的追问**：底座构建中用 `AskUserQuestion` 提问时，umadev 把问题和编号选项内联渲染、把你的回答转回同一会话——而不是让追问静默自动取消。
 - **三语**：zh-CN / zh-TW / en 全程覆盖用户可见文案，按系统语言检测、可随时切换。
 
 ## 运行模式
@@ -378,7 +380,7 @@ flowchart TB
 
 ### 底座自带模型 — umadev 不接外部 API
 
-umadev 不自带模型，也不接第三方 API。底座用它自己的模型——你订阅登录的，或你给底座自己配的第三方 / 本地模型。选底座时 umadev 会读出并显示它当前用的模型和思考强度（`/status` 也能看），但**绝不覆盖**：运行时默认不传 `--model`，底座用它自己的；想换就改底座自己的配置，或用 `/model <id>` 临时覆盖这一会话。
+umadev 不自带模型，也不接第三方 API。底座用它自己的模型——你订阅登录的，或你给底座自己配的第三方 / 本地模型。选底座时 umadev 会读出并显示它当前用的模型和思考强度（`/status` 也能看），但**绝不覆盖**：运行时默认不传 `--model`，底座用它自己的；想换就改底座自己的配置，或在 `~/.umadev/config.toml` 里填 `model` / 用 `umadev run --model <id>` 覆盖。TUI 里的 `/model` 命令不改任何东西——它只告诉你模型在哪（底座持有），因为 umadev 从不强加模型。
 
 umadev 读取的来源：claude 的 `~/.claude/settings.json`（`model` / `effortLevel`）、codex 的 `~/.codex/config.toml`（`model` / `model_reasoning_effort`）、opencode 的 `opencode.json`（`model`，思考强度内置在模型变体里）。
 
@@ -431,7 +433,7 @@ output/<slug>-clarify.md
 
 你可以回答澄清问题，也可以输入 `c` 跳过。
 
-> 小任务有轻量路径：9 阶段是面向"完整商业级交付"的主链，不是每个需求都得全程走完。用 `/kind`（全栈 / 仅前端 / 仅后端 / bugfix / 重构）声明任务类型后，umadev 会据此裁剪阶段——bugfix、小改动不会强行拉你走 PRD / 架构 / UIUX 全套。
+> 小任务有轻量路径：9 阶段是面向"完整商业级交付"的主链，不是每个需求都得全程走完。底座的模型先判意图，协调者据此裁剪或展开计划——对话不进流程、bugfix 不组队、小改动不会强行拉你走 PRD / 架构 / UIUX 全套；想强制走快路径用 `/quick`。
 
 ### 每个阶段由谁主导、产出什么
 
@@ -485,7 +487,7 @@ umadev 最早来自治理工具，这部分仍然是核心能力。
 
 这些规则是一条**治理基线**，不是绝对真理——每条都可以在 `.umadev/rules.toml` 里禁用、按路径排除或调参（见下文）。它们的作用是给底座的产出兜底，而不是替你做最终的工程判断。
 
-规范层有 25 条 clause，实现层目前有 112 条规则，覆盖：
+规范层有 32 条 clause，实现层目前有 112 条规则，覆盖：
 
 - UI 质量：不用 emoji 当图标，不写硬编码颜色，不产出模板感 UI。
 - 安全：不写密钥，不写危险命令，不写 SQL 注入、SSRF、XXE 等危险代码。
@@ -518,7 +520,7 @@ blocked_domains = ["internal-bad-proxy.corp"]
 
 ## 知识库是什么
 
-umadev 内置了 418 份 markdown 知识文件，不只是普通文档，而是给底座看的工程标准库。这些文件已编译进二进制，首次运行时自动解压到 `~/.umadev/knowledge`，随后每次注入不再有额外的冷启动时间。
+umadev 内置了 459 份 markdown 知识文件，不只是普通文档，而是给底座看的工程标准库。这些文件已编译进二进制，首次运行时自动解压到 `~/.umadev/knowledge`，随后每次注入不再有额外的冷启动时间。
 
 它覆盖：
 
@@ -619,23 +621,28 @@ umadev 有两套入口，一一对应：
 | `/claude` · `/codex` · `/opencode` | 切换驱动的本机底座 CLI（存入 `~/.umadev/config.toml`）；切换时显示该底座当前的模型与思考强度 |
 | `/offline` | 切到离线确定性模板（演示 / CI，完全不联网） |
 | `/status` | 当前底座、它的**驱动模型**和**思考强度**（读自底座自己的配置，umadev 不覆盖） |
-| `/model <id>` | 临时覆盖这一会话用的模型（默认不覆盖，底座用它自己的） |
-| `/kind <类型>` | 指定任务类型（全栈 / 仅前端 / 仅后端 / bugfix / 重构），据此裁剪阶段 |
+| `/model [id]` | 只告诉你模型在哪——底座持有，umadev 不强加（要覆盖就改 config 的 `model` 或用 `run --model`） |
+| `/sandbox [档位]` | 查看 / 切换 Codex 底座的启动沙箱（`read-only` · `workspace-write` · `danger-full-access`） |
 
 **驱动流程与过门**
 
 | 命令 | 作用 |
 |---|---|
 | 直接打字 | 底座的模型判断：对话 / 小修 / 完整 build；若有确认门打开，则作为修改意见 |
-| `/run <需求>` | 显式开始一次完整流水线（强制走完整 build） |
+| `/run [slug] <需求>` | 显式开始一次完整构建 |
 | `/goal <目标>` | 让底座持续干到目标达成（三个底座都支持；`UMADEV_NO_GOAL_MODE=1` 退出） |
 | `/quick <需求>` | 强制走快路径（轻量单点改动，不展开计划） |
 | `/plan [skip\|add\|veto\|up\|down <id>]` | 查看 / 步级调度当前可视计划；无参折叠面板 |
 | `/continue`（门上也可直接输 `c`） | 通过当前确认门、进入下一阶段 |
 | `/revise <反馈>` | 停在当前门，带反馈重做本阶段 |
+| `/redo [阶段]` | 重跑某个阶段块 |
+| `/mode <plan\|guarded\|auto>` | 设置信任 / 自主档位 |
 | `/manual` · `/auto` | 切换"逐门人工确认 / 全自动"（默认 `guarded`；`shift+Tab` 也可切换） |
-| `/redo` | 重跑上一个阶段块 |
-| `/abort` · `/stop` | 中止当前运行（磁盘工作流状态保留，下次可续跑） |
+| `/cancel` · `/abort` | 中止当前运行（磁盘工作流状态保留，下次可续跑） |
+| `/tasks [stop\|resume]` | 列出 / 管理后台运行 |
+| `/adopt` | 接管现有（棕地）仓库：识别技术栈、索引源码、反推契约 |
+| `/init` | 写入 `umadev.yaml` manifest |
+| `/diff [产物]` | 查看某个产物（默认 `prd`，也可 `architecture` / `uiux` / …） |
 
 **预览与交付**
 
@@ -643,8 +650,9 @@ umadev 有两套入口，一一对应：
 |---|---|
 | `/preview` | 启动前端 dev server 并打开浏览器 |
 | `/stop-preview` | 停止预览服务 |
-| `/deploy` | **预览**部署命令（只看不执行） |
-| `/deploy confirm` | 真正执行部署 |
+| `/deploy` | 识别目标并**预览**部署命令（真正部署用 `umadev deploy --run`） |
+| `/pr [create]` | 干跑 PR（评审报告 + proof-pack 作为正文）；`/pr create` 真正开 PR |
+| `/export` | 导出当前会话 |
 
 **检查点与回滚**（影子 git，不碰你自己的 `.git`）
 
@@ -658,17 +666,18 @@ umadev 有两套入口，一一对应：
 | 命令 | 作用 |
 |---|---|
 | `/spec` | 查看完整 `UMADEV_HOST_SPEC_V1` 规范 |
-| `/diff [名字]` | 查看某个产物（默认 `prd`，也可 `architecture` / `uiux` / …） |
 | `/verify` | 工作区合规报告 + 证据链 |
 | `/doctor` | 自检（二进制 / manifest / 探针） |
 | `/status` | 当前阶段 / 门 / 运行状态 |
-| `/history` | 完整对话历史 |
-| `/sessions` | 列出本项目持久化的对话会话 |
-| `/resume <id>` | 续接某个持久化对话会话 |
-| `/usage` | token / 用量统计 |
+| `/team` · `/constitution` | 实时团队花名册 · 团队运行章程 |
+| `/lessons` · `/pitfalls` | 本项目学到的（验证过的模式 · 复发踩坑） |
 | `/knowledge` | 本次命中的知识库条目 |
+| `/usage` | token / 用量统计 |
+| `/history` · `/runs` | 过去的门快照 · 过去的运行 |
+| `/sessions` · `/resume <id>` · `/compact` | 列出 · 续接 · 压缩持久化对话 |
 | `/skill` · `/mcp` | 已安装的 Skill / MCP server |
 | `/config` | 当前生效配置 |
+| `/version` · `/changelog` | 构建版本 · 更新日志 |
 
 **设计与项目**
 
@@ -676,17 +685,18 @@ umadev 有两套入口，一一对应：
 |---|---|
 | `/design <方向>` | 锁定设计系统方向（`modern-minimal` / `editorial-clean` / …） |
 | `/template <名字>` | 选脚手架模板 |
-| `/name <名字>` | 设置项目 slug |
-| `/init` | 写入 `umadev.yaml` manifest |
 
-**通用**
+**通用与界面**
 
 | 命令 | 作用 |
 |---|---|
 | `/help`（或 F1） | 帮助浮层（含全部快捷键） |
-| `/compact` | 按 token 预算压缩对话上下文（总结并折叠，替代 FIFO 截断） |
+| `/lang [zh-CN\|zh-TW\|en]` | 切换界面语言 |
+| `/setup` | 重新走首启底座选择器 |
+| `/logs` | 切换底座实时进程输出的可见性（默认关） |
+| `/mouse` · `/animations` · `/redraw` | 切换鼠标捕获 · 动画 · 强制重绘 |
+| `/bug` | 打开预填的 bug 反馈 |
 | `/clear` | 清空聊天 |
-| `/export` | 导出当前会话 |
 | `/quit`（或 Esc） | 退出（工作流状态已保存，可续跑） |
 
 ### 终端 CLI 子命令
@@ -696,10 +706,13 @@ umadev 有两套入口，一一对应：
 | 命令 | 作用 |
 |---|---|
 | `umadev init` | 脚手架工作区（写 `umadev.yaml` + 设计系统 / 模板 / 知识库种子） |
+| `umadev adopt [path]` | 接管现有仓库：识别技术栈、索引源码、反推 API 契约 |
 | `umadev`（无子命令） | 启动聊天 TUI |
 | `umadev doctor` | 自检 |
-| `umadev verify` | 工作区合规 + 证据链状态 |
-| `umadev report` | 合规映射（SOC 2 / ISO 27001 / EU AI Act） |
+| `umadev verify` | 工作区合规 + 证据链状态（`--runtime` 启动应用并探测路由） |
+| `umadev report` | 合规映射（SOC 2 / ISO 27001 / EU AI Act）；`--review` 生成 PR 级评审报告 + 跑 pre-PR 安全扫描 |
+| `umadev usage` | 按运行 / 阶段的 token 用量 + 粗略成本估算 |
+| `umadev lessons` | 本项目学到的：高频踩坑 + 验证过的模式 |
 | `umadev history` | 列出回滚快照 |
 | `umadev rollback latest` | 回滚到某快照 |
 | `umadev update` | 升级 umadev 到最新版（经 npm） |
@@ -709,10 +722,19 @@ umadev 有两套入口，一一对应：
 
 | 命令 | 作用 |
 |---|---|
-| `umadev run "<需求>" --backend <id>` | 跑一次流水线，停在 `docs_confirm` 门 |
+| `umadev run "<需求>" --backend <id>` | 跑一次构建，停在 `docs_confirm` 门（`--mode plan\|guarded\|auto` 设信任档） |
+| `umadev quick "<任务>" --backend <id>` | 轻量快路径（跳过重阶段与门） |
 | `umadev continue [--backend <id>]` | 通过当前门（自动复用上次的 `--backend`） |
 | `umadev revise "<反馈>"` | 停在门，记录修改并重跑本块 |
+| `umadev redo <阶段> [--backend <id>]` | 复用上次上下文重跑某一阶段 |
 | `umadev spec [--clauses]` | 打印规范（`--clauses` 看条款表） |
+
+**交付与 PR**
+
+| 命令 | 作用 |
+|---|---|
+| `umadev deploy [--run]` | 识别部署目标并打印命令；`--run` 真正部署并写 `deploy-proof.json` |
+| `umadev pr [--create]` | 干跑 PR（评审报告 + proof-pack 正文）；`--create` 在功能分支提交、推送、开 PR |
 
 **治理 / CI**
 
@@ -744,7 +766,10 @@ umadev 有两套入口，一一对应：
 | `UMADEV_CLAUDE_BIN` / `UMADEV_CODEX_BIN` | `claude` / `codex` 二进制路径 | `claude` / `codex` |
 | `UMADEV_WORKER_TIMEOUT` | 单次 worker 超时（秒） | `300` |
 | `UMADEV_VERIFY_TIMEOUT_SECS` | verify 循环单次超时（秒） | `120` |
-| `UMADEV_MODEL_PLAN` / `UMADEV_MODEL_BUILD` | 分阶段模型分层（等价 `/model plan\|build`） | — |
+| `UMADEV_MODEL_PLAN` / `UMADEV_MODEL_BUILD` | 分阶段模型分层覆盖（规划阶段 / 写码阶段） | — |
+| `UMADEV_NO_GOAL_MODE` | 置 `1` 关闭 `/goal` 模式 | — |
+| `UMADEV_SHOW_PROCESS_LOGS` | 预置底座实时进程日志可见性（也可在 App 内用 `/logs` 切换） | 关 |
+| `UMADEV_CONTINUOUS` | 置 `0`（或 `UMADEV_LEGACY_RUN=1`）退出持续单会话路径 | 开 |
 | `OPENAI_EMBED_KEY` | 启用远程向量嵌入（否则用内置离线模型 + BM25） | — |
 | `XDG_CONFIG_HOME` | `config.toml` 的基目录 | `$HOME` |
 
@@ -763,7 +788,7 @@ umadev 有两套入口，一一对应：
 ```toml
 backend = "claude-code"
 lang = "zh-CN"
-# model 默认留空 — 底座用它自己配置的模型；只有想覆盖某会话时才填（等价 /model <id>）
+# model 默认留空 — 底座用它自己配置的模型；只有想覆盖时才填（或用 `umadev run --model <id>`）
 # model = "opus"
 ```
 
@@ -800,13 +825,13 @@ umadev 是一个 10 crate Rust workspace。
 | Crate | 普通话理解 | 技术职责 |
 |---|---|---|
 | `umadev` | 主程序 | CLI、TUI 入口、doctor、hook、CI、MCP / Skill / Knowledge 管理 |
-| `umadev-spec` | 规则说明书 | `UMADEV_HOST_SPEC_V1` 的 Rust 数据（25 条 clause） |
+| `umadev-spec` | 规则说明书 | `UMADEV_HOST_SPEC_V1` 的 Rust 数据（32 条 clause） |
 | `umadev-governance` | 质检和红线 | 112 条治理规则、审计、策略、合规映射 |
 | `umadev-agent` | 协调者引擎 | 意图路由（`router`）、可视计划 DAG（`plan_state`）、规范注入（`context::compose_firmware`）、团队调度（`director::summon` + `director_loop`）、finalize 交付、gate、质量门、8 个评审角色、验收 / 有界返工、信任分级、自学习记忆；9 阶段主链是最完整的交付路径 |
 | `umadev-runtime` | 统一大脑接口 | Runtime trait + 持续会话 `BaseSession` trait、Offline、能力契约 |
 | `umadev-host` | 驱动外部 CLI | Claude Code / Codex / OpenCode：持续会话驱动（`*_session.rs`）+ 单发兜底 |
 | `umadev-contract` | API 对账员 | OpenAPI 契约、前后端路径校验 |
-| `umadev-knowledge` | 知识检索 | 纯 Rust BM25 + CJK-bigram 分词、chunk、**本地向量通道**（multilingual-e5-small, f16, candle，内置离线；远程 `OPENAI_EMBED_KEY` 仅为可选覆盖）、HyDE 查询扩展、RRF 融合；418 份文件编译进二进制 |
+| `umadev-knowledge` | 知识检索 | 纯 Rust BM25 + CJK-bigram 分词、chunk、**本地向量通道**（multilingual-e5-small, f16, candle，内置离线；远程 `OPENAI_EMBED_KEY` 仅为可选覆盖）、HyDE 查询扩展、RRF 融合；459 份文件编译进二进制 |
 | `umadev-tui` | 终端界面 | ratatui 聊天 UI：真实 markdown 渲染、逐词 diff 卡、折叠工具行、构建完成卡（带可点击预览地址） |
 | `umadev-i18n` | 多语言 | 简体中文、繁體中文、English |
 
