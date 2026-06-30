@@ -18,8 +18,9 @@ use std::path::{Path, PathBuf};
 /// for the endpoint-coverage check; the style files (css/…) matter for the
 /// post-phase governance scan, where hardcoded colors live.
 const SRC_EXT: &[&str] = &[
-    "tsx", "jsx", "ts", "js", "vue", "svelte", "astro", "py", "rs", "go", "java", "rb", "php",
-    "cs", "kt", "ex", "exs", "dart", "swift", "css", "scss", "sass", "less", "html",
+    "tsx", "jsx", "ts", "js", "mjs", "cjs", "vue", "svelte", "astro", "py", "rs", "go", "java",
+    "rb", "php", "cs", "kt", "ex", "exs", "dart", "swift", "scala", "c", "cc", "cpp", "h", "hpp",
+    "css", "scss", "sass", "less", "html",
 ];
 
 /// Directories never worth scanning (build output / vendored deps / VCS /

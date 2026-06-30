@@ -18,7 +18,7 @@
 //! value is in surfacing the customer's OWN installed tooling's verdict as
 //! reviewable evidence, with zero new heavy transitive deps.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -208,23 +208,72 @@ fn scan_owned_sast(project_root: &Path) -> ScanResult {
     const CAT: &str = "sast";
     let ctx = umadev_governance::ProjectContext::unknown();
     let mut findings: Vec<umadev_governance::SastFinding> = Vec::new();
+    // Track how many files were actually examined. A scan that examined NOTHING
+    // (unreadable tree / everything skipped / past the depth+file cutoff) must
+    // NOT report "clean" (M4) — that would assert verified-clean having verified
+    // nothing. We surface a `Skipped` row instead.
+    let mut files_scanned = 0usize;
+    // Pass 1: full owned SAST over the code source tree.
     // Bound: at most 600 source files (the `source_files` collector caps it too).
     for f in crate::acceptance::source_files(project_root) {
         let Ok(content) = std::fs::read_to_string(&f) else {
             continue;
         };
-        let rel = f
-            .strip_prefix(project_root)
-            .unwrap_or(&f)
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
+        files_scanned += 1;
+        let rel = rel_path(project_root, &f);
         findings.extend(umadev_governance::sast_scan_file(&rel, &content, ctx));
         if findings.len() >= 500 {
             break; // a degenerate repo can't make this unbounded
         }
     }
+    // Pass 2: secret-only scan over CONFIG / IaC / env / shell files (M5) — the
+    // #1 real-world leak locations (`.env`, JSON/YAML/TOML, Terraform,
+    // Dockerfiles, shell, `.properties`/`.ini`), which the code-source collector
+    // deliberately skips. A leaked key here was previously invisible.
+    if findings.len() < 500 {
+        for f in config_secret_files(project_root) {
+            let Ok(content) = std::fs::read_to_string(&f) else {
+                continue;
+            };
+            files_scanned += 1;
+            let rel = rel_path(project_root, &f);
+            let d = umadev_governance::check_hardcoded_secret(&rel, &content);
+            if d.block
+                && !findings
+                    .iter()
+                    .any(|g| g.file == rel && g.clause == d.clause)
+            {
+                let message = d
+                    .reason
+                    .split(". ")
+                    .next()
+                    .unwrap_or(&d.reason)
+                    .trim()
+                    .to_string();
+                findings.push(umadev_governance::SastFinding {
+                    file: rel,
+                    clause: d.clause,
+                    severity: umadev_governance::SastSeverity::High,
+                    message,
+                });
+            }
+            if findings.len() >= 500 {
+                break;
+            }
+        }
+    }
     // Best-effort: persist the detailed findings for the proof-pack / review.
     write_sast_findings(project_root, &findings);
+
+    // M4: a scan that examined zero files is "not run", never "clean".
+    if files_scanned == 0 {
+        return ScanResult::skipped(
+            TOOL,
+            CAT,
+            "no source or config files to scan — UmaDev baseline SAST examined 0 files \
+             (unreadable tree / all skipped); reported as not-run, never clean",
+        );
+    }
 
     if findings.is_empty() {
         return ScanResult {
@@ -259,6 +308,68 @@ fn scan_owned_sast(project_root: &Path) -> ScanResult {
             "{n} security defect(s) ({high} high) — e.g. {} (see sast-findings.json)",
             seen.join(", ")
         ),
+    }
+}
+
+/// Workspace-relative, forward-slashed path of `f` under `project_root`.
+fn rel_path(project_root: &Path, f: &Path) -> String {
+    f.strip_prefix(project_root)
+        .unwrap_or(f)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// Directories never worth walking for secrets (build output / vendored deps /
+/// VCS / UmaDev's own artifact dirs). Mirrors the code-source collector's skip
+/// set so the config pass doesn't dredge `node_modules` / `.git` for keys.
+const CONFIG_SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".git",
+    "vendor",
+    "__pycache__",
+    ".next",
+    "out",
+    "coverage",
+];
+
+/// Collect CONFIG / IaC / env / shell files (bounded: depth 8, 400 files) that
+/// the code-source collector skips but which legitimately carry leaked secrets.
+/// [`umadev_governance::is_config_secret_path`] is the single source of truth for
+/// which non-code files are secret-scanned. Fail-open: an unreadable tree yields
+/// an empty list, never an error.
+fn config_secret_files(project_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_config_secret(project_root, &mut out, 0);
+    out
+}
+
+/// Recursive worker for [`config_secret_files`] (bounded: depth 8, 400 files).
+fn collect_config_secret(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 8 || out.len() >= 400 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            // Skip dot-dirs (`.git`, `.umadev`, …) + build/vendor dirs. A `.env`
+            // FILE starts with a dot too, but the dot rule only applies to dirs,
+            // so `.env` is still collected below.
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || CONFIG_SKIP_DIRS.contains(&name) {
+                continue;
+            }
+            collect_config_secret(&p, out, depth + 1);
+        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            if umadev_governance::is_config_secret_path(name) {
+                out.push(p);
+            }
+        }
     }
 }
 
@@ -877,5 +988,83 @@ mod tests {
         let sast = scan.results.iter().find(|r| r.category == "sast").unwrap();
         assert_eq!(sast.status, ScanStatus::Clean);
         assert_eq!(sast.findings, 0);
+    }
+
+    // M4: a scan that examined NOTHING must NOT report `Clean`.
+    #[test]
+    fn owned_sast_zero_files_is_not_clean() {
+        // An empty repo (no source, no config) → 0 files examined → the owned SAST
+        // row must be `Skipped` (not run), NEVER `Clean`. A clean verdict over zero
+        // files is a security scan asserting "verified" having verified nothing.
+        let tmp = TempDir::new().unwrap();
+        let scan = run_security_scan(tmp.path());
+        let sast = scan.results.iter().find(|r| r.category == "sast").unwrap();
+        assert_eq!(
+            sast.status,
+            ScanStatus::Skipped,
+            "0 files scanned must be Skipped, not Clean: {sast:?}"
+        );
+        assert_ne!(sast.status, ScanStatus::Clean);
+        // It examined nothing, so it must not count as a scanner that "ran".
+        assert!(
+            !scan.any_ran(),
+            "an owned SAST that examined nothing did not run"
+        );
+    }
+
+    // M5: a secret in a CONFIG / IaC / env file is now collected + scanned.
+    #[test]
+    fn owned_sast_finds_secret_in_env_file() {
+        // No source files at all — only a `.env` carrying a real key. The code
+        // collector skips `.env`, so without the config pass this leak was
+        // invisible. It must now surface as a SAST finding (and NOT be a clean/
+        // skipped scan).
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            concat!(
+                "DATABASE_PASSWORD=\nAPI_KEY=sk_live_4eC39H",
+                "qLyjWDarjtT1zdp7dcABCDEFGH\n"
+            ),
+        )
+        .unwrap();
+        let scan = run_security_scan(tmp.path());
+        let sast = scan.results.iter().find(|r| r.category == "sast").unwrap();
+        assert_eq!(
+            sast.status,
+            ScanStatus::Findings,
+            "the .env secret must be found: {sast:?}"
+        );
+        assert!(sast.findings >= 1);
+        // The detailed dump cites the offending file.
+        let dump =
+            std::fs::read_to_string(tmp.path().join(sast_findings_rel_path())).unwrap_or_default();
+        assert!(
+            dump.contains(".env"),
+            "the finding cites the .env file: {dump}"
+        );
+    }
+
+    #[test]
+    fn owned_sast_finds_secret_in_yaml_config() {
+        // A YAML config file with a hardcoded provider token — the config pass
+        // must scan it even though it is not code source.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("deploy")).unwrap();
+        std::fs::write(
+            tmp.path().join("deploy/values.yaml"),
+            concat!(
+                "github:\n  token: \"ghp_16C7e42F",
+                "292c6912E7710c838347Ae178B4a\"\n"
+            ),
+        )
+        .unwrap();
+        let scan = run_security_scan(tmp.path());
+        let sast = scan.results.iter().find(|r| r.category == "sast").unwrap();
+        assert_eq!(
+            sast.status,
+            ScanStatus::Findings,
+            "the YAML secret must be found: {sast:?}"
+        );
     }
 }

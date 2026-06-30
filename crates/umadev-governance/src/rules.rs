@@ -1276,23 +1276,67 @@ fn rm_target_is_catastrophic(lower: &str, trigger: &str) -> bool {
 
 /// **UD-SEC-003**: block hardcoded secrets in source files.
 ///
-/// Catches API keys, tokens, and passwords embedded directly in code instead
-/// of read from environment variables. Scans source files (not `.env`/config
-/// where secrets legitimately live) for high-entropy patterns and known key
-/// prefixes. Runs as part of the `pre-write` hook on Write/Edit tool calls.
+/// Catches API keys, tokens, private keys, and passwords embedded directly in
+/// code or config instead of read from environment variables. Scans shipping
+/// source AND the config / IaC / env files where secrets are most commonly
+/// leaked (`.env`, JSON/YAML/TOML, Terraform, Dockerfiles, shell) — see
+/// [`is_secret_scanned_path`]. Runs as part of the `pre-write` hook on
+/// Write/Edit tool calls and in the owned baseline SAST.
 ///
-/// Fail-open on non-source files (docs, data) — secrets rules only apply to
-/// code that ships.
+/// Layered, highest-signal first, returning the first hit:
+/// 1. a PEM `-----BEGIN … PRIVATE KEY-----` block (an unambiguous key);
+/// 2. a named key (`api_key`/`secret`/`token`/`password`/…) `=`/`:`-assigned a
+///    quoted value — covers the spaced (`const API_KEY = "…"`) and JSON
+///    (`"apiKey": "…"`) forms a contiguous-prefix scan misses;
+/// 3. the contiguous assignment prefixes (`api_key=…`, env-style);
+/// 4. bare provider key shapes (`sk-…`/`ghp_…`/`glpat-…`/`AIza…`/`SG.…`/…);
+/// 5. a DB connection string with an embedded password;
+/// 6. an entropy FALLBACK — a high-entropy quoted literal with no known name
+///    (tuned to skip hashes / UUIDs / URLs / prose so it does not flood);
+/// 7. a hardcoded long-lived JWT literal.
+///
+/// Steps 6–7 (the noisiest) are suppressed on test / fixture / example paths.
+/// Fail-open on non-scanned files (docs, images, data) — `Decision::pass()`.
 #[must_use]
+#[allow(clippy::too_many_lines)] // a flat, ordered list of secret-detector dispatches
 pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
-    // Only scan code files — secrets legitimately live in .env/config/yaml.
-    let ext = extension_of(file_path);
-    if !SECRET_SCAN_EXTENSIONS.contains(&ext.as_str()) {
+    if !is_secret_scanned_path(file_path) {
         return Decision::pass();
     }
+    let test_path = looks_like_secret_test_path(file_path);
     let lower = content.to_ascii_lowercase();
 
-    // 1. Known key prefixes (high signal, low false-positive).
+    // 0. PEM private-key block — never a placeholder; the gravest, clearest leak.
+    if let Some(label) = pem_private_key_label(content) {
+        return Decision::block(
+            "UD-SEC-003",
+            format!(
+                "UmaDev: hardcoded private key detected (UD-SEC-003). \
+                 `{file_path}` embeds a {label} private-key block \
+                 (`-----BEGIN … PRIVATE KEY-----`). A private key must NEVER live in \
+                 source — load it from a secret store / an env var / a mounted file \
+                 (gitignored) and rotate this key immediately if it was committed.",
+            ),
+        );
+    }
+
+    // 1. Named key + separator + quoted value: `const API_KEY = "…"`,
+    //    `"apiKey": "…"`, `password: "…"` — the spaced / JSON-key forms the
+    //    contiguous `SECRET_PREFIXES` scan cannot see.
+    if let Some((name, len)) = named_secret_match(content) {
+        return Decision::block(
+            "UD-SEC-003",
+            format!(
+                "UmaDev: hardcoded secret detected (UD-SEC-003). \
+                 `{file_path}` assigns what looks like a real `{name}` a literal value \
+                 (length {len}). Secrets must come from environment variables, never \
+                 source code. Read it from `process.env.<NAME>` / `std::env::var(...)` \
+                 and move the value to `.env` (gitignored).",
+            ),
+        );
+    }
+
+    // 2. Contiguous assignment-style prefixes (`api_key=value`, env files).
     for prefix in SECRET_PREFIXES {
         // Look for `prefix=...` or `prefix: ...` followed by a value that
         // looks like a real key (length > 20, not a placeholder).
@@ -1304,8 +1348,7 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
                 .take_while(|c| !matches!(c, '"' | '\'' | '\n' | '\r'))
                 .collect();
             // Skip obvious placeholders / examples.
-            let v_lower = value.to_ascii_lowercase();
-            if v_lower.len() > 20 && !SECRET_PLACEHOLDERS.iter().any(|p| v_lower.contains(p)) {
+            if value.chars().count() > 20 && !is_placeholder_value(&value) {
                 return Decision::block(
                     "UD-SEC-003",
                     format!(
@@ -1315,7 +1358,7 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
                          Replace with `process.env.{}` / `std::env::var(...)` and move the \
                          value to `.env` (gitignored).",
                         prefix.trim_end_matches(['=', ':']).to_uppercase(),
-                        value.len(),
+                        value.chars().count(),
                         prefix
                             .trim_end_matches(['=', ':'])
                             .replace(' ', "_")
@@ -1325,7 +1368,7 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
             }
         }
     }
-    // 2. Bare key-shape prefixes carry no `=`/`:` separator, so a raw substring
+    // 3. Bare key-shape prefixes carry no `=`/`:` separator, so a raw substring
     //    match would fire on ordinary identifiers. `bare_secret_matches`
     //    enforces a leading word boundary plus the real trailing key shape
     //    before reporting a hit.
@@ -1342,7 +1385,7 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
             ),
         );
     }
-    // 3. Connection strings with embedded credentials.
+    // 4. Connection strings with embedded credentials.
     //    `postgres://user:password@host` / `mongodb://user:pass@host`
     for scheme in DB_SCHEMES {
         if let Some(idx) = lower.find(scheme) {
@@ -1353,10 +1396,7 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
                     let pw = &after[colon + 1..at];
                     let pw_lower = pw.to_ascii_lowercase();
                     // Skip placeholders.
-                    if !pw_lower.is_empty()
-                        && pw_lower != "password"
-                        && !SECRET_PLACEHOLDERS.iter().any(|p| pw_lower.contains(p))
-                    {
+                    if !pw_lower.is_empty() && pw_lower != "password" && !is_placeholder_value(pw) {
                         return Decision::block(
                             "UD-SEC-003",
                             format!(
@@ -1371,7 +1411,117 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
             }
         }
     }
+    // 5. Entropy FALLBACK — a high-entropy quoted literal with no known name.
+    //    The lowest-signal detector, so it is suppressed on test/fixture/example
+    //    paths and tuned (length + entropy + hash/UUID/URL skips) not to flood.
+    if !test_path {
+        if let Some(len) = high_entropy_secret_literal(content) {
+            return Decision::block(
+                "UD-SEC-003",
+                format!(
+                    "UmaDev: high-entropy secret literal detected (UD-SEC-003). \
+                     `{file_path}` embeds a long, random-looking string literal (length {len}) \
+                     with no recognizable key name — the shape of a leaked credential. If this \
+                     is a secret, read it from an env var and move the value to `.env` \
+                     (gitignored); if it is genuinely not a secret, keep it out of a key-shaped \
+                     literal.",
+                ),
+            );
+        }
+        // 6. Hardcoded long-lived JWT literal (low priority).
+        if let Some(len) = hardcoded_jwt_literal(content) {
+            return Decision::block(
+                "UD-SEC-003",
+                format!(
+                    "UmaDev: hardcoded JWT detected (UD-SEC-003). \
+                     `{file_path}` embeds a literal JSON Web Token (length {len}). A signed \
+                     token is a bearer credential — never commit one; mint it at runtime or read \
+                     it from an env var / secret store.",
+                ),
+            );
+        }
+    }
     Decision::pass()
+}
+
+/// `true` when [`check_hardcoded_secret`] will scan a file at `file_path`: a
+/// shipping source file ([`SECRET_SCAN_EXTENSIONS`]), a config / IaC / env file
+/// ([`SECRET_CONFIG_EXTENSIONS`] — the #1 real-world leak locations), or a
+/// secret-bearing well-known filename (`Dockerfile`/`Containerfile`, any
+/// `.env`-family file). The owned SAST uses this to decide which non-code files
+/// to also walk for secrets.
+#[must_use]
+pub fn is_secret_scanned_path(file_path: &str) -> bool {
+    let ext = extension_of(file_path);
+    SECRET_SCAN_EXTENSIONS.contains(&ext.as_str()) || is_config_secret_path(file_path)
+}
+
+/// `true` when `file_path` is a CONFIG / IaC / env / shell file that is
+/// secret-scanned but is NOT general code source ([`SECRET_CONFIG_EXTENSIONS`]
+/// or a well-known secret-bearing filename: `Dockerfile`/`Containerfile`, any
+/// `.env`-family file). The owned SAST uses this for its second, secret-only
+/// pass — it already covers code source through its own source collector, so
+/// this predicate is the disjoint config surface.
+#[must_use]
+pub fn is_config_secret_path(file_path: &str) -> bool {
+    let ext = extension_of(file_path);
+    if SECRET_CONFIG_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
+    let name = file_name_of(file_path).to_ascii_lowercase();
+    // (`.env` and `foo.env` already match via the `env` extension above; only the
+    // `.env.local` / `.env.production` family needs an explicit name check.)
+    name == "dockerfile"
+        || name.starts_with("dockerfile.")
+        || name == "containerfile"
+        || name.starts_with(".env.")
+}
+
+/// The final path component of `file_path` (handles `/` and `\` separators).
+fn file_name_of(file_path: &str) -> &str {
+    file_path.rsplit(['/', '\\']).next().unwrap_or(file_path)
+}
+
+/// `true` for a path where the NOISIEST secret detectors (the entropy + JWT
+/// fallback) must be suppressed to avoid flooding: a test / fixture / example /
+/// sample / template path (realistic-but-fake secrets), a generated LOCKFILE
+/// (full of SRI integrity hashes), or a minified bundle (one giant high-entropy
+/// line). The high-signal detectors (PEM, named keys, provider shapes) still fire
+/// on these, so a REAL key here is not a free pass.
+fn looks_like_secret_test_path(file_path: &str) -> bool {
+    let l = file_path.to_ascii_lowercase();
+    if l.contains(".test.")
+        || l.contains(".spec.")
+        || l.contains("_test.")
+        || l.contains("test_")
+        || l.contains("/tests/")
+        || l.contains("/test/")
+        || l.contains("/__tests__/")
+        || l.contains("/testdata/")
+        || l.contains("/fixtures/")
+        || l.contains("/fixture/")
+        || l.contains("/mocks/")
+        || l.contains("/examples/")
+        || l.contains("/example/")
+        || l.contains(".example")
+        || l.contains(".sample")
+        || l.contains(".template")
+        || l.contains(".dist")
+        || l.contains(".mock")
+        || l.contains(".min.")
+    {
+        return true;
+    }
+    // Generated lockfiles: high-entropy integrity hashes everywhere, no secrets.
+    // (`*.lock` covers Cargo.lock / yarn.lock / poetry.lock / composer.lock / …)
+    let name = file_name_of(&l);
+    extension_of(name) == "lock"
+        || name == "package-lock.json"
+        || name == "npm-shrinkwrap.json"
+        || name == "pnpm-lock.yaml"
+        || name == "go.sum"
+        || name.ends_with("-lock.json")
+        || name.ends_with("-lock.yaml")
 }
 
 /// Scan `content` for a bare key-shape secret (a Stripe-style `sk_`/`pk_` key,
@@ -1403,13 +1553,13 @@ fn bare_secret_matches(content: &str) -> Option<(&'static str, usize)> {
             continue;
         }
         let matched = whole.as_str();
-        // Re-check placeholders so example/test keys still pass, matching the
-        // separator-prefix path's policy.
-        let lower = matched.to_ascii_lowercase();
-        if SECRET_PLACEHOLDERS.iter().any(|p| lower.contains(p)) {
+        // Re-check placeholders so example keys still pass, matching the
+        // separator-prefix path's policy (anchored, never substring — a real
+        // token that merely contains `test`/`foo` is NOT whitelisted).
+        if is_placeholder_value(matched) {
             continue;
         }
-        let label = bare_secret_label(&lower);
+        let label = bare_secret_label(&matched.to_ascii_lowercase());
         return Some((label, matched.len()));
     }
     None
@@ -1417,16 +1567,33 @@ fn bare_secret_matches(content: &str) -> Option<(&'static str, usize)> {
 
 /// Human-readable label for a bare-secret hit, derived from its prefix.
 fn bare_secret_label(lower: &str) -> &'static str {
-    if lower.starts_with("akia") {
+    if lower.starts_with("akia") || lower.starts_with("asia") {
         "AWS access-key"
-    } else if lower.starts_with("ghp_") || lower.starts_with("gho_") {
+    } else if lower.starts_with("github_pat_") {
+        "GitHub fine-grained PAT"
+    } else if lower.starts_with("ghp_")
+        || lower.starts_with("gho_")
+        || lower.starts_with("ghs_")
+        || lower.starts_with("ghu_")
+        || lower.starts_with("ghr_")
+    {
         "GitHub token"
-    } else if lower.starts_with("xoxb-") {
+    } else if lower.starts_with("glpat-") {
+        "GitLab PAT"
+    } else if lower.starts_with("xox") {
         "Slack token"
+    } else if lower.starts_with("aiza") {
+        "Google API key"
+    } else if lower.starts_with("sg.") {
+        "SendGrid key"
+    } else if lower.starts_with("npm_") {
+        "npm token"
+    } else if lower.starts_with("sk-") {
+        "OpenAI key"
     } else if lower.starts_with("stripe_") {
         "Stripe"
     } else {
-        // Stripe-style publishable/secret key.
+        // Stripe-style `sk_`/`pk_` publishable/secret key.
         "secret/publishable"
     }
 }
@@ -1435,20 +1602,296 @@ fn bare_secret_label(lower: &str) -> &'static str {
 ///
 /// The leading word boundary is verified separately in [`bare_secret_matches`]
 /// (the `regex` crate has no look-behind). Shapes:
+/// - `sk-(proj-)?…{20,}` — OpenAI keys (HYPHEN, distinct from Stripe's `sk_`).
 /// - `(sk_|pk_)…{16,}` — Stripe-style keys (incl. live/test variants); the
 ///   16-char floor keeps it off short identifiers.
 /// - `stripe_…{16,}` — a `stripe_`-prefixed key value.
-/// - `(ghp_|gho_)…{20,}` — GitHub personal-access / OAuth tokens.
-/// - `xoxb-…{10,}` — Slack bot tokens.
-/// - the exact AWS access-key-id form (case-insensitive), which no longer fires
-///   on `nakia` / `balalaika`.
+/// - `(ghp_|gho_|ghs_|ghu_|ghr_)…{20,}` / `github_pat_…{20,}` — GitHub tokens.
+/// - `glpat-…{20,}` — GitLab personal-access tokens.
+/// - `xox[bpars]-…{10,}` — Slack bot/user/app tokens.
+/// - `AIza…{30,}` — Google API keys.
+/// - `SG.…{16,}.…{16,}` — SendGrid keys.
+/// - `npm_…{36}` — npm automation tokens.
+/// - the exact AWS access-key-id forms `AKIA`/`ASIA` (case-insensitive), which
+///   no longer fire on `nakia` / `balalaika`.
 fn bare_secret_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"(?i)(?:(?:sk_|pk_)[A-Za-z0-9_]{16,}|stripe_[A-Za-z0-9]{16,}|(?:ghp_|gho_)[A-Za-z0-9]{20,}|xoxb-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})",
-        )
+        Regex::new(concat!(
+            r"(?i)(?:",
+            r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}",
+            r"|(?:sk_|pk_)[A-Za-z0-9_]{16,}",
+            r"|stripe_[A-Za-z0-9]{16,}",
+            r"|github_pat_[A-Za-z0-9_]{20,}",
+            r"|(?:ghp_|gho_|ghs_|ghu_|ghr_)[A-Za-z0-9]{20,}",
+            r"|glpat-[A-Za-z0-9_-]{20,}",
+            r"|xox[bpars]-[A-Za-z0-9-]{10,}",
+            r"|AIza[A-Za-z0-9_-]{30,}",
+            r"|SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}",
+            r"|npm_[A-Za-z0-9]{36}",
+            r"|(?:AKIA|ASIA)[0-9A-Z]{16}",
+            r")",
+        ))
         .expect("bare-secret regex is well-formed")
+    })
+}
+
+/// Match a NAMED secret assignment: a key NAME (`api_key`/`secret`/`token`/
+/// `password`/…) followed by `=`/`:` (with any spacing, and optionally a quoted
+/// name as in JSON) and a QUOTED value. This is the form a contiguous
+/// `name=value` prefix scan misses: `const API_KEY = "…"` (spaces) and
+/// `"apiKey": "…"` (quote-colon). Returns `(matched_name, value_char_len)` for
+/// the first non-placeholder hit. The quoted-value requirement keeps it off
+/// `process.env.X` references and bare code expressions.
+fn named_secret_match(content: &str) -> Option<(String, usize)> {
+    for caps in named_secret_regex().captures_iter(content) {
+        let (Some(name), Some(value)) = (caps.get(1), caps.get(2)) else {
+            continue;
+        };
+        let value = value.as_str();
+        if is_placeholder_value(value) {
+            continue;
+        }
+        return Some((name.as_str().to_string(), value.chars().count()));
+    }
+    None
+}
+
+/// Compiled detector for a named secret key assigned a quoted literal value.
+///
+/// `["']?` around the name allows a JSON quoted key (`"apiKey":`); `\s*[:=]\s*`
+/// allows any spacing (`const API_KEY = "…"`); the value class excludes
+/// whitespace and structural punctuation so it stops at the literal's end and
+/// never runs into surrounding code. The 12-char value floor keeps it off short,
+/// low-signal values. The NAME (`\b`-bounded) is the high-signal part — `secret`
+/// will not match inside `secret_key`, which forces the longer alternative.
+fn named_secret_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(concat!(
+            r#"(?i)["']?\b("#,
+            r"api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token",
+            r"|access[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd",
+            r"|secret|token|auth",
+            r#")\b["']?\s*[:=]\s*["']([^\s"',;(){}]{12,})["']"#,
+        ))
+        .expect("named-secret regex is well-formed")
+    })
+}
+
+/// Compiled detector for a PEM private-key block — an unambiguous leaked key.
+/// Covers plain `PRIVATE KEY` plus the `RSA`/`EC`/`DSA`/`OPENSSH`/`PGP`/
+/// `ENCRYPTED` variants (and the `PGP PRIVATE KEY BLOCK` form).
+fn pem_private_key_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"-----BEGIN (?:(?:RSA|EC|DSA|OPENSSH|PGP|ENCRYPTED) )?PRIVATE KEY(?: BLOCK)?-----",
+        )
+        .expect("pem private-key regex is well-formed")
+    })
+}
+
+/// Label for a PEM private-key hit (the key kind), or `None` when absent.
+fn pem_private_key_label(content: &str) -> Option<&'static str> {
+    let m = pem_private_key_regex().find(content)?;
+    let s = m.as_str();
+    let label = if s.contains("RSA") {
+        "RSA"
+    } else if s.contains("OPENSSH") {
+        "OpenSSH"
+    } else if s.contains("EC ") {
+        "EC"
+    } else if s.contains("DSA") {
+        "DSA"
+    } else if s.contains("PGP") {
+        "PGP"
+    } else {
+        "PKCS8"
+    };
+    Some(label)
+}
+
+/// Compiled detector for a hardcoded 3-part JWT literal (`header.payload.sig`,
+/// each base64url, both header and payload starting `eyJ`).
+fn jwt_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*")
+            .expect("jwt regex is well-formed")
+    })
+}
+
+/// Length of the first hardcoded JWT literal in `content`, or `None`.
+fn hardcoded_jwt_literal(content: &str) -> Option<usize> {
+    jwt_regex().find(content).map(|m| m.as_str().len())
+}
+
+/// Compiled detector that captures the inside of a quoted string literal of at
+/// least 20 non-quote chars — the candidate surface for the entropy fallback.
+fn quoted_literal_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"["']([^"'\r\n]{20,})["']"#).expect("quoted-literal regex is well-formed")
+    })
+}
+
+/// Length of the first quoted string literal in `content` that looks like a
+/// high-entropy secret with no recognizable key name, or `None`. The entropy
+/// fallback's scan front-end.
+fn high_entropy_secret_literal(content: &str) -> Option<usize> {
+    for caps in quoted_literal_regex().captures_iter(content) {
+        let val = caps.get(1)?.as_str();
+        if is_high_entropy_secret(val) {
+            return Some(val.chars().count());
+        }
+    }
+    None
+}
+
+/// Whether `val` is a high-entropy string with the SHAPE of a leaked credential.
+/// Deliberately conservative so the always-on scan does not flood: requires a
+/// 20-char floor, no whitespace, a letter+digit MIX, and a Shannon entropy >=
+/// 4.0 bits/byte, and skips the high-entropy NON-secrets (hex hashes, UUIDs,
+/// URLs/paths, repeated filler, known example markers).
+fn is_high_entropy_secret(val: &str) -> bool {
+    if val.chars().count() < 20 {
+        return false;
+    }
+    if val.chars().any(char::is_whitespace) {
+        return false;
+    }
+    // Real keys/tokens mix character classes; prose words and identifiers do not.
+    let has_alpha = val.chars().any(|c| c.is_ascii_alphabetic());
+    let has_digit = val.chars().any(|c| c.is_ascii_digit());
+    if !(has_alpha && has_digit) {
+        return false;
+    }
+    if looks_like_hex_hash(val)
+        || looks_like_uuid(val)
+        || looks_like_url_or_path(val)
+        || looks_like_integrity_or_digest(val)
+        || is_filler_value(&val.to_ascii_lowercase())
+        || is_placeholder_value(val)
+    {
+        return false;
+    }
+    shannon_entropy(val) >= 4.0
+}
+
+/// `true` when `s` is a Subresource-Integrity hash (`sha512-…`) or an OCI image
+/// digest (`sha256:…`) — high-entropy, but a content hash, not a credential.
+fn looks_like_integrity_or_digest(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    [
+        "sha1-", "sha256-", "sha384-", "sha512-", "md5-", "sha1:", "sha256:", "sha512:",
+    ]
+    .iter()
+    .any(|p| l.starts_with(p))
+}
+
+/// Shannon entropy (bits per byte) of `s`; `0.0` for empty. Called only on short
+/// bounded literals, so a `u32` byte count is sufficient.
+fn shannon_entropy(s: &str) -> f64 {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in bytes {
+        counts[usize::from(b)] += 1;
+    }
+    let total = f64::from(u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+    let mut h = 0.0_f64;
+    for &c in &counts {
+        if c == 0 {
+            continue;
+        }
+        let p = f64::from(c) / total;
+        h -= p * p.log2();
+    }
+    h
+}
+
+/// `true` when `s` is a hex string at least 32 chars long — an MD5/SHA digest /
+/// commit hash / checksum, not a secret. (High entropy, but a known non-secret.)
+fn looks_like_hex_hash(s: &str) -> bool {
+    s.len() >= 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `true` when `s` is a canonical `8-4-4-4-12` hex UUID.
+fn looks_like_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && b.iter().enumerate().all(|(i, &c)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                c == b'-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// `true` when `s` is a URL / data-URI / filesystem-style path — high-entropy but
+/// not a credential. Excluding any `/` also drops standard-base64 false anchors;
+/// real keys are caught by the named/provider/PEM detectors above.
+fn looks_like_url_or_path(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    l.contains("://") || l.starts_with("data:") || l.starts_with("www.") || s.contains('/')
+}
+
+/// `true` when `v` is a single repeated alphanumeric character (>=4 of them,
+/// ignoring separators) — `xxxxxxxx`, `00000000`, `--------`: filler, not a key.
+fn is_filler_value(v: &str) -> bool {
+    let mut chars = v.chars().filter(char::is_ascii_alphanumeric);
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let mut count = 1usize;
+    let mut all_same = true;
+    for c in chars {
+        count += 1;
+        if c != first {
+            all_same = false;
+        }
+    }
+    all_same && count >= 4
+}
+
+/// `true` when `value` is an example / placeholder, not a real secret.
+///
+/// Two tiers (the M7 fix): long unambiguous markers ([`SECRET_EXAMPLE_MARKERS`])
+/// match as a SUBSTRING; short ambiguous words ([`SECRET_PLACEHOLDER_WORDS`])
+/// match ONLY when they are essentially the whole value (the word optionally
+/// followed by digits / separators), never as a substring — so a real
+/// `mytestkey…secret` is not whitelisted by a stray `test`.
+fn is_placeholder_value(value: &str) -> bool {
+    let vl = value.to_ascii_lowercase();
+    if vl.is_empty() {
+        return true;
+    }
+    // Ellipsis / angle-bracket / shell-var / template markers.
+    if vl.contains("...")
+        || (vl.contains('<') && vl.contains('>'))
+        || vl.contains("${")
+        || vl.contains("{{")
+    {
+        return true;
+    }
+    if SECRET_EXAMPLE_MARKERS.iter().any(|m| vl.contains(m)) {
+        return true;
+    }
+    if is_filler_value(&vl) {
+        return true;
+    }
+    SECRET_PLACEHOLDER_WORDS.iter().any(|w| {
+        vl == *w
+            || vl.strip_prefix(w).is_some_and(|rest| {
+                !rest.is_empty()
+                    && rest
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+            })
     })
 }
 
@@ -7326,9 +7769,51 @@ const DEBUG_PATTERNS: &[DebugPattern] = &[
     },
 ];
 
-/// Source-file extensions where hardcoded-secret scanning applies.
+/// Source-file extensions where hardcoded-secret scanning applies. Covers the
+/// shipping languages whose source the team produces — including the families a
+/// code-only list used to miss (`cs` / `dart` / `ex` / `exs` / `c` / `cpp` /
+/// `scala`), which are collected as source elsewhere but were secret-blind here.
 const SECRET_SCAN_EXTENSIONS: &[&str] = &[
-    "js", "jsx", "ts", "tsx", "py", "rb", "go", "rs", "java", "kt", "swift", "php", "vue", "svelte",
+    "js", "jsx", "ts", "tsx", "mjs", "cjs", "py", "rb", "go", "rs", "java", "kt", "swift", "php",
+    "vue", "svelte", "cs", "dart", "ex", "exs", "c", "cpp", "cc", "h", "hpp", "scala",
+];
+
+/// Config / IaC / env / shell extensions where secrets are MOST commonly leaked
+/// (`.env`, JSON/YAML/TOML config, Terraform, shell scripts, `.properties`/`.ini`,
+/// CI/Docker fragments). A code-only secret scan is blind to exactly these — the
+/// #1 real-world leak locations — so they get the same hardcoded-secret pass even
+/// though they are not general source. PEM/key material files are included so a
+/// pasted private key is caught wherever it lands.
+const SECRET_CONFIG_EXTENSIONS: &[&str] = &[
+    "env",
+    "json",
+    "json5",
+    "yaml",
+    "yml",
+    "toml",
+    "tf",
+    "tfvars",
+    "hcl",
+    "properties",
+    "ini",
+    "cfg",
+    "conf",
+    "config",
+    "sh",
+    "bash",
+    "zsh",
+    "ksh",
+    "xml",
+    "gradle",
+    "pem",
+    "key",
+    "crt",
+    "cert",
+    "pfx",
+    "p12",
+    "asc",
+    "ps1",
+    "bat",
 ];
 
 /// Assignment-style key prefixes that indicate a hardcoded secret. Lowercase,
@@ -7353,26 +7838,50 @@ const SECRET_PREFIXES: &[&str] = &[
     "private_key=",
 ];
 
-/// Placeholder values that mean "this isn't a real secret" — skip them.
-const SECRET_PLACEHOLDERS: &[&str] = &[
+/// Long, unambiguous example/placeholder MARKERS — safe to match as a SUBSTRING
+/// of a value because they do not occur inside a real key by chance. A value
+/// containing any of these is an example, not a secret.
+///
+/// (The old flat `SECRET_PLACEHOLDERS` list mixed these with 3-char words like
+/// `foo`/`test` and matched the whole set via `.contains()`, so any REAL key
+/// that merely contained `test`/`foo` — `mytestkey…`, `…foobar…` — was silently
+/// whitelisted: an insider-bypass and accidental-drop hole. The short words now
+/// live in [`SECRET_PLACEHOLDER_WORDS`] and only match a whole/anchored value.)
+const SECRET_EXAMPLE_MARKERS: &[&str] = &[
     "your_",
     "your-",
-    "<...>",
+    "yourapi",
+    "youraccount",
     "example",
     "placeholder",
     "changeme",
-    "xxx",
-    "...",
-    "replace",
-    "insert",
-    "todo",
-    "demo",
-    "test",
-    "sample",
+    "change_me",
+    "change-me",
+    "redacted",
+    "replace_",
+    "replace-",
+    "replaceme",
+    "insert_",
+    "insert-",
     "dummy",
-    "foo",
-    "bar",
-    "mock",
+    "notreal",
+    "fakekey",
+    "fake_",
+    "sample",
+    "<your",
+    "<api",
+    "<token",
+    "<secret",
+    "<key",
+];
+
+/// Short, AMBIGUOUS placeholder words — matched only when they are (essentially)
+/// the WHOLE value (optionally followed by digits/separators), never as a
+/// substring, so a real `mytestkey…` / `…foobar…` secret is not whitelisted by a
+/// 3-letter coincidence. See [`is_placeholder_value`].
+const SECRET_PLACEHOLDER_WORDS: &[&str] = &[
+    "foo", "bar", "baz", "qux", "xxx", "test", "demo", "mock", "abc", "todo", "tbd", "none",
+    "null", "nil",
 ];
 
 /// DB URL schemes whose connection strings may carry embedded credentials.
@@ -8744,13 +9253,312 @@ const x = 1;",
     }
 
     #[test]
-    fn secret_ignores_non_source_files() {
-        // .env files legitimately hold secrets.
+    fn secret_ignores_truly_non_scanned_files() {
+        // Docs / data / images are not scanned — a key-shaped string in a `.md`
+        // walkthrough or a `.csv` is not a leaked source credential.
+        let d = check_hardcoded_secret(
+            "README.md",
+            concat!("API_KEY=stripe_R8xQ2mK7", "vN4pL9wB3yT6jH1sD5gF0"),
+        );
+        assert!(!d.block, "non-scanned files pass: {}", d.reason);
+        let d2 = check_hardcoded_secret(
+            "data/users.csv",
+            concat!("id,key\n1,sk_live_4eC39H", "qLyjWDarjtT1zdp7dcABCDEFGH\n"),
+        );
+        assert!(!d2.block, "csv data files pass: {}", d2.reason);
+    }
+
+    // M5: config / IaC / env files are the #1 leak locations — now scanned.
+    #[test]
+    fn secret_blocks_env_file_secret() {
+        // A real key committed into `.env` is exactly the leak we must catch — it
+        // is no longer a free pass just because the extension is `.env`.
         let d = check_hardcoded_secret(
             ".env",
             concat!("API_KEY=stripe_R8xQ2mK7", "vN4pL9wB3yT6jH1sD5gF0"),
         );
-        assert!(!d.block);
+        assert!(d.block, "a real secret in .env must block");
+        assert_eq!(d.clause, "UD-SEC-003");
+    }
+
+    #[test]
+    fn secret_blocks_secret_in_yaml_and_dockerfile_and_tf() {
+        // YAML config value.
+        let yaml = check_hardcoded_secret(
+            "k8s/secrets.yaml",
+            concat!(
+                "apiKey: \"AIzaSyD-abc123_",
+                "DEF456ghi789JKL012mno345PQ\"\n"
+            ),
+        );
+        assert!(
+            yaml.block,
+            "a Google key in YAML must block: {}",
+            yaml.reason
+        );
+        // Dockerfile (no extension) — recognized by filename.
+        let docker = check_hardcoded_secret(
+            "Dockerfile",
+            concat!("ENV STRIPE=sk_live_4eC39H", "qLyjWDarjtT1zdp7dcABCDEFGH\n"),
+        );
+        assert!(
+            docker.block,
+            "a key in a Dockerfile must block: {}",
+            docker.reason
+        );
+        // Terraform.
+        let tf = check_hardcoded_secret(
+            "infra/main.tf",
+            concat!("client_secret = \"abcdEFGH", "ijkl0123MNOPqrst4567uvwx\"\n"),
+        );
+        assert!(tf.block, "a client_secret in .tf must block: {}", tf.reason);
+    }
+
+    // M6: C# / Dart / Elixir secret-blind → now scanned.
+    #[test]
+    fn secret_blocks_csharp_and_dart_and_elixir() {
+        let cs = check_hardcoded_secret(
+            "Service.cs",
+            concat!(
+                "var apiKey = \"sk_live_4eC39H",
+                "qLyjWDarjtT1zdp7dcABCDEFGH\";"
+            ),
+        );
+        assert!(cs.block, "a C# hardcoded key must block: {}", cs.reason);
+        let dart = check_hardcoded_secret(
+            "lib/api.dart",
+            concat!(
+                "const token = \"ghp_16C7e42F",
+                "292c6912E7710c838347Ae178B4a\";"
+            ),
+        );
+        assert!(
+            dart.block,
+            "a Dart hardcoded token must block: {}",
+            dart.reason
+        );
+        let ex = check_hardcoded_secret(
+            "lib/app.ex",
+            concat!("@secret \"glpat-abcd", "EFGH1234ijklMNOP5678\"\n"),
+        );
+        assert!(
+            ex.block,
+            "an Elixir hardcoded token must block: {}",
+            ex.reason
+        );
+    }
+
+    // H1: spaced and JSON-quote-colon named secrets.
+    #[test]
+    fn secret_blocks_spaced_named_key() {
+        // `const API_KEY = "..."` — spaces around `=`, a generic (non-provider)
+        // value the bare-shape detector would miss. The named-key path catches it.
+        let d = check_hardcoded_secret(
+            "src/cfg.ts",
+            "const API_KEY = \"a1B2c3D4e5F6g7H8i9J0kLmN\";",
+        );
+        assert!(d.block, "a spaced named key must block: {}", d.reason);
+        assert_eq!(d.clause, "UD-SEC-003");
+    }
+
+    #[test]
+    fn secret_blocks_json_quote_colon_key() {
+        // `"apiKey": "..."` — the JSON quote-colon form a `name=` scan misses.
+        let d = check_hardcoded_secret(
+            "config.json",
+            "{ \"apiKey\": \"a1B2c3D4e5F6g7H8i9J0kLmN\" }",
+        );
+        assert!(d.block, "a JSON-key secret must block: {}", d.reason);
+    }
+
+    // H1: entropy fallback — a high-entropy literal with NO known name.
+    #[test]
+    fn secret_blocks_high_entropy_unnamed_literal() {
+        // No key name at all, just a long high-entropy literal assigned to a
+        // generic identifier — the entropy fallback must still flag it.
+        let d = check_hardcoded_secret(
+            "src/cfg.ts",
+            "const blob = \"a1B2c3D4e5F6g7H8i9J0kL3mN9pQ7rS\";",
+        );
+        assert!(d.block, "a high-entropy literal must block: {}", d.reason);
+    }
+
+    // H2: OpenAI sk- (HYPHEN) keys.
+    #[test]
+    fn secret_blocks_openai_sk_hyphen_key() {
+        let d = check_hardcoded_secret(
+            "src/ai.ts",
+            concat!(
+                "const k = \"sk-proj-aBcd",
+                "EFGH1234ijklMNOP5678qrstUVWX\";"
+            ),
+        );
+        assert!(d.block, "an OpenAI sk- key must block: {}", d.reason);
+        assert!(d.reason.contains("OpenAI"), "labelled OpenAI: {}", d.reason);
+    }
+
+    // H3: PEM private keys.
+    #[test]
+    fn secret_blocks_pem_private_key() {
+        let d = check_hardcoded_secret(
+            "src/keys.go",
+            "var key = `-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----`",
+        );
+        assert!(d.block, "a PEM private key must block: {}", d.reason);
+        assert!(
+            d.reason.contains("private key"),
+            "names the key: {}",
+            d.reason
+        );
+        // OpenSSH form too.
+        let d2 = check_hardcoded_secret("deploy.sh", "KEY=\"-----BEGIN OPENSSH PRIVATE KEY-----\"");
+        assert!(d2.block, "an OpenSSH private key must block: {}", d2.reason);
+    }
+
+    // H8: additional provider token families.
+    #[test]
+    fn secret_blocks_extended_token_families() {
+        let cases = [
+            (
+                "ghs_",
+                concat!("ghs_aBcdEFGH", "1234ijklMNOP5678qrstUVWX90"),
+            ),
+            ("glpat-", concat!("glpat-abcd", "EFGH1234ijklMNOP5678")),
+            (
+                "AIza",
+                concat!("AIzaSyD-aBcd", "EFGH1234ijklMNOP5678qrstUVWXyz0"),
+            ),
+            (
+                "SG.",
+                concat!("SG.aBcdEFGH1234ijkl", "MNOP.5678qrstUVWXyz09ABcd12"),
+            ),
+            (
+                "npm_",
+                concat!("npm_aBcdEFGH1234ijkl", "MNOP5678qrstUVWX90abcdEFGH12"),
+            ),
+            ("ASIA", concat!("ASIA7K3M", "9P2QX4RT6V8W")),
+        ];
+        for (label, token) in cases {
+            let src = format!("const k = \"{token}\";");
+            let d = check_hardcoded_secret("src/k.ts", &src);
+            assert!(d.block, "{label} token must block: {}", d.reason);
+        }
+    }
+
+    // L9: hardcoded long-lived JWT.
+    #[test]
+    fn secret_blocks_hardcoded_jwt() {
+        let d = check_hardcoded_secret(
+            "src/auth.ts",
+            concat!(
+                "const t = \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+                ".eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c\";"
+            ),
+        );
+        assert!(d.block, "a hardcoded JWT must block: {}", d.reason);
+    }
+
+    // M7: anchored placeholder — a real key CONTAINING `test`/`foo` is NOT a free
+    // pass (the old substring-contains whitelist let it through).
+    #[test]
+    fn secret_blocks_real_key_containing_placeholder_word() {
+        let d = check_hardcoded_secret(
+            "src/api.ts",
+            "const API_KEY = \"testRealKey9aB7cD3eF1gH5jK\";",
+        );
+        assert!(
+            d.block,
+            "a real key merely containing `test` must NOT be whitelisted: {}",
+            d.reason
+        );
+    }
+
+    #[test]
+    fn secret_still_allows_anchored_placeholder() {
+        // A whole-value placeholder word still passes (`test`, `foo123`), and the
+        // long example markers (`your_`, `example`, `changeme`) still pass.
+        for v in [
+            "const API_KEY = \"test\";",
+            "const API_KEY = \"changeme_please_now_xx\";",
+            "apiKey: \"your_api_key_goes_here\"",
+            "const API_KEY = \"REPLACE_ME_with_real_key\";",
+        ] {
+            let d = check_hardcoded_secret("src/api.ts", v);
+            assert!(!d.block, "placeholder must pass: {v} -> {}", d.reason);
+        }
+    }
+
+    // Entropy fallback must NOT flood on benign high-entropy non-secrets.
+    #[test]
+    fn secret_allows_hash_uuid_url_in_source() {
+        for v in [
+            // sha256 hex digest (commit/checksum) — high entropy, not a secret.
+            "const sri = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\";",
+            // canonical UUID.
+            "const id = \"550e8400-e29b-41d4-a716-446655440000\";",
+            // a long URL.
+            "const url = \"https://api.example.com/v2/resource/items/details\";",
+            // a filesystem path.
+            "const p = \"/usr/local/share/app/config/settings/defaults\";",
+            // a long prose string (has spaces).
+            "const msg = \"this is a perfectly ordinary human-readable sentence\";",
+        ] {
+            let d = check_hardcoded_secret("src/x.ts", v);
+            assert!(
+                !d.block,
+                "benign high-entropy literal must pass: {v} -> {}",
+                d.reason
+            );
+        }
+    }
+
+    #[test]
+    fn secret_allows_lockfile_integrity_hashes() {
+        // `package-lock.json` is full of SRI integrity hashes — high entropy, but
+        // not secrets. The entropy fallback must not flood on them.
+        let lock = check_hardcoded_secret(
+            "package-lock.json",
+            "{ \"integrity\": \"sha512-aBcDeF1234567890GhIjKlMnOpQrStUvWxYz0987654321ZyXw==\" }",
+        );
+        assert!(
+            !lock.block,
+            "lockfile integrity hash must pass: {}",
+            lock.reason
+        );
+        // The SRI shape is skipped even outside a lockfile name.
+        let sri = check_hardcoded_secret(
+            "src/app.ts",
+            "const h = \"sha512-aBcDeF1234567890GhIjKlMnOpQrStUvWxYz0987654321Zy\";",
+        );
+        assert!(!sri.block, "an SRI hash literal must pass: {}", sri.reason);
+    }
+
+    #[test]
+    fn secret_entropy_fallback_suppressed_on_test_paths() {
+        // A realistic-but-fake key in a fixture must not flood the entropy
+        // fallback — but a real PROVIDER-shaped key in a test still blocks.
+        let fixture = check_hardcoded_secret(
+            "src/__tests__/api.test.ts",
+            "const blob = \"a1B2c3D4e5F6g7H8i9J0kL3mN9pQ7rS\";",
+        );
+        assert!(
+            !fixture.block,
+            "entropy fallback is suppressed on test paths: {}",
+            fixture.reason
+        );
+        let real = check_hardcoded_secret(
+            "src/__tests__/api.test.ts",
+            concat!(
+                "const k = \"sk_live_4eC39H",
+                "qLyjWDarjtT1zdp7dcABCDEFGH\";"
+            ),
+        );
+        assert!(
+            real.block,
+            "a real provider key in a test file STILL blocks: {}",
+            real.reason
+        );
     }
 
     #[test]
