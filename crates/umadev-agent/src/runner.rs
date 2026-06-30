@@ -10,7 +10,7 @@
 //! ones without changing this orchestration.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use chrono::Utc;
 use umadev_runtime::Runtime;
@@ -464,25 +464,88 @@ struct AcceptanceVerdict {
     notes: String,
 }
 
-/// Resolve the model to drive a phase, honouring optional per-tier overrides:
-/// `UMADEV_MODEL_BUILD` for the code phases (frontend / backend) and
-/// `UMADEV_MODEL_PLAN` for the planning phases (research / docs / spec /
-/// quality / delivery). This is the per-phase model assignment the field's top
-/// agents converged on — plan with a cheaper, faster model and write code with
-/// a stronger one (Cline Plan/Act, Roo Architect→Code, Aider architect/editor).
-/// Falls back to the single configured `default_model` when a tier is unset, so
-/// the default single-model behaviour is unchanged.
-fn model_for_phase(default_model: &str, phase: Phase) -> String {
-    let tier_var = if matches!(phase, Phase::Frontend | Phase::Backend) {
-        "UMADEV_MODEL_BUILD"
-    } else {
-        "UMADEV_MODEL_PLAN"
-    };
-    std::env::var(tier_var)
+/// Env vars that SEED the per-phase model tiers once at startup: `UMADEV_MODEL_BUILD`
+/// for the code phases, `UMADEV_MODEL_PLAN` for the planning phases. The LIVE
+/// values are the thread-safe shared state behind [`set_model_tiers`], never these
+/// envs at runtime.
+const MODEL_BUILD_ENV: &str = "UMADEV_MODEL_BUILD";
+/// See [`MODEL_BUILD_ENV`].
+const MODEL_PLAN_ENV: &str = "UMADEV_MODEL_PLAN";
+
+/// Per-phase model tier overrides: a cheaper/faster `plan` model for the planning
+/// phases, a stronger `build` model for the code phases. Each `None` falls back to
+/// the single configured model.
+#[derive(Debug, Clone, Default)]
+struct ModelTiers {
+    /// Planning phases (research / docs / spec / quality / delivery). `None` →
+    /// the single configured model.
+    plan: Option<String>,
+    /// Code phases (frontend / backend). `None` → the single configured model.
+    build: Option<String>,
+}
+
+/// Process-wide, thread-safe per-phase model tier overrides — the single source of
+/// truth [`model_for_phase`] reads and the TUI writes (via [`set_model_tiers`]).
+/// Lazily seeded from [`MODEL_PLAN_ENV`] / [`MODEL_BUILD_ENV`] on first access
+/// (one-time startup read, so an external launch override is honoured), then
+/// driven only by [`set_model_tiers`]. Replaces a per-phase `std::env::var` read
+/// whose matching `/model`-tier `set_var` raced this getenv (a `setenv`/`getenv`
+/// data race → UB). Fail-open on lock poisoning.
+static MODEL_TIERS: OnceLock<RwLock<ModelTiers>> = OnceLock::new();
+
+/// The lazily-initialised model-tier cell, seeded from the env exactly once (the
+/// only env read; after it the values are pure shared state).
+fn model_tiers_cell() -> &'static RwLock<ModelTiers> {
+    MODEL_TIERS.get_or_init(|| {
+        RwLock::new(ModelTiers {
+            plan: env_tier(MODEL_PLAN_ENV),
+            build: env_tier(MODEL_BUILD_ENV),
+        })
+    })
+}
+
+/// Read one tier env var, trimmed and emptiness-filtered (the historical seed
+/// normalisation). Pure helper for the one-time [`model_tiers_cell`] seed.
+fn env_tier(var: &str) -> Option<String> {
+    std::env::var(var)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| default_model.to_string())
+}
+
+/// Set the live per-phase model tier overrides (the `/model plan|build` change +
+/// the startup publish). Thread-safe: the next phase observes them via
+/// [`model_for_phase`] WITHOUT any process-global env mutation, so a live change
+/// can never data-race a phase's model read. Each `None` / empty value clears that
+/// tier (→ the single configured model). Fail-open: a poisoned lock is a no-op.
+pub fn set_model_tiers(plan: Option<&str>, build: Option<&str>) {
+    let norm = |v: Option<&str>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    if let Ok(mut guard) = model_tiers_cell().write() {
+        guard.plan = norm(plan);
+        guard.build = norm(build);
+    }
+}
+
+/// Resolve the model to drive a phase, honouring optional per-tier overrides:
+/// the `build` tier for the code phases (frontend / backend) and the `plan` tier
+/// for the planning phases (research / docs / spec / quality / delivery). This is
+/// the per-phase model assignment the field's top agents converged on — plan with
+/// a cheaper, faster model and write code with a stronger one (Cline Plan/Act, Roo
+/// Architect→Code, Aider architect/editor). Reads the **thread-safe shared tiers**
+/// ([`model_tiers_cell`], seeded once from the env then driven by
+/// [`set_model_tiers`]) rather than the env per call — a runtime `set_var` racing
+/// this read would be UB. Falls back to the single configured `default_model` when
+/// a tier is unset (incl. a poisoned lock), so the default single-model behaviour
+/// is unchanged.
+fn model_for_phase(default_model: &str, phase: Phase) -> String {
+    let tier = model_tiers_cell().read().ok().and_then(|guard| {
+        if matches!(phase, Phase::Frontend | Phase::Backend) {
+            guard.build.clone()
+        } else {
+            guard.plan.clone()
+        }
+    });
+    tier.unwrap_or_else(|| default_model.to_string())
 }
 
 /// Per-phase generation token budget. Long-form artifact phases (docs /
@@ -6412,14 +6475,47 @@ not json at all
         assert!(rough_cost_usd(2_000_000) > rough_cost_usd(1_000_000));
     }
 
+    /// Serialize the model-tier tests: the live tiers are process-wide shared
+    /// state, so a test that SETS them must not race one that asserts the cleared
+    /// default. Both acquire this lock (poison-tolerant).
+    static MODEL_TIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn model_for_phase_defaults_without_tier_env() {
-        // With no tier env set, every phase uses the single configured model —
-        // the default single-model behaviour is unchanged. (Uses a tier var
-        // name no other test touches to stay isolated under parallel runs.)
+        let _g = MODEL_TIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // With no tier override set, every phase uses the single configured model —
+        // the default single-model behaviour is unchanged. Clear the shared tiers
+        // first so a sibling test's set value can't leak in (no env involved).
+        set_model_tiers(None, None);
         assert_eq!(model_for_phase("base-model", Phase::Frontend), "base-model");
         assert_eq!(model_for_phase("base-model", Phase::Docs), "base-model");
         assert_eq!(model_for_phase("base-model", Phase::Backend), "base-model");
+    }
+
+    #[test]
+    fn set_model_tiers_is_observed_by_model_for_phase_without_env() {
+        let _g = MODEL_TIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The tiers are thread-safe shared state, NOT the process env: a
+        // `/model plan|build` change via the setter is observed by the phase reader
+        // with no `set_var`/`var` round-trip (which would be a setenv/getenv data
+        // race → UB). The build tier drives code phases; the plan tier the rest.
+        set_model_tiers(Some("plan-model"), Some("build-model"));
+        assert_eq!(model_for_phase("base", Phase::Frontend), "build-model");
+        assert_eq!(model_for_phase("base", Phase::Backend), "build-model");
+        assert_eq!(model_for_phase("base", Phase::Docs), "plan-model");
+        assert_eq!(model_for_phase("base", Phase::Research), "plan-model");
+
+        // A None / empty tier cleanly falls back to the single configured model.
+        set_model_tiers(None, Some("   "));
+        assert_eq!(model_for_phase("base", Phase::Docs), "base");
+        assert_eq!(model_for_phase("base", Phase::Frontend), "base");
+
+        // Reset so other tests see a clean slate.
+        set_model_tiers(None, None);
     }
     use umadev_runtime::{
         CompletionRequest, CompletionResponse, Runtime, RuntimeError, RuntimeKind, Usage,

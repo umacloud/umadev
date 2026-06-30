@@ -2314,11 +2314,11 @@ pub struct App {
     /// (a Maven / Gradle build, `spring-boot:run`, a dependency install) keeps its
     /// FULL captured output and stays EXPANDED in the transcript so the user sees
     /// the build progressing — instead of a 200-char clip that auto-collapses to a
-    /// checkmark. The renderer reads THIS field (not the env) so the behaviour is
-    /// deterministic + testable; the matching `UMADEV_SHOW_PROCESS_LOGS` env is what
-    /// the out-of-process base drivers read. Seeded at construction from the saved
-    /// preference / an external env override, flipped live by `/logs`. Default
-    /// `false`.
+    /// checkmark. The renderer reads THIS field (not the shared flag) so the
+    /// behaviour is deterministic + testable; the matching thread-safe shared flag
+    /// (`umadev_host::process_logs`) is what the out-of-process base drivers read.
+    /// Seeded at construction from the saved preference / an external env override,
+    /// flipped live by `/logs`. Default `false`.
     pub show_process_logs: bool,
     /// `true` when the user asked to quit.
     pub should_quit: bool,
@@ -2522,17 +2522,21 @@ impl App {
         let backend_label = backend.clone().unwrap_or_else(|| "offline".to_string());
         let lang = config.resolved_lang();
         umadev_i18n::set_lang(lang);
-        // Export per-phase model tiers (if configured) so the in-process worker
-        // loop drives each phase with the right-sized model.
+        // Publish per-phase model tiers (if configured) into the runner's
+        // thread-safe shared state so the in-process worker loop drives each phase
+        // with the right-sized model. Shared state, not process env (a runtime
+        // setenv racing the runner's getenv is UB); seeded once from the env.
         config.apply_model_tiers();
-        // Publish the saved process-log preference (`/logs`) into the env the base
-        // drivers read, so a build's long-running command output is surfaced from
-        // the first turn. Off by default; an external env override wins.
+        // Publish the saved process-log preference (`/logs`) into the base drivers'
+        // thread-safe shared flag, so a build's long-running command output is
+        // surfaced from the first turn. Off by default; an external env override
+        // (seeded into the flag at launch) wins.
         config.apply_process_logs();
         // Publish the project's Codex launch-sandbox choice (`.umadevrc`
-        // `[codex] sandbox_mode`) into `UMADEV_CODEX_SANDBOX` so the codex driver
-        // honors it, mirroring the model-tier export above. Default stays the safe
-        // `workspace-write`; an env already set (advanced / CI) wins.
+        // `[codex] sandbox_mode`) into the codex driver's thread-safe shared
+        // override so the driver honors it, mirroring the model-tier publish above.
+        // Default stays the safe `workspace-write`; an override seeded from the env
+        // at launch (advanced / CI) wins.
         let codex_sandbox = resolve_and_publish_codex_sandbox(&project_root);
         let mode = if config.has_backend() {
             AppMode::Chat
@@ -2645,9 +2649,10 @@ impl App {
             tick: 0,
             animations: animations_enabled_default(),
             verbose: false,
-            // Seed from the env `apply_process_logs()` just published — captures BOTH
-            // the saved `/logs` preference and an external `UMADEV_SHOW_PROCESS_LOGS`
-            // override, so the renderer agrees with the base drivers from turn one.
+            // Seed from the shared flag `apply_process_logs()` just published —
+            // captures BOTH the saved `/logs` preference and an external
+            // `UMADEV_SHOW_PROCESS_LOGS` launch override (seeded into the flag), so
+            // the renderer agrees with the base drivers from turn one.
             show_process_logs: umadev_host::process_logs::show_process_logs(),
             should_quit: false,
             force_repaint: false,
@@ -11337,8 +11342,8 @@ impl App {
     /// `danger-full-access` removes the sandbox so full-stack work runs. If the
     /// active base isn't codex, a note says the setting only applies to codex.
     ///
-    /// A valid arg sets it for THIS session (publishes to `UMADEV_CODEX_SANDBOX`,
-    /// the env the codex driver reads — the SAME mechanism as startup) AND
+    /// A valid arg sets it for THIS session (publishes into the codex driver's
+    /// thread-safe shared sandbox override — the SAME mechanism as startup) AND
     /// persists it to `.umadevrc` so it survives a restart. The high-risk tier
     /// reuses the SAME loud red liability warning shown at startup. An
     /// unrecognised arg just prints usage (never crashes). Fail-open throughout:
@@ -11390,9 +11395,11 @@ impl App {
         }
         let mode = CodexSandbox::parse_fail_open(arg);
 
-        // Apply for THIS session: publish to the env the codex driver reads, so
-        // the next codex turn uses it — the SAME mechanism as startup.
-        std::env::set_var("UMADEV_CODEX_SANDBOX", mode.as_codex_arg());
+        // Apply for THIS session: publish to the codex driver's thread-safe shared
+        // override, so the next codex turn uses it — the SAME mechanism as startup.
+        // NOT a process-env `set_var`: the driver reads this from a background task
+        // while a turn streams, so a runtime setenv racing its getenv is UB.
+        umadev_host::codex_session::set_codex_sandbox(Some(mode.as_codex_arg()));
 
         // Persist to `.umadevrc` so it survives a restart. Fail-open: a write
         // error still leaves the session env set; we just warn it didn't save.
@@ -12372,17 +12379,24 @@ pub(crate) struct ChatSession {
 /// Used by both the Ctrl+R toggle (to pick the row to flip) and the renderer (to
 /// decide whether to draw the head-N preview + summary). Cheap line count;
 /// fail-open (anything else → not foldable).
-/// Resolve the effective Codex launch sandbox and publish it into
-/// `UMADEV_CODEX_SANDBOX` (the env the codex driver reads). Precedence: a
-/// pre-set env (advanced / CI override) wins; otherwise the project's `.umadevrc`
-/// `[codex] sandbox_mode` is resolved (fail-open → `workspace-write`) and
-/// exported. Returns the effective mode so the caller can decide whether to warn.
+/// Resolve the effective Codex launch sandbox and publish it into the codex
+/// driver's **thread-safe shared override** (`umadev_host::codex_session`).
+/// Precedence: an override already in effect (an external `UMADEV_CODEX_SANDBOX`
+/// launch env is seeded into that shared state on first read — advanced / CI) wins;
+/// otherwise the project's `.umadevrc` `[codex] sandbox_mode` is resolved
+/// (fail-open → `workspace-write`) and published. Returns the effective mode so
+/// the caller can decide whether to warn.
+///
+/// Uses shared state, NOT a process-env `set_var`: the driver reads it from a
+/// background task while a turn streams, so a runtime setenv racing its getenv is
+/// UB. The launch env is read once (to seed the shared override), never mutated.
 fn resolve_and_publish_codex_sandbox(
     project_root: &std::path::Path,
 ) -> umadev_agent::config::CodexSandbox {
     use umadev_agent::config::CodexSandbox;
-    // An explicit env (set by an advanced user or CI) is authoritative.
-    if let Ok(v) = std::env::var("UMADEV_CODEX_SANDBOX") {
+    // An override already in effect (seeded from an external launch env, or set
+    // earlier) is authoritative.
+    if let Some(v) = umadev_host::codex_session::codex_sandbox_override() {
         if !v.trim().is_empty() {
             return CodexSandbox::parse_fail_open(&v);
         }
@@ -12391,18 +12405,18 @@ fn resolve_and_publish_codex_sandbox(
     let mode = umadev_agent::config::load_project_config(project_root)
         .codex
         .resolved_sandbox();
-    std::env::set_var("UMADEV_CODEX_SANDBOX", mode.as_codex_arg());
+    umadev_host::codex_session::set_codex_sandbox(Some(mode.as_codex_arg()));
     mode
 }
 
 /// The Codex sandbox tier currently in effect, for DISPLAY (`/sandbox` with no
-/// arg). Reads the published `UMADEV_CODEX_SANDBOX` env first (what the codex
-/// driver will actually use this session — set at startup or by `/sandbox
-/// <mode>`), falling back to the project's `.umadevrc`. Pure read; unlike
-/// [`resolve_and_publish_codex_sandbox`] it does NOT mutate the environment.
+/// arg). Reads the driver's shared sandbox override first (what the codex driver
+/// will actually use this session — seeded from the launch env at startup or set
+/// by `/sandbox <mode>`), falling back to the project's `.umadevrc`. Pure read;
+/// unlike [`resolve_and_publish_codex_sandbox`] it does NOT mutate any state.
 fn effective_codex_sandbox(project_root: &std::path::Path) -> umadev_agent::config::CodexSandbox {
     use umadev_agent::config::CodexSandbox;
-    if let Ok(v) = std::env::var("UMADEV_CODEX_SANDBOX") {
+    if let Some(v) = umadev_host::codex_session::codex_sandbox_override() {
         if !v.trim().is_empty() {
             return CodexSandbox::parse_fail_open(&v);
         }
@@ -20457,10 +20471,10 @@ mod tests {
             "ON: the output is NOT clipped to 200 chars"
         );
 
-        // Toggling /logs again turns it back off (and clears the published env).
+        // Toggling /logs again turns it back off (and clears the shared flag — the
+        // toggle drives thread-safe state now, never the process env).
         let _ = on.slash_logs();
         assert!(!on.show_process_logs, "/logs toggles back off");
-        std::env::remove_var(umadev_host::process_logs::SHOW_PROCESS_LOGS_ENV);
     }
 
     /// Helper: a tool row whose `status` is whatever the caller passes, so the
@@ -21110,18 +21124,15 @@ mod tests {
             .any(|m| m.body().contains("nonsense") || m.body().contains("未知")));
     }
 
-    /// Serialize the `/sandbox` tests that mutate the process-global
-    /// `UMADEV_CODEX_SANDBOX` env so they can't observe each other's writes when
-    /// the suite runs multi-threaded. Each test restores the var on exit. (Note:
-    /// `App::new` only PUBLISHES the var when it is unset/empty, so a non-empty
-    /// value set by `/sandbox` is never clobbered by a parallel `App::new`.)
+    /// Serialize the `/sandbox` tests that mutate the process-wide thread-safe
+    /// codex sandbox override so they can't observe each other's writes when the
+    /// suite runs multi-threaded. Each test restores the override on exit. (The
+    /// override is shared state, NOT the process env: a runtime setenv racing the
+    /// codex driver's getenv would be UB.)
     static SANDBOX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sandbox_env_restore(prev: Option<String>) {
-        match prev {
-            Some(v) => std::env::set_var("UMADEV_CODEX_SANDBOX", v),
-            None => std::env::remove_var("UMADEV_CODEX_SANDBOX"),
-        }
+        umadev_host::codex_session::set_codex_sandbox(prev.as_deref());
     }
 
     #[test]
@@ -21144,9 +21155,9 @@ mod tests {
         let _guard = SANDBOX_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = std::env::var("UMADEV_CODEX_SANDBOX").ok();
+        let prev = umadev_host::codex_session::codex_sandbox_override();
         // Pin a known tier so App::new can't emit a startup danger warning.
-        std::env::set_var("UMADEV_CODEX_SANDBOX", "workspace-write");
+        umadev_host::codex_session::set_codex_sandbox(Some("workspace-write"));
         let mut a = fresh_app(Some("codex"));
         let before = a.history.len();
         a.slash_sandbox("");
@@ -21176,15 +21187,16 @@ mod tests {
         let _guard = SANDBOX_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = std::env::var("UMADEV_CODEX_SANDBOX").ok();
-        std::env::set_var("UMADEV_CODEX_SANDBOX", "workspace-write");
+        let prev = umadev_host::codex_session::codex_sandbox_override();
+        umadev_host::codex_session::set_codex_sandbox(Some("workspace-write"));
         let mut a = fresh_app(Some("codex"));
         a.slash_sandbox("danger-full-access");
-        // (1) session env published for the next codex turn (same mechanism as startup).
+        // (1) the shared override is published for the next codex turn (same
+        // mechanism as startup) — thread-safe state, not the process env.
         assert_eq!(
-            std::env::var("UMADEV_CODEX_SANDBOX").as_deref(),
-            Ok("danger-full-access"),
-            "publishes the new tier to the session env"
+            umadev_host::codex_session::codex_sandbox_override().as_deref(),
+            Some("danger-full-access"),
+            "publishes the new tier to the shared override"
         );
         // (2) persisted to .umadevrc so it survives a restart.
         let cfg = umadev_agent::config::load_project_config(&a.project_root);
@@ -21206,16 +21218,16 @@ mod tests {
         let _guard = SANDBOX_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = std::env::var("UMADEV_CODEX_SANDBOX").ok();
-        std::env::set_var("UMADEV_CODEX_SANDBOX", "workspace-write");
+        let prev = umadev_host::codex_session::codex_sandbox_override();
+        umadev_host::codex_session::set_codex_sandbox(Some("workspace-write"));
         let mut a = fresh_app(Some("codex"));
         let before = a.history.len();
         a.slash_sandbox("yolo-root");
         // Garbage never silently widens/narrows the sandbox.
         assert_eq!(
-            std::env::var("UMADEV_CODEX_SANDBOX").as_deref(),
-            Ok("workspace-write"),
-            "garbage leaves the session env unchanged"
+            umadev_host::codex_session::codex_sandbox_override().as_deref(),
+            Some("workspace-write"),
+            "garbage leaves the shared override unchanged"
         );
         let body = a
             .history
@@ -21233,17 +21245,17 @@ mod tests {
         let _guard = SANDBOX_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prev = std::env::var("UMADEV_CODEX_SANDBOX").ok();
-        std::env::set_var("UMADEV_CODEX_SANDBOX", "workspace-write");
+        let prev = umadev_host::codex_session::codex_sandbox_override();
+        umadev_host::codex_session::set_codex_sandbox(Some("workspace-write"));
         let mut a = fresh_app(Some("codex"));
-        // Corrupt .umadevrc so the persist is REFUSED (returns Err) — the session
-        // env must STILL be set (fail-open) and the user warned the save failed.
+        // Corrupt .umadevrc so the persist is REFUSED (returns Err) — the shared
+        // override must STILL be set (fail-open) and the user warned it didn't save.
         std::fs::write(a.project_root.join(".umadevrc"), "= = not valid toml").unwrap();
         a.slash_sandbox("read-only");
         assert_eq!(
-            std::env::var("UMADEV_CODEX_SANDBOX").as_deref(),
-            Ok("read-only"),
-            "fail-open: session env set even though the persist failed"
+            umadev_host::codex_session::codex_sandbox_override().as_deref(),
+            Some("read-only"),
+            "fail-open: shared override set even though the persist failed"
         );
         let body = a
             .history

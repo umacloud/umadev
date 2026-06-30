@@ -40,8 +40,8 @@ pub struct UserConfig {
     /// code with a stronger one (the per-phase model assignment top agents use).
     /// `model_plan` drives research/docs/spec/quality; `model_build` drives the
     /// frontend/backend code phases. Unset → every phase uses [`Self::model`].
-    /// Applied via the `UMADEV_MODEL_PLAN` / `UMADEV_MODEL_BUILD` env the runner
-    /// reads, so the worker path needs no extra plumbing.
+    /// Applied via the runner's thread-safe shared tier state (see
+    /// [`Self::apply_model_tiers`]), so the worker path needs no extra plumbing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_plan: Option<String>,
     /// Stronger model for the code phases — see [`Self::model_plan`].
@@ -64,10 +64,9 @@ pub struct UserConfig {
 
     /// Show the base's long-running command (build / install / `spring-boot:run`)
     /// output in the transcript as it runs, instead of the tight 200-char clip on
-    /// completion. Off by default. Toggled live via `/logs`; published to the
-    /// `UMADEV_SHOW_PROCESS_LOGS` env the host drivers read (see
-    /// [`Self::publish_process_logs`]). Only serialized when `true` so a default
-    /// config stays clean.
+    /// completion. Off by default. Toggled live via `/logs`; published into the
+    /// host drivers' thread-safe shared flag (see [`Self::publish_process_logs`]).
+    /// Only serialized when `true` so a default config stays clean.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub show_process_logs: bool,
 
@@ -182,44 +181,49 @@ impl UserConfig {
         self.backend.is_some()
     }
 
-    /// Export the per-phase model tiers ([`Self::model_plan`] /
-    /// [`Self::model_build`]) to the `UMADEV_MODEL_PLAN` / `UMADEV_MODEL_BUILD`
-    /// env the runner reads. Call once at startup and after any `/model
-    /// plan|build` change so the in-process worker loop picks them up. An unset
-    /// tier clears the env so it cleanly falls back to the single model.
+    /// Publish the per-phase model tiers ([`Self::model_plan`] /
+    /// [`Self::model_build`]) into the runner's **thread-safe shared tier state**
+    /// (`umadev_agent::runner::set_model_tiers`). Call once at startup and after
+    /// any `/model plan|build` change so the in-process worker loop picks them up.
+    /// An unset tier clears that tier so it cleanly falls back to the single model.
+    ///
+    /// Uses shared state, NOT the process env: the runner reads the tiers from
+    /// background tasks while a turn streams, so a runtime `set_var` would be a
+    /// `setenv`/`getenv` data race (UB). The env is only read once at startup to
+    /// seed the shared state, never mutated at runtime.
     pub fn apply_model_tiers(&self) {
-        for (var, val) in [
-            ("UMADEV_MODEL_PLAN", self.model_plan.as_deref()),
-            ("UMADEV_MODEL_BUILD", self.model_build.as_deref()),
-        ] {
-            match val {
-                Some(m) if !m.is_empty() => std::env::set_var(var, m),
-                _ => std::env::remove_var(var),
-            }
-        }
+        umadev_agent::runner::set_model_tiers(
+            self.model_plan.as_deref(),
+            self.model_build.as_deref(),
+        );
     }
 
-    /// Publish the saved process-log preference into the `UMADEV_SHOW_PROCESS_LOGS`
-    /// env the base drivers read, so the choice takes effect on the next
-    /// turn/session. Call at startup (from [`Self::show_process_logs`]) and after a
-    /// live `/logs` toggle. A `false` value clears the env so it cleanly falls back
-    /// to the tight default. Associated (not `&self`) so the live toggle can publish
-    /// the new value without re-borrowing the whole config.
+    /// Publish the saved process-log preference into the host drivers' **thread-safe
+    /// shared flag** (`umadev_host::process_logs::set_show_process_logs`), so the
+    /// choice takes effect on the next streamed event. Call at startup (from
+    /// [`Self::apply_process_logs`]) and after a live `/logs` toggle. Associated
+    /// (not `&self`) so the live toggle can publish the new value without
+    /// re-borrowing the whole config.
+    ///
+    /// Uses shared state, NOT the process env: the drivers read the flag from
+    /// background tasks while a turn streams, so a runtime `set_var`/`remove_var`
+    /// would be a `setenv`/`getenv` data race (UB). The env is only read once at
+    /// startup to seed the flag, never mutated at runtime.
     pub fn publish_process_logs(on: bool) {
-        if on {
-            std::env::set_var(umadev_host::process_logs::SHOW_PROCESS_LOGS_ENV, "1");
-        } else {
-            std::env::remove_var(umadev_host::process_logs::SHOW_PROCESS_LOGS_ENV);
-        }
+        umadev_host::process_logs::set_show_process_logs(on);
     }
 
     /// Publish THIS config's saved process-log preference at startup (see
-    /// [`Self::publish_process_logs`]). An env already set externally (advanced /
-    /// CI) wins and is never cleared here; otherwise the saved preference is honored
-    /// only to TURN IT ON (a `false` config leaves the env untouched, so an external
-    /// override survives). The live `/logs` toggle still set/clears explicitly.
+    /// [`Self::publish_process_logs`]). An env set externally at launch (advanced /
+    /// CI) wins and is never overridden here: the host flag seeds itself from that
+    /// same env on first read, so realizing that read pins the override. Otherwise
+    /// the saved preference is honored only to TURN IT ON (a `false` config leaves
+    /// the default off). The live `/logs` toggle still sets the flag explicitly.
     pub fn apply_process_logs(&self) {
         if std::env::var(umadev_host::process_logs::SHOW_PROCESS_LOGS_ENV).is_ok() {
+            // One-time startup read: realize the host flag's lazy env-seed so an
+            // external override is live, then leave it untouched.
+            let _ = umadev_host::process_logs::show_process_logs();
             return;
         }
         if self.show_process_logs {

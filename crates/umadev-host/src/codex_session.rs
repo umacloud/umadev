@@ -65,7 +65,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -93,18 +93,69 @@ fn codex_app_server_subcmd() -> String {
     std::env::var("UMADEV_CODEX_APP_SERVER_SUBCMD").unwrap_or_else(|_| "app-server".to_string())
 }
 
+/// Env that SEEDS [`codex_sandbox_override`] once at startup (the project's
+/// `.umadevrc` `[codex] sandbox_mode` published by the TUI, or an advanced / CI
+/// override). The LIVE value is the thread-safe shared state behind
+/// [`set_codex_sandbox`], never this env at runtime.
+const CODEX_SANDBOX_ENV: &str = "UMADEV_CODEX_SANDBOX";
+
+/// Process-wide, thread-safe Codex launch-sandbox override — the single source of
+/// truth this driver reads and the TUI writes. Lazily seeded from
+/// [`CODEX_SANDBOX_ENV`] on first access (one-time startup read, so an external
+/// launch override is honoured), then driven only by [`set_codex_sandbox`].
+/// Replaces a per-session `std::env::var` read whose matching `/sandbox`
+/// `set_var` raced this getenv (a `setenv`/`getenv` data race → UB). `None` →
+/// not set → the fail-open default. Fail-open on lock poisoning.
+static CODEX_SANDBOX: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+/// The lazily-initialised sandbox cell, seeded from the env exactly once (the only
+/// env read; after it the value is pure shared state).
+fn codex_sandbox_cell() -> &'static RwLock<Option<String>> {
+    CODEX_SANDBOX.get_or_init(|| {
+        RwLock::new(
+            std::env::var(CODEX_SANDBOX_ENV)
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        )
+    })
+}
+
+/// Set the live Codex launch-sandbox override (the `/sandbox` command + the
+/// startup publish). Thread-safe: the next codex session start observes it via
+/// [`codex_sandbox_mode`] WITHOUT any process-global env mutation. `None` / an
+/// empty value clears it (→ the fail-open `workspace-write` default). Fail-open: a
+/// poisoned lock is a no-op (the prior value stands).
+pub fn set_codex_sandbox(mode: Option<&str>) {
+    let next = mode.map(str::to_string).filter(|s| !s.trim().is_empty());
+    if let Ok(mut guard) = codex_sandbox_cell().write() {
+        *guard = next;
+    }
+}
+
+/// The raw Codex sandbox override currently in effect (`None` if unset), read from
+/// the thread-safe shared state. For the TUI's display / precedence checks that
+/// previously read the env directly. Fail-open: a poisoned lock reads as `None`.
+#[must_use]
+pub fn codex_sandbox_override() -> Option<String> {
+    codex_sandbox_cell()
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
 /// Resolve the Codex launch sandbox for the WRITABLE session paths
 /// (`thread/start` + the writable `thread/resume`). Mirrors the env-driven
-/// [`crate::claude_session`] `UMADEV_CLAUDE_PERMISSION_MODE` precedent: the TUI
-/// publishes the project's `.umadevrc` `[codex] sandbox_mode` into
-/// `UMADEV_CODEX_SANDBOX` at startup, and advanced users / CI can set it
-/// directly. Fail-open: unset / unknown → the safe `workspace-write` baseline,
-/// so default behaviour is UNCHANGED and a typo can never widen the sandbox.
+/// [`crate::claude_session`] `UMADEV_CLAUDE_PERMISSION_MODE` precedent, but reads
+/// the **thread-safe shared override** ([`codex_sandbox_override`], seeded once
+/// from `UMADEV_CODEX_SANDBOX` then driven by [`set_codex_sandbox`]) rather than
+/// the env per call — a runtime `set_var` racing this read would be UB. Fail-open:
+/// unset / unknown → the safe `workspace-write` baseline, so default behaviour is
+/// UNCHANGED and a typo can never widen the sandbox.
 ///
 /// (The read-only critic fork — [`thread_start_params_readonly`] — is NEVER driven
 /// by this: its `read-only` sandbox is the single-writer invariant, not a knob.)
 fn codex_sandbox_mode() -> &'static str {
-    resolve_codex_sandbox(std::env::var("UMADEV_CODEX_SANDBOX").ok().as_deref())
+    resolve_codex_sandbox(codex_sandbox_override().as_deref())
 }
 
 /// Pure, unit-testable core of [`codex_sandbox_mode`]: map a raw env string to
@@ -1793,6 +1844,38 @@ mod tests {
     }
 
     #[test]
+    fn set_codex_sandbox_is_observed_by_the_driver_via_shared_state_no_env() {
+        // The live sandbox is thread-safe shared state, NOT the process env: a
+        // `/sandbox` change via the setter is observed by the driver's
+        // `codex_sandbox_mode` reader without any `set_var`/`var` round-trip
+        // (which would be a setenv/getenv data race → UB). Save/restore the global
+        // so parallel tests stay clean.
+        let prev = codex_sandbox_override();
+
+        set_codex_sandbox(Some("read-only"));
+        assert_eq!(codex_sandbox_override().as_deref(), Some("read-only"));
+        assert_eq!(
+            codex_sandbox_mode(),
+            "read-only",
+            "driver reads shared state"
+        );
+
+        set_codex_sandbox(Some("danger-full-access"));
+        assert_eq!(codex_sandbox_mode(), "danger-full-access");
+
+        // Clearing it falls back to the fail-open default (no env involved).
+        set_codex_sandbox(None);
+        assert_eq!(codex_sandbox_override(), None);
+        assert_eq!(codex_sandbox_mode(), "workspace-write");
+
+        // An empty / whitespace value clears it too (never widens by accident).
+        set_codex_sandbox(Some("   "));
+        assert_eq!(codex_sandbox_override(), None);
+
+        set_codex_sandbox(prev.as_deref());
+    }
+
+    #[test]
     fn codex_approval_policy_pairs_full_access_with_never() {
         // danger-full-access is the explicit non-interactive opt-in: ALWAYS never,
         // even in the guarded (non-autonomous) tier, so local servers / git run
@@ -2502,10 +2585,11 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_gates_item_started_on_the_process_log_toggle() {
-        // The env wiring: `item/started` is surfaced as a running ToolCall ONLY when
-        // the process-log toggle is on; OFF (the default) it is ignored exactly as
-        // before. This test owns the env var for its body and restores it after.
-        let prev = std::env::var(crate::process_logs::SHOW_PROCESS_LOGS_ENV).ok();
+        // The toggle wiring: `item/started` is surfaced as a running ToolCall ONLY
+        // when the process-log toggle is on; OFF (the default) it is ignored exactly
+        // as before. Drives the THREAD-SAFE shared flag (not the process env, which
+        // a streaming getenv would race → UB); save/restore it around the body.
+        let prev = crate::process_logs::show_process_logs();
         let pending = empty_pending();
         let approvals = empty_approvals();
         let turn_id: TurnId = Arc::new(Mutex::new(None));
@@ -2514,19 +2598,16 @@ mod tests {
         let line = r#"{"method":"item/started","params":{"item":{"type":"commandExecution","command":"mvn -q install","status":"running"}}}"#;
 
         // OFF → ignored (no event).
-        std::env::remove_var(crate::process_logs::SHOW_PROCESS_LOGS_ENV);
+        crate::process_logs::set_show_process_logs(false);
         dispatch_line(line, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
         assert!(rx.try_recv().is_err(), "OFF: item/started is ignored");
 
         // ON → the running command surfaces immediately.
-        std::env::set_var(crate::process_logs::SHOW_PROCESS_LOGS_ENV, "1");
+        crate::process_logs::set_show_process_logs(true);
         dispatch_line(line, &pending, &approvals, &turn_id, &latest_usage, &tx).await;
         let got = rx.try_recv();
-        // Restore the env BEFORE asserting so a failure can't leak the toggle.
-        match prev {
-            Some(v) => std::env::set_var(crate::process_logs::SHOW_PROCESS_LOGS_ENV, v),
-            None => std::env::remove_var(crate::process_logs::SHOW_PROCESS_LOGS_ENV),
-        }
+        // Restore the flag BEFORE asserting so a failure can't leak the toggle.
+        crate::process_logs::set_show_process_logs(prev);
         let Ok(SessionEvent::ToolCall { name, .. }) = got else {
             panic!("ON: item/started must stream a running ToolCall, got {got:?}");
         };

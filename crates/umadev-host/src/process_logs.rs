@@ -22,19 +22,64 @@
 //!
 //! # The toggle
 //!
-//! [`SHOW_PROCESS_LOGS_ENV`] (`UMADEV_SHOW_PROCESS_LOGS`) — truthy turns it on.
-//! The TUI publishes it from the saved preference at startup and flips it live via
-//! the `/logs` command, so the next turn/session picks it up. **OFF by default**:
-//! every driver behaves exactly as before.
+//! [`SHOW_PROCESS_LOGS_ENV`] (`UMADEV_SHOW_PROCESS_LOGS`) — truthy turns it on at
+//! launch. The live flag, however, is process-wide **thread-safe shared state**
+//! (an [`AtomicBool`]), NOT the process env: the TUI seeds it from the saved
+//! preference / env at startup and flips it live via the `/logs` command through
+//! [`set_show_process_logs`], while the three base drivers read it per streaming
+//! event via [`show_process_logs`]. **OFF by default**: every driver behaves
+//! exactly as before.
+//!
+//! ## Why not the env
+//!
+//! The drivers read this flag from background tokio tasks that live for the whole
+//! session, while a `/logs` toggle runs on a different task. `std::env::set_var` /
+//! `std::env::var` (POSIX `setenv`/`getenv`) are **not** thread-safe — a runtime
+//! `setenv` racing a concurrent `getenv` is a data race (UB: can segfault / read a
+//! freed `environ` slot). So the live value lives in an `AtomicBool`; the env is
+//! read **once** at startup only, to seed it (an external launch override still
+//! works), and is never mutated at runtime.
 //!
 //! Fail-open by contract: every function here is total and never panics — an unset
-//! / unparsable env is simply "off", and the cap always returns a usable bound.
+//! / unparsable env seeds "off", and the cap always returns a usable bound.
 
-/// Env toggle. Truthy (`1` / `true` / `yes` / `on`, case-insensitive) makes the
-/// base drivers surface the FULL long-running command output (and, for codex,
-/// stream it as it runs) instead of a tight clip. Anything else (incl. unset) is
-/// off — the historical behaviour.
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+/// Env toggle, read **once at startup** to seed [`show_process_logs`]. Truthy
+/// (`1` / `true` / `yes` / `on`, case-insensitive) makes the base drivers surface
+/// the FULL long-running command output (and, for codex, stream it as it runs)
+/// instead of a tight clip. Anything else (incl. unset) is off — the historical
+/// behaviour. The LIVE toggle is the [`AtomicBool`] behind [`set_show_process_logs`],
+/// never this env at runtime.
 pub const SHOW_PROCESS_LOGS_ENV: &str = "UMADEV_SHOW_PROCESS_LOGS";
+
+/// Process-wide, thread-safe live process-log visibility flag — the single source
+/// of truth the drivers read and the TUI writes. Lazily seeded from
+/// [`SHOW_PROCESS_LOGS_ENV`] on first access (one-time startup read, so an
+/// external launch override is honoured), then driven only by
+/// [`set_show_process_logs`]. Replaces a per-call `std::env::var` read whose
+/// matching runtime `set_var` raced the drivers' getenv (a `setenv`/`getenv` data
+/// race → UB).
+static SHOW_PROCESS_LOGS: OnceLock<AtomicBool> = OnceLock::new();
+
+/// The lazily-initialised flag cell, seeded from the env exactly once. The seed is
+/// the ONLY env read; after it, the value is pure shared state.
+fn show_process_logs_cell() -> &'static AtomicBool {
+    SHOW_PROCESS_LOGS.get_or_init(|| {
+        AtomicBool::new(is_truthy(
+            std::env::var(SHOW_PROCESS_LOGS_ENV).ok().as_deref(),
+        ))
+    })
+}
+
+/// Set the live process-log visibility flag (the `/logs` toggle + the startup
+/// seed-from-preference). Thread-safe: the drivers observe it on their next
+/// per-event [`show_process_logs`] read WITHOUT any process-global env mutation,
+/// so a live toggle can never data-race a streaming getenv.
+pub fn set_show_process_logs(on: bool) {
+    show_process_logs_cell().store(on, Ordering::Relaxed);
+}
 
 /// Per-command output preview cap (chars) when process logs are OFF — the
 /// historical tight clip that keeps a chatty tool result from flooding the
@@ -47,11 +92,13 @@ const DEFAULT_TOOL_OUTPUT_CAP: usize = 200;
 const VERBOSE_TOOL_OUTPUT_CAP: usize = 16 * 1024;
 
 /// `true` when the user opted in to seeing the base's long-running process logs.
-/// Read fresh each call so a live `/logs` toggle takes effect on the next turn.
-/// Fail-open: unset / unparsable → `false`.
+/// Reads the thread-safe live flag (seeded once from the env, then driven by
+/// [`set_show_process_logs`]) so a live `/logs` toggle takes effect on the next
+/// streamed event without a process-global env read. Fail-open: an unset /
+/// unparsable seed → `false`.
 #[must_use]
 pub fn show_process_logs() -> bool {
-    is_truthy(std::env::var(SHOW_PROCESS_LOGS_ENV).ok().as_deref())
+    show_process_logs_cell().load(Ordering::Relaxed)
 }
 
 /// Pure, testable core of [`show_process_logs`]: a lenient truthy check.
@@ -155,6 +202,20 @@ mod tests {
         for off in [None, Some(""), Some("0"), Some("false"), Some("nope")] {
             assert!(!is_truthy(off), "{off:?} should be falsy");
         }
+    }
+
+    #[test]
+    fn setter_is_observed_by_getter_with_no_env() {
+        // The live flag is thread-safe shared state, NOT the process env: a
+        // `/logs`-style toggle via the setter is observed by the drivers' getter
+        // without any `set_var`/`var` round-trip (which would be a setenv/getenv
+        // data race → UB). Save/restore the global so parallel tests stay clean.
+        let prev = show_process_logs();
+        set_show_process_logs(true);
+        assert!(show_process_logs(), "setter ON is observed by the getter");
+        set_show_process_logs(false);
+        assert!(!show_process_logs(), "setter OFF is observed by the getter");
+        set_show_process_logs(prev);
     }
 
     #[test]
