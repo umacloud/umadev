@@ -1159,6 +1159,12 @@ async fn drive_plan_steps(
     // already been attempted for, so `drive_build_step` fires the (forked, fail-open)
     // reflection consult AT MOST ONCE per signature per run. Bounded by construction.
     let mut reflected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // BOUNDED RE-PLAN guard (mirrors the `reflected` bound): a run gets AT MOST ONE
+    // re-plan of a blocked subtree. When a step blocks and strands dependents, the
+    // director asks the brain (read-only fork, fail-open) for a replacement sub-DAG that
+    // routes around the blocker; this flag is consumed on the single attempt (whether or
+    // not it helps) so re-planning can NEVER loop — after one try, honesty wins.
+    let mut replanned = false;
 
     // Walk the DAG by readiness: drive each ready step, mark it, repeat. A step that
     // can't be accepted (after its bounded fix budget) is marked Blocked so it stops
@@ -1243,6 +1249,7 @@ async fn drive_plan_steps(
             reply,
             drove,
             made_progress,
+            gap_evidence,
         } = outcome;
         if !reply.is_empty() {
             last_reply = reply;
@@ -1321,6 +1328,31 @@ async fn drive_plan_steps(
                 )));
                 break;
             }
+        }
+
+        // BOUNDED RE-PLAN (≤1 per run) — a step just BLOCKED. If it strands a dependent
+        // subtree (those steps can never become ready), ask the brain ONCE for a
+        // replacement sub-DAG that routes around / resolves the blocker, validate it
+        // through the SAME `normalized()` machinery, and merge it into the live plan
+        // replacing the blocked subtree — then keep driving. Every failure mode (no
+        // dependents, budget spent, consult failed, unparseable, no genuine change)
+        // falls back to today's EXACT behaviour: the strand is left for
+        // `mark_unreachable_pending_blocked` below and reported honestly. The merged
+        // sub-DAG still faces the identical acceptance floor; no gate is weakened. The
+        // `replanned` flag is consumed on the single attempt so this can never loop.
+        if status == StepStatus::Blocked {
+            attempt_replan_blocked_subtree(
+                session,
+                options,
+                events,
+                plan,
+                &step.id,
+                &step_title,
+                &gap_evidence,
+                &mut replanned,
+                deadline,
+            )
+            .await;
         }
 
         // ACTIVE FACT-RECORDING BACKSTOP — after a Build step that did REAL work,
@@ -1468,6 +1500,12 @@ struct StepOutcome {
     /// green build / a seat that actually reviewed). `false` = a neutral skip that
     /// must not count toward `Done`.
     made_progress: bool,
+    /// The TYPED gap evidence from the step's LAST failing acceptance check (the
+    /// diagnosed "declared X but Y" lines the deterministic floor produced) — carried
+    /// out so a BOUNDED RE-PLAN of a blocked subtree can feed the brain WHY the step
+    /// blocked, not just that it did. Empty on an accepted step or a neutral skip that
+    /// produced no verifiable failure.
+    gap_evidence: Vec<String>,
 }
 
 /// The overall-goal preamble prepended to every plan-step directive — the directive
@@ -1715,6 +1753,7 @@ async fn drive_build_step(
                 // floor positively confirmed real work — exactly the (drove ||
                 // has_positive_evidence) condition that let it accept here.
                 made_progress: true,
+                gap_evidence: Vec::new(), // accepted → no gap to re-plan around
             };
         }
         // SELF-EVOLUTION (a SIDE EFFECT of this FAILING verdict — never a driver of
@@ -1781,6 +1820,9 @@ async fn drive_build_step(
         reply: last_reply,
         drove,
         made_progress: false,
+        // The last failing round's typed evidence — WHY this step could not pass its
+        // acceptance — so a bounded re-plan can route around the diagnosed blocker.
+        gap_evidence: prior_fail_errors,
     }
 }
 
@@ -1873,6 +1915,7 @@ async fn drive_review_step(
             reply: String::new(),
             drove: reviewed,
             made_progress: reviewed,
+            gap_evidence: Vec::new(), // review accepted → no gap
         };
     }
     // Wall-clock ceiling: the team found blocking issues, but the budget is already
@@ -1891,6 +1934,7 @@ async fn drive_review_step(
             reply: String::new(),
             drove: false,
             made_progress: true,
+            gap_evidence: Vec::new(), // advisory review deferred to the final gate
         };
     }
     // The team found blocking issues — fold them into ONE bounded fix turn on the
@@ -1931,6 +1975,7 @@ async fn drive_review_step(
         reply: String::new(),
         drove,
         made_progress: true,
+        gap_evidence: Vec::new(), // review accepted (advisory) → no gap to re-plan
     }
 }
 
@@ -2763,6 +2808,145 @@ fn route_focus_line(route: &RoutePlan) -> String {
 /// Best-effort + fail-open: a write error is ignored, never blocks the schedule.
 fn persist_plan_ref(plan: &Plan, options: &RunOptions) {
     let _ = plan_state::save(plan, &options.project_root);
+}
+
+/// **BOUNDED RE-PLAN of a blocked subtree** (the coordinator's self-repair lever). A
+/// plan step just ended [`StepStatus::Blocked`] — it could not pass its deterministic
+/// acceptance after its bounded fix budget. Today that permanently strands its whole
+/// dependent subtree (honestly reported, never repaired). This makes ONE bounded,
+/// fail-open attempt to route around the blocker instead:
+///
+/// 1. **Trigger** — only when the blocked step actually STRANDS a Pending dependent
+///    subtree ([`Plan::stranded_dependents`]). A leaf block strands nothing, so today's
+///    honest strand is already correct → no consult, no budget spent.
+/// 2. **Consult** — ONE read-only forked brain consult ([`crate::continuous::ForkConsult`]),
+///    seeded with the TYPED gap evidence (WHY the step blocked — the acceptance /
+///    evidence-contract gaps the floor already computed), the blocked step, and its
+///    stranded subtree, asking for a REPLACEMENT sub-DAG (fresh steps that resolve /
+///    route around the blocker).
+/// 3. **Merge-through-normalized** — the returned sub-DAG is parsed
+///    ([`plan_state::parse_brain_steps`]) and merged via [`Plan::merge_replan`], which
+///    re-validates the WHOLE spliced plan through the same `normalized()` machinery
+///    (dedup / dangling-dep strip / cycle-break / seat floors) and preserves the
+///    survivors' statuses. The re-planned subtree faces the IDENTICAL acceptance floor.
+/// 4. **Surface** — a merged re-plan re-emits [`EngineEvent::plan_posted`] (the plan
+///    panel already renders it) + persists, so the user sees the revised plan.
+///
+/// **Strict bounds + fail-open.** `replanned` caps this at ONE attempt per run and is
+/// consumed the moment the consult is committed (whether or not it helps), so a failed /
+/// unhelpful consult can NEVER retry — re-planning never loops. EVERY failure mode
+/// (already re-planned, no stranded dependents, budget spent, fork/consult failure,
+/// unparseable reply, a sub-DAG that changes nothing) returns `false` and leaves the
+/// plan EXACTLY as today's honest stranded-Blocked report expects. Returns `true` only
+/// when a genuinely-new sub-DAG was merged.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_replan_blocked_subtree(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    plan: &mut Plan,
+    blocked_id: &str,
+    blocked_title: &str,
+    gap_evidence: &[String],
+    replanned: &mut bool,
+    deadline: std::time::Instant,
+) -> bool {
+    // BOUND: at most ONE re-plan per run (mirrors the `reflected` signature bound).
+    if *replanned {
+        return false;
+    }
+    // Only worth repairing when the block actually STRANDS a dependent subtree — a leaf
+    // block has nothing to recover, so today's honest strand is already correct.
+    let stranded = plan.stranded_dependents(blocked_id);
+    if stranded.is_empty() {
+        return false;
+    }
+    // Commit the single attempt NOW (whether or not it helps) so a failed / unhelpful
+    // consult can never retry — re-planning must never loop; after one try honesty wins.
+    *replanned = true;
+    // Don't open a consult past the wall-clock budget (graceful ceiling).
+    if std::time::Instant::now() >= deadline {
+        return false;
+    }
+
+    // Build the read-only consult: the blocked step + WHY it blocked + the stranded
+    // subtree, asking for a replacement sub-DAG that routes around / resolves it.
+    let system = "You are a senior engineering director REPAIRING a build plan mid-flight. \
+         ONE step has BLOCKED — it could not pass its deterministic acceptance after its \
+         bounded fix budget — and its dependent steps are now STRANDED (they can never \
+         become ready). Propose a small REPLACEMENT sub-DAG (1-5 steps) that ROUTES AROUND \
+         or RESOLVES the blocker: use FRESH step ids (not already in the plan) that achieve \
+         the stranded goals a DIFFERENT way, or split the blocked work into smaller, \
+         separately-verifiable pieces. Do NOT re-emit the blocked step unchanged — give a \
+         genuinely different route. A step MAY depend_on an EXISTING non-replaced step id \
+         (e.g. an already-done scaffold or contract). Same vocab as the planner — \
+         `seat`: product-manager|architect|uiux-designer|frontend-engineer|\
+         backend-engineer|qa-engineer|security-engineer|devops-engineer; \
+         `kind`: build|review; \
+         `acceptance`: source-present|build-test|contract|design-tokens|review-clean; \
+         `evidence` (preferred): an array of machine-checkable proofs, e.g. \
+         {\"kind\":\"file-exists\",\"path\":\"src/foo.ts\"}, {\"kind\":\"build-clean\"}. \
+         JSON shape: {\"steps\":[{\"id\":\"…\",\"title\":\"…\",\"seat\":\"…\",\"kind\":\"build\",\
+         \"depends_on\":[],\"acceptance\":\"…\",\"evidence\":[…]}]}";
+    let gap_line = if gap_evidence.is_empty() {
+        "(the step produced no verifiable progress / no positive evidence)".to_string()
+    } else {
+        gap_evidence.join("; ")
+    };
+    let stranded_line = plan
+        .steps
+        .iter()
+        .filter(|s| stranded.iter().any(|id| id == &s.id))
+        .map(|s| format!("- {} ({}): {}", s.id, s.seat.role_id(), s.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let blocked_seat = plan
+        .steps
+        .iter()
+        .find(|s| s.id == blocked_id)
+        .map_or("?", |s| s.seat.role_id());
+    let user = format!(
+        "BLOCKED step: {blocked_id} — {blocked_title} (seat {blocked_seat}).\n\
+         Why it blocked (typed gap evidence): {gap_line}.\n\
+         STRANDED dependent steps needing a new route:\n{stranded_line}\n\n\
+         Overall requirement:\n{}\n\n\
+         Return ONE JSON object with the replacement sub-DAG.",
+        options.requirement
+    );
+
+    // ONE read-only forked consult — same fail-open contract as every other consult: a
+    // missing fork / offline brain / timeout / no JSON → `None` → fall back to honest strand.
+    let fork = crate::continuous::fork_with_timeout(session).await;
+    let consult = crate::continuous::ForkConsult::new(fork);
+    let reply = consult.judge_json("replan", system, user).await;
+    consult.end().await;
+    let Some(reply) = reply else {
+        return false; // consult failed / offline → today's honest strand
+    };
+    let new_steps = plan_state::parse_brain_steps(&reply);
+    if new_steps.is_empty() {
+        return false; // unparseable / empty sub-DAG → honest strand
+    }
+
+    // The subtree to replace = the blocked step + its stranded dependents.
+    let mut replaced: std::collections::HashSet<String> = stranded.into_iter().collect();
+    replaced.insert(blocked_id.to_string());
+    // Merge-through-normalized; a no-op / invalid sub-DAG leaves the plan unchanged.
+    if !plan.merge_replan(&replaced, new_steps) {
+        return false; // nothing genuinely new → honest strand
+    }
+
+    // Merged: surface the REVISED plan (reuse the existing PlanPosted render), persist,
+    // and re-sync the phase anchor. The honest stranded-report path below still runs at
+    // the end of the schedule for anything the re-plan did NOT recover.
+    events.emit(EngineEvent::Note(format!(
+        "team · re-planned around a blocked step ({blocked_title}) — revised the plan to \
+         route around it (bounded: one re-plan per run)"
+    )));
+    events.emit(EngineEvent::plan_posted(plan));
+    persist_plan_ref(plan, options);
+    sync_phase_from_plan(plan, options);
+    true
 }
 
 /// MEDIUM #2 — after the schedule drains, honestly mark every Pending step that can
@@ -8513,5 +8697,249 @@ mod tests {
         );
         let ready: Vec<String> = loaded.ready_steps().iter().map(|s| s.id.clone()).collect();
         assert_eq!(ready, vec!["b"], "the reset step is ready again");
+    }
+
+    // ── BOUNDED RE-PLAN of a blocked subtree (attempt_replan_blocked_subtree) ──
+
+    /// scaffold(Done) → api(Blocked) → ui(Pending): a blocked step that STRANDS a
+    /// dependent (`ui`). `mk` mirrors the inline PlanStep builder the other tests use.
+    fn blocked_subtree_plan() -> Plan {
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
+        let mk = |id: &str, deps: &[&str], status: StepStatus| PlanStep {
+            id: id.into(),
+            title: format!("Build the {id}"),
+            seat: crate::critics::Seat::BackendEngineer,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status,
+        };
+        Plan {
+            steps: vec![
+                mk("scaffold", &[], StepStatus::Done),
+                mk("api", &["scaffold"], StepStatus::Blocked),
+                mk("ui", &["api"], StepStatus::Pending),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        }
+    }
+
+    /// A brain re-plan reply: a fresh route {api2 → ui2} around the blocked `api`.
+    const REPLAN_SUBDAG: &str = r#"{"steps":[
+        {"id":"api2","title":"alt api","seat":"backend-engineer","kind":"build",
+         "depends_on":["scaffold"],"acceptance":"source-present"},
+        {"id":"ui2","title":"alt ui","seat":"frontend-engineer","kind":"build",
+         "depends_on":["api2"],"acceptance":"source-present"}]}"#;
+
+    #[tokio::test]
+    async fn replan_triggers_once_merges_a_validated_subdag_and_is_bounded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        // The fork's judge turn emits the replacement sub-DAG JSON.
+        let mut sess = FakeSession::new(vec![], true, REPLAN_SUBDAG);
+        let o = opts(tmp.path());
+        let mut plan = blocked_subtree_plan();
+        let mut replanned = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(3_600);
+
+        // First block WITH stranded dependents → ONE re-plan; the sub-DAG is merged
+        // (routed through normalized(): dedup / dangling strip / cycle-break / floors).
+        let merged = attempt_replan_blocked_subtree(
+            &mut sess,
+            &o,
+            &events,
+            &mut plan,
+            "api",
+            "Build the api",
+            &["source-present: no source files on disk".to_string()],
+            &mut replanned,
+            deadline,
+        )
+        .await;
+        assert!(
+            merged,
+            "a blocked step with stranded dependents re-plans once"
+        );
+        assert!(replanned, "the single-attempt budget is consumed");
+        let ids: Vec<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            ids.contains(&"api2") && ids.contains(&"ui2"),
+            "the fresh route is spliced in: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"api") && !ids.contains(&"ui"),
+            "the blocked subtree is replaced: {ids:?}"
+        );
+        // The surviving Done step KEEPS its status (normalized's reset was undone).
+        assert_eq!(
+            plan.steps
+                .iter()
+                .find(|s| s.id == "scaffold")
+                .unwrap()
+                .status,
+            StepStatus::Done
+        );
+
+        // BOUND: a SECOND block does NOT re-plan again (the flag is already consumed).
+        let before = plan.clone();
+        let again = attempt_replan_blocked_subtree(
+            &mut sess,
+            &o,
+            &events,
+            &mut plan,
+            "api2",
+            "alt api",
+            &[],
+            &mut replanned,
+            deadline,
+        )
+        .await;
+        assert!(!again, "at most ONE re-plan per run");
+        assert_eq!(plan, before, "a second attempt leaves the plan unchanged");
+    }
+
+    #[tokio::test]
+    async fn replan_falls_back_when_the_consult_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        // can_fork == false → the consult can't open → judge_json None → fallback.
+        let mut sess = FakeSession::new(vec![], false, REPLAN_SUBDAG);
+        let o = opts(tmp.path());
+        let mut plan = blocked_subtree_plan();
+        let before = plan.clone();
+        let mut replanned = false;
+        let merged = attempt_replan_blocked_subtree(
+            &mut sess,
+            &o,
+            &events,
+            &mut plan,
+            "api",
+            "Build the api",
+            &[],
+            &mut replanned,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(!merged, "a failed consult falls back to the honest strand");
+        assert_eq!(plan, before, "the plan is unchanged when the consult fails");
+        assert!(
+            replanned,
+            "the attempt is still consumed so a failed consult can never retry (no loop)"
+        );
+    }
+
+    #[tokio::test]
+    async fn replan_falls_back_on_an_unparseable_or_noop_subdag() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        // Unparseable fork reply → parse_brain_steps empty → fallback.
+        let mut sess = FakeSession::new(vec![], true, "not json at all");
+        let o = opts(tmp.path());
+        let mut plan = blocked_subtree_plan();
+        let before = plan.clone();
+        let mut replanned = false;
+        let merged = attempt_replan_blocked_subtree(
+            &mut sess,
+            &o,
+            &events,
+            &mut plan,
+            "api",
+            "Build the api",
+            &[],
+            &mut replanned,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(!merged, "an unparseable sub-DAG falls back");
+        assert_eq!(plan, before);
+
+        // A no-op sub-DAG that re-emits ONLY existing ids (no new route) also falls back.
+        let mut sess2 = FakeSession::new(
+            vec![],
+            true,
+            r#"{"steps":[{"id":"ui","title":"x","seat":"frontend-engineer","kind":"build","acceptance":"source-present"}]}"#,
+        );
+        let mut plan2 = blocked_subtree_plan();
+        let before2 = plan2.clone();
+        let mut replanned2 = false;
+        let merged2 = attempt_replan_blocked_subtree(
+            &mut sess2,
+            &o,
+            &events,
+            &mut plan2,
+            "api",
+            "Build the api",
+            &[],
+            &mut replanned2,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(
+            !merged2,
+            "a sub-DAG adding no NEW id changes nothing → fallback"
+        );
+        assert_eq!(plan2, before2);
+    }
+
+    #[tokio::test]
+    async fn replan_does_not_trigger_for_a_blocked_leaf_with_no_dependents() {
+        use crate::plan_state::{AcceptanceSpec, PlanStep, StepKind};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        // A valid sub-DAG is available on the fork, but the blocked step is a LEAF
+        // (nothing depends on it) → nothing to recover → no consult, no change.
+        let mut sess = FakeSession::new(vec![], true, REPLAN_SUBDAG);
+        let o = opts(tmp.path());
+        let mut plan = Plan {
+            steps: vec![
+                PlanStep {
+                    id: "scaffold".into(),
+                    title: "scaffold".into(),
+                    seat: crate::critics::Seat::FrontendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: vec![],
+                    acceptance: AcceptanceSpec::SourcePresent,
+                    evidence: Vec::new(),
+                    status: StepStatus::Done,
+                },
+                PlanStep {
+                    id: "leaf".into(),
+                    title: "a leaf".into(),
+                    seat: crate::critics::Seat::FrontendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: vec!["scaffold".into()],
+                    acceptance: AcceptanceSpec::SourcePresent,
+                    evidence: Vec::new(),
+                    status: StepStatus::Blocked,
+                },
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        let before = plan.clone();
+        let mut replanned = false;
+        let merged = attempt_replan_blocked_subtree(
+            &mut sess,
+            &o,
+            &events,
+            &mut plan,
+            "leaf",
+            "a leaf",
+            &[],
+            &mut replanned,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        assert!(
+            !merged,
+            "a blocked leaf has nothing to recover → no re-plan"
+        );
+        assert!(
+            !replanned,
+            "no stranded dependents → the single-attempt budget is NOT spent"
+        );
+        assert_eq!(plan, before, "the plan is unchanged for a leaf block");
     }
 }

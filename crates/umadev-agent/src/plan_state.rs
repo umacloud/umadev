@@ -656,6 +656,120 @@ impl Plan {
         (done, self.steps.len())
     }
 
+    /// The ids of the steps that transitively depend on `id` AND are still
+    /// [`StepStatus::Pending`] — the subtree that would be **stranded** (never become
+    /// ready) if `id` ends [`StepStatus::Blocked`]. `ready_steps` requires EVERY
+    /// dependency `Done`, and a Blocked step never flips to Done, so every Pending step
+    /// with a (direct or transitive) `depends_on` path to `id` is unreachable. Excludes
+    /// `id` itself; a `Done` / `Active` / `Blocked` dependent is not "stranded" (it
+    /// already ran or is terminal). Returns empty for an unknown id or a leaf with no
+    /// pending dependents — the signal a BOUNDED RE-PLAN reads to decide whether a block
+    /// is worth repairing (a leaf block strands nothing, so today's honest strand is
+    /// already correct). Computed by a downstream reachability walk over the inverted
+    /// `depends_on` edges; cycle-safe (bounded by a `visited` set). Pure.
+    #[must_use]
+    pub fn stranded_dependents(&self, id: &str) -> Vec<String> {
+        let adj = self.downstream_adjacency();
+        let Some((&start, _)) = adj.get_key_value(id) else {
+            return Vec::new();
+        };
+        let mut visited: HashSet<&str> = HashSet::new();
+        visited.insert(start);
+        let mut downstream: HashSet<&str> = HashSet::new();
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            if let Some(neighbours) = adj.get(node) {
+                for &nb in neighbours {
+                    if visited.insert(nb) {
+                        downstream.insert(nb);
+                        stack.push(nb);
+                    }
+                }
+            }
+        }
+        self.steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Pending && downstream.contains(s.id.as_str()))
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// **BOUNDED RE-PLAN merge** — replace a blocked subtree with a validated
+    /// replacement sub-DAG. `replaced` is the set of step ids being retired (the blocked
+    /// step + its stranded pending dependents, from [`Self::stranded_dependents`]);
+    /// `new_steps` is the brain's proposed replacement (parsed via [`parse_brain_steps`]).
+    ///
+    /// The whole merged plan (the SURVIVING steps + the new steps) is re-validated
+    /// through the EXISTING [`Self::normalized`] machinery — dedup by id, dangling-dep
+    /// strip, cycle-break, and the per-seat / falsifiability evidence floors — so a
+    /// re-planned subtree faces the identical structural discipline (and later the
+    /// identical acceptance floor) as a freshly-synthesised plan. `normalized` resets
+    /// every status to `Pending`, so afterward the SURVIVING steps' persisted statuses
+    /// are restored (an already-`Done` step is NOT re-driven); the NEW steps keep
+    /// `Pending` (fresh work the scheduler will pick up by readiness).
+    ///
+    /// Returns `true` ONLY when the merge actually CHANGES the plan — the replacement
+    /// must introduce at least one genuinely-new step id (a real route around the
+    /// blocker). An empty / unparseable sub-DAG, a reply that re-emits only existing
+    /// ids, or a normalisation that survives nothing new leaves `self` **unchanged** and
+    /// returns `false` (fail-open → the caller keeps today's honest stranded-Blocked
+    /// report). Never panics.
+    pub fn merge_replan(&mut self, replaced: &HashSet<String>, new_steps: Vec<PlanStep>) -> bool {
+        if new_steps.is_empty() {
+            return false;
+        }
+        let old_ids: HashSet<String> = self.steps.iter().map(|s| s.id.trim().to_string()).collect();
+        // The replacement must add at least one NEW id — otherwise nothing routes
+        // around the blocker and the blocked situation is unchanged.
+        let introduces_new = new_steps.iter().any(|s| {
+            let id = s.id.trim();
+            !id.is_empty() && !old_ids.contains(id)
+        });
+        if !introduces_new {
+            return false;
+        }
+        // Snapshot the survivors' statuses so `normalized`'s Pending-reset can't wipe
+        // already-completed work (the surviving Done steps must stay Done).
+        let survivor_status: std::collections::HashMap<String, StepStatus> = self
+            .steps
+            .iter()
+            .filter(|s| !replaced.contains(&s.id))
+            .map(|s| (s.id.trim().to_string(), s.status))
+            .collect();
+        // Build the merged node list: SURVIVORS first (so `normalized`'s first-seen
+        // dedup keeps them over any colliding new id), then the new sub-DAG.
+        let mut merged: Vec<PlanStep> = self
+            .steps
+            .iter()
+            .filter(|s| !replaced.contains(&s.id))
+            .cloned()
+            .collect();
+        merged.extend(new_steps);
+        let candidate = Plan {
+            steps: merged,
+            risks: self.risks.clone(),
+            open_questions: self.open_questions.clone(),
+        };
+        let Some(mut normalized) = candidate.normalized() else {
+            return false; // nothing usable survived normalisation → fail-open
+        };
+        // Restore the survivors' statuses; NEW steps keep `normalized`'s fresh Pending.
+        for s in &mut normalized.steps {
+            if let Some(&st) = survivor_status.get(&s.id) {
+                s.status = st;
+            }
+        }
+        // Final guard: the normalised merge must still carry a genuinely-new step id
+        // (one absent from the OLD plan) — else the sub-DAG collapsed to nothing new and
+        // the blocked situation is unchanged (fail-open → honest strand).
+        let recovered = normalized.steps.iter().any(|s| !old_ids.contains(&s.id));
+        if !recovered {
+            return false;
+        }
+        *self = normalized;
+        true
+    }
+
     /// Normalise a freshly-parsed plan: drop empty-id steps, dedupe ids, drop
     /// `depends_on` entries that reference a non-existent step (so the DAG is
     /// self-consistent and `ready_steps` can't deadlock on a dangling dep), then
@@ -1191,36 +1305,56 @@ pub async fn synthesize_plan(
     let json = crate::continuous::extract_json_object(&text)?;
     let raw: BrainPlan = serde_json::from_str(&json).ok()?;
     let plan = Plan {
-        steps: raw
-            .steps
-            .into_iter()
-            .map(|b| {
-                let kind = StepKind::parse(&b.kind);
-                PlanStep {
-                    id: b.id,
-                    title: b.title,
-                    // An unknown / missing seat fails open to a sensible default by
-                    // step kind (build→frontend doer, review→QA) so a vague brain
-                    // reply still yields an assignable step.
-                    seat: Seat::from_alias(&b.seat).unwrap_or(match kind {
-                        StepKind::Review => Seat::QaEngineer,
-                        StepKind::Build => Seat::FrontendEngineer,
-                    }),
-                    kind,
-                    depends_on: b.depends_on,
-                    acceptance: AcceptanceSpec::parse(&b.acceptance, kind),
-                    // Parse + OWN the brain's proposed per-step evidence (dropping
-                    // anything unparseable); empty ⇒ the step falls back to its
-                    // acceptance criterion at verify time (fail-open).
-                    evidence: parse_brain_evidence(&b.evidence),
-                    status: StepStatus::Pending,
-                }
-            })
-            .collect(),
+        steps: raw.steps.into_iter().map(brain_step_to_plan_step).collect(),
         risks: raw.risks,
         open_questions: raw.open_questions,
     };
     plan.normalized()
+}
+
+/// Map ONE tolerant [`BrainStep`] into an owned [`PlanStep`] — the shared node parse
+/// used by both [`synthesize_plan`] (the initial DAG) and [`parse_brain_steps`] (a
+/// re-plan sub-DAG). An unknown / missing seat fails open to a sensible default by step
+/// kind (build → frontend doer, review → QA) so a vague brain reply still yields an
+/// assignable step; the brain's proposed per-step evidence is validated + OWNED
+/// (unparseable entries dropped, an under-specified one retained as a held gap); status
+/// always starts [`StepStatus::Pending`] — the director drives it from reality, never
+/// the brain's optimistic claim.
+fn brain_step_to_plan_step(b: BrainStep) -> PlanStep {
+    let kind = StepKind::parse(&b.kind);
+    PlanStep {
+        id: b.id,
+        title: b.title,
+        seat: Seat::from_alias(&b.seat).unwrap_or(match kind {
+            StepKind::Review => Seat::QaEngineer,
+            StepKind::Build => Seat::FrontendEngineer,
+        }),
+        kind,
+        depends_on: b.depends_on,
+        acceptance: AcceptanceSpec::parse(&b.acceptance, kind),
+        evidence: parse_brain_evidence(&b.evidence),
+        status: StepStatus::Pending,
+    }
+}
+
+/// Parse a brain-supplied plan JSON reply into owned [`PlanStep`]s WITHOUT normalising
+/// or wrapping in a full [`Plan`] — the raw replacement nodes a BOUNDED RE-PLAN merges
+/// into an existing plan (the merge, [`Plan::merge_replan`], re-normalises the whole
+/// thing so dedup / dangling-dep strip / cycle-break / seat floors run over the spliced
+/// result). Accepts either a bare JSON object or a reply with surrounding prose (it
+/// re-extracts the object). Fail-open by contract: unparseable JSON / no `steps` yields
+/// an EMPTY vec, so the caller falls back to today's honest stranded-Blocked report and
+/// nothing is merged. Reuses the tolerant [`BrainStep`] parse, so one malformed field
+/// never sinks the batch.
+pub(crate) fn parse_brain_steps(json_text: &str) -> Vec<PlanStep> {
+    let raw: Option<BrainPlan> = serde_json::from_str(json_text).ok().or_else(|| {
+        crate::continuous::extract_json_object(json_text)
+            .and_then(|j| serde_json::from_str(&j).ok())
+    });
+    match raw {
+        Some(p) => p.steps.into_iter().map(brain_step_to_plan_step).collect(),
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -2421,5 +2555,100 @@ mod tests {
             "a single bare step at exactly half must NOT trip the >50% backstop: {:?}",
             ev_of(&p, "prd")
         );
+    }
+
+    // ── BOUNDED RE-PLAN: stranded_dependents + merge_replan + parse_brain_steps ──
+
+    /// Set a status helper for the re-plan tests.
+    fn mark(p: &mut Plan, id: &str, s: StepStatus) {
+        assert!(p.mark(id, s), "step {id} must exist");
+    }
+
+    #[test]
+    fn stranded_dependents_are_the_pending_downstream_cone() {
+        // a → b → c, plus an independent d. Block a: b and c are stranded (Pending
+        // downstream); d is not (independent). Done/Active dependents are not stranded.
+        let mut p = plan(vec![
+            step("a", &[]),
+            step("b", &["a"]),
+            step("c", &["b"]),
+            step("d", &[]),
+        ]);
+        let mut stranded = p.stranded_dependents("a");
+        stranded.sort();
+        assert_eq!(stranded, vec!["b".to_string(), "c".to_string()]);
+        // A leaf (nothing depends on it) strands nothing → no re-plan is warranted.
+        assert!(p.stranded_dependents("c").is_empty());
+        assert!(p.stranded_dependents("d").is_empty());
+        // An unknown id fails open to empty.
+        assert!(p.stranded_dependents("nope").is_empty());
+        // A dependent that already reached Done is NOT stranded (it ran already).
+        mark(&mut p, "b", StepStatus::Done);
+        assert_eq!(p.stranded_dependents("a"), vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn merge_replan_splices_a_subdag_through_normalized_and_preserves_survivor_status() {
+        // scaffold(Done) → api(BLOCKED) → ui(Pending). Replace {api, ui} with a fresh
+        // route {api2, ui2} that depends on the surviving scaffold.
+        let mut p = plan(vec![
+            step("scaffold", &[]),
+            step("api", &["scaffold"]),
+            step("ui", &["api"]),
+        ]);
+        mark(&mut p, "scaffold", StepStatus::Done);
+        mark(&mut p, "api", StepStatus::Blocked);
+        let replaced: HashSet<String> = ["api".to_string(), "ui".to_string()].into_iter().collect();
+        let new_steps = vec![step("api2", &["scaffold"]), step("ui2", &["api2"])];
+        assert!(p.merge_replan(&replaced, new_steps));
+        let ids: Vec<&str> = p.steps.iter().map(|s| s.id.as_str()).collect();
+        // The blocked subtree is gone; the fresh route is spliced in.
+        assert!(ids.contains(&"api2") && ids.contains(&"ui2"));
+        assert!(!ids.contains(&"api") && !ids.contains(&"ui"));
+        // The surviving Done step KEEPS its status (normalized's Pending-reset was undone).
+        assert_eq!(
+            p.steps.iter().find(|s| s.id == "scaffold").unwrap().status,
+            StepStatus::Done
+        );
+        // The new steps are Pending (fresh work), and the dangling dep on `scaffold` held
+        // (it's a survivor, so the edge is NOT stripped) → api2 depends_on scaffold.
+        assert_eq!(
+            p.steps.iter().find(|s| s.id == "api2").unwrap().status,
+            StepStatus::Pending
+        );
+        assert_eq!(deps_of(&p, "api2"), &["scaffold".to_string()]);
+    }
+
+    #[test]
+    fn merge_replan_rejects_a_no_op_subdag_that_adds_no_new_id() {
+        // The brain re-emits ONLY existing ids (no genuinely-new route) → no-op → reject.
+        let mut p = plan(vec![step("a", &[]), step("b", &["a"])]);
+        mark(&mut p, "a", StepStatus::Blocked);
+        let before = p.clone();
+        let replaced: HashSet<String> = ["a".to_string()].into_iter().collect();
+        // Only "b" (an existing id) is offered — nothing new.
+        assert!(!p.merge_replan(&replaced, vec![step("b", &[])]));
+        assert_eq!(p, before, "a no-op sub-DAG must leave the plan UNCHANGED");
+        // An empty sub-DAG is also a no-op.
+        assert!(!p.merge_replan(&replaced, vec![]));
+        assert_eq!(p, before);
+    }
+
+    #[test]
+    fn parse_brain_steps_is_fail_open_and_tolerant() {
+        // A bare JSON object parses; a re-plan reply wrapped in prose is re-extracted.
+        let good = r#"{"steps":[{"id":"x","title":"do x","seat":"backend-engineer",
+            "kind":"build","depends_on":["scaffold"],"acceptance":"contract"}]}"#;
+        let steps = parse_brain_steps(good);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, "x");
+        assert_eq!(steps[0].seat, Seat::BackendEngineer);
+        assert_eq!(steps[0].depends_on, vec!["scaffold".to_string()]);
+        // Prose around the object is tolerated (re-extraction).
+        let wrapped = format!("here is the plan:\n{good}\nthanks");
+        assert_eq!(parse_brain_steps(&wrapped).len(), 1);
+        // Unparseable / no steps → EMPTY (fail-open, nothing merged).
+        assert!(parse_brain_steps("not json at all").is_empty());
+        assert!(parse_brain_steps(r#"{"steps":[]}"#).is_empty());
     }
 }
