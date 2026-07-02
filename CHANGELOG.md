@@ -2,6 +2,46 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.24] — 换行不再误发 · 多语言代码高亮 · /model 选择器 · 底座失败给下一步
+
+这一版是**今天的用户反馈修复**加一次对照 Claude Code 与 opencode 的**交互对等审计**。多行输入不再在 Apple Terminal / 默认终端上**悄悄误发**(Ctrl+J 在每个终端都能换行,支持的终端上再开 kitty 键盘协议让 Shift+Enter 也生效);代码块高亮从手搓 ~5 语言的关键词着色升级为纯 Rust 的 **~25 语言真词法高亮**;`/model` 不带参数现打开**交互式选择器**;**Ctrl+点击**可直接打开转录里的链接与文件路径;底座失败时不再把原始报错甩给你,而是**点名下一步该敲哪条命令**;花费表旁新增**上下文余量表与压缩提醒**。另修复 Windows PowerShell 执行策略死循环、续跑计划的勾选与完成数。全部 fail-open、无 emoji、无硬编码色值,`forbid(unsafe_code)` 保持。
+
+### 新增 — Ctrl+J 换行(不再误提交)
+
+- **多行输入不再悄悄误发**:此前只绑了 Shift+Enter,而 kitty 键盘协议从未开启 —— 在 Apple Terminal / 多数默认终端上,Shift+Enter 到达时只是一个裸 CR,直接把半句话**提交**了。现 Ctrl+J(一个字面 LF,每个终端、每条输入路径都通用)插入换行;Enter 仍提交;`setup_terminal` 启用 kitty 协议(`PushKeyboardEnhancementFlags DISAMBIGUATE_ESCAPE_CODES`,按 `supports_keyboard_enhancement` 守卫,restore / panic / 信号路径对称弹栈,只压一次而非每次恢复都压),支持的终端上 Shift+Enter 也生效。`/help` 与输入提示都提到 Ctrl+J。
+
+### 新增 — 多语言代码高亮
+
+- **代码块高亮从手搓 ~5 语言的关键词着色升级为纯 Rust 词法高亮**,覆盖约 25 种语言,做真正的字符串 / 注释 / 数字 / 关键词分词(含多行结构)。高亮组映射到主题 token 层(`syn_color`),配色始终随主题、无硬编码色值;每次调用 fail-open 回落旧着色 / 纯文本,半途的流式代码围栏不会 panic,diff 的 +/- 着色保留。net-new 依赖仅 synoptic 一小簇(regex / unicode-width 本就在树里),远小于 syntect 的体量。
+
+### 新增 — 交互式 /model 选择器
+
+- **`/model` 不带参数现打开交互式选择器**:按底座列出常见模型(Claude 家族 / codex / opencode,各带描述、标出当前项,外加一行「自定义 / 直接输入 id」以 fail-open 保留任意底座支持的 id);↑↓ / j-k / Home / End / 1-9 / Enter / Esc 操作。`/model <id>` 仍直接设置,`/model plan|build` 仍针对持久化的分阶段档位。经既有配置路径持久化。
+
+### 新增 — Ctrl+点击打开链接 / 文件路径
+
+- **鼠标捕获会吞掉终端原生的修饰键点击,所以 UmaDev 在应用内自己接管**:Ctrl+左键经选择层缓存的行几何命中被点 token,链接(http/https)在默认浏览器打开、文件路径(绝对 / `~/` / `X:\` / 存在的相对路径,`file.rs:12:5` 位置后缀自动剥离)在默认应用 / 访达 / 资源管理器打开;边界修剪(尾随标点与不配对括号剔除、配对括号保留、CJK 干净收尾)。安全:仅 http/https(ftp / file / javascript 拒绝),引号 / 反引号 / 控制字符 / 空白拒绝,路径必须能规范化到真实存在的项;opener 始终是 argv 向量、绝不是 shell 字符串 —— 且 Windows 上刻意用 `explorer <目标>` 而非 `cmd /C start`(cmd 会重解析命令行,查询串里合法的 `&` 会被当成命令分隔符,精心构造的「URL」点一下就可能执行命令 —— 评审时抓到,explorer 按字面取参)。spawn 走 stdio-null + 分离线程回收,fail-open 带一条本地化状态备注,miss 是静默 no-op,普通点选 / 拖选不受影响。
+
+### 新增 — 底座失败给下一步
+
+- **借来的底座 CLI 失败时,UmaDev 不再把原始 stderr 直接甩给你,而是点名下一步该敲哪条命令**:认证过期 → `claude auth login` + `CLAUDE_CODE_OAUTH_TOKEN` / `codex login` / `opencode auth login`(按底座,和选择器的登录提示、doctor 的无头凭据事实一致);限流 / 过载 → `/model` 换模型或换底座(限流指向附带的原始信息看重置时间);上下文超长 → `/compact`;网络不变。分类器(Auth / RateLimit / Overloaded / Context / Network / Exited / Unknown,最具体优先、fail-open,Unknown 原样保留)在 `/run` 与 chat 两条路径都生效;仅检测 / 展示,不改运行控制、四条不变量与重试逻辑,不引脆弱的跨底座重置时间解析器。
+
+### 新增 — 上下文余量表 + 压缩提醒
+
+- **花费表旁新增实时上下文余量表**("ctx 34k/200k · 17%"):分子取底座上一轮真实 INPUT token(它刚读进的上下文,由 `EngineEvent::TurnUsage` 捕获、`/clear` 归零),落表前回落到转录的 chars/4 估算,无可显示时隐藏;分母取一张保守的静态实用预算表(Claude 家族 200k、gpt-5 400k、o 系 / gpt-4 128k,未知 / offline 则隐藏)—— 标注为估算、非硬上限。占用首次越过 80% 时**恰好一次**推送一行 `/compact` 提示(锁存,掉下再武装,由 usage 事件驱动、绝不逐帧),与被动的 `BaseFailure::Context` 补救互为主动一侧。窄终端下和花费表一样先被宽度守卫丢掉;INFO → WARNING 越阈变色、无硬编码色值。
+
+### 修复 — Windows PowerShell 执行策略
+
+- **底座此前反复用 `powershell.exe -Command 'npm i'` 跑 node CLI**,会命中 `npm.ps1` shim、在 Restricted 执行策略下报「因为在此系统上禁止运行脚本 / running scripts is disabled」,而且**一遍遍重试同一条命令**。这是**环境门、不是偶发失败**:同命令重试永不可能成功,必须改写调用方式。error_kb 新增 `detect_powershell_policy`(置于分类级联**最前**,否则 SecurityError / UnauthorizedAccess token 会误分到权限族继续空转;高精度双语短语 + 仅在 `.ps1` shim 上下文才认的歧义 token,HTTP-401 的 UnauthorizedAccess 绝不误报);固件 `windows_shell_directive()`:改经 cmd 跑(`cmd /c npm ...` / npm.cmd / npx.cmd,pnpm / yarn 同理),`-ExecutionPolicy Bypass -File` 仅作逐次回落,**绝不改用户机器策略**,且**不重试同一条命令**。+知识标准 `windows-node-cli-invocation`(quality 95),含「环境门 ≠ 偶发失败,盲目重试无意义」的泛化规则。
+
+### 修复 — 续跑计划勾选(用户实测)
+
+- **`/continue` 后,阻塞前已完成的步骤现正确显示为已勾选、完成数为真**(此前读作 0/N、靠前步骤留空)。根因:`PlanPosted` 事件只带步骤摘要行、从不带每步状态,续跑重发计划时未对阻塞前步骤重放 `PlanStepStatus`,TUI 又把每行硬编码为 pending 并丢弃载荷里的完成数 —— 于是续跑后先前已完成的步骤一直 `[ ]`、表头数 0/N,只有当前在跑的步骤靠自己的实时状态事件显 `[~]`。修法(一个事件、无排序竞态):`PlanPosted` 增 `statuses`(与步骤下标对齐、缺失回落 pending),从计划持久化的每步状态(新 `Plan::step_statuses`)填充;面板表头、`/plan` 卡、`/team` 名册、任务 chip 都从行派生所以自动一致,恢复的完成行不伪造交接时间线;bin 打印同样显示持久化标记;全新计划仍是全 pending、逐字节等价。
+
+### 内部
+
+- 全部改动 fail-open,无 emoji,无硬编码色值,`forbid(unsafe_code)` 保持;net-new 依赖仅 synoptic 一小簇(char_index / if_chain / nohash-hasher,regex / unicode-width 本就在树里)。计数:tui 788、agent 1145、i18n 6;新增 i18n 键(Ctrl+J 提示、`/model` 选择器、Ctrl+点击备注、上下文 / 压缩表、11 条 base.fail.* 补救键)三语注册进 MIGRATED 守卫。
+
 ## [1.0.23] — 终端层结构性加固 · 乱码根除 · 输入两路收敛 · 历史随会话保存
 
 这一版是一次**结构性加固**:连续几轮用户实测的 TUI 问题(乱码、Windows 输入、重开丢历史)暴露的不是零散 bug,而是终端层的三笔结构性欠账。本次对照成熟终端 UI 实现做了整层审计,把三笔欠账**在根上还清** —— 用原语替掉症状补丁,而不是继续见一个修一个。**渲染自愈成为原语**:启动时**探测**终端是否真支持同步输出(DECRQM 查询,查不到回落白名单先验),已确认支持的终端上每一帧都是同步括号内的**原子整帧重绘** —— 造成长跑 / 焦点切换 / 叠字类乱码的显示漂移**活不过一帧**;不支持的终端经一个污染标志自愈;旧的枚举式重绘触发(周期刷洗 / 逐事件强制)整套删除。**输入两路收敛**:unix 与 Windows 输入路径共用**同一张**键位映射表,配跨路径契约测试 —— 同一输入必须产出同一事件,未来再分叉是 CI 挂掉、不是发到用户手里。**看得见的转录随会话保存**:重开 UmaDev 不再是一片空白的对话。另有 Windows 焦点切换乱码修复、外部终止也还原终端、续跑历史分隔线。
