@@ -1,6 +1,6 @@
 {
   "name": "@umacloud/cli-linux-arm64",
-  "version": "1.0.22",
+  "version": "1.0.23",
   "description": "umadev prebuilt binary for Linux (aarch64 / gnu).",
   "homepage": "https://github.com/umacloud/umadev",
   "repository": {
