@@ -10,6 +10,7 @@
 //! `/login` route satisfied the check if the word "login" appeared anywhere.
 //! This module does it properly against the typed [`ApiSpec`].
 
+use crate::backend::{route_registered, BackendRoute};
 use crate::extract::FrontendCall;
 use crate::parse::ApiSpec;
 
@@ -63,6 +64,16 @@ impl ContractViolation {
             detail: format!("PRD route `{route}` has no matching contract endpoint"),
         }
     }
+
+    fn unregistered_endpoint(method: &str, path: &str) -> Self {
+        Self {
+            kind: ViolationKind::UnmatchedRoute,
+            detail: format!(
+                "contract declares {} {path} but no backend route registration implements it",
+                method.to_uppercase()
+            ),
+        }
+    }
 }
 
 /// Validate frontend calls against the contract.
@@ -109,6 +120,42 @@ pub fn validate_frontend_vs_contract(
                 .map(|e| e.path.as_str())
                 .unwrap_or(&call.path);
             violations.push(ContractViolation::method_mismatch(call, declared));
+        }
+    }
+    violations
+}
+
+/// Validate the **backend** against the contract — the symmetric counterpart
+/// of [`validate_frontend_vs_contract`]. Every endpoint the contract declares
+/// must have a real backend route REGISTRATION (see [`route_registered`]); a
+/// contract endpoint with no matching registration is flagged. This strengthens
+/// the UD-CODE-003 cross-check: the frontend side proves callers match the
+/// contract, this side proves the server actually serves it (not just that the
+/// path appears in a `fetch` call or a comment).
+///
+/// Fail-open: when `routes` is empty (a pure-frontend project, or a backend in
+/// a framework we cannot parse) this returns no violations rather than flagging
+/// every endpoint — the same fail-open stance the acceptance check takes.
+/// Contract endpoints whose path is too generic to check (`/`, `/api`, `/:id`)
+/// are skipped.
+#[must_use]
+pub fn validate_backend_vs_contract(
+    routes: &[BackendRoute],
+    spec: &ApiSpec,
+) -> Vec<ContractViolation> {
+    if routes.is_empty() {
+        return Vec::new();
+    }
+    let mut violations = Vec::new();
+    for e in &spec.endpoints {
+        if !crate::backend::path_has_checkable_segment(&e.path) {
+            continue;
+        }
+        if !route_registered(routes, e.method, &e.path) {
+            violations.push(ContractViolation::unregistered_endpoint(
+                e.method.as_str(),
+                &e.path,
+            ));
         }
     }
     violations
@@ -477,6 +524,68 @@ mod tests {
         let routes = extract_prd_routes(prd);
         // `/` and `/x` (len < 3) dropped; only `/reports` survives.
         assert_eq!(routes, vec!["/reports".to_string()]);
+    }
+
+    // ---- validate_backend_vs_contract (symmetric BE↔contract cross-check) ----
+
+    #[test]
+    fn backend_vs_contract_flags_unregistered_endpoint() {
+        use crate::backend::BackendRoute;
+        let spec = spec(); // GET/POST /api/users, GET/DELETE /api/users/:id
+                           // Backend only registers the list + create, not the item routes.
+        let routes = vec![
+            BackendRoute {
+                file: "s.js".into(),
+                method: Some(HttpVerb::Get),
+                path: "/api/users".into(),
+            },
+            BackendRoute {
+                file: "s.js".into(),
+                method: Some(HttpVerb::Post),
+                path: "/api/users".into(),
+            },
+        ];
+        let v = validate_backend_vs_contract(&routes, &spec);
+        // GET + DELETE /api/users/:id are declared but not registered.
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(v.iter().all(|x| x.kind == ViolationKind::UnmatchedRoute));
+        assert!(v.iter().any(|x| x.detail.contains("/api/users/:id")));
+    }
+
+    #[test]
+    fn backend_vs_contract_clean_when_all_registered() {
+        use crate::backend::BackendRoute;
+        let spec = spec();
+        let routes = vec![
+            BackendRoute {
+                file: "s.js".into(),
+                method: Some(HttpVerb::Get),
+                path: "/api/users".into(),
+            },
+            BackendRoute {
+                file: "s.js".into(),
+                method: Some(HttpVerb::Post),
+                path: "/api/users".into(),
+            },
+            BackendRoute {
+                file: "s.js".into(),
+                method: Some(HttpVerb::Get),
+                path: "/api/users/:id".into(),
+            },
+            BackendRoute {
+                file: "s.js".into(),
+                method: Some(HttpVerb::Delete),
+                path: "/api/users/:id".into(),
+            },
+        ];
+        assert!(validate_backend_vs_contract(&routes, &spec).is_empty());
+    }
+
+    #[test]
+    fn backend_vs_contract_fail_open_when_no_routes() {
+        // No backend registrations → fail-open (do not flag every endpoint).
+        let spec = spec();
+        assert!(validate_backend_vs_contract(&[], &spec).is_empty());
     }
 
     #[test]

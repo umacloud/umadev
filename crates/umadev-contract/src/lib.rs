@@ -48,12 +48,16 @@
     clippy::case_sensitive_file_extension_comparisons
 )]
 
+pub mod backend;
 pub mod derive;
 pub mod extract;
 pub mod parse;
 pub mod render;
 pub mod validate;
 
+pub use backend::{
+    extract_backend_routes, path_has_checkable_segment, route_registered, BackendRoute,
+};
 pub use derive::{
     derive_endpoints_from_requirement, extract_entities, fields_for_entity, merge_specs,
 };
@@ -61,7 +65,8 @@ pub use extract::{extract_frontend_calls, FrontendCall};
 pub use parse::{parse_architecture, ApiSpec, Endpoint, HttpVerb, SecurityKind};
 pub use render::{render_json, render_yaml, write_contract};
 pub use validate::{
-    extract_prd_routes, validate_frontend_vs_contract, validate_prd_vs_contract, ContractViolation,
+    extract_prd_routes, validate_backend_vs_contract, validate_frontend_vs_contract,
+    validate_prd_vs_contract, ContractViolation,
 };
 
 /// On-disk directory for contract artifacts, relative to the project root.

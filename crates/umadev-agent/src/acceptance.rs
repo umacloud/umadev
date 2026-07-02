@@ -266,6 +266,27 @@ fn static_prefix(path: &str) -> &str {
 /// Planned endpoints (from the architecture API table) with no implementation
 /// evidence in the workspace. Empty when there's no architecture doc / no
 /// endpoints (fail-open — never a false alarm).
+///
+/// ## What counts as "implemented"
+/// The check matches each planned endpoint against the project's real **backend
+/// route REGISTRATIONS** (`umadev_contract::extract_backend_routes`) — an
+/// `app.get(...)` / `@app.route(...)` / `@GetMapping(...)` / `.route("/x", get(...))`
+/// site, comment-stripped — NOT a raw substring over all source. This closes
+/// the biggest false-pass in the deterministic floor: previously a planned
+/// endpoint counted as done if its static path prefix appeared **anywhere** in
+/// the concatenated source — including a frontend `fetch('/api/login')` call or
+/// a `// TODO app.post('/api/login')` comment — so a backend that lived only as
+/// frontend call-sites falsely PASSED.
+///
+/// ## Fail-open (no false failures)
+/// When the extractor finds **no** backend registration anywhere — a genuine
+/// pure-frontend project (the endpoint legitimately isn't ours to serve), or a
+/// backend in a framework we can't parse — the check falls back to the legacy
+/// surface behavior rather than falsely flagging every endpoint. Only a project
+/// that HAS a backend we can read is held to the "real registration exists"
+/// standard. Path parameters are normalised (`:id` ≡ `{id}` ≡ `<id>`) and a
+/// mount/global/controller prefix the regex can't reconstruct is tolerated by a
+/// right-aligned tail match (see `umadev_contract::route_registered`).
 #[must_use]
 pub fn task_acceptance_gaps(project_root: &Path, slug: &str) -> Vec<String> {
     let arch = std::fs::read_to_string(project_root.join(format!("output/{slug}-architecture.md")))
@@ -277,6 +298,43 @@ pub fn task_acceptance_gaps(project_root: &Path, slug: &str) -> Vec<String> {
     if spec.is_empty() {
         return Vec::new();
     }
+
+    let backend_routes = umadev_contract::extract_backend_routes(project_root);
+    if backend_routes.is_empty() {
+        // Fail-open: no recognised backend registration exists anywhere. Preserve
+        // the legacy surface behavior so a pure-frontend project — or a backend
+        // in a framework we cannot parse — is NOT falsely failed.
+        return legacy_surface_gaps(project_root, &spec);
+    }
+
+    // The project HAS a backend we can read: every planned endpoint must have a
+    // real route registration. A frontend `fetch`/`axios` call or a comment is
+    // not a registration, so it can no longer satisfy the endpoint.
+    let mut gaps = Vec::new();
+    for e in &spec.endpoints {
+        // Skip endpoints too generic to verify (`/`, `/api`, a purely-param
+        // path) — mirrors the legacy `needle.len() < 4` skip.
+        if !umadev_contract::path_has_checkable_segment(&e.path) {
+            continue;
+        }
+        if !umadev_contract::route_registered(&backend_routes, e.method, &e.path) {
+            gaps.push(format!(
+                "{} {} — {}",
+                e.method.as_str(),
+                e.path,
+                e.description
+            ));
+        }
+    }
+    gaps
+}
+
+/// Legacy substring-over-source coverage check, retained as the fail-open
+/// fallback for projects with no backend registration we can read (pure
+/// frontend, or an unparseable framework). This is exactly the pre-hardening
+/// behavior — deliberately lenient (a path appearing anywhere counts) — so we
+/// never turn a project we can't reason about into a false failure.
+fn legacy_surface_gaps(project_root: &Path, spec: &umadev_contract::ApiSpec) -> Vec<String> {
     let surface = implementation_surface(project_root);
     if surface.trim().is_empty() {
         // No source at all → the base wrote nothing; every endpoint is a gap.
@@ -344,6 +402,124 @@ mod tests {
         .unwrap();
         let gaps2 = task_acceptance_gaps(tmp.path(), "demo");
         assert!(gaps2.is_empty(), "all endpoints implemented: {gaps2:?}");
+    }
+
+    #[test]
+    fn frontend_fetch_or_comment_no_longer_satisfies_backend_endpoint() {
+        // THE BUG BEING FIXED: a planned endpoint that exists ONLY as a frontend
+        // fetch() call and a comment must NOT count as implemented, once the
+        // project is shown to have a real backend. Previously the substring check
+        // over concatenated source passed it (a backend that lived only as
+        // frontend call-sites falsely PASSED).
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("output")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# API\n\n\
+             | Method | Path | Description | Auth |\n\
+             |---|---|---|---|\n\
+             | GET | /api/todos | list todos | none |\n\
+             | POST | /api/login | login | none |\n",
+        )
+        .unwrap();
+        // A REAL backend registers /api/todos (so the project is in strict mode)…
+        fs::write(
+            tmp.path().join("src/server.js"),
+            "app.get('/api/todos', listTodos);",
+        )
+        .unwrap();
+        // …but /api/login exists ONLY as a frontend fetch and a comment.
+        fs::write(
+            tmp.path().join("src/web.tsx"),
+            "// app.post('/api/login', doLogin)\nfunction f(){ return fetch('/api/login'); }",
+        )
+        .unwrap();
+
+        let gaps = task_acceptance_gaps(tmp.path(), "demo");
+        assert_eq!(gaps.len(), 1, "only /api/login must be a gap: {gaps:?}");
+        assert!(gaps[0].contains("/api/login"), "{gaps:?}");
+        assert!(
+            !gaps.iter().any(|g| g.contains("/api/todos")),
+            "the real backend route must pass: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn real_backend_registration_passes() {
+        // A backend with a real `app.post('/api/login')` registration passes.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("output")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# API\n\n\
+             | Method | Path | Description | Auth |\n\
+             |---|---|---|---|\n\
+             | POST | /api/login | login | none |\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("src/server.js"),
+            "app.post('/api/login', (req,res) => res.json({ok:true}));",
+        )
+        .unwrap();
+        assert!(
+            task_acceptance_gaps(tmp.path(), "demo").is_empty(),
+            "a real registration must clear the endpoint"
+        );
+    }
+
+    #[test]
+    fn param_path_normalized_across_frameworks() {
+        // Planned /api/users/:id is served by a FastAPI `{id}` registration.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("output")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# API\n\n\
+             | Method | Path | Description | Auth |\n\
+             |---|---|---|---|\n\
+             | GET | /api/users/:id | get user | none |\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("src/main.py"),
+            "@app.get('/api/users/{id}')\ndef get_user(id): ...",
+        )
+        .unwrap();
+        assert!(
+            task_acceptance_gaps(tmp.path(), "demo").is_empty(),
+            ":id must match a {{id}} registration"
+        );
+    }
+
+    #[test]
+    fn pure_frontend_project_not_falsely_failed() {
+        // No backend registration anywhere (only a frontend fetch). The endpoint
+        // legitimately isn't ours to serve → fail-open to legacy behavior, not a
+        // false failure.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("output")).unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "# API\n\n\
+             | Method | Path | Description | Auth |\n\
+             |---|---|---|---|\n\
+             | GET | /api/todos | list | none |\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("src/web.tsx"),
+            "export const load = () => fetch('/api/todos');",
+        )
+        .unwrap();
+        assert!(
+            task_acceptance_gaps(tmp.path(), "demo").is_empty(),
+            "a pure-frontend project must not be failed for a backend it never owned"
+        );
     }
 
     #[test]
