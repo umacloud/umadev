@@ -345,6 +345,7 @@
 "chat.queued" = "[排隊] 上一條還在回覆,這條會在它回完後立刻發出。"
 "chat.interrupted" = " [已中斷] 回覆未完成"
 "chat.restored" = "[會話] 已恢復上次的對話({} 則記錄)。繼續聊即可,或 /sessions 切換、/clear 重開。"
+"chat.restored_divider" = "──── 已恢復 —— 上方是先前的對話(向上捲動可回看) ────"
 "sessions.empty" = "[會話] 本專案還沒有已儲存的對話。聊幾句後會自動儲存,可用 /resume <id> 恢復。"
 "sessions.header" = "[會話] 已儲存的對話(* = 目前):\n{}  用 /resume <id> 恢復某一個。"
 "resume.usage" = "用法:/resume <id> —— 先用 /sessions 查看可恢復的對話 id。"

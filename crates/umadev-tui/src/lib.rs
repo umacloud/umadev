@@ -3915,6 +3915,24 @@ fn restore_terminal(terminal: &mut Term) {
     restore_sequence(terminal.backend_mut());
 }
 
+/// Wave 3 P1 — the SYNCHRONOUS emergency teardown run when a termination
+/// signal (SIGTERM / SIGHUP / a stray SIGINT; the Windows console-close /
+/// shutdown notifications) reaches the event loop: persist the chat FIRST
+/// (transcript + the Wave 3 display snapshot — the cheap, must-not-lose step),
+/// then disable raw mode and emit the full [`restore_sequence`] directly to the
+/// terminal writer (`restore_sequence` flushes at the end — write-direct, no
+/// queued frame), so even if the OS follows up with an immediate SIGKILL the
+/// user's shell is already out of the alt screen / raw / mouse modes and the
+/// conversation is on disk. Every step is best-effort (fail-open); the caller
+/// then leaves through the normal quit path, whose idempotent restore +
+/// scrollback handoff finish the exit. Takes the writer generically so the
+/// persist+restore sequence is unit-tested directly — no real signals needed.
+fn signal_teardown<W: std::io::Write>(app: &App, out: &mut W) {
+    app.persist_chat();
+    let _ = disable_raw_mode();
+    restore_sequence(out);
+}
+
 /// Whether the terminal supports **DEC private mode 2026 (synchronized output)**
 /// — the BSU/ESU pair (`\x1b[?2026h` … `\x1b[?2026l`).
 ///
@@ -4333,6 +4351,123 @@ async fn next_resume_signal(sig: &mut Option<ResumeSignal>) {
     }
 }
 
+/// Wave 3 P1 — the TERMINATION-signal listener set the event loop selects on:
+/// SIGTERM (an external `kill` / a service manager / a system shutdown),
+/// SIGHUP (the terminal window or SSH connection closed), and SIGINT as
+/// belt-and-suspenders (raw mode reads Ctrl-C as a key so the terminal never
+/// sends it, but an external `kill -INT` still does). Before this set existed,
+/// any of those killed the process INSIDE the alternate screen with raw mode +
+/// mouse reporting still latched onto the user's shell (unusable until
+/// `reset`), and the display transcript's tail rows were never persisted.
+/// Every slot is an `Option`: a failed registration leaves that slot inert
+/// (fail-open) — never a startup error.
+#[cfg(unix)]
+struct TermSignals {
+    /// SIGTERM — external kill / service manager / shutdown.
+    term: Option<tokio::signal::unix::Signal>,
+    /// SIGHUP — the controlling terminal (window / SSH session) went away.
+    hup: Option<tokio::signal::unix::Signal>,
+    /// SIGINT — belt-and-suspenders for an external `kill -INT` (raw mode
+    /// normally delivers Ctrl-C as a key event, never a signal).
+    int: Option<tokio::signal::unix::Signal>,
+}
+/// See the unix [`TermSignals`] — the Windows console notifications that mean
+/// "this process is about to be torn down": the console window closing and a
+/// system shutdown/logoff. Best-effort parity; unix is the primary target.
+#[cfg(windows)]
+struct TermSignals {
+    /// The console window is closing.
+    close: Option<tokio::signal::windows::CtrlClose>,
+    /// The system is shutting down / the user is logging off.
+    shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+/// See [`TermSignals`] — the placeholder for platforms with neither unix
+/// signals nor the Windows console notifications (the arm stays inert).
+#[cfg(not(any(unix, windows)))]
+struct TermSignals;
+
+/// Register the termination listeners (Wave 3 P1). tokio installs each handler
+/// safely (no `unsafe`, no work in signal context); the event-loop arm does the
+/// actual persist + restore on the loop thread. Fail-open per slot: a
+/// registration failure leaves that slot `None` (that signal then keeps its
+/// default disposition, exactly as before this wave).
+fn register_termination_signals() -> TermSignals {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        TermSignals {
+            term: signal(SignalKind::terminate()).ok(),
+            hup: signal(SignalKind::hangup()).ok(),
+            int: signal(SignalKind::interrupt()).ok(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        TermSignals {
+            close: tokio::signal::windows::ctrl_close().ok(),
+            shutdown: tokio::signal::windows::ctrl_shutdown().ok(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        TermSignals
+    }
+}
+
+/// Await the next registered termination signal (Wave 3 P1). Resolves when ANY
+/// registered listener fires; an unregistered slot pends forever, and when the
+/// whole set failed to register the future never resolves — the select! arm is
+/// then inert (fail-open, mirroring [`next_resume_signal`]).
+async fn next_termination_signal(sigs: &mut TermSignals) {
+    #[cfg(unix)]
+    {
+        /// One optional signal stream: resolve on delivery, pend when absent.
+        async fn recv_opt(s: &mut Option<tokio::signal::unix::Signal>) {
+            match s.as_mut() {
+                Some(sig) => {
+                    let _ = sig.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        tokio::select! {
+            () = recv_opt(&mut sigs.term) => {}
+            () = recv_opt(&mut sigs.hup) => {}
+            () = recv_opt(&mut sigs.int) => {}
+        }
+    }
+    #[cfg(windows)]
+    {
+        /// The console-close stream: resolve on delivery, pend when absent.
+        async fn recv_close(s: &mut Option<tokio::signal::windows::CtrlClose>) {
+            match s.as_mut() {
+                Some(sig) => {
+                    let _ = sig.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        /// The shutdown/logoff stream: resolve on delivery, pend when absent.
+        async fn recv_shutdown(s: &mut Option<tokio::signal::windows::CtrlShutdown>) {
+            match s.as_mut() {
+                Some(sig) => {
+                    let _ = sig.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        tokio::select! {
+            () = recv_close(&mut sigs.close) => {}
+            () = recv_shutdown(&mut sigs.shutdown) => {}
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = sigs;
+        std::future::pending::<()>().await;
+    }
+}
+
 /// R3 — minimum interval between streaming-driven transcript redraws. A burst of
 /// engine events keeps the frame dirty while this budget throttles the actual
 /// repaints to ~60fps, so token streaming costs ~one re-layout per frame instead
@@ -4538,6 +4673,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // R5 SIGCONT listener (Unix job-control resume). `None` on non-unix / if
     // registration failed — the select! arm is then inert (fail-open).
     let mut resume_sig = register_resume_signal();
+    // Wave 3 P1 — termination listeners (SIGTERM / SIGHUP / stray SIGINT; the
+    // Windows console-close + shutdown notifications). Any unregistered slot is
+    // inert; the arm persists the chat + restores the terminal, then quits.
+    let mut term_sig = register_termination_signals();
 
     // --- R3 event coalescing + frame budget -----------------------------------
     // A burst of streaming engine events (each a token / progress note) must
@@ -5811,6 +5950,24 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 reassert_terminal_modes(terminal, app.mouse_scroll);
                 app.contaminate_terminal();
             }
+            // Wave 3 P1 — a TERMINATION signal (SIGTERM from an external kill /
+            // service manager, SIGHUP from a closed terminal window or dropped
+            // SSH session, a stray external SIGINT; on Windows the console-close
+            // / shutdown notifications). Without this arm the default
+            // disposition killed the process INSIDE the alt screen — raw mode +
+            // mouse reporting left latched on the user's shell (unusable until
+            // `reset`) and the conversation's tail rows never persisted. tokio
+            // delivers the signal safely on the loop thread; persist + restore
+            // run SYNCHRONOUSLY here (direct writes, flushed inside
+            // `signal_teardown`) so an OS follow-up SIGKILL can no longer catch
+            // a broken shell or an unsaved chat, then the loop exits through the
+            // NORMAL quit path below — whose idempotent restore + scrollback
+            // handoff print the transcript to the primary screen. Fail-open:
+            // unregistered listeners leave this arm inert.
+            () = next_termination_signal(&mut term_sig) => {
+                signal_teardown(app, terminal.backend_mut());
+                app.should_quit = true;
+            }
             // R3 — frame-deadline flush. When a streaming burst marked the frame
             // dirty but the ~16ms budget had not elapsed (so the loop-top draw was
             // skipped), this wakes the loop EXACTLY at the budget deadline so the
@@ -5826,6 +5983,12 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             break;
         }
     }
+    // Wave 3 — final display-transcript snapshot. Rows pushed AFTER the last
+    // recorded turn (build-complete cards, system notes, gate outcomes) are part
+    // of what the user saw; one persist at teardown makes the reopened screen
+    // match the closed one. Best-effort + cheap (a chat with no recorded turns
+    // is a no-op) — and NOT a hot-loop write: this runs exactly once per quit.
+    app.persist_chat();
     // Quit / app teardown: close the resident chat session so its base subprocess
     // doesn't outlive the TUI. Best-effort; fail-open — never block the exit.
     let parked = chat_session_holder
@@ -5998,6 +6161,45 @@ mod tests {
         // wedges or diverges (the property we care about is "complete every time").
         assert!(twice.windows(once.len()).any(|w| w == once.as_slice()));
         assert!(String::from_utf8_lossy(&twice).contains("\x1b[?1049l"));
+    }
+
+    /// Wave 3 P1 — the termination-signal teardown: ONE synchronous call must
+    /// (a) persist the chat to `.umadev/chat/<id>.json` — display transcript
+    /// included — and (b) emit the COMPLETE terminal-restore sequence directly
+    /// to the writer. Covered by unit-testing the helper the signal arm calls,
+    /// not by sending real signals (deterministic; no process-global handlers
+    /// touched in tests).
+    #[test]
+    fn signal_teardown_persists_chat_and_emits_full_restore() {
+        let (mut app, tmp) = build_test_app();
+        app.record_user_turn("信号前的最后一句");
+        // Wipe the turn-time persist so the assertion below proves the SIGNAL
+        // path wrote the file, not the earlier record.
+        let path = tmp
+            .path()
+            .join(".umadev")
+            .join("chat")
+            .join(format!("{}.json", app.chat_id));
+        let _ = std::fs::remove_file(&path);
+
+        let mut out: Vec<u8> = Vec::new();
+        signal_teardown(&app, &mut out);
+
+        // (a) The chat is back on disk — transcript AND the display snapshot.
+        let text = std::fs::read_to_string(&path).expect("the signal teardown persisted the chat");
+        assert!(text.contains("信号前的最后一句"));
+        assert!(
+            text.contains("\"display\""),
+            "the display transcript rides the emergency persist"
+        );
+        // (b) The full restore sequence was written directly (and flushed) so an
+        // immediate SIGKILL follow-up cannot leave the shell in the alt screen /
+        // raw / mouse modes.
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[?1049l"), "left the alternate screen");
+        assert!(s.contains("\x1b[?1000l"), "mouse capture disabled");
+        assert!(s.contains("\x1b[?2004l"), "bracketed paste disabled");
+        assert!(s.contains("\x1b[?25h"), "cursor shown");
     }
 
     /// The `force_full_repaint` path the event loop takes on a height change /

@@ -347,6 +347,7 @@
 "chat.queued" = "[queued] Queued — the base is still replying; this message will be sent the moment it finishes."
 "chat.interrupted" = " [interrupted] reply incomplete"
 "chat.restored" = "[chat] Restored your last conversation ({} messages). Pick up where you left off, or /sessions to switch, /clear to start fresh."
+"chat.restored_divider" = "──── restored — the previous conversation is above (scroll up to review) ────"
 "sessions.empty" = "[chat] No saved chats for this project yet. They save automatically as you talk; reopen one with /resume <id>."
 "sessions.header" = "[chat] Saved chats (* = current):\n{}  Reopen one with /resume <id>."
 "resume.usage" = "Usage: /resume <id> — run /sessions first to see resumable chat ids."

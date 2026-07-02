@@ -766,7 +766,11 @@ fn merge_seat_status(acc: SeatStatus, role: &str, status: &str) -> SeatStatus {
 }
 
 /// Source of a chat message — used to colour the role label.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+///
+/// Serde-derived (Wave 3): the visible display transcript is persisted inside
+/// [`ChatSession`] so a relaunch rebuilds the same screen; an unknown variant
+/// in a newer file simply fails that one row's lenient parse (fail-open).
+#[derive(Debug, Copy, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ChatRole {
     /// The end user typing into the input box.
     You,
@@ -788,8 +792,9 @@ pub enum ChatRole {
 /// Lifecycle of a structured tool call shown in the transcript. Drives the
 /// status glyph (queued = dim, running = spinner, ok = green, fail = red) and
 /// the auto-collapse policy (a finished OK call collapses; running / failed
-/// always stay expanded).
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// always stay expanded). Serde-derived so a persisted tool row round-trips
+/// its terminal state (Wave 3 — display-transcript persistence).
+#[derive(Debug, Copy, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ToolStatus {
     /// Announced but not yet started (rare on the stream path; reserved).
     Queued,
@@ -824,7 +829,9 @@ impl ToolStatus {
 /// glyph, the bold name, then the dim primary argument) with its result folded
 /// into a dim gutter line below. Replaces the old path that flattened a tool
 /// call into a sentence-like string, so a write/edit no longer reads like prose.
-#[derive(Debug, Clone, Eq, PartialEq)]
+/// Serde-derived (Wave 3) so a persisted display transcript keeps tool rows
+/// structured across a relaunch instead of flattening them to prose.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     /// The tool's name as the base reports it (`Read` / `Edit` / `Bash` …).
     pub name: String,
@@ -941,8 +948,9 @@ pub struct PaletteEntry {
 /// the BEFORE file for a deletion — whichever the row belongs to (so the number
 /// column tracks the file you can actually open). `text` is the raw content
 /// WITHOUT the +/-/space prefix (the gutter carries that), syntax-highlighted by
-/// the renderer per the file extension.
-#[derive(Debug, Clone, Eq, PartialEq)]
+/// the renderer per the file extension. Serde-derived (Wave 3) so a persisted
+/// diff card survives a relaunch line-for-line.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DiffLine {
     /// Gutter marker: `'+'` add, `'-'` delete, `' '` unchanged context.
     pub tag: char,
@@ -964,7 +972,7 @@ pub struct DiffLine {
 
 /// A contiguous block of changed + surrounding-context lines (one `@@` hunk),
 /// already trimmed to ±N context lines.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DiffHunk {
     /// The lines of this hunk in display order.
     pub lines: Vec<DiffLine>,
@@ -976,7 +984,7 @@ pub struct DiffHunk {
 /// [`umadev_runtime::ToolEdit`] (a `Write`/`Edit` the base actually performed),
 /// so the user sees code being added / changed in real time instead of a bare
 /// `Write src/app.tsx` row.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileDiff {
     /// The edited file's path (rendered in the header + used for the language
     /// hint that drives syntax highlighting).
@@ -1599,8 +1607,10 @@ fn unquote_unescape(s: &str) -> String {
 /// typed enum is the P0 data-model foundation the tool-row beautification (P4),
 /// the long-output folding (P6), and the diff card (P1) build on; everything
 /// else stays plain `Text`, so the upgrade is backward-compatible by
-/// construction.
-#[derive(Debug, Clone, Eq, PartialEq)]
+/// construction. Serde-derived (Wave 3, externally tagged): the display
+/// transcript persists these rows structured, and a variant a given binary
+/// doesn't know fails only that row's lenient parse (fail-open).
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MessageBody {
     /// A free-text body (already cleaned of ANSI etc.). Goes through the shared
     /// markdown renderer (`markdown_to_lines`) on the assistant/host path.
@@ -1658,8 +1668,10 @@ impl MessageBody {
     }
 }
 
-/// One row in the chat history.
-#[derive(Debug, Clone, Eq, PartialEq)]
+/// One row in the chat history. Serde-derived (Wave 3) — the unit the
+/// persisted display transcript ([`ChatSession::display`]) stores and the
+/// relaunch rebuild restores, so the reopened screen matches the closed one.
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     /// Who "said" this.
     pub role: ChatRole,
@@ -1868,7 +1880,13 @@ pub struct App {
     /// so the pure `&App` renderer can populate it on first use.
     pub mention_files: std::cell::RefCell<Option<Vec<String>>>,
 
-    /// Bounded scrolling chat history (older lines roll off).
+    /// Bounded scrolling chat history (older lines roll off). This is the
+    /// VISIBLE rendered surface (prose + tool rows + diff cards + plan memos +
+    /// notes) — distinct from the base-facing [`Self::conversation`] /
+    /// [`Self::full_transcript`]. Wave 3: persisted as
+    /// [`ChatSession::display`] on the same cadence as the transcript and
+    /// REBUILT by [`Self::load_chat`] on reopen, so a relaunch shows the same
+    /// screen instead of an empty conversation.
     pub history: VecDeque<ChatMessage>,
 
     /// **Transcript scrollback** — how many wrapped rows the user has scrolled
@@ -2827,6 +2845,10 @@ impl App {
             // so the on-disk history survives in full and is never mutated by
             // compaction. `/resume` reopens the complete conversation.
             messages: self.full_transcript.clone(),
+            // Wave 3 — the VISIBLE rendered transcript (prose + tool rows + diff
+            // cards + notes), already bounded by HISTORY_CAP, so a relaunch
+            // rebuilds the exact screen the user left instead of an empty one.
+            display: Some(self.history.iter().cloned().collect()),
         };
         let Ok(body) = serde_json::to_string_pretty(&session) else {
             return;
@@ -2890,6 +2912,12 @@ impl App {
     /// Load a saved chat by id into the live buffer (Wave 5 / `/resume <id>`).
     /// Returns `true` on success. Fail-open: a missing / corrupt / empty file
     /// returns `false` and leaves the live conversation untouched.
+    ///
+    /// Wave 3: also REBUILDS the visible display transcript ([`Self::history`])
+    /// — from the persisted rich rows when the file has them, else seeded as
+    /// plain prose from the durable transcript — ending with a restore divider
+    /// and re-pinned to the bottom, so reopening shows the conversation, never
+    /// an empty screen.
     pub(crate) fn load_chat(&mut self, id: &str) -> bool {
         let Ok(text) = std::fs::read_to_string(self.chat_path(id)) else {
             return false;
@@ -2920,6 +2948,44 @@ impl App {
         if self.chat_session_id.is_some() {
             self.host_chat_session_active = true;
         }
+        // Wave 3 — rebuild the VISIBLE display transcript. Prefer the persisted
+        // rich rows (tool rows / diff cards / notes survive verbatim; any row
+        // saved mid-flight settles to Aborted so nothing spins forever); an old
+        // file without the field — or one whose display rows were all corrupt
+        // (`lenient_display_rows` → `None`) — falls back to plain prose seeded
+        // from the durable transcript, so even a legacy chat reopens visible.
+        let rows: Vec<ChatMessage> = session.display.map_or_else(
+            || seed_display_from_transcript(&self.full_transcript),
+            |d| d.into_iter().map(settle_restored_row).collect(),
+        );
+        self.history.clear();
+        self.history.extend(rows);
+        while self.history.len() > HISTORY_CAP {
+            self.history.pop_front();
+        }
+        // The replaced transcript invalidates every display-derived live pointer
+        // (indices into the OLD `history`, the streaming caches, a drag selection
+        // or search over rows that no longer exist) — mirror the `/clear` resets.
+        self.thinking_block_idx = None;
+        self.thinking_block_start = None;
+        self.stream_tool_batch = None;
+        self.stream_text_active = false;
+        self.reset_stream_md_cache();
+        self.selection = None;
+        self.selection_dragging = false;
+        self.search = None;
+        // The restore boundary: the reopened conversation ends here and new turns
+        // continue below — the same affordance as the run-resume separator, so
+        // the transcript reads as one continuous history to scroll back through.
+        self.push(
+            ChatRole::System,
+            umadev_i18n::t(self.lang, "chat.restored_divider"),
+        );
+        // Land pinned to the bottom (the newest rows + the divider on screen) and
+        // heal the frame in full — the whole viewport just changed.
+        self.transcript_scroll.set(0);
+        self.transcript_prev_hidden.set(0);
+        self.request_transcript_repaint();
         true
     }
 
@@ -12564,6 +12630,76 @@ pub(crate) struct ChatSession {
     pub base_session_id: Option<String>,
     /// The conversation transcript, oldest → newest.
     pub messages: Vec<umadev_runtime::Message>,
+    /// Wave 3 — the **visible display transcript**: the rendered rows the user
+    /// actually saw (prose, structured tool rows, diff cards, system notes),
+    /// bounded by [`HISTORY_CAP`]. Persisted alongside the base-facing
+    /// [`Self::messages`] so a relaunch REBUILDS the same screen instead of an
+    /// empty conversation (the Claude Code / opencode reopen model).
+    /// `#[serde(default)]` for back-compat: an old file without the field loads
+    /// as `None` and `load_chat` seeds prose rows from `messages` instead.
+    /// Deserialized LENIENTLY, element-wise ([`lenient_display_rows`]): a
+    /// corrupt / unknown row is skipped rather than failing the whole session
+    /// (fail-open — the durable prose transcript always survives). An older
+    /// binary reading a new file simply ignores this extra field.
+    #[serde(default, deserialize_with = "lenient_display_rows")]
+    pub display: Option<Vec<ChatMessage>>,
+}
+
+/// Lenient, element-wise deserializer for [`ChatSession::display`] (Wave 3).
+///
+/// The display transcript is a *reconstruction convenience*, never the durable
+/// record — so its parse must be unable to take the session down. A field that
+/// isn't an array yields `None` (→ prose seeding from `messages`); an array is
+/// parsed row by row and any row that fails (hand-edited file, a variant from a
+/// newer binary) is skipped; an all-corrupt/empty array again yields `None`.
+fn lenient_display_rows<'de, D>(de: D) -> Result<Option<Vec<ChatMessage>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let value = serde_json::Value::deserialize(de)?;
+    let serde_json::Value::Array(items) = value else {
+        return Ok(None);
+    };
+    let rows: Vec<ChatMessage> = items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value(item).ok())
+        .collect();
+    Ok(if rows.is_empty() { None } else { Some(rows) })
+}
+
+/// Seed a plain-prose display transcript from the durable `{role, content}`
+/// turns — the Wave 3 fallback for an OLD session file persisted before the
+/// `display` field existed (or one whose display rows were corrupt). Even a
+/// legacy chat then reopens with the conversation visible instead of empty:
+/// user turns render as `You` rows, everything else as `Host` prose.
+fn seed_display_from_transcript(messages: &[umadev_runtime::Message]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .map(|m| ChatMessage {
+            role: if m.role == "user" {
+                ChatRole::You
+            } else {
+                ChatRole::Host
+            },
+            kind: MessageBody::Text(m.content.clone()),
+            collapsed: false,
+        })
+        .collect()
+}
+
+/// Settle one restored display row (Wave 3): a tool row persisted mid-flight
+/// (`Queued` / `Running` — e.g. the process died between the announce and the
+/// result) is marked `Aborted`, mirroring the live interrupt-settle policy, so
+/// a restored transcript can never show a spinner for a call that will never
+/// return. Every other row passes through unchanged.
+fn settle_restored_row(mut row: ChatMessage) -> ChatMessage {
+    if let MessageBody::Tool(t) = &mut row.kind {
+        if !t.status.is_terminal() {
+            t.status = ToolStatus::Aborted;
+        }
+    }
+    row
 }
 
 /// A best-effort ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) WITHOUT pulling
@@ -14818,18 +14954,33 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
             }],
+            display: Some(vec![ChatMessage {
+                role: ChatRole::You,
+                kind: MessageBody::Text("hi".to_string()),
+                collapsed: false,
+            }]),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: ChatSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back.base_session_id.as_deref(), Some("base-xyz"));
+        // Wave 3 — the display transcript round-trips through the same file.
+        let display = back.display.expect("the display rows round-trip");
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, ChatRole::You);
+        assert_eq!(display[0].body(), "hi");
 
-        // OLD file (no `base_session_id` key) → `#[serde(default)]` yields `None`.
+        // OLD file (no `base_session_id` / `display` key) → `#[serde(default)]`
+        // yields `None` for both (back-compat / fail-open).
         let legacy = r#"{"id":"old","updated_at":"x","backend":"codex",
             "messages":[{"role":"user","content":"hi"}]}"#;
         let parsed: ChatSession = serde_json::from_str(legacy).unwrap();
         assert_eq!(
             parsed.base_session_id, None,
             "an old chat file without the field loads as None (back-compat)"
+        );
+        assert_eq!(
+            parsed.display, None,
+            "an old chat file without display rows loads as None (Wave 3 back-compat)"
         );
         assert_eq!(parsed.messages.len(), 1, "the transcript still loads");
     }
@@ -14887,6 +15038,203 @@ mod tests {
         assert!(
             !app.host_chat_session_active,
             "a None base session id never force-flags the session active"
+        );
+    }
+
+    /// Wave 3 P0 — the VISIBLE display transcript round-trips: rich rows (a
+    /// structured tool row with its result, a system note) survive persist →
+    /// relaunch verbatim, a tool row saved mid-flight settles to Aborted, the
+    /// restored transcript ends with the divider, and the view re-pins to the
+    /// bottom.
+    #[test]
+    fn display_transcript_round_trips_rich_rows_and_ends_with_divider() {
+        let (mut app, tmp) = temp_app();
+        app.push(ChatRole::You, "做一个看板");
+        app.push(ChatRole::Host, "好的，开始搭建。");
+        // A finished tool row (result attached) + one still in flight.
+        app.history.push_back(ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Tool(ToolCall {
+                name: "Bash".to_string(),
+                arg: "npm test".to_string(),
+                status: ToolStatus::Ok,
+                result: Some("42 tests passed".to_string()),
+                merged: false,
+                count: 1,
+                collapsed: true,
+            }),
+            collapsed: false,
+        });
+        app.history.push_back(ChatMessage {
+            role: ChatRole::Host,
+            kind: MessageBody::Tool(ToolCall {
+                name: "Write".to_string(),
+                arg: "src/app.tsx".to_string(),
+                status: ToolStatus::Running,
+                result: None,
+                merged: false,
+                count: 1,
+                collapsed: false,
+            }),
+            collapsed: false,
+        });
+        app.push(ChatRole::System, "note: checkpoint saved");
+        // A recorded exchange makes the chat persistable; `record_agentic_done`
+        // persists (transcript + the display snapshot above).
+        app.record_user_turn("做一个看板");
+        app.record_agentic_done("好的，开始搭建。".to_string(), false, None);
+
+        // Simulate a restart: a brand-new App over the SAME project root.
+        let cfg = UserConfig {
+            backend: Some("claude-code".to_string()),
+            lang: Some("zh-CN".to_string()),
+            ..Default::default()
+        };
+        let app2 = App::new(
+            "demo",
+            cfg,
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        // The rich rows were REBUILT, not flattened: the finished tool row keeps
+        // its structure, result, and fold state...
+        let ok_tool = app2
+            .history
+            .iter()
+            .find_map(|m| match &m.kind {
+                MessageBody::Tool(t) if t.name == "Bash" => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the finished tool row survives the relaunch");
+        assert_eq!(ok_tool.status, ToolStatus::Ok);
+        assert_eq!(ok_tool.result.as_deref(), Some("42 tests passed"));
+        assert!(ok_tool.collapsed, "the fold state survives");
+        // ...the mid-flight tool row settled to Aborted (nothing spins forever)...
+        let write_tool = app2
+            .history
+            .iter()
+            .find_map(|m| match &m.kind {
+                MessageBody::Tool(t) if t.name == "Write" => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the in-flight tool row survives the relaunch");
+        assert_eq!(
+            write_tool.status,
+            ToolStatus::Aborted,
+            "a restored mid-flight tool row settles to Aborted"
+        );
+        // ...and the prose + note rows are back too.
+        assert!(app2
+            .history
+            .iter()
+            .any(|m| m.role == ChatRole::You && m.body() == "做一个看板"));
+        assert!(app2
+            .history
+            .iter()
+            .any(|m| m.role == ChatRole::System && m.body() == "note: checkpoint saved"));
+        // The restored transcript ends with the divider, then the launch-time
+        // "restored N turns" note — and the view is pinned to the bottom.
+        let divider = umadev_i18n::t(app2.lang, "chat.restored_divider");
+        let rows: Vec<String> = app2.history.iter().map(|m| m.body().to_string()).collect();
+        let divider_idx = rows
+            .iter()
+            .position(|b| b == divider)
+            .expect("the restore divider is present");
+        assert_eq!(
+            divider_idx,
+            rows.len() - 2,
+            "the restored rows end with the divider (only the restore note follows)"
+        );
+        assert!(
+            rows.last().unwrap().contains("恢复"),
+            "the chat.restored note follows the divider"
+        );
+        assert_eq!(
+            app2.transcript_scroll.get(),
+            0,
+            "the restored transcript lands pinned to the bottom"
+        );
+    }
+
+    /// Wave 3 P0 back-compat — an OLD session file (persisted before the
+    /// `display` field existed) still reopens VISIBLE: the prose conversation is
+    /// seeded from the durable transcript (user → You, assistant → Host), ends
+    /// with the divider, and never crashes.
+    #[test]
+    fn old_session_file_without_display_seeds_prose_history() {
+        let (mut app, _tmp) = temp_app();
+        let dir = app.project_root.join(".umadev").join("chat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = r#"{"id":"legacy-1","updated_at":"2026-01-01T00:00:00Z","backend":"claude-code",
+            "messages":[{"role":"user","content":"老问题"},{"role":"assistant","content":"老回答"}]}"#;
+        std::fs::write(dir.join("legacy-1.json"), legacy).unwrap();
+
+        assert!(
+            app.load_chat("legacy-1"),
+            "an old file without display rows still loads"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.role == ChatRole::You && m.body() == "老问题"),
+            "the user turn is seeded as a visible You row"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.role == ChatRole::Host && m.body() == "老回答"),
+            "the assistant turn is seeded as a visible Host row"
+        );
+        assert_eq!(
+            app.history.back().unwrap().body(),
+            umadev_i18n::t(app.lang, "chat.restored_divider"),
+            "the seeded transcript ends with the restore divider"
+        );
+        assert_eq!(app.transcript_scroll.get(), 0);
+    }
+
+    /// Wave 3 P0 fail-open — a corrupt `display` field can never take the chat
+    /// down: a wrong-typed field falls back to prose seeding, and a corrupt ROW
+    /// inside an otherwise-good array is skipped element-wise while the valid
+    /// rows survive.
+    #[test]
+    fn corrupt_display_field_falls_back_cleanly() {
+        let (mut app, _tmp) = temp_app();
+        let dir = app.project_root.join(".umadev").join("chat");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (a) `display` is the wrong TYPE entirely → lenient parse yields None →
+        // the prose conversation is seeded from the durable transcript.
+        let wrong_type = r#"{"id":"corrupt-a","updated_at":"x","backend":"codex",
+            "messages":[{"role":"user","content":"你好"}],"display":"not-an-array"}"#;
+        std::fs::write(dir.join("corrupt-a.json"), wrong_type).unwrap();
+        assert!(
+            app.load_chat("corrupt-a"),
+            "a corrupt display field never fails the load"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.role == ChatRole::You && m.body() == "你好"),
+            "fell back to prose seeding from the durable transcript"
+        );
+
+        // (b) ONE corrupt row inside the array is skipped; the valid row survives
+        // (element-wise leniency — never all-or-nothing).
+        let mixed = r#"{"id":"corrupt-b","updated_at":"x","backend":"codex",
+            "messages":[{"role":"user","content":"第二"}],
+            "display":[{"bogus":true},{"role":"System","kind":{"Text":"手写行"},"collapsed":false}]}"#;
+        std::fs::write(dir.join("corrupt-b.json"), mixed).unwrap();
+        assert!(app.load_chat("corrupt-b"));
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.role == ChatRole::System && m.body() == "手写行"),
+            "the valid display row survives element-wise parsing"
+        );
+        assert!(
+            !app.history.iter().any(|m| m.body() == "第二"),
+            "the display path was used — no prose-seeding duplicate"
         );
     }
 

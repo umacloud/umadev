@@ -350,6 +350,9 @@ mod tests {
             "tui.gate_block.hint",
             "tui.scroll.both",
             "tui.scroll.above",
+            // Wave 3 (TUI lifecycle + display-transcript persistence): the
+            // restore-boundary divider appended after a rebuilt transcript.
+            "chat.restored_divider",
             "tui.hint.palette",
             "tui.hint.gate_tag",
             "tui.hint.gate_action",
