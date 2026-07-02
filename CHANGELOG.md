@@ -2,6 +2,36 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.22] — 依赖先装再跑测试 · 长跑不再乱码 · 阻塞给解决建议 · 悬置项登记册
+
+这一版把用户实测的几处高频卡点收口。**跑测试前先把依赖(含 dev / test 附加项)一次装齐**,不再上演"跑 `pytest` → `No module named pytest` → sync → 重试"的来回:一次运行里出现缺模块报错被当成漏装依赖、而不是测试失败,专门点了 uv 的坑(默认 `uv sync` 不含 dev 附加项、要 `uv sync --extra dev` / `--all-extras`)。**长跑不再乱码**:一次长时间流式运行结束后,不再留下互相叠字的转录和冻住的"本轮已中止"页脚 —— 在运行落定的那一刻与转录换基 / 收缩时强制整帧重绘(此前只覆盖了输入框)。**阻塞现在给解决建议**:某个评审席位打回时,除了指出哪里不对,还给出逐条的"怎么修"与下一步该做什么。并新增**第三条持久记忆通道 —— OPEN-DECISIONS 悬置项登记册**:把未决 / 推迟 / 受阻 / 等待未来触发的事项落进 `docs/decisions/OPEN-DECISIONS.md`,每次任务开始自动回灌进底座上下文,悬而未决的事再也不会丢。
+
+### 新增 / 改进 — 依赖先装再跑测试
+
+- **跑测试前先把依赖(含 dev / test 附加项)一次装齐,不再来回**:此前底座对着缺 dev 依赖的环境跑 `uv run python -m pytest`、报 `No module named pytest`,再 `uv sync --extra dev` 重跑 —— 每次白费一个来回。现三管齐下、全部 fail-open / 确定性 / 只在构建 + 验证路径生效:
+  - **固件 / 方法论指令**(`experts::deps_before_tests_directive`)接进 `director_build_directive`(完整构建 `/run`)、`continuous::phase_directive`(Quality 重型 + 精简 / VERIFY)与 `coach::render_quality`:在跑测试前**一次装齐**依赖(含 dev / test 附加项);一次运行里的 `No module named pytest` / `ModuleNotFoundError` / `ruff: not found` 是漏装了依赖、**不是测试失败**,别盲目重试。明确点出用户实测的 uv 坑(默认 `uv sync` 不含 dev 附加项 → `uv sync --extra dev` / `--all-extras` / `--group dev`),并覆盖 `pip -e '.[dev]'`、`poetry --with dev`、`pdm -G dev`、`npm ci`。聊天 / 前端轮不注入。
+  - **error_kb 识别缺测试工具**(`detect_missing_test_tool`,置于级联最前):把缺失的测试 / lint 工具(`pytest` / `ruff` / `mypy` / `jest` / `eslint` … 叠加"无此模块 / 命令找不到 / 无法识别"标记)识别为稳定指纹 `dependency/test-deps-missing` → 触发"先装 dev 依赖"的规避建议;缺失的是**应用自身模块**则仍归一到通用 module-not-found 家族,普通失败测试不被误判。
+  - **知识标准** `knowledge/testing/01-standards/dependency-install-before-tests.md`(quality_score 95):给出规则 + 各生态安装命令 + uv `--extra dev` 陷阱,并明确"一次测试运行里的缺模块报错是漏装、不是测试失败"。
+
+### 修复 — TUI(长跑乱码 / 冻住的中止页脚)
+
+- **长跑结束后不再留下叠字转录 + 冻住的"本轮已中止"页脚(用户实测,1.0.21 仍存在)**:叠字的根因是增量 diff **漂移** —— 终端与 ratatui 模型逐渐失同步(撕裂的半截写入、宽 CJK / 自动换行在大段团队评审输出上的分歧),而非 ratatui 自身留了陈旧单元。此前唯一能治漂移的周期性自愈刷洗有两处缺口:(1) 刷洗以 `app_is_live` 为门,长跑一落定(完成 / 中止)就**停**,已积累的叠字与"本轮已中止"页脚**冻在屏上**(又以 `sync_output` 为门,不支持 DEC-2026 的终端运行期从不刷洗);(2) 转录**换基**(`MAX_RENDER_ROWS` 前段 `split_off`)或**收缩**(fold / `/compact` / `/clear` / 去掉活性指示)时没有任何东西强制重绘 —— 既有的 `force_full_repaint` 触发只覆盖输入框高度 / resize / resume。
+- **修法(事件驱动,不做每帧过度重绘)**:(a) `live_settled` —— 在 `app_is_live` 的 true→false 边沿,对最终落定帧强制**一次**干净整帧重绘(关键修复,每种终端都生效、一次性、非周期性闪烁),叠字与中止页脚不再冻住;(b) `transcript_reflow_needs_repaint` —— 在 `MAX_RENDER_ROWS` 首次越界拆分或转录收缩时重绘,但稳态粘底流式增长时**不**重绘(不抖动);(c) `scroll_jump_repaint` —— 仅当滚动偏移真正移动时才重绘。状态栏竖向换行也是终端漂移(`meta_row` 本就夹到 1 行区域),由落定重绘一并治好。`forbid(unsafe_code)` 保持。
+
+### 新增 — 团队评审(阻塞给解决建议)
+
+- **评审阻塞现在给出逐条解决建议 + 下一步**:此前 UmaDev 只显示**哪里不对**(评审席位的 blocking 发现 + 证据),不说**该怎么办** —— `RoleVerdict` 有 blocking + evidence 却无"如何修",返工指令也没为用户算出逐条补救。现给 `RoleVerdict` 加了与 blocking **按下标对齐**的 `remediation: Vec<String>` 通道(每个席位在**同一次评判轮**里为每条 must-fix 各产出一行"怎么修" —— 不额外调大脑、不靠关键词启发;8 份评审系统提示现请求 `remediation` / `fix`)。`normalized()` **就地**裁剪 remediation,使中间的空条目不会把后面的修法错位到别的阻塞上。它搭 `EngineEvent::CriticVerdict` 直达 TUI:任一席位打回时,团队评审面板内联显示首条阻塞的修法 + 一行 WARNING 色的"下一步:`/run` 让团队应用这些修复,或 `/revise <指引>`";`push_critic_note` 在永不丢失的转录里逐条列出阻塞及其修法;headless / CLI 打印也带出首条修法。**Advisory + fail-open**(缺失 / 偏短的 remediation → 阻塞照旧显示、绝不编造修法;循环控制与四条不变量不变)。
+
+### 新增 — 记忆(OPEN-DECISIONS 悬置项登记册)
+
+- **第三条持久记忆通道:悬置项登记册**:执行中被留作未决 / 推迟 / 受阻 / 等待未来触发的事项(缺一把外部密钥、依赖某个下游任务、一个含糊的设计决策、一个开放问题、一次推迟的验证、一处带保留的边界)此前会**丢** —— 留在工作记忆里或在聊天里提一嘴就忘了,毫无可追溯性。用户已用一条手写 `CLAUDE.md` 指令验证有效(一次运行里登记册累积了 22 条分类事项、无一丢失),本次将其内建,让每个项目都有。它与 `facts.jsonl`(持久事实)、`lessons` / `reflections`(踩坑)并列,成为第三条记忆通道:open-decisions。
+- **实现**(`open_decisions.rs`,仿 `project_facts`):读 / 追加一份**只追加、项目可见**的登记册 `docs/decisions/OPEN-DECISIONS.md`(**提交进仓库、不 gitignore** —— 就是要被评审 / diff);宽容解析器(`## OPEN|RESOLVED — <类别> — <标题>` + 字段行);API `load_decisions` / `unresolved` / `counts` / `decisions_directive` / `decisions_recall_block` / `append_decision`;fail-open(缺失 / 畸形 → 空)、有界(256 条解析上限、12 条召回、1600 字预算)、确定性。**固件**(`context.rs`,自门控到工作轮):KV 缓存稳定头里放一条静态指令(把任何未决 / 推迟 / 受阻 / 等待项记入登记册,只追加 + 就地解决,含三个类别 waiting-on-external / design-decision-to-evaluate / existing-design-boundary 与七个字段),并在事实召回之后放一段**易变召回**(未决项 + 一行"(N 条未决 + M 条已解决)"摘要),让此前的悬置项**自动回灌**进底座上下文,而非指望它重读文件;KV 缓存稳定前缀不变量仍成立;聊天 / 琐碎轮两者都不给。
+- 附:知识标准 `knowledge/agentic-delivery/01-standards/open-decisions-parking-lot-register.md`(quality 95);+15 测试。
+
+### 内部
+
+- 计数:agent 1120 → 1121 → 1137;tui 694 → 697;i18n +6;bin 191 + 22。全部改动 fail-open、确定性,门控到对应路径。
+
 ## [1.0.21] — TUI Windows 退格修复 · 评审有据不再幻觉 · 文档同步去味
 
 这一版把用户实测的 **Windows 退格删不掉**修好(Windows Terminal / ConPTY 上退格键此前根本删不了字),配套补上 Alt-退格删词、Windows 默认走原生 crossterm 输入后端让 Esc / 方向键都认得、帮助浮层滚动到底不再"按住下键再上看着像卡住";并把**质量评审裁判从凭空幻觉改成有据可依** —— 把真实存在的测试 / 源码文件清单喂进它的评审上下文,它不再张口就说"没有测试 / 没有后端 / 没有源码"从而触发一轮冤枉返工。最后把对外文档整体**同步 + 去味**:说清 UmaDev 是什么、而不是不是什么,清掉只有内部才懂的"总监"框架与 AI 营销腔。
