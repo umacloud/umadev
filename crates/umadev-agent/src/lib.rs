@@ -60,6 +60,7 @@ pub mod first_pass;
 pub mod gates;
 pub mod lessons;
 pub mod manifest;
+pub mod open_decisions;
 pub mod phases;
 pub mod plan_state;
 pub mod planner;
@@ -143,6 +144,11 @@ pub use lessons::{
     ValidatedEntry,
 };
 pub use manifest::{ConformanceLevel, Profile, SpecManifest};
+pub use open_decisions::{
+    append_decision, counts as open_decision_counts, decisions_directive, decisions_recall_block,
+    load_decisions, unresolved as unresolved_decisions, DecisionStatus, NewDecision, OpenDecision,
+    DECISIONS_FIRMWARE_BUDGET, REGISTER_REL_PATH as OPEN_DECISIONS_REL_PATH,
+};
 pub use phases::{
     agentic_knowledge_digest, knowledge_top_files, phase_knowledge_digest, PhaseOutput,
 };

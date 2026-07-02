@@ -235,6 +235,22 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
             fw.push_block(&charter);
         }
 
+        // ── OPEN-DECISIONS discipline — the parking-lot DIRECTIVE (static) ────
+        // The third durable-memory channel (sibling of the recorded facts below +
+        // the pitfall ledger): a committed register of items left undecided /
+        // deferred / blocked / parked pending a future trigger, so a real dev
+        // team's parking-lot list is built into EVERY project instead of relying
+        // on the base to hold open items in working memory (where they are lost).
+        // This block is the RECORD guidance — WHEN/WHERE to append, the append-
+        // only + resolved-in-place discipline, the three categories + the entry
+        // fields. It is a byte-STATIC `&'static str` (no per-turn data), so it
+        // sits in the KV-cache-stable head like the anti-slop law — a fixed
+        // policy, paid once. The volatile RECALL of the actual unresolved items
+        // is injected below the boundary (next to the recorded facts). Always-on
+        // for work turns ON PURPOSE: without it a fresh project would never be
+        // told to record its FIRST open item.
+        fw.push_block(crate::open_decisions::decisions_directive());
+
         // ══ STABLE → VOLATILE BOUNDARY (KV-cache) ════════════════════════════
         // Everything ABOVE this point (identity, output-language, craft law,
         // anti-slop law, user charter) is byte-stable across turns and forms the
@@ -263,6 +279,24 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         );
         if !facts.trim().is_empty() {
             fw.push_block(&facts);
+        }
+
+        // ── OPEN-DECISIONS RECALL — unresolved items resurface (volatile) ────
+        // The still-UNRESOLVED parking-lot items for THIS project, prefixed with
+        // the `(N unresolved + M resolved)` summary, so a prior deferred/blocked
+        // item auto-resurfaces into the base's context at each task/phase start
+        // instead of relying on it to re-read `docs/decisions/OPEN-DECISIONS.md`.
+        // The paired RECORD directive is in the stable head above. Volatile (it
+        // changes as items are added/resolved) → placed AFTER the STABLE boundary
+        // next to the recorded facts. Bounded ([`DECISIONS_FIRMWARE_BUDGET`] +
+        // item cap) + fail-open: no register / a malformed register / no open
+        // items → empty, spending nothing (0 recall tokens on a fresh project).
+        let open_decisions = crate::open_decisions::decisions_recall_block(
+            root,
+            crate::open_decisions::DECISIONS_FIRMWARE_BUDGET,
+        );
+        if !open_decisions.trim().is_empty() {
+            fw.push_block(&open_decisions);
         }
 
         // ── App RUNTIME MODEL — keep it the user's choice, not the dev base's ──
@@ -913,6 +947,106 @@ mod tests {
         assert!(
             !fw.contains("KNOWN PROJECT FACTS"),
             "no store → no facts block: {fw}"
+        );
+    }
+
+    /// Seed a committed open-decisions register with two unresolved items + one
+    /// resolved item.
+    fn seed_open_decisions(root: &Path) {
+        let path = root.join(crate::open_decisions::REGISTER_REL_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "# Open Decisions Register\n\n\
+             ## OPEN — waiting-on-external-condition — Stripe live key not provisioned\n\
+             - **Open item**: cannot wire live payments without STRIPE_LIVE_KEY\n\
+             - **Resolves when**: the STRIPE_LIVE_KEY env var is available\n\n\
+             ## OPEN — design-decision-to-evaluate — Session store cookie vs Redis\n\
+             - **Open item**: pick the session backend\n\n\
+             ## RESOLVED — existing-design-boundary — Single-region deploy accepted\n\
+             - **Resolution**: single region for v1\n",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_turn_recalls_open_decisions_and_carries_the_directive() {
+        // The decision-loss fix: on a WORK turn the firmware RECALLS the still-
+        // unresolved parking-lot items (prefixed with the N/M summary) AND carries
+        // the always-on record-to-register DIRECTIVE (categories + fields).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_open_decisions(tmp.path());
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::BackendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "接着做支付和会话").await;
+        // RECALL: the unresolved items + the "(N unresolved + M resolved)" summary.
+        assert!(
+            fw.contains("2 unresolved + 1 resolved"),
+            "recall carries the N/M summary: {fw}"
+        );
+        assert!(fw.contains("Stripe live key"), "recalls open item 1: {fw}");
+        assert!(fw.contains("cookie vs Redis"), "recalls open item 2: {fw}");
+        assert!(
+            !fw.contains("Single-region deploy"),
+            "resolved item not recalled: {fw}"
+        );
+        // DIRECTIVE: the record-to-register guidance with the categories + fields.
+        assert!(
+            fw.contains(crate::open_decisions::REGISTER_REL_PATH),
+            "directive names the register path: {fw}"
+        );
+        assert!(
+            fw.contains("waiting-on-external-condition")
+                && fw.contains("design-decision-to-evaluate")
+                && fw.contains("existing-design-boundary"),
+            "directive documents the three categories: {fw}"
+        );
+        assert!(
+            fw.contains("**Resolves when**") && fw.contains("**Open item**"),
+            "directive documents the structured fields: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_chat_carries_no_open_decisions_block() {
+        // Pure chat stays light: even with a register on disk, a chat turn carries
+        // NEITHER the recall NOR the directive (0 tokens on chat/trivial).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_open_decisions(tmp.path());
+        let r = route(RouteClass::Chat, Depth::Fast, Vec::new());
+        let fw = compose_firmware(tmp.path(), &r, "你好,在吗?").await;
+        assert!(
+            !fw.contains("OPEN DECISIONS") && !fw.contains("OPEN-DECISIONS DISCIPLINE"),
+            "chat carries no open-decisions block: {fw}"
+        );
+        assert!(
+            !fw.contains("2 unresolved"),
+            "chat carries no recall summary: {fw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_decisions_is_fail_open_on_a_missing_register() {
+        // No register (a fresh project): a work turn still carries the always-on
+        // DIRECTIVE (so the base records its FIRST open item) but NO recall — and
+        // never panics.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "做一个登录页").await;
+        assert!(
+            fw.contains("OPEN-DECISIONS DISCIPLINE"),
+            "directive is always-on for a work turn: {fw}"
+        );
+        assert!(
+            !fw.contains("OPEN DECISIONS — unresolved"),
+            "no register → no recall block: {fw}"
         );
     }
 
