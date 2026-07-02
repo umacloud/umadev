@@ -164,6 +164,14 @@ pub(crate) fn parse_facts(reply: &str) -> Vec<Fact> {
 /// [`crate::project_facts::record_facts`] (a write error is swallowed → still `0`).
 pub(crate) fn record_from_reply(root: &Path, reply: &str) -> usize {
     let facts = parse_facts(reply);
+    // STALENESS SWEEP first: tombstone any stored LIVE fact this run's observations
+    // clearly CONTRADICT (a changed value for the same key) or that has gone dead (a
+    // `path` fact whose absolute target no longer exists), so a rotten fact stops
+    // being recalled. Runs even on a `none` reply (an empty `facts` still lets the
+    // dead-path signal fire); an empty store is a cheap no-op. Non-destructive (the
+    // row is kept on disk, just flagged), bounded, deterministic, fully fail-open —
+    // then the fresh observation is recorded, superseding any same-key tombstone.
+    let _ = project_facts::mark_stale_facts(root, &facts);
     if facts.is_empty() {
         return 0;
     }

@@ -141,9 +141,9 @@ pub use lessons::{
     capture_dev_errors, capture_gate_revision, capture_quality_failures,
     capture_validated_patterns, fold_beliefs, lessons_report, list_sedimented_lessons,
     parse_reconcile_decision, pitfall_efficacy_summary, pitfall_overview, reconcile_candidates,
-    reconcile_prompt, scan_contradictions, sediment_lessons, sediment_lessons_with_judge, Lesson,
-    LessonsReport, PitfallEfficacySummary, PitfallEntry, PitfallStatus, ReconcileDecision,
-    ValidatedEntry,
+    reconcile_prompt, resolve_new_lesson_conflicts, scan_contradictions, sediment_lessons,
+    sediment_lessons_with_judge, Lesson, LessonsReport, PitfallEfficacySummary, PitfallEntry,
+    PitfallStatus, ReconcileDecision, ValidatedEntry,
 };
 pub use manifest::{ConformanceLevel, Profile, SpecManifest};
 pub use open_decisions::{

@@ -476,6 +476,11 @@ pub fn capture_quality_failures(
         });
     }
     append_raw_lessons(project_root, "quality-failures.jsonl", &lessons);
+    // Record-time contradiction control: demote the lower-standing side of any
+    // genuine conflict this new lesson introduces (fail-open, no-op when empty).
+    if !lessons.is_empty() {
+        let _ = resolve_new_lesson_conflicts(project_root, &lessons);
+    }
 }
 
 /// Capture a gate revision as both an ADR record AND a raw lesson.
@@ -545,7 +550,10 @@ pub fn capture_gate_revision(
         evidence_count: 0,
         evidence: Vec::new(),
     };
-    append_raw_lessons(project_root, "gate-revisions.jsonl", &[lesson]);
+    let lessons = [lesson];
+    append_raw_lessons(project_root, "gate-revisions.jsonl", &lessons);
+    // Record-time contradiction control (fail-open).
+    let _ = resolve_new_lesson_conflicts(project_root, &lessons);
 
     adr_path
 }
@@ -636,7 +644,10 @@ pub fn capture_validated_patterns(
         evidence_count: 0,
         evidence: Vec::new(),
     };
-    append_raw_lessons(project_root, "validated-decisions.jsonl", &[lesson]);
+    let lessons = [lesson];
+    append_raw_lessons(project_root, "validated-decisions.jsonl", &lessons);
+    // Record-time contradiction control (fail-open).
+    let _ = resolve_new_lesson_conflicts(project_root, &lessons);
 }
 
 /// Minimum [`crate::tech_debt::DebtKind::severity`] a debt item must reach to
@@ -739,6 +750,10 @@ pub fn capture_tech_debt(
     }
     let written = lessons.len();
     append_raw_lessons(project_root, "tech-debt.jsonl", &lessons);
+    // Record-time contradiction control (fail-open, no-op when empty).
+    if !lessons.is_empty() {
+        let _ = resolve_new_lesson_conflicts(project_root, &lessons);
+    }
     written
 }
 
@@ -2110,11 +2125,70 @@ fn antonym_conflict(
     })
 }
 
+/// Efficacy gap below which two contradicting lessons are treated as EQUALLY
+/// proven, so the tie falls back to the historical age rule (keep the fresher
+/// advice). Two un-sampled lessons both score neutral and tie EXACTLY here, so a
+/// fresh corpus's contradiction behaviour is byte-for-byte unchanged; only once
+/// real outcome evidence separates them does efficacy override age.
+const CONTRA_EFFICACY_EPS: f64 = 1e-3;
+
+/// The recall-standing score that decides which side of a contradiction to KEEP —
+/// the SAME two axes recall ranking already trusts: the smoothed [`Lesson::trust`]
+/// EMA times the discrete [`efficacy_weight`] (helpful/harmful ratio). Neutral
+/// `0.5 · 1.0` for an un-sampled lesson, so two unproven lessons score equal and
+/// the loser is decided by age (below), not by noise.
+fn contradiction_score(l: &Lesson) -> f64 {
+    f64::from(l.trust()) * efficacy_weight(l)
+}
+
+/// Pick the LOSER of a genuine contradiction — the lesson to DEMOTE so the higher-
+/// standing one keeps the scarce recall slot. Efficacy-aware: the lower
+/// [`contradiction_score`] loses when the two are meaningfully apart
+/// ([`CONTRA_EFFICACY_EPS`]); on a tie (both un-sampled, or equally proven) it
+/// falls back to the historical rule — the OLDER lesson loses, keeping the fresher
+/// advice. Deterministic; total (always returns one side).
+fn contradiction_loser<'a>(a: &'a Lesson, b: &'a Lesson) -> &'a Lesson {
+    let (sa, sb) = (contradiction_score(a), contradiction_score(b));
+    if (sa - sb).abs() > CONTRA_EFFICACY_EPS {
+        if sa < sb {
+            a
+        } else {
+            b
+        }
+    } else if a.first_seen <= b.first_seen {
+        a
+    } else {
+        b
+    }
+}
+
+/// Whether two same-corpus lessons GENUINELY contradict — the shared triple gate
+/// both the full-corpus scan and the record-time resolver fold into: high topic
+/// overlap ([`CONTRA_TOPIC_OVERLAP`]), BOTH sides carrying enough advice tokens
+/// ([`CONTRA_MIN_ADVICE_TOKENS`]), low advice-text overlap ([`CONTRA_TEXT_SIM_MAX`]),
+/// AND an explicit [`antonym_conflict`]. The antonym + min-token gates are the
+/// false-positive guard: "agree but worded differently" and "both short /
+/// boilerplate" pairs fail here and are NEVER judged a contradiction. `ta`/`tb`
+/// are the pre-tokenised advice sets ([`advice_tokens`]).
+fn genuine_contradiction(
+    a: &Lesson,
+    ta: &std::collections::HashSet<String>,
+    b: &Lesson,
+    tb: &std::collections::HashSet<String>,
+) -> bool {
+    lesson_similarity(a, b) >= CONTRA_TOPIC_OVERLAP
+        && ta.len() >= CONTRA_MIN_ADVICE_TOKENS
+        && tb.len() >= CONTRA_MIN_ADVICE_TOKENS
+        && jaccard_of(ta, tb) <= CONTRA_TEXT_SIM_MAX
+        && antonym_conflict(ta, tb)
+}
+
 /// Scan the raw ledgers for same-topic lesson pairs that GENUINELY contradict —
-/// high topic overlap, low advice-text overlap, AND an explicit antonym conflict —
-/// and route each hit through the INVALIDATE path, marking the OLDER lesson
-/// invalid. Returns how many lessons were invalidated. Bounded O(n²);
-/// deterministic; pure-local; fail-open.
+/// high topic overlap, low advice-text overlap, AND an explicit antonym conflict
+/// ([`genuine_contradiction`]) — and route each hit through the INVALIDATE path,
+/// marking the LOSER ([`contradiction_loser`]: the lower-efficacy side, or the
+/// OLDER one on a tie) invalid. Returns how many lessons were invalidated. Bounded
+/// O(n²); deterministic; pure-local; fail-open.
 ///
 /// The antonym + min-token gates are the false-positive fix: low text overlap
 /// alone caught lessons that merely AGREE in different words. Now a pair must also
@@ -2145,28 +2219,13 @@ pub fn scan_contradictions(project_root: &Path) -> usize {
         for j in (i + 1)..pool.len() {
             let a = pool[i];
             let b = pool[j];
-            // Same topic (high keyword/domain overlap) …
-            if lesson_similarity(a, b) < CONTRA_TOPIC_OVERLAP {
+            if !genuine_contradiction(a, &tokens[i], b, &tokens[j]) {
                 continue;
             }
-            // … both sides carry enough advice to judge (skip thin/boilerplate) …
-            if tokens[i].len() < CONTRA_MIN_ADVICE_TOKENS
-                || tokens[j].len() < CONTRA_MIN_ADVICE_TOKENS
-            {
-                continue;
-            }
-            // … the advice text barely overlaps …
-            if jaccard_of(&tokens[i], &tokens[j]) > CONTRA_TEXT_SIM_MAX {
-                continue;
-            }
-            // … AND they carry explicitly OPPOSING verbs (the disagreement proof).
-            // Without this, "agree but worded differently" was mis-invalidated.
-            if !antonym_conflict(&tokens[i], &tokens[j]) {
-                continue;
-            }
-            // Mark the OLDER one stale (keep the fresher advice). Tie → keep `a`.
-            let older = if a.first_seen <= b.first_seen { a } else { b };
-            to_invalidate.insert(lesson_identity(older));
+            // Demote the LOSER — the lower-efficacy side, or the OLDER one on a tie
+            // (keeping the fresher advice), so two opposing lessons never both
+            // survive in recall.
+            to_invalidate.insert(lesson_identity(contradiction_loser(a, b)));
         }
     }
     if to_invalidate.is_empty() {
@@ -2240,6 +2299,75 @@ fn apply_invalidations(
         }
     }
     marked
+}
+
+/// Record-time CONTRADICTION CONTROL — when NEW lessons are recorded, demote the
+/// lower-standing side of any GENUINE conflict between a new lesson and an existing
+/// one so two opposing lessons about the same subject never both poison recall.
+///
+/// The efficacy-aware sibling of [`scan_contradictions`], scoped to the just-
+/// captured lessons (only pairs where at least ONE side is new are judged, so this
+/// is targeted and cheap, not a full re-scan). A conflict must clear the SAME
+/// triple gate ([`genuine_contradiction`]: high topic overlap, low advice overlap,
+/// and an explicit antonym), so two lessons that merely share a tech but AGREE are
+/// left alone. On a real conflict the [`contradiction_loser`] (the lower
+/// helpful/harmful + trust side, or the older one on a tie) is marked `invalidated`
+/// (non-destructive; the row stays on disk for provenance, out of recall). Pitfalls
+/// (`DevError`) and beliefs govern themselves and never participate, matching
+/// `scan_contradictions`.
+///
+/// Bounded (pool capped at [`BELIEF_SCAN_LIMIT`]), deterministic, pure-local, and
+/// fail-open: an empty input, a `< 2` pool, or any store error marks nothing (`0`)
+/// and never panics. Returns how many lessons were invalidated.
+pub fn resolve_new_lesson_conflicts(project_root: &Path, new_lessons: &[Lesson]) -> usize {
+    // Identities of the genuinely-new advisory lessons (pitfalls/beliefs excluded).
+    let new_ids: std::collections::HashSet<(String, String, String)> = new_lessons
+        .iter()
+        .filter(|l| l.kind != LessonKind::DevError && l.kind != LessonKind::Belief)
+        .map(lesson_identity)
+        .collect();
+    if new_ids.is_empty() {
+        return 0;
+    }
+
+    let raw = read_all_raw_lessons(project_root);
+    let pool: Vec<&Lesson> = raw
+        .iter()
+        .filter(|l| {
+            l.kind != LessonKind::DevError && l.kind != LessonKind::Belief && !l.invalidated
+        })
+        .take(BELIEF_SCAN_LIMIT)
+        .collect();
+    if pool.len() < 2 {
+        return 0;
+    }
+
+    // Pre-tokenise + pre-mark "is new" once per lesson so the pair loop is O(1) each.
+    let tokens: Vec<std::collections::HashSet<String>> =
+        pool.iter().map(|l| advice_tokens(l)).collect();
+    let is_new: Vec<bool> = pool
+        .iter()
+        .map(|l| new_ids.contains(&lesson_identity(l)))
+        .collect();
+
+    let mut to_invalidate: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    for i in 0..pool.len() {
+        for j in (i + 1)..pool.len() {
+            // Only judge pairs that involve a NEW lesson (the record-time trigger).
+            if !is_new[i] && !is_new[j] {
+                continue;
+            }
+            if !genuine_contradiction(pool[i], &tokens[i], pool[j], &tokens[j]) {
+                continue;
+            }
+            to_invalidate.insert(lesson_identity(contradiction_loser(pool[i], pool[j])));
+        }
+    }
+    if to_invalidate.is_empty() {
+        return 0;
+    }
+    apply_invalidations(project_root, &to_invalidate)
 }
 
 /// Build the reconcile candidate pairs `(fresh_lesson, its top-s older similar
@@ -6229,6 +6357,107 @@ mod tests {
         assert!(
             !antonym_conflict(&c, &d),
             "agreeing advice carries no antonym"
+        );
+    }
+
+    // ── Record-time efficacy-aware contradiction control ───────────────────────
+
+    #[test]
+    fn resolve_keeps_the_higher_efficacy_lesson_even_when_it_is_older() {
+        // Efficacy — not age — decides the loser: an OLDER but PROVEN-helpful lesson
+        // is KEPT above the cut, and the NEWER contradicting-but-unproven one is
+        // demoted. (The historical scan would have culled the older one.)
+        let tmp = TempDir::new().unwrap();
+        let mut proven = mk_db_lesson(
+            "indexing add",
+            "always add a btree index on every filtered column for speed",
+            "missing indexes slowed reads across the board significantly",
+            "2026-06-01T00:00:00Z",
+        );
+        proven.trust = 0.9;
+        proven.efficacy = Some(PitfallEfficacy {
+            helpful: 8,
+            harmful: 0,
+            ..Default::default()
+        });
+        let unproven = mk_db_lesson(
+            "indexing drop",
+            "avoid over indexing and drop redundant indexes to keep writes fast",
+            "too many indexes bloated writes and storage badly here",
+            "2026-06-20T00:00:00Z",
+        );
+        write_raw_lessons(
+            tmp.path(),
+            "quality-failures.jsonl",
+            &[proven, unproven.clone()],
+        );
+
+        // The unproven one is the NEW lesson being recorded → triggers resolution.
+        let n = resolve_new_lesson_conflicts(tmp.path(), std::slice::from_ref(&unproven));
+        assert_eq!(n, 1, "exactly the lower-efficacy side is demoted");
+        let rows = read_raw_lessons(tmp.path(), "quality-failures.jsonl");
+        assert!(
+            rows.iter()
+                .find(|l| l.title == "indexing drop")
+                .unwrap()
+                .invalidated,
+            "the lower-efficacy (newer, unproven) lesson is demoted below recall"
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|l| l.title == "indexing add")
+                .unwrap()
+                .invalidated,
+            "the higher-efficacy (older, proven) lesson is KEPT above the cut"
+        );
+    }
+
+    #[test]
+    fn resolve_spares_non_contradicting_same_tech_lessons() {
+        // Two lessons about the SAME tech that AGREE (no antonym) both survive — the
+        // conservative guard: same subject is not enough, the guidance must oppose.
+        let tmp = TempDir::new().unwrap();
+        let older = mk_db_lesson(
+            "indexing A",
+            "create a composite covering index spanning the lookup columns",
+            "sequential scans dominated the slow report query plan",
+            "2026-06-01T00:00:00Z",
+        );
+        let newer = mk_db_lesson(
+            "indexing B",
+            "build a multicolumn btree so the planner reaches rows directly",
+            "full table reads bottlenecked dashboard latency badly here",
+            "2026-06-20T00:00:00Z",
+        );
+        write_raw_lessons(
+            tmp.path(),
+            "quality-failures.jsonl",
+            &[older, newer.clone()],
+        );
+        assert_eq!(
+            resolve_new_lesson_conflicts(tmp.path(), std::slice::from_ref(&newer)),
+            0,
+            "agreeing same-tech lessons are never demoted"
+        );
+        assert!(read_raw_lessons(tmp.path(), "quality-failures.jsonl")
+            .iter()
+            .all(|l| !l.invalidated));
+    }
+
+    #[test]
+    fn resolve_is_fail_open_on_a_missing_store() {
+        // A store that can't be read marks nothing and never panics.
+        let missing = std::path::Path::new("/nonexistent/umadev/lessons/root/xyz");
+        let l = mk_db_lesson(
+            "indexing add",
+            "always add a btree index on every filtered column for speed",
+            "missing indexes slowed reads across the board significantly",
+            "2026-06-01T00:00:00Z",
+        );
+        assert_eq!(
+            resolve_new_lesson_conflicts(missing, std::slice::from_ref(&l)),
+            0
         );
     }
 

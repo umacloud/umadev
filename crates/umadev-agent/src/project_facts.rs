@@ -91,6 +91,26 @@ pub struct Fact {
     /// skipped from the serialized line so the on-disk shape stays minimal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// `true` once a run OBSERVED this fact to be CONTRADICTED — its asserted
+    /// `path` no longer exists on disk, or a fresh observation this run reported a
+    /// clearly different value for the same key (see [`mark_stale_facts`]). A stale
+    /// fact is a TOMBSTONE: [`load_facts`] / [`facts_firmware_block`] exclude it
+    /// from recall (demoted below the cut) but it is KEPT on disk for provenance —
+    /// the same non-destructive posture the lessons ledger uses for an invalidated
+    /// lesson. It is cleared automatically when the key is re-recorded with a fresh
+    /// value ([`record_facts`] replaces the row). `#[serde(default)]` keeps every
+    /// pre-existing JSONL row readable, and `skip_serializing_if` keeps a LIVE
+    /// fact's on-disk shape byte-for-byte as before (no `stale` key emitted), so
+    /// the documented base-append contract is unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stale: bool,
+}
+
+/// `skip_serializing_if` predicate — true for the default `false` so a LIVE fact
+/// never emits a `stale` key and its on-disk line stays byte-for-byte as before.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Fact {
@@ -105,24 +125,49 @@ impl Fact {
             key: key.into(),
             value: value.into(),
             category: category.map(Into::into),
+            stale: false,
         }
     }
 }
+
+/// Serialises the read-modify-write of the fact store so concurrent callers (a
+/// forked critic, a parallel step, the staleness sweep vs. the recorder) can't
+/// clobber each other. Recovers from poison so a panic elsewhere never blocks
+/// this fail-open path. Shared by [`record_facts`] and [`mark_stale_facts`].
+static FACTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Absolute path of the fact store for a given project root.
 fn facts_path(root: &Path) -> PathBuf {
     root.join(FACTS_REL_PATH)
 }
 
-/// Load the durable facts for `root`, newest LAST.
+/// Load the durable, RECALLABLE facts for `root`, newest LAST — the LIVE facts
+/// only, with stale tombstones excluded so a contradicted fact never surfaces.
 ///
 /// Fail-open + forgiving: a missing file yields an empty vec; a corrupt/garbage
 /// line is skipped (a single bad append never loses the rest of the store). The
 /// result is deduped by key (case-insensitive, last occurrence wins so a re-record
 /// supersedes the older value) and capped at [`MAX_FACTS`] (oldest dropped), so a
-/// store grown by raw base appends is always normalised on read.
+/// store grown by raw base appends is always normalised on read. Stale
+/// (tombstoned) facts are filtered LAST — they stay on disk for provenance (see
+/// [`load_facts_raw`]) but are demoted below recall.
 #[must_use]
 pub fn load_facts(root: &Path) -> Vec<Fact> {
+    load_facts_raw(root)
+        .into_iter()
+        .filter(|f| !f.stale)
+        .collect()
+}
+
+/// Load ALL durable facts for `root` (LIVE and stale) newest LAST, one row per key.
+///
+/// The provenance-preserving loader the read-modify-write mutators
+/// ([`record_facts`], [`mark_stale_facts`]) read through so a rewrite never drops a
+/// stale tombstone. Recall goes through [`load_facts`] (which filters stale on top
+/// of this); callers that must see the tombstones read here directly. Same
+/// fail-open + dedup + cap normalisation as [`load_facts`].
+#[must_use]
+fn load_facts_raw(root: &Path) -> Vec<Fact> {
     let Ok(text) = std::fs::read_to_string(facts_path(root)) else {
         return Vec::new();
     };
@@ -155,9 +200,8 @@ pub fn record_fact(root: &Path, fact: Fact) -> bool {
 /// recording a fact must never block the team.
 pub fn record_facts(root: &Path, incoming: &[Fact]) -> usize {
     // Serialize the read-modify-write so concurrent callers (a forked critic, a
-    // parallel step) can't clobber each other. Recover from poison so a panic
-    // elsewhere never blocks this fail-open path.
-    static FACTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // parallel step, the staleness sweep) can't clobber each other. Recover from
+    // poison so a panic elsewhere never blocks this fail-open path.
     let _guard = FACTS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -172,7 +216,10 @@ pub fn record_facts(root: &Path, incoming: &[Fact]) -> usize {
         return 0;
     }
 
-    let mut store = load_facts(root);
+    // Read the RAW store (LIVE + stale) so a rewrite preserves tombstones for keys
+    // we don't touch; a fresh value for a key drops its old (live or stale) row and
+    // replaces it with a LIVE one below, so re-recording a key revives it.
+    let mut store = load_facts_raw(root);
     for f in &valid {
         let key_l = f.key.to_lowercase();
         store.retain(|e| e.key.to_lowercase() != key_l);
@@ -189,6 +236,142 @@ pub fn record_facts(root: &Path, incoming: &[Fact]) -> usize {
     }
     let _ = write_atomic(&path, &render_jsonl(&store));
     valid.len()
+}
+
+/// STALENESS SWEEP — tombstone stored LIVE facts a run OBSERVED to be contradicted
+/// so a rotten fact stops being recalled, WITHOUT physically deleting it.
+///
+/// Two deterministic, conservative contradiction signals — a fact is demoted to a
+/// stale tombstone (kept on disk for provenance, excluded from [`load_facts`] /
+/// [`facts_firmware_block`]) only on a CLEAR one, never a weak/ambiguous hint:
+///
+/// - **Observed value contradiction** — an `observed` fact this run reported the
+///   SAME key with a clearly DIFFERENT value (after whitespace/case
+///   normalisation). A pure refinement (one value contains the other, e.g. adding
+///   `--prod`) or a mere formatting variant is NOT a contradiction, so a caller
+///   that keeps refining a command never over-prunes its own fact. In the pipeline
+///   the fresh value is then re-[`record_facts`]ed, which supersedes the tombstone
+///   anyway; the tombstone matters when no clean replacement is recorded.
+/// - **Dead path** — a `category == "path"` fact whose value is a single
+///   ABSOLUTE path token that `try_exists()` reports as definitively absent
+///   (`Ok(false)`). Relative paths (could be a not-yet-built artifact), values
+///   with arguments/globs/`~`/`$`, and any I/O error (`Err`) are all left ALONE —
+///   we demote only on unambiguous non-existence.
+///
+/// Bounded (one pass over the ≤ [`MAX_FACTS`] store, one `try_exists` per path
+/// fact), deterministic, and fail-open at every step: an empty/unreadable store,
+/// no observations, or a failed write all yield `0` and never panic. Returns how
+/// many LIVE facts were newly tombstoned.
+pub fn mark_stale_facts(root: &Path, observed: &[Fact]) -> usize {
+    // Share the recorder's lock so a concurrent record/sweep can't clobber the
+    // rewrite. Poison-tolerant (fail-open).
+    let _guard = FACTS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut store = load_facts_raw(root);
+    if store.is_empty() {
+        return 0;
+    }
+
+    // The run's OBSERVED truth: key (lowercased) → normalised value. Empty
+    // keys/values are dropped so a blank observation never contradicts anything.
+    let observed_values: std::collections::HashMap<String, String> = observed
+        .iter()
+        .filter(|f| !f.key.trim().is_empty() && !f.value.trim().is_empty())
+        .map(|f| (f.key.trim().to_lowercase(), norm_value(&f.value)))
+        .collect();
+
+    let mut marked = 0usize;
+    for f in &mut store {
+        if f.stale {
+            continue; // already a tombstone — never re-mark
+        }
+        if fact_is_contradicted(f, &observed_values) {
+            f.stale = true;
+            marked += 1;
+        }
+    }
+    if marked == 0 {
+        return 0; // nothing clearly contradicted → no rewrite (byte-for-byte stable)
+    }
+
+    let path = facts_path(root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = write_atomic(&path, &render_jsonl(&store));
+    marked
+}
+
+/// Whether a stored LIVE fact is CLEARLY contradicted by the run's observations —
+/// the shared conservative test both staleness signals fold into. See
+/// [`mark_stale_facts`] for the full rationale.
+fn fact_is_contradicted(
+    f: &Fact,
+    observed_values: &std::collections::HashMap<String, String>,
+) -> bool {
+    // Signal 1 — a fresh observation reported a clearly different value for this key.
+    if let Some(observed) = observed_values.get(&f.key.trim().to_lowercase()) {
+        if values_contradict(&norm_value(&f.value), observed) {
+            return true;
+        }
+    }
+    // Signal 2 — a `path` fact whose asserted absolute path no longer exists.
+    if f.category.as_deref().map(str::to_lowercase).as_deref() == Some("path")
+        && path_is_dead(&f.value)
+    {
+        return true;
+    }
+    false
+}
+
+/// Normalise a fact value for comparison: trim, lowercase, collapse internal
+/// whitespace runs to a single space. So `"npm run build"` and `" NPM  run build "`
+/// compare EQUAL and a mere formatting difference never reads as a contradiction.
+fn norm_value(v: &str) -> String {
+    v.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Whether two already-normalised values CLEARLY contradict (conservative). They
+/// must be non-trivial, unequal, and NEITHER a substring of the other — so a pure
+/// refinement/superset (`"vite build"` → `"vite build --prod"`) is treated as an
+/// extension, not a contradiction. This is the over-pruning guard: an ambiguous or
+/// weak difference abstains rather than demote a still-good fact.
+fn values_contradict(stored: &str, observed: &str) -> bool {
+    const MIN_VALUE_LEN: usize = 2;
+    if stored.len() < MIN_VALUE_LEN || observed.len() < MIN_VALUE_LEN {
+        return false; // too thin to judge → abstain
+    }
+    stored != observed && !stored.contains(observed) && !observed.contains(stored)
+}
+
+/// Whether `value` is a single ABSOLUTE path token that definitively does not
+/// exist — the conservative dead-path signal. Values with whitespace (a command
+/// with args), globs, or shell/`~`/`$` expansion, and RELATIVE paths (which could
+/// be a not-yet-built artifact) are all skipped: they can't be resolved
+/// unambiguously, so we never demote on them. Only `try_exists() == Ok(false)`
+/// (definitely absent) is a contradiction; any `Err` (permission, transient mount)
+/// leaves the fact ALONE (fail-open).
+fn path_is_dead(value: &str) -> bool {
+    let v = value.trim();
+    if v.len() < 2
+        || v.chars().any(char::is_whitespace)
+        || v.starts_with('~')
+        || v.contains('$')
+        || v.contains('*')
+        || v.contains('?')
+    {
+        return false;
+    }
+    let p = Path::new(v);
+    if !p.is_absolute() {
+        return false;
+    }
+    matches!(p.try_exists(), Ok(false))
 }
 
 /// The firmware **recall** block: the stored facts as a compact, token-budgeted
@@ -268,6 +451,7 @@ fn normalize(f: Fact) -> Fact {
             .category
             .map(|c| excerpt(c.trim(), MAX_CATEGORY_CHARS))
             .filter(|c| !c.is_empty()),
+        stale: f.stale,
     }
 }
 
@@ -556,5 +740,149 @@ mod tests {
         record_fact(tmp.path(), Fact::new("port", "5173", Some("port")));
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk.lines().count(), 2, "compacted to 2 canonical lines");
+    }
+
+    // ── Staleness sweep (contradiction control for facts) ──────────────────────
+
+    #[test]
+    fn observed_contradiction_tombstones_a_fact_and_demotes_it_from_recall() {
+        // A stored fact whose asserted value the run OBSERVES to be clearly
+        // different is demoted from recall but KEPT on disk for provenance.
+        let tmp = tempfile::TempDir::new().unwrap();
+        record_fact(
+            tmp.path(),
+            Fact::new("build", "npm run build", Some("command")),
+        );
+        let marked = mark_stale_facts(
+            tmp.path(),
+            &[Fact::new("build", "vite build", None::<String>)],
+        );
+        assert_eq!(marked, 1, "the contradicted fact is tombstoned");
+        // Demoted below recall: neither the recall load nor the firmware sees it.
+        assert!(
+            load_facts(tmp.path()).iter().all(|f| f.key != "build"),
+            "a stale fact is excluded from recall"
+        );
+        let block = facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET);
+        assert!(
+            !block.contains("npm run build"),
+            "the stale value never surfaces in the firmware: {block}"
+        );
+        // Provenance: the row (old value) survives on disk, flagged stale.
+        let on_disk = std::fs::read_to_string(tmp.path().join(FACTS_REL_PATH)).unwrap();
+        assert!(
+            on_disk.contains("npm run build") && on_disk.contains("\"stale\":true"),
+            "the tombstone is kept on disk for provenance: {on_disk}"
+        );
+    }
+
+    #[test]
+    fn a_weak_or_ambiguous_signal_never_demotes_a_good_fact() {
+        // Over-pruning guard: a formatting-only variant, a refinement/superset, an
+        // equal value, and an unrelated observed key must all leave the fact LIVE.
+        let tmp = tempfile::TempDir::new().unwrap();
+        record_fact(
+            tmp.path(),
+            Fact::new("build", "npm run build", Some("command")),
+        );
+        // Case/whitespace variant → normalises equal → not a contradiction.
+        assert_eq!(
+            mark_stale_facts(
+                tmp.path(),
+                &[Fact::new("build", "  NPM   run   build ", None::<String>)]
+            ),
+            0,
+            "a formatting variant is not a contradiction"
+        );
+        // A pure refinement (superset) → an extension, not a contradiction.
+        assert_eq!(
+            mark_stale_facts(
+                tmp.path(),
+                &[Fact::new("build", "npm run build --prod", None::<String>)]
+            ),
+            0,
+            "a refinement is not a contradiction"
+        );
+        // An unrelated observed key never touches this fact.
+        assert_eq!(
+            mark_stale_facts(tmp.path(), &[Fact::new("test", "npm test", None::<String>)]),
+            0,
+            "an unrelated observation contradicts nothing"
+        );
+        // The fact is still recalled after all three weak signals.
+        assert!(
+            load_facts(tmp.path())
+                .iter()
+                .any(|f| f.key == "build" && f.value == "npm run build"),
+            "a good fact survives every weak/ambiguous signal"
+        );
+    }
+
+    #[test]
+    fn a_dead_absolute_path_fact_is_tombstoned_but_a_live_one_survives() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // An absolute path that certainly does not exist → dead → tombstoned.
+        let dead = tmp.path().join("definitely-not-here-xyz");
+        record_fact(
+            tmp.path(),
+            Fact::new("jdk", dead.to_string_lossy(), Some("path")),
+        );
+        // An absolute path that DOES exist (the temp dir itself) → live.
+        record_fact(
+            tmp.path(),
+            Fact::new("workspace", tmp.path().to_string_lossy(), Some("path")),
+        );
+        // A RELATIVE path (could be a not-yet-built artifact) → never demoted.
+        record_fact(tmp.path(), Fact::new("dist", "./dist", Some("path")));
+        let marked = mark_stale_facts(tmp.path(), &[]);
+        assert_eq!(marked, 1, "only the dead absolute path is tombstoned");
+        let live = load_facts(tmp.path());
+        assert!(live.iter().all(|f| f.key != "jdk"), "dead path demoted");
+        assert!(
+            live.iter().any(|f| f.key == "workspace"),
+            "an existing absolute path stays live"
+        );
+        assert!(
+            live.iter().any(|f| f.key == "dist"),
+            "a relative path is never demoted (could be a build artifact)"
+        );
+    }
+
+    #[test]
+    fn re_recording_a_key_revives_a_stale_fact() {
+        // A fresh observation for a tombstoned key supersedes the tombstone: the
+        // store holds one LIVE row again, recalled normally.
+        let tmp = tempfile::TempDir::new().unwrap();
+        record_fact(
+            tmp.path(),
+            Fact::new("build", "npm run build", Some("command")),
+        );
+        mark_stale_facts(
+            tmp.path(),
+            &[Fact::new("build", "vite build", None::<String>)],
+        );
+        assert!(load_facts(tmp.path()).iter().all(|f| f.key != "build"));
+        // Record the fresh value → the key is live again.
+        record_fact(
+            tmp.path(),
+            Fact::new("build", "vite build", Some("command")),
+        );
+        let live = load_facts(tmp.path());
+        let build: Vec<_> = live.iter().filter(|f| f.key == "build").collect();
+        assert_eq!(build.len(), 1, "one live row for the revived key");
+        assert_eq!(build[0].value, "vite build", "the fresh value is recalled");
+    }
+
+    #[test]
+    fn mark_stale_is_fail_open_on_an_empty_or_missing_store() {
+        // No store → nothing to sweep → 0, no file created, never a panic.
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            mark_stale_facts(tmp.path(), &[Fact::new("build", "x", None::<String>)]),
+            0
+        );
+        assert!(!tmp.path().join(FACTS_REL_PATH).exists());
+        let missing = Path::new("/nonexistent/umadev/facts/root/xyz");
+        assert_eq!(mark_stale_facts(missing, &[]), 0);
     }
 }
