@@ -992,7 +992,15 @@ async fn drive_director_loop_with_idle(
         //    inspecting reality over the borrowed brain. When a route is in hand, the
         //    review team is sized from the ROUTE's seats (deliverable 3 on the
         //    single-turn path too); else the kind-derived team (the legacy entry).
-        let qc = run_auto_qc(session, options, events, route, Some(turn.text.as_str())).await;
+        let qc = run_auto_qc(
+            session,
+            options,
+            events,
+            route,
+            Some(turn.text.as_str()),
+            turn.ran_build_tool,
+        )
+        .await;
 
         // 4. Clean QC → the build is genuinely done. Settle and report honestly.
         if qc.is_clean() {
@@ -1399,8 +1407,21 @@ async fn drive_plan_steps(
     // does not re-drive here (each step was already verified); it folds any residual
     // finding into ONE last fix turn, bounded, then settles. This guarantees a
     // step-driven build is never held to a WEAKER bar than the single-turn build.
-    let final_gate =
-        run_final_gate(session, options, events, route, &last_reply, deadline, "").await;
+    // Seed corroboration `false`: the step-driver doesn't observe per-step tool calls
+    // here, so the final whole-build gate's round 0 runs UmaDev's OWN build/test read
+    // rather than trusting the last step's prose (a safe tightening — each step was
+    // already verified; this only re-checks once). Fix rounds re-derive it per turn.
+    let final_gate = run_final_gate(
+        session,
+        options,
+        events,
+        route,
+        &last_reply,
+        deadline,
+        "",
+        false,
+    )
+    .await;
     if !final_gate.reply.is_empty() {
         last_reply = final_gate.reply;
     }
@@ -2498,6 +2519,7 @@ struct FinalGateOutcome {
     clean: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_final_gate(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -2510,11 +2532,20 @@ async fn run_final_gate(
     // turn carries the team's standards + memory). `""` = the byte-for-byte original
     // directive (the `/run` step-driver passes this), so existing callers are unchanged.
     fix_prefix: &str,
+    // OBSERVED-tool corroboration for the SEED reply: did a real build/test/lint runner
+    // run producing `seed_reply`? Callers that can't observe it pass `false` (conservative
+    // — round 0 then runs UmaDev's own read rather than trusting the seed's prose). Each
+    // fix round below re-derives it from its OWN turn's observed tool calls.
+    seed_ran_build_tool: bool,
 ) -> FinalGateOutcome {
     let mut last_reply = String::new();
     // The incremental-verify signal seeds from the LAST step's reply (the steps just
     // ran the build/test); each fix round below then carries its own turn's reply.
     let mut verify_signal = seed_reply.to_string();
+    // The observed-tool corroboration paired with `verify_signal`: seeds from the caller,
+    // then tracks each fix turn's OWN observed run — so a fix turn's green claim can only
+    // skip the read when THAT turn actually ran a runner.
+    let mut verify_ran_build_tool = seed_ran_build_tool;
     for round in 0..MAX_QC_ROUNDS {
         // The QC read ALWAYS runs (it is read-only + cheap), so the build is held to
         // the objective floor every iteration — even at the budget. The final gate
@@ -2526,6 +2557,7 @@ async fn run_final_gate(
             events,
             Some(route),
             Some(verify_signal.as_str()),
+            verify_ran_build_tool,
         )
         .await;
         if qc.is_clean() {
@@ -2574,6 +2606,7 @@ async fn run_final_gate(
         {
             Ok(t) => {
                 verify_signal = t.text.clone();
+                verify_ran_build_tool = t.ran_build_tool;
                 last_reply = t.text;
             }
             // A dead/hung session → settle (fail-open). The gate did NOT clear, so the
@@ -2642,9 +2675,12 @@ pub async fn run_post_build_qc(
     // the standards + memory. Fail-open: empty recall = the byte-for-byte plain directive.
     let prefix = post_build_rework_context(options);
     // The chat-build surface only needs the fix-turn reply; its caller does not gate a
-    // finalize on the gate's clean-ness (the `/run` step path does — see H1).
+    // finalize on the gate's clean-ness (the `/run` step path does — see H1). Seed
+    // corroboration `false`: this entry has only the seed REPLY text, not an observed
+    // run, so round 0 runs UmaDev's own build/test read rather than trusting the seed's
+    // prose "it's green" — narration alone must not skip. Fix rounds re-derive per turn.
     run_final_gate(
-        session, options, events, route, seed_reply, deadline, &prefix,
+        session, options, events, route, seed_reply, deadline, &prefix, false,
     )
     .await
     .reply
@@ -3251,6 +3287,13 @@ struct TurnResult {
     /// The accumulated assistant text. The caller reads it for the "claimed a build"
     /// hard-gate; this loop reads it to decide whether QC is even warranted.
     text: String,
+    /// `true` when the base ACTUALLY invoked a build/test/lint runner on the tool-call
+    /// stream THIS turn (an observed `SessionEvent::ToolCall` whose command matched
+    /// [`crate::gates::command_is_build_test_runner`]). This is the OBSERVED-tool
+    /// corroboration the auto-QC requires before trusting the reply's prose "it's green"
+    /// enough to SKIP UmaDev's own build/test read — narration alone (a green claim with
+    /// NO runner ever invoked) leaves this `false`, so UmaDev runs its own read instead.
+    ran_build_tool: bool,
 }
 
 /// Send one directive and pump the base's event stream to its `TurnDone`, forwarding
@@ -3329,6 +3372,11 @@ async fn drive_one_turn_with_backoff(
     // compile / npm install / a long test), so the next wait uses the extended tool
     // window; otherwise the base default — so a truly hung base still settles.
     let mut in_tool_call = false;
+    // Did the base ACTUALLY run a build/test/lint runner this turn? Set from the OBSERVED
+    // tool-call stream below (not the reply prose), it is the corroboration the auto-QC
+    // requires before a green CLAIM is trusted to skip UmaDev's own build/test read. Reset
+    // alongside `text` on a transient re-drive so it reflects only the FINAL attempt.
+    let mut ran_build_tool = false;
     loop {
         // Wall-clock budget reached DURING a turn (not just between steps/rounds). A
         // base that stays ACTIVE — keeps emitting tool-calls / text deltas (e.g.
@@ -3354,7 +3402,10 @@ async fn drive_one_turn_with_backoff(
                  on what's built (raise UMADEV_RUN_BUDGET_SECS for a longer run)"
                     .to_string(),
             ));
-            return Ok(TurnResult { text });
+            return Ok(TurnResult {
+                text,
+                ran_build_tool,
+            });
         }
         // Idle watchdog (P0-3 / P1-11): a base that HANGS (stops emitting stdout
         // but never exits) would leave `next_event()` blocked forever — no
@@ -3411,7 +3462,10 @@ async fn drive_one_turn_with_backoff(
                          longer run)"
                             .to_string(),
                     ));
-                    return Ok(TurnResult { text });
+                    return Ok(TurnResult {
+                        text,
+                        ran_build_tool,
+                    });
                 }
                 // Watchdog re-drive (bounded SINGLE retry): a NON-tool silent hang on a
                 // base that is STILL ALIVE (no exit captured even after the watchdog's
@@ -3482,6 +3536,17 @@ async fn drive_one_turn_with_backoff(
                 });
             }
             SessionEvent::ToolCall { name, input } => {
+                // OBSERVED-tool corroboration (honesty floor): if THIS tool call is a real
+                // build/test/lint runner, record it — the auto-QC will require this signal
+                // before trusting the reply's prose "it's green" enough to skip UmaDev's
+                // own build/test read. We read the actual shell `command` the base RAN (not
+                // its narration), so a green claim with no runner ever invoked can't skip.
+                // Fail-open: a non-shell tool / no command → no signal (UmaDev verifies).
+                if let Some(cmd) = input.get("command").and_then(serde_json::Value::as_str) {
+                    if crate::gates::command_is_build_test_runner(cmd) {
+                        ran_build_tool = true;
+                    }
+                }
                 // Surface what the base actually DID (the source of truth). The
                 // governance hook governs the write itself in real time (claude); the
                 // content-governance QC scan is the craft floor for ALL bases. Here we
@@ -3567,7 +3632,10 @@ async fn drive_one_turn_with_backoff(
                     // base's REAL reported usage, fall back to the chars/4 estimate.
                     record_turn_usage(options, events, usage, est_tokens);
                     capture_turn_pitfalls(options, events, &pitfalls);
-                    return Ok(TurnResult { text });
+                    return Ok(TurnResult {
+                        text,
+                        ran_build_tool,
+                    });
                 }
                 // LOW #2: an Interrupted/Failed turn still consumed tokens — record the
                 // usage on these paths too (not just Completed/Truncated), so `/usage`
@@ -3614,6 +3682,9 @@ async fn drive_one_turn_with_backoff(
                         text.clear();
                         pitfalls.clear();
                         in_tool_call = false;
+                        // The re-drive is a fresh attempt — the corroboration must reflect
+                        // ONLY tools the FINAL attempt actually runs, never a prior try's.
+                        ran_build_tool = false;
                         continue;
                     }
                     return Err(reason);
@@ -3801,6 +3872,11 @@ async fn run_auto_qc(
     events: &Arc<dyn EventSink>,
     route: Option<&RoutePlan>,
     last_turn_text: Option<&str>,
+    // OBSERVED-tool corroboration: did the base ACTUALLY run a build/test/lint runner this
+    // turn (a real `SessionEvent::ToolCall`, not reply prose)? Required — alongside a green
+    // CLAIM in `last_turn_text` — before the duplicate build/test read is skipped. `false`
+    // (the conservative default when no observation is available) → UmaDev runs its own read.
+    ran_build_tool: bool,
 ) -> QcReport {
     events.emit(EngineEvent::Note("team · honesty + QC read".to_string()));
     let route_team = route.map(|r| r.team.as_slice());
@@ -3916,9 +3992,19 @@ async fn run_auto_qc(
     // objective floor still governs. Fail-open + safe: any ambiguity or any failure
     // whiff in the reply (or no reply at all) falls back to running our own read, so
     // a real failure is never skipped over.
-    let base_already_verified = last_turn_text
-        .map(crate::gates::base_ran_build_test_clean)
-        .unwrap_or(false);
+    //
+    // HONESTY TIGHTENING: a green CLAIM in the reply is now honored to skip our read
+    // ONLY IF it is CORROBORATED by an OBSERVED build/test/lint runner this turn
+    // (`ran_build_tool`, set from the actual tool-call stream). The prose claim alone —
+    // even a creatively-worded "cargo test passed, exit 0" the base merely NARRATED with
+    // no runner ever invoked — no longer skips the floor: absent corroboration, UmaDev
+    // runs its OWN verify. That is a re-verify, never a false FAIL — a genuinely clean
+    // build simply re-passes; only an unproven claim is downgraded from "trusted" to
+    // "checked". Fail-open: no reply / no observation → run our own read.
+    let base_already_verified = ran_build_tool
+        && last_turn_text
+            .map(crate::gates::base_ran_build_test_clean)
+            .unwrap_or(false);
     if base_already_verified {
         events.emit(EngineEvent::Note(
             "team · base already ran build/test green this turn — trusting its result, skipping the duplicate full build"
@@ -4359,6 +4445,83 @@ mod tests {
             Ok(r) => assert_eq!(r.text, "done, real usage attached"),
             Err(e) => panic!("a turn with real usage must complete cleanly: {e}"),
         }
+    }
+
+    /// A turn that RUNS a shell command (a `ToolCall`) before finishing, for asserting
+    /// the observed-tool corroboration (`ran_build_tool`) the auto-QC honesty floor reads.
+    fn tool_then_text_turn(command: &str, s: &str) -> Vec<SessionEvent> {
+        vec![
+            SessionEvent::ToolCall {
+                name: "Bash".to_string(),
+                input: serde_json::json!({ "command": command }),
+            },
+            SessionEvent::TextDelta(s.to_string()),
+            SessionEvent::TurnDone {
+                status: TurnStatus::Completed,
+                usage: None,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn drive_one_turn_records_an_observed_build_runner() {
+        // The observed-tool corroboration is set from the ACTUAL tool-call stream: a turn
+        // that runs `cargo test` marks `ran_build_tool = true`; a turn that only runs a
+        // non-runner (`cat package.json`) leaves it `false` even when the reply CLAIMS a
+        // green build — so narration alone can never corroborate.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let idle = IdleBudget::new(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+
+        let mut ran = FakeSession::new(
+            vec![tool_then_text_turn(
+                "cargo test --workspace",
+                "All tests pass.",
+            )],
+            false,
+            "",
+        );
+        let out = drive_one_turn(
+            &mut ran,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            idle,
+            deadline,
+        )
+        .await
+        .expect("turn completes");
+        assert!(
+            out.ran_build_tool,
+            "an observed `cargo test` runner must set ran_build_tool"
+        );
+
+        let mut narrated = FakeSession::new(
+            vec![tool_then_text_turn(
+                "cat package.json",
+                "Ran cargo test — all tests pass (exit code 0).",
+            )],
+            false,
+            "",
+        );
+        let out2 = drive_one_turn(
+            &mut narrated,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            idle,
+            deadline,
+        )
+        .await
+        .expect("turn completes");
+        assert!(
+            !out2.ran_build_tool,
+            "a non-runner tool + a NARRATED green claim must NOT set ran_build_tool"
+        );
     }
 
     // ── The USB-model loop: base builds end to end → UmaDev auto-QC → bounded fix ──
@@ -5538,7 +5701,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
         assert!(qc.is_clean(), "source present + nothing to fail → clean QC");
     }
 
@@ -5567,7 +5730,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = codex_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
         assert!(
             !qc.is_clean(),
             "an emoji-as-icon write by codex must be governed: {:?}",
@@ -5598,7 +5761,7 @@ mod tests {
         let mut sess = FakeSession::new(vec![], false, "");
         let mut o = opts(tmp.path());
         o.backend = "claude-code".to_string();
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
         assert!(
             !qc.is_clean(),
             "an emoji-as-icon write must be governed by QC even on claude: {:?}",
@@ -5626,7 +5789,7 @@ mod tests {
         let mut sess = FakeSession::new(vec![], false, "");
         let mut o = codex_opts(tmp.path());
         o.requirement = "做一个简单的静态介绍页,纯前端".to_string();
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
         assert!(
             qc.is_clean(),
             "a clean static page must not be falsely flagged: {:?}",
@@ -5642,7 +5805,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
         assert!(!qc.is_clean(), "no source → blocking");
         assert!(
             qc.blocking.iter().any(|b| b.contains("source-present")),
@@ -5672,7 +5835,7 @@ mod tests {
         let reply = r#"{"accepts": false, "blocking": ["a review nit that must NOT surface"]}"#;
         let mut sess = FakeSession::new(vec![], true, reply);
         let o = lean_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
         assert!(
             qc.is_clean(),
             "a lean goal with source present is clean — the fork review is skipped: {:?}",
@@ -5689,7 +5852,7 @@ mod tests {
         let (events, _rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = lean_opts(tmp.path());
-        let qc = run_auto_qc(&mut sess, &o, &events, None, None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
         assert!(!qc.is_clean(), "a lean goal with no source still blocks");
         assert!(
             qc.blocking.iter().any(|b| b.contains("source-present")),
@@ -5708,22 +5871,23 @@ mod tests {
 
     #[tokio::test]
     async fn incremental_verify_skips_the_duplicate_build_when_base_ran_it_green() {
-        // Wave 3 incremental verify: when the base's reply reports a PASSED build/test,
-        // UmaDev skips its OWN duplicate full build/test read — it emits the
-        // "trusting its result" note and does NOT emit the "verify build-test" note.
-        // The source-present floor + governance still ran (clean here), so QC is clean.
+        // Wave 3 incremental verify (honesty-tightened fast path): a base reply that
+        // reports a PASSED build/test AND is CORROBORATED by an OBSERVED build/test runner
+        // this turn (`ran_build_tool = true`) skips UmaDev's OWN duplicate read — it emits
+        // the "trusting its result" note and NOT the "verify build-test" note. This is the
+        // honest run's fast path, preserved. The source-present floor + governance still
+        // ran (clean here), so QC is clean.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
         let (events, rec) = sink();
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path()); // "做一个登录系统" — non-lean, so it reaches the build read
-                                  // M3: the skip needs MACHINE evidence (a named runner / exit-code), not prose —
-                                  // so the reply names the commands it ran and reports an exit-code-0 result.
         let reply = "Implemented the login system end to end. Ran `npm test` and `npm run build` — all tests pass and the build succeeded (exit code 0).";
-        let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply)).await;
+        // ran_build_tool = true: a real runner WAS observed on the tool-call stream.
+        let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply), true).await;
         assert!(
             qc.is_clean(),
-            "clean source + trusted build → clean: {:?}",
+            "clean source + corroborated build → clean: {:?}",
             qc.blocking
         );
         assert!(
@@ -5733,6 +5897,38 @@ mod tests {
         assert!(
             !note_seen(&rec, "verify build-test"),
             "the duplicate build/test read must be skipped (no verify note)"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_verify_does_not_skip_a_green_claim_with_no_observed_run() {
+        // HONESTY TIGHTENING (the hole closed): the base CLAIMS a green build with all the
+        // machine-evidence words a text scan would trust ("ran npm test", "exit code 0"),
+        // but NO build/test runner was observed on the tool-call stream this turn
+        // (`ran_build_tool = false`) — it narrated the run without running it. UmaDev must
+        // NOT skip its own read: it does NOT emit the "trusting its result" note and DOES
+        // run its own build/test read. A re-verify, never a false FAIL — with no manifest
+        // the read is neutral, so QC is still clean (a genuinely clean build re-passes).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let o = opts(tmp.path());
+        let reply = "Implemented the login system end to end. Ran `npm test` and `npm run build` — all tests pass and the build succeeded (exit code 0).";
+        // ran_build_tool = false: the base narrated a run it never actually performed.
+        let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply), false).await;
+        assert!(
+            qc.is_clean(),
+            "no manifest → neutral re-verify, still clean (no false FAIL): {:?}",
+            qc.blocking
+        );
+        assert!(
+            !note_seen(&rec, "base already ran build/test green"),
+            "an un-corroborated green claim must NOT trigger the skip"
+        );
+        assert!(
+            note_seen(&rec, "verify build-test"),
+            "UmaDev runs its OWN read when a green claim is not corroborated by a real run"
         );
     }
 
@@ -5748,7 +5944,15 @@ mod tests {
         let mut sess = FakeSession::new(vec![], false, "");
         let o = opts(tmp.path());
         // Ambiguous "done" — no "tests pass"/"build succeeded" → must NOT skip.
-        let qc = run_auto_qc(&mut sess, &o, &events, None, Some("Done — implemented it.")).await;
+        let qc = run_auto_qc(
+            &mut sess,
+            &o,
+            &events,
+            None,
+            Some("Done — implemented it."),
+            false,
+        )
+        .await;
         assert!(
             qc.is_clean(),
             "no manifest → neutral build read, still clean"
@@ -5858,7 +6062,7 @@ mod tests {
         let mut deliberate = opts(tmp.path());
         deliberate.requirement = "做一个完整的任务管理产品".to_string();
         let route = build_route();
-        let qc = run_auto_qc(&mut sess, &deliberate, &events, Some(&route), None).await;
+        let qc = run_auto_qc(&mut sess, &deliberate, &events, Some(&route), None, false).await;
         assert!(
             qc.blocking.iter().any(|b| b.contains("coverage gap")),
             "deliberate QC enforces the acceptance floor: {:?}",
@@ -5868,7 +6072,7 @@ mod tests {
         // Lean requirement → QC returns at the lean short-circuit, BEFORE the floor.
         let mut lean = opts(tmp.path());
         lean.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
-        let qc2 = run_auto_qc(&mut sess, &lean, &events, None, None).await;
+        let qc2 = run_auto_qc(&mut sess, &lean, &events, None, None, false).await;
         assert!(
             !qc2.blocking.iter().any(|b| b.contains("coverage gap")),
             "a lean goal does NOT pay the acceptance floor (speed): {:?}",
@@ -5896,7 +6100,7 @@ mod tests {
         );
         // …but the ROUTE is deliberate (Standard depth) → the full gate must run.
         let route = build_route();
-        let qc = run_auto_qc(&mut sess, &o, &events, Some(&route), None).await;
+        let qc = run_auto_qc(&mut sess, &o, &events, Some(&route), None, false).await;
         assert!(
             qc.blocking.iter().any(|b| b.contains("coverage gap")),
             "a deliberate route runs the full gate even when the requirement reads lean: {:?}",

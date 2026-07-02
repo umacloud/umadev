@@ -485,6 +485,131 @@ fn contains_word(haystack: &str, word: &str) -> bool {
     false
 }
 
+/// Does this SHELL COMMAND actually invoke a build / test / lint RUNNER? This is the
+/// OBSERVED-tool corroboration the director requires before a base's prose "it's green"
+/// is trusted enough to SKIP UmaDev's own objective build/test read: a green CLAIM in
+/// the reply text ([`base_ran_build_test_clean`]) is honest ONLY when a real runner was
+/// seen running on the tool-call stream THIS turn (`SessionEvent::ToolCall`'s command).
+/// Narration alone — a "cargo test passed, exit 0" written into the reply with no runner
+/// ever invoked — no longer skips the floor, because it produces no matching tool call.
+///
+/// **Bounded + comment/quote-tolerant.** The command is split on shell separators
+/// (`;` `|` `&`, newlines — so `&&`/`||` fall out and a runner in a LATER segment of a
+/// chain like `cd app && npm test` still counts); each segment has its leading noise
+/// peeled (wrapping quotes/parens, `NAME=value` env-assignments, `sudo`/`time`/`env`/…
+/// wrappers) and a `#` comment or empty segment is not a run; the FIRST real command
+/// word is then matched (anchored, path-basename-normalized) against a bounded runner
+/// set — so a runner NAME buried inside a quoted argument to a non-runner (`echo "npm
+/// test"`, `git commit -m "run cargo test"`) does NOT falsely corroborate.
+/// Deterministic, fail-open: an empty / unparseable command → `false` (UmaDev runs its
+/// own read — never a false skip).
+#[must_use]
+pub fn command_is_build_test_runner(command: &str) -> bool {
+    let lowered = command.to_lowercase();
+    lowered
+        .split([';', '\n', '|', '&'])
+        .any(segment_invokes_runner)
+}
+
+/// One shell segment → does its FIRST real command word invoke a build/test/lint runner?
+/// Leading noise (wrapping quotes/parens, env-assignments, `sudo`/`time`/`env`/…) is
+/// peeled so the real command is examined; a `#` comment or empty segment is not a run.
+fn segment_invokes_runner(seg: &str) -> bool {
+    let mut words = seg
+        .split_whitespace()
+        .skip_while(|w| is_leading_command_noise(w));
+    let Some(w0) = words.next() else {
+        return false;
+    };
+    // Strip wrapping quotes/parens/backticks off the command word.
+    let w0 =
+        w0.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | '{' | '}' | '\\'));
+    if w0.is_empty() || w0.starts_with('#') {
+        return false;
+    }
+    // A leading path (`./gradlew`, `/usr/bin/cargo`, `node_modules/.bin/eslint`) → basename.
+    let cmd = w0.rsplit('/').next().unwrap_or(w0);
+    let sub = words.next().unwrap_or("");
+    match cmd {
+        // JS/TS package managers: a build/test/lint verb, `run|exec|dlx <such a script>`,
+        // or the manager's own test / clean-install shorthands.
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            is_js_build_test_verb(sub)
+                || (matches!(sub, "run" | "exec" | "dlx") && {
+                    let next = words.next().unwrap_or("");
+                    is_js_build_test_verb(next) || is_js_test_tool(next)
+                })
+                || (cmd == "npm" && matches!(sub, "ci" | "t"))
+                || (cmd == "bun" && sub == "test")
+        }
+        // JS/TS tool runners invoked directly via npx.
+        "npx" => is_js_test_tool(sub),
+        "cargo" => matches!(sub, "test" | "build" | "check" | "clippy" | "nextest"),
+        "go" => matches!(sub, "test" | "build" | "vet"),
+        "python" | "python3" => {
+            sub == "-m"
+                && matches!(
+                    words.next().unwrap_or(""),
+                    "pytest" | "unittest" | "tox" | "nox"
+                )
+        }
+        "deno" => matches!(sub, "test" | "lint" | "check"),
+        "dotnet" => matches!(sub, "test" | "build"),
+        "cmake" => sub == "--build",
+        // Standalone test / lint / build binaries — the command name alone is the run.
+        "pytest" | "tox" | "nox" | "ruff" | "mypy" | "flake8" | "pylint" | "jest" | "vitest"
+        | "mocha" | "ava" | "tsc" | "eslint" | "phpunit" | "rspec" | "ctest" | "make"
+        | "gradle" | "gradlew" | "mvn" | "rustc" => true,
+        _ => false,
+    }
+}
+
+/// A JS/TS package-manager script name that means build/test/lint (so `npm run <it>` is a
+/// real runner). Prefix-matched so scoped scripts (`test:unit`, `lint:fix`, `build:prod`)
+/// still count; a non-build script (`dev`, `start`, `serve`) is intentionally excluded.
+fn is_js_build_test_verb(w: &str) -> bool {
+    const ROOTS: &[&str] = &[
+        "test",
+        "build",
+        "lint",
+        "typecheck",
+        "type-check",
+        "check",
+        "tsc",
+        "e2e",
+        "unit",
+        "vitest",
+        "jest",
+        "coverage",
+        "verify",
+        "ci",
+    ];
+    ROOTS.iter().any(|r| {
+        w.strip_prefix(r)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':') || rest.starts_with('-'))
+    })
+}
+
+/// A JS/TS tool a `npx` / `<pm> exec|dlx` invocation runs that is a build/test/lint runner.
+fn is_js_test_tool(w: &str) -> bool {
+    matches!(
+        w,
+        "jest" | "vitest" | "mocha" | "ava" | "tsc" | "eslint" | "playwright"
+    )
+}
+
+/// A leading shell token that is NOISE before the real command — a wrapper command
+/// (`sudo` / `time` / `env` / …) or a `NAME=value` env-assignment prefix — so the first
+/// REAL command word is examined, not `sudo` / `FOO=bar`.
+fn is_leading_command_noise(w: &str) -> bool {
+    matches!(
+        w,
+        "sudo" | "time" | "command" | "exec" | "env" | "nice" | "then" | "do" | "!" | "\\"
+    ) || w.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +625,73 @@ mod tests {
             "Here's how I'd approach it conceptually — nothing touched."
         ));
         assert!(!claims_code_changes("这是我的思路，我先和你确认一下方案"));
+    }
+
+    #[test]
+    fn command_is_build_test_runner_recognises_common_runners() {
+        // The OBSERVED-tool corroboration must fire for the common build/test/lint
+        // runners across ecosystems — anchored at the real command word, tolerant of
+        // env-assignments, wrapper commands, path prefixes, and shell chains.
+        for cmd in [
+            "npm test",
+            "npm run build",
+            "npm run test:unit",
+            "npm ci",
+            "pnpm run lint",
+            "yarn build",
+            "bun test",
+            "npx jest --ci",
+            "pnpm exec eslint .",
+            "cargo test --workspace",
+            "cargo clippy -- -D warnings",
+            "cargo build --release",
+            "go test ./...",
+            "pytest -q",
+            "python -m pytest tests/",
+            "tox",
+            "eslint src/",
+            "npx tsc --noEmit",
+            "./gradlew test",
+            "mvn -q test",
+            "make build",
+            "deno test",
+            "dotnet test",
+            "FORCE_COLOR=1 CI=true npm test", // env-assignment prefix peeled
+            "sudo make install",              // wrapper peeled
+            "cd app && npm run build",        // runner in a later chain segment
+            "cargo build 2>&1 | tee log",     // runner before a pipe
+        ] {
+            assert!(
+                command_is_build_test_runner(cmd),
+                "should read as a build/test/lint run: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_is_build_test_runner_ignores_non_runners() {
+        // A non-runner command must NOT corroborate — including a runner NAME that only
+        // appears as a quoted argument to a non-runner (the narration-in-a-command hole),
+        // a `#` comment, a dev-server / start script, and plain file ops.
+        for cmd in [
+            "echo \"npm test\"",
+            "git commit -m \"run cargo test\"",
+            "cat package.json",
+            "ls -la src",
+            "npm run dev",
+            "npm run start",
+            "node server.js",
+            "rm -rf build",
+            "# cargo test",
+            "grep -r 'pytest' .",
+            "mkdir -p dist",
+            "",
+        ] {
+            assert!(
+                !command_is_build_test_runner(cmd),
+                "must NOT read as a build/test/lint run: {cmd:?}"
+            );
+        }
     }
 
     #[test]
