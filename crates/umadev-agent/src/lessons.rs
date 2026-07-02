@@ -157,9 +157,12 @@ pub struct Lesson {
     /// intersects it — precise, prose-independent triggering.
     #[serde(default)]
     pub context: Vec<String>,
-    /// Efficacy tracking for `DevError` pitfalls — closes the loop on whether
-    /// the recorded fix actually achieved "一次过". `None` for non-pitfall
-    /// kinds and for pitfalls never yet surfaced to the worker.
+    /// Efficacy tracking — the pitfall-fix half (`injected` / `recurred_after_warning`
+    /// / `proven_fix` / …) closes the loop on whether a `DevError` fix achieved
+    /// "一次过", and the general `helpful` / `harmful` tally records the RECALL
+    /// outcome (recalled-then-passed vs recalled-then-failed) for ANY lesson kind.
+    /// `None` until first observed: written on first outcome feedback (see
+    /// [`Lesson::apply_trust_feedback`]) or first pitfall injection.
     #[serde(default)]
     pub efficacy: Option<PitfallEfficacy>,
     /// `true` once the memory-reconcile step judged this lesson superseded /
@@ -222,6 +225,20 @@ const TRUST_PENALTY: f32 = 0.10;
 /// reward can resurrect it.
 const TRUST_FLOOR: f32 = 0.05;
 
+/// Minimum OUTCOME observations (helpful + harmful) before efficacy can DEMOTE a
+/// lesson out of recall. Below this a lesson is never pruned on efficacy — a
+/// single (or few) bad outcome is noise, not proof the advice is poison.
+/// Conservative by design: pruning is irreversible-looking to the user, so it
+/// must wait for a real sample.
+const EFFICACY_MIN_SAMPLES: u32 = 4;
+
+/// Helpful ratio `helpful / (helpful + harmful)` at/below which a WELL-SAMPLED
+/// lesson is treated as poison and demoted below the recall cut. `0.25` ≈ it
+/// coincided with a FAILURE roughly three times for every pass — strong evidence
+/// its advice hurts more than it helps. Conservative so an occasionally-unlucky
+/// but genuinely useful lesson is not culled.
+const EFFICACY_POISON_RATIO: f64 = 0.25;
+
 /// Tracks whether a pitfall's fix actually works once we start warning about it.
 ///
 /// The mechanism is self-contained per record (no global run counter): each
@@ -229,7 +246,7 @@ const TRUST_FLOOR: f32 = 0.05;
 /// in [`Self::occ_at_injection`]. If the count later grows, the warning failed
 /// to prevent recurrence ([`Self::recurred_after_warning`]); if it stays flat
 /// across a later injection, the fix is working.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PitfallEfficacy {
     /// How many times this pitfall has been surfaced to the worker as a warning.
     pub injected: u32,
@@ -261,6 +278,23 @@ pub struct PitfallEfficacy {
     /// Empty until reflection runs. `#[serde(default)]` keeps older rows readable.
     #[serde(default)]
     pub next_strategy: String,
+    /// OUTCOME-efficacy tally (GENERAL — valid for any lesson kind, not just
+    /// pitfalls): how many times the owning lesson was RECALLED into a step whose
+    /// acceptance verdict then PASSED. Distinct from [`Lesson::trust`] (a smoothed
+    /// pass/fail EMA): these are the raw DISCRETE counts, so the efficacy prune
+    /// gate can require a real MINIMUM SAMPLE SIZE — something a single float can
+    /// never express (it can't tell "one bad outcome" from "six"). Bumped only via
+    /// [`Lesson::apply_trust_feedback`], the one choke-point every recall-outcome
+    /// trust update already passes through. `#[serde(default)]` keeps older rows
+    /// readable and un-observed lessons at `0`.
+    #[serde(default)]
+    pub helpful: u32,
+    /// OUTCOME-efficacy tally: how many times the owning lesson was recalled into a
+    /// step that then still FAILED (its signature/identity recurred DESPITE the
+    /// injection). The harmful half of [`Self::helpful`]; together they give the
+    /// helpful ratio the recall ranking and the poison-prune gate read.
+    #[serde(default)]
+    pub harmful: u32,
 }
 
 /// Lifecycle of a pitfall's fix, derived from its efficacy record.
@@ -313,6 +347,41 @@ impl Lesson {
             base - TRUST_PENALTY
         };
         self.trust = next.clamp(TRUST_FLOOR, 1.0);
+        // Grounded outcome tally ALONGSIDE the smoothed trust EMA above: the
+        // discrete helpful/harmful counts give the prune gate a real SAMPLE SIZE
+        // (trust alone can't tell "one bad outcome" from "six"). Best-effort,
+        // saturating, never fallible — this is the single choke-point every
+        // recall-outcome trust update (dev-error reflux, signature reflux,
+        // non-pitfall identity reflux) already passes through.
+        let eff = self.efficacy.get_or_insert_with(PitfallEfficacy::default);
+        if passed {
+            eff.helpful = eff.helpful.saturating_add(1);
+        } else {
+            eff.harmful = eff.harmful.saturating_add(1);
+        }
+    }
+
+    /// Total OUTCOME observations recorded for this lesson (`helpful + harmful`) —
+    /// the SAMPLE SIZE the efficacy prune gate reads. `0` when never observed.
+    #[must_use]
+    pub fn efficacy_samples(&self) -> u32 {
+        self.efficacy
+            .as_ref()
+            .map_or(0, |e| e.helpful.saturating_add(e.harmful))
+    }
+
+    /// Helpful ratio `helpful / (helpful + harmful)` in `[0, 1]` once at least one
+    /// outcome has been observed; `None` while un-sampled so callers treat an
+    /// un-observed lesson as NEUTRAL — never poison, never re-ranked — keeping a
+    /// fresh corpus's behaviour byte-for-byte unchanged.
+    #[must_use]
+    pub fn helpful_ratio(&self) -> Option<f64> {
+        let e = self.efficacy.as_ref()?;
+        let total = e.helpful.saturating_add(e.harmful);
+        if total == 0 {
+            return None;
+        }
+        Some(f64::from(e.helpful) / f64::from(total))
     }
 
     /// `true` when this is a precisely-recognised pitfall (a classified error
@@ -1032,6 +1101,8 @@ pub fn record_pitfall_strategy(project_root: &Path, signature: &str, strategy: &
                 proven_fix: false,
                 failed_fixes: Vec::new(),
                 next_strategy: String::new(),
+                helpful: 0,
+                harmful: 0,
             });
             eff.next_strategy = truncate(strategy, 600);
             changed = true;
@@ -2730,6 +2801,37 @@ fn lesson_importance(l: &Lesson) -> f64 {
     imp.clamp(0.05, 1.0)
 }
 
+/// A lesson is efficacy-POISON when it has accumulated enough OUTCOME samples AND
+/// its helpful ratio has fallen to/below the poison floor — well-sampled evidence
+/// that reusing it hurts more than it helps.
+///
+/// Gated by [`EFFICACY_MIN_SAMPLES`] so it NEVER fires on a single (or thin)
+/// observation — a lesson must genuinely earn its demotion. Deterministic +
+/// conservative + fail-open: an un-sampled lesson (`helpful_ratio` → `None`) is
+/// never poison. Recall EXCLUDES poison lessons (demoted below the cut), but they
+/// stay on disk for provenance — the same non-destructive posture as `invalidated`.
+fn is_efficacy_poison(l: &Lesson) -> bool {
+    l.efficacy_samples() >= EFFICACY_MIN_SAMPLES
+        && l.helpful_ratio()
+            .is_some_and(|r| r <= EFFICACY_POISON_RATIO)
+}
+
+/// Multiplicative recall-ranking factor from OUTCOME efficacy — the outcome half
+/// of "did reusing this actually HELP?", grounded in the DISCRETE helpful/harmful
+/// tally (distinct from the smoothed [`Lesson::trust`] EMA, and reinforcing it).
+///
+/// Neutral `1.0` until observed, so an un-sampled lesson ranks EXACTLY as before
+/// (no behaviour change on a fresh corpus). Once observed it scales in
+/// `[~0.3, ~1.2]` with the helpful ratio, so a proven-helpful lesson floats up to
+/// win the scarce injection budget and a proven-unhelpful one sinks — folded in as
+/// just one more bounded multiplicative axis (it modulates, never dominates).
+fn efficacy_weight(l: &Lesson) -> f64 {
+    match l.helpful_ratio() {
+        None => 1.0,
+        Some(r) => 0.3 + r * 0.9,
+    }
+}
+
 /// Composite retrieval score: `recency · importance · relevance`, the product
 /// of the three normalised axes.
 ///
@@ -2760,7 +2862,15 @@ fn lesson_decay_score(
     // as a multiplicative factor (like the other axes) so it modulates, never
     // dominates — and clamped above 0 by `Lesson::trust`, so it can damp a
     // distrusted lesson hard without ever zeroing it out of recovery.
-    rel * lesson_importance(l) * recency_weight(&l.first_seen, now) * f64::from(l.trust())
+    //
+    // Efficacy (`efficacy_weight`) is the fifth axis: the DISCRETE recalled-then-
+    // passed / recalled-then-failed tally, so a lesson that has PROVEN helpful by
+    // outcome outranks an equally-relevant one that has proven unhelpful. Neutral
+    // (1.0) until observed, so an un-sampled lesson is unaffected.
+    rel * lesson_importance(l)
+        * recency_weight(&l.first_seen, now)
+        * f64::from(l.trust())
+        * efficacy_weight(l)
 }
 
 /// Find the best-matching pitfall for `failure_detail` IFF it has TRULY recurred
@@ -2786,6 +2896,10 @@ pub fn recurring_pitfall_for_error(project_root: &Path, failure_detail: &str) ->
         .into_iter()
         .filter(|l| l.signature == sig || (!family.is_empty() && l.signature.starts_with(&family)))
         .collect();
+    // Efficacy PRUNE (step 3): a demoted (poison) pitfall is out of the loop — it
+    // must not drive a reflection consult either. Sample-gated, so a genuine
+    // recurrence is never culled before it has earned enough bad outcomes.
+    hits.retain(|l| !is_efficacy_poison(l));
     if hits.is_empty() {
         return None;
     }
@@ -2834,15 +2948,29 @@ pub fn lessons_for_error(project_root: &Path, failure_detail: &str) -> String {
         .into_iter()
         .filter(|l| l.signature == sig || (!family.is_empty() && l.signature.starts_with(&family)))
         .collect();
+    // Efficacy PRUNE (step 3): drop well-sampled poison pitfalls before ranking, so
+    // a fix that has proven to hurt more than help stops being re-injected. If that
+    // leaves nothing, abstain — injecting nothing beats injecting a proven-bad fix
+    // (the same "knowledge → noise" defence this function already takes on the
+    // generic-fallback path). Sample-gated, so a first recurrence is never culled.
+    hits.retain(|l| !is_efficacy_poison(l));
     if hits.is_empty() {
         return String::new();
     }
     // Recurring-despite-warning first (these need a harder push), then the most
-    // frequently-hit.
+    // outcome-EFFECTIVE (proven-helpful ratio), then the most frequently-hit — so
+    // among equal-relevance same-family pitfalls the one whose warning most reliably
+    // led to a pass surfaces first. Un-sampled pitfalls tie at neutral, so ordering
+    // is unchanged until outcomes accumulate.
     hits.sort_by(|a, b| {
         let recurring = |l: &Lesson| u8::from(l.pitfall_status() == PitfallStatus::Recurring);
         recurring(b)
             .cmp(&recurring(a))
+            .then_with(|| {
+                b.helpful_ratio()
+                    .unwrap_or(0.5)
+                    .total_cmp(&a.helpful_ratio().unwrap_or(0.5))
+            })
             .then(b.hits().cmp(&a.hits()))
     });
     let top = &hits[0];
@@ -3141,6 +3269,13 @@ fn select_relevant_lessons(project_root: &Path, requirement: &str) -> Vec<Lesson
     // exact raw lessons a matched belief already covers, so the prompt shows the
     // distilled rule instead of its near-duplicate evidence.
     let mut lessons = read_lessons_for_recall(project_root);
+    // Efficacy PRUNE (step 3): a well-sampled lesson whose advice has proven to
+    // hurt more than help (see [`is_efficacy_poison`]) is demoted OUT of the recall
+    // candidate set entirely — a wrong lesson must stop poisoning behaviour. Gated
+    // by a minimum sample size so a single bad outcome never culls a lesson;
+    // fail-open (an un-sampled / thinly-sampled lesson is untouched). The row stays
+    // on disk for provenance — pruned from RECALL, never deleted.
+    lessons.retain(|l| !is_efficacy_poison(l));
     if lessons.is_empty() {
         return Vec::new();
     }
@@ -3358,6 +3493,8 @@ fn record_pitfall_injections(project_root: &Path, signatures: &[String], active_
                 proven_fix: false,
                 failed_fixes: Vec::new(),
                 next_strategy: String::new(),
+                helpful: 0,
+                harmful: 0,
             });
             eff.injected = eff.injected.saturating_add(1);
             eff.occ_at_injection = occ;
@@ -3406,6 +3543,8 @@ pub fn mark_pitfalls_resolved(project_root: &Path, raw_errors: &[String]) -> usi
                 proven_fix: false,
                 failed_fixes: Vec::new(),
                 next_strategy: String::new(),
+                helpful: 0,
+                harmful: 0,
             });
             eff.proven_fix = true;
             eff.recurred_after_warning = false;
@@ -4078,6 +4217,8 @@ mod tests {
                 proven_fix: false,
                 failed_fixes: vec!["npm install lodash".into()],
                 next_strategy: String::new(),
+                helpful: 0,
+                harmful: 0,
             }),
             invalidated: false,
             trust: NEUTRAL_TRUST,
@@ -4135,6 +4276,8 @@ mod tests {
                 failed_fixes: vec!["delete node_modules and reinstall".into()],
                 next_strategy: "Pin react-router-dom to v6 and migrate the data router APIs."
                     .into(),
+                helpful: 0,
+                harmful: 0,
             }),
             invalidated: false,
             trust: NEUTRAL_TRUST,
@@ -4175,6 +4318,8 @@ mod tests {
                     proven_fix: false,
                     failed_fixes: vec![],
                     next_strategy: "Add lodash to package.json and run a clean install.".into(),
+                    helpful: 0,
+                    harmful: 0,
                 }),
                 ..neighbour.clone()
             }),
@@ -4490,6 +4635,8 @@ mod tests {
             proven_fix: false,
             failed_fixes: Vec::new(),
             next_strategy: String::new(),
+            helpful: 0,
+            harmful: 0,
         }));
         let validated = mk(Some(PitfallEfficacy {
             injected: 2,
@@ -4498,6 +4645,8 @@ mod tests {
             proven_fix: true,
             failed_fixes: Vec::new(),
             next_strategy: String::new(),
+            helpful: 0,
+            harmful: 0,
         }));
         assert!(
             lesson_importance(&recurring) > lesson_importance(&validated),
@@ -4532,6 +4681,8 @@ mod tests {
                 proven_fix: false,
                 failed_fixes: vec!["npm install lodash".into()],
                 next_strategy: String::new(),
+                helpful: 0,
+                harmful: 0,
             }),
             invalidated: false,
             trust: NEUTRAL_TRUST,
@@ -4550,6 +4701,8 @@ mod tests {
                 proven_fix: false,
                 failed_fixes: Vec::new(),
                 next_strategy: String::new(),
+                helpful: 0,
+                harmful: 0,
             }),
             ..recurring.clone()
         };
@@ -4651,6 +4804,8 @@ mod tests {
                 proven_fix: false,
                 failed_fixes: Vec::new(),
                 next_strategy: String::new(),
+                helpful: 0,
+                harmful: 0,
             }),
             invalidated: false,
             trust: NEUTRAL_TRUST,
@@ -4679,6 +4834,8 @@ mod tests {
                     proven_fix: true,
                     failed_fixes: Vec::new(),
                     next_strategy: String::new(),
+                    helpful: 0,
+                    harmful: 0,
                 }),
                 invalidated: false,
                 trust: NEUTRAL_TRUST,
@@ -6231,5 +6388,216 @@ mod tests {
             evidence_count: 0,
             evidence: Vec::new(),
         }
+    }
+
+    // ── Efficacy loop: outcomes earn/lose a lesson's place in recall ──
+
+    /// A disk-free Failure lesson carrying an OUTCOME tally, keyword `login` so a
+    /// "login system" query matches it.
+    fn mk_failure_eff(title: &str, helpful: u32, harmful: u32) -> Lesson {
+        Lesson {
+            kind: LessonKind::Failure,
+            domain: "frontend".into(),
+            title: title.into(),
+            body: String::new(),
+            fix: "apply the recorded fix".into(),
+            root_cause: String::new(),
+            keywords: vec!["login".into()],
+            source_requirement: "login system".into(),
+            first_seen: "2026-06-25T00:00:00Z".into(),
+            signature: String::new(),
+            occurrences: 1,
+            context: Vec::new(),
+            efficacy: Some(PitfallEfficacy {
+                helpful,
+                harmful,
+                ..PitfallEfficacy::default()
+            }),
+            invalidated: false,
+            trust: NEUTRAL_TRUST,
+            evidence_count: 0,
+            evidence: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn recall_outcome_moves_the_helpful_harmful_tally() {
+        // Step 1: a lesson RECALLED then PASSED gains helpful; recalled then still
+        // FAILED (recurs despite the injection) gains harmful — the outcome signal
+        // that closes the loop. Rides the SAME wired seam (`apply_dev_error_trust`).
+        let tmp = TempDir::new().unwrap();
+        let err = vec!["Error: Cannot find module 'lodash'".to_string()];
+        capture_dev_errors(tmp.path(), &err, "demo", "需求");
+        let sig = "dependency/module-not-found/lodash";
+        let eff_of = |t: &std::path::Path| {
+            read_raw_lessons(t, DEV_ERRORS_FILE)
+                .into_iter()
+                .find(|l| l.signature == sig)
+                .and_then(|l| l.efficacy)
+        };
+        apply_dev_error_trust(tmp.path(), &err, true);
+        let e = eff_of(tmp.path()).unwrap();
+        assert_eq!((e.helpful, e.harmful), (1, 0), "a pass increments helpful");
+        apply_dev_error_trust(tmp.path(), &err, false);
+        let e = eff_of(tmp.path()).unwrap();
+        assert_eq!(
+            (e.helpful, e.harmful),
+            (1, 1),
+            "a recurrence-despite-injection increments harmful"
+        );
+    }
+
+    #[test]
+    fn nonpitfall_recall_outcome_moves_the_tally_via_identity() {
+        // The non-pitfall (Failure / belief) reflux also feeds the tally: a surfaced
+        // identity whose step then passes gains helpful.
+        let tmp = TempDir::new().unwrap();
+        let req = "做一个登录系统";
+        capture_quality_failures(tmp.path(), &[check("coverage", "failed", 20)], "demo", req);
+        let _ = relevant_lessons_for_prompt(tmp.path(), req); // snapshot surfaced ids
+        let ids = read_surfaced_identities(tmp.path());
+        assert!(!ids.is_empty(), "the failure lesson was surfaced");
+        apply_trust_for_identities(tmp.path(), &ids, true);
+        let eff = read_raw_lessons(tmp.path(), "quality-failures.jsonl")
+            .into_iter()
+            .next()
+            .and_then(|l| l.efficacy)
+            .expect("outcome feedback created an efficacy record");
+        assert_eq!((eff.helpful, eff.harmful), (1, 0));
+    }
+
+    #[test]
+    fn efficacy_ranks_proven_helpful_above_proven_unhelpful_of_equal_relevance() {
+        // Step 2: two lessons equal on every OTHER axis (relevance / recency /
+        // importance / trust) must be ordered by outcome efficacy — proven-helpful
+        // above proven-unhelpful — with an un-sampled lesson sitting at neutral
+        // between (un-sampled behaviour is unchanged).
+        let base = seed_cluster_one_lesson(); // Failure, efficacy None, neutral trust
+        let q: std::collections::HashSet<String> = ["color", "token"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let now = Utc::now();
+        let mut high = base.clone();
+        high.efficacy = Some(PitfallEfficacy {
+            helpful: 4,
+            harmful: 0,
+            ..PitfallEfficacy::default()
+        });
+        let mut low = base.clone();
+        low.efficacy = Some(PitfallEfficacy {
+            helpful: 1,
+            harmful: 2, // ratio 0.33, samples 3 < floor → ranked low but NOT pruned
+            ..PitfallEfficacy::default()
+        });
+        let sh = lesson_decay_score(&high, &q, now);
+        let su = lesson_decay_score(&base, &q, now);
+        let sl = lesson_decay_score(&low, &q, now);
+        assert!(
+            sh > su && su > sl,
+            "proven-helpful > un-sampled(neutral) > proven-unhelpful: {sh} > {su} > {sl}"
+        );
+    }
+
+    #[test]
+    fn efficacy_poison_is_pruned_from_recall_after_min_samples() {
+        // Step 3: a well-sampled poison lesson is demoted OUT of recall while a
+        // healthy one of equal relevance survives.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_raw_lessons(
+            root,
+            "quality-failures.jsonl",
+            &[
+                mk_failure_eff("HEALTHY-KEEP", 5, 0),
+                mk_failure_eff("POISON-DROP", 0, 5),
+            ],
+        );
+        let titles: Vec<String> = relevant_lessons_for_prompt_ranked(root, "login system")
+            .into_iter()
+            .map(|(_, l)| l.title)
+            .collect();
+        assert!(
+            titles.iter().any(|t| t == "HEALTHY-KEEP"),
+            "the healthy lesson still surfaces: {titles:?}"
+        );
+        assert!(
+            !titles.iter().any(|t| t == "POISON-DROP"),
+            "the poison lesson is pruned below the recall cut: {titles:?}"
+        );
+    }
+
+    #[test]
+    fn single_observation_never_prunes() {
+        // The prune gate is sample-size gated: one (or a few, below the floor) bad
+        // outcome NEVER culls a lesson — only a well-sampled poison ratio does.
+        assert!(
+            !is_efficacy_poison(&mk_failure_eff("thin", 0, 1)),
+            "a single bad outcome never prunes"
+        );
+        assert!(
+            !is_efficacy_poison(&mk_failure_eff("few", 0, 3)),
+            "below the sample floor never prunes"
+        );
+        assert!(
+            !is_efficacy_poison(&mk_failure_eff("mixed", 2, 2)),
+            "a 50% ratio at the floor is not poison"
+        );
+        assert!(
+            is_efficacy_poison(&mk_failure_eff("poison", 0, 4)),
+            "all-harmful at the sample floor is poison"
+        );
+        assert!(
+            is_efficacy_poison(&mk_failure_eff("mostly-bad", 1, 5)),
+            "helpful ratio <= 0.25 with enough samples is poison"
+        );
+    }
+
+    #[test]
+    fn lessons_for_error_abstains_on_a_poison_pitfall_but_not_a_thin_one() {
+        // The at-failure recall prunes poison too: a proven-bad fix stops being
+        // re-injected (abstain), but a thinly-sampled one still surfaces.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let err = "Error: Cannot find module 'lodash'";
+        let mut thin = mk_pitfall(
+            "dependency/module-not-found/lodash",
+            "install lodash",
+            "missing dep",
+            "2026-06-21T00:00:00Z",
+            2,
+        );
+        thin.efficacy = Some(PitfallEfficacy {
+            harmful: 1,
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&thin));
+        assert!(
+            !lessons_for_error(root, err).is_empty(),
+            "a thinly-sampled pitfall still surfaces"
+        );
+        let mut poison = thin.clone();
+        poison.efficacy = Some(PitfallEfficacy {
+            harmful: 5,
+            ..PitfallEfficacy::default()
+        });
+        write_raw_lessons(root, DEV_ERRORS_FILE, std::slice::from_ref(&poison));
+        assert!(
+            lessons_for_error(root, err).is_empty(),
+            "a well-sampled poison pitfall is pruned → abstain"
+        );
+    }
+
+    #[test]
+    fn efficacy_recall_is_fail_open_on_a_corrupt_store() {
+        // The poison filter + efficacy ranking must never panic on an unreadable /
+        // corrupt store — fail-open to an empty recall.
+        let tmp = TempDir::new().unwrap();
+        let raw = tmp.path().join(RAW_DIR);
+        std::fs::create_dir_all(&raw).unwrap();
+        std::fs::write(raw.join("quality-failures.jsonl"), "not json\n{oops").unwrap();
+        assert!(relevant_lessons_for_prompt(tmp.path(), "anything").is_empty());
+        assert!(relevant_lessons_for_prompt_ranked(tmp.path(), "anything").is_empty());
+        assert!(lessons_for_error(tmp.path(), "Error: Cannot find module 'lodash'").is_empty());
     }
 }
