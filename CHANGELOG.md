@@ -2,6 +2,26 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.26] — 记忆真自进化 · 团队席位真专家 · 验收更硬
+
+这一版是一次**深层引擎升级**,源自一轮逐行自审加对前沿多智能体研究的对照:不加一个可见的 UI 功能,而是让内核的两件事从「看着像」变成「真的是」。**记忆从「捕获」变「真自进化」** —— 自进化机器早就存在,却只在旧的单发路径被调用,主线的总监循环一个都不碰:lesson 的信任分从不更新、pitfall 从不标记解决、反思从不触发,记忆只是「捕获+频率+召回」,不是进化;本次把整套闭环接到默认路径,并补上一直缺的「从成功学」能力。**团队席位从「换名字的提示词」变真专家** —— 审计发现一个干活席位不过是共享大脑上的 ~5 行人设,知识摘要与踩坑召回对每个席位用的是同一套机制;现在每个席位按自己的专业抽知识、带自己的工作方法、被自己的确定性地板判。外加一处杜绝「前端 fetch 就当后端实现」的验收误判修复。所有改动确定性、fail-open、有界,不改运行控制、四条治理不变量或验收/覆盖/门禁地板。
+
+### 记忆 — 从「捕获」变「真自进化」
+
+- **自进化闭环接入默认路径**:lesson 的信任分随每步验收结果升降、pitfall 复原后标记解决、真复发时触发反思策略、交付时做记忆和解 —— 此前这些只在旧路径(`runner.rs` 单发)跑,主线的总监循环是死代码,于是真实路径上 lesson 的信任永不更新、pitfall 永不标记解决、反思永不触发。新 `self_evolve.rs` 把这五件事全部搬到活路径:PASS 分支奖励被召回的 lesson/error 签名(信任回流 + 复原时标记 pitfall 已解决),FAIL 分支惩罚 + 反思(只读 fork 反思一次/签名/run)+ 把 `lessons_for_error` 注入返工指令,交付且干净又是深思构建时做记忆和解。每条都是总监**已算出**的验收结论的副作用,借脑一律只读 fork + fail-open(offline → 记忆不动、步骤绝不阻塞)。
+- **效力闭环**:lesson 按「是否真防住复发」赚取召回位置 —— 被召回后通过 → 有用票 +1,被召回却仍复发 → 有害票 +1(在 `apply_trust_feedback` 单一choke-point自动计),给剪枝门一个 EMA 给不了的真实样本量。`efficacy_weight` 成为衰减分里的第五个乘性轴(相关·重要·新近·信任·效力):未观测时中性 1.0(新语料逐字节不变),观测后按有用比落到 ~0.3..1.2,喂给固件踩坑摘要、逐步召回与 coach 重排。有毒 lesson(样本 >=4 且有用比 <=0.25)在三处召回入口被剪除、`lessons_for_error` 弃权,但留盘做溯源 —— 样本门确保单次薄观测永不误剪。
+- **成功配方记忆**:UmaDev 有丰富的「失败→踩坑」管线,却在构建干净通过时把赢的打法丢掉 —— 审计称这是最大的「团队变强」缺口。新 `recipes.rs`(跨项目 `~/.umadev/recipes/`,原子写 + 进程锁 + fail-open)在干净深思交付的收尾处把「赢的打法」(通过的步骤顺序/席位/关键脚手架/模式 + 技术栈·类型·需求形状指纹)蒸馏成一条 `Recipe`,由一次只读 fork consult 富化(consult 失败也照存);计划合成时召回最近的一条(相似度 = 技术栈·类型·形状,有下限)拼进合成指令作为**可采纳的先验**(「过去一次干净构建用过这个形状 —— 合适就采纳,不是模板」)—— 从只从失败学,变成也从成功学。配方是先验/建议,绝不是门禁,不碰验收/覆盖/门禁与评审结论。
+
+### 团队 — 席位从「换名字的提示词」变真专家
+
+- **per-seat 知识路由**:审计发现一个干活席位只是共享大脑上的 ~5 行人设 —— 知识摘要键在步骤指令文本(每个席位同一套机制)、踩坑召回键在整轮需求(每步同一份),而旧的 per-seat 知识子目录在默认路径被丢了。现 `experts::seat_knowledge_domains` 把每个席位映到自己的领域(前端→前端/设计/uiux/跨端;安全→安全/合规/治理;后端→后端/api/数据库/架构;QA→测试/性能/可观测;devops→cicd/运维/发布;architect/designer/pm 同理),`seat_query_bias`(领域词汇混进查询)与 `seat_method`(有界的 per-seat 工作方法清单)配套;`seat_scoped_knowledge_digest` 在**同一渲染预算**下把偏置混进查询、把结果过滤到该席位的领域子目录,fail-open 回落原摘要。同一步指令换个席位 → 不同知识 + 不同方法(测试证明是席位在驱动)。未知席位 / 无匹配 → 原行为。
+- **per-seat 确定性地板**:此前席位叙事有别,但一个后端步和一个前端步是**同样**验收的;可证伪性还是「大脑可选」(许多构建步带的不过是「源码存在」)。`Plan::normalized()` 新增两道(接在既有 enforce_contract_first / enforce_test_authoring_independence 的同一执行缝):`enforce_seat_evidence_floor` 只给**没有比「源码存在」更强契约**的构建步按席位补默认契约 —— 后端 → ContractMatches(喂新的路由注册校验)、QA → TestPasses(测试真通过才算)、前端 → BuildClean(禁用图案/无障碍治理地板)、安全干活步 → BuildClean;大脑自愿给的契约绝不被移除或降级,其他席位/评审步/已带契约的步不动。`enforce_falsifiability_floor`:若**过半**构建步仍是裸的,判定大脑整体欠指定,给每个裸构建步补 BuildClean 默认。全部复用既有 `EvidenceContract` 变体,不新增变体、不新增门禁语义,`acceptance.rs` 不动(只改每步「该满足什么」,既有验收器不变照查)。
+- **endpoint 验收修复**:审计发现 endpoint 验收是「子串戏法」—— 一个计划的接口只要其路径前缀在拼接后的源码里**任何地方**出现(含一个前端 fetch() 调用或注释)就算已实现,于是只以前端调用点形式存在的后端会**假通过**。新 `umadev-contract/backend.rs` 的 `extract_backend_routes`(与前端调用抽取器对称)只解析**真实的服务端路由注册**(剥注释、识引号),覆盖 Express/Koa/Fastify/Hapi/NestJS、Flask/FastAPI/Django、axum/actix、gin/chi/net-http、Spring —— 接收者限于服务端句柄,所以前端 axios/fetch 永不算注册。`acceptance.rs` 的 `route_registered` 改按方法+路径匹配(`:id`/`{id}`/`<id>` 归一 + 容忍挂载前缀的尾部匹配,但拒绝冲突字面量:`/api/users` 不再实现 `/api/users/:id`)。关键地 fail-open 以避免假失败:一个**零**可检测后端注册的项目(纯前端或不可解析)回落到保留的旧子串行为,绝不误判为失败 —— 只有**有可读后端**的项目才必须给出真实注册。`validate.rs` 新增 `validate_backend_vs_contract`(UD-CODE-003 的后端侧)。
+
+### 内部
+
+- 全部改动确定性、fail-open、有界,不改运行控制、四条治理不变量、确定性地板(验收/覆盖/门禁)或席位评审结论;每次借脑一律只读 fork + fail-open(offline → None → 记忆不动、步骤不阻塞),信任/pitfall/和解/配方写入均best-effort、报错绝不触及交付。net-new 模块:`self_evolve.rs`(仿 `fact_extract.rs`)、`recipes.rs`、`umadev-contract/backend.rs` —— 复用既有记忆原语与既有 EvidenceContract 变体,无新记忆设计、无新门禁语义、无新依赖。计数:agent 1195、contract 135+20;本轮五个特性 +48 agent 测试、contract +20。
+
 ## [1.0.25] — Linux glibc 兼容性修复 · 模型交给底座
 
 这一版聚焦一处**用户实测的 Linux 兼容性阻断**,外加一次定位对齐。x86_64 Linux 二进制此前在 Ubuntu 24.04(glibc 2.39)上直接 `cargo build`,于是绑定 `GLIBC_2.39`、在 RHEL / Rocky 9、Ubuntu 22.04 以及任何 glibc 2.31–2.38 的系统上以「GLIBC_2.39 not found」一启动就失败(一位 glibc 2.34 的用户被彻底挡在门外)。本次把两个 linux 二进制都改经 `cross`(Ubuntu 20.04 基础镜像 / glibc 2.31)构建,凡 glibc >= 2.31 皆可运行,并加了一道 CI 守卫:一旦二进制再需要更新的符号就让发布失败。同时**移除 `/model`** —— 模型 100% 是底座的事,UmaDev 不拥有任何模型端点。
