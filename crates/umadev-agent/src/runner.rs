@@ -3622,6 +3622,7 @@ impl<R: Runtime> AgentRunner<R> {
             role: role.to_string(),
             accepts,
             blocking,
+            remediation: Vec::new(),
             advisory,
             evidence: Vec::new(),
         }
