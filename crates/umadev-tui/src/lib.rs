@@ -4138,6 +4138,47 @@ fn resume_gap_elapsed(gap: Duration, threshold: Duration) -> bool {
     gap >= threshold
 }
 
+/// A live turn/run just SETTLED — `thinking` / a tool / an active run flipped to
+/// done, aborted, or finished (the `app_is_live` true→false edge). The periodic
+/// self-heal scrub (R1) is gated on `app_is_live`, so it STOPS the instant the
+/// turn settles: whatever incremental-diff drift accumulated over a long
+/// streaming run (the reported "rows overlapping / `本轮已中止` stacked down the
+/// right edge") would otherwise FREEZE on screen with no further scrub to scrub
+/// it. One clean full repaint on the settling edge repaints the final frame so
+/// the drift can't persist. Fires ONLY on the true→false edge, so a steady idle
+/// screen or a steady live run never repaints. Pure, so it is unit-tested.
+fn live_settled(prev_live: bool, now_live: bool) -> bool {
+    prev_live && !now_live
+}
+
+/// Whether the transcript's frame-over-frame geometry changed in a way the
+/// incremental diff can leave stale rows behind, so the next frame must fully
+/// repaint. Two triggers, both DISCRETE (they never fire on the steady per-row
+/// growth of a bottom-pinned streaming run, which the diff paints cleanly — so a
+/// marathon run heals without thrashing the repaint every frame):
+///
+/// * **`MAX_RENDER_ROWS` front-trim first crosses in** (`prev_cut == 0 &&
+///   cur_cut > 0`): the retained scrollback just started being trimmed at the
+///   front, re-basing the whole kept window. Fires once on the crossing, not on
+///   each subsequent per-row trim advance (whose painted tail is identical).
+/// * **The transcript SHRANK** (`cur_total < prev_total`): a fold/collapse
+///   toggle, `/compact`, `/clear`, or the live activity indicator removed at
+///   settle vacated rows below the new end — exactly where a diff-only console
+///   leaves orphaned stale rows. Streaming only ever GROWS the total, so this
+///   never trips mid-stream.
+///
+/// Pure, so the gating is unit-tested directly.
+fn transcript_reflow_needs_repaint(
+    prev_total: usize,
+    cur_total: usize,
+    prev_cut: usize,
+    cur_cut: usize,
+) -> bool {
+    let split_rebased = prev_cut == 0 && cur_cut > 0;
+    let shrank = cur_total < prev_total;
+    split_rebased || shrank
+}
+
 /// Whether there is LIVE output on screen — a turn thinking, a tool running, or
 /// an active (unfinished, un-aborted) pipeline run. R1 gates the self-healing
 /// scrub on this so a fully idle conversation is never repainted every couple
@@ -4416,8 +4457,18 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     let mut last_draw = Instant::now()
         .checked_sub(FRAME_MIN)
         .unwrap_or_else(Instant::now);
+    // Live→settled self-heal. Whether the PREVIOUS iteration saw a live turn/run
+    // (`app_is_live`). The R1 scrub — the only repaint that runs DURING a long
+    // streaming run — is gated on the SAME `app_is_live`, so it stops the instant
+    // the turn settles, freezing any accumulated incremental-diff drift on screen.
+    // A true→false edge here forces one clean repaint of the final settled frame
+    // (see [`live_settled`]). Starts `false` (a cold launch is idle).
+    let mut was_live = false;
 
     loop {
+        // Compute the live state ONCE per iteration: the R1 scrub gate and the
+        // live→settled self-heal below share it.
+        let now_live = app_is_live(app, continuous_run_active);
         // R1 — periodic self-healing scrub. While a turn is LIVE (thinking /
         // tool running / active run), force a full clear+repaint on a low
         // cadence so any drift ratatui's prev-vs-next diff can't see (a
@@ -4430,16 +4481,23 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
         // flicker — so we skip the periodic scrub there entirely (the one-shot
         // R4 resize / R5 resume / Ctrl+L repaints still run; they're infrequent
         // and necessary). Fixes the "工作状态下屏幕刷新闪烁" report.
-        if sync_output
-            && scrub_due(
-                app_is_live(app, continuous_run_active),
-                last_scrub.elapsed(),
-                scrub_int,
-            )
-        {
+        if sync_output && scrub_due(now_live, last_scrub.elapsed(), scrub_int) {
             force_full_repaint = true;
             last_scrub = Instant::now();
         }
+
+        // Live→settled self-heal. The R1 scrub above stops the instant a live
+        // turn/run settles (it is gated on `now_live`), so any drift that
+        // accumulated over a long streaming run would otherwise FREEZE on screen —
+        // the reported "rows overlapping / `本轮已中止` stacked down the right edge"
+        // that persists after the run ends. One clean repaint on the true→false
+        // edge scrubs the final settled frame. Fires once per settle (no thrash);
+        // works on every terminal, sync-output or not, because it's a one-shot
+        // clear at a discrete transition, not a periodic flicker.
+        if live_settled(was_live, now_live) {
+            force_full_repaint = true;
+        }
+        was_live = now_live;
 
         // Drain a one-shot full-repaint request raised by a height-changing or
         // transcript-clearing operation (a multi-line history recall, `/clear`).
@@ -4448,6 +4506,15 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
         // row the change vacated can survive as stale overlap on the Windows
         // console. Fail-open: a missed flag only forgoes one full repaint.
         if app.take_force_repaint() {
+            force_full_repaint = true;
+        }
+        // Drain the TRANSCRIPT-repaint request (the counterpart of the input-box
+        // one above): the renderer raises it when the transcript RE-BASED (the
+        // `MAX_RENDER_ROWS` front-trim first crossed in) or SHRANK, and the scroll
+        // handlers raise it on a real scroll jump. Folded into the same
+        // `force_full_repaint` gate so the next frame scrubs any stale/overlapping
+        // rows the incremental diff left over a long streaming run. Fail-open.
+        if app.take_transcript_repaint() {
             force_full_repaint = true;
         }
         // Generic input-height-change guard: if the rendered input-box height
@@ -9614,6 +9681,65 @@ mod tests {
         assert!(
             !resume_gap_elapsed(Duration::from_secs(4), threshold),
             "a sub-threshold gap never trips the reassert"
+        );
+    }
+
+    #[test]
+    fn live_settled_fires_only_on_the_settling_edge() {
+        // A live turn/run just ended (true→false) → repaint the final frame so the
+        // scrub that stopped with it doesn't freeze accumulated drift on screen.
+        assert!(
+            live_settled(true, false),
+            "the live→settled edge forces one clean repaint"
+        );
+        // A steady live run does NOT repaint (the R1 scrub owns that cadence).
+        assert!(
+            !live_settled(true, true),
+            "a steady live run does not repaint on this path"
+        );
+        // A steady idle screen never repaints.
+        assert!(
+            !live_settled(false, false),
+            "a steady idle screen never repaints"
+        );
+        // A turn STARTING (idle→live) is not a settle — no repaint here.
+        assert!(
+            !live_settled(false, true),
+            "starting a turn is not a settle edge"
+        );
+    }
+
+    #[test]
+    fn transcript_reflow_repaints_on_rebase_and_shrink_but_not_steady_growth() {
+        // The `MAX_RENDER_ROWS` front-trim FIRST crosses in (prev_cut 0 → cut > 0):
+        // the whole retained window re-based → repaint once on the crossing.
+        assert!(
+            transcript_reflow_needs_repaint(8000, 8000, 0, 50),
+            "the MAX_RENDER_ROWS split re-base forces a repaint"
+        );
+        // Already trimming and the trim merely advances by a row (cut 50 → 51) with
+        // the total capped: the painted tail is identical → NO repaint (no thrash
+        // over a marathon streaming run).
+        assert!(
+            !transcript_reflow_needs_repaint(8000, 8000, 50, 51),
+            "a per-row trim advance past the cap does not thrash the repaint"
+        );
+        // The transcript SHRANK (a fold/collapse toggle, `/compact`, `/clear`, or
+        // the live indicator removed at settle) → repaint (vacated rows below).
+        assert!(
+            transcript_reflow_needs_repaint(500, 480, 0, 0),
+            "a transcript shrink forces a repaint"
+        );
+        // Steady bottom-pinned streaming GROWTH (total climbs, no trim yet) → the
+        // diff paints the new tail cleanly → NO repaint.
+        assert!(
+            !transcript_reflow_needs_repaint(500, 512, 0, 0),
+            "steady streaming growth never forces a repaint"
+        );
+        // A first frame (prev_total 0 → some) is growth, not a shrink → no repaint.
+        assert!(
+            !transcript_reflow_needs_repaint(0, 300, 0, 0),
+            "the first populated frame does not spuriously repaint"
         );
     }
 

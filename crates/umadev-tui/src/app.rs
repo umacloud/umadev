@@ -1879,6 +1879,28 @@ pub struct App {
     /// growing) the highlight must be re-based by the delta — else it paints a
     /// row off until the next mouse event re-syncs it. `0` until the first render.
     pub transcript_cut: std::cell::Cell<usize>,
+    /// Previous frame's total folded VISUAL-row count (post-`MAX_RENDER_ROWS`
+    /// trim), published by the renderer. Read next frame to detect a transcript
+    /// **shrink** (a fold/collapse toggle, `/compact`, `/clear`, or the live
+    /// activity indicator removed at settle) — rows below the new end were
+    /// vacated, exactly where a diff-only console can leave orphaned stale rows,
+    /// so the renderer requests a full repaint via
+    /// [`Self::transcript_repaint_pending`]. `0` until the first render (a first
+    /// frame never counts as a shrink). See
+    /// [`crate::transcript_reflow_needs_repaint`].
+    pub transcript_prev_total: std::cell::Cell<usize>,
+    /// One-shot request, raised by the renderer (`&App`, so interior-mutable) or a
+    /// scroll handler, for a FULL clear + redraw on the next frame — the
+    /// transcript counterpart of [`Self::force_repaint`] (which covers the INPUT
+    /// box). Set when the transcript **reflows / re-bases / scrolls** in a way the
+    /// incremental diff can leave stale rows behind over a long streaming run: the
+    /// `MAX_RENDER_ROWS` front-trim first crossing in, a transcript shrink, or a
+    /// user scroll jump. Drained by the event loop via
+    /// [`Self::take_transcript_repaint`], which folds it into the same
+    /// `force_full_repaint` gate as the input-box / resize / resume self-heal.
+    /// Fires only on the discrete EVENT (never every streaming frame), so a
+    /// marathon run heals without thrashing the repaint. Defaults `false`.
+    pub transcript_repaint_pending: std::cell::Cell<bool>,
     /// The maximum the transcript can scroll up (= rows hidden above the
     /// viewport), recomputed by the renderer every frame from the CURRENT
     /// width/height. Interior-mutable so the pure `render` fn can publish it for
@@ -2571,6 +2593,8 @@ impl App {
             transcript_scroll: std::cell::Cell::new(0),
             transcript_prev_hidden: std::cell::Cell::new(0),
             transcript_cut: std::cell::Cell::new(0),
+            transcript_prev_total: std::cell::Cell::new(0),
+            transcript_repaint_pending: std::cell::Cell::new(false),
             transcript_max_scroll: std::cell::Cell::new(0),
             transcript_viewport_rows: std::cell::Cell::new(0),
             input_text_cols: std::cell::Cell::new(0),
@@ -3621,28 +3645,49 @@ impl App {
     }
 
     /// Scroll the transcript UP by `rows` (toward older history). Any non-zero
-    /// scroll makes the renderer STOP auto-sticking to the bottom.
+    /// scroll makes the renderer STOP auto-sticking to the bottom. A real offset
+    /// change requests a full repaint (see [`Self::scroll_jump_repaint`]).
     pub fn transcript_scroll_up(&mut self, rows: usize) {
         let max = self.transcript_max_scroll.get();
+        let before = self.transcript_scroll.get();
         self.transcript_scroll
-            .set(self.transcript_scroll.get().saturating_add(rows).min(max));
+            .set(before.saturating_add(rows).min(max));
+        self.scroll_jump_repaint(before);
     }
 
     /// Scroll the transcript DOWN by `rows` (toward the newest content). Hitting
     /// `0` re-pins to the bottom and re-enables auto-stick.
     pub fn transcript_scroll_down(&mut self, rows: usize) {
-        self.transcript_scroll
-            .set(self.transcript_scroll.get().saturating_sub(rows));
+        let before = self.transcript_scroll.get();
+        self.transcript_scroll.set(before.saturating_sub(rows));
+        self.scroll_jump_repaint(before);
     }
 
     /// Jump to the very top of the transcript (oldest content on screen).
     pub fn transcript_scroll_to_top(&mut self) {
+        let before = self.transcript_scroll.get();
         self.transcript_scroll.set(self.transcript_max_scroll.get());
+        self.scroll_jump_repaint(before);
     }
 
     /// Jump back to the bottom (newest content) and re-enable auto-stick.
     pub fn transcript_scroll_to_bottom(&mut self) {
+        let before = self.transcript_scroll.get();
         self.transcript_scroll.set(0);
+        self.scroll_jump_repaint(before);
+    }
+
+    /// Request a full clear + repaint when a scroll actually moved the viewport
+    /// (`before` differs from the new offset). A scroll jump replaces the whole
+    /// visible window at once; on a diff-only console the outgoing rows can survive
+    /// as stale overlap, so a clean repaint scrubs them. No-op on a boundary scroll
+    /// that changed nothing (already pinned / already at the top), and the loop
+    /// coalesces repeated requests into ONE clear per drawn frame, so a fast wheel
+    /// spin never repaints more than once per frame.
+    fn scroll_jump_repaint(&self, before: usize) {
+        if self.transcript_scroll.get() != before {
+            self.request_transcript_repaint();
+        }
     }
 
     /// Scroll the help overlay DOWN by `rows`, clamped to the renderer-published
@@ -4477,6 +4522,26 @@ impl App {
     #[must_use]
     pub fn take_force_repaint(&mut self) -> bool {
         std::mem::take(&mut self.force_repaint)
+    }
+
+    /// Request a FULL clear + redraw on the next frame because the TRANSCRIPT
+    /// (not the input box) reflowed / re-based / scrolled — see
+    /// [`Self::transcript_repaint_pending`]. Takes `&self` so the pure `&App`
+    /// renderer and the interior-mutable scroll helpers can both raise it.
+    pub fn request_transcript_repaint(&self) {
+        self.transcript_repaint_pending.set(true);
+    }
+
+    /// Take + clear the pending transcript-repaint request (the transcript
+    /// counterpart of [`Self::take_force_repaint`]). The event loop ORs this into
+    /// its `force_full_repaint` gate every iteration, so a transcript reflow /
+    /// `MAX_RENDER_ROWS` re-base / scroll jump clears the screen + resets
+    /// ratatui's back-buffer before the next draw and no stale row survives.
+    /// Drains in one shot; `&self` (interior-mutable `Cell`) so it composes with
+    /// the renderer's `&App`. Returns `false` in the steady state.
+    #[must_use]
+    pub fn take_transcript_repaint(&self) -> bool {
+        self.transcript_repaint_pending.replace(false)
     }
 
     /// The rendered input-box height (clamped visible rows + underline + meta) at
@@ -16927,6 +16992,62 @@ mod tests {
         assert!(
             a.take_force_repaint(),
             "shrinking the input box on forward-recall must force a full repaint"
+        );
+    }
+
+    // ---- long-run transcript garble: a transcript reflow / scroll must force a
+    // full repaint too (not just the input box), so a diff-only console can't
+    // leave stale/overlapping rows over a long streaming run. ----------------
+
+    #[test]
+    fn scroll_jump_requests_a_transcript_repaint() {
+        let mut a = fresh_app(Some("offline"));
+        // The renderer publishes the scroll bound; pin one so a scroll actually
+        // moves the offset.
+        a.transcript_max_scroll.set(100);
+        assert!(
+            !a.take_transcript_repaint(),
+            "no transcript repaint pending before any scroll"
+        );
+        // A real scroll UP (0 → 10) replaces the visible window → repaint.
+        a.transcript_scroll_up(10);
+        assert_eq!(a.transcript_scroll(), 10);
+        assert!(
+            a.take_transcript_repaint(),
+            "a scroll jump that moved the viewport must force a full repaint"
+        );
+        // Drains in one shot.
+        assert!(
+            !a.take_transcript_repaint(),
+            "the transcript repaint request drains once"
+        );
+        // Scrolling back to the bottom (10 → 0) also moves the window → repaint.
+        a.transcript_scroll_to_bottom();
+        assert_eq!(a.transcript_scroll(), 0);
+        assert!(
+            a.take_transcript_repaint(),
+            "jumping back to the bottom also forces a repaint"
+        );
+    }
+
+    #[test]
+    fn boundary_scroll_that_moves_nothing_does_not_repaint() {
+        let mut a = fresh_app(Some("offline"));
+        a.transcript_max_scroll.set(0); // everything fits: nothing to scroll
+                                        // Already pinned to the bottom (offset 0): a scroll-down / to-bottom is a
+                                        // no-op and must NOT force a needless repaint (no thrash on a static view).
+        a.transcript_scroll_down(5);
+        a.transcript_scroll_to_bottom();
+        assert!(
+            !a.take_transcript_repaint(),
+            "a scroll that changed nothing must not force a repaint"
+        );
+        // A scroll UP clamped to a zero bound also moves nothing → no repaint.
+        a.transcript_scroll_up(5);
+        assert_eq!(a.transcript_scroll(), 0);
+        assert!(
+            !a.take_transcript_repaint(),
+            "a scroll clamped to a zero bound moves nothing → no repaint"
         );
     }
 

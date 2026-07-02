@@ -4313,6 +4313,18 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // next mouse event to re-anchor against the freshly published rows).
     let prev_cut = app.transcript_cut.replace(cut);
     let total = folded.len();
+    // Self-heal (long-run garble): if the transcript RE-BASED (the
+    // `MAX_RENDER_ROWS` front-trim first crossed in) or SHRANK (a fold / collapse
+    // / `/compact` / `/clear` / the live indicator removed at settle), request a
+    // full clear + repaint on the NEXT frame so the incremental diff can't leave
+    // stale/overlapping rows behind. Only the discrete EVENT trips it — a steady
+    // bottom-pinned streaming append (total grows, cut still 0 or already >0)
+    // never does — so a marathon run heals without thrashing the repaint. `&App`
+    // publishes the request through an interior-mutable cell, drained by the loop.
+    let prev_total = app.transcript_prev_total.replace(total);
+    if crate::transcript_reflow_needs_repaint(prev_total, total, prev_cut, cut) {
+        app.request_transcript_repaint();
+    }
     // The scroll-hint title (added below when content overflows) is a `Block` title
     // row that `Block::inner` STEALS off the top — so whenever it's shown the real
     // paintable viewport is one row shorter. Account for it: decide overflow against
@@ -7220,6 +7232,33 @@ mod tests {
             )));
         }
         app
+    }
+
+    #[test]
+    fn render_requests_repaint_on_a_transcript_shrink_but_not_a_steady_frame() {
+        // Long-run garble self-heal at the RENDER level: a steady, unchanged frame
+        // must NOT raise the transcript-repaint request (no thrash), but a
+        // transcript SHRINK (rows dropped below the new end — a fold/collapse /
+        // `/compact` / `/clear`) MUST, so the diff can't leave stale rows behind.
+        let mut app = app_with_long_transcript(60);
+        // First render populates the geometry (prev_total). Drain whatever the
+        // first-frame publish raised so we measure the steady/shrink deltas clean.
+        let _ = render_chat_at(&app, 80, 18);
+        let _ = app.take_transcript_repaint();
+        // A second, identical frame: nothing shifted → no repaint request.
+        let _ = render_chat_at(&app, 80, 18);
+        assert!(
+            !app.take_transcript_repaint(),
+            "a steady, unchanged frame must not thrash the repaint"
+        );
+        // Drop the back half of the transcript so the next fold is much shorter —
+        // a genuine shrink (the vacated rows are exactly the stale-row risk).
+        app.history.truncate(app.history.len() / 2);
+        let _ = render_chat_at(&app, 80, 18);
+        assert!(
+            app.take_transcript_repaint(),
+            "a transcript shrink must force a full repaint"
+        );
     }
 
     #[test]
