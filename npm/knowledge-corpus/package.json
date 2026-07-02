@@ -1,6 +1,6 @@
 {
   "name": "@umacloud/knowledge",
-  "version": "1.0.24",
+  "version": "1.0.25",
   "description": "UmaDev curated engineering knowledge corpus (standards, methodologies, expert playbooks, design systems, miniprogram/uniapp guides). Platform-independent data shipped once so npm users get the full KB offline.",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/umacloud/umadev.git" },
