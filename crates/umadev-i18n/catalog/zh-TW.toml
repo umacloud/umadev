@@ -352,6 +352,7 @@
 "resume.not_found" = "[會話] 沒找到對話 `{}`(可能已刪除或 id 有誤)。/sessions 看現有清單。"
 "resume.done" = "[會話] 已恢復對話 `{}`({} 則記錄),底座會接上這段上下文。"
 "compact.too_short" = "[compact] 對話還太短,無需壓縮。"
+"compact.nudge" = "[compact] 上下文已用約 {}% — 執行 /compact 折疊早前對話以在溢出前釋放空間。"
 "compact.summary" = "[早前對話摘要 · 共 {} 則]\n{}"
 "compact.done" = "[compact] 已把對話摺疊摘要:{} 則 -> {} 則,釋放上下文且保留早前要點。"
 "compact.in_progress" = "[compact] 正在把早前的對話總結成摘要以釋放上下文——最近幾輪原樣保留,完整歷史仍存檔…"
@@ -757,6 +758,7 @@
 # 參考費率(僅供參考)。
 "tui.gauge.tokens" = "▍ {} tok"
 "tui.gauge.cost" = "≈${}"
+"tui.gauge.context" = "上下文 {}/{} · {}%"
 # 閒置時連按兩次 Esc 回退提示(Feature B):第一次 Esc 預備,第二次把上一則訊息載回輸入框編輯並重送。
 "tui.rewind.hint" = "再按一次 Esc 編輯並重送上一則訊息"
 # 可捲動內容浮層進度

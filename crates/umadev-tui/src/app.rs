@@ -281,6 +281,63 @@ fn well_known_models(backend_id: &str) -> &'static [(&'static str, &'static str)
     }
 }
 
+/// Occupancy percent at which the proactive `/compact` nudge fires — high enough
+/// that it's genuinely getting full, low enough to leave room before the base
+/// fails with a "prompt too long" (the reactive `BaseFailure::Context` remedy).
+pub(crate) const CONTEXT_NUDGE_PCT: u16 = 80;
+
+/// A **conservative** estimate of the active base/model's default context budget,
+/// used purely as the DENOMINATOR of the context-usage gauge — UmaDev owns no
+/// model, so this is never a hard limit it enforces (the base owns the real
+/// window). It reflects the base CLI's *practical default* budget, NOT a model's
+/// theoretical maximum: current Claude models can reach ~1M with the long-context
+/// beta, but `claude-code` defaults to ~200k (the point where `/compact` becomes
+/// due, and the size `base_error` classifies "prompt too long" against), so a
+/// conservative 200k errs toward nudging early — a safe direction, since running
+/// `/compact` is always fine, while under-estimating would let the base overflow.
+///
+/// Matched by lowercased substring so a version suffix or a `provider/model`
+/// prefix (opencode's `anthropic/claude-opus-4-8`) still resolves. `None` when
+/// nothing matches AND the backend has no safe default (offline / unknown) → the
+/// gauge then shows nothing rather than a fabricated denominator (fail-open).
+#[must_use]
+pub(crate) fn context_window_estimate(backend_id: &str, model: &str) -> Option<u64> {
+    let m = model.to_ascii_lowercase();
+    // Model-id substring match wins (most specific). Ordered so a `gpt-5` hit
+    // beats the generic `gpt-4` bucket.
+    if m.contains("claude") {
+        return Some(200_000);
+    }
+    if m.contains("gpt-5") {
+        return Some(400_000);
+    }
+    if m.contains("o4-mini") || m.contains("o3") || m.contains("gpt-4") {
+        return Some(128_000);
+    }
+    // No usable model id (unset → the base runs its own default) → a safe
+    // per-backend default budget; unknown / offline base → nothing.
+    match backend_id {
+        // claude-code, and opencode (which commonly drives a Claude model), share
+        // the conservative Claude-family floor; codex uses the GPT default.
+        "claude-code" | "opencode" => Some(200_000),
+        "codex" => Some(128_000),
+        _ => None,
+    }
+}
+
+/// Round `used / total` to a whole percent for the context-usage gauge. Clamped to
+/// `0..=100` (the conservative denominator can under-count a larger real window, so
+/// a raw ratio may exceed 100 — showing a capped `100%` reads as "full", never an
+/// absurd `>100%`). Pure, saturating, `total == 0` → 0.
+#[must_use]
+pub(crate) fn context_usage_pct(used: u64, total: u64) -> u16 {
+    if total == 0 {
+        return 0;
+    }
+    let pct = used.saturating_mul(100) / total;
+    u16::try_from(pct.min(100)).unwrap_or(100)
+}
+
 /// A spawned token-budgeted compaction job — everything the async summary task
 /// needs, snapshotted off `&mut App` so the task never touches app state. The
 /// task forks the base, summarises [`Self::folded`], and reports the outcome
@@ -2463,6 +2520,21 @@ pub struct App {
     /// Starts at 0 each launch and grows per turn; shown on the waiting indicator.
     pub session_tokens: u64,
 
+    /// The base's REAL input-token count from the LAST turn (`EngineEvent::TurnUsage`).
+    /// This is the live **context-occupancy** proxy: the input tokens the base READ
+    /// that turn ≈ how full its context is right now (distinct from cumulative
+    /// [`Self::session_tokens`] spend). 0 until the first turn reports usage → the
+    /// context gauge then falls back to a transcript estimate, or shows nothing.
+    /// Reset to 0 on `/clear`. Numerator of the meta-row context-usage gauge.
+    pub last_turn_input_tokens: u64,
+
+    /// Whether the proactive `/compact` nudge has already fired for the current
+    /// threshold crossing, so the one-line hint surfaces ONCE when context first
+    /// crosses [`CONTEXT_NUDGE_PCT`] — not every turn. Re-armed (set `false`) when
+    /// occupancy drops back below the threshold (e.g. after a `/compact`) or on
+    /// `/clear`. Deterministic, bounded: at most one nudge per crossing.
+    pub(crate) context_nudge_shown: bool,
+
     /// One-line status shown in the top bar.
     pub status: String,
     /// Spinner animation tick.
@@ -2807,6 +2879,8 @@ impl App {
             redo_stack: Vec::new(),
             last_snapshot_at: None,
             session_tokens: 0,
+            last_turn_input_tokens: 0,
+            context_nudge_shown: false,
             status: String::new(),
             tick: 0,
             animations: animations_enabled_default(),
@@ -6692,6 +6766,11 @@ impl App {
                 self.session_tokens = self
                     .session_tokens
                     .saturating_add(u64::from(input_tokens) + u64::from(output_tokens));
+                // The LAST turn's input tokens = the context the base just read ≈
+                // current context occupancy (the numerator of the context gauge). A
+                // fresh real measurement each turn; drives the proactive /compact nudge.
+                self.last_turn_input_tokens = u64::from(input_tokens);
+                self.maybe_nudge_compaction();
             }
             EngineEvent::Note(note) => {
                 // A TERMINAL-ABORT note (a block that returned `Err` → produced
@@ -8258,6 +8337,71 @@ impl App {
         }
     }
 
+    /// Best available estimate of the CURRENT context size (tokens the base is
+    /// carrying) — the NUMERATOR of the context-usage gauge. Prefers the base's
+    /// REAL last-turn input-token count (that IS roughly the context it just read);
+    /// falls back to a chars/4 estimate of the tracked working transcript (the
+    /// project-wide heuristic, via [`umadev_agent::compaction::transcript_tokens`])
+    /// before any usage has landed; `None` when there is nothing to show yet.
+    /// Pure read, fail-open.
+    #[must_use]
+    pub(crate) fn context_used_tokens(&self) -> Option<u64> {
+        if self.last_turn_input_tokens > 0 {
+            return Some(self.last_turn_input_tokens);
+        }
+        let est = umadev_agent::compaction::transcript_tokens(&self.conversation);
+        if est == 0 {
+            return None;
+        }
+        Some(u64::try_from(est).unwrap_or(u64::MAX))
+    }
+
+    /// The context-window DENOMINATOR for the active base/model, or `None` when the
+    /// base is offline / unknown (the gauge then shows nothing). Pure read.
+    #[must_use]
+    pub(crate) fn context_window_tokens(&self) -> Option<u64> {
+        context_window_estimate(
+            self.backend.as_deref().unwrap_or(""),
+            &self.effective_model(),
+        )
+    }
+
+    /// Current context occupancy as a whole percent (`used / window`), or `None`
+    /// when either the numerator or the denominator is unavailable — fail-open, so
+    /// the gauge/nudge never act on a fabricated number. Pure read.
+    #[must_use]
+    pub(crate) fn context_usage_pct(&self) -> Option<u16> {
+        let used = self.context_used_tokens()?;
+        let total = self.context_window_tokens()?;
+        Some(context_usage_pct(used, total))
+    }
+
+    /// Surface the proactive `/compact` nudge ONCE when context occupancy first
+    /// crosses [`CONTEXT_NUDGE_PCT`] — the pre-emptive version of the reactive
+    /// `BaseFailure::Context` remedy, fired before the base overflows. Bounded:
+    /// the [`Self::context_nudge_shown`] latch fires the one-line System hint a
+    /// single time per crossing and re-arms once occupancy drops back below the
+    /// threshold (e.g. after a `/compact`). No usage / unknown model → no-op
+    /// (fail-open, never a spurious nudge). Called after each real `TurnUsage`.
+    pub(crate) fn maybe_nudge_compaction(&mut self) {
+        let Some(pct) = self.context_usage_pct() else {
+            return;
+        };
+        if pct < CONTEXT_NUDGE_PCT {
+            // Back under the line — re-arm so the next crossing can nudge again.
+            self.context_nudge_shown = false;
+            return;
+        }
+        if self.context_nudge_shown {
+            return; // already nudged for this crossing — don't spam.
+        }
+        self.context_nudge_shown = true;
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "compact.nudge", &[&pct.to_string()]),
+        );
+    }
+
     /// Whether the working transcript is over the compaction token budget and a
     /// fold of at least [`umadev_agent::compaction::MIN_FOLD`] older messages is
     /// available — the deterministic auto-compaction trigger. Pure read.
@@ -8775,8 +8919,11 @@ impl App {
                 self.conversation_generation = self.conversation_generation.wrapping_add(1);
                 self.compaction_in_flight = false;
                 // A cleared session starts metering from zero — the persistent
-                // token/cost gauge resets with the transcript.
+                // token/cost gauge resets with the transcript, and the context
+                // gauge + its one-shot nudge re-arm for the fresh conversation.
                 self.session_tokens = 0;
+                self.last_turn_input_tokens = 0;
+                self.context_nudge_shown = false;
                 self.transcript_scroll.set(0);
                 self.transcript_prev_hidden.set(0);
                 // P5a: a cleared transcript invalidates the streaming cache.
@@ -14304,6 +14451,94 @@ mod tests {
         // (where `animations_enabled_default` would otherwise pick `false`).
         app.animations = true;
         app
+    }
+
+    // ---- Context-usage gauge + proactive compaction nudge --------------------
+
+    #[test]
+    fn context_window_table_returns_sane_denominators() {
+        // Claude family (incl. opencode's `provider/model` form) → the 200k floor.
+        assert_eq!(
+            context_window_estimate("claude-code", "claude-opus-4-8"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_window_estimate("opencode", "anthropic/claude-sonnet-4-6"),
+            Some(200_000)
+        );
+        // GPT-5 family → 400k; older o-series / gpt-4 → 128k.
+        assert_eq!(
+            context_window_estimate("codex", "gpt-5.1-codex"),
+            Some(400_000)
+        );
+        assert_eq!(context_window_estimate("codex", "o4-mini"), Some(128_000));
+        // Unset model → the per-backend default budget.
+        assert_eq!(context_window_estimate("claude-code", ""), Some(200_000));
+        assert_eq!(context_window_estimate("codex", ""), Some(128_000));
+        // Unknown / offline base with no usable model → nothing (fail-open).
+        assert_eq!(context_window_estimate("offline", ""), None);
+        assert_eq!(context_window_estimate("", "some-unknown-model"), None);
+    }
+
+    #[test]
+    fn context_usage_pct_is_bounded_and_saturating() {
+        assert_eq!(context_usage_pct(0, 200_000), 0);
+        assert_eq!(context_usage_pct(100_000, 200_000), 50);
+        assert_eq!(context_usage_pct(160_000, 200_000), 80);
+        // A conservative denominator can under-count → clamp at 100, never >100.
+        assert_eq!(context_usage_pct(500_000, 200_000), 100);
+        // total == 0 → 0, never a divide-by-zero.
+        assert_eq!(context_usage_pct(1234, 0), 0);
+    }
+
+    #[test]
+    fn context_gauge_computes_pct_from_last_turn_input_tokens() {
+        let mut app = fresh_app(Some("claude-code"));
+        // No usage and an empty transcript → nothing to show (fail-open).
+        assert!(app.context_used_tokens().is_none());
+        assert!(app.context_usage_pct().is_none());
+        // A known last-turn input count against the 200k Claude estimate → a sane %.
+        app.last_turn_input_tokens = 50_000;
+        assert_eq!(app.context_used_tokens(), Some(50_000));
+        assert_eq!(app.context_window_tokens(), Some(200_000));
+        assert_eq!(app.context_usage_pct(), Some(25));
+    }
+
+    #[test]
+    fn context_gauge_falls_open_when_model_unknown() {
+        let mut app = fresh_app(None); // offline / no backend
+        app.last_turn_input_tokens = 50_000;
+        // Numerator exists but there's no denominator → gauge shows nothing.
+        assert_eq!(app.context_used_tokens(), Some(50_000));
+        assert!(app.context_window_tokens().is_none());
+        assert!(app.context_usage_pct().is_none());
+    }
+
+    #[test]
+    fn compaction_nudge_fires_once_on_crossing_and_not_below() {
+        let mut app = fresh_app(Some("claude-code"));
+        let before = app.history.len();
+        // Below the 80% threshold (100k/200k = 50%) → no nudge.
+        app.last_turn_input_tokens = 100_000;
+        app.maybe_nudge_compaction();
+        assert_eq!(app.history.len(), before);
+        assert!(!app.context_nudge_shown);
+        // Cross the threshold (170k/200k = 85%) → nudge exactly once.
+        app.last_turn_input_tokens = 170_000;
+        app.maybe_nudge_compaction();
+        assert_eq!(app.history.len(), before + 1);
+        assert!(app.context_nudge_shown);
+        // Still above threshold next turn → no second nudge (no spam).
+        app.last_turn_input_tokens = 180_000;
+        app.maybe_nudge_compaction();
+        assert_eq!(app.history.len(), before + 1);
+        // Drop back below (e.g. after a /compact) → re-arm; a later crossing nudges again.
+        app.last_turn_input_tokens = 90_000;
+        app.maybe_nudge_compaction();
+        assert!(!app.context_nudge_shown);
+        app.last_turn_input_tokens = 175_000;
+        app.maybe_nudge_compaction();
+        assert_eq!(app.history.len(), before + 2);
     }
 
     // ---- I1: kill-ring + yank / yank-pop -------------------------------------

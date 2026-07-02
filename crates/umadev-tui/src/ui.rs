@@ -4149,6 +4149,32 @@ fn token_gauge_text(app: &App) -> Option<String> {
     }
 }
 
+/// The live context-occupancy gauge for the meta row — how full the base's
+/// context is *right now* (distinct from the cumulative-spend gauge above), so
+/// the user can see when `/compact` is due instead of only learning it when the
+/// base fails. NUMERATOR: the base's real last-turn input tokens (the context it
+/// just read), or a chars/4 transcript estimate before any usage lands.
+/// DENOMINATOR: a conservative per-base/per-model context-window estimate — see
+/// [`crate::app::context_window_estimate`]. Renders `ctx 34k/200k · 17%`.
+///
+/// Fail-open: `None` (show nothing) when there is no usage/transcript yet or the
+/// model is unknown, so a fresh session or an unrecognised base never shows a
+/// fabricated or wrong number — honest over decorative, matching the spend gauge.
+fn context_gauge_text(app: &App) -> Option<String> {
+    let used = app.context_used_tokens()?;
+    let total = app.context_window_tokens()?;
+    let pct = crate::app::context_usage_pct(used, total);
+    Some(umadev_i18n::tf(
+        app.lang,
+        "tui.gauge.context",
+        &[
+            &fmt_token_count(used),
+            &fmt_token_count(total),
+            &pct.to_string(),
+        ],
+    ))
+}
+
 /// Build ONE transcript message into its [`RenderedRow`]s — the per-message
 /// half of [`render_transcript`], extracted verbatim so the result can be folded
 /// then cached per message (see [`message_folded_lines`]). The caller owns the
@@ -5747,6 +5773,22 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         if let Some(gauge) = token_gauge_text(app) {
             parts.push(("·".into(), theme::BORDER()));
             parts.push((gauge, theme::INFO()));
+        }
+        // Live context-occupancy gauge, right after cumulative spend. Turns to the
+        // warning tone once occupancy crosses the nudge threshold (the persistent
+        // visual companion to the one-shot `/compact` hint), so a full context is
+        // legible at a glance. Absent until there's usage/transcript to size it.
+        if let Some(gauge) = context_gauge_text(app) {
+            let over = app
+                .context_usage_pct()
+                .is_some_and(|p| p >= crate::app::CONTEXT_NUDGE_PCT);
+            let color = if over {
+                theme::WARNING()
+            } else {
+                theme::INFO()
+            };
+            parts.push(("·".into(), theme::BORDER()));
+            parts.push((gauge, color));
         }
     }
     parts.push(("·".into(), theme::BORDER()));

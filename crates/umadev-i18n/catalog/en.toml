@@ -354,6 +354,10 @@
 "resume.not_found" = "[chat] No chat `{}` (it may be deleted, or the id is wrong). /sessions lists what's available."
 "resume.done" = "[chat] Reopened chat `{}` ({} messages); the base will carry on with this context."
 "compact.too_short" = "[compact] The conversation is still short — nothing to compact yet."
+# Proactive compaction nudge (Feature: ctx usage). Surfaced ONCE when context
+# occupancy first crosses the high threshold, before the base fails with a
+# "prompt too long". `{}` is the rounded percent.
+"compact.nudge" = "[compact] Context is ~{}% full — run /compact to condense older turns and free up room before it overflows."
 "compact.summary" = "[Summary of earlier conversation · {} messages]\n{}"
 "compact.done" = "[compact] Folded the conversation into a summary: {} -> {} messages — frees context while keeping the earlier points."
 "compact.in_progress" = "[compact] Summarizing the earlier conversation to free context — the recent turns stay verbatim and the full history is kept on disk…"
@@ -767,6 +771,10 @@
 # token count; the cost is the flat blended reference rate (estimate only).
 "tui.gauge.tokens" = "▍ {} tok"
 "tui.gauge.cost" = "≈${}"
+# Live context-window occupancy gauge (Feature: ctx usage). `{}` are the current
+# context size, the per-model context-window estimate, and the rounded percent —
+# renders as "ctx 34k/200k · 17%". Both counts pass through the compact humaniser.
+"tui.gauge.context" = "ctx {}/{} · {}%"
 # Idle double-Esc rewind hint (Feature B): first Esc arms it, a second edits +
 # resends the last user message.
 "tui.rewind.hint" = "Press Esc again to edit & resend your last message"

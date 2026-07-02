@@ -399,6 +399,10 @@ mod tests {
             // the idle double-Esc rewind hint.
             "tui.gauge.tokens",
             "tui.gauge.cost",
+            // Live context-window occupancy gauge + the proactive one-shot
+            // compaction nudge fired when it crosses the high threshold.
+            "tui.gauge.context",
+            "compact.nudge",
             "tui.rewind.hint",
             "tui.palette.title",
             // Phase-2-C-P1: in-transcript search (Ctrl+F) — prompt label, live
