@@ -696,6 +696,9 @@
 "tui.scroll.above" = "↑ {} lines above"
 # Toast after a drag-select copy ({} = number of characters copied to clipboard)
 "tui.copied" = "Copied {} characters"
+# Ctrl+click opened a URL / file from the transcript ({} = the opened target; iTerm2's native Cmd+click is unaffected)
+"tui.link.opened" = "Opened {}"
+"tui.link.open_failed" = "Could not open {}"
 # Tool-call rows: merged read/grep batch headline + grep metric
 "tui.tool.batch" = "inspected {} files"
 "tui.tool.matches" = "{} matches"
@@ -830,6 +833,7 @@
 "tui.help.key.scroll" = "page the transcript up / down"
 "tui.help.key.jump" = "jump transcript to top / bottom (empty input)"
 "tui.help.key.wheel" = "scroll · extend selection while dragging"
+"tui.help.key.link" = "open the URL / file under the cursor (iTerm2's native Cmd+click also works)"
 "tui.help.edit.clear" = "clear chat history (config stays)"
 "tui.help.edit.help" = "this overlay"
 "tui.help.edit.quit" = "exit"

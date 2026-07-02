@@ -693,6 +693,9 @@
 "tui.scroll.above" = "↑ 上方还有 {} 行"
 # 拖拽选择复制后的提示({} = 复制到剪贴板的字符数)
 "tui.copied" = "已复制 {} 个字符"
+# Ctrl+点击打开记录里的链接 / 文件({} = 打开的目标;iTerm2 原生 Cmd+点击不受影响)
+"tui.link.opened" = "已打开 {}"
+"tui.link.open_failed" = "无法打开 {}"
 # 工具调用行:连续只读工具合并后的标题 + grep 命中计数
 "tui.tool.batch" = "读取 {} 个文件"
 "tui.tool.matches" = "{} 处匹配"
@@ -819,6 +822,7 @@
 "tui.help.key.scroll" = "上下翻页查看记录"
 "tui.help.key.jump" = "跳到记录顶部 / 底部(输入为空时)"
 "tui.help.key.wheel" = "滚动 · 拖拽时扩展选区"
+"tui.help.key.link" = "打开光标下的网址 / 文件(iTerm2 也可直接 Cmd+点击)"
 "tui.help.edit.clear" = "清空对话历史(配置保留)"
 "tui.help.edit.help" = "本浮层"
 "tui.help.edit.quit" = "退出"

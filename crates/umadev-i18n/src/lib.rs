@@ -406,6 +406,12 @@ mod tests {
             "tui.help.key.scroll",
             "tui.help.key.jump",
             "tui.help.key.wheel",
+            // Ctrl+click open-link layer: the opened/failed status notes and
+            // the /help cheatsheet row (iTerm2's native Cmd+click is noted
+            // there because macOS terminals intercept Cmd themselves).
+            "tui.help.key.link",
+            "tui.link.opened",
+            "tui.link.open_failed",
             "tui.bang.exit",
             "tui.bang.failed",
             "tui.bang.spawn_failed",

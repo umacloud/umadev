@@ -32,6 +32,7 @@
 pub mod app;
 pub mod config;
 pub mod input;
+pub mod link;
 pub mod selection;
 pub mod ui;
 
@@ -5106,13 +5107,35 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                             {
                                 let (col, row) = (me.column, me.row);
                                 match me.kind {
+                                    // Ctrl+Left-down: OPEN the URL / existing file under
+                                    // the cursor (browser / Finder / Explorer) instead of
+                                    // starting a selection — the in-app equivalent of the
+                                    // terminal's Cmd/Ctrl+click, which mouse capture
+                                    // swallows. SGR reports carry the ctrl bit, so this
+                                    // works on Windows Terminal and most unix terminals;
+                                    // macOS terminals usually intercept Cmd+click
+                                    // themselves (iTerm2's native Cmd+click keeps working
+                                    // — it never reaches us). A miss (no URL, no existing
+                                    // path) is a silent no-op; the rest of the gesture
+                                    // (drag/up) is suppressed via `link_click_pending` so
+                                    // it can't extend or re-copy a stale selection.
+                                    MouseEventKind::Down(MouseButton::Left)
+                                        if me.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        app.link_click_open(col, row);
+                                    }
                                     // Left-down: begin a selection at this point (or
                                     // clear it if the click is outside the transcript).
                                     MouseEventKind::Down(MouseButton::Left) => {
                                         app.selection_begin(col, row);
                                     }
                                     // Left-drag: extend the live selection's cursor.
-                                    MouseEventKind::Drag(MouseButton::Left) => {
+                                    // (A drag inside a Ctrl+click gesture is ignored —
+                                    // no selection was opened and the one-time copy hint
+                                    // must not fire on a link click.)
+                                    MouseEventKind::Drag(MouseButton::Left)
+                                        if !app.link_click_pending =>
+                                    {
                                         app.selection_extend(col, row);
                                         // A drag that began OUTSIDE the transcript
                                         // (the input box / padding) never opened a
@@ -5120,6 +5143,14 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                                         // — that reads as "copy is broken". Surface
                                         // the native-selection / `/mouse` hint once.
                                         app.hint_native_copy_once();
+                                    }
+                                    // Left-up closing a Ctrl+click gesture: just disarm.
+                                    // Without this the release would re-copy whatever
+                                    // selection was still highlighted from before.
+                                    MouseEventKind::Up(MouseButton::Left)
+                                        if app.link_click_pending =>
+                                    {
+                                        app.link_click_pending = false;
                                     }
                                     // Left-up: if a non-empty selection was made, copy its
                                     // text to the system clipboard via OSC 52 and toast.

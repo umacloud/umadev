@@ -2004,6 +2004,15 @@ pub struct App {
     /// 更多" gap). `None` outside a drag.
     pub last_drag_mouse: Option<(u16, u16)>,
 
+    /// `true` while a **Ctrl+click (open-link) gesture** is in flight — set on
+    /// the Ctrl+Left-down that routed to [`Self::link_click_open`], cleared on
+    /// the matching Left-up. While armed, the event loop suppresses the
+    /// drag-selection layer for the rest of the gesture (no selection extend,
+    /// no copy hint, and crucially no mouse-up re-copy of a stale highlighted
+    /// span). A plain click (no ctrl) never sets this, so selection behavior
+    /// is byte-for-byte unchanged.
+    pub link_click_pending: bool,
+
     /// **Per-frame cache of the rendered transcript as plain text** — one
     /// `String` per wrapped visual row, in render order. Rebuilt every frame by
     /// `ui::render_transcript` from the same folded `Vec<Line>` it paints. The
@@ -2636,6 +2645,7 @@ impl App {
             selection: None,
             selection_dragging: false,
             last_drag_mouse: None,
+            link_click_pending: false,
             transcript_rows: std::cell::RefCell::new(Vec::new()),
             transcript_gutters: std::cell::RefCell::new(Vec::new()),
             transcript_row_wraps: std::cell::RefCell::new(Vec::new()),
@@ -4024,6 +4034,58 @@ impl App {
             umadev_i18n::tf(self.lang, "tui.copied", &[&count.to_string()]),
         );
         Some(text)
+    }
+
+    // ---- Ctrl+click → open URL / file (the in-app Cmd+click) --------------
+
+    /// Resolve what a Ctrl+click at screen `(col, row)` would OPEN, without
+    /// opening it: maps the cell through the same cached-row geometry the
+    /// selection layer uses, rejoins the soft-wrapped logical line (so a URL
+    /// folded across visual rows is seen whole), and asks [`crate::link`] for
+    /// the token under the cursor. A URL is returned validated + trimmed; a
+    /// path token is returned only when it resolves to an EXISTING file/dir
+    /// (canonicalized, `~`/relative-to-workspace expanded). `None` = nothing
+    /// openable under the cursor. Pure with respect to app state — split from
+    /// [`Self::link_click_open`] so tests never spawn a real opener.
+    #[must_use]
+    pub fn link_target_at(&self, col: u16, row: u16) -> Option<String> {
+        let point = self.map_mouse_point(col, row)?;
+        let candidate = {
+            let rows = self.transcript_rows.borrow();
+            let wraps = self.transcript_row_wraps.borrow();
+            let (line, off) = crate::link::logical_line_at(&rows, &wraps, point.0, point.1)?;
+            crate::link::find_link(&line, off)?
+        };
+        match candidate {
+            crate::link::LinkCandidate::Url(url) => Some(url),
+            crate::link::LinkCandidate::Path(tok) => {
+                crate::link::resolve_path(&tok, &self.project_root).map(|p| p.display().to_string())
+            }
+        }
+    }
+
+    /// Ctrl+click at screen `(col, row)`: open the URL / existing file under
+    /// the cursor with the platform opener, spawned detached (all stdio null,
+    /// reaped off-thread — see [`crate::link::spawn_opener`]). Arms
+    /// [`Self::link_click_pending`] unconditionally so the rest of the mouse
+    /// gesture (drag / up) never touches the selection layer. Affordance: one
+    /// status note on success or on a failed spawn; a click that hits nothing
+    /// openable is a SILENT no-op (no note spam). Fail-open by contract —
+    /// nothing here can block the event loop.
+    pub fn link_click_open(&mut self, col: u16, row: u16) {
+        self.link_click_pending = true;
+        let Some(target) = self.link_target_at(col, row) else {
+            return;
+        };
+        let key = if crate::link::spawn_opener(&target).is_ok() {
+            "tui.link.opened"
+        } else {
+            "tui.link.open_failed"
+        };
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, key, &[&target]),
+        );
     }
 
     /// Render the chat history to a plain-text transcript for the **scrollback
@@ -19797,6 +19859,105 @@ mod tests {
             "no hint while a real selection is live"
         );
         assert!(!a.native_copy_hint_shown, "and it does not latch");
+    }
+
+    // ── Ctrl+click → open URL / file under the cursor ─────────────────────
+
+    /// Seed a wide viewport whose row 0 holds a URL mid-sentence, pinned to
+    /// the top (no scroll), no gutters — so screen col == char index.
+    fn seed_link_geometry(a: &App, rows: &[&str]) {
+        *a.transcript_rows.borrow_mut() = rows.iter().map(|s| (*s).to_string()).collect();
+        a.transcript_gutters.borrow_mut().clear();
+        a.transcript_row_wraps.borrow_mut().clear();
+        a.transcript_area.set((0, 0, 60, 4));
+        a.transcript_max_scroll.set(0);
+        a.set_transcript_scroll(0);
+        a.transcript_first_visible.set(0);
+    }
+
+    #[test]
+    fn ctrl_click_resolves_the_url_under_the_cursor() {
+        let a = fresh_app(Some("offline"));
+        seed_link_geometry(&a, &["preview at http://127.0.0.1:4173/ now"]);
+        // Click on the '1' of `127` (screen col 18, row 0).
+        assert_eq!(
+            a.link_target_at(18, 0).as_deref(),
+            Some("http://127.0.0.1:4173/"),
+            "the URL under the cursor is recovered, boundary-trimmed"
+        );
+        // A click on plain prose hits nothing (silent no-op upstream).
+        assert_eq!(a.link_target_at(2, 0), None, "plain words are not links");
+        // A click past the end of the text hits nothing either.
+        assert_eq!(
+            a.link_target_at(55, 0),
+            None,
+            "blank right margin is a miss"
+        );
+    }
+
+    #[test]
+    fn ctrl_click_resolves_only_existing_paths() {
+        let a = fresh_app(Some("offline"));
+        // A real file in the workspace + a non-existent sibling on row 1.
+        std::fs::write(a.project_root.join("proof.png"), b"x").unwrap();
+        seed_link_geometry(&a, &["shot: proof.png done", "shot: missing.png done"]);
+        let hit = a
+            .link_target_at(8, 0)
+            .expect("existing workspace file resolves");
+        assert!(
+            hit.ends_with("proof.png"),
+            "resolved to the canonicalized real file: {hit}"
+        );
+        assert_eq!(
+            a.link_target_at(8, 1),
+            None,
+            "a path token that does not exist is a miss, not an open"
+        );
+    }
+
+    #[test]
+    fn link_click_miss_is_silent_and_suppresses_the_gesture() {
+        let mut a = fresh_app(Some("offline"));
+        seed_link_geometry(&a, &["no links in this row at all"]);
+        let before = a.history.len();
+        a.link_click_open(3, 0);
+        assert!(
+            a.link_click_pending,
+            "the gesture is armed even on a miss (drag/up stay suppressed)"
+        );
+        assert_eq!(a.history.len(), before, "a miss posts no status note");
+        assert!(
+            a.selection.is_none(),
+            "no selection is opened by ctrl+click"
+        );
+        // The event loop clears the flag on mouse-up; a PLAIN click afterwards
+        // must start a selection exactly as before (behavior unchanged).
+        a.link_click_pending = false;
+        a.selection_begin(3, 0);
+        assert!(
+            a.selection.is_some(),
+            "plain click still begins a selection"
+        );
+        assert!(a.selection_dragging, "and still opens a drag");
+        assert!(
+            !a.link_click_pending,
+            "a plain click never arms the link gesture"
+        );
+    }
+
+    #[test]
+    fn ctrl_click_reads_a_url_across_soft_wrapped_rows() {
+        let a = fresh_app(Some("offline"));
+        // One logical line folded over two visual rows mid-URL.
+        seed_link_geometry(&a, &["see http://127.0.0.1:41", "73/ done"]);
+        *a.transcript_row_wraps.borrow_mut() = vec![false, true];
+        // Click on the second visual row's `7` (screen col 0, row 1): the
+        // rejoined logical line yields the WHOLE url.
+        assert_eq!(
+            a.link_target_at(0, 1).as_deref(),
+            Some("http://127.0.0.1:4173/"),
+            "soft-wrapped URL rejoins before extraction"
+        );
     }
 
     #[test]

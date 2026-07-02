@@ -5899,6 +5899,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("PgUp / PgDn", umadev_i18n::t(lang, "tui.help.key.scroll")),
                     ("Home / End", umadev_i18n::t(lang, "tui.help.key.jump")),
                     ("Wheel", umadev_i18n::t(lang, "tui.help.key.wheel")),
+                    ("Ctrl+Click", umadev_i18n::t(lang, "tui.help.key.link")),
                     ("F1", umadev_i18n::t(lang, "tui.help.edit.toggle")),
                     ("Esc", umadev_i18n::t(lang, "tui.help.edit.esc")),
                 ],
