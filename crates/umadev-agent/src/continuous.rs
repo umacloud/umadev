@@ -704,7 +704,18 @@ fn evaluate_tool_call(
         .and_then(serde_json::Value::as_str)
         .or_else(|| input.get("path").and_then(serde_json::Value::as_str))
         .unwrap_or_default();
-    if lname == "write" || lname == "edit" || lname == "update" || lname == "create" {
+    // Keep this write-tool set aligned with the hook's `is_write` matcher
+    // (Write / Edit / MultiEdit / NotebookEdit): a mutating tool omitted here
+    // falls through to the observe-only `Decision::pass()` below with NO content
+    // scan, so a secret written via `MultiEdit` / `NotebookEdit` would bypass the
+    // governor. `update` / `create` cover the non-Claude bases' tool names.
+    if lname == "write"
+        || lname == "edit"
+        || lname == "multiedit"
+        || lname == "notebookedit"
+        || lname == "update"
+        || lname == "create"
+    {
         let content = input
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -2983,6 +2994,78 @@ mod tests {
             &serde_json::json!({ "file_path": "a.rs" }),
         );
         assert!(!decision.block);
+    }
+
+    /// A leaked credential — the irreversible-if-written floor — assembled at
+    /// runtime so this source file carries no contiguous key.
+    fn leaked_secret() -> String {
+        format!(
+            "const k = \"sk_live_4eC39H{}\";",
+            "qLyjWDarjtT1zdp7dcABCDEFGH"
+        )
+    }
+
+    #[tokio::test]
+    async fn multiedit_write_reaches_the_content_scan() {
+        // A `MultiEdit` mutating tool must be content-scanned like Write/Edit —
+        // before, `evaluate_tool_call` matched only write/edit/update/create, so
+        // a secret written via MultiEdit fell through to an observe-only pass and
+        // bypassed the governor.
+        let policy = umadev_governance::Policy::default();
+        let (target, decision) = evaluate_tool_call(
+            &policy,
+            umadev_governance::ProjectContext::unknown(),
+            "MultiEdit",
+            &serde_json::json!({ "file_path": "src/cfg.js", "new_string": leaked_secret() }),
+        );
+        assert_eq!(target, "src/cfg.js");
+        assert!(
+            decision.block,
+            "a MultiEdit write must reach the content scan and block a leaked secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn notebookedit_write_reaches_the_content_scan() {
+        // Same coverage guarantee for `NotebookEdit`: its cell source must be
+        // content-scanned like a Write, not silently passed. Routed to a
+        // secret-scanned path (a notebook cell IS code) to isolate the
+        // tool-ROUTING fix from the scan's own extension policy — the fix makes
+        // the tool reach the scan; what the scan then scans is unchanged.
+        let policy = umadev_governance::Policy::default();
+        let (target, decision) = evaluate_tool_call(
+            &policy,
+            umadev_governance::ProjectContext::unknown(),
+            "NotebookEdit",
+            &serde_json::json!({ "file_path": "notebook_cell.py", "content": leaked_secret() }),
+        );
+        assert_eq!(target, "notebook_cell.py");
+        assert!(
+            decision.block,
+            "a NotebookEdit write must reach the content scan and block a leaked secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiedit_and_notebookedit_route_identically_to_write() {
+        // Routing parity: for the SAME (path, content) the new write tools
+        // resolve to the exact same decision as a plain Write — proving they are
+        // no longer dropped to the observe-only pass.
+        let policy = umadev_governance::Policy::default();
+        let ctx = || umadev_governance::ProjectContext::unknown();
+        let input = serde_json::json!({ "file_path": "src/cfg.js", "new_string": leaked_secret() });
+        let (_t, write_d) = evaluate_tool_call(&policy, ctx(), "Write", &input);
+        let (_t, multi_d) = evaluate_tool_call(&policy, ctx(), "MultiEdit", &input);
+        let (_t, nb_d) = evaluate_tool_call(&policy, ctx(), "NotebookEdit", &input);
+        assert!(write_d.block, "baseline Write must block the secret");
+        assert_eq!(
+            multi_d.block, write_d.block,
+            "MultiEdit must route to the scan exactly like Write"
+        );
+        assert_eq!(
+            nb_d.block, write_d.block,
+            "NotebookEdit must route to the scan exactly like Write"
+        );
     }
 
     // ── TurnDone boundary (Failed → hard stop) ─────────────────────────────

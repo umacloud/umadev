@@ -3293,6 +3293,22 @@ enum GateBlock {
 /// and pauses at the correct gate for review.
 fn resolve_active_gate(state: &umadev_agent::WorkflowState) -> Result<Gate> {
     if state.active_gate.is_empty() {
+        // A CLEANLY-FINISHED pipeline also has an empty `active_gate`, but it
+        // must NOT be treated as an interruption to recover from: inferring a
+        // gate from `phase == "delivery"` would yield `PreviewConfirm` and
+        // RE-EXECUTE backend → quality → delivery — re-invoking the paid base
+        // CLI and overwriting the proof-pack. Detect the completion sentinel
+        // BEFORE inferring a gate and bail (never a silent no-op — see the
+        // `continue` help). A mid-`delivery` INTERRUPTION carries a different
+        // note, so it still falls through to the recovery path below.
+        if is_pipeline_complete(state) {
+            anyhow::bail!(
+                "pipeline already complete (phase: {}) — nothing to continue. \
+                 Run `umadev run` to start a fresh requirement, `umadev redo` to \
+                 re-run this one, or `umadev report` to view the delivered proof-pack.",
+                state.phase
+            );
+        }
         // Try to recover from an intra-phase interruption by inferring the
         // gate from the current phase position.
         if let Some(gate) = infer_gate_from_phase(&state.phase) {
@@ -3320,6 +3336,28 @@ fn resolve_active_gate(state: &umadev_agent::WorkflowState) -> Result<Gate> {
             state.active_gate
         ),
     }
+}
+
+/// The exact note the runner stamps when a full pipeline finishes cleanly
+/// (`runner.rs`: keep `phase = "delivery"`, clear `active_gate`, set this note).
+/// Used as the completion sentinel — a mid-`delivery` interruption never carries
+/// this note, so matching it distinguishes "done" from "recover".
+const PIPELINE_COMPLETE_NOTE: &str = "Pipeline complete.";
+
+/// True when the persisted state is a CLEANLY-FINISHED pipeline (not a
+/// mid-block interruption). The runner finalizes a full run with
+/// `phase = "delivery"`, an empty `active_gate`, and `note =
+/// "Pipeline complete."`; a `continue` on that state must bail, NOT re-run the
+/// preview_confirm block. Deterministic + conservative: requires BOTH the
+/// delivery phase, an empty gate AND the sentinel note, so a genuine
+/// gate-pause (non-empty gate) or a mid-delivery kill (different note) is never
+/// mistaken for completion.
+fn is_pipeline_complete(state: &umadev_agent::WorkflowState) -> bool {
+    state.active_gate.is_empty()
+        && state
+            .phase
+            .eq_ignore_ascii_case(umadev_spec::Phase::Delivery.id())
+        && state.note.trim() == PIPELINE_COMPLETE_NOTE
 }
 
 /// Infer which gate block to re-run when the pipeline was interrupted
@@ -5390,6 +5428,85 @@ mod tests {
             Gate::ClarifyGate,
             "interrupted docs should re-run from clarify"
         );
+    }
+
+    /// Build a workflow state with the given phase / gate / note; the other
+    /// fields are fixed and irrelevant to gate resolution.
+    fn state_with(phase: &str, active_gate: &str, note: &str) -> umadev_agent::WorkflowState {
+        umadev_agent::WorkflowState {
+            phase: phase.to_string(),
+            active_gate: active_gate.to_string(),
+            slug: "test".to_string(),
+            requirement: "test".to_string(),
+            last_transition_at: "2026-01-01T00:00:00Z".to_string(),
+            note: note.to_string(),
+            backend: String::new(),
+            base_session_id: None,
+            spec_version: "UMADEV_HOST_SPEC_V1".to_string(),
+        }
+    }
+
+    #[test]
+    fn is_pipeline_complete_only_for_the_finished_sentinel() {
+        // The exact finished state the runner persists.
+        assert!(is_pipeline_complete(&state_with(
+            "delivery",
+            "",
+            "Pipeline complete."
+        )));
+        // A mid-`delivery` interruption shares phase+empty-gate but NOT the note.
+        assert!(!is_pipeline_complete(&state_with("delivery", "", "")));
+        assert!(!is_pipeline_complete(&state_with(
+            "delivery",
+            "",
+            "Advanced to delivery"
+        )));
+        // A genuine gate-pause has a non-empty gate — never "complete".
+        assert!(!is_pipeline_complete(&state_with(
+            "preview_confirm",
+            "preview_confirm",
+            "Pipeline complete."
+        )));
+        // Wrong phase never counts.
+        assert!(!is_pipeline_complete(&state_with(
+            "backend",
+            "",
+            "Pipeline complete."
+        )));
+    }
+
+    #[test]
+    fn resolve_active_gate_bails_on_completed_pipeline_without_rerunning() {
+        // MONEY defect: a finished run persists phase="delivery", gate="",
+        // note="Pipeline complete." A second `continue` must NOT infer
+        // PreviewConfirm and re-execute backend->quality->delivery (re-invoking
+        // the paid base + overwriting the proof-pack) — it must bail.
+        let state = state_with("delivery", "", "Pipeline complete.");
+        let err = resolve_active_gate(&state).expect_err("completed pipeline must bail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already complete"),
+            "message must say the pipeline is already complete: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_active_gate_still_resumes_a_real_gate_pause() {
+        // A genuine preview_confirm gate-pause (non-empty gate) resolves exactly
+        // as before — the completion guard must not touch it.
+        let state = state_with("preview_confirm", "preview_confirm", "");
+        let gate = resolve_active_gate(&state).expect("gate-pause must resume");
+        assert_eq!(gate, Gate::PreviewConfirm);
+    }
+
+    #[test]
+    fn resolve_active_gate_still_recovers_a_mid_delivery_interrupt() {
+        // A kill DURING delivery (phase="delivery", empty gate, but NOT the
+        // completion note) is a real interruption — it must still recover by
+        // inferring the preview_confirm block, not be mistaken for "complete".
+        let state = state_with("delivery", "", "Advanced to delivery");
+        let gate = resolve_active_gate(&state).expect("mid-delivery interrupt must recover");
+        assert_eq!(gate, Gate::PreviewConfirm);
     }
 
     // ── P0-1: the governance hook is fail-open even against a PANICKING rule ──

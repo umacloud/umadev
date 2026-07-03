@@ -661,8 +661,13 @@ pub fn install_claude_hook(
         })
     });
     let hook_cmd = format!("{bin} hook pre-write");
+    // NOTE: this matcher MUST stay a superset of `run_pre_write_scoped`'s
+    // `is_write` set (Write / Edit / MultiEdit / NotebookEdit) — a tool the
+    // hook can govern but that the matcher omits would never fire the hook at
+    // all, so its writes (e.g. a secret leaked into an .ipynb via NotebookEdit)
+    // silently bypass the irreversible floor.
     matchers.push(serde_json::json!({
-        "matcher": "Write|Edit|MultiEdit",
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
         "hooks": [{"type": "command", "command": hook_cmd}]
     }));
     // Also register the Bash guard (UD-SEC-002) so the host's command
@@ -696,8 +701,11 @@ pub fn install_claude_hook(
             })
         })
     });
+    // Same superset invariant as the PreToolUse matcher above: audit every
+    // write tool the hook understands (Write / Edit / MultiEdit / NotebookEdit)
+    // plus Bash, so a NotebookEdit write is recorded to the tool-call JSONL too.
     post_matchers.push(serde_json::json!({
-        "matcher": "Write|Edit|MultiEdit|Bash",
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
         "hooks": [{"type": "command", "command": post_hook_cmd}]
     }));
 
@@ -926,6 +934,71 @@ mod tests {
         assert!(!settings2.contains("hook pre-write"));
         assert!(!settings2.contains("hook pre-bash"));
         assert!(!settings2.contains("hook tool-audit"));
+    }
+
+    #[test]
+    fn installed_matchers_cover_notebookedit() {
+        // The installed matcher regexes MUST be a superset of the runtime
+        // `is_write` set — otherwise a governed write tool (NotebookEdit) never
+        // fires the hook and its writes bypass the irreversible floor + audit.
+        let tmp = tempfile::TempDir::new().unwrap();
+        install_claude_hook(tmp.path()).unwrap();
+        let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&settings).unwrap();
+        // The pre-write guard and the post-write audit each carry a matcher that
+        // lists NotebookEdit alongside Write/Edit/MultiEdit.
+        let has_notebook = |phase: &str, cmd_suffix: &str| {
+            v["hooks"][phase]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| {
+                    m["hooks"].as_array().is_some_and(|hs| {
+                        hs.iter().any(|h| {
+                            h["command"]
+                                .as_str()
+                                .is_some_and(|c| c.ends_with(cmd_suffix))
+                        })
+                    })
+                })
+                .any(|m| {
+                    m["matcher"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("NotebookEdit"))
+                })
+        };
+        assert!(
+            has_notebook("PreToolUse", "hook pre-write"),
+            "PreToolUse write matcher must cover NotebookEdit"
+        );
+        assert!(
+            has_notebook("PostToolUse", "hook tool-audit"),
+            "PostToolUse audit matcher must cover NotebookEdit"
+        );
+    }
+
+    #[test]
+    fn notebookedit_write_reaches_the_secret_floor() {
+        // A NotebookEdit cell write must be routed to the same irreversible-floor
+        // scan as a plain Write (the runtime `is_write` set already covers it —
+        // this locks that coverage). Routed to a secret-scanned path (a notebook
+        // cell IS code) to isolate the tool-ROUTING guarantee from the scan's own
+        // extension policy, which this fix does not change.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let payload = serde_json::json!({
+            "tool_name": "NotebookEdit",
+            "tool_input": {
+                "file_path": root.join("notebook_cell.py").to_string_lossy(),
+                "content": secret_content(),
+            }
+        })
+        .to_string();
+        let d = run_pre_write_scoped(&payload, &umadev_governance::Policy::default(), Some(&root));
+        assert!(
+            d.block,
+            "a NotebookEdit secret write must be caught by the irreversible floor"
+        );
     }
 
     #[test]
