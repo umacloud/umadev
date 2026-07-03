@@ -269,6 +269,63 @@ impl ToolEdit {
     }
 }
 
+/// Extract the **full** proposed content a mutating base tool would write, so the
+/// governance content scan (secret floor / craft rules) sees every byte that
+/// would land — never an empty string for a tool it "supports".
+///
+/// This is deliberately **distinct** from [`ToolEdit::from_claude_tool_input`],
+/// which lifts only a *representative* first hunk for the TUI diff card. A
+/// content scan must see EVERYTHING: a secret inlined into a later `MultiEdit`
+/// hunk, or into a notebook cell, must not hide behind a first-hunk-only read.
+///
+/// Shapes handled (mutually exclusive in a real payload, tried in this order):
+/// - `MultiEdit` = `{file_path, edits: [{old_string, new_string}, …]}` →
+///   concatenation of **all** `edits[].new_string`, newline-joined.
+/// - `Write` / `create_file` = `{file_path, content}` → `content`.
+/// - `NotebookEdit` = `{notebook_path, new_source, …}` → `new_source`.
+/// - `Edit` = `{file_path, old_string, new_string}` → `new_string`.
+/// - codex / opencode alt → `new_str`.
+///
+/// **Fail-open:** a malformed / absent payload yields `String::new()`, so the
+/// caller scans `""` (today's no-op) — never a panic, never a fabricated body.
+#[must_use]
+pub fn write_scan_content(input: &serde_json::Value) -> String {
+    // MultiEdit: the batch of hunks lives in `edits[]` with NO top-level content.
+    // Join every hunk's `new_string` so a secret in `edits[1..]` can't slip past
+    // a first-hunk-only read.
+    if let Some(edits) = input.get("edits").and_then(serde_json::Value::as_array) {
+        let joined: Vec<&str> = edits
+            .iter()
+            .filter_map(|e| e.get("new_string").and_then(serde_json::Value::as_str))
+            .collect();
+        if !joined.is_empty() {
+            return joined.join("\n");
+        }
+    }
+    // Single-body shapes: Write (`content`), NotebookEdit (`new_source`),
+    // Edit (`new_string`), codex/opencode (`new_str`). First present wins.
+    for key in ["content", "new_source", "new_string", "new_str"] {
+        if let Some(s) = input.get(key).and_then(serde_json::Value::as_str) {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
+/// The target path a mutating base tool would write, for governance scoping.
+/// `Write` / `Edit` / `MultiEdit` carry `file_path`; `NotebookEdit` carries
+/// `notebook_path`; codex / opencode `update` / `create` carry `path`. First
+/// present wins; **fail-open** to `""` when none is present.
+#[must_use]
+pub fn write_scan_path(input: &serde_json::Value) -> String {
+    for key in ["file_path", "path", "notebook_path"] {
+        if let Some(s) = input.get(key).and_then(serde_json::Value::as_str) {
+            return s.to_string();
+        }
+    }
+    String::new()
+}
+
 /// One labeled option the base offered inside an `AskUserQuestion` call.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct AskOption {
@@ -1055,6 +1112,64 @@ mod tests {
         assert_eq!(e.path, "src/lib.rs");
         assert_eq!(e.before, "let x = 1;");
         assert_eq!(e.after, "let x = 2;");
+    }
+
+    // ── write_scan_content / write_scan_path (governance content extraction) ──
+
+    #[test]
+    fn write_scan_content_concatenates_all_multiedit_hunks() {
+        // A real MultiEdit carries NO top-level content; every hunk's `new_string`
+        // must be scanned so a secret in a later hunk can't hide behind the first.
+        let input = serde_json::json!({
+            "file_path": "src/cfg.js",
+            "edits": [
+                { "old_string": "a", "new_string": "let a = 1;" },
+                { "old_string": "b", "new_string": "let token = SECRET;" }
+            ]
+        });
+        let content = write_scan_content(&input);
+        assert_eq!(content, "let a = 1;\nlet token = SECRET;");
+        assert_eq!(write_scan_path(&input), "src/cfg.js");
+    }
+
+    #[test]
+    fn write_scan_content_reads_notebook_new_source() {
+        // A real NotebookEdit carries its cell body in `new_source` (NOT `content`)
+        // and its path in `notebook_path` (NOT `file_path`).
+        let input = serde_json::json!({
+            "notebook_path": "analysis.ipynb",
+            "new_source": "key = SECRET"
+        });
+        assert_eq!(write_scan_content(&input), "key = SECRET");
+        assert_eq!(write_scan_path(&input), "analysis.ipynb");
+    }
+
+    #[test]
+    fn write_scan_content_preserves_write_and_edit_shapes() {
+        // Write → `content`; Edit → `new_string`; codex/opencode alt → `new_str`.
+        let write = serde_json::json!({ "file_path": "a.ts", "content": "W" });
+        assert_eq!(write_scan_content(&write), "W");
+        let edit = serde_json::json!({ "file_path": "a.ts", "new_string": "E" });
+        assert_eq!(write_scan_content(&edit), "E");
+        let alt = serde_json::json!({ "path": "a.ts", "new_str": "A" });
+        assert_eq!(write_scan_content(&alt), "A");
+        assert_eq!(write_scan_path(&alt), "a.ts");
+    }
+
+    #[test]
+    fn write_scan_content_fails_open_on_malformed_payload() {
+        // Absent / wrong-typed fields yield "" (today's no-op scan), never a panic.
+        assert_eq!(write_scan_content(&serde_json::json!({})), "");
+        assert_eq!(write_scan_content(&serde_json::json!({ "edits": [] })), "");
+        assert_eq!(
+            write_scan_content(&serde_json::json!({ "edits": [{ "old_string": "x" }] })),
+            ""
+        );
+        assert_eq!(
+            write_scan_content(&serde_json::json!({ "content": 42 })),
+            ""
+        );
+        assert_eq!(write_scan_path(&serde_json::json!({})), "");
     }
 
     #[tokio::test]

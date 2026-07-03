@@ -168,7 +168,8 @@ fn run_pre_write_scoped(
     if !is_write {
         return Decision::pass();
     }
-    let file_path = payload.tool_input.file_path.as_deref().unwrap_or("");
+    // `file_path` for Write/Edit/MultiEdit; `notebook_path` for NotebookEdit.
+    let file_path = payload.tool_input.scan_path();
     // Scope to the governed root: a write to a file OUTSIDE the UmaDev project
     // (e.g. the base touching something in a sibling dir or the user's home)
     // is none of UmaDev's business — pass it. Only files under the run's root
@@ -176,13 +177,13 @@ fn run_pre_write_scoped(
     if !path_under_root(file_path, root) {
         return Decision::pass();
     }
-    let content = payload.tool_input.content.as_deref().unwrap_or("");
-    // For Edit, the new content may be in `new_string` rather than `content`.
-    let content = if content.is_empty() {
-        payload.tool_input.new_string.as_deref().unwrap_or("")
-    } else {
-        content
-    };
+    // The FULL proposed body: a MultiEdit concatenates every `edits[].new_string`
+    // and a NotebookEdit reads `new_source`, so the bypass-immune secret floor
+    // below scans the REAL content instead of "" (Write/Edit stay `content` /
+    // `new_string`). Without this a secret inlined via MultiEdit / NotebookEdit
+    // would land unchecked even though the tool is in the write set.
+    let content = payload.tool_input.scan_content();
+    let content = content.as_str();
 
     // Bypass-immune IRREVERSIBLE FLOOR runs FIRST and is exempt from any policy
     // disable — it blocks regardless of `.umadev/rules.toml`. Mirrors Claude
@@ -501,6 +502,18 @@ struct ToolInput {
     content: Option<String>,
     #[serde(default)]
     new_string: Option<String>,
+    /// `MultiEdit` = `{file_path, edits: [{old_string, new_string}, …]}` — the
+    /// batch of hunks, with NO top-level `content`/`new_string`. Each hunk's
+    /// `new_string` must be scanned so an inlined secret can't hide here.
+    #[serde(default)]
+    edits: Vec<EditHunk>,
+    /// `NotebookEdit` = `{notebook_path, new_source, …}` — the edited cell's
+    /// source lands in `new_source` (NOT `content`).
+    #[serde(default)]
+    new_source: Option<String>,
+    /// `NotebookEdit`'s target path (NOT `file_path`).
+    #[serde(default)]
+    notebook_path: Option<String>,
     /// Shell command (Claude Code's `Bash` tool uses `command`).
     #[serde(default)]
     command: Option<String>,
@@ -509,6 +522,51 @@ struct ToolInput {
     cmd: Option<String>,
     #[serde(default)]
     script: Option<String>,
+}
+
+/// One hunk of a Claude `MultiEdit` batch. Only `new_string` (the proposed new
+/// text) is load-bearing for the governance content scan; `old_string` is
+/// ignored here.
+#[derive(Debug, Default, Deserialize)]
+struct EditHunk {
+    #[serde(default)]
+    new_string: Option<String>,
+}
+
+impl ToolInput {
+    /// The write target path for governance scoping: `file_path` (Write / Edit /
+    /// MultiEdit), else `notebook_path` (NotebookEdit). Fail-open to `""`.
+    fn scan_path(&self) -> &str {
+        self.file_path
+            .as_deref()
+            .or(self.notebook_path.as_deref())
+            .unwrap_or("")
+    }
+
+    /// The **full** proposed body for the governance content scan. Mirrors
+    /// `umadev_runtime::write_scan_content` over this typed shape: a `MultiEdit`
+    /// batch is the concatenation of ALL `edits[].new_string` (so a secret in any
+    /// hunk is seen), a `NotebookEdit` cell is `new_source`, and Write / Edit stay
+    /// `content` / `new_string`. **Fail-open** to `""` — a body that is absent for
+    /// every shape scans nothing (today's behavior), never a panic.
+    fn scan_content(&self) -> String {
+        if !self.edits.is_empty() {
+            let joined: Vec<&str> = self
+                .edits
+                .iter()
+                .filter_map(|e| e.new_string.as_deref())
+                .collect();
+            if !joined.is_empty() {
+                return joined.join("\n");
+            }
+        }
+        [&self.content, &self.new_source, &self.new_string]
+            .into_iter()
+            .flatten()
+            .next()
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// The cross-platform home directory (`HOME`, then `USERPROFILE` on Windows).
@@ -978,19 +1036,65 @@ mod tests {
     }
 
     #[test]
+    fn multiedit_secret_in_edits_is_blocked_by_the_floor() {
+        // THE bypass this fix closes: a real `MultiEdit` carries its hunks in
+        // `edits[].new_string` with NO top-level content, so the hook used to scan
+        // "" and a secret inlined via MultiEdit LANDED. Now every hunk is
+        // concatenated and the irreversible secret floor catches it. The secret is
+        // in the SECOND hunk to prove all hunks are scanned, not just the first.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let payload = serde_json::json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": root.join("cfg.js").to_string_lossy(),
+                "edits": [
+                    { "old_string": "a", "new_string": "const a = 1;" },
+                    { "old_string": "b", "new_string": secret_content() }
+                ]
+            }
+        })
+        .to_string();
+        let d = run_pre_write_scoped(&payload, &umadev_governance::Policy::default(), Some(&root));
+        assert!(
+            d.block,
+            "a secret inlined via a MultiEdit hunk must now be blocked by the floor"
+        );
+    }
+
+    #[test]
+    fn multiedit_clean_edits_pass() {
+        // The fix must not over-block: a well-formed MultiEdit whose hunks are all
+        // clean scans real (clean) content and passes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let payload = serde_json::json!({
+            "tool_name": "MultiEdit",
+            "tool_input": {
+                "file_path": root.join("cfg.js").to_string_lossy(),
+                "edits": [{ "old_string": "a", "new_string": "export const a = 1;" }]
+            }
+        })
+        .to_string();
+        let d = run_pre_write_scoped(&payload, &umadev_governance::Policy::default(), Some(&root));
+        assert!(!d.block, "a clean MultiEdit must pass the write hook");
+    }
+
+    #[test]
     fn notebookedit_write_reaches_the_secret_floor() {
-        // A NotebookEdit cell write must be routed to the same irreversible-floor
-        // scan as a plain Write (the runtime `is_write` set already covers it —
-        // this locks that coverage). Routed to a secret-scanned path (a notebook
-        // cell IS code) to isolate the tool-ROUTING guarantee from the scan's own
+        // A real `NotebookEdit` = `{notebook_path, new_source, …}` — path in
+        // `notebook_path` (NOT `file_path`), body in `new_source` (NOT `content`).
+        // Before, both fell to "" so the floor scanned nothing; now `new_source` is
+        // read and the secret is caught. Routed to a secret-scanned path (a
+        // notebook cell IS code) to isolate the extraction fix from the scan's own
         // extension policy, which this fix does not change.
         let tmp = tempfile::TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let payload = serde_json::json!({
             "tool_name": "NotebookEdit",
             "tool_input": {
-                "file_path": root.join("notebook_cell.py").to_string_lossy(),
-                "content": secret_content(),
+                "notebook_path": root.join("notebook_cell.py").to_string_lossy(),
+                "new_source": secret_content(),
             }
         })
         .to_string();
@@ -999,6 +1103,21 @@ mod tests {
             d.block,
             "a NotebookEdit secret write must be caught by the irreversible floor"
         );
+    }
+
+    #[test]
+    fn malformed_multiedit_payload_fails_open() {
+        // An empty / body-less MultiEdit batch scans "" and passes — today's
+        // behavior preserved, never a crash on a reshaped payload.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let payload = serde_json::json!({
+            "tool_name": "MultiEdit",
+            "tool_input": { "file_path": root.join("cfg.js").to_string_lossy(), "edits": [] }
+        })
+        .to_string();
+        let d = run_pre_write_scoped(&payload, &umadev_governance::Policy::default(), Some(&root));
+        assert!(!d.block, "an empty MultiEdit batch must fail open (pass)");
     }
 
     #[test]

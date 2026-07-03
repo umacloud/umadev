@@ -698,12 +698,10 @@ fn evaluate_tool_call(
         let decision = umadev_governance::check_dangerous_bash(cmd);
         return (cmd.to_string(), decision);
     }
-    // File-mutating tools: scan the proposed content.
-    let path = input
-        .get("file_path")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| input.get("path").and_then(serde_json::Value::as_str))
-        .unwrap_or_default();
+    // File-mutating tools: scan the proposed content. `write_scan_path` covers
+    // `file_path` (Write/Edit/MultiEdit), `path` (codex/opencode update/create)
+    // AND `notebook_path` (NotebookEdit) in that order.
+    let path = umadev_runtime::write_scan_path(input);
     // Keep this write-tool set aligned with the hook's `is_write` matcher
     // (Write / Edit / MultiEdit / NotebookEdit): a mutating tool omitted here
     // falls through to the observe-only `Decision::pass()` below with NO content
@@ -716,17 +714,16 @@ fn evaluate_tool_call(
         || lname == "update"
         || lname == "create"
     {
-        let content = input
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| input.get("new_string").and_then(serde_json::Value::as_str))
-            .or_else(|| input.get("new_str").and_then(serde_json::Value::as_str))
-            .unwrap_or_default();
-        let decision = umadev_governance::scan_content_with_context(path, content, policy, ctx);
-        return (path.to_string(), decision);
+        // Extract the REAL body via the shared runtime walk: a MultiEdit's
+        // `edits[].new_string` are concatenated and a NotebookEdit's `new_source`
+        // is read, so the scan sees the actual content instead of "". Write/Edit
+        // are unchanged (`content` / `new_string` / `new_str`).
+        let content = umadev_runtime::write_scan_content(input);
+        let decision = umadev_governance::scan_content_with_context(&path, &content, policy, ctx);
+        return (path, decision);
     }
     // Read / Grep / Glob / … — observe-only, never a write. Pass.
-    (path.to_string(), umadev_governance::Decision::pass())
+    (path, umadev_governance::Decision::pass())
 }
 
 /// Map a [`SessionEvent::NeedApproval`] to a trust-tiered [`ApprovalDecision`].
@@ -3007,64 +3004,99 @@ mod tests {
 
     #[tokio::test]
     async fn multiedit_write_reaches_the_content_scan() {
-        // A `MultiEdit` mutating tool must be content-scanned like Write/Edit —
-        // before, `evaluate_tool_call` matched only write/edit/update/create, so
-        // a secret written via MultiEdit fell through to an observe-only pass and
-        // bypassed the governor.
+        // A real `MultiEdit` = `{file_path, edits: [{old_string, new_string}, …]}`
+        // with NO top-level content. Before, extraction read `content`/`new_string`
+        // and fell to "" for this shape, so the scan ran over nothing and a secret
+        // inlined via `edits[].new_string` bypassed the governor. Now the batch is
+        // concatenated and scanned. The secret sits in the SECOND hunk to prove
+        // every hunk is read, not just the first.
         let policy = umadev_governance::Policy::default();
         let (target, decision) = evaluate_tool_call(
             &policy,
             umadev_governance::ProjectContext::unknown(),
             "MultiEdit",
-            &serde_json::json!({ "file_path": "src/cfg.js", "new_string": leaked_secret() }),
+            &serde_json::json!({
+                "file_path": "src/cfg.js",
+                "edits": [
+                    { "old_string": "a", "new_string": "let a = 1;" },
+                    { "old_string": "b", "new_string": leaked_secret() }
+                ]
+            }),
         );
         assert_eq!(target, "src/cfg.js");
         assert!(
             decision.block,
-            "a MultiEdit write must reach the content scan and block a leaked secret"
+            "a MultiEdit write must reach the content scan and block a secret in any hunk"
         );
     }
 
     #[tokio::test]
     async fn notebookedit_write_reaches_the_content_scan() {
-        // Same coverage guarantee for `NotebookEdit`: its cell source must be
-        // content-scanned like a Write, not silently passed. Routed to a
-        // secret-scanned path (a notebook cell IS code) to isolate the
-        // tool-ROUTING fix from the scan's own extension policy — the fix makes
-        // the tool reach the scan; what the scan then scans is unchanged.
+        // A real `NotebookEdit` = `{notebook_path, new_source, …}` — the cell body
+        // is in `new_source` (NOT `content`) and the path in `notebook_path` (NOT
+        // `file_path`). Before, both fell to "" so the scan saw nothing. Routed to
+        // a secret-scanned path (a notebook cell IS code) to isolate the extraction
+        // fix from the scan's own extension policy, which this fix does not change.
         let policy = umadev_governance::Policy::default();
         let (target, decision) = evaluate_tool_call(
             &policy,
             umadev_governance::ProjectContext::unknown(),
             "NotebookEdit",
-            &serde_json::json!({ "file_path": "notebook_cell.py", "content": leaked_secret() }),
+            &serde_json::json!({
+                "notebook_path": "notebook_cell.py",
+                "new_source": leaked_secret()
+            }),
         );
-        assert_eq!(target, "notebook_cell.py");
+        assert_eq!(target, "notebook_cell.py", "path comes from notebook_path");
         assert!(
             decision.block,
-            "a NotebookEdit write must reach the content scan and block a leaked secret"
+            "a NotebookEdit write must scan new_source and block a leaked secret"
         );
     }
 
     #[tokio::test]
-    async fn multiedit_and_notebookedit_route_identically_to_write() {
-        // Routing parity: for the SAME (path, content) the new write tools
-        // resolve to the exact same decision as a plain Write — proving they are
-        // no longer dropped to the observe-only pass.
+    async fn multiedit_and_notebookedit_clean_content_passes() {
+        // The fix must not over-block: a well-formed MultiEdit / NotebookEdit whose
+        // real body is clean resolves to a normal pass, exactly like a clean Write.
         let policy = umadev_governance::Policy::default();
         let ctx = || umadev_governance::ProjectContext::unknown();
-        let input = serde_json::json!({ "file_path": "src/cfg.js", "new_string": leaked_secret() });
-        let (_t, write_d) = evaluate_tool_call(&policy, ctx(), "Write", &input);
-        let (_t, multi_d) = evaluate_tool_call(&policy, ctx(), "MultiEdit", &input);
-        let (_t, nb_d) = evaluate_tool_call(&policy, ctx(), "NotebookEdit", &input);
-        assert!(write_d.block, "baseline Write must block the secret");
-        assert_eq!(
-            multi_d.block, write_d.block,
-            "MultiEdit must route to the scan exactly like Write"
+        let (_t, multi_d) = evaluate_tool_call(
+            &policy,
+            ctx(),
+            "MultiEdit",
+            &serde_json::json!({
+                "file_path": "src/util.js",
+                "edits": [{ "old_string": "x", "new_string": "export const x = 1;" }]
+            }),
         );
-        assert_eq!(
-            nb_d.block, write_d.block,
-            "NotebookEdit must route to the scan exactly like Write"
+        assert!(!multi_d.block, "a clean MultiEdit must pass");
+        let (_t, nb_d) = evaluate_tool_call(
+            &policy,
+            ctx(),
+            "NotebookEdit",
+            &serde_json::json!({
+                "notebook_path": "nb_cell.py",
+                "new_source": "total = 1 + 2"
+            }),
+        );
+        assert!(!nb_d.block, "a clean NotebookEdit must pass");
+    }
+
+    #[tokio::test]
+    async fn malformed_write_payload_fails_open() {
+        // A mutating tool whose body fields are absent / wrong-typed scans "" and
+        // passes — today's behavior, never a crash.
+        let policy = umadev_governance::Policy::default();
+        let (target, decision) = evaluate_tool_call(
+            &policy,
+            umadev_governance::ProjectContext::unknown(),
+            "MultiEdit",
+            &serde_json::json!({ "file_path": "src/cfg.js", "edits": [] }),
+        );
+        assert_eq!(target, "src/cfg.js");
+        assert!(
+            !decision.block,
+            "an empty MultiEdit batch scans nothing and passes"
         );
     }
 
