@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -484,44 +485,155 @@ pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]
     index
 }
 
-/// Build a deterministic signature of the corpus: one line per file
-/// `<relative_path>\t<mtime_secs>\t<size>`, sorted. Identical for identical
-/// corpora; differs as soon as any file changes, is added, or is removed.
-/// Build a machine-INDEPENDENT corpus signature: for each file, store its
-/// path RELATIVE to the knowledge dir it came from + a truncated SHA-256 of
-/// its CONTENT (NOT mtime). This means two clones of the same knowledge/
-/// tree produce the SAME signature, so the `.umadev/kb-index/` cache can
-/// be copied between machines / re-clones and still hit — previously the
-/// signature used absolute paths + mtime, which differ per machine/clone, so
-/// copying the cache silently invalidated it everywhere.
+/// Build a machine-INDEPENDENT corpus signature: one sorted line per file,
+/// `<relative_path>\t<truncated_sha256_of_content>`, prefixed with the schema
+/// version. Keying on CONTENT (not mtime / absolute path) keeps the signature —
+/// and thus the on-disk `.umadev/kb-index/` cache — identical across
+/// clones/machines, so a copied cache still hits. The output is byte-identical
+/// for an unchanged corpus and differs the moment any file's content changes, a
+/// file is added, or a file is removed.
+///
+/// PERF (the bug this docs the fix for): `retrieve()` runs ~10-30× per run and
+/// every call recomputes this signature BEFORE the cache-hit check. A naive
+/// implementation `std::fs::read` + SHA-256'd the WHOLE corpus on each of those
+/// calls, so retrieval latency scaled O(total corpus bytes) PER QUERY even on a
+/// cache hit. The content hash is now memoized per file in an in-process cache
+/// keyed on the cheap `(mtime, size)` `stat` ([`file_content_hash`]): on a warm
+/// memo with unchanged metadata the stored hash is reused WITHOUT reading the
+/// file, so a repeat call over an unchanged corpus does only one cheap `stat`
+/// per file (O(file count), zero byte reads) and returns the byte-identical
+/// signature. A file is re-read + re-hashed only when its `(mtime, size)`
+/// differs from the last-seen state (a real edit), so the content-based output —
+/// and its cross-machine portability — is preserved exactly. Invalidation
+/// guarantee: a real edit (mtime OR size change), a new file, or a removed file
+/// still changes the signature and forces a rebuild.
+///
+/// Correctness tradeoff: the memo trusts `(mtime, size)` within a single process
+/// run. A content edit that leaves BOTH mtime and size unchanged would reuse the
+/// stale hash for the rest of that run — an astronomically rare case that also
+/// self-heals on the next run (the memo starts cold, so the first retrieval
+/// re-reads real content). Everything is fail-open: a `stat`/read error is
+/// treated as "changed" → re-read (never a panic), and a rebuilt index is itself
+/// fail-open, so at worst a false miss costs one extra rebuild.
 ///
 /// `knowledge_dirs` is the list of roots to strip (so `ChunkMeta.path`-style
 /// relative keys land in the signature). Falls back to the file name when no
 /// root matches.
 fn corpus_signature(paths: &[PathBuf], knowledge_dirs: &[PathBuf]) -> String {
+    // Take the process-wide per-file hash memo. Fail-open on a poisoned lock:
+    // fall back to a fresh empty memo (correct, just not accelerated).
+    match signature_memo().lock() {
+        Ok(mut memo) => compute_signature(paths, knowledge_dirs, &mut memo).0,
+        Err(_) => compute_signature(paths, knowledge_dirs, &mut HashMap::new()).0,
+    }
+}
+
+/// One in-process per-file content-hash memo entry: the cheap freshness keys
+/// (`mtime`, `size`) captured at hash time, plus the truncated-SHA-256 hex the
+/// signature keys on. Reused verbatim while `(mtime, size)` is unchanged.
+struct CachedFileHash {
+    /// Last-seen modification time (a cheap `stat`, no read).
+    mtime: std::time::SystemTime,
+    /// Last-seen file size in bytes (a cheap `stat`, no read).
+    size: u64,
+    /// The content hash computed when this entry was last (re)read.
+    hash: String,
+}
+
+/// The process-wide per-file content-hash memo, keyed by absolute path. Purely
+/// an in-process accelerator for [`corpus_signature`]: it never touches disk, so
+/// it changes nothing about the portable, content-based on-disk `.sig`. Fail-open
+/// — a poisoned lock just takes the un-memoized (still correct) path.
+fn signature_memo() -> &'static Mutex<HashMap<PathBuf, CachedFileHash>> {
+    static MEMO: OnceLock<Mutex<HashMap<PathBuf, CachedFileHash>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One cheap `stat` of a file's `(mtime, size)` — no read, no hash. Fail-open to
+/// `None` on any error (a missing file, or a platform without `modified()`),
+/// which callers treat as "changed" and re-read.
+fn file_stat(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    Some((md.modified().ok()?, md.len()))
+}
+
+/// Truncated (first 8 bytes → 16 hex chars) SHA-256 of a file's CONTENT, with a
+/// per-file `(mtime, size)` in-process memo. Returns the cached hash WITHOUT
+/// reading the file when the cheap `stat` matches the last-seen state; otherwise
+/// reads the file once, hashes it, and records the result. Increments
+/// `content_reads` exactly when it performs a real byte read — the testable seam
+/// that proves an unchanged corpus is signed without re-reading every file.
+/// Fail-open: a read failure returns `None` (the file is skipped from the
+/// signature, matching the prior behaviour).
+fn file_content_hash(
+    path: &Path,
+    memo: &mut HashMap<PathBuf, CachedFileHash>,
+    content_reads: &mut usize,
+) -> Option<String> {
     use sha2::{Digest, Sha256};
-    let mut entries: Vec<(String, String)> = paths
-        .iter()
-        .filter_map(|p| {
-            // Relative path: strip the matching knowledge dir prefix.
-            let rel = knowledge_dirs
-                .iter()
-                .find_map(|d| p.strip_prefix(d).ok())
-                .or_else(|| p.file_name().map(std::path::Path::new))
-                .map(|r| r.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|| p.to_string_lossy().replace('\\', "/"));
-            // Content hash (truncated SHA-256, hex) — stable across clones,
-            // unlike mtime. Read failure → skip the file (fail-open).
-            let bytes = std::fs::read(p).ok()?;
-            let digest = Sha256::digest(&bytes);
-            let hash_hex: String = digest.iter().take(8).fold(String::new(), |mut acc, b| {
-                use std::fmt::Write as _;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-            Some((rel, hash_hex))
-        })
-        .collect();
+    let stat = file_stat(path);
+    // Fast path: cheap `stat` matches the memoized `(mtime, size)` → reuse the
+    // stored content hash, no byte read.
+    if let Some((mtime, size)) = stat {
+        if let Some(cached) = memo.get(path) {
+            if cached.mtime == mtime && cached.size == size {
+                return Some(cached.hash.clone());
+            }
+        }
+    }
+    // Slow path: memo miss / changed metadata / unstat-able → read + hash once.
+    // A read failure short-circuits BEFORE the counter bumps, so `content_reads`
+    // counts only files actually read from disk (fail-open: the file is skipped).
+    let bytes = std::fs::read(path).ok()?;
+    *content_reads += 1;
+    let digest = Sha256::digest(&bytes);
+    let hash_hex: String = digest.iter().take(8).fold(String::new(), |mut acc, b| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+    // Only cacheable when we have a `(mtime, size)` to key on; otherwise the next
+    // call re-reads (fail-open, still correct).
+    if let Some((mtime, size)) = stat {
+        memo.insert(
+            path.to_path_buf(),
+            CachedFileHash {
+                mtime,
+                size,
+                hash: hash_hex.clone(),
+            },
+        );
+    }
+    Some(hash_hex)
+}
+
+/// The pure, testable core of [`corpus_signature`]: builds the content-based
+/// signature over `paths` using (and updating) `memo`, and returns it alongside
+/// the number of files that needed a real byte read (`content_reads`) — `0` when
+/// every file was served from the warm memo. Taking the memo as a parameter lets
+/// a test drive the fast/slow paths deterministically without the process-global
+/// memo.
+fn compute_signature(
+    paths: &[PathBuf],
+    knowledge_dirs: &[PathBuf],
+    memo: &mut HashMap<PathBuf, CachedFileHash>,
+) -> (String, usize) {
+    let mut content_reads = 0usize;
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(paths.len());
+    for p in paths {
+        // Content hash first: a read failure skips the file (fail-open).
+        let Some(hash) = file_content_hash(p, memo, &mut content_reads) else {
+            continue;
+        };
+        // Relative path: strip the matching knowledge dir prefix.
+        let rel = knowledge_dirs
+            .iter()
+            .find_map(|d| p.strip_prefix(d).ok())
+            .or_else(|| p.file_name().map(std::path::Path::new))
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| p.to_string_lossy().replace('\\', "/"));
+        entries.push((rel, hash));
+    }
     entries.sort();
     // Fold in the schema version so a tokenizer/chunker/layout upgrade
     // invalidates every older cache even when no source file changed.
@@ -530,7 +642,10 @@ fn corpus_signature(paths: &[PathBuf], knowledge_dirs: &[PathBuf]) -> String {
         .map(|(p, h)| format!("{p}\t{h}"))
         .collect::<Vec<_>>()
         .join("\n");
-    format!("schema=v{INDEX_SCHEMA_VERSION}\n{body}")
+    (
+        format!("schema=v{INDEX_SCHEMA_VERSION}\n{body}"),
+        content_reads,
+    )
 }
 
 /// Maximum number of `.md` files the index will scan. A guard against a
@@ -1434,6 +1549,121 @@ B: {sb}"
         assert!(
             sig.starts_with(&format!("schema=v{INDEX_SCHEMA_VERSION}")),
             "signature must be prefixed with the schema version: {sig}"
+        );
+    }
+
+    #[test]
+    fn signature_unchanged_corpus_reuses_memo_without_reading() {
+        // PERF regression guard: the old code `read` + SHA-256'd the WHOLE corpus
+        // on EVERY retrieval. With the per-file `(mtime, size)` memo, a repeat
+        // signature over an unchanged corpus must read ZERO files and return the
+        // byte-identical signature. `compute_signature` reports the real read
+        // count via a LOCAL memo, so the assertion is deterministic (no shared
+        // process-global state).
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::write(dir.join("a.md"), "alpha content").unwrap();
+        fs::write(dir.join("b.md"), "beta content longer").unwrap();
+        let paths = vec![dir.join("a.md"), dir.join("b.md")];
+        let dirs = [dir.clone()];
+
+        let mut memo: HashMap<PathBuf, CachedFileHash> = HashMap::new();
+        // Cold memo: both files are read + hashed once.
+        let (sig1, reads1) = compute_signature(&paths, &dirs, &mut memo);
+        assert_eq!(reads1, 2, "cold memo must read both files exactly once");
+        // Warm memo, unchanged corpus: NO byte reads, identical signature.
+        let (sig2, reads2) = compute_signature(&paths, &dirs, &mut memo);
+        assert_eq!(
+            reads2, 0,
+            "an unchanged corpus must be signed from the memo without reading any file"
+        );
+        assert_eq!(
+            sig1, sig2,
+            "the memoized signature must be byte-identical to the freshly-read one"
+        );
+    }
+
+    #[test]
+    fn signature_rereads_only_the_edited_file_and_invalidates() {
+        // A real edit (content + size change → mtime/size differ) must re-read
+        // ONLY the changed file and produce a DIFFERENT signature (→ rebuild).
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::write(dir.join("a.md"), "alpha").unwrap();
+        fs::write(dir.join("b.md"), "beta").unwrap();
+        let paths = vec![dir.join("a.md"), dir.join("b.md")];
+        let dirs = [dir.clone()];
+
+        let mut memo: HashMap<PathBuf, CachedFileHash> = HashMap::new();
+        let (sig1, _) = compute_signature(&paths, &dirs, &mut memo);
+
+        // Edit b.md — a longer body guarantees a size change even if the
+        // filesystem's mtime granularity is coarse.
+        fs::write(dir.join("b.md"), "beta edited with more bytes").unwrap();
+        let (sig2, reads) = compute_signature(&paths, &dirs, &mut memo);
+        assert_eq!(reads, 1, "only the edited file may be re-read");
+        assert_ne!(
+            sig1, sig2,
+            "a real edit must change the signature (→ rebuild)"
+        );
+    }
+
+    #[test]
+    fn signature_invalidates_on_added_or_removed_file() {
+        // A new or removed file must change the signature regardless of the memo.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::write(dir.join("a.md"), "alpha").unwrap();
+        let dirs = [dir.clone()];
+
+        let mut memo: HashMap<PathBuf, CachedFileHash> = HashMap::new();
+        let one = vec![dir.join("a.md")];
+        let (sig_one, _) = compute_signature(&one, &dirs, &mut memo);
+
+        // Added file.
+        fs::write(dir.join("b.md"), "beta").unwrap();
+        let two = vec![dir.join("a.md"), dir.join("b.md")];
+        let (sig_two, _) = compute_signature(&two, &dirs, &mut memo);
+        assert_ne!(sig_one, sig_two, "an added file must change the signature");
+
+        // Removed file (back to just a.md); a.md is served from the warm memo.
+        let (sig_removed, reads) = compute_signature(&one, &dirs, &mut memo);
+        assert_eq!(reads, 0, "the surviving file is unchanged → no re-read");
+        assert_eq!(
+            sig_one, sig_removed,
+            "removing the added file must restore the original signature"
+        );
+    }
+
+    #[test]
+    fn signature_fail_open_on_missing_or_unreadable_file() {
+        // A missing/unreadable file must be skipped (fail-open), never panic, and
+        // must not be memoized (no `stat`), so the readable files still sign.
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::write(dir.join("a.md"), "alpha").unwrap();
+        let dirs = [dir.clone()];
+        // b.md does not exist on disk.
+        let paths = vec![dir.join("a.md"), dir.join("b.md")];
+
+        let mut memo: HashMap<PathBuf, CachedFileHash> = HashMap::new();
+        let (sig, reads) = compute_signature(&paths, &dirs, &mut memo);
+        // Only a.md contributes; the missing file is skipped.
+        assert_eq!(
+            reads, 1,
+            "only the readable file is read; the missing one is skipped"
+        );
+        assert!(
+            sig.contains("a.md"),
+            "the readable file must be in the signature: {sig}"
+        );
+        assert!(
+            !sig.contains("b.md"),
+            "the missing file must be skipped: {sig}"
         );
     }
 
