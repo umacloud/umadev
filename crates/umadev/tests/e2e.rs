@@ -209,6 +209,13 @@ fn run_with_backend_drives_a_fake_host_cli() {
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_LEGACY_PIPELINE", "1")
+        // Pin the per-phase legacy path (not the continuous session): a fake
+        // `echo` host can't sustain a long session, so the default continuous
+        // path races to a "session send: Broken pipe" HardStop. That HardStop
+        // now correctly maps to a non-zero exit, so leaving the session on made
+        // these fixed-pipeline tests flaky. `UMADEV_CONTINUOUS=0` makes them
+        // deterministically drive the intended per-phase pipeline.
+        .env("UMADEV_CONTINUOUS", "0")
         .status()
         .expect("umadev run --backend should be invocable");
     assert!(status.success(), "run --backend failed: {status}");
@@ -219,6 +226,13 @@ fn run_with_backend_drives_a_fake_host_cli() {
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_LEGACY_PIPELINE", "1")
+        // Pin the per-phase legacy path (not the continuous session): a fake
+        // `echo` host can't sustain a long session, so the default continuous
+        // path races to a "session send: Broken pipe" HardStop. That HardStop
+        // now correctly maps to a non-zero exit, so leaving the session on made
+        // these fixed-pipeline tests flaky. `UMADEV_CONTINUOUS=0` makes them
+        // deterministically drive the intended per-phase pipeline.
+        .env("UMADEV_CONTINUOUS", "0")
         .status()
         .expect("continue should be invocable");
     assert!(status2.success(), "continue --backend failed: {status2}");
@@ -274,6 +288,13 @@ echo 'driven via fake claude across all phases'
             .env("UMADEV_RETRY_BASE_MS", "1")
             .env("UMADEV_WORKER_TIMEOUT", "30")
             .env("UMADEV_LEGACY_PIPELINE", "1")
+            // Pin the per-phase legacy path (not the continuous session): a fake
+            // `echo` host can't sustain a long session, so the default continuous
+            // path races to a "session send: Broken pipe" HardStop. That HardStop
+            // now correctly maps to a non-zero exit, so leaving the session on made
+            // these fixed-pipeline tests flaky. `UMADEV_CONTINUOUS=0` makes them
+            // deterministically drive the intended per-phase pipeline.
+            .env("UMADEV_CONTINUOUS", "0")
             .status()
             .expect("umadev should invoke");
         assert!(status.success(), "umadev {:?} failed: {status}", args);
@@ -352,6 +373,13 @@ fn backend_captures_stdout_and_tolerates_stderr() {
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_LEGACY_PIPELINE", "1")
+        // Pin the per-phase legacy path (not the continuous session): a fake
+        // `echo` host can't sustain a long session, so the default continuous
+        // path races to a "session send: Broken pipe" HardStop. That HardStop
+        // now correctly maps to a non-zero exit, so leaving the session on made
+        // these fixed-pipeline tests flaky. `UMADEV_CONTINUOUS=0` makes them
+        // deterministically drive the intended per-phase pipeline.
+        .env("UMADEV_CONTINUOUS", "0")
         .status()
         .expect("run --backend should invoke");
     assert!(
@@ -364,6 +392,13 @@ fn backend_captures_stdout_and_tolerates_stderr() {
         .current_dir(root)
         .env("UMADEV_CLAUDE_BIN", &fake)
         .env("UMADEV_LEGACY_PIPELINE", "1")
+        // Pin the per-phase legacy path (not the continuous session): a fake
+        // `echo` host can't sustain a long session, so the default continuous
+        // path races to a "session send: Broken pipe" HardStop. That HardStop
+        // now correctly maps to a non-zero exit, so leaving the session on made
+        // these fixed-pipeline tests flaky. `UMADEV_CONTINUOUS=0` makes them
+        // deterministically drive the intended per-phase pipeline.
+        .env("UMADEV_CONTINUOUS", "0")
         .status()
         .expect("continue should work");
     assert!(s2.success(), "continue failed: {s2}");
@@ -413,6 +448,13 @@ fn backend_timeout_falls_back_without_hanging() {
         // timeout-fallback artifact (`output/timeout-research.md`), which the
         // director-driven default (Wave 1) does not produce.
         .env("UMADEV_LEGACY_PIPELINE", "1")
+        // Pin the per-phase legacy path (not the continuous session): a fake
+        // `echo` host can't sustain a long session, so the default continuous
+        // path races to a "session send: Broken pipe" HardStop. That HardStop
+        // now correctly maps to a non-zero exit, so leaving the session on made
+        // these fixed-pipeline tests flaky. `UMADEV_CONTINUOUS=0` makes them
+        // deterministically drive the intended per-phase pipeline.
+        .env("UMADEV_CONTINUOUS", "0")
         .status();
     // The process must have terminated (either success via fallback, or a
     // bounded exit) — the key assertion is "did not hang". A timeout of the

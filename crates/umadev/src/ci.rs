@@ -118,11 +118,6 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
         }
     }
 
-    println!(
-        "\nUmaDev: {} file(s) scanned, {} blocked, {} violation(s).",
-        result.files_scanned, result.files_blocked, result.violations,
-    );
-
     // UD-SEC-016: run `npm audit` if a package-lock.json is present, to catch
     // known-vulnerable dependencies (OWASP A06). Best-effort: if npm isn't
     // installed or the audit fails, skip silently (the file scan still ran).
@@ -144,8 +139,26 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
         }
     }
 
+    // Summary is printed AFTER the npm-audit block so its counts reflect any
+    // UD-SEC-016 CVE hits — otherwise a JS project with a critical CVE printed
+    // "0 blocked, 0 violations" and then a "BLOCK UD-SEC-016" line, exiting 1
+    // while the summary claimed a clean scan.
+    println!("{}", scan_summary(&result));
+
     result.failed = result.files_blocked > 0 && !opts.report_only;
     Ok(result)
+}
+
+/// Render the one-line scan summary from the FINAL [`CiResult`] — after the
+/// UD-SEC-016 npm-audit block has folded any CVE hits into `files_blocked` /
+/// `violations`. Keeping this pure (a function of the final counts) is what
+/// stops the printed summary from contradicting a subsequent `BLOCK` line or
+/// the process exit code.
+fn scan_summary(result: &CiResult) -> String {
+    format!(
+        "\nUmaDev: {} file(s) scanned, {} blocked, {} violation(s).",
+        result.files_scanned, result.files_blocked, result.violations,
+    )
 }
 
 /// Result of an `npm audit --json` scan.
@@ -258,8 +271,22 @@ fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
 /// staged files appear as new), so it still works without the ls-files fallback;
 /// that fallback covers only the "not a git repo" case.
 fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    // `-c core.quotePath=false` + `-z`: emit NUL-separated, UNQUOTED paths so a
+    // staged file with a non-ASCII (`café.tsx`) or spaced name is scanned rather
+    // than dropped. At git's default (`core.quotePath=true`) such a path is
+    // octal-escaped + double-quoted (`"caf\303\251.tsx"`), so `extension()`
+    // yields `tsx"` and it silently falls out of SCAN_EXTENSIONS — a real
+    // violation would never be scanned. `-z` also removes the quoting entirely,
+    // so the raw path round-trips to `git show :<rel>` in `read_staged_blob`.
     let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", "--cached"])
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--name-only",
+            "-z",
+            "--cached",
+        ])
         .current_dir(root)
         .output();
     let out = match output {
@@ -267,7 +294,7 @@ fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
         _ => {
             // Not a git repo — fall back to ls-files (tracked, index == HEAD).
             let ls = std::process::Command::new("git")
-                .args(["ls-files"])
+                .args(["-c", "core.quotePath=false", "ls-files", "-z"])
                 .current_dir(root)
                 .output();
             match ls {
@@ -278,7 +305,8 @@ fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     };
     let text = String::from_utf8_lossy(&out);
     let files: Vec<PathBuf> = text
-        .lines()
+        .split('\0')
+        .filter(|l| !l.is_empty())
         .filter(|l| {
             let ext = Path::new(l)
                 .extension()
@@ -489,6 +517,58 @@ mod tests {
         // now-clean working copy.
         assert_eq!(result.files_blocked, 1, "staged violation must be flagged");
         assert!(result.failed);
+    }
+
+    #[test]
+    fn changed_only_scans_non_ascii_staged_filename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return; // git not available — skip
+        }
+        // A non-ASCII filename: at git's default core.quotePath=true, `git diff
+        // --name-only --cached` would emit `"caf\303\251.tsx"` (octal-escaped +
+        // quoted), so `extension()` sees `tsx"` and the file drops out of the
+        // scan. The -c core.quotePath=false + -z fix must scan it.
+        let file = root.join("café.tsx");
+        std::fs::write(&file, "<b>\u{1f50d}</b>\n").unwrap(); // emoji violation
+        assert!(git(root, &["add", "café.tsx"]));
+
+        // Sanity: git_changed_files must surface the non-ASCII path (unquoted).
+        let listed = git_changed_files(root).unwrap();
+        assert!(
+            listed.iter().any(|p| p.ends_with("café.tsx")),
+            "the non-ASCII staged path must be listed unquoted, got {listed:?}"
+        );
+
+        let result = run(&CiOptions {
+            report_only: false,
+            changed_only: true,
+            project_root: root.to_path_buf(),
+        })
+        .unwrap();
+        assert_eq!(
+            result.files_blocked, 1,
+            "a violation in a non-ASCII staged filename must be scanned + blocked"
+        );
+        assert!(result.failed);
+    }
+
+    #[test]
+    fn scan_summary_reflects_post_audit_counts() {
+        // Emulate the result AFTER the npm-audit block folded a critical CVE in:
+        // the summary must report the inflated counts, not the pre-audit "0
+        // blocked, 0 violations" that used to precede a `BLOCK UD-SEC-016` line.
+        let result = CiResult {
+            files_scanned: 3,
+            files_blocked: 1,
+            violations: 2,
+            failed: true,
+        };
+        let line = scan_summary(&result);
+        assert!(line.contains("3 file(s) scanned"), "{line}");
+        assert!(line.contains("1 blocked"), "{line}");
+        assert!(line.contains("2 violation(s)"), "{line}");
     }
 
     // --- UD-SEC-016: npm audit parsing ----------------------------------

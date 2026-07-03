@@ -197,31 +197,42 @@ impl McpConfig {
 
 /// Parse `-- npx -y @modelcontextprotocol/server-github` into command + args.
 /// The `--` separates the name from the server command.
+///
+/// This whitespace-splits a raw string; a caller that already holds the
+/// shell-tokenized argv (clap's post-`--` `Vec<String>`) must use
+/// [`parse_command_parts`] instead, so a quoted multi-word arg is not re-split.
 pub fn parse_command(raw: &str) -> McpServerEntry {
-    let parts: Vec<&str> = raw.split_whitespace().collect();
-    if parts.is_empty() {
+    let parts: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
+    parse_command_parts(&parts)
+}
+
+/// Build an [`McpServerEntry`] from an ALREADY-TOKENIZED command vector — the
+/// `-- <command> <args…>` argv clap captured after `--`. Unlike
+/// [`parse_command`] (which whitespace-splits a raw string, destroying quoting),
+/// each token is kept VERBATIM, so a quoted multi-word arg (`-- node "my
+/// server.js"`) stays a single arg instead of collapsing into `my` + `server.js`
+/// and writing the wrong MCP server entry to the base config.
+pub fn parse_command_parts(parts: &[String]) -> McpServerEntry {
+    let Some(first) = parts.first() else {
         return McpServerEntry {
             command: None,
             args: vec![],
             env: BTreeMap::new(),
             url: None,
         };
-    }
-    // If the first part looks like a URL, it's an SSE/HTTP server.
-    if parts[0].starts_with("http://") || parts[0].starts_with("https://") {
+    };
+    // If the first token looks like a URL, it's an SSE/HTTP server.
+    if first.starts_with("http://") || first.starts_with("https://") {
         return McpServerEntry {
             command: None,
             args: vec![],
             env: BTreeMap::new(),
-            url: Some(parts[0].to_string()),
+            url: Some(first.clone()),
         };
     }
     McpServerEntry {
-        command: Some(parts[0].to_string()),
-        args: parts[1..]
-            .iter()
-            .map(std::string::ToString::to_string)
-            .collect(),
+        command: Some(first.clone()),
+        args: parts[1..].to_vec(),
         env: BTreeMap::new(),
         url: None,
     }
@@ -727,6 +738,28 @@ mod tests {
         let entry = parse_command("https://mcp.example.com/sse");
         assert!(entry.command.is_none());
         assert_eq!(entry.url.as_deref(), Some("https://mcp.example.com/sse"));
+    }
+
+    #[test]
+    fn parse_command_parts_preserves_quoted_multiword_arg() {
+        // clap's post-`--` argv: `-- node "my server.js"` tokenizes to two
+        // elements; the space-bearing arg must survive as ONE arg, not be
+        // re-split into `my` + `server.js` (the old join+split bug).
+        let argv = vec!["node".to_string(), "my server.js".to_string()];
+        let entry = parse_command_parts(&argv);
+        assert_eq!(entry.command.as_deref(), Some("node"));
+        assert_eq!(entry.args, vec!["my server.js".to_string()]);
+    }
+
+    #[test]
+    fn parse_command_parts_url_and_empty() {
+        let url = parse_command_parts(&["https://mcp.example.com/sse".to_string()]);
+        assert!(url.command.is_none());
+        assert_eq!(url.url.as_deref(), Some("https://mcp.example.com/sse"));
+
+        let empty = parse_command_parts(&[]);
+        assert!(empty.command.is_none());
+        assert!(empty.args.is_empty());
     }
 
     #[test]

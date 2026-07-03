@@ -1266,11 +1266,14 @@ fn cmd_mcp_manage(
                     "server name required: umadev mcp-manage install <name> -- <command>"
                 )
             })?;
-            let cmd_str = command.join(" ");
-            if cmd_str.is_empty() {
+            if command.iter().all(|t| t.trim().is_empty()) {
                 anyhow::bail!("command required after --: e.g. `-- npx -y @mcp/server-github`");
             }
-            let entry = mcp_manager::parse_command(&cmd_str);
+            // Pass clap's post-`--` argv straight through — first token is the
+            // command, the rest are args VERBATIM. Joining + re-splitting on
+            // whitespace (the old path) mangled a quoted multi-word arg like
+            // `-- node "my server.js"` into `["node","my","server.js"]`.
+            let entry = mcp_manager::parse_command_parts(&command);
             for b in &backends {
                 let path = mcp_manager::install(*b, &root, &server_name, &entry)?;
                 println!("[ok] Installed MCP server '{server_name}' for {}.", b.id());
@@ -2538,6 +2541,33 @@ enum DirectorOutcome {
     HardStop(String),
 }
 
+/// Whether a director `/run` outcome must map to a **non-zero process exit**.
+/// `run` / `quick` are documented for scripting/CI, so a `HardStop` (dead
+/// session / a claimed build with zero real source) must NOT exit 0 — otherwise
+/// `umadev run … && next` proceeds as if the build succeeded. `Done` is success.
+fn director_outcome_is_failure(outcome: &DirectorOutcome) -> bool {
+    matches!(outcome, DirectorOutcome::HardStop(_))
+}
+
+/// Whether a single-shot [`RunReport`] must map to a **non-zero process exit**.
+/// A genuine gate PAUSE (`paused_at.is_some()`) or a clean Delivery completion
+/// are both successes (exit 0); anything else — no gate pause and the run never
+/// reached Delivery — is the quality gate blocking it, which must be a failure
+/// so a scripted `umadev run … && next` does not treat a blocked run as success.
+fn run_report_is_failure(report: &RunReport) -> bool {
+    report.paused_at.is_none() && report.final_phase != umadev_spec::Phase::Delivery
+}
+
+/// Whether a legacy continuous [`umadev_agent::RunOutcome`] must map to a
+/// non-zero process exit. Only a `HardStop` is a failure; a `Completed` (heavy
+/// OR lean) and a `PausedAtGate` are both successes. (Distinct from
+/// [`run_report_is_failure`], which cannot be reused here: a LEAN `Completed`
+/// reports its final phase as `Quality`, not `Delivery`, and must NOT be a
+/// failure.)
+fn run_outcome_is_failure(outcome: &umadev_agent::RunOutcome) -> bool {
+    matches!(outcome, umadev_agent::RunOutcome::HardStop(_))
+}
+
 /// Drive an explicit `/run` (full product build) through the **director build loop**
 /// — the USB / smart-hardware model of `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md`
 /// (simplified: no marker protocol) — instead of the legacy fixed 9-phase pipeline.
@@ -2820,6 +2850,12 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                         let _ = printer.await;
                         let outcome = outcome?;
                         print_continuous_report(&project_root, &label, &requirement, &outcome);
+                        // A HardStop must map to a non-zero exit (scripting/CI):
+                        // the honest report is already printed above. A gate pause
+                        // or a (heavy/lean) completion exit 0.
+                        if run_outcome_is_failure(&outcome) {
+                            anyhow::bail!("`umadev run` halted before completion (hard stop)");
+                        }
                         return Ok(());
                     }
 
@@ -2864,20 +2900,26 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
                     let _ = session.end().await;
                     drop(sink);
                     let _ = printer.await;
-                    match outcome? {
+                    let outcome = outcome?;
+                    match &outcome {
                         DirectorOutcome::Done => {
                             println!("{}", umadev_i18n::tl("director.run_done"));
-                            println!("  workspace: {}", project_root.display());
-                            println!("  runtime: {label}");
                         }
                         DirectorOutcome::HardStop(reason) => {
                             println!(
                                 "{}",
-                                umadev_i18n::tlf("continuous.hardstop_report", &[&reason])
+                                umadev_i18n::tlf("continuous.hardstop_report", &[reason])
                             );
-                            println!("  workspace: {}", project_root.display());
-                            println!("  runtime: {label}");
                         }
+                    }
+                    println!("  workspace: {}", project_root.display());
+                    println!("  runtime: {label}");
+                    // The honest report is already printed above; a HardStop must
+                    // still map to a non-zero exit so `umadev run … && next` does
+                    // not proceed as if the build succeeded (these verbs are
+                    // documented for scripting/CI). A clean `Done` exits 0.
+                    if director_outcome_is_failure(&outcome) {
+                        anyhow::bail!("`umadev run` halted before completion (hard stop)");
                     }
                     return Ok(());
                 }
@@ -2936,6 +2978,15 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
     };
 
     print_report(&project_root, &runtime_label, &report);
+    // The report is already printed; a quality-gate-blocked run (no gate pause,
+    // never reached Delivery) must map to a non-zero exit so a scripted
+    // `umadev run … && next` does not treat it as success. A gate PAUSE and a
+    // clean Delivery both exit 0.
+    if run_report_is_failure(&report) {
+        anyhow::bail!(
+            "`umadev run` stopped before delivery (quality gate blocked — see the quality report)"
+        );
+    }
     Ok(())
 }
 
@@ -3037,6 +3088,30 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Recover the run's requirement from persisted [`umadev_agent::WorkflowState`]
+/// for a resume verb (`redo` / `continue` / `revise`), or bail.
+///
+/// **Never scrapes `note`.** `note` is a free-form status line (e.g. `"worker:
+/// claude-code (…)"` / `"Light pipeline complete."`), NOT the goal — the old
+/// `note.split_once(": ")` recovery mistook such a line for the requirement and
+/// drove the base with garbage like `"claude-code (…)"`. When no real
+/// requirement was recorded we REFUSE rather than fabricate one, so the base is
+/// never driven with a scraped non-requirement.
+///
+/// # Errors
+/// Returns `Err` (a clear, actionable message) when `state.requirement` is
+/// empty / whitespace.
+fn require_recorded_requirement(state: &umadev_agent::WorkflowState) -> Result<String> {
+    if state.requirement.trim().is_empty() {
+        anyhow::bail!(
+            "no requirement recorded in .umadev/workflow-state.json — the original \
+             goal can't be recovered. Re-run `umadev run \"<requirement>\"` to \
+             re-establish it before resuming."
+        );
+    }
+    Ok(state.requirement.clone())
+}
+
 /// `umadev redo <phase>` — re-run a single named phase using the prior run's
 /// persisted context. Resolves the backend the same way `continue` does
 /// (explicit flag > persisted state > offline). Rejects an unknown phase name
@@ -3073,15 +3148,7 @@ async fn cmd_redo(
     } else {
         state.slug.clone()
     };
-    let requirement = if state.requirement.is_empty() {
-        state
-            .note
-            .split_once(": ")
-            .map_or("(no requirement recorded)", |x| x.1)
-            .to_string()
-    } else {
-        state.requirement.clone()
-    };
+    let requirement = require_recorded_requirement(&state)?;
     // backend: explicit flag > persisted state > offline.
     let backend_id: Option<String> = backend_override
         .as_ref()
@@ -3399,17 +3466,13 @@ async fn drive_gate_block(
     } else {
         state.slug.clone()
     };
-    let requirement = requirement_override.unwrap_or_else(|| {
-        if state.requirement.is_empty() {
-            state
-                .note
-                .split_once(": ")
-                .map_or("(no requirement recorded)", |x| x.1)
-                .to_string()
-        } else {
-            state.requirement.clone()
-        }
-    });
+    // An explicit override (e.g. `revise` folds the feedback into the goal) wins;
+    // otherwise recover the recorded requirement — NEVER scrape `note` (a status
+    // line), which used to drive the base with a non-requirement.
+    let requirement = match requirement_override {
+        Some(r) => r,
+        None => require_recorded_requirement(state)?,
+    };
 
     // Resolve backend: explicit flag > persisted state > offline.
     let backend_id: Option<String> = backend_override
@@ -3679,14 +3742,10 @@ async fn cmd_revise(text: String, project_root: Option<PathBuf>) -> Result<()> {
             // actually incorporates the feedback, then re-run the block
             // that produced this gate (docs for docs_confirm, frontend
             // for preview_confirm). The pipeline pauses at the same gate.
-            let base_req = if state.requirement.is_empty() {
-                state
-                    .note
-                    .split_once(": ")
-                    .map_or(String::new(), |x| x.1.to_string())
-            } else {
-                state.requirement.clone()
-            };
+            // Recover the recorded goal to fold the feedback into — NEVER scrape
+            // `note`; refuse if no requirement was recorded rather than revise a
+            // base driven with a scraped non-requirement.
+            let base_req = require_recorded_requirement(&state)?;
             let revised = format!("{base_req}\n\n## Revision request\n{notes}");
             drive_gate_block(
                 &project_root,
@@ -5362,6 +5421,81 @@ mod tests {
         assert!(plan_has_delivery(
             "build a SaaS dashboard with login and a database"
         ));
+    }
+
+    // ---- run/quick exit-code mapping (a failed run must NOT exit 0) ----
+
+    #[test]
+    fn director_outcome_exit_mapping() {
+        // `Done` succeeds (exit 0); `HardStop` fails (non-zero).
+        assert!(!director_outcome_is_failure(&DirectorOutcome::Done));
+        assert!(director_outcome_is_failure(&DirectorOutcome::HardStop(
+            "session died".into()
+        )));
+    }
+
+    #[test]
+    fn run_report_exit_mapping() {
+        // A genuine gate PAUSE → success (exit 0).
+        let paused = RunReport {
+            final_phase: umadev_spec::Phase::Docs,
+            paused_at: Some(Gate::DocsConfirm),
+            completed: Vec::new(),
+        };
+        assert!(!run_report_is_failure(&paused));
+        // A clean Delivery completion → success (exit 0).
+        let delivered = RunReport {
+            final_phase: umadev_spec::Phase::Delivery,
+            paused_at: None,
+            completed: Vec::new(),
+        };
+        assert!(!run_report_is_failure(&delivered));
+        // No gate pause + never reached Delivery = quality gate blocked → failure.
+        let blocked = RunReport {
+            final_phase: umadev_spec::Phase::Quality,
+            paused_at: None,
+            completed: Vec::new(),
+        };
+        assert!(run_report_is_failure(&blocked));
+    }
+
+    #[test]
+    fn run_outcome_exit_mapping() {
+        use umadev_agent::RunOutcome;
+        assert!(!run_outcome_is_failure(&RunOutcome::PausedAtGate(
+            Gate::DocsConfirm
+        )));
+        assert!(!run_outcome_is_failure(&RunOutcome::Completed));
+        assert!(run_outcome_is_failure(&RunOutcome::HardStop(
+            "no code".into()
+        )));
+    }
+
+    // ---- requirement recovery must NOT scrape `note` ----
+
+    #[test]
+    fn empty_requirement_recovery_refuses_and_does_not_scrape_note() {
+        // Empty requirement + a status-line note that LOOKS like `key: value`.
+        // The old code scraped `"claude-code (…)"` out of it and drove the base
+        // with that garbage; the fix must REFUSE instead.
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.requirement = String::new();
+        state.note = "worker: claude-code (native session)".to_string();
+        let recovered = require_recorded_requirement(&state);
+        assert!(
+            recovered.is_err(),
+            "an empty requirement must refuse, not scrape the note"
+        );
+        // Belt-and-braces: the scraped fragment must not surface as a requirement.
+        if let Ok(req) = &recovered {
+            assert!(!req.contains("claude-code"), "note was scraped: {req}");
+        }
+        // A real recorded requirement is returned verbatim.
+        state.requirement = "build a todo app with email login".to_string();
+        assert_eq!(
+            require_recorded_requirement(&state).unwrap(),
+            "build a todo app with email login"
+        );
     }
 
     // ---- intra-phase resume recovery ----
