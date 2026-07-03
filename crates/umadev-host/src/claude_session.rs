@@ -85,6 +85,14 @@ pub struct ClaudeSession {
     program: String,
     /// The workspace this session runs in, so a fork operates in the same dir.
     workspace: std::path::PathBuf,
+    /// Temp file backing `--append-system-prompt-file` when the composed firmware
+    /// was too large for the command line (the Windows `cmd.exe` ~8191 cap; see
+    /// [`crate::command_line_budget`]). Held for the whole session lifetime so
+    /// `claude` can read it, and deleted when the session drops. `None` on the
+    /// normal inline `--append-system-prompt` fast path (small firmware / a fork,
+    /// whose args carry no firmware). Never read directly — kept only for its
+    /// `Drop` cleanup.
+    _firmware_file: Option<FirmwareFile>,
 }
 
 impl ClaudeSession {
@@ -185,9 +193,18 @@ impl ClaudeSession {
         session_id: &str,
     ) -> Result<Self, SessionError> {
         let (prog, lead) = spawn_parts(program);
-        let mut cmd = Command::new(prog);
+        // Move an oversized `--append-system-prompt <firmware>` OFF the command line
+        // (to a temp file passed as `--append-system-prompt-file <path>`) when the
+        // whole line would exceed the Windows `cmd.exe` ~8191 cap — otherwise an npm
+        // `.cmd` shim invoked via `cmd /c` truncates the firmware → corrupted system
+        // prompt. Small firmware / mac+Linux keep the inline arg (fast path); a fork's
+        // args carry no firmware, so this is a no-op there. Fail-open (a temp-write
+        // error keeps the inline arg). The guard is held on the session so the file
+        // lives for the child's lifetime and is cleaned up on drop.
+        let (args, firmware_file) = maybe_divert_firmware(&prog, &lead, args);
+        let mut cmd = Command::new(&prog);
         cmd.args(&lead);
-        cmd.args(args);
+        cmd.args(&args);
         cmd.current_dir(workspace);
         // Mark "UmaDev is driving" + the governed root for the PreToolUse hook
         // (see `crate::GOVERN_ROOT_ENV`). The base inherits this var and passes
@@ -233,6 +250,7 @@ impl ClaudeSession {
             session_id: session_id.to_string(),
             program: program.to_string(),
             workspace: workspace.to_path_buf(),
+            _firmware_file: firmware_file,
         })
     }
 
@@ -419,6 +437,93 @@ fn spawn_err(program: &str, e: &std::io::Error) -> String {
     } else {
         format!("failed to spawn `{program}`: {e}")
     }
+}
+
+/// A temp file that carries the composed firmware to `claude` via
+/// `--append-system-prompt-file` instead of on the command line, deleted when this
+/// guard drops. The owning [`ClaudeSession`] holds it for the child's whole lifetime
+/// (claude reads the file at startup) and cleans it up when the session ends.
+struct FirmwareFile {
+    /// Absolute path of the written temp file.
+    path: std::path::PathBuf,
+}
+
+impl FirmwareFile {
+    /// Write `text` to a freshly, uniquely named temp file under `dir`. Fail-open:
+    /// propagates the I/O error so the caller can fall back to the inline arg.
+    fn write_in(dir: &Path, text: &str) -> std::io::Result<Self> {
+        // A UUID name avoids collisions across concurrent sessions / critic forks.
+        let path = dir.join(format!("umadev-firmware-{}.txt", new_session_id()));
+        std::fs::write(&path, text)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for FirmwareFile {
+    fn drop(&mut self) {
+        // Best-effort cleanup; a leftover temp file must never crash the session.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Rewrite an inline `--append-system-prompt <firmware>` pair in `args` to
+/// `--append-system-prompt-file <tempfile>` (written under `dir`), returning the
+/// temp-file guard the caller must keep alive for the child's lifetime. This moves a
+/// multi-KB firmware OFF the command line so a Windows `.cmd` shim invoked via
+/// `cmd /c` (cap ~8191) cannot truncate it. `--append-system-prompt-file` is a
+/// documented `claude` flag (verified via `claude --help`: "via:
+/// --system-prompt[-file], --append-system-prompt[-file]").
+///
+/// **Fail-open by contract:** when the flag is absent (e.g. a read-only fork's args),
+/// has no value, or the temp write fails, `args` is returned UNCHANGED with no guard —
+/// the inline arg stays (mac/Linux tolerate the big arg; on Windows this is the
+/// pre-existing behavior, never a crash). Deterministic given `dir`; exposed for tests.
+fn divert_append_system_to_file_in(
+    mut args: Vec<String>,
+    dir: &Path,
+) -> (Vec<String>, Option<FirmwareFile>) {
+    let Some(flag_idx) = args.iter().position(|a| a == "--append-system-prompt") else {
+        return (args, None);
+    };
+    let val_idx = flag_idx + 1;
+    if val_idx >= args.len() {
+        return (args, None);
+    }
+    match FirmwareFile::write_in(dir, &args[val_idx]) {
+        Ok(file) => {
+            args[flag_idx] = "--append-system-prompt-file".to_string();
+            args[val_idx] = file.path.to_string_lossy().into_owned();
+            (args, Some(file))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not write firmware temp file; passing --append-system-prompt inline (may exceed the Windows command-line limit)"
+            );
+            (args, None)
+        }
+    }
+}
+
+/// Move an oversized firmware off the command line when the spawn tokens
+/// (`prog` + `lead` + `args`) would exceed the platform command-line budget (the
+/// Windows `cmd.exe` ~8191 cap; see [`crate::command_line_budget`]). Under budget →
+/// the fast argv path is kept unchanged (the inline `--append-system-prompt`, no temp
+/// file). Fail-open (see [`divert_append_system_to_file_in`]).
+fn maybe_divert_firmware(
+    prog: &str,
+    lead: &[String],
+    args: &[String],
+) -> (Vec<String>, Option<FirmwareFile>) {
+    let line = crate::command_line_len(
+        std::iter::once(prog)
+            .chain(lead.iter().map(String::as_str))
+            .chain(args.iter().map(String::as_str)),
+    );
+    if line <= crate::command_line_budget() {
+        return (args.to_vec(), None);
+    }
+    divert_append_system_to_file_in(args.to_vec(), &std::env::temp_dir())
 }
 
 /// The argument vector preceding any input — the stream-json continuous-session
@@ -1063,6 +1168,94 @@ mod tests {
         assert!(args.contains(&"--append-system-prompt".to_string()));
         assert!(!args.contains(&"--system-prompt".to_string()));
         assert!(args.contains(&"be terse".to_string()));
+    }
+
+    #[test]
+    fn divert_append_system_moves_large_firmware_off_the_command_line() {
+        // A multi-KB firmware would overflow a Windows `.cmd` command line, so it is
+        // written to a temp file and passed via `--append-system-prompt-file <path>`
+        // instead of `--append-system-prompt <firmware>`.
+        let firmware = "FIRMWARE-".repeat(1_000); // ~9 KB, distinctive
+        let args = session_args("sid-x", Some(&firmware), true, None);
+        assert!(args.contains(&"--append-system-prompt".to_string()));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (out, guard) = divert_append_system_to_file_in(args, dir.path());
+        let guard = guard.expect("a large firmware must be diverted to a file");
+
+        // The flag flipped to the `-file` form, and the multi-KB firmware is NO LONGER
+        // anywhere on the argv (the whole bug: it must leave the command line).
+        assert!(out.contains(&"--append-system-prompt-file".to_string()));
+        assert!(!out.contains(&"--append-system-prompt".to_string()));
+        assert!(
+            !out.iter().any(|a| a.contains("FIRMWARE-")),
+            "the firmware text must not remain on the command line"
+        );
+        // The path is on the argv and the file holds the exact firmware.
+        let path = guard.path.clone();
+        assert!(out.iter().any(|a| a == &path.to_string_lossy()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), firmware);
+
+        // Dropping the guard (as the session does on end) removes the temp file.
+        drop(guard);
+        assert!(
+            !path.exists(),
+            "the temp firmware file must be cleaned up on drop"
+        );
+    }
+
+    #[test]
+    fn divert_append_system_is_fail_open_on_write_error() {
+        // A temp-write failure (here: a non-existent target dir) must fall back to the
+        // inline `--append-system-prompt` arg UNCHANGED — never a crash, never a
+        // silently-dropped firmware.
+        let firmware = "x".repeat(9_000);
+        let args = session_args("sid-y", Some(&firmware), true, None);
+        let bad_dir = std::path::Path::new("/umadev-no-such-dir-1a2b3c/nested");
+        let (out, guard) = divert_append_system_to_file_in(args.clone(), bad_dir);
+        assert!(guard.is_none(), "a write error yields no guard");
+        assert_eq!(
+            out, args,
+            "args stay unchanged (inline arg preserved) on failure"
+        );
+        assert!(out.contains(&"--append-system-prompt".to_string()));
+        assert!(out.contains(&firmware));
+    }
+
+    #[test]
+    fn maybe_divert_firmware_keeps_small_firmware_inline() {
+        // A small firmware fits the command-line budget on every platform, so the fast
+        // inline `--append-system-prompt` argv path is kept (no temp file).
+        let args = session_args("sid-s", Some("be terse"), true, None);
+        let (out, guard) = maybe_divert_firmware("claude", &[], &args);
+        assert!(guard.is_none(), "small firmware must stay inline");
+        assert_eq!(out, args);
+        assert!(out.contains(&"--append-system-prompt".to_string()));
+    }
+
+    #[test]
+    fn maybe_divert_firmware_diverts_oversized_firmware() {
+        // An oversized firmware pushes the whole spawn line past the budget, so the
+        // budget gate triggers the off-command-line diversion end to end.
+        let firmware = "y".repeat(130_000); // over the non-Windows 120_000 backstop too
+        let args = session_args("sid-o", Some(&firmware), true, None);
+        let (out, guard) = maybe_divert_firmware("claude", &[], &args);
+        assert!(
+            guard.is_some(),
+            "oversized firmware must be diverted to a file"
+        );
+        assert!(out.contains(&"--append-system-prompt-file".to_string()));
+        assert!(!out.iter().any(|a| a.contains(&firmware)));
+    }
+
+    #[test]
+    fn maybe_divert_firmware_ignores_forkless_args_without_firmware() {
+        // A read-only critic fork's args carry NO `--append-system-prompt`, so even
+        // over budget there is nothing to divert (fail-open no-op).
+        let args = fork_session_args("fork-sid");
+        let (out, guard) = maybe_divert_firmware("claude", &[], &args);
+        assert!(guard.is_none());
+        assert_eq!(out, args);
     }
 
     /// The permission mode tracks the autonomy tier (claude consistent with

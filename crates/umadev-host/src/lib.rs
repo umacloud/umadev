@@ -890,15 +890,107 @@ pub fn std_command(program: &str) -> std::process::Command {
     c
 }
 
+/// Conservative command-line length budget, in bytes, above which UmaDev moves a
+/// large prompt / system-prompt OFF the command line (to the child's stdin, or
+/// for `claude`'s firmware to a temp file passed via `--append-system-prompt-file`).
+///
+/// Windows `cmd.exe` caps the ENTIRE command line at ~8191 chars, and npm installs
+/// the base CLIs as `.cmd` shims that [`spawn_parts`] invokes as
+/// `cmd /c <resolved path> <args…>` — so on Windows the whole line (program + every
+/// flag + the multi-KB prompt/firmware) must fit under that cap or it is silently
+/// truncated → corrupted generation. 7000 leaves >1000 chars of headroom under 8191
+/// for the `cmd /c` wrapper, the resolved program path, and quoting expansion, while
+/// keeping every normal prompt on the fast argv path. Off Windows there is no such
+/// per-line cap; the only real bound is Linux's 128 KiB `MAX_ARG_STRLEN` per single
+/// arg, so the budget is a high 120_000 backstop — merged prompts are already capped
+/// at 110_000 by [`merge_prompt`], so this never triggers on the normal mac/Linux
+/// path and the argv fast path is preserved there. `UMADEV_CMDLINE_BUDGET` overrides
+/// the derived value (an escape hatch for a machine whose effective limit differs).
+#[must_use]
+pub(crate) fn command_line_budget() -> usize {
+    command_line_budget_from(std::env::var("UMADEV_CMDLINE_BUDGET").ok().as_deref())
+}
+
+/// [`command_line_budget`] with the `UMADEV_CMDLINE_BUDGET` value passed in — pure
+/// (no global env read), so the override + platform-default logic is testable
+/// without mutating process env (which would race parallel tests). A positive
+/// integer override wins; junk / zero / absent → the platform default.
+#[must_use]
+fn command_line_budget_from(override_val: Option<&str>) -> usize {
+    if let Some(v) = override_val
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return v;
+    }
+    if cfg!(windows) {
+        7_000
+    } else {
+        120_000
+    }
+}
+
+/// Approximate total command-line length for a token sequence (program + every
+/// arg, in the order they are spawned). Adds a small per-token quoting/separator
+/// allowance and a fixed wrapper allowance for the Windows `.cmd` → `cmd /c
+/// <resolved path>` form (whose resolved path length the caller already includes
+/// via [`spawn_parts`]'s `lead`). Deterministic; used only to decide argv vs
+/// stdin/file delivery, so a slight over-estimate is the safe direction.
+#[must_use]
+pub(crate) fn command_line_len<'a, I: IntoIterator<Item = &'a str>>(tokens: I) -> usize {
+    // space + up to two quote chars per token, and a wrapper allowance for
+    // `cmd /c ` plus quoting expansion the estimate cannot see per-char.
+    const PER_TOKEN_OVERHEAD: usize = 3;
+    const WRAP_OVERHEAD: usize = 512;
+    WRAP_OVERHEAD
+        + tokens
+            .into_iter()
+            .map(|t| t.len() + PER_TOKEN_OVERHEAD)
+            .sum::<usize>()
+}
+
+/// The EFFECTIVE prompt channel for a call: an [`PromptChannel::Arg`] prompt that
+/// would push the whole command line past [`command_line_budget`] is delivered via
+/// [`PromptChannel::Stdin`] instead, so the Windows `cmd.exe` ~8191 cap can't
+/// truncate it. Both single-shot bases read the prompt from stdin — `claude --print`
+/// and `opencode run` (verified) — so the diverted prompt arrives intact. A `Stdin`
+/// call stays `Stdin`; an `Arg` prompt that fits stays `Arg` (the fast path, so small
+/// prompts and mac/Linux are unchanged). `program`/`lead` are the resolved spawn
+/// tokens from [`spawn_parts`], so the wrapped `.cmd` form is accounted for.
+fn effective_prompt_channel(
+    call: &SubprocessCall<'_>,
+    program: &str,
+    lead: &[String],
+) -> PromptChannel {
+    if !matches!(call.channel, PromptChannel::Arg) || call.prompt.is_empty() {
+        return call.channel;
+    }
+    let line = command_line_len(
+        std::iter::once(program)
+            .chain(lead.iter().map(String::as_str))
+            .chain(call.args.iter().map(String::as_str))
+            .chain(std::iter::once(call.prompt)),
+    );
+    if line > command_line_budget() {
+        PromptChannel::Stdin
+    } else {
+        PromptChannel::Arg
+    }
+}
+
 /// Run a host CLI subprocess. Errors carry a human-readable string suitable for
 /// `RuntimeError::HostProcess`.
 pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<SubprocessOutput, String> {
     let started = Instant::now();
     let (program, lead) = spawn_parts(call.program);
+    // An oversized `Arg` prompt is delivered via stdin instead, so a Windows `.cmd`
+    // shim (`cmd /c …`, ~8191-char cap) can't truncate it (see
+    // `effective_prompt_channel`). Small prompts / mac+Linux keep the argv fast path.
+    let channel = effective_prompt_channel(&call, &program, &lead);
     let mut cmd = Command::new(program);
     cmd.args(&lead);
     cmd.args(call.args);
-    if matches!(call.channel, PromptChannel::Arg) && !call.prompt.is_empty() {
+    if matches!(channel, PromptChannel::Arg) && !call.prompt.is_empty() {
         // Skip an EMPTY prompt: appending "" as a CLI arg is never intended and
         // breaks strict tools (e.g. GNU `printenv VAR ""` exits 1 where BSD exits
         // 0). A real base prompt is always non-empty, so this only fixes the edge.
@@ -926,7 +1018,7 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     // writing stdout (its pipe full, we aren't reading yet) so it stops reading
     // stdin, so our write blocks — and `drain_and_wait`'s ceiling hasn't started.
     // Spawning the writer lets stdout drain while the prompt streams in.
-    let stdin_writer = if matches!(call.channel, PromptChannel::Stdin) {
+    let stdin_writer = if matches!(channel, PromptChannel::Stdin) {
         child.stdin.take().map(|mut stdin| {
             let prompt = call.prompt.as_bytes().to_vec();
             tokio::spawn(async move {
@@ -1113,10 +1205,14 @@ pub(crate) async fn run_subprocess_streaming(
 
     let started = Instant::now();
     let (program, lead) = spawn_parts(call.program);
+    // An oversized `Arg` prompt is delivered via stdin instead, so a Windows `.cmd`
+    // shim (`cmd /c …`, ~8191-char cap) can't truncate it (see
+    // `effective_prompt_channel`). Small prompts / mac+Linux keep the argv fast path.
+    let channel = effective_prompt_channel(&call, &program, &lead);
     let mut cmd = Command::new(program);
     cmd.args(&lead);
     cmd.args(call.args);
-    if matches!(call.channel, PromptChannel::Arg) && !call.prompt.is_empty() {
+    if matches!(channel, PromptChannel::Arg) && !call.prompt.is_empty() {
         // Skip an EMPTY prompt: appending "" as a CLI arg is never intended and
         // breaks strict tools (e.g. GNU `printenv VAR ""` exits 1 where BSD exits
         // 0). A real base prompt is always non-empty, so this only fixes the edge.
@@ -1141,7 +1237,7 @@ pub(crate) async fn run_subprocess_streaming(
     // `run_subprocess`) — a >64 KiB prompt that fully writes before any stdout
     // read deadlocks a base that emits before draining all of stdin. Spawning
     // the writer lets the stdout loop below drain while the prompt streams in.
-    let stdin_writer = if matches!(call.channel, PromptChannel::Stdin) {
+    let stdin_writer = if matches!(channel, PromptChannel::Stdin) {
         child.stdin.take().map(|mut stdin| {
             let prompt = call.prompt.as_bytes().to_vec();
             tokio::spawn(async move {
@@ -2304,6 +2400,107 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.stdout, "piped-prompt-body");
+    }
+
+    #[test]
+    fn command_line_budget_default_and_override() {
+        let platform_default = if cfg!(windows) { 7_000 } else { 120_000 };
+        // Off Windows the budget is a high backstop under Linux's 128 KiB per-arg
+        // cap; merged prompts (capped 110_000) never trip it → argv fast path kept.
+        assert_eq!(command_line_budget_from(None), platform_default);
+        // A positive override wins (an escape hatch for a tighter machine cap).
+        assert_eq!(command_line_budget_from(Some("1234")), 1234);
+        // Junk / zero fall back to the platform default (never a 0 budget that would
+        // divert every prompt) — fail-open.
+        assert_eq!(command_line_budget_from(Some("0")), platform_default);
+        assert_eq!(command_line_budget_from(Some("nope")), platform_default);
+    }
+
+    #[test]
+    fn command_line_len_accounts_for_wrapper_and_crosses_windows_budget() {
+        // A short, realistic `claude` session command line fits the conservative
+        // Windows `cmd.exe` budget (7000) with room to spare — the fast argv path.
+        let sid = "00000000-0000-4000-8000-000000000000";
+        let small = command_line_len([
+            "claude",
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--session-id",
+            sid,
+            "--append-system-prompt",
+            "be terse",
+        ]);
+        assert!(
+            small < 7_000,
+            "small line unexpectedly over budget: {small}"
+        );
+        // A multi-KB firmware pushes the WHOLE line (wrapper overhead included) past
+        // the Windows budget, so it MUST be diverted off the command line. This is the
+        // threshold computed for the `cmd /c <resolved .cmd path>` wrapped case.
+        let firmware = "x".repeat(8_000);
+        let big = command_line_len(["claude", "--append-system-prompt", firmware.as_str()]);
+        assert!(
+            big > 7_000,
+            "8 KB firmware must exceed the Windows budget: {big}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_arg_prompt_is_delivered_via_stdin_not_truncated() {
+        // A prompt that would overflow the command line is routed through stdin (both
+        // `claude --print` and `opencode run` read the prompt from stdin), so nothing
+        // is truncated. The `sh` probe reports WHERE the prompt landed: `$1` (argv) vs
+        // stdin (`cat`). Over the non-Windows 120_000 budget requires a >120 KB prompt.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let big = "x".repeat(121_000);
+        let out = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &[
+                "-c".to_string(),
+                "printf 'ARG<%s>' \"$1\"; printf 'IN<'; cat; printf '>'".to_string(),
+                "probe".to_string(),
+            ],
+            prompt: &big,
+            channel: PromptChannel::Arg,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(15),
+            env: &[],
+        })
+        .await
+        .unwrap();
+        // Diverted: `$1` is empty (no positional prompt) and the FULL prompt arrived on
+        // stdin — proving it was NOT truncated onto the command line.
+        assert!(
+            out.stdout.starts_with("ARG<>IN<"),
+            "prompt should have left argv"
+        );
+        assert!(out.stdout.ends_with('>'));
+        assert_eq!(out.stdout.len(), "ARG<>IN<>".len() + big.len());
+        assert!(out.stdout.contains(&big));
+    }
+
+    #[tokio::test]
+    async fn small_arg_prompt_keeps_the_argv_fast_path() {
+        // A small prompt stays a positional arg (no stdin diversion, no regression),
+        // so `$1` carries it and stdin is empty. Mac/Linux behavior is unchanged.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &[
+                "-c".to_string(),
+                "printf 'ARG<%s>' \"$1\"; printf 'IN<'; cat; printf '>'".to_string(),
+                "probe".to_string(),
+            ],
+            prompt: "hello",
+            channel: PromptChannel::Arg,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(5),
+            env: &[],
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.stdout, "ARG<hello>IN<>");
     }
 
     #[tokio::test]
