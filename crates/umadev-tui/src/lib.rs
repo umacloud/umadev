@@ -163,23 +163,67 @@ fn print_scrollback_handoff(app: &App) {
     let _ = out.flush();
 }
 
+/// Decide whether a firing panic hook should run the FULL terminal restore
+/// (disable raw mode + [`restore_sequence`] + the printed notice) or merely
+/// chain the previous hook without touching the terminal.
+///
+/// The full restore is correct ONLY when the panic actually terminates the
+/// TUI — a panic on the render-loop / main thread: `block_on` re-raises it, so
+/// the process is on its way out and the terminal must be handed back clean.
+/// A panic on a background `tokio` worker is swallowed by the runtime's
+/// `catch_unwind`: the process does NOT exit, the render loop keeps calling
+/// `terminal.draw`, and running the teardown there would rip the LIVE session
+/// out of raw mode + off the alt screen mid-frame (keys stop echoing, the
+/// cursor reappears, "terminal restored." lands on the primary screen) — the
+/// inverse of the teardown every other path guards. So a non-loop thread gets
+/// chain-only, and the loop restores itself normally on its own exit.
+///
+/// `loop_thread` is the render-loop thread id captured when the hook was
+/// installed (on the main thread, before the first await). `None` means it
+/// could not be determined — fail SAFE to the full restore so a genuinely
+/// crashed terminal is never left dirty.
+fn should_full_restore(
+    loop_thread: Option<std::thread::ThreadId>,
+    current: std::thread::ThreadId,
+) -> bool {
+    match loop_thread {
+        Some(id) => id == current,
+        None => true,
+    }
+}
+
 /// Replace the global panic hook with one that restores the terminal
 /// (disable raw mode, leave the alternate screen, show the cursor) before
-/// the panic unwinds. Idempotent: the prior hook is chained so repeated
-/// installs don't stack indefinitely.
+/// the panic unwinds — but ONLY when the panic actually terminates the TUI.
+/// Idempotent: the prior hook is chained so repeated installs don't stack
+/// indefinitely.
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
+    // Capture the render-loop / main thread id NOW: this fn runs inline in
+    // `run` before the first await, and `block_on` drives the render loop on
+    // this same thread. A later panic can then be told apart by the thread it
+    // fires on — the render-loop thread means a terminating panic (restore);
+    // any other thread means a background-task panic that tokio's catch_unwind
+    // swallows (the loop keeps running, so must NOT tear down the live terminal).
+    let loop_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
-        // Best-effort restoration — ignore errors, we're panicking anyway. Routes
-        // through the SAME complete + ordered restore as the normal teardown so a
-        // panic can't leave the Windows console stuck on the alt screen / in raw
-        // mode (raw mode OFF first, then the writer sequence).
-        let _ = disable_raw_mode();
-        let mut out = std::io::stdout();
-        restore_sequence(&mut out);
-        // Print a visible marker so the user knows it was a panic, not a
-        // clean exit, then defer to the previous hook for the backtrace.
-        eprintln!("\n\numadev: panic — terminal restored.\n");
+        if should_full_restore(Some(loop_thread), std::thread::current().id()) {
+            // Best-effort restoration — ignore errors, we're panicking anyway.
+            // Routes through the SAME complete + ordered restore as the normal
+            // teardown so a panic can't leave the Windows console stuck on the
+            // alt screen / in raw mode (raw mode OFF first, then the writer
+            // sequence).
+            let _ = disable_raw_mode();
+            let mut out = std::io::stdout();
+            restore_sequence(&mut out);
+            // Print a visible marker so the user knows it was a panic, not a
+            // clean exit.
+            eprintln!("\n\numadev: panic — terminal restored.\n");
+        }
+        // Always chain the previous hook for the backtrace / log. On the
+        // background-task path this is the ONLY action, so the panic is still
+        // reported (and repainted over by the next frame) without tearing the
+        // live session out of raw mode / the alt screen.
         prev(info);
     }));
 }
@@ -6516,6 +6560,58 @@ mod tests {
         // wedges or diverges (the property we care about is "complete every time").
         assert!(twice.windows(once.len()).any(|w| w == once.as_slice()));
         assert!(String::from_utf8_lossy(&twice).contains("\x1b[?1049l"));
+    }
+
+    // --- Panic hook: the full terminal restore must run ONLY when the panic
+    // actually terminates the TUI (a panic on the render-loop / main thread),
+    // never when a background tokio worker panics and gets swallowed by
+    // catch_unwind — otherwise the teardown fires on a still-live session. The
+    // thread-id decision is factored into `should_full_restore` so both
+    // branches are tested without an actual panic / a real terminal. --------
+
+    /// A panic on the RENDER-LOOP thread (the captured loop id equals the
+    /// firing thread's id) MUST run the full restore — `block_on` re-raises it,
+    /// the process is terminating, and the terminal has to be handed back clean.
+    /// The legitimate teardown-on-real-panic case must never regress.
+    #[test]
+    fn panic_on_loop_thread_runs_full_restore() {
+        let loop_id = std::thread::current().id();
+        assert!(
+            should_full_restore(Some(loop_id), loop_id),
+            "a panic on the render-loop thread must full-restore the terminal"
+        );
+    }
+
+    /// A panic on a NON-loop thread (a swallowed background-task panic — the
+    /// firing thread differs from the captured loop id) MUST NOT run the full
+    /// restore: the render loop is still alive and still drawing, and tearing it
+    /// out of raw mode / off the alt screen mid-frame is the corruption bug.
+    /// It gets chain-only instead.
+    #[test]
+    fn panic_on_background_thread_does_not_full_restore() {
+        let loop_id = std::thread::current().id();
+        // A freshly spawned thread is guaranteed a DIFFERENT ThreadId — this
+        // stands in for any `tokio::spawn`ed worker whose panic catch_unwind
+        // swallows without exiting the process.
+        let other_id = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("the probe thread cannot panic");
+        assert_ne!(loop_id, other_id, "spawned threads get distinct ids");
+        assert!(
+            !should_full_restore(Some(loop_id), other_id),
+            "a swallowed background-task panic must NOT tear down the live terminal"
+        );
+    }
+
+    /// Fail-safe: if the render-loop thread id could not be determined (`None`),
+    /// the hook must prefer the full restore rather than risk leaving a
+    /// genuinely crashed terminal dirty.
+    #[test]
+    fn panic_with_unknown_loop_thread_fails_safe_to_full_restore() {
+        assert!(
+            should_full_restore(None, std::thread::current().id()),
+            "an unknown loop thread must fail safe to the full restore"
+        );
     }
 
     /// The kitty keyboard-protocol setup emits a `CSI > … u` push with the
