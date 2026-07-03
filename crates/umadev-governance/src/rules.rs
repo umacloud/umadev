@@ -702,18 +702,22 @@ const COLOR_ALLOWED: &[&str] = &[
 fn emoji_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // Comprehensive graphical-emoji ranges. Leaves CJK ideographs and
-        // CJK punctuation alone (those are legitimate text, not emoji icons).
-        // Covers: misc symbols + dingbats, technical symbols, enclosed
-        // alphanumerics (① ⓵), pictographs, transport/map, supplemental
-        // symbols, flags, skin-tone modifiers, and the keycap/variation
-        // selectors that turn plain chars into emoji.
+        // TRUE pictographic-emoji ranges only. Leaves CJK ideographs and CJK
+        // punctuation alone, and deliberately EXCLUDES three symbol blocks that
+        // carry legitimate typographic / technical text, not emoji icons:
+        //   - U+2300-23FF (Miscellaneous Technical): keyboard glyphs `⌥⌫⏎⎋`;
+        //   - U+2460-24FF (Enclosed Alphanumerics): CJK numbering `①②③`;
+        //   - U+25A0-25FF (Geometric Shapes): doc bullets `● ▶ ■ □ ▲ ▼ ◆`.
+        // The remaining `\x{2600}-\x{27BF}` (Misc Symbols + Dingbats) DOES hold
+        // real emoji (`✅ ❌ ⚠`), so it stays — the few typographic marks inside
+        // it (`★ ☆ ♪ ✓ ✗`) are exempted per-char by `is_typographic_symbol`.
+        // Covers: misc symbols + dingbats, pictographs, transport/map,
+        // supplemental symbols, flags, skin-tone modifiers, and the keycap /
+        // variation selectors that turn plain chars into emoji.
         Regex::new(concat!(
             r"[",
-            r"\x{2300}-\x{23FF}",   // misc technical (⚠ etc.)
-            r"\x{2460}-\x{24FF}",   // enclosed alphanumerics (① ⓵)
-            r"\x{25A0}-\x{27BF}",   // geometric shapes + misc symbols + dingbats
-            r"\x{2B00}-\x{2BFF}",   // misc symbols and arrows
+            r"\x{2600}-\x{27BF}",   // misc symbols + dingbats (✅ ❌ ⚠ …)
+            r"\x{2B00}-\x{2BFF}",   // misc symbols and arrows (⭐ ⬛ ⬜ …)
             r"\x{1F000}-\x{1F0FF}", // mahjong + dominoes + playing cards
             r"\x{1F100}-\x{1F1FF}", // enclosed alphanumeric supplement + flags
             r"\x{1F200}-\x{1F2FF}", // enclosed ideographic supplement
@@ -734,16 +738,24 @@ fn emoji_regex() -> &'static Regex {
 }
 
 /// `true` for typographic / technical glyphs that fall inside the emoji regex's
-/// code-point ranges but are legitimate symbols, NOT emoji-as-functional-icons,
-/// so they must not trip UD-CODE-001:
-/// - `⌈ ⌉ ⌊ ⌋` (U+2308..U+230B) ceiling / floor brackets
-/// - `⌘` (U+2318) place-of-interest / command key
+/// remaining code-point range (`\x{2600}-\x{27BF}`) but are legitimate symbols /
+/// marks — bullets, rating stars, music notes, check/cross dingbats — NOT
+/// emoji-as-functional-icons, so they must not trip UD-CODE-001:
+/// - `★ ☆` (U+2605..U+2606) black / white star — rating & list marks
+/// - `♩ ♪ ♫ ♬` (U+2669..U+266C) music notes
 /// - `✓ ✔ ✕ ✖ ✗ ✘` (U+2713..U+2718) check / cross / multiply dingbats
 ///
-/// Note: the colourful emoji check marks (`✅` U+2705, `❌` U+274C) are NOT in
-/// this set — those remain blocked.
+/// The `⌈⌉⌊⌋` (U+2308..U+230B) / `⌘` (U+2318) entries are retained as a
+/// belt-and-braces guard even though their block (U+2300-23FF) is now excluded
+/// from the regex entirely.
+///
+/// Note: the colourful emoji marks (`✅` U+2705, `❌` U+274C, `⚠` U+26A0,
+/// `⭐` U+2B50) are NOT in this set — those remain blocked.
 fn is_typographic_symbol(ch: char) -> bool {
-    matches!(ch as u32, 0x2308..=0x230B | 0x2318 | 0x2713..=0x2718)
+    matches!(
+        ch as u32,
+        0x2308..=0x230B | 0x2318 | 0x2605..=0x2606 | 0x2669..=0x266C | 0x2713..=0x2718,
+    )
 }
 
 fn hex_color_regex() -> &'static Regex {
@@ -1652,9 +1664,47 @@ fn named_secret_match(content: &str) -> Option<(String, usize)> {
         if is_placeholder_value(value) {
             continue;
         }
+        // Same guards the entropy fallback already applies (see
+        // [`is_high_entropy_secret`]): a value that is a URL / data-URI /
+        // filesystem path, or a low-entropy lowercase kebab-/snake-case slug
+        // (a design token like `color-primary-strong`, an identifier, a
+        // pagination cursor) is NOT a credential — it must not hard-block on
+        // the un-overridable secret floor merely because it sits under a
+        // `token`/`auth`/`secret` name. A genuine secret-shaped value
+        // (`sk-ant-…`, `AKIA…`, a mixed-case / high-entropy base64 or hex blob)
+        // has no `://`/`/` and mixes case or entropy, so it still blocks here.
+        if looks_like_url_or_path(value) || looks_like_low_entropy_slug(value) {
+            continue;
+        }
         return Some((name.as_str().to_string(), value.chars().count()));
     }
     None
+}
+
+/// `true` when `s` is a low-entropy lowercase kebab-/snake-case slug — a design
+/// token / identifier / cursor (`color-primary-strong`, `pagination-cursor-abc`,
+/// `page_size_default`), NOT a credential.
+///
+/// The named-secret branch uses this (alongside [`looks_like_url_or_path`]) so a
+/// slug assigned to a `token`/`auth`/`secret` name is not mistaken for a leaked
+/// secret. Three conditions, each a distinguisher from a real credential:
+/// - contains a `-`/`_`/`.` word separator (a slug is segmented; a raw key is not);
+/// - only lowercase letters, digits, and those separators — real provider keys
+///   mix case (`sk-ant-a1B2c3…`) or are uppercase (`AKIA…`), so they never match;
+/// - Shannon entropy below the same 4.0-bit floor the entropy fallback treats as
+///   secret-like, so a genuine all-lowercase HIGH-entropy blob still reads as a
+///   secret and blocks.
+fn looks_like_low_entropy_slug(s: &str) -> bool {
+    if !s.contains(['-', '_', '.']) {
+        return false;
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    shannon_entropy(s) < 4.0
 }
 
 /// Compiled detector for a named secret key assigned a quoted literal value.
@@ -8976,10 +9026,44 @@ const x = 1;",
     }
 
     #[test]
-    fn emoji_blocks_keycap_numbers() {
-        // Enclosed/keycap-style emoji.
-        assert!(check_emoji("src/Step.tsx", "① first").block);
+    fn emoji_blocks_astral_keycap_but_allows_enclosed_alnum() {
+        // Astral keycap emoji (🔟, U+1F51F) still blocks...
         assert!(check_emoji("src/Num.tsx", "🔟").block);
+        // ...but the Enclosed Alphanumerics block (① U+2460) is NOT an emoji: it
+        // is CJK/doc numbering (`步骤①：`) and must PASS (Finding #2 false-positive).
+        assert!(!check_emoji("src/Step.tsx", "① first").block);
+    }
+
+    #[test]
+    fn emoji_allows_cjk_numbering_and_keyboard_and_bullets() {
+        // Finding #2: typographic / technical glyphs that are NOT pictographic
+        // emoji must PASS — a trilingual product legitimately ships these.
+        // Enclosed alphanumerics (CJK step numbering).
+        assert!(!check_emoji("docs/Guide.tsx", "<p>步骤①：安装 步骤②：配置</p>").block);
+        // Keyboard-shortcut glyphs (Miscellaneous Technical U+2300-23FF).
+        assert!(!check_emoji("src/Keys.tsx", "<kbd>⌥⌫⏎⎋</kbd>").block);
+        // Geometric-shape bullets / markers (U+25A0-25FF).
+        assert!(!check_emoji("src/List.tsx", "<li>● item ▶ play ■ stop</li>").block);
+        // Rating stars (★ ☆), music notes (♪), and check/cross dingbats (✓ ✗).
+        assert!(!check_emoji("src/Rate.tsx", "<span>★★☆ ♪ ✓ ✗</span>").block);
+    }
+
+    #[test]
+    fn emoji_still_blocks_real_pictographic_emoji() {
+        // Finding #2 must NOT weaken real detection: genuine emoji-as-icon still
+        // block, including ones that neighbour the now-exempt ranges.
+        for (path, src) in [
+            ("src/A.tsx", "<button>😀</button>"),
+            ("src/B.tsx", "<button>🚀</button>"),
+            ("src/C.tsx", "<Icon>✅</Icon>"),
+            ("src/D.tsx", "<span>🔥 hot</span>"),
+            ("src/E.tsx", "<span>⭐ star</span>"), // U+2B50, not the ★ U+2605 mark
+        ] {
+            assert!(
+                check_emoji(path, src).block,
+                "real emoji must still block: {src}",
+            );
+        }
     }
 
     #[test]
@@ -9658,6 +9742,52 @@ const x = 1;",
             ),
         );
         assert!(d.block, "a real ghp_ token must block");
+    }
+
+    // Finding C: the NAMED-secret branch must not hard-block legitimate
+    // token/auth/secret config on the un-overridable floor. A URL value or a
+    // low-entropy kebab-/snake-case design token is NOT a credential.
+    #[test]
+    fn secret_allows_url_and_design_token_under_secret_name() {
+        for v in [
+            // A URL assigned to an `auth` key (an OIDC endpoint, not a secret).
+            "{ \"auth\": \"https://sso.mycorp.io/oidc/authorize\" }",
+            // A hyphenated lowercase design token under a `token` key.
+            "{ \"token\": \"color-primary-strong\" }",
+            // A snake_case identifier under a `secret` key.
+            "{ \"secret\": \"page_size_default_value\" }",
+            // A pagination cursor slug assigned to a `token` const.
+            "const token = \"pagination-cursor-abc\";",
+        ] {
+            let d = check_hardcoded_secret("src/cfg.ts", v);
+            assert!(
+                !d.block,
+                "a URL / low-entropy design token under a secret name must PASS: {v} -> {}",
+                d.reason
+            );
+        }
+    }
+
+    // Finding C must NOT weaken detection: a genuine high-entropy / mixed-case
+    // secret assigned to a `token`/`auth`/`api_key` name STILL blocks.
+    #[test]
+    fn secret_still_blocks_real_secret_under_secret_name() {
+        for v in [
+            // Anthropic-style key under a `token` key — mixed case + digits.
+            "{ \"token\": \"sk-ant-a1B2c3D4e5F6g7H8i9J0kLmN\" }",
+            // AWS access-key id under an `auth` key.
+            "{ \"auth\": \"AKIAIOSFODNN7QRT4UVWZ\" }",
+            // A 32+ mixed-case base64-ish blob under an `api_key` key.
+            "const api_key = \"a1B2c3D4e5F6g7H8i9J0kL3mN9pQ7rS\";",
+        ] {
+            let d = check_hardcoded_secret("src/cfg.ts", v);
+            assert!(
+                d.block,
+                "a real secret under a secret name must STILL block: {v} -> {}",
+                d.reason
+            );
+            assert_eq!(d.clause, "UD-SEC-003");
+        }
     }
 
     // --- frontend DB access (UD-SEC-004) -------------------------------
