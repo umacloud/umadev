@@ -203,17 +203,33 @@ fn path_template_matches(template: &str, call_path: &str) -> bool {
         .all(|(t, c)| is_template_param(t) || t == c)
 }
 
-/// Whether a template segment is a `:param` placeholder. Requires `:` to be
-/// followed by at least one valid param-name char (letter / underscore /
-/// digit), so a bare `:`, `::`, or `:#` is treated as a literal segment and
-/// must match the call segment exactly (previously anything starting with
-/// `:` matched anything, so `/api/:` would wrongly match `/api/foo`).
+/// Whether a template segment is a path-parameter placeholder, across the
+/// vocabularies a contract may be written in:
+/// - `:id` (Express / Rails / gin) — `:` followed by at least one valid
+///   param-name char (letter / digit / underscore), so a bare `:`, `::`, or
+///   `:#` stays a literal segment that must match exactly (previously anything
+///   starting with `:` matched anything, so `/api/:` wrongly matched
+///   `/api/foo`).
+/// - `{id}` (OpenAPI / FastAPI / Spring) and `<int:id>` (Django) — a whole
+///   segment wrapped in braces / angle brackets. Without these, an
+///   OpenAPI-style contract path `/api/users/{id}` failed to match a real call
+///   `/api/users/123` and raised a systematic false `UndeclaredCall`. Mirrors
+///   [`crate::backend::is_param_segment`], which already accepts these forms
+///   on the backend-route side, so the two sides share one param vocabulary.
+///
+/// A bare `{}` / `<>` (nothing between the brackets) is NOT a parameter and
+/// stays a literal.
 pub(crate) fn is_template_param(segment: &str) -> bool {
-    let mut chars = segment.chars();
-    matches!(chars.next(), Some(':'))
-        && chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    let colon = {
+        let mut chars = segment.chars();
+        matches!(chars.next(), Some(':'))
+            && chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    colon
+        || (segment.len() > 2 && segment.starts_with('{') && segment.ends_with('}'))
+        || (segment.len() > 2 && segment.starts_with('<') && segment.ends_with('>'))
 }
 
 /// Parse the architecture Markdown into an [`ApiSpec`]. Looks for a Markdown
@@ -651,6 +667,31 @@ mod tests {
     fn path_template_matches_multi_param() {
         assert!(path_template_matches("/api/:org/:repo", "/api/foo/bar"));
         assert!(!path_template_matches("/api/:org/:repo", "/api/foo"));
+    }
+
+    #[test]
+    fn path_template_matches_brace_and_angle_params() {
+        // Fix #3: OpenAPI `{id}` and Django `<int:id>` param segments match a
+        // concrete call segment, sharing the backend param vocabulary.
+        assert!(path_template_matches("/api/users/{id}", "/api/users/123"));
+        assert!(path_template_matches(
+            "/api/orders/<int:id>",
+            "/api/orders/42"
+        ));
+        assert!(path_template_matches("/api/{org}/{repo}", "/api/foo/bar"));
+        // A conflicting literal still rejects.
+        assert!(!path_template_matches("/api/users/{id}", "/api/orders/1"));
+    }
+
+    #[test]
+    fn is_template_param_vocabulary() {
+        for yes in [":id", ":userId", "{id}", "<int:id>", "<slug>"] {
+            assert!(is_template_param(yes), "{yes:?} should be a param");
+        }
+        // Not params: bare punctuation, empty brackets, plain literals.
+        for no in [":", "::", "{}", "<>", "users", "v1", "{", "id}"] {
+            assert!(!is_template_param(no), "{no:?} must NOT be a param");
+        }
     }
 
     #[test]

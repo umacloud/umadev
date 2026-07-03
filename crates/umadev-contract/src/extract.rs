@@ -108,8 +108,12 @@ fn fetch_regex() -> &'static Regex {
         // `/api/users/${id}`, which `normalize_template_path` then rewrites to
         // `/api/users/:param`. Stopping at `$` (the old behaviour) truncated it
         // to `/api/users/`, a systematic false UndeclaredCall.
+        // `lead` is a captured left boundary (the `regex` crate has no
+        // look-behind): a `fetch(` whose preceding char is an identifier char
+        // is really the tail of `prefetch(` / `refetch(` / `router.prefetch(`,
+        // not a fetch call, and is rejected in `extract_from_file`.
         Regex::new(
-            r#"fetch\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`](?:[^)]*?method\s*:\s*['"`](?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)['"`])?"#,
+            r#"(?P<lead>[A-Za-z0-9_$.]?)fetch\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`](?:[^)]*?method\s*:\s*['"`](?P<method>GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)['"`])?"#,
         )
         .expect("fetch regex well-formed")
     })
@@ -144,9 +148,12 @@ fn swr_query_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         // Path keeps `${...}` interpolation (normalised later), matching the
-        // fetch/axios regexes — see `fetch_regex` rationale.
+        // fetch/axios regexes — see `fetch_regex` rationale. `lead` is the same
+        // captured left-boundary guard as `fetch_regex`: a hook name that is a
+        // suffix of a longer identifier (`myUseQuery(`) is rejected in
+        // `extract_from_file`.
         Regex::new(
-            r#"(?:useSWR|useSWRInfinite|useQuery|useFetch)\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`]"#,
+            r#"(?P<lead>[A-Za-z0-9_$.]?)(?:useSWR|useSWRInfinite|useQuery|useFetch)\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`]"#,
         )
         .expect("swr/query regex well-formed")
     })
@@ -308,6 +315,16 @@ pub fn extract_frontend_calls(project_root: &Path) -> Vec<FrontendCall> {
     collect_frontend_sources(project_root, &mut files, 0);
     let mut calls: Vec<FrontendCall> = Vec::new();
     for file in &files {
+        // Skip oversized files (a minified / bundled `app.min.js`, not
+        // hand-written source): running the multi-regex + comment-strip over a
+        // megabyte of minified code both wastes work and floods phantom calls.
+        // Mirrors `backend::MAX_FILE_BYTES`.
+        let Ok(meta) = std::fs::metadata(file) else {
+            continue;
+        };
+        if meta.len() > MAX_FRONTEND_FILE_BYTES {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(file) else {
             continue;
         };
@@ -331,6 +348,13 @@ pub fn extract_frontend_calls(project_root: &Path) -> Vec<FrontendCall> {
 
 /// Extract calls from one file's content.
 fn extract_from_file(file: &str, content: &str) -> Vec<FrontendCall> {
+    // Strip JS/TS comments FIRST: a commented-out `// fetch('/api/deprecated')`
+    // or `/* axios.get('/api/gone') */` must NEVER become a phantom
+    // `UndeclaredCall` (the frontend mirror of the backend false-PASS the
+    // `backend` module fixes). The strip is string/template-literal aware, so a
+    // `//` inside a real URL string is preserved.
+    let stripped = crate::backend::strip_comments_jsts(content);
+    let content = stripped.as_str();
     let mut calls: Vec<FrontendCall> = Vec::new();
     // `method_known` records whether the verb came from the call shape (true)
     // or is a best-effort default (false). The path is query-stripped then
@@ -355,6 +379,9 @@ fn extract_from_file(file: &str, content: &str) -> Vec<FrontendCall> {
     // fetch('/x') is GET by spec default → `method_known = true` still, because
     // GET *is* fetch's defined default (not a guess).
     for cap in fetch_regex().captures_iter(content) {
+        if reject_for_identifier_lead(cap.name("lead").map(|m| m.as_str()).unwrap_or("")) {
+            continue; // `prefetch(` / `refetch(` / `router.prefetch(`, not `fetch(`
+        }
         let path = cap.name("path").map(|m| m.as_str()).unwrap_or("");
         if path.is_empty() {
             continue;
@@ -389,6 +416,9 @@ fn extract_from_file(file: &str, content: &str) -> Vec<FrontendCall> {
     }
     // useSWR / useQuery / useFetch — read hooks, always GET (known).
     for cap in swr_query_regex().captures_iter(content) {
+        if reject_for_identifier_lead(cap.name("lead").map(|m| m.as_str()).unwrap_or("")) {
+            continue; // suffix of a longer identifier, not a real hook call
+        }
         let path = cap.name("path").map(|m| m.as_str()).unwrap_or("");
         if !path.is_empty() {
             push(&mut calls, HttpVerb::Get, true, path);
@@ -461,6 +491,12 @@ const MAX_FRONTEND_DEPTH: usize = 16;
 /// `backend.rs` `MAX_FILES = 800`) so a deep + wide enterprise frontend can't
 /// make contract extraction read + multi-regex an unbounded file set.
 const MAX_FRONTEND_FILES: usize = 800;
+
+/// Skip frontend files larger than this. A bundled / minified asset
+/// (`app.min.js`, a vendored `*.bundle.js`) is not hand-written call source;
+/// scanning it wastes work and, on a single-line minified blob, would flood
+/// phantom calls. Mirrors `backend::MAX_FILE_BYTES`.
+const MAX_FRONTEND_FILE_BYTES: u64 = 600_000;
 
 fn collect_frontend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     if depth > MAX_FRONTEND_DEPTH || out.len() >= MAX_FRONTEND_FILES {
@@ -938,5 +974,185 @@ mod tests {
                 "{bad:?} should be rejected as an identifier-suffix lead"
             );
         }
+    }
+
+    // ---- Fix #1: comment-strip before the call regexes ----
+
+    #[test]
+    fn commented_fetch_is_not_a_phantom_call() {
+        // A line-commented fetch must NOT become an UndeclaredCall.
+        let calls = extract_from_file(
+            "src/a.ts",
+            "// fetch('/api/deprecated')\nfetch('/api/real')",
+        );
+        let p: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
+        assert!(p.contains(&"/api/real"), "real call kept: {p:?}");
+        assert!(
+            !p.contains(&"/api/deprecated"),
+            "commented call must not be a phantom: {p:?}"
+        );
+    }
+
+    #[test]
+    fn block_commented_axios_is_not_a_phantom_call() {
+        let calls = extract_from_file(
+            "src/a.ts",
+            "/* axios.get('/api/gone') */ axios.post('/api/live')",
+        );
+        let p: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
+        assert!(p.contains(&"/api/live"), "real call kept: {p:?}");
+        assert!(
+            !p.contains(&"/api/gone"),
+            "block-commented call must not be a phantom: {p:?}"
+        );
+    }
+
+    #[test]
+    fn double_slash_inside_url_string_does_not_break_extraction() {
+        // Regression: the comment strip is string-aware, so a `//` inside a URL
+        // string must not truncate the following real call. (The absolute-path
+        // `fetch('/api/ok')` is still captured.)
+        let calls = extract_from_file(
+            "src/a.ts",
+            "const base = 'https://cdn.example.com'; fetch('/api/ok')",
+        );
+        assert!(
+            calls.iter().any(|c| c.path == "/api/ok"),
+            "real call after a URL string must still extract: {calls:?}"
+        );
+    }
+
+    // ---- Fix #4: fetch/swr left-boundary guard ----
+
+    #[test]
+    fn prefetch_is_not_a_fetch_call() {
+        // `router.prefetch('/route')` and `refetch('/x')` contain `fetch(` but
+        // are NOT fetch calls — the identifier lead must reject them.
+        let calls = extract_from_file(
+            "src/a.ts",
+            "router.prefetch('/route'); refetch('/x'); const p = prefetch('/y');",
+        );
+        let p: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            p.is_empty(),
+            "prefetch/refetch must not match as fetch: {p:?}"
+        );
+    }
+
+    #[test]
+    fn genuine_fetch_still_matches_after_boundary_guard() {
+        // Negative-control for #4: real fetch calls at various boundaries still
+        // match (guard is not too strict).
+        let calls = extract_from_file(
+            "src/a.ts",
+            "fetch('/api/a'); await fetch('/api/b'); const r = fetch('/api/c');",
+        );
+        let p: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
+        for want in ["/api/a", "/api/b", "/api/c"] {
+            assert!(p.contains(&want), "{want} must still match: {p:?}");
+        }
+    }
+
+    #[test]
+    fn suffix_hook_is_not_a_swr_call() {
+        // A hook name that is a suffix of a longer identifier must be rejected.
+        let calls = extract_from_file("src/a.ts", "const d = myuseQuery('/api/x');");
+        let p: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
+        assert!(!p.contains(&"/api/x"), "suffix hook must not match: {p:?}");
+    }
+
+    // ---- Fix #3: {id} / <int:id> contract params match a real call ----
+
+    #[test]
+    fn brace_param_contract_matches_concrete_call() {
+        // An OpenAPI-style `/api/users/{id}` contract must match a real
+        // `/api/users/123` call — previously a systematic false UndeclaredCall.
+        use crate::parse::parse_architecture;
+        use crate::validate::validate_frontend_vs_contract;
+        let spec = parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n\
+             |---|---|---|---|---|---|\n\
+             | GET | /api/users/{id} | - | - | none | Get one |\n",
+            "demo",
+        );
+        let calls = extract_from_file("src/a.ts", "fetch('/api/users/123')");
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert!(
+            v.is_empty(),
+            "a {{id}} contract must match /api/users/123, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn angle_param_contract_matches_concrete_call() {
+        // Django-style `<int:id>` param segment must match a real call too.
+        use crate::parse::parse_architecture;
+        use crate::validate::validate_frontend_vs_contract;
+        let spec = parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n\
+             |---|---|---|---|---|---|\n\
+             | GET | /api/orders/<int:id> | - | - | none | Get one |\n",
+            "demo",
+        );
+        let calls = extract_from_file("src/a.ts", "fetch('/api/orders/42')");
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert!(
+            v.is_empty(),
+            "an <int:id> contract must match /api/orders/42, got {v:?}"
+        );
+    }
+
+    #[test]
+    fn undeclared_call_still_caught_after_param_broadening() {
+        // Regression guard: broadening param vocab must NOT hide a genuine
+        // undeclared call to a path with no matching contract template.
+        use crate::parse::parse_architecture;
+        use crate::validate::validate_frontend_vs_contract;
+        use crate::validate::ViolationKind;
+        let spec = parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n\
+             |---|---|---|---|---|---|\n\
+             | GET | /api/users/{id} | - | - | none | Get one |\n",
+            "demo",
+        );
+        let calls = extract_from_file("src/a.ts", "fetch('/api/nope/1')");
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert_eq!(
+            v.len(),
+            1,
+            "an undeclared call must still be flagged: {v:?}"
+        );
+        assert_eq!(v[0].kind, ViolationKind::UndeclaredCall);
+    }
+
+    // ---- Fix #6: oversize file skipped ----
+
+    #[test]
+    fn oversize_file_is_skipped() {
+        // A minified / bundled file over MAX_FRONTEND_FILE_BYTES must not be
+        // scanned (it would flood phantom calls and waste work).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // One real small file that MUST still be scanned.
+        std::fs::write(src.join("app.ts"), "fetch('/api/real')").unwrap();
+        // One oversize minified blob whose calls must be ignored.
+        let mut big = String::new();
+        big.push_str("fetch('/api/flood');");
+        while (big.len() as u64) <= MAX_FRONTEND_FILE_BYTES {
+            big.push_str("/*pad*/const x=1;");
+        }
+        std::fs::write(src.join("app.min.js"), &big).unwrap();
+
+        let calls = extract_frontend_calls(tmp.path());
+        let p: Vec<&str> = calls.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            p.contains(&"/api/real"),
+            "small file must be scanned: {p:?}"
+        );
+        assert!(
+            !p.contains(&"/api/flood"),
+            "oversize file must be skipped: {p:?}"
+        );
     }
 }

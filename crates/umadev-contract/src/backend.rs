@@ -801,6 +801,14 @@ pub fn route_registered(routes: &[BackendRoute], method: HttpVerb, path: &str) -
 /// unusual input just yields best-effort output, never a panic.
 fn strip_comments(src: &str, lang: Lang) -> String {
     let hash_line = matches!(lang, Lang::Py);
+    // Rust `'` is a lifetime tick (`&'a`, `'_`, `'static`) far more often than
+    // a char-literal delimiter, and a lifetime is a LONE `'` with no closer.
+    // Treating it as a string open leaves `quote` stuck (often to EOF), and
+    // while a quote is open no `//` comment is stripped — so a commented-out
+    // `.route("/api/old", get(old))` after a `&'static str` survives and is
+    // falsely extracted as an implemented route (a false acceptance PASS). See
+    // `rust_char_literal_len`.
+    let rust = matches!(lang, Lang::Rust);
     let chars: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
     let mut i = 0;
@@ -856,6 +864,21 @@ fn strip_comments(src: &str, lang: Lang) -> String {
             out.push(' ');
             continue;
         }
+        // Rust: do NOT treat `'` as a string delimiter (`"` / backtick still
+        // cover real Rust strings). Consume a *balanced* char literal
+        // (`'x'`, `'\n'`, `'\u{..}'`) verbatim so an inner `"` / `/` can't open
+        // a string or comment; a lone tick (a lifetime) is emitted as an
+        // ordinary char and never opens a quote.
+        if rust && c == '\'' {
+            if let Some(consumed) = rust_char_literal_len(&chars, i) {
+                out.extend(chars[i..i + consumed].iter().copied());
+                i += consumed;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+            continue;
+        }
         if c == '"' || c == '\'' || c == '`' {
             quote = Some(c);
         }
@@ -863,6 +886,62 @@ fn strip_comments(src: &str, lang: Lang) -> String {
         i += 1;
     }
     out
+}
+
+/// If `chars[i]` (which must be `'`) begins a Rust **char literal**
+/// (`'x'`, `'\n'`, `'\''`, `'\\'`, `'\u{1F600}'`), return its length in
+/// `char`s including both quotes; otherwise `None`.
+///
+/// A `None` result means the `'` is a **lifetime** tick (`'a`, `'_`,
+/// `'static`) — a lone `'` that must NOT be treated as a string delimiter (it
+/// has no closer, so opening a quote there gets stuck open and stops comment
+/// stripping). Bounded: never scans past a short fixed window, never panics on
+/// truncated input (a dangling `'` at EOF simply returns `None`).
+fn rust_char_literal_len(chars: &[char], i: usize) -> Option<usize> {
+    // chars[i] == '\''.
+    let c1 = *chars.get(i + 1)?;
+    if c1 == '\\' {
+        // Escaped char literal.
+        let c2 = *chars.get(i + 2)?;
+        if c2 == 'u' {
+            // Unicode escape `'\u{XXXX}'`: require the brace group then a close.
+            if chars.get(i + 3) != Some(&'{') {
+                return None;
+            }
+            // Up to 6 hex digits fit in a `char`; scan a bounded window for `}`.
+            let cap = (i + 4 + 8).min(chars.len());
+            let mut j = i + 4;
+            while j < cap {
+                if chars[j] == '}' {
+                    return (chars.get(j + 1) == Some(&'\'')).then_some(j + 2 - i);
+                }
+                j += 1;
+            }
+            None
+        } else {
+            // Simple escape `'\n'` → `'` `\` c2 `'`.
+            (chars.get(i + 3) == Some(&'\'')).then_some(4)
+        }
+    } else if c1 == '\'' {
+        // `''` is not a valid char literal (and not a lifetime) — leave the
+        // first tick as an ordinary char.
+        None
+    } else {
+        // Plain char literal `'x'` → `'` c1 `'`. A lifetime `'a` has a
+        // non-quote char after the name (`,`, `>`, ` `, `:`), so it fails here
+        // and the tick is emitted as an ordinary char.
+        (chars.get(i + 2) == Some(&'\'')).then_some(3)
+    }
+}
+
+/// Strip line + block comments from JS/TS source (`//`, `/* */`, string- and
+/// template-literal aware). A thin wrapper over [`strip_comments`] so the
+/// frontend call extractor ([`crate::extract`]) can drop commented-out
+/// `fetch`/`axios` call-sites before running its regexes — without which a
+/// `// fetch('/api/deprecated')` becomes a phantom `UndeclaredCall`, the
+/// frontend mirror of the backend false-PASS this module fixes.
+pub(crate) fn strip_comments_jsts(src: &str) -> String {
+    strip_comments(src, Lang::JsTs)
 }
 
 /// Recursively collect backend source files (bounded by depth + count; skips
@@ -1057,6 +1136,103 @@ mod tests {
             Lang::Rust,
         );
         assert!(paths(&routes).contains(&(Some(HttpVerb::Get), "/api/ping")));
+    }
+
+    #[test]
+    fn rust_lifetime_does_not_swallow_commented_route() {
+        // Finding B: a Rust lifetime `&'static str` is a LONE `'`. If it were
+        // treated as a string open, the quote would get stuck to EOF and stop
+        // comment stripping, so the commented-out `.route(...)` below would be
+        // extracted → a commented endpoint reported as IMPLEMENTED (false PASS).
+        let src = "const NAME: &'static str = \"x\";\n\
+                   // let app = Router::new().route(\"/api/old\", get(old));\n\
+                   let app = Router::new().route(\"/api/real\", get(real));";
+        let routes = extract_from_file("main.rs", src, Lang::Rust);
+        let p = paths(&routes);
+        assert!(
+            p.contains(&(Some(HttpVerb::Get), "/api/real")),
+            "the real route must still register: {p:?}"
+        );
+        assert!(
+            !p.iter().any(|(_, path)| *path == "/api/old"),
+            "the commented-out route must NOT be extracted: {p:?}"
+        );
+    }
+
+    #[test]
+    fn rust_generic_lifetime_and_anon_lifetime_do_not_stick() {
+        // `<'a>` and `'_` are lifetimes (lone ticks); a `//` comment AFTER them
+        // must still be stripped.
+        let src = "struct S<'a> { r: &'a str, m: PhantomData<'_> }\n\
+                   // app has .route(\"/api/ghost\", get(g))\n\
+                   fn build<'a>() { Router::new().route(\"/api/keep\", post(k)); }";
+        let routes = extract_from_file("s.rs", src, Lang::Rust);
+        let p = paths(&routes);
+        assert!(
+            p.contains(&(Some(HttpVerb::Post), "/api/keep")),
+            "route after lifetimes must register: {p:?}"
+        );
+        assert!(
+            !p.iter().any(|(_, path)| *path == "/api/ghost"),
+            "commented route must not survive: {p:?}"
+        );
+    }
+
+    #[test]
+    fn rust_char_literal_with_quote_does_not_open_string() {
+        // A char literal `'"'` contains a `"`. It must be consumed as a literal
+        // so the inner `"` does NOT open a string that swallows a following
+        // `//` comment (which would leak the commented route below).
+        let src = "let q = '\"';\n\
+                   // Router::new().route(\"/api/hidden\", get(h));\n\
+                   Router::new().route(\"/api/shown\", get(s));";
+        let routes = extract_from_file("q.rs", src, Lang::Rust);
+        let p = paths(&routes);
+        assert!(
+            p.contains(&(Some(HttpVerb::Get), "/api/shown")),
+            "route after char literal must register: {p:?}"
+        );
+        assert!(
+            !p.iter().any(|(_, path)| *path == "/api/hidden"),
+            "commented route after a '\"' char literal must not survive: {p:?}"
+        );
+    }
+
+    #[test]
+    fn rust_char_literal_len_recognises_forms() {
+        // Positive: real char literals report their full length.
+        let cases = [("'x'", 3usize), ("'\\n'", 4), ("'\\''", 4), ("'\\\\'", 4)];
+        for (lit, want) in cases {
+            let chars: Vec<char> = lit.chars().collect();
+            assert_eq!(
+                rust_char_literal_len(&chars, 0),
+                Some(want),
+                "char literal {lit:?} should consume {want}"
+            );
+        }
+        // Unicode escape.
+        let u: Vec<char> = "'\\u{1F600}'".chars().collect();
+        assert_eq!(rust_char_literal_len(&u, 0), Some(u.len()));
+        // Negative: lifetimes are lone ticks, not char literals.
+        for life in ["'a", "'_", "'static", "'a,", "'a>"] {
+            let chars: Vec<char> = life.chars().collect();
+            assert_eq!(
+                rust_char_literal_len(&chars, 0),
+                None,
+                "lifetime {life:?} must not read as a char literal"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_string_double_slash_still_preserved() {
+        // Regression guard: `"` is STILL a Rust string delimiter, so a `//`
+        // inside a string literal must not be stripped as a comment.
+        let stripped = strip_comments("let u = \"http://x/y\"; foo();", Lang::Rust);
+        assert!(
+            stripped.contains("http://x/y"),
+            "rust string // preserved: {stripped}"
+        );
     }
 
     // ---- Go ----
