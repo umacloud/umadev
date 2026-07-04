@@ -2742,6 +2742,66 @@ async fn drive_director_run(
     Ok(DirectorOutcome::Done)
 }
 
+/// Decide whether to publish the `.umadevrc` `[codex] sandbox_mode` into the
+/// codex driver's shared override, and to what. Mirrors the TUI's
+/// `resolve_and_publish_codex_sandbox` precedence: an override already in effect
+/// (seeded from an external `UMADEV_CODEX_SANDBOX` launch env, or set earlier)
+/// wins and is NOT clobbered (`None`); otherwise the project's `.umadevrc` choice
+/// is resolved (fail-open → `workspace-write`) and returned so the caller
+/// publishes it. Pure + unit-testable: reads no process-global state and writes
+/// none.
+fn codex_sandbox_to_publish(
+    existing_override: Option<String>,
+    project_root: &std::path::Path,
+) -> Option<umadev_agent::config::CodexSandbox> {
+    if let Some(v) = existing_override {
+        if !v.trim().is_empty() {
+            return None;
+        }
+    }
+    Some(
+        umadev_agent::config::load_project_config(project_root)
+            .codex
+            .resolved_sandbox(),
+    )
+}
+
+/// Publish the project's `.umadevrc` `[codex] sandbox_mode` into the codex
+/// driver's thread-safe shared override so a HEADLESS `umadev run/quick/continue
+/// --backend codex` honours the user's sandbox choice — the SAME shared setter the
+/// TUI publishes through (`resolve_and_publish_codex_sandbox` →
+/// `umadev_host::codex_session::set_codex_sandbox`). Without this the CLI silently
+/// ignored `.umadevrc` `[codex] sandbox_mode` (it only took effect in the TUI, so
+/// e.g. a `danger-full-access` project could never boot its dev server headless).
+/// Fail-open: no `.umadevrc` / no `[codex]` section → the safe `workspace-write`
+/// default (today's behaviour); an external launch override already in effect is
+/// respected, never clobbered.
+fn publish_codex_sandbox_from_rc(project_root: &std::path::Path) {
+    let existing = umadev_host::codex_session::codex_sandbox_override();
+    if let Some(mode) = codex_sandbox_to_publish(existing, project_root) {
+        umadev_host::codex_session::set_codex_sandbox(Some(mode.as_codex_arg()));
+    }
+}
+
+/// Emit a one-time, LOUD warning when the project's `.umadevrc` sets a non-empty
+/// `[model] provider` — a value UmaDev deliberately IGNORES. UmaDev owns no model
+/// endpoint and does not route models: the base CLI's own login/config decides
+/// which model runs. Without this warning a mis-set provider silently does
+/// nothing ("I configured a model but it didn't take effect"). Fail-open: a
+/// config read error yields the default (no provider → silent). Printed at most
+/// once per process invocation, so it is inherently one-time.
+fn warn_if_model_provider_ignored(project_root: &std::path::Path) {
+    let cfg = umadev_agent::config::load_project_config(project_root);
+    if let Some(provider) = cfg.model.ignored_provider() {
+        eprintln!(
+            "  [config] .umadevrc [model] provider = {provider:?} is IGNORED — UmaDev owns \
+             no model endpoint and does not route models; the base CLI's own login/config \
+             decides which model runs. Configure the model in your base CLI (claude-code / \
+             codex / opencode), or remove [model] from .umadevrc to silence this."
+        );
+    }
+}
+
 async fn cmd_run(args: RunArgs) -> Result<()> {
     // Reject an empty / whitespace-only requirement up front with a helpful
     // message, rather than running the whole pipeline on nothing.
@@ -2752,6 +2812,8 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
+    // A dead `[model] provider` fails LOUD, not silent (UmaDev routes no models).
+    warn_if_model_provider_ignored(&project_root);
     let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
     let opts = RunOptions {
         project_root: project_root.clone(),
@@ -2782,6 +2844,13 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         // relative to its cwd, which differs from the launching cwd whenever
         // `--project-root` points elsewhere.
         driver.set_workspace(project_root.clone());
+        // Headless parity with the TUI: publish `.umadevrc` `[codex] sandbox_mode`
+        // into the codex driver's shared override BEFORE the continuous session is
+        // built, so `--backend codex` honours the user's sandbox choice instead of
+        // silently ignoring it. No-op for the other bases (only codex reads it).
+        if backend.id() == "codex" {
+            publish_codex_sandbox_from_rc(&project_root);
+        }
         // Long-session model: pin a fresh session id + enable continuation so the
         // base reuses ONE session across this run's serial phases instead of a
         // fresh, context-re-feeding `--print` process per phase. The first call
@@ -3052,6 +3121,8 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
+    // A dead `[model] provider` fails LOUD, not silent (UmaDev routes no models).
+    warn_if_model_provider_ignored(&project_root);
     let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
     let opts = RunOptions {
         project_root: project_root.clone(),
@@ -3106,6 +3177,12 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
             umadev_host::ProbeResult::Unhealthy { detail } => {
                 anyhow::bail!("backend `{}` is unhealthy: {detail}", backend.id());
             }
+        }
+        // Headless parity with the TUI: publish `.umadevrc` `[codex] sandbox_mode`
+        // into the codex driver's shared override so `--backend codex` honours the
+        // user's sandbox choice. No-op for the other bases (only codex reads it).
+        if backend.id() == "codex" {
+            publish_codex_sandbox_from_rc(&project_root);
         }
         let label = format!(
             "Base CLI worker — {} ({}) · lightweight track",
@@ -3562,6 +3639,13 @@ async fn drive_gate_block(
         let mut driver = umadev_host::driver_for(backend.id())
             .ok_or_else(|| anyhow::anyhow!("no driver registered for `{}`", backend.id()))?;
         driver.set_workspace(project_root.to_path_buf());
+        // Headless parity with the TUI: publish `.umadevrc` `[codex] sandbox_mode`
+        // into the codex driver's shared override BEFORE a continuous resume, so a
+        // `--backend codex` continue/revise honours the user's sandbox choice.
+        // No-op for the other bases (only codex reads it).
+        if backend.id() == "codex" {
+            publish_codex_sandbox_from_rc(project_root);
+        }
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
@@ -3710,6 +3794,8 @@ async fn cmd_continue(
     backend_override: Option<BackendArg>,
 ) -> Result<()> {
     let project_root = resolve_root(project_root)?;
+    // A dead `[model] provider` fails LOUD, not silent (UmaDev routes no models).
+    warn_if_model_provider_ignored(&project_root);
     let state = match umadev_agent::read_workflow_state_diagnostic(&project_root) {
         umadev_agent::ReadState::Ok(s) => s,
         umadev_agent::ReadState::Missing => {
@@ -5255,6 +5341,98 @@ mod tests {
         // Fail-open on empty firmware.
         assert_eq!(prepend_firmware("", "GOAL".to_string()), "GOAL");
         assert_eq!(prepend_firmware("   ", "GOAL".to_string()), "GOAL");
+    }
+
+    #[test]
+    fn codex_sandbox_to_publish_reads_umadevrc_when_no_override() {
+        // No override in effect → the headless run path publishes the `.umadevrc`
+        // `[codex] sandbox_mode` (the P2 fix: the CLI no longer ignores it).
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"danger-full-access\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_sandbox_to_publish(None, tmp.path()),
+            Some(umadev_agent::config::CodexSandbox::DangerFullAccess),
+        );
+    }
+
+    #[test]
+    fn codex_sandbox_to_publish_respects_existing_override() {
+        // An override already in effect (an external `UMADEV_CODEX_SANDBOX` launch
+        // env, or a `/sandbox` set) wins and is NOT clobbered by `.umadevrc`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"danger-full-access\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            codex_sandbox_to_publish(Some("read-only".to_string()), tmp.path()),
+            None,
+        );
+    }
+
+    #[test]
+    fn codex_sandbox_to_publish_defaults_when_no_config() {
+        // No `.umadevrc` at all → the safe `workspace-write` baseline (fail-open,
+        // today's default behaviour unchanged).
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            codex_sandbox_to_publish(None, tmp.path()),
+            Some(umadev_agent::config::CodexSandbox::WorkspaceWrite),
+        );
+    }
+
+    #[test]
+    fn publish_codex_sandbox_from_rc_sets_shared_override() {
+        // End-to-end seam: publishing writes the codex driver's THREAD-SAFE shared
+        // override (the same one the TUI writes + the codex session reads). Save /
+        // restore the process-global so this stays the only global-mutating test.
+        let prev = umadev_host::codex_session::codex_sandbox_override();
+        umadev_host::codex_session::set_codex_sandbox(None);
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"danger-full-access\"\n",
+        )
+        .unwrap();
+        publish_codex_sandbox_from_rc(tmp.path());
+        assert_eq!(
+            umadev_host::codex_session::codex_sandbox_override().as_deref(),
+            Some("danger-full-access"),
+            "the headless run path must publish the .umadevrc codex sandbox"
+        );
+        umadev_host::codex_session::set_codex_sandbox(prev.as_deref());
+    }
+
+    #[test]
+    fn model_provider_ignored_warning_seam() {
+        // A non-empty `[model] provider` is surfaced as IGNORED so the run warns
+        // loudly (UmaDev routes no models — the base decides); empty / absent
+        // stays silent so the common case prints nothing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[model]\nprovider = \"deepseek\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            umadev_agent::config::load_project_config(tmp.path())
+                .model
+                .ignored_provider(),
+            Some("deepseek"),
+        );
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp2.path().join(".umadevrc"), "[quality]\nthreshold = 80\n").unwrap();
+        assert_eq!(
+            umadev_agent::config::load_project_config(tmp2.path())
+                .model
+                .ignored_provider(),
+            None,
+        );
     }
 
     #[tokio::test]

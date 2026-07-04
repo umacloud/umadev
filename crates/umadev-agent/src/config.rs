@@ -23,10 +23,13 @@
 //! top_k = 6                            # chunks injected per phase
 //!
 //! [model]
-//! provider = "deepseek"                # use this named provider (defined in
-//!                                       # ~/.umadev/config.toml) instead of
-//!                                       # the global default. Empty = disable
-//!                                       # any custom provider for this project.
+//! # DEPRECATED / UNUSED — UmaDev does NOT route models. UmaDev owns no model
+//! # endpoint; the base CLI's OWN login/config (claude-code / codex / opencode)
+//! # is the sole authority for which model runs. A non-empty `provider` here is
+//! # IGNORED, and the run prints a one-time "ignored" warning so it fails loud
+//! # rather than silently doing nothing. To use a different model, configure it
+//! # in your base CLI, not here. Kept only so an older `.umadevrc` still parses.
+//! provider = ""                        # ignored — configure the model in the base CLI
 //!
 //! [codex]
 //! sandbox_mode = "workspace-write"     # codex launch sandbox: read-only |
@@ -145,20 +148,42 @@ pub struct ExpertsConfig {
     pub custom_knowledge: Option<String>,
 }
 
-/// Custom-model (API provider) overrides.
+/// **DEPRECATED / UNUSED** custom-model (API provider) override.
 ///
-/// A project can pin which named provider (defined in the user's
-/// `~/.umadev/config.toml`) runs this project's pipeline. This lets one
-/// machine use different models for different projects — e.g. a cheap model
-/// for throwaway experiments, a strong one for the production repo.
+/// UmaDev deliberately owns NO model endpoint and does NOT route models: the
+/// base CLI's own login/config (claude-code / codex / opencode) is the sole
+/// authority for which model runs. This section is therefore **not consumed by
+/// the run path** — the run always drives the base on the base's own model. It
+/// is retained ONLY so an older `.umadevrc` that sets `[model] provider` still
+/// parses; a non-empty value is IGNORED, and the run surfaces a one-time
+/// "ignored" warning (see [`ModelConfig::ignored_provider`]) so a mis-set
+/// provider fails LOUD rather than silently doing nothing. To change the model,
+/// configure it in the base CLI, not here.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelConfig {
-    /// Name of the provider to use for this project, overriding the global
-    /// `default_provider`. An empty string means "explicitly use no custom
-    /// provider" (fall back to host CLI / offline). `None` (field absent)
-    /// means "no opinion — use the global setting."
+    /// **Unused / deprecated.** The named provider a project once pinned. UmaDev
+    /// does not route models, so this is never consumed — the base CLI decides.
+    /// `Some(non-empty)` triggers the one-time "ignored" run warning; `Some("")`
+    /// / `None` (field absent) stay silent (the common case). Kept for
+    /// backward-compatible parsing only.
     #[serde(default)]
     pub provider: Option<String>,
+}
+
+impl ModelConfig {
+    /// The configured provider name IF the user set a non-empty one — a value
+    /// UmaDev deliberately **IGNORES** (it owns no model endpoint; the base CLI's
+    /// own login/config is authoritative). `None` when unset or explicitly empty
+    /// (incl. whitespace-only), so the common case stays silent. The run path
+    /// surfaces a one-time "ignored" warning when this is `Some`, so a mis-set
+    /// provider fails LOUD instead of silently doing nothing.
+    #[must_use]
+    pub fn ignored_provider(&self) -> Option<&str> {
+        self.provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+    }
 }
 
 /// Codex base launch-sandbox customization (`.umadevrc` `[codex]` section).
@@ -612,6 +637,37 @@ mod tests {
         std::fs::write(tmp.path().join(".umadevrc"), "[quality]\nthreshold = 80\n").unwrap();
         let cfg = load_project_config(tmp.path());
         assert!(cfg.model.provider.is_none());
+    }
+
+    #[test]
+    fn model_provider_non_empty_is_reported_ignored() {
+        // A user who set `[model] provider` gets it surfaced as IGNORED so the
+        // run can warn loudly (UmaDev does not route models — the base decides).
+        let cfg = ModelConfig {
+            provider: Some("deepseek".to_string()),
+        };
+        assert_eq!(cfg.ignored_provider(), Some("deepseek"));
+    }
+
+    #[test]
+    fn model_provider_empty_or_absent_stays_silent() {
+        // Empty / whitespace-only / absent are the common cases and MUST stay
+        // silent (no spurious warning).
+        assert_eq!(
+            ModelConfig {
+                provider: Some(String::new())
+            }
+            .ignored_provider(),
+            None
+        );
+        assert_eq!(
+            ModelConfig {
+                provider: Some("   ".to_string())
+            }
+            .ignored_provider(),
+            None
+        );
+        assert_eq!(ModelConfig::default().ignored_provider(), None);
     }
 
     #[test]
