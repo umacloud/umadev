@@ -39,9 +39,9 @@ The main `umadev` package lists all five platform packages under
 
 1. Tries to install every `optionalDependency`.
 2. Silently skips any whose `os` / `cpu` does not match the current host.
-3. Ends up installing only the matching `@umadev/cli-<platform>`.
+3. Ends up installing only the matching `@umacloud/cli-<platform>`.
 
-The JS shim then uses `require.resolve('@umadev/cli-<platform>/bin/umadev')`
+The JS shim then uses `require.resolve('@umacloud/cli-<platform>/bin/umadev')`
 to locate the binary and `child_process.spawnSync` to exec it with the
 user's argv. `stdio: 'inherit'` preserves the TTY so the ratatui UI
 works.
@@ -50,7 +50,7 @@ works.
 
 1. CI builds `umadev` for each target (see `.github/workflows/release.yml`).
 2. For each target the CI calls `npm/scripts/stage.sh <platform> <binary>`.
-3. `npm/scripts/publish.sh` publishes every platform package (`@umadev/cli-*`)
+3. `npm/scripts/publish.sh` publishes every platform package (`@umacloud/cli-*`)
    first, then the main `umadev` package last so its
    `optionalDependencies` resolve cleanly.
 

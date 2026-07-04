@@ -664,15 +664,28 @@ shipped for them.
 
 ### 7.2 Reference surface inventory
 
-| Surface | Claude Code | Codex CLI / Desktop |
-|---|---|---|
-| Persistent rules | `.claude/skills/umadev/SKILL.md`, `CLAUDE.md` | `AGENTS.md`, `skills/umadev/SKILL.md` |
-| Slash command | `commands/umadev.md` | (host-defined; AGENTS.md guidance) |
-| Pre-write hook | `hooks.PreToolUse` matcher `Write\|Edit` | `[[hooks.PreToolUse]]` in `.codex/config.toml` |
-| Post-write hook | `hooks.PostToolUse` matcher `Write\|Edit` | `[[hooks.PostToolUse]]` in `.codex/config.toml` |
-| Prompt hook | `hooks.UserPromptSubmit` | `[[hooks.UserPromptSubmit]]` |
-| Artifact dir | workspace `output/` | workspace `output/` |
-| Evidence dir | workspace `.umadev/audit/` | same |
+Only **Claude Code** exposes a tool-lifecycle hook surface
+(`hooks.PreToolUse` / `hooks.PostToolUse`). Codex and OpenCode have **no such
+hook** — the reference implementation does NOT invent a `.codex/config.toml`
+(or opencode) hook for them. For those two bases the SAME governance effect is
+delivered runner-side: UmaDev's own runner scans each write before it is
+applied and records the audit trail as it streams the base's tool-use events
+(`umadev_agent::continuous::govern_tool_call`,
+`director_loop::record_tool_call_audit`), and the firmware reaches the base via
+the first-directive prefix / `AGENTS.md` rather than a native system-prompt
+hook. The clause *effect* is preserved on all three; only the delivery pipe
+differs (this is the §7.4 degradation in practice).
+
+| Surface | Claude Code | Codex CLI | OpenCode |
+|---|---|---|---|
+| Persistent rules | `.claude/skills/umadev/SKILL.md`, `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` |
+| Slash command | `commands/umadev.md` | (host-defined; AGENTS.md guidance) | (host-defined; AGENTS.md guidance) |
+| Firmware injection | native `--append-system-prompt` | first-directive prefix (no native slot) | first-directive prefix (no native slot) |
+| Pre-write governance | `hooks.PreToolUse` matcher `Write\|Edit` | runner-side pre-apply scan (no host hook) | runner-side pre-apply scan (no host hook) |
+| Post-write audit | `hooks.PostToolUse` matcher `Write\|Edit` | runner-side tool-use stream (no host hook) | runner-side tool-use stream (no host hook) |
+| Prompt-time context | `hooks.UserPromptSubmit` | runner-side per-turn injection | runner-side per-turn injection |
+| Artifact dir | workspace `output/` | workspace `output/` | workspace `output/` |
+| Evidence dir | workspace `.umadev/audit/` | same | same |
 
 ### 7.3 Reference clause → hook command
 

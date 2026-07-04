@@ -326,7 +326,7 @@ Tool calls, verification runs, and critic verdicts are written to `.umadev/audit
 
 **4. Governance runs on every file write**
 
-~112 rules check for emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook into Claude Code, as a pre-commit hook in git, and as part of the quality gate. All rules are configurable in `.umadev/rules.toml` and are fail-open — a bug in the governor never blocks your work.
+~112 rules check for emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook into Claude Code, as a pre-commit hook in git, and as part of the quality gate. At write time only the irreversible floor (leaked secrets / credentials, sensitive-path writes, destructive shell) is hard-blocked; craft and quality findings (emoji, color, AI-slop) are flagged and repaired by the post-write QC loop rather than pinning the base's hands mid-file. All rules are configurable in `.umadev/rules.toml` and are fail-open — a bug in the governor never blocks your work.
 
 ---
 
@@ -342,9 +342,9 @@ Tool calls, verification runs, and critic verdicts are written to `.umadev/audit
 
 ### The base brings its own model — umadev has none
 
-umadev connects to no model API and stores no credentials of its own. The base uses its own configured model — your logged-in subscription, or whatever third-party / local model you routed through the base. By default umadev passes no `--model` flag; the base runs on its own configuration. To override, set `model` in `~/.umadev/config.toml` or pass `umadev run --model <id>`; otherwise change the model in the base's own config. The TUI `/model` command does not switch anything — it just shows where the model lives, because UmaDev never imposes one.
+umadev connects to no model API and stores no credentials of its own. The base uses its own configured model — your logged-in subscription, or whatever third-party / local model you routed through the base. umadev passes no `--model` flag and owns no model of its own: to change the model, change it in the base's own config. There is deliberately **no `/model` command and no `umadev run --model`** — UmaDev never imposes a model.
 
-umadev reads and surfaces the base's current model and reasoning effort in `/status` — it reads `~/.claude/settings.json` for Claude Code, `~/.codex/config.toml` for Codex, and `opencode.json` for OpenCode — but never overrides those values unless you explicitly ask it to.
+umadev reads and surfaces the base's model and reasoning effort where the base exposes them — it reads `~/.claude/settings.json` for Claude Code, `~/.codex/config.toml` for Codex, and `opencode.json` for OpenCode — but never overrides those values. In practice a Claude Code continuous session reports the exact resolved model most reliably (the base emits it on session start); other bases may only show what their config pins. The context-window gauge shows a real model **name** always, but a numeric window only when the base's own config exposes an exact one — UmaDev never guesses a window from a model-name table (it would drift, and a base can route to a third-party / local model whose real window UmaDev can't read).
 
 Wider model coverage means routing the base to a third-party or local model. That is the base's job. umadev does not add new base drivers for that.
 
@@ -559,8 +559,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 |---|---|
 | `/claude` · `/codex` · `/opencode` | Switch the base being driven (saved to `~/.umadev/config.toml`) |
 | `/offline` | Switch to deterministic offline templates (demo / CI, no network) |
-| `/status` | Active base, its current model, and reasoning effort (read from the base's own config) |
-| `/model [id]` | Show where the model lives — the base owns it; UmaDev imposes none (set `model` in config or `run --model` to override) |
+| `/status` | Active base, its model, and reasoning effort where the base exposes them (read-only; UmaDev never sets a model) |
 | `/sandbox [tier]` | View / change the Codex base's launch sandbox (`read-only` · `workspace-write` · `danger-full-access`) |
 
 **Drive the flow**
@@ -722,9 +721,8 @@ User config:
 # ~/.umadev/config.toml
 backend = "claude-code"
 lang = "en"
-# model is empty by default — the base uses its own configured model.
-# Set it here (or pass `umadev run --model <id>`) only to override.
-# model = "opus"
+# umadev owns no model — the base runs on its own configured model.
+# To change the model, change it in the base's own config (not here).
 ```
 
 Project config:

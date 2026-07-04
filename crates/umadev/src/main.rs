@@ -1044,13 +1044,20 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("[ok] Installed UmaDev PreToolUse hook for Claude Code.");
                 println!("  → {}", path.display());
                 println!();
-                println!("Every Write/Edit tool call will now be checked for:");
+                println!("Every Write/Edit tool call is checked. Only the irreversible-if-written");
+                println!("floor is HARD-BLOCKED at write time:");
+                println!("  • hardcoded secrets / credentials in source  (UD-SEC-001)");
+                println!(
+                    "  • sensitive-path writes (.git/.env/.ssh)     (UD-SEC-001) — bypass-immune"
+                );
+                println!();
+                println!(
+                    "Craft / quality findings are FLAGGED, not blocked — they are repaired by"
+                );
+                println!("the post-write QC loop so a single nit never stops the base mid-write:");
                 println!("  • emoji-as-functional-icons (UD-CODE-001)");
                 println!("  • hardcoded color literals   (UD-CODE-002)");
                 println!("  • AI-slop / placeholders     (UD-CODE-002)");
-                println!(
-                    "  • sensitive-path writes      (UD-SEC-001) — .git/.env/.ssh bypass-immune"
-                );
                 println!();
                 println!("A PostToolUse audit hook also records every executed Write/Edit/Bash");
                 println!(
@@ -1443,12 +1450,18 @@ fn cmd_ci(report_only: bool, changed_only: bool, project_root: Option<PathBuf>) 
 
 /// The marker the pre-commit hook uses to identify itself (so uninstall is safe).
 const PRE_COMMIT_MARKER: &str = "# umadev pre-commit governance hook";
+/// Closing marker of the UmaDev block, so uninstall can strip exactly our lines
+/// even when they sit ABOVE the user's own hook (we prepend, not append).
+const PRE_COMMIT_END_MARKER: &str = "# end umadev pre-commit governance hook";
 
 /// Write the `umadev ci` pre-commit git hook into `.git/hooks/pre-commit`.
 /// Idempotent — if a UmaDev hook is already present, it's a no-op. A
-/// pre-existing non-UmaDev pre-commit hook is PRESERVED: our check is
-/// appended below it (it runs first, then ours), so the user's existing commit
-/// checks are never disabled.
+/// pre-existing non-UmaDev pre-commit hook is PRESERVED, and our check is
+/// PREPENDED (immediately after the shebang) so UmaDev governance runs FIRST,
+/// **before** any early `exit`/`exec`/`return` in the user's own hook could
+/// skip it. Appending below the user's hook (the old behaviour) let a user
+/// script that bailed early silence UmaDev entirely — governance that never
+/// runs is worse than no promise of it.
 fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
     let git_dir = project_root.join(".git");
     if !git_dir.exists() {
@@ -1475,14 +1488,23 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
          # Runs `umadev ci --changed-only` on staged files before commit.\n\
          # A governance violation aborts the commit. Remove with:\n\
          #   umadev uninstall --host pre-commit\n\
-         {bin} ci --changed-only\n",
+         {bin} ci --changed-only\n\
+         {end}\n",
         marker = PRE_COMMIT_MARKER,
+        end = PRE_COMMIT_END_MARKER,
     );
-    // Preserve a pre-existing user hook (it ran first) and append our check
-    // below — no clobber, no `.bak`. A fresh hook needs a shebang; the existing
-    // one already has its own.
+    // Preserve a pre-existing user hook but run our check FIRST. If the file has
+    // a shebang, insert our block immediately after it (keeping the user's
+    // interpreter line); otherwise prepend a fresh shebang + our block above the
+    // user's content. Either way UmaDev governance executes before any early
+    // exit/exec in the user's script can skip it. A fresh hook is just shebang +
+    // our block.
     let script = match std::fs::read_to_string(&hook_path) {
-        Ok(existing) => format!("{}\n\n{our_block}", existing.trim_end()),
+        Ok(existing) if existing.starts_with("#!") => {
+            let (shebang, body) = existing.split_once('\n').unwrap_or((existing.as_str(), ""));
+            format!("{shebang}\n{our_block}\n{body}")
+        }
+        Ok(existing) => format!("#!/bin/sh\n{our_block}\n{existing}"),
         Err(_) => format!("#!/bin/sh\n{our_block}"),
     };
     std::fs::write(&hook_path, script)?;
@@ -1502,17 +1524,42 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
 fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
     let hook_path = project_root.join(".git/hooks/pre-commit");
     let content = std::fs::read_to_string(&hook_path).unwrap_or_default();
-    let Some(idx) = content.find(PRE_COMMIT_MARKER) else {
+    let Some(start) = content.find(PRE_COMMIT_MARKER) else {
         return Ok(()); // absent or not ours — nothing to do.
     };
-    // Strip ONLY our appended block (marker -> EOF). Install appended it after any
-    // pre-existing user hook (`{user}\n\n{our_block}`), so everything before the
-    // marker is the user's own hook and MUST be preserved (deleting the whole file
-    // would destroy it). When nothing meaningful remains, we created the file
-    // ourselves (just a `#!/bin/sh` shebang or empty) — remove it cleanly.
-    let kept = content[..idx].trim_end().to_string();
+    // Strip ONLY our own block, keeping everything before AND after it: a current
+    // install PREPENDS the block (so the user's hook is BELOW ours), while an
+    // older UmaDev appended it (user hook ABOVE). Prefer the explicit end marker
+    // to bound our block precisely; fall back to marker -> EOF for the legacy
+    // appended format that predates the end marker. Whatever the layout, the
+    // user's own hook lines are preserved.
+    let end = match content[start..].find(PRE_COMMIT_END_MARKER) {
+        Some(rel) => {
+            let end_marker_pos = start + rel;
+            // Consume through the end-marker's own line terminator.
+            content[end_marker_pos..]
+                .find('\n')
+                .map_or(content.len(), |nl| end_marker_pos + nl + 1)
+        }
+        None => content.len(),
+    };
+    let before = content[..start].trim_end();
+    let after = content[end..].trim();
+    let mut kept = String::new();
+    kept.push_str(before);
+    if !after.is_empty() {
+        if !kept.is_empty() {
+            kept.push('\n');
+        }
+        kept.push_str(after);
+    }
+    let kept = kept.trim().to_string();
+    // When nothing meaningful remains, we created the file ourselves (just a
+    // `#!/bin/sh` shebang or empty) — remove it cleanly.
     if kept.is_empty() || kept == "#!/bin/sh" {
-        std::fs::remove_file(&hook_path)?;
+        if hook_path.exists() {
+            std::fs::remove_file(&hook_path)?;
+        }
     } else {
         std::fs::write(&hook_path, format!("{kept}\n"))?;
         #[cfg(unix)]
@@ -1655,9 +1702,13 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
              - **No secrets in source code** — use environment variables.\n\
              - **Follow the spec preamble** in each coach prompt.\n\n\
              ## Governance\n\n\
-             Your Write/Edit/Bash calls are intercepted by UmaDev's governance hook.\n\
-             Violations are blocked with a specific reason and fix suggestion.\n\
-             Configure: `.umadev/rules.toml`.\n",
+             Your Write/Edit/Bash calls pass through UmaDev's governance hook. It is\n\
+             fail-open: only the irreversible-if-written floor (hardcoded secrets /\n\
+             credentials, sensitive-path writes to .git/.env/.ssh, destructive shell)\n\
+             is HARD-BLOCKED at write time. Craft / quality findings (emoji-as-icons,\n\
+             hardcoded colors, AI-slop) are FLAGGED and repaired by the post-write QC\n\
+             loop — never hard-blocked mid-write, so a single nit can't stop you from\n\
+             finishing the file. Configure: `.umadev/rules.toml`.\n",
             version = env!("CARGO_PKG_VERSION"),
         );
         let _ = std::fs::write(&claude_md, claude_content);
@@ -4922,6 +4973,75 @@ mod tests {
             !resolved.as_os_str().is_empty(),
             "fallback must yield a usable path, never panic"
         );
+    }
+
+    #[test]
+    fn pre_commit_hook_runs_umadev_first_even_with_user_early_exit() {
+        // A user's existing hook that bails early must NOT be able to skip
+        // UmaDev governance: we PREPEND our check so it runs before any early
+        // exit in the user's script.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let user_hook = "#!/bin/sh\nexit 0  # user bails before anything else\necho never\n";
+        let hook_path = hooks.join("pre-commit");
+        std::fs::write(&hook_path, user_hook).unwrap();
+
+        install_pre_commit_hook(root).unwrap();
+        let after = std::fs::read_to_string(&hook_path).unwrap();
+
+        // Our block is present, and it sits ABOVE the user's `exit 0` so it
+        // executes first regardless of the early exit.
+        let our_pos = after
+            .find("ci --changed-only")
+            .expect("umadev block present");
+        let exit_pos = after.find("exit 0").expect("user hook preserved");
+        assert!(
+            our_pos < exit_pos,
+            "UmaDev check must run BEFORE the user's early exit, got:\n{after}"
+        );
+        // The user's own line survives (non-destructive).
+        assert!(after.contains("echo never"), "user hook body preserved");
+        // Exactly one shebang, and it's still the first line.
+        assert!(after.starts_with("#!/bin/sh"), "shebang stays on line 1");
+        assert_eq!(
+            after.matches("#!/bin/sh").count(),
+            1,
+            "no duplicate shebang"
+        );
+
+        // Idempotent: a second install does not double-add the block.
+        install_pre_commit_hook(root).unwrap();
+        let after2 = std::fs::read_to_string(&hook_path).unwrap();
+        assert_eq!(
+            after2.matches(PRE_COMMIT_MARKER).count(),
+            1,
+            "re-install must not duplicate the UmaDev block"
+        );
+
+        // Uninstall strips only our block and preserves the user's hook.
+        uninstall_pre_commit_hook(root).unwrap();
+        let restored = std::fs::read_to_string(&hook_path).unwrap();
+        assert!(!restored.contains(PRE_COMMIT_MARKER), "our block removed");
+        assert!(restored.contains("echo never"), "user hook restored intact");
+        assert!(restored.contains("exit 0"), "user early-exit restored");
+    }
+
+    #[test]
+    fn pre_commit_hook_fresh_install_and_full_uninstall() {
+        // With no pre-existing hook, install creates one and uninstall removes
+        // the file entirely (we own the whole thing).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let hook_path = install_pre_commit_hook(root).unwrap();
+        assert!(hook_path.exists());
+        let body = std::fs::read_to_string(&hook_path).unwrap();
+        assert!(body.starts_with("#!/bin/sh"));
+        assert!(body.contains("ci --changed-only"));
+        uninstall_pre_commit_hook(root).unwrap();
+        assert!(!hook_path.exists(), "a UmaDev-only hook is removed cleanly");
     }
 
     #[test]

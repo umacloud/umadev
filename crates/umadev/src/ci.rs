@@ -176,17 +176,72 @@ impl NpmAuditResult {
     }
 }
 
+/// How long to wait for `npm audit` before giving up. `npm audit` reaches out
+/// to the registry and can stall indefinitely (a hung registry, a proxy, a
+/// broken lockfile). 60s is generous for a real audit yet bounds a stuck one.
+const NPM_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Run `cmd` to completion, capping the wait at `timeout`. Returns
+/// `Ok(Some(stdout))` when the child exits within budget, `Ok(None)` when it
+/// overruns (the child is killed + reaped — fail-open), or `Err(..)` only when
+/// the child can't be spawned or polled.
+///
+/// stdout is drained on a worker thread so a large report can't fill the OS
+/// pipe buffer and deadlock the poll loop; a killed child closes the pipe,
+/// which ends the read, so the thread always terminates.
+fn run_capturing_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut out) = stdout {
+            let _ = out.read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            break; // child exited within budget
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            return Ok(None); // timed out — fail-open (skip)
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(Some(reader.join().unwrap_or_default()))
+}
+
 /// Run `npm audit --json` and count vulnerabilities by severity (UD-SEC-016).
-/// Returns an error only if npm isn't available or the command fails; a
-/// successful run with zero vulns returns an all-zero result.
+/// Returns an error only if npm isn't available or the command can't be
+/// spawned; a successful run with zero vulns returns an all-zero result.
+///
+/// **Bounded + fail-open.** The subprocess is capped at [`NPM_AUDIT_TIMEOUT`];
+/// if it overruns, the child is killed and an all-zero result is returned (the
+/// audit is SKIPPED, never hangs CI).
 fn npm_audit(project_root: &Path) -> std::io::Result<NpmAuditResult> {
-    let output = umadev_host::std_command("npm")
-        .args(["audit", "--json"])
-        .current_dir(project_root)
-        .output()?;
+    let mut cmd = umadev_host::std_command("npm");
+    cmd.args(["audit", "--json"]).current_dir(project_root);
     // npm audit exits non-zero when vulns are found, but stdout still has JSON.
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_npm_audit(&text).map_or(Ok(NpmAuditResult::default()), Ok)
+    match run_capturing_with_timeout(cmd, NPM_AUDIT_TIMEOUT)? {
+        Some(text) => Ok(parse_npm_audit(&text).unwrap_or_default()),
+        None => Ok(NpmAuditResult::default()), // timed out → skip (fail-open)
+    }
 }
 
 /// Parse `npm audit --json` output into a severity-count summary.
@@ -602,5 +657,38 @@ mod tests {
     #[test]
     fn npm_audit_returns_none_on_garbage() {
         assert!(parse_npm_audit("not json").is_none());
+    }
+
+    // --- bounded npm-audit wait (never hangs CI) ------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn capturing_timeout_kills_a_stuck_child_fast() {
+        use std::time::{Duration, Instant};
+        // A child that would run for 10s, capped at 200ms → returns None (skip)
+        // WELL before the child's own runtime, and quickly.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 10");
+        let started = Instant::now();
+        let out = run_capturing_with_timeout(cmd, Duration::from_millis(200)).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            out.is_none(),
+            "an overrunning audit must be skipped, not returned"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the wait must be bounded, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capturing_returns_stdout_when_child_exits_in_time() {
+        use std::time::Duration;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("printf 'hello-audit'");
+        let out = run_capturing_with_timeout(cmd, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.as_deref(), Some("hello-audit"));
     }
 }

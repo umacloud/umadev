@@ -63,7 +63,6 @@ research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_con
 | `/design` | Browse available design systems |
 | `/design <name>` | Select a design system |
 | `/template <name>` | Select a seed template |
-| `/model` | Show where the model lives — the base owns it; UmaDev imposes none |
 
 ### Pipeline
 | Command | Description |
@@ -136,9 +135,8 @@ custom_knowledge = "team-standards/"  # additional knowledge directory
 
 ```toml
 backend = "claude-code"
-# model is empty by default — the base uses its own configured model.
-# Set it (or pass `umadev run --model <id>`) only to override.
-# model = "opus"
+# umadev owns no model — the base runs on its own configured model.
+# To change the model, change it in the base's own config (not here).
 design_system = "modern-minimal"
 seed_template = "dashboard"
 ```

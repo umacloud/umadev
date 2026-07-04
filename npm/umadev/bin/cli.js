@@ -148,6 +148,13 @@ function drawBar(label, got, total, startTime) {
       c('2') + '  ·  ' + mb + '/' + tot + ' MB  ·  ' + spd + c('0') + '   ',
   );
 }
+// Per-attempt idle timeout. Short on purpose: the model is OPTIONAL (RAG works
+// locally via BM25 without it), and a stalled source must fail over to the next
+// base fast instead of making first-run feel hung. A HEALTHY download is never
+// cut off — this is a no-progress (socket-idle) timeout, and the live progress
+// bar keeps ticking while bytes flow. The old 120s made a single dead source
+// block for two minutes, times several bases and files.
+const DOWNLOAD_IDLE_TIMEOUT_MS = 20000;
 // Download one URL to `dest`, following redirects (GitHub → CDN), drawing a
 // progress bar when `withBar`. Resolves on success, rejects on any error.
 function downloadTo(url, dest, withBar, label) {
@@ -210,7 +217,9 @@ function downloadTo(url, dest, withBar, label) {
       },
     );
     req.on('error', reject);
-    req.setTimeout(120000, () => req.destroy(new Error('timeout')));
+    req.setTimeout(DOWNLOAD_IDLE_TIMEOUT_MS, () =>
+      req.destroy(new Error('idle timeout')),
+    );
   });
 }
 // Ordered list of base URLs to try for the model files. An explicit override

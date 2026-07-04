@@ -6,7 +6,7 @@
 # Assumes:
 #   - `stage.sh` has already populated each `npm/cli-<platform>/bin/`
 #     with the matching prebuilt binary.
-#   - `npm whoami` is logged in with publish rights to the `@umadev`
+#   - `npm whoami` is logged in with publish rights to the `@umacloud`
 #     scope and to the `umadev` name.
 #   - All package.json versions are aligned (this script does NOT bump).
 #
@@ -50,15 +50,10 @@ for pkg in "${PLATFORM_PACKAGES[@]}"; do
   (cd "$NPM_ROOT/$pkg" && npm publish --access public $DRY_RUN)
 done
 
-# 2b) Publish the platform-independent model package first (the main
-#     package depends on it, so it must exist on the registry before
-#     the main publish below).
-if [[ -f "$NPM_ROOT/model-e5-small/model.safetensors" ]]; then
-  echo "publish.sh: npm publish model-e5-small..."
-  (cd "$NPM_ROOT/model-e5-small" && npm publish --access public $DRY_RUN) || echo "publish.sh: model-e5-small publish failed (likely > npm size limit) -- skipping (optional)" >&2
-else
-  echo "publish.sh: skipping model-e5-small (weights not fetched)" >&2
-fi
+# 2b) The embedding model is NO LONGER shipped on npm. The ~224MB fp16 model
+#     exceeds npm's package size limit, so the CLI shim fetches it on first
+#     run into ~/.umadev/embed-model (see npm/umadev/bin/cli.js). RAG is local
+#     and fully functional without it (BM25), so nothing to publish here.
 
 # 2c) Publish the knowledge corpus package (main depends on it). Stage the
 #     repo's knowledge/ tree into it first (CI / ephemeral).

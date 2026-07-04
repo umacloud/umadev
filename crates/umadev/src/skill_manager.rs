@@ -2,9 +2,15 @@
 //!
 //! A Skill bundles domain expertise into a single installable unit:
 //! - **Knowledge docs**: copied into the RAG index so the host's research
-//!   and generation phases can cite them.
-//! - **Governance rules**: merged into `.umadev/rules.toml` so the
-//!   governance engine enforces them.
+//!   and generation phases can cite them. The source subpath is PRESERVED so
+//!   same-named files from different subdirs (`a/guide.md` vs `b/guide.md`)
+//!   never clobber each other.
+//! - **Governance rules**: the declared clause ids are merged into
+//!   `.umadev/rules.toml` so the governance engine enforces them — concretely,
+//!   each is removed from the `[disabled]` opt-out list (governance enforces
+//!   every clause by default, so "enable" means "not disabled"). Idempotent +
+//!   fail-open: a missing rules.toml means the clauses are already in force; an
+//!   unparseable one is left untouched.
 //! - **System prompt**: appended to `CLAUDE.md` / coach prompt so the host
 //!   knows about the domain constraints.
 //!
@@ -128,8 +134,12 @@ impl SkillRegistry {
                 continue; // refuse to follow a symlink out of the skill dir
             }
             if meta.file_type().is_file() {
-                let fname = src.file_name().unwrap_or_default();
-                let copy_dst = knowledge_dest.join(fname);
+                // Preserve the manifest-relative subpath — flattening to the
+                // basename let `a/guide.md` and `b/guide.md` silently overwrite
+                // each other. `is_safe_relpath` (above) guarantees `rel_path` is
+                // all-`Normal`, so the join stays under `knowledge_dest`. Mirrors
+                // knowledge_manager's subpath-preserving copy.
+                let copy_dst = knowledge_dest.join(rel_path);
                 std::fs::create_dir_all(copy_dst.parent().unwrap_or(&knowledge_dest))?;
                 std::fs::copy(&src, &copy_dst)?;
                 knowledge_copied += 1;
@@ -169,12 +179,62 @@ impl SkillRegistry {
             }
         };
 
+        // Merge the skill's declared governance clauses into rules.toml so the
+        // engine actually enforces them (honesty fix: the old impl only COUNTED
+        // them). Fail-open — never fails the install.
+        let rules_added = self.merge_skill_rules(&manifest.rules);
+
         Ok(SkillInstallResult {
             name: manifest.name,
             knowledge_copied,
-            rules_added: manifest.rules.len(),
+            rules_added,
             prompt_updated,
         })
+    }
+
+    /// Ensure every governance clause the skill DECLARES is actually enforced by
+    /// the project's `.umadev/rules.toml`: remove each declared clause id from
+    /// the `[disabled]` opt-out list. Governance enforces every clause by
+    /// default, so "enable a clause" concretely means "make sure it isn't
+    /// disabled". Idempotent + fail-open — a missing rules.toml means the clauses
+    /// are already in force (nothing to write); an unparseable file is left
+    /// untouched (governance's own loader already warns and enforces all rules).
+    /// Returns the number of declared clauses now guaranteed enforced.
+    fn merge_skill_rules(&self, clauses: &[String]) -> usize {
+        if clauses.is_empty() {
+            return 0;
+        }
+        let path = self.project_root.join(".umadev").join("rules.toml");
+        // Absent file → every clause is enforced by default; the skill's
+        // declared clauses are already in force.
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return clauses.len();
+        };
+        // Do NOT clobber a file we can't parse — governance's loader falls back
+        // to all-rules-on, which enforces the skill's clauses anyway.
+        let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
+            return clauses.len();
+        };
+        let want: std::collections::HashSet<String> =
+            clauses.iter().map(|c| c.to_ascii_lowercase()).collect();
+        let mut changed = false;
+        if let Some(arr) = doc
+            .get_mut("disabled")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .and_then(|t| t.get_mut("clauses"))
+            .and_then(toml_edit::Item::as_array_mut)
+        {
+            let before = arr.len();
+            arr.retain(|v| {
+                v.as_str()
+                    .is_none_or(|s| !want.contains(&s.to_ascii_lowercase()))
+            });
+            changed = arr.len() != before;
+        }
+        if changed {
+            let _ = atomic_write(&path, &doc.to_string());
+        }
+        clauses.len()
     }
 
     /// List all installed skills.
@@ -443,6 +503,70 @@ mod tests {
         assert!(
             !after.contains("<!-- skill:test-skill -->"),
             "block removed"
+        );
+    }
+
+    #[test]
+    fn install_merges_declared_rules_into_rules_toml() {
+        // The declared clauses must actually be ENFORCED (removed from the
+        // `[disabled]` opt-out list) — not merely counted.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        std::fs::write(
+            tmp.path().join(".umadev/rules.toml"),
+            "[disabled]\nclauses = [\"UD-ARCH-001\", \"UD-ARCH-999\"]\n",
+        )
+        .unwrap();
+        // make_skill_dir declares rules = ["UD-ARCH-001"].
+        let source = make_skill_dir(tmp.path(), "react-pro");
+        let result = registry.install(&source).unwrap();
+        assert_eq!(result.rules_added, 1, "one declared clause merged");
+        let after = std::fs::read_to_string(tmp.path().join(".umadev/rules.toml")).unwrap();
+        assert!(
+            !after.contains("UD-ARCH-001"),
+            "the skill's clause is un-disabled (now enforced): {after}"
+        );
+        assert!(
+            after.contains("UD-ARCH-999"),
+            "an unrelated disabled clause is preserved: {after}"
+        );
+    }
+
+    #[test]
+    fn install_preserves_knowledge_subpaths_no_clobber() {
+        // Two same-named docs in different subdirs must NOT overwrite each other.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        let source = tmp.path().join("multi-skill");
+        std::fs::create_dir_all(source.join("a")).unwrap();
+        std::fs::create_dir_all(source.join("b")).unwrap();
+        std::fs::write(source.join("a/guide.md"), "# A guide").unwrap();
+        std::fs::write(source.join("b/guide.md"), "# B guide").unwrap();
+        let manifest = SkillManifest {
+            name: "multi".into(),
+            description: "two same-named docs".into(),
+            version: "1.0".into(),
+            knowledge: vec!["a/guide.md".into(), "b/guide.md".into()],
+            rules: vec![],
+            system_prompt: String::new(),
+        };
+        std::fs::write(
+            source.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let result = registry.install(&source).unwrap();
+        assert_eq!(result.knowledge_copied, 2);
+        let base = tmp.path().join("knowledge/skills/multi");
+        assert_eq!(
+            std::fs::read_to_string(base.join("a/guide.md")).unwrap(),
+            "# A guide"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("b/guide.md")).unwrap(),
+            "# B guide",
+            "b/guide.md must not be clobbered by a/guide.md"
         );
     }
 
