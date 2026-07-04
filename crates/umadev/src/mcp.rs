@@ -29,7 +29,9 @@ use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 
-use umadev_governance::{check_dangerous_bash, scan_content_with_policy, Policy};
+use umadev_governance::{
+    check_dangerous_bash, pre_write_floor_decision, scan_content_with_policy, Policy,
+};
 
 /// Tool name: govern a file's proposed content.
 const TOOL_GOVERN_FILE: &str = "govern_file";
@@ -105,11 +107,27 @@ fn serve_io<R: BufRead, W: Write>(reader: &mut R, out: &mut W, policy: &Policy) 
             writeln!(out, "{serialized}")?;
             out.flush()?;
         }
+        // A `shutdown` request ends the loop AFTER its response is written, so a
+        // client blocked on the reply gets it and the server then exits cleanly.
+        // Before, the shutdown branch returned a response but the loop never broke,
+        // so the server hung until stdin EOF and a waiting client stalled. Checked
+        // on the raw line (independent of the response) so a shutdown NOTIFICATION
+        // (no `id`, no response) still ends the loop.
+        if is_shutdown_request(line) {
+            break;
+        }
         if hit_cap {
             drain_to_newline(reader);
         }
     }
     Ok(())
+}
+
+/// Is this input line a JSON-RPC `shutdown` request? [`serve_io`] uses it to end
+/// the loop after the shutdown response is written. Fail-open: an unparseable /
+/// non-shutdown line is not a shutdown, so the loop continues as before.
+fn is_shutdown_request(line: &str) -> bool {
+    serde_json::from_str::<JsonRpcRequest>(line).is_ok_and(|r| r.method == "shutdown")
 }
 
 /// Parse one input line into the response to write (if any). A well-formed
@@ -400,9 +418,20 @@ fn arg_root(args: &Value) -> PathBuf {
 }
 
 /// `govern_file`: run the governance rules on a file's proposed content.
+///
+/// The bypass-immune irreversible floor runs FIRST ([`pre_write_floor_decision`])
+/// and IGNORES the project policy — so a `.umadev/rules.toml` that disabled
+/// UD-SEC-003/018/026 (or the UD-SEC-001 path guard) can NOT turn a leaked
+/// `sk_live_…` secret / credential / sensitive-path write into a "PASS" here. Only
+/// when the floor is clean does the policy-aware content scan run (which honours
+/// disabled clauses for everything else).
 fn govern_file_tool(args: &Value, policy: &Policy) -> (String, bool) {
     let path = args.get("file_path").and_then(Value::as_str).unwrap_or("");
     let content = args.get("content").and_then(Value::as_str).unwrap_or("");
+    let floor = pre_write_floor_decision(path, content);
+    if floor.block {
+        return govern_decision_text(true, &floor.clause, &floor.reason);
+    }
     let d = scan_content_with_policy(path, content, policy);
     govern_decision_text(d.block, &d.clause, &d.reason)
 }
@@ -845,6 +874,117 @@ mod tests {
         let resp = handle_request(&req, &policy).unwrap();
         let result = resp.result.unwrap();
         assert_eq!(result["isError"], false);
+    }
+
+    #[test]
+    fn govern_file_floor_blocks_secret_despite_disabled_clauses() {
+        // REPRODUCTION: even with the secret clauses (UD-SEC-003/018/026) disabled
+        // in the project policy, `govern_file` must NOT return PASS for a hardcoded
+        // live secret — the bypass-immune floor blocks it FIRST, before the
+        // policy-aware scan (which would otherwise honour the disable and pass).
+        let policy = Policy {
+            disabled: umadev_governance::DisabledSection {
+                clauses: vec![
+                    "UD-SEC-001".into(),
+                    "UD-SEC-003".into(),
+                    "UD-SEC-018".into(),
+                    "UD-SEC-026".into(),
+                ],
+            },
+            ..Default::default()
+        };
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(31)),
+            method: "tools/call".into(),
+            params: json!({
+                "name": "govern_file",
+                "arguments": {
+                    "file_path": "src/cfg.ts",
+                    "content": "const k = \"aB3xK9pQ7mNr2WvT5sZ8dF1gH4jL6cE0\";"
+                }
+            }),
+        };
+        let resp = handle_request(&req, &policy).unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(
+            result["isError"], true,
+            "the floor must block a leaked secret even when the clauses are disabled"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("BLOCKED"), "{text}");
+    }
+
+    #[test]
+    fn govern_file_floor_blocks_sensitive_path_despite_disabled_clause() {
+        // Disabling UD-SEC-001 must not let `govern_file` PASS a write to a
+        // sensitive path — the floor's path guard still blocks it.
+        let policy = Policy {
+            disabled: umadev_governance::DisabledSection {
+                clauses: vec!["UD-SEC-001".into()],
+            },
+            ..Default::default()
+        };
+        let (text, is_error) = govern_file_tool(
+            &json!({ "file_path": ".env", "content": "PORT=3000" }),
+            &policy,
+        );
+        assert!(
+            is_error,
+            "a write to .env must block despite disabled UD-SEC-001"
+        );
+        assert!(text.contains("UD-SEC-001"), "{text}");
+    }
+
+    #[test]
+    fn serve_io_breaks_the_loop_on_shutdown() {
+        // A `shutdown` request must (a) get its response, then (b) END the loop so a
+        // client blocked on exit doesn't hang. A request AFTER shutdown must NOT be
+        // answered — the loop already broke.
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"shutdown"}"#);
+        input.push(b'\n');
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":2,"method":"initialize"}"#);
+        input.push(b'\n');
+        let mut out: Vec<u8> = Vec::new();
+        let mut reader = std::io::Cursor::new(input);
+        serve_io(&mut reader, &mut out, &Policy::default()).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "only the shutdown reply is written, then the loop ends: {text}"
+        );
+        let resp: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            resp["id"], 1,
+            "the shutdown request is answered before exit"
+        );
+        // The post-shutdown `initialize` was never reached.
+        assert!(
+            !text.contains("serverInfo"),
+            "no request after shutdown may be answered: {text}"
+        );
+    }
+
+    #[test]
+    fn shutdown_notification_also_breaks_the_loop() {
+        // A shutdown with NO id is a notification (no response), but it must STILL
+        // end the loop — the raw-line check is independent of the response.
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","method":"shutdown"}"#);
+        input.push(b'\n');
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":2,"method":"initialize"}"#);
+        input.push(b'\n');
+        let mut out: Vec<u8> = Vec::new();
+        let mut reader = std::io::Cursor::new(input);
+        serve_io(&mut reader, &mut out, &Policy::default()).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("serverInfo"),
+            "the loop must break on a shutdown notification too: {text}"
+        );
     }
 
     #[test]

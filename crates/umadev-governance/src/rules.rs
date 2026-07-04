@@ -652,6 +652,53 @@ pub fn is_irreversible_write_floor(clause: &str) -> bool {
     )
 }
 
+/// The bypass-immune, un-closable **irreversible write floor** — the ONE shared
+/// entry point every write-governance surface runs FIRST.
+///
+/// A leaked secret / credential in committed source, or a write to a sensitive
+/// path (`.env`, `.ssh/`, `id_rsa`, `credentials`, …), is irreversible the
+/// instant it lands on disk + in git. So — exactly like Claude Code's
+/// bypass-immune safetyCheck (`permissions.ts` step 1f/1g) — this floor MUST NOT
+/// be switchable off by a project's `.umadev/rules.toml` disabled-clause list. It
+/// therefore takes **no** [`Policy`](crate::policy::Policy) and deliberately
+/// IGNORES disabled clauses: routing it through [`scan_content_with_policy`] /
+/// [`scan_content_with_context`] would honour `is_disabled`, letting a rules.toml
+/// quietly turn the floor off — a real bypass of the "bypass-immune" floor. That
+/// is the whole point.
+///
+/// The Claude PreToolUse hook, the CI / pre-commit scan (`umadev ci`), the MCP
+/// `govern_file` tool, and the non-Claude runner-side governance
+/// (`continuous` / `director_loop`) all call this BEFORE their policy-aware
+/// content scan, so every write-governance entry point enforces the identical
+/// floor — including for a `.env` / `.ssh` / no-extension path a content-only
+/// scan would miss.
+///
+/// Runs the SAME set the hook's floor uses (do NOT broaden it):
+/// - `UD-SEC-001` sensitive path ([`check_sensitive_path`])
+/// - `UD-SEC-003` hardcoded secret ([`check_hardcoded_secret`])
+/// - `UD-SEC-018` plaintext password ([`check_plaintext_password`])
+/// - `UD-SEC-026` client secret leak ([`check_client_secret_leak`])
+///
+/// Deterministic and **fail-open by contract**: each check runs under the same
+/// panic-catching guard as the policy scan, so an adversarial input returns
+/// [`Decision::pass`] rather than crashing the host. Returns the FIRST block, or
+/// `Decision::pass()` when the proposed write is clean.
+#[must_use]
+pub fn pre_write_floor_decision(file_path: &str, content: &str) -> Decision {
+    for check in [
+        check_sensitive_path,
+        check_hardcoded_secret_ungated,
+        check_plaintext_password,
+        check_client_secret_leak,
+    ] {
+        let decision = run_check_guarded(check, file_path, content);
+        if decision.block {
+            return decision;
+        }
+    }
+    Decision::pass()
+}
+
 /// File extensions guarded by the emoji rule (UD-CODE-001).
 const EMOJI_GUARDED_EXTS: &[&str] = &[
     "tsx", "ts", "jsx", "js", "mjs", "cjs", "vue", "svelte", "astro", "html", "htm", "css", "scss",
@@ -1597,6 +1644,16 @@ pub fn check_hardcoded_secret(file_path: &str, content: &str) -> Decision {
     if !is_secret_scanned_path(file_path) {
         return Decision::pass();
     }
+    check_hardcoded_secret_ungated(file_path, content)
+}
+
+/// The secret detection WITHOUT the path-extension gate. The irreversible
+/// pre-write FLOOR ([`pre_write_floor_decision`]) calls this so a leaked secret in
+/// ANY written file — a `Makefile`, a no-extension config, a `.env`, an `.ssh`
+/// key — is caught, not only the recognized code/config extensions that the
+/// normal (overridable) content scan is gated to. UD-SEC-003; bypass-immune.
+#[allow(clippy::too_many_lines)] // one sequential detector chain; splitting it hurts readability
+pub(crate) fn check_hardcoded_secret_ungated(file_path: &str, content: &str) -> Decision {
     let test_path = looks_like_secret_test_path(file_path);
     let lower = content.to_ascii_lowercase();
 
@@ -8763,6 +8820,33 @@ pub fn check_command_injection(file_path: &str, content: &str) -> Decision {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    // --- pre_write_floor_decision (the shared bypass-immune floor) --------
+
+    #[test]
+    fn floor_blocks_sensitive_path_regardless_of_content() {
+        // A write to `.env` is blocked on the PATH guard (UD-SEC-001) even with
+        // empty content — the floor does not need a secret in the body, and a
+        // dot-file with NO extension is exactly what a content-only scan misses.
+        let d = pre_write_floor_decision(".env", "");
+        assert!(d.block);
+        assert_eq!(d.clause, "UD-SEC-001");
+    }
+
+    #[test]
+    fn floor_blocks_hardcoded_secret_in_any_file() {
+        let d = pre_write_floor_decision(
+            "src/cfg.ts",
+            "const k = \"aB3xK9pQ7mNr2WvT5sZ8dF1gH4jL6cE0\";",
+        );
+        assert!(d.block, "a leaked live secret must hit the floor");
+        assert!(is_irreversible_write_floor(&d.clause));
+    }
+
+    #[test]
+    fn floor_passes_clean_code() {
+        assert!(!pre_write_floor_decision("src/Btn.tsx", "export const x = 1;").block);
+    }
 
     // --- emoji ----------------------------------------------------------
 

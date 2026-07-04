@@ -65,9 +65,9 @@ pub use rules::{
     check_swift_force_unwrap, check_todo_residue, check_ts_any, check_typosquat_packages,
     check_unreliable_sources, check_unsafe_deserialization, check_unused_variables,
     check_xpath_injection, check_xxe, file_has_server_surface, is_config_secret_path,
-    is_irreversible_write_floor, is_secret_scanned_path, sast_scan_file, scan_content,
-    scan_content_with_context, scan_content_with_policy, Decision, ProjectContext, SastFinding,
-    SastSeverity,
+    is_irreversible_write_floor, is_secret_scanned_path, pre_write_floor_decision, sast_scan_file,
+    scan_content, scan_content_with_context, scan_content_with_policy, Decision, ProjectContext,
+    SastFinding, SastSeverity,
 };
 #[allow(unused_imports)]
 pub use rules::{

@@ -17,13 +17,47 @@
 //! Summary at the end: `UmaDev: 3 files blocked, 5 violations (exit 1)`.
 
 use std::path::{Path, PathBuf};
-use umadev_governance::{scan_content_with_policy, Policy};
+use umadev_governance::{
+    check_sensitive_path, pre_write_floor_decision, scan_content_with_policy, Policy,
+};
 
 /// File extensions the CI scan considers "source" (governance-eligible).
 const SCAN_EXTENSIONS: &[&str] = &[
     "js", "jsx", "ts", "tsx", "py", "rb", "go", "rs", "java", "kt", "swift", "php", "vue",
     "svelte", "astro",
 ];
+
+/// Is `rel` a security-sensitive path that MUST be scanned by the bypass-immune
+/// floor REGARDLESS of its extension?
+///
+/// The `SCAN_EXTENSIONS` allow-list silently drops exactly the files most likely
+/// to leak a live secret — `.env` (no extension), `id_rsa`, `*.pem`, `credentials`,
+/// anything under `.ssh/` — so a staged `.env` with a `sk_live_…` key used to scan
+/// as "0 files, 0 blocked, exit 0". This predicate pulls those paths back into
+/// scope so [`pre_write_floor_decision`] can block them. It is a SUPERSET of the
+/// floor's own path guard ([`check_sensitive_path`]) plus the two dotenv/cert
+/// forms the guard's fixed suffix list omits (`.env.<anything>`, `*.pem`), so a
+/// secret in any of them reaches the content floor. Segment-aware via the reused
+/// guard, so `messages.ts` never matches.
+fn is_sensitive_scan_path(rel: &str) -> bool {
+    let lower = rel.replace('\\', "/").to_ascii_lowercase();
+    // *.pem (private keys / certs) anywhere in the tree.
+    if std::path::Path::new(&lower)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pem"))
+    {
+        return true;
+    }
+    // Any dotenv variant: `.env`, `.env.local`, `.env.staging`, `.env.<x>`.
+    let last = lower.rsplit('/').next().unwrap_or("");
+    if last == ".env" || last.starts_with(".env.") {
+        return true;
+    }
+    // Reuse the floor's EXACT path guard for the rest (`.ssh/` `.aws/` `.git/`
+    // segments, `id_rsa` / `credentials` / `.npmrc` / … suffixes) so CI stays in
+    // lockstep with the floor rather than drifting from a hand-copied list.
+    check_sensitive_path(rel, "").block
+}
 
 /// Directories to skip during the scan (deps, build output, VCS).
 const SKIP_DIRS: &[&str] = &[
@@ -105,7 +139,18 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
             };
             disk
         };
-        let decision = scan_content_with_policy(&rel, &content, &policy);
+        // Bypass-immune irreversible floor FIRST (path-type + content
+        // secret/password): a `.umadev/rules.toml` that disabled UD-SEC-001/003/018/026
+        // must NOT let a leaked secret or a sensitive-path write (e.g. a staged
+        // `.env`) pass CI. Only when the floor is clean do we fall through to the
+        // policy-aware content scan (which honours disabled clauses for everything
+        // else).
+        let floor = pre_write_floor_decision(&rel, &content);
+        let decision = if floor.block {
+            floor
+        } else {
+            scan_content_with_policy(&rel, &content, &policy)
+        };
         if decision.block {
             result.files_blocked += 1;
             result.violations += 1;
@@ -311,7 +356,10 @@ fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or_default();
-            if SCAN_EXTENSIONS.contains(&ext) {
+            // Source by extension, OR a sensitive path regardless of extension, so
+            // a committed `.env` / `*.pem` / `credentials` reaches the floor in a
+            // full scan too (the same set the changed-only path pulls in).
+            if SCAN_EXTENSIONS.contains(&ext) || is_sensitive_scan_path(&path.to_string_lossy()) {
                 files.push(path);
             }
         }
@@ -367,7 +415,10 @@ fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or_default();
-            SCAN_EXTENSIONS.contains(&ext)
+            // Source by extension, OR a sensitive path (`.env` / `id_rsa` / `*.pem`
+            // / `.ssh/*` / `credentials`) regardless of extension — the floor must
+            // see a staged secret file even though it carries no source extension.
+            SCAN_EXTENSIONS.contains(&ext) || is_sensitive_scan_path(l)
         })
         .map(|l| root.join(l))
         .collect();
@@ -572,6 +623,95 @@ mod tests {
         // now-clean working copy.
         assert_eq!(result.files_blocked, 1, "staged violation must be flagged");
         assert!(result.failed);
+    }
+
+    #[test]
+    fn changed_only_blocks_a_staged_dotenv_secret() {
+        // REPRODUCTION: a staged `.env` carrying a live Stripe key. `.env` has no
+        // source extension, so the OLD collect-by-extension scan never saw it —
+        // "0 file(s) scanned, 0 blocked, exit 0". The floor must now pull the
+        // sensitive path into scope and BLOCK it (UD-SEC-001 path guard), failing
+        // CI with a non-zero exit.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return; // git not available — skip
+        }
+        std::fs::write(
+            root.join(".env"),
+            "STRIPE_SECRET_KEY=aB3xK9pQ7mNr2WvT5sZ8dF1gH4jL6cE0\n",
+        )
+        .unwrap();
+        assert!(git(root, &["add", ".env"]));
+
+        // Sanity: the sensitive path is now in the changed-file scan set despite
+        // having no source extension.
+        let listed = git_changed_files(root).unwrap();
+        assert!(
+            listed.iter().any(|p| p.ends_with(".env")),
+            "a staged .env must be listed for scanning, got {listed:?}"
+        );
+
+        let result = run(&CiOptions {
+            report_only: false,
+            changed_only: true,
+            project_root: root.to_path_buf(),
+        })
+        .unwrap();
+        assert!(
+            result.files_blocked >= 1,
+            "a staged .env secret must be blocked, not silently skipped"
+        );
+        assert!(result.failed, "and it must fail CI (non-zero exit)");
+    }
+
+    #[test]
+    fn changed_only_blocks_a_secret_in_a_no_extension_file() {
+        // A staged `credentials` file (no extension) with a live secret must be
+        // scanned + blocked too — the sensitive-path scope is not limited to
+        // dotenv files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return; // git not available — skip
+        }
+        std::fs::write(
+            root.join("credentials"),
+            "aws_secret_access_key = aB3xK9pQ7mNr2WvT5sZ8dF1gH4jL6cE0\n",
+        )
+        .unwrap();
+        assert!(git(root, &["add", "credentials"]));
+        let result = run(&CiOptions {
+            report_only: false,
+            changed_only: true,
+            project_root: root.to_path_buf(),
+        })
+        .unwrap();
+        assert!(
+            result.files_blocked >= 1,
+            "a staged credentials secret must block"
+        );
+        assert!(result.failed);
+    }
+
+    #[test]
+    fn is_sensitive_scan_path_matches_the_floor_set() {
+        // The extension-agnostic scan predicate covers the dotenv/cert/key set …
+        assert!(is_sensitive_scan_path(".env"));
+        assert!(is_sensitive_scan_path("apps/api/.env.production"));
+        assert!(is_sensitive_scan_path(".env.staging")); // arbitrary dotenv variant
+        assert!(is_sensitive_scan_path("certs/server.pem"));
+        assert!(is_sensitive_scan_path("deploy/id_rsa"));
+        assert!(is_sensitive_scan_path("secrets/credentials"));
+        assert!(is_sensitive_scan_path(".ssh/known_hosts"));
+        // … and does NOT sweep in ordinary source (that rides SCAN_EXTENSIONS).
+        assert!(!is_sensitive_scan_path("src/messages.ts"));
+        assert!(!is_sensitive_scan_path("README.md"));
+        // A dotenv TEMPLATE is in scan SCOPE (any `.env.*`), but the floor's path
+        // guard never auto-blocks it — only its content is judged, so a
+        // placeholder file passes while a real `.env` is blocked on the path.
+        assert!(is_sensitive_scan_path(".env.example"));
+        assert!(!check_sensitive_path(".env.example", "").block);
     }
 
     #[test]

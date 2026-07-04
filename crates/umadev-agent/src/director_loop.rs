@@ -3945,6 +3945,15 @@ fn tool_call_governance_verdict(
     {
         let path = umadev_runtime::write_scan_path(input);
         let content = umadev_runtime::write_scan_content(input);
+        // Bypass-immune irreversible floor FIRST (ignores disabled clauses), in
+        // lockstep with `continuous::evaluate_tool_call`, so a non-Claude base's
+        // write to a leaked secret / sensitive `.env`/`.ssh`/no-extension path is
+        // recorded as blocked regardless of a rules.toml disable. Clean → the
+        // policy-aware content scan.
+        let floor = umadev_governance::pre_write_floor_decision(&path, &content);
+        if floor.block {
+            return floor;
+        }
         return umadev_governance::scan_content_with_context(&path, &content, &policy, ctx);
     }
     umadev_governance::Decision::pass()
@@ -4485,6 +4494,32 @@ mod tests {
             recorded.contains("\"decision\":\"block\""),
             "the audit trail records the real `block` verdict, not a hardcoded allow: {recorded}"
         );
+    }
+
+    #[test]
+    fn default_loop_floor_blocks_env_write_even_when_clauses_disabled() {
+        // P2: the default loop's verdict must apply the bypass-immune floor. Even
+        // with the secret/path clauses disabled in `.umadev/rules.toml`, a write to
+        // `.env` (no source extension → a content scan alone would miss it) is
+        // blocked by the floor's path guard (UD-SEC-001) — the same un-closable
+        // floor `continuous::evaluate_tool_call` and the Claude hook apply.
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let udir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&udir).unwrap();
+        std::fs::write(
+            udir.join("rules.toml"),
+            "[disabled]\nclauses = [\"UD-SEC-001\", \"UD-SEC-003\", \"UD-SEC-018\", \"UD-SEC-026\"]\n",
+        )
+        .unwrap();
+        let options = opts(tmp.path());
+
+        let env_write = serde_json::json!({ "file_path": ".env", "content": "PORT=3000" });
+        let d = tool_call_governance_verdict(&options, "Write", &env_write);
+        assert!(
+            d.block,
+            "the floor must block a .env write despite the disabled clauses"
+        );
+        assert_eq!(d.clause, "UD-SEC-001");
     }
 
     // ── A scripted fake BaseSession: each `send_turn` loads the next scripted

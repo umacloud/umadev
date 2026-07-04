@@ -732,6 +732,15 @@ fn evaluate_tool_call(
         // is read, so the scan sees the actual content instead of "". Write/Edit
         // are unchanged (`content` / `new_string` / `new_str`).
         let content = umadev_runtime::write_scan_content(input);
+        // Bypass-immune irreversible floor FIRST (ignores disabled clauses), so a
+        // non-Claude base (codex / opencode) — which has no PreToolUse hook — gets
+        // the SAME un-closable floor as the Claude hook for a leaked secret /
+        // credential / sensitive `.env`/`.ssh`/no-extension path. Only when it is
+        // clean do we run the policy-aware, context-aware content scan.
+        let floor = umadev_governance::pre_write_floor_decision(&path, &content);
+        if floor.block {
+            return (path, floor);
+        }
         let decision = umadev_governance::scan_content_with_context(&path, &content, policy, ctx);
         return (path, decision);
     }
@@ -3099,6 +3108,63 @@ mod tests {
             }),
         );
         assert!(!nb_d.block, "a clean NotebookEdit must pass");
+    }
+
+    #[tokio::test]
+    async fn floor_blocks_env_write_even_with_clauses_disabled() {
+        // A non-Claude base (codex / opencode — no PreToolUse hook) writing to
+        // `.env` must be blocked by the bypass-immune floor even when the project
+        // DISABLED the secret/path clauses. `.env` has no source extension, so a
+        // content-only scan would miss it; the floor's path guard blocks it.
+        let policy = umadev_governance::Policy {
+            disabled: umadev_governance::DisabledSection {
+                clauses: vec![
+                    "UD-SEC-001".into(),
+                    "UD-SEC-003".into(),
+                    "UD-SEC-018".into(),
+                    "UD-SEC-026".into(),
+                ],
+            },
+            ..Default::default()
+        };
+        let (target, decision) = evaluate_tool_call(
+            &policy,
+            umadev_governance::ProjectContext::unknown(),
+            "Write",
+            &serde_json::json!({ "file_path": ".env", "content": "PORT=3000" }),
+        );
+        assert_eq!(target, ".env");
+        assert!(
+            decision.block,
+            "the floor must block a .env write despite the disabled clauses"
+        );
+        assert_eq!(decision.clause, "UD-SEC-001");
+    }
+
+    #[tokio::test]
+    async fn floor_blocks_secret_in_codex_update_despite_disabled_clause() {
+        // A codex/opencode `update` writing a leaked secret into a NO-EXTENSION
+        // file must be caught by the content floor (UD-SEC-003) even when the
+        // project disabled that clause — the runner-side counterpart to the hook.
+        let policy = umadev_governance::Policy {
+            disabled: umadev_governance::DisabledSection {
+                clauses: vec!["UD-SEC-003".into()],
+            },
+            ..Default::default()
+        };
+        let (_t, decision) = evaluate_tool_call(
+            &policy,
+            umadev_governance::ProjectContext::unknown(),
+            "update",
+            &serde_json::json!({ "path": "Makefile", "content": leaked_secret() }),
+        );
+        assert!(
+            decision.block,
+            "a leaked secret must block on the floor even with UD-SEC-003 disabled"
+        );
+        assert!(umadev_governance::is_irreversible_write_floor(
+            &decision.clause
+        ));
     }
 
     #[tokio::test]
