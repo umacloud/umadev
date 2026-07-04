@@ -2989,6 +2989,40 @@ fn spawn_chat_session_preload(
     });
 }
 
+/// Decide whether a FAILED chat turn earns the ONE bounded auto-re-drive on a fresh
+/// session (the stale-post-run-session recovery in [`drive_chat_session_turn`]). Pure +
+/// total so the one-shot bound is unit-testable and can't silently rot into a loop.
+/// Returns `true` ONLY when EVERY guard holds:
+/// - `attempt == 0` — this is the resident FIRST try. The re-drive itself sets
+///   `attempt = 1`, so a second failure can never satisfy this → **at most one retry,
+///   never a loop**.
+/// - the failure classifies as [`umadev_agent::base_error::BaseFailure::Unknown`] — an
+///   UNCLASSIFIABLE base error (claude's `error_during_execution`), the stale-session
+///   signature. A KNOWN transient (429 / overloaded / network) is deliberately NOT
+///   re-driven: an immediate fresh session can't clear a rate limit; auth / context /
+///   a hard exit are futile to retry.
+/// - the attempt was CLEAN — nothing streamed (`streamed_any == false`) AND no reactive
+///   build fired (`became_build == false`) — so the re-drive can neither double-render a
+///   partial answer nor re-run a workspace side effect.
+/// - the base is STILL ALIVE (`base_exited == false`) — a dead process is torn down and
+///   reported, never re-driven onto itself.
+fn chat_turn_should_auto_redrive(
+    attempt: u8,
+    failure_reason: &str,
+    streamed_any: bool,
+    became_build: bool,
+    base_exited: bool,
+) -> bool {
+    attempt == 0
+        && !streamed_any
+        && !became_build
+        && !base_exited
+        && matches!(
+            umadev_agent::base_error::classify(None, None, Some(failure_reason.trim())),
+            umadev_agent::base_error::BaseFailure::Unknown
+        )
+}
+
 /// Drive ONE chat turn over the **resident** base session — the latency fix.
 ///
 /// Opens the session lazily on the FIRST turn (firmware composed ONCE and injected
@@ -3020,6 +3054,10 @@ fn spawn_chat_session_preload(
 /// session back as `Primed` instead of tearing it down — the failure is still
 /// surfaced, but the next follow-up reuses the bare resident session (no repo-map
 /// re-scan, no full-transcript replay). It never panics.
+///
+/// The bounded first-turn auto-recovery gate is factored out into
+/// [`chat_turn_should_auto_redrive`] so the ONE-shot bound is a pure, unit-tested
+/// predicate rather than an inline condition that could silently rot into a loop.
 async fn drive_chat_session_turn(turn: ChatSessionTurn) {
     let ChatSessionTurn {
         text,
@@ -3051,273 +3089,339 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
     // skipped). Used after the turn to report the real changed-file set.
     let before = git_status_porcelain(&project_root);
 
-    // Take the resident session, or lazily open a fresh one. Three cases:
-    //   - `Primed`: a session that already drove a turn — reuse it BARE (its own
-    //     native memory carries the dialogue; firmware + MCP loaded long ago);
-    //   - `Warm`: a session the background pre-load (or an earlier lazy-open)
-    //     spawned but never turned — send its FIRST directive (front-load the
-    //     transcript + re-prefix firmware for a non-claude base);
-    //   - empty holder: lazily open a warm session NOW (the pre-load missed / a
-    //     prior session was closed), then send its first directive.
-    // The pre-load is what removes the first-reply latency: by the time the user
-    // sends, the holder usually already has a `Warm` session (MCP + firmware loaded
-    // off the hot path), so this turn is just `send_turn` + drain.
-    let mut guard = chat_session.lock().await;
-    let (mut session, first_directive) = match guard.take() {
-        Some(ResidentChat::Primed(s)) => (s, text.clone()),
-        Some(ResidentChat::Warm(w)) => {
-            let directive =
-                first_chat_directive(w.firmware.as_deref(), &backend, &conversation, &text);
-            (w.session, directive)
-        }
-        None => match open_warm_chat_session(
-            &backend,
-            &model,
-            &project_root,
-            autonomous,
-            resume_session_id.as_deref(),
-        )
-        .await
-        {
-            Ok(w) => {
-                let directive =
-                    first_chat_directive(w.firmware.as_deref(), &backend, &conversation, &text);
-                (w.session, directive)
-            }
-            Err(e) => {
-                drop(guard);
-                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                    "continuous.tui_session_unavailable",
-                    &[&e.to_string()],
-                )));
-                return;
-            }
-        },
-    };
-    drop(guard);
-
-    // Send the directive into the resident session. A send error means the session
-    // is dead — drop it (so the next turn re-opens) and report an honest failure.
-    if let Err(e) = session.send_turn(first_directive).await {
-        let _ = session.end().await;
-        let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-            "route.failed",
-            &[&backend, &e.to_string()],
-        )));
-        return;
-    }
-
-    // Reactive build: the FIRST workspace write flips this turn into a build. Built
-    // host-on (a host session writes real files); fires its side-effects once.
-    let reactive = Arc::new(ReactiveBuild::new(true));
-    let mut text_acc = String::new();
-
-    // Tool-aware idle budget (parity with the /run path): the base window for a
-    // quiet/hung base, the liveness-poll interval while it is plausibly mid-tool. Read
-    // once per turn so a mid-turn env flip can't race.
+    // ── Bounded first-turn auto-recovery ─────────────────────────────────────────
+    // A resident chat session that sat IDLE through a multi-minute run (or a long
+    // pause) can go stale: its FIRST turn afterwards comes back as an UNCLASSIFIABLE
+    // base error (claude's `error_during_execution` -> `BaseFailure::Unknown`) even
+    // though the process is still alive. Dead-ending that first message -- then
+    // auto-replaying the queued duplicate -- is the reported bug. So on a CLEAN
+    // first-attempt `Unknown` failure on a STILL-ALIVE base we RE-DRIVE the turn ONCE
+    // on a guaranteed-fresh session before surfacing anything (mirrors the /run
+    // watchdog's single re-drive). `attempt` is the hard bound: 0 = the resident try,
+    // 1 = the one retry. The retry REUSES this turn's UI (no re-emitted user bubble or
+    // assistant row) and only fires when the first attempt failed CLEAN -- nothing
+    // streamed, no reactive build -- so it can never double-render or re-run a side
+    // effect. A KNOWN-transient failure (429 / overloaded / network) is NOT retried:
+    // an immediate fresh session cannot clear a rate limit, so those keep the
+    // park-the-live-session-and-surface path below.
+    //
+    // `text_acc` / `reactive` live across attempts (reset at the top of each) so the
+    // post-turn code reads the LAST attempt's stream + build-ness; `session` is carried
+    // OUT of the loop by the terminal `break` so the post-turn park / QC drive it. Read
+    // the tool-aware idle budget once (a mid-turn env flip can't race it).
     let idle = chat_idle_budget();
-    let mut in_tool_call = false;
+    let mut attempt: u8 = 0;
+    // Declared here (not initialized) so the post-turn code below can read the LAST
+    // attempt's values; the `'attempt` loop head unconditionally assigns both before
+    // the drain, so they are always initialized by the time a terminal `break` exits.
+    let mut text_acc: String;
+    let mut reactive: Arc<ReactiveBuild>;
 
-    // Drain the turn. ANY event resets the idle clock; while a tool runs the path keeps
-    // waiting as long as the base stays alive (the liveness poll), so a long silent
-    // build is never killed; only a non-tool hang settles. A `None` / a `Failed` status
-    // is an honest terminal. The loop breaks with whether the finish was truncated
-    // (mid-stream cut-off). `deadline` is `None`: chat is interactive (the user controls
-    // via Esc) and a dead base still settles via the `Ok(None)` session-ended path.
-    let truncated = loop {
-        let ev = match next_chat_event_idle(session.as_mut(), idle, in_tool_call, None).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => {
-                // Session ended mid-turn (process dead / EOF) — capture stderr + exit
-                // status before dropping so the user sees WHY (e.g. a base that
-                // crashed on a bad config), then report.
-                let tail = session.stderr_tail();
-                let exit = session.try_exit_status();
-                let _ = session.end().await;
-                let reason =
-                    enrich_base_failure("base session ended mid-turn", exit, tail, &backend);
-                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                    "route.failed",
-                    &[&backend, &reason],
-                )));
-                return;
-            }
-            Err(()) => {
-                // Non-tool idle hang (deadline is None for chat, so an in-tool live base
-                // never lands here — it keeps waiting until the user hits Esc or it
-                // exits). Capture the base's OWN stderr + exit status FIRST, then
-                // interrupt + drop the session and settle honestly. The base message is
-                // the trilingual long-task diagnosis (NOT a misleading "check your
-                // login/model config") — `enrich_base_failure` still PREPENDS the
-                // auth/network classification when the base's own stderr actually
-                // indicates one. Report the BASE idle window (the
-                // `UMADEV_IDLE_TIMEOUT_SECS` knob the user would raise).
-                let tail = session.stderr_tail();
-                let exit = session.try_exit_status();
-                // Abort the hung turn — a control request, it does NOT kill the base —
-                // then decide park-vs-teardown by the base's liveness.
-                let _ = session.interrupt().await;
-                let reason = enrich_base_failure(
-                    &umadev_i18n::tlf(
-                        "base.fail.idle",
-                        &[&idle.window(false).as_secs().to_string()],
-                    ),
-                    exit,
-                    tail,
+    let (truncated, mut session) = 'attempt: loop {
+        // Acquire the session + its first directive for THIS attempt -- identical on the
+        // first try and the retry. Three cases:
+        //   - `Primed`: a session that already drove a turn -- reuse it BARE (its own
+        //     native memory carries the dialogue; firmware + MCP loaded long ago);
+        //   - `Warm`: a pre-loaded / earlier-lazy-opened session, never turned -- send
+        //     its FIRST directive (front-load the transcript + re-prefix firmware for a
+        //     non-claude base);
+        //   - empty holder: lazily open a warm session NOW.
+        // On the RETRY the stale session was already ended, so the holder is either empty
+        // (-> a fresh lazy-open) or already re-populated by the re-fired pre-load (-> that
+        // fresh warm session) -- either way the retry drives a FRESH base.
+        let (mut session, first_directive) = {
+            let mut guard = chat_session.lock().await;
+            let acquired = match guard.take() {
+                Some(ResidentChat::Primed(s)) => (s, text.clone()),
+                Some(ResidentChat::Warm(w)) => {
+                    let directive =
+                        first_chat_directive(w.firmware.as_deref(), &backend, &conversation, &text);
+                    (w.session, directive)
+                }
+                None => match open_warm_chat_session(
                     &backend,
-                );
-                // Transient idle blip on a STILL-ALIVE base (a slow/quiet base, a
-                // network stall): don't tear the session down. `interrupt()` settled the
-                // hung turn, so PARK it back as `Primed` (exactly like the
-                // Esc/Interrupted arm below) — the next follow-up then reuses it BARE (no
-                // repo-map re-scan, no full-transcript replay — the "重头开始" feeling).
-                // Only `end()` when the base ACTUALLY died (a real exit status). The
-                // failure is surfaced to the user either way.
-                if exit.is_none() {
-                    *chat_session.lock().await = Some(ResidentChat::Primed(session));
-                } else {
-                    let _ = session.end().await;
-                }
-                let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                    "route.failed",
-                    &[&backend, &reason],
-                )));
-                return;
-            }
+                    &model,
+                    &project_root,
+                    autonomous,
+                    resume_session_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(w) => {
+                        let directive = first_chat_directive(
+                            w.firmware.as_deref(),
+                            &backend,
+                            &conversation,
+                            &text,
+                        );
+                        (w.session, directive)
+                    }
+                    Err(e) => {
+                        drop(guard);
+                        let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                            "continuous.tui_session_unavailable",
+                            &[&e.to_string()],
+                        )));
+                        return;
+                    }
+                },
+            };
+            drop(guard);
+            acquired
         };
-        // Arm/disarm the in-tool-call state from this event before handling it (parity
-        // with the /run pumps): a tool-use switches the next wait to the liveness poll,
-        // a tool-result restores the base window.
-        if let Some(t) = umadev_agent::director_loop::tool_phase_transition(&ev) {
-            in_tool_call = t;
+
+        // Fresh per-attempt accumulators (a retry restarts stream + build detection;
+        // safe because a retry only follows a CLEAN first-attempt failure).
+        text_acc = String::new();
+        reactive = Arc::new(ReactiveBuild::new(true));
+        let mut in_tool_call = false;
+
+        // Send the directive into the (resident or fresh) session. A send error means
+        // the session is dead -- report an honest CHAT-turn failure (never a phantom
+        // routing failure). The holder was already emptied above, so the next turn
+        // lazily re-opens.
+        if let Err(e) = session.send_turn(first_directive).await {
+            let _ = session.end().await;
+            let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                "chat.turn_failed",
+                &[&backend, &e.to_string()],
+            )));
+            return;
         }
-        match ev {
-            umadev_runtime::SessionEvent::TextDelta(delta) => {
-                text_acc.push_str(&delta);
-                sink.emit(EngineEvent::WorkerStream {
-                    event: umadev_runtime::StreamEvent::Text { delta },
-                });
-            }
-            umadev_runtime::SessionEvent::ThinkingDelta(delta) => {
-                // The base reasoned before answering this chat turn — surface that
-                // reasoning as a collapsed `[thinking]` block (Ctrl+O to expand), the
-                // transparency win. NOT accumulated into `text_acc` (the answer).
-                sink.emit(EngineEvent::WorkerStream {
-                    event: umadev_runtime::StreamEvent::ThinkingDelta(delta),
-                });
-            }
-            umadev_runtime::SessionEvent::ToolCall { name, input } => {
-                // The FIRST workspace write flips the turn into a build (one-shot,
-                // fail-open). The base decides chat-vs-build by ACTING.
-                if is_workspace_write_tool(&name) {
-                    react_to_first_write(Some(&reactive), &project_root, &sink);
-                }
-                let mut detail = session_tool_target(&input);
-                // The base asked the user a structured multiple-choice question via
-                // its OWN `AskUserQuestion` tool. UmaDev drives the base
-                // non-interactively, so that call can't pop up its picker and
-                // auto-cancels — it used to render as a bare optionless stub and read
-                // as cancelled. Surface the question + numbered options as a Note +
-                // give the tool row a real detail, AND STORE the parsed question so
-                // the user's NEXT line is relayed back as a resolved, framed answer
-                // (the reply flows into THIS same session — the base kept the question
-                // in its own context). Fail-open: a non-question / unreadable call →
-                // None → the plain tool row, nothing stored.
-                if let Some(q) = umadev_runtime::AskUserQuestion::from_tool_input(&name, &input) {
-                    detail = q.summary();
-                    sink.emit(EngineEvent::Note(umadev_agent::ask_question_note(&q)));
-                    *pending_ask.lock().await = Some(q);
-                }
-                // P1: forward the structured before/after for a Write/Edit so the
-                // TUI draws a live diff card on the reactive session path too.
-                // Fail-open: non-edit / unreadable input → None → plain row.
-                let edit = umadev_runtime::ToolEdit::from_claude_tool_input(&name, &input);
-                sink.emit(EngineEvent::WorkerStream {
-                    event: umadev_runtime::StreamEvent::ToolUse { name, detail, edit },
-                });
-            }
-            umadev_runtime::SessionEvent::ToolResult { ok, summary } => {
-                sink.emit(EngineEvent::WorkerStream {
-                    event: umadev_runtime::StreamEvent::ToolResult { ok, summary },
-                });
-            }
-            umadev_runtime::SessionEvent::NeedApproval {
-                req_id,
-                action,
-                target,
-            } => {
-                // Always-on irreversible floor — the SAME gate the director loop
-                // applies: deny an irreversible action (with a note), allow the rest
-                // so a guarded chat turn isn't wedged waiting on a human headlessly.
-                let decision = if umadev_agent::requires_confirmation(mode, &action, &target) {
-                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
-                        "continuous.dangerous_action_denied",
-                        &[&action, &target],
-                    )));
-                    umadev_runtime::ApprovalDecision::Deny
-                } else {
-                    umadev_runtime::ApprovalDecision::Allow
-                };
-                if let Err(e) = session.respond(&req_id, decision).await {
-                    let _ = session.end().await;
-                    let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                        "route.failed",
-                        &[&backend, &e.to_string()],
-                    )));
-                    return;
-                }
-            }
-            umadev_runtime::SessionEvent::TurnDone { status, .. } => match status {
-                umadev_runtime::TurnStatus::Completed => break false,
-                // Truncated → the turn ended early (rate limit / retry / cut-off);
-                // accept what landed but flag the "may be incomplete" caveat below.
-                umadev_runtime::TurnStatus::Truncated => break true,
-                umadev_runtime::TurnStatus::Interrupted => {
-                    // ESC / abort. The session is still alive and primed — capture its
-                    // resumable id (for the saved chat) BEFORE parking it back so the
-                    // next turn reuses it, and settle this turn as a (non-build) chat so
-                    // `thinking` clears.
-                    let base_session_id = session.session_id().map(str::to_string);
-                    *chat_session.lock().await = Some(ResidentChat::Primed(session));
-                    let _ = route_tx.send(RouteDecision::AgenticDone {
-                        reply: String::new(),
-                        director_build: false,
-                        base_session_id,
-                    });
-                    return;
-                }
-                umadev_runtime::TurnStatus::Failed(reason) => {
-                    // The base reported a REAL turn failure (an API error like a 429
-                    // rate limit, an auth / overloaded / network failure). This is the
-                    // bug fix: such a turn used to be swallowed and read as a silent
-                    // "[agentic] 完成" + "本轮无文件变更". Now: capture the base's OWN
-                    // stderr FIRST (a cause that only landed there is folded in), run
-                    // the reason through the actionable classifier (429 → "底座触发限流
-                    // …"), and surface THAT as the failure note. This branch returns
-                    // BEFORE the post-turn fact line / AgenticDone, so no false
-                    // "完成" / "无文件变更" is ever emitted for a failed turn.
+
+        // Drain THIS attempt's turn. ANY event resets the idle clock; while a tool runs
+        // the path keeps waiting as long as the base stays alive (the liveness poll), so
+        // a long silent build is never killed; only a non-tool hang settles. A `None` /
+        // a `Failed` status is an honest terminal. The terminal `break` carries whether
+        // the finish was truncated (mid-stream cut-off) AND the live session. `deadline`
+        // is `None`: chat is interactive (the user controls via Esc) and a dead base
+        // still settles via the `Ok(None)` session-ended path.
+        loop {
+            let ev = match next_chat_event_idle(session.as_mut(), idle, in_tool_call, None).await {
+                Ok(Some(ev)) => ev,
+                Ok(None) => {
+                    // Session ended mid-turn (process dead / EOF) — capture stderr + exit
+                    // status before dropping so the user sees WHY (e.g. a base that
+                    // crashed on a bad config), then report.
                     let tail = session.stderr_tail();
                     let exit = session.try_exit_status();
-                    let enriched = enrich_base_turn_failure(&reason, tail, &backend);
-                    // A turn that FAILED (429 / overloaded / transient network) but left
-                    // the base process ALIVE is a recoverable blip — the `TurnDone` already
-                    // settled this turn, so PARK the session back as `Primed` (no teardown)
-                    // so the next follow-up reuses it BARE instead of lazily re-opening
-                    // (which would re-scan the repo-map + replay the full transcript — the
-                    // "重头开始" feeling). Only `end()` when the base ACTUALLY died (a real
-                    // exit status). The failure is surfaced to the user either way.
+                    let _ = session.end().await;
+                    let reason =
+                        enrich_base_failure("base session ended mid-turn", exit, tail, &backend);
+                    let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                        "chat.turn_failed",
+                        &[&backend, &reason],
+                    )));
+                    return;
+                }
+                Err(()) => {
+                    // Non-tool idle hang (deadline is None for chat, so an in-tool live base
+                    // never lands here — it keeps waiting until the user hits Esc or it
+                    // exits). Capture the base's OWN stderr + exit status FIRST, then
+                    // interrupt + drop the session and settle honestly. The base message is
+                    // the trilingual long-task diagnosis (NOT a misleading "check your
+                    // login/model config") — `enrich_base_failure` still PREPENDS the
+                    // auth/network classification when the base's own stderr actually
+                    // indicates one. Report the BASE idle window (the
+                    // `UMADEV_IDLE_TIMEOUT_SECS` knob the user would raise).
+                    let tail = session.stderr_tail();
+                    let exit = session.try_exit_status();
+                    // Abort the hung turn — a control request, it does NOT kill the base —
+                    // then decide park-vs-teardown by the base's liveness.
+                    let _ = session.interrupt().await;
+                    let reason = enrich_base_failure(
+                        &umadev_i18n::tlf(
+                            "base.fail.idle",
+                            &[&idle.window(false).as_secs().to_string()],
+                        ),
+                        exit,
+                        tail,
+                        &backend,
+                    );
+                    // Transient idle blip on a STILL-ALIVE base (a slow/quiet base, a
+                    // network stall): don't tear the session down. `interrupt()` settled the
+                    // hung turn, so PARK it back as `Primed` (exactly like the
+                    // Esc/Interrupted arm below) — the next follow-up then reuses it BARE (no
+                    // repo-map re-scan, no full-transcript replay — the "重头开始" feeling).
+                    // Only `end()` when the base ACTUALLY died (a real exit status). The
+                    // failure is surfaced to the user either way.
                     if exit.is_none() {
                         *chat_session.lock().await = Some(ResidentChat::Primed(session));
                     } else {
                         let _ = session.end().await;
                     }
                     let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                        "route.failed",
-                        &[&backend, &enriched],
+                        "chat.turn_failed",
+                        &[&backend, &reason],
                     )));
                     return;
                 }
-            },
+            };
+            // Arm/disarm the in-tool-call state from this event before handling it (parity
+            // with the /run pumps): a tool-use switches the next wait to the liveness poll,
+            // a tool-result restores the base window.
+            if let Some(t) = umadev_agent::director_loop::tool_phase_transition(&ev) {
+                in_tool_call = t;
+            }
+            match ev {
+                umadev_runtime::SessionEvent::TextDelta(delta) => {
+                    text_acc.push_str(&delta);
+                    sink.emit(EngineEvent::WorkerStream {
+                        event: umadev_runtime::StreamEvent::Text { delta },
+                    });
+                }
+                umadev_runtime::SessionEvent::ThinkingDelta(delta) => {
+                    // The base reasoned before answering this chat turn — surface that
+                    // reasoning as a collapsed `[thinking]` block (Ctrl+O to expand), the
+                    // transparency win. NOT accumulated into `text_acc` (the answer).
+                    sink.emit(EngineEvent::WorkerStream {
+                        event: umadev_runtime::StreamEvent::ThinkingDelta(delta),
+                    });
+                }
+                umadev_runtime::SessionEvent::ToolCall { name, input } => {
+                    // The FIRST workspace write flips the turn into a build (one-shot,
+                    // fail-open). The base decides chat-vs-build by ACTING.
+                    if is_workspace_write_tool(&name) {
+                        react_to_first_write(Some(&reactive), &project_root, &sink);
+                    }
+                    let mut detail = session_tool_target(&input);
+                    // The base asked the user a structured multiple-choice question via
+                    // its OWN `AskUserQuestion` tool. UmaDev drives the base
+                    // non-interactively, so that call can't pop up its picker and
+                    // auto-cancels — it used to render as a bare optionless stub and read
+                    // as cancelled. Surface the question + numbered options as a Note +
+                    // give the tool row a real detail, AND STORE the parsed question so
+                    // the user's NEXT line is relayed back as a resolved, framed answer
+                    // (the reply flows into THIS same session — the base kept the question
+                    // in its own context). Fail-open: a non-question / unreadable call →
+                    // None → the plain tool row, nothing stored.
+                    if let Some(q) = umadev_runtime::AskUserQuestion::from_tool_input(&name, &input)
+                    {
+                        detail = q.summary();
+                        sink.emit(EngineEvent::Note(umadev_agent::ask_question_note(&q)));
+                        *pending_ask.lock().await = Some(q);
+                    }
+                    // P1: forward the structured before/after for a Write/Edit so the
+                    // TUI draws a live diff card on the reactive session path too.
+                    // Fail-open: non-edit / unreadable input → None → plain row.
+                    let edit = umadev_runtime::ToolEdit::from_claude_tool_input(&name, &input);
+                    sink.emit(EngineEvent::WorkerStream {
+                        event: umadev_runtime::StreamEvent::ToolUse { name, detail, edit },
+                    });
+                }
+                umadev_runtime::SessionEvent::ToolResult { ok, summary } => {
+                    sink.emit(EngineEvent::WorkerStream {
+                        event: umadev_runtime::StreamEvent::ToolResult { ok, summary },
+                    });
+                }
+                umadev_runtime::SessionEvent::NeedApproval {
+                    req_id,
+                    action,
+                    target,
+                } => {
+                    // Always-on irreversible floor — the SAME gate the director loop
+                    // applies: deny an irreversible action (with a note), allow the rest
+                    // so a guarded chat turn isn't wedged waiting on a human headlessly.
+                    let decision = if umadev_agent::requires_confirmation(mode, &action, &target) {
+                        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "continuous.dangerous_action_denied",
+                            &[&action, &target],
+                        )));
+                        umadev_runtime::ApprovalDecision::Deny
+                    } else {
+                        umadev_runtime::ApprovalDecision::Allow
+                    };
+                    if let Err(e) = session.respond(&req_id, decision).await {
+                        let _ = session.end().await;
+                        let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                            "chat.turn_failed",
+                            &[&backend, &e.to_string()],
+                        )));
+                        return;
+                    }
+                }
+                umadev_runtime::SessionEvent::TurnDone { status, .. } => match status {
+                    // Carry the live session OUT of the loop so the post-turn park / QC
+                    // drive the SAME base that just answered.
+                    umadev_runtime::TurnStatus::Completed => break 'attempt (false, session),
+                    // Truncated → the turn ended early (rate limit / retry / cut-off);
+                    // accept what landed but flag the "may be incomplete" caveat below.
+                    umadev_runtime::TurnStatus::Truncated => break 'attempt (true, session),
+                    umadev_runtime::TurnStatus::Interrupted => {
+                        // ESC / abort. The session is still alive and primed — capture its
+                        // resumable id (for the saved chat) BEFORE parking it back so the
+                        // next turn reuses it, and settle this turn as a (non-build) chat so
+                        // `thinking` clears.
+                        let base_session_id = session.session_id().map(str::to_string);
+                        *chat_session.lock().await = Some(ResidentChat::Primed(session));
+                        let _ = route_tx.send(RouteDecision::AgenticDone {
+                            reply: String::new(),
+                            director_build: false,
+                            base_session_id,
+                        });
+                        return;
+                    }
+                    umadev_runtime::TurnStatus::Failed(reason) => {
+                        // The base reported a REAL turn failure (an API error like a 429
+                        // rate limit, an auth / overloaded / network failure, or an
+                        // unclassifiable `error_during_execution`). Capture the base's OWN
+                        // stderr FIRST (a cause that only landed there is folded in) and run
+                        // the reason through the actionable classifier (429 → "底座触发限流
+                        // …"). This returns BEFORE the post-turn fact line / AgenticDone, so
+                        // no false "完成" / "无文件变更" is ever emitted for a failed turn.
+                        let tail = session.stderr_tail();
+                        let exit = session.try_exit_status();
+                        let enriched = enrich_base_turn_failure(&reason, tail, &backend);
+                        // Bounded first-turn auto-recovery (see the block comment above the
+                        // `'attempt` loop): a CLEAN first-attempt UNCLASSIFIABLE failure on a
+                        // STILL-ALIVE base earns exactly ONE fresh-session re-drive — the
+                        // stale-post-run-session case. "Clean" = nothing streamed + no
+                        // reactive build, so the retry can neither double-render nor re-run a
+                        // side effect. A known-transient failure (429 / overloaded / network)
+                        // is NOT retried (an immediate fresh session can't clear a rate limit)
+                        // and a dead base is torn down — both skip straight to the terminal.
+                        if chat_turn_should_auto_redrive(
+                            attempt,
+                            &reason,
+                            !text_acc.trim().is_empty(),
+                            reactive
+                                .became_build
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                            exit.is_some(),
+                        ) {
+                            // End the stale (but alive) session, then re-drive ONCE: the
+                            // `'attempt` loop head re-acquires a FRESH session (a re-fired
+                            // pre-load's warm session, or a lazy-open). Surface a "retrying"
+                            // note so the recovery reads as intentional, not a silent stall.
+                            let _ = session.end().await;
+                            attempt = 1;
+                            sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                "chat.turn_failed_retrying",
+                                &[&backend, &enriched],
+                            )));
+                            continue 'attempt;
+                        }
+                        // Not recoverable, or the one retry ALSO failed → honest terminal. A
+                        // turn that FAILED (429 / overloaded / transient network) but left
+                        // the base process ALIVE is a recoverable blip — PARK the session back
+                        // as `Primed` (no teardown) so the next follow-up reuses it BARE
+                        // instead of lazily re-opening (re-scanning the repo-map + replaying
+                        // the full transcript — the "重头开始" feeling). Only `end()` when the
+                        // base ACTUALLY died (a real exit status). Surfaced via the chat-turn
+                        // key (never the phantom routing key) either way.
+                        if exit.is_none() {
+                            *chat_session.lock().await = Some(ResidentChat::Primed(session));
+                        } else {
+                            let _ = session.end().await;
+                        }
+                        let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                            "chat.turn_failed",
+                            &[&backend, &enriched],
+                        )));
+                        return;
+                    }
+                },
+            }
         }
     };
 
@@ -4852,6 +4956,41 @@ fn detach_resident_close(session: ResidentChat) {
     });
 }
 
+/// Refresh the RESIDENT chat session after a `/run` director build releases its OWN
+/// session. The chat holder's session sat IDLE for the whole (multi-minute) run, so a
+/// base like claude-code can return `error_during_execution` on the FIRST post-run
+/// chat turn against that stale process — the reported dead-end. This detaches +
+/// closes the idle holder OFF the render path (a wedged base's shutdown must never
+/// freeze the shell) and re-fires the background pre-load so the next chat message
+/// gets a FRESH hot session instead of one idle for minutes — the SAME discipline the
+/// `/backend`-switch refresh uses. Also drops any pending base question pinned to the
+/// closed session. Only fires after a real `/run` (a chat turn already parks its own
+/// fresh session). Fully fail-open + non-blocking: the only inline await is the brief
+/// holder-lock take (uncontended here — the run just ended, no chat turn is in flight).
+async fn refresh_resident_chat_after_run(
+    app: &App,
+    chat_session_holder: &ChatSessionHolder,
+    pending_ask_holder: &PendingAskHolder,
+) {
+    if let Some(stale) = chat_session_holder.lock().await.take() {
+        detach_resident_close(stale);
+    }
+    // The old session is gone — drop any base question pinned to it so the fresh
+    // session's first turn isn't mis-relayed as its answer.
+    *pending_ask_holder.lock().await = None;
+    spawn_chat_session_preload(
+        app.backend.as_deref(),
+        String::new(),
+        app.project_root.clone(),
+        continuous_autonomous(app.effective_trust_mode()),
+        // Resume whatever cross-session id the chat is pinned to (fail-open to a fresh
+        // open); the run's outcome still reaches the fresh session via the front-loaded
+        // conversation transcript, so context is never lost.
+        app.chat_session_id.clone(),
+        chat_session_holder.clone(),
+    );
+}
+
 /// Close a director-run base session OFF the render-loop thread — same rationale
 /// as [`detach_resident_close`], for the `Box<dyn BaseSession>` parked in a
 /// [`SessionHolder`]. Best-effort, fail-open.
@@ -5374,6 +5513,12 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // base session, never two turns at once). The drained turn's
                     // handle is parked in `run_task` so Ctrl-C can abort it.
                     Some(RouteDecision::AgenticDone { reply, director_build, base_session_id }) => {
+                        // Capture whether THIS terminal outcome came from an explicit
+                        // `/run` director build (its OWN session) BEFORE `record_*`
+                        // clears the marker — a chat turn (even one promoted to a build)
+                        // already parked its own fresh session, so only a `/run` needs
+                        // the idle resident chat session refreshed.
+                        let was_run = app.director_run_in_flight;
                         app.record_agentic_done(reply, director_build, base_session_id);
                         // Build-complete experience: an EFFECTIVE build (a `/run`
                         // build, a chat "build me X", or a chat turn the reactive
@@ -5385,6 +5530,12 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                         // its answer). Fail-open + non-blocking by contract.
                         if director_build {
                             finalize_build_completion(app, &sink);
+                        }
+                        // A `/run` just released its OWN director session; the resident
+                        // CHAT session sat idle the whole run and may be stale — refresh
+                        // it (detach + re-pre-load) so the first post-run chat turn is hot.
+                        if was_run {
+                            refresh_resident_chat_after_run(app, &chat_session_holder, &pending_ask_holder).await;
                         }
                         run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &sink, &route_tx);
                         // The exchange just landed — if the working transcript has
@@ -5400,8 +5551,14 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                     // Enter from auto-replaying the same broken route while still
                     // preserving real follow-up turns typed behind it.
                     Some(RouteDecision::Failed(note)) => {
+                        let was_run = app.director_run_in_flight;
                         app.record_route_failed(note);
                         app.drop_failed_route_duplicate_queued_chat();
+                        // A failed `/run` also leaves the idle resident chat session
+                        // possibly-stale — refresh it before the next chat turn drains.
+                        if was_run {
+                            refresh_resident_chat_after_run(app, &chat_session_holder, &pending_ask_holder).await;
+                        }
                         run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &sink, &route_tx);
                     }
                     None => {}
@@ -9898,6 +10055,368 @@ mod tests {
             sent.lock().unwrap().len(),
             2,
             "both turns drove the ONE resident session (no re-open)"
+        );
+    }
+
+    // ---- Bounded first-turn chat-failure auto-re-drive: the decision gate ----------
+
+    #[test]
+    fn first_turn_unknown_clean_live_failure_earns_one_redrive() {
+        // The reported bug: a stale post-run session returns an UNCLASSIFIABLE
+        // `error_during_execution` (`BaseFailure::Unknown`) on its first turn. A clean
+        // (nothing streamed, no build), still-alive FIRST attempt earns exactly ONE
+        // fresh-session re-drive.
+        assert!(chat_turn_should_auto_redrive(
+            0,                        // the resident first attempt
+            "error_during_execution", // unclassifiable → BaseFailure::Unknown
+            false,                    // nothing streamed
+            false,                    // no reactive build fired
+            false,                    // the base is still alive
+        ));
+    }
+
+    #[test]
+    fn second_attempt_never_redrives_so_the_bound_is_exactly_one() {
+        // After the one re-drive (`attempt == 1`) a SECOND identical failure must fall
+        // through to the honest terminal — the hard proof the re-drive can never loop.
+        assert!(!chat_turn_should_auto_redrive(
+            1,
+            "error_during_execution",
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn known_transient_failure_is_not_auto_redriven() {
+        // A rate-limit / overloaded blip is KNOWN-transient: an immediate fresh session
+        // can't clear it, so it takes the surface-and-park path, never the re-drive.
+        assert!(!chat_turn_should_auto_redrive(
+            0,
+            "API Error: Request rejected (429) — usage limit",
+            false,
+            false,
+            false,
+        ));
+        assert!(!chat_turn_should_auto_redrive(
+            0,
+            "the base is overloaded (529)",
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn a_dirty_first_attempt_is_never_redriven() {
+        // If the attempt already STREAMED a partial answer, or a reactive build fired, a
+        // re-drive would double-render / re-run a side effect — forbidden even for
+        // Unknown.
+        assert!(
+            !chat_turn_should_auto_redrive(0, "error_during_execution", true, false, false),
+            "a streamed partial answer blocks the re-drive"
+        );
+        assert!(
+            !chat_turn_should_auto_redrive(0, "error_during_execution", false, true, false),
+            "a fired reactive build blocks the re-drive"
+        );
+    }
+
+    #[test]
+    fn a_dead_base_is_never_redriven() {
+        // A base that ACTUALLY exited is torn down + reported, never re-driven.
+        assert!(!chat_turn_should_auto_redrive(
+            0,
+            "error_during_execution",
+            false,
+            false,
+            true,
+        ));
+    }
+
+    /// Models the reported stale-post-run chat session: its FIRST turn fails with an
+    /// UNCLASSIFIABLE base error (`error_during_execution` → `BaseFailure::Unknown`) on a
+    /// STILL-ALIVE base (no exit status), and its teardown (`end`) seeds the holder with
+    /// a FRESH recovery session — standing in for the lazy re-open / re-fired pre-load
+    /// the bounded first-turn auto-re-drive re-acquires. Lets a unit test prove the ONE
+    /// re-drive recovers the turn IN PLACE (no dead-end Failed, no re-emitted user turn).
+    struct StaleFirstTurnSession {
+        /// The shared chat holder; `end` seeds `recovery` into it for the re-drive.
+        holder: ChatSessionHolder,
+        /// The fresh session the re-drive re-acquires (moved into the holder on `end`).
+        recovery: Option<ResidentChat>,
+        /// Set on `end` so the test can assert the stale session was torn down BEFORE the
+        /// re-drive (the fresh-session guarantee).
+        ended: Arc<std::sync::atomic::AtomicBool>,
+        /// One-shot: the single `next_event` yields the unclassifiable failure, then EOF.
+        emitted: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl umadev_runtime::BaseSession for StaleFirstTurnSession {
+        async fn send_turn(&mut self, _d: String) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            if self.emitted {
+                return None;
+            }
+            self.emitted = true;
+            Some(umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Failed("error_during_execution".into()),
+                usage: None,
+            })
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: umadev_runtime::ApprovalDecision,
+        ) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            self.ended.store(true, std::sync::atomic::Ordering::SeqCst);
+            // The stale session is gone → the fresh session the re-drive re-acquires is
+            // now in the holder (models the lazy re-open / re-fired pre-load).
+            if let Some(recovery) = self.recovery.take() {
+                *self.holder.lock().await = Some(recovery);
+            }
+            Ok(())
+        }
+        fn session_id(&self) -> Option<&str> {
+            None
+        }
+        fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+            None // the base process is still ALIVE — the stale-session case, not a crash
+        }
+    }
+
+    /// The reported bug: a resident chat session that sat idle through a `/run` returns
+    /// an UNCLASSIFIABLE `error_during_execution` on its FIRST post-run turn. On a CLEAN,
+    /// still-alive first attempt UmaDev must RE-DRIVE the SAME turn ONCE on a fresh
+    /// session and let that succeed — a clean `AgenticDone`, NOT the mislabeled dead-end
+    /// Failed — and do so with NO second re-drive (bounded, never a loop).
+    #[tokio::test]
+    async fn chat_first_turn_unknown_failure_auto_redrives_once_and_recovers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+        // The fresh session the re-drive re-acquires: one clean reply.
+        let (recovery, rec_sent, _rec_ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta("recovered on a fresh session".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        let stale_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stale = StaleFirstTurnSession {
+            holder: holder.clone(),
+            recovery: Some(ResidentChat::Primed(Box::new(recovery))),
+            ended: stale_ended.clone(),
+            emitted: false,
+        };
+        *holder.lock().await = Some(ResidentChat::Primed(Box::new(stale)));
+
+        drive_chat_session_turn(chat_turn(
+            "hello after run",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // Exactly ONE terminal decision, and it is a clean AgenticDone carrying the fresh
+        // session's reply — the re-drive recovered the turn in place; no dead-end Failed.
+        match route_rx.try_recv() {
+            Ok(RouteDecision::AgenticDone { reply, .. }) => assert!(
+                reply.contains("recovered"),
+                "the fresh session's reply is delivered: {reply}"
+            ),
+            other => panic!("expected a clean AgenticDone after one auto-re-drive, got {other:?}"),
+        }
+        assert!(
+            route_rx.try_recv().is_err(),
+            "exactly one terminal decision — the re-drive is bounded, never a loop"
+        );
+        // The stale session was torn down BEFORE the re-drive (fresh-session guarantee).
+        assert!(
+            stale_ended.load(std::sync::atomic::Ordering::SeqCst),
+            "the stale session was end()-ed before the re-drive"
+        );
+        // The SAME turn was re-driven on the fresh session (one directive reached it).
+        assert_eq!(
+            rec_sent.lock().unwrap().len(),
+            1,
+            "the same turn was re-driven once on the fresh recovery session"
+        );
+        // The recovery surfaced the new `chat.turn_failed_retrying` i18n key so it reads
+        // as an intentional retry, not a silent stall. Compute the key's fixed lead in
+        // the SAME (system) locale the note is rendered in, so the check is locale-safe.
+        let retry_lead = umadev_i18n::tlf("chat.turn_failed_retrying", &["\u{1}", "\u{1}"]);
+        let retry_lead = retry_lead.split('\u{1}').next().unwrap().to_string();
+        let mut saw_retry_note = false;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(s) = ev {
+                if s.contains(&retry_lead) {
+                    saw_retry_note = true;
+                }
+            }
+        }
+        assert!(
+            saw_retry_note,
+            "a 'retrying once on a fresh session' note is surfaced"
+        );
+    }
+
+    /// A KNOWN-transient first-turn failure (429 rate limit) on a live base is NOT
+    /// auto-re-driven (an immediate fresh session can't clear a rate limit): it surfaces
+    /// exactly ONCE, via the CHAT-turn i18n key (`chat.turn_failed`) — never the phantom
+    /// `route.failed` that produced the mislabeled "路由失败(底座)" bug — and emits NO
+    /// "retrying" note (bounded: the transient path never loops).
+    #[tokio::test]
+    async fn chat_first_turn_transient_failure_is_surfaced_once_not_redriven() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, mut engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let (fake, sent, _ended) =
+            FakeChatSession::new(vec![vec![umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Failed(
+                    "API Error: Request rejected (429) — usage limit".into(),
+                ),
+                usage: None,
+            }]]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+
+        drive_chat_session_turn(chat_turn(
+            "hi",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        ))
+        .await;
+
+        // Exactly ONE terminal Failed — no re-drive, no loop.
+        let note = match route_rx.try_recv() {
+            Ok(RouteDecision::Failed(note)) => note,
+            other => panic!("expected a single Failed for a transient turn failure, got {other:?}"),
+        };
+        assert!(
+            route_rx.try_recv().is_err(),
+            "a transient failure surfaces exactly once"
+        );
+        // Only ONE directive was ever sent — the transient path did not re-drive.
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "a transient failure is not auto-re-driven"
+        );
+
+        // The failure uses the CHAT-turn key, not the phantom ROUTING key. Both leads are
+        // rendered in the SAME (system) locale as the note, so the check is locale-safe.
+        let chat_lead = umadev_i18n::tlf("chat.turn_failed", &["\u{1}", "\u{1}"]);
+        let chat_lead = chat_lead.split('\u{1}').next().unwrap().to_string();
+        let route_lead = umadev_i18n::tlf("route.failed", &["\u{1}", "\u{1}"]);
+        let route_lead = route_lead.split('\u{1}').next().unwrap().to_string();
+        assert!(
+            note.contains(&chat_lead),
+            "the note is the chat-turn-failure key: {note}"
+        );
+        assert!(
+            !note.contains(&route_lead),
+            "the note must NOT be the phantom routing-failure key: {note}"
+        );
+
+        // No 'retrying' note was emitted for the transient path.
+        let retry_lead = umadev_i18n::tlf("chat.turn_failed_retrying", &["\u{1}", "\u{1}"]);
+        let retry_lead = retry_lead.split('\u{1}').next().unwrap().to_string();
+        let mut saw_retry = false;
+        while let Ok(ev) = engine_rx.try_recv() {
+            if let EngineEvent::Note(s) = ev {
+                if s.contains(&retry_lead) {
+                    saw_retry = true;
+                }
+            }
+        }
+        assert!(
+            !saw_retry,
+            "a known-transient failure must NOT emit a retry note"
+        );
+    }
+
+    /// Fix: a `/run` leaves the resident chat session idle for the whole run, so it may
+    /// be stale. `refresh_resident_chat_after_run` must DETACH it (empty the holder → the
+    /// next turn gets a fresh session) and DROP any base question pinned to the
+    /// now-closed session. Offline backend → the re-fired pre-load is a no-op, so the
+    /// holder stays deterministically empty (no real base is ever spawned).
+    #[tokio::test]
+    async fn refresh_after_run_detaches_stale_holder_and_drops_pending_question() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = crate::config::UserConfig {
+            backend: Some("offline".to_string()),
+            lang: Some("en".to_string()),
+            ..Default::default()
+        };
+        let app = crate::app::App::new(
+            "demo",
+            cfg,
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+
+        let (fake, _sent, ended) = FakeChatSession::new(vec![]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Primed(Box::new(fake)),
+        )));
+        let pending: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(
+            umadev_runtime::AskUserQuestion::from_tool_input(
+                "AskUserQuestion",
+                &serde_json::json!({
+                    "questions": [{"header": "H", "question": "Q?", "options": [{"label": "A"}]}]
+                }),
+            ),
+        ));
+        assert!(
+            pending.lock().await.is_some(),
+            "precondition: a base question is pinned to the (about-to-be-stale) session"
+        );
+
+        refresh_resident_chat_after_run(&app, &holder, &pending).await;
+
+        // The stale holder was detached (emptied) — the offline pre-load never refills it.
+        assert!(
+            holder.lock().await.is_none(),
+            "the stale resident session was detached from the holder"
+        );
+        // The base question pinned to the closed session was dropped.
+        assert!(
+            pending.lock().await.is_none(),
+            "the pending base question was cleared with the stale session"
+        );
+        // The detached session is closed OFF the render path (best-effort, spawned).
+        // Give the close task a bounded chance to run, then confirm the base was ended.
+        for _ in 0..64 {
+            if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "the detached session is closed off the render path"
         );
     }
 

@@ -344,6 +344,8 @@
 "run.queued" = "[queued] 已排隊 — 當前階段跑完(下個 gate / 空隙)就把它作為修改發給底座。再按 Esc 可中斷當前階段。"
 "chat.queued" = "[排隊] 上一條還在回覆,這條會在它回完後立刻發出。"
 "chat.queued_duplicate_skipped" = "[note] 上一輪路由失敗後,已跳過一條完全相同的排隊訊息,避免自動重複送出。"
+"chat.turn_failed" = "[warn] 本輪底座執行出錯(底座 `{}`): {}\n  可重試,或用 /run <需求> 顯式啟動流水線。"
+"chat.turn_failed_retrying" = "[note] 本輪底座執行出錯(底座 `{}`): {} —— 正在用新工作階段重試一次…"
 "chat.interrupted" = " [已中斷] 回覆未完成"
 "chat.restored" = "[會話] 已恢復上次的對話({} 則記錄)。繼續聊即可,或 /sessions 切換、/clear 重開。"
 "chat.restored_divider" = "──── 已恢復 —— 上方是先前的對話(向上捲動可回看) ────"

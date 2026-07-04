@@ -2516,6 +2516,21 @@ pub struct App {
     /// gate), not the chat-routing queue.
     pub queued_chat: std::collections::VecDeque<String>,
 
+    /// The EXACT text of the chat turn most recently dispatched to the base (a fresh
+    /// `Action::Route`, or a drained queued turn). On a terminal route failure this is
+    /// the authoritative "what just failed" key — [`Self::drop_failed_route_duplicate_queued_chat`]
+    /// drops queued turns equal to THIS (not the fragile "last user turn in
+    /// conversation" heuristic, which a relayed / reframed turn or an intervening
+    /// record could skew). `None` until the first dispatch.
+    pub last_dispatched_chat: Option<String>,
+
+    /// One-shot dedup guard armed by [`Self::record_route_failed`] with the just-failed
+    /// turn's text. If the user's VERY NEXT submit is that same text (a reflexive
+    /// re-send / a double-Enter that outran the failure note), [`Self::submit_text`]
+    /// swallows it ONCE so a failed turn never silently auto-duplicates. Consumed on
+    /// the next submit regardless of match (a later deliberate re-send is untouched).
+    pub suppress_route_dup: Option<String>,
+
     /// **Streaming throttle** — tracks the last tool-use name + count so
     /// consecutive same-type tool calls (e.g. 10 × Read) collapse into one
     /// line `[read] Read (10): file1, file2, …` instead of flooding the chat.
@@ -2811,6 +2826,8 @@ impl App {
             queued_steer: VecDeque::new(),
             pending_steer: None,
             queued_chat: std::collections::VecDeque::new(),
+            last_dispatched_chat: None,
+            suppress_route_dup: None,
             stream_tool_batch: None,
             stream_text_active: false,
             stream_md_cache: std::cell::RefCell::new(crate::ui::StreamMarkdownCache::default()),
@@ -7792,6 +7809,24 @@ impl App {
     /// gate is the documented shortcut for "approve / continue" — match
     /// the gate card so users don't have to type `/continue` every time.
     fn submit_text(&mut self, text: String) -> Action {
+        // Fix (dedup): a failed chat turn armed a ONE-SHOT guard with its exact text.
+        // If the user's very next submit is that same text — a reflexive re-send, or a
+        // double-Enter that outran the failure note — swallow it ONCE so a failed turn
+        // never silently auto-duplicates (the queued-duplicate drop only covers turns
+        // parked WHILE thinking; this covers a re-send AFTER the failure cleared it).
+        // Consumed unconditionally (a different submit clears it), and only when we are
+        // actually on the fresh-chat-route path (not thinking, no gate open) so a gate
+        // answer or a parked turn is never suppressed.
+        if let Some(dup) = self.suppress_route_dup.take() {
+            if !self.thinking && self.active_gate.is_none() && dup == text.trim() {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "chat.queued_duplicate_skipped").to_string(),
+                );
+                self.refresh_status();
+                return Action::None;
+            }
+        }
         self.push(ChatRole::You, text.clone());
         // A brain-driven turn is still in flight (`thinking`). Firing a second one
         // now would drive the SAME base `session_id` in two subprocesses at once →
@@ -7885,6 +7920,8 @@ impl App {
             // from an earlier phase and flash red immediately).
             self.last_output_at = None;
             self.tool_in_progress = false;
+            // Record the exact dispatched text so a terminal failure can dedup off it.
+            self.last_dispatched_chat = Some(text.clone());
             self.refresh_status();
             Action::Route(text)
         } else if !self.run_started {
@@ -7900,6 +7937,8 @@ impl App {
             // Fresh chat turn → fresh stall clock (see above).
             self.last_output_at = None;
             self.tool_in_progress = false;
+            // Record the exact dispatched text so a terminal failure can dedup off it.
+            self.last_dispatched_chat = Some(text.clone());
             self.refresh_status();
             Action::Route(text)
         } else {
@@ -8079,6 +8118,9 @@ impl App {
         // Settle the live task as Failed (a no-op for a plain chat-route failure,
         // which never registered a task).
         self.mark_active_task(TaskStatus::Failed);
+        // Arm the one-shot dedup guard with the just-failed turn's text so an immediate
+        // reflexive re-send of the SAME message is swallowed once (see `submit_text`).
+        self.suppress_route_dup = self.last_dispatched_chat.clone();
         self.refresh_status();
         self.push(ChatRole::System, note);
     }
@@ -8177,6 +8219,8 @@ impl App {
     /// subprocesses resuming one `session_id` at once).
     pub(crate) fn take_next_queued_chat(&mut self) -> Option<String> {
         let text = self.queued_chat.pop_front()?;
+        // This drained turn is now the dispatched one → dedup a later failure off it.
+        self.last_dispatched_chat = Some(text.clone());
         self.record_user_turn(&text);
         Some(text)
     }
@@ -8188,12 +8232,15 @@ impl App {
     /// again as soon as the failure note landed, reading as "it skipped thinking
     /// and dumped old output". Different queued turns still drain normally.
     pub(crate) fn drop_failed_route_duplicate_queued_chat(&mut self) -> usize {
+        // Key off the EXACT text just dispatched to the base (the turn that failed),
+        // not the last "user" turn in conversation memory. The conversation heuristic
+        // was fragile: a relayed / reframed turn, or an intervening record, could make
+        // the "last user turn" differ from what was actually sent, so a real duplicate
+        // slipped through (or a distinct turn got wrongly dropped).
         let Some(failed_turn) = self
-            .conversation
-            .iter()
-            .rev()
-            .find(|m| m.role == "user")
-            .map(|m| m.content.trim().to_string())
+            .last_dispatched_chat
+            .as_deref()
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
         else {
             return 0;
@@ -23310,6 +23357,106 @@ mod tests {
         assert_eq!(
             a.take_next_queued_chat().as_deref(),
             Some("different follow-up")
+        );
+    }
+
+    // ---- post-failure reflexive-resend dedup guard + post-run refresh trigger -----
+
+    #[test]
+    fn a_failed_turn_swallows_one_immediate_reflexive_resend() {
+        let mut a = fresh_app(Some("offline"));
+        // Dispatch a turn → it records the EXACT dispatched text.
+        let first = a.submit_text("retry me".to_string());
+        assert!(matches!(first, Action::Route(_)));
+        assert_eq!(a.last_dispatched_chat.as_deref(), Some("retry me"));
+        // The route fails → arms the one-shot dedup guard with that exact text, and
+        // clears `thinking` so a fresh submit is accepted.
+        a.record_route_failed("boom".into());
+        assert_eq!(a.suppress_route_dup.as_deref(), Some("retry me"));
+        assert!(!a.thinking);
+        // A reflexive re-send of the SAME text right after the failure is swallowed ONCE
+        // (no route), with the skipped-duplicate note.
+        let resend = a.submit_text("retry me".to_string());
+        assert_eq!(
+            resend,
+            Action::None,
+            "an identical re-send just after a failure is swallowed"
+        );
+        assert!(
+            a.suppress_route_dup.is_none(),
+            "the one-shot guard is consumed"
+        );
+        assert!(
+            a.history
+                .iter()
+                .any(|m| m.body().contains("完全相同") || m.body().contains("identical")),
+            "the transcript explains the skipped duplicate"
+        );
+        // One-shot: a LATER deliberate re-send of the same text now routes normally.
+        let deliberate = a.submit_text("retry me".to_string());
+        assert!(
+            matches!(deliberate, Action::Route(_)),
+            "a later deliberate re-send is untouched"
+        );
+    }
+
+    #[test]
+    fn the_resend_guard_only_swallows_the_exact_failed_text_and_is_consumed_either_way() {
+        let mut a = fresh_app(Some("offline"));
+        let _ = a.submit_text("first thing".to_string());
+        a.record_route_failed("boom".into());
+        assert_eq!(a.suppress_route_dup.as_deref(), Some("first thing"));
+        // A DIFFERENT next submit is NOT swallowed — it routes — and the guard is
+        // consumed regardless (a distinct follow-up is never mistaken for the duplicate).
+        let other = a.submit_text("a different message".to_string());
+        assert!(
+            matches!(other, Action::Route(_)),
+            "a distinct follow-up routes normally"
+        );
+        assert!(
+            a.suppress_route_dup.is_none(),
+            "the guard is consumed on the next submit either way"
+        );
+    }
+
+    #[test]
+    fn a_gate_answer_is_never_swallowed_by_the_resend_guard() {
+        let mut a = fresh_app(Some("offline"));
+        // Arm the guard with "c" via a failed dispatch of that text.
+        let _ = a.submit_text("c".to_string());
+        a.record_route_failed("boom".into());
+        assert_eq!(a.suppress_route_dup.as_deref(), Some("c"));
+        // "c" now arrives WHILE a gate is open → it is the gate approval, not a reflexive
+        // re-send, so the guard must NOT swallow it.
+        a.active_gate = Some(Gate::DocsConfirm);
+        let action = a.submit_text("c".to_string());
+        assert_eq!(
+            action,
+            Action::Continue(Gate::DocsConfirm),
+            "a gate answer is honored, never suppressed by the dedup guard"
+        );
+    }
+
+    #[test]
+    fn terminal_recorders_clear_the_run_marker_so_the_post_run_refresh_must_snapshot_it_first() {
+        // The post-run resident-chat refresh (a `/run` leaves the idle chat session
+        // stale) keys off `director_run_in_flight` — but BOTH terminal recorders CLEAR
+        // it. So the event loop MUST snapshot `was_run` BEFORE recording; this locks the
+        // invariant that makes the capture-before-record ordering load-bearing.
+        let mut failed = fresh_app(Some("offline"));
+        failed.director_run_in_flight = true;
+        failed.record_route_failed("run failed".into());
+        assert!(
+            !failed.director_run_in_flight,
+            "a failed run clears the in-flight marker"
+        );
+
+        let mut done = fresh_app(Some("offline"));
+        done.director_run_in_flight = true;
+        done.record_agentic_done("built it".into(), true, None);
+        assert!(
+            !done.director_run_in_flight,
+            "a completed run clears the in-flight marker"
         );
     }
 

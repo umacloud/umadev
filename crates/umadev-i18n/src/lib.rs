@@ -465,6 +465,13 @@ mod tests {
             "tui.hint.aborted",
             "config.save_failed_note",
             "chat.claims_unverified",
+            // Resident chat-turn failure (drive_chat_session_turn): a base TURN error
+            // on the chat hot path is surfaced via these (NOT the phantom route.failed
+            // that implies a routing consult that never ran) — a bounded one-shot fresh-
+            // session re-drive announces itself with `_retrying`, a final failure with
+            // `chat.turn_failed`.
+            "chat.turn_failed",
+            "chat.turn_failed_retrying",
             "chat.director_build_with_history",
             "gate.clarify_write_failed",
             // P2-D: gate-card artifact health labels (were hard-coded English).

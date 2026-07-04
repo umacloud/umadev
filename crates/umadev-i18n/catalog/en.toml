@@ -346,6 +346,8 @@
 "run.queued" = "[queued] Queued — it will be sent to the base as a revision at the next gap (gate / phase boundary). Press Esc to interrupt the current phase."
 "chat.queued" = "[queued] Queued — the base is still replying; this message will be sent the moment it finishes."
 "chat.queued_duplicate_skipped" = "[note] The last route failed, so an identical queued message was skipped instead of being auto-sent again."
+"chat.turn_failed" = "[warn] Base execution failed this turn (base `{}`): {}\n  You can retry, or use /run <requirement> to start the pipeline explicitly."
+"chat.turn_failed_retrying" = "[note] Base execution errored this turn (base `{}`): {} — retrying once on a fresh session…"
 "chat.interrupted" = " [interrupted] reply incomplete"
 "chat.restored" = "[chat] Restored your last conversation ({} messages). Pick up where you left off, or /sessions to switch, /clear to start fresh."
 "chat.restored_divider" = "──── restored — the previous conversation is above (scroll up to review) ────"
