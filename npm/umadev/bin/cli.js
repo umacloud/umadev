@@ -109,8 +109,9 @@ function findKnowledgeDir() {
 
 // ── Local embedding model — ensure it's on disk, else download it (with a
 // progress bar) from THIS version's GitHub Release. Checked on EVERY launch
-// (a cheap stat); the ~224MB fp16 model is too large for npm, so it's a
-// one-time fetch into ~/.umadev/embed-model. Fail-open: any failure launches
+// (a cheap integrity check — size + JSON parse + safetensors header, not just
+// existence, so a corrupt cache re-downloads); the ~224MB fp16 model is too large
+// for npm, so it's a one-time fetch into ~/.umadev/embed-model. Fail-open: any failure launches
 // anyway and the binary degrades to BM25 lexical retrieval, retrying next time.
 function homeDir() {
   return process.env.HOME || process.env.USERPROFILE || os.homedir();
@@ -119,14 +120,107 @@ function modelTargetDir() {
   return path.join(homeDir(), '.umadev', 'embed-model');
 }
 const MODEL_FILES = ['config.json', 'tokenizer.json', 'model.safetensors'];
-function modelPresent(dir) {
-  return MODEL_FILES.every((f) => {
-    try {
-      return fs.statSync(path.join(dir, f)).size > 0;
-    } catch (_) {
-      return false;
+// A real multilingual-e5-small safetensors is tens of MB (fp16 ~224MB, f32
+// ~448MB); anything under 1 MiB is a truncated/garbage download, never a real
+// model. The JSON sidecars (config.json / tokenizer.json) are far smaller.
+const MIN_SAFETENSORS_BYTES = 1048576; // 1 MiB
+// Largest JSON sidecar we fully JSON.parse on the (per-launch) presence check.
+// config.json is well under this; tokenizer.json (XLM-R vocab) can be ~17MB —
+// for a file that large a full parse every launch would tax startup, so we do a
+// cheap structural completeness check instead (opens with '{', closes with '}').
+const JSON_FULL_PARSE_LIMIT = 4 * 1048576; // 4 MiB
+
+// Read `length` bytes from `filePath` at byte `position` (fewer if near EOF).
+// Returns a Buffer of the bytes actually read. Throws on I/O error (callers
+// treat a throw as "corrupt/absent"). Used to sniff file headers/footers without
+// slurping a multi-hundred-MB model into memory.
+function readSlice(filePath, position, length) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(length);
+    const n = fs.readSync(fd, buf, 0, length, position);
+    return buf.subarray(0, n);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Is a JSON model sidecar (config.json / tokenizer.json) a complete, non-trivial
+// JSON object — not empty, not truncated, not binary garbage? A small file is
+// fully JSON.parsed and must be a non-empty object; a large file (tokenizer.json)
+// is checked structurally so the hot launch path never pays a ~17MB parse. Any
+// read/parse error returns false so the caller re-downloads it. Never throws.
+function jsonModelFileLooksValid(filePath) {
+  try {
+    const size = fs.statSync(filePath).size;
+    if (size <= 0) return false;
+    if (size <= JSON_FULL_PARSE_LIMIT) {
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      return (
+        parsed !== null &&
+        typeof parsed === 'object' &&
+        Object.keys(parsed).length > 0
+      );
     }
-  });
+    const head = readSlice(filePath, 0, 64).toString('utf8').replace(/^\s+/, '');
+    const tail = readSlice(filePath, Math.max(0, size - 64), 64)
+      .toString('utf8')
+      .replace(/\s+$/, '');
+    return head.startsWith('{') && tail.endsWith('}');
+  } catch (_) {
+    return false;
+  }
+}
+
+// Does model.safetensors look structurally intact WITHOUT loading it? The format
+// is `<u64 LE header-length N><N-byte JSON header><tensor data>`, so a sane size
+// floor PLUS a header-length prefix that actually fits inside the file catches a
+// truncated download (whose prefix points past EOF) or garbage. Any read error
+// returns false so the caller re-downloads. Never throws.
+function safetensorsLooksValid(filePath) {
+  try {
+    const size = fs.statSync(filePath).size;
+    if (size < MIN_SAFETENSORS_BYTES) return false;
+    const prefix = readSlice(filePath, 0, 8);
+    if (prefix.length < 8) return false;
+    const headerLen = prefix.readBigUInt64LE(0);
+    return headerLen > 0n && 8n + headerLen <= BigInt(size);
+  } catch (_) {
+    return false;
+  }
+}
+
+// One model file is "usable" when it exists AND passes a cheap integrity check
+// for its kind. A file that exists but is CORRUPT (truncated download / garbage)
+// is treated as absent so `modelPresent` is false and the wrapper re-downloads —
+// the P3 self-heal fix (a non-empty corrupt cache previously healed never).
+function modelFileValid(dir, name) {
+  const filePath = path.join(dir, name);
+  if (name.endsWith('.safetensors')) return safetensorsLooksValid(filePath);
+  if (name.endsWith('.json')) return jsonModelFileLooksValid(filePath);
+  try {
+    return fs.statSync(filePath).size > 0;
+  } catch (_) {
+    return false;
+  }
+}
+function modelPresent(dir) {
+  return MODEL_FILES.every((f) => modelFileValid(dir, f));
+}
+// Remove any existing model files (and leftover `.part` temporaries) so a
+// re-download starts from a clean slate — called before re-fetching a cache that
+// failed `modelPresent`. Fail-open: unlink errors are ignored (a fresh download's
+// atomic rename overwrites anyway); never throws.
+function clearModelFiles(dir) {
+  for (const f of MODEL_FILES) {
+    for (const p of [path.join(dir, f), path.join(dir, f + '.part')]) {
+      try {
+        fs.unlinkSync(p);
+      } catch (_) {
+        /* missing or locked — the re-download's rename overwrites it */
+      }
+    }
+  }
 }
 // Render one frame of the download progress bar (in place, via \r). Block-glyph
 // bar + percent + downloaded/total + live speed; ANSI-colored only on a TTY so a
@@ -276,7 +370,7 @@ async function downloadFile(bases, name, dest, withBar, label) {
 }
 async function ensureModel() {
   const dir = modelTargetDir();
-  if (modelPresent(dir)) return dir; // already installed — fast path, no network
+  if (modelPresent(dir)) return dir; // already installed & intact — fast path, no network
   let version = '0.0.0';
   try {
     version = require('../package.json').version;
@@ -286,6 +380,10 @@ async function ensureModel() {
   const bases = releaseBases(version);
   try {
     fs.mkdirSync(dir, { recursive: true });
+    // modelPresent() was false — either absent (first run) or a corrupt/partial
+    // cache. Drop any bad or leftover `.part` files first so this fetch self-heals
+    // a corrupt download instead of being shadowed by it (P3).
+    clearModelFiles(dir);
     process.stderr.write(
       '\n  本地向量检索模型缺失,正在下载 multilingual-e5-small(国内自动走镜像)…\n',
     );
