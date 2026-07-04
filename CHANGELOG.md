@@ -42,6 +42,17 @@
 - **检索性能**:BM25 语料签名不再每次检索都重读 + SHA256 整个知识库(改按 `(mtime, size)` 廉价 stat 记忆),排序结果对未变语料逐字节一致。
 - 另修一批 TUI 边缘:>1000 行时 thinking 写错行、复制带席位符 ⏺/●、拖图粘贴接近上限丢附件、首屏 CJK 列对齐、纯工具轮 / rewind 首轮的持久化。
 
+### 修复 — Codex 深度审计(安全 / 进程 / 文件系统边界)
+
+多轮逐段源码审计后系统性收紧了三类边界。全部 fail-open、有界、非破坏性。
+
+- **安全底线统一到一条不可绕过的 floor**:泄密 / 危险路径 / 危险命令的不可逆地板此前只有 Claude 写钩子执行,CI/pre-commit、MCP `govern_file`、非 Claude 底座各走各的、还尊重"被关闭的规则",可被绕过。现在抽出一条 `pre_write_floor_decision`,所有写入入口都先过它、无视 disabled 规则。**关键**:密钥内容检查此前按扩展名门控,写进 `Makefile` / `.env` / 无扩展 config 的密钥会整个逃掉 —— 现在地板扫描**不分扩展名**;CI/pre-commit 也收 `.env`/`.pem`/dotenv 路径(暂存 `.env` 里的真密钥会拦并非零退出,此前 "0 scanned")。
+- **危险 Bash 底线防等价写法绕过**:`rm -fr /`、`rm -rf -- /`、`git -C … push`、`git clean -fdx` 等变体归一识别;`.umadev/rules.toml` 解析失败大声告警不静默换策略;路径排除改分段锚定;OpenCode guarded ruleset 同步补齐;"No leaked secrets" 交付质量门禁也扫 `.env`/config。
+- **子进程 / 超时收口(不再挂死 / 不留孤儿 / 不无界)**:`verify` 超时不再先等管道后杀而挂死;runtime-proof / `/stop-preview` 杀整个进程组(连 npm→node/vite 孙进程);`deploy`/e2e 的 `timeout(output())` 超时真杀 + 输出封顶;CI npm audit 60s 超时;OpenCode 普通 HTTP 加 45s 超时;三底座 `end()` 统一有界 reap;`StderrTail` 多字节不再 panic;stderr drain 任务不泄漏;streaming 输出 256KiB 封顶。
+- **文件系统边界**:一批目录走查改 `symlink_metadata` **不跟随符号链接** + 深度上限(验收 / RAG 索引 / proof-pack / 密钥扫描 / lessons 不再被仓库内软链拉进外部文件、也不会因软链环递归失控);run slug 清洗(`../` / 绝对路径不能逃出 `output/`);embed 模型缓存损坏会**自愈重下**。
+- **配置 / 交付一致性**:`.umadevrc [codex] sandbox_mode` 在无头 CLI 也生效;死 `[model] provider` 配置改为运行时告警;隔离分支不复用非当前 HEAD 派生的陈旧分支;回滚基线改**每次 run 一次**;checkpoint 影子提交纳入 `.gitignore` 文件;默认 director loop 审计记真实裁决;`pr --create` 暂存按当前 slug 范围;`install --base pre-commit` 从子目录也能找到仓库根;Codex 多文件变更逐文件上报。
+- **本地 RAG 与文档诚实性**:通用 `OPENAI_API_KEY` 不再静默触发云端 embedding —— 默认纯本地,云端需显式 `UMADEV_ALLOW_CLOUD_EMBED=1` + 专用 key,语料绝不悄悄上传;spec 表、README、install 文案、npm scope(`@umacloud`)、`/model` 旧文案等漂移一并校正。
+
 ## [1.0.29] — 界面不再闪 · 上下文余量表准了 · 会话连续 · 检索自我调优
 
 这一版是一批面向用户的修复 + 一处引擎自进化收尾:先把日常最扎眼的几处交互问题一次修干净 —— 界面每隔几十秒常刷的闪烁、codex 上下文余量表超 100%、流式路径每轮丢会话上下文、预览起错服务器 —— 再补齐**自进化三件套**的最后一块(committed:检索按构建结果学有没有用)。全部改动确定性、fail-open、有界、非破坏性且保守,不改运行控制、四条治理不变量或验收 / 覆盖 / 门禁地板。
