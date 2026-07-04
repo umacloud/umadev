@@ -5,17 +5,28 @@
 //! subscription (`/v1/embeddings`, `text-embedding-3-small`, 1536-dim) and
 //! the vectors are searched with brute-force cosine similarity.
 //!
-//! ## Activation contract (three layers, all must hold)
+//! ## Activation contract
 //! 1. **Compile time**: the `vector` cargo feature is on (`--features
 //!    umadev-knowledge/vector`). Without it, this whole module compiles
 //!    to the offline stub and pulls in zero HTTP dependencies.
-//! 2. **Runtime**: an API key env var is set. We accept `OPENAI_EMBED_KEY`
-//!    (the dedicated var) OR fall back to the standard `OPENAI_API_KEY`,
-//!    so users who only have the latter still get vectors.
-//! 3. **Config**: `.umadevrc [knowledge] engine = "hybrid"`.
+//! 2. **Local first (the shipped default)**: with the `vector-local` feature
+//!    and the bundled candle model present, embedding runs fully on-device —
+//!    no key, no network. Zero setup; this is what a default install uses.
+//! 3. **Cloud embedding is OFF by default — explicit opt-in only**: sending
+//!    corpus or query text to a REMOTE embeddings endpoint requires BOTH the
+//!    dedicated `OPENAI_EMBED_KEY` **and** an explicit `UMADEV_ALLOW_CLOUD_EMBED=1`
+//!    opt-in (the single decision seam is [`cloud_embed_key`]). The generic
+//!    `OPENAI_API_KEY` NEVER authorizes an upload — a user who set it for some
+//!    unrelated OpenAI tool must never have their curated corpus silently
+//!    shipped to the cloud.
+//! 4. **Config**: `.umadevrc [knowledge] engine = "hybrid"`.
 //!
-//! When any layer is missing, `is_enabled()` is false and the retriever
-//! transparently uses BM25 only.
+//! `is_enabled()` reports whether a vector *retrieval* channel is plausibly
+//! available (a local model, or any OpenAI key for a pre-built / remote store);
+//! it gates fusion, NOT uploads. The actual network embed calls are gated
+//! strictly by [`cloud_embed_key`], so when cloud embedding is not explicitly
+//! opted in the retriever transparently uses the local model or BM25 only —
+//! never the cloud.
 //!
 //! ## Why not HNSW?
 //! `hnsw_rs` requires edition-2024 / Rust ≥1.85 and adds a non-trivial
@@ -24,10 +35,15 @@
 //! HNSW only matters at millions of vectors — out of scope here. (If the
 //! corpus ever grows that large, this module is the single swap point.)
 //!
-//! ## Network policy (fail-open)
-//! - No env key / no feature → [`VectorStore::disabled()`], every method no-op.
-//! - Key present but network fails → returns empty results, logs a warning.
-//!   Retrieval NEVER blocks the pipeline; BM25 is always the fallback.
+//! ## Network policy (fail-open, local-first)
+//! - Default install → LOCAL candle embedding, else BM25. No corpus ever leaves
+//!   the machine.
+//! - Cloud embedding runs ONLY when the user explicitly opts in
+//!   (`OPENAI_EMBED_KEY` + `UMADEV_ALLOW_CLOUD_EMBED=1`); a generic
+//!   `OPENAI_API_KEY` alone never triggers a network embed.
+//! - Cloud opted-in but network fails → returns empty results, logs a warning.
+//!   Retrieval NEVER blocks the pipeline; the local model / BM25 is always the
+//!   fallback.
 //!
 //! ## Storage
 //! Vectors are cached at `.umadev/kb-index/vectors.bin` (a serde blob).
@@ -113,23 +129,37 @@ pub fn expected_dim_for_model(model: &str) -> Option<usize> {
         .find(|(name, _)| *name == model)
         .map(|(_, dim)| *dim)
 }
-/// Env vars that activate the vector layer. `OPENAI_EMBED_KEY` is checked
-/// first (dedicated), then we fall back to the standard `OPENAI_API_KEY` so
-/// users with only the standard key configured still get vectors. Only
-/// referenced when the `vector` feature is on.
+/// The DEDICATED, embedding-specific key. This is the ONLY key that can
+/// authorize a CLOUD embed (see [`cloud_embed_key`]) — and only when the
+/// explicit opt-in flag [`ENV_ALLOW_CLOUD`] is also set. Only referenced when
+/// the `vector` feature is on.
 #[cfg(feature = "vector")]
 const ENV_KEY: &str = "OPENAI_EMBED_KEY";
+/// The generic OpenAI key. Consulted ONLY by [`is_enabled`] to decide whether a
+/// vector *retrieval* channel is plausibly available (so a pre-built / remote
+/// store is still searched) — it NEVER authorizes a cloud upload. The
+/// upload-authorizing gate ([`cloud_embed_key`]) deliberately ignores it, so a
+/// user who set `OPENAI_API_KEY` for some unrelated tool never has their corpus
+/// shipped to the cloud.
 #[cfg(feature = "vector")]
 const ENV_KEY_FALLBACK: &str = "OPENAI_API_KEY";
+/// The explicit "yes, send my corpus/query to a cloud embeddings endpoint"
+/// opt-in. Cloud embedding stays OFF unless this is truthy AND [`ENV_KEY`] is
+/// set — making leaving the local-only default a loud, intentional act.
+#[cfg(feature = "vector")]
+const ENV_ALLOW_CLOUD: &str = "UMADEV_ALLOW_CLOUD_EMBED";
 #[cfg(feature = "vector")]
 const ENV_BASE: &str = "OPENAI_EMBED_BASE";
 /// Embedding model. `text-embedding-3-small` is the cheapest high-quality
 /// option (~$0.02/M tokens as of 2026) and 1536-dim.
 const DEFAULT_MODEL: &str = "text-embedding-3-small";
 
-/// Resolve the API key, checking the dedicated var then the standard one.
-/// Returns `None` when neither is set (or empty). Only compiled when the
-/// `vector` feature is on (the constants it reads are feature-gated).
+/// Probe whether ANY OpenAI key is configured (dedicated or generic). Used
+/// ONLY by [`is_enabled`] to decide whether a vector *retrieval* channel is
+/// plausibly available — it does NOT authorize a network upload. The
+/// upload-authorizing gate is the strictly stricter [`cloud_embed_key`]. Only
+/// compiled when the `vector` feature is on (the constants it reads are
+/// feature-gated).
 #[cfg(feature = "vector")]
 fn resolve_api_key() -> Option<String> {
     for var in [ENV_KEY, ENV_KEY_FALLBACK] {
@@ -142,8 +172,57 @@ fn resolve_api_key() -> Option<String> {
     None
 }
 
-/// Whether the vector layer is configured (feature on + env key present).
-/// This is the single switch the retriever checks before trying vectors.
+/// Whether the user has explicitly opted in to CLOUD embedding via
+/// `UMADEV_ALLOW_CLOUD_EMBED`. Truthy = `1` / `true` / `yes` / `on`
+/// (case-insensitive, trimmed); anything else (or unset) means NO. This is one
+/// half of the two-part cloud gate; the other half is the dedicated key. See
+/// [`cloud_embed_key`].
+#[cfg(feature = "vector")]
+fn cloud_embed_opt_in() -> bool {
+    std::env::var(ENV_ALLOW_CLOUD).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Resolve the key authorized to CLOUD-embed, or `None` when cloud embedding is
+/// not explicitly enabled. This is the SINGLE decision seam for "should we send
+/// corpus/query text to a remote embeddings endpoint", and it is intentionally
+/// strict — BOTH must hold:
+/// 1. the explicit opt-in flag `UMADEV_ALLOW_CLOUD_EMBED` is truthy, AND
+/// 2. the DEDICATED `OPENAI_EMBED_KEY` is set (non-empty).
+///
+/// The generic `OPENAI_API_KEY` is deliberately NOT consulted here: the product
+/// promises local-only RAG, so a key a user set for an unrelated OpenAI tool
+/// must never cause their curated corpus to be uploaded. When this returns
+/// `None`, embedding stays on the local candle model (if present) or falls back
+/// to BM25 — never the cloud. Only compiled with the `vector` feature.
+#[cfg(feature = "vector")]
+fn cloud_embed_key() -> Option<String> {
+    if !cloud_embed_opt_in() {
+        return None;
+    }
+    let key = std::env::var(ENV_KEY).ok()?;
+    let key = key.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    }
+}
+
+/// Whether a vector *retrieval* channel is plausibly available — the single
+/// switch the retriever checks before fusing a (pre-built or freshly embedded)
+/// vector store. True when a bundled local model is present OR any OpenAI key is
+/// configured.
+///
+/// This is deliberately looser than the CLOUD-upload gate ([`cloud_embed_key`]):
+/// it may report `true` for a generic `OPENAI_API_KEY`, but that alone never
+/// causes a network embed — the actual embed calls ([`embed_query`] /
+/// [`embed_batch`]) authorize an upload strictly, so a generic key degrades to
+/// the local model or BM25 rather than shipping corpus to the cloud.
 ///
 /// Without the `vector` cargo feature this is a compile-time `false`.
 #[must_use]
@@ -491,7 +570,9 @@ pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
     }
     #[cfg(feature = "vector")]
     {
-        let key = resolve_api_key()?;
+        // CLOUD embed only on an explicit opt-in (dedicated key + allow flag).
+        // A generic OPENAI_API_KEY resolves to None here → no network, BM25.
+        let key = cloud_embed_key()?;
         let url = format!("{}/v1/embeddings", api_base());
         let body = serde_json::json!({ "model": DEFAULT_MODEL, "input": text });
         let mut vecs = http_embed(&url, &key, body).await?;
@@ -535,7 +616,11 @@ pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
     }
     #[cfg(feature = "vector")]
     {
-        let key = resolve_api_key()?;
+        // CLOUD embed only on an explicit opt-in (dedicated key + allow flag).
+        // A generic OPENAI_API_KEY resolves to None here, so a batch of corpus
+        // chunks is NEVER uploaded off the back of an unrelated key — the whole
+        // point of the local-only promise. Falls open to the local model / BM25.
+        let key = cloud_embed_key()?;
         if texts.is_empty() {
             return Some(Vec::new());
         }
@@ -1014,6 +1099,101 @@ mod tests {
         {
             let _ = out;
         }
+    }
+
+    // P2: the generic OPENAI_API_KEY must NEVER authorize a CLOUD embed. Only the
+    // dedicated OPENAI_EMBED_KEY + the explicit UMADEV_ALLOW_CLOUD_EMBED opt-in
+    // may. `cloud_embed_key()` is the testable seam on that decision.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn generic_openai_api_key_does_not_authorize_cloud_embed() {
+        // Hold the env lock + neutralise any installed local model so the test
+        // reflects purely the cloud-gate decision.
+        let _no_local = crate::testsupport::without_local_model();
+        std::env::remove_var(ENV_KEY);
+        std::env::remove_var(ENV_ALLOW_CLOUD);
+        // A generic key set for some UNRELATED OpenAI tool.
+        std::env::set_var(ENV_KEY_FALLBACK, "sk-generic-unrelated");
+        assert!(
+            cloud_embed_key().is_none(),
+            "a generic OPENAI_API_KEY must NOT authorize cloud embedding"
+        );
+        // Even with the allow flag on, a generic key alone is NOT the dedicated
+        // key, so still no cloud upload.
+        std::env::set_var(ENV_ALLOW_CLOUD, "1");
+        assert!(
+            cloud_embed_key().is_none(),
+            "allow flag + generic key (no dedicated key) must still NOT authorize cloud"
+        );
+        std::env::remove_var(ENV_KEY_FALLBACK);
+        std::env::remove_var(ENV_ALLOW_CLOUD);
+    }
+
+    // The dedicated OPENAI_EMBED_KEY ALONE is not enough — cloud embedding must be
+    // a loud, intentional act, so the explicit opt-in flag is also required.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn embed_key_without_allow_flag_stays_local() {
+        let _no_local = crate::testsupport::without_local_model();
+        std::env::remove_var(ENV_ALLOW_CLOUD);
+        std::env::set_var(ENV_KEY, "sk-embed-specific");
+        assert!(
+            cloud_embed_key().is_none(),
+            "the dedicated key without UMADEV_ALLOW_CLOUD_EMBED must NOT enable cloud"
+        );
+        std::env::remove_var(ENV_KEY);
+    }
+
+    // The intentional path still works: dedicated key + explicit allow flag.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn explicit_opt_in_authorizes_cloud_embed() {
+        let _no_local = crate::testsupport::without_local_model();
+        // A generic key present alongside must NOT be the one used.
+        std::env::set_var(ENV_KEY_FALLBACK, "sk-generic-unrelated");
+        std::env::set_var(ENV_KEY, "sk-embed-specific");
+        std::env::set_var(ENV_ALLOW_CLOUD, "1");
+        assert_eq!(
+            cloud_embed_key().as_deref(),
+            Some("sk-embed-specific"),
+            "dedicated key + explicit opt-in authorizes cloud embedding with the DEDICATED key"
+        );
+        std::env::remove_var(ENV_KEY);
+        std::env::remove_var(ENV_KEY_FALLBACK);
+        std::env::remove_var(ENV_ALLOW_CLOUD);
+    }
+
+    // The opt-in flag parses a small set of truthy tokens; everything else is NO.
+    #[cfg(feature = "vector")]
+    #[test]
+    fn cloud_embed_opt_in_only_truthy_tokens() {
+        let _env = crate::testsupport::env_guard();
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            std::env::set_var(ENV_ALLOW_CLOUD, v);
+            assert!(cloud_embed_opt_in(), "{v:?} must read as opted-in");
+        }
+        for v in ["0", "false", "no", "off", "", "maybe"] {
+            std::env::set_var(ENV_ALLOW_CLOUD, v);
+            assert!(!cloud_embed_opt_in(), "{v:?} must read as NOT opted-in");
+        }
+        std::env::remove_var(ENV_ALLOW_CLOUD);
+    }
+
+    // End-to-end: with ONLY a generic key and no opt-in, the corpus batch embed
+    // short-circuits to None BEFORE any network call — no corpus leaves the box.
+    #[cfg(feature = "vector")]
+    #[tokio::test]
+    async fn embed_batch_generic_key_only_uploads_nothing() {
+        let _no_local = crate::testsupport::without_local_model();
+        std::env::remove_var(ENV_KEY);
+        std::env::remove_var(ENV_ALLOW_CLOUD);
+        std::env::set_var(ENV_KEY_FALLBACK, "sk-generic-unrelated");
+        let out = embed_batch(&["a curated corpus chunk".to_string()]).await;
+        assert!(
+            out.is_none(),
+            "a generic OPENAI_API_KEY alone must not upload corpus chunks"
+        );
+        std::env::remove_var(ENV_KEY_FALLBACK);
     }
 
     #[test]
