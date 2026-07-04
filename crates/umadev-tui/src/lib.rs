@@ -515,6 +515,12 @@ fn start_preview_server(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    // Detach the preview server into its OWN session (no controlling terminal)
+    // so its — or a descendant's — direct /dev/tty writes can't paint over the
+    // alt-screen. The unsafe `setsid`/`pre_exec` seam lives in `umadev-agent`
+    // because this crate is `#![forbid(unsafe_code)]`. Safe: all three stdio
+    // streams are null above. Fail-open.
+    umadev_agent::detach_from_controlling_terminal(&mut cmd);
     // Port-conflict guard: if the port is already bound (the user's own
     // Vite/Next/Express), DON'T spawn a second server — it would either fail or
     // bind a different port while we open the wrong URL. Open / surface what's
@@ -3278,6 +3284,12 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                         event: umadev_runtime::StreamEvent::ThinkingDelta(delta),
                     });
                 }
+                umadev_runtime::SessionEvent::SessionModel(id) => {
+                    // The base reported its resolved model at session init — surface it
+                    // so the live context gauge uses the REAL window, not a per-backend
+                    // guess, even when the user pinned no model. Informational only.
+                    sink.emit(EngineEvent::BaseModel { id });
+                }
                 umadev_runtime::SessionEvent::ToolCall { name, input } => {
                     // The FIRST workspace write flips the turn into a build (one-shot,
                     // fail-open). The base decides chat-vs-build by ACTING.
@@ -4626,6 +4638,28 @@ fn frame_needs_clear(sync_output: bool, heal_requested: bool) -> bool {
     sync_output || heal_requested
 }
 
+/// P4 — whether the NON-sync repaint heartbeat is due. On a terminal without
+/// synchronized output (classic conhost: no `WT_SESSION`, and the DECRQM probe
+/// never answers) the every-frame full repaint is unreachable AND a long steady
+/// streaming run trips no discrete contamination trigger, so ratatui's own
+/// prev-vs-next diff never reconciles against terminal reality — drift
+/// accumulates and is never wiped (the reported Windows 界面错乱 after a while).
+/// This forces ONE full clear+repaint on a bounded `cadence` *while the app is
+/// live*, so accumulated drift can never outlive the heartbeat.
+///
+/// Gated to the non-sync path: under confirmed sync output every frame already
+/// clears+repaints (P0), so adding heartbeat clears there is pointless and would
+/// only cost bytes; and an IDLE screen has nothing to drift, so it never pays a
+/// clear (no flicker on a settled chat). Pure, so the truth table is unit-tested.
+fn periodic_repaint_due(
+    sync_output: bool,
+    live: bool,
+    since_last_full_repaint: Duration,
+    cadence: Duration,
+) -> bool {
+    !sync_output && live && since_last_full_repaint >= cadence
+}
+
 /// P2 — the DECRQM query asking the terminal whether DEC private mode 2026
 /// (synchronized output) is implemented: `CSI ? 2026 $ p`. Sent ONCE right
 /// after the event loop starts, and only on the owned-input path — the DECRPM
@@ -4917,6 +4951,14 @@ async fn next_termination_signal(sigs: &mut TermSignals) {
 /// `select!` arm.
 const FRAME_MIN: Duration = Duration::from_millis(16);
 
+/// P4 — the non-sync live-run repaint heartbeat: the longest a classic-conhost
+/// session may go without a full clear+repaint while streaming, so accumulated
+/// incremental-diff drift can never outlive it. Set well above [`FRAME_MIN`] so
+/// it is at most ~one extra clear per second (NOT a per-frame clear), and it
+/// only applies while the app is live — an idle screen never pays it. See
+/// [`periodic_repaint_due`].
+const REPAINT_HEARTBEAT: Duration = Duration::from_secs(1);
+
 /// M1 — the bounded budget the cancel-drain branch waits for an aborting task to
 /// wind down before forcing the post-cancel cleanup. Captured ONCE as an
 /// ABSOLUTE deadline when the drain starts (see `cancel_deadline`) so the wait is
@@ -5178,6 +5220,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
     // the healing frame actually draws. Cleared after each draw. Always starts
     // `false`, so behavior is identical when no drift.
     let mut force_full_repaint = false;
+    // P4 — non-sync repaint-heartbeat clock: the last time the screen was fully
+    // cleared+repainted. On a classic-conhost session (no sync output) a long
+    // steady streaming run forces no full repaint, so drift ratatui's diff can't
+    // see would accumulate; `periodic_repaint_due` consults this to force one
+    // clear+repaint per `REPAINT_HEARTBEAT` while live. Reset on every real
+    // clear below. Inert on the sync path (which clears every frame anyway).
+    let mut last_full_repaint = Instant::now();
     // R5 resume-gap threshold + the last time any input event arrived. A long
     // gap before the next event looks like a sleep/wake / re-attach.
     let resume_threshold = resume_gap();
@@ -5408,6 +5457,23 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
         }
         last_input_block_rows = Some(input_rows_now);
 
+        // P4 — non-sync live-run repaint heartbeat. On a terminal WITHOUT
+        // synchronized output (classic conhost) nothing forces a full repaint
+        // during a long steady streaming run, so incremental-diff drift would
+        // accumulate unwiped (the Windows 界面错乱 after a while). Force ONE full
+        // clear+repaint on a bounded cadence while live; gated to the non-sync
+        // path so sync-output terminals (which already clear every frame — P0)
+        // and idle screens (nothing to drift) are untouched. Fail-open: it only
+        // sets the existing heal flag, so it can never wedge the loop.
+        if periodic_repaint_due(
+            sync_output,
+            now_live,
+            last_full_repaint.elapsed(),
+            REPAINT_HEARTBEAT,
+        ) {
+            force_full_repaint = true;
+        }
+
         // R3 — frame-budget gate. Draw when a self-heal repaint is forced, when a
         // latency-sensitive source asked for an immediate frame (`draw_now` —
         // input, the 80ms animation tick, a cancel drain), or when the transcript
@@ -5451,6 +5517,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
             // contamination. Fail-open: a clear error never blocks the draw.
             if frame_needs_clear(sync_output, force_full_repaint) {
                 let _ = terminal.clear();
+                // P4 — a full wipe just happened; restart the non-sync repaint
+                // heartbeat from here so it measures the gap since the last real
+                // full repaint (whatever forced it — heal, contamination, or the
+                // heartbeat itself), never re-firing sooner than the cadence.
+                last_full_repaint = Instant::now();
             }
             // `.map(|f| f.area)` drops the `CompletedFrame`'s borrow of `terminal`
             // (keeping only the Copy `Rect`), so the ESU write through
@@ -11357,6 +11428,43 @@ mod tests {
         assert!(
             frame_needs_clear(false, true),
             "non-sync heals exactly when the contamination flag was drained"
+        );
+    }
+
+    #[test]
+    fn non_sync_live_run_gets_a_bounded_repaint_heartbeat() {
+        // P4 — the classic-conhost drift wipe. The heartbeat fires ONLY on the
+        // non-sync path, ONLY while live, and ONLY once the cadence has elapsed.
+        let cadence = Duration::from_secs(1);
+        // Non-sync + live + past the cadence → force one full repaint.
+        assert!(
+            periodic_repaint_due(false, true, Duration::from_millis(1200), cadence),
+            "non-sync live run past the cadence must force a full repaint"
+        );
+        // At the boundary (>=) it counts.
+        assert!(
+            periodic_repaint_due(false, true, cadence, cadence),
+            "the cadence boundary itself is due"
+        );
+        // Within the cadence → not yet (bounded, never a per-frame clear).
+        assert!(
+            !periodic_repaint_due(false, true, Duration::from_millis(200), cadence),
+            "within the cadence the heartbeat must not fire (no per-frame clear)"
+        );
+        // Idle → never (an idle screen can't drift; no flicker on a settled chat).
+        assert!(
+            !periodic_repaint_due(false, false, Duration::from_secs(10), cadence),
+            "an idle non-sync screen never pays a heartbeat clear"
+        );
+        // Sync output → NEVER on this path — every frame already repaints (P0),
+        // so the heartbeat must add no clears there, live or idle.
+        assert!(
+            !periodic_repaint_due(true, true, Duration::from_secs(10), cadence),
+            "sync output must not take the heartbeat path (already clears every frame)"
+        );
+        assert!(
+            !periodic_repaint_due(true, false, Duration::from_secs(10), cadence),
+            "sync output idle must not take the heartbeat path either"
         );
     }
 

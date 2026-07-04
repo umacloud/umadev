@@ -28,6 +28,11 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 zip = { workspace = true }
 
+# Only for the `setsid(2)` pre-exec seam in `spawn_util` (detaching a spawned
+# child from the controlling terminal). Unix-only so no other target pays for it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # Enable real HTTP embeddings in the knowledge crate. The binary enables this

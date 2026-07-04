@@ -253,14 +253,19 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
             return proof;
         }
     };
-    let spawn = Command::new(&plan.program)
-        .args(&plan.args)
+    let mut cmd = Command::new(&plan.program);
+    cmd.args(&plan.args)
         .current_dir(&plan.dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn();
+        .kill_on_drop(true);
+    // Detach the dev server into its OWN session (no controlling terminal) so a
+    // descendant that writes straight to /dev/tty — a Spring/Logback console
+    // appender, Maven/npm/Docker progress — can't paint over the TUI's
+    // alt-screen. Safe: all three stdio streams are piped/null above. Fail-open.
+    crate::spawn_util::detach_from_controlling_terminal(&mut cmd);
+    let spawn = cmd.spawn();
     let mut child = match spawn {
         Ok(c) => c,
         Err(e) => {

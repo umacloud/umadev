@@ -787,16 +787,20 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         // pipes and drop partial output on timeout; instead we detach the
         // readers, race wait() against the timer, then drain the buffers.
         let (vprog, vlead) = spawn_parts(&step.program);
-        let mut child = match Command::new(vprog)
-            .args(&vlead)
+        let mut vcmd = Command::new(vprog);
+        vcmd.args(&vlead)
             .args(&step.args)
             .current_dir(workspace)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        // Detach into a new session (no controlling terminal): a `--runtime`
+        // step may boot a server whose console/descendant output would otherwise
+        // write straight to /dev/tty and bleed over the TUI's alt-screen. Safe:
+        // stdio is piped/null above. Fail-open (see spawn_util).
+        crate::spawn_util::detach_from_controlling_terminal(&mut vcmd);
+        let mut child = match vcmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 // A non-skippable install that can't even spawn is an install

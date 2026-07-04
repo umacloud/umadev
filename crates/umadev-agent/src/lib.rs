@@ -9,7 +9,11 @@
 //! integration lands. The shape stabilises now so downstream crates
 //! (CLI, CI plugins) can already import it.
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: the crate is unsafe-free EXCEPT the single audited
+// `pre_exec` seam in `spawn_util` (a `#[allow(unsafe_code)]` island), which
+// lets the `#![forbid(unsafe_code)]` crates — notably `umadev-tui` — detach a
+// spawned child from the controlling terminal without relaxing their policy.
+#![deny(unsafe_code)]
 #![warn(missing_docs, clippy::all, clippy::pedantic)]
 #![allow(
     clippy::module_name_repetitions,
@@ -78,6 +82,7 @@ pub mod security;
 pub mod self_evolve;
 pub mod sizing_calibration;
 pub mod skills;
+pub mod spawn_util;
 pub mod state;
 pub mod tech_debt;
 pub mod test_integrity;
@@ -199,6 +204,7 @@ pub use skills::{
     graduate_skill, graduate_validated_patterns, read_skills, retrieve_skills,
     skill_description_prompt, skills_for_prompt, skills_report, Skill,
 };
+pub use spawn_util::{detach_from_controlling_terminal, detach_kind, DetachKind};
 pub use state::{
     list_snapshots, read_workflow_state, read_workflow_state_diagnostic, restore_snapshot,
     unfinished_plan_summary, write_workflow_state, ReadState, WorkflowState,
