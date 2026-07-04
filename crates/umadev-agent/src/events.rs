@@ -126,6 +126,17 @@ pub enum EngineEvent {
         /// Tokens produced in the response this turn.
         output_tokens: u32,
     },
+    /// The base reported the EXACT model it resolved for the live session (from
+    /// the session `init` frame — see `umadev_runtime::SessionEvent::SessionModel`).
+    /// The UI uses it as the LIVE source of the context-gauge DENOMINATOR: the real
+    /// model window instead of a per-backend guess, even when the user pinned no
+    /// model. Emitted at most once per session, before any `TurnUsage`. Fail-open:
+    /// a base that reports no model simply never emits this, and the gauge keeps
+    /// its static estimate.
+    BaseModel {
+        /// The base-reported model id (e.g. `claude-sonnet-4-5-20250929`).
+        id: String,
+    },
     /// A **transient, in-place status line** — NOT a transcript entry. Used by
     /// the long-phase heartbeat for its periodic "still working (mm:ss)" beats:
     /// a UI overwrites a single status field with `Some(text)` and clears it on

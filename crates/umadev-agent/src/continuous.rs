@@ -545,6 +545,12 @@ async fn drive_phase(
                     event: StreamEvent::ThinkingDelta(text),
                 });
             }
+            SessionEvent::SessionModel(id) => {
+                // The base reported its resolved model at session init — surface it
+                // so the TUI's context gauge uses the REAL window, not a per-backend
+                // guess. Purely informational; drives no loop control.
+                events.emit(EngineEvent::BaseModel { id });
+            }
             SessionEvent::ToolCall { name, input } => {
                 govern_tool_call(options, events, &policy, phase, &name, &input);
             }
@@ -1924,6 +1930,12 @@ async fn drive_rework_turn_with_idle(
                 events.emit(EngineEvent::WorkerStream {
                     event: StreamEvent::ThinkingDelta(delta),
                 });
+            }
+            SessionEvent::SessionModel(id) => {
+                // The base reported its resolved model at session init — surface it
+                // so the TUI's context gauge uses the REAL window, not a per-backend
+                // guess. Informational only; drives no rework control.
+                events.emit(EngineEvent::BaseModel { id });
             }
             SessionEvent::ToolCall { name, input } => {
                 // Rework writes real files — govern + audit them exactly like a

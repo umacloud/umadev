@@ -206,22 +206,33 @@ pub(crate) const CONTEXT_NUDGE_PCT: u16 = 80;
 /// gauge then shows nothing rather than a fabricated denominator (fail-open).
 #[must_use]
 pub(crate) fn context_window_estimate(backend_id: &str, model: &str) -> Option<u64> {
-    let m = model.to_ascii_lowercase();
+    // Normalize so a DOTTED table key (`claude-sonnet-4.5`) and the base's REAL
+    // DASHED id (`claude-sonnet-4-5-20250929`, the exact string the init frame
+    // reports) resolve to the SAME rule: fold every `.` to `-`, then match on
+    // dashed substrings. Without this fold a real id fell through to the generic
+    // 200K bucket and the gauge could not tell 200K from 1M.
+    let m = model.to_ascii_lowercase().replace('.', "-");
     // Model-id substring match wins (most specific). Ordered so a `gpt-5` hit
     // beats the generic `gpt-4` bucket.
-    if m.contains("gemini-1.5") || m.contains("gemini-2") || m.contains("gemini-3") {
+    if m.contains("gemini-1-5") || m.contains("gemini-2") || m.contains("gemini-3") {
         return Some(1_000_000);
     }
-    if m.contains("glm-4.5") || m.contains("glm-5") {
+    if m.contains("glm-4-5") || m.contains("glm-5") {
         return Some(128_000);
     }
-    if m.contains("claude-sonnet-4.5") || m.contains("claude-opus-4.1") {
+    // 1M is RESERVED for the Sonnet 4.x 1M-context beta: a Claude id that carries
+    // the explicit `-1m` / `[1m]` marker (opencode's `…[1m]`, or a `-1m` alias).
+    // The marker is the ONLY thing that lifts a Claude model out of the 200K
+    // family — Opus included (Opus is 200K, NOT 1M; the old table wrongly put
+    // `claude-opus-4.1` in the 1M bucket), and a bare Sonnet 4.5 (default 200K).
+    if m.contains("claude") && (m.contains("-1m") || m.contains("[1m]")) {
         return Some(1_000_000);
     }
     if m.contains("claude") {
         return Some(200_000);
     }
-    if m.contains("gpt-5.5") || m.contains("gpt-5.1") || m.contains("gpt-5") {
+    // GPT-5.x (incl. GPT-5-codex) → 400K.
+    if m.contains("gpt-5") {
         return Some(400_000);
     }
     if m.contains("o4-mini") || m.contains("o3") || m.contains("gpt-4") {
@@ -231,9 +242,12 @@ pub(crate) fn context_window_estimate(backend_id: &str, model: &str) -> Option<u
     // per-backend default budget; unknown / offline base → nothing.
     match backend_id {
         // claude-code, and opencode (which commonly drives a Claude model), share
-        // the conservative Claude-family floor; codex uses the GPT default.
+        // the conservative Claude-family 200K floor — never regress it to 128K.
         "claude-code" | "opencode" => Some(200_000),
-        "codex" => Some(128_000),
+        // codex's login default is a GPT-5-codex model (400K window), so a codex
+        // session with no detected model id defaults to 400K rather than the old
+        // 128K guess (which under-counted the real window by >3x).
+        "codex" => Some(400_000),
         _ => None,
     }
 }
@@ -6672,6 +6686,17 @@ impl App {
                 // fresh real measurement each turn; drives the proactive /compact nudge.
                 self.last_turn_input_tokens = u64::from(input_tokens);
                 self.maybe_nudge_compaction();
+            }
+            EngineEvent::BaseModel { id } => {
+                // The base reported the EXACT model it resolved for this session (its
+                // `init` frame). Adopt it as the LIVE source of the context-gauge
+                // denominator so `context_window_tokens()` uses the real model window
+                // immediately — even when the user pinned nothing and the static
+                // config detection guessed a per-backend default. Fail-open: an empty
+                // id is ignored (keep whatever detection already found).
+                if !id.is_empty() {
+                    self.base_model = Some(id);
+                }
             }
             EngineEvent::Note(note) => {
                 // A TERMINAL-ABORT note (a block that returned `Err` → produced
@@ -14323,12 +14348,36 @@ mod tests {
 
     #[test]
     fn context_window_table_returns_sane_denominators() {
-        // Claude family (incl. opencode's `provider/model` form) follows the
-        // detected model window; older/unknown Claude variants keep the 200k floor.
+        // A bare Sonnet 4.x (dotted OR the base's real dashed id) is the DEFAULT
+        // 200K family — 1M is the opt-in beta, reserved for the explicit marker.
         assert_eq!(
             context_window_estimate("claude-code", "claude-sonnet-4.5"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_window_estimate("claude-code", "claude-sonnet-4-5-20250929"),
+            Some(200_000)
+        );
+        // The 1M-context beta marker (`[1m]` / `-1m`) lifts Sonnet 4.x to 1M.
+        assert_eq!(
+            context_window_estimate("claude-code", "claude-sonnet-4-5-20250929[1m]"),
             Some(1_000_000)
         );
+        assert_eq!(
+            context_window_estimate("opencode", "anthropic/claude-sonnet-4-5-1m"),
+            Some(1_000_000)
+        );
+        // Opus is 200K, NOT 1M — dotted key AND the real dashed id both resolve to
+        // the 200K family (this was the headline bug: Opus mis-bucketed at 1M).
+        assert_eq!(
+            context_window_estimate("claude-code", "claude-opus-4.1"),
+            Some(200_000)
+        );
+        assert_eq!(
+            context_window_estimate("claude-code", "claude-opus-4-1-20250805"),
+            Some(200_000)
+        );
+        // Other Claude variants (incl. opencode's `provider/model` form) → 200K.
         assert_eq!(
             context_window_estimate("opencode", "anthropic/claude-sonnet-4-6"),
             Some(200_000)
@@ -14343,12 +14392,50 @@ mod tests {
             Some(128_000)
         );
         assert_eq!(context_window_estimate("codex", "o4-mini"), Some(128_000));
-        // Unset model → the per-backend default budget.
+        // Unset model → the per-backend default budget: claude-code/opencode keep
+        // the 200K floor (never 128K); codex defaults to the GPT-5-codex 400K.
         assert_eq!(context_window_estimate("claude-code", ""), Some(200_000));
-        assert_eq!(context_window_estimate("codex", ""), Some(128_000));
+        assert_eq!(context_window_estimate("opencode", ""), Some(200_000));
+        assert_eq!(context_window_estimate("codex", ""), Some(400_000));
+        // An UNKNOWN model on claude-code falls back to the 200K floor, not 128K.
+        assert_eq!(
+            context_window_estimate("claude-code", "totally-unknown-model"),
+            Some(200_000)
+        );
         // Unknown / offline base with no usable model → nothing (fail-open).
         assert_eq!(context_window_estimate("offline", ""), None);
         assert_eq!(context_window_estimate("", "some-unknown-model"), None);
+    }
+
+    #[test]
+    fn base_model_engine_event_drives_context_gauge_live() {
+        // The base reports its resolved model at session init (`EngineEvent::BaseModel`)
+        // → the gauge denominator switches to the REAL model window immediately, even
+        // when the user pinned nothing (fresh app: no detected model).
+        let mut app = fresh_app(Some("claude-code"));
+        app.last_turn_input_tokens = 100_000;
+        // Pin "user pinned nothing" deterministically — `fresh_app` would otherwise
+        // inherit the dev host's ambient `~/.claude/settings.json` model.
+        app.base_model = None;
+        // Before the init frame: the claude-code 200K per-backend floor.
+        assert_eq!(app.context_window_tokens(), Some(200_000));
+        // A dashed real Sonnet id WITH the 1M-beta marker → 1M window, live.
+        app.apply_engine(EngineEvent::BaseModel {
+            id: "claude-sonnet-4-5-20250929[1m]".to_string(),
+        });
+        assert_eq!(
+            app.base_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929[1m]")
+        );
+        assert_eq!(app.context_window_tokens(), Some(1_000_000));
+        // A dashed real Opus id resolves to 200K (NOT 1M) — the corrected bucket.
+        app.apply_engine(EngineEvent::BaseModel {
+            id: "claude-opus-4-1-20250805".to_string(),
+        });
+        assert_eq!(app.context_window_tokens(), Some(200_000));
+        // Fail-open: an empty id is ignored, keeping the last good model.
+        app.apply_engine(EngineEvent::BaseModel { id: String::new() });
+        assert_eq!(app.base_model.as_deref(), Some("claude-opus-4-1-20250805"));
     }
 
     #[test]
@@ -14365,6 +14452,10 @@ mod tests {
     #[test]
     fn context_gauge_computes_pct_from_last_turn_input_tokens() {
         let mut app = fresh_app(Some("claude-code"));
+        // Pin "no detected model" so this exercises the claude-code 200K default
+        // deterministically — `fresh_app` would otherwise inherit the dev host's
+        // ambient `~/.claude/settings.json` model (test isolation).
+        app.base_model = None;
         // No usage and an empty transcript → nothing to show (fail-open).
         assert!(app.context_used_tokens().is_none());
         assert!(app.context_usage_pct().is_none());
@@ -14445,6 +14536,9 @@ mod tests {
     #[test]
     fn compaction_nudge_fires_once_on_crossing_and_not_below() {
         let mut app = fresh_app(Some("claude-code"));
+        // Pin the deterministic 200K default (not the dev host's ambient `~/.claude`
+        // model) — the 80% crossing math below is written against a 200K denominator.
+        app.base_model = None;
         let before = app.history.len();
         // Below the 80% threshold (100k/200k = 50%) → no nudge.
         app.last_turn_input_tokens = 100_000;

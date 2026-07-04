@@ -836,6 +836,16 @@ pub enum SessionEvent {
     /// simply never emits this; an unparseable thinking frame is skipped, never a
     /// panic.
     ThinkingDelta(String),
+    /// The base reported the EXACT model it resolved for this session, read from
+    /// the session `init` frame (claude's stream-json `system`/`init` line carries
+    /// a `model` field like `claude-sonnet-4-5-20250929`). Emitted at most once,
+    /// at session start, BEFORE any turn. The consumer threads it to the
+    /// context-usage gauge so the denominator is the base's REAL window instead of
+    /// a per-backend guess (a static default couldn't tell 200K from 1M).
+    /// **Fail-open:** a base whose init frame carries no model id simply never
+    /// emits this — the gauge falls back to its static estimate exactly as before;
+    /// an unparseable frame is skipped, never a panic.
+    SessionModel(String),
     /// The base invoked a tool — `name` is the tool id (`Write`/`Edit`/`Bash`/
     /// `Read`/…), `input` the raw tool input (e.g. `{"file_path": "..."}`).
     /// This is where a real file write shows up.

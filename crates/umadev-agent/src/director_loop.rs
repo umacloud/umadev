@@ -3639,6 +3639,12 @@ async fn drive_one_turn_with_backoff(
                     event: StreamEvent::ThinkingDelta(delta),
                 });
             }
+            SessionEvent::SessionModel(id) => {
+                // The base reported its resolved model at session init — surface it
+                // so the TUI's context gauge uses the REAL window, not a per-backend
+                // guess. Purely informational; drives no loop control or acceptance.
+                events.emit(EngineEvent::BaseModel { id });
+            }
             SessionEvent::ToolCall { name, input } => {
                 // OBSERVED-tool corroboration (honesty floor): if THIS tool call is a real
                 // build/test/lint runner, record it — the auto-QC will require this signal

@@ -811,8 +811,24 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
         Some("system") => {
             tracing::debug!(
                 system = %describe_system_event(&v),
-                "inbound base system message (no event)"
+                "inbound base system message"
             );
+            // The session `init` frame carries the EXACT model claude resolved for
+            // this session (e.g. `claude-sonnet-4-5-20250929`) — the authoritative
+            // denominator for the context-usage gauge. Surface it ONCE as a
+            // `SessionModel` event so the TUI stops guessing a per-backend default;
+            // the control flow is untouched (still no event for any other system
+            // frame). Fail-open: a missing / non-string / empty `model`, or any
+            // non-init system frame, yields no event exactly as before.
+            if v.get("subtype").and_then(Value::as_str) == Some("init") {
+                if let Some(model) = v
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty())
+                {
+                    return vec![SessionEvent::SessionModel(model.to_string())];
+                }
+            }
             vec![]
         }
         // keep_alive, status, tool_progress, … → not events.
@@ -1524,6 +1540,39 @@ mod tests {
         };
         assert_eq!(name, "Write");
         assert_eq!(input["file_path"], "src/App.tsx");
+    }
+
+    #[test]
+    fn init_frame_yields_session_model_and_is_fail_open() {
+        // The session `init` frame carries the EXACT resolved model — surfaced ONCE
+        // as a `SessionModel` event so the context gauge stops guessing a default.
+        let init = r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-4-5-20250929","tools":["Bash"]}"#;
+        assert_eq!(
+            parse_stdout_line(init),
+            vec![SessionEvent::SessionModel(
+                "claude-sonnet-4-5-20250929".to_string()
+            )],
+            "init frame's model id flows through to a SessionModel event"
+        );
+        // Fail-open: an init frame with no `model` field yields no event (the gauge
+        // then falls back to its static estimate exactly as before).
+        let no_model = r#"{"type":"system","subtype":"init","session_id":"s1"}"#;
+        assert!(
+            parse_stdout_line(no_model).is_empty(),
+            "missing model → no event (fail-open)"
+        );
+        // Fail-open: an empty model string is treated as absent.
+        let empty = r#"{"type":"system","subtype":"init","model":""}"#;
+        assert!(
+            parse_stdout_line(empty).is_empty(),
+            "empty model → no event"
+        );
+        // A non-init system frame (status / other) still produces no event.
+        let status = r#"{"type":"system","subtype":"status","model":"claude-sonnet-4-5-20250929"}"#;
+        assert!(
+            parse_stdout_line(status).is_empty(),
+            "only the init frame carries the authoritative model"
+        );
     }
 
     #[test]
