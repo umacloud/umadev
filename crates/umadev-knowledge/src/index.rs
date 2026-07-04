@@ -667,6 +667,14 @@ fn max_md_files() -> usize {
 /// Recursively collect `.md` file paths under `dir`, up to `depth` 6.
 /// Matches the legacy `walk_md` behaviour (phases.rs:1851) so the corpus
 /// coverage is identical.
+///
+/// No-follow: entries are classified with `symlink_metadata` (lstat), so a
+/// symlinked directory INSIDE the knowledge tree is never descended and a
+/// symlinked `.md` is never collected — a link can't pull markdown from OUTSIDE
+/// the corpus into the RAG index, and a symlink cycle can't recurse. Fail-open:
+/// an entry whose metadata can't be read is skipped, never aborting the walk.
+/// (umadev-knowledge deliberately does not depend on umadev-agent, so this
+/// mirrors that crate's `fswalk` policy inline rather than sharing the helper.)
 fn walk_md(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let cap = max_md_files();
     if depth > 6 {
@@ -682,9 +690,16 @@ fn walk_md(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.is_dir() {
+        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+            continue;
+        };
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
             walk_md(&p, out, depth + 1);
-        } else if p.extension().and_then(|s| s.to_str()) == Some("md") {
+        } else if ft.is_file() && p.extension().and_then(|s| s.to_str()) == Some("md") {
             if cap != 0 && out.len() >= cap {
                 warn_md_cap_once(cap);
                 return;
@@ -1234,6 +1249,39 @@ B: {sb}"
         assert_eq!(
             paths, sorted,
             "chunk paths must be in stable sorted order: {paths:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_md_no_follow_symlinks_out_and_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+        // OUTSIDE the corpus: a markdown file that must never enter the index.
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("outside.md"), "# outside\n").unwrap();
+
+        // The corpus dir: a real in-tree .md, a dir symlink escaping OUTSIDE,
+        // and a self-cycle symlink.
+        let corpus = tempfile::TempDir::new().unwrap();
+        std::fs::write(corpus.path().join("inside.md"), "# inside\n").unwrap();
+        symlink(outside.path(), corpus.path().join("escape")).unwrap();
+        symlink(corpus.path(), corpus.path().join("loop")).unwrap();
+
+        // Terminates: an escaping / cyclic dir symlink is never descended.
+        let mut out = Vec::new();
+        walk_md(corpus.path(), &mut out, 0);
+
+        assert!(
+            out.iter().any(|p| p.ends_with("inside.md")),
+            "in-tree markdown must still be indexed: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|p| p.ends_with("outside.md")),
+            "a symlink must not pull markdown from outside the corpus: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|p| p.to_string_lossy().contains("escape")),
+            "walk must not traverse an escaping symlink: {out:?}"
         );
     }
 

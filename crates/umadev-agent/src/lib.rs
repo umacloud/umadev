@@ -61,6 +61,7 @@ pub mod events;
 pub mod experts;
 pub mod fact_extract;
 pub mod first_pass;
+pub(crate) mod fswalk;
 pub mod gates;
 pub mod knowledge_feedback;
 pub mod lessons;

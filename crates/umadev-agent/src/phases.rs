@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use umadev_governance::{compliance::write_compliance_mapping, extract_api_urls, record_tool_call};
 use umadev_spec::Phase;
 
+use crate::fswalk::{classify_no_follow, EntryKind};
 use crate::runner::RunOptions;
 
 /// What the phase produced. Returned for tracing / tests.
@@ -2642,10 +2643,13 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            walk_files(&p, out, depth + 1);
-        } else {
-            out.push(p);
+        // No-follow: never pack a file reached THROUGH a symlink — a link inside
+        // the packed dirs could otherwise pull a file from OUTSIDE the workspace
+        // into the proof-pack zip, and a dir-symlink cycle could recurse.
+        match classify_no_follow(&p) {
+            EntryKind::Dir => walk_files(&p, out, depth + 1),
+            EntryKind::File => out.push(p),
+            EntryKind::Skip => {}
         }
     }
 }
@@ -2748,16 +2752,24 @@ fn collect_code_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || SECRET_LEAK_SKIP_DIRS.contains(&name) {
-                continue;
+        // No-follow: keep the secret-leak scan inside the workspace — a symlink
+        // is never traversed, so it can't be steered OUT of the tree or cycled.
+        match classify_no_follow(&p) {
+            EntryKind::Dir => {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || SECRET_LEAK_SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                collect_code_files(&p, out, depth + 1);
             }
-            collect_code_files(&p, out, depth + 1);
-        } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-            if SECRET_LEAK_CODE_EXT.contains(&ext) {
-                out.push(p);
+            EntryKind::File => {
+                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    if SECRET_LEAK_CODE_EXT.contains(&ext) {
+                        out.push(p);
+                    }
+                }
             }
+            EntryKind::Skip => {}
         }
     }
 }
@@ -2776,16 +2788,24 @@ fn collect_design_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     let Ok(rd) = fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || SECRET_LEAK_SKIP_DIRS.contains(&name) {
-                continue;
+        // No-follow: keep the design-quality scan inside the workspace — a
+        // symlink is never traversed, so it can't escape the tree or cycle.
+        match classify_no_follow(&p) {
+            EntryKind::Dir => {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || SECRET_LEAK_SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                collect_design_files(&p, out, depth + 1);
             }
-            collect_design_files(&p, out, depth + 1);
-        } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-            if DESIGN_SCAN_EXT.contains(&ext) {
-                out.push(p);
+            EntryKind::File => {
+                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    if DESIGN_SCAN_EXT.contains(&ext) {
+                        out.push(p);
+                    }
+                }
             }
+            EntryKind::Skip => {}
         }
     }
 }
@@ -4617,6 +4637,41 @@ mod tests {
             .unwrap();
         assert!(zip.is_file());
         assert!(fs::metadata(zip).unwrap().len() > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_files_no_follow_symlinks_out_and_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+        // OUTSIDE the workspace: a file that must NEVER be packed into the zip.
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("outside.md"), "outside\n").unwrap();
+
+        // A packed subtree with a real file, an escaping dir symlink, and a
+        // self-cycle symlink.
+        let ws = TempDir::new().unwrap();
+        let sub = ws.path().join("changes");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("real.md"), "in-tree\n").unwrap();
+        symlink(outside.path(), sub.join("escape")).unwrap();
+        symlink(&sub, sub.join("loop")).unwrap();
+
+        // Terminates: the escaping / cyclic dir symlink is never descended.
+        let mut out = Vec::new();
+        walk_files(&sub, &mut out, 0);
+
+        assert!(
+            out.iter().any(|p| p.ends_with("real.md")),
+            "in-tree file must still be packed: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|p| p.ends_with("outside.md")),
+            "proof pack must not include files reached via an escaping symlink: {out:?}"
+        );
+        assert!(
+            !out.iter().any(|p| p.to_string_lossy().contains("escape")),
+            "walk must not traverse an escaping symlink: {out:?}"
+        );
     }
 
     // ---- smart knowledge digest ----

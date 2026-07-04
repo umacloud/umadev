@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::fswalk::{classify_no_follow, EntryKind};
 use crate::phases::QualityCheck;
 use umadev_contract::ApiSpec;
 
@@ -2772,10 +2773,10 @@ pub fn list_sedimented_lessons(project_root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     let project_learned = project_root.join(LEARNED_DIR);
     if project_learned.is_dir() {
-        collect_md_files(&project_learned, &mut files);
+        collect_md_files(&project_learned, &mut files, 0);
     }
     if let Some(global) = global_learned_dir() {
-        collect_md_files(&global, &mut files);
+        collect_md_files(&global, &mut files, 0);
     }
     files
 }
@@ -2803,20 +2804,37 @@ fn clear_auto_sediment_files(domain_dir: &Path) {
     }
 }
 
-fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Maximum depth for the sedimented-lesson listing walk. The learned tree is
+/// domain-shallow in practice; the cap is defense-in-depth so a stray symlink
+/// cycle (already unreachable via the no-follow classification below) or a
+/// pathological hand-nested tree can't recurse unbounded.
+const MAX_LESSON_DEPTH: usize = 12;
+
+fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > MAX_LESSON_DEPTH {
+        return;
+    }
     let Ok(rd) = fs::read_dir(dir) else {
         return;
     };
     for entry in rd.flatten() {
         let p = entry.path();
-        if p.is_dir() {
-            // Skip the _raw dir (raw JSONL, not retrievable markdown).
-            if p.file_name().is_some_and(|n| n == "_raw") {
-                continue;
+        // No-follow: a symlink (dir or file) is skipped, so the listing can't
+        // escape the learned tree or loop through a cycle.
+        match classify_no_follow(&p) {
+            EntryKind::Dir => {
+                // Skip the _raw dir (raw JSONL, not retrievable markdown).
+                if p.file_name().is_some_and(|n| n == "_raw") {
+                    continue;
+                }
+                collect_md_files(&p, out, depth + 1);
             }
-            collect_md_files(&p, out);
-        } else if p.extension().and_then(|s| s.to_str()) == Some("md") {
-            out.push(p);
+            EntryKind::File => {
+                if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                    out.push(p);
+                }
+            }
+            EntryKind::Skip => {}
         }
     }
 }

@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use crate::fswalk::{classify_no_follow, EntryKind};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -356,19 +357,27 @@ fn collect_config_secret(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            // Skip dot-dirs (`.git`, `.umadev`, …) + build/vendor dirs. A `.env`
-            // FILE starts with a dot too, but the dot rule only applies to dirs,
-            // so `.env` is still collected below.
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || CONFIG_SKIP_DIRS.contains(&name) {
-                continue;
+        // No-follow: a symlink (dir or file) is never traversed, so the
+        // secret scan can't be steered OUT of the workspace or into a cycle.
+        match classify_no_follow(&p) {
+            EntryKind::Dir => {
+                // Skip dot-dirs (`.git`, `.umadev`, …) + build/vendor dirs. A
+                // `.env` FILE starts with a dot too, but the dot rule only
+                // applies to dirs, so `.env` is still collected below.
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || CONFIG_SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                collect_config_secret(&p, out, depth + 1);
             }
-            collect_config_secret(&p, out, depth + 1);
-        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if umadev_governance::is_config_secret_path(name) {
-                out.push(p);
+            EntryKind::File => {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    if umadev_governance::is_config_secret_path(name) {
+                        out.push(p);
+                    }
+                }
             }
+            EntryKind::Skip => {}
         }
     }
 }
@@ -1065,6 +1074,37 @@ mod tests {
             sast.status,
             ScanStatus::Findings,
             "the YAML secret must be found: {sast:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_secret_scan_no_follow_symlinks_out_and_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+        // OUTSIDE the workspace: a config file with a secret the scan must never
+        // reach through a symlink.
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join(".env"), "SECRET=leaked-abc123\n").unwrap();
+
+        // The workspace: a real in-tree `.env`, a dir symlink escaping OUTSIDE,
+        // and a self-cycle symlink.
+        let ws = TempDir::new().unwrap();
+        std::fs::write(ws.path().join(".env"), "INSIDE=ok\n").unwrap();
+        symlink(outside.path(), ws.path().join("escape")).unwrap();
+        symlink(ws.path(), ws.path().join("loop")).unwrap();
+
+        // Terminates: an escaping / cyclic dir symlink is never descended.
+        let found = config_secret_files(ws.path());
+
+        // No regression: the in-tree `.env` is still collected.
+        assert!(
+            found.iter().any(|p| p == &ws.path().join(".env")),
+            "in-tree config secret file must still be scanned: {found:?}"
+        );
+        // The scan must not be steered OUTSIDE the workspace via the symlink.
+        assert!(
+            !found.iter().any(|p| p.to_string_lossy().contains("escape")),
+            "config-secret walk must not traverse an escaping symlink: {found:?}"
         );
     }
 }

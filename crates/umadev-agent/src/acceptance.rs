@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::fswalk::{classify_no_follow, EntryKind};
+
 /// Source + style extensions. The code files form the "implementation surface"
 /// for the endpoint-coverage check; the style files (css/…) matter for the
 /// post-phase governance scan, where hardcoded colors live.
@@ -67,16 +69,26 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || SKIP_DIRS.contains(&name) {
-                continue;
+        // No-follow: `symlink_metadata` classifies a symlink AS a symlink
+        // (`Skip`), so a link inside the tree can never make the walk descend
+        // into — or collect a file from — OUTSIDE the workspace, and a symlink
+        // cycle is unreachable.
+        match classify_no_follow(&p) {
+            EntryKind::Dir => {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                collect(&p, out, depth + 1);
             }
-            collect(&p, out, depth + 1);
-        } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-            if SRC_EXT.contains(&ext) && is_nontrivial_source(&p, ext) {
-                out.push(p);
+            EntryKind::File => {
+                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    if SRC_EXT.contains(&ext) && is_nontrivial_source(&p, ext) {
+                        out.push(p);
+                    }
+                }
             }
+            EntryKind::Skip => {}
         }
     }
 }
@@ -198,20 +210,28 @@ fn find_design_tokens(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
     };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            // Skip dot-dirs + build/vendor/VCS dirs — but DO descend into `output`
-            // (the tokens file is a legitimate blackboard artifact there), so the
-            // generic `output` skip does not apply to this scan.
-            if name.starts_with('.') || (SKIP_DIRS.contains(&name) && name != "output") {
-                continue;
+        // No-follow (see `collect`): never descend a symlinked directory nor
+        // pick up a symlinked file from outside the workspace.
+        match classify_no_follow(&p) {
+            EntryKind::Dir => {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                // Skip dot-dirs + build/vendor/VCS dirs — but DO descend into
+                // `output` (the tokens file is a legitimate blackboard artifact
+                // there), so the generic `output` skip does not apply to this scan.
+                if name.starts_with('.') || (SKIP_DIRS.contains(&name) && name != "output") {
+                    continue;
+                }
+                find_design_tokens(&p, out, depth + 1);
             }
-            find_design_tokens(&p, out, depth + 1);
-        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            let lower = name.to_ascii_lowercase();
-            if lower == "design-tokens.json" || lower == "design-tokens.css" {
-                out.push(p);
+            EntryKind::File => {
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    let lower = name.to_ascii_lowercase();
+                    if lower == "design-tokens.json" || lower == "design-tokens.css" {
+                        out.push(p);
+                    }
+                }
             }
+            EntryKind::Skip => {}
         }
     }
 }
@@ -608,6 +628,52 @@ mod tests {
         assert!(
             found.iter().any(|p| p.ends_with("ProfilePanel.vue")),
             "deep real source must be visible to QA/source-present scans: {found:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_files_no_follow_symlinks_out_and_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+        // OUTSIDE the workspace: a real source file the walk must NEVER reach.
+        // If a symlink were followed this would be fed to the LLM judge / SAST.
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(outside.path().join("secret")).unwrap();
+        fs::write(
+            outside.path().join("secret/leaked.rs"),
+            "fn leaked() { let x = 1; x + 1; }\n",
+        )
+        .unwrap();
+
+        // The workspace: one real in-tree file, a dir symlink escaping OUTSIDE,
+        // and a self-referential symlink cycle (src/loop -> src).
+        let ws = TempDir::new().unwrap();
+        fs::create_dir_all(ws.path().join("src")).unwrap();
+        fs::write(
+            ws.path().join("src/main.rs"),
+            "fn main() { let y = 2; println!(\"{y}\"); }\n",
+        )
+        .unwrap();
+        symlink(outside.path(), ws.path().join("src/escape")).unwrap();
+        symlink(ws.path().join("src"), ws.path().join("src/loop")).unwrap();
+
+        // Terminates (no stack overflow / hang) because a dir symlink is never
+        // descended, so the cycle is unreachable.
+        let found = source_files(ws.path());
+
+        // No regression: the real in-tree file is still collected.
+        assert!(
+            found.iter().any(|p| p.ends_with("main.rs")),
+            "in-tree source must still be walked: {found:?}"
+        );
+        // A symlink must not pull a file from OUTSIDE the workspace into scope.
+        assert!(
+            !found.iter().any(|p| p.ends_with("leaked.rs")),
+            "a symlink must not pull files from outside the workspace: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.to_string_lossy().contains("escape")),
+            "the walk must not traverse an escaping symlink at all: {found:?}"
         );
     }
 

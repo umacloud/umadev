@@ -31,6 +31,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::fswalk::{classify_no_follow, EntryKind};
+
 /// Directories never worth scanning — build output / vendored deps / VCS /
 /// UmaDev's own artifact dirs. Mirrors the acceptance/checkpoint skip sets so the
 /// guard never walks `node_modules` or a base's `output/` doc blackboard.
@@ -369,13 +371,20 @@ fn walk(root: &Path, dir: &Path, snap: &mut TestSnapshot, depth: usize) {
     };
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+        // No-follow: a symlinked dir/file is skipped so the test snapshot never
+        // walks OUT of the workspace or loops through a symlink cycle. A real
+        // file falls through to the classification below.
+        match classify_no_follow(&p) {
+            EntryKind::Dir => {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                walk(root, &p, snap, depth + 1);
                 continue;
             }
-            walk(root, &p, snap, depth + 1);
-            continue;
+            EntryKind::Skip => continue,
+            EntryKind::File => {}
         }
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let name_lower = name.to_ascii_lowercase();
@@ -1163,5 +1172,49 @@ mod tests {
         );
         let findings = check(tmp.path(), Some(&before));
         assert!(findings.is_empty(), "reorder is clean: {findings:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_no_follow_symlinks_out_and_cycle_terminates() {
+        use std::os::unix::fs::symlink;
+        // OUTSIDE the workspace: a "test" file that must never enter the snapshot.
+        let outside = TempDir::new().unwrap();
+        std::fs::create_dir_all(outside.path().join("tests")).unwrap();
+        write(
+            outside.path(),
+            "tests/evil.test.js",
+            "test('leak', () => { expect(1).toBe(1); });\n",
+        );
+
+        // The workspace: a real in-tree test file, a dir symlink escaping
+        // OUTSIDE, and a self-cycle symlink.
+        let ws = TempDir::new().unwrap();
+        write(
+            ws.path(),
+            "tests/app.test.js",
+            "test('add', () => { expect(1 + 2).toBe(3); });\n",
+        );
+        symlink(outside.path(), ws.path().join("escape")).unwrap();
+        symlink(ws.path(), ws.path().join("loop")).unwrap();
+
+        // Terminates: an escaping / cyclic dir symlink is never descended.
+        let snap = snapshot(ws.path());
+
+        assert!(
+            snap.tests.keys().any(|k| k.ends_with("app.test.js")),
+            "in-tree test must still be snapshotted: {:?}",
+            snap.tests.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !snap.tests.keys().any(|k| k.contains("evil")),
+            "a symlink must not pull a test file from outside the workspace: {:?}",
+            snap.tests.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !snap.tests.keys().any(|k| k.contains("escape")),
+            "walk must not traverse an escaping symlink: {:?}",
+            snap.tests.keys().collect::<Vec<_>>()
+        );
     }
 }
