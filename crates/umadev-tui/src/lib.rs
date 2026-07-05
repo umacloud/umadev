@@ -5781,13 +5781,22 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
         // wedge the loop.
         let editing_recently =
             last_input_edit.is_some_and(|t| t.elapsed() <= INPUT_EDIT_HEAL_WINDOW);
-        if periodic_repaint_due(
-            sync_output,
-            now_live,
-            editing_recently,
-            last_full_repaint.elapsed(),
-            REPAINT_HEARTBEAT,
-        ) {
+        // Gated to Windows. This full-clear heartbeat exists ONLY to wipe classic
+        // conhost's incremental-diff drift (the "Windows 界面错乱 after a while"). On
+        // macOS/Linux ratatui's incremental diff reconciles reliably, so a periodic
+        // full clear there is pure harm: a ~1Hz whole-screen flash during a long
+        // streaming run (reported on macOS Terminal.app). Unix terminals never drift
+        // this way, and their event-driven heals (resize/paste contamination,
+        // input-height change, /clear) still fire — so nothing is left un-healed.
+        if cfg!(windows)
+            && periodic_repaint_due(
+                sync_output,
+                now_live,
+                editing_recently,
+                last_full_repaint.elapsed(),
+                REPAINT_HEARTBEAT,
+            )
+        {
             force_full_repaint = true;
         }
 
