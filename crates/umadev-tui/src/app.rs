@@ -3325,6 +3325,20 @@ impl App {
             self.push_tool_use(name, &edit.path);
             return;
         }
+        // Defensive: never render the SAME diff card twice in a row. UmaDev's own
+        // pipeline emits one card per tool call, but a base can surface an edit both in
+        // its streamed narration AND as the structured tool call (or an opencode tool
+        // part can arrive under two ids), landing a byte-identical card right after the
+        // last one - the reported duplicate. Two genuinely-distinct edits never produce
+        // byte-identical before/after (a re-edit sees a changed before), so collapsing
+        // an exact consecutive duplicate is safe.
+        if let Some(last) = self.history.back() {
+            if let MessageBody::Diff(prev) = &last.kind {
+                if *prev == diff {
+                    return;
+                }
+            }
+        }
         self.stream_tool_batch = None;
         self.history.push_back(ChatMessage {
             role: ChatRole::Host,
@@ -22734,6 +22748,51 @@ mod tests {
         );
         assert!(all.contains(&('-', "let y = 2;")), "deletion kept: {all:?}");
         assert!(all.contains(&('+', "let y = 3;")), "addition kept: {all:?}");
+    }
+
+    #[test]
+    fn identical_diff_card_is_not_rendered_twice_in_a_row() {
+        // A base can surface the same edit both in its narration AND as the structured
+        // tool call (or an opencode tool part can arrive under two ids), landing a
+        // byte-identical diff card right after the last - the reported duplicate. The
+        // guard collapses it, while a different follow-up edit still renders its card.
+        let mut a = fresh_app(Some("offline"));
+        for _ in 0..2 {
+            a.apply_engine(EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::ToolUse {
+                    name: "Edit".into(),
+                    detail: "src/lib.rs".into(),
+                    edit: Some(umadev_runtime::ToolEdit {
+                        path: "src/lib.rs".into(),
+                        before: "let x = 1;\nlet y = 2;\n".into(),
+                        after: "let x = 1;\nlet y = 3;\n".into(),
+                    }),
+                },
+            });
+        }
+        let one = a
+            .history
+            .iter()
+            .filter(|m| matches!(m.kind, MessageBody::Diff(_)))
+            .count();
+        assert_eq!(one, 1, "an identical consecutive diff must render once");
+        a.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolUse {
+                name: "Edit".into(),
+                detail: "src/lib.rs".into(),
+                edit: Some(umadev_runtime::ToolEdit {
+                    path: "src/lib.rs".into(),
+                    before: "let y = 3;\n".into(),
+                    after: "let y = 4;\n".into(),
+                }),
+            },
+        });
+        let two = a
+            .history
+            .iter()
+            .filter(|m| matches!(m.kind, MessageBody::Diff(_)))
+            .count();
+        assert_eq!(two, 2, "a distinct follow-up edit still renders its own card");
     }
 
     #[test]
