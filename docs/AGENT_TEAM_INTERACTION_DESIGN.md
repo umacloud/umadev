@@ -323,7 +323,7 @@ dependencies. Therefore:
 
 ## 9. Executable handoff for the remaining items (P1/P2)
 
-Delivered (phases 1-5, tested + clippy-clean + committed): Seat Cards
+Delivered (phases 1-8, tested + clippy-clean + committed): Seat Cards
 (ArtifactKind + SeatCard + Seat::card), the bidirectional per-hop contract
 (Seat::missing_inputs / missing_outputs + CriticArtifacts::present, wired live in
 run_critics_concurrently), and the versioning primitive (artifact_version /
@@ -357,3 +357,18 @@ end.
 Sequencing: A -> C -> B -> D. Each a tested, clippy-clean, committed increment. The
 two Default-less struct refactors (B, and the PlanStep side-step in C) are exactly
 where a fatigued session introduces regressions - do them fresh.
+
+
+### Status delta (phases 6-8, delivered after this section was first written)
+- **item C** is now DONE at the logic level: the versioning STORE
+  (`read`/`write_artifact_versions`, `stale_artifacts` at `.umadev/artifact-versions.json`)
+  AND the DAG invalidation (`Plan::invalidate_stale` - re-opens a step whose seat
+  reads a stale artifact + its transitive downstream) are implemented + tested. ONLY
+  the live director-flow wiring remains (record doc versions on a build pass; call
+  `invalidate_stale` on resume) - deferred because its correctness depends on precise
+  record/check lifecycle placement in the live run path (a fatigued mis-placement
+  causes spurious re-runs in users' runs). A glob-based hook design (scan `output/`,
+  map `*-<kind>.md` -> `ArtifactKind`, no slug plumbing) is worked out and ready.
+- **item D** is DONE: the private scratch lane (`write`/`read`/`clear_scratch`) ships.
+- **Remaining, genuinely large/risky:** item A (parser materialization) and item B
+  (the ~24-site `RoleVerdict` `..Default::default()` refactor, then the field).
