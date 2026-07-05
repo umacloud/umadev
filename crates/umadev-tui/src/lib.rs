@@ -243,6 +243,7 @@ struct WindowsConsoleModeGuard;
 
 #[cfg(not(windows))]
 impl WindowsConsoleModeGuard {
+    #[allow(clippy::unused_self)]
     fn flush_input_buffer(&self) {}
 }
 
@@ -4187,8 +4188,8 @@ fn json_value(path: &std::path::Path) -> Option<serde_json::Value> {
 }
 
 fn json_text_value(text: &str) -> Option<serde_json::Value> {
-    serde_json::from_str(&text).ok().or_else(|| {
-        let stripped = strip_jsonc_comments(&text);
+    serde_json::from_str(text).ok().or_else(|| {
+        let stripped = strip_jsonc_comments(text);
         serde_json::from_str(&stripped)
             .ok()
             .or_else(|| serde_json::from_str(&remove_json_trailing_commas(&stripped)).ok())

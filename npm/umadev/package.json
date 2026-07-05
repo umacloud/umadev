@@ -1,6 +1,6 @@
 {
   "name": "umadev",
-  "version": "1.0.30",
+  "version": "1.0.31",
   "description": "UmaDev: A coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use — PM, architect, designer, frontend, backend, QA, security, DevOps — borrowing that logged-in base as the brain to turn one requirement into a shippable, commercial-grade app, coordinated by a scheduling seat. No API key needed.",
   "keywords": [
     "ai",
@@ -37,11 +37,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@umacloud/cli-darwin-arm64": "1.0.30",
-    "@umacloud/cli-darwin-x64": "1.0.30",
-    "@umacloud/cli-linux-x64": "1.0.30",
-    "@umacloud/cli-linux-arm64": "1.0.30",
-    "@umacloud/cli-win32-x64": "1.0.30",
-    "@umacloud/knowledge": "1.0.30"
+    "@umacloud/cli-darwin-arm64": "1.0.31",
+    "@umacloud/cli-darwin-x64": "1.0.31",
+    "@umacloud/cli-linux-x64": "1.0.31",
+    "@umacloud/cli-linux-arm64": "1.0.31",
+    "@umacloud/cli-win32-x64": "1.0.31",
+    "@umacloud/knowledge": "1.0.31"
   }
 }
