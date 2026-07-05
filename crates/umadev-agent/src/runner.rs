@@ -3813,10 +3813,20 @@ impl<R: Runtime> AgentRunner<R> {
         // unrecognised role id is simply skipped.
         for (critic, verdict) in team.iter().zip(verdicts.iter_mut()) {
             if let Some(seat) = crate::critics::Seat::from_alias(critic.role()) {
-                let missing = seat.missing_inputs(&present);
-                if !missing.is_empty() {
+                let missing_in = seat.missing_inputs(&present);
+                if !missing_in.is_empty() {
                     verdict.advisory.push(format!(
-                        "契约缺口:座位 {} 在缺少声明输入 {missing:?} 的情况下评审(在交接处发现,而非下游)",
+                        "契约缺口(输入):座位 {} 缺少声明输入 {missing_in:?}(交接处发现,非下游)",
+                        critic.role()
+                    ));
+                }
+                // Output side of the per-hop contract: a seat that OWNS an artifact
+                // but did not materialize it is a specification/completeness gap (the
+                // top multi-agent failure class) - surface it at the hop.
+                let missing_out = seat.missing_outputs(&present);
+                if !missing_out.is_empty() {
+                    verdict.advisory.push(format!(
+                        "契约缺口(产出):座位 {} 未产出其负责的 artifact {missing_out:?}(规格缺口,交接处发现)",
                         critic.role()
                     ));
                 }

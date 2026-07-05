@@ -268,6 +268,22 @@ impl Seat {
             .filter(|r| !present.contains(r))
             .collect()
     }
+
+    /// The declared contract OUTPUTS ([`SeatCard::produces`]) this seat has NOT
+    /// materialized given the artifacts present - the output side of the per-hop
+    /// contract (symmetric to [`Self::missing_inputs`]). A non-empty result means a
+    /// seat that OWNS an artifact did not produce it (a specification/completeness
+    /// gap - the top multi-agent failure class), caught at the hop. Advisory +
+    /// fail-open; the deterministic floor still owns loop control.
+    #[must_use]
+    pub fn missing_outputs(self, present: &[ArtifactKind]) -> Vec<ArtifactKind> {
+        self.card()
+            .produces
+            .iter()
+            .copied()
+            .filter(|a| !present.contains(a))
+            .collect()
+    }
 }
 
 /// One role's structured opinion on the shared artifacts — the team layer's
@@ -1181,6 +1197,41 @@ mod tests {
             Seat::ProductManager.missing_inputs(&empty.present()),
             vec![A::Requirement]
         );
+    }
+
+    #[test]
+    fn missing_outputs_flags_an_unmaterialized_owned_artifact() {
+        use ArtifactKind as A;
+        let full = CriticArtifacts {
+            requirement: "r",
+            prd: "p",
+            architecture: "a",
+            uiux: "u",
+            ..CriticArtifacts::default()
+        };
+        let present = full.present();
+        for s in [Seat::ProductManager, Seat::Architect, Seat::UiuxDesigner] {
+            assert!(
+                s.missing_outputs(&present).is_empty(),
+                "{s:?} owns present docs, no output gap"
+            );
+        }
+        let no_arch = CriticArtifacts {
+            requirement: "r",
+            prd: "p",
+            uiux: "u",
+            ..CriticArtifacts::default()
+        };
+        let out = Seat::Architect.missing_outputs(&no_arch.present());
+        assert!(
+            out.contains(&A::Architecture)
+                && out.contains(&A::ApiContract)
+                && out.contains(&A::DataModel),
+            "architect absent outputs must be flagged: {out:?}"
+        );
+        for s in [Seat::QaEngineer, Seat::SecurityEngineer, Seat::DevopsEngineer] {
+            assert!(s.missing_outputs(&present).is_empty(), "{s:?} owns no doc");
+        }
     }
 
     #[test]
