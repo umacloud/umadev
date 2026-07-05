@@ -1382,7 +1382,11 @@ mod tests {
                 && out.contains(&A::DataModel),
             "architect absent outputs must be flagged: {out:?}"
         );
-        for s in [Seat::QaEngineer, Seat::SecurityEngineer, Seat::DevopsEngineer] {
+        for s in [
+            Seat::QaEngineer,
+            Seat::SecurityEngineer,
+            Seat::DevopsEngineer,
+        ] {
             assert!(s.missing_outputs(&present).is_empty(), "{s:?} owns no doc");
         }
     }
@@ -1433,7 +1437,10 @@ mod tests {
         assert!(tmp.path().join(".umadev").join("scratch").exists());
         assert!(!tmp.path().join("output").exists());
         write_scratch(tmp.path(), "../../etc/passwd", "x");
-        assert_eq!(read_scratch(tmp.path(), "../../etc/passwd").as_deref(), Some("x"));
+        assert_eq!(
+            read_scratch(tmp.path(), "../../etc/passwd").as_deref(),
+            Some("x")
+        );
         assert!(scratch_path(tmp.path(), "../../etc/passwd")
             .starts_with(tmp.path().join(".umadev").join("scratch")));
         clear_scratch(tmp.path());

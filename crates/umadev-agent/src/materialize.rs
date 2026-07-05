@@ -47,7 +47,10 @@ fn section_body<'a>(md: &'a str, keys: &[&str]) -> Option<Vec<&'a str>> {
             continue;
         }
         let heading = l.trim_start_matches('#').trim().to_ascii_lowercase();
-        if !keys.iter().any(|k| heading.contains(&k.to_ascii_lowercase())) {
+        if !keys
+            .iter()
+            .any(|k| heading.contains(&k.to_ascii_lowercase()))
+        {
             continue;
         }
         let level = l.chars().take_while(|c| *c == '#').count();
@@ -95,7 +98,13 @@ fn bullet_payload(line: &str) -> Option<String> {
 pub fn parse_data_model(architecture_md: &str) -> Vec<DataModelEntity> {
     let Some(body) = section_body(
         architecture_md,
-        &["data model", "数据模型", "数据模型设计", "data schema", "schema"],
+        &[
+            "data model",
+            "数据模型",
+            "数据模型设计",
+            "data schema",
+            "schema",
+        ],
     ) else {
         return Vec::new();
     };
@@ -127,7 +136,13 @@ pub fn parse_data_model(architecture_md: &str) -> Vec<DataModelEntity> {
 pub fn parse_design_tokens(uiux_md: &str) -> Vec<(String, String)> {
     let Some(body) = section_body(
         uiux_md,
-        &["design token", "design-token", "设计令牌", "design system tokens", "tokens"],
+        &[
+            "design token",
+            "design-token",
+            "设计令牌",
+            "design system tokens",
+            "tokens",
+        ],
     ) else {
         return Vec::new();
     };
@@ -136,9 +151,7 @@ pub fn parse_design_tokens(uiux_md: &str) -> Vec<(String, String)> {
         let Some(payload) = bullet_payload(line) else {
             continue;
         };
-        let split = payload
-            .split_once(':')
-            .or_else(|| payload.split_once('='));
+        let split = payload.split_once(':').or_else(|| payload.split_once('='));
         if let Some((k, val)) = split {
             let k = k.trim().to_string();
             let val = val.trim().to_string();
@@ -156,7 +169,13 @@ pub fn parse_design_tokens(uiux_md: &str) -> Vec<(String, String)> {
 pub fn parse_acceptance(prd_md: &str) -> Vec<String> {
     let Some(body) = section_body(
         prd_md,
-        &["acceptance", "验收", "验收标准", "acceptance criteria", "验收条件"],
+        &[
+            "acceptance",
+            "验收",
+            "验收标准",
+            "acceptance criteria",
+            "验收条件",
+        ],
     ) else {
         return Vec::new();
     };
@@ -221,7 +240,10 @@ mod tests {
 ";
         let tokens = parse_design_tokens(uiux);
         assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0], ("color.primary".to_string(), "#0B5FFF".to_string()));
+        assert_eq!(
+            tokens[0],
+            ("color.primary".to_string(), "#0B5FFF".to_string())
+        );
         assert_eq!(tokens[1], ("spacing.md".to_string(), "16px".to_string()));
 
         let prd = "\
@@ -254,7 +276,10 @@ mod tests {
         let c = materialize(root, "app");
         assert_eq!(c.data_model.len(), 1);
         // The typed contract is emitted to disk next to the prose.
-        let emitted = root.join(".umadev").join("contracts").join("derived-contracts.json");
+        let emitted = root
+            .join(".umadev")
+            .join("contracts")
+            .join("derived-contracts.json");
         assert!(emitted.exists());
         let round: DerivedContracts =
             serde_json::from_str(&std::fs::read_to_string(emitted).unwrap()).unwrap();

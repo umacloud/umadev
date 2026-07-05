@@ -9404,7 +9404,11 @@ mod tests {
         std::fs::write(root.join("output").join("app-prd.md"), "prd v2 CHANGED").unwrap();
         invalidate_stale_steps(root, &mut plan);
         let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
-        assert_eq!(by("fe"), StepStatus::Pending, "frontend re-opens on a prd change");
+        assert_eq!(
+            by("fe"),
+            StepStatus::Pending,
+            "frontend re-opens on a prd change"
+        );
         assert_eq!(by("qa"), StepStatus::Pending, "its downstream re-opens too");
     }
 

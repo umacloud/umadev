@@ -564,8 +564,7 @@ impl Plan {
         loop {
             let before = stale_ids.len();
             for s in &self.steps {
-                if !stale_ids.contains(&s.id)
-                    && s.depends_on.iter().any(|d| stale_ids.contains(d))
+                if !stale_ids.contains(&s.id) && s.depends_on.iter().any(|d| stale_ids.contains(d))
                 {
                     stale_ids.insert(s.id.clone());
                 }
@@ -1521,9 +1520,27 @@ mod tests {
     fn invalidate_stale_reopens_consumers_and_their_downstream() {
         use crate::critics::ArtifactKind as A;
         let mut p = plan(vec![
-            step_seat("arch", &[], Seat::Architect, StepKind::Build, AcceptanceSpec::TurnSettled),
-            step_seat("be", &["arch"], Seat::BackendEngineer, StepKind::Build, AcceptanceSpec::TurnSettled),
-            step_seat("qa", &["be"], Seat::QaEngineer, StepKind::Review, AcceptanceSpec::ReviewClean),
+            step_seat(
+                "arch",
+                &[],
+                Seat::Architect,
+                StepKind::Build,
+                AcceptanceSpec::TurnSettled,
+            ),
+            step_seat(
+                "be",
+                &["arch"],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::TurnSettled,
+            ),
+            step_seat(
+                "qa",
+                &["be"],
+                Seat::QaEngineer,
+                StepKind::Review,
+                AcceptanceSpec::ReviewClean,
+            ),
         ]);
         for s in &mut p.steps {
             s.status = StepStatus::Done;
