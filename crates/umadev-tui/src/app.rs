@@ -8865,10 +8865,20 @@ impl App {
     fn push_preflight(&mut self, text: &str) {
         let ds = self.config.design_system.as_deref().unwrap_or("auto");
         let tpl = self.config.seed_template.as_deref().unwrap_or("auto");
+        // The gate line must reflect the ACTIVE trust mode, not a hard-coded
+        // "auto-pass": in guarded mode the two pipeline gates pause for approval
+        // (the run receives effective_trust_mode()), so a fixed "gates auto-pass"
+        // sentence contradicted the guarded chip.
+        let gate_key = match self.effective_trust_mode() {
+            umadev_agent::TrustMode::Auto => "run.gate_line.auto",
+            umadev_agent::TrustMode::Guarded => "run.gate_line.guarded",
+            umadev_agent::TrustMode::Plan => "run.gate_line.plan",
+        };
+        let gate_line = umadev_i18n::t(self.lang, gate_key);
         let plan = umadev_i18n::tf(
             self.lang,
             "run.preflight_plan",
-            &[text, &self.backend_label, ds, tpl],
+            &[text, &self.backend_label, ds, tpl, gate_line],
         );
         self.push(ChatRole::UmaDev, plan);
     }

@@ -145,6 +145,113 @@ impl Seat {
     }
 }
 
+/// The kinds of shared-blackboard artifact a seat reads or produces - the typed
+/// vocabulary of the hand-off contract, borrowed from A2A's `Artifact` concept but
+/// kept in-process. Mirrors [`CriticArtifacts`]' fields plus the DERIVED typed
+/// contracts (API surface, data model, design tokens, acceptance map) so a seat's
+/// declared inputs/outputs are a checkable surface, not a bare convention. See
+/// `docs/AGENT_TEAM_INTERACTION_DESIGN.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArtifactKind {
+    /// The original requirement (the root input; produced by the user).
+    Requirement,
+    /// The PRD document.
+    Prd,
+    /// The architecture document.
+    Architecture,
+    /// The UI/UX document.
+    Uiux,
+    /// The typed API surface (the `umadev-contract` OpenAPI derivation).
+    ApiContract,
+    /// The typed data model.
+    DataModel,
+    /// The typed design-token set.
+    DesignTokens,
+    /// The FR -> acceptance-criteria map.
+    Acceptance,
+    /// The delivered source-code digest.
+    Code,
+    /// The deterministic QA-floor findings (produced by the floor, not a seat).
+    QaFloor,
+    /// The deterministic security-floor findings (produced by the floor).
+    SecurityFloor,
+}
+
+/// A seat's self-describing capability card - the internal analogue of an A2A
+/// "Agent Card": who the seat is, whether it DOES or only REVIEWS, what it OWNS,
+/// and - the load-bearing part - which shared artifacts it READS as its contract
+/// input and which it PRODUCES. Makes the roster self-describing and turns every
+/// hand-off into an explicit, checkable contract (a seat's declared
+/// `reads`/`produces` is the per-hop validation surface). Pure data - no I/O.
+#[derive(Debug, Clone)]
+pub struct SeatCard {
+    /// The seat this card describes.
+    pub seat: Seat,
+    /// Doer (drives the main session serially) vs reviewer (read-only fork).
+    pub is_doer: bool,
+    /// One line naming what the seat owns.
+    pub owns: &'static str,
+    /// The artifacts this seat consumes as its contract input.
+    pub reads: &'static [ArtifactKind],
+    /// The artifacts this seat produces / owns on the blackboard.
+    pub produces: &'static [ArtifactKind],
+}
+
+impl Seat {
+    /// This seat's [`SeatCard`] - its self-describing capability + typed I/O
+    /// contract. Total (every seat has a card) and deterministic.
+    #[must_use]
+    pub fn card(self) -> SeatCard {
+        use ArtifactKind as A;
+        let (owns, reads, produces): (&'static str, &'static [A], &'static [A]) = match self {
+            Self::ProductManager => (
+                "scope / requirements / acceptance",
+                &[A::Requirement],
+                &[A::Prd, A::Acceptance],
+            ),
+            Self::Architect => (
+                "the API surface + data model",
+                &[A::Requirement, A::Prd],
+                &[A::Architecture, A::ApiContract, A::DataModel],
+            ),
+            Self::UiuxDesigner => (
+                "the design system + page hierarchy",
+                &[A::Requirement, A::Prd],
+                &[A::Uiux, A::DesignTokens],
+            ),
+            Self::FrontendEngineer => (
+                "the UI implementation",
+                &[A::Prd, A::Uiux, A::DesignTokens, A::ApiContract],
+                &[A::Code],
+            ),
+            Self::BackendEngineer => (
+                "the API + data layer implementation",
+                &[A::Architecture, A::ApiContract, A::DataModel],
+                &[A::Code],
+            ),
+            Self::QaEngineer => (
+                "test coverage + the acceptance floor",
+                &[A::Requirement, A::Acceptance, A::Code, A::QaFloor],
+                &[],
+            ),
+            Self::SecurityEngineer => (
+                "the attack-surface review",
+                &[A::Code, A::SecurityFloor],
+                &[],
+            ),
+            Self::DevopsEngineer => ("build / deploy / CI", &[A::Code], &[]),
+        };
+        SeatCard {
+            seat: self,
+            is_doer: self.is_doer(),
+            owns,
+            reads,
+            produces,
+        }
+    }
+}
+
 /// One role's structured opinion on the shared artifacts — the team layer's
 /// unit of cross-review. Aligns with the runner's existing ad-hoc verdicts
 /// (`AcceptanceVerdict` / `DocsVerdict` / `DesignVerdict`) but generalises them
@@ -927,6 +1034,62 @@ pub fn append_team_ledger(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALL_SEATS: &[Seat] = &[
+        Seat::ProductManager,
+        Seat::Architect,
+        Seat::UiuxDesigner,
+        Seat::FrontendEngineer,
+        Seat::BackendEngineer,
+        Seat::QaEngineer,
+        Seat::SecurityEngineer,
+        Seat::DevopsEngineer,
+    ];
+
+    #[test]
+    fn seat_cards_form_a_well_formed_handoff_contract() {
+        use ArtifactKind as A;
+        for &s in ALL_SEATS {
+            let card = s.card();
+            assert_eq!(card.seat, s, "card seat mismatch");
+            assert_eq!(card.is_doer, s.is_doer(), "{s:?} is_doer mismatch");
+            assert!(!card.owns.is_empty(), "{s:?} owns nothing");
+        }
+        let produced: std::collections::HashSet<A> = ALL_SEATS
+            .iter()
+            .flat_map(|s| s.card().produces.iter().copied())
+            .collect();
+        for &s in ALL_SEATS {
+            for &r in s.card().reads {
+                let ok = matches!(r, A::Requirement | A::QaFloor | A::SecurityFloor)
+                    || produced.contains(&r);
+                assert!(ok, "{s:?} reads {r:?} which no seat produces");
+            }
+        }
+        for k in [
+            A::Prd,
+            A::Architecture,
+            A::Uiux,
+            A::ApiContract,
+            A::DataModel,
+            A::DesignTokens,
+            A::Acceptance,
+        ] {
+            let owners = ALL_SEATS
+                .iter()
+                .filter(|s| s.card().produces.contains(&k))
+                .count();
+            assert_eq!(owners, 1, "{k:?} must have exactly one owning seat");
+        }
+        for &s in ALL_SEATS {
+            if !s.is_doer() {
+                assert!(
+                    !s.card().produces.contains(&A::Code),
+                    "reviewer {s:?} must not produce Code"
+                );
+            }
+        }
+    }
 
     #[test]
     fn role_verdict_empty_is_fail_open_accept() {

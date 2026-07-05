@@ -388,7 +388,10 @@
 "run.queued_dropped" = "[note] The run stopped before your queued message \"{}\" could be sent — just send it again."
 "run.classified_build" = "-> Classified as a build task · entering the 9-phase pipeline (/cancel to stop mid-way)"
 "design.suggest_hint" = "Tip: you haven't picked a design system. Use /design <name> to lock the visual direction before the run:\n  {}.\n  Skipping is fine — the worker will auto-pick one based on the requirement."
-"run.preflight_plan" = "Requirement received: \"{}\"\n\nConfig: worker `{}` · design system `{}` · template `{}`\n\n9-phase pipeline:\n  1) research (competitors + discovery) -> 2) docs (PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend (built from UIUX tokens) -> [gate] preview_confirm\n  5) backend -> 6) quality (5-dimension review) -> 7) delivery -> proof-pack\n\nThe two gates auto-approve by default (they show as checkpoints only); press shift+Tab for manual per-gate review. Starting the pipeline…"
+"run.preflight_plan" = "Requirement received: \"{}\"\n\nConfig: worker `{}` · design system `{}` · template `{}`\n\n9-phase pipeline:\n  1) research (competitors + discovery) -> 2) docs (PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend (built from UIUX tokens) -> [gate] preview_confirm\n  5) backend -> 6) quality (5-dimension review) -> 7) delivery -> proof-pack\n\n{}"
+"run.gate_line.auto" = "The two gates auto-approve by default (they show as checkpoints only); press shift+Tab or /manual for per-gate review. Starting the pipeline…"
+"run.gate_line.guarded" = "Guarded mode: the two gates (docs_confirm / preview_confirm) pause for your per-gate approval; press shift+Tab or /auto to auto-approve. Starting the pipeline…"
+"run.gate_line.plan" = "Plan mode: read out the plan only, no code written (/mode guarded or auto to execute). Starting the pipeline…"
 "run.cancelled" = "[cancelled] The current run is stopped, back to the prompt. Artifacts from completed phases stay in output/; you can /continue or type a new requirement next time."
 
 # /init manifest

@@ -244,10 +244,13 @@ impl RoutePlan {
                     "这是一个小排障,快速定位并修复。".to_string()
                 }
             }
-            RouteClass::Build => format!(
-                "这是一次完整构建({}),进研发流程:计划 + 团队 + 质量门。",
-                self.depth.as_str()
-            ),
+            RouteClass::Build => {
+                // A REASON (why build), not a restatement of the localized
+                // intent.build headline the card already shows - otherwise the card
+                // printed the full-build line twice (the reported duplicate).
+                "判定为完整构建:需求规模较大、涉及多个环节,交由多角色团队分阶段交付更稳妥。"
+                    .to_string()
+            }
         }
     }
 

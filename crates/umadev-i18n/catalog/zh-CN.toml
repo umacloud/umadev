@@ -380,7 +380,10 @@
 "run.queued_dropped" = "[note] 运行已中止,你排队的消息「{}」未发送 —— 直接重新发给我即可。"
 "run.classified_build" = "-> 判断为开发任务 · 进入 9 阶段流水线(想中途停用 /cancel)"
 "design.suggest_hint" = "提示: 你还没选设计系统。可用 /design <name> 在 run 前锁定视觉方向:\n  {}。\n  不选也行 — worker 会自动根据需求推荐一个。"
-"run.preflight_plan" = "收到需求:\"{}\"\n\n配置: worker `{}` · 设计系统 `{}` · 模板 `{}`\n\n9 阶段流水线:\n  1) research(竞品 + discovery) -> 2) docs(PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend(按 UIUX tokens 实现) -> [gate] preview_confirm\n  5) backend -> 6) quality(5 维审查) -> 7) delivery -> proof-pack\n\n两道 gate 默认自动通过(仅作为检查点显示);按 shift+Tab 可转手动逐门审稿。流水线启动中…"
+"run.preflight_plan" = "收到需求:\"{}\"\n\n配置: worker `{}` · 设计系统 `{}` · 模板 `{}`\n\n9 阶段流水线:\n  1) research(竞品 + discovery) -> 2) docs(PRD + Architecture + UIUX) -> [gate] docs_confirm\n  3) spec -> 4) frontend(按 UIUX tokens 实现) -> [gate] preview_confirm\n  5) backend -> 6) quality(5 维审查) -> 7) delivery -> proof-pack\n\n{}"
+"run.gate_line.auto" = "两道 gate 默认自动通过(仅作为检查点显示);按 shift+Tab 或 /manual 可转逐门审批。流水线启动中…"
+"run.gate_line.guarded" = "当前守护模式:两道 gate(docs_confirm / preview_confirm)会停下等你逐门审批;按 shift+Tab 或 /auto 可切自动通过。流水线启动中…"
+"run.gate_line.plan" = "当前计划模式:只读出计划、不写代码(/mode guarded 或 auto 才执行)。流水线启动中…"
 "run.cancelled" = "[已取消] 当前运行已停止,回到输入。已完成阶段的产物保留在 output/,下次 /continue 或输入新需求都可以。"
 
 # /init manifest
