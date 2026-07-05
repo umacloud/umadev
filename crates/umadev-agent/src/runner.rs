@@ -3784,6 +3784,8 @@ impl<R: Runtime> AgentRunner<R> {
         // and the consult transparently falls back to the main read-only runtime.
         let forks: Vec<Option<Box<dyn umadev_runtime::Runtime>>> =
             team.iter().map(|_| self.runtime.fork()).collect();
+        // Present-artifact set for the per-hop hand-off check below (computed once).
+        let present = arts.present();
         let futures = team.iter().zip(forks.iter()).map(|(critic, fork)| {
             let consult: ForkedConsult<'_, R> = ForkedConsult {
                 runner: self,
@@ -3802,7 +3804,25 @@ impl<R: Runtime> AgentRunner<R> {
                 .await
             }
         });
-        join_all_ordered(futures).await
+        let mut verdicts = join_all_ordered(futures).await;
+        // Per-hop hand-off check (docs/AGENT_TEAM_INTERACTION_DESIGN.md P0): fold a
+        // DIAGNOSED advisory into any seat that reviewed WITHOUT its declared
+        // contract inputs (its SeatCard.reads). Advisory-only - the deterministic
+        // floor still owns loop control; this just makes a bad hand-off VISIBLE at
+        // the hop instead of surfacing as a mysterious downstream gap. Fail-open: an
+        // unrecognised role id is simply skipped.
+        for (critic, verdict) in team.iter().zip(verdicts.iter_mut()) {
+            if let Some(seat) = crate::critics::Seat::from_alias(critic.role()) {
+                let missing = seat.missing_inputs(&present);
+                if !missing.is_empty() {
+                    verdict.advisory.push(format!(
+                        "契约缺口:座位 {} 在缺少声明输入 {missing:?} 的情况下评审(在交接处发现,而非下游)",
+                        critic.role()
+                    ));
+                }
+            }
+        }
+        verdicts
     }
 
     /// The DETERMINISTIC QA floor — the hard signal that runs BEFORE the QA
