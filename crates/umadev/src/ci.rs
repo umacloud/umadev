@@ -264,8 +264,12 @@ fn run_capturing_with_timeout(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = reader.join();
-            return Ok(None); // timed out — fail-open (skip)
+            // Do NOT join the reader here. A shell child can fork a grandchild
+            // (e.g. `sh -c "sleep 10"` -> `sleep`) that inherits the stdout pipe and
+            // holds it open until IT exits, so `read_to_string` would block far past
+            // our budget. On timeout we skip the audit and discard its output, so we
+            // detach the reader and return promptly (it ends when the pipe closes).
+            return Ok(None); // timed out — fail-open (skip), promptly
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
