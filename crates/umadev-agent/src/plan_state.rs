@@ -542,6 +542,49 @@ impl Plan {
             .collect()
     }
 
+    /// Re-open every step (and its transitive downstream) whose seat READS an
+    /// artifact that is now STALE - the blackboard staleness invalidation the
+    /// versioning store enables (docs/AGENT_TEAM_INTERACTION_DESIGN.md item C). A
+    /// step's consumed artifacts are its seat's [`crate::critics::SeatCard::reads`];
+    /// if any is in `stale`, the step - and everything transitively depending on it -
+    /// flips back to [`StepStatus::Pending`] so the director re-derives it against the
+    /// changed upstream instead of trusting a now-poisoned result. Deterministic +
+    /// pure; the director computes `stale` (via `critics::stale_artifacts`) and calls
+    /// this on re-plan. Returns re-opened ids (sorted). Fail-open: empty re-opens none.
+    pub fn invalidate_stale(&mut self, stale: &[crate::critics::ArtifactKind]) -> Vec<String> {
+        if stale.is_empty() {
+            return Vec::new();
+        }
+        let mut stale_ids: HashSet<String> = self
+            .steps
+            .iter()
+            .filter(|s| s.seat.card().reads.iter().any(|r| stale.contains(r)))
+            .map(|s| s.id.clone())
+            .collect();
+        loop {
+            let before = stale_ids.len();
+            for s in &self.steps {
+                if !stale_ids.contains(&s.id)
+                    && s.depends_on.iter().any(|d| stale_ids.contains(d))
+                {
+                    stale_ids.insert(s.id.clone());
+                }
+            }
+            if stale_ids.len() == before {
+                break;
+            }
+        }
+        let mut reopened = Vec::new();
+        for s in &mut self.steps {
+            if stale_ids.contains(&s.id) && s.status != StepStatus::Pending {
+                s.status = StepStatus::Pending;
+                reopened.push(s.id.clone());
+            }
+        }
+        reopened.sort();
+        reopened
+    }
+
     /// The steps whose dependencies are ALL [`StepStatus::Done`] and which are not
     /// themselves finished/blocked — the set the director may drive next. A step
     /// with an unknown dependency id is treated as not-ready (conservative).
@@ -1468,6 +1511,32 @@ mod tests {
             risks: vec![],
             open_questions: vec![],
         }
+    }
+
+    fn status_of(p: &Plan, id: &str) -> StepStatus {
+        p.steps.iter().find(|s| s.id == id).unwrap().status
+    }
+
+    #[test]
+    fn invalidate_stale_reopens_consumers_and_their_downstream() {
+        use crate::critics::ArtifactKind as A;
+        let mut p = plan(vec![
+            step_seat("arch", &[], Seat::Architect, StepKind::Build, AcceptanceSpec::TurnSettled),
+            step_seat("be", &["arch"], Seat::BackendEngineer, StepKind::Build, AcceptanceSpec::TurnSettled),
+            step_seat("qa", &["be"], Seat::QaEngineer, StepKind::Review, AcceptanceSpec::ReviewClean),
+        ]);
+        for s in &mut p.steps {
+            s.status = StepStatus::Done;
+        }
+        let reopened = p.invalidate_stale(&[A::Architecture]);
+        assert_eq!(reopened, vec!["be".to_string(), "qa".to_string()]);
+        assert_eq!(status_of(&p, "arch"), StepStatus::Done);
+        assert_eq!(status_of(&p, "be"), StepStatus::Pending);
+        assert_eq!(status_of(&p, "qa"), StepStatus::Pending);
+        for s in &mut p.steps {
+            s.status = StepStatus::Done;
+        }
+        assert!(p.invalidate_stale(&[]).is_empty());
     }
 
     /// Find a step's `depends_on` by id (test helper).
