@@ -205,6 +205,56 @@ pub fn is_stale(recorded_upstream: &str, current_upstream: &str) -> bool {
     !recorded_upstream.is_empty() && recorded_upstream != current_upstream
 }
 
+/// Path of the persisted artifact-version store (`.umadev/artifact-versions.json`).
+fn artifact_versions_path(project_root: &std::path::Path) -> std::path::PathBuf {
+    project_root.join(".umadev").join("artifact-versions.json")
+}
+
+/// Read the persisted `artifact-name -> last-seen version` map. Fail-open: a
+/// missing or corrupt store yields an empty map (versioning is an optimisation,
+/// never a blocker).
+#[must_use]
+pub fn read_artifact_versions(
+    project_root: &std::path::Path,
+) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(artifact_versions_path(project_root))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the `artifact-name -> version` map (best-effort; a write error is
+/// swallowed - the staleness store must never block a run).
+pub fn write_artifact_versions(
+    project_root: &std::path::Path,
+    versions: &std::collections::BTreeMap<String, String>,
+) {
+    let path = artifact_versions_path(project_root);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(versions) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Which named artifacts have CHANGED since their recorded version - the set a
+/// re-plan should treat as stale and invalidate downstream of. `current` is the
+/// freshly-hashed `(name, version)` of the live artifacts. Fail-open: an artifact
+/// with no recorded version is NOT stale (a fresh artifact never invalidates).
+#[must_use]
+pub fn stale_artifacts(
+    project_root: &std::path::Path,
+    current: &[(String, String)],
+) -> Vec<String> {
+    let recorded = read_artifact_versions(project_root);
+    current
+        .iter()
+        .filter(|(name, ver)| recorded.get(name).is_some_and(|r| is_stale(r, ver)))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// A seat's self-describing capability card - the internal analogue of an A2A
 /// "Agent Card": who the seat is, whether it DOES or only REVIEWS, what it OWNS,
 /// and - the load-bearing part - which shared artifacts it READS as its contract
@@ -1273,6 +1323,27 @@ mod tests {
         assert!(is_stale(&a, &b), "changed upstream must be stale");
         assert!(!is_stale(&a, &a), "unchanged upstream is fresh");
         assert!(!is_stale("", &b), "no recorded version fails open to fresh");
+    }
+
+    #[test]
+    fn artifact_version_store_detects_changed_upstream() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("architecture".to_string(), artifact_version("arch v1"));
+        m.insert("prd".to_string(), artifact_version("prd v1"));
+        write_artifact_versions(tmp.path(), &m);
+        let current = vec![
+            ("architecture".to_string(), artifact_version("arch v2")),
+            ("prd".to_string(), artifact_version("prd v1")),
+            ("uiux".to_string(), artifact_version("uiux v1")),
+        ];
+        assert_eq!(
+            stale_artifacts(tmp.path(), &current),
+            vec!["architecture".to_string()]
+        );
+        assert_eq!(read_artifact_versions(tmp.path()).get("prd"), m.get("prd"));
+        let empty = tempfile::TempDir::new().unwrap();
+        assert!(stale_artifacts(empty.path(), &current).is_empty());
     }
 
     #[test]
