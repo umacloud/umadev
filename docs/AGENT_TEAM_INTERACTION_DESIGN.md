@@ -372,3 +372,26 @@ where a fatigued session introduces regressions - do them fresh.
 - **item D** is DONE: the private scratch lane (`write`/`read`/`clear_scratch`) ships.
 - **Remaining, genuinely large/risky:** item A (parser materialization) and item B
   (the ~24-site `RoleVerdict` `..Default::default()` refactor, then the field).
+
+
+## 10. Roadmap COMPLETE (phases 1-11)
+
+All planned enhancements from section 5 / section 9 are now implemented, tested, and
+clippy-clean:
+
+- Seat Cards (typed self-describing capability + I/O contract per seat).
+- Per-hop contract - BOTH directions (missing_inputs + missing_outputs), wired live
+  into run_critics_concurrently.
+- item A - two-layer artifact materialization: umadev_agent::materialize parses the
+  data model / design tokens / acceptance out of the prose docs into typed contracts,
+  emitted to .umadev/contracts/derived-contracts.json, wired into the docs stage.
+- item B - structured verdict provenance: RoleVerdict.provenance (seat + artifact +
+  diagnosed note), populated by the per-hop check; serde-backward-compatible.
+- item C - artifact versioning to DAG staleness invalidation: artifact_version /
+  is_stale + the .umadev/artifact-versions.json store + Plan::invalidate_stale + the
+  live director wiring (record on save, re-open stale downstream on resume).
+- item D - private blackboard scratch lane: write/read/clear_scratch.
+
+Every piece is additive, deterministic, and fail-open; the deterministic floor still
+owns loop control (critic opinions + these signals are advisory). Full workspace
+clippy + tests green.
