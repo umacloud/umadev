@@ -612,6 +612,7 @@ mod tests {
             remediation: vec!["add an API table: method / path / auth per endpoint".to_string()],
             advisory: vec!["consider rate limiting".to_string()],
             evidence: vec!["architecture.md".to_string()],
+            ..Default::default()
         };
         let ev = EngineEvent::critic_verdict(&v);
         let EngineEvent::CriticVerdict {

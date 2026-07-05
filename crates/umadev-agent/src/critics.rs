@@ -410,6 +410,23 @@ impl Seat {
     }
 }
 
+/// Where a verdict finding came from - structured provenance for the audit trail
+/// and for keeping a rework directive DIAGNOSED (which seat, which artifact) rather
+/// than a bare "go fix it". Populated Rust-side (the per-hop contract check), not by
+/// the base, so it is a trustworthy deterministic annotation.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Provenance {
+    /// The seat/role the finding originated from.
+    #[serde(default)]
+    pub seat: String,
+    /// The artifact the finding is about, when it maps to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ArtifactKind>,
+    /// A one-line diagnosed description (what + why), never a bare "fix it".
+    #[serde(default)]
+    pub note: String,
+}
+
 /// One role's structured opinion on the shared artifacts — the team layer's
 /// unit of cross-review. Aligns with the runner's existing ad-hoc verdicts
 /// (`AcceptanceVerdict` / `DocsVerdict` / `DesignVerdict`) but generalises them
@@ -450,6 +467,12 @@ pub struct RoleVerdict {
     /// Concrete observations (file/where) backing the verdict.
     #[serde(default)]
     pub evidence: Vec<String>,
+    /// Structured, Rust-side provenance for the findings above (seat + artifact +
+    /// diagnosed note). Additive + serde(default) so older verdict JSON still parses;
+    /// populated by deterministic annotators (the per-hop hand-off check), never
+    /// trusted from the base.
+    #[serde(default)]
+    pub provenance: Vec<Provenance>,
 }
 
 impl RoleVerdict {
@@ -466,6 +489,7 @@ impl RoleVerdict {
             remediation: Vec::new(),
             advisory: Vec::new(),
             evidence: Vec::new(),
+            provenance: Vec::new(),
         }
     }
 
@@ -1412,6 +1436,26 @@ mod tests {
     }
 
     #[test]
+    fn provenance_is_additive_and_serde_backward_compatible() {
+        // A verdict with structured provenance round-trips through serde.
+        let mut v = RoleVerdict::empty("architect");
+        v.provenance.push(Provenance {
+            seat: "backend-engineer".to_string(),
+            artifact: Some(ArtifactKind::ApiContract),
+            note: "missing declared input".to_string(),
+        });
+        let json = serde_json::to_string(&v).unwrap();
+        let back: RoleVerdict = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.provenance.len(), 1);
+        assert_eq!(back.provenance[0].artifact, Some(ArtifactKind::ApiContract));
+        assert_eq!(back.provenance[0].seat, "backend-engineer");
+        // Backward compat: an OLD verdict JSON WITHOUT `provenance` still parses.
+        let old = serde_json::json!({"role": "qa-engineer", "accepts": true}).to_string();
+        let parsed: RoleVerdict = serde_json::from_str(&old).unwrap();
+        assert!(parsed.provenance.is_empty());
+    }
+
+    #[test]
     fn role_verdict_empty_is_fail_open_accept() {
         // The fail-open verdict must ACCEPT with no findings — an absent critic
         // can never block (invariant 1).
@@ -1484,6 +1528,7 @@ mod tests {
             remediation: vec![],
             advisory: vec!["c".into()],
             evidence: vec![],
+            ..Default::default()
         };
         append_team_ledger(tmp.path(), "docs", 1, &v);
         let content =

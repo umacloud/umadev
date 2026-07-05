@@ -3589,6 +3589,7 @@ impl<R: Runtime> AgentRunner<R> {
             remediation: Vec::new(),
             advisory,
             evidence: Vec::new(),
+            provenance: Vec::new(),
         }
         .normalized(role);
         crate::critics::append_team_ledger(&self.options.project_root, phase, round, &v);
@@ -3819,6 +3820,14 @@ impl<R: Runtime> AgentRunner<R> {
                         "契约缺口(输入):座位 {} 缺少声明输入 {missing_in:?}(交接处发现,非下游)",
                         critic.role()
                     ));
+                    // Structured provenance for the audit trail + a diagnosed rework.
+                    for m in missing_in {
+                        verdict.provenance.push(crate::critics::Provenance {
+                            seat: critic.role().to_string(),
+                            artifact: Some(m),
+                            note: "缺少声明的契约输入(交接处发现,非下游)".to_string(),
+                        });
+                    }
                 }
                 // Output side of the per-hop contract: a seat that OWNS an artifact
                 // but did not materialize it is a specification/completeness gap (the
@@ -3829,6 +3838,13 @@ impl<R: Runtime> AgentRunner<R> {
                         "契约缺口(产出):座位 {} 未产出其负责的 artifact {missing_out:?}(规格缺口,交接处发现)",
                         critic.role()
                     ));
+                    for m in missing_out {
+                        verdict.provenance.push(crate::critics::Provenance {
+                            seat: critic.role().to_string(),
+                            artifact: Some(m),
+                            note: "未产出其负责的契约产出(规格缺口)".to_string(),
+                        });
+                    }
                 }
             }
         }
