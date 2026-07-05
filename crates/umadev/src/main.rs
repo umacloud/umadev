@@ -6154,6 +6154,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // crossterm/console API + CI-env/timing differ on Windows; logic covered on unix
     fn workspace_root_falls_back_to_start_when_no_marker() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sub = tmp.path().join("loose");

@@ -1,0 +1,35 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/weiyou/Documents/kaifa/UmaDev/target/debug/umadev hook pre-write"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/weiyou/Documents/kaifa/UmaDev/target/debug/umadev hook pre-bash"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/weiyou/Documents/kaifa/UmaDev/target/debug/umadev hook tool-audit"
+          }
+        ]
+      }
+    ]
+  }
+}

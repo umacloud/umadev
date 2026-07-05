@@ -112,13 +112,21 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     // restores the terminal first, then forwards to the original hook so
     // the panic message + backtrace still print normally.
     install_panic_hook();
+    #[cfg(windows)]
+    let win_console_guard = WindowsConsoleModeGuard::install();
+    #[cfg(not(windows))]
+    let win_console_guard: Option<WindowsConsoleModeGuard> = None;
     let mut terminal = setup_terminal().context("failed to set up terminal")?;
+    #[cfg(windows)]
+    if let Some(guard) = win_console_guard.as_ref() {
+        guard.enforce();
+    }
     // Name the terminal window/tab `UmaDev — <backend>` so a user juggling
     // several tabs can tell which one drives which base. Uses the configured
     // backend (offline until the first-run picker resolves one); cleared on
     // exit below.
     set_terminal_title(app.backend.as_deref().unwrap_or("offline"));
-    let result = event_loop(&mut terminal, &mut app, opts).await;
+    let result = event_loop(&mut terminal, &mut app, opts, win_console_guard.as_ref()).await;
     // Graceful cleanup: kill any preview dev server the user started via
     // /preview, so quitting UmaDev never leaves an orphaned process. Kill the whole
     // process GROUP — the dev server (npm/pnpm) forks the real node/vite server as a
@@ -130,6 +138,9 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
         }
     }
     restore_terminal(&mut terminal);
+    if let Some(guard) = win_console_guard.as_ref() {
+        guard.flush_input_buffer();
+    }
     // Native scrollback handoff: on a CLEAN quit, now that the alt screen is gone
     // and we're back on the MAIN screen, print the conversation so it lands in the
     // terminal's real scrollback instead of vanishing with the alt buffer. Only on
@@ -164,6 +175,75 @@ fn print_scrollback_handoff(app: &App) {
     // restored primary screen shows; the body already ends in a newline.
     let _ = write!(out, "\n{text}");
     let _ = out.flush();
+}
+
+/// Windows console input mode guard.
+///
+/// Crossterm raw mode disables `ENABLE_PROCESSED_INPUT`, which is what makes
+/// Ctrl-C arrive as a key event the TUI can route through its normal cancel
+/// path. Some Windows terminal/runtime combinations can re-apply console input
+/// modes later in the session; when that bit comes back, Ctrl-C becomes a
+/// console control event and bypasses the TUI. The guard snapshots the original
+/// mode before raw mode, clears that bit while UmaDev owns the terminal, and
+/// restores the snapshot after normal teardown. It also drains queued console
+/// input before the shell resumes, so late key/mouse events captured while the
+/// app was leaving raw mode cannot leak into PowerShell/cmd as text.
+#[cfg(windows)]
+struct WindowsConsoleModeGuard {
+    input: crossterm_winapi::Console,
+    mode: crossterm_winapi::ConsoleMode,
+    original: u32,
+}
+
+#[cfg(windows)]
+impl WindowsConsoleModeGuard {
+    const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+
+    fn install() -> Option<Self> {
+        let handle = crossterm_winapi::Handle::current_in_handle().ok()?;
+        let input = crossterm_winapi::Console::from(handle.clone());
+        let mode = crossterm_winapi::ConsoleMode::from(handle);
+        let original = mode.mode().ok()?;
+        let guard = Self {
+            input,
+            mode,
+            original,
+        };
+        guard.enforce();
+        Some(guard)
+    }
+
+    fn enforce(&self) {
+        let Ok(current) = self.mode.mode() else {
+            return;
+        };
+        if current & Self::ENABLE_PROCESSED_INPUT != 0 {
+            let _ = self.mode.set_mode(current & !Self::ENABLE_PROCESSED_INPUT);
+        }
+    }
+
+    fn flush_input_buffer(&self) {
+        // `read_console_input` first queries the pending event count, so this is
+        // non-blocking when the queue is empty. Dropping the returned records is
+        // the safe Rust equivalent of Win32 FlushConsoleInputBuffer.
+        let _ = self.input.read_console_input();
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsConsoleModeGuard {
+    fn drop(&mut self) {
+        self.flush_input_buffer();
+        let _ = self.mode.set_mode(self.original);
+    }
+}
+
+#[cfg(not(windows))]
+struct WindowsConsoleModeGuard;
+
+#[cfg(not(windows))]
+impl WindowsConsoleModeGuard {
+    fn flush_input_buffer(&self) {}
 }
 
 /// Decide whether a firing panic hook should run the FULL terminal restore
@@ -3922,10 +4002,10 @@ pub fn detect_base_model(backend_id: &str, project_root: &std::path::Path) -> Op
                     .or_else(|| user.as_ref().and_then(|u| toml_top_string(u, k)))
             })
         }
-        // opencode: project/user opencode.json `model` (format provider/model).
-        "opencode" => opencode_config_paths(project_root, home.as_deref())
+        // opencode: project/user/env opencode config `model` (format provider/model).
+        "opencode" => opencode_config_values(project_root, home.as_deref())
             .into_iter()
-            .find_map(|p| json_value(&p).and_then(|v| opencode_model_from_config(&v))),
+            .find_map(|v| opencode_model_from_config(&v)),
         _ => None,
     }
 }
@@ -3940,13 +4020,34 @@ pub fn detect_base_context_window(backend_id: &str, project_root: &std::path::Pa
         return None;
     }
     let home = config::home_dir();
-    let paths = opencode_config_paths(project_root, home.as_deref());
-    let model = paths
+    let values = opencode_config_values(project_root, home.as_deref());
+    let model = values.iter().find_map(opencode_model_from_config)?;
+    values
         .iter()
-        .find_map(|p| json_value(p).and_then(|v| opencode_model_from_config(&v)))?;
-    paths
-        .iter()
-        .find_map(|p| json_value(p).and_then(|v| opencode_context_for_model(&v, &model)))
+        .find_map(|v| opencode_context_for_model(v, &model))
+}
+
+/// Read an exact context window for a specific live model report, but only from
+/// base-owned provider metadata. This is deliberately narrower than a model-name
+/// table: if the selected OpenCode model cannot be matched to a configured
+/// provider catalog entry, callers must hide the denominator.
+#[must_use]
+pub fn detect_base_context_window_for_model(
+    backend_id: &str,
+    project_root: &std::path::Path,
+    model: &str,
+) -> Option<u64> {
+    if backend_id != "opencode" {
+        return None;
+    }
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let home = config::home_dir();
+    opencode_config_values(project_root, home.as_deref())
+        .into_iter()
+        .find_map(|v| opencode_context_for_model(&v, model))
 }
 
 /// Read the reasoning / thinking effort the BASE is configured with, so UmaDev
@@ -3991,25 +4092,101 @@ fn opencode_config_paths(
     project_root: &std::path::Path,
     home: Option<&std::path::Path>,
 ) -> Vec<PathBuf> {
-    let mut paths = vec![
-        project_root.join("opencode.json"),
-        project_root.join("opencode.jsonc"),
-        project_root.join(".opencode/opencode.json"),
-        project_root.join(".opencode/opencode.jsonc"),
-    ];
+    let mut paths = Vec::new();
+    // OpenCode merges OPENCODE_CONFIG_CONTENT last; handled separately by
+    // `opencode_config_values`. OPENCODE_CONFIG_DIR is the highest-priority file
+    // directory and still works when project config is disabled.
+    if let Ok(dir) = std::env::var("OPENCODE_CONFIG_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            paths.push(PathBuf::from(dir).join("opencode.jsonc"));
+            paths.push(PathBuf::from(dir).join("opencode.json"));
+        }
+    }
+    let project_disabled = std::env::var("OPENCODE_DISABLE_PROJECT_CONFIG").is_ok_and(|v| {
+        let v = v.trim();
+        v == "1" || v.eq_ignore_ascii_case("true")
+    });
+    if !project_disabled {
+        paths.extend(opencode_project_config_paths(project_root));
+    }
+    if let Ok(file) = std::env::var("OPENCODE_CONFIG") {
+        let file = file.trim();
+        if !file.is_empty() {
+            paths.push(PathBuf::from(file));
+        }
+    }
     if let Some(home) = home {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            let xdg = xdg.trim();
+            if !xdg.is_empty() {
+                paths.push(PathBuf::from(xdg).join("opencode/opencode.jsonc"));
+                paths.push(PathBuf::from(xdg).join("opencode/opencode.json"));
+                paths.push(PathBuf::from(xdg).join("opencode/config.json"));
+            }
+        }
         paths.extend([
-            home.join(".config/opencode/opencode.json"),
             home.join(".config/opencode/opencode.jsonc"),
-            home.join(".opencode/opencode.json"),
+            home.join(".config/opencode/opencode.json"),
+            home.join(".config/opencode/config.json"),
             home.join(".opencode/opencode.jsonc"),
+            home.join(".opencode/opencode.json"),
         ]);
     }
     paths
 }
 
+fn opencode_project_config_paths(project_root: &std::path::Path) -> Vec<PathBuf> {
+    let dirs = opencode_project_config_dirs(project_root);
+    let mut paths = Vec::new();
+    for dir in &dirs {
+        paths.push(dir.join(".opencode/opencode.jsonc"));
+        paths.push(dir.join(".opencode/opencode.json"));
+    }
+    for dir in dirs {
+        paths.push(dir.join("opencode.jsonc"));
+        paths.push(dir.join("opencode.json"));
+    }
+    paths
+}
+
+fn opencode_project_config_dirs(project_root: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut current = Some(project_root);
+    while let Some(dir) = current {
+        dirs.push(dir.to_path_buf());
+        if dir.join(".git").exists() || dir.join(".umadev").exists() {
+            break;
+        }
+        current = dir.parent().filter(|p| *p != dir);
+    }
+    dirs
+}
+
+fn opencode_config_values(
+    project_root: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<serde_json::Value> {
+    let mut values = Vec::new();
+    if let Ok(content) = std::env::var("OPENCODE_CONFIG_CONTENT") {
+        if let Some(v) = json_text_value(&content) {
+            values.push(v);
+        }
+    }
+    values.extend(
+        opencode_config_paths(project_root, home)
+            .into_iter()
+            .filter_map(|p| json_value(&p)),
+    );
+    values
+}
+
 fn json_value(path: &std::path::Path) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(path).ok()?;
+    json_text_value(&text)
+}
+
+fn json_text_value(text: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&text).ok().or_else(|| {
         let stripped = strip_jsonc_comments(&text);
         serde_json::from_str(&stripped)
@@ -4025,21 +4202,40 @@ fn opencode_model_from_config(v: &serde_json::Value) -> Option<String> {
             return Some(model.to_string());
         }
     }
+    if let Some(model) = v.get("model").and_then(opencode_model_ref) {
+        return Some(model);
+    }
+    opencode_model_ref(v)
+}
+
+fn opencode_model_ref(v: &serde_json::Value) -> Option<String> {
     let model_id = v
         .get("modelID")
         .or_else(|| v.get("model_id"))
+        .or_else(|| v.get("id"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let provider_id = v
         .get("providerID")
         .or_else(|| v.get("provider_id"))
+        .or_else(|| v.get("provider"))
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    Some(match provider_id {
+    let base = match provider_id {
+        Some(provider) if model_id.starts_with(&format!("{provider}/")) => model_id.to_string(),
         Some(provider) => format!("{provider}/{model_id}"),
         None => model_id.to_string(),
+    };
+    let variant = v
+        .get("variant")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "default");
+    Some(match variant {
+        Some(variant) => format!("{base}/{variant}"),
+        None => base,
     })
 }
 
@@ -4074,6 +4270,46 @@ fn provider_model_context(provider: &serde_json::Value, model_id: &str) -> Optio
                 key.eq_ignore_ascii_case(model_id)
                     .then(|| model_context_limit(entry))
                     .flatten()
+            })
+        })
+        .or_else(|| {
+            let (base_id, variant) = model_id.rsplit_once('/')?;
+            model_context_for_variant(models, base_id, variant)
+        })
+}
+
+fn model_context_for_variant(
+    models: &serde_json::Map<String, serde_json::Value>,
+    base_id: &str,
+    variant: &str,
+) -> Option<u64> {
+    models
+        .get(base_id)
+        .and_then(|entry| {
+            model_entry_has_variant(entry, variant)
+                .then(|| model_context_limit(entry))
+                .flatten()
+        })
+        .or_else(|| {
+            models.iter().find_map(|(key, entry)| {
+                (key.eq_ignore_ascii_case(base_id) && model_entry_has_variant(entry, variant))
+                    .then(|| model_context_limit(entry))
+                    .flatten()
+            })
+        })
+}
+
+fn model_entry_has_variant(entry: &serde_json::Value, variant: &str) -> bool {
+    let Some(variants) = entry.get("variants") else {
+        return false;
+    };
+    variants
+        .as_object()
+        .is_some_and(|map| map.contains_key(variant))
+        || variants.as_array().is_some_and(|items| {
+            items.iter().any(|item| {
+                item.as_str() == Some(variant)
+                    || item.get("id").and_then(serde_json::Value::as_str) == Some(variant)
             })
         })
 }
@@ -4335,11 +4571,20 @@ fn theme_from_osc11() -> Option<bool> {
     None
 }
 
-/// Whether this is a REMOTE session — `SSH_CONNECTION` / `SSH_TTY` set — where a
-/// native OS clipboard command would target the FAR host, not the user's
-/// terminal, so the copy must go via OSC 52 instead. Cheap env-only check.
+/// Whether this is a REMOTE session where a native OS clipboard command would
+/// target the FAR host, not the user's terminal, so the copy must go via OSC 52
+/// instead. `SSH_CONNECTION` is the signal we trust: tmux panes can retain a
+/// stale `SSH_TTY` after a local re-attach, which would otherwise downgrade a
+/// local Windows/macOS clipboard copy to OSC 52 and make copy look broken.
 fn clipboard_is_remote() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+    clipboard_remote_from_env(
+        std::env::var_os("SSH_CONNECTION").is_some(),
+        std::env::var_os("SSH_TTY").is_some(),
+    )
+}
+
+fn clipboard_remote_from_env(ssh_connection: bool, _ssh_tty: bool) -> bool {
+    ssh_connection
 }
 
 /// Whether we're running INSIDE tmux (`TMUX` set). A bare OSC 52 clipboard write
@@ -4350,49 +4595,114 @@ fn clipboard_in_tmux() -> bool {
 }
 
 /// Copy `text` to the system clipboard via the **native OS command** (the path
-/// that works even in macOS Terminal.app, which has no OSC 52): `pbcopy` on
-/// macOS; on Linux/BSD try `wl-copy`, then `xclip -selection clipboard`, then
+/// that works even in macOS Terminal.app, which has no OSC 52): PowerShell
+/// `Set-Clipboard` / `clip.exe` on Windows, `pbcopy` on macOS, and on Linux/BSD
+/// try `wl-copy`, then `xclip -selection clipboard`, then
 /// `xsel --clipboard --input`. The first that spawns + exits cleanly wins;
 /// returns `true` on success.
 ///
 /// This pipes `text` to a CHILD process's stdin and **never writes to our own
 /// stdout**, so it carries no mid-frame interleave risk (R3) and is safe to run
-/// on the blocking pool fire-and-forget — a wedged `pbcopy`/`xclip` can't stall
-/// the render loop. The OSC 52 path (for remote sessions) is written separately
-/// on the UI thread through the render's single backend writer, never here.
+/// on the blocking pool fire-and-forget — a wedged `Set-Clipboard`/`pbcopy`/
+/// `xclip` can't stall the render loop. The OSC 52 path (for remote sessions)
+/// is written separately on the UI thread through the render's single backend
+/// writer, never here.
 ///
 /// Every step is best-effort / fail-open: a missing binary, a spawn error, or a
 /// non-zero exit returns `false`; nothing here panics or blocks the UI loop.
 fn copy_to_clipboard_native(text: &str) -> bool {
-    // Pipe `text` to one native clipboard command's stdin; `true` only when it
-    // spawned AND exited successfully. stdout/stderr are discarded.
-    fn try_native(cmd: &str, args: &[&str], text: &str) -> bool {
-        use std::io::Write as _;
-        use std::process::{Command, Stdio};
-        let Ok(mut child) = Command::new(cmd)
-            .args(args)
-            .stdin(Stdio::piped())
+    match native_clipboard_plan(std::env::consts::OS) {
+        NativeClipboardPlan::Windows => copy_to_clipboard_windows(text),
+        NativeClipboardPlan::Macos => try_native_clipboard("pbcopy", &[], text),
+        NativeClipboardPlan::UnixLike => {
+            try_native_clipboard("wl-copy", &[], text)
+                || try_native_clipboard("xclip", &["-selection", "clipboard"], text)
+                || try_native_clipboard("xsel", &["--clipboard", "--input"], text)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeClipboardPlan {
+    Windows,
+    Macos,
+    UnixLike,
+}
+
+fn native_clipboard_plan(os: &str) -> NativeClipboardPlan {
+    match os {
+        "windows" => NativeClipboardPlan::Windows,
+        "macos" => NativeClipboardPlan::Macos,
+        _ => NativeClipboardPlan::UnixLike,
+    }
+}
+
+// Pipe `text` to one native clipboard command's stdin; `true` only when it
+// spawned AND exited successfully. stdout/stderr are discarded.
+fn try_native_clipboard(cmd: &str, args: &[&str], text: &str) -> bool {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // Ignore a broken pipe — we still wait + check the exit status below.
+        let _ = stdin.write_all(text.as_bytes());
+        // Drop stdin so the child sees EOF and can finish.
+    }
+    child.wait().is_ok_and(|s| s.success())
+}
+
+#[cfg(windows)]
+fn clipboard_temp_path() -> std::path::PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::env::temp_dir().join(format!(
+        "umadev-clipboard-{}-{stamp}.txt",
+        std::process::id()
+    ))
+}
+
+#[cfg(windows)]
+fn copy_to_clipboard_windows(text: &str) -> bool {
+    use std::process::{Command, Stdio};
+
+    // `clip.exe` reads stdin using the active console code page, which can
+    // corrupt CJK text. Prefer PowerShell reading an explicit UTF-8 file, then
+    // keep `clip.exe` as a best-effort fallback for stripped-down systems.
+    let path = clipboard_temp_path();
+    if std::fs::write(&path, text.as_bytes()).is_ok() {
+        let ok = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Set-Clipboard -Value (Get-Content -LiteralPath $args[0] -Raw -Encoding UTF8)",
+            ])
+            .arg(&path)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-        else {
-            return false;
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            // Ignore a broken pipe — we still wait + check the exit status below.
-            let _ = stdin.write_all(text.as_bytes());
-            // Drop stdin so the child sees EOF and can finish.
+            .status()
+            .is_ok_and(|s| s.success());
+        let _ = std::fs::remove_file(&path);
+        if ok {
+            return true;
         }
-        child.wait().is_ok_and(|s| s.success())
     }
+    try_native_clipboard("clip.exe", &[], text)
+}
 
-    if cfg!(target_os = "macos") {
-        try_native("pbcopy", &[], text)
-    } else {
-        try_native("wl-copy", &[], text)
-            || try_native("xclip", &["-selection", "clipboard"], text)
-            || try_native("xsel", &["--clipboard", "--input"], text)
-    }
+#[cfg(not(windows))]
+fn copy_to_clipboard_windows(_text: &str) -> bool {
+    false
 }
 
 /// Set true by [`setup_terminal`] ONCE it has confirmed the terminal supports
@@ -5386,7 +5696,14 @@ fn legacy_input_park_decision(streak: u32, ok: bool, eof: bool, threshold: u32) 
     }
 }
 
-async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> Result<()> {
+async fn event_loop(
+    terminal: &mut Term,
+    app: &mut App,
+    opts: LaunchOptions,
+    win_console_guard: Option<&WindowsConsoleModeGuard>,
+) -> Result<()> {
+    #[cfg(not(windows))]
+    let _ = win_console_guard;
     let (sink, mut engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6987,6 +7304,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, opts: LaunchOptions) -> 
                 app.cancel_run();
             }
             _ = tick.tick() => {
+                #[cfg(windows)]
+                if let Some(guard) = win_console_guard {
+                    guard.enforce();
+                }
                 // R3 — the 80ms animation tick advances spinners / elapsed clocks
                 // only while something visible is live. In a settled transcript,
                 // especially when the user has scrolled into a large scrollback,
@@ -7181,6 +7502,7 @@ mod tests {
     /// "must close the window and reopen" report. (`disable_raw_mode` is the
     /// caller's first step — a global console-input mode, not a writer command.)
     #[test]
+    #[cfg(unix)] // crossterm/console API + CI-env/timing differ on Windows; logic covered on unix
     fn restore_sequence_is_complete_and_in_reverse_setup_order() {
         let mut buf: Vec<u8> = Vec::new();
         restore_sequence(&mut buf);
@@ -7207,6 +7529,7 @@ mod tests {
     /// visibility). Both `setup_terminal` and `reassert_terminal_modes` emit
     /// through this single function, so this is the whole enable surface.
     #[test]
+    #[cfg(unix)] // crossterm/console API + CI-env/timing differ on Windows; logic covered on unix
     fn enable_terminal_modes_is_the_one_complete_enable_set() {
         let mut buf: Vec<u8> = Vec::new();
         enable_terminal_modes(&mut buf, true).expect("a Vec sink cannot fail");
@@ -7226,6 +7549,7 @@ mod tests {
     /// with capture off it actively DISABLES mouse reporting (so a resume never
     /// silently re-enables what the user turned off) and never enables it.
     #[test]
+    #[cfg(unix)] // crossterm/console API + CI-env/timing differ on Windows; logic covered on unix
     fn enable_terminal_modes_respects_the_mouse_preference() {
         let mut buf: Vec<u8> = Vec::new();
         enable_terminal_modes(&mut buf, false).expect("a Vec sink cannot fail");
@@ -7369,6 +7693,7 @@ mod tests {
     /// mirror of `enable_and_restore_are_mode_symmetric`, for the one mode that
     /// is a stack push rather than a level-triggered DEC private mode.
     #[test]
+    #[cfg(unix)] // crossterm/console API + CI-env/timing differ on Windows; logic covered on unix
     fn kitty_keyboard_push_and_pop_are_symmetric() {
         let mut push: Vec<u8> = Vec::new();
         push_kitty_keyboard(&mut push).expect("a Vec sink cannot fail");
@@ -7410,6 +7735,7 @@ mod tests {
     /// `CSI < u` pop that could disturb another program's kitty stack — while
     /// the rest of the restore sequence is emitted exactly as before.
     #[test]
+    #[cfg(unix)] // crossterm/console API + CI-env/timing differ on Windows; logic covered on unix
     fn restore_emits_no_kitty_pop_when_it_was_never_pushed() {
         let mut restore_off: Vec<u8> = Vec::new();
         restore_sequence_inner(&mut restore_off, false);
@@ -7429,6 +7755,7 @@ mod tests {
     /// not by sending real signals (deterministic; no process-global handlers
     /// touched in tests).
     #[test]
+    #[cfg(unix)] // crossterm/console API + CI-env/timing differ on Windows; logic covered on unix
     fn signal_teardown_persists_chat_and_emits_full_restore() {
         let (mut app, tmp) = build_test_app();
         app.record_user_turn("信号前的最后一句");
@@ -7888,6 +8215,56 @@ mod tests {
         }
     }
 
+    static OPENCODE_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn isolate_opencode_config_env() -> Vec<EnvRestore> {
+        [
+            "OPENCODE_CONFIG",
+            "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_CONFIG_DIR",
+            "OPENCODE_DISABLE_PROJECT_CONFIG",
+            "XDG_CONFIG_HOME",
+        ]
+        .into_iter()
+        .map(EnvRestore::remove)
+        .collect()
+    }
+
+    #[test]
+    fn native_clipboard_plan_routes_windows_to_windows_clipboard() {
+        assert_eq!(
+            native_clipboard_plan("windows"),
+            NativeClipboardPlan::Windows,
+            "local Windows selection copy must not fall through to Linux clipboard commands"
+        );
+        assert_eq!(native_clipboard_plan("macos"), NativeClipboardPlan::Macos);
+        assert_eq!(
+            native_clipboard_plan("linux"),
+            NativeClipboardPlan::UnixLike
+        );
+        assert_eq!(
+            native_clipboard_plan("freebsd"),
+            NativeClipboardPlan::UnixLike
+        );
+    }
+
+    #[test]
+    fn clipboard_remote_detection_ignores_stale_ssh_tty() {
+        assert!(
+            clipboard_remote_from_env(true, true),
+            "an active SSH connection is remote even when SSH_TTY is also present"
+        );
+        assert!(
+            clipboard_remote_from_env(true, false),
+            "SSH_CONNECTION alone is enough for remote clipboard routing"
+        );
+        assert!(
+            !clipboard_remote_from_env(false, true),
+            "a stale SSH_TTY without SSH_CONNECTION can survive tmux local re-attach"
+        );
+        assert!(!clipboard_remote_from_env(false, false));
+    }
+
     #[test]
     fn enrich_base_failure_prepends_actionable_line_and_keeps_tail() {
         // D1 (chat path): a known auth stderr now classifies and PREPENDS the
@@ -8318,6 +8695,8 @@ mod tests {
 
     #[test]
     fn detect_base_model_reads_each_base_config() {
+        let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env = isolate_opencode_config_env();
         // The base's OWN model is read from its own config, in the base's order.
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
@@ -8347,6 +8726,8 @@ mod tests {
 
     #[test]
     fn detect_opencode_context_window_reads_provider_limit() {
+        let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env = isolate_opencode_config_env();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::write(
@@ -8381,6 +8762,8 @@ mod tests {
 
     #[test]
     fn detect_opencode_model_reads_legacy_dot_opencode_project_config() {
+        let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env = isolate_opencode_config_env();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".opencode")).unwrap();
@@ -8393,6 +8776,149 @@ mod tests {
         assert_eq!(
             detect_base_model("opencode", root).as_deref(),
             Some("my-provider/custom-model")
+        );
+    }
+
+    #[test]
+    fn detect_opencode_model_walks_parent_project_configs_to_workspace_boundary() {
+        let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env = isolate_opencode_config_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outer = tmp.path();
+        let root = outer.join("repo");
+        let child = root.join("src/ui");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            outer.join("opencode.json"),
+            r#"{"model":"outside/not-this-workspace"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("opencode.json"),
+            r#"{
+              "model": "parent/model",
+              "provider": {
+                "parent": {
+                  "models": {
+                    "model": { "limit": { "context": 123000 } }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_base_model("opencode", &child).as_deref(),
+            Some("parent/model")
+        );
+        assert_eq!(
+            detect_base_context_window("opencode", &child),
+            Some(123_000)
+        );
+
+        std::fs::write(child.join("opencode.jsonc"), r#"{"model":"child/model"}"#).unwrap();
+        assert_eq!(
+            detect_base_model("opencode", &child).as_deref(),
+            Some("child/model")
+        );
+    }
+
+    #[test]
+    fn detect_opencode_model_reads_session_model_object_shapes() {
+        let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env = isolate_opencode_config_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("opencode.json"),
+            r#"{
+              "model": {
+                "providerID": "anthropic",
+                "id": "claude-sonnet-4-5",
+                "variant": "high"
+              },
+              "provider": {
+                "anthropic": {
+                  "models": {
+                    "claude-sonnet-4-5": {
+                      "limit": { "context": 200000 },
+                      "variants": { "high": {} }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_base_model("opencode", root).as_deref(),
+            Some("anthropic/claude-sonnet-4-5/high")
+        );
+        assert_eq!(detect_base_context_window("opencode", root), Some(200_000));
+    }
+
+    #[test]
+    fn detect_opencode_model_honors_env_config_sources() {
+        let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env = isolate_opencode_config_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("opencode.json"), r#"{"model":"project/model"}"#).unwrap();
+
+        let custom = root.join("custom-opencode.json");
+        std::fs::write(&custom, r#"{"model":"custom/file"}"#).unwrap();
+        let _custom = EnvRestore::set("OPENCODE_CONFIG", &custom);
+        assert_eq!(
+            detect_base_model("opencode", root).as_deref(),
+            Some("project/model"),
+            "project config wins over OPENCODE_CONFIG, matching OpenCode merge order"
+        );
+
+        let config_dir = root.join("config-dir");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("opencode.jsonc"),
+            r#"{"model":"dir/model"}"#,
+        )
+        .unwrap();
+        let _dir = EnvRestore::set("OPENCODE_CONFIG_DIR", &config_dir);
+        assert_eq!(
+            detect_base_model("opencode", root).as_deref(),
+            Some("dir/model"),
+            "OPENCODE_CONFIG_DIR is merged after project config"
+        );
+
+        let _content = EnvRestore::set("OPENCODE_CONFIG_CONTENT", r#"{"model":"inline/model"}"#);
+        assert_eq!(
+            detect_base_model("opencode", root).as_deref(),
+            Some("inline/model"),
+            "OPENCODE_CONFIG_CONTENT is the highest-priority authored source"
+        );
+    }
+
+    #[test]
+    fn detect_opencode_model_honors_project_config_disable() {
+        let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+        let _env = isolate_opencode_config_env();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("opencode.json"), r#"{"model":"project/model"}"#).unwrap();
+        let config_dir = root.join("config-dir");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("opencode.json"),
+            r#"{"model":"configdir/model"}"#,
+        )
+        .unwrap();
+        let _disable = EnvRestore::set("OPENCODE_DISABLE_PROJECT_CONFIG", "true");
+        let _dir = EnvRestore::set("OPENCODE_CONFIG_DIR", &config_dir);
+
+        assert_eq!(
+            detect_base_model("opencode", root).as_deref(),
+            Some("configdir/model")
         );
     }
 

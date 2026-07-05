@@ -9,8 +9,8 @@
 //! of the first visible row, the event loop turns mouse down/drag/up into a
 //! [`Selection`] over those cached rows, the renderer paints the selected span
 //! with a selection background, and on mouse-up we extract the selected text and
-//! copy it to the system clipboard via OSC 52 (which works from inside the alt
-//! screen, where a normal clipboard write would not reach the host).
+//! copy it to the system clipboard through the platform path selected by the
+//! event loop: native clipboard locally, OSC 52 when running through SSH.
 //!
 //! Everything in this module is **pure + fail-open**: every coordinate is
 //! clamped, every out-of-range index degrades to an empty string or a no-op
@@ -324,19 +324,18 @@ pub fn osc52_for(text: &str, in_tmux: bool) -> String {
 
 /// Pure decision: which clipboard path to PREFER for the current environment.
 ///
-/// `"native"` — shell out to the OS clipboard command (pbcopy / wl-copy / xclip
-/// / xsel), the most compatible path on a LOCAL session (works in macOS
-/// Terminal.app, which has no OSC 52 support). `"osc52"` — write the OSC 52
+/// `"native"` — shell out to the OS clipboard command (PowerShell/clip.exe /
+/// pbcopy / wl-copy / xclip / xsel), the most compatible path on a LOCAL session
+/// (works in terminals with no OSC 52 support). `"osc52"` — write the OSC 52
 /// escape, the only path that reaches the *user's* clipboard across an SSH /
 /// remote session (a native command would target the far host, not the terminal
 /// the user is sitting at).
 ///
 /// Factored out so the local-vs-remote routing is unit-testable without
-/// spawning a process. The caller still falls back from `"native"` to OSC 52 at
-/// runtime when no native binary is found / succeeds — that runtime fallback is
-/// best-effort and not represented here. `os` is the target-OS string
-/// (`std::env::consts::OS`), reserved for future per-OS routing; the
-/// local/remote split is what decides the preference today.
+/// spawning a process. The caller writes OSC 52 for remote sessions and uses the
+/// native command path for local sessions; both are best-effort. `os` is the
+/// target-OS string (`std::env::consts::OS`), reserved for future per-OS routing;
+/// the local/remote split is what decides the preference today.
 #[must_use]
 pub fn clipboard_path(is_remote: bool, _os: &str) -> &'static str {
     if is_remote {
@@ -748,6 +747,8 @@ mod tests {
         assert_eq!(clipboard_path(false, "macos"), "native");
         // Local Linux likewise prefers native (wl-copy / xclip / xsel).
         assert_eq!(clipboard_path(false, "linux"), "native");
+        // Local Windows must prefer its native clipboard path, not Linux tools.
+        assert_eq!(clipboard_path(false, "windows"), "native");
     }
 
     #[test]
@@ -756,5 +757,6 @@ mod tests {
         // the terminal the user sits at — only OSC 52 reaches their clipboard.
         assert_eq!(clipboard_path(true, "macos"), "osc52");
         assert_eq!(clipboard_path(true, "linux"), "osc52");
+        assert_eq!(clipboard_path(true, "windows"), "osc52");
     }
 }

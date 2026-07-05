@@ -3317,6 +3317,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "crossterm",
+ "crossterm_winapi",
  "futures",
  "libc",
  "pulldown-cmark",

@@ -788,12 +788,27 @@ pub fn capture_dev_errors(
     // record (and merges any newly-seen context) rather than being dropped, so
     // the KB measures how often each pitfall actually bites.
     let mut store: Vec<Lesson> = read_raw_lessons(project_root, DEV_ERRORS_FILE);
-    let mut idx: std::collections::HashMap<String, usize> = store
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| !l.signature.is_empty())
-        .map(|(i, l)| (l.signature.clone(), i))
-        .collect();
+    // Key the recurrence index by the NORMALIZED signature. The lookup below
+    // normalizes the incoming error's signature, so indexing by the raw stored
+    // signature would MISS any pitfall recorded before normalization existed (or
+    // whose stored form isn't already normalized) - its `occurrences` would freeze
+    // forever (the reported "已踩 17 次" that never grows). Normalizing both sides
+    // collapses old + new to one key. On a collision (an old frozen record plus a
+    // newer shadow of the same root cause), point the index at the HIGHER-count
+    // record so the increment lands on the canonical one, not a duplicate.
+    let mut idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, l) in store.iter().enumerate() {
+        let sig = normalize_signature(&l.signature);
+        if sig.is_empty() {
+            continue;
+        }
+        match idx.get(&sig) {
+            Some(&j) if store[j].hits() >= l.hits() => {}
+            _ => {
+                idx.insert(sig, i);
+            }
+        }
+    }
 
     let mut new_count = 0usize;
     let mut changed = false;

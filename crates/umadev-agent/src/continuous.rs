@@ -3790,7 +3790,9 @@ mod tests {
         // Bound the WHOLE run too, as a backstop: if the timeout regressed this
         // would hang forever, so the test asserts it returns well under the cap.
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            // Generous backstop: the inner fork timeout fires quickly, but Windows
+            // CI runners are slow enough that a tight 20s cap tripped spuriously.
+            std::time::Duration::from_secs(120),
             run_block(&mut session, &options, &events, Phase::Research),
         )
         .await

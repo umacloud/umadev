@@ -1,0 +1,10 @@
+[32156551ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_RESET @ http://localhost:3010/_next/image?url=%2Fassets%2Fmascot-thumb.png&w=256&q=75:0
+[32156551ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_RESET @ http://localhost:3010/__nextjs_font/geist-latin.woff2:0
+[32156551ms] [ERROR] Failed to load resource: net::ERR_INCOMPLETE_CHUNKED_ENCODING @ http://localhost:3010/?_rsc=q3mOO9BClNZHexY7:0
+[32156552ms] [ERROR] Failed to fetch RSC payload for http://localhost:3010/. Falling back to browser navigation. TypeError: network error @ http://localhost:3010/_next/static/chunks/node_modules_next_dist_1ybzpk2._.js:3318
+[32156553ms] [ERROR] Failed to load resource: net::ERR_CONNECTION_REFUSED @ http://localhost:3010/?_rsc=q3mOO9BClNZHexY7:0
+[32156553ms] [ERROR] Failed to fetch RSC payload for http://localhost:3010/. Falling back to browser navigation. TypeError: Failed to fetch
+    at createFetch (http://localhost:3010/_next/static/chunks/node_modules_next_dist_client_0r5nbpw._.js:8207:21)
+    at async fetchServerResponse (http://localhost:3010/_next/static/chunks/node_modules_next_dist_client_0r5nbpw._.js:8051:21)
+    at async fetchMissingDynamicData (http://localhost:3010/_next/static/chunks/node_modules_next_dist_client_0r5nbpw._.js:9464:24) @ http://localhost:3010/_next/static/chunks/node_modules_next_dist_1ybzpk2._.js:3318
+[32156562ms] [ERROR] WebSocket is already in CLOSING or CLOSED state. @ http://localhost:3010/_next/static/chunks/node_modules_next_dist_1ybzpk2._.js:2836

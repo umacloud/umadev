@@ -2223,8 +2223,12 @@ pub struct App {
     pub backend: Option<String>,
     /// Display label for the worker — `claude-code` / `codex` / `offline`.
     pub backend_label: String,
-    /// The active base's configured model, read once from the base's own config.
+    /// The active base's displayed model: static config at launch, replaced by
+    /// the base's live session report when one arrives.
     pub(crate) base_model: Option<String>,
+    /// Whether [`Self::base_model`] came from a live base session report rather
+    /// than a static config read.
+    pub(crate) base_model_live: bool,
     /// Exact context window read from the base config when available.
     pub(crate) base_context_window: Option<u64>,
 
@@ -2776,6 +2780,7 @@ impl App {
             backend,
             backend_label,
             base_model,
+            base_model_live: false,
             base_context_window,
             slug: slug.into(),
             requirement: String::new(),
@@ -4972,6 +4977,80 @@ impl App {
         text.lines().count().max(1)
     }
 
+    /// Normalize text at the paste boundary.
+    ///
+    /// Windows Terminal / ConPTY can deliver bracketed paste newlines as bare
+    /// `\r`; without this, the insert filter drops them as control chars and a
+    /// multi-line paste collapses into one line. ANSI control strings are removed
+    /// as whole sequences rather than only dropping the ESC byte, so pasted
+    /// colored terminal output does not leak `[31m` fragments into the prompt.
+    fn normalize_paste_text(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' => {
+                    out.push('\n');
+                    i += 1;
+                    if bytes.get(i) == Some(&b'\n') {
+                        i += 1;
+                    }
+                }
+                0x1b => {
+                    i = Self::skip_paste_escape(bytes, i);
+                }
+                _ => {
+                    if !text.is_char_boundary(i) {
+                        i += 1;
+                        continue;
+                    }
+                    let Some(ch) = text[i..].chars().next() else {
+                        break;
+                    };
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        out
+    }
+
+    fn skip_paste_escape(bytes: &[u8], esc: usize) -> usize {
+        let Some(kind) = bytes.get(esc + 1).copied() else {
+            return esc + 1;
+        };
+        match kind {
+            b'[' => Self::skip_paste_csi(bytes, esc + 2),
+            b']' | b'P' | b'_' => Self::skip_paste_string(bytes, esc + 2),
+            _ => (esc + 2).min(bytes.len()),
+        }
+    }
+
+    fn skip_paste_csi(bytes: &[u8], mut i: usize) -> usize {
+        while i < bytes.len() {
+            let b = bytes[i];
+            i += 1;
+            if (0x40..=0x7e).contains(&b) {
+                break;
+            }
+        }
+        i
+    }
+
+    fn skip_paste_string(bytes: &[u8], mut i: usize) -> usize {
+        while i < bytes.len() {
+            if bytes[i] == 0x07 {
+                return i + 1;
+            }
+            if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                return i + 2;
+            }
+            i += 1;
+        }
+        i
+    }
+
     /// The chip token shown in the input box for a stashed large paste, e.g.
     /// `[粘贴 42 行]` / `[pasted 42 lines]`. Derived purely from the stashed
     /// text's line count, so the same definition recomputes the exact token on
@@ -4993,6 +5072,7 @@ impl App {
         // A paste is an edit — close the kill-coalesce + yank-pop windows so a
         // following kill starts fresh and Alt+Y isn't mistaken for valid.
         self.reset_kill_yank();
+        let text = Self::normalize_paste_text(text);
         let lines: Vec<&str> = text.trim().lines().collect();
         let all_images = !lines.is_empty()
             && lines
@@ -5032,17 +5112,28 @@ impl App {
         // `[粘贴 N 行]` chip with the full text parked in `text_stash`, so it
         // doesn't flood the box into unscrollable noise; it expands back inline
         // on submit. Same proven chip+stash+expand pattern as images.
-        let lines = Self::paste_line_count(text);
+        let lines = Self::paste_line_count(&text);
         let chars = text.chars().count();
         if lines > PASTE_CHIP_MIN_LINES || chars > PASTE_CHIP_MIN_CHARS {
-            let chip = self.text_chip(text);
-            self.text_stash.push(text.to_string());
+            let chip = self.text_chip(&text);
+            // Reserve room for the WHOLE chip BEFORE stashing. Near INPUT_CAP,
+            // `insert_str_at_cursor` would otherwise land a partial token (or
+            // nothing), leaving `text_stash` with no intact chip to expand on
+            // submit. Same invariant as image attachments: backing data exists
+            // only when the visible token that references it landed whole.
+            let need = chip.chars().count();
+            if INPUT_CAP.saturating_sub(self.input_len()) < need {
+                return;
+            }
+            self.text_stash.push(text.clone());
             self.insert_str_at_cursor(&chip);
-            self.insert_str_at_cursor(" ");
+            if INPUT_CAP.saturating_sub(self.input_len()) > 0 {
+                self.insert_str_at_cursor(" ");
+            }
             return;
         }
         // A small paste → verbatim (real text, the dominant case).
-        self.insert_str_at_cursor(text);
+        self.insert_str_at_cursor(&text);
     }
 
     /// Canonicalise + validate a candidate image path; on success push it to
@@ -6851,12 +6942,24 @@ impl App {
             }
             EngineEvent::BaseModel { id } => {
                 // The base reported the EXACT model it resolved for this session (its
-                // `init` frame). Adopt it as the live display model. It is NOT used to
-                // infer the context window: a model-id table drifts, and the base may
-                // route to a third-party/local model whose real window UmaDev cannot
-                // prove. Fail-open: an empty id is ignored.
+                // session metadata). Adopt it as the live display model. It is NOT
+                // used to infer the context window from a hardcoded table: model ids
+                // drift, and the base may route to a third-party/local model whose
+                // real window UmaDev cannot prove. If OpenCode provider metadata can
+                // prove the live model's exact window, keep it; otherwise clear any
+                // stale denominator from a previous static config match. Fail-open:
+                // an empty id is ignored.
+                let id = id.trim();
                 if !id.is_empty() {
-                    self.base_model = Some(id);
+                    self.base_model = Some(id.to_string());
+                    self.base_model_live = true;
+                    self.base_context_window = self
+                        .backend
+                        .as_deref()
+                        .filter(|b| !b.is_empty() && *b != "offline")
+                        .and_then(|b| {
+                            crate::detect_base_context_window_for_model(b, &self.project_root, id)
+                        });
                 }
             }
             EngineEvent::Note(note) => {
@@ -11131,16 +11234,33 @@ impl App {
         ));
         body.push_str(&format!("spec         {}\n", umadev_spec::SPEC_VERSION));
         body.push_str(&format!("worker       {}\n", self.backend_label));
-        // Read-only observation: UmaDev never sets a model, so show the base's OWN
-        // configured model (or note it runs on its login default). On-demand overlay
-        // — the file read here is fine (not a per-frame path).
-        match self
-            .backend
+        // Read-only observation: UmaDev never sets a model. Prefer the model the
+        // live base reported for this session; fall back to the base's static config
+        // only when no runtime report exists.
+        let display_model = self
+            .base_model
             .as_deref()
-            .filter(|b| !b.is_empty() && *b != "offline")
-            .and_then(|b| crate::detect_base_model(b, &self.project_root))
-        {
-            Some(m) => body.push_str(&format!("model        {m} (the base's own)\n")),
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        let detected_model = display_model
+            .map(|m| {
+                let source = if self.base_model_live {
+                    "reported by the base"
+                } else {
+                    "configured by the base"
+                };
+                (m, source)
+            })
+            .or_else(|| {
+                self.backend
+                    .as_deref()
+                    .filter(|b| !b.is_empty() && *b != "offline")
+                    .and_then(|b| crate::detect_base_model(b, &self.project_root))
+                    .map(|m| (m, "configured by the base"))
+            });
+        match detected_model {
+            Some((m, source)) => body.push_str(&format!("model        {m} ({source})\n")),
             None => body.push_str(&format!(
                 "model        {} login default (the base's own)\n",
                 self.backend_label
@@ -11592,6 +11712,7 @@ impl App {
             .as_deref()
             .filter(|b| !b.is_empty() && *b != "offline")
             .and_then(|b| crate::detect_base_model(b, &self.project_root));
+        self.base_model_live = false;
         self.base_context_window = backend
             .as_deref()
             .filter(|b| !b.is_empty() && *b != "offline")
@@ -14574,11 +14695,11 @@ mod tests {
 
     #[test]
     fn base_model_engine_event_updates_display_not_context_window() {
-        // The base reports its resolved model at session init (`EngineEvent::BaseModel`)
-        // → the UI records the real model for DISPLAY only (see `model_meta_text`). It
-        // must NOT infer a context window from that id: a hardcoded model table drifts
-        // and a base may route to a third-party/local model, so only an EXACT
-        // base-config window is ever a denominator — honest over decorative.
+        // The base reports its resolved model via `EngineEvent::BaseModel`, so
+        // the UI records the real model for DISPLAY only (see `model_meta_text`).
+        // It must NOT infer a context window from that id: a hardcoded model
+        // table drifts and a base may route to a third-party/local model, so
+        // only an EXACT base-config window is ever a denominator.
         let mut app = fresh_app(Some("claude-code"));
         app.last_turn_input_tokens = 100_000;
         // Pin "user pinned nothing" deterministically — `fresh_app` would otherwise
@@ -14696,6 +14817,56 @@ mod tests {
         assert_eq!(app.base_context_window, Some(200_000));
         assert_eq!(app.context_window_tokens(), Some(200_000));
         assert_eq!(app.context_usage_pct(), Some(50));
+    }
+
+    #[test]
+    fn live_base_model_recomputes_exact_opencode_context_or_clears_stale_window() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("opencode.json"),
+            r#"{
+              "model": "provider-auth-big/glm-5",
+              "provider": {
+                "provider-auth-big": {
+                  "models": {
+                    "glm-5": { "limit": { "context": 200000 } },
+                    "glm-5-next": {
+                      "limit": { "context": 300000 },
+                      "variants": { "high": {} }
+                    }
+                  }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let mut app = App::new(
+            "demo".to_string(),
+            UserConfig {
+                backend: Some("opencode".into()),
+                ..Default::default()
+            },
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        assert_eq!(app.base_context_window, Some(200_000));
+
+        app.apply_engine(EngineEvent::BaseModel {
+            id: "provider-auth-big/glm-5-next/high".to_string(),
+        });
+        assert_eq!(
+            app.base_context_window,
+            Some(300_000),
+            "live model can keep the gauge only when provider metadata proves it"
+        );
+
+        app.apply_engine(EngineEvent::BaseModel {
+            id: "provider-auth-big/unknown".to_string(),
+        });
+        assert_eq!(
+            app.base_context_window, None,
+            "a live model mismatch must clear the stale static denominator"
+        );
     }
 
     #[test]
@@ -15431,6 +15602,34 @@ mod tests {
     }
 
     #[test]
+    fn small_paste_normalizes_windows_cr_newlines() {
+        let mut a = fresh_app(Some("offline"));
+        a.handle_paste("first\rsecond\r\nthird");
+        assert_eq!(a.input, "first\nsecond\nthird");
+        assert!(a.text_stash.is_empty(), "a small paste stays inline");
+    }
+
+    #[test]
+    fn small_paste_strips_ansi_sequences() {
+        let mut a = fresh_app(Some("offline"));
+        a.handle_paste("\x1b[31mred\x1b[0m \x1b]0;title\x07plain \x1bPignored\x1b\\done");
+        assert_eq!(a.input, "red plain done");
+    }
+
+    #[test]
+    fn large_paste_stashes_normalized_windows_newlines() {
+        let mut a = fresh_app(Some("offline"));
+        let big = (0..20)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\r");
+        a.handle_paste(&big);
+        assert_eq!(a.text_stash.len(), 1, "CR-separated paste is still bulky");
+        assert!(a.input.contains("粘贴") || a.input.contains("pasted"));
+        assert_eq!(a.text_stash[0], big.replace('\r', "\n"));
+    }
+
+    #[test]
     fn paste_preserves_tab_indentation() {
         // Low finding — the insert filter keeps `\n` but used to drop ALL other
         // control chars, silently stripping every `\t` out of pasted tab-indented
@@ -15476,6 +15675,40 @@ mod tests {
         a.clear_input();
         assert!(a.text_stash.is_empty(), "clear_input drops the stash");
         assert!(a.input.is_empty());
+    }
+
+    #[test]
+    fn large_paste_near_input_cap_never_orphans_the_stash() {
+        // Mirrors the image-chip cap guard: if the visible `[pasted N lines]`
+        // token cannot fit WHOLE, do not stash the backing text. A partial chip
+        // would not expand on submit, silently dropping the pasted content.
+        let big = numbered_lines("row", 30);
+
+        let mut a = fresh_app(Some("offline"));
+        let chip = a.text_chip(&big);
+        let room = chip.chars().count().saturating_sub(1);
+        a.input = "x".repeat(INPUT_CAP - room);
+        a.input_cursor = a.input_len();
+        let before = a.input.clone();
+        a.handle_paste(&big);
+        assert_eq!(a.input, before, "no partial paste chip should be inserted");
+        assert!(
+            a.text_stash.is_empty(),
+            "no backing stash should exist without a complete chip"
+        );
+
+        let mut b = fresh_app(Some("offline"));
+        let chip = b.text_chip(&big);
+        b.input = "y".repeat(INPUT_CAP - chip.chars().count());
+        b.input_cursor = b.input_len();
+        b.handle_paste(&big);
+        assert_eq!(b.text_stash.len(), 1, "the complete chip fits");
+        assert!(b.input.ends_with(&chip), "chip landed whole: {}", b.input);
+        assert_eq!(
+            b.expand_attachments(&b.input),
+            format!("{}{}", "y".repeat(INPUT_CAP - chip.chars().count()), big),
+            "the fitted chip expands to the exact pasted text"
+        );
     }
 
     // ---- chip-aware deletion (user-reported: backspace "does nothing" on a chip) -
@@ -19605,6 +19838,61 @@ mod tests {
         assert!(joined.contains("umadev"));
         assert!(joined.contains(env!("CARGO_PKG_VERSION")));
         assert!(joined.contains("UMADEV_HOST_SPEC_V1"));
+    }
+
+    #[test]
+    fn slash_version_prefers_live_base_model_over_static_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/config.toml"),
+            "model = \"gpt-static-config\"\n",
+        )
+        .unwrap();
+        let mut app = App::new(
+            "demo".to_string(),
+            UserConfig {
+                backend: Some("codex".into()),
+                ..Default::default()
+            },
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+
+        app.apply_engine(EngineEvent::BaseModel {
+            id: "  gpt-live-session  ".to_string(),
+        });
+        app.open_version_overlay();
+
+        let joined = app.overlay.as_ref().unwrap().lines.join("\n");
+        assert!(joined.contains("model        gpt-live-session (reported by the base)"));
+        assert!(!joined.contains("gpt-static-config"));
+    }
+
+    #[test]
+    fn slash_version_labels_static_model_as_configured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
+        std::fs::write(
+            tmp.path().join(".codex/config.toml"),
+            "model = \"gpt-static-config\"\n",
+        )
+        .unwrap();
+        let mut app = App::new(
+            "demo".to_string(),
+            UserConfig {
+                backend: Some("codex".into()),
+                ..Default::default()
+            },
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+
+        app.open_version_overlay();
+
+        let joined = app.overlay.as_ref().unwrap().lines.join("\n");
+        assert!(joined.contains("model        gpt-static-config (configured by the base)"));
+        assert!(!joined.contains("reported by the base"));
     }
 
     #[test]

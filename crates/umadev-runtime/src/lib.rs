@@ -952,11 +952,11 @@ pub enum SessionEvent {
     /// panic.
     ThinkingDelta(String),
     /// The base reported the EXACT model it resolved for this session, read from
-    /// the session `init` frame (claude's stream-json `system`/`init` line carries
-    /// a `model` field like `claude-sonnet-4-5-20250929`). Emitted at most once,
-    /// at session start, BEFORE any turn. Consumers may display this model id, but
-    /// must not treat it as proof of a context-window size: that requires explicit
-    /// base configuration/provider metadata.
+    /// the base's own session metadata (for example claude's stream-json
+    /// `system/init` `model` field or opencode's `session.updated.info.model`).
+    /// Consumers may display this model id, but must not treat it as proof of a
+    /// context-window size: that requires explicit base configuration/provider
+    /// metadata. Consumers should treat duplicate reports as idempotent.
     /// **Fail-open:** a base whose init frame carries no model id simply never
     /// emits this; an unparseable frame is skipped, never a panic.
     SessionModel(String),

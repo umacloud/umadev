@@ -778,6 +778,7 @@ async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEve
 pub struct PartTracker {
     text_lens: std::collections::HashMap<String, usize>,
     tools_called: std::collections::HashSet<String>,
+    session_model: Option<String>,
 }
 
 /// Translate one SSE frame's JSON payload (`{id,type,properties}`) into zero or
@@ -812,9 +813,65 @@ pub fn translate_frame_tracked(
         "session.error" => translate_error(&props, session_id),
         "permission.asked" => translate_permission(&props, session_id),
         "session.status" => translate_status(&props, session_id),
+        "session.created" | "session.updated" => {
+            translate_session_model(&props, session_id, tracker)
+        }
         // Connection / liveness frames carry no turn semantics.
         _ => Vec::new(),
     }
+}
+
+fn translate_session_model(
+    props: &Value,
+    session_id: &str,
+    tracker: &mut PartTracker,
+) -> Vec<SessionEvent> {
+    if props.get("sessionID").and_then(Value::as_str) != Some(session_id) {
+        return Vec::new();
+    }
+    let Some(model) = props
+        .pointer("/info/model")
+        .or_else(|| props.get("model"))
+        .and_then(opencode_model_ref)
+    else {
+        return Vec::new();
+    };
+    if tracker.session_model.as_deref() == Some(model.as_str()) {
+        return Vec::new();
+    }
+    tracker.session_model = Some(model.clone());
+    vec![SessionEvent::SessionModel(model)]
+}
+
+fn opencode_model_ref(v: &Value) -> Option<String> {
+    let model_id = v
+        .get("modelID")
+        .or_else(|| v.get("model_id"))
+        .or_else(|| v.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let provider_id = v
+        .get("providerID")
+        .or_else(|| v.get("provider_id"))
+        .or_else(|| v.get("provider"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let base = match provider_id {
+        Some(provider) if model_id.starts_with(&format!("{provider}/")) => model_id.to_string(),
+        Some(provider) => format!("{provider}/{model_id}"),
+        None => model_id.to_string(),
+    };
+    let variant = v
+        .get("variant")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "default");
+    Some(match variant {
+        Some(variant) => format!("{base}/{variant}"),
+        None => base,
+    })
 }
 
 /// Map opencode's lowercase tool name to the claude-shaped name the agent-side
@@ -1399,6 +1456,38 @@ mod tests {
     }
 
     // frame translation (the SSE -> event core)
+
+    #[test]
+    fn translate_session_updated_yields_resolved_session_model_once() {
+        let frame = serde_json::json!({
+            "id": "evt_model",
+            "type": "session.updated",
+            "properties": {
+                "sessionID": "ses_abc",
+                "info": {
+                    "id": "ses_abc",
+                    "model": {
+                        "providerID": "anthropic",
+                        "id": "claude-sonnet-4-5",
+                        "variant": "high"
+                    }
+                }
+            }
+        });
+        let payload = serde_json::to_string(&frame).unwrap();
+        let mut tracker = PartTracker::default();
+        assert_eq!(
+            translate_frame_tracked(&payload, "ses_abc", &mut tracker),
+            vec![SessionEvent::SessionModel(
+                "anthropic/claude-sonnet-4-5/high".to_string()
+            )]
+        );
+        assert!(
+            translate_frame_tracked(&payload, "ses_abc", &mut tracker).is_empty(),
+            "duplicate session model reports should be idempotent"
+        );
+        assert!(translate_frame(&payload, "other_session").is_empty());
+    }
 
     #[test]
     fn translate_tool_running_is_a_toolcall_with_input() {
