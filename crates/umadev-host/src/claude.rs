@@ -61,10 +61,71 @@ pub struct ClaudeCodeDriver {
     workspace: Option<std::path::PathBuf>,
 }
 
+/// Resolve the `claude` executable to spawn.
+///
+/// Precedence: an explicit `UMADEV_CLAUDE_BIN` wins; otherwise, if `claude` was
+/// installed via npm, the bare `claude` on `PATH` is a **shim** (a `.cmd`/`.ps1`
+/// on Windows, a node-wrapper on Unix) that Rust/tokio can't spawn directly —
+/// on Windows that surfaces as `os error 193` (not a valid Win32 app) or
+/// `os error 232` (broken pipe). So we prefer the REAL launcher binary under the
+/// npm global's `@anthropic-ai/claude-code/bin/claude(.exe)` when it exists.
+/// Everything falls back to the bare `claude` (PATH resolution) — a curl-native
+/// install, or any setup without the npm package, is unaffected. Cached once.
+#[must_use]
+pub fn resolve_claude_program() -> String {
+    static RESOLVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            if let Ok(bin) = std::env::var("UMADEV_CLAUDE_BIN") {
+                if !bin.trim().is_empty() {
+                    return bin;
+                }
+            }
+            // The npm shim only fails to spawn on WINDOWS (os error 193 "not a
+            // valid Win32 application" / 232 "broken pipe"): there the bare
+            // `claude` on PATH is a `.cmd`/`.ps1`/bash shim that CreateProcess
+            // can't exec. On Unix the npm shim is an executable shebang script
+            // that works via PATH, so we leave it alone (and never pay an `npm`
+            // subprocess there). Windows-only: prefer the real launcher binary.
+            #[cfg(windows)]
+            if let Some(real) = npm_global_claude_binary() {
+                return real;
+            }
+            "claude".to_string()
+        })
+        .clone()
+}
+
+/// The real `@anthropic-ai/claude-code/bin/claude.exe` under the npm global root,
+/// when npm is present and the package is installed there. Fail-open: any error /
+/// missing path → `None` (caller falls back to bare `claude`). Windows-only —
+/// the shim spawn failure this works around does not occur on Unix.
+#[cfg(windows)]
+fn npm_global_claude_binary() -> Option<String> {
+    let out = std::process::Command::new("npm.cmd")
+        .args(["root", "-g"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(&root)
+        .join("@anthropic-ai")
+        .join("claude-code")
+        .join("bin")
+        .join("claude.exe");
+    p.is_file().then(|| p.to_string_lossy().into_owned())
+}
+
 impl Default for ClaudeCodeDriver {
     fn default() -> Self {
         Self {
-            program: std::env::var("UMADEV_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string()),
+            program: resolve_claude_program(),
             print_flag: std::env::var("UMADEV_CLAUDE_PRINT_FLAG")
                 .unwrap_or_else(|_| "--print".to_string()),
             timeout: crate::worker_timeout_from_env(),
