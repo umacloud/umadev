@@ -3214,9 +3214,8 @@ fn spawn_chat_session_preload(
         // opens its own session. Holding the permit across the open keeps the warm
         // session's startup off the wire while a turn is talking, so a low-concurrency
         // gateway never sees two connections at once.
-        let _permit = match umadev_agent::base_gate::try_base_permit() {
-            Some(p) => p,
-            None => return,
+        let Some(_permit) = umadev_agent::base_gate::try_base_permit() else {
+            return;
         };
         // Open OUTSIDE the lock so the (slow) MCP/firmware load never holds the
         // mutex a live turn might need — then take the lock only to park it.
