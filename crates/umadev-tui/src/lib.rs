@@ -1784,6 +1784,33 @@ fn is_workspace_write_tool(name: &str) -> bool {
     )
 }
 
+/// Whether a written file path is a DOCUMENTATION artifact (a planning doc / spec /
+/// markdown), NOT source code — so writing it must NOT flip a light chat turn into a
+/// code BUILD. Writing the PRD / architecture / UIUX / SRS under `output/`, a
+/// `.umadev/` internal, or any markdown doc is legitimate PRE-development work
+/// (research / docs / spec, before the user's go-ahead to build); flipping it to a
+/// build runs the source-present CODE floor, which then falsely fails a deliberately
+/// code-free docs turn with "claimed done but no source" — the reported spec-phase
+/// misjudgement. A subsequent REAL code write on the same turn still flips it (the
+/// one-shot latch is armed on the first NON-doc write). Conservative: only the clear
+/// doc surfaces count; an empty or unrecognised path is treated as code (never masks
+/// a real build). Does NOT touch the honesty floor itself — it only stops a pure-docs
+/// turn from being mislabelled a build in the first place.
+fn is_doc_artifact_path(path: &str) -> bool {
+    let p = path.trim().replace('\\', "/").to_ascii_lowercase();
+    if p.is_empty() {
+        return false;
+    }
+    if p.contains("output/") || p.contains(".umadev/") {
+        return true;
+    }
+    // Extension via `Path` (p is already lower-cased) — markdown is docs, not code.
+    std::path::Path::new(&p)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e, "md" | "markdown"))
+}
+
 /// React to the FIRST workspace write on the light chat path: flip the turn into a
 /// build. Called from the stream closure the instant a `Write`/`Edit`-family tool
 /// call is seen. Fires its side-effects exactly ONCE (the `reacted` latch), so a
@@ -2461,8 +2488,11 @@ async fn drive_agentic_stream(
         // turn into a build (lock + isolate + a `Build` intent card). `react_to_
         // first_write` is one-shot + fail-open, so this is cheap on every later
         // write and a no-op when reactive build is disabled / already triggered.
-        if let umadev_runtime::StreamEvent::ToolUse { name, .. } = &ev {
-            if is_workspace_write_tool(name) {
+        if let umadev_runtime::StreamEvent::ToolUse { name, detail, .. } = &ev {
+            // Only a CODE write flips the turn to a build; writing a docs/spec artifact
+            // (PRD / architecture / UIUX / SRS / any markdown) is legitimate pre-
+            // development work and must NOT trigger the source-present code floor.
+            if is_workspace_write_tool(name) && !is_doc_artifact_path(detail) {
                 react_to_first_write(reactive_ctx.as_deref(), &reactive_root, &reactive_sink);
             }
         }
@@ -3555,11 +3585,16 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                 }
                 umadev_runtime::SessionEvent::ToolCall { name, input } => {
                     // The FIRST workspace write flips the turn into a build (one-shot,
-                    // fail-open). The base decides chat-vs-build by ACTING.
-                    if is_workspace_write_tool(&name) {
+                    // fail-open). The base decides chat-vs-build by ACTING. But a
+                    // docs/spec artifact write (PRD / architecture / UIUX / SRS / any
+                    // markdown) is legitimate pre-development work — it must NOT flip to
+                    // a build, or the source-present CODE floor falsely fails a
+                    // deliberately code-free docs turn with "claimed done but no source".
+                    let target = session_tool_target(&input);
+                    if is_workspace_write_tool(&name) && !is_doc_artifact_path(&target) {
                         react_to_first_write(Some(&reactive), &project_root, &sink);
                     }
-                    let mut detail = session_tool_target(&input);
+                    let mut detail = target;
                     // The base asked the user a structured multiple-choice question via
                     // its OWN `AskUserQuestion` tool. UmaDev drives the base
                     // non-interactively, so that call can't pop up its picker and
@@ -10708,6 +10743,40 @@ mod tests {
             assert!(
                 !is_workspace_write_tool(r),
                 "`{r}` is NOT a workspace write"
+            );
+        }
+    }
+
+    /// A docs/spec artifact write (PRD / architecture / UIUX / SRS / any markdown, or
+    /// anything under `output/` or `.umadev/`) is legitimate PRE-development work and
+    /// must NOT flip a light chat turn into a code build — otherwise the source-present
+    /// CODE floor falsely fails a deliberately code-free docs turn with "build claimed
+    /// done but no source". A real CODE write still flips it. Empty/unknown = code
+    /// (never masks a real build).
+    #[test]
+    fn doc_artifact_writes_are_not_a_code_build() {
+        for doc in [
+            "output/app-prd.md",
+            "output/todo-srs.md",
+            ".umadev/coach/CURRENT.md",
+            "README.md",
+            "docs/design.markdown",
+            "/abs/path/output/x-uiux.md",
+        ] {
+            assert!(is_doc_artifact_path(doc), "`{doc}` is a doc artifact");
+        }
+        for code in [
+            "src/app.ts",
+            "app/page.tsx",
+            "main.rs",
+            "index.html",
+            "styles.css",
+            "server.py",
+            "", // empty path = treated as code so it NEVER masks a real build
+        ] {
+            assert!(
+                !is_doc_artifact_path(code),
+                "`{code}` is NOT a doc artifact"
             );
         }
     }
