@@ -2,6 +2,20 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.39] - TUI 闪屏根治 + 分析中打字实时回显 + opencode 登录不再硬拦 + codex 沙箱主动提示
+
+一批 Windows 交互体验修复:闪屏、输入延迟、底座选择、codex 沙箱。全部确定性、fail-open。
+
+### 修复
+
+- TUI 闪屏根治(WezTerm / git bash / 任何界面刷新都闪):(1)每帧全屏清除此前只凭"允许名单"就做,而 Windows 从不发同步探测确认,在 conpty 不保证 DEC-2026 原子交换时每帧可见地闪——现在改为**只在探测真确认同步输出时**才每帧清除;(2)非同步终端的 1Hz 全屏重绘心跳此前对**所有** Windows 生效,把 WezTerm / git bash / mintty 这些本不漂移的好终端也一起闪——现在**收窄到真 legacy conhost**(排除 Windows Terminal / MSYS / WezTerm / VS Code / kitty 等);(3)缩短 1.0.38 引入的空闲自愈窗口(12s→3s)。好终端不再闪,conhost 的错乱仍由收窄后的心跳愈合。
+- 分析中打字 5-8 秒才显示 → **实时回显**:底座"分析/思考"时会密集不间断地吐 reasoning token,事件循环此前**无界**地把每一个都排空完才回到 `select!`,整个 5-8 秒响应窗口内 `input.next()` 从不被 poll,打字全憋着最后一次性刷出(连选择答案都被批量应用弄乱)。现在给单次排空**加上限**、满了就回到 `select!`(input 被 poll),既保留合并渲染又恢复实时响应。
+- opencode(及所有底座)未登录**不再硬拦**:登录探测对指向本地/第三方模型的底座是假阴性(那种根本不需要 `<底座> auth login`),而产品契约是"驱动底座已配置的一切"。改为**两步软确认**——首次给登录提示,同一底座再选一次即可继续进入。
+
+### 新增
+
+- codex + Windows + 限制性沙箱**开跑前主动提示**:codex 的 `workspace-write` 沙箱在 Windows 会屏蔽网络 / dev 端口 / git(全栈构建跑不完),且其沙箱辅助进程(`codex-windows-sandbox-setup.exe`)在部分机器缺运行时会崩(原生弹窗 UmaDev 拦不到)。现在提前提示并指向一条命令 `/sandbox danger-full-access`。
+
 ## [1.0.38] - 第三方/限流模型下持续会话健壮性:不再"只有第一轮能用" + Windows 交互修复
 
 底座指向第三方/限流模型(如 claude-code → GLM)时,持续会话在第一轮后崩溃、无法恢复的一类问题的根治,以及一批 Windows 交互修复。全部确定性、fail-open。

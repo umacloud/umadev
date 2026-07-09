@@ -290,6 +290,7 @@
 
 # Codex 高危沙箱責任警告(僅在 codex 且 danger-full-access 時顯示)
 "codex.sandbox.danger_warning" = "警告:Codex 高危沙箱模式(danger-full-access)已開啟 —— 請自行承擔系統環境風險。\n  關閉:在 .umadevrc 中設定 [codex] sandbox_mode = \"workspace-write\" 後重新啟動。"
+"codex.sandbox.windows_hint" = "提示(Windows + Codex):目前沙箱會封鎖網路、本地 dev 埠與 git,全端建置(npm install / dev server / git)無法完成;且 codex 的 Windows 沙箱輔助程序在部分機器上會因缺少執行階段而報「找不到指定的模組」。做全端開發請執行 /sandbox danger-full-access 放開(UmaDev 仍全程稽核)。"
 
 # /sandbox —— 在應用內查看 / 修改 Codex 底座啟動沙箱(無需手改 .umadevrc)
 "sandbox.current" = "Codex 沙箱目前為:{}\n  (僅對 codex 底座生效 —— 它決定 codex 執行時能動到哪些東西)"
@@ -343,7 +344,7 @@
 "picker.auth.not_logged_in" = "已安裝 · 未登入 -> {}"
 "picker.auth.not_installed" = "未安裝 -> {}"
 "picker.auth.unknown" = "已安裝 · 登入未驗證"
-"picker.block.not_logged_in" = "{} 已安裝但未登入。先在終端執行 `{}`,再回來選。"
+"picker.block.not_logged_in" = "{} 已安裝但未登入。先在終端執行 `{}` —— 或者,若你讓它指向本地/第三方模型(無需登入),再選一次即可繼續。"
 "picker.block.not_installed" = "{} 未安裝。先執行 `{}`,再重新開啟 UmaDev。"
 "quit.confirm_running" = "再按一次 Esc 退出 UmaDev(workflow state 已儲存,下次 `umadev` 自動續上)。"
 "quit.use_command" = "Ctrl+C 已不再退出(防止複製誤觸);要退出請用 /quit 或 /exit —— workflow state 會保存,下次自動續上。"

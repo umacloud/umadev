@@ -5743,6 +5743,42 @@ const FRAME_MIN: Duration = Duration::from_millis(16);
 /// it is at most ~one extra clear per second (NOT a per-frame clear), and it
 /// only applies while the app is live — an idle screen never pays it. See
 /// [`periodic_repaint_due`].
+/// Whether we are on CLASSIC Windows conhost — the ONLY terminal that actually accumulates
+/// incremental-diff drift and needs the 1Hz full-clear heartbeat. Every known-good terminal
+/// (Windows Terminal, git bash / mintty, WezTerm, VS Code, kitty, alacritty …) reconciles fine
+/// and only FLICKERS under a naked periodic clear, so they are all excluded: the gate now keys
+/// off "is this the drift-prone legacy console," not the far-too-broad "is Windows".
+#[cfg(windows)]
+fn is_legacy_conhost() -> bool {
+    use std::env::{var, var_os};
+    var_os("WT_SESSION").is_none()            // not Windows Terminal
+        && var_os("MSYSTEM").is_none()        // not git bash / mintty (MSYS2)
+        && var_os("KITTY_WINDOW_ID").is_none()
+        && !matches!(
+            var("TERM_PROGRAM").ok().as_deref(),
+            Some("WezTerm" | "vscode" | "alacritty" | "ghostty" | "WarpTerminal")
+        )
+        // mintty & other VT terminals set TERM=xterm*; classic conhost does not.
+        && !var("TERM")
+            .map(|t| t.starts_with("xterm") || t.contains("kitty"))
+            .unwrap_or(false)
+}
+
+/// Non-Windows: the legacy-conhost heartbeat never applies.
+#[cfg(not(windows))]
+fn is_legacy_conhost() -> bool {
+    false
+}
+
+/// Max engine events applied in ONE drain pass of the event loop's `engine_rx` select arm
+/// before yielding back to `select!`. The base's extended-thinking tokens stream back-to-back
+/// with no gap, so an UNBOUNDED drain (`while try_recv().is_some()`) stayed inside that arm -
+/// out of `select!` - for the whole 5-8s response window, starving `input.next()` and the
+/// redraw: keystrokes only flushed in one batch AFTER the burst ("typing lags 5-8s during
+/// analysis"). Capping the pass keeps the redraw-coalescing win (one re-layout per batch, not
+/// per token) while guaranteeing the loop re-enters `select!` every few ms so input is polled.
+const ENGINE_DRAIN_BURST_CAP: usize = 128;
+
 const REPAINT_HEARTBEAT: Duration = Duration::from_secs(1);
 
 /// P4c - how long AFTER the app goes idle the non-sync repaint heartbeat keeps firing. Drift
@@ -5751,7 +5787,7 @@ const REPAINT_HEARTBEAT: Duration = Duration::from_secs(1);
 /// live-only heartbeat misses. Healing for a bounded window past the idle transition wipes
 /// that drift within ~1 tick of return, while a LONG-settled screen stops clearing so there is
 /// no perpetual idle flicker. Only on the non-sync Windows path.
-const IDLE_HEAL_WINDOW: Duration = Duration::from_secs(12);
+const IDLE_HEAL_WINDOW: Duration = Duration::from_secs(3);
 
 /// P4b — how long after the last input-buffer edit the non-sync repaint
 /// heartbeat treats the prompt as "editing recently" and keeps healing. On
@@ -6036,6 +6072,12 @@ async fn event_loop(
     // atomically, so neither a mid-paint tear NOR accumulated drift can survive
     // a frame. See [`synchronized_output_supported`] / [`sync_probe_outcome`].
     let mut sync_output = synchronized_output_supported();
+    // Fix A — the every-frame P0 clear is only invisible when DEC 2026 is TRULY honored, which
+    // only a real DECRPM probe reply confirms. `sync_output` above is a mere env-allowlist
+    // GUESS; on Windows the probe never runs (legacy input path) and conpty may not honor 2026,
+    // so trusting the guess blanked the whole screen every frame = the WezTerm/WT flicker. P0
+    // keys off this CONFIRMED flag instead (stays false until a real reply lands).
+    let mut sync_confirmed = false;
     // P2 — runtime capability query. Send the DECRQM through the render's OWN
     // backend writer (single-writer discipline; raw mode is on, so nothing
     // echoes) and arm the reply deadline. OWNED input path only: the owned
@@ -6266,12 +6308,17 @@ async fn event_loop(
         // falls back to the env allowlist. Cheap once resolved: the deadline
         // is `None` and this whole block is skipped for the session.
         if let Some(deadline) = sync_probe_deadline {
-            if let Some(confirmed) = sync_probe_outcome(
-                input.take_sync_output_reply(),
-                Instant::now() >= deadline,
-                sync_output,
-            ) {
+            let reply = input.take_sync_output_reply();
+            let got_reply = reply.is_some();
+            if let Some(confirmed) =
+                sync_probe_outcome(reply, Instant::now() >= deadline, sync_output)
+            {
                 sync_output = confirmed;
+                // Fix A: only a REAL reply confirms 2026 end-to-end; a timeout-fallback to the
+                // allowlist does NOT enable the every-frame P0 clear.
+                if got_reply {
+                    sync_confirmed = confirmed;
+                }
                 sync_probe_deadline = None;
             }
         }
@@ -6349,7 +6396,7 @@ async fn event_loop(
         // P4c - also heal for a bounded window right after going idle (drift on settle /
         // unfocused-redraw), not only while live/editing.
         let recently_idle = idle_since.is_some_and(|t| t.elapsed() < IDLE_HEAL_WINDOW);
-        if cfg!(windows)
+        if is_legacy_conhost()
             && periodic_repaint_due(
                 sync_output,
                 now_live || recently_idle,
@@ -6402,7 +6449,7 @@ async fn event_loop(
             // visibly flicker, so only a requested heal (the P3 contamination
             // drain — `force_full_repaint`) clears, exactly once per
             // contamination. Fail-open: a clear error never blocks the draw.
-            if frame_needs_clear(sync_output, force_full_repaint) {
+            if frame_needs_clear(sync_confirmed, force_full_repaint) {
                 let _ = terminal.clear();
                 // P4 — a full wipe just happened; restart the non-sync repaint
                 // heartbeat from here so it measures the gap since the last real
@@ -6547,8 +6594,18 @@ async fn event_loop(
                 // the exact same handling as before (no behaviour change); only the
                 // intervening redraws are coalesced.
                 let mut current = maybe_event;
+                let mut drained = 0usize;
                 while let Some(ev) = current.take() {
                     apply_engine_event!(ev);
+                    // Bound the pass: a DENSE streaming burst keeps `try_recv()` non-empty for
+                    // the whole response window, so without this cap the loop never returns to
+                    // `select!` and `input.next()` is never polled - keystrokes lag 5-8s. At the
+                    // cap, break, redraw the coalesced batch, and re-enter `select!` (input +
+                    // tick get polled); the rest drains over the next iterations.
+                    drained += 1;
+                    if drained >= ENGINE_DRAIN_BURST_CAP {
+                        break;
+                    }
                     // R3 — pull the next already-queued engine event (if any) and
                     // apply it in this same pass; `None` ends the drain.
                     current = engine_rx.try_recv().ok();

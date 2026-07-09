@@ -1854,6 +1854,12 @@ pub struct App {
     /// Inline notice shown in the picker footer (e.g. "claude-code 未安装")
     /// so rejecting an un-ready host gives visible feedback ON the picker.
     pub picker_notice: Option<String>,
+    /// Two-step SOFT confirm for a base the login PROBE reports as NOT logged in: the id
+    /// awaiting a SECOND select. The probe is a false negative for a base pointed at a LOCAL /
+    /// third-party model (needs no `<base> auth login`), and the product contract is "drive
+    /// whatever the base is configured with" — so a not-logged-in base warns once, then the
+    /// same base selected again proceeds. `None` = no pending confirm.
+    pub picker_login_confirm: Option<String>,
 
     /// Chat input buffer (UTF-8 String — mutate via cursor helpers,
     /// never via raw push/pop, so multi-byte chars stay intact).
@@ -2721,6 +2727,7 @@ impl App {
             picker_items: step_items(PickerStep::Language, lang, &[]),
             picker_selected: lang as usize,
             picker_notice: None,
+            picker_login_confirm: None,
             input: String::new(),
             input_cursor: 0,
             attachments: Vec::new(),
@@ -3207,6 +3214,21 @@ impl App {
             self.push(
                 ChatRole::Error,
                 umadev_i18n::t(self.lang, "codex.sandbox.danger_warning").to_string(),
+            );
+        } else if cfg!(windows)
+            && self.backend.as_deref() == Some("codex")
+            && !matches!(mode, umadev_agent::config::CodexSandbox::DangerFullAccess)
+        {
+            // Windows + codex + a RESTRICTIVE sandbox is doubly problematic and worth flagging
+            // UP FRONT (before the user hits a native error dialog UmaDev can't intercept):
+            // (1) codex's `workspace-write` OS-sandbox launches `codex-windows-sandbox-setup.exe`,
+            // which fails with "找不到指定的模块" (a missing runtime) on some machines, and
+            // (2) even when it loads, this sandbox BLOCKS the network, local dev ports and git —
+            // so a full-stack build (npm install / a dev server / git) cannot complete. Point at
+            // the one-command fix.
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "codex.sandbox.windows_hint").to_string(),
             );
         }
     }
@@ -7411,17 +7433,31 @@ impl App {
                             return Action::None;
                         }
                         AuthMark::NotLoggedIn => {
-                            let cmd = if chosen.login_cmd.is_empty() {
-                                chosen.detail.clone()
+                            // SOFT two-step, NOT a hard block: the login probe is a false
+                            // negative for a base the user has pointed at a LOCAL / third-party
+                            // model (opencode → local, claude → GLM, …) that needs no
+                            // `<base> auth login`, and the product contract is "drive whatever
+                            // the base is already configured with." So the FIRST select warns
+                            // (login hint + "select again to continue anyway"); selecting the
+                            // SAME base again proceeds. A different base re-warns (id mismatch).
+                            let id = chosen.backend_id.clone();
+                            if id.is_some() && self.picker_login_confirm == id {
+                                self.picker_login_confirm = None;
+                                // fall through to commit
                             } else {
-                                chosen.login_cmd.clone()
-                            };
-                            self.picker_notice = Some(umadev_i18n::tf(
-                                self.lang,
-                                "picker.block.not_logged_in",
-                                &[&chosen.label, &cmd],
-                            ));
-                            return Action::None;
+                                let cmd = if chosen.login_cmd.is_empty() {
+                                    chosen.detail.clone()
+                                } else {
+                                    chosen.login_cmd.clone()
+                                };
+                                self.picker_notice = Some(umadev_i18n::tf(
+                                    self.lang,
+                                    "picker.block.not_logged_in",
+                                    &[&chosen.label, &cmd],
+                                ));
+                                self.picker_login_confirm = id;
+                                return Action::None;
+                            }
                         }
                         // Unknown that hasn't even been confirmed installed (a base
                         // not yet probed: `ready=false`, no auth signal) stays blocked
@@ -18080,7 +18116,8 @@ mod tests {
             "npm i -g claude",
         );
         let action = app.apply_key(KeyCode::Enter);
-        // Commit is BLOCKED — stays on the picker with the login command surfaced.
+        // FIRST Enter: soft-warned, NOT committed — stays on the picker with the login command
+        // surfaced (the probe may be a false negative for a local/third-party-configured base).
         assert_eq!(action, Action::None);
         assert_eq!(app.mode, AppMode::Picker);
         let notice = app.picker_notice.as_deref().unwrap_or("");
@@ -18088,6 +18125,11 @@ mod tests {
             notice.contains("claude auth login"),
             "login cmd shown: {notice}"
         );
+        // SECOND Enter on the SAME base: proceeds anyway (drive-whatever-is-configured), so a
+        // local/third-party model that needs no login is never permanently blocked.
+        let action2 = app.apply_key(KeyCode::Enter);
+        assert_ne!(action2, Action::None, "second select commits, not blocked");
+        assert_eq!(app.mode, AppMode::Chat, "second select enters chat");
     }
 
     #[test]

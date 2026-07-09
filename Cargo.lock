@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "umadev"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3188,7 +3188,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-agent"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3213,7 +3213,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-contract"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "pretty_assertions",
  "regex",
@@ -3226,7 +3226,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-governance"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "chrono",
  "pretty_assertions",
@@ -3243,7 +3243,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-host"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "async-trait",
  "futures",
@@ -3259,7 +3259,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-i18n"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-knowledge"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -3290,7 +3290,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-runtime"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "async-trait",
  "mockito",
@@ -3304,7 +3304,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-spec"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "serde",
  "serde_json",
@@ -3312,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-tui"
-version = "1.0.38"
+version = "1.0.39"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -295,6 +295,7 @@
 
 # Codex high-risk sandbox liability warning (only shown for danger-full-access on codex)
 "codex.sandbox.danger_warning" = "WARNING: Codex high-risk sandbox (danger-full-access) is ENABLED — you assume all risk to your system environment.\n  To revert: set [codex] sandbox_mode = \"workspace-write\" in .umadevrc, then restart."
+"codex.sandbox.windows_hint" = "Note (Windows + Codex): the current sandbox BLOCKS the network, local dev ports and git, so a full-stack build (npm install / a dev server / git) cannot complete; and codex\u2019s Windows sandbox helper fails with \u201cmodule not found\u201d on some machines. For full-stack work run /sandbox danger-full-access to open it up (UmaDev still audits everything)."
 
 # /sandbox — view / change the Codex base launch sandbox in-app (no .umadevrc hand-edit)
 "sandbox.current" = "Codex sandbox is currently: {}\n  (applies to the codex base only — it controls what the codex worker may touch when it runs)"
@@ -348,7 +349,7 @@
 "picker.auth.not_logged_in" = "installed · not logged in -> {}"
 "picker.auth.not_installed" = "not installed -> {}"
 "picker.auth.unknown" = "installed · login not verified"
-"picker.block.not_logged_in" = "{} is installed but not logged in. Run `{}` in your terminal first, then come back."
+"picker.block.not_logged_in" = "{} is installed but not logged in. Run `{}` first — or, if you point it at a local / third-party model that needs no login, select it again to continue."
 "picker.block.not_installed" = "{} is not installed. Run `{}` first, then re-open UmaDev."
 "quit.confirm_running" = "Press Esc again to quit UmaDev (workflow state is saved; the next `umadev` resumes automatically)."
 "quit.use_command" = "Ctrl+C no longer quits (so a copy reflex can't drop the session); use /quit or /exit to exit — workflow state is saved and resumes next time."
