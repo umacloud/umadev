@@ -5789,6 +5789,15 @@ const REPAINT_HEARTBEAT: Duration = Duration::from_secs(1);
 /// no perpetual idle flicker. Only on the non-sync Windows path.
 const IDLE_HEAL_WINDOW: Duration = Duration::from_secs(3);
 
+/// How long AFTER the last resize event every frame keeps doing a full clear+repaint. A window
+/// drag fires many Resize events over several frames and the terminal settles its own buffer
+/// across them, so ONE contamination clear (fired on a single Resize) is not enough - stale
+/// cells from the pre-settle sizes survive (the reported "resize garbles the layout"). Healing
+/// for a short window past the LAST resize covers the whole drag + settle. Cheap: resize is
+/// infrequent, and on a confirmed-sync terminal every frame already clears (P0) so this is a
+/// no-op there.
+const RESIZE_HEAL_WINDOW: Duration = Duration::from_millis(300);
+
 /// P4b — how long after the last input-buffer edit the non-sync repaint
 /// heartbeat treats the prompt as "editing recently" and keeps healing. On
 /// classic conhost a same-line edit on an idle prompt drifts under ratatui's
@@ -6117,6 +6126,12 @@ async fn event_loop(
     // clear+repaint per `REPAINT_HEARTBEAT` while live. Reset on every real
     // clear below. Inert on the sync path (which clears every frame anyway).
     let mut last_full_repaint = Instant::now();
+    // Paste-burst timing: arrival Instant of the previous key, to flag a pasted newline
+    // (Windows delivers a bracketed paste as raw keys) apart from a genuine submit Enter.
+    let mut last_key_instant: Option<Instant> = None;
+    // Resize heal: Instant of the last Resize event, to force a clear+repaint for a short
+    // window afterwards so a multi-frame drag + settle fully heals (not just one frame).
+    let mut last_resize_at: Option<Instant> = None;
     // P4b — the last time a keystroke/paste actually EDITED the input buffer
     // (insert / backspace / kill / paste / recall — a pure caret move does not
     // count). On the non-sync path (classic conhost) a same-line edit on an idle
@@ -6396,6 +6411,12 @@ async fn event_loop(
         // P4c - also heal for a bounded window right after going idle (drift on settle /
         // unfocused-redraw), not only while live/editing.
         let recently_idle = idle_since.is_some_and(|t| t.elapsed() < IDLE_HEAL_WINDOW);
+        // Resize heal window - force a full clear+repaint for a short spell after the last
+        // resize so a multi-frame drag + terminal-buffer settle heals completely (one
+        // contamination clear on a single Resize left stale cells from the pre-settle sizes).
+        if last_resize_at.is_some_and(|t| t.elapsed() < RESIZE_HEAL_WINDOW) {
+            force_full_repaint = true;
+        }
         if is_legacy_conhost()
             && periodic_repaint_due(
                 sync_output,
@@ -6652,6 +6673,9 @@ async fn event_loop(
                     last_input = now;
                 }
                 if let Some(Ok(Event::Resize(..))) = &maybe_key {
+                    // Open the resize heal window (see RESIZE_HEAL_WINDOW): every frame clears
+                    // for a short spell so the settled size fully repaints, not just one frame.
+                    last_resize_at = Some(Instant::now());
                     // R4 — resize contamination. DON'T `clear()` immediately (that
                     // blanks the screen for a frame → flicker); contaminate so the
                     // NEXT frame does the clear+repaint back-to-back (inside the
@@ -6906,6 +6930,15 @@ async fn event_loop(
                             // idle-edit heal only matters on classic conhost, so
                             // mac/Linux/Windows-Terminal pay no clone.
                             let edit_probe = (!sync_output).then(|| app.input.clone());
+                            // Paste-burst timing (real loop only): a key landing within
+                            // PASTE_BURST_GAP of the previous one is part of a paste (a burst
+                            // far faster than typing), so the Enter handler treats a pasted
+                            // newline as an insert, not a submit (Windows delivers a bracketed
+                            // paste as raw key events, not a crossterm Event::Paste).
+                            let key_gap = last_key_instant.map(|t| t.elapsed());
+                            last_key_instant = Some(Instant::now());
+                            app.key_arrived_in_burst =
+                                key_gap.is_some_and(|g| g <= crate::app::PASTE_BURST_GAP);
                             let action =
                                 app.apply_key_with_mods(replay_key.code, replay_key.modifiers);
                             // Republish the LIVE trust tier so a mid-turn mode switch

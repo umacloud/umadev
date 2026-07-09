@@ -95,6 +95,13 @@ const COMPACTION_MIN_TAIL: usize = 4;
 /// Max chars in the input box.
 const INPUT_CAP: usize = 8192;
 
+/// Max gap between two consecutive key events for the later one to count as part of a PASTE
+/// BURST (a paste arrives back-to-back far faster than typing). Used ONLY on Windows to tell a
+/// pasted newline — which the Windows console delivers as a bare Enter, not a crossterm
+/// `Event::Paste` — from a genuine submit Enter (which follows a human-speed pause). Generous
+/// enough to cover the per-key redraw between paste keys, well below any human key interval.
+pub(crate) const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(30);
+
 /// A bracketed paste with MORE than this many lines collapses to a single
 /// `[粘贴 N 行]` chip (the full text is stashed and re-expanded on submit)
 /// instead of flooding the input box into unscrollable noise. Mirrors the
@@ -1854,6 +1861,13 @@ pub struct App {
     /// Inline notice shown in the picker footer (e.g. "claude-code 未安装")
     /// so rejecting an un-ready host gives visible feedback ON the picker.
     pub picker_notice: Option<String>,
+    /// Set by the event loop when THIS key landed in a sub-`PASTE_BURST_GAP` burst — faster
+    /// than any human types, i.e. part of a PASTE. On Windows the console delivers a bracketed
+    /// paste as raw key events (never a crossterm `Event::Paste`), so a newline INSIDE a pasted
+    /// multi-line requirement arrives as a bare Enter; this flag lets the Enter handler insert
+    /// it instead of submitting (which truncated the paste at the first line). Never set in
+    /// tests (they call `apply_key` directly), so submit is unaffected off the real loop.
+    pub key_arrived_in_burst: bool,
     /// Two-step SOFT confirm for a base the login PROBE reports as NOT logged in: the id
     /// awaiting a SECOND select. The probe is a false negative for a base pointed at a LOCAL /
     /// third-party model (needs no `<base> auth login`), and the product contract is "drive
@@ -2728,6 +2742,7 @@ impl App {
             picker_selected: lang as usize,
             picker_notice: None,
             picker_login_confirm: None,
+            key_arrived_in_burst: false,
             input: String::new(),
             input_cursor: 0,
             attachments: Vec::new(),
@@ -7876,6 +7891,19 @@ impl App {
                 if shift {
                     // Shift+Enter inserts a literal newline so the user
                     // can build multi-line prompts inside the chat box.
+                    self.insert_at_cursor('\n');
+                    return Action::None;
+                }
+                // Windows paste-truncation guard: the Windows console delivers a bracketed
+                // paste as raw key events (no `Event::Paste`), so a newline INSIDE a pasted
+                // multi-line requirement arrives as a bare Enter and used to SUBMIT the text
+                // before it — truncating the paste at line 1. The event loop flags a key that
+                // landed in a sub-`PASTE_BURST_GAP` burst (faster than any human types), so a
+                // pasted newline inserts instead of submitting. Only the real loop sets the
+                // flag (tests never do), and it's gated to Windows (other platforms frame paste
+                // as a proper `Event::Paste`), so genuine submit is untouched everywhere else.
+                #[cfg(windows)]
+                if self.key_arrived_in_burst {
                     self.insert_at_cursor('\n');
                     return Action::None;
                 }

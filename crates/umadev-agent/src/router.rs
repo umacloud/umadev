@@ -884,13 +884,30 @@ fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
     // to a BUILD-SHAPED kind (`Greenfield` → the full roster via `team_for_kind`); a
     // read-only class (chat / explain) keeps the light `Light` default (no team
     // wanted there anyway). The brain may still narrow it via a parseable `kind`.
-    let kind = parse_kind(&brain.kind).unwrap_or_else(|| {
+    let mut kind = parse_kind(&brain.kind).unwrap_or_else(|| {
         if class.mutates_workspace() {
             TaskKind::Greenfield
         } else {
             TaskKind::Light
         }
     });
+    // Domain floor for the TEAM (not the intent): a brain that sized a BUILD as the broad
+    // `Greenfield` - the default / lazy pick, especially from a weaker third-party model - but
+    // whose requirement carries a CLEAR single-domain signal (a pure backend task, a pure
+    // frontend task) should scope to that domain so it does not convene irrelevant reviewers
+    // (the reported "优化后端代码 pulls in a uiux-designer + frontend-engineer" waste). This
+    // does NOT re-route intent - the brain still decided BUILD; it only narrows the roster to
+    // the domain the deterministic classifier is CONFIDENT about, and ONLY narrows
+    // Greenfield -> a single-domain kind (never widens, never touches a lean/doc kind), so a
+    // genuine full-stack build the brain called greenfield stays greenfield unless the text is
+    // unambiguously one domain.
+    if class == RouteClass::Build && kind == TaskKind::Greenfield {
+        if let single @ (TaskKind::BackendOnly | TaskKind::FrontendOnly) =
+            crate::planner::classify(requirement)
+        {
+            kind = single;
+        }
+    }
     // Depth from the brain's complexity. A garbled/missing `complexity` on a real
     // product BUILD must NOT default to `Fast`: a Fast build is non-deliberate
     // (`Depth::Fast.is_deliberate() == false`) AND `reconcile_team` early-returns the
@@ -1250,6 +1267,27 @@ mod tests {
         assert!(
             !p.team.is_empty(),
             "a deliberate build with a bad kind must still convene a team"
+        );
+    }
+
+    #[tokio::test]
+    async fn brain_greenfield_narrows_to_backend_for_a_pure_backend_task() {
+        // A weaker brain sizes a PURE backend task ("优化后端代码") as the broad greenfield;
+        // the deterministic domain floor scopes the team to BackendOnly so it convenes no UI
+        // reviewers (the reported "backend task pulls in a uiux-designer + frontend-engineer").
+        let brain =
+            TriageBrain("{\"class\":\"build\",\"kind\":\"greenfield\",\"complexity\":\"medium\"}");
+        let p = route_via_brain(&brain, "优化后端代码,提升接口性能").await;
+        assert_eq!(p.class, RouteClass::Build);
+        assert_eq!(
+            p.kind,
+            TaskKind::BackendOnly,
+            "a clearly backend build the brain called greenfield narrows to BackendOnly"
+        );
+        assert!(
+            !p.team.contains(&Seat::UiuxDesigner) && !p.team.contains(&Seat::FrontendEngineer),
+            "a pure-backend build convenes NO UI reviewers: {:?}",
+            p.team
         );
     }
 
