@@ -1630,7 +1630,11 @@ mod tests {
             requires_confirmation_with_ledger(
                 TrustMode::Guarded,
                 "edit",
-                "/etc/passwd",
+                // Per-OS out-of-tree absolute path: a leading `/` is NOT absolute on
+                // Windows (needs a drive letter), so a hardcoded `/etc/passwd` reads as
+                // in-tree there and the assertion wrongly fails — `out_of_tree_abs()`
+                // returns the right escaping absolute path for each platform.
+                out_of_tree_abs(),
                 tmp.path(),
                 &ledger
             ),

@@ -6891,7 +6891,10 @@ mod tests {
             "an unparseable plan posts nothing — single-turn fallback"
         );
         // IntentDecided still fired (it never depends on the plan).
-        assert!(rec.count(|e| matches!(e, EngineEvent::IntentDecided { .. })) == 1);
+        assert_eq!(
+            rec.count(|e| matches!(e, EngineEvent::IntentDecided { .. })),
+            1
+        );
     }
 
     #[tokio::test]

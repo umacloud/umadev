@@ -5957,10 +5957,9 @@ impl App {
         let input = self.input.trim_start();
         let (prefix, partial) = if let Some(rest) = input.strip_prefix("/design ") {
             ("/design ", rest.trim())
-        } else if let Some(rest) = input.strip_prefix("/template ") {
-            ("/template ", rest.trim())
         } else {
-            return None;
+            let rest = input.strip_prefix("/template ")?;
+            ("/template ", rest.trim())
         };
         let candidates = if prefix == "/design " {
             self.list_design_systems()
@@ -20012,7 +20011,7 @@ mod tests {
         );
         // Force the strictest-skipping tier; the floor must still gate.
         app.trust_mode_override = Some(umadev_agent::TrustMode::Auto);
-        assert!(app.effective_trust_mode() == umadev_agent::TrustMode::Auto);
+        assert_eq!(app.effective_trust_mode(), umadev_agent::TrustMode::Auto);
         let preview = app.slash_deploy("");
         assert!(
             matches!(preview, Action::None),
