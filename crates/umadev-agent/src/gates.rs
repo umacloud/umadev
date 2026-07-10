@@ -276,7 +276,20 @@ pub fn claims_code_changes(text: &str) -> bool {
     if EN.iter().any(|k| t.contains(k)) {
         return true;
     }
-    ZH.iter().any(|k| text.contains(k))
+    // ZH: a change verb is a code CLAIM only when NOT negated. "未写入真实代码" / "没有修改" /
+    // "不新增" is the OPPOSITE of a claim - a bare substring match wrongly read the negated verb
+    // as a claim (the plan-mode read-only reply "未写入真实代码" then false-tripped the
+    // source-present hard-gate -> a spurious "0 source files" abort in zh-CN). A verb counts only
+    // if the character immediately before it is not a negation (未 / 没 / 不 / 无).
+    const ZH_NEG: &[char] = &['未', '没', '不', '无'];
+    ZH.iter().any(|k| {
+        text.match_indices(k).any(|(i, _)| {
+            text[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|prev| !ZH_NEG.contains(&prev))
+        })
+    })
 }
 
 /// Heuristic: does this base reply show it ALREADY ran the project's build/test

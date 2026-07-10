@@ -5399,16 +5399,15 @@ impl MouseSeqFilter {
 
 /// P0 — whether this frame must `terminal.clear()` (wipe the real screen and
 /// reset ratatui's back buffer so the draw that follows re-emits EVERY cell)
-/// before drawing. Under CONFIRMED synchronized output: every frame — the
-/// clear+redraw pair is bracketed by BSU/ESU and swaps atomically, so the full
-/// repaint is invisible and no terminal-side drift can outlive one frame (the
-/// root fix: ratatui's diff never reconciles against the real terminal, so a
-/// drifted screen under identical buffers produces an empty diff forever).
-/// WITHOUT confirmed sync output an every-frame clear would visibly flicker,
-/// so only a requested heal (the P3 contamination drain) clears — exactly once
-/// per contamination. Pure, so the guard is unit-tested.
-fn frame_needs_clear(sync_output: bool, heal_requested: bool) -> bool {
-    sync_output || heal_requested
+/// before drawing. Clears when EITHER a sync-heal is due (`sync_heal_due` — on a
+/// confirmed-sync terminal, throttled to the streaming-drift cadence, NOT every
+/// frame: an unthrottled per-frame clear flickered on imperfect-sync terminals
+/// while scrolling) OR a discrete heal was requested (`heal_requested` — the P3
+/// contamination drain / resize / focus, once each). Pure, so the guard is
+/// unit-tested. The caller decides `sync_heal_due` from the streaming-activity +
+/// cadence gate; here it is a plain OR so the truth table stays trivial.
+fn frame_needs_clear(sync_heal_due: bool, heal_requested: bool) -> bool {
+    sync_heal_due || heal_requested
 }
 
 /// P4 — whether the NON-sync repaint heartbeat is due. On a terminal without
@@ -5417,33 +5416,30 @@ fn frame_needs_clear(sync_output: bool, heal_requested: bool) -> bool {
 /// streaming run trips no discrete contamination trigger, so ratatui's own
 /// prev-vs-next diff never reconciles against terminal reality — drift
 /// accumulates and is never wiped (the reported Windows 界面错乱 after a while).
-/// This forces ONE full clear+repaint on a bounded `cadence` *while the app is
-/// live* OR *while the prompt was edited recently*, so accumulated drift can
-/// never outlive the heartbeat.
+/// This forces ONE full clear+repaint on a bounded `cadence` **while the app is
+/// live** (streaming), so accumulated streaming drift can never outlive it.
 ///
-/// `editing_recently` closes the idle-edit heal gap: on classic conhost a
-/// same-line backspace/insert on an IDLE prompt (the app is not "live") heals via
-/// none of the other triggers — the every-frame clear needs sync output, the
-/// contamination flag is not raised on a plain edit, and the input-height guard
-/// only fires on a height change — so ratatui's incremental diff drifts and only
-/// a manual resize recovers. Treating a recent edit as a heartbeat reason
-/// generalizes the resize heal to idle edits: an idle backspace self-heals within
-/// one `cadence` instead of requiring a resize. The `cadence` still throttles it,
-/// so it fires at most ~1x/sec while editing — never a per-keystroke clear.
+/// TYPING IS DELIBERATELY NOT A TRIGGER. A keystroke is NOT a drift source —
+/// ratatui's cell diff already rewrites an edited/vacated cell correctly (a
+/// backspace emits a space over the old glyph), so a same-line edit needs no full
+/// repaint. The heartbeat's clear is a NAKED whole-screen wipe on classic conhost
+/// (no sync output to hide it), so firing it while the user types blanked the
+/// screen ~1x/sec DURING typing — the reported "Windows 输入闪屏". Keying the
+/// heartbeat off live/streaming only (not "edited recently") heals the real drift
+/// case while an idle prompt — typed at or not — never pays a clear.
 ///
 /// Gated to the non-sync path: under confirmed sync output every frame already
 /// clears+repaints (P0), so adding heartbeat clears there is pointless and would
-/// only cost bytes; and an IDLE, un-edited screen has nothing to drift, so it
+/// only cost bytes; and an idle, non-streaming screen has nothing to drift, so it
 /// never pays a clear (no flicker on a settled chat). Pure, so the truth table is
 /// unit-tested.
 fn periodic_repaint_due(
     sync_output: bool,
     live: bool,
-    editing_recently: bool,
     since_last_full_repaint: Duration,
     cadence: Duration,
 ) -> bool {
-    !sync_output && (live || editing_recently) && since_last_full_repaint >= cadence
+    !sync_output && live && since_last_full_repaint >= cadence
 }
 
 /// P2 — the DECRQM query asking the terminal whether DEC private mode 2026
@@ -5781,13 +5777,15 @@ const ENGINE_DRAIN_BURST_CAP: usize = 128;
 
 const REPAINT_HEARTBEAT: Duration = Duration::from_secs(1);
 
-/// P4c - how long AFTER the app goes idle the non-sync repaint heartbeat keeps firing. Drift
-/// often appears just after a run settles, or while the window is unfocused (alt-tab away, the
-/// Windows console redraws its own buffer, come back to a garbled screen) - cases the
-/// live-only heartbeat misses. Healing for a bounded window past the idle transition wipes
-/// that drift within ~1 tick of return, while a LONG-settled screen stops clearing so there is
-/// no perpetual idle flicker. Only on the non-sync Windows path.
-const IDLE_HEAL_WINDOW: Duration = Duration::from_secs(3);
+/// P4 — how long after the last streaming/engine write the classic-conhost repaint
+/// heartbeat keeps healing. Drift accrues only from cell writes, so the heal is gated on
+/// ACTIVE streaming: while tokens flow this stays fresh and the heartbeat fires each
+/// [`REPAINT_HEARTBEAT`] to wipe accumulated drift; ~this long after output settles it
+/// lapses and a STATIC screen (a live run stalled on a tool, a settled prompt, an idle
+/// chat) stops clearing entirely — no perpetual flicker, and none while typing. Kept a
+/// little above the cadence so the final settled frame still gets one healing repaint.
+/// Only on the non-sync Windows path.
+const STREAM_HEAL_WINDOW: Duration = Duration::from_millis(1500);
 
 /// How long AFTER the last resize event every frame keeps doing a full clear+repaint. A window
 /// drag fires many Resize events over several frames and the terminal settles its own buffer
@@ -5797,17 +5795,6 @@ const IDLE_HEAL_WINDOW: Duration = Duration::from_secs(3);
 /// infrequent, and on a confirmed-sync terminal every frame already clears (P0) so this is a
 /// no-op there.
 const RESIZE_HEAL_WINDOW: Duration = Duration::from_millis(300);
-
-/// P4b — how long after the last input-buffer edit the non-sync repaint
-/// heartbeat treats the prompt as "editing recently" and keeps healing. On
-/// classic conhost a same-line edit on an idle prompt drifts under ratatui's
-/// incremental diff; this window lets the [`REPAINT_HEARTBEAT`] fire a bounded
-/// full clear+repaint (throttled by the cadence to ~1x/sec — never per
-/// keystroke) so an idle backspace self-heals within ~1s instead of requiring a
-/// manual resize. Kept a little wider than the cadence so the SETTLED line after
-/// the final keystroke still gets one healing repaint; then it lapses and the
-/// idle screen goes quiet again (no ongoing flicker). See [`periodic_repaint_due`].
-const INPUT_EDIT_HEAL_WINDOW: Duration = Duration::from_secs(2);
 
 /// M1 — the bounded budget the cancel-drain branch waits for an aborting task to
 /// wind down before forcing the post-cancel cleanup. Captured ONCE as an
@@ -6132,15 +6119,6 @@ async fn event_loop(
     // Resize heal: Instant of the last Resize event, to force a clear+repaint for a short
     // window afterwards so a multi-frame drag + settle fully heals (not just one frame).
     let mut last_resize_at: Option<Instant> = None;
-    // P4b — the last time a keystroke/paste actually EDITED the input buffer
-    // (insert / backspace / kill / paste / recall — a pure caret move does not
-    // count). On the non-sync path (classic conhost) a same-line edit on an idle
-    // prompt drifts under ratatui's incremental diff and only a resize recovers;
-    // `periodic_repaint_due` consults this so the repaint heartbeat also fires
-    // while the prompt was edited within `INPUT_EDIT_HEAL_WINDOW`, healing the
-    // drift within one cadence. `None` until the first edit. Recorded only on the
-    // non-sync path (sync-output terminals clear every frame anyway).
-    let mut last_input_edit: Option<Instant> = None;
     // R5 resume-gap threshold + the last time any input event arrived. A long
     // gap before the next event looks like a sleep/wake / re-attach.
     let resume_threshold = resume_gap();
@@ -6197,8 +6175,11 @@ async fn event_loop(
     // the final settled frame gets one clean full repaint (see the loop top).
     // Starts `false` (a cold launch is idle).
     let mut was_live = false;
-    // P4c - set on the live->idle edge, cleared when live; feeds the bounded post-idle heal.
-    let mut idle_since: Option<Instant> = None;
+    // P4 — the last time a streaming/engine event actually wrote to the transcript.
+    // The classic-conhost repaint heartbeat consults this so it heals ONLY while output
+    // is actively streaming (drift accrues from cell writes), never on a STATIC screen —
+    // a live-but-stalled run (waiting on a tool) or a settled prompt must not flash.
+    let mut last_stream_activity: Option<Instant> = None;
 
     // Apply one engine event plus the event-loop side effects that depend on the
     // resulting app state. Kept as a local macro because it needs to await parked
@@ -6348,15 +6329,12 @@ async fn event_loop(
         // P0 — and this merely guarantees the settled frame draws.)
         let now_live = app_is_live(app, continuous_run_active);
         if was_live && !now_live {
+            // The live→settled edge: contaminate so the final settled frame gets ONE
+            // clean full repaint on a non-sync terminal — the drift a long streaming run
+            // accumulated must not freeze on screen. This one-shot heal (not a timed
+            // window) is what covers settle drift; the streaming heartbeat below covers
+            // drift DURING the run.
             app.contaminate_terminal();
-            // Enter the bounded post-idle heal window (P4c): drift that appears just after a
-            // run settles, or while unfocused (alt-tab away -> terminal redraws -> come back
-            // to a garbled screen), still self-heals for a few ticks even though the app is
-            // no longer "live". Cleared once genuinely live again.
-            idle_since = Some(Instant::now());
-        }
-        if now_live {
-            idle_since = None;
         }
         was_live = now_live;
 
@@ -6399,18 +6377,22 @@ async fn event_loop(
         // throttles it to ~1x/sec, so editing never triggers a per-keystroke
         // clear. Fail-open: it only sets the existing heal flag, so it can never
         // wedge the loop.
-        let editing_recently =
-            last_input_edit.is_some_and(|t| t.elapsed() <= INPUT_EDIT_HEAL_WINDOW);
         // Gated to Windows. This full-clear heartbeat exists ONLY to wipe classic
-        // conhost's incremental-diff drift (the "Windows 界面错乱 after a while"). On
-        // macOS/Linux ratatui's incremental diff reconciles reliably, so a periodic
-        // full clear there is pure harm: a ~1Hz whole-screen flash during a long
-        // streaming run (reported on macOS Terminal.app). Unix terminals never drift
-        // this way, and their event-driven heals (resize/paste contamination,
-        // input-height change, /clear) still fire — so nothing is left un-healed.
-        // P4c - also heal for a bounded window right after going idle (drift on settle /
-        // unfocused-redraw), not only while live/editing.
-        let recently_idle = idle_since.is_some_and(|t| t.elapsed() < IDLE_HEAL_WINDOW);
+        // conhost's incremental-diff drift while STREAMING (the "Windows 界面错乱
+        // after a while"). On macOS/Linux ratatui's incremental diff reconciles
+        // reliably, so a periodic full clear there is pure harm: a ~1Hz whole-screen
+        // flash during a long streaming run (reported on macOS Terminal.app). Unix
+        // terminals never drift this way, and their event-driven heals (resize/paste
+        // contamination, input-height change, /clear) still fire — so nothing is left
+        // un-healed. Typing is NOT a trigger (see `periodic_repaint_due`): a naked
+        // full clear while the user types WAS the "Windows 输入闪屏".
+        //
+        // The heartbeat fires ONLY while output is actively STREAMING (drift accrues
+        // from cell writes). A STATIC screen — a live run stalled on a tool, a settled
+        // prompt, an idle chat — has no new drift, so it must never flash. The settle
+        // edge is healed once by `contaminate_terminal()` above, not by a timed window.
+        let stream_active_recently =
+            last_stream_activity.is_some_and(|t| t.elapsed() < STREAM_HEAL_WINDOW);
         // Resize heal window - force a full clear+repaint for a short spell after the last
         // resize so a multi-frame drag + terminal-buffer settle heals completely (one
         // contamination clear on a single Resize left stale cells from the pre-settle sizes).
@@ -6420,8 +6402,7 @@ async fn event_loop(
         if is_legacy_conhost()
             && periodic_repaint_due(
                 sync_output,
-                now_live || recently_idle,
-                editing_recently,
+                stream_active_recently,
                 last_full_repaint.elapsed(),
                 REPAINT_HEARTBEAT,
             )
@@ -6459,18 +6440,25 @@ async fn event_loop(
             if sync_output {
                 let _ = terminal.backend_mut().execute(BeginSynchronizedUpdate);
             }
-            // P0 — the root fix for persistent garble. ratatui's flush diffs its
-            // OWN prev/next buffers and never reconciles against the real
-            // terminal; when the terminal drifts while the buffers are identical
-            // (the bottom-pinned steady state) the diff is EMPTY and the garble
-            // would persist forever. Under CONFIRMED sync output, clear + fully
-            // repaint EVERY frame — done INSIDE the BSU/ESU block, so the
-            // clear+draw swap atomically (invisible) and no drift survives past
-            // one frame. On a NON-sync terminal an every-frame clear would
-            // visibly flicker, so only a requested heal (the P3 contamination
-            // drain — `force_full_repaint`) clears, exactly once per
-            // contamination. Fail-open: a clear error never blocks the draw.
-            if frame_needs_clear(sync_confirmed, force_full_repaint) {
+            // P0 — heal terminal-side drift, but NOT on every frame. ratatui's flush
+            // diffs its OWN prev/next buffers and never reconciles against the real
+            // terminal, so a drifted screen under identical buffers produces an empty
+            // diff. Under CONFIRMED sync output a full clear+repaint is bracketed by
+            // BSU/ESU and swaps atomically, so it is INVISIBLE on a well-behaved sync
+            // terminal — but doing it EVERY frame flickered on a terminal whose sync
+            // is imperfect (a GPU terminal with its own smooth-scroll): scrolling
+            // (many frames) poured out the flicker, worst at the bottom (reported on
+            // otty; zed's solid sync and non-sync Terminal.app — which never takes this
+            // path — both stay clean). So the sync clear is now gated the SAME way as
+            // the conhost heartbeat: it heals ONLY while output is actively STREAMING
+            // (drift accrues from cell WRITES) and only on the throttled cadence —
+            // never during a pure scroll or on an idle screen. Discrete heals
+            // (`force_full_repaint`: resize / focus / contamination) still clear
+            // immediately, once each. Fail-open: a clear error never blocks the draw.
+            let sync_heal_due = sync_confirmed
+                && stream_active_recently
+                && last_full_repaint.elapsed() >= REPAINT_HEARTBEAT;
+            if frame_needs_clear(sync_heal_due, force_full_repaint) {
                 let _ = terminal.clear();
                 // P4 — a full wipe just happened; restart the non-sync repaint
                 // heartbeat from here so it measures the gap since the last real
@@ -6609,6 +6597,11 @@ async fn event_loop(
                 // R3 — engine events change the transcript; mark it dirty
                 // (budget-gated so a streaming burst coalesces).
                 needs_redraw = true;
+                // P4 — record streaming activity: this is the ONLY signal that gates the
+                // classic-conhost repaint heartbeat, so the heal fires while output flows
+                // and stops within STREAM_HEAL_WINDOW once it settles (never on a static
+                // screen — no flicker while a live run stalls on a tool, or after it ends).
+                last_stream_activity = Some(Instant::now());
                 // R3 — drain EVERY currently-pending engine event in one pass so a
                 // burst of streaming tokens (or progress notes) is applied before a
                 // SINGLE redraw, not one full re-layout per token. Each event runs
@@ -6871,14 +6864,7 @@ async fn event_loop(
                     // `handle_paste` also detects a dragged-in image PATH and turns
                     // it into an `[图片 N]` attachment chip (forwarded to the base as
                     // an `@<path>` mention on submit); plain text is inserted as-is.
-                    let paste_before = app.input.len();
                     app.handle_paste(pasted);
-                    // P4b — a paste that changed the buffer is a same-line edit; on
-                    // the non-sync path record it so the repaint heartbeat heals
-                    // conhost incremental-diff drift within one cadence.
-                    if !sync_output && app.input.len() != paste_before {
-                        last_input_edit = Some(Instant::now());
-                    }
                 } else if let Some(Ok(Event::Key(key))) = maybe_key {
                     // Accept Press AND Repeat. On terminals that negotiate the
                     // kitty / enhanced-keyboard protocol (Ghostty, recent iTerm2,
@@ -6924,12 +6910,6 @@ async fn event_loop(
                                 needs_redraw = true;
                                 continue;
                             }
-                            // P4b — snapshot the buffer so an actual edit
-                            // (insert / backspace / kill / recall) can be told apart
-                            // from a pure caret move. Only on the non-sync path — the
-                            // idle-edit heal only matters on classic conhost, so
-                            // mac/Linux/Windows-Terminal pay no clone.
-                            let edit_probe = (!sync_output).then(|| app.input.clone());
                             // Paste-burst timing (real loop only): a key landing within
                             // PASTE_BURST_GAP of the previous one is part of a paste (a burst
                             // far faster than typing), so the Enter handler treats a pasted
@@ -6952,15 +6932,6 @@ async fn event_loop(
                                 if matches!(m, umadev_agent::TrustMode::Auto) {
                                     allow_pending_approval(&approval_holder);
                                 }
-                            }
-                            // P4b — a key that CHANGED the input buffer is a same-line
-                            // edit; record the time so the non-sync repaint heartbeat
-                            // heals conhost incremental-diff drift within one cadence.
-                            // A pure caret move (arrows / home / end) leaves the buffer
-                            // unchanged and is intentionally not counted — no idle
-                            // flicker on a settled prompt.
-                            if edit_probe.is_some_and(|before| before != app.input) {
-                                last_input_edit = Some(Instant::now());
                             }
                             match action {
                                 // Quit sets `app.should_quit`; the loop-bottom check
@@ -13270,96 +13241,74 @@ mod tests {
     // contamination) ------------------------------------------------------------
 
     #[test]
-    fn confirmed_sync_output_clears_every_frame_but_non_sync_only_on_heal() {
-        // P0 — under CONFIRMED synchronized output EVERY frame clears the back
-        // buffer and fully repaints (atomically inside BSU/ESU), so terminal
-        // drift ratatui's own prev-vs-next diff can't see never survives past
-        // one frame — with or without a pending heal.
+    fn frame_clears_on_sync_heal_due_or_a_requested_heal_else_never() {
+        // P0 — a full clear+repaint fires when a SYNC-heal is due (throttled to the
+        // streaming-drift cadence — NOT every frame; the caller gates it on streaming
+        // activity, so a pure scroll / idle screen never clears — the otty scroll-
+        // flicker fix) OR when a discrete heal (contamination / resize / focus) was
+        // requested.
         assert!(
             frame_needs_clear(true, false),
-            "sync output → every frame is a full repaint"
+            "a due sync heal forces the (atomic, BSU/ESU-wrapped) clear+repaint"
         );
         assert!(
             frame_needs_clear(true, true),
-            "sync output + a pending heal → still exactly one clear"
+            "sync heal + a pending discrete heal → still exactly one clear"
         );
-        // Non-sync: an every-frame clear would visibly flicker, so the steady
-        // state NEVER clears — only the P3 contamination drain forces the one
-        // healing clear+repaint.
+        // Neither a sync heal due NOR a requested heal → NEVER clear. This is the
+        // steady state during a pure scroll or an idle screen: rely on ratatui's diff,
+        // so nothing flickers (the case that flickered on otty when it was `sync` alone).
         assert!(
             !frame_needs_clear(false, false),
-            "non-sync steady state must not clear every frame (flicker)"
+            "no sync heal due and no requested heal must not clear (scroll/idle = no flicker)"
         );
         assert!(
             frame_needs_clear(false, true),
-            "non-sync heals exactly when the contamination flag was drained"
+            "a discrete heal (contamination drain) clears exactly once"
         );
     }
 
     #[test]
     fn non_sync_live_run_gets_a_bounded_repaint_heartbeat() {
-        // P4 — the classic-conhost drift wipe. The heartbeat fires ONLY on the
-        // non-sync path, ONLY while live OR recently edited, and ONLY once the
-        // cadence has elapsed. Signature: (sync, live, editing_recently, elapsed,
-        // cadence).
+        // P4 — the classic-conhost STREAMING-drift wipe. The heartbeat fires ONLY on
+        // the non-sync path, ONLY while live (streaming), and ONLY once the cadence
+        // has elapsed. Signature: (sync, live, elapsed, cadence).
         let cadence = Duration::from_secs(1);
         // Non-sync + live + past the cadence → force one full repaint.
         assert!(
-            periodic_repaint_due(false, true, false, Duration::from_millis(1200), cadence),
+            periodic_repaint_due(false, true, Duration::from_millis(1200), cadence),
             "non-sync live run past the cadence must force a full repaint"
         );
         // At the boundary (>=) it counts.
         assert!(
-            periodic_repaint_due(false, true, false, cadence, cadence),
+            periodic_repaint_due(false, true, cadence, cadence),
             "the cadence boundary itself is due"
         );
         // Within the cadence → not yet (bounded, never a per-frame clear).
         assert!(
-            !periodic_repaint_due(false, true, false, Duration::from_millis(200), cadence),
+            !periodic_repaint_due(false, true, Duration::from_millis(200), cadence),
             "within the cadence the heartbeat must not fire (no per-frame clear)"
         );
-        // Idle + not edited → never (an idle screen can't drift; no flicker on a
-        // settled chat).
+
+        // --- THE FLICKER FIX: typing / an idle prompt is NEVER a heartbeat reason.
+        // `live` is false when no run streams (an idle prompt, whether or not the
+        // user is typing at it). Even long past the cadence it must NOT force a
+        // clear — a naked whole-screen wipe while the user types WAS the reported
+        // "Windows 输入闪屏". ratatui's cell diff heals a same-line edit on its own.
         assert!(
-            !periodic_repaint_due(false, false, false, Duration::from_secs(10), cadence),
-            "an idle, un-edited non-sync screen never pays a heartbeat clear"
+            !periodic_repaint_due(false, false, Duration::from_secs(10), cadence),
+            "an idle / typed-at non-streaming prompt must NEVER pay a heartbeat clear"
         );
 
-        // --- P4b: the idle-edit heal gap -------------------------------------
-        // THE FIX — non-sync + NOT live but the prompt was edited recently + past
-        // the cadence → DUE. This is the classic-conhost same-line backspace heal:
-        // an idle edit self-heals within one cadence instead of needing a resize.
-        assert!(
-            periodic_repaint_due(false, false, true, Duration::from_millis(1200), cadence),
-            "non-sync recently-edited idle prompt past the cadence must heal (the fix)"
-        );
-        // Editing still respects the cadence throttle: edited but within the
-        // cadence → NOT yet due, so a burst of keystrokes never forces a per-key
-        // clear (the crucial no-flicker guarantee).
-        assert!(
-            !periodic_repaint_due(false, false, true, Duration::from_millis(200), cadence),
-            "an edit within the cadence must not fire — the cadence still throttles"
-        );
-        // Live AND editing recently → still due (existing live behavior unchanged).
-        assert!(
-            periodic_repaint_due(false, true, true, Duration::from_millis(1200), cadence),
-            "non-sync live + recently edited past the cadence is still due"
-        );
         // Sync output → NEVER on this path — every frame already repaints (P0),
-        // so the heartbeat must add no clears there, live / idle / editing.
+        // so the heartbeat must add no clears there, live or idle.
         assert!(
-            !periodic_repaint_due(true, true, false, Duration::from_secs(10), cadence),
+            !periodic_repaint_due(true, true, Duration::from_secs(10), cadence),
             "sync output must not take the heartbeat path (already clears every frame)"
         );
         assert!(
-            !periodic_repaint_due(true, false, false, Duration::from_secs(10), cadence),
+            !periodic_repaint_due(true, false, Duration::from_secs(10), cadence),
             "sync output idle must not take the heartbeat path either"
-        );
-        // Sync output + recently edited → STILL never (the edit signal must not
-        // leak a clear onto a sync-output terminal — it clears every frame anyway).
-        assert!(
-            !periodic_repaint_due(true, false, true, Duration::from_secs(10), cadence),
-            "sync output + recent edit must not take the heartbeat path"
         );
     }
 

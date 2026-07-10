@@ -182,7 +182,7 @@ pub fn run_security_scan(project_root: &Path) -> SecurityScan {
     // in collect-all mode, so `security` / `report --review` find real defects
     // even on a machine with neither gitleaks nor semgrep installed. gitleaks /
     // npm-audit below remain OPTIONAL upgrades that add their own signal.
-    results.push(scan_owned_sast(project_root));
+    results.extend(scan_owned_sast(project_root));
 
     // --- secrets: gitleaks over the whole tree -------------------------------
     results.push(scan_secrets(project_root));
@@ -210,12 +210,14 @@ const SAST_REL_PATH: &str = ".umadev/audit/sast-findings.json";
 /// real security defects (injection / missing-auth / hardcoded-secret / …).
 ///
 /// **Always runs — never skipped for lack of a tool.** A clean tree yields a
-/// `Clean` row; defects yield a `Findings` row whose detail names the worst
-/// offenders. The full per-finding list is also written to
-/// `.umadev/audit/sast-findings.json` so the proof-pack + review report can cite
-/// exact files/clauses. Pure + fail-open: an unreadable file is skipped, the
-/// detailed dump is best-effort, and the row is well-formed regardless.
-fn scan_owned_sast(project_root: &Path) -> ScanResult {
+/// single `Clean` row; defects yield up to TWO `Findings` rows — a dedicated
+/// `secrets`-category row for any leaked-credential clause (UD-SEC-003 / -015) so
+/// the review report HARD-blocks merge on a live key (matching gitleaks), plus a
+/// general `sast` row for every other defect. The full per-finding list is also
+/// written to `.umadev/audit/sast-findings.json` so the proof-pack + review report
+/// can cite exact files/clauses. Pure + fail-open: an unreadable file is skipped,
+/// the detailed dump is best-effort, and the rows are well-formed regardless.
+fn scan_owned_sast(project_root: &Path) -> Vec<ScanResult> {
     const TOOL: &str = "umadev-sast";
     const CAT: &str = "sast";
     let ctx = umadev_governance::ProjectContext::unknown();
@@ -227,12 +229,17 @@ fn scan_owned_sast(project_root: &Path) -> ScanResult {
     let mut files_scanned = 0usize;
     // Pass 1: full owned SAST over the code source tree.
     // Bound: at most 600 source files (the `source_files` collector caps it too).
-    for f in crate::acceptance::source_files(project_root) {
-        let Ok(content) = std::fs::read_to_string(&f) else {
+    let src_files = crate::acceptance::source_files(project_root);
+    // M4 (extended): a walk that hit the file CAP left part of the tree UNSCANNED, so a
+    // later "clean" is only clean over what we SAW. `source_files` stops descending once it
+    // exceeds the cap, so a returned count past the cap means the tree was truncated.
+    let source_truncated = src_files.len() > crate::acceptance::MAX_SOURCE_FILES;
+    for f in &src_files {
+        let Ok(content) = std::fs::read_to_string(f) else {
             continue;
         };
         files_scanned += 1;
-        let rel = rel_path(project_root, &f);
+        let rel = rel_path(project_root, f);
         findings.extend(umadev_governance::sast_scan_file(&rel, &content, ctx));
         if findings.len() >= 500 {
             break; // a degenerate repo can't make this unbounded
@@ -279,48 +286,102 @@ fn scan_owned_sast(project_root: &Path) -> ScanResult {
 
     // M4: a scan that examined zero files is "not run", never "clean".
     if files_scanned == 0 {
-        return ScanResult::skipped(
+        return vec![ScanResult::skipped(
             TOOL,
             CAT,
             "no source or config files to scan — UmaDev baseline SAST examined 0 files \
              (unreadable tree / all skipped); reported as not-run, never clean",
-        );
+        )];
     }
 
     if findings.is_empty() {
-        return ScanResult {
+        // Be HONEST about partial coverage: a tree past the file cap was only partially
+        // walked, so "clean" is clean over the {files_scanned} files we saw — not a
+        // whole-tree guarantee. (M4: never assert verified-clean over what wasn't scanned.)
+        let detail = if source_truncated {
+            format!(
+                "no security defects in the {files_scanned} source file(s) scanned \
+                 (UmaDev baseline SAST) — the tree exceeded the {}-file cap, so coverage is \
+                 PARTIAL, not a whole-repo guarantee",
+                crate::acceptance::MAX_SOURCE_FILES
+            )
+        } else {
+            "no security defects in source (UmaDev baseline SAST)".to_string()
+        };
+        return vec![ScanResult {
             tool: TOOL.to_string(),
             category: CAT.to_string(),
             status: ScanStatus::Clean,
             findings: 0,
-            detail: "no security defects in source (UmaDev baseline SAST)".to_string(),
-        };
+            detail,
+        }];
     }
-    let high = findings
+
+    // A leaked CREDENTIAL (hardcoded secret / private key / JWT signing key) is a HARD
+    // block, not an advisory. The review report Fails merge only on a `secrets`-category
+    // Findings row (matching gitleaks); the owned SAST used to fold these into its generic
+    // `sast` row, so on a machine WITHOUT gitleaks (the default) a committed `sk_live_...`
+    // key was reported "mergeable". Split the secret clauses into their own `secrets` row so
+    // the existing hard-block gate fires. `UD-SEC-003` = hardcoded secret / private key,
+    // `UD-SEC-015` = JWT hardcoded/none signing key.
+    const SECRET_CLAUSES: &[&str] = &["UD-SEC-003", "UD-SEC-015"];
+    let (secrets, others): (Vec<_>, Vec<_>) = findings
         .iter()
-        .filter(|f| f.severity == umadev_governance::SastSeverity::High)
-        .count();
-    let n = u32::try_from(findings.len()).unwrap_or(u32::MAX);
-    // Name the first couple of distinct clauses so the row is actionable at a glance.
-    let mut seen: Vec<&str> = Vec::new();
-    for f in &findings {
-        if !seen.contains(&f.clause.as_str()) {
-            seen.push(&f.clause);
+        .partition(|f| SECRET_CLAUSES.contains(&f.clause.as_str()));
+
+    let mut rows = Vec::new();
+    if !secrets.is_empty() {
+        let n = u32::try_from(secrets.len()).unwrap_or(u32::MAX);
+        // Name the distinct files so the row is actionable without opening the dump.
+        let mut files: Vec<&str> = Vec::new();
+        for f in &secrets {
+            if !files.contains(&f.file.as_str()) {
+                files.push(&f.file);
+            }
+            if files.len() >= 3 {
+                break;
+            }
         }
-        if seen.len() >= 3 {
-            break;
+        rows.push(ScanResult {
+            tool: TOOL.to_string(),
+            category: "secrets".to_string(),
+            status: ScanStatus::Findings,
+            findings: n,
+            detail: format!(
+                "{n} hardcoded secret(s)/key(s) in the working tree — e.g. {} \
+                 (UmaDev baseline SAST; see sast-findings.json)",
+                files.join(", ")
+            ),
+        });
+    }
+    if !others.is_empty() {
+        let high = others
+            .iter()
+            .filter(|f| f.severity == umadev_governance::SastSeverity::High)
+            .count();
+        let n = u32::try_from(others.len()).unwrap_or(u32::MAX);
+        // Name the first couple of distinct clauses so the row is actionable at a glance.
+        let mut seen: Vec<&str> = Vec::new();
+        for f in &others {
+            if !seen.contains(&f.clause.as_str()) {
+                seen.push(&f.clause);
+            }
+            if seen.len() >= 3 {
+                break;
+            }
         }
+        rows.push(ScanResult {
+            tool: TOOL.to_string(),
+            category: CAT.to_string(),
+            status: ScanStatus::Findings,
+            findings: n,
+            detail: format!(
+                "{n} security defect(s) ({high} high) — e.g. {} (see sast-findings.json)",
+                seen.join(", ")
+            ),
+        });
     }
-    ScanResult {
-        tool: TOOL.to_string(),
-        category: CAT.to_string(),
-        status: ScanStatus::Findings,
-        findings: n,
-        detail: format!(
-            "{n} security defect(s) ({high} high) — e.g. {} (see sast-findings.json)",
-            seen.join(", ")
-        ),
-    }
+    rows
 }
 
 /// Workspace-relative, forward-slashed path of `f` under `project_root`.
@@ -850,6 +911,38 @@ mod tests {
     }
 
     #[test]
+    fn owned_sast_secret_becomes_a_hard_blocking_secrets_row() {
+        // HIGH: a leaked credential found by the OWNED baseline SAST (the only secret
+        // detector on a machine without gitleaks — the default) must produce a
+        // `secrets`-category Findings row so the review report HARD-blocks merge. It used
+        // to fold into the generic `sast` row, whose category the hard-block gate ignored,
+        // so a committed private key was reported "ready to merge".
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/config.py"),
+            "PRIVATE = \"\"\"-----BEGIN RSA PRIVATE KEY-----\n\
+             MIIEowIBAAKCAQEAabcdef0123456789\n\
+             -----END RSA PRIVATE KEY-----\"\"\"\n",
+        )
+        .unwrap();
+        let scan = run_security_scan(tmp.path());
+        assert!(
+            scan.has_secret_findings(),
+            "a leaked private key must surface as a hard-blocking secrets row: {:?}",
+            scan.results
+        );
+        // And it must be attributable to a Findings row in the `secrets` category.
+        assert!(
+            scan.results
+                .iter()
+                .any(|r| r.category == "secrets" && r.status == ScanStatus::Findings),
+            "expected a secrets Findings row: {:?}",
+            scan.results
+        );
+    }
+
+    #[test]
     fn write_then_read_roundtrips() {
         let tmp = TempDir::new().unwrap();
         let scan = SecurityScan {
@@ -1069,13 +1162,14 @@ mod tests {
         )
         .unwrap();
         let scan = run_security_scan(tmp.path());
-        let sast = scan.results.iter().find(|r| r.category == "sast").unwrap();
-        assert_eq!(
-            sast.status,
-            ScanStatus::Findings,
-            "the .env secret must be found: {sast:?}"
-        );
-        assert!(sast.findings >= 1);
+        // A hardcoded key (UD-SEC-003) now surfaces as a hard-blocking `secrets` row.
+        let secrets = scan
+            .results
+            .iter()
+            .find(|r| r.category == "secrets" && r.status == ScanStatus::Findings)
+            .expect("the .env secret must be found as a secrets finding");
+        assert!(secrets.findings >= 1);
+        assert!(scan.has_secret_findings());
         // The detailed dump cites the offending file.
         let dump =
             std::fs::read_to_string(tmp.path().join(sast_findings_rel_path())).unwrap_or_default();
@@ -1100,11 +1194,11 @@ mod tests {
         )
         .unwrap();
         let scan = run_security_scan(tmp.path());
-        let sast = scan.results.iter().find(|r| r.category == "sast").unwrap();
-        assert_eq!(
-            sast.status,
-            ScanStatus::Findings,
-            "the YAML secret must be found: {sast:?}"
+        // The provider token (UD-SEC-003) surfaces as a hard-blocking `secrets` row.
+        assert!(
+            scan.has_secret_findings(),
+            "the YAML secret must be found as a secrets finding: {:?}",
+            scan.results
         );
     }
 

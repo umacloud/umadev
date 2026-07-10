@@ -242,7 +242,8 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
     //    port and risk a hang).
     let already_up = curl_status(&base_url, 3).await.is_some();
     if matches!(decide_boot_plan(already_up), BootPlan::Reuse) {
-        return finish_proof(workspace, &dev, base_url, Some(0)).await;
+        // reused=true: this is a FOREIGN holder we did not spawn — verify strictly.
+        return finish_proof(workspace, &dev, base_url, Some(0), true).await;
     }
 
     // 4. Spawn the dev server, capturing its output so we can read readiness and
@@ -319,11 +320,12 @@ pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
         BootOutcome::Ready {
             base_url: effective,
             ready_ms,
-        } => finish_proof(workspace, &dev, effective, Some(ready_ms)).await,
+        } => finish_proof(workspace, &dev, effective, Some(ready_ms), false).await,
         BootOutcome::AlreadyRunning { base_url: existing } => {
             // The server reported another instance is already up at a known URL;
-            // our spawn is a redundant duplicate. Probe the existing one.
-            finish_proof(workspace, &dev, existing, Some(0)).await
+            // our spawn is a redundant duplicate. Probe the existing one — but it is
+            // a PRE-EXISTING server we did not boot, so verify it strictly (reused=true).
+            finish_proof(workspace, &dev, existing, Some(0), true).await
         }
         BootOutcome::Timeout => {
             let mut proof = RuntimeProof::not_verified(boot_timeout_reason(READY_TIMEOUT_SECS));
@@ -394,6 +396,7 @@ async fn finish_proof(
     dev: &DevServer,
     base_url: String,
     ready_ms: Option<u64>,
+    reused: bool,
 ) -> RuntimeProof {
     let mut proof = RuntimeProof {
         timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -408,6 +411,7 @@ async fn finish_proof(
 
     // Probe the documented routes (from the contract), else just the root.
     let paths = contract_route_paths(workspace);
+    let had_contract = !paths.is_empty();
     let probe_paths = if paths.is_empty() {
         vec!["/".to_string()]
     } else {
@@ -417,29 +421,73 @@ async fn finish_proof(
         proof.routes.push(probe_route(&base_url, path).await);
     }
 
-    // Downgrade to NotVerified if NO probed route returned a 2xx/3xx: the server booted and
-    // "answered" its base URL, but a 404/500 on EVERY route is not a VERIFIED runtime - the
-    // top-line verdict (is_verified(), the proof-pack headline) must not claim success when
-    // every route errored. A single ok route keeps Verified.
-    // Downgrade only when NO probed route proves the server is even UP: every probe was a
-    // 5xx or got NO response (status 0). A 4xx (401/405 on a GET-probed auth-gated / POST-only
-    // contract route) STILL proves the server booted + is routing, so it keeps Verified -
-    // downgrading on `!ok` (which includes 4xx) wrongly failed working auth/POST-only backends.
-    // A 500 on every route (booted-but-broken) is the case this correctly catches.
-    if !proof.routes.is_empty()
-        && proof
-            .routes
+    // Optional e2e suite (run before the verdict so a failing suite can downgrade it).
+    proof.e2e = run_e2e_if_present(workspace).await;
+
+    // Decide the verdict from the probe results (pure, unit-tested).
+    if let Some(reason) = downgrade_reason(
+        &proof.routes,
+        reused,
+        had_contract,
+        &base_url,
+        proof.e2e.as_ref(),
+    ) {
+        proof.status = RuntimeStatus::NotVerified(reason);
+    }
+    proof
+}
+
+/// Decide whether probe results warrant DOWNGRADING the runtime verdict from
+/// Verified. Pure + deterministic (no IO) so the verdict policy is unit-tested
+/// directly. Returns the `NotVerified` reason, or `None` to keep Verified.
+///
+/// Precedence, most-specific first:
+/// 1. **Foreign reuse (#3)** — a server we did NOT spawn this run (`reused`) that,
+///    given real CONTRACT routes, answers NONE of them (every probe 404 /
+///    no-response / 5xx) is almost certainly a DIFFERENT app on a colliding
+///    default port, not this build. A `401/403/405` still proves the route EXISTS
+///    (auth / method), so an auth-gated app the user runs themselves is NOT
+///    false-failed — this only fires when every documented route is truly absent.
+/// 2. **Booted-but-broken (#6)** — every probe was a `5xx` or no-response. A `4xx`
+///    proves the server booted + is routing, so it keeps Verified (downgrading on
+///    `!ok` wrongly failed working auth/POST-only backends).
+/// 3. **Failed e2e (#5)** — the route probes pass but the e2e suite that RAN came
+///    back failing; the headline verdict must not claim "verified". A `None` e2e
+///    (no suite detected) keeps the route-level verdict.
+fn downgrade_reason(
+    routes: &[RouteProbe],
+    reused: bool,
+    had_contract: bool,
+    base_url: &str,
+    e2e: Option<&E2eResult>,
+) -> Option<String> {
+    if reused
+        && had_contract
+        && !routes.is_empty()
+        && routes
             .iter()
-            .all(|r| r.status == 0 || r.status >= 500)
+            .all(|r| r.status == 0 || r.status == 404 || r.status >= 500)
     {
-        proof.status = RuntimeStatus::NotVerified(
+        return Some(format!(
+            "reused an already-running server on {base_url} that answered NONE of the {} \
+             documented route(s) — likely a different app on a colliding port, not this build",
+            routes.len()
+        ));
+    }
+    if !routes.is_empty() && routes.iter().all(|r| r.status == 0 || r.status >= 500) {
+        return Some(
             "the app booted but every probed route returned a 5xx or no response".to_string(),
         );
     }
-
-    // Optional e2e suite.
-    proof.e2e = run_e2e_if_present(workspace).await;
-    proof
+    if let Some(e2e) = e2e {
+        if !e2e.passed {
+            return Some(format!(
+                "the app booted but its e2e suite failed (`{}`)",
+                e2e.command
+            ));
+        }
+    }
+    None
 }
 
 /// Persist the proof to `.umadev/audit/runtime-proof.json`. Returns the path on
@@ -1927,6 +1975,66 @@ mod tests {
         // duplicate.
         assert_eq!(decide_boot_plan(true), BootPlan::Reuse);
         assert_eq!(decide_boot_plan(false), BootPlan::Spawn);
+    }
+
+    fn probe(path: &str, status: u16) -> RouteProbe {
+        RouteProbe {
+            path: path.to_string(),
+            status,
+            ms: 1,
+            ok: status < 400,
+        }
+    }
+
+    #[test]
+    fn downgrade_reused_foreign_server_that_answers_no_contract_route() {
+        // HIGH #3: a reused server (not spawned this run) that 404s every documented
+        // contract route is a different app on a colliding port — NOT verified.
+        let routes = vec![probe("/api/users", 404), probe("/api/health", 404)];
+        let r = downgrade_reason(&routes, true, true, "http://localhost:3000", None);
+        assert!(r.unwrap().contains("colliding port"));
+        // But a reused server that DOES answer a route (or auth-gates it) stays verified:
+        let auth = vec![probe("/api/users", 401), probe("/api/health", 200)];
+        assert!(downgrade_reason(&auth, true, true, "http://localhost:3000", None).is_none());
+        // An auth-gated app where EVERY route is 401 still proves routes exist → verified.
+        let all_auth = vec![probe("/api/users", 401), probe("/api/admin", 403)];
+        assert!(downgrade_reason(&all_auth, true, true, "http://localhost:3000", None).is_none());
+        // The SAME 404s on a server WE spawned (reused=false) are not the foreign case —
+        // a 404 keeps Verified (route-quirk tolerance), only 5xx/no-response downgrades.
+        assert!(downgrade_reason(&routes, false, true, "http://localhost:3000", None).is_none());
+    }
+
+    #[test]
+    fn downgrade_booted_but_broken_all_5xx() {
+        // #6: every route 5xx / no-response → booted-but-broken, NotVerified.
+        let routes = vec![probe("/", 500), probe("/api", 0)];
+        assert!(downgrade_reason(&routes, false, false, "u", None)
+            .unwrap()
+            .contains("5xx or no response"));
+        // A single 4xx keeps Verified (server is up + routing).
+        let ok = vec![probe("/", 500), probe("/api", 401)];
+        assert!(downgrade_reason(&ok, false, false, "u", None).is_none());
+    }
+
+    #[test]
+    fn downgrade_when_e2e_suite_failed() {
+        // MED #5: route probes pass but a RAN e2e suite failed → NotVerified.
+        let routes = vec![probe("/", 200)];
+        let failed = E2eResult {
+            command: "npm run test:e2e".to_string(),
+            passed: false,
+            ms: 10,
+            output: String::new(),
+        };
+        let r = downgrade_reason(&routes, false, true, "u", Some(&failed));
+        assert!(r.unwrap().contains("e2e suite failed"));
+        // A passing suite keeps Verified; None (no suite) keeps Verified.
+        let passed = E2eResult {
+            passed: true,
+            ..failed.clone()
+        };
+        assert!(downgrade_reason(&routes, false, true, "u", Some(&passed)).is_none());
+        assert!(downgrade_reason(&routes, false, true, "u", None).is_none());
     }
 
     #[test]

@@ -437,15 +437,19 @@ fn is_network(hay: &str) -> Option<bool> {
         // the session and recovers instead of hard-failing on an unclassifiable
         // transport error (the enriched reason still carries the base's real cause).
         "broken pipe",
-        "os error 32",
         "epipe",
-        // WINDOWS broken pipe is `os error 232` (NOT a superstring of "os error 32") and its
-        // localized text differs per locale ("The pipe is being closed." / zh 管道正在被关闭),
-        // so match all three forms - else a Windows session death classifies as Unknown and
-        // hard-fails instead of taking the transient session-restart path.
+        // NOTE: do NOT match the bare `os error 32`. On Unix EPIPE IS errno 32, but Rust
+        // already formats it as "Broken pipe (os error 32)" so "broken pipe" above catches
+        // it; on WINDOWS raw OS error 32 is ERROR_SHARING_VIOLATION (a file is locked by
+        // another process) — an entirely different, NON-transport failure that must not be
+        // misclassified as a transient session death.
+        // WINDOWS broken pipe is `os error 232` and its localized text differs per locale
+        // ("The pipe is being closed." / zh 管道正在被关闭); match the specific forms so a
+        // Windows session death takes the transient session-restart path, WITHOUT letting a
+        // bare "管道" (pipe) substring in unrelated Chinese error text false-match.
         "os error 232",
         "pipe is being closed",
-        "管道",
+        "管道正在被关闭",
     ];
     if SSL_MARKERS.iter().any(|m| hay.contains(m)) {
         return Some(true);

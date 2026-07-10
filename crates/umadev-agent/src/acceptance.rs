@@ -57,7 +57,9 @@ const SKIP_DIRS: &[&str] = &[
 const MAX_SOURCE_DEPTH: usize = 16;
 
 /// Maximum number of source files scanned (guards a pathological monorepo).
-const MAX_SOURCE_FILES: usize = 600;
+/// `pub` so the SAST scan can tell whether a large tree was CAPPED and therefore
+/// report partial (not "clean-verified") coverage — see `security::scan_owned_sast`.
+pub const MAX_SOURCE_FILES: usize = 600;
 
 /// Recursively collect source files (bounded by depth + file count).
 fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {

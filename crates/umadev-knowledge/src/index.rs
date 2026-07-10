@@ -488,8 +488,17 @@ pub fn load_or_build_index_multi(project_root: &Path, knowledge_dirs: &[PathBuf]
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(text) = serde_json::to_vec(&index) {
-        let _ = std::fs::write(&path, text);
-        let _ = std::fs::write(&sig_path, &signature);
+        // Write the signature ONLY when the index write actually SUCCEEDED. Writing
+        // the sig unconditionally after a FAILED index write (disk full, or a Windows
+        // lock / transient EACCES while the previous valid index file survives) leaves
+        // an inconsistent old-index + new-sig pair on disk — every later load then sees
+        // `stored_sig == signature` and serves the STALE pre-change index until the
+        // corpus changes again. Gating the sig on the index write keeps the pair
+        // consistent: a failed index write leaves the old sig, so the next load's
+        // signature mismatch rebuilds instead of trusting a stale cache.
+        if std::fs::write(&path, text).is_ok() {
+            let _ = std::fs::write(&sig_path, &signature);
+        }
     }
 
     index

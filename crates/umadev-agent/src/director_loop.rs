@@ -643,6 +643,26 @@ pub async fn drive_director_loop_routed(
         }
     }
 
+    // Plan (read-only) mode must NOT drive a code-writing BUILD. The continuous engine guards
+    // its executing phases with `plan_mode_skip` (continuous.rs), but director_loop had NO such
+    // guard - so a build SPAWNED in Plan drove every step while the approval floor DENIED each
+    // write (Plan escalates every non-read action), producing ZERO source files and a confusing
+    // deny-storm before aborting (the opencode "edit -> pyproject.toml 按拒绝处理" report). Stop
+    // cleanly with the actionable read-only notice: no code is written, the source-present
+    // hard-gate does NOT fire (the reply claims no build), and the user is told to switch to
+    // /mode guarded or auto to execute.
+    if !options.mode.executes() {
+        events.emit(EngineEvent::Note(
+            umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+        ));
+        events.emit(EngineEvent::Note(
+            umadev_i18n::tl("mode.plan.gate").to_string(),
+        ));
+        return DirectorLoopOutcome::Done {
+            reply: umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+        };
+    }
+
     // Read the idle watchdog window + the wall-clock build budget ONCE at the
     // boundary (not per-wait), so a mid-run env flip can't race the in-flight turns.
     // The deadline is a GRACEFUL ceiling — the loop winds down (final gate on what's
@@ -881,6 +901,23 @@ pub async fn drive_director_loop_resume(
     events: &Arc<dyn EventSink>,
     route: &RoutePlan,
 ) -> Option<DirectorLoopOutcome> {
+    // MED-3: a RESUME must honor the same Plan (read-only) gate as a fresh routed run.
+    // Without this, `/continue` in Plan mode re-drove every remaining step while the
+    // approval floor denied each write (Plan escalates all non-read actions) — the same
+    // deny-storm the fresh path already guards at `drive_director_loop_routed`. Stop
+    // cleanly with the read-only notice instead of resuming into a write storm.
+    if !options.mode.executes() {
+        events.emit(EngineEvent::Note(
+            umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+        ));
+        events.emit(EngineEvent::Note(
+            umadev_i18n::tl("mode.plan.gate").to_string(),
+        ));
+        return Some(DirectorLoopOutcome::Done {
+            reply: umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+        });
+    }
+
     let mut plan = load_resumable_plan(&options.project_root)?;
 
     // Surface the routing decision (the same visible intent card a fresh run shows).
@@ -6719,6 +6756,35 @@ mod tests {
                 EngineEvent::Note(n) if n.contains("time budget reached")
             )),
             "the graceful budget wind-down note fires: {:?}",
+            rec.events()
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_loop_in_plan_mode_stops_read_only_without_driving_writes() {
+        // A director BUILD spawned in Plan (read-only) mode must STOP cleanly with the
+        // read-only notice, NOT drive the plan and deny-storm every write (the reported
+        // opencode "edit -> pyproject.toml 按拒绝处理 -> 0 source files" storm). The guard
+        // returns BEFORE any turn is driven, so an empty FakeSession is never touched.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        o.mode = TrustMode::Plan;
+        let route = build_route();
+        let outcome =
+            drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(
+            matches!(outcome, DirectorLoopOutcome::Done { .. }),
+            "plan mode settles cleanly (Done, not a deny-storm): {outcome:?}"
+        );
+        assert!(
+            rec.events().iter().any(|e| matches!(
+                e,
+                EngineEvent::Note(n) if n.contains("计划模式") || n.contains("plan")
+            )),
+            "the read-only plan-mode notice fires: {:?}",
             rec.events()
         );
     }

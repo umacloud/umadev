@@ -893,20 +893,25 @@ fn brain_to_route(brain: &BrainRoute, requirement: &str) -> RoutePlan {
     });
     // Domain floor for the TEAM (not the intent): a brain that sized a BUILD as the broad
     // `Greenfield` - the default / lazy pick, especially from a weaker third-party model - but
-    // whose requirement carries a CLEAR single-domain signal (a pure backend task, a pure
-    // frontend task) should scope to that domain so it does not convene irrelevant reviewers
-    // (the reported "优化后端代码 pulls in a uiux-designer + frontend-engineer" waste). This
-    // does NOT re-route intent - the brain still decided BUILD; it only narrows the roster to
-    // the domain the deterministic classifier is CONFIDENT about, and ONLY narrows
-    // Greenfield -> a single-domain kind (never widens, never touches a lean/doc kind), so a
-    // genuine full-stack build the brain called greenfield stays greenfield unless the text is
-    // unambiguously one domain.
-    if class == RouteClass::Build && kind == TaskKind::Greenfield {
-        if let single @ (TaskKind::BackendOnly | TaskKind::FrontendOnly) =
-            crate::planner::classify(requirement)
-        {
-            kind = single;
-        }
+    // whose requirement is a PURE BACKEND task should scope to BackendOnly so it does not
+    // convene irrelevant UI reviewers (the reported "优化后端代码 pulls in a uiux-designer +
+    // frontend-engineer" waste). This does NOT re-route intent - the brain still decided BUILD.
+    //
+    // ONE-DIRECTION ONLY (Greenfield -> BackendOnly). We deliberately do NOT narrow
+    // Greenfield -> FrontendOnly: a full-stack app (a blog, a shop, a dashboard) is almost
+    // always described purely by its PAGES ("博客系统,有文章列表和文章详情页面") with no
+    // backend keyword, so `classify` reads FrontendOnly on mere UI-keyword presence — but the
+    // app STILL needs persistence. Narrowing it would DROP the backend phase entirely and
+    // ship a frontend-only shell with no data layer, overruling the brain's authoritative
+    // greenfield on a weak heuristic. A genuinely frontend-only build is caught upstream (the
+    // brain routes it as a lean kind, or `classify`'s simple-build/`纯前端` path → Light).
+    // This also makes `brain_to_route` consistent with the fork-based `reconcile` path, which
+    // already trusts the brain's greenfield over a frontend-leaning floor.
+    if class == RouteClass::Build
+        && kind == TaskKind::Greenfield
+        && crate::planner::classify(requirement) == TaskKind::BackendOnly
+    {
+        kind = TaskKind::BackendOnly;
     }
     // Depth from the brain's complexity. A garbled/missing `complexity` on a real
     // product BUILD must NOT default to `Fast`: a Fast build is non-deliberate
@@ -1287,6 +1292,29 @@ mod tests {
         assert!(
             !p.team.contains(&Seat::UiuxDesigner) && !p.team.contains(&Seat::FrontendEngineer),
             "a pure-backend build convenes NO UI reviewers: {:?}",
+            p.team
+        );
+    }
+
+    #[tokio::test]
+    async fn brain_greenfield_stays_greenfield_for_a_page_described_fullstack_build() {
+        // HIGH #4: a full-stack app described purely by its PAGES ("博客系统,有文章列表和文章
+        // 详情页面") has a frontend keyword (页面) and NO backend keyword, so the deterministic
+        // classifier reads FrontendOnly. The brain authoritatively called it greenfield — the
+        // domain floor must NOT narrow it to FrontendOnly and DROP the backend phase; a blog
+        // needs persistence. It stays Greenfield with the full roster (incl. the backend seat).
+        let brain =
+            TriageBrain("{\"class\":\"build\",\"kind\":\"greenfield\",\"complexity\":\"complex\"}");
+        let p = route_via_brain(&brain, "做一个博客系统,有文章列表和文章详情页面").await;
+        assert_eq!(p.class, RouteClass::Build);
+        assert_eq!(
+            p.kind,
+            TaskKind::Greenfield,
+            "a page-described full-stack build must NOT be narrowed to frontend-only"
+        );
+        assert!(
+            p.team.contains(&Seat::BackendEngineer),
+            "the backend seat must survive: {:?}",
             p.team
         );
     }

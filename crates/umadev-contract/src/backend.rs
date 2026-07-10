@@ -448,25 +448,27 @@ fn extract_py(file: &str, src: &str, routes: &mut Vec<BackendRoute>) {
 // Rust — axum / actix
 // ---------------------------------------------------------------------------
 
-/// axum router: `.route("/x", get(h).post(h2))`. Captures the path plus a
-/// bounded window of the handler expression, which is then scanned for method
-/// constructor fns.
+/// axum route ANCHOR: `.route("/x",` — matches only up to the comma so the match
+/// end marks the START of this route's handler window. The window itself is
+/// bounded per-route in [`extract_rust_chained`] (NOT captured here), because a
+/// greedy `[^;]{0,240}` handler capture swallowed sibling `.route(...)` calls in
+/// an idiomatic `Router::new().route(a).route(b).route(c);` chain.
 fn rust_axum_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\.route\s*\(\s*\x22(?P<path>/[^\x22]*)\x22\s*,\s*(?P<handlers>[^;]{0,240})")
+        Regex::new(r"\.route\s*\(\s*\x22(?P<path>/[^\x22]*)\x22\s*,")
             .expect("rust axum regex well-formed")
     })
 }
 
-/// actix resource: `web::resource("/x").route(web::get().to(h))`.
+/// actix resource ANCHOR: `web::resource("/x")` — matches up to the closing
+/// paren so the match end marks the START of the `.route(web::get()…)` handler
+/// window, which [`extract_rust_chained`] bounds per-resource.
 fn rust_actix_resource_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"web::resource\s*\(\s*\x22(?P<path>/[^\x22]*)\x22\s*\)(?P<handlers>[^;]{0,240})",
-        )
-        .expect("rust actix resource regex well-formed")
+        Regex::new(r"web::resource\s*\(\s*\x22(?P<path>/[^\x22]*)\x22\s*\)")
+            .expect("rust actix resource regex well-formed")
     })
 }
 
@@ -491,24 +493,49 @@ fn rust_verb_regex() -> &'static Regex {
     })
 }
 
+/// Scan `src` for every `anchor`-matched route registration and attribute the
+/// verbs found in each route's OWN handler window — bounded by the NEXT route
+/// anchor or the statement terminator `;`, whichever comes first.
+///
+/// The old single-regex `[^;]{0,240}` handler capture swallowed sibling
+/// `.route(...)` calls in an idiomatic `Router::new().route(a).route(b).route(c);`
+/// chain: non-overlapping `captures_iter` then resumed PAST the swallowed
+/// siblings, so only the first path was extracted — with the siblings' verbs
+/// mis-credited to it (a phantom `DELETE /api/users`, a dropped `/api/health`).
+/// The `regex` crate has no look-around, so we can't say "stop before the next
+/// `.route(`" in the pattern; instead we collect the anchor positions and bound
+/// each handler window at the next anchor's start. Fixes both the dropped paths
+/// and the phantom verbs.
+fn extract_rust_chained(anchor: &Regex, file: &str, src: &str, routes: &mut Vec<BackendRoute>) {
+    // (handler-window start, path) for every anchor, in source order.
+    let anchors: Vec<(usize, &str)> = anchor
+        .captures_iter(src)
+        .filter_map(|c| Some((c.get(0)?.end(), c.name("path")?.as_str())))
+        .collect();
+    for (i, &(hstart, path)) in anchors.iter().enumerate() {
+        // Window ends at the next route anchor OR this statement's `;`, whichever
+        // is first — so a route only ever owns the verbs in its OWN handler expr.
+        let next_anchor = anchors.get(i + 1).map_or(src.len(), |&(start, _)| start);
+        let next_semi = src[hstart..].find(';').map_or(src.len(), |p| hstart + p);
+        let handlers = &src[hstart..next_anchor.min(next_semi)];
+        let mut any_method = false;
+        for vc in rust_verb_regex().captures_iter(handlers) {
+            let verb = vc.name("m").map(|m| m.as_str()).unwrap_or("");
+            if let Some(m) = parse_method(verb) {
+                push_route(routes, file, m.into_method(), path);
+                any_method = true;
+            }
+        }
+        if !any_method {
+            push_route(routes, file, None, path);
+        }
+    }
+}
+
 /// Extract every Rust registration form from a (comment-stripped) file.
 fn extract_rust(file: &str, src: &str, routes: &mut Vec<BackendRoute>) {
     for regex in [rust_axum_regex(), rust_actix_resource_regex()] {
-        for cap in regex.captures_iter(src) {
-            let path = cap.name("path").map(|m| m.as_str()).unwrap_or("");
-            let handlers = cap.name("handlers").map(|m| m.as_str()).unwrap_or("");
-            let mut any_method = false;
-            for vc in rust_verb_regex().captures_iter(handlers) {
-                let verb = vc.name("m").map(|m| m.as_str()).unwrap_or("");
-                if let Some(m) = parse_method(verb) {
-                    push_route(routes, file, m.into_method(), path);
-                    any_method = true;
-                }
-            }
-            if !any_method {
-                push_route(routes, file, None, path);
-            }
-        }
+        extract_rust_chained(regex, file, src, routes);
     }
     for cap in rust_actix_attr_regex().captures_iter(src) {
         let verb = cap.name("m").map(|m| m.as_str()).unwrap_or("");
@@ -1157,6 +1184,44 @@ mod tests {
         );
         assert!(paths(&routes).contains(&(Some(HttpVerb::Get), "/api/users")));
         assert!(paths(&routes).contains(&(Some(HttpVerb::Post), "/api/users")));
+    }
+
+    #[test]
+    fn axum_chained_routes_each_own_their_verbs() {
+        // The idiomatic single-statement `.route(a).route(b).route(c);` chain. The old
+        // `[^;]{0,240}` handler window swallowed the sibling `.route`s into the first
+        // route's window, so only `/api/users` extracted — credited with EVERY verb in
+        // the chain (a phantom DELETE /api/users) while `/api/users/:id` and
+        // `/api/health` were dropped. Each route must now own ONLY its own verbs.
+        let routes = extract_from_file(
+            "main.rs",
+            "let app = Router::new()\
+             .route(\"/api/users\", get(list).post(create))\
+             .route(\"/api/users/:id\", get(one).delete(del))\
+             .route(\"/api/health\", get(health));",
+            Lang::Rust,
+        );
+        let p = paths(&routes);
+        assert!(p.contains(&(Some(HttpVerb::Get), "/api/users")), "{p:?}");
+        assert!(p.contains(&(Some(HttpVerb::Post), "/api/users")), "{p:?}");
+        assert!(
+            p.contains(&(Some(HttpVerb::Get), "/api/users/:id")),
+            "{p:?}"
+        );
+        assert!(
+            p.contains(&(Some(HttpVerb::Delete), "/api/users/:id")),
+            "{p:?}"
+        );
+        assert!(p.contains(&(Some(HttpVerb::Get), "/api/health")), "{p:?}");
+        // No verb leaks across routes: /api/users must NOT carry the sibling's DELETE.
+        assert!(
+            !p.contains(&(Some(HttpVerb::Delete), "/api/users")),
+            "phantom DELETE leaked onto /api/users: {p:?}"
+        );
+        assert!(
+            !p.contains(&(Some(HttpVerb::Post), "/api/users/:id")),
+            "phantom POST leaked onto /api/users/:id: {p:?}"
+        );
     }
 
     #[test]
