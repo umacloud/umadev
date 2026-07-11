@@ -7504,11 +7504,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_drives_high_blast_radius_ready_peer_first_keeping_dag_order() {
+    async fn scheduler_drives_ready_peers_in_plan_order_keeping_dag() {
         // Source seeded → every source-present step PASSES in one turn, so the schedule
-        // walks cleanly and we can read the pure DRIVE order. `schema` (radius 2) must be
-        // driven BEFORE `config` (radius 0) even though `config` is earlier in plan order
-        // — the expensive-to-unwind upstream work goes first. And `api`/`ui` (which
+        // walks cleanly and we can read the pure DRIVE order. Ready peers run in PLAN ORDER,
+        // so `config` (first in the plan) is driven BEFORE `schema` — what runs matches what
+        // the checklist shows (no "skipped task 3, jumped to task 4"). And `api`/`ui` (which
         // depend on `schema`) must run AFTER `schema`, never before (DAG order intact).
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
@@ -7533,10 +7533,10 @@ mod tests {
 
         let order = active_order(&rec);
         let pos = |id: &str| order.iter().position(|x| x == id).expect("step ran");
-        // Priority among the initial ready PEERS: schema (radius 2) before config (0).
+        // Order among the initial ready PEERS is PLAN ORDER: config (first) before schema.
         assert!(
-            pos("schema") < pos("config"),
-            "the higher-blast-radius peer is scheduled first: {order:?}"
+            pos("config") < pos("schema"),
+            "ready peers run in plan order (config before schema): {order:?}"
         );
         // DAG order preserved: a dependent never runs before its prerequisite.
         assert!(
@@ -7557,19 +7557,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rework_prioritizes_the_higher_blast_radius_blocking_peer() {
-        // NO source → both ready peers (schema, config) FAIL their source-present
-        // acceptance and are reworked, then marked Blocked. The blast-radius scheduler
-        // must rework the higher-impact `schema` (radius 2) FIRST — all of schema's
-        // directives land before any of config's. (schema's block then strands api/ui,
-        // which are pruned — its handling obviates their rework.)
+    async fn rework_drives_ready_peers_in_plan_order() {
+        // NO source → both ready peers (config, schema) FAIL their source-present
+        // acceptance and are reworked, then marked Blocked. The scheduler drives ready peers
+        // in PLAN ORDER, so `config` (first in the plan) is reworked FIRST. (schema's block
+        // then strands api/ui, which are pruned.)
         let tmp = tempfile::TempDir::new().unwrap();
         // NO source seeded.
         let (events, rec) = sink();
         // Plenty of default-completing turns; a FUTURE deadline so the full per-step fix
         // budget runs (isolates the rework ORDER from the wall-clock ceiling).
         let mut sess = FakeSession::new(vec![], false, "");
-        let sent = sess.sent_handle();
         let mut o = opts(tmp.path());
         o.requirement = "做一个完整的产品".to_string();
         let route = build_route();
@@ -7587,7 +7585,7 @@ mod tests {
         .await;
         assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
 
-        // schema is reworked before config: schema becomes Active first.
+        // config is reworked before schema: config becomes Active first.
         let order = active_order(&rec);
         let pos = |id: &str| order.iter().position(|x| x == id);
         assert!(
@@ -7595,24 +7593,13 @@ mod tests {
             "both failing peers were driven: {order:?}"
         );
         assert!(
-            pos("schema") < pos("config"),
-            "the higher-blast-radius blocking peer is reworked first: {order:?}"
+            pos("config") < pos("schema"),
+            "the plan-order-first peer (config) is reworked first: {order:?}"
         );
-        // Directive order confirms it at the turn level: every 'schema' directive lands
-        // before the first 'config' directive (schema's whole rework finishes first).
-        let sent = sent.lock().unwrap();
-        let last_schema = sent
-            .iter()
-            .rposition(|d| d.contains("Build the schema"))
-            .expect("schema was driven");
-        let first_config = sent
-            .iter()
-            .position(|d| d.contains("Build the config"))
-            .expect("config was driven");
-        assert!(
-            last_schema < first_config,
-            "schema's rework completes before config's begins: {sent:?}"
-        );
+        // (`active_order` above is the authoritative drive-order signal — one PlanStepStatus
+        // `active` event per step as it's picked. A per-directive text check is unreliable
+        // here because every step directive RECITES the whole plan, so a pending peer's title
+        // appears in the active peer's directives too.)
         // schema ended Blocked; its dependents api/ui were stranded (pruned), not
         // reworked — the upstream block obviated the downstream rework.
         use crate::plan_state::StepStatus;

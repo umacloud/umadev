@@ -644,11 +644,19 @@ impl Plan {
     /// plan's original order (the sort is stable → deterministic). Pure.
     #[must_use]
     pub fn ready_steps_prioritized(&self) -> Vec<&PlanStep> {
-        let radius = self.blast_radius_map();
-        let mut ready = self.ready_steps();
-        // Stable sort by DESCENDING blast radius; ties keep original (plan) order.
-        ready.sort_by_key(|s| std::cmp::Reverse(radius.get(s.id.as_str()).copied().unwrap_or(0)));
-        ready
+        // Schedule ready peers in PLAN ORDER (top-to-bottom), so what RUNS matches what the
+        // checklist SHOWS — a user reads the plan as an ordered list and expects step N to be
+        // driven before step N+1. `ready_steps` already yields plan order, so we keep it.
+        //
+        // An earlier version reordered ready peers by DESCENDING blast radius (run the
+        // higher-fan-out peer first). That surfaced as the repeatedly-reported "it skipped
+        // task 3 and jumped to task 4": a frontend step (many dependents) outranked its
+        // independent qa-test-authoring peer, which then sat `pending` while a later step ran —
+        // and it ran code BEFORE its test-authoring peer, against test-first discipline.
+        // Correctness is unaffected either way: `ready_steps` already guarantees every
+        // returned step's dependencies are `Done`, so a step still never runs before a
+        // prerequisite; this only chooses the order among independent, already-ready peers.
+        self.ready_steps()
     }
 
     /// Build the **downstream** adjacency of the plan DAG: maps each step id to the ids
@@ -1980,28 +1988,26 @@ mod tests {
     }
 
     #[test]
-    fn ready_steps_prioritized_orders_ready_peers_by_blast_radius() {
-        // Two independent ready peers with DIFFERENT blast radii, plus two steps that
-        // depend on the high-radius one. `config` is listed FIRST in plan order but has
-        // radius 0; `schema` has radius 2 (api + ui depend on it). The prioritised
-        // schedule must surface `schema` BEFORE `config` even though plan order is the
-        // reverse — the upstream, expensive-to-unwind work is driven first.
+    fn ready_steps_prioritized_keeps_plan_order_among_ready_peers() {
+        // Independent ready peers are scheduled in PLAN ORDER (top-to-bottom), so what RUNS
+        // matches what the checklist SHOWS — no "it skipped task 3 and jumped to task 4". An
+        // earlier blast-radius reorder ran a high-fan-out peer before an earlier one.
         let mut p = plan(vec![
-            step("config", &[]),      // radius 0, first in plan order
-            step("schema", &[]),      // radius 2 (api, ui)
+            step("config", &[]),      // first in plan order
+            step("schema", &[]),      // second; api + ui depend on it
             step("api", &["schema"]), // not ready until schema is Done
             step("ui", &["schema"]),
         ]);
         // Plain readiness is plan order: config, schema (api/ui gated by schema).
         let ready: Vec<_> = p.ready_steps().iter().map(|s| s.id.clone()).collect();
         assert_eq!(ready, vec!["config", "schema"]);
-        // Prioritised readiness puts the higher-blast-radius peer first.
+        // Prioritised readiness KEEPS plan order: config BEFORE schema.
         let prio: Vec<_> = p
             .ready_steps_prioritized()
             .iter()
             .map(|s| s.id.clone())
             .collect();
-        assert_eq!(prio, vec!["schema", "config"]);
+        assert_eq!(prio, vec!["config", "schema"]);
         // DAG correctness: a dependent never appears before its prerequisite is Done —
         // api/ui are absent until schema completes.
         assert!(!prio.contains(&"api".to_string()));
