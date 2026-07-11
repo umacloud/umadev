@@ -1823,6 +1823,30 @@ async fn drive_build_step(
         instruction.push_str("\n\n## Known pitfalls to avoid (from past runs)\n");
         instruction.push_str(pitfalls.trim());
     }
+    // REQUIRED DELIVERABLE PATH(S): a step's acceptance verifies a SPECIFIC file exists
+    // (a doc-first PRD/architecture/UIUX at `output/<slug>-*.md`, a named source file).
+    // A weak base often writes the deliverable to a plausible-but-wrong path (e.g. under
+    // `docs/`), which fails the file-exists/contains check and stalls the step in rework.
+    // Naming the exact path(s) the acceptance checks removes that ambiguity up front.
+    let required_paths: Vec<&str> = step
+        .evidence
+        .iter()
+        .filter_map(|e| match e {
+            crate::plan_state::EvidenceContract::FileExists { path }
+            | crate::plan_state::EvidenceContract::FileContains { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !required_paths.is_empty() {
+        instruction.push_str(
+            "\n\n## Required deliverable path(s)\nWrite this step's deliverable to EXACTLY \
+             the path(s) below — the acceptance verifies the file exists there, so writing \
+             it anywhere else (e.g. under docs/) fails the step:\n",
+        );
+        for p in &required_paths {
+            instruction.push_str(&format!("- `{p}`\n"));
+        }
+    }
 
     // TEST-INTEGRITY BASELINE (UD-QA-001). Snapshot the project's TEST surface
     // BEFORE this step's doer turn(s) so the deterministic floor can detect
@@ -4902,6 +4926,34 @@ mod tests {
         std::fs::write(root.join("app.ts"), "export const x = 1;").unwrap();
     }
 
+    /// Seed the three core-doc deliverables the doc-first skeleton requires, so a
+    /// deliberate step-driven build's prepended PM/architect/UIUX doc steps pass their
+    /// FileContains/FileExists acceptance and the plan proceeds to the code steps.
+    /// Also seeds an execution plan citing the PRD's `FR-001` so the requirement-
+    /// coverage floor is satisfied — otherwise the PRD's declared `FR-001` reads as an
+    /// uncovered requirement, failing the contract floor a backend step verifies against
+    /// (`ContractMatches`) and stalling the build at the frontend phase.
+    fn seed_core_docs(root: &std::path::Path) {
+        let out = root.join("output");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("demo-prd.md"), "# PRD\n\nFR-001 login\n").unwrap();
+        std::fs::write(
+            out.join("demo-architecture.md"),
+            "# Architecture\n\n## API\nGET /api/x\n",
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("demo-uiux.md"),
+            "# UI/UX\n\ndesign tokens + component states\n",
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("demo-execution-plan.md"),
+            "# Execution plan\n\n- FR-001 login covered by the auth task\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn real_usage_is_preferred_over_the_estimate() {
         // F3: when the base reports REAL per-turn usage on `TurnDone`, the consumer
@@ -6918,12 +6970,14 @@ mod tests {
         // doer's reply text threads back through `SummonResult.text`.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
+        seed_core_docs(tmp.path()); // the doc-first skeleton prepends 3 doc steps
         let (events, rec) = sink();
         let plan_json = r#"{"steps":[
             {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
             {"id":"ui","title":"Build the UI","seat":"frontend-engineer","kind":"build","depends_on":["scaffold"],"acceptance":"source-present"}
         ],"risks":["state mgmt"],"open_questions":[]}"#;
         // Turn 1 = the JSON plan (main-session planning turn); turn 2 = the build.
+        // Extra doc/build steps beyond these default-complete on the FakeSession.
         let turns = vec![
             text_turn(plan_json),
             text_turn("Built the whole app end to end. Done."),
@@ -6939,22 +6993,26 @@ mod tests {
             drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
         assert!(matches!(outcome, DirectorLoopOutcome::Done { .. }));
 
-        // The plan was posted with both steps.
+        // The plan was posted with all 5 steps (3 doc-first + the 2 brain build steps).
         assert!(
-            rec.count(|e| matches!(e, EngineEvent::PlanPosted { total, .. } if *total == 2)) == 1,
-            "a 2-step plan was posted: {:?}",
+            rec.count(|e| matches!(e, EngineEvent::PlanPosted { total, .. } if *total == 5)) == 1,
+            "a 5-step plan (3 doc + 2 brain) was posted: {:?}",
             rec.events()
         );
-        // At least one step was surfaced as active (the ready scaffold step).
+        // At least one step was surfaced as active (the ready PRD doc step).
         assert!(
             rec.count(
                 |e| matches!(e, EngineEvent::PlanStepStatus { status, .. } if status == "active")
             ) >= 1,
             "a ready step ticked active"
         );
-        // It was persisted to disk and is loadable.
+        // It was persisted to disk and is loadable, and OPENS with the PRD doc step.
         let loaded = crate::plan_state::load(tmp.path()).expect("plan persisted");
-        assert_eq!(loaded.steps.len(), 2);
+        assert_eq!(loaded.steps.len(), 5);
+        assert_eq!(
+            loaded.steps[0].id, "umadev-phase-prd",
+            "the doc-first skeleton opens the plan with the PRD step"
+        );
         // The step-driven loop drove the doer turn and threaded its reply back.
         match outcome {
             DirectorLoopOutcome::Done { reply } => assert!(reply.contains("Built the whole app")),
@@ -7043,15 +7101,20 @@ mod tests {
         // and ticks each step Done on the checklist.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path()); // source present → each step's acceptance passes
+        seed_core_docs(tmp.path()); // the doc-first skeleton prepends 3 doc steps
         let (events, rec) = sink();
         let plan_json = r#"{"steps":[
             {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
             {"id":"ui","title":"Build the UI","seat":"frontend-engineer","kind":"build","depends_on":["scaffold"],"acceptance":"source-present"}
         ],"risks":[],"open_questions":[]}"#;
-        // Turn 1 = plan JSON; turn 2 = scaffold doer; turn 3 = ui doer. The
+        // Turn 1 = plan JSON; the deliberate route prepends 3 doc steps (PRD /
+        // architecture / UIUX), each consuming a doer turn BEFORE scaffold + ui. The
         // FakeSession default-completes any further turns (the final QC gate).
         let turns = vec![
             text_turn(plan_json),
+            text_turn("Wrote the PRD. Done."),
+            text_turn("Wrote the architecture. Done."),
+            text_turn("Wrote the UI/UX doc. Done."),
             text_turn("Scaffolded the app skeleton. Done."),
             text_turn("Built the UI. Done."),
         ];
@@ -7117,13 +7180,19 @@ mod tests {
         // and reflects the completed steps (backend completed → `backend`/`delivery`).
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path()); // source present → each step's acceptance passes
+        seed_core_docs(tmp.path()); // the doc-first skeleton prepends 3 doc steps
         let (events, _rec) = sink();
         let plan_json = r#"{"steps":[
             {"id":"fe","title":"Build the frontend","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
             {"id":"be","title":"Build the backend","seat":"backend-engineer","kind":"build","depends_on":["fe"],"acceptance":"source-present"}
         ],"risks":[],"open_questions":[]}"#;
+        // The deliberate Greenfield route prepends 3 doc steps (PRD / architecture /
+        // UIUX), each consuming a doer turn BEFORE the fe + be code steps.
         let turns = vec![
             text_turn(plan_json),
+            text_turn("Wrote the PRD. Done."),
+            text_turn("Wrote the architecture. Done."),
+            text_turn("Wrote the UI/UX doc. Done."),
             text_turn("Built the frontend. Done."),
             text_turn("Built the backend. Done."),
         ];
@@ -7220,16 +7289,22 @@ mod tests {
         // back; here the clamp guarantees a non-decreasing phase rank at every Done.)
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
+        seed_core_docs(tmp.path()); // the doc-first skeleton prepends 3 doc steps
         let (events, _rec) = sink();
-        // backend (later phase) is the FIRST step; frontend (earlier phase) depends on
-        // it — so the EARLIER-phase step finishes LAST. The clamp must keep the phase
+        // backend (later phase) is the FIRST code step; frontend (earlier phase) depends
+        // on it — so the EARLIER-phase step finishes LAST. The clamp must keep the phase
         // at `backend` after the trailing frontend step, never regress to `frontend`.
         let plan_json = r#"{"steps":[
             {"id":"be","title":"Build the backend","seat":"backend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"},
             {"id":"fe","title":"Polish the frontend","seat":"frontend-engineer","kind":"build","depends_on":["be"],"acceptance":"source-present"}
         ],"risks":[],"open_questions":[]}"#;
+        // The deliberate Greenfield route prepends 3 doc steps (PRD / architecture /
+        // UIUX), each consuming a doer turn BEFORE the be + fe code steps.
         let turns = vec![
             text_turn(plan_json),
+            text_turn("Wrote the PRD. Done."),
+            text_turn("Wrote the architecture. Done."),
+            text_turn("Wrote the UI/UX doc. Done."),
             text_turn("Built the backend. Done."),
             text_turn("Polished the frontend. Done."),
         ];
@@ -7380,11 +7455,16 @@ mod tests {
         // single end-to-end turn — the build is never lost to a scheduling failure.
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
+        // Seed the core docs so the doc-first skeleton's FIRST step (the PRD doc) has its
+        // deliverable on disk — it then accepts on round 0 WITHOUT driving a turn
+        // (drove=false), which is exactly the first-step "couldn't drive" bail path this
+        // test exercises. The partial (no-TurnDone) turn is that PRD step's round-0 summon.
+        seed_core_docs(tmp.path());
         let (events, rec) = sink();
         let plan_json = r#"{"steps":[
             {"id":"a","title":"Step A","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
         ],"risks":[],"open_questions":[]}"#;
-        // Turn 1 = plan JSON. Turn 2 (the first step's doer) has NO TurnDone → the
+        // Turn 1 = plan JSON. Turn 2 (the first doc step's doer) has NO TurnDone → the
         // session drains to None mid-turn → summon's pump returns done=false with no
         // text, so the first step "didn't drive" → fall back to the single turn.
         let turns = vec![

@@ -833,14 +833,17 @@ impl Plan {
     /// permanently un-ready, a silent deadlock). Returns `None` if nothing usable
     /// survives (the caller then fail-opens to no plan).
     ///
-    /// `doc_slug` carries the build's slug ONLY on a DELIBERATE route (`Some(slug)`)
-    /// — then the core-doc evidence floor binds any PM/architect BUILD step to
-    /// actually produce its PRD/architecture doc (see
-    /// [`Self::enforce_doc_evidence_floor`]). `None` (a lean/quick route, a re-plan
-    /// merge, or a test) skips that floor — the smaller path never demands the full
-    /// doc set, and finalize honestly reports any missing doc rather than fabricating
-    /// it.
-    fn normalized(mut self, doc_slug: Option<&str>) -> Option<Self> {
+    /// `doc_skeleton` carries `(slug, needs_ui)` ONLY on a DELIBERATE route
+    /// (`Some((slug, needs_ui))`) — then TWO doc-first guarantees fire: first
+    /// [`Self::ensure_doc_first_skeleton`] INSERTS the missing PM/architect (and, when
+    /// `needs_ui`, UIUX) doc BUILD steps at the head of the plan and chains later code
+    /// steps behind them, so a backend-first brain plan can never skip the three core
+    /// docs; then the core-doc evidence floor binds each such seat to actually PRODUCE
+    /// its PRD/architecture/UIUX doc (see [`Self::enforce_doc_evidence_floor`]). `None`
+    /// (a lean/quick route, a re-plan merge, or a test) skips BOTH — the smaller path
+    /// never demands the full doc set, and finalize honestly reports any missing doc
+    /// rather than fabricating it.
+    fn normalized(mut self, doc_skeleton: Option<(&str, bool)>) -> Option<Self> {
         let mut seen: HashSet<String> = HashSet::new();
         self.steps.retain(|s| {
             let id = s.id.trim();
@@ -848,6 +851,16 @@ impl Plan {
         });
         if self.steps.is_empty() {
             return None;
+        }
+        // DOC-FIRST SKELETON (deliberate builds only) — before any structural ordering,
+        // seat the three core-doc BUILD steps (PRD / architecture / [UIUX]) at the head
+        // of the plan when the brain's plan omitted them, so a weak base that jumped
+        // straight to backend code is forced through docs first. Idempotent + fail-open;
+        // `None` (lean / quick / re-plan / test) skips it. `enforce_contract_first`
+        // (below) then wires the frontend/backend build steps behind the architect seat,
+        // so code can't start before the docs.
+        if let Some((slug, needs_ui)) = doc_skeleton {
+            self.ensure_doc_first_skeleton(slug, needs_ui);
         }
         // M5: build the id set from the TRIMMED id — the deps below are trimmed
         // before the `ids.contains(d)` membership test, so an un-trimmed id here
@@ -905,7 +918,7 @@ impl Plan {
         // pins BuildClean onto a doc-authoring step (which can NEVER make the project build -
         // the plan would stall at its first doc step, reworking "make the build clean" at a
         // PM who writes no code).
-        if let Some(slug) = doc_slug {
+        if let Some((slug, _needs_ui)) = doc_skeleton {
             self.enforce_doc_evidence_floor(slug);
         }
         self.enforce_falsifiability_floor();
@@ -1161,10 +1174,108 @@ impl Plan {
                     path: format!("output/{slug}-architecture.md"),
                     needle: "API".to_string(),
                 },
+                Seat::UiuxDesigner => EvidenceContract::FileExists {
+                    path: format!("output/{slug}-uiux.md"),
+                },
                 _ => continue, // every other seat authors no core narrative doc
             };
             push_unique(&mut s.evidence, contract);
         }
+    }
+
+    /// **Doc-first skeleton (deliberate builds only)** — GUARANTEE the plan opens with
+    /// the three core-doc BUILD steps (PRD → architecture → [UIUX]) even when the
+    /// brain's plan omitted them, so a weak base that decomposed the requirement into
+    /// backend code with no docs is still forced through docs FIRST. For each core-doc
+    /// seat missing from the plan (matched by seat + [`StepKind::Build`]), a step is
+    /// synthesised and PREPENDED, chained in order (PRD → architecture → UIUX) so the
+    /// docs run sequentially; a seat the brain ALREADY seated is left in place (its id
+    /// still anchors the chain, so no duplicate is inserted). When `needs_ui`, the UIUX
+    /// doc is part of the chain and every frontend BUILD step gains a `depends_on` on it
+    /// (design system before the UI). Any code step is later wired behind the architect
+    /// seat by [`Self::enforce_contract_first`], so implementation can never start
+    /// before the docs land. Idempotent (an already-doc-first plan is unchanged) and
+    /// fail-open (no code step / all docs present ⇒ a no-op). Pure over `self`.
+    fn ensure_doc_first_skeleton(&mut self, slug: &str, needs_ui: bool) {
+        use crate::critics::Seat;
+        let mut wanted: Vec<(Seat, &'static str, String, EvidenceContract)> = vec![
+            (
+                Seat::ProductManager,
+                "umadev-phase-prd",
+                "锁定产品需求文档 PRD（功能需求 FR-、验收口径、用户闭环路径）".to_string(),
+                EvidenceContract::FileContains {
+                    path: format!("output/{slug}-prd.md"),
+                    needle: "FR-".to_string(),
+                },
+            ),
+            (
+                Seat::Architect,
+                "umadev-phase-architecture",
+                "输出架构文档（分层 / 分包、数据模型、API 契约、技术栈选型与理由）".to_string(),
+                EvidenceContract::FileContains {
+                    path: format!("output/{slug}-architecture.md"),
+                    needle: "API".to_string(),
+                },
+            ),
+        ];
+        if needs_ui {
+            wanted.push((
+                Seat::UiuxDesigner,
+                "umadev-phase-uiux",
+                "输出 UI/UX 设计文档（设计令牌、排版系统、页面骨架、组件状态）".to_string(),
+                EvidenceContract::FileExists {
+                    path: format!("output/{slug}-uiux.md"),
+                },
+            ));
+        }
+        let mut inserted: Vec<PlanStep> = Vec::new();
+        let mut prev_doc_id: Option<String> = None;
+        let mut uiux_doc_id: Option<String> = None;
+        for (seat, id, title, evidence) in wanted {
+            if let Some(existing) = self
+                .steps
+                .iter()
+                .find(|s| s.seat == seat && s.kind == StepKind::Build)
+            {
+                prev_doc_id = Some(existing.id.clone());
+                if seat == Seat::UiuxDesigner {
+                    uiux_doc_id = Some(existing.id.clone());
+                }
+                continue;
+            }
+            let step = PlanStep {
+                id: id.to_string(),
+                title,
+                seat,
+                kind: StepKind::Build,
+                depends_on: prev_doc_id.iter().cloned().collect(),
+                acceptance: AcceptanceSpec::SourcePresent,
+                evidence: vec![evidence],
+                status: StepStatus::Pending,
+            };
+            prev_doc_id = Some(step.id.clone());
+            if seat == Seat::UiuxDesigner {
+                uiux_doc_id = Some(step.id.clone());
+            }
+            inserted.push(step);
+        }
+        if inserted.is_empty() {
+            return;
+        }
+        if let Some(ref uiux) = uiux_doc_id {
+            for s in &mut self.steps {
+                if s.kind == StepKind::Build
+                    && s.seat == Seat::FrontendEngineer
+                    && &s.id != uiux
+                    && !s.depends_on.contains(uiux)
+                {
+                    s.depends_on.push(uiux.clone());
+                }
+            }
+        }
+        let mut head = inserted;
+        head.append(&mut self.steps);
+        self.steps = head;
     }
 }
 
@@ -1432,15 +1543,20 @@ pub async fn synthesize_plan(
         risks: raw.risks,
         open_questions: raw.open_questions,
     };
-    // Enforce the core-doc evidence floor ONLY on a deliberate route (pass the slug);
-    // a lean/quick build never demands the full doc set. This binds the PM/architect
-    // seat to actually produce its PRD/architecture (a verified deliverable), so the
-    // doc is real up front — never a template stub retro-fitted at finalize.
-    let doc_slug = route
-        .depth
-        .is_deliberate()
-        .then(|| options.effective_slug());
-    plan.normalized(doc_slug.as_deref())
+    // Enforce the DOC-FIRST skeleton + core-doc evidence floor ONLY on a deliberate
+    // route; a lean/quick build never demands the full doc set. The skeleton SEATS the
+    // three core-doc steps up front (so a backend-first brain plan can't skip them) and
+    // the floor binds each such seat to actually produce its PRD/architecture/UIUX (a
+    // verified deliverable), so the docs are real up front — never a template stub
+    // retro-fitted at finalize. `needs_ui` is true only for a UI-bearing build.
+    let doc_skeleton = route.depth.is_deliberate().then(|| {
+        let needs_ui = matches!(
+            route.kind,
+            crate::planner::TaskKind::Greenfield | crate::planner::TaskKind::FrontendOnly
+        );
+        (options.effective_slug(), needs_ui)
+    });
+    plan.normalized(doc_skeleton.as_ref().map(|(s, ui)| (s.as_str(), *ui)))
 }
 
 /// Map ONE tolerant [`BrainStep`] into an owned [`PlanStep`] — the shared node parse
@@ -2594,7 +2710,7 @@ mod tests {
                 AcceptanceSpec::SourcePresent,
             ),
         ])
-        .normalized(Some("demo"))
+        .normalized(Some(("demo", true)))
         .expect("usable");
         assert!(
             ev_of(&p, "prd").contains(&EvidenceContract::FileContains {
@@ -2611,6 +2727,117 @@ mod tests {
             }),
             "a deliberate architect build step must produce the architecture doc: {:?}",
             ev_of(&p, "arch")
+        );
+    }
+
+    #[test]
+    fn doc_first_skeleton_inserts_the_three_core_docs_before_a_backend_only_plan() {
+        // DOC-FIRST ENFORCEMENT: a brain plan that jumped straight to a single backend
+        // BUILD step (no docs) must, on a deliberate UI-bearing route, gain the three
+        // core-doc BUILD steps (PRD → architecture → UIUX) PREPENDED and chained, with
+        // the right evidence paths — and the backend code step must depend on the
+        // architect doc (so code can't start before the docs).
+        let p = plan(vec![step_seat(
+            "api",
+            &[],
+            Seat::BackendEngineer,
+            StepKind::Build,
+            AcceptanceSpec::SourcePresent,
+        )])
+        .normalized(Some(("demo", true)))
+        .expect("usable");
+        // All three doc steps were seated.
+        for id in [
+            "umadev-phase-prd",
+            "umadev-phase-architecture",
+            "umadev-phase-uiux",
+        ] {
+            assert!(
+                p.steps.iter().any(|s| s.id == id),
+                "the {id} doc step was inserted: {:?}",
+                p.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>()
+            );
+        }
+        // The plan OPENS with the PRD step (docs first).
+        assert_eq!(
+            p.steps[0].id, "umadev-phase-prd",
+            "the plan opens with the PRD"
+        );
+        // Each doc step carries its verified-deliverable evidence path.
+        assert!(
+            ev_of(&p, "umadev-phase-prd").contains(&EvidenceContract::FileContains {
+                path: "output/demo-prd.md".to_string(),
+                needle: "FR-".to_string(),
+            })
+        );
+        assert!(
+            ev_of(&p, "umadev-phase-architecture").contains(&EvidenceContract::FileContains {
+                path: "output/demo-architecture.md".to_string(),
+                needle: "API".to_string(),
+            })
+        );
+        assert!(
+            ev_of(&p, "umadev-phase-uiux").contains(&EvidenceContract::FileExists {
+                path: "output/demo-uiux.md".to_string(),
+            })
+        );
+        // The docs are CHAINED: architecture depends on PRD, UIUX depends on architecture.
+        assert_eq!(
+            deps_of(&p, "umadev-phase-architecture"),
+            &["umadev-phase-prd".to_string()]
+        );
+        assert_eq!(
+            deps_of(&p, "umadev-phase-uiux"),
+            &["umadev-phase-architecture".to_string()]
+        );
+        // The backend code step is wired BEHIND the architect doc (enforce_contract_first),
+        // so implementation can't start before the docs land.
+        assert!(
+            deps_of(&p, "api").contains(&"umadev-phase-architecture".to_string()),
+            "the backend step depends on the architect doc: {:?}",
+            deps_of(&p, "api")
+        );
+    }
+
+    #[test]
+    fn doc_first_skeleton_does_not_duplicate_a_seated_pm_step() {
+        // Idempotence: a brain plan that ALREADY seated the PM keeps that one PM step —
+        // the skeleton inserts the MISSING docs (architecture, UIUX) but never a second
+        // PM step (matched by seat + build kind), so a doc-first plan is unchanged in
+        // its PM seat.
+        let p = plan(vec![
+            step_seat(
+                "my-prd",
+                &[],
+                Seat::ProductManager,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+            step_seat(
+                "api",
+                &[],
+                Seat::BackendEngineer,
+                StepKind::Build,
+                AcceptanceSpec::SourcePresent,
+            ),
+        ])
+        .normalized(Some(("demo", true)))
+        .expect("usable");
+        let pm_steps: Vec<&str> = p
+            .steps
+            .iter()
+            .filter(|s| s.seat == Seat::ProductManager && s.kind == StepKind::Build)
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(
+            pm_steps,
+            vec!["my-prd"],
+            "the already-seated PM step is not duplicated: {pm_steps:?}"
+        );
+        // The synthetic PM id was NOT inserted (the brain's own PM step covers the seat).
+        assert!(
+            !p.steps.iter().any(|s| s.id == "umadev-phase-prd"),
+            "no synthetic PM step when the brain already seated one"
         );
     }
 
@@ -2646,7 +2873,7 @@ mod tests {
             StepKind::Build,
             AcceptanceSpec::SourcePresent,
         )])
-        .normalized(Some("demo"))
+        .normalized(Some(("demo", true)))
         .expect("usable");
         assert!(
             !ev_of(&no_pm, "ui")
