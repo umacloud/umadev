@@ -1242,6 +1242,7 @@ fn cmd_update(yes: bool) -> Result<()> {
     {
         Ok(s) if s.success() => {
             println!("[ok] UmaDev upgraded. Run `umadev --version` to confirm.");
+            warn_if_umadev_shadowed_on_path();
             Ok(())
         }
         Ok(s) => anyhow::bail!("npm exited with status {s}"),
@@ -1249,6 +1250,62 @@ fn cmd_update(yes: bool) -> Result<()> {
             anyhow::bail!("could not run npm ({e}); run `npm install -g umadev@latest` yourself")
         }
     }
+}
+
+/// Every `umadev` launcher found on `PATH`, in PATH order (at most one per dir). The
+/// FIRST is the one the shell actually runs; the rest are shadowed. On Windows we look
+/// for the npm-shim spellings (`.cmd` / `.exe` / `.bat`) plus the bare name.
+fn find_all_umadev_on_path() -> Vec<std::path::PathBuf> {
+    match std::env::var_os("PATH") {
+        Some(path) => find_all_umadev_in(&path),
+        None => Vec::new(),
+    }
+}
+
+/// Pure worker for [`find_all_umadev_on_path`] over an explicit `PATH` value — no process
+/// env read, so the shadow logic is unit-testable without a racy `set_var`.
+fn find_all_umadev_in(path: &std::ffi::OsStr) -> Vec<std::path::PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["umadev.cmd", "umadev.exe", "umadev.bat", "umadev"]
+    } else {
+        &["umadev"]
+    };
+    let mut out = Vec::new();
+    for dir in std::env::split_paths(path) {
+        for n in names {
+            let cand = dir.join(n);
+            if cand.is_file() {
+                out.push(cand);
+                break; // one launcher per dir is enough to establish the shadow
+            }
+        }
+    }
+    out
+}
+
+/// Warn when MORE THAN ONE `umadev` is on `PATH`: an earlier one shadows the just-upgraded
+/// npm-global binary, so `umadev --version` can still report the OLD version even though the
+/// upgrade succeeded (the reported "updated but `--version` unchanged" — a stale launcher
+/// left in Node's own dir sat ahead of `npm-global` on PATH). Advisory + fail-open: it only
+/// reads PATH and prints; it never blocks or modifies anything.
+fn warn_if_umadev_shadowed_on_path() {
+    let all = find_all_umadev_on_path();
+    if all.len() < 2 {
+        return;
+    }
+    println!(
+        "\n[!] Multiple `umadev` launchers are on PATH — the shell runs only the FIRST, which \
+         may be a STALE one, so `umadev --version` can still show the old version after this \
+         upgrade:"
+    );
+    for (i, p) in all.iter().enumerate() {
+        let mark = if i == 0 { "   <- this one runs" } else { "" };
+        println!("      {}. {}{mark}", i + 1, p.display());
+    }
+    println!(
+        "      If `umadev --version` didn't change, delete the earlier (stale) launcher above \
+         and keep only the npm-global one."
+    );
 }
 
 /// `umadev mcp serve` — run the MCP governance server over stdio.
@@ -5272,6 +5329,40 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_all_umadev_in_reports_every_launcher_in_path_order() {
+        // #4 — the shadow detector must list EACH `umadev` on PATH, first-wins order, so the
+        // update warning can point at a stale earlier launcher. Two dirs each hold a launcher;
+        // a third dir holds nothing.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let empty = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "umadev.cmd"
+        } else {
+            "umadev"
+        };
+        std::fs::write(a.path().join(name), "shim-a").unwrap();
+        std::fs::write(b.path().join(name), "shim-b").unwrap();
+        let joined = std::env::join_paths([a.path(), empty.path(), b.path()]).unwrap();
+
+        let found = find_all_umadev_in(&joined);
+        assert_eq!(
+            found.len(),
+            2,
+            "both launchers found, the empty dir skipped"
+        );
+        assert!(
+            found[0].starts_with(a.path()),
+            "first PATH dir wins: {found:?}"
+        );
+        assert!(found[1].starts_with(b.path()));
+
+        // A single launcher (the healthy case) reports exactly one → no shadow warning.
+        let single = std::env::join_paths([a.path(), empty.path()]).unwrap();
+        assert_eq!(find_all_umadev_in(&single).len(), 1);
+    }
 
     #[test]
     fn upsert_managed_section_appends_then_refreshes_in_place_preserving_edits() {

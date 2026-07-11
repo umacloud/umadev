@@ -5796,6 +5796,16 @@ const STREAM_HEAL_WINDOW: Duration = Duration::from_millis(1500);
 /// no-op there.
 const RESIZE_HEAL_WINDOW: Duration = Duration::from_millis(300);
 
+/// How long AFTER a focus-return (or the first interaction past a long idle gap) every frame
+/// keeps doing a full clear+repaint. Focus return, like a resize, makes the terminal redraw
+/// its OWN buffer over several frames (worse across a multi-monitor compositor / the Windows
+/// console), so a single heal races the terminal's later stale redraw and the garble survives.
+/// A short window past the return covers that settle so OUR repaint wins. A little wider than
+/// the resize window because a multi-monitor focus switch settles slower. Only meaningful on
+/// the non-sync path (a confirmed-sync terminal already swaps atomically), and it only opens
+/// on an ACTUAL focus/resume event — never periodically — so an idle screen never flickers.
+const FOCUS_HEAL_WINDOW: Duration = Duration::from_millis(450);
+
 /// M1 — the bounded budget the cancel-drain branch waits for an aborting task to
 /// wind down before forcing the post-cancel cleanup. Captured ONCE as an
 /// ABSOLUTE deadline when the drain starts (see `cancel_deadline`) so the wait is
@@ -6119,6 +6129,10 @@ async fn event_loop(
     // Resize heal: Instant of the last Resize event, to force a clear+repaint for a short
     // window afterwards so a multi-frame drag + settle fully heals (not just one frame).
     let mut last_resize_at: Option<Instant> = None;
+    // Focus-return heal: Instant of the last FocusGained (or resume-gap) event, to force a
+    // clear+repaint window afterwards so the terminal's own multi-frame redraw on focus
+    // return can't leave stale cells behind (see FOCUS_HEAL_WINDOW).
+    let mut last_focus_gained_at: Option<Instant> = None;
     // R5 resume-gap threshold + the last time any input event arrived. A long
     // gap before the next event looks like a sleep/wake / re-attach.
     let resume_threshold = resume_gap();
@@ -6399,6 +6413,18 @@ async fn event_loop(
         if last_resize_at.is_some_and(|t| t.elapsed() < RESIZE_HEAL_WINDOW) {
             force_full_repaint = true;
         }
+        // Focus-return heal window - the SAME multi-frame settle problem as resize. On focus
+        // return the terminal (notably the Windows console, and worse across a multi-monitor
+        // compositor) redraws its OWN buffer over SEVERAL frames; a single contamination clear
+        // races that and gets overwritten by the terminal's later stale redraw, so the garble
+        // survives (the reported "focus away for minutes, focus back → 乱码" on a 2-external-
+        // monitor laptop). Healing every frame for a short window past focus return makes OUR
+        // repaint the last word after the terminal settles. Also opened on the resume-gap path
+        // below, so a terminal that never delivers a DEC-1004 focus event still heals on the
+        // first interaction after returning.
+        if last_focus_gained_at.is_some_and(|t| t.elapsed() < FOCUS_HEAL_WINDOW) {
+            force_full_repaint = true;
+        }
         if is_legacy_conhost()
             && periodic_repaint_due(
                 sync_output,
@@ -6662,6 +6688,11 @@ async fn event_loop(
                     if resume_gap_elapsed(now.duration_since(last_input), resume_threshold) {
                         reassert_terminal_modes(terminal, app.mouse_scroll);
                         app.contaminate_terminal();
+                        // Backstop for a terminal that never delivers a DEC-1004 focus event
+                        // (some Windows console setups): the first interaction after a long
+                        // idle gap opens the SAME focus-heal window, so the returning screen
+                        // heals over the terminal's own redraw settle, not just one frame.
+                        last_focus_gained_at = Some(now);
                     }
                     last_input = now;
                 }
@@ -6695,6 +6726,11 @@ async fn event_loop(
                     // on unix: returning to a well-behaved xterm just repaints one
                     // clean frame).
                     app.contaminate_terminal();
+                    // Open the focus-heal WINDOW (not just one frame): the terminal's own
+                    // redraw on focus return spans several frames on a multi-monitor / Windows
+                    // console setup, so keep healing briefly so its later stale redraw can't
+                    // overwrite our clean frame (the reported focus-return 乱码).
+                    last_focus_gained_at = Some(Instant::now());
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
                     // Mouse → wheel scrollback + the in-app drag-to-select/copy layer
                     // (the Claude Code approach: WE render the selection highlight and

@@ -1593,6 +1593,12 @@ async fn drive_plan_steps(
     // finalize INSIDE `qc.is_clean()`). Fail-open: a dirty gate just means "not clean".
     let clean = plan.steps.iter().all(|s| s.status == StepStatus::Done) && final_gate.clean;
     finalize_phase_from_plan(plan, options, clean);
+    // A PERSISTENT per-step completion summary, emitted on EVERY deliberate-build exit
+    // (clean, budget-reached, or blocked). The live plan panel is ephemeral — it vanishes
+    // when the run settles — so on an incomplete finish the user could no longer see WHICH
+    // steps completed, which stalled, which never ran (reported feedback). This writes the
+    // breakdown into the transcript so the final task state always survives.
+    emit_plan_completion_summary(plan, events);
     // Wave 4 (§L4 / G8): a step-driven (always deliberate) build leaves the FULL
     // shareable delivery — core docs + proof-pack + scorecard — but ONLY when the
     // build settled clean (every step Done). MEDIUM M2: passing `clean` here stops
@@ -3365,6 +3371,39 @@ fn mark_ready_steps(plan: &mut Option<Plan>, events: &Arc<dyn EventSink>, status
             events.emit(EngineEvent::plan_step_status(id, title, status));
         }
     }
+}
+
+/// Emit a PERSISTENT per-step completion summary (a multi-line transcript Note) grouping
+/// every plan step by its terminal status, so an incomplete / budget-reached / blocked
+/// build still shows the user exactly which steps finished, which stalled, and which never
+/// ran — the live plan panel is ephemeral and vanishes on settle. No-op on an empty plan.
+/// Fail-open by construction (it only reads the plan + emits a note).
+fn emit_plan_completion_summary(plan: &Plan, events: &Arc<dyn EventSink>) {
+    if plan.steps.is_empty() {
+        return;
+    }
+    let count = |want: StepStatus| plan.steps.iter().filter(|s| s.status == want).count();
+    let mut lines = vec![umadev_i18n::tlf(
+        "plan.summary.header",
+        &[
+            &count(StepStatus::Done).to_string(),
+            &count(StepStatus::Active).to_string(),
+            &count(StepStatus::Blocked).to_string(),
+            &count(StepStatus::Pending).to_string(),
+        ],
+    )];
+    // One line per step, in plan order, marked by terminal status. Markers mirror the live
+    // checklist ([√] done · [~] in progress · [ ] pending) and add [✗] for a blocked step.
+    for s in &plan.steps {
+        let marker = match s.status {
+            StepStatus::Done => "[√]",
+            StepStatus::Active => "[~]",
+            StepStatus::Blocked => "[✗]",
+            StepStatus::Pending => "[ ]",
+        };
+        lines.push(format!("  {marker} {} ({})", s.title, s.seat.role_id()));
+    }
+    events.emit(EngineEvent::Note(lines.join("\n")));
 }
 
 /// On a clean settle: tick any non-Done step to `Done`, emit a status event for
@@ -6329,6 +6368,62 @@ mod tests {
             EngineEvent::Note(n) => n.contains(needle),
             _ => false,
         })
+    }
+
+    #[test]
+    fn plan_completion_summary_lists_every_step_by_terminal_status() {
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let (events, rec) = sink();
+        let mk = |id: &str, seat, status| PlanStep {
+            id: id.to_string(),
+            title: format!("do {id}"),
+            seat,
+            kind: StepKind::Build,
+            depends_on: vec![],
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status,
+        };
+        let plan = Plan {
+            steps: vec![
+                mk("a", crate::critics::Seat::ProductManager, StepStatus::Done),
+                mk("b", crate::critics::Seat::UiuxDesigner, StepStatus::Pending),
+                mk(
+                    "c",
+                    crate::critics::Seat::BackendEngineer,
+                    StepStatus::Active,
+                ),
+                mk("d", crate::critics::Seat::QaEngineer, StepStatus::Blocked),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        emit_plan_completion_summary(&plan, &events);
+        // Header carries the 1/1/1/1 counts (done / active / blocked / pending), locale-neutral.
+        assert!(note_seen(
+            &rec,
+            &umadev_i18n::tlf("plan.summary.header", &["1", "1", "1", "1"])
+        ));
+        // Every step appears, marked by its terminal status.
+        assert!(note_seen(&rec, "[√] do a (product-manager)"), "done step");
+        assert!(note_seen(&rec, "[ ] do b (uiux-designer)"), "pending step");
+        assert!(
+            note_seen(&rec, "[~] do c (backend-engineer)"),
+            "active step"
+        );
+        assert!(note_seen(&rec, "[✗] do d (qa-engineer)"), "blocked step");
+
+        // An empty plan emits no summary at all.
+        let (events2, rec2) = sink();
+        emit_plan_completion_summary(
+            &Plan {
+                steps: vec![],
+                risks: vec![],
+                open_questions: vec![],
+            },
+            &events2,
+        );
+        assert!(!note_seen(&rec2, "["), "empty plan emits nothing");
     }
 
     #[tokio::test]

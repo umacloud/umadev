@@ -185,6 +185,7 @@
 "plan.panel.title" = "Plan"
 "plan.panel.collapsed" = "Plan {}/{} — /plan to expand"
 "plan.panel.active_step" = "step {}/{} · running"
+"plan.summary.header" = "Task summary — {} done · {} in progress · {} blocked · {} not started"
 "plan.panel.more_hint" = "scroll up or /plan for all"
 "plan.none" = "No active plan. A build or a deliberate turn posts one here."
 "plan.review.title" = "Team review"

@@ -180,6 +180,7 @@
 "plan.panel.title" = "計畫"
 "plan.panel.collapsed" = "計畫 {}/{} — /plan 展開"
 "plan.panel.active_step" = "步驟 {}/{} · 進行中"
+"plan.summary.header" = "任務總結 — {} 完成 · {} 進行中 · {} 堵塞 · {} 未完成"
 "plan.panel.more_hint" = "上滑或 /plan 檢視全部"
 "plan.none" = "暫無計畫。完整建置或一次深思熟慮的任務會在這裡生成計畫。"
 "plan.review.title" = "團隊評審"
