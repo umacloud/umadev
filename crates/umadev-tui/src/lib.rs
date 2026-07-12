@@ -5442,6 +5442,40 @@ fn periodic_repaint_due(
     !sync_output && live && since_last_full_repaint >= cadence
 }
 
+/// P4b — the ATOMIC streaming heartbeat for a terminal that supports the
+/// synchronized-output brackets (`sync_output`) but whose per-frame P0 heal is
+/// off because sync was never CONFIRMED by a real DECRQM reply.
+///
+/// The reported gap: **Windows Terminal** is allowlisted as `sync_output == true`,
+/// yet on Windows the DEC 2026 probe is never sent (the legacy input path has no
+/// lane for the reply), so `sync_confirmed` stays `false` for the whole session.
+/// Such a terminal gets NEITHER P0 (which keys off `sync_confirmed`) NOR the
+/// classic-conhost heartbeat ([`periodic_repaint_due`], which needs `!sync_output`
+/// and `is_legacy_conhost()`), so accumulated incremental-diff drift never heals
+/// during a long heavy stream.
+///
+/// This heals it with the SAME throttled streaming heartbeat as conhost, but —
+/// crucially — because `sync_output` is `true`, the resulting `terminal.clear()`
+/// lands INSIDE the frame's BSU/ESU brackets, so the wipe swaps atomically and is
+/// INVISIBLE (no flicker). Gated to active streaming + the throttle exactly like
+/// [`periodic_repaint_due`], so an idle screen never pays a clear.
+///
+/// Deliberately requires `sync_output == true`: a NON-sync terminal that is not
+/// `is_legacy_conhost()` (macOS Terminal.app / plain non-sync) is `sync_output ==
+/// false`, so it does NOT match here and keeps getting no heartbeat — a naked
+/// clear there would reintroduce flicker. And when sync IS confirmed, P0 already
+/// heals every frame, so this must not add a second clear: `!sync_confirmed`
+/// excludes that case. Pure, so the truth table is unit-tested.
+fn atomic_unconfirmed_heartbeat_due(
+    sync_output: bool,
+    sync_confirmed: bool,
+    live: bool,
+    since_last_full_repaint: Duration,
+    cadence: Duration,
+) -> bool {
+    sync_output && !sync_confirmed && live && since_last_full_repaint >= cadence
+}
+
 /// P2 — the DECRQM query asking the terminal whether DEC private mode 2026
 /// (synchronized output) is implemented: `CSI ? 2026 $ p`. Sent ONCE right
 /// after the event loop starts, and only on the owned-input path — the DECRPM
@@ -6425,9 +6459,26 @@ async fn event_loop(
         if last_focus_gained_at.is_some_and(|t| t.elapsed() < FOCUS_HEAL_WINDOW) {
             force_full_repaint = true;
         }
-        if is_legacy_conhost()
+        // P4b — a terminal that supports the synchronized-output brackets
+        // (`sync_output`) but whose per-frame P0 heal is off because sync was never
+        // CONFIRMED (notably Windows Terminal: the DECRQM probe is never sent on
+        // Windows, so `sync_confirmed` stays false forever) gets NEITHER P0 nor the
+        // conhost P4 heartbeat — drift never heals. Heal it with the SAME throttled
+        // streaming heartbeat; because `sync_output` is true the forced clear lands
+        // inside the BSU/ESU bracket below → atomic → invisible (no flicker). Gated
+        // to active streaming + the throttle, exactly like the conhost heartbeat, so
+        // an idle screen never pays a clear. macOS Terminal.app (sync_output=false)
+        // does NOT match here, so it keeps getting no heartbeat and stays clean.
+        if (is_legacy_conhost()
             && periodic_repaint_due(
                 sync_output,
+                stream_active_recently,
+                last_full_repaint.elapsed(),
+                REPAINT_HEARTBEAT,
+            ))
+            || atomic_unconfirmed_heartbeat_due(
+                sync_output,
+                sync_confirmed,
                 stream_active_recently,
                 last_full_repaint.elapsed(),
                 REPAINT_HEARTBEAT,
@@ -13382,6 +13433,88 @@ mod tests {
         assert!(
             !periodic_repaint_due(true, false, Duration::from_secs(10), cadence),
             "sync output idle must not take the heartbeat path either"
+        );
+    }
+
+    #[test]
+    fn atomic_unconfirmed_heartbeat_heals_sync_output_but_unconfirmed_terminals() {
+        // P4b — the ATOMIC streaming heartbeat that closes the Windows Terminal gap:
+        // a terminal that supports the BSU/ESU brackets (`sync_output`) but never got
+        // sync CONFIRMED (the DECRQM probe is never sent on Windows) gets NEITHER the
+        // per-frame P0 clear (keys off `sync_confirmed`) NOR the conhost heartbeat
+        // (needs `!sync_output`). This helper heals it, and because `sync_output` is
+        // true the clear lands inside BSU/ESU → atomic → no flicker.
+        // Signature: (sync_output, sync_confirmed, live, elapsed, cadence).
+        let cadence = Duration::from_secs(1);
+
+        // --- THE FIX: sync_output=true, sync_confirmed=false, streaming, past cadence
+        // → fire (atomic wipe under BSU/ESU). This is Windows Terminal.
+        assert!(
+            atomic_unconfirmed_heartbeat_due(
+                true,
+                false,
+                true,
+                Duration::from_millis(1200),
+                cadence
+            ),
+            "sync_output-but-unconfirmed (Windows Terminal) must heal during streaming"
+        );
+        // Boundary (>=) counts.
+        assert!(
+            atomic_unconfirmed_heartbeat_due(true, false, true, cadence, cadence),
+            "the cadence boundary itself is due"
+        );
+        // Within the cadence → not yet (throttled, never per-frame).
+        assert!(
+            !atomic_unconfirmed_heartbeat_due(
+                true,
+                false,
+                true,
+                Duration::from_millis(200),
+                cadence
+            ),
+            "within the cadence the heartbeat must not fire (no per-frame clear)"
+        );
+        // Not streaming → never (an idle screen has no fresh drift → no flash).
+        assert!(
+            !atomic_unconfirmed_heartbeat_due(true, false, false, Duration::from_secs(10), cadence),
+            "an idle sync_output-but-unconfirmed screen must NEVER pay a heartbeat clear"
+        );
+
+        // --- NO-REGRESSION MATRIX (the four rows the fix must preserve) ---
+
+        // Row 1: sync_confirmed=true (probe succeeded, e.g. a modern mac/linux sync
+        // terminal) → NO heartbeat here — P0 already clears every frame, so a second
+        // clear would be wasted bytes. `!sync_confirmed` excludes it.
+        assert!(
+            !atomic_unconfirmed_heartbeat_due(true, true, true, Duration::from_secs(10), cadence),
+            "a CONFIRMED sync terminal is healed by P0 every frame — must NOT double-clear"
+        );
+
+        // Row 4 (the critical one): sync_output=false + NOT is_legacy_conhost, i.e.
+        // macOS Terminal.app / plain non-sync (sync_output=false, sync_confirmed=false).
+        // It must get NO heartbeat here — a naked clear (no BSU/ESU) would reintroduce
+        // the very flicker the current gating avoids. `sync_output` being required
+        // excludes it, live or idle, however long past the cadence.
+        assert!(
+            !atomic_unconfirmed_heartbeat_due(false, false, true, Duration::from_secs(10), cadence),
+            "macOS Terminal.app (non-sync) must NOT get this heartbeat — no naked clear, no new flicker"
+        );
+        assert!(
+            !atomic_unconfirmed_heartbeat_due(
+                false,
+                false,
+                false,
+                Duration::from_secs(10),
+                cadence
+            ),
+            "idle non-sync Terminal.app must stay clean too"
+        );
+        // Row 3: classic conhost (sync_output=false) is handled by `periodic_repaint_due`,
+        // NOT here — this helper never fires on the non-sync path.
+        assert!(
+            !atomic_unconfirmed_heartbeat_due(false, true, true, Duration::from_secs(10), cadence),
+            "the non-sync path belongs to the conhost heartbeat, never to this one"
         );
     }
 
