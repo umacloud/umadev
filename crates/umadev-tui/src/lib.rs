@@ -405,6 +405,17 @@ enum RouteDecision {
     /// channel so the event loop clears the "thinking…" status on EVERY terminal
     /// outcome, and a plain progress Note never has to.
     Failed(String),
+    /// A director build PAUSED at a spec-MUST confirmation gate (`docs_confirm` /
+    /// `preview_confirm`) awaiting the user. The agent already emitted
+    /// `GateOpened` (the gate card + picker render through `apply_engine`) and
+    /// persisted the plan + open door; this terminal decision clears the
+    /// "thinking…" state and arms the app's director-pause marker so gate
+    /// approval (`c` / `/continue`) and a typed revision resume via
+    /// `drive_director_loop_resume` instead of the legacy gate blocks.
+    RunPausedAtGate {
+        /// The gate the run parked at.
+        gate: Gate,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1251,6 +1262,8 @@ fn spawn_director_loop(
     route_override: Option<RoutePlan>,
     goal_mode: bool,
     resume: bool,
+    steer: umadev_agent::SteerIntake,
+    approval: ApprovalHolder,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_director_loop(
         options,
@@ -1261,6 +1274,8 @@ fn spawn_director_loop(
         route_override,
         goal_mode,
         resume,
+        steer,
+        approval,
     ))
 }
 
@@ -1283,6 +1298,14 @@ async fn run_director_loop(
     route_override: Option<RoutePlan>,
     goal_mode: bool,
     resume: bool,
+    // A2#3/#4: the hosting UI's live hooks — the shared mid-run steering intake
+    // and the y/n approval pause holder. Scoped into the agent's task-local
+    // `RunInteraction` around the drive below, so the director loop can pause at
+    // the spec-MUST gates, ask the live user to approve an escalated action, and
+    // fold queued steering into the next step — all fail-open (a CLI drive that
+    // never scopes them keeps headless behaviour byte-for-byte).
+    steer: umadev_agent::SteerIntake,
+    approval: ApprovalHolder,
 ) {
     {
         let backend = options.backend.clone();
@@ -1469,7 +1492,36 @@ async fn run_director_loop(
         // plan) OR the first remaining step can't drive on this fresh session — in both
         // cases we fail open to a fresh routed run, so a resume never loses the build.
         // A non-resume `/run` / `/goal` skips straight to the fresh routed run.
-        let outcome = {
+        // A2#3/#4 + A1-GAP1: scope the hosting UI's interaction hooks around the
+        // WHOLE drive (a tokio task-local — everything awaited inside inherits it):
+        //  - `confirm_gates: true` revives the two spec-MUST gates on this default
+        //    path (a guarded run pauses at docs_confirm / preview_confirm);
+        //  - `approval` backs an escalated base action with the SAME y/n
+        //    `await_user_approval` pause the chat drain uses (bounded, fail-open
+        //    deny) instead of a silent headless auto-deny;
+        //  - `steer` lets the loop fold queued user steering into the next step.
+        // The CLI drive never scopes this, so headless behaviour is unchanged.
+        let interaction = {
+            let holder = approval.clone();
+            let cb_sink = sink.clone();
+            let approval_cb: umadev_agent::ApprovalFn =
+                Arc::new(move |action: String, target: String| {
+                    let holder = holder.clone();
+                    let cb_sink = cb_sink.clone();
+                    Box::pin(async move {
+                        matches!(
+                            await_user_approval(&holder, &cb_sink, &action, &target).await,
+                            ApprovalReply::Allow
+                        )
+                    }) as umadev_agent::ApprovalFuture
+                });
+            umadev_agent::RunInteraction {
+                steer: Some(steer),
+                approval: Some(approval_cb),
+                confirm_gates: true,
+            }
+        };
+        let outcome = umadev_agent::hosted_interaction(interaction, async {
             let resumed = if resume {
                 umadev_agent::drive_director_loop_resume(
                     session.as_mut(),
@@ -1494,7 +1546,8 @@ async fn run_director_loop(
                     .await
                 }
             }
-        };
+        })
+        .await;
         // Always end the session (release the process / server).
         let _ = session.end().await;
 
@@ -1527,8 +1580,96 @@ async fn run_director_loop(
                 sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
                 let _ = route_tx.send(RouteDecision::Failed(reason));
             }
+            umadev_agent::DirectorLoopOutcome::PausedAtGate { gate } => {
+                // Spec-MUST gate pause (A1-GAP1): the loop already persisted the
+                // plan + open door and emitted `GateOpened` (the gate card renders
+                // through the engine stream). NO source hard-gate here — the build
+                // is parked mid-flight, not settled. The session was ended above;
+                // the resume re-attaches via the persisted base session id +
+                // plan.json. This terminal decision clears `thinking` and arms the
+                // app's director-pause marker so approval / a revision resume the
+                // director loop instead of the legacy gate blocks.
+                let _ = route_tx.send(RouteDecision::RunPausedAtGate { gate });
+            }
         }
     }
+}
+
+/// Drain any steering left in the shared intake when a director run settles and
+/// surface it honestly through the app's `run.queued_unsent` note (A2#4 — the
+/// queued chip must never stick over a silent drop). Called only on a DIRECTOR
+/// run's terminal decisions; a plain chat turn leaves `queued_steer` parked for
+/// the next run. Fail-open: a poisoned lock reads as "nothing left".
+fn surface_unsent_steer(app: &mut App, steer: &umadev_agent::SteerIntake) {
+    let leftover: Vec<String> = steer
+        .lock()
+        .map(|mut q| q.drain(..).collect())
+        .unwrap_or_default();
+    app.surface_unsent_steer(leftover);
+}
+
+/// Resume a DIRECTOR build parked at a spec-MUST confirmation gate (A1-GAP1) —
+/// the approval (`c` / `/continue` / a picker Approve) and the free-text revision
+/// both land here. Re-attaches to the persisted `.umadev/plan.json` via
+/// `drive_director_loop_resume` on a fresh session (the persisted base session id
+/// restores the base's own context), driving ONLY the remaining steps — the
+/// already-`Done` doc/frontend steps are never re-run, and the transition-
+/// triggered gate check cannot re-fire for them.
+///
+/// `gate_revision` carries a revision typed at the gate: it is folded into the
+/// resumed run as a steering directive the loop drains at the next step boundary
+/// (`umadev_agent::interaction`), so the feedback is honoured in-context instead
+/// of restarting the producing block. Mirrors the `/run` arm's app-state setup
+/// (thinking flags, task registry, requirement recovery) exactly.
+#[allow(clippy::too_many_arguments)]
+fn resume_director_after_gate(
+    app: &mut App,
+    opts: &LaunchOptions,
+    sink: &Arc<ChannelSink>,
+    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
+    steer_holder: &umadev_agent::SteerIntake,
+    approval_holder: &ApprovalHolder,
+    gate_revision: Option<(Gate, String)>,
+) -> tokio::task::JoinHandle<()> {
+    if let Some((gate, text)) = gate_revision {
+        if let Ok(mut q) = steer_holder.lock() {
+            q.push(format!(
+                "Revision requested by the user at the `{}` confirmation gate — honour it \
+                 before continuing with the plan:\n{text}",
+                gate.id_str()
+            ));
+        }
+    }
+    app.director_gate_paused = false;
+    app.thinking = true;
+    app.thinking_started = Some(std::time::Instant::now());
+    app.last_output_at = None;
+    app.tool_in_progress = false;
+    app.agentic_in_flight = true;
+    app.director_run_in_flight = true;
+    // Recover the requirement/slug from the persisted workflow state when the
+    // in-memory ones are empty (a fresh session resuming a parked run).
+    let req = app.resume_run_requirement();
+    app.register_run_task(&req);
+    app.requirement.clone_from(&req);
+    let mut run_opts = current_run_options(app, opts);
+    run_opts.requirement = req;
+    let autonomous = continuous_autonomous(run_opts.mode);
+    spawn_director_loop(
+        run_opts,
+        sink.clone(),
+        route_tx.clone(),
+        autonomous,
+        // A gate resume inherits no chat transcript (the plan + artifacts are the
+        // continuity), same as the `/continue` cross-session resume.
+        Vec::new(),
+        None,
+        true,
+        // Re-attach to the persisted plan; only the remaining steps drive.
+        true,
+        steer_holder.clone(),
+        approval_holder.clone(),
+    )
 }
 
 /// Open the director's base session, RESUMING the persisted base conversation when
@@ -6113,6 +6254,13 @@ async fn event_loop(
     // between the spawned chat-turn drain (which registers a pause + blocks on it) and
     // this event loop (which routes the user's y/n/Esc into it). `None` = no pause.
     let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    // A2#4/#5: the mid-run steering intake for the DIRECTOR path. `/plan skip|veto|
+    // add`, text typed while a director build runs, and a gate revision all land in
+    // `app.queued_steer`; this loop moves them into this shared intake, and the
+    // director loop drains it at each step boundary (`umadev_agent::interaction`) —
+    // so steering applies at the next step instead of evaporating (the director
+    // path never emits the GateOpened/BlockCompleted gaps the legacy queue used).
+    let steer_holder: umadev_agent::SteerIntake = Arc::new(std::sync::Mutex::new(Vec::new()));
     // Seed the LIVE trust tier from the startup mode so the first turn's approval
     // decisions read the right tier before any mid-turn switch republishes it.
     publish_live_trust(app.effective_trust_mode());
@@ -6356,7 +6504,29 @@ async fn event_loop(
             // A message the user QUEUED mid-phase is ready to fire at
             // this gap: re-run the producing block with it folded in as
             // a revision (mirrors the Action::Revise path).
-            if let Some(text) = app.pending_steer.take() {
+            // A DIRECTOR run's gate first: fold the queued steer into the
+            // RESUMED plan as a step-boundary directive (never a legacy block
+            // spawn, which would restart the producing phases from scratch).
+            if app.pending_steer.is_some()
+                && !continuous_run_active
+                && (app.director_gate_paused
+                    || umadev_agent::has_resumable_director_plan(&app.project_root))
+            {
+                if let Some(text) = app.pending_steer.take() {
+                    sink.emit(EngineEvent::Note(format!("queued steer: {text}")));
+                    let gate = app.active_gate.take().unwrap_or(Gate::DocsConfirm);
+                    app.gate_choice = None;
+                    run_task = Some(resume_director_after_gate(
+                        app,
+                        &opts,
+                        &sink,
+                        &route_tx,
+                        &steer_holder,
+                        &approval_holder,
+                        Some((gate, text)),
+                    ));
+                }
+            } else if let Some(text) = app.pending_steer.take() {
                 sink.emit(EngineEvent::Note(format!("queued steer: {text}")));
                 let gate = app.active_gate;
                 app.active_gate = None;
@@ -6394,6 +6564,19 @@ async fn event_loop(
     }
 
     loop {
+        // A2#4/#5: while a director build is in flight, hand any queued steering
+        // (`/plan skip|veto|add`, text typed mid-build) to the shared intake the
+        // loop drains at each STEP BOUNDARY — so mid-run steering applies at the
+        // next step instead of after the whole build. Legacy pipeline runs keep
+        // `queued_steer` parked for their own gate/block gaps (they never set
+        // `director_run_in_flight`). Fail-open on a poisoned lock (items stay
+        // queued and surface honestly at the terminal decision).
+        if app.director_run_in_flight && !app.queued_steer.is_empty() {
+            if let Ok(mut q) = steer_holder.lock() {
+                q.extend(app.queued_steer.drain(..));
+            }
+        }
+
         // P2 — resolve the startup sync-output probe. The DECRPM verdict is
         // captured inside `input.next()` (the reply yields no input event, so
         // it can't wake the loop itself); polling it here — the 80ms tick
@@ -6660,6 +6843,15 @@ async fn event_loop(
                         // the idle resident chat session refreshed.
                         let was_run = app.director_run_in_flight;
                         app.record_agentic_done(reply, director_build, base_session_id);
+                        // A2#4: steering still parked in the intake when a DIRECTOR
+                        // run settled never reached a step boundary — surface it so
+                        // the user knows to resend (never a silent drop), mirroring
+                        // the legacy `run.queued_unsent` behaviour at delivery. A
+                        // plain chat turn leaves `queued_steer` parked: a `/plan`
+                        // edit queued before a run legitimately waits for that run.
+                        if director_build || was_run {
+                            surface_unsent_steer(app, &steer_holder);
+                        }
                         // Build-complete experience: an EFFECTIVE build (a `/run`
                         // build, a chat "build me X", or a chat turn the reactive
                         // detector promoted to a build) gets the "✅ done + what
@@ -6694,12 +6886,28 @@ async fn event_loop(
                         let was_run = app.director_run_in_flight;
                         app.record_route_failed(note);
                         app.drop_failed_route_duplicate_queued_chat();
+                        // A failed DIRECTOR run strands any steering parked in the
+                        // intake — surface it honestly (never a silent drop). A
+                        // failed chat turn leaves `queued_steer` parked (see above).
+                        if was_run {
+                            surface_unsent_steer(app, &steer_holder);
+                        }
                         // A failed `/run` also leaves the idle resident chat session
                         // possibly-stale — refresh it before the next chat turn drains.
                         if was_run {
                             refresh_resident_chat_after_run(app, &chat_session_holder, &pending_ask_holder).await;
                         }
                         run_task = drain_next_queued_chat(app, &chat_session_holder, &pending_ask_holder, &approval_holder, &sink, &route_tx);
+                    }
+                    // A director build parked at a spec-MUST gate (A1-GAP1). The
+                    // `GateOpened` event (drained above, same batch) already set
+                    // `active_gate` + rendered the gate card/picker; this terminal
+                    // decision clears the in-flight state and arms the director-
+                    // pause marker so `c` / `/continue` / a typed revision resume
+                    // the DIRECTOR plan, not a legacy gate block. Queued chat is
+                    // deliberately NOT drained — the gate awaits the user's answer.
+                    Some(RouteDecision::RunPausedAtGate { gate }) => {
+                        app.record_run_paused_at_gate(gate);
                     }
                     None => {}
                 }
@@ -7156,33 +7364,67 @@ async fn event_loop(
                                     spawn_probe(sink.clone());
                                 }
                                 Action::Continue(gate) => {
-                                    let run_opts = current_run_options(app, &opts);
-                                    // Continuous run: resume the parked session at the
-                                    // next gate-anchored phase. Single-shot: fresh
-                                    // `Block::Continue`.
-                                    run_task = Some(if continuous_run_active {
-                                        let autonomous = continuous_autonomous(run_opts.mode);
-                                        spawn_continuous_block(
-                                            run_opts,
-                                            sink.clone(),
-                                            session_holder.clone(),
-                                            continuous_resume_phase(gate),
-                                            autonomous,
-                                        )
+                                    // A1-GAP1: a DIRECTOR run parked at a spec-MUST
+                                    // gate resumes via the persisted plan
+                                    // (`drive_director_loop_resume`) — never a legacy
+                                    // gate block. Detected by the in-memory pause
+                                    // marker (same-session) OR a resumable director
+                                    // plan on disk (a fresh session after a restart —
+                                    // only the director loop writes plan.json). The
+                                    // legacy continuous path keeps priority while ITS
+                                    // run is live.
+                                    if !continuous_run_active
+                                        && (app.director_gate_paused
+                                            || umadev_agent::has_resumable_director_plan(
+                                                &app.project_root,
+                                            ))
+                                    {
+                                        run_task = Some(resume_director_after_gate(
+                                            app,
+                                            &opts,
+                                            &sink,
+                                            &route_tx,
+                                            &steer_holder,
+                                            &approval_holder,
+                                            None,
+                                        ));
                                     } else {
-                                        spawn_block(
-                                            run_opts,
-                                            app.brain_spec(),
-                                            sink.clone(),
-                                            Block::Continue(gate),
-                                        )
-                                    });
+                                        let run_opts = current_run_options(app, &opts);
+                                        // Continuous run: resume the parked session at the
+                                        // next gate-anchored phase. Single-shot: fresh
+                                        // `Block::Continue`.
+                                        run_task = Some(if continuous_run_active {
+                                            let autonomous =
+                                                continuous_autonomous(run_opts.mode);
+                                            spawn_continuous_block(
+                                                run_opts,
+                                                sink.clone(),
+                                                session_holder.clone(),
+                                                continuous_resume_phase(gate),
+                                                autonomous,
+                                            )
+                                        } else {
+                                            spawn_block(
+                                                run_opts,
+                                                app.brain_spec(),
+                                                sink.clone(),
+                                                Block::Continue(gate),
+                                            )
+                                        });
+                                    }
                                 }
                                 Action::Cancel => {
                                     // A cancel abandons any in-flight guarded approval pause
                                     // cleanly: drop its sender so the drain's `await` fail-opens
                                     // to DENY (Fix ③ — no hang) before we tear the task down.
                                     clear_pending_approval(&approval_holder);
+                                    // And drops any steering parked for the cancelled run —
+                                    // a stale directive must never leak into the NEXT run's
+                                    // first step (mirrors `cancel_run`'s queued_steer clear).
+                                    if let Ok(mut q) = steer_holder.lock() {
+                                        q.clear();
+                                    }
+                                    app.director_gate_paused = false;
                                     if let Some(h) = run_task.take() {
                                         // Schedule cancellation, then get the WAIT off the
                                         // render path: park the aborting handle and let the
@@ -7324,6 +7566,10 @@ async fn event_loop(
                                             // `/continue` resume → re-attach to the persisted
                                             // plan; `/run` + `/goal` → a fresh run (false).
                                             resume,
+                                            // A2#3/#4: the hosted interaction hooks — the
+                                            // steering intake + the y/n approval pause.
+                                            steer_holder.clone(),
+                                            approval_holder.clone(),
                                         ));
                                     } else {
                                         // LEGACY (opt-in) or offline / non-host: drive the
@@ -7509,75 +7755,112 @@ async fn event_loop(
                                     )));
                                 }
                                 Action::Revise(text) => {
-                                    // Re-run the block that PRODUCED the current
-                                    // gate, with the revision feedback folded into
-                                    // the requirement so the worker actually
-                                    // incorporates it. Branch on the active gate:
-                                    //   - docs_confirm  → re-run Initial (regen docs)
-                                    //   - preview_confirm→ re-run Continue(DocsConfirm)
-                                    //     (regen spec → frontend), NOT the docs.
-                                    // Re-running Initial unconditionally was a bug:
-                                    // a UI revision at preview_confirm would have
-                                    // thrown away the approved docs and regenerated
-                                    // them instead of redoing the frontend.
-                                    sink.emit(EngineEvent::Note(format!("user revision: {text}")));
-                                    let revised_requirement = format!(
-                                        "{}\n\n## Revision request\n{text}",
-                                        app.requirement
-                                    );
-                                    let run_opts = RunOptions {
-                                        project_root: opts.project_root.clone(),
-                                        requirement: revised_requirement,
-                                        slug: opts.slug.clone(),
-                                        model: String::new(),
-                                        backend: app.backend.clone().unwrap_or_default(),
-                                        design_system: app.config.design_system.clone().unwrap_or_default(),
-                                        seed_template: app.config.seed_template.clone().unwrap_or_default(),
-                                        mode: app.effective_trust_mode(),
-                                        // Snapshot the strict-coverage opt-in once at
-                                        // the app boundary; the runner reads this, not
-                                        // the live env (which races in parallel).
-                                        strict_coverage: umadev_agent::strict_coverage_from_env(),
-                                    };
-                                    let gate = app.active_gate;
-                                    // The producing block is re-running, so the gate
-                                    // is no longer active — clear it so the status
-                                    // bar / prompt don't keep showing the old gate
-                                    // (and its timers) during the rework.
-                                    app.active_gate = None;
-                                    app.gate_choice = None;
-                                    // P1-D: on a continuous run, feed the revision back
-                                    // into the SAME held director session by re-driving
-                                    // the producing block on the continuous engine —
-                                    // NOT a single-shot `spawn_block`, which would orphan
-                                    // the held session (leaked, never `end()`-ed) and
-                                    // silently swap to the per-phase re-feed engine.
-                                    run_task = Some(if continuous_run_active {
-                                        let autonomous = continuous_autonomous(run_opts.mode);
-                                        let start_after =
-                                            continuous_revise_phase(gate.unwrap_or(Gate::DocsConfirm));
-                                        spawn_continuous_block(
-                                            run_opts,
-                                            sink.clone(),
-                                            session_holder.clone(),
-                                            start_after,
-                                            autonomous,
-                                        )
+                                    // A1-GAP1: a revision typed at a DIRECTOR gate
+                                    // folds into the RESUMED run as a steering
+                                    // directive at the next step boundary — the base
+                                    // reworks the artifacts in-context on the same
+                                    // plan instead of a legacy block re-run.
+                                    if !continuous_run_active
+                                        && (app.director_gate_paused
+                                            || umadev_agent::has_resumable_director_plan(
+                                                &app.project_root,
+                                            ))
+                                    {
+                                        sink.emit(EngineEvent::Note(format!(
+                                            "user revision: {text}"
+                                        )));
+                                        let gate =
+                                            app.active_gate.take().unwrap_or(Gate::DocsConfirm);
+                                        app.gate_choice = None;
+                                        run_task = Some(resume_director_after_gate(
+                                            app,
+                                            &opts,
+                                            &sink,
+                                            &route_tx,
+                                            &steer_holder,
+                                            &approval_holder,
+                                            Some((gate, text)),
+                                        ));
                                     } else {
-                                        let block = match gate {
-                                            Some(Gate::PreviewConfirm) => {
-                                                Block::Continue(Gate::DocsConfirm)
-                                            }
-                                            // A revise AT the clarify gate re-asks the
-                                            // clarifying questions with the new info —
-                                            // NOT a jump straight to research/docs
-                                            // (Block::Initial skips clarify entirely).
-                                            Some(Gate::ClarifyGate) => Block::Clarify,
-                                            // docs_confirm or unknown → regenerate docs
-                                            _ => Block::Initial,
+                                        // Re-run the block that PRODUCED the current
+                                        // gate, with the revision feedback folded into
+                                        // the requirement so the worker actually
+                                        // incorporates it. Branch on the active gate:
+                                        //   - docs_confirm  → re-run Initial (regen docs)
+                                        //   - preview_confirm→ re-run Continue(DocsConfirm)
+                                        //     (regen spec → frontend), NOT the docs.
+                                        // Re-running Initial unconditionally was a bug:
+                                        // a UI revision at preview_confirm would have
+                                        // thrown away the approved docs and regenerated
+                                        // them instead of redoing the frontend.
+                                        sink.emit(EngineEvent::Note(format!(
+                                            "user revision: {text}"
+                                        )));
+                                        let revised_requirement = format!(
+                                            "{}\n\n## Revision request\n{text}",
+                                            app.requirement
+                                        );
+                                        let run_opts = RunOptions {
+                                            project_root: opts.project_root.clone(),
+                                            requirement: revised_requirement,
+                                            slug: opts.slug.clone(),
+                                            model: String::new(),
+                                            backend: app.backend.clone().unwrap_or_default(),
+                                            design_system: app.config.design_system.clone().unwrap_or_default(),
+                                            seed_template: app.config.seed_template.clone().unwrap_or_default(),
+                                            mode: app.effective_trust_mode(),
+                                            // Snapshot the strict-coverage opt-in once at
+                                            // the app boundary; the runner reads this, not
+                                            // the live env (which races in parallel).
+                                            strict_coverage: umadev_agent::strict_coverage_from_env(),
                                         };
-                                        spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
-                                    });
+                                        let gate = app.active_gate;
+                                        // The producing block is re-running, so the gate
+                                        // is no longer active — clear it so the status
+                                        // bar / prompt don't keep showing the old gate
+                                        // (and its timers) during the rework.
+                                        app.active_gate = None;
+                                        app.gate_choice = None;
+                                        // P1-D: on a continuous run, feed the revision back
+                                        // into the SAME held director session by re-driving
+                                        // the producing block on the continuous engine —
+                                        // NOT a single-shot `spawn_block`, which would orphan
+                                        // the held session (leaked, never `end()`-ed) and
+                                        // silently swap to the per-phase re-feed engine.
+                                        run_task = Some(if continuous_run_active {
+                                            let autonomous =
+                                                continuous_autonomous(run_opts.mode);
+                                            let start_after = continuous_revise_phase(
+                                                gate.unwrap_or(Gate::DocsConfirm),
+                                            );
+                                            spawn_continuous_block(
+                                                run_opts,
+                                                sink.clone(),
+                                                session_holder.clone(),
+                                                start_after,
+                                                autonomous,
+                                            )
+                                        } else {
+                                            let block = match gate {
+                                                Some(Gate::PreviewConfirm) => {
+                                                    Block::Continue(Gate::DocsConfirm)
+                                                }
+                                                // A revise AT the clarify gate re-asks the
+                                                // clarifying questions with the new info —
+                                                // NOT a jump straight to research/docs
+                                                // (Block::Initial skips clarify entirely).
+                                                Some(Gate::ClarifyGate) => Block::Clarify,
+                                                // docs_confirm or unknown → regenerate docs
+                                                _ => Block::Initial,
+                                            };
+                                            spawn_block(
+                                                run_opts,
+                                                app.brain_spec(),
+                                                sink.clone(),
+                                                block,
+                                            )
+                                        });
+                                    }
                                 }
                                 Action::StartPreview { url, command } => {
                                     // Manual `/preview`: start the server AND open the
@@ -10899,6 +11182,8 @@ mod tests {
             None,
             false,
             false,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            Arc::new(std::sync::Mutex::new(None)),
         )
         .await;
 

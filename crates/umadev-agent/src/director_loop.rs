@@ -558,6 +558,21 @@ pub enum DirectorLoopOutcome {
     /// The session died / a turn failed — an honest hard stop, never disguised as
     /// success. Carries a machine-true reason.
     Failed(String),
+    /// The run PAUSED at a spec-MUST human confirmation gate (`UD-FLOW-002`
+    /// `docs_confirm` / `UD-FLOW-003` `preview_confirm`) awaiting the user.
+    ///
+    /// Produced ONLY on a HOSTED, non-auto run (the hosting UI declared it can
+    /// render + resume gates — [`crate::interaction::RunInteraction::confirm_gates`]
+    /// — and the trust tier is not `auto`): the plan was persisted with the
+    /// remaining steps `Pending`, the open door was written to
+    /// `workflow-state.json#active_gate`, and an [`EngineEvent::GateOpened`] was
+    /// emitted. The caller resumes via [`drive_director_loop_resume`] once the
+    /// user approves (the already-`Done` doc steps are never re-driven). Headless
+    /// runs never produce this — they keep today's drive-through behaviour.
+    PausedAtGate {
+        /// The gate now awaiting the user's confirmation.
+        gate: crate::gates::Gate,
+    },
 }
 
 /// Drive an explicit `/run` (full product build) through the **director build loop**
@@ -853,6 +868,18 @@ fn invalidate_stale_steps(root: &Path, plan: &mut Plan) {
     plan.invalidate_stale(&kinds);
 }
 
+/// Whether `root` holds a resumable **director-loop plan** specifically: a
+/// persisted `.umadev/plan.json` with at least one incomplete step. Strictly
+/// narrower than [`has_resumable_run`] (which also accepts a legacy workflow
+/// state parked at a gate): only the director loop writes `plan.json`, so this is
+/// the discriminator the TUI uses to route a gate approval / revision back into
+/// [`drive_director_loop_resume`] instead of the legacy gate-block machinery.
+/// Pure, read-only, fail-open (absent / corrupt / fully-terminal plan → `false`).
+#[must_use]
+pub fn has_resumable_director_plan(root: &Path) -> bool {
+    load_resumable_plan(root).is_some()
+}
+
 /// Whether `root` holds a director-loop run that can be RESUMED on a fresh session:
 /// either a persisted `.umadev/plan.json` with an incomplete step, OR a
 /// `.umadev/workflow-state.json` parked at a gate / in a non-terminal phase. Pure,
@@ -919,6 +946,11 @@ pub async fn drive_director_loop_resume(
     }
 
     let mut plan = load_resumable_plan(&options.project_root)?;
+
+    // The resume CLOSES any door the previous pause left open: re-sync the phase
+    // state (its writes always clear `active_gate`), so `/status` stops reporting
+    // "paused at gate" the moment the run is driving again. Fail-open.
+    sync_phase_from_plan(&plan, options);
 
     // Surface the routing decision (the same visible intent card a fresh run shows).
     events.emit(EngineEvent::intent_decided(route));
@@ -1579,6 +1611,28 @@ async fn drive_plan_steps(
             )
             .await;
         }
+
+        // ── Spec-MUST human confirmation gates on the DEFAULT path (UD-FLOW-002 /
+        // UD-FLOW-003 — A1-GAP1). When the just-settled step completed the core-doc
+        // family (PM / architect / UIUX all Done) → pause at `docs_confirm`; when it
+        // completed the frontend family → `preview_confirm`. Hosted + non-auto runs
+        // only (headless / auto keep today's drive-through). The pause is REAL: the
+        // plan persists with the remaining steps Pending, the open door lands in
+        // `workflow-state.json`, `GateOpened` renders the gate card, and the caller
+        // resumes via `drive_director_loop_resume` (Done steps never re-drive).
+        // FAIL-OPEN: if the plan can't persist, do NOT pause — a pause that can't
+        // re-load would lose the build on resume, so the run keeps driving instead.
+        if let Some(gate) = confirm_gate_after_step(step.seat, step_kind, status, plan, options) {
+            if plan_state::save(plan, &options.project_root).is_ok() {
+                // Checkpoint the doc versions the user is confirming, so a resume
+                // re-opens doc steps ONLY if the user actually edits a doc while
+                // the run is parked (the staleness store, same as persist_plan_ref).
+                record_artifact_versions(&options.project_root);
+                persist_gate_open(options, gate);
+                events.emit(EngineEvent::gate_opened(gate));
+                return Some(DirectorLoopOutcome::PausedAtGate { gate });
+            }
+        }
     }
 
     // MEDIUM #2 — honest scope: a Blocked step permanently strands its dependents as
@@ -1701,6 +1755,133 @@ async fn drive_plan_steps(
         run_actual_size_from_plan(plan),
     );
     Some(DirectorLoopOutcome::Done { reply: last_reply })
+}
+
+/// The confirmation gate to OPEN after a plan step settled, or `None` (the
+/// overwhelmingly common case) — the DEFAULT path's revival of the two spec-MUST
+/// human gates (`UD-FLOW-002` docs_confirm / `UD-FLOW-003` preview_confirm;
+/// A1-GAP1: `drive_plan_steps` never emitted `GateOpened` and never paused, so
+/// the gates only existed on the legacy engine).
+///
+/// **Transition-triggered by design** (no persisted "gate passed" state needed):
+/// a gate fires exactly when the JUST-SETTLED step is a `Done` BUILD step of the
+/// gate's producing seat family AND that family is now fully `Done`. A resumed
+/// run never re-drives a `Done` step, so a resume can never re-fire the gate it
+/// paused at; a doc step re-opened by artifact staleness (the user revised the
+/// doc) that re-settles `Done` legitimately re-confirms.
+///
+/// Fires ONLY when every condition holds:
+/// - the run is HOSTED by a UI that renders + resumes gates
+///   ([`crate::interaction::gates_hosted`]) — a headless CLI / CI run could never
+///   resume a pause, so it keeps today's drive-through behaviour (fail-open);
+/// - the trust tier is NOT `auto` ([`crate::trust::TrustMode::gates_auto_approve`]
+///   — auto runs end-to-end, exactly as today);
+/// - real work remains (≥1 `Pending`/`Active` step) — a pause with nothing left
+///   would strand the run (a fully-terminal plan is not resumable).
+fn confirm_gate_after_step(
+    seat: crate::critics::Seat,
+    kind: plan_state::StepKind,
+    status: StepStatus,
+    plan: &Plan,
+    options: &RunOptions,
+) -> Option<crate::gates::Gate> {
+    use crate::critics::Seat;
+    // Only a BUILD step that genuinely settled Done completes a gate's producing
+    // work (a Blocked doc/frontend step is an honest gap — nothing to confirm).
+    if kind != plan_state::StepKind::Build || status != StepStatus::Done {
+        return None;
+    }
+    if options.mode.gates_auto_approve() || !crate::interaction::gates_hosted() {
+        return None;
+    }
+    // Never pause a run that has nothing left to drive — the pause would not be
+    // resumable and the final gate / finalize below own the ending instead.
+    if !plan
+        .steps
+        .iter()
+        .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active))
+    {
+        return None;
+    }
+    // "The whole family is Done" — true only when the family is non-empty AND
+    // every member reached Done (a Blocked member keeps the gate closed: the
+    // docs/preview are incomplete, so there is nothing coherent to confirm).
+    let family_done = |member: &dyn Fn(&plan_state::PlanStep) -> bool| -> bool {
+        let mut any = false;
+        for s in plan.steps.iter().filter(|s| member(s)) {
+            any = true;
+            if s.status != StepStatus::Done {
+                return false;
+            }
+        }
+        any
+    };
+    let doc_seat = |s: Seat| {
+        matches!(
+            s,
+            Seat::ProductManager | Seat::Architect | Seat::UiuxDesigner
+        )
+    };
+    if doc_seat(seat)
+        && family_done(&|s: &plan_state::PlanStep| {
+            s.kind == plan_state::StepKind::Build && doc_seat(s.seat)
+        })
+    {
+        return Some(crate::gates::Gate::DocsConfirm);
+    }
+    if seat == Seat::FrontendEngineer
+        && family_done(&|s: &plan_state::PlanStep| {
+            s.kind == plan_state::StepKind::Build && s.seat == Seat::FrontendEngineer
+        })
+    {
+        return Some(crate::gates::Gate::PreviewConfirm);
+    }
+    None
+}
+
+/// Persist the OPEN-GATE workflow state for a director-loop pause — the P0-A twin
+/// of [`crate::continuous::run_block`]'s gate write, so `/status`, `umadev
+/// continue`, and a fresh TUI session all read the REAL door this run parked at.
+/// Phase is clamped monotonic exactly like [`persist_phase_impl`]; the base
+/// session id (the cross-session resume pointer) is carried forward. **Fail-open
+/// by contract:** a failed write is swallowed — the pause itself is already
+/// guarded by a successful plan persist at the call site.
+fn persist_gate_open(options: &RunOptions, gate: crate::gates::Gate) {
+    let current_state = crate::state::read_workflow_state(&options.project_root);
+    let current = current_state
+        .as_ref()
+        .and_then(|s| {
+            umadev_spec::PHASE_CHAIN
+                .iter()
+                .copied()
+                .find(|p| p.id() == s.phase)
+        })
+        .unwrap_or(Phase::Research);
+    let gate_phase = match gate {
+        crate::gates::Gate::DocsConfirm => Phase::DocsConfirm,
+        crate::gates::Gate::PreviewConfirm => Phase::PreviewConfirm,
+        // Never produced by the director loop; anchor defensively to the head.
+        crate::gates::Gate::ClarifyGate => Phase::Research,
+    };
+    // Clamp: never regress below what's already on disk (the doc steps may have
+    // already advanced the phase past the gate's own anchor).
+    let phase = if phase_rank(gate_phase) >= phase_rank(current) {
+        gate_phase
+    } else {
+        current
+    };
+    let state = crate::state::WorkflowState {
+        phase: phase.id().to_string(),
+        active_gate: gate.id_str().to_string(),
+        slug: options.effective_slug(),
+        requirement: options.requirement.clone(),
+        last_transition_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        note: format!("Paused at {} (director loop)", gate.id_str()),
+        backend: options.backend.clone(),
+        base_session_id: current_state.and_then(|s| s.base_session_id),
+        spec_version: umadev_spec::SPEC_VERSION.to_string(),
+    };
+    let _ = crate::state::write_workflow_state(&options.project_root, &state);
 }
 
 /// The ACTUAL [`crate::sizing_calibration::SizeRank`] a step-driven build settled at,
@@ -1971,6 +2152,24 @@ async fn drive_build_step(
     if !pitfalls.trim().is_empty() {
         instruction.push_str("\n\n## Known pitfalls to avoid (from past runs)\n");
         instruction.push_str(pitfalls.trim());
+    }
+    // MID-RUN USER STEERING (A2#4/#5): drain the hosting UI's queued directives
+    // (`/plan skip|veto|add`, text typed while the build ran, a gate revision) at
+    // this STEP BOUNDARY and fold them into the doer's directive — so steering
+    // applies at the next step instead of evaporating (the director path never
+    // emitted the GateOpened/BlockCompleted gaps the legacy queue drained at).
+    // Fail-open: headless / no intake / empty queue → the directive is unchanged.
+    let steering = crate::interaction::take_steer();
+    if !steering.is_empty() {
+        events.emit(EngineEvent::Note(umadev_i18n::tlf(
+            "plan.steer.folded",
+            &[&steering.len().to_string()],
+        )));
+        instruction
+            .push_str("\n\n## User steering (queued mid-run — honour it from this step onward)\n");
+        for s in &steering {
+            instruction.push_str(&format!("- {s}\n"));
+        }
     }
     // REQUIRED DELIVERABLE PATH(S): a step's acceptance verifies a SPECIFIC file exists
     // (a doc-first PRD/architecture/UIUX at `output/<slug>-*.md`, a named source file).
@@ -3834,6 +4033,80 @@ struct TurnResult {
     ran_build_tool: bool,
 }
 
+/// The outcome of [`resolve_approval`]: the decision plus whether it was made
+/// HEADLESSLY (the deterministic floor auto-decided with no live user) — the
+/// caller keeps its own existing note behaviour for the headless deny, so the
+/// legacy paths stay byte-for-byte silent/loud exactly as they were.
+pub(crate) struct ResolvedApproval {
+    /// The decision to answer the base with.
+    pub decision: ApprovalDecision,
+    /// `true` when no live user was consulted (unscoped / no callback) — today's
+    /// deterministic floor decided.
+    pub headless: bool,
+}
+
+/// Resolve a base [`SessionEvent::NeedApproval`] with the trust floor FIRST and —
+/// new (A2#3) — a live user SECOND: when the floor says the action needs
+/// confirmation and the run is TUI-hosted ([`crate::interaction::request_approval`]),
+/// PAUSE and ask the user (the same y/n `await_user_approval` flow the chat drain
+/// uses; bounded, fail-open deny), remembering an approved reversible class in the
+/// project trust ledger so it is not re-asked (exactly like the chat drain).
+/// Headless (CLI / CI / no callback) keeps today's behaviour byte-for-byte: the
+/// floor's escalation degrades to DENY and the CALLER emits (or doesn't emit) its
+/// existing note — this helper only emits the interactive allow/deny notes.
+pub(crate) async fn resolve_approval(
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    action: &str,
+    target: &str,
+) -> ResolvedApproval {
+    let ledger = crate::trust::TrustLedger::load(&options.project_root);
+    if !requires_confirmation_with_ledger(
+        options.mode,
+        action,
+        target,
+        &options.project_root,
+        &ledger,
+    ) {
+        return ResolvedApproval {
+            decision: ApprovalDecision::Allow,
+            headless: true,
+        };
+    }
+    match crate::interaction::request_approval(action, target).await {
+        Some(true) => {
+            // Remember this reversible class so it is not re-asked (an
+            // irreversible-floor action records nothing → always re-asks) —
+            // mirrors the chat drain's approval bookkeeping exactly.
+            crate::trust::remember_project_approval(&options.project_root, action, target);
+            events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "trust.pause.allowed",
+                &[action, target],
+            )));
+            ResolvedApproval {
+                decision: ApprovalDecision::Allow,
+                headless: false,
+            }
+        }
+        Some(false) => {
+            events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "trust.pause.denied",
+                &[action, target],
+            )));
+            ResolvedApproval {
+                decision: ApprovalDecision::Deny,
+                headless: false,
+            }
+        }
+        // Headless — the floor's escalation degrades to DENY, exactly as today;
+        // the caller keeps its own existing note behaviour.
+        None => ResolvedApproval {
+            decision: ApprovalDecision::Deny,
+            headless: true,
+        },
+    }
+}
+
 /// Send one directive and pump the base's event stream to its `TurnDone`, forwarding
 /// tool calls + text to the live sink (the SAME `WorkerStream` render path the
 /// pipeline uses), answering approvals via the always-on irreversible floor, and
@@ -4111,10 +4384,13 @@ async fn drive_one_turn_with_backoff(
                 // its OWN `AskUserQuestion` tool. Driven non-interactively, that call
                 // can't render its picker and auto-cancels — was a bare optionless
                 // stub read as cancelled. Surface the question + numbered options as a
-                // Note + give the tool row a real detail, so the user sees what's asked
-                // and that the base awaits their choice (relayed next turn — see
-                // `crate::ask_question`). Fail-open: a non-question call → None.
-                if let Some(surface) = crate::ask_question::surface(&name, &input) {
+                // Note + give the tool row a real detail. A2#6: on THIS mid-run
+                // director path the honest hint is the MID-RUN variant — the build
+                // continues with the base's default; a typed answer folds in as
+                // follow-up steering at the next step boundary (never "the base is
+                // waiting on you", which is only true on the chat surface's relay).
+                // Fail-open: a non-question call → None.
+                if let Some(surface) = crate::ask_question::surface_mid_run(&name, &input) {
                     detail = surface.detail;
                     events.emit(EngineEvent::Note(surface.note));
                 } else if let Some(surface) = crate::ask_question::exit_plan_surface(&name, &input)
@@ -4157,23 +4433,19 @@ async fn drive_one_turn_with_backoff(
                 // isn't re-denied. Fail-open: a missing/corrupt ledger behaves as
                 // the bare mode policy. Reversible in-tree edits stay allowed so a
                 // headless build isn't wedged waiting on a human.
-                let ledger = crate::trust::TrustLedger::load(&options.project_root);
-                let decision = if requires_confirmation_with_ledger(
-                    options.mode,
-                    &action,
-                    &target,
-                    &options.project_root,
-                    &ledger,
-                ) {
+                //
+                // A2#3: when the run is TUI-HOSTED, an escalation PAUSES and asks
+                // the live user (the same y/n flow as the chat drain — bounded,
+                // fail-open deny) instead of headlessly auto-denying while the UI
+                // copy claims "needs your confirmation". Headless keeps the deny.
+                let resolved = resolve_approval(options, events, &action, &target).await;
+                if resolved.headless && matches!(resolved.decision, ApprovalDecision::Deny) {
                     events.emit(EngineEvent::Note(umadev_i18n::tlf(
                         "continuous.dangerous_action_denied",
                         &[&action, &target],
                     )));
-                    ApprovalDecision::Deny
-                } else {
-                    ApprovalDecision::Allow
-                };
-                if let Err(e) = session.respond(&req_id, decision).await {
+                }
+                if let Err(e) = session.respond(&req_id, resolved.decision).await {
                     // LOW #2: a turn that dies on the approval round-trip still spent
                     // its tokens — record the estimate (fail-open) before bailing. No
                     // `TurnDone` yet → estimate (F3).
@@ -5259,7 +5531,7 @@ mod tests {
         let outcome = drive_director_loop(&mut sess, &o, &events, "GO".to_string()).await;
         match outcome {
             DirectorLoopOutcome::Done { reply } => assert!(reply.contains("created the login")),
-            other @ DirectorLoopOutcome::Failed(_) => panic!("expected Done, got {other:?}"),
+            other => panic!("expected Done, got {other:?}"),
         }
         let sent = sent.lock().unwrap();
         // Exactly ONE main directive: the opening build. Clean QC → no fix pass.
@@ -7180,7 +7452,7 @@ mod tests {
         // The step-driven loop drove the doer turn and threaded its reply back.
         match outcome {
             DirectorLoopOutcome::Done { reply } => assert!(reply.contains("Built the whole app")),
-            other @ DirectorLoopOutcome::Failed(_) => panic!("expected Done, got {other:?}"),
+            other => panic!("expected Done, got {other:?}"),
         }
     }
 
@@ -10239,5 +10511,439 @@ mod tests {
             "no stranded dependents → the single-attempt budget is NOT spent"
         );
         assert_eq!(plan, before, "the plan is unchanged for a leaf block");
+    }
+
+    // ── Spec-MUST confirmation gates on the DEFAULT path (A1-GAP1 / UD-FLOW-002 /
+    //    UD-FLOW-003): a HOSTED, guarded run pauses at docs_confirm once the core-doc
+    //    steps settle Done, and at preview_confirm once the frontend family settles;
+    //    auto / headless runs drive through exactly as today; a resume never
+    //    re-fires the gate it paused at. ──
+
+    /// A doc-first 4-step plan (PM → architect → frontend/backend) whose steps all
+    /// pass a seeded source-present acceptance, so gate positions are deterministic.
+    fn gated_plan() -> crate::plan_state::Plan {
+        use crate::critics::Seat;
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let mk = |id: &str, seat: Seat, deps: &[&str]| PlanStep {
+            id: id.into(),
+            title: format!("do the {id} work"),
+            seat,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        };
+        Plan {
+            steps: vec![
+                mk("pm", Seat::ProductManager, &[]),
+                mk("arch", Seat::Architect, &["pm"]),
+                mk("fe", Seat::FrontendEngineer, &["arch"]),
+                mk("be", Seat::BackendEngineer, &["arch"]),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        }
+    }
+
+    /// The hosted interaction a TUI provides (gates on; no steer/approval needed).
+    fn gates_hosted_interaction() -> crate::interaction::RunInteraction {
+        crate::interaction::RunInteraction {
+            steer: None,
+            approval: None,
+            confirm_gates: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_guarded_build_pauses_at_docs_confirm_with_persisted_door() {
+        // The revived spec-MUST docs gate: once the PM + architect doc steps settle
+        // Done on a HOSTED guarded run, the schedule PAUSES — GateOpened emitted,
+        // plan persisted (remaining steps Pending), the open door written to
+        // workflow-state — and returns PausedAtGate instead of driving the code steps.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        o.mode = TrustMode::Guarded;
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = gated_plan();
+
+        let outcome = crate::interaction::hosted(gates_hosted_interaction(), async {
+            drive_plan_steps(
+                &mut sess,
+                &o,
+                &events,
+                &route,
+                &mut plan,
+                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            )
+            .await
+        })
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                Some(DirectorLoopOutcome::PausedAtGate {
+                    gate: crate::gates::Gate::DocsConfirm
+                })
+            ),
+            "a hosted guarded run pauses at docs_confirm: {outcome:?}"
+        );
+        // GateOpened rendered the gate card (the TUI's active_gate driver).
+        assert_eq!(
+            rec.count(|e| matches!(
+                e,
+                EngineEvent::GateOpened {
+                    gate: crate::gates::Gate::DocsConfirm,
+                    ..
+                }
+            )),
+            1,
+            "exactly one docs_confirm GateOpened was emitted"
+        );
+        // The persisted plan holds the pause honestly: docs Done, code Pending.
+        let loaded = plan_state::load(tmp.path()).expect("plan persisted at the pause");
+        let status_of = |id: &str| loaded.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(status_of("pm"), StepStatus::Done);
+        assert_eq!(status_of("arch"), StepStatus::Done);
+        assert_eq!(status_of("fe"), StepStatus::Pending);
+        assert_eq!(status_of("be"), StepStatus::Pending);
+        // The open door is on disk for /status + a fresh session's /continue.
+        let state = crate::state::read_workflow_state(tmp.path()).expect("state written");
+        assert_eq!(state.active_gate, "docs_confirm");
+        assert!(has_resumable_run(tmp.path()));
+        assert!(has_resumable_director_plan(tmp.path()));
+    }
+
+    #[tokio::test]
+    async fn resume_after_docs_gate_pauses_at_preview_then_completes() {
+        // The full round-trip: docs pause → approve (resume) → the docs gate never
+        // re-fires (transition-triggered: the Done doc steps are never re-driven),
+        // the frontend step completes → preview_confirm pause → approve (resume) →
+        // the backend step completes → a clean Done outcome.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut o = opts(tmp.path());
+        o.mode = TrustMode::Guarded;
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+
+        // 1. Fresh drive → docs pause (as covered above).
+        let mut plan = gated_plan();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let outcome = crate::interaction::hosted(gates_hosted_interaction(), async {
+            drive_plan_steps(
+                &mut sess,
+                &o,
+                &events,
+                &route,
+                &mut plan,
+                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            )
+            .await
+        })
+        .await;
+        assert!(matches!(
+            outcome,
+            Some(DirectorLoopOutcome::PausedAtGate {
+                gate: crate::gates::Gate::DocsConfirm
+            })
+        ));
+
+        // 2. User approves → resume on a FRESH session. The docs gate must NOT
+        //    re-fire; the frontend step settles → preview_confirm pause.
+        let mut sess2 = FakeSession::new(vec![], false, "");
+        let outcome2 = crate::interaction::hosted(gates_hosted_interaction(), async {
+            drive_director_loop_resume(&mut sess2, &o, &events, &route).await
+        })
+        .await;
+        assert!(
+            matches!(
+                outcome2,
+                Some(DirectorLoopOutcome::PausedAtGate {
+                    gate: crate::gates::Gate::PreviewConfirm
+                })
+            ),
+            "the resumed run pauses next at preview_confirm (docs never re-fires): {outcome2:?}"
+        );
+        assert_eq!(
+            rec.count(|e| matches!(
+                e,
+                EngineEvent::GateOpened {
+                    gate: crate::gates::Gate::DocsConfirm,
+                    ..
+                }
+            )),
+            1,
+            "docs_confirm opened exactly ONCE across the whole run"
+        );
+        let state = crate::state::read_workflow_state(tmp.path()).expect("state");
+        assert_eq!(state.active_gate, "preview_confirm");
+
+        // 3. User approves the preview → resume completes the backend step; the
+        //    schedule finishes with a Done outcome and no further gate.
+        let mut sess3 = FakeSession::new(vec![], false, "");
+        let outcome3 = crate::interaction::hosted(gates_hosted_interaction(), async {
+            drive_director_loop_resume(&mut sess3, &o, &events, &route).await
+        })
+        .await;
+        assert!(
+            matches!(outcome3, Some(DirectorLoopOutcome::Done { .. })),
+            "the final resume completes the plan: {outcome3:?}"
+        );
+        let loaded = plan_state::load(tmp.path()).expect("plan persisted");
+        assert!(
+            loaded.steps.iter().all(|s| s.status == StepStatus::Done),
+            "every step settled Done across the gated round-trip"
+        );
+        // Phase-monotonicity core assertion (same invariant the phase tests lock):
+        // the finished build's persisted phase is at least `backend`.
+        let rank = |id: &str| {
+            umadev_spec::PHASE_CHAIN
+                .iter()
+                .position(|p| p.id() == id)
+                .unwrap()
+        };
+        let final_state = crate::state::read_workflow_state(tmp.path()).expect("state");
+        assert!(
+            rank(&final_state.phase) >= rank("backend"),
+            "the completed gated run's phase never regressed: {}",
+            final_state.phase
+        );
+        assert!(
+            final_state.active_gate.is_empty(),
+            "no stale open door after the run completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_and_headless_runs_never_pause_at_a_gate() {
+        // Auto tier (hosted) and a headless guarded run (no interaction scope) BOTH
+        // keep today's drive-through behaviour: no GateOpened, a Done outcome, every
+        // step complete in one schedule.
+        for (mode, hosted) in [(TrustMode::Auto, true), (TrustMode::Guarded, false)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            seed_source(tmp.path());
+            let (events, rec) = sink();
+            let mut sess = FakeSession::new(vec![], false, "");
+            let mut o = opts(tmp.path());
+            o.mode = mode;
+            o.requirement = "做一个完整的产品".to_string();
+            let route = build_route();
+            let mut plan = gated_plan();
+
+            let drive = drive_plan_steps(
+                &mut sess,
+                &o,
+                &events,
+                &route,
+                &mut plan,
+                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            );
+            let outcome = if hosted {
+                crate::interaction::hosted(gates_hosted_interaction(), drive).await
+            } else {
+                drive.await
+            };
+            assert!(
+                matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+                "mode={mode:?} hosted={hosted}: drives through with no pause: {outcome:?}"
+            );
+            assert_eq!(
+                rec.count(|e| matches!(e, EngineEvent::GateOpened { .. })),
+                0,
+                "mode={mode:?} hosted={hosted}: no gate event on the drive-through path"
+            );
+            assert!(
+                plan.steps.iter().all(|s| s.status == StepStatus::Done),
+                "every step completed in one schedule"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gate_never_fires_with_no_remaining_work() {
+        // A docs-only plan (PM + architect, nothing after) must NOT pause: a pause
+        // with nothing left to drive would strand the run (not resumable). The
+        // schedule finishes normally instead.
+        use crate::critics::Seat;
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let mut o = opts(tmp.path());
+        o.mode = TrustMode::Guarded;
+        o.requirement = "写两份文档".to_string();
+        let route = build_route();
+        let mk = |id: &str, seat: Seat, deps: &[&str]| PlanStep {
+            id: id.into(),
+            title: format!("write the {id} doc"),
+            seat,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        };
+        let mut plan = Plan {
+            steps: vec![
+                mk("pm", Seat::ProductManager, &[]),
+                mk("arch", Seat::Architect, &["pm"]),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+
+        let outcome = crate::interaction::hosted(gates_hosted_interaction(), async {
+            drive_plan_steps(
+                &mut sess,
+                &o,
+                &events,
+                &route,
+                &mut plan,
+                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            )
+            .await
+        })
+        .await;
+        assert!(
+            matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+            "a docs-only plan finishes instead of pausing un-resumably: {outcome:?}"
+        );
+        assert_eq!(
+            rec.count(|e| matches!(e, EngineEvent::GateOpened { .. })),
+            0,
+            "no gate fires when nothing remains to resume into"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_steer_folds_into_the_next_build_step_directive() {
+        // A2#4/#5: directives queued in the hosted steering intake are drained at
+        // the next STEP BOUNDARY and folded into the doer's instruction — steering
+        // applies mid-run instead of evaporating. Auto tier so no gate pause
+        // interleaves; the intake is consumed exactly once.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, rec) = sink();
+        let mut sess = FakeSession::new(vec![], false, "");
+        let sent = sess.sent_handle();
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的产品".to_string();
+        let route = build_route();
+        let mut plan = gated_plan();
+
+        let steer: crate::interaction::SteerIntake = Arc::new(std::sync::Mutex::new(vec![
+            "Plan steering: SKIP step `be` — do not perform it.".to_string(),
+        ]));
+        let interaction = crate::interaction::RunInteraction {
+            steer: Some(Arc::clone(&steer)),
+            approval: None,
+            confirm_gates: false,
+        };
+        let outcome = crate::interaction::hosted(interaction, async {
+            drive_plan_steps(
+                &mut sess,
+                &o,
+                &events,
+                &route,
+                &mut plan,
+                IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            )
+            .await
+        })
+        .await;
+        assert!(matches!(outcome, Some(DirectorLoopOutcome::Done { .. })));
+        // The FIRST doer directive carries the folded steering block…
+        let sent = sent.lock().unwrap();
+        let steered: Vec<&String> = sent
+            .iter()
+            .filter(|d| d.contains("## User steering"))
+            .collect();
+        assert!(
+            steered
+                .first()
+                .is_some_and(|d| d.contains("SKIP step `be`")),
+            "the queued directive folded into a step directive: {sent:?}"
+        );
+        // …exactly once (the intake drains on consumption, never re-applied).
+        assert_eq!(steered.len(), 1, "steering applied at ONE step boundary");
+        assert!(
+            steer.lock().unwrap().is_empty(),
+            "the intake drained on consumption"
+        );
+        // The fold was surfaced to the user (the i18n note).
+        assert!(
+            rec.count(|e| matches!(e, EngineEvent::Note(n) if n.contains("1"))) >= 1,
+            "a fold note was emitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_headless_keeps_the_floor_and_hosted_asks_the_user() {
+        // A2#3: the interactive approval bridge. Headless (no scope): the floor's
+        // escalation degrades to DENY exactly as today. Hosted: the callback's
+        // verdict decides — an Allow also records the reversible class in the
+        // project trust ledger (like the chat drain), a Deny denies.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut o = opts(tmp.path());
+        o.mode = TrustMode::Guarded;
+        let (events, _rec) = sink();
+
+        // An out-of-tree write escalates under Guarded (root-aware policy).
+        let action = "write";
+        let target = "/etc/hosts-not-ours";
+
+        // Headless: escalate → DENY, flagged headless (the caller emits its note).
+        let headless = resolve_approval(&o, &events, action, target).await;
+        assert!(matches!(headless.decision, ApprovalDecision::Deny));
+        assert!(headless.headless);
+
+        // Hosted + user APPROVES → Allow, interactive.
+        let approve: crate::interaction::ApprovalFn =
+            Arc::new(|_a, _t| Box::pin(async { true }) as crate::interaction::ApprovalFuture);
+        let hosted_allow = crate::interaction::hosted(
+            crate::interaction::RunInteraction {
+                steer: None,
+                approval: Some(approve),
+                confirm_gates: false,
+            },
+            resolve_approval(&o, &events, action, target),
+        )
+        .await;
+        assert!(matches!(hosted_allow.decision, ApprovalDecision::Allow));
+        assert!(!hosted_allow.headless);
+        // The approved reversible class was remembered (not re-asked next time):
+        // the SAME action now passes the floor without any callback.
+        let after = resolve_approval(&o, &events, action, target).await;
+        assert!(
+            matches!(after.decision, ApprovalDecision::Allow),
+            "the remembered class skips the re-ask"
+        );
+
+        // Hosted + user DENIES an (unremembered) escalation → Deny, interactive.
+        let deny: crate::interaction::ApprovalFn =
+            Arc::new(|_a, _t| Box::pin(async { false }) as crate::interaction::ApprovalFuture);
+        let hosted_deny = crate::interaction::hosted(
+            crate::interaction::RunInteraction {
+                steer: None,
+                approval: Some(deny),
+                confirm_gates: false,
+            },
+            resolve_approval(&o, &events, "bash", "git push --force origin main"),
+        )
+        .await;
+        assert!(matches!(hosted_deny.decision, ApprovalDecision::Deny));
+        assert!(!hosted_deny.headless);
     }
 }

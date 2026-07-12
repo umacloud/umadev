@@ -101,7 +101,7 @@
 "gate.clarify.next" = "回答完后输入 c 继续(进入联网调研),或描述修改意见"
 "gate.docs.title" = "docs_confirm — three core docs are ready for review"
 "gate.docs.checklist" = "PRD: 目标 / 范围 / 验收标准是否覆盖你真正要做的事?\n架构: API 接口、数据模型、技术选型是否合理?\n设计: 配色 / 字体 / 组件 token 是否符合预期, 有无暗色模式?"
-"gate.docs.next" = "看不懂没关系 — 按 c 信任 AI 的方案直接继续。注意:输入任何文字都会按你的修改重做整个 block(几分钟;误触了可以 /cancel 停),只想通过就别输文字。"
+"gate.docs.next" = "看不懂没关系 — 按 c(或回复「确认」「通过」)信任 AI 的方案直接继续。输入修改意见会按你的意见重做(几分钟;误触了可以 /cancel 停)。"
 "gate.preview.title" = "preview_confirm — frontend preview is ready for review"
 "gate.preview.checklist" = "前端是否按 UIUX 设计系统实现(图标库 / token / 排版)?\n页面结构和交互流是否匹配 PRD 的用户故事?\nfetch 的接口地址是否和架构文档里的 API 一致?"
 "gate.preview.next" = "审核前端可运行预览。按 c 确认进入 backend / quality / delivery;输入文字会按你的修改重做前端(几分钟;误触可 /cancel)。"
@@ -146,6 +146,7 @@
 "ask.prompt.relay_hint" = "回复选项编号(或直接输入文字),我会在同一对话里把你的选择转交给底座 —— 它无法弹出自己的选择框,所以是在等你的回答,并未被取消。"
 # 文字问答模式(question_form = text):把底座的提问以自然语言方式呈现,你用自己的话回答,无需选编号。
 "ask.prompt.text_hint" = "用你自己的话回答即可 —— 直接告诉我你的决定,我会在同一对话里转交给底座(无需选编号)。"
+"ask.prompt.midrun_hint" = "构建不会停在这里:底座会先按默认选项继续。你现在输入的回答会在下一个步骤边界并入指令,作为后续调整生效。"
 
 # 底座自身的计划模式(claude-code 的 ExitPlanMode)—— 底座起草了计划,正请求退出它自己的
 # 计划模式并开始执行。这是底座的计划模式,与 UmaDev 的守护模式不同,必须清楚标注区分。
@@ -200,6 +201,7 @@
 "plan.steer.move" = "调整步骤 `{}`（{}）——折进下一条指令。"
 "plan.steer.unknown_step" = "当前计划没有步骤 `{}`。"
 "plan.steer.queued" = "计划修改已排队,将在下一个步骤边界生效。"
+"plan.steer.folded" = "已把 {} 条排队的调整并入当前步骤指令。"
 
 # 团队(/team)—— 把 AI 开发团队作为一等概念呈现
 "team.title" = "你的 AI 开发团队"
@@ -287,7 +289,7 @@
 "session.completed" = "[session] workspace 上次跑完了流水线(需求:\"{}\")。\n  /diff 看上次产出 · 或直接输入新需求开新一轮。"
 "session.paused_at_gate" = "[session] workspace 上次会话停在 gate `{}`(需求:\"{}\")。\n  /continue 继续推进 · /diff 看产出 · 或开新需求(会重置 workflow state)。"
 "session.unfinished" = "[session] 检测到未完成的会话(phase={}, 需求:\"{}\")。\n  输入 /continue 推进上次 · 输入新需求会重新开始 · /status 查看详情"
-"session.resume_goal" = "[目标] 上次有个目标没做完:下一步「{}」(已完成 {}/{} 步)。/run 续上 · 或直接说要不要继续。"
+"session.resume_goal" = "[目标] 上次有个目标没做完:下一步「{}」(已完成 {}/{} 步)。/continue 续上 · 或直接说要不要继续。"
 
 # Codex 高危沙箱责任警告(仅在 codex 且 danger-full-access 时显示)
 "codex.sandbox.danger_warning" = "警告:Codex 高危沙箱模式(danger-full-access)已开启 —— 请自行承担系统环境风险。\n  关闭:在 .umadevrc 中设置 [codex] sandbox_mode = \"workspace-write\" 后重启。"
@@ -534,6 +536,7 @@
 "checkpoint.created" = "已创建文件检查点 `{}`:{}\n用 /rewind 查看,/rewind {} 回滚。"
 "checkpoint.git_required" = "无法创建检查点——检查点用影子 git 快照工作区文件,需要本机安装 git。"
 "rewind.empty" = "还没有文件检查点。/checkpoint [说明] 手动建一个;每个阶段开始也会自动建。"
+"rewind.busy" = "有任务正在跑 — 先 /cancel 停掉再 /rewind,避免回滚和运行同时写同一个工作区。"
 "rewind.list_header" = "文件检查点(新→旧)——用 /rewind <id> 回滚工作区文件:\n"
 "rewind.restored" = "已把工作区文件回滚到 `{}`(回滚前的现场已自动存档,可再 /rewind 回去)。"
 "rewind.failed" = "回滚失败:{}"
@@ -699,7 +702,7 @@
 # 标题栏 + 闸门卡片
 "tui.title.workspace_placeholder" = "<工作区>"
 "tui.gate_block.title" = "闸门 —— 暂停并确认"
-"tui.gate_block.hint" = "/continue 通过 · 直接输入修改意见 · Esc 退出"
+"tui.gate_block.hint" = "/continue 通过 · 直接输入修改意见 · 连按两次 Esc 取消本轮运行"
 # 滚动指示器(数字为占位、箭头为符号)
 "tui.scroll.both" = "↑ {} · ↓ {} 更多 —— End 回到底部"
 "tui.scroll.above" = "↑ 上方还有 {} 行"

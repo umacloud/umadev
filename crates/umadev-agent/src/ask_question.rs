@@ -99,6 +99,30 @@ pub fn note_for(q: &AskUserQuestion) -> String {
     note_for_with(q, prefers_text_questions())
 }
 
+/// [`surface`] for a **mid-run director build** (A2#6): same detail/question
+/// block, but the hint is the HONEST mid-run variant — on the director path the
+/// base's `AskUserQuestion` call auto-cancels and the build CONTINUES with the
+/// base's own default; a typed reply is folded in as follow-up steering at the
+/// next step boundary, not relayed as the live answer. The chat surface keeps
+/// [`surface`] (there the pending-ask machinery really does relay the reply).
+#[must_use]
+pub fn surface_mid_run(name: &str, input: &serde_json::Value) -> Option<AskQuestionSurface> {
+    let q = AskUserQuestion::from_tool_input(name, input)?;
+    let mut note = umadev_i18n::tlf("ask.prompt.header", &[]);
+    note.push('\n');
+    if prefers_text_questions() {
+        note.push_str(&q.prose_block());
+    } else {
+        note.push_str(&q.prompt_block());
+    }
+    note.push('\n');
+    note.push_str(&umadev_i18n::tlf("ask.prompt.midrun_hint", &[]));
+    Some(AskQuestionSurface {
+        detail: q.summary(),
+        note,
+    })
+}
+
 /// The pure body of [`note_for`], parameterized on `prefer_text` so the framing is
 /// testable without the process-global flag.
 ///
@@ -263,6 +287,42 @@ mod tests {
     fn surface_fails_open_for_non_question_tools() {
         let input = serde_json::json!({"file_path": "src/app.rs"});
         assert!(surface("Write", &input).is_none());
+    }
+
+    #[test]
+    fn surface_mid_run_uses_the_honest_midrun_hint_not_the_relay_framing() {
+        // A2#6: on the director path the base's question auto-cancels and the
+        // build CONTINUES with a default — the mid-run surface must carry the
+        // honest hint (answer folds in as follow-up steering), never the chat
+        // relay's "the base is waiting on your answer" framing.
+        let input = serde_json::json!({
+            "questions": [{
+                "header": "Auth",
+                "question": "Which auth method should the app use?",
+                "options": [
+                    {"label": "Email + password"},
+                    {"label": "OAuth (Google)"}
+                ]
+            }]
+        });
+        let mid = surface_mid_run("AskUserQuestion", &input).expect("has a surface");
+        // Same question/options block as the chat surface…
+        assert!(mid.note.contains("Which auth method"), "note: {}", mid.note);
+        // …but the MID-RUN hint, not the relay hint.
+        assert!(
+            mid.note
+                .contains(&umadev_i18n::tlf("ask.prompt.midrun_hint", &[])),
+            "carries the honest mid-run hint: {}",
+            mid.note
+        );
+        assert!(
+            !mid.note
+                .contains(&umadev_i18n::tlf("ask.prompt.relay_hint", &[])),
+            "never claims the base is waiting on a relayed answer: {}",
+            mid.note
+        );
+        // Fail-open parity with `surface`.
+        assert!(surface_mid_run("Write", &serde_json::json!({})).is_none());
     }
 
     #[test]

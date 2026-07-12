@@ -101,7 +101,7 @@
 "gate.clarify.next" = "When done, type c to continue (into web research), or describe changes"
 "gate.docs.title" = "docs_confirm — three core docs are ready for review"
 "gate.docs.checklist" = "PRD: do goals / scope / acceptance criteria cover what you actually want?\nArchitecture: are the API, data model and tech choices sound?\nDesign: do colors / fonts / component tokens match expectations, is there dark mode?"
-"gate.docs.next" = "Not sure? press c to trust the AI's plan. Note: typing ANY text re-runs the whole block per your change (minutes; /cancel to stop); to just approve, type nothing."
+"gate.docs.next" = "Not sure? press c (or reply \"ok\" / \"approve\") to trust the AI's plan. Typing a revision re-runs the work with your change (minutes; /cancel to stop)."
 "gate.preview.title" = "preview_confirm — frontend preview is ready for review"
 "gate.preview.checklist" = "Does the frontend follow the UIUX design system (icon lib / tokens / typography)?\nDo the page structure and flows match the PRD user stories?\nDo the fetch URLs match the architecture doc's API?"
 "gate.preview.next" = "Review the runnable frontend preview. Press c to proceed to backend / quality / delivery; typing text re-runs the frontend per your change (minutes; /cancel to undo)."
@@ -149,6 +149,7 @@
 # Text-question mode (`question_form = text`): the base asked a question, framed as
 # prose the user answers in their own words rather than by picking a number.
 "ask.prompt.text_hint" = "Answer in your own words — just tell me what you want and I'll pass it to the base in this same conversation (no need to pick a number)."
+"ask.prompt.midrun_hint" = "The build does not stop here: the base continues with its default choice. An answer you type now is folded into the directive at the next step boundary as follow-up steering."
 
 # The base CLI's OWN plan mode (claude-code's ExitPlanMode) — the base drafted a
 # plan and is asking to leave ITS plan mode and start executing. This is the BASE's
@@ -205,6 +206,7 @@
 "plan.steer.move" = "Reordering step `{}` ({}) — folded into the next directive."
 "plan.steer.unknown_step" = "No step `{}` in the current plan."
 "plan.steer.queued" = "Plan edit queued; it applies at the next step boundary."
+"plan.steer.folded" = "Folded {} queued steering item(s) into the current step's directive."
 
 # Team (/team) — surface the AI development team as a first-class concept
 "team.title" = "Your AI development team"
@@ -292,7 +294,7 @@
 "session.completed" = "[session] This workspace finished its last pipeline run (requirement: \"{}\").\n  /diff to view the last output · or just type a new requirement to start fresh."
 "session.paused_at_gate" = "[session] This workspace paused at gate `{}` last session (requirement: \"{}\").\n  /continue to proceed · /diff to view output · or start a new requirement (resets workflow state)."
 "session.unfinished" = "[session] Detected an unfinished session (phase={}, requirement: \"{}\").\n  Type /continue to resume · a new requirement restarts from scratch · /status for details"
-"session.resume_goal" = "[goal] Last time a goal was left unfinished: next step \"{}\" (step {}/{} done). /run to pick it back up · or just say whether to continue."
+"session.resume_goal" = "[goal] Last time a goal was left unfinished: next step \"{}\" (step {}/{} done). /continue to pick it back up · or just say whether to continue."
 
 # Codex high-risk sandbox liability warning (only shown for danger-full-access on codex)
 "codex.sandbox.danger_warning" = "WARNING: Codex high-risk sandbox (danger-full-access) is ENABLED — you assume all risk to your system environment.\n  To revert: set [codex] sandbox_mode = \"workspace-write\" in .umadevrc, then restart."
@@ -542,6 +544,7 @@
 "checkpoint.created" = "Created file checkpoint `{}`: {}\nUse /rewind to view, /rewind {} to roll back."
 "checkpoint.git_required" = "Cannot create a checkpoint — checkpoints snapshot workspace files with a shadow git, which requires git installed locally."
 "rewind.empty" = "No file checkpoints yet. /checkpoint [note] makes one manually; one is also created at the start of every phase."
+"rewind.busy" = "A task is running — /cancel it before /rewind, to avoid a rollback and a run writing the same workspace."
 "rewind.list_header" = "File checkpoints (new → old) — use /rewind <id> to roll workspace files back:\n"
 "rewind.restored" = "Rolled workspace files back to `{}` (the pre-rewind state was auto-archived, so you can /rewind forward again)."
 "rewind.failed" = "Rewind failed: {}"
@@ -708,7 +711,7 @@
 # Title row + gate block
 "tui.title.workspace_placeholder" = "<workspace>"
 "tui.gate_block.title" = "GATE — pause & decide"
-"tui.gate_block.hint" = "/continue to approve · type a revision · Esc to quit"
+"tui.gate_block.hint" = "/continue to approve · type a revision · Esc Esc cancels the run"
 # Transcript scroll indicators (counts are placeholders; arrows are symbols)
 "tui.scroll.both" = "↑ {} · ↓ {} more — End to bottom"
 "tui.scroll.above" = "↑ {} lines above"

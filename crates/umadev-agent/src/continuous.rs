@@ -669,10 +669,18 @@ fn govern_tool_call(
     // call can't pop up a picker and auto-cancels — previously surfaced as a bare
     // "AskUserQuestion" stub with NO options, silently treated as cancelled. Now
     // we render the question + numbered options as a prominent Note and give the
-    // tool row a real one-line detail, so the user SEES what's asked and that the
-    // base is awaiting their choice (relayed on the next turn — see
-    // `crate::ask_question`). Fail-open: a non-question / unreadable call → None.
-    if let Some(surface) = crate::ask_question::surface(name, input) {
+    // tool row a real one-line detail, so the user SEES what's asked. A2#6: when
+    // this turn is a TUI-HOSTED director step (a steering intake exists), the
+    // hint is the HONEST mid-run variant — the build continues with the base's
+    // default and a typed answer folds in as steering at the next step boundary;
+    // the legacy pipeline keeps its existing relay framing. Fail-open: a
+    // non-question / unreadable call → None.
+    let ask_surface = if crate::interaction::steering_hosted() {
+        crate::ask_question::surface_mid_run(name, input)
+    } else {
+        crate::ask_question::surface(name, input)
+    };
+    if let Some(surface) = ask_surface {
         target = surface.detail;
         events.emit(EngineEvent::Note(surface.note));
     } else if let Some(surface) = crate::ask_question::exit_plan_surface(name, input) {
@@ -2009,8 +2017,15 @@ async fn drive_rework_turn_with_idle(
                 action,
                 target,
             } => {
-                let decision = approval_decision(options, &action, &target);
-                if session.respond(&req_id, decision).await.is_err() {
+                // A2#3: this pump drives the director loop's doer/rework turns too
+                // (`director::summon`), so a TUI-HOSTED run PAUSES and asks the live
+                // user when the floor escalates (the same y/n flow as the chat
+                // drain). Headless — the legacy pipeline, CLI, CI — resolves on the
+                // deterministic floor exactly as before (same decision, still no
+                // note), so legacy behaviour is byte-for-byte unchanged.
+                let resolved =
+                    crate::director_loop::resolve_approval(options, events, &action, &target).await;
+                if session.respond(&req_id, resolved.decision).await.is_err() {
                     return ReworkTurn {
                         done: false,
                         text,

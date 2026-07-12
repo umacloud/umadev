@@ -6075,6 +6075,13 @@ fn status_text_and_color(app: &App) -> Option<(String, Color)> {
         // silently make a wedged run show stale phase progress. Checked before
         // `run_started` because `mark_block_aborted` leaves `run_started` set.
         format!("[aborted] {}", umadev_i18n::t(app.lang, "status.aborted"))
+    } else if app.active_gate.is_some() {
+        // A2#12: a run parked at a confirmation gate reads as PAUSED — the
+        // dedicated `status.paused` copy existed but was never rendered, so the
+        // meta row kept showing the running heartbeat (or bare status) while the
+        // run was actually waiting on the user. Checked before `run_started`
+        // (both the legacy pipeline and a director pause keep run state around).
+        umadev_i18n::t(app.lang, "status.paused").to_string()
     } else if app.run_started {
         // While a slow phase's heartbeat is live, show its in-place "still
         // working (mm:ss)" reassurance (overwritten each beat) instead of letting

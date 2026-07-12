@@ -2897,6 +2897,17 @@ async fn drive_director_run(
         // A session that died / a turn that failed is an honest hard stop (never
         // disguised as a build).
         DirectorLoopOutcome::Failed(reason) => return Ok(DirectorOutcome::HardStop(reason)),
+        // Defensive: a gate pause is only produced on a HOSTED run (the TUI scopes
+        // `umadev_agent::RunInteraction` with `confirm_gates`), never on this
+        // headless CLI drive. If it ever surfaces, report it honestly as a paused
+        // (not failed) run and point at the resume surface.
+        DirectorLoopOutcome::PausedAtGate { gate } => {
+            events.emit(umadev_agent::EngineEvent::Note(format!(
+                "run paused at gate `{}` — reopen the TUI (`umadev`) and approve, or `umadev continue`",
+                gate.id_str()
+            )));
+            return Ok(DirectorOutcome::Done);
+        }
     };
 
     // Objective source-present hard-gate (the deterministic reality floor): the

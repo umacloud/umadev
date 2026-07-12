@@ -2254,6 +2254,13 @@ pub struct App {
     /// [`Self::record_agentic_done`] keys the hand-back on. This flag is retained only
     /// as the explicit-`/run` in-flight marker.
     pub(crate) director_run_in_flight: bool,
+    /// A DIRECTOR build is parked at a spec-MUST confirmation gate (A1-GAP1):
+    /// set by [`Self::record_run_paused_at_gate`] when the run's terminal
+    /// `RunPausedAtGate` decision lands, cleared when the gate resolves (the
+    /// resume spawn, a cancel, or a fresh run). The event loop keys the gate
+    /// approval / revision routing on it — a director pause resumes via
+    /// `drive_director_loop_resume`, never a legacy gate block.
+    pub(crate) director_gate_paused: bool,
 
     /// Currently active backend id (matches `config.backend`).
     /// `None` means offline / no host CLI.
@@ -2816,6 +2823,7 @@ impl App {
             chat_id: new_chat_session_id(),
             run_session_handed_to_chat: false,
             director_run_in_flight: false,
+            director_gate_paused: false,
             backend,
             backend_label,
             base_model,
@@ -6658,6 +6666,17 @@ impl App {
                 // early-return paths can never leave one rendering; the paused path
                 // re-arms it below.
                 self.gate_choice = None;
+                // A DIRECTOR run's gate: the slug was never set by a
+                // `PipelineStarted` (the director path doesn't emit one), so the
+                // gate card would list `output/<slug>-*.md` placeholders. Adopt
+                // the persisted workflow slug fail-open (best-effort read).
+                if self.slug.is_empty() {
+                    if let Some(s) = umadev_agent::read_workflow_state(&self.project_root) {
+                        if !s.slug.trim().is_empty() {
+                            self.slug = s.slug;
+                        }
+                    }
+                }
                 // Resolve the structured choice to render as a picker: the event's
                 // choice when it carries renderable options, else none (fail-open
                 // → the existing free-form gate). Stashed below ONLY on the paused
@@ -6693,8 +6712,12 @@ impl App {
                 // which re-runs the producing block with the queued text folded
                 // in as a revision (overriding both auto-approve and the manual
                 // pause). `active_gate` is already set above, so the loop knows
-                // which block produced this gate.
-                if !self.queued_steer.is_empty() {
+                // which block produced this gate. A DIRECTOR run keeps its queue
+                // on the steering lane instead (the event loop moves it into the
+                // run's step-boundary intake), so the gate PAUSES for the user
+                // and the steer applies on the resumed plan — never a legacy
+                // block re-spawn.
+                if !self.queued_steer.is_empty() && !self.director_run_in_flight {
                     // Fold EVERY queued steer (FIFO) into one revision — a single
                     // `Option` used to overwrite all but the last, silently
                     // dropping the earlier turns.
@@ -8247,6 +8270,17 @@ impl App {
         // (A gate is never open while `thinking`, so this check sits ahead of gate
         // handling.)
         if self.thinking {
+            // A DIRECTOR build in flight (A2#4/#5): text typed now is mid-run
+            // STEERING, not a parked chat turn — queue it on the steering lane so
+            // the event loop hands it to the run's step-boundary intake and it
+            // applies at the NEXT step, instead of sitting until the whole build
+            // settles (the strongest engine had the weakest steering).
+            if self.director_run_in_flight {
+                self.queued_steer.push_back(text);
+                self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.queued"));
+                self.refresh_status();
+                return Action::None;
+            }
             // Park it WITHOUT recording into conversation memory yet. Recording at
             // submit time left a dangling "user said X" with no assistant reply in
             // memory whenever the user then interrupted (Ctrl-C clears `queued_chat`
@@ -8287,7 +8321,18 @@ impl App {
                 }
                 return Action::None;
             }
-            if matches!(text.trim(), "c" | "C") {
+            // A2#2: run the free text through the SAME `classify_reply` the CLI
+            // gate surfaces use, so "确认" / "通过" / "approve" / "ok" / "lgtm"
+            // APPROVES the gate instead of being mistaken for a revision that
+            // re-runs the whole producing block (the reported trap). The literal
+            // `c` shortcut stays first (classify_reply would read it as a
+            // revision); "取消" / "cancel" cancels; everything else revises.
+            let approved = matches!(text.trim(), "c" | "C")
+                || matches!(
+                    umadev_agent::classify_reply(&text),
+                    umadev_agent::GateOutcome::Approved
+                );
+            if approved {
                 self.active_gate = None;
                 self.gate_choice = None;
                 let what = match gate {
@@ -8299,6 +8344,16 @@ impl App {
                 // A manual approval also builds trust for this gate.
                 self.record_trust_pass(gate.id_str());
                 return Action::Continue(gate);
+            }
+            if matches!(
+                umadev_agent::classify_reply(&text),
+                umadev_agent::GateOutcome::Cancelled
+            ) {
+                // An explicit cancel at the gate — same path as the picker's
+                // Cancel option (the run is torn down, never a revision spawn).
+                self.active_gate = None;
+                self.gate_choice = None;
+                return Action::Cancel;
             }
             // A revision request resets this gate's trust streak.
             self.record_trust_revision(gate.id_str());
@@ -8546,8 +8601,10 @@ impl App {
         self.stream_text_active = false;
         self.reset_stream_md_cache();
         // A failed director run does NOT hand a session back to chat (there is no
-        // settled build session to continue) — just clear the in-flight marker.
+        // settled build session to continue) — just clear the in-flight marker
+        // (and any stale gate-pause marker: the failed run resolves its pause).
         self.director_run_in_flight = false;
+        self.director_gate_paused = false;
         // Settle the live task as Failed (a no-op for a plain chat-route failure,
         // which never registered a task).
         self.mark_active_task(TaskStatus::Failed);
@@ -8621,6 +8678,9 @@ impl App {
         // fresh. The in-flight marker is always cleared (it was only ever an
         // aliveness/UI hint once the class moved into the task).
         self.director_run_in_flight = false;
+        // A settled run is no longer parked at any gate (safety: a stale pause
+        // marker must never survive into the next run's routing).
+        self.director_gate_paused = false;
         if director_build {
             self.run_session_handed_to_chat = true;
             // The director build settled cleanly → mark its task Done.
@@ -8650,6 +8710,51 @@ impl App {
         // Wave 5 / G11: persist after the assistant turn lands so the saved chat
         // holds complete user→assistant exchanges.
         self.persist_chat();
+    }
+
+    /// A DIRECTOR build parked at a spec-MUST confirmation gate (A1-GAP1) — the
+    /// terminal `RunPausedAtGate` decision's recorder. Clears the in-flight
+    /// "thinking…" state (the run task has settled; a fresh session resumes it on
+    /// approval) and arms [`Self::director_gate_paused`] so the gate approval /
+    /// revision paths resume the DIRECTOR plan. The `GateOpened` engine event —
+    /// drained before terminal decisions — already set [`Self::active_gate`] and
+    /// rendered the gate card/picker; re-asserting it here is a fail-open backstop
+    /// only (idempotent, never a second card).
+    pub(crate) fn record_run_paused_at_gate(&mut self, gate: Gate) {
+        self.thinking = false;
+        self.thinking_started = None;
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
+        self.stream_text_active = false;
+        self.stream_tool_batch = None;
+        self.collapse_thinking_block();
+        self.reset_stream_md_cache();
+        // The run task is gone; what remains is the parked plan on disk. The
+        // pause marker (not the in-flight marker) carries the state forward.
+        self.director_run_in_flight = false;
+        self.director_gate_paused = true;
+        if self.active_gate.is_none() {
+            self.active_gate = Some(gate);
+        }
+        self.refresh_status();
+    }
+
+    /// Surface steering that never reached a step boundary when a director run
+    /// settled (A2#4 — a queued directive must never be dropped silently, and the
+    /// queued chip must never stick). Folds the shared intake's `leftover` with
+    /// anything still parked in [`Self::queued_steer`], and pushes ONE honest
+    /// `run.queued_unsent` note. No-op when both are empty (the common case).
+    pub(crate) fn surface_unsent_steer(&mut self, mut leftover: Vec<String>) {
+        leftover.extend(self.queued_steer.drain(..));
+        leftover.retain(|s| !s.trim().is_empty());
+        if leftover.is_empty() {
+            return;
+        }
+        let text = leftover.join("\n");
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "run.queued_unsent", &[&text]),
+        );
     }
 
     /// Pop the oldest chat turn parked by [`submit_text`] while a route was in
@@ -9028,6 +9133,9 @@ impl App {
         self.run_started = false;
         self.active_gate = None;
         self.gate_choice = None;
+        // A fresh run supersedes any parked director gate (its plan is being
+        // replaced) — the stale pause marker must not hijack the next approval.
+        self.director_gate_paused = false;
         // A fresh run starts UNARMED: interrupt_armed_at is only cleared by the confirming
         // second Esc, so without this a stale arm from a PREVIOUS run (still inside its 3s
         // window) made a single Esc on the new run cancel it immediately - defeating the
@@ -9257,6 +9365,8 @@ impl App {
         self.tool_in_progress = false;
         // A cancelled director run hands nothing back to chat.
         self.director_run_in_flight = false;
+        // A cancel resolves any parked director gate — the run is over.
+        self.director_gate_paused = false;
         // Drop chat turns parked behind the in-flight route so they can't fire
         // into a freshly-reset state.
         self.queued_chat.clear();
@@ -10177,7 +10287,7 @@ impl App {
     /// requirement is returned for the resumed build's firmware / lessons context.
     /// Fail-open: a missing / empty persisted field keeps the in-memory value, so a
     /// resume is never blocked by an unreadable state file.
-    fn resume_run_requirement(&mut self) -> String {
+    pub(crate) fn resume_run_requirement(&mut self) -> String {
         let state = umadev_agent::read_workflow_state(&self.project_root);
         if let Some(s) = &state {
             if self.slug.is_empty() && !s.slug.trim().is_empty() {
@@ -10693,6 +10803,16 @@ impl App {
     /// files to that checkpoint (the present is auto-checkpointed first, so the
     /// rewind is itself undoable).
     fn slash_rewind(&mut self, arg: &str) -> Action {
+        // A2#11: the same busy-guard as `/redo` — a rewind while a run is writing
+        // the workspace is a second writer racing the first (the restore and the
+        // base's edits interleave). Politely refuse; `/cancel` first. Uses
+        // `has_active_run` so the director/agentic build counts too (a legacy
+        // `is_pipeline_active` check would miss it). Listing (`/rewind` with no
+        // id) stays allowed below — it is read-only.
+        if !arg.trim().is_empty() && self.has_active_run() {
+            self.push(ChatRole::System, umadev_i18n::t(self.lang, "rewind.busy"));
+            return Action::None;
+        }
         let arg = arg.trim();
         if arg.is_empty() {
             let list = umadev_agent::checkpoint::list_checkpoints(&self.project_root);
@@ -18901,6 +19021,135 @@ mod tests {
         }
         let action = app.apply_key(KeyCode::Enter);
         assert_eq!(action, Action::Revise("去掉 OAuth".to_string()));
+    }
+
+    #[test]
+    fn approval_words_at_open_gate_approve_instead_of_revising() {
+        // A2#2: "确认" / "通过" / "approve" / "ok" / "lgtm" at a gate run through
+        // `classify_reply` and APPROVE — the reported trap was typing 确认 and
+        // watching the whole producing block re-run as a "revision". The literal
+        // `c` shortcut keeps working (covered elsewhere).
+        for word in ["确认", "通过", "approve", "ok", "LGTM"] {
+            let mut app = fresh_app(Some("offline"));
+            app.apply_engine(EngineEvent::GateOpened {
+                gate: Gate::DocsConfirm,
+                choice: None,
+            });
+            let action = app.submit_text(word.to_string());
+            assert_eq!(
+                action,
+                Action::Continue(Gate::DocsConfirm),
+                "`{word}` approves the gate"
+            );
+            assert!(app.active_gate.is_none(), "`{word}` cleared the gate");
+        }
+    }
+
+    #[test]
+    fn cancel_words_at_open_gate_cancel_the_run() {
+        // A2#2: "取消" / "cancel" at a gate cancels (the picker's Cancel path) —
+        // never a revision that re-runs the block with "取消" as feedback.
+        for word in ["取消", "cancel"] {
+            let mut app = fresh_app(Some("offline"));
+            app.apply_engine(EngineEvent::GateOpened {
+                gate: Gate::DocsConfirm,
+                choice: None,
+            });
+            let action = app.submit_text(word.to_string());
+            assert_eq!(action, Action::Cancel, "`{word}` cancels at the gate");
+            assert!(app.active_gate.is_none(), "`{word}` cleared the gate");
+        }
+    }
+
+    #[test]
+    fn text_during_director_run_queues_as_steering_not_chat() {
+        // A2#4/#5: while a DIRECTOR build is in flight, typed text is mid-run
+        // STEERING (queued_steer → the step-boundary intake), not a chat turn
+        // parked until the whole build settles. A plain chat turn keeps the old
+        // queued_chat lane.
+        let mut app = fresh_app(Some("offline"));
+        app.thinking = true;
+        app.director_run_in_flight = true;
+        let action = app.submit_text("把配色换成暗色".into());
+        assert_eq!(action, Action::None);
+        assert_eq!(app.queued_steer.len(), 1, "steer lane took the message");
+        assert!(app.queued_chat.is_empty(), "chat lane untouched");
+
+        // A non-director thinking turn still parks on the chat lane.
+        let mut chat = fresh_app(Some("offline"));
+        chat.thinking = true;
+        let action = chat.submit_text("另一个问题".into());
+        assert_eq!(action, Action::None);
+        assert!(chat.queued_steer.is_empty());
+        assert_eq!(chat.queued_chat.len(), 1);
+    }
+
+    #[test]
+    fn record_run_paused_at_gate_clears_thinking_and_arms_the_pause() {
+        // The RunPausedAtGate terminal decision: the in-flight state clears, the
+        // director-pause marker arms, and the gate is asserted fail-open even if
+        // the GateOpened event raced (idempotent backstop).
+        let mut app = fresh_app(Some("offline"));
+        app.thinking = true;
+        app.agentic_in_flight = true;
+        app.director_run_in_flight = true;
+        app.record_run_paused_at_gate(Gate::DocsConfirm);
+        assert!(!app.thinking && !app.agentic_in_flight && !app.director_run_in_flight);
+        assert!(app.director_gate_paused, "the pause marker is armed");
+        assert_eq!(app.active_gate, Some(Gate::DocsConfirm));
+        // A cancel resolves the pause (no stale marker into the next run).
+        app.cancel_run();
+        assert!(!app.director_gate_paused);
+    }
+
+    #[test]
+    fn surface_unsent_steer_reports_leftovers_once_and_clears_the_chip() {
+        // A2#4: steering that never reached a step boundary is surfaced honestly
+        // (run.queued_unsent) and the queued chip clears; nothing queued → no note.
+        let mut app = fresh_app(Some("offline"));
+        app.queued_steer.push_back("skip step 2".into());
+        let before = app.history.len();
+        app.surface_unsent_steer(vec!["make it dark".into()]);
+        assert!(app.queued_steer.is_empty(), "the queued chip cleared");
+        assert_eq!(app.history.len(), before + 1, "ONE surfacing note");
+        let body = app.history.back().unwrap().body().to_string();
+        assert!(body.contains("skip step 2") && body.contains("make it dark"));
+        // Empty → silent no-op.
+        let before = app.history.len();
+        app.surface_unsent_steer(Vec::new());
+        assert_eq!(app.history.len(), before);
+    }
+
+    #[test]
+    fn rewind_is_refused_while_a_run_is_writing_the_workspace() {
+        // A2#11: `/rewind <id>` during an active run would be a second writer
+        // racing the build — refused with the busy note (same guard as /redo).
+        // The read-only list form stays allowed.
+        let mut app = fresh_app(Some("offline"));
+        app.agentic_in_flight = true; // a director/agentic build is live
+        for c in "/rewind c1".chars() {
+            let _ = app.apply_key(KeyCode::Char(c));
+        }
+        let action = app.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::None);
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.body() == umadev_i18n::t(app.lang, "rewind.busy")),
+            "the busy note was surfaced"
+        );
+        // Listing (no id) is read-only and never refused.
+        for c in "/rewind".chars() {
+            let _ = app.apply_key(KeyCode::Char(c));
+        }
+        let action = app.apply_key(KeyCode::Enter);
+        assert_eq!(action, Action::None);
+        let busy_notes = app
+            .history
+            .iter()
+            .filter(|m| m.body() == umadev_i18n::t(app.lang, "rewind.busy"))
+            .count();
+        assert_eq!(busy_notes, 1, "the list form is not refused");
     }
 
     #[test]

@@ -64,6 +64,7 @@ pub mod fact_extract;
 pub mod first_pass;
 pub(crate) mod fswalk;
 pub mod gates;
+pub mod interaction;
 pub mod knowledge_feedback;
 pub mod lessons;
 pub mod manifest;
@@ -134,8 +135,8 @@ pub use director::{
     VerifyKind, VerifyResult,
 };
 pub use director_loop::{
-    drive_director_loop, drive_director_loop_resume, drive_director_loop_routed, has_resumable_run,
-    run_post_build_qc, DirectorLoopOutcome,
+    drive_director_loop, drive_director_loop_resume, drive_director_loop_routed,
+    has_resumable_director_plan, has_resumable_run, run_post_build_qc, DirectorLoopOutcome,
 };
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use first_pass::{
@@ -146,6 +147,9 @@ pub use first_pass::{
 pub use gates::{
     claims_code_changes, classify_reply, Gate, GateChoice, GateChoiceOption, GateDecision,
     GateOutcome,
+};
+pub use interaction::{
+    hosted as hosted_interaction, ApprovalFn, ApprovalFuture, RunInteraction, SteerIntake,
 };
 pub use lessons::{
     apply_dev_error_trust, apply_trust_for_identities, apply_trust_for_signatures,
