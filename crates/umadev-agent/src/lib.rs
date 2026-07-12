@@ -42,6 +42,7 @@ pub mod acceptance;
 pub mod adopt;
 pub mod agents;
 pub mod app_runtime;
+pub mod arch_fitness;
 pub mod ask_question;
 pub mod base_error;
 pub mod base_gate;
