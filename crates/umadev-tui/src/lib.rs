@@ -5476,6 +5476,48 @@ fn atomic_unconfirmed_heartbeat_due(
     sync_output && !sync_confirmed && live && since_last_full_repaint >= cadence
 }
 
+/// Whether the tick-time terminal-size poll detected a resize whose
+/// `Event::Resize` never arrived. ConPTY / Windows Terminal coalesces the
+/// resize burst of a window drag or a fullscreen toggle and can drop the TAIL
+/// event entirely, so the event path (`Event::Resize` → [`apply_resize_heal`])
+/// never fires — and an IDLE app (a settled welcome screen) draws no frame, so
+/// even ratatui's own autoresize (which only runs inside `terminal.draw`)
+/// never sees the new size. The screen stays painted at the STALE (wider)
+/// width: every row physically overflows, autowrap spills the status bar's
+/// tail one-char-per-row down the left column, remnants of pre-resize content
+/// survive at the top, and nothing ever repaints (the reported permanent
+/// resize garble on cmd.exe / Windows Terminal). The event loop's 80ms tick —
+/// which fires even when idle — therefore polls the backend size (one cheap
+/// `GetConsoleScreenBufferInfo` / `TIOCGWINSZ` syscall; a lost resize event is
+/// not Windows-only, so the poll runs on every platform) and, when the size
+/// actually CHANGED, runs the exact same heal as a delivered `Event::Resize`.
+///
+/// Pure decision so the truth table is unit-tested: `prev` is the last size a
+/// delivered Resize event carried or the poll observed — `None` until the
+/// first successful reading, so startup never fires a spurious heal; `polled`
+/// is this tick's reading — `None` when the backend query failed (fail-open:
+/// an error must never fabricate a resize). Only a KNOWN-different size fires,
+/// so an unchanged idle screen never pays a clear (the no-per-frame-clear
+/// anti-flicker contract holds).
+fn size_poll_detected_resize(prev: Option<(u16, u16)>, polled: Option<(u16, u16)>) -> bool {
+    matches!((prev, polled), (Some(p), Some(now)) if p != now)
+}
+
+/// The ONE resize reaction, shared by BOTH detection paths — a delivered
+/// `Event::Resize` and the tick-time size-poll fallback
+/// ([`size_poll_detected_resize`]): open the [`RESIZE_HEAL_WINDOW`] (every
+/// frame clears for a short spell so the multi-frame drag + terminal-buffer
+/// settle fully heals, not just one frame) and contaminate the terminal (P3)
+/// so the NEXT frame does one clear+repaint back-to-back — never an immediate
+/// `clear()` here (that blanks the screen for a frame → flicker; on a sync
+/// terminal the deferred clear lands inside the loop-top BSU/ESU and swaps
+/// atomically). The new dimensions themselves are picked up by ratatui's
+/// autoresize inside `terminal.draw`. Fail-open: only flags are set.
+fn apply_resize_heal(app: &App, last_resize_at: &mut Option<Instant>) {
+    *last_resize_at = Some(Instant::now());
+    app.contaminate_terminal();
+}
+
 /// P2 — the DECRQM query asking the terminal whether DEC private mode 2026
 /// (synchronized output) is implemented: `CSI ? 2026 $ p`. Sent ONCE right
 /// after the event loop starts, and only on the owned-input path — the DECRPM
@@ -6163,6 +6205,13 @@ async fn event_loop(
     // Resize heal: Instant of the last Resize event, to force a clear+repaint for a short
     // window afterwards so a multi-frame drag + settle fully heals (not just one frame).
     let mut last_resize_at: Option<Instant> = None;
+    // Size-poll resize-fallback baseline: the last terminal size a delivered Resize
+    // event carried or the 80ms tick's backend-size poll observed. ConPTY / Windows
+    // Terminal can coalesce a drag/fullscreen resize burst and DROP the tail
+    // Event::Resize; comparing the polled size against this catches the lost event
+    // and runs the exact same heal path (see `size_poll_detected_resize`). `None`
+    // until the first successful reading so startup never fires a spurious heal.
+    let mut last_known_size: Option<(u16, u16)> = None;
     // Focus-return heal: Instant of the last FocusGained (or resume-gap) event, to force a
     // clear+repaint window afterwards so the terminal's own multi-frame redraw on focus
     // return can't leave stale cells behind (see FOCUS_HEAL_WINDOW).
@@ -6784,23 +6833,26 @@ async fn event_loop(
                     }
                     last_input = now;
                 }
-                if let Some(Ok(Event::Resize(..))) = &maybe_key {
-                    // Open the resize heal window (see RESIZE_HEAL_WINDOW): every frame clears
-                    // for a short spell so the settled size fully repaints, not just one frame.
-                    last_resize_at = Some(Instant::now());
-                    // R4 — resize contamination. DON'T `clear()` immediately (that
-                    // blanks the screen for a frame → flicker); contaminate so the
-                    // NEXT frame does the clear+repaint back-to-back (inside the
-                    // loop-top BSU/ESU on a sync terminal, swapping atomically).
-                    // Heals the STALE cells some terminals (notably the Windows
-                    // console) leave after a resize that ratatui's incremental
-                    // diff won't overwrite — INCLUDING a same-size resize: a
-                    // window switch / focus return can deliver a same-dimension
-                    // Resize after the terminal already scrolled/redrawn its own
-                    // buffer, so it must never be debounced away. The new
-                    // dimensions themselves are picked up by ratatui's autoresize
-                    // inside `terminal.draw`. Fail-open.
-                    app.contaminate_terminal();
+                if let Some(Ok(Event::Resize(w, h))) = &maybe_key {
+                    // R4 — resize heal, via the ONE path shared with the tick-time
+                    // size-poll fallback (`apply_resize_heal`): open the resize heal
+                    // window (see RESIZE_HEAL_WINDOW — every frame clears for a short
+                    // spell so the settled size fully repaints, not just one frame)
+                    // and contaminate rather than `clear()` immediately (that blanks
+                    // the screen for a frame → flicker); the NEXT frame does the
+                    // clear+repaint back-to-back (inside the loop-top BSU/ESU on a
+                    // sync terminal, swapping atomically). Heals the STALE cells some
+                    // terminals (notably the Windows console) leave after a resize
+                    // that ratatui's incremental diff won't overwrite — INCLUDING a
+                    // same-size resize: a window switch / focus return can deliver a
+                    // same-dimension Resize after the terminal already
+                    // scrolled/redrawn its own buffer, so it must never be debounced
+                    // away. The new dimensions themselves are picked up by ratatui's
+                    // autoresize inside `terminal.draw`; recording them as the poll
+                    // baseline keeps the tick's size poll from re-firing on a resize
+                    // this event path already healed. Fail-open.
+                    apply_resize_heal(app, &mut last_resize_at);
+                    last_known_size = Some((*w, *h));
                 } else if let Some(Ok(Event::FocusGained)) = &maybe_key {
                     // Focus regained (DEC mode 1004). While the window was
                     // unfocused the terminal may have scrolled or redrawn its own
@@ -7748,6 +7800,28 @@ async fn event_loop(
                 #[cfg(windows)]
                 if let Some(guard) = win_console_guard {
                     guard.enforce();
+                }
+                // Size-poll resize fallback (see `size_poll_detected_resize`).
+                // ConPTY / Windows Terminal coalesces a drag / fullscreen-toggle
+                // resize burst and can drop the tail Event::Resize entirely — and
+                // an IDLE app draws no frame, so ratatui's autoresize never runs
+                // either: the screen stays painted at the stale width and the
+                // terminal's own reflow garbles it PERMANENTLY (wrapped status-bar
+                // tail spilling down the left column, orphan pre-resize cells).
+                // Polling the backend size on this tick — which fires even when
+                // idle — catches the lost event on every platform for one cheap
+                // syscall; a real change runs the EXACT same heal as a delivered
+                // Event::Resize. Fail-open: a failed size query changes nothing,
+                // and an unchanged size never clears (no per-frame flicker).
+                let polled = terminal.size().ok().map(|s| (s.width, s.height));
+                if size_poll_detected_resize(last_known_size, polled) {
+                    apply_resize_heal(app, &mut last_resize_at);
+                    // Repaint promptly at the new size — an idle screen has no
+                    // other draw trigger pending.
+                    draw_now = true;
+                }
+                if polled.is_some() {
+                    last_known_size = polled;
                 }
                 // R3 — the 80ms animation tick advances spinners / elapsed clocks
                 // only while something visible is live. In a settled transcript,
@@ -13389,6 +13463,64 @@ mod tests {
         assert!(
             frame_needs_clear(false, true),
             "a discrete heal (contamination drain) clears exactly once"
+        );
+    }
+
+    #[test]
+    fn size_poll_detects_a_lost_resize_event_only_on_a_real_change() {
+        // No baseline yet (startup / first poll) → record only, never heal: the
+        // initial paint must not be preceded by a spurious clear.
+        assert!(
+            !size_poll_detected_resize(None, Some((120, 30))),
+            "the first size reading is a baseline, not a resize"
+        );
+        // Unchanged size → no heal. This is the idle steady state — the 80ms tick
+        // polls forever, so an identical reading MUST stay silent (the
+        // no-per-frame-clear anti-flicker contract).
+        assert!(
+            !size_poll_detected_resize(Some((120, 30)), Some((120, 30))),
+            "an unchanged size must never trigger a clear (idle = no flicker)"
+        );
+        // Width shrink — the fullscreen/drag case: rows painted at the stale wider
+        // width overflow the new terminal, autowrap spills the status bar's tail
+        // down the left column. The poll must catch it even with no Resize event.
+        assert!(
+            size_poll_detected_resize(Some((160, 40)), Some((120, 40))),
+            "a width change with no delivered Resize event must heal"
+        );
+        // Growth and a height-only change count too.
+        assert!(size_poll_detected_resize(Some((120, 30)), Some((160, 30))));
+        assert!(size_poll_detected_resize(Some((120, 30)), Some((120, 31))));
+        // A failed backend size query fabricates nothing (fail-open), with or
+        // without a baseline — and it must not erase the baseline either (the
+        // caller keeps the old one so a later good reading still compares).
+        assert!(!size_poll_detected_resize(Some((120, 30)), None));
+        assert!(!size_poll_detected_resize(None, None));
+    }
+
+    #[test]
+    fn poll_detected_resize_runs_the_same_heal_as_an_event_resize() {
+        // The shared reaction (`apply_resize_heal`) — used by BOTH a delivered
+        // Event::Resize and the tick-time size-poll fallback — raises the P3
+        // contamination flag (one full clear+repaint on the next frame) AND opens
+        // the RESIZE_HEAL_WINDOW (every frame keeps clearing for a short spell so
+        // the terminal's multi-frame buffer settle heals too, not just one frame).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let app = App::new(
+            "demo".to_string(),
+            crate::config::UserConfig::default(),
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        let mut last_resize_at = None;
+        apply_resize_heal(&app, &mut last_resize_at);
+        assert!(
+            app.take_terminal_contaminated(),
+            "a detected resize contaminates → one healing clear+repaint next frame"
+        );
+        assert!(
+            last_resize_at.is_some_and(|t| t.elapsed() < RESIZE_HEAL_WINDOW),
+            "a detected resize opens the resize heal window for the settle frames"
         );
     }
 
