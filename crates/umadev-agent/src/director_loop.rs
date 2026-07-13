@@ -1003,6 +1003,12 @@ async fn synthesize_and_post_plan(
     // attributed to the run budget (no separate fixed 180s clock).
     let plan = plan_state::synthesize_plan(session, options, &options.requirement, route, deadline)
         .await?;
+    // A FRESH plan synthesis == a NEW deliberate run: rotate the previous run's
+    // notes (`.umadev/run-notes.md` → `.umadev/run-notes.prev.md`) so the notes
+    // file stays run-scoped. A RESUME re-attaches the persisted plan (it never
+    // reaches this synthesis), so its notes survive — exactly the memory it wants
+    // back. Best-effort + fail-open (see `context::rotate_run_notes`).
+    crate::context::rotate_run_notes(&options.project_root);
     // Persist best-effort; a failed write is ignored (fail-open — never blocks).
     let _ = plan_state::save(&plan, &options.project_root);
     // Sync the 9-phase workflow state off its initial `research` value the moment a
@@ -1132,10 +1138,18 @@ async fn drive_director_loop_with_idle(
         // 1. Drive ONE end-to-end base turn (build, or fix-the-QC-findings). The
         //    base runs its own agentic tool loop (PM→…→QA internally) and writes
         //    real files under the run-lock the caller holds (single-writer).
-        // Change 1: defer the base's premature project-level wrap-up on this mid-run turn
-        // (round-0 build or a fix round) — narration stays, only the "## Next steps"
-        // conclusion is held back; the integrated final report comes at convergence.
-        let directive = format!("{next_directive}{}", wrapup_suppression_note());
+        // Change 1 (scoped to FIX rounds): defer the base's premature project-level
+        // wrap-up on a fix turn — narration stays, only the "## Next steps" conclusion
+        // is held back; the integrated final report then supersedes it at convergence.
+        // ROUND 0 gets NO suppression: a single-turn build that settles clean keeps its
+        // round-0 reply as the final word (no extra report turn), so suppressing the
+        // wrap-up there would deliberately strip the ONLY final report the user gets
+        // (the clean single-turn build's one turn IS its wrap-up).
+        let directive = if round == 0 {
+            next_directive.clone()
+        } else {
+            format!("{next_directive}{}", wrapup_suppression_note())
+        };
         let turn = match drive_one_turn(session, options, events, directive, idle, deadline).await {
             Ok(t) => t,
             // A base-reported turn failure (an API error like a 429 rate limit)
@@ -1361,9 +1375,12 @@ async fn drive_plan_steps(
 
     let mut last_reply = String::new();
     // Change 2: did the build actually go through blocking-item rework? Set true when a
-    // review step fired a fix turn OR the final gate ran a fix turn. Only then is the ONE
-    // integrated final report produced at convergence — a clean build (no blockers) keeps
-    // the last build step's reply as its correct final result (no extra turn).
+    // review step fired a fix turn OR the final gate ran a fix turn. The ONE integrated
+    // final report is produced at convergence when this is set OR when the build settled
+    // CLEAN (every step Done + a clean final gate): every per-step doer reply was
+    // wrap-up-suppressed, so a clean plan-driven build still needs its deferred final
+    // report. Only a build that ended neither clean nor reworked (blocked / stranded)
+    // keeps the last step's reply (no report turn burned on a non-delivering base).
     let mut reworked = false;
     let mut transitions = 0usize;
     // The running count of completed BUILD steps — the "work turn" tally that the
@@ -1683,23 +1700,7 @@ async fn drive_plan_steps(
         reworked = true;
     }
 
-    // Change 2: the build has CONVERGED. If it actually went through blocking-item rework
-    // (a review-step fix turn OR the final gate's fix turn), the base's earlier streamed
-    // "here's what I did — ## Next steps" (report A) is stale — it can't reflect the
-    // blocking-item fixes or the plan/dependency changes they caused. Drive ONE governed
-    // turn on the MAIN continuous session (which holds the full build + rework history) to
-    // produce the holistic final report, and record THAT as the reply the user sees. A
-    // clean build (no rework) skips this entirely and keeps the last build step's reply.
-    // FAIL-OPEN: a dead/empty turn degrades to the existing `last_reply` (never lost). This
-    // runs AFTER `run_final_gate` and BEFORE the structured completion artifacts below,
-    // which stay untouched (they were already emitted post-convergence).
-    if reworked {
-        last_reply = integrated_final_report(session, options, events, last_reply, deadline).await;
-    }
-
-    // Persist the plan's terminal state for resume.
-    persist_plan_ref(plan, options);
-    // Sync the 9-phase workflow state at finalize. HONEST clean signal: every step
+    // HONEST clean signal (used for the report below AND finalize): every step
     // reached Done (none Blocked / stranded) AND the final whole-build gate settled
     // clean — only then may the build claim `delivery`. H1: the final gate runs the
     // cross-cutting checks (coverage / contract / runtime-proof / governance / fork
@@ -1710,6 +1711,30 @@ async fn drive_plan_steps(
     // step path's gate never weaker than the single-turn loop (which already gates
     // finalize INSIDE `qc.is_clean()`). Fail-open: a dirty gate just means "not clean".
     let clean = plan.steps.iter().all(|s| s.status == StepStatus::Done) && final_gate.clean;
+
+    // Change 2: the build has CONVERGED — drive the ONE integrated final report on the
+    // MAIN continuous session (which holds the full build + rework history) and record
+    // THAT as the reply the user sees. Two cases earn it, exactly once each:
+    //   - REWORKED (a review-step fix turn OR the final gate's fix turn ran): the base's
+    //     earlier streamed "here's what I did — ## Next steps" (report A) is stale — it
+    //     can't reflect the blocking-item fixes or the plan/dependency changes they caused.
+    //   - CLEAN plan-driven convergence: every per-step doer directive carried the
+    //     wrap-up suppression note (`summon_directive`), so the last step's reply is a
+    //     deliberately conclusion-free step narration — WITHOUT this turn a clean build
+    //     would end on a mid-run narration and the deferred wrap-up would never arrive
+    //     (the user's final report is worth the one extra bounded turn).
+    // A build that ended NEITHER clean NOR reworked (blocked/stranded steps, no fix turn
+    // ran — e.g. a dead session) keeps the honest last reply + the per-step completion
+    // summary below; no report turn is burned on a base that isn't delivering.
+    // FAIL-OPEN: a dead/empty turn degrades to the existing `last_reply` (never lost). This
+    // runs AFTER `run_final_gate` and BEFORE the structured completion artifacts below,
+    // which stay untouched (they were already emitted post-convergence).
+    if reworked || clean {
+        last_reply = integrated_final_report(session, options, events, last_reply, deadline).await;
+    }
+
+    // Persist the plan's terminal state for resume.
+    persist_plan_ref(plan, options);
     finalize_phase_from_plan(plan, options, clean);
     // A PERSISTENT per-step completion summary, emitted on EVERY deliberate-build exit
     // (clean, budget-reached, or blocked). The live plan panel is ephemeral — it vanishes
@@ -1984,7 +2009,9 @@ fn step_goal_frame(options: &RunOptions) -> String {
 /// to hold back only the project-level DONE / next-steps CONCLUSION this turn; the
 /// single integrated final report is written once the whole build converges (after
 /// review + any rework — see [`integrated_final_report_directive`]). Appended to the
-/// mid-run doer / review-fix / single-turn directives, NEVER to the integrated-summary
+/// mid-run doer / review-fix / single-turn FIX-round directives — NEVER to the
+/// single-turn ROUND-0 build directive (a clean single-turn build settles on that one
+/// reply, so its only turn IS the wrap-up) and NEVER to the integrated-summary
 /// directive (that one WANTS the conclusion).
 pub(crate) fn wrapup_suppression_note() -> &'static str {
     "\n\n## Stay mid-run — do NOT write the final wrap-up yet\n\
@@ -2001,8 +2028,11 @@ pub(crate) fn wrapup_suppression_note() -> &'static str {
 /// (it accumulated the full build + every rework across steps), the base can produce a
 /// holistic report from its OWN context — UmaDev keeps no critic verdicts agent-side.
 /// This is the wrap-up deferred by [`wrapup_suppression_note`], so it explicitly WANTS
-/// the conclusion (no suppression appended). Emitted only when the build actually went
-/// through blocking-item rework; a clean build keeps the last build step's reply as-is.
+/// the conclusion (no suppression appended). Emitted when the build went through
+/// blocking-item rework (any path) AND at the CLEAN convergence of a plan-driven
+/// build (whose per-step doer replies were all suppression-noted, so without this
+/// turn a clean build would end on a conclusion-free step narration). A clean
+/// single-turn build keeps its round-0 reply as-is — that turn ran un-suppressed.
 fn integrated_final_report_directive(options: &RunOptions) -> String {
     let req = options.requirement.trim();
     let goal = if req.is_empty() {
@@ -2162,6 +2192,20 @@ async fn drive_build_step(
         instruction.push_str("\n\n");
         instruction.push_str(plan_progress.trim());
     }
+    // RUN-NOTES RECALL (B1#6, bounded): the base's OWN persisted working notes
+    // from earlier in this run (`.umadev/run-notes.md` — the firmware told it to
+    // append decisions / discoveries / blockers there). Re-injected as a bounded
+    // tail at each step so the working memory SURVIVES session resets, compaction,
+    // and cross-session resumes on a fresh brain. Fail-open: an absent / empty /
+    // unreadable file injects nothing (directive unchanged).
+    let run_notes = crate::context::run_notes_tail_block(
+        &options.project_root,
+        crate::context::RUN_NOTES_TAIL_LINES,
+    );
+    if !run_notes.trim().is_empty() {
+        instruction.push_str("\n\n");
+        instruction.push_str(run_notes.trim());
+    }
     if !pitfalls.trim().is_empty() {
         instruction.push_str("\n\n## Known pitfalls to avoid (from past runs)\n");
         instruction.push_str(pitfalls.trim());
@@ -2234,6 +2278,16 @@ async fn drive_build_step(
         .is_deliberate()
         .then(|| crate::arch_fitness::baseline(&options.project_root));
 
+    // STEP-ATTRIBUTABLE-EVIDENCE BASELINE (the dead-summon fix). Snapshot the source
+    // tree (path → size/mtime, bounded like `acceptance::source_files`) BEFORE this
+    // step's doer turn(s), so a step whose turn NEVER ran (`!drove`) can only accept
+    // on evidence attributable to THIS step — its own declared FileExists/FileContains
+    // paths, or a source-tree delta since this snapshot — never on workspace-global
+    // "any source exists" positives that an EARLIER step left on disk. Without this,
+    // a base that died after step 1 wrote real source let steps 2..N fake-tick Done
+    // over turns that never ran, converging into a fake clean delivery.
+    let step_tree_baseline = source_tree_snapshot(&options.project_root);
+
     let mut drove = false;
     let mut last_reply = String::new();
     // SELF-EVOLUTION accounting across this step's fix rounds (a SIDE EFFECT of the
@@ -2278,6 +2332,33 @@ async fn drive_build_step(
         .await;
         if summoned.done {
             drove = true;
+        }
+        // DEFINITE no-turn (the dead-summon fix, primary guard): the doer directive
+        // could not even be SENT — the base process is gone, so NO turn ran for this
+        // round and no re-drive can reach the brain either. Stop the step immediately
+        // and honestly: the caller marks it Blocked (for ANY step, not just the
+        // first). Verifying acceptance here would read workspace-global evidence an
+        // EARLIER step left on disk and fake-tick this step Done over work that never
+        // ran. Distinct from a hung-but-productive turn (`done == false` after a real
+        // send), which still gets verified below — its work may be real.
+        if summoned.send_failed {
+            events.emit(EngineEvent::Note(format!(
+                "team · step '{}' — base session unreachable (the doer directive could \
+                 not be sent); marking the step blocked",
+                step.title
+            )));
+            return StepOutcome {
+                accepted: false,
+                reply: last_reply,
+                drove,
+                made_progress: false,
+                gap_evidence: vec![
+                    "base session unreachable — the step's doer directive could not be \
+                     sent, so no turn ever ran for this step"
+                        .to_string(),
+                ],
+                reworked: false,
+            };
         }
         if !summoned.text.trim().is_empty() {
             last_reply = summoned.text.clone();
@@ -2335,11 +2416,18 @@ async fn drive_build_step(
         // MEDIUM #3 — a dead/hung summon turn that never actually ran (`!drove`) must
         // not "complete" a Build step on a NEUTRAL-SKIP acceptance (an unavailable
         // check / a TurnSettled free pass). Require REAL evidence: either the doer
-        // turn actually ran, OR the floor produced positive evidence (real source on
-        // disk / a green build). Without either, a build step over a dead session is
-        // honestly left unaccepted (→ the caller marks it Blocked), so a dead session
-        // can't silently tick steps 2..N Done over an empty build.
-        if verdict.accepted && (drove || verdict.has_positive_evidence) {
+        // turn actually ran, OR — belt+suspenders for the dead-summon fix — evidence
+        // ATTRIBUTABLE TO THIS STEP: its own declared FileExists/FileContains paths on
+        // disk, or a source-tree delta since this step's start. A workspace-global
+        // positive (`verdict.has_positive_evidence` via "any source exists") is NOT
+        // enough when no turn ran: after an earlier step wrote source and the base
+        // died, that global signal held for every later step and fake-ticked them
+        // Done. Without step-attributable evidence, a build step over a dead session
+        // is honestly left unaccepted (→ the caller marks it Blocked).
+        if verdict.accepted
+            && (drove
+                || step_attributable_evidence(&options.project_root, step, &step_tree_baseline))
+        {
             // SELF-EVOLUTION (a SIDE EFFECT of the PASS verdict; best-effort +
             // fail-open, never changes the outcome below): the recalled lessons were
             // in front of the doer and the step PASSED — reward their trust. If this
@@ -2409,6 +2497,15 @@ async fn drive_build_step(
             evidence_line,
             step_criterion_label(step),
         );
+        // B1#2: thread the failing build/test output's BOUNDED verbatim tail into the
+        // rework directive when the floor captured one — the brain adapts from the raw
+        // compiler/test evidence, not only UmaDev's one-line distillation. Skipped
+        // cleanly when no raw log exists (a file-exists gap, contract drift, …).
+        if let Some(raw) = verdict.raw_log.as_deref() {
+            instruction.push_str("\n\n## Raw failing build/test output (verbatim tail)\n```text\n");
+            instruction.push_str(raw.trim_end());
+            instruction.push_str("\n```");
+        }
         // Re-recite the plan position on a fix re-drive too, so a long fix sequence
         // on one step stays anchored to the overall plan.
         if !plan_progress.trim().is_empty() {
@@ -2694,6 +2791,63 @@ async fn review_residual_floor_corroboration(
     corroborating
 }
 
+/// A bounded snapshot of the project's source tree — path → (byte size, mtime) —
+/// taken at a build step's START (see [`source_tree_snapshot`]). The comparison
+/// basis for the step-attributable-evidence check ([`step_attributable_evidence`]).
+type SourceTreeSnapshot =
+    std::collections::BTreeMap<std::path::PathBuf, (u64, Option<std::time::SystemTime>)>;
+
+/// Snapshot the project's SOURCE tree (path → size/mtime) — the same bounded file
+/// set as [`crate::acceptance::source_files`] (depth 8, 600 files, vendor/VCS dirs
+/// skipped), so it is cheap (metadata reads only, no content hashing). Taken at a
+/// build step's start; [`step_attributable_evidence`] compares against it to decide
+/// whether anything REAL changed during the step. Fail-open: an unreadable entry is
+/// simply absent from the snapshot.
+fn source_tree_snapshot(root: &std::path::Path) -> SourceTreeSnapshot {
+    crate::acceptance::source_files(root)
+        .into_iter()
+        .filter_map(|p| {
+            let meta = std::fs::metadata(&p).ok()?;
+            Some((p, (meta.len(), meta.modified().ok())))
+        })
+        .collect()
+}
+
+/// Evidence ATTRIBUTABLE TO THIS STEP — the bar a Build step must meet to accept
+/// when its doer turn NEVER ran (`!drove`, the dead-summon guard). Two accepted
+/// forms, both step-specific by construction:
+///
+/// 1. the step's OWN declared `FileExists` / `FileContains` evidence paths verify
+///    on disk (the plan named this step's concrete deliverable and it is there), or
+/// 2. the source tree CHANGED since this step's start (`baseline`,
+///    [`source_tree_snapshot`]) — a turn that died mid-way after writing real files
+///    still shows a delta, so hung-but-productive work is honoured.
+///
+/// Deliberately NEVER the bare workspace-global source-present positive ("any
+/// source exists"): after an earlier step wrote source and the base process died,
+/// that global signal held for every remaining step and fake-ticked them Done over
+/// turns that never ran — a fake clean delivery. Fail-open in the honest direction:
+/// no declared evidence + no delta → `false` (the step is left to the bounded fix
+/// loop / Blocked, and the final gate still owns reality).
+fn step_attributable_evidence(
+    root: &std::path::Path,
+    step: &plan_state::PlanStep,
+    baseline: &SourceTreeSnapshot,
+) -> bool {
+    let declared = step.evidence.iter().any(|e| match e {
+        plan_state::EvidenceContract::FileExists { path } => step_path_exists(root, path),
+        plan_state::EvidenceContract::FileContains { path, needle } => matches!(
+            file_contains_outcome(root, path, needle),
+            EvidenceOutcome::Pass
+        ),
+        _ => false,
+    });
+    if declared {
+        return true;
+    }
+    source_tree_snapshot(root) != *baseline
+}
+
 /// The outcome of verifying one step against its declared acceptance.
 struct StepVerdict {
     /// Whether the step's deterministic acceptance check passed (or was a neutral
@@ -2709,6 +2863,13 @@ struct StepVerdict {
     has_positive_evidence: bool,
     /// Concrete evidence lines from the check (failed-step names / drift / count).
     evidence: Vec<String>,
+    /// B1#2 — a BOUNDED verbatim tail of the failing build/test output (last ~60
+    /// lines, char-capped; see [`director::verify_build_test_raw`]), captured only
+    /// when the verdict REJECTED on a real build/test failure. Threaded into the
+    /// step's rework directive so the brain fixes from the raw compiler/test
+    /// evidence, not only UmaDev's one-line distillation. `None` when the failure
+    /// has no raw log (a file-exists gap, contract drift, …) — skipped cleanly.
+    raw_log: Option<String>,
 }
 
 impl StepVerdict {
@@ -2772,6 +2933,7 @@ async fn verify_step_acceptance(
             accepted: true,
             has_positive_evidence: false,
             evidence: Vec::new(),
+            raw_log: None,
         },
         A::SourcePresent => acceptance_from_verify(
             director::verify(options, events, VerifyKind::SourcePresent).await,
@@ -2796,12 +2958,16 @@ async fn verify_step_acceptance(
             // forward so a Build step whose build/test check is a neutral skip (no
             // manifest) still counts as positive progress for the dead-summon guard.
             let src_positive = src.available && src.passed;
-            with_source_evidence(
-                acceptance_from_verify(
-                    director::verify(options, events, VerifyKind::BuildTest).await,
-                ),
-                src_positive,
-            )
+            // B1#2: run the log-capturing variant so a REJECTING verdict carries the
+            // failing build/test output's bounded verbatim tail for the rework
+            // directive. Same check, same events; a pass/skip yields no raw log.
+            events.emit(EngineEvent::Note("team · verify build-test".to_string()));
+            let (bt, raw) = director::verify_build_test_raw(options).await;
+            let mut v = with_source_evidence(acceptance_from_verify(bt), src_positive);
+            if !v.accepted {
+                v.raw_log = raw;
+            }
+            v
         }
         A::Contract => {
             let src = director::verify(options, events, VerifyKind::SourcePresent).await;
@@ -2841,6 +3007,7 @@ async fn verify_step_acceptance(
                 // must not count as real progress that marks a step Done over no work.
                 has_positive_evidence: src_positive || (review.seats > 0 && !review.has_blocking()),
                 evidence: review.blocking.clone(),
+                raw_log: None,
             }
         }
         A::TurnSettled => {
@@ -2859,6 +3026,7 @@ async fn verify_step_acceptance(
                 accepted: true,
                 has_positive_evidence: false,
                 evidence: Vec::new(),
+                raw_log: None,
             }
         }
     }
@@ -2888,6 +3056,7 @@ fn acceptance_from_verify(r: VerifyResult) -> StepVerdict {
         } else {
             Vec::new()
         },
+        raw_log: None,
     }
 }
 
@@ -2960,10 +3129,14 @@ async fn verify_step_evidence(
         .evidence
         .iter()
         .any(|c| matches!(c, E::BuildClean | E::TestPasses { .. }));
-    let build = if needs_build {
-        Some(director::verify(options, events, VerifyKind::BuildTest).await)
+    // B1#2: the log-capturing variant — a failing build/test keeps a bounded verbatim
+    // tail of its raw output so the rework directive carries the raw evidence too.
+    let (build, build_raw) = if needs_build {
+        events.emit(EngineEvent::Note("team · verify build-test".to_string()));
+        let (r, raw) = director::verify_build_test_raw(options).await;
+        (Some(r), raw)
     } else {
-        None
+        (None, None)
     };
     let needs_contract = step
         .evidence
@@ -3013,14 +3186,18 @@ async fn verify_step_evidence(
         }
     }
 
+    let accepted = gaps.is_empty();
     StepVerdict {
         // Accept iff NO declared contract is unsatisfied. (A neutral-skip-only step on
         // a Build path still has the honesty floor's positive source evidence; a
         // non-Build step with only skips is a neutral accept, matching the acceptance
         // path's fail-open posture.)
-        accepted: gaps.is_empty(),
+        accepted,
         has_positive_evidence: any_positive,
         evidence: gaps,
+        // The raw build/test tail rides only a REJECTING verdict (a failed build that
+        // produced gaps); a clean/neutral verdict carries no log.
+        raw_log: if accepted { None } else { build_raw },
     }
 }
 
@@ -4384,6 +4561,12 @@ async fn drive_one_turn_with_backoff(
                     text.clear();
                     pitfalls.clear();
                     in_tool_call = false;
+                    // The re-drive is a fresh attempt — the corroboration must reflect
+                    // ONLY tools the FINAL attempt actually runs, never the abandoned
+                    // (hung) attempt's runner: a stale `true` here would let the
+                    // re-driven turn's bare green CLAIM skip UmaDev's own build/test
+                    // read (mirrors the transient-retry reset below).
+                    ran_build_tool = false;
                     continue;
                 }
                 // No event within the idle window → the base is hung. Settle as a
@@ -4770,6 +4953,13 @@ struct QcReport {
     /// The deduped, source-tagged union of blocking problems (e.g. `verify build:
     /// FAILED …`, `[security] no input validation`). Empty = clean.
     blocking: Vec<String>,
+    /// B1#2 — a BOUNDED verbatim tail of the failing build/test output (last ~60
+    /// lines, char-capped; see [`director::verify_build_test_raw`]), captured when
+    /// the build/test fact read FAILED. Folded into the fix directive as raw
+    /// evidence the brain adapts from — never a substitute for the one-line
+    /// distillation in `blocking`. `None` when no raw log exists (clean build,
+    /// skipped read, or a non-build finding) — the directive skips it cleanly.
+    raw_failure_log: Option<String>,
 }
 
 impl QcReport {
@@ -4805,13 +4995,23 @@ impl QcReport {
         } else {
             format!("{}\n\n", prefix.trim_end())
         };
+        // B1#2: when the build/test fact read captured the failing output, append its
+        // bounded verbatim tail so the fix turn works from the RAW compiler/test
+        // evidence too (adaptable), not only the one-line distillation above. Absent
+        // raw log (clean build / non-build findings) → byte-for-byte the plain form.
+        let raw = match self.raw_failure_log.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => {
+                format!("\n\n## Raw failing build/test output (verbatim tail)\n```text\n{t}\n```")
+            }
+            _ => String::new(),
+        };
         format!(
             "{lead}An objective check of what you just built surfaced problems that must be \
              fixed (these are real facts read from disk / review, not your memory):\n\
              {body}\nFix the cause of each one yourself with your tools — edit/create \
              the real files — then RUN the project's own build and tests to confirm \
              they pass. When it is genuinely clean, end your turn and report honestly \
-             what you fixed."
+             what you fixed.{raw}"
         )
     }
 }
@@ -4851,6 +5051,9 @@ async fn run_auto_qc(
     events.emit(EngineEvent::Note("team · honesty + QC read".to_string()));
     let route_team = route.map(|r| r.team.as_slice());
     let mut blocking: Vec<String> = Vec::new();
+    // B1#2: the failing build/test output's bounded raw tail (when the fact read
+    // below fails) — threaded into the fix directive as adaptable raw evidence.
+    let mut raw_failure_log: Option<String> = None;
 
     // 1. Honesty hard floor (UmaDev's own read-only check): did real source actually
     //    land? A claimed build with zero source is the decisive blocking finding —
@@ -4866,7 +5069,10 @@ async fn run_auto_qc(
         ));
         // No source means nothing to build/test or review — return now with the
         // decisive finding rather than reading over an empty tree.
-        return QcReport { blocking };
+        return QcReport {
+            blocking,
+            raw_failure_log: None,
+        };
     }
 
     // CONTENT GOVERNANCE: scan what the base actually wrote for craft/quality
@@ -4944,7 +5150,10 @@ async fn run_auto_qc(
             "team · lean / document goal — source check done, skipping the duplicate build + fork review"
                 .to_string(),
         ));
-        return QcReport { blocking };
+        return QcReport {
+            blocking,
+            raw_failure_log: None,
+        };
     }
 
     // 2. Build/test FACT read (optional, when a manifest is present). UmaDev reads
@@ -4981,9 +5190,14 @@ async fn run_auto_qc(
                 .to_string(),
         ));
     } else {
-        let bt = director::verify(options, events, VerifyKind::BuildTest).await;
+        // B1#2: the log-capturing variant — a FAILED read keeps the raw output's
+        // bounded tail alongside the one-line blocking distillation. Same check,
+        // same note as `director::verify(BuildTest)` emitted before.
+        events.emit(EngineEvent::Note("team · verify build-test".to_string()));
+        let (bt, raw) = director::verify_build_test_raw(options).await;
         if let Some(line) = build_test_blocking(&bt) {
             blocking.push(line);
+            raw_failure_log = raw;
         }
     }
 
@@ -5028,7 +5242,10 @@ async fn run_auto_qc(
         blocking.push(finding);
     }
 
-    QcReport { blocking }
+    QcReport {
+        blocking,
+        raw_failure_log,
+    }
 }
 
 /// The REQUIRED acceptance floor for a deliberate build (Wave 4, §L4 / task 2) —
@@ -5614,6 +5831,108 @@ mod tests {
         assert!(
             !out2.ran_build_tool,
             "a non-runner tool + a NARRATED green claim must NOT set ran_build_tool"
+        );
+    }
+
+    /// Attempt 1 OBSERVES a real test runner (`cargo test` ToolCall + result) then
+    /// HANGS silently (no TurnDone, base still alive) → the silent-hang watchdog
+    /// re-drives once; attempt 2 only NARRATES a green result — no tool call at all.
+    struct HangsAfterRunnerThenNarrates {
+        sends: usize,
+        current: std::collections::VecDeque<SessionEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for HangsAfterRunnerThenNarrates {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("test".into()))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            self.sends += 1;
+            self.current = if self.sends == 1 {
+                // A REAL runner ran (observed), its result landed… then the stream
+                // goes silent with the turn still open (a dropped stream).
+                vec![
+                    SessionEvent::ToolCall {
+                        name: "Bash".to_string(),
+                        input: serde_json::json!({ "command": "cargo test --workspace" }),
+                    },
+                    SessionEvent::ToolResult {
+                        ok: true,
+                        summary: "test result: ok".to_string(),
+                    },
+                ]
+            } else {
+                // The re-driven attempt: a bare green CLAIM, no runner invoked.
+                vec![
+                    SessionEvent::TextDelta("Ran the suite again — all green, exit 0.".to_string()),
+                    SessionEvent::TurnDone {
+                        status: TurnStatus::Completed,
+                        usage: None,
+                    },
+                ]
+            }
+            .into();
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            if let Some(ev) = self.current.pop_front() {
+                return Some(ev);
+            }
+            // Queue drained with the turn still open: hang (alive), never EOF.
+            std::future::pending::<()>().await;
+            None
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn watchdog_redrive_resets_stale_ran_build_tool() {
+        // Bug 4: attempt 1 really ran `cargo test` (an OBSERVED ToolCall) then hung;
+        // the silent-hang watchdog re-drove the SAME directive. Attempt 2 only
+        // NARRATED a green result. The corroboration must reflect ONLY the FINAL
+        // attempt — a stale `ran_build_tool = true` inherited from the abandoned
+        // attempt would let attempt 2's bare green claim skip UmaDev's own
+        // build/test read (the transient-retry path already resets it; the watchdog
+        // re-drive must mirror it).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (events, _rec) = sink();
+        let mut sess = HangsAfterRunnerThenNarrates {
+            sends: 0,
+            current: std::collections::VecDeque::new(),
+        };
+        let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_one_turn(
+                &mut sess,
+                &opts(tmp.path()),
+                &events,
+                "build it".to_string(),
+                budget,
+                std::time::Instant::now() + Duration::from_secs(3_600),
+            ),
+        )
+        .await
+        .expect("the watchdog re-drive settles, never hangs forever")
+        .expect("the re-driven attempt completes");
+        assert_eq!(sess.sends, 2, "the watchdog re-drove exactly once");
+        assert_eq!(out.text, "Ran the suite again — all green, exit 0.");
+        assert!(
+            !out.ran_build_tool,
+            "a watchdog re-drive must NOT inherit the abandoned attempt's runner corroboration"
         );
     }
 
@@ -7152,11 +7471,38 @@ mod tests {
                 "verify build-test: FAILED — build: FAILED (exit 1)".into(),
                 "[security] no input validation".into(),
             ],
+            raw_failure_log: None,
         };
         let d = qc.fix_directive();
         assert!(d.contains("must be fixed"));
         assert!(d.contains("build: FAILED"));
         assert!(d.contains("no input validation"));
+        // B1#2 — no raw log captured → the directive skips the excerpt cleanly.
+        assert!(
+            !d.contains("Raw failing build/test output"),
+            "no raw section without a captured log: {d}"
+        );
+    }
+
+    #[test]
+    fn fix_directive_carries_the_bounded_raw_failure_log_when_captured() {
+        // B1#2: a captured failing build/test tail rides the fix directive VERBATIM
+        // (fenced), after the distilled findings — raw evidence the brain adapts from.
+        let qc = QcReport {
+            blocking: vec!["verify build-test: FAILED — test: FAILED (exit 101)".into()],
+            raw_failure_log: Some(
+                "$ cargo test   (step `test`, exit 101)\nassertion `left == right` failed\n  left: 2\n right: 3"
+                    .to_string(),
+            ),
+        };
+        let d = qc.fix_directive();
+        assert!(d.contains("## Raw failing build/test output (verbatim tail)"));
+        assert!(
+            d.contains("assertion `left == right` failed"),
+            "the raw excerpt is carried verbatim: {d}"
+        );
+        // The distilled finding is still there — the raw log supplements, never replaces.
+        assert!(d.contains("test: FAILED (exit 101)"));
     }
 
     // ── Wave 4: required acceptance floor (deliberate only; bugfix repro test) ──
@@ -7617,6 +7963,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_plan_synthesis_rotates_the_previous_runs_notes() {
+        // B1#6 run-scoping: a NEW deliberate run (fresh plan synthesis) rotates the
+        // previous run's `.umadev/run-notes.md` to `.umadev/run-notes.prev.md`, so
+        // the notes file always belongs to ONE run. (A RESUME keeps the live file —
+        // covered by `resume_step_directive_recalls_the_persisted_run_notes`.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        seed_core_docs(tmp.path());
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("run-notes.md"),
+            "- [t0] STALE_NOTE from the previous run\n",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+        let plan_json = r#"{"steps":[
+            {"id":"scaffold","title":"Scaffold","seat":"frontend-engineer","kind":"build","depends_on":[],"acceptance":"source-present"}
+        ],"risks":[],"open_questions":[]}"#;
+        let turns = vec![text_turn(plan_json), text_turn("Built. Done.")];
+        let mut sess = FakeSession::new(turns, true, plan_json);
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的任务管理产品".to_string();
+        let route = build_route();
+        let _ = drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+        assert!(
+            !dir.join("run-notes.md").exists(),
+            "a fresh run starts with a clean notes sheet"
+        );
+        let prev = std::fs::read_to_string(dir.join("run-notes.prev.md"))
+            .expect("previous run's notes preserved");
+        assert!(
+            prev.contains("STALE_NOTE"),
+            "the previous run's notes rotate one generation back: {prev}"
+        );
+    }
+
+    #[tokio::test]
     async fn routed_loop_fails_open_to_single_turn_when_plan_unparseable() {
         // The fork replies with garbage (no JSON object) → synthesize_plan returns
         // None → the loop behaves EXACTLY like today's single-turn build. No
@@ -7743,13 +8127,17 @@ mod tests {
             sent.iter().any(|d| d.contains("Build the UI")),
             "the ui step got its own focused directive: {sent:?}"
         );
-        // Change 2: a CLEAN build (no blocking-item rework) must NOT drive the extra
-        // integrated final-report turn — the last build step's reply is the final word.
-        assert!(
-            !sent
-                .iter()
-                .any(|d| d.contains("integrated final report for this build")),
-            "a clean build drives no integrated final-report turn: {sent:?}"
+        // Change 2 (Bug-2 fix): a CLEAN multi-step deliberate build DOES drive the ONE
+        // integrated final-report turn at convergence — every per-step doer directive
+        // carried the wrap-up suppression note, so without this turn the build's final
+        // reply would be the last step's deliberately conclusion-free narration (the
+        // deferred wrap-up would never arrive). Exactly ONCE — never a double report.
+        assert_eq!(
+            sent.iter()
+                .filter(|d| d.contains("integrated final report for this build"))
+                .count(),
+            1,
+            "a clean multi-step build drives exactly ONE integrated final-report turn: {sent:?}"
         );
         // FIX #6: each per-step directive HARD-scopes the base to ONE step (the root
         // fix for "the base builds the whole project in step 1's turn"). The focused
@@ -8354,8 +8742,8 @@ mod tests {
         // base's premature "## Next steps" report A is stale, so at convergence the
         // scheduler drives ONE integrated final-report turn on the MAIN session and
         // records THAT as the reply. Proven by the integrated-report DIRECTIVE being
-        // sent (only this change emits it); the clean counterpart above asserts the
-        // negative (no such directive on a clean build).
+        // sent EXACTLY once (the clean counterpart above asserts its own exactly-once
+        // — a clean convergence earns the report too now, but never a double).
         use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path()); // the build step's source-present acceptance passes
@@ -8417,11 +8805,14 @@ mod tests {
 
         let sent = sent.lock().unwrap();
         // The ONE integrated final-report turn fired at convergence (its distinctive
-        // directive was sent) — this only happens on the reworked path.
-        assert!(
+        // directive was sent) — and EXACTLY once: a reworked build must never
+        // double-report now that a clean convergence also drives the report turn.
+        assert_eq!(
             sent.iter()
-                .any(|d| d.contains("integrated final report for this build")),
-            "a reworked build drives the integrated final-report turn: {sent:?}"
+                .filter(|d| d.contains("integrated final report for this build"))
+                .count(),
+            1,
+            "a reworked build drives exactly ONE integrated final-report turn: {sent:?}"
         );
         // And the final reply is NOT the premature report A (it was superseded).
         match outcome {
@@ -8431,6 +8822,221 @@ mod tests {
             ),
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    // ── Dead-summon guard (Bug 1, empirically reproduced): after an early step
+    //    wrote real source and the base process DIED, the remaining steps' summons
+    //    can't run — but the workspace-global source-present positive (step 1's
+    //    files) used to fake-tick them Done, converging into a fake clean delivery.
+    //    Now: a definite send failure blocks the step for ANY step (not just the
+    //    first), and a `!drove` step needs STEP-ATTRIBUTABLE evidence (its own
+    //    declared file paths / a source-tree delta since the step start). ──
+
+    /// A main session that is ALIVE for its first `alive_turns` sends, then DIES.
+    /// `send_fails_after_death = true` → every later `send_turn` errors (the base
+    /// process exited — the DEFINITE no-turn signal; mirrors the dead-session probe);
+    /// `false` → later sends still "succeed" but the event stream is instant EOF
+    /// (a silent death with no send error — the belt+suspenders shape).
+    struct DyingSession {
+        alive_turns: usize,
+        turns_sent: usize,
+        send_fails_after_death: bool,
+        current: std::collections::VecDeque<SessionEvent>,
+    }
+
+    impl DyingSession {
+        fn new(alive_turns: usize, send_fails_after_death: bool) -> Self {
+            Self {
+                alive_turns,
+                turns_sent: 0,
+                send_fails_after_death,
+                current: std::collections::VecDeque::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSession for DyingSession {
+        async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
+            Err(SessionError::ForkUnsupported("dead".into()))
+        }
+        async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+            self.turns_sent += 1;
+            if self.turns_sent > self.alive_turns {
+                if self.send_fails_after_death {
+                    return Err(SessionError::Send("base process exited".into()));
+                }
+                // Silent death: the send "lands" but the stream just ends (EOF).
+                self.current.clear();
+                return Ok(());
+            }
+            self.current = vec![
+                SessionEvent::TextDelta("Scaffolded the app skeleton.".to_string()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ]
+            .into();
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<SessionEvent> {
+            self.current.pop_front()
+        }
+        async fn respond(
+            &mut self,
+            _req_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    /// The probe's 3-step chain: scaffold → feature-a → feature-b, all
+    /// source-present Build steps (the acceptance shape that fake-ticked).
+    fn dead_session_plan() -> crate::plan_state::Plan {
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+        let mk = |id: &str, deps: &[&str]| PlanStep {
+            id: id.into(),
+            title: format!("step {id}"),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: StepKind::Build,
+            depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        };
+        Plan {
+            steps: vec![
+                mk("scaffold", &[]),
+                mk("feature-a", &["scaffold"]),
+                mk("feature-b", &["feature-a"]),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        }
+    }
+
+    /// Drive the dead-session scenario and assert the honest outcome shared by both
+    /// death shapes: step 1 (which really ran) is Done, steps 2..N end BLOCKED (not
+    /// fake-Done off step 1's source), and the run does not finalize as `delivery`.
+    async fn assert_dead_session_blocks_remaining_steps(send_fails: bool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path()); // step 1's real source — the old GLOBAL evidence trap
+        let (events, _rec) = sink();
+        let mut sess = DyingSession::new(1, send_fails);
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的任务管理产品".to_string();
+        let route = build_route();
+        let mut plan = dead_session_plan();
+
+        let outcome = drive_plan_steps(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &mut plan,
+            IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        )
+        .await;
+        // Step 1 really drove → no first-step bail; the schedule settles honestly.
+        assert!(
+            matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+            "the schedule settles (never wedges) over a dead session: {outcome:?}"
+        );
+        use crate::plan_state::StepStatus;
+        let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
+        assert_eq!(
+            by("scaffold"),
+            StepStatus::Done,
+            "the real turn's step is Done"
+        );
+        assert_eq!(
+            by("feature-a"),
+            StepStatus::Blocked,
+            "a step whose turn never ran must NOT tick Done off step 1's source"
+        );
+        assert_eq!(
+            by("feature-b"),
+            StepStatus::Blocked,
+            "the stranded dependent is honestly Blocked, not fake-Done"
+        );
+        // NOT a clean delivery: the 9-phase state must not claim `delivery`.
+        assert_ne!(
+            persisted_phase_id(tmp.path()).as_deref(),
+            Some("delivery"),
+            "a dead-session build must not finalize as a clean delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_session_send_failure_blocks_remaining_steps_not_fake_done() {
+        // The probe shape (scratchpad replan-probe/deadsession): sends FAIL after
+        // step 1 — the DEFINITE no-turn signal marks every later step Blocked.
+        assert_dead_session_blocks_remaining_steps(true).await;
+    }
+
+    #[tokio::test]
+    async fn silently_dead_session_blocks_remaining_steps_without_step_evidence() {
+        // Belt+suspenders: the sends still "succeed" but no turn ever produces an
+        // event (EOF) — `!drove` with NO step-attributable evidence (no declared
+        // file paths, no source-tree delta) must leave the step Blocked even though
+        // the workspace-global source-present positive (step 1's files) holds.
+        assert_dead_session_blocks_remaining_steps(false).await;
+    }
+
+    #[tokio::test]
+    async fn dead_turn_with_step_attributable_delta_still_completes_the_step() {
+        // The HONEST counter-case: a turn that died mid-way (`!drove`) but whose
+        // work REALLY landed — the step's own declared FileExists path appears on
+        // disk during the step — still ticks Done (hung-but-productive is honoured;
+        // the guard rejects only evidence that cannot be attributed to the step).
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let (events, _rec) = sink();
+        // The step's deliverable ALREADY exists when its (dead) turn is verified —
+        // declared FileExists evidence is step-attributable by construction.
+        std::fs::write(tmp.path().join("feature.ts"), "export const f = 1;").unwrap();
+        let mut sess = DyingSession::new(0, false); // dead from the very first send
+        let mut o = opts(tmp.path());
+        o.requirement = "做一个完整的任务管理产品".to_string();
+        let route = build_route();
+        let step = crate::plan_state::PlanStep {
+            id: "feature".into(),
+            title: "Build the feature".into(),
+            seat: crate::critics::Seat::FrontendEngineer,
+            kind: crate::plan_state::StepKind::Build,
+            depends_on: vec![],
+            acceptance: crate::plan_state::AcceptanceSpec::SourcePresent,
+            evidence: vec![crate::plan_state::EvidenceContract::FileExists {
+                path: "feature.ts".into(),
+            }],
+            status: crate::plan_state::StepStatus::Pending,
+        };
+        let mut reflected = std::collections::HashSet::new();
+        let out = drive_build_step(
+            &mut sess,
+            &o,
+            &events,
+            &route,
+            &step,
+            "",
+            0,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+            &mut reflected,
+        )
+        .await;
+        assert!(
+            out.accepted && out.made_progress,
+            "declared step-attributable evidence completes the step even when the turn died"
+        );
     }
 
     // ── First-pass acceptance signal: the measured engineering-doctrine telemetry
@@ -9779,9 +10385,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
         let (events, rec) = sink();
-        // The first (and only) step's doer turn has a text delta but NO TurnDone → the
-        // session drains to None mid-turn → summon returns done=false (didn't drive).
-        let turns = vec![vec![SessionEvent::TextDelta("partial, no TurnDone".into())]];
+        // EVERY doer turn (round 0 + the bounded fix re-drives) has a text delta but
+        // NO TurnDone → the session drains to None mid-turn each time → summon keeps
+        // returning done=false (a session that STAYS dead; the dead-summon guard now
+        // re-drives a mid-turn death within the bounded fix budget before giving up,
+        // so a single dead batch followed by default-completing turns would recover).
+        let turns = vec![
+            vec![SessionEvent::TextDelta("partial, no TurnDone".into())];
+            MAX_STEP_FIX_ROUNDS + 2
+        ];
         let mut sess = FakeSession::new(turns, false, "");
         let mut o = opts(tmp.path());
         o.requirement = "做一个完整的产品".to_string();
@@ -10481,6 +11093,65 @@ mod tests {
         assert!(
             outcome.is_none(),
             "no persisted plan → no resume (caller fails open to a fresh run)"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_step_directive_recalls_the_persisted_run_notes() {
+        // B1#6 (run-notes survive session resets): notes the base appended to
+        // `.umadev/run-notes.md` earlier in the run are re-injected — bounded tail
+        // under the persisted-notes header — into the step directive on a RESUME
+        // over a FRESH session. And a resume never rotates the file (the notes are
+        // exactly the memory it wants back).
+        use crate::plan_state::{Plan, StepStatus};
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_source(tmp.path());
+        let notes_dir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(
+            notes_dir.join("run-notes.md"),
+            "- [t1] NOTES_MARKER chose sqlite: zero-config for this scale\n",
+        )
+        .unwrap();
+        let (events, _rec) = sink();
+
+        let persisted = Plan {
+            steps: vec![
+                resume_step("alpha", "ALPHA scaffold the project", &[], StepStatus::Done),
+                resume_step(
+                    "beta",
+                    "BETA build the remaining feature",
+                    &["alpha"],
+                    StepStatus::Pending,
+                ),
+            ],
+            risks: vec![],
+            open_questions: vec![],
+        };
+        plan_state::save(&persisted, tmp.path()).expect("persist the plan");
+
+        let mut sess = FakeSession::new(vec![text_turn("Built BETA. Done.")], false, "");
+        let sent = sess.sent_handle();
+        let o = opts(tmp.path());
+        let route = build_route();
+        let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
+        assert!(
+            matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+            "the resumable plan drives to a Done outcome"
+        );
+
+        let sent = sent.lock().unwrap();
+        assert!(
+            sent.iter().any(
+                |d| d.contains("## Run notes (yours, persisted)") && d.contains("NOTES_MARKER")
+            ),
+            "the driven step's directive recalls the persisted run notes: {sent:?}"
+        );
+        // The resume kept the notes file in place — rotation happens ONLY on a
+        // fresh plan synthesis (a NEW run), never on a resume.
+        assert!(
+            tmp.path().join(".umadev/run-notes.md").exists(),
+            "a resume must not rotate the run notes away"
         );
     }
 

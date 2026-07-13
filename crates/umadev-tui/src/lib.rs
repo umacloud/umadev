@@ -367,6 +367,47 @@ fn build_brain(
     }
 }
 
+/// Build the **COLD-context judge surface** for the adversarial critic seats
+/// (QA + security — see `umadev_agent::critics::RoleCritic::cold`): each call
+/// runs ONE fresh, stateless one-shot on the configured base
+/// (`Runtime::complete` — `claude --print` / `codex exec` / `opencode run`, the
+/// same primitive the chat router's triage uses), so the reviewer shares NO
+/// context with the doer's main session — no transcript, no framing, no blind
+/// spots. A FRESH driver is built per call (no pinned session, no resume) so
+/// every judge is a brand-new conversation.
+///
+/// Fail-open by contract: an unknown/offline backend, a call error, or an empty
+/// reply resolves `None`, which makes the seat fall back to its read-only fork
+/// (today's behaviour) — a cold seat can degrade but never disappears. Shared by
+/// the TUI's director drive and the CLI `umadev run` path (`umadev` main).
+#[must_use]
+pub fn cold_judge_surface(
+    backend: &str,
+    model: &str,
+    root: &std::path::Path,
+) -> umadev_agent::critics::ColdJudgeFn {
+    let backend = backend.to_string();
+    let model = model.to_string();
+    let root = root.to_path_buf();
+    Arc::new(move |system: String, user: String| {
+        let backend = backend.clone();
+        let model = model.clone();
+        let root = root.clone();
+        Box::pin(async move {
+            // A fresh driver per judge call: no session id, no resume — cold by
+            // construction (a reused driver would auto-resume its own first call).
+            let mut driver = driver_for(&backend)?;
+            driver.set_continue_session(false);
+            driver.set_session_id(None);
+            driver.set_workspace(root);
+            let req = umadev_agent::experts::Prompt { system, user }.into_request(model, 2000);
+            let resp = driver.complete(req).await.ok()?;
+            let text = resp.text.trim().to_string();
+            (!text.is_empty()).then_some(text)
+        }) as umadev_agent::critics::ColdJudgeFuture
+    })
+}
+
 /// Terminal signal from a brain-driven turn back to the event loop. UmaDev no
 /// longer classifies the user's intent (chat vs run) up front — every non-slash
 /// message goes straight to the tools-enabled base session, which decides for
@@ -1521,32 +1562,42 @@ async fn run_director_loop(
                 confirm_gates: true,
             }
         };
-        let outcome = umadev_agent::hosted_interaction(interaction, async {
-            let resumed = if resume {
-                umadev_agent::drive_director_loop_resume(
-                    session.as_mut(),
-                    &options,
-                    &sink_dyn,
-                    &route,
-                )
-                .await
-            } else {
-                None
-            };
-            match resumed {
-                Some(o) => o,
-                None => {
-                    umadev_agent::drive_director_loop_routed(
+        // COLD-context critics (B2#1): scope a fresh stateless one-shot judge
+        // surface over the whole drive so the adversarial seats (QA + security)
+        // review with NO doer context. Fail-open: a surface that can't serve makes
+        // those seats fall back to their read-only fork, exactly today's path.
+        let cold_surface = cold_judge_surface(&backend, &model, &root);
+        // Box::pin the (large) drive future: the task-local scope wrapper would
+        // otherwise hold it inline and trip `clippy::large_futures`.
+        let outcome = umadev_agent::critics::with_cold_surface(
+            cold_surface,
+            Box::pin(umadev_agent::hosted_interaction(interaction, async {
+                let resumed = if resume {
+                    umadev_agent::drive_director_loop_resume(
                         session.as_mut(),
                         &options,
                         &sink_dyn,
-                        directive,
-                        Some(&route),
+                        &route,
                     )
                     .await
+                } else {
+                    None
+                };
+                match resumed {
+                    Some(o) => o,
+                    None => {
+                        umadev_agent::drive_director_loop_routed(
+                            session.as_mut(),
+                            &options,
+                            &sink_dyn,
+                            directive,
+                            Some(&route),
+                        )
+                        .await
+                    }
                 }
-            }
-        })
+            })),
+        )
         .await;
         // Always end the session (release the process / server).
         let _ = session.end().await;
@@ -11172,8 +11223,10 @@ mod tests {
         };
 
         // Drive the director loop body directly (no spawn): the session start fails
-        // open AFTER the baseline write, so the loop returns cleanly.
-        run_director_loop(
+        // open AFTER the baseline write, so the loop returns cleanly. Box::pin —
+        // the loop body future is large (clippy::large_futures) and the spawn
+        // wrapper normally heap-allocates it.
+        Box::pin(run_director_loop(
             options,
             sink,
             route_tx,
@@ -11184,7 +11237,7 @@ mod tests {
             false,
             Arc::new(std::sync::Mutex::new(Vec::new())),
             Arc::new(std::sync::Mutex::new(None)),
-        )
+        ))
         .await;
 
         // The baseline is on disk and carries the run's identity — exactly what the

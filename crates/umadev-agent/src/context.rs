@@ -314,6 +314,18 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         // told to record its FIRST open item.
         fw.push_block(crate::open_decisions::decisions_directive());
 
+        // ── RUN-NOTES discipline — persist working memory across resets (static) ─
+        // The fourth durable-memory channel (sibling of the facts store, the
+        // open-decisions register, and the pitfall ledger): the base is told to
+        // append important decisions / discoveries / blockers to
+        // `.umadev/run-notes.md` as it works, because the file SURVIVES session
+        // resets / compaction / resumes while its context does not (B1#6). Like
+        // the open-decisions directive above, this is the byte-STATIC record
+        // guidance and lives in the KV-cache-stable head; the volatile RECALL (the
+        // bounded tail of the actual notes) rides the director's step directives,
+        // not the firmware. Work-class turns only — bare chat writes no notes.
+        fw.push_block(run_notes_directive());
+
         // ══ STABLE → VOLATILE BOUNDARY (KV-cache) ════════════════════════════
         // Everything ABOVE this point (identity, output-language, craft law,
         // anti-slop law, user charter) is byte-stable across turns and forms the
@@ -581,6 +593,109 @@ pub fn project_context(root: &Path, scope: &[String], budget_chars: usize) -> St
 /// top-K (a digest ≈ half a screen), never the whole corpus. Tighter than the
 /// pipeline per-phase `top_k`: the firmware is an overlay, not the primary brief.
 const JIT_KNOWLEDGE_CHUNKS: usize = 4;
+
+// ===================================================================
+// Run notes — the base's OWN persisted working memory for ONE run
+// ===================================================================
+
+/// Workspace-relative path of the run-scoped notes file — the base's OWN durable
+/// working memory for the CURRENT run. The firmware ([`run_notes_directive`])
+/// tells the base to append important decisions / discoveries / blockers here as
+/// timestamped bullets; the director's step directives re-inject a bounded tail
+/// ([`run_notes_tail_block`]) so the notes SURVIVE session resets, compaction,
+/// and cross-session resumes (B1#6 — an external memory file beats context that
+/// evaporates).
+pub const RUN_NOTES_REL_PATH: &str = ".umadev/run-notes.md";
+
+/// Where the PREVIOUS run's notes are rotated when a NEW deliberate run starts
+/// (fresh plan synthesis → [`rotate_run_notes`]). Keeps the notes file
+/// run-scoped: a new build starts with a clean sheet while the last run's notes
+/// stay inspectable one generation back.
+pub const RUN_NOTES_PREV_REL_PATH: &str = ".umadev/run-notes.prev.md";
+
+/// How many trailing note lines a step directive recalls — the newest entries
+/// matter most, and the bound keeps the recall a compact block, never a second
+/// transcript.
+pub const RUN_NOTES_TAIL_LINES: usize = 30;
+
+/// Character ceiling for the recalled tail (belt-and-suspenders on top of the
+/// line bound, so 30 pathological lines can't blow the directive budget).
+const RUN_NOTES_TAIL_CHARS: usize = 4_000;
+
+/// The RECORD half of the run-notes discipline — the compact firmware
+/// instruction (work-class turns only) telling the base to persist its working
+/// memory as it goes. A byte-STATIC `&'static str` (no per-turn data), so it
+/// sits in the KV-cache-stable head like the open-decisions directive. The
+/// volatile RECALL half is [`run_notes_tail_block`], injected into the
+/// director's step directives, not here.
+pub(crate) fn run_notes_directive() -> &'static str {
+    "## Run notes (persist your working memory)\n\
+     As you work, APPEND important decisions, discoveries, and blockers to \
+     `.umadev/run-notes.md` (create the file if missing) as short timestamped bullets, e.g. \
+     `- [2026-01-01 12:00] chose SQLite over Postgres: zero-config for this scale`. This file \
+     PERSISTS across session resets, compaction, and resumes — anything only in your head can \
+     be lost, anything in the file comes back to you. Keep entries one line each, append-only; \
+     never rewrite or delete earlier entries."
+}
+
+/// The RECALL half of the run-notes discipline: a bounded tail (last `max_lines`
+/// non-empty lines, ≤ [`RUN_NOTES_TAIL_CHARS`] chars) of the base's own
+/// `.umadev/run-notes.md`, under a `## Run notes (yours, persisted)` header —
+/// injected into each step directive so the base's working memory survives a
+/// session reset / resume / fresh brain. Fail-open by contract: an absent,
+/// empty, whitespace-only, or unreadable file yields `""` (nothing injected,
+/// directive unchanged).
+#[must_use]
+pub fn run_notes_tail_block(root: &Path, max_lines: usize) -> String {
+    let Ok(body) = std::fs::read_to_string(root.join(RUN_NOTES_REL_PATH)) else {
+        return String::new();
+    };
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let start = lines.len().saturating_sub(max_lines.max(1));
+    let mut tail = lines[start..].join("\n");
+    // Keep the NEWEST notes when over the char ceiling (drop from the head, on a
+    // char boundary so a multi-byte entry can never panic the compose).
+    let total = tail.chars().count();
+    if total > RUN_NOTES_TAIL_CHARS {
+        tail = tail.chars().skip(total - RUN_NOTES_TAIL_CHARS).collect();
+    }
+    format!(
+        "## Run notes (yours, persisted)\n\
+         Your own working notes from earlier in this run (`{RUN_NOTES_REL_PATH}` — they \
+         survived any session reset; keep appending new ones):\n{tail}"
+    )
+}
+
+/// Rotate the run-notes file at the start of a NEW deliberate run (fresh plan
+/// synthesis): `.umadev/run-notes.md` → `.umadev/run-notes.prev.md` (replacing
+/// any older prev), so notes stay scoped to ONE run. A RESUME re-attaches the
+/// SAME plan and never rotates — its notes are exactly the memory it wants back.
+/// Best-effort + fail-open at every step: an absent file is a no-op, a failed
+/// rename degrades to copy+remove, and any IO error is swallowed (rotation must
+/// never block a run).
+pub fn rotate_run_notes(root: &Path) {
+    let cur = root.join(RUN_NOTES_REL_PATH);
+    let prev = root.join(RUN_NOTES_PREV_REL_PATH);
+    match std::fs::read_to_string(&cur) {
+        Ok(body) if !body.trim().is_empty() => {
+            let _ = std::fs::remove_file(&prev);
+            if std::fs::rename(&cur, &prev).is_err() {
+                // Cross-device / locked-file fallback: copy the content, then clear.
+                let _ = std::fs::write(&prev, body);
+                let _ = std::fs::remove_file(&cur);
+            }
+        }
+        // An empty notes file carries nothing worth keeping — just clear it.
+        Ok(_) => {
+            let _ = std::fs::remove_file(&cur);
+        }
+        // No notes (or unreadable) → nothing to rotate.
+        Err(_) => {}
+    }
+}
 
 /// A budget-bounded, priority-ordered prompt assembler. Blocks are pushed in
 /// descending priority; once the running length would exceed the cap the next
@@ -1540,6 +1655,121 @@ mod tests {
             b.as_bytes().get(..anchor),
             "the stable prefix up to the volatile boundary must be byte-identical"
         );
+    }
+
+    #[tokio::test]
+    async fn run_notes_directive_rides_work_turns_not_bare_chat() {
+        // The RECORD instruction (append decisions/discoveries/blockers to
+        // `.umadev/run-notes.md`, it persists across sessions) leads every WORK
+        // turn's firmware; a bare chat turn stays light and carries none of it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let build = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::BackendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &build, "做一个登录系统").await;
+        assert!(
+            fw.contains(RUN_NOTES_REL_PATH) && fw.contains("persist your working memory"),
+            "a work turn carries the run-notes record directive: {fw}"
+        );
+        // A fast quick-edit is still a WORK turn (craft tier) → directive present.
+        let qe = route(RouteClass::QuickEdit, Depth::Fast, Vec::new());
+        let fw_qe = compose_firmware(tmp.path(), &qe, "改个文案").await;
+        assert!(
+            fw_qe.contains(RUN_NOTES_REL_PATH),
+            "a quick-edit work turn carries the directive too"
+        );
+        // Bare chat: no craft head, no run-notes discipline.
+        let chat = route(RouteClass::Chat, Depth::Fast, Vec::new());
+        let fw_chat = compose_firmware(tmp.path(), &chat, "你好,在吗?").await;
+        assert!(
+            !fw_chat.contains(RUN_NOTES_REL_PATH),
+            "bare chat must not carry the run-notes directive: {fw_chat}"
+        );
+    }
+
+    #[test]
+    fn run_notes_tail_block_is_bounded_and_recalls_the_newest_lines() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Absent file → empty (fail-open, nothing injected).
+        assert!(run_notes_tail_block(tmp.path(), RUN_NOTES_TAIL_LINES).is_empty());
+        // Write 50 numbered entries; the recall carries ONLY the last 30, newest
+        // preserved verbatim, under the persisted-notes header.
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = (1..=50)
+            .map(|i| format!("- [t{i}] note number {i}\n"))
+            .collect();
+        std::fs::write(dir.join("run-notes.md"), body).unwrap();
+        let block = run_notes_tail_block(tmp.path(), RUN_NOTES_TAIL_LINES);
+        assert!(
+            block.starts_with("## Run notes (yours, persisted)"),
+            "the recall block carries the persisted-notes header: {block}"
+        );
+        assert!(
+            block.contains("note number 50") && block.contains("note number 21"),
+            "the newest 30 entries are recalled: {block}"
+        );
+        assert!(
+            !block.contains("note number 20\n") && !block.contains("note number 1]"),
+            "entries beyond the 30-line tail are dropped: {block}"
+        );
+        // A whitespace-only file injects nothing.
+        std::fs::write(dir.join("run-notes.md"), "\n\n   \n").unwrap();
+        assert!(run_notes_tail_block(tmp.path(), RUN_NOTES_TAIL_LINES).is_empty());
+        // Pathologically long lines are additionally capped by the char ceiling —
+        // the NEWEST content survives the cut (drop-from-head), never a panic.
+        let huge = format!("- old {}\n- newest 说明 NEWEST_MARK\n", "x".repeat(10_000));
+        std::fs::write(dir.join("run-notes.md"), huge).unwrap();
+        let capped = run_notes_tail_block(tmp.path(), RUN_NOTES_TAIL_LINES);
+        assert!(
+            capped.contains("NEWEST_MARK"),
+            "newest note survives the cap"
+        );
+        assert!(
+            capped.chars().count() < RUN_NOTES_TAIL_CHARS + 300,
+            "the recall stays bounded: {} chars",
+            capped.chars().count()
+        );
+    }
+
+    #[test]
+    fn run_notes_tail_block_is_fail_open_on_an_unreadable_path() {
+        // A DIRECTORY squatting on the notes path makes the read fail → empty
+        // block, never an error (io failures must skip silently).
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(RUN_NOTES_REL_PATH)).unwrap();
+        assert!(run_notes_tail_block(tmp.path(), RUN_NOTES_TAIL_LINES).is_empty());
+    }
+
+    #[test]
+    fn rotate_run_notes_scopes_the_file_to_one_run() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&dir).unwrap();
+        // No notes → rotation is a silent no-op (a fresh project's first run).
+        rotate_run_notes(tmp.path());
+        assert!(!dir.join("run-notes.prev.md").exists());
+        // A new run rotates the previous run's notes to `.prev` and clears the live
+        // file, so the new run starts with a clean sheet.
+        std::fs::write(dir.join("run-notes.md"), "- [t1] run A learned X\n").unwrap();
+        rotate_run_notes(tmp.path());
+        assert!(!dir.join("run-notes.md").exists(), "live file cleared");
+        let prev = std::fs::read_to_string(dir.join("run-notes.prev.md")).unwrap();
+        assert!(prev.contains("run A learned X"), "old notes preserved");
+        // The NEXT rotation replaces the old prev with the newer generation.
+        std::fs::write(dir.join("run-notes.md"), "- [t2] run B learned Y\n").unwrap();
+        rotate_run_notes(tmp.path());
+        let prev2 = std::fs::read_to_string(dir.join("run-notes.prev.md")).unwrap();
+        assert!(prev2.contains("run B learned Y") && !prev2.contains("run A"));
+        // An EMPTY live file is just cleared; the prev generation stays intact.
+        std::fs::write(dir.join("run-notes.md"), "   \n").unwrap();
+        rotate_run_notes(tmp.path());
+        assert!(!dir.join("run-notes.md").exists());
+        assert!(std::fs::read_to_string(dir.join("run-notes.prev.md"))
+            .unwrap()
+            .contains("run B"));
     }
 
     #[test]

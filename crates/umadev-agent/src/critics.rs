@@ -473,6 +473,16 @@ pub struct RoleVerdict {
     /// trusted from the base.
     #[serde(default)]
     pub provenance: Vec<Provenance>,
+    /// Whether this verdict was produced on a **COLD** context — a FRESH, stateless
+    /// judge surface seeded ONLY with the seat prompt + the shared blackboard
+    /// artifacts, never the main session's transcript (see [`RoleCritic::cold`]).
+    /// Recorded Rust-side by the consult that actually served the judge turn (never
+    /// trusted from the base), and surfaced in the team ledger so divergence between
+    /// cold and forked verdicts is visible. `false` for a forked (context-inheriting)
+    /// review, for the fail-open fallback path, and — via `serde(default)` — for any
+    /// older persisted verdict JSON.
+    #[serde(default)]
+    pub cold: bool,
 }
 
 impl RoleVerdict {
@@ -490,6 +500,7 @@ impl RoleVerdict {
             advisory: Vec::new(),
             evidence: Vec::new(),
             provenance: Vec::new(),
+            cold: false,
         }
     }
 
@@ -625,6 +636,27 @@ pub trait RoleCritic: Send + Sync {
     /// Stable role id (e.g. `product-manager`) — used in the ledger + prompts.
     fn role(&self) -> &str;
 
+    /// Whether this seat reviews on a **COLD** context — a FRESH, stateless judge
+    /// surface seeded ONLY with the seat prompt + the shared blackboard artifacts
+    /// (the [`CriticArtifacts`] bundle), never the main session's transcript.
+    ///
+    /// The ADVERSARIAL seats (QA + security) are cold: a reviewer that shares NO
+    /// prior context with the coder cannot inherit the doer's framing or blind
+    /// spots, and production evidence says such reviewers catch more (and more
+    /// severe) defects. The intent-context seats (PM / architect / designer /
+    /// frontend / backend / DevOps) stay on the read-only fork — they benefit
+    /// from knowing what the team intended.
+    ///
+    /// This is purely a SURFACE preference, never a hard requirement: when no
+    /// cold surface is scoped ([`cold_surface`] → `None` on a headless / unwired
+    /// path) or the fresh one-shot fails, the seat falls back to the fork
+    /// (today's behaviour) — a cold seat can degrade but never disappears
+    /// (invariant 1). Defaults to `false` so every existing / custom critic is
+    /// byte-for-byte unchanged.
+    fn cold(&self) -> bool {
+        false
+    }
+
     /// Review the shared artifacts and return this role's verdict.
     ///
     /// `consult` runs ONE strict-JSON judge turn on a forked read-only session
@@ -652,6 +684,50 @@ pub trait CriticConsult: Send + Sync {
     /// returns a verdict — the fail-open empty one when there's no brain / the
     /// call failed / the reply didn't parse.
     async fn judge(&self, role: &str, system: &str, user: String) -> RoleVerdict;
+}
+
+/// The reply future a [`ColdJudgeFn`] resolves to: the fresh surface's raw reply
+/// text, or `None` when the surface could not serve (no such backend / offline /
+/// a call error / an empty reply) — the caller then falls back to the read-only
+/// fork, so a cold seat degrades but never disappears.
+pub type ColdJudgeFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>;
+
+/// A host-provided FRESH, STATELESS one-shot judge surface for cold-context
+/// critics: `(system, user) -> reply text`.
+///
+/// Each call is a brand-new conversation on the borrowed brain — the same
+/// stateless `Runtime::complete` primitive the chat router's triage and the
+/// compaction summarizer use (`claude --print` and equivalents: no session, no
+/// resume, no fork) — so the reviewer shares NOTHING with the doer's main
+/// session. The AGENT crate cannot build a host driver itself (it owns no model
+/// endpoint and does not depend on `umadev-host`), so the hosting layer scopes
+/// this via [`with_cold_surface`] around a run; an unscoped (headless / unwired)
+/// run simply reads `None` and every seat keeps today's fork path.
+pub type ColdJudgeFn = std::sync::Arc<dyn Fn(String, String) -> ColdJudgeFuture + Send + Sync>;
+
+tokio::task_local! {
+    /// The hosting layer's cold judge surface for the CURRENT run task (mirrors
+    /// `crate::interaction`'s task-local pattern: reach the deep engine without
+    /// threading a parameter through every pump signature). Unset → every consult
+    /// fails open to `None` and behaviour is byte-for-byte today's fork path.
+    static COLD_SURFACE: ColdJudgeFn;
+}
+
+/// Run `fut` with `surface` scoped as the current task's COLD judge surface —
+/// the hosting layer (TUI / CLI) wraps its whole director-loop drive in this so
+/// the adversarial seats (QA + security) can review on a fresh stateless
+/// context. Everything awaited inside inherits the scope.
+pub async fn with_cold_surface<F: std::future::Future>(surface: ColdJudgeFn, fut: F) -> F::Output {
+    COLD_SURFACE.scope(surface, fut).await
+}
+
+/// The current task's cold judge surface, if the hosting layer scoped one.
+/// `None` when unscoped (headless CLI / CI / tests that don't opt in) — the
+/// caller then keeps the fork path, fail-open.
+#[must_use]
+pub(crate) fn cold_surface() -> Option<ColdJudgeFn> {
+    COLD_SURFACE.try_with(std::clone::Clone::clone).ok()
 }
 
 /// Product-manager critic — reviews the docs from the PM seat: does the plan
@@ -750,6 +826,12 @@ impl RoleCritic for QaCritic {
         "qa-engineer"
     }
 
+    /// QA is an ADVERSARIAL seat — it reviews on a cold, doer-context-free
+    /// surface when one is available (see [`RoleCritic::cold`]).
+    fn cold(&self) -> bool {
+        true
+    }
+
     async fn review(
         &self,
         consult: &dyn CriticConsult,
@@ -800,6 +882,12 @@ impl RoleCritic for SecurityCritic {
     #[allow(clippy::unnecessary_literal_bound)]
     fn role(&self) -> &str {
         "security-engineer"
+    }
+
+    /// Security is an ADVERSARIAL seat — it reviews on a cold, doer-context-free
+    /// surface when one is available (see [`RoleCritic::cold`]).
+    fn cold(&self) -> bool {
+        true
     }
 
     async fn review(
@@ -1247,6 +1335,10 @@ pub fn append_team_ledger(
         "blocking": verdict.blocking.len(),
         "advisory": verdict.advisory.len(),
         "evidence": verdict.evidence.len(),
+        // Which CONTEXT served the verdict: `true` = a fresh, stateless cold
+        // surface (no doer transcript), `false` = the read-only fork. Recorded so
+        // divergence between cold and forked verdicts is auditable per seat.
+        "cold": verdict.cold,
     });
     let path = dir.join("team-ledger.jsonl");
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -1737,6 +1829,73 @@ mod tests {
         // A frontend-only route → just the frontend + QA code reviewers it convened.
         let fe = quality_team_for_seats(&[Seat::FrontendEngineer, Seat::QaEngineer]);
         assert_eq!(fe.len(), 2);
+    }
+
+    #[test]
+    fn adversarial_seats_are_cold_the_rest_stay_forked() {
+        // The COLD roster is exactly the adversarial pair: QA + security review on
+        // a fresh doer-context-free surface; every intent-context seat keeps the
+        // fork (it benefits from knowing what the team intended).
+        for seat in ALL_SEATS {
+            let critic = critic_for_seat(*seat);
+            let expect_cold = matches!(seat, Seat::QaEngineer | Seat::SecurityEngineer);
+            assert_eq!(
+                critic.cold(),
+                expect_cold,
+                "{seat:?} cold flag mismatch (only QA + security are cold)"
+            );
+        }
+    }
+
+    #[test]
+    fn role_verdict_cold_is_serde_backward_compatible() {
+        // Older persisted verdict JSON (no `cold` key) still parses, defaulting to
+        // the forked (false) context; a cold verdict round-trips the flag.
+        let old = serde_json::json!({"role": "qa-engineer", "accepts": true}).to_string();
+        let parsed: RoleVerdict = serde_json::from_str(&old).unwrap();
+        assert!(!parsed.cold, "absent `cold` defaults to forked");
+        let mut v = RoleVerdict::empty("security-engineer");
+        v.cold = true;
+        let back: RoleVerdict = serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert!(back.cold, "the cold flag round-trips");
+    }
+
+    #[test]
+    fn team_ledger_records_the_verdict_context_cold_or_forked() {
+        // The evidence trail: the ledger line says WHICH context served the verdict
+        // so cold-vs-forked divergence is auditable per seat.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cold = RoleVerdict::empty("qa-engineer");
+        cold.cold = true;
+        append_team_ledger(tmp.path(), "quality", 0, &cold);
+        let forked = RoleVerdict::empty("backend-engineer");
+        append_team_ledger(tmp.path(), "quality", 0, &forked);
+        let content =
+            std::fs::read_to_string(tmp.path().join(".umadev/team-ledger.jsonl")).unwrap();
+        let mut lines = content.lines();
+        assert!(lines.next().unwrap().contains("\"cold\":true"));
+        assert!(lines.next().unwrap().contains("\"cold\":false"));
+    }
+
+    #[tokio::test]
+    async fn cold_surface_is_scoped_and_fails_open_unscoped() {
+        // Unscoped (headless / unwired) → None: every seat keeps today's fork path.
+        assert!(
+            cold_surface().is_none(),
+            "unscoped task has no cold surface"
+        );
+        // Scoped → the surface is visible to everything awaited inside the scope.
+        let surface: ColdJudgeFn = std::sync::Arc::new(|_system, _user| {
+            Box::pin(async { Some("{\"accepts\":true}".to_string()) }) as ColdJudgeFuture
+        });
+        with_cold_surface(surface, async {
+            let s = cold_surface().expect("scoped surface visible");
+            let reply = s("sys".to_string(), "user".to_string()).await;
+            assert_eq!(reply.as_deref(), Some("{\"accepts\":true}"));
+        })
+        .await;
+        // Outside the scope the task-local is gone again (fail-open).
+        assert!(cold_surface().is_none());
     }
 
     #[test]

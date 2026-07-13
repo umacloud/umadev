@@ -3590,6 +3590,8 @@ impl<R: Runtime> AgentRunner<R> {
             advisory,
             evidence: Vec::new(),
             provenance: Vec::new(),
+            // An ad-hoc judge runs on the main runtime, never a cold surface.
+            cold: false,
         }
         .normalized(role);
         crate::critics::append_team_ledger(&self.options.project_root, phase, round, &v);

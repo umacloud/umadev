@@ -127,6 +127,14 @@ pub struct SummonResult {
     /// Parallel: the forked seat returned a verdict). `false` = degraded /
     /// session ended — the director proceeds, it does not block.
     pub done: bool,
+    /// Serial only — a DEFINITE no-turn: the doer directive could not even be
+    /// SENT (the base process already exited / the pipe is closed), so no turn
+    /// ever ran for this summon. Distinguishes a dead session from a turn that
+    /// ran but hung/died mid-way after doing real work; the step scheduler marks
+    /// such a step Blocked instead of verifying workspace-global evidence an
+    /// earlier step left behind. Always `false` for a Parallel summon (a failed
+    /// fork is already the fail-open `done == false` accept).
+    pub send_failed: bool,
     /// For a Parallel summon: the seat's structured verdict over the artifacts
     /// (None for a Serial doer, which mutates files rather than judging).
     pub verdict: Option<RoleVerdict>,
@@ -280,6 +288,7 @@ pub async fn summon(
             SummonResult {
                 role: role.to_string(),
                 done: turn.done,
+                send_failed: turn.send_failed,
                 verdict: None,
                 text: turn.text,
                 pitfalls: turn.pitfalls,
@@ -298,6 +307,7 @@ pub async fn summon(
             SummonResult {
                 role: role.to_string(),
                 done,
+                send_failed: false,
                 verdict: Some(verdict),
                 text: String::new(),
                 pitfalls: Vec::new(),
@@ -377,6 +387,9 @@ fn summon_directive(options: &RunOptions, role: &str, instruction: &str) -> Stri
 /// uses, but for ONE director-chosen seat. The seat reviews the current on-disk
 /// blackboard (quality surface) with `instruction` appended as the focus. A base
 /// that can't fork / an unknown role → `None` (the caller fail-opens to accept).
+/// An ADVERSARIAL seat (QA / security) under a host-scoped cold surface reviews
+/// on a FRESH stateless one-shot instead — no doer transcript — with the fork as
+/// its fail-open backup (see [`crate::critics::RoleCritic::cold`]).
 async fn summon_parallel_seat(
     session: &mut dyn BaseSession,
     options: &RunOptions,
@@ -389,7 +402,6 @@ async fn summon_parallel_seat(
     // Open a read-only fork (bounded by a timeout so a wedged handshake can't
     // hang the director). A failed fork → ForkConsult fail-opens to accept.
     let fork = continuous::fork_with_timeout(session).await;
-    let consult = continuous::ForkConsult::new(fork);
     // Read the quality-surface blackboard so the parallel seat reviews the real
     // delivered code + the deterministic floor (same surface the review team sees).
     let bb = continuous::Blackboard::read(options, ReviewKind::Quality);
@@ -401,6 +413,18 @@ async fn summon_parallel_seat(
         format!("{}\n\n[director focus] {instruction}", options.requirement)
     };
     let arts = bb.artifacts(&focused);
+    // COLD-context seat (B2#1): an ADVERSARIAL seat (`critic.cold()` — QA /
+    // security) under a host-scoped fresh judge surface reviews on that stateless
+    // one-shot (no doer transcript), with the fork above kept as its fail-open
+    // backup. Every other seat — and every unscoped path — keeps the fork
+    // byte-for-byte (today's behaviour).
+    if let Some(surface) = crate::critics::cold_surface().filter(|_| critic.cold()) {
+        let consult = continuous::ColdConsult::new(surface, continuous::ForkConsult::new(fork));
+        let verdict = critic.review(&consult, arts).await;
+        consult.end().await;
+        return Some(verdict);
+    }
+    let consult = continuous::ForkConsult::new(fork);
     let verdict = critic.review(&consult, arts).await;
     consult.end().await;
     Some(verdict)
@@ -550,17 +574,40 @@ pub async fn verify(
 /// skipped (neutral). A failed, non-skipped step → `passed = false` with the
 /// step name as evidence.
 async fn verify_build_test(options: &RunOptions) -> VerifyResult {
+    verify_build_test_raw(options).await.0
+}
+
+/// Cap on the RAW failing-log tail threaded into a rework directive: last lines…
+const RAW_LOG_TAIL_LINES: usize = 60;
+/// …and a character ceiling so the excerpt can never blow the directive budget
+/// (the per-step capture in `crate::verify` is already ≤ 8 KiB per stream).
+const RAW_LOG_TAIL_CHARS: usize = 4096;
+
+/// [`verify_build_test`] plus a BOUNDED verbatim tail of the FIRST failing step's
+/// raw build/test output (B1#2: a rework directive that carries the raw failure
+/// evidence — not only UmaDev's one-line distillation — lets the brain adapt from
+/// the compiler/test output itself). The floor already captured this output to
+/// produce the diagnosis ([`crate::verify::VerifyOutcome::stdout`]/`stderr`); this
+/// just threads a bounded slice (last [`RAW_LOG_TAIL_LINES`] lines, ≤
+/// [`RAW_LOG_TAIL_CHARS`] chars) through instead of dropping it. `None` when
+/// everything passed / was skipped / the failing step produced no output — the
+/// caller skips the excerpt cleanly then.
+pub(crate) async fn verify_build_test_raw(options: &RunOptions) -> (VerifyResult, Option<String>) {
     let outcomes = crate::verify::run_verify(&options.project_root).await;
     if outcomes.is_empty() {
         // No recognised project manifest → nothing to build. Neutral, not a fail.
-        return VerifyResult {
-            available: false,
-            passed: true,
-            evidence: vec!["no project manifest — build/test skipped".to_string()],
-        };
+        return (
+            VerifyResult {
+                available: false,
+                passed: true,
+                evidence: vec!["no project manifest — build/test skipped".to_string()],
+            },
+            None,
+        );
     }
     let mut evidence = Vec::new();
     let mut passed = true;
+    let mut raw: Option<String> = None;
     for o in &outcomes {
         if o.skipped {
             continue; // a step whose binary is absent is neutral
@@ -570,13 +617,42 @@ async fn verify_build_test(options: &RunOptions) -> VerifyResult {
         } else {
             passed = false;
             evidence.push(format!("{}: FAILED (exit {})", o.step, o.exit_code));
+            // Keep the FIRST failing step's raw tail (the root failure; later steps
+            // often cascade from it). Bounded; empty output → no excerpt.
+            if raw.is_none() {
+                let combined = format!("{}\n{}", o.stdout.trim_end(), o.stderr.trim_end());
+                let tail = bounded_log_tail(&combined);
+                if !tail.trim().is_empty() {
+                    raw = Some(format!(
+                        "$ {}   (step `{}`, exit {})\n{tail}",
+                        o.command, o.step, o.exit_code
+                    ));
+                }
+            }
         }
     }
-    VerifyResult {
-        available: true,
-        passed,
-        evidence,
+    (
+        VerifyResult {
+            available: true,
+            passed,
+            evidence,
+        },
+        raw,
+    )
+}
+
+/// The last [`RAW_LOG_TAIL_LINES`] lines of `s`, additionally capped to the LAST
+/// [`RAW_LOG_TAIL_CHARS`] characters (the end of a build/test log carries the
+/// error). Pure + bounded; an empty input yields an empty string.
+pub(crate) fn bounded_log_tail(s: &str) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(RAW_LOG_TAIL_LINES);
+    let tail = lines[start..].join("\n");
+    let n = tail.chars().count();
+    if n <= RAW_LOG_TAIL_CHARS {
+        return tail;
     }
+    tail.chars().skip(n - RAW_LOG_TAIL_CHARS).collect()
 }
 
 /// Run the contract + coverage floor and report drift as factual evidence. An
@@ -974,6 +1050,31 @@ mod tests {
             !unknown.is_empty() && unknown.contains(instr),
             "unknown seat fails open"
         );
+    }
+
+    #[test]
+    fn bounded_log_tail_keeps_the_last_lines_and_caps_chars() {
+        // B1#2 bounding: the raw-failure excerpt is the LAST ~60 lines (the end of a
+        // build/test log carries the error), additionally char-capped — never the
+        // whole log, never the head.
+        let long: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let tail = bounded_log_tail(&long);
+        assert!(
+            tail.starts_with("line 140"),
+            "keeps the LAST 60 lines: {tail}"
+        );
+        assert!(
+            tail.ends_with("line 199"),
+            "the final line survives: {tail}"
+        );
+        assert_eq!(tail.lines().count(), 60, "exactly the last 60 lines");
+        // Char ceiling: a single huge line is cut to the trailing chars.
+        let huge = "x".repeat(20_000);
+        let cut = bounded_log_tail(&huge);
+        assert_eq!(cut.chars().count(), 4096, "the char cap holds");
+        // Small input passes through untouched; empty stays empty.
+        assert_eq!(bounded_log_tail("a\nb"), "a\nb");
+        assert_eq!(bounded_log_tail(""), "");
     }
 
     // ---- A scriptable fake BaseSession that records the directive it was driven

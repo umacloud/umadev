@@ -2884,12 +2884,15 @@ async fn drive_director_run(
     // back as a bounded fix directive the base acts on. Every floor invariant
     // (single-writer, governance, advisory review, fail-open) is preserved inside
     // the loop; the objective source-present hard-gate runs HERE, unchanged.
-    let reply = match umadev_agent::drive_director_loop_routed(
-        session,
-        options,
-        events,
-        directive,
-        Some(&route),
+    //
+    // COLD-context critics (B2#1): scope a fresh stateless one-shot judge surface
+    // over the drive so the adversarial seats (QA + security) review with NO doer
+    // context — same wiring as the TUI drive. Fail-open: a surface that can't
+    // serve (offline / unknown backend) leaves those seats on their read-only
+    // fork, exactly today's path.
+    let reply = match umadev_agent::critics::with_cold_surface(
+        umadev_tui::cold_judge_surface(&options.backend, &options.model, &options.project_root),
+        umadev_agent::drive_director_loop_routed(session, options, events, directive, Some(&route)),
     )
     .await
     {

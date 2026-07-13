@@ -1719,10 +1719,18 @@ pub(crate) async fn run_review_team(
     for _ in team {
         forks.push(fork_with_timeout(session).await);
     }
-    let reviews = team
-        .iter()
-        .zip(forks)
-        .map(|(critic, fork)| review_one(critic.as_ref(), fork, arts));
+    // COLD-context seats (B2#1): when the hosting layer scoped a fresh stateless
+    // judge surface, the ADVERSARIAL seats (`critic.cold()` — QA + security) review
+    // on it instead of the fork, so they share NO context with the doer. The fork
+    // opened above is kept as each cold seat's fail-open BACKUP (surface fails →
+    // today's fork review — a critic is never lost). Unscoped (`cold_surface()` →
+    // `None`, every headless / unwired path) leaves every seat byte-for-byte on
+    // the fork path.
+    let cold = crate::critics::cold_surface();
+    let reviews = team.iter().zip(forks).map(|(critic, fork)| {
+        let cold = cold.clone().filter(|_| critic.cold());
+        review_one(critic.as_ref(), fork, cold, arts)
+    });
     let verdicts = crate::runner::join_all_ordered(reviews).await;
 
     // Sequentially (deterministic order) record + fold blocking — the seat order
@@ -1783,18 +1791,34 @@ pub(crate) async fn fork_with_timeout(
 /// empty verdict. The critic's `review` runs its strict-JSON judge turn through a
 /// [`ForkConsult`] that owns the fork; a fork that didn't open routes to a
 /// fail-open consult that simply ACCEPTS.
+///
+/// `cold` is `Some(surface)` only for an ADVERSARIAL seat under a host-scoped
+/// fresh judge surface: the review then runs through a [`ColdConsult`] (fresh
+/// stateless one-shot, no doer transcript) with the fork as its fail-open
+/// BACKUP. `None` (a forked seat, or no surface scoped) keeps today's fork path
+/// byte-for-byte.
 async fn review_one(
     critic: &dyn RoleCritic,
     fork: Result<Box<dyn BaseSession>, SessionError>,
+    cold: Option<crate::critics::ColdJudgeFn>,
     arts: CriticArtifacts<'_>,
 ) -> RoleVerdict {
-    let consult = ForkConsult::new(fork);
     // Panic isolation (parity with `runner::run_critics_concurrently`): a critic that
     // PANICS (e.g. a slice/unwrap on a malformed brain reply) must collapse to its
     // empty accepting verdict, NOT unwind through the shared `join_all_ordered` driver
     // and abort the entire /run. The review is already fail-open for value errors; this
     // extends that to a panic on the flagship director path too.
     let role = critic.role().to_string();
+    if let Some(surface) = cold {
+        let consult = ColdConsult::new(surface, ForkConsult::new(fork));
+        let verdict = crate::runner::catch_unwind_future(critic.review(&consult, arts), || {
+            RoleVerdict::empty(&role)
+        })
+        .await;
+        consult.end().await;
+        return verdict;
+    }
+    let consult = ForkConsult::new(fork);
     let verdict = crate::runner::catch_unwind_future(critic.review(&consult, arts), || {
         RoleVerdict::empty(&role)
     })
@@ -1812,6 +1836,14 @@ async fn review_one(
 pub(crate) struct ReworkTurn {
     /// The turn finished (Completed / Truncated). `false` = failed / dead / hung.
     pub done: bool,
+    /// A DEFINITE no-turn: the directive could not even be SENT (`send_turn`
+    /// errored — the base process already exited / the pipe is closed), so no doer
+    /// turn ever ran. Distinguishes "the session is dead" from "the turn ran but
+    /// hung / died mid-way after doing real work": the step scheduler must mark a
+    /// step whose directive never reached the brain Blocked instead of verifying
+    /// workspace-global evidence an EARLIER step left on disk (which fake-ticked
+    /// steps Done over a dead base). Always `false` when a turn was actually sent.
+    pub send_failed: bool,
     /// The accumulated assistant text for this turn.
     pub text: String,
     /// Summaries of every FAILED tool result this turn produced (the pitfall feed).
@@ -1881,6 +1913,9 @@ async fn drive_rework_turn_with_idle(
     if session.send_turn(directive).await.is_err() {
         return ReworkTurn {
             done: false,
+            // The directive never reached the base — a DEFINITE no-turn, not a
+            // hung-but-productive one (see the field doc).
+            send_failed: true,
             text: String::new(),
             pitfalls: Vec::new(),
         };
@@ -1923,6 +1958,7 @@ async fn drive_rework_turn_with_idle(
             ));
             return ReworkTurn {
                 done: true,
+                send_failed: false,
                 text,
                 pitfalls,
             };
@@ -1953,6 +1989,7 @@ async fn drive_rework_turn_with_idle(
                 )));
                 return ReworkTurn {
                     done: false,
+                    send_failed: false,
                     text,
                     pitfalls,
                 };
@@ -1966,6 +2003,7 @@ async fn drive_rework_turn_with_idle(
                 )));
                 return ReworkTurn {
                     done: false,
+                    send_failed: false,
                     text,
                     pitfalls,
                 };
@@ -2028,6 +2066,7 @@ async fn drive_rework_turn_with_idle(
                 if session.respond(&req_id, resolved.decision).await.is_err() {
                     return ReworkTurn {
                         done: false,
+                        send_failed: false,
                         text,
                         pitfalls,
                     };
@@ -2046,6 +2085,7 @@ async fn drive_rework_turn_with_idle(
                 // Failed → stop reworking (fail-open, advisory).
                 return ReworkTurn {
                     done: matches!(status, TurnStatus::Completed | TurnStatus::Truncated),
+                    send_failed: false,
                     text,
                     pitfalls,
                 };
@@ -2478,6 +2518,78 @@ impl CriticConsult for ForkConsult {
     }
 }
 
+/// The cold-context preamble prepended to a COLD seat's judge directive. Unlike
+/// the fork's [`INDEPENDENT_REVIEW_FIREWALL`] (which must QUARANTINE inherited
+/// maker reasoning), a cold surface has no prior context by construction — the
+/// preamble instead frames the review as an external clean-room audit so the
+/// seat digs for what the artifact itself proves rather than expecting a
+/// narrative to lean on.
+const COLD_REVIEW_PREAMBLE: &str = "You are an INDEPENDENT external reviewer brought in with \
+     NO prior context on this project's conversation or its author's reasoning. Everything you \
+     may consider is provided below: the artifact, the acceptance criteria, and the requirement. \
+     Review from your role's seat and judge what the artifact ACTUALLY is and does — you have no \
+     author narrative to lean on, so dig for what the artifact itself proves or fails to prove.";
+
+/// A [`CriticConsult`] for a **COLD-context** seat (B2#1): the judge turn runs on
+/// the host-scoped FRESH, STATELESS one-shot surface
+/// ([`crate::critics::cold_surface`] — the same `Runtime::complete` primitive the
+/// chat router's triage uses), seeded ONLY with the seat's system prompt + the
+/// blackboard artifacts. The main session's transcript is NEVER an input, so the
+/// reviewer shares none of the doer's framing or blind spots.
+///
+/// Fail-open at every edge (invariant 1): a surface call that times out, errors,
+/// returns nothing, or returns unparseable JSON falls back to the read-only FORK
+/// (`fallback` — today's behaviour), so a cold seat can degrade but never
+/// disappears. Only a verdict that ACTUALLY came off the fresh surface is tagged
+/// `cold = true` (the evidence trail records the real context, never the intent).
+pub(crate) struct ColdConsult {
+    /// The host-scoped fresh one-shot judge surface.
+    surface: crate::critics::ColdJudgeFn,
+    /// The read-only fork kept as the fail-open backup (today's path).
+    fallback: ForkConsult,
+}
+
+impl ColdConsult {
+    pub(crate) fn new(surface: crate::critics::ColdJudgeFn, fallback: ForkConsult) -> Self {
+        Self { surface, fallback }
+    }
+
+    /// Best-effort close the backup fork session (release the process / server).
+    pub(crate) async fn end(&self) {
+        self.fallback.end().await;
+    }
+}
+
+#[async_trait::async_trait]
+impl CriticConsult for ColdConsult {
+    async fn judge(&self, role: &str, system: &str, user: String) -> RoleVerdict {
+        // The cold directive is built from ONLY the clean-room preamble, the seat's
+        // strict-JSON system prompt, and the artifact payload — a one-shot surface
+        // has no session, so a main-session transcript CANNOT be an input.
+        let cold_system = format!(
+            "{COLD_REVIEW_PREAMBLE}\n\n{system}\n\nReturn EXACTLY ONE JSON object and \
+             nothing else — no markdown, no code fence, no prose before or after."
+        );
+        // Bound the one-shot like any judge turn so a wedged base can't hang the gate.
+        let reply = tokio::time::timeout(
+            review_turn_timeout(),
+            (self.surface)(cold_system, user.clone()),
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(text) = reply {
+            if let Some(mut verdict) = try_parse_verdict(role, &text) {
+                verdict.cold = true;
+                return verdict;
+            }
+        }
+        // The fresh surface could not serve (open/call failure, timeout, no JSON) →
+        // fall back to the read-only fork, exactly today's review. Never lose a critic.
+        self.fallback.judge(role, system, user).await
+    }
+}
+
 /// Drain a read-only fork's events until its `TurnDone`, returning the collected
 /// assistant text (`Some`) — or `None` if the session ended first. Tool noise on
 /// a read-only fork is ignored. Split out of `judge` to keep nesting shallow.
@@ -2497,12 +2609,17 @@ async fn drain_review_text(fork: &mut Box<dyn BaseSession>) -> Option<String> {
 /// Parse a fork's judge reply into a [`RoleVerdict`], fail-open to the empty
 /// (accepting) verdict when no JSON object is found / it doesn't deserialize.
 fn parse_verdict(role: &str, text: &str) -> RoleVerdict {
-    let Some(json) = extract_json_object(text) else {
-        return RoleVerdict::empty(role);
-    };
+    try_parse_verdict(role, text).unwrap_or_else(|| RoleVerdict::empty(role))
+}
+
+/// [`parse_verdict`] without the fail-open collapse: `None` when the reply holds
+/// no JSON object / doesn't deserialize — so a caller with a BETTER fallback than
+/// "empty accept" (the cold consult falls back to the FORK) can take it instead.
+fn try_parse_verdict(role: &str, text: &str) -> Option<RoleVerdict> {
+    let json = extract_json_object(text)?;
     serde_json::from_str::<RoleVerdict>(&json)
+        .ok()
         .map(|v| v.normalized(role))
-        .unwrap_or_else(|_| RoleVerdict::empty(role))
 }
 
 /// Extract the first balanced top-level JSON object from `text` (the judge reply
@@ -4669,6 +4786,164 @@ mod tests {
                 .iter()
                 .any(|b| b.contains("No tests exist anywhere")),
             "a critic's blocking finding must pass through un-suppressed: {blocking:?}"
+        );
+    }
+
+    // ── COLD-context critics (B2#1): fresh surface for adversarial seats ────
+
+    #[tokio::test]
+    async fn cold_seats_review_on_the_fresh_surface_forked_seats_on_the_fork() {
+        // With a host-scoped cold surface, the ADVERSARIAL seat (QA) judges on the
+        // fresh stateless one-shot — seeded ONLY with its seat prompt + the
+        // blackboard artifacts, NEVER the main session's transcript — while the
+        // intent-context seat (backend) stays on the read-only fork, byte-for-byte
+        // today's path. The ledger records which context served each verdict.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "def app():\n    return 1\n").unwrap();
+        let options = opts(root, "build an API", TrustMode::Auto);
+        let (events, _rec) = sink();
+
+        // QA is a cold seat; backend is a forked seat. Every FORK judge is scripted
+        // to return the FORK_MARKER finding, so where a verdict CAME FROM is
+        // distinguishable from what it says.
+        let team: Vec<Box<dyn RoleCritic>> = vec![
+            Box::new(crate::critics::QaCritic),
+            Box::new(crate::critics::BackendCritic),
+        ];
+        let fork_json = r#"{"accepts":false,"blocking":["FORK_MARKER unmapped error path"]}"#;
+        let mut session = FakeBaseSession::new(vec![])
+            .with_fork_script(vec![Some(fork_json.into()), Some(fork_json.into())]);
+        // Simulate a doer transcript on the MAIN session — the secret must never
+        // reach the cold surface (a one-shot has no session to inherit it from).
+        session
+            .send_turn("MAIN_TRANSCRIPT_SECRET the doer's chain of thought".to_string())
+            .await
+            .unwrap();
+
+        // The recording cold surface: captures (system, user) and returns the
+        // COLD_MARKER finding.
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_h = Arc::clone(&seen);
+        let surface: crate::critics::ColdJudgeFn = Arc::new(move |system, user| {
+            seen_h.lock().unwrap().push((system, user));
+            Box::pin(async {
+                Some(
+                    r#"{"accepts":false,"blocking":["COLD_MARKER unauthenticated delete route"]}"#
+                        .to_string(),
+                )
+            }) as crate::critics::ColdJudgeFuture
+        });
+
+        let blocking = crate::critics::with_cold_surface(
+            surface,
+            run_review_team(
+                &mut session,
+                &options,
+                &events,
+                ReviewKind::Quality,
+                &team,
+                0,
+            ),
+        )
+        .await;
+
+        // The QA verdict came off the COLD surface; the backend verdict off the fork.
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.starts_with("[qa-engineer]") && b.contains("COLD_MARKER")),
+            "the cold seat's verdict comes from the fresh surface: {blocking:?}"
+        );
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.starts_with("[backend-engineer]") && b.contains("FORK_MARKER")),
+            "the forked seat is unchanged (fork verdict): {blocking:?}"
+        );
+        assert!(
+            !blocking
+                .iter()
+                .any(|b| b.starts_with("[qa-engineer]") && b.contains("FORK_MARKER")),
+            "a healthy cold surface means the QA seat never consults the fork: {blocking:?}"
+        );
+
+        // Exactly ONE cold consult (only QA is cold in this team), seeded with the
+        // seat prompt + the blackboard — and NO main-session transcript content.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "only the adversarial seat goes cold");
+        let (system, user) = &seen[0];
+        assert!(
+            system.contains("INDEPENDENT external reviewer") && system.contains("QA engineer"),
+            "the cold prompt carries the clean-room preamble + the seat persona: {system}"
+        );
+        assert!(
+            user.contains("src/app.py"),
+            "the cold prompt carries the real blackboard artifacts: {user}"
+        );
+        assert!(
+            !system.contains("MAIN_TRANSCRIPT_SECRET") && !user.contains("MAIN_TRANSCRIPT_SECRET"),
+            "the main session's transcript is NEVER an input to a cold review"
+        );
+
+        // The evidence trail records the context per seat: QA cold, backend forked.
+        let ledger = std::fs::read_to_string(root.join(".umadev/team-ledger.jsonl")).unwrap();
+        let qa_line = ledger
+            .lines()
+            .find(|l| l.contains("\"role\":\"qa-engineer\""))
+            .expect("qa ledger line");
+        assert!(qa_line.contains("\"cold\":true"), "{qa_line}");
+        let be_line = ledger
+            .lines()
+            .find(|l| l.contains("\"role\":\"backend-engineer\""))
+            .expect("backend ledger line");
+        assert!(be_line.contains("\"cold\":false"), "{be_line}");
+    }
+
+    #[tokio::test]
+    async fn cold_seat_falls_back_to_the_fork_when_the_fresh_surface_cannot_serve() {
+        // Fail-open (never lose a critic): a cold surface that cannot serve (returns
+        // None — no backend / call error / empty reply) makes the adversarial seat
+        // fall back to its read-only FORK, exactly today's behaviour — and the
+        // ledger honestly records the verdict as forked (`cold:false`).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.py"), "def app():\n    return 1\n").unwrap();
+        let options = opts(root, "build an API", TrustMode::Auto);
+        let (events, _rec) = sink();
+
+        let team: Vec<Box<dyn RoleCritic>> = vec![Box::new(crate::critics::QaCritic)];
+        let mut session = FakeBaseSession::new(vec![]).with_fork_script(vec![Some(
+            r#"{"accepts":false,"blocking":["FORK_MARKER missing failure-path test"]}"#.into(),
+        )]);
+        let dead_surface: crate::critics::ColdJudgeFn =
+            Arc::new(|_system, _user| Box::pin(async { None }) as crate::critics::ColdJudgeFuture);
+
+        let blocking = crate::critics::with_cold_surface(
+            dead_surface,
+            run_review_team(
+                &mut session,
+                &options,
+                &events,
+                ReviewKind::Quality,
+                &team,
+                0,
+            ),
+        )
+        .await;
+
+        assert!(
+            blocking
+                .iter()
+                .any(|b| b.starts_with("[qa-engineer]") && b.contains("FORK_MARKER")),
+            "the failed cold surface falls back to the fork verdict: {blocking:?}"
+        );
+        let ledger = std::fs::read_to_string(root.join(".umadev/team-ledger.jsonl")).unwrap();
+        assert!(
+            ledger.contains("\"cold\":false"),
+            "a fallback verdict is honestly recorded as forked: {ledger}"
         );
     }
 
