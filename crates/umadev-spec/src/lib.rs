@@ -216,6 +216,21 @@ pub const CLAUSES: &[Clause] = &[
         level: ClauseLevel::Should,
         section: "3.4",
     },
+    // Architecture-fitness floor. `UD-CODE-005` is deliberately SKIPPED — that
+    // slot stays reserved for the §10 accessibility candidate — so this family
+    // lands on 006. One clause entry carries three sub-rules (the data model
+    // has no variant ids; `parts[2]` must be exactly three digits): the
+    // god-file gate (`006a`, blocking), the architecture-doc layer-dependency
+    // rules verified against import edges (`006b`, blocking), and added-code
+    // clone detection (`006c`, advisory). Sub-rule ids live in the prose
+    // (§3.6) and in `umadev_agent::arch_fitness`.
+    Clause {
+        id: "UD-CODE-006",
+        layer: Layer::Code,
+        title: "Architecture-fitness floor",
+        level: ClauseLevel::Must,
+        section: "3.6",
+    },
     // Test-integrity guard: a code-weight constraint over the TEST code the team
     // writes. Namespaced `UD-QA-*` (the `UD-CODE-005` slot is reserved for the §10
     // accessibility candidate), but classified in the Code layer with its siblings

@@ -231,6 +231,55 @@ than a spurious block, and **adding** new tests is never a violation — only
 the destruction or weakening of pre-existing test signal is. A
 genuinely-passing, un-gamed suite is unaffected.
 
+### 3.6 Architecture-fitness floor (`UD-CODE-006`)
+
+> Level: **MUST** (sub-rule `UD-CODE-006c` is advisory)
+
+The injected firmware *preaches* layering, small focused modules, and no
+copy-paste — but a prompt is not a floor. A borrowed brain under pressure
+ships one giant file, imports the database from the UI, and pastes the same
+block into three places while every other deterministic check (build/test,
+coverage, contract, test-integrity) still reads green. A conformant host
+**MUST** verify architecture fitness on its own deterministic floor, with
+three sub-rules:
+
+1. **God-file gate** (`UD-CODE-006a`, blocking) — a **NEW** source file over
+   500 lines, or a touched file that **grew past** 800 lines during the
+   step, is a blocking finding carrying a split directive ("split by
+   feature/domain"). The grown ceiling **MAY** be overridden by host
+   configuration; generated, vendored, lock, and test files are exempt.
+   Without a before-baseline, newness cannot be established, so only the
+   hard grown ceiling applies to a touched file — a merely-touched legacy
+   file is never falsely blocked.
+2. **Layer-dependency rules** (`UD-CODE-006b`, blocking) — the architecture
+   document (`output/<slug>-architecture.md`) **MAY** declare a layering
+   contract: a directory→layer mapping table, a one-way `->` order chain,
+   and/or explicit `LAYER-RULE: a !-> b` ban lines. When declared, every
+   resolved import edge of the repository **MUST** be checked against it;
+   an edge that goes against the declared one-way order or crosses a
+   banned pair is a blocking finding naming both files and the violated
+   rule. No declaration in the document → the check silently no-ops.
+3. **Clone detection** (`UD-CODE-006c`, advisory) — normalized
+   (whitespace-squeezed, comment-stripped) windows of code **added** in
+   touched files are compared against the rest of the repository; a
+   duplicated block of at least 5 lines yields an advisory finding naming
+   the sibling location ("reuse it instead"). Deduplication judgment stays
+   with the critics and the user; the host **MUST NOT** block on this
+   sub-rule alone — the floor only surfaces the evidence.
+
+Blocking findings are part of the **deterministic floor** (not an advisory
+critic): each is folded into the step's acceptance as a typed, file-naming
+rework directive, driving a **bounded** rework round under the host's
+existing fix-round / stall counters — never an open-ended loop. The gate is
+**fail-open**: an unreadable or absent architecture document, a document
+with no layering declaration, an empty or unresolvable import-edge set, an
+unreadable tree, and an oversized repository (a blown scan budget) all
+degrade to a silent skip — the gate never fabricates a block and never
+errors. The sub-rule identifiers `UD-CODE-006a/b/c` label individual
+findings; the clause carried in the machine-readable `CLAUSES` data is the
+parent `UD-CODE-006`. (The `-005` slot in this family remains reserved for
+the §10 accessibility candidate.)
+
 ## 4. Layer 2 — Flow contract
 
 This layer governs **the order, gates, and continuity** of the
@@ -1017,3 +1066,4 @@ The clause-ID prefix space `UD-*` is reserved for this specification.
 | 1.0.0-draft.3 | 2026-06-22 | Promoted shipped capabilities to normative clauses: `UD-FLOW-007` (role-critic team), `UD-FLOW-008` (trust tiers + irreversibility floor), `UD-ART-007` (PR artifact), `UD-EVID-006/007/008` (runtime / deploy / review-report evidence). §9 crate table updated to the ten-crate workspace; manifest `declared_by` synced to `umadev@1.0.x`. |
 | 1.0.0-draft.4 | 2026-06-23 | Added §9.3 (continuous-session driving model) and §9.4 (team-of-roles collaboration model) describing how the reference implementation drives one long-lived base session per run and realizes `UD-FLOW-007` as a director-led team over a shared blackboard. **Non-normative**: no clause added, changed, or renumbered — both sections describe the reference driver and cite only existing clauses. |
 | 1.0.0-draft.5 | 2026-06-24 | Added §9.5 (director-driven turn model: route → plan → schedule → deliver) describing how the reference implementation decides whether/how deeply to engage the flow contract per turn, and clarified the **scope** of `UD-FLOW-001` in §4.1: the phase chain is the `standard`-profile *full commercial build* — the deepest play the directing Agent routes to and its plan expands into — not a funnel every turn is forced through. Reconciles the everyday director/router/plan product behaviour with the normative chain. **Non-normative**: no clause added, changed, renumbered, or weakened — `UD-FLOW-001` stays a MUST for the build it governs; §9.5 and the §4.1 scoping paragraph cite only existing clauses. |
+| 1.0.0-draft.6 | 2026-07-13 | Added §3.6 `UD-CODE-006` (architecture-fitness floor: god-file gate, architecture-doc layer-dependency rules, added-code clone advisory), matching the shipped `umadev_agent::arch_fitness` gate. The `-005` slot in the `UD-CODE-*` family stays reserved for the §10 accessibility candidate, so the family numbering skips to 006. No existing clause changed, renumbered, or weakened. |

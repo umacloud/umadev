@@ -69,6 +69,15 @@ pub fn framework_for(clause_id: &str) -> ComplianceFrameworks {
             iso27001_annex_a: s(&["A.5.37"]),
             eu_ai_act_article: s(&["Article 13"]),
         },
+        // Architecture-fitness floor: deterministic structural checks over the
+        // delivered source (god files, layer-dependency violations, clones) —
+        // change management; ISO secure development life cycle + secure coding;
+        // EU AI Act accuracy/robustness.
+        "UD-CODE-006" => ComplianceFrameworks {
+            soc2_cc: s(&["CC8.1"]),
+            iso27001_annex_a: s(&["A.8.25", "A.8.28"]),
+            eu_ai_act_article: s(&["Article 15"]),
+        },
         // Test-integrity guard: anti-reward-hacking enforcement over the test
         // signal — change-management + monitoring controls; ISO secure-coding +
         // security-testing in development/acceptance; EU AI Act accuracy/robustness.

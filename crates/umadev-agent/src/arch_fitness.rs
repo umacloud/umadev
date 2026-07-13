@@ -1,6 +1,6 @@
 //! Architecture-fitness floor — the deterministic anti-spaghetti gate
-//! (`UD-CODE-005` clause family; the spec-prose addition to
-//! `spec/UMADEV_HOST_SPEC_V1.md` is pending).
+//! (`UD-CODE-006` clause family; normative prose in
+//! `spec/UMADEV_HOST_SPEC_V1.md` §3.6).
 //!
 //! The L0 firmware *preaches* layering, small focused modules, and no
 //! copy-paste — but preaching is a prompt, not a floor. A borrowed brain under
@@ -10,7 +10,7 @@
 //! module makes UmaDev's own deterministic floor *verify* architecture
 //! fitness, with three rules:
 //!
-//! 1. **God-file gate** (`UD-CODE-005a`, blocking) — a NEW source file over
+//! 1. **God-file gate** (`UD-CODE-006a`, blocking) — a NEW source file over
 //!    500 lines, or a touched file that GREW PAST 800 lines this step, blocks
 //!    with a split directive ("split by feature/domain; real teams don't ship
 //!    one giant file"). The grown ceiling is overridable via
@@ -19,7 +19,7 @@
 //!    exempt. Without a before-baseline (the plain [`arch_fitness_findings`]
 //!    entry) newness cannot be known, so only the hard grown ceiling fires on
 //!    a touched file — never a false block on a merely-touched legacy file.
-//! 2. **Layer-dependency rules** (`UD-CODE-005b`, blocking) — the architecture
+//! 2. **Layer-dependency rules** (`UD-CODE-006b`, blocking) — the architecture
 //!    doc (`output/<slug>-architecture.md`) may DECLARE a layering contract
 //!    (convention below); every resolved import edge from the repo map
 //!    ([`umadev_knowledge::repomap::symbol_index`], the same
@@ -27,7 +27,7 @@
 //!    checked against it. An edge that goes AGAINST the declared one-way order
 //!    or crosses a banned pair blocks, naming both files and the violated
 //!    rule. No declaration in the doc → this check silently no-ops.
-//! 3. **Clone gate** (`UD-CODE-005c`, ADVISORY) — normalized
+//! 3. **Clone gate** (`UD-CODE-006c`, ADVISORY) — normalized
 //!    (whitespace-squeezed, comment-stripped) 5-line windows of code ADDED in
 //!    touched files are hashed against the rest of the repo; a duplicated
 //!    block ≥ 5 lines yields an advisory naming the sibling location ("reuse
@@ -97,16 +97,16 @@ use crate::fswalk::{classify_no_follow, EntryKind};
 // Rule ids + thresholds
 // ---------------------------------------------------------------------------
 
-/// Clause id of the god-file gate (rule 1). Spec prose addition pending.
-pub const RULE_GOD_FILE: &str = "UD-CODE-005a";
-/// Clause id of the layer-dependency gate (rule 2). Spec prose addition pending.
-pub const RULE_LAYER: &str = "UD-CODE-005b";
-/// Clause id of the clone gate (rule 3, advisory). Spec prose addition pending.
-pub const RULE_CLONE: &str = "UD-CODE-005c";
+/// Clause id of the god-file gate (rule 1, spec §3.6).
+pub const RULE_GOD_FILE: &str = "UD-CODE-006a";
+/// Clause id of the layer-dependency gate (rule 2, spec §3.6).
+pub const RULE_LAYER: &str = "UD-CODE-006b";
+/// Clause id of the clone gate (rule 3, advisory, spec §3.6).
+pub const RULE_CLONE: &str = "UD-CODE-006c";
 
-/// Default line ceiling for a NEW source file (`UD-CODE-005a`).
+/// Default line ceiling for a NEW source file (`UD-CODE-006a`).
 const NEW_FILE_MAX_LINES: usize = 500;
-/// Default line ceiling a touched file must not GROW PAST (`UD-CODE-005a`).
+/// Default line ceiling a touched file must not GROW PAST (`UD-CODE-006a`).
 /// Overridable via `UMADEV_ARCH_MAX_FILE_LINES`.
 const GROWN_FILE_MAX_LINES: usize = 800;
 
@@ -225,7 +225,7 @@ struct FileScan {
 /// [`crate::test_integrity::snapshot`]) and compared to the after-state by
 /// [`arch_fitness_findings_since`]. `disabled == true` (huge repo / blown
 /// read budget / unreadable tree at capture time) makes every later
-/// comparison a silent no-op — fail-open (`UD-CODE-005`).
+/// comparison a silent no-op — fail-open (`UD-CODE-006`).
 #[derive(Debug, Clone, Default)]
 pub struct ArchBaseline {
     files: BTreeMap<String, FileScan>,
@@ -441,7 +441,7 @@ fn is_exempt(rel: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Architecture-fitness findings for the given touched-file set
-/// (`UD-CODE-005`; spec prose pending). `touched` is the changed-file set the
+/// (`UD-CODE-006`, spec §3.6). `touched` is the changed-file set the
 /// caller knows (absolute or workspace-relative paths). Deterministic and
 /// fail-open: any error path yields no findings.
 ///
@@ -485,7 +485,7 @@ pub fn arch_fitness_findings(root: &Path, slug: &str, touched: &[PathBuf]) -> Ve
 /// with full semantics — a NEW file over the new-file ceiling or a file that
 /// GREW PAST the grown ceiling blocks; a duplicated block of ADDED code is
 /// advisory. Empty when the baseline is disabled or the tree cannot be
-/// scanned (fail-open, `UD-CODE-005`).
+/// scanned (fail-open, `UD-CODE-006`).
 #[must_use]
 pub fn arch_fitness_findings_since(root: &Path, slug: &str, before: &ArchBaseline) -> Vec<Finding> {
     if before.disabled {
@@ -517,7 +517,7 @@ pub fn arch_fitness_findings_since(root: &Path, slug: &str, before: &ArchBaselin
     out
 }
 
-/// Build one god-file finding (`UD-CODE-005a`). `before_lines` is `Some` for
+/// Build one god-file finding (`UD-CODE-006a`). `before_lines` is `Some` for
 /// the grew-past form, `None` for the new-file / ceiling form.
 fn god_file_finding(rel: &str, before_lines: Option<usize>, lines: usize, max: usize) -> Finding {
     let message = match before_lines {
@@ -562,7 +562,7 @@ impl LayerSpec {
 }
 
 /// Verify the repo-map import edges against the architecture doc's layering
-/// declaration (`UD-CODE-005b`). No doc / no declaration / no resolved edges
+/// declaration (`UD-CODE-006b`). No doc / no declaration / no resolved edges
 /// → empty (fail-open). Bounded by the repo map's own scan caps (and its
 /// mtime cache keeps repeat calls cheap).
 fn layer_findings(root: &Path, slug: &str) -> Vec<Finding> {
@@ -973,7 +973,7 @@ mod tests {
             .join("\n")
     }
 
-    // ---------------- god-file gate (UD-CODE-005a) ----------------
+    // ---------------- god-file gate (UD-CODE-006a) ----------------
 
     #[test]
     fn new_600_line_file_blocks_with_a_split_directive() {
@@ -1097,7 +1097,7 @@ mod tests {
         assert_eq!(line_ceilings(), (NEW_FILE_MAX_LINES, GROWN_FILE_MAX_LINES));
     }
 
-    // ---------------- layer rules (UD-CODE-005b) ----------------
+    // ---------------- layer rules (UD-CODE-006b) ----------------
 
     /// Seed a three-layer TS project whose repository file imports the
     /// controller — an edge AGAINST the declared order.
@@ -1218,7 +1218,7 @@ mod tests {
         assert!(parse_layer_spec("# nothing here\n").is_empty());
     }
 
-    // ---------------- clone gate (UD-CODE-005c, advisory) ----------------
+    // ---------------- clone gate (UD-CODE-006c, advisory) ----------------
 
     /// An 8-line, distinctly non-boilerplate block.
     const SHARED_BLOCK: &str = "\
