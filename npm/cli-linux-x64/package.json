@@ -1,6 +1,6 @@
 {
   "name": "@umacloud/cli-linux-x64",
-  "version": "1.0.51",
+  "version": "1.0.52",
   "description": "umadev prebuilt binary for Linux (x86_64 / gnu).",
   "homepage": "https://github.com/umacloud/umadev",
   "repository": {
