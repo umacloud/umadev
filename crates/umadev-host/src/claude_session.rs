@@ -440,6 +440,13 @@ impl BaseSession for ClaudeSession {
 /// Reader task: parse stdout NDJSON → events forever. On EOF (the base process
 /// died / the session ended) emit a terminal `Failed` so a crash mid-turn
 /// surfaces as `TurnDone{Failed}` rather than a silent hang.
+///
+/// Lines flow through a per-session [`SubagentGrouper`] (NOT the stateless
+/// [`parse_stdout_line`] directly): a NESTED sub-agent's streamed frames are
+/// buffered and flushed as ONE grouped block instead of interleaving
+/// fragmentarily with the main agent's output, while MAIN-line frames yield
+/// byte-for-byte the events `parse_stdout_line` produces (see the grouper's
+/// contract + tests).
 async fn pump_stdout(stdout: ChildStdout, tx: mpsc::Sender<SessionEvent>) {
     // Read raw bytes per line and decode LOSSY: `next_line` returns `Err` on a
     // single invalid UTF-8 byte, and the old `while let Ok(Some)` treated that as
@@ -449,18 +456,27 @@ async fn pump_stdout(stdout: ChildStdout, tx: mpsc::Sender<SessionEvent>) {
     // `parse_stdout_line`, not the whole stream).
     let mut reader = BufReader::new(stdout);
     let mut line_buf = Vec::new();
+    let mut grouper = SubagentGrouper::default();
     loop {
         line_buf.clear();
         match reader.read_until(b'\n', &mut line_buf).await {
             Ok(0) | Err(_) => break, // EOF or read error → the base process is gone
             Ok(_) => {
                 let line = String::from_utf8_lossy(&line_buf);
-                for ev in parse_stdout_line(line.trim_end_matches(['\r', '\n'])) {
+                for ev in grouper.on_line(line.trim_end_matches(['\r', '\n'])) {
                     if tx.send(ev).await.is_err() {
                         return; // consumer dropped → stop
                     }
                 }
             }
+        }
+    }
+    // The base died / the stream ended: flush any still-held sub-agent buffers
+    // FIRST so nothing a sub-agent produced is ever silently dropped, then the
+    // synthetic terminal Failed.
+    for ev in grouper.flush_all() {
+        if tx.send(ev).await.is_err() {
+            return; // consumer dropped → stop
         }
     }
     let _ = tx
@@ -881,6 +897,10 @@ pub fn user_message_line(directive: &str) -> String {
 /// Parse one stdout NDJSON line into zero or more [`SessionEvent`]s.
 /// Fail-open: an unparseable / unknown line yields `vec![]` (skipped noise),
 /// never an error or panic. Exposed for tests.
+///
+/// This is the STATELESS parse. The live pump wraps it in a [`SubagentGrouper`],
+/// which buffers a nested sub-agent's frames into one grouped block; main-line
+/// frames yield exactly what this function yields (locked by the equality tests).
 #[must_use]
 pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
     let trimmed = line.trim();
@@ -890,20 +910,34 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
     let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
         return vec![]; // not JSON (a stray log line) → skip
     };
+    parse_frame(&v)
+}
+
+/// The frame-level dispatch behind [`parse_stdout_line`]: one parsed stream-json
+/// frame → zero or more [`SessionEvent`]s. Split out so the stateful
+/// [`SubagentGrouper`] can reuse the EXACT same dispatch for main-line frames
+/// (byte-for-byte parity) without re-serializing. Fail-open: an unknown frame
+/// type yields `vec![]`, never an error or panic.
+#[must_use]
+fn parse_frame(v: &Value) -> Vec<SessionEvent> {
     match v.get("type").and_then(Value::as_str) {
         // Incremental text deltas (we launch with `--include-partial-messages`), so
         // a reply streams token-by-token instead of arriving all at once.
-        Some("stream_event") => parse_stream_event(&v),
+        Some("stream_event") => parse_stream_event(v),
         // The tool-noise frames (a base `Agent`/`Task` spawns a NESTED sub-agent
         // whose `tool_use` / `tool_result` blocks otherwise masquerade as the main
         // agent's output — the file-tree garble). `attribute_if_subagent` is PURELY
         // additive: a MAIN-line frame (no / null `parent_tool_use_id`) returns the
         // parser's output UNCHANGED; only a genuine sub-agent frame gets its tool
-        // events visually attributed. See `attribute_if_subagent`.
-        Some("assistant") => attribute_if_subagent(&v, parse_assistant(&v)),
-        Some("user") => attribute_if_subagent(&v, parse_user_tool_results(&v)),
-        Some("result") => vec![parse_result(&v)],
-        Some("control_request") => parse_control_request(&v),
+        // events visually attributed. See `attribute_if_subagent`. On the live pump
+        // sub-agent frames are normally intercepted by the [`SubagentGrouper`]
+        // BEFORE reaching this dispatch — this per-event attribution remains as the
+        // fallback for any sub-agent frame that bypasses the buffer, so leakage can
+        // never regress to unattributed.
+        Some("assistant") => attribute_if_subagent(v, parse_assistant(v)),
+        Some("user") => attribute_if_subagent(v, parse_user_tool_results(v)),
+        Some("result") => vec![parse_result(v)],
+        Some("control_request") => parse_control_request(v),
         // Item 2 — observability: an inbound `control_response` (claude's ACK to our
         // `interrupt` / other control acks) and the session `system`/init frame used
         // to fall through the `_ => vec![]` arm and be silently dropped. Surface them
@@ -913,14 +947,14 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
         // malformed frame.
         Some("control_response") => {
             tracing::debug!(
-                control = %describe_control_response(&v),
+                control = %describe_control_response(v),
                 "inbound base control ack (no event)"
             );
             vec![]
         }
         Some("system") => {
             tracing::debug!(
-                system = %describe_system_event(&v),
+                system = %describe_system_event(v),
                 "inbound base system message"
             );
             // The session `init` frame carries the EXACT model claude resolved for
@@ -944,7 +978,7 @@ pub fn parse_stdout_line(line: &str) -> Vec<SessionEvent> {
             // orchestrator can refuse to settle a turn as "done" while the base's
             // OWN background agents are still running (the premature-final-report
             // fix). Fail-open: a non-task system frame yields no event, as before.
-            if let Some(ev) = background_task_event(&v) {
+            if let Some(ev) = background_task_event(v) {
                 return vec![ev];
             }
             vec![]
@@ -1011,6 +1045,520 @@ fn mark_subagent_events(events: Vec<SessionEvent>) -> Vec<SessionEvent> {
             other => other,
         })
         .collect()
+}
+
+/// Cap on the bytes one sub-agent buffer may hold before an EARLY partial flush
+/// (a fail-open backstop): a huge exploration can neither hold memory unbounded
+/// nor keep the transcript silent for its whole run. On exceed the held content
+/// flushes as a grouped block carrying [`SUBAGENT_EARLY_FLUSH_NOTE`] and the
+/// buffer stays open, so later output keeps grouping — nothing is ever dropped.
+const SUBAGENT_BUFFER_CAP_BYTES: usize = 32 * 1024;
+
+/// Bound on the remembered spawn-label map (`tool_use` id → sub-agent label), so
+/// a very long turn cannot grow it unbounded. Oldest entries are evicted first;
+/// a missed label degrades to the plain marker header, never an error.
+const SUBAGENT_LABELS_CAP: usize = 128;
+
+/// Suffix on the ONE lightweight "working" row yielded when a sub-agent buffer
+/// OPENS, so the spawn is visible immediately while its output is grouped.
+/// Hardcoded CJK next to [`SUBAGENT_MARKER`] by the same convention (driver-level
+/// attribution text; no emoji).
+const SUBAGENT_WORKING: &str = "工作中…";
+
+/// Note appended when the byte cap forces an early partial flush, telling the
+/// reader the block was cut here and the rest keeps grouping. Appended AFTER the
+/// preview cap so it always survives truncation.
+const SUBAGENT_EARLY_FLUSH_NOTE: &str = "[注:子代理输出较长,已先行刷出,其余继续汇总]";
+
+/// Inline flag appended to a FAILED nested tool row in the compacted block.
+const SUBAGENT_ROW_FAILED: &str = "(失败)";
+
+/// Per-row cap (chars) for one compacted `name(target) → summary` line, so a
+/// single chatty tool result cannot dominate the grouped block.
+const SUBAGENT_ROW_CAP: usize = 160;
+
+/// One captured sub-agent event, held in a [`SubagentBuffer`] until it flushes.
+enum SubagentEntry {
+    /// Assistant text (a sub-agent's `stream_event` text deltas — the orphan
+    /// fragments of the interleaving bug). Concatenated at render time.
+    Text(String),
+    /// Extended-thinking reasoning. Captured so it can never leak into the main
+    /// transcript; re-emitted at flush as ONE `ThinkingDelta`, which joins the
+    /// collapsed `[thinking]` block exactly like main-line reasoning.
+    Thinking(String),
+    /// A nested tool call → rendered as a `name(target)` row, completed by the
+    /// next `Result` into `name(target) → summary`.
+    Call {
+        /// Tool id (`Read`, `Grep`, …).
+        name: String,
+        /// Short human target ([`summarize_input`]: file path / command / …).
+        target: String,
+    },
+    /// A nested tool result → completes the pending call row.
+    Result {
+        /// Whether the nested tool call succeeded.
+        ok: bool,
+        /// Truncated result preview (already capped by [`summarize_tool_content`]).
+        summary: String,
+    },
+}
+
+impl SubagentEntry {
+    /// Approximate held bytes, for the [`SUBAGENT_BUFFER_CAP_BYTES`] backstop.
+    fn cost(&self) -> usize {
+        match self {
+            Self::Text(t) | Self::Thinking(t) => t.len(),
+            Self::Call { name, target } => name.len() + target.len(),
+            Self::Result { summary, .. } => summary.len(),
+        }
+    }
+}
+
+/// One sub-agent's held output while its spawn is in flight, keyed by the
+/// spawning `tool_use` id (the `parent_tool_use_id` every nested frame carries).
+struct SubagentBuffer {
+    /// The spawning `tool_use` id — the buffer key AND the terminal-signal match
+    /// (the main-line `tool_result` answering it / a terminal `task_notification`
+    /// whose `task_id` equals it).
+    id: String,
+    /// Human header label (`subagent_type` / task description / tool name),
+    /// resolved from the spawning `tool_use` block when it was seen; empty when
+    /// unknown (degrades to the plain marker header).
+    label: String,
+    /// Captured events in arrival order.
+    entries: Vec<SubagentEntry>,
+    /// Approximate held bytes (see [`SUBAGENT_BUFFER_CAP_BYTES`]).
+    bytes: usize,
+}
+
+/// Stateful de-interleaver for a base's NESTED sub-agents (`Agent`/`Task`) — the
+/// fix for sub-agent streamed output interleaving fragmentarily with the main
+/// agent's transcript (orphan text deltas + tool-result chunks as bare main-line
+/// bullets).
+///
+/// Contract:
+/// - **Main-line frames** (no / null `parent_tool_use_id`) yield byte-for-byte
+///   the events [`parse_stdout_line`] yields — locked by the equality tests.
+/// - **Sub-agent frames**: `TextDelta` / `ThinkingDelta` / `ToolCall` /
+///   `ToolResult` are CAPTURED into a per-sub-agent buffer instead of being
+///   yielded; the buffer flushes as ONE grouped block (header row + one compacted
+///   `ToolResult`) when its terminating signal arrives — the main-line
+///   `tool_result` answering the spawning `tool_use` id (sync sub-agents) or a
+///   terminal `task_notification` (background ones). Fail-open backstops: the
+///   byte cap forces an early partial flush, and the turn boundary (`TurnDone`) /
+///   stream EOF flush everything still held BEFORE the terminal event — nothing
+///   is ever silently dropped.
+/// - When a buffer OPENS, ONE lightweight attributed "working" row is yielded so
+///   the spawn stays visible while output is grouped.
+/// - Any sub-agent event that is NOT bufferable (an approval request, a turn
+///   boundary, a non-bufferable frame type) passes through IMMEDIATELY with the
+///   existing per-event attribution ([`mark_subagent_events`]) — buffering can
+///   never hold a control-flow event (that would deadlock the approval loop) and
+///   can never regress to unattributed leakage.
+#[derive(Default)]
+struct SubagentGrouper {
+    /// Open buffers in spawn order (linear scan — a turn has few sub-agents).
+    buffers: Vec<SubagentBuffer>,
+    /// Recent `tool_use` id → label, bounded by [`SUBAGENT_LABELS_CAP`].
+    labels: std::collections::VecDeque<(String, String)>,
+}
+
+impl SubagentGrouper {
+    /// One raw stdout NDJSON line → the events to yield NOW (possibly empty while
+    /// a sub-agent's output is being held). Fail-open exactly like
+    /// [`parse_stdout_line`]: a non-JSON / empty line yields nothing.
+    fn on_line(&mut self, line: &str) -> Vec<SessionEvent> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return vec![];
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            return vec![]; // not JSON (a stray log line) → skip, same as the pure parse
+        };
+        match parent_tool_use_id(&v).map(str::to_string) {
+            Some(pid) => self.capture_frame(&pid, &v),
+            None => self.main_line_frame(&v),
+        }
+    }
+
+    /// A MAIN-line frame: yield exactly what [`parse_frame`] yields, PLUS any
+    /// grouped-block flushes its content triggers (a sub-agent's terminating
+    /// signal / the turn boundary), emitted BEFORE the main-line events so the
+    /// transcript reads "grouped sub-agent block → its final report / turn end".
+    fn main_line_frame(&mut self, v: &Value) -> Vec<SessionEvent> {
+        let events = parse_frame(v);
+        let mut out = Vec::new();
+        match v.get("type").and_then(Value::as_str) {
+            // Remember spawn labels (`Agent`/`Task` `tool_use` blocks) so a later
+            // buffer can name its sub-agent.
+            Some("assistant") => self.record_spawn_labels(v),
+            // Sync terminal: the main-line `tool_result` answering the spawning
+            // `tool_use` id — that sub-agent is done; flush its grouped block
+            // first, then the final report streams as before.
+            Some("user") => {
+                for id in tool_result_ids(v) {
+                    out.extend(self.flush_buffer(&id));
+                }
+            }
+            // Background terminal: a terminal `task_notification` (completed /
+            // failed / stopped). Key-matched fail-open: an id that names no held
+            // buffer flushes nothing (the turn boundary backstop still covers it).
+            Some("system") => {
+                if let Some(id) = terminal_task_id(v) {
+                    out.extend(self.flush_buffer(id));
+                }
+            }
+            _ => {}
+        }
+        // Turn boundary backstop: the turn is over — nothing may stay held, and
+        // every grouped block must precede the `TurnDone` event.
+        if events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::TurnDone { .. }))
+        {
+            out.extend(self.flush_all());
+        }
+        out.extend(events);
+        out
+    }
+
+    /// A SUB-AGENT frame (non-null `parent_tool_use_id` = `pid`): capture its
+    /// bufferable events; pass anything else through with per-event attribution.
+    fn capture_frame(&mut self, pid: &str, v: &Value) -> Vec<SessionEvent> {
+        let events = match v.get("type").and_then(Value::as_str) {
+            Some("stream_event") => parse_stream_event(v),
+            Some("assistant") => {
+                // A sub-agent can spawn its OWN nested sub-agent — remember those
+                // labels too so the nested buffer gets a real header.
+                self.record_spawn_labels(v);
+                parse_assistant(v)
+            }
+            Some("user") => {
+                // A NESTED sub-agent's terminating tool_result arrives inside its
+                // PARENT sub-agent's frames — flush the nested buffer here so it
+                // is not held until the turn boundary.
+                let mut out = Vec::new();
+                for id in tool_result_ids(v) {
+                    out.extend(self.flush_buffer(&id));
+                }
+                out.extend(self.capture_events(pid, parse_user_tool_results(v)));
+                return out;
+            }
+            // Not a bufferable producer (`result` / `control_request` / `system` /
+            // unknown) → exactly today's path: the shared dispatch, whose
+            // sub-agent arms apply the per-event marker fallback.
+            _ => return parse_frame(v),
+        };
+        self.capture_events(pid, events)
+    }
+
+    /// Route parsed sub-agent events into the `pid` buffer. Only the four
+    /// transcript kinds are held; any other event (an approval request, a turn
+    /// boundary, a background-task signal) passes through IMMEDIATELY — holding
+    /// one would deadlock control flow — with the per-event attribution fallback.
+    fn capture_events(&mut self, pid: &str, events: Vec<SessionEvent>) -> Vec<SessionEvent> {
+        let mut out = Vec::new();
+        for ev in events {
+            let entry = match ev {
+                SessionEvent::TextDelta(t) => SubagentEntry::Text(t),
+                SessionEvent::ThinkingDelta(t) => SubagentEntry::Thinking(t),
+                SessionEvent::ToolCall { name, input } => SubagentEntry::Call {
+                    target: summarize_input(&input),
+                    name,
+                },
+                SessionEvent::ToolResult { ok, summary } => SubagentEntry::Result { ok, summary },
+                other => {
+                    out.extend(mark_subagent_events(vec![other]));
+                    continue;
+                }
+            };
+            out.extend(self.push_entry(pid, entry));
+        }
+        out
+    }
+
+    /// Append one entry to the `pid` buffer, opening it (and yielding the ONE
+    /// visible "working" row) on first use, and early-flushing on the byte cap.
+    fn push_entry(&mut self, pid: &str, entry: SubagentEntry) -> Vec<SessionEvent> {
+        let mut out = Vec::new();
+        let pos = if let Some(p) = self.buffers.iter().position(|b| b.id == pid) {
+            p
+        } else {
+            let label = self.label_for(pid);
+            out.push(SessionEvent::ToolCall {
+                name: subagent_working_row(&label),
+                input: Value::Null,
+            });
+            self.buffers.push(SubagentBuffer {
+                id: pid.to_string(),
+                label,
+                entries: Vec::new(),
+                bytes: 0,
+            });
+            self.buffers.len() - 1
+        };
+        let buf = &mut self.buffers[pos];
+        buf.bytes = buf.bytes.saturating_add(entry.cost());
+        buf.entries.push(entry);
+        if buf.bytes > SUBAGENT_BUFFER_CAP_BYTES {
+            // Early partial flush: emit what is held (with the continuation note)
+            // and keep the buffer OPEN so later output keeps grouping. Also acts
+            // as a periodic liveness signal during a very chatty sub-agent run.
+            let held = std::mem::take(&mut buf.entries);
+            buf.bytes = 0;
+            out.extend(render_subagent_flush(&buf.label, &held, true));
+        }
+        out
+    }
+
+    /// Flush ONE buffer (its terminating signal arrived) as a grouped block.
+    /// Unknown id / nothing held → no events (fail-open).
+    fn flush_buffer(&mut self, id: &str) -> Vec<SessionEvent> {
+        match self.buffers.iter().position(|b| b.id == id) {
+            Some(p) => {
+                let buf = self.buffers.remove(p);
+                render_subagent_flush(&buf.label, &buf.entries, false)
+            }
+            None => vec![],
+        }
+    }
+
+    /// Flush EVERY held buffer (turn boundary / stream EOF) — the backstop that
+    /// guarantees nothing a sub-agent produced is ever silently dropped.
+    fn flush_all(&mut self) -> Vec<SessionEvent> {
+        std::mem::take(&mut self.buffers)
+            .into_iter()
+            .flat_map(|b| render_subagent_flush(&b.label, &b.entries, false))
+            .collect()
+    }
+
+    /// The remembered label for a spawning `tool_use` id (newest wins); empty
+    /// when the spawn frame was never seen (degrades to the plain header).
+    fn label_for(&self, pid: &str) -> String {
+        self.labels
+            .iter()
+            .rev()
+            .find(|(id, _)| id == pid)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_default()
+    }
+
+    /// Remember `tool_use` id → human label for every tool call in an assistant
+    /// frame, so a buffer opened by that id can name its sub-agent. Label
+    /// preference: `input.subagent_type` (e.g. `Explore`) → `input.description`
+    /// (the short task summary) → the tool name. Bounded FIFO eviction.
+    fn record_spawn_labels(&mut self, v: &Value) {
+        let Some(blocks) = v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        for b in blocks {
+            if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let Some(id) = b
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let input = b.get("input");
+            let label = input
+                .and_then(|i| i.get("subagent_type"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    input
+                        .and_then(|i| i.get("description"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| b.get("name").and_then(Value::as_str))
+                .unwrap_or("")
+                .trim();
+            self.labels.push_back((id.to_string(), truncate(label, 60)));
+            while self.labels.len() > SUBAGENT_LABELS_CAP {
+                self.labels.pop_front();
+            }
+        }
+    }
+}
+
+/// The `tool_use_id`s of every `tool_result` block in a `user` frame — the sync
+/// terminating signals a grouped buffer matches against. Fail-open: a malformed
+/// frame yields an empty list.
+fn tool_result_ids(v: &Value) -> Vec<String> {
+    v.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+                .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `task_id` of a TERMINAL `task_notification` system frame (completed /
+/// failed / stopped — the background sub-agent's terminating signal), or `None`
+/// for any other frame. Mirrors [`background_task_event`]'s terminal test.
+fn terminal_task_id(v: &Value) -> Option<&str> {
+    if v.get("subtype").and_then(Value::as_str) != Some("task_notification") {
+        return None;
+    }
+    let status = v.get("status").and_then(Value::as_str).unwrap_or("");
+    if status == "running" || status == "pending" {
+        return None; // not terminal — the task is still live
+    }
+    v.get("task_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// The ONE visible row yielded when a sub-agent buffer opens: marker + label +
+/// "working", so the user sees the spawn immediately while output is grouped.
+fn subagent_working_row(label: &str) -> String {
+    if label.is_empty() {
+        format!("{SUBAGENT_MARKER}{SUBAGENT_WORKING}")
+    } else {
+        format!("{SUBAGENT_MARKER}{label} · {SUBAGENT_WORKING}")
+    }
+}
+
+/// The grouped block's header-row name: marker + label, or the bare marker stem
+/// (`↳ 子代理`) when the spawn label was never seen.
+fn subagent_header_row(label: &str) -> String {
+    if label.is_empty() {
+        SUBAGENT_MARKER
+            .trim_end()
+            .trim_end_matches('·')
+            .trim_end()
+            .to_string()
+    } else {
+        format!("{SUBAGENT_MARKER}{label}")
+    }
+}
+
+/// Render one buffer's held entries as the grouped block: a header `ToolCall`
+/// row, the captured reasoning as ONE `ThinkingDelta` (joins the collapsed
+/// thinking channel — never the transcript), and ONE `ToolResult` whose summary
+/// is the compacted content ([`render_subagent_body`]) bounded by the same
+/// preview-cap conventions as any tool result ([`crate::process_logs`] — the
+/// process-logs verbose toggle widens it). `early` appends
+/// [`SUBAGENT_EARLY_FLUSH_NOTE`] AFTER the cap so it always survives. Nothing
+/// held → no events.
+fn render_subagent_flush(label: &str, entries: &[SubagentEntry], early: bool) -> Vec<SessionEvent> {
+    if entries.is_empty() {
+        return vec![];
+    }
+    let on = crate::process_logs::show_process_logs();
+    let cap = crate::process_logs::cap_for(on);
+    let mut events = vec![SessionEvent::ToolCall {
+        name: subagent_header_row(label),
+        input: Value::Null,
+    }];
+    let thinking: String = entries
+        .iter()
+        .filter_map(|e| match e {
+            SubagentEntry::Thinking(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    if !thinking.is_empty() {
+        events.push(SessionEvent::ThinkingDelta(
+            crate::process_logs::truncate_preview(&thinking, cap, on),
+        ));
+    }
+    let (ok, body) = render_subagent_body(entries);
+    let mut summary = crate::process_logs::truncate_preview(&body, cap, on);
+    if early {
+        summary.push('\n');
+        summary.push_str(SUBAGENT_EARLY_FLUSH_NOTE);
+    }
+    events.push(SessionEvent::ToolResult {
+        ok,
+        summary: format!("{SUBAGENT_MARKER}{summary}"),
+    });
+    events
+}
+
+/// Compact one buffer's entries into the grouped block body: text runs
+/// concatenated, tool rows as `name(target) → summary` lines (per-row capped),
+/// failed rows flagged inline. The block's `ok` reflects how the sub-agent
+/// ENDED (its LAST tool result) — a single failed probe mid-exploration does not
+/// paint the whole block as failed; the authoritative verdict is the main-line
+/// `tool_result` that follows it. Thinking entries are handled separately (see
+/// [`render_subagent_flush`]).
+fn render_subagent_body(entries: &[SubagentEntry]) -> (bool, String) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut text_run = String::new();
+    let mut pending_call: Option<String> = None;
+    for e in entries {
+        match e {
+            SubagentEntry::Text(t) => {
+                if let Some(call) = pending_call.take() {
+                    lines.push(call);
+                }
+                text_run.push_str(t);
+            }
+            SubagentEntry::Thinking(_) => {}
+            SubagentEntry::Call { name, target } => {
+                push_text_run(&mut lines, &mut text_run);
+                if let Some(call) = pending_call.take() {
+                    lines.push(call);
+                }
+                pending_call = Some(if target.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name}({})", truncate(target, 80))
+                });
+            }
+            SubagentEntry::Result { ok, summary } => {
+                push_text_run(&mut lines, &mut text_run);
+                let s = truncate(first_line(summary), SUBAGENT_ROW_CAP);
+                let mut line = match pending_call.take() {
+                    Some(call) => format!("{call} → {s}"),
+                    None => format!("→ {s}"),
+                };
+                if !ok {
+                    line.push_str(SUBAGENT_ROW_FAILED);
+                }
+                lines.push(line);
+            }
+        }
+    }
+    push_text_run(&mut lines, &mut text_run);
+    if let Some(call) = pending_call.take() {
+        lines.push(call);
+    }
+    let ended_ok = !matches!(
+        entries
+            .iter()
+            .rev()
+            .find(|e| matches!(e, SubagentEntry::Result { .. })),
+        Some(SubagentEntry::Result { ok: false, .. })
+    );
+    (ended_ok, lines.join("\n"))
+}
+
+/// Push the accumulated text run (trimmed) as one body block, then clear it.
+fn push_text_run(lines: &mut Vec<String>, run: &mut String) {
+    let t = run.trim();
+    if !t.is_empty() {
+        lines.push(t.to_string());
+    }
+    run.clear();
+}
+
+/// The first non-empty rendering line of a (possibly multiline) tool summary.
+fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or("").trim()
 }
 
 /// A short, fail-open one-line description of an inbound `control_response` (claude's
@@ -2306,6 +2854,281 @@ mod tests {
     }
 
     #[test]
+    fn subagent_stream_buffers_and_flushes_as_one_block_on_spawning_tool_result() {
+        let mut g = SubagentGrouper::default();
+        // Main line spawns the sub-agent: an `Agent` tool_use with id `toolu_spawn`.
+        let spawn = r#"{"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"toolu_spawn","name":"Agent",
+             "input":{"subagent_type":"Explore","description":"scan the repo"}}]}}"#;
+        assert_eq!(
+            g.on_line(spawn),
+            parse_stdout_line(spawn),
+            "the main-line spawn frame passes through unchanged"
+        );
+
+        let delta = |text: &str| {
+            format!(
+                r#"{{"type":"stream_event","parent_tool_use_id":"toolu_spawn","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{text}"}}}}}}"#
+            )
+        };
+        // First sub-agent event → exactly ONE lightweight working row (buffer opens).
+        let opened = g.on_line(&delta("exploring the tree "));
+        assert_eq!(
+            opened.len(),
+            1,
+            "one working row, no leaked text: {opened:?}"
+        );
+        let SessionEvent::ToolCall { name, .. } = &opened[0] else {
+            panic!("expected the working row, got {opened:?}");
+        };
+        assert!(
+            name.starts_with(SUBAGENT_MARKER)
+                && name.contains("Explore")
+                && name.contains(SUBAGENT_WORKING),
+            "the working row names the sub-agent: {name}"
+        );
+
+        // Everything else the sub-agent streams is HELD: zero events mid-run —
+        // this is exactly the fragmentary interleave the fix removes.
+        assert!(g.on_line(&delta("in src/")).is_empty());
+        let call = r#"{"type":"assistant","parent_tool_use_id":"toolu_spawn","message":{"content":[
+            {"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#;
+        assert!(
+            g.on_line(call).is_empty(),
+            "a sub-agent tool call is buffered, not yielded"
+        );
+        let result = r#"{"type":"user","parent_tool_use_id":"toolu_spawn","message":{"content":[
+            {"type":"tool_result","content":"17 | fn main() {}"}]}}"#;
+        assert!(
+            g.on_line(result).is_empty(),
+            "a sub-agent tool result is buffered, not yielded"
+        );
+
+        // The MAIN-line tool_result answering the spawn id terminates the
+        // sub-agent: the grouped block (header + ONE compacted ToolResult)
+        // flushes FIRST, then the untouched main-line final report.
+        let report = r#"{"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"toolu_spawn","content":"final report"}]}}"#;
+        let evs = g.on_line(report);
+        assert_eq!(
+            evs.len(),
+            3,
+            "header + grouped result + main-line report: {evs:?}"
+        );
+        let SessionEvent::ToolCall { name, .. } = &evs[0] else {
+            panic!("expected the grouped-block header, got {evs:?}");
+        };
+        assert_eq!(name, &format!("{SUBAGENT_MARKER}Explore"));
+        let SessionEvent::ToolResult { ok, summary } = &evs[1] else {
+            panic!("expected the grouped result, got {evs:?}");
+        };
+        assert!(*ok);
+        assert!(summary.starts_with(SUBAGENT_MARKER));
+        assert!(
+            summary.contains("exploring the tree in src/"),
+            "text deltas concatenate into one coherent run: {summary}"
+        );
+        assert!(
+            summary.contains("Read(src/lib.rs) → 17 | fn main() {}"),
+            "tool rows compact as `name(target) → summary`: {summary}"
+        );
+        assert_eq!(
+            &evs[2],
+            &parse_stdout_line(report)[0],
+            "the main-line final report event is untouched"
+        );
+    }
+
+    #[test]
+    fn background_subagent_flushes_on_terminal_task_notification() {
+        let mut g = SubagentGrouper::default();
+        let spawn = r#"{"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"task_bg1","name":"Task",
+             "input":{"description":"write the docs","run_in_background":true}}]}}"#;
+        assert_eq!(g.on_line(spawn), parse_stdout_line(spawn));
+        let delta = r#"{"type":"stream_event","parent_tool_use_id":"task_bg1","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"drafting"}}}"#;
+        let opened = g.on_line(delta);
+        assert_eq!(opened.len(), 1, "one working row: {opened:?}");
+
+        // A non-terminal notification flushes nothing (today's no-event parity).
+        let running = r#"{"type":"system","subtype":"task_notification","task_id":"task_bg1","status":"running"}"#;
+        assert_eq!(g.on_line(running), parse_stdout_line(running));
+
+        // The terminal notification flushes the grouped block BEFORE the
+        // Finished lifecycle signal.
+        let done = r#"{"type":"system","subtype":"task_notification","task_id":"task_bg1","status":"completed"}"#;
+        let evs = g.on_line(done);
+        assert_eq!(evs.len(), 3, "header + grouped result + Finished: {evs:?}");
+        assert!(
+            matches!(&evs[0], SessionEvent::ToolCall { name, .. }
+                if name.starts_with(SUBAGENT_MARKER) && name.contains("write the docs")),
+            "the header carries the task description label: {evs:?}"
+        );
+        assert!(
+            matches!(&evs[1], SessionEvent::ToolResult { summary, .. } if summary.contains("drafting")),
+            "the grouped result carries the buffered output: {evs:?}"
+        );
+        assert_eq!(
+            evs[2],
+            SessionEvent::BackgroundTask(BackgroundTaskSignal::Finished {
+                id: "task_bg1".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn turn_done_flushes_held_buffers_before_the_turn_done_event() {
+        let mut g = SubagentGrouper::default();
+        // A sub-agent with NO recorded spawn label (its frame was missed) —
+        // degrades to the plain marker, never blocks the buffering.
+        let delta = r#"{"type":"stream_event","parent_tool_use_id":"toolu_lost","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"orphan work"}}}"#;
+        let opened = g.on_line(delta);
+        assert_eq!(opened.len(), 1, "working row: {opened:?}");
+        assert!(
+            matches!(&opened[0], SessionEvent::ToolCall { name, .. }
+                if name == &format!("{SUBAGENT_MARKER}{SUBAGENT_WORKING}")),
+            "label-less working row is marker + working: {opened:?}"
+        );
+
+        // No terminating signal ever arrives; the turn ends → the held buffer
+        // flushes BEFORE the TurnDone event, so nothing is silently dropped.
+        let result_line = r#"{"type":"result","subtype":"success","stop_reason":"end_turn"}"#;
+        let evs = g.on_line(result_line);
+        assert_eq!(evs.len(), 3, "header + grouped result + TurnDone: {evs:?}");
+        assert!(
+            matches!(&evs[0], SessionEvent::ToolCall { name, .. } if name == "↳ 子代理"),
+            "label-less header is the bare marker stem: {evs:?}"
+        );
+        assert!(
+            matches!(&evs[1], SessionEvent::ToolResult { summary, .. } if summary.contains("orphan work"))
+        );
+        assert!(
+            matches!(
+                evs.last(),
+                Some(SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    ..
+                })
+            ),
+            "TurnDone comes AFTER every flushed block: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn buffer_cap_triggers_early_flush_with_truncation_note_and_one_working_row() {
+        let mut g = SubagentGrouper::default();
+        let chunk = "x".repeat(1024);
+        let line = |text: &str| {
+            format!(
+                r#"{{"type":"stream_event","parent_tool_use_id":"toolu_big","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{text}"}}}}}}"#
+            )
+        };
+        // 33 KB of held text crosses the 32 KB cap on the 33rd chunk → ONE early
+        // partial flush; the buffer stays open.
+        let mut all = Vec::new();
+        for _ in 0..33 {
+            all.extend(g.on_line(&line(&chunk)));
+        }
+        let working_rows = all
+            .iter()
+            .filter(|e| {
+                matches!(e, SessionEvent::ToolCall { name, .. } if name.contains(SUBAGENT_WORKING))
+            })
+            .count();
+        assert_eq!(
+            working_rows,
+            1,
+            "the buffer-open working row appears exactly once: {}",
+            all.len()
+        );
+        let early: Vec<&String> = all
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::ToolResult { summary, .. } => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(early.len(), 1, "exactly one early partial flush block");
+        assert!(
+            early[0].contains(SUBAGENT_EARLY_FLUSH_NOTE),
+            "the early flush carries the continuation note: {}",
+            early[0]
+        );
+
+        // The buffer stays OPEN after the cap flush: further output is still
+        // grouped (zero events, no second working row) and the terminal flush
+        // carries ONLY the remainder, without the note.
+        assert!(g.on_line(&line("tail-after-cap")).is_empty());
+        let report = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_big","content":"done"}]}}"#;
+        let evs = g.on_line(report);
+        assert!(
+            evs.iter().any(|e| matches!(e, SessionEvent::ToolResult { summary, .. }
+                if summary.contains("tail-after-cap") && !summary.contains(SUBAGENT_EARLY_FLUSH_NOTE))),
+            "the terminal flush groups the remainder without the note: {evs:?}"
+        );
+    }
+
+    #[test]
+    fn grouper_yields_identical_events_for_main_line_frames() {
+        // The pump routes every line through the grouper; for MAIN-line frames it
+        // must be event-for-event identical to the stateless parse (the
+        // byte-for-byte contract of the de-interleaving fix).
+        let lines = [
+            r#"{"type":"system","subtype":"init","session_id":"x","model":"claude-sonnet-4-5"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}"#,
+            r#"{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":null,"message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"src/App.tsx"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","is_error":true,"content":"boom"}]}}"#,
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#,
+            r#"{"type":"system","subtype":"task_started","task_id":"a1","task_type":"local_agent"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a1","status":"completed"}"#,
+            r#"{"type":"system","subtype":"background_tasks_changed","tasks":[]}"#,
+            "not json at all",
+            "",
+            r#"{"type":"result","subtype":"success","stop_reason":"end_turn"}"#,
+        ];
+        let mut g = SubagentGrouper::default();
+        for line in lines {
+            assert_eq!(
+                g.on_line(line),
+                parse_stdout_line(line),
+                "main-line parity broken for: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_grouper_labels_contain_no_emoji() {
+        // Repo rule: no emoji as functional markers — same bar as SUBAGENT_MARKER.
+        for s in [
+            SUBAGENT_WORKING,
+            SUBAGENT_EARLY_FLUSH_NOTE,
+            SUBAGENT_ROW_FAILED,
+        ] {
+            assert!(
+                !s.chars().any(|c| c as u32 >= 0x1F000),
+                "no emoji in the grouper label: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_approval_request_is_never_buffered() {
+        // A `control_request` raised while a sub-agent runs must pass through
+        // IMMEDIATELY (holding it would deadlock the approval loop), even if the
+        // frame carries a `parent_tool_use_id`.
+        let mut g = SubagentGrouper::default();
+        let delta = r#"{"type":"stream_event","parent_tool_use_id":"toolu_a","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"working"}}}"#;
+        assert_eq!(g.on_line(delta).len(), 1, "working row only");
+        let approval = r#"{"type":"control_request","parent_tool_use_id":"toolu_a","request_id":"r9","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#;
+        let evs = g.on_line(approval);
+        assert!(
+            matches!(&evs[..], [SessionEvent::NeedApproval { req_id, .. }] if req_id == "r9"),
+            "the approval request passes through immediately: {evs:?}"
+        );
+    }
+
+    #[test]
     fn new_session_ids_look_like_uuid_v4_and_are_unique() {
         let a = new_session_id();
         let b = new_session_id();
@@ -2376,6 +3199,76 @@ mod tests {
                 usage: None,
             }
         );
+        let _ = s.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_groups_subagent_stream_into_one_block() {
+        // End-to-end through the REAL pump: a sub-agent's streamed frames must
+        // arrive as ONE grouped block (working row → header → compacted result)
+        // instead of interleaving with the main line.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            "#!/bin/sh\nread _line\n\
+             printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"sub1\",\"name\":\"Agent\",\"input\":{\"subagent_type\":\"Explore\",\"description\":\"scan\"}}]}}'\n\
+             printf '%s\\n' '{\"type\":\"stream_event\",\"parent_tool_use_id\":\"sub1\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"found it\"}}}'\n\
+             printf '%s\\n' '{\"type\":\"user\",\"parent_tool_use_id\":\"sub1\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"content\":\"src tree\"}]}}'\n\
+             printf '%s\\n' '{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"sub1\",\"content\":\"report\"}]}}'\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}'\n\
+             cat >/dev/null\n",
+        );
+        let mut s = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-subagent",
+            true,
+            None,
+        )
+        .await
+        .expect("start");
+        s.send_turn("explore".to_string()).await.expect("send");
+
+        let mut got = Vec::new();
+        while let Some(ev) = s.next_event().await {
+            let done = matches!(ev, SessionEvent::TurnDone { .. });
+            got.push(ev);
+            if done {
+                break;
+            }
+        }
+        // 0: the main-line Agent spawn row (untouched).
+        assert!(
+            matches!(&got[0], SessionEvent::ToolCall { name, .. } if name == "Agent"),
+            "main-line spawn row unchanged: {got:?}"
+        );
+        // 1: the ONE working row when the buffer opens.
+        assert!(
+            matches!(&got[1], SessionEvent::ToolCall { name, .. }
+                if name.starts_with(SUBAGENT_MARKER) && name.contains(SUBAGENT_WORKING)),
+            "working row: {got:?}"
+        );
+        // 2–3: the grouped block, flushed by the spawning tool_result.
+        assert!(
+            matches!(&got[2], SessionEvent::ToolCall { name, .. }
+                if name == &format!("{SUBAGENT_MARKER}Explore")),
+            "grouped-block header: {got:?}"
+        );
+        assert!(
+            matches!(&got[3], SessionEvent::ToolResult { summary, .. }
+                if summary.starts_with(SUBAGENT_MARKER)
+                    && summary.contains("found it")
+                    && summary.contains("src tree")),
+            "grouped, compacted sub-agent output: {got:?}"
+        );
+        // 4: the main-line final report, unmarked and unchanged.
+        assert!(
+            matches!(&got[4], SessionEvent::ToolResult { summary, .. } if summary == "report"),
+            "main-line final report unchanged: {got:?}"
+        );
+        assert!(matches!(got.last(), Some(SessionEvent::TurnDone { .. })));
         let _ = s.end().await;
     }
 
