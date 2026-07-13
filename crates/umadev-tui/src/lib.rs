@@ -3407,6 +3407,13 @@ struct WarmChatSession {
     /// nothing). Re-prefixed onto the first directive ONLY for a non-claude base —
     /// claude already got it natively, so it is never restated there.
     firmware: Option<String>,
+    /// The backend id this warm session was opened against (`claude-code` /
+    /// `codex` / `opencode`). Load-bearing for the post-switch ordering race: a
+    /// SLOW pre-load opened for the OLD base can land AFTER `/backend` already
+    /// closed the holder and occupy the slot — the turn-time guard
+    /// ([`resident_for_turn`]) rejects a parked warm session whose base no longer
+    /// matches instead of silently driving the wrong brain under the new label.
+    backend: String,
 }
 
 /// Open a WARM resident chat session — spawn the base, load its MCP servers, and
@@ -3455,7 +3462,11 @@ async fn open_warm_chat_session(
         )
         .await
         {
-            return Ok(WarmChatSession { session, firmware });
+            return Ok(WarmChatSession {
+                session,
+                firmware,
+                backend: backend.to_string(),
+            });
         }
     }
     let session = umadev_host::session_for(
@@ -3466,7 +3477,11 @@ async fn open_warm_chat_session(
         firmware.as_deref(),
     )
     .await?;
-    Ok(WarmChatSession { session, firmware })
+    Ok(WarmChatSession {
+        session,
+        firmware,
+        backend: backend.to_string(),
+    })
 }
 
 /// Build the FIRST directive sent into a freshly-opened warm session: front-load
@@ -3489,6 +3504,80 @@ fn first_chat_directive(
         Some(fw) if backend != "claude-code" => format!("{fw}\n\n---\n\n{with_history}"),
         _ => with_history,
     }
+}
+
+/// Turn-time guard for the parked resident session: return the parked session if
+/// it may serve THIS turn's backend, plus any stale session the caller must close.
+///
+/// A parked WARM session pinned to a DIFFERENT base is the post-`/backend`-switch
+/// ordering race: the switch closes the holder inline and pre-loads the NEW base,
+/// but a SLOW open for the OLD base (the launch / `/resume` pre-load still loading
+/// MCP servers, or one that held the base-gate permit so the new pre-load skipped)
+/// can land afterwards and occupy the slot. Serving it would silently drive the
+/// WRONG brain under the new backend's label — and parking it after the turn would
+/// persist the old base's session id as the new base's resume pointer. Reject it:
+/// the caller closes it off the render path and lazily opens the RIGHT base, whose
+/// first directive front-loads the conversation transcript, so no context is lost.
+///
+/// A `Primed` session is always trusted: it can only have been parked by a turn on
+/// the CURRENT base (a backend switch is rejected while any turn is in flight, and
+/// the switch itself closes whatever was parked). Pure + total.
+fn resident_for_turn(
+    parked: Option<ResidentChat>,
+    backend: &str,
+) -> (Option<ResidentChat>, Option<ResidentChat>) {
+    match parked {
+        Some(ResidentChat::Warm(w)) if w.backend != backend => (None, Some(ResidentChat::Warm(w))),
+        other => (other, None),
+    }
+}
+
+/// Decide how a TRANSIENT-failure park re-enters the holder (the idle-blip and
+/// `TurnStatus::Failed`-with-a-still-alive-base paths). A session whose FIRST
+/// (front-loaded) directive failed with NOTHING streamed back may never have
+/// absorbed the transcript at all — codex's `turn/start` rejected by an overloaded
+/// server never enters the thread — so re-parking it `Primed` would send the NEXT
+/// turn BARE into a brain that never saw the prior dialogue (the post-switch /
+/// post-resume amnesia). Re-park it as `Warm` (carrying the same firmware +
+/// backend) so the next turn rebuilds the FULL front-loaded first directive.
+///
+/// Any streamed evidence (`saw_stream`: text / thinking / a tool call landed) or a
+/// bare `Primed` acquire ([`AttemptDirective::Bare`]) proves the base already
+/// carries the dialogue → park `Primed` (bare reuse, the pre-existing behavior).
+/// Pure + total so the disposition is unit-testable.
+fn park_after_transient_failure(
+    session: Box<dyn umadev_runtime::BaseSession>,
+    attempt: &AttemptDirective,
+    saw_stream: bool,
+    backend: &str,
+) -> ResidentChat {
+    match attempt {
+        AttemptDirective::FrontLoaded { firmware } if !saw_stream => {
+            ResidentChat::Warm(WarmChatSession {
+                session,
+                firmware: firmware.clone(),
+                backend: backend.to_string(),
+            })
+        }
+        _ => ResidentChat::Primed(session),
+    }
+}
+
+/// What ONE attempt of [`drive_chat_session_turn`] actually sent into the base —
+/// the front-loaded FIRST directive of a warm / lazy-opened session (carrying that
+/// session's firmware, needed for a `Warm` re-park), or a bare `Primed` reuse.
+/// Drives the transient-failure park disposition
+/// ([`park_after_transient_failure`]).
+enum AttemptDirective {
+    /// The front-loaded first directive (firmware + bounded transcript + task);
+    /// `firmware` is the warm session's firmware, re-carried on a `Warm` re-park.
+    FrontLoaded {
+        /// The warm session's firmware (`None` when composed to nothing).
+        firmware: Option<String>,
+    },
+    /// A bare reuse of an already-primed session — its native memory carries the
+    /// dialogue, so a transient failure always re-parks it `Primed`.
+    Bare,
 }
 
 /// Spawn a BACKGROUND pre-load of the resident chat session — the core of the
@@ -3706,14 +3795,32 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         // On the RETRY the stale session was already ended, so the holder is either empty
         // (-> a fresh lazy-open) or already re-populated by the re-fired pre-load (-> that
         // fresh warm session) -- either way the retry drives a FRESH base.
-        let (mut session, first_directive) = {
+        // `attempt_directive` records what THIS attempt sent: `FrontLoaded` (a warm /
+        // lazy-opened session's FIRST directive, carrying its firmware) lets a
+        // transient failure that streamed NOTHING re-park the session `Warm` so the
+        // next turn re-feeds the full transcript (see
+        // [`park_after_transient_failure`]); `Bare` for a `Primed` reuse.
+        let (mut session, first_directive, attempt_directive) = {
             let mut guard = chat_session.lock().await;
-            let acquired = match guard.take() {
-                Some(ResidentChat::Primed(s)) => (s, text.clone()),
+            // Post-switch ordering race: a stale pre-load parked for ANOTHER base may
+            // occupy the holder — close it off the render path and fall through to a
+            // fresh lazy-open on the RIGHT base (see [`resident_for_turn`]).
+            let (taken, stale) = resident_for_turn(guard.take(), &backend);
+            if let Some(s) = stale {
+                detach_resident_close(s);
+            }
+            let acquired = match taken {
+                Some(ResidentChat::Primed(s)) => (s, text.clone(), AttemptDirective::Bare),
                 Some(ResidentChat::Warm(w)) => {
                     let directive =
                         first_chat_directive(w.firmware.as_deref(), &backend, &conversation, &text);
-                    (w.session, directive)
+                    (
+                        w.session,
+                        directive,
+                        AttemptDirective::FrontLoaded {
+                            firmware: w.firmware,
+                        },
+                    )
                 }
                 None => match open_warm_chat_session(
                     &backend,
@@ -3731,7 +3838,13 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                             &conversation,
                             &text,
                         );
-                        (w.session, directive)
+                        (
+                            w.session,
+                            directive,
+                            AttemptDirective::FrontLoaded {
+                                firmware: w.firmware,
+                            },
+                        )
                     }
                     Err(e) => {
                         drop(guard);
@@ -3752,6 +3865,12 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
         text_acc = String::new();
         reactive = Arc::new(ReactiveBuild::new(true));
         let mut in_tool_call = false;
+        // Whether the base streamed ANY non-terminal event back for THIS attempt —
+        // the proof it absorbed the directive. Drives the transient-failure park
+        // disposition: a FIRST (front-loaded) directive that produced nothing may
+        // never have entered the base's context, so it re-parks `Warm` for a full
+        // re-feed instead of `Primed` (see [`park_after_transient_failure`]).
+        let mut saw_stream = false;
         // Outstanding-background-agents guard (the premature-final-report fix): the
         // base may dispatch its own background sub-agents mid-chat and then end the
         // turn while they still run — settling would park/tear the session and their
@@ -3837,13 +3956,21 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                     );
                     // Transient idle blip on a STILL-ALIVE base (a slow/quiet base, a
                     // network stall): don't tear the session down. `interrupt()` settled the
-                    // hung turn, so PARK it back as `Primed` (exactly like the
-                    // Esc/Interrupted arm below) — the next follow-up then reuses it BARE (no
-                    // repo-map re-scan, no full-transcript replay — the "重头开始" feeling).
-                    // Only `end()` when the base ACTUALLY died (a real exit status). The
+                    // hung turn, so PARK it back (like the Esc/Interrupted arm below) — the
+                    // next follow-up then reuses it (no repo-map re-scan — the "重头开始"
+                    // feeling). Disposition via [`park_after_transient_failure`]: a FIRST
+                    // front-loaded directive that produced ZERO events re-parks `Warm` so
+                    // the next turn re-feeds the transcript (the base may never have
+                    // absorbed it); anything else re-parks `Primed` (bare reuse). Only
+                    // `end()` when the base ACTUALLY died (a real exit status). The
                     // failure is surfaced to the user either way.
                     if exit.is_none() {
-                        *chat_session.lock().await = Some(ResidentChat::Primed(session));
+                        *chat_session.lock().await = Some(park_after_transient_failure(
+                            session,
+                            &attempt_directive,
+                            saw_stream,
+                            &backend,
+                        ));
                     } else {
                         let _ = session.end().await;
                     }
@@ -3862,6 +3989,12 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
             }
             // Feed the outstanding-background-agents guard (cheap, fail-open).
             bg.observe(&ev);
+            // Any non-terminal event proves the base absorbed this attempt's
+            // directive (a bare `TurnDone` — e.g. an immediate `Failed` on the
+            // send — is exactly the NOT-absorbed signature).
+            if !matches!(ev, umadev_runtime::SessionEvent::TurnDone { .. }) {
+                saw_stream = true;
+            }
             match ev {
                 umadev_runtime::SessionEvent::TextDelta(delta) => {
                     text_acc.push_str(&delta);
@@ -4130,14 +4263,24 @@ async fn drive_chat_session_turn(turn: ChatSessionTurn) {
                         }
                         // Not recoverable, or the one retry ALSO failed → honest terminal. A
                         // turn that FAILED (429 / overloaded / transient network) but left
-                        // the base process ALIVE is a recoverable blip — PARK the session back
-                        // as `Primed` (no teardown) so the next follow-up reuses it BARE
-                        // instead of lazily re-opening (re-scanning the repo-map + replaying
-                        // the full transcript — the "重头开始" feeling). Only `end()` when the
-                        // base ACTUALLY died (a real exit status). Surfaced via the chat-turn
-                        // key (never the phantom routing key) either way.
+                        // the base process ALIVE is a recoverable blip — PARK the session
+                        // back (no teardown) so the next follow-up reuses it instead of
+                        // lazily re-opening (re-scanning the repo-map — the "重头开始"
+                        // feeling). Disposition via [`park_after_transient_failure`]: a
+                        // FIRST front-loaded directive that failed with ZERO events streamed
+                        // re-parks `Warm` so the next turn re-feeds the transcript (codex's
+                        // `turn/start` rejected by an overloaded server never entered the
+                        // thread — a bare `Primed` follow-up would be the post-switch
+                        // amnesia); anything else re-parks `Primed` (bare reuse). Only
+                        // `end()` when the base ACTUALLY died (a real exit status). Surfaced
+                        // via the chat-turn key (never the phantom routing key) either way.
                         if exit.is_none() {
-                            *chat_session.lock().await = Some(ResidentChat::Primed(session));
+                            *chat_session.lock().await = Some(park_after_transient_failure(
+                                session,
+                                &attempt_directive,
+                                saw_stream,
+                                &backend,
+                            ));
                         } else {
                             let _ = session.end().await;
                         }
@@ -13924,6 +14067,7 @@ mod tests {
             ResidentChat::Warm(WarmChatSession {
                 session: Box::new(fake),
                 firmware: None,
+                backend: "claude-code".to_string(),
             }),
         )));
 
@@ -14004,6 +14148,178 @@ mod tests {
         assert_eq!(bare, "做个登录页");
     }
 
+    /// The turn-time resident guard (the post-`/backend`-switch ordering race): a
+    /// parked WARM session pinned to ANOTHER base is rejected as stale (the caller
+    /// closes it and lazily opens the right base), while a matching warm session and
+    /// any primed session pass through untouched.
+    #[test]
+    fn resident_for_turn_rejects_a_warm_session_from_another_base() {
+        // Stale: warm claude parked, but the turn now runs on codex.
+        let (fake, _s, _e) = FakeChatSession::new(vec![]);
+        let parked = Some(ResidentChat::Warm(WarmChatSession {
+            session: Box::new(fake),
+            firmware: Some("FW".into()),
+            backend: "claude-code".into(),
+        }));
+        let (usable, stale) = resident_for_turn(parked, "codex");
+        assert!(
+            usable.is_none(),
+            "a wrong-base warm session is never served"
+        );
+        assert!(
+            matches!(stale, Some(ResidentChat::Warm(_))),
+            "the stale warm session is returned for closing"
+        );
+        // Matching: warm codex serves a codex turn.
+        let (fake, _s, _e) = FakeChatSession::new(vec![]);
+        let parked = Some(ResidentChat::Warm(WarmChatSession {
+            session: Box::new(fake),
+            firmware: None,
+            backend: "codex".into(),
+        }));
+        let (usable, stale) = resident_for_turn(parked, "codex");
+        assert!(matches!(usable, Some(ResidentChat::Warm(_))));
+        assert!(stale.is_none());
+        // Primed is always trusted (only a turn on the current base parks one).
+        let (fake, _s, _e) = FakeChatSession::new(vec![]);
+        let (usable, stale) =
+            resident_for_turn(Some(ResidentChat::Primed(Box::new(fake))), "codex");
+        assert!(matches!(usable, Some(ResidentChat::Primed(_))));
+        assert!(stale.is_none());
+        // Empty holder stays empty.
+        let (usable, stale) = resident_for_turn(None, "codex");
+        assert!(usable.is_none() && stale.is_none());
+    }
+
+    /// The transient-failure park disposition: a FIRST front-loaded directive that
+    /// streamed NOTHING re-parks `Warm` (the next turn re-feeds the transcript — the
+    /// base may never have absorbed it); streamed evidence or a bare `Primed`
+    /// acquire re-parks `Primed` (the pre-existing behavior).
+    #[tokio::test]
+    async fn park_after_transient_failure_reparks_warm_only_for_an_unabsorbed_first_directive() {
+        // First directive + nothing streamed → Warm (full re-feed next turn).
+        let front = AttemptDirective::FrontLoaded {
+            firmware: Some("FW".into()),
+        };
+        let (fake, _s, _e) = FakeChatSession::new(vec![]);
+        let parked = park_after_transient_failure(Box::new(fake), &front, false, "codex");
+        match parked {
+            ResidentChat::Warm(w) => {
+                assert_eq!(w.firmware.as_deref(), Some("FW"), "the firmware is carried");
+                assert_eq!(w.backend, "codex");
+            }
+            ResidentChat::Primed(_) => panic!("an unabsorbed first directive must re-park Warm"),
+        }
+        // First directive but the base DID stream → Primed (it absorbed the history).
+        let (fake, _s, _e) = FakeChatSession::new(vec![]);
+        let parked = park_after_transient_failure(Box::new(fake), &front, true, "codex");
+        assert!(matches!(parked, ResidentChat::Primed(_)));
+        // A bare Primed reuse (no first directive this attempt) stays Primed.
+        let (fake, _s, _e) = FakeChatSession::new(vec![]);
+        let parked =
+            park_after_transient_failure(Box::new(fake), &AttemptDirective::Bare, false, "codex");
+        assert!(matches!(parked, ResidentChat::Primed(_)));
+    }
+
+    /// End-to-end amnesia regression on the resident chat path: the FIRST
+    /// front-loaded directive fails with a KNOWN-transient error (429) and ZERO
+    /// events streamed — the base never absorbed the transcript. The session must
+    /// re-park `Warm` so the NEXT turn re-feeds the full front-load (firmware +
+    /// prior dialogue), instead of going out bare into an empty brain.
+    #[tokio::test]
+    async fn unabsorbed_first_directive_failure_refeeds_the_transcript_on_the_next_turn() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Turn 1: an immediate KNOWN-transient failure (no auto-redrive, base still
+        // alive), with NO events before it. Turn 2: a clean completion.
+        let (fake, sent, _ended) = FakeChatSession::new(vec![
+            vec![umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Failed("429 Too Many Requests".into()),
+                usage: None,
+            }],
+            vec![
+                umadev_runtime::SessionEvent::TextDelta("有上下文的回答".into()),
+                umadev_runtime::SessionEvent::TurnDone {
+                    status: umadev_runtime::TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+        ]);
+        let holder: ChatSessionHolder = Arc::new(tokio::sync::Mutex::new(Some(
+            ResidentChat::Warm(WarmChatSession {
+                session: Box::new(fake),
+                firmware: Some("FW-CODEX".into()),
+                backend: "codex".into(),
+            }),
+        )));
+        let prior = vec![
+            umadev_runtime::Message {
+                role: "user".into(),
+                content: "MARKER-EARLIER 我们之前定了用 SQLite".into(),
+            },
+            umadev_runtime::Message {
+                role: "assistant".into(),
+                content: "好的,表结构已定".into(),
+            },
+        ];
+
+        // Turn 1 — fails clean; the session must re-park WARM (not Primed).
+        let mut turn = chat_turn(
+            "继续实现",
+            holder.clone(),
+            sink.clone(),
+            route_tx.clone(),
+            tmp.path().to_path_buf(),
+        );
+        turn.backend = "codex".into();
+        turn.conversation = prior.clone();
+        drive_chat_session_turn(turn).await;
+        assert!(
+            matches!(route_rx.try_recv(), Ok(RouteDecision::Failed(_))),
+            "the transient failure is surfaced honestly"
+        );
+        assert!(
+            matches!(*holder.lock().await, Some(ResidentChat::Warm(_))),
+            "an unabsorbed first directive re-parks the session WARM for a full re-feed"
+        );
+
+        // Turn 2 — the re-fed first directive carries the firmware AND the prior
+        // dialogue again (the amnesia fix), then completes and parks Primed.
+        let mut turn = chat_turn(
+            "再试一次",
+            holder.clone(),
+            sink,
+            route_tx,
+            tmp.path().to_path_buf(),
+        );
+        turn.backend = "codex".into();
+        turn.conversation = prior;
+        drive_chat_session_turn(turn).await;
+        let sent = sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            2,
+            "two directives into the same session: {sent:?}"
+        );
+        assert!(
+            sent[0].contains("FW-CODEX") && sent[0].contains("MARKER-EARLIER"),
+            "the first attempt front-loaded firmware + transcript: {:?}",
+            sent[0]
+        );
+        assert!(
+            sent[1].contains("FW-CODEX") && sent[1].contains("MARKER-EARLIER"),
+            "the retry turn RE-FEEDS the full front-load (no bare amnesia turn): {:?}",
+            sent[1]
+        );
+        assert!(
+            matches!(*holder.lock().await, Some(ResidentChat::Primed(_))),
+            "a completed turn parks Primed as before"
+        );
+    }
+
     /// The background pre-load is a NO-OP for a non-host (offline) brain — there is no
     /// resident process to keep, so the holder stays empty and the first chat turn
     /// lazily opens exactly as before. (Hermetic: an offline id never spawns a base.)
@@ -14044,6 +14360,7 @@ mod tests {
         ResidentChat::Warm(WarmChatSession {
             session: Box::new(warm_fake),
             firmware: None,
+            backend: "claude-code".to_string(),
         })
         .end()
         .await;

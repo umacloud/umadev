@@ -445,6 +445,7 @@
 
 # /backend and /model
 "backend.switched" = "Switched worker to `{}` — the next run uses this backend."
+"backend.handoff" = "「backend switched {} → {}: the conversation above is handed over to the new base via the transcript; the previous base's native deep context does not migrate — restate any key background that is missing.」"
 "backend.busy_no_switch" = "A run is in progress on the current base — /cancel it before switching the base, so the run and its session stay coherent."
 "chat.busy_cancel_first" = "A run or turn is in progress — /cancel it first; resuming or compacting now would corrupt the active session."
 

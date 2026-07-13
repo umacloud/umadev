@@ -10094,6 +10094,9 @@ impl App {
             return Action::None;
         }
         let id = backend.unwrap_or("offline").to_string();
+        // Snapshot the OLD base label BEFORE committing — the context-handoff block
+        // below names both sides of the switch.
+        let previous = self.backend_label.clone();
         self.commit_backend(backend.map(str::to_string));
         // The resident chat session is pinned to the OLD base — flag it for close so
         // the next chat turn opens a fresh session on the newly-selected base.
@@ -10102,6 +10105,22 @@ impl App {
             ChatRole::System,
             umadev_i18n::tf(self.lang, "backend.switched", &[&id]),
         );
+        // CONTEXT HANDOFF (honest-continuity contract): a mid-conversation switch
+        // carries the dialogue ONLY via UmaDev's own bounded transcript — the new
+        // base's first directive front-loads it (`first_chat_directive`); the OLD
+        // base's native deep session context cannot migrate. Record ONE compact
+        // handoff block into the conversation itself so (a) the NEW base explicitly
+        // sees the preceding dialogue was handed over from another base and (b) the
+        // user sees honestly what carries and what doesn't. Only a REAL switch
+        // (target differs) with prior dialogue records it; persisted so a relaunch
+        // keeps the marker. Appended at the transcript TAIL, so the token-bounded
+        // front-load always keeps it. Fail-open: an empty conversation is a no-op.
+        if previous != id && !self.conversation.is_empty() {
+            let handoff = umadev_i18n::tf(self.lang, "backend.handoff", &[&previous, &id]);
+            self.record_turn("system", handoff.clone());
+            self.persist_chat();
+            self.push(ChatRole::System, handoff);
+        }
         self.refresh_status();
         Action::BackendChanged
     }
@@ -16495,6 +16514,172 @@ mod tests {
         assert!(
             app.chat_session_dirty,
             "/resume flags the resident session for re-open against the resumed base id"
+        );
+    }
+
+    #[test]
+    fn backend_switch_keeps_conversation_clears_resume_id_and_records_one_handoff() {
+        // The reported context-loss chain, link by link: a `/backend` switch must
+        // (a) KEEP `conversation` (the bounded transcript the new base's first
+        // directive front-loads), (b) CLEAR the old base's resumable session id (a
+        // claude id means nothing to codex — the post-switch pre-load must open
+        // FRESH, `resume_session_id = None`), and (c) record exactly ONE context
+        // handoff block into the conversation so the new base + the user both see
+        // what carried over.
+        let (mut app, _tmp) = temp_app();
+        app.record_user_turn("MARKER-EARLIER-TURN 我要一个登录页");
+        app.record_agentic_done(
+            "已完成登录页初版".to_string(),
+            false,
+            Some("claude-sess-1".to_string()),
+        );
+        assert_eq!(app.chat_session_id.as_deref(), Some("claude-sess-1"));
+        let chat_id_before = app.chat_id.clone();
+
+        let action = app.slash_backend(Some("codex"));
+        assert_eq!(action, Action::BackendChanged);
+        // (a) the conversation SURVIVES the switch.
+        assert!(
+            app.conversation
+                .iter()
+                .any(|m| m.content.contains("MARKER-EARLIER-TURN")),
+            "the bounded transcript must survive a backend switch"
+        );
+        assert_eq!(
+            app.chat_id, chat_id_before,
+            "a backend switch never re-mints the chat id"
+        );
+        // (b) the old base's resume pointer is invalidated → the `BackendChanged`
+        // pre-load passes `None` (`app.chat_session_id.clone()`), a fresh open.
+        assert!(
+            app.chat_session_id.is_none(),
+            "a claude session id must not be resumed on codex"
+        );
+        assert!(!app.host_chat_session_active);
+        assert!(
+            app.chat_session_dirty,
+            "the old base's resident session is flagged for close"
+        );
+        // (c) exactly ONE handoff block, in the conversation (the new base sees it)
+        // AND on screen (the user sees it).
+        let handoff = umadev_i18n::tf(app.lang, "backend.handoff", &["claude-code", "codex"]);
+        assert_eq!(
+            app.conversation
+                .iter()
+                .filter(|m| m.role == "system" && m.content == handoff)
+                .count(),
+            1,
+            "exactly one context-handoff block is recorded"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.role == ChatRole::System && m.body() == handoff),
+            "the handoff note is also shown to the user"
+        );
+        // Switching back records a SECOND, direction-reversed handoff (once per switch).
+        let _ = app.slash_backend(Some("claude-code"));
+        let back = umadev_i18n::tf(app.lang, "backend.handoff", &["codex", "claude-code"]);
+        assert_eq!(
+            app.conversation
+                .iter()
+                .filter(|m| m.content == back)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn backend_switch_records_no_handoff_for_same_base_or_empty_chat() {
+        // Same target → not a real switch → no handoff block.
+        let (mut app, _tmp) = temp_app();
+        app.record_user_turn("你好");
+        let _ = app.slash_backend(Some("claude-code"));
+        assert!(
+            !app.conversation.iter().any(|m| m.role == "system"),
+            "re-selecting the current base records no handoff"
+        );
+        // Empty conversation → nothing to hand over → no block (fail-open).
+        let (mut app, _tmp) = temp_app();
+        let _ = app.slash_backend(Some("codex"));
+        assert!(
+            app.conversation.is_empty(),
+            "an empty chat records no handoff block"
+        );
+    }
+
+    #[test]
+    fn resumed_chat_survives_a_backend_switch_into_the_new_base_first_directive() {
+        // The exact reported repro, end to end: work on claude in one process →
+        // relaunch in ANOTHER process → resume the saved chat by id → switch to
+        // codex → the NEXT turn's first directive (what codex actually receives)
+        // must carry the pre-resume dialogue AND the handoff marker. This is the
+        // full chain: persist → load_chat → slash_backend → conversation_snapshot →
+        // first_chat_directive.
+        let (mut app, tmp) = temp_app();
+        app.record_user_turn("MARKER-RESUME-A17 我们决定数据层用 SQLite");
+        app.record_agentic_done(
+            "好的,就用 SQLite,表结构已经定了".to_string(),
+            false,
+            Some("claude-deep-sess-9".to_string()),
+        );
+        let saved_chat_id = app.chat_id.clone();
+        drop(app);
+
+        // A brand-new process over the SAME project root (the native-terminal case).
+        let cfg = UserConfig {
+            backend: Some("claude-code".to_string()),
+            lang: Some("zh-CN".to_string()),
+            ..Default::default()
+        };
+        let mut app2 = App::new(
+            "demo",
+            cfg,
+            tmp.path().join("config2.toml"),
+            tmp.path().to_path_buf(),
+        );
+        // Resume the saved chat explicitly (the `/resume <id>` path).
+        let _ = app2.try_slash_command(&format!("/resume {saved_chat_id}"));
+        assert_eq!(app2.chat_id, saved_chat_id);
+        assert_eq!(
+            app2.chat_session_id.as_deref(),
+            Some("claude-deep-sess-9"),
+            "the resumed chat restores the OLD base's resumable id"
+        );
+
+        // Switch to codex mid-conversation.
+        let action = app2.slash_backend(Some("codex"));
+        assert_eq!(action, Action::BackendChanged);
+        assert!(
+            app2.chat_session_id.is_none(),
+            "the claude session id is dropped — the codex pre-load opens fresh"
+        );
+
+        // The NEXT turn's first directive on the new base: front-load the snapshot
+        // exactly as `drive_chat_session_turn` does for a Warm codex session.
+        let convo = app2.conversation_snapshot();
+        let directive =
+            crate::first_chat_directive(Some("FW-CODEX"), "codex", &convo, "接着把接口做完");
+        assert!(
+            directive.contains("MARKER-RESUME-A17"),
+            "the first directive on the new base must carry the resumed dialogue: {directive:?}"
+        );
+        assert!(
+            directive.contains("SQLite"),
+            "prior decisions ride the front-load: {directive:?}"
+        );
+        let handoff = umadev_i18n::tf(app2.lang, "backend.handoff", &["claude-code", "codex"]);
+        assert!(
+            directive.contains(&handoff),
+            "the handoff block reaches the new base inside the front-load: {directive:?}"
+        );
+        assert!(
+            directive.starts_with("FW-CODEX"),
+            "codex has no native system slot — firmware is front-loaded too"
+        );
+        assert!(
+            directive.contains("接着把接口做完"),
+            "the current ask closes the directive"
         );
     }
 

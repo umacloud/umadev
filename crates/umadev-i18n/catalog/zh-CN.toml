@@ -436,6 +436,7 @@
 
 # /backend and /model
 "backend.switched" = "已切换底座到 `{}` — 下一个 run 起用此 backend。"
+"backend.handoff" = "「底座已切换 {} → {}:上文对话已随转录移交给新底座;原底座的原生深层上下文不迁移,关键背景如有缺失请补充说明。」"
 "backend.busy_no_switch" = "当前底座上有运行进行中 —— 请先 /cancel 再切换底座,以免运行与其会话错配。"
 "chat.busy_cancel_first" = "有运行或对话进行中 —— 请先 /cancel;此时切换会话或压缩会破坏当前会话。"
 
