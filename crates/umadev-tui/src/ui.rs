@@ -1282,6 +1282,105 @@ impl MsgFoldCache {
     }
 }
 
+/// **R7 — whole-transcript assembly cache.** One level above [`MsgFoldCache`]:
+/// caches the fully ASSEMBLED folded transcript (welcome banner + gap rows +
+/// every settled message, in order) so a frame whose stable prefix is unchanged
+/// — every scroll frame, every animation tick on a settled chat — skips the
+/// per-message walk entirely: no per-message key lookups, no cache-hit row
+/// clones, no re-derivation of the selection-layer text. The paint then only
+/// materializes the VISIBLE window (see `render_transcript`), so a wheel tick
+/// costs O(viewport), not O(total history) — the root fix for the reported
+/// scroll lag on a long transcript.
+///
+/// **Validity** is a single signature ([`transcript_prefix_sig`]): a hash over
+/// the render width, theme generation, language, `verbose`, and the full
+/// [`msg_fold_key`] of every message in the stable prefix, in order. Any
+/// content edit, append, collapse toggle, width/theme/lang change flips the
+/// signature and triggers one full rebuild (which itself reuses the
+/// per-message [`MsgFoldCache`], so only changed messages re-parse).
+///
+/// **The volatile tail is never cached here.** Messages from the first
+/// non-render-cacheable one onward (the live streaming tail, a `Running` tool
+/// row) plus the animated thinking indicator are re-folded fresh every frame,
+/// exactly as before — the cache covers only the settled prefix whose bytes
+/// are proven reproducible from the signature inputs.
+///
+/// **Fail-open by contract**: a borrow conflict falls back to a local
+/// throwaway cache (a fresh rebuild — the prior behaviour, just slower); a
+/// signature mismatch can only ever cause a rebuild, never a stale paint.
+#[derive(Debug, Clone)]
+pub(crate) struct TranscriptCache {
+    /// Signature of the cached prefix (`0` = empty/never built; the sig
+    /// function never returns 0).
+    sig: u64,
+    /// The assembled folded rows of the stable prefix (pre-front-trim).
+    lines: Vec<Line<'static>>,
+    /// Per-row soft-wrap continuation flags, in lockstep with `lines`.
+    wraps: Vec<bool>,
+    /// The selection layer's logical text per row (gutter-stripped), derived
+    /// once per rebuild instead of once per frame.
+    rows: Vec<String>,
+    /// The stripped leading-gutter width per row, in lockstep with `rows`.
+    gutters: Vec<usize>,
+    /// Signature the currently PUBLISHED `App::transcript_rows` (and gutters /
+    /// wraps) prefix was built from; when it and `published_cut` both match,
+    /// a frame only swaps the small volatile tail instead of re-publishing
+    /// every row's `String`.
+    published_sig: u64,
+    /// Front-trim (`MAX_RENDER_ROWS`) offset the published rows assume.
+    published_cut: usize,
+}
+
+impl TranscriptCache {
+    /// An empty, never-built cache (`sig == 0` can never match a real sig).
+    pub(crate) fn new() -> Self {
+        Self {
+            sig: 0,
+            lines: Vec::new(),
+            wraps: Vec::new(),
+            rows: Vec::new(),
+            gutters: Vec::new(),
+            published_sig: 0,
+            published_cut: 0,
+        }
+    }
+
+    /// Cached prefix row count — test-only introspection.
+    #[cfg(test)]
+    fn prefix_rows(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// The cached signature — test-only introspection.
+    #[cfg(test)]
+    fn signature(&self) -> u64 {
+        self.sig
+    }
+}
+
+/// The [`TranscriptCache`] validity signature: hashes EVERYTHING that
+/// determines the assembled stable-prefix rows — the render width, the theme
+/// generation, the language (welcome banner + every i18n label), the global
+/// `verbose` reveal, the prefix length, and each stable message's full
+/// [`msg_fold_key`] in order. Any input that could change a single cached byte
+/// flips the signature (the same reproducibility contract [`MsgFoldCache`]
+/// already relies on). Never returns `0` (the cache's "never built" sentinel).
+fn transcript_prefix_sig(app: &App, stable_len: usize, width: usize, theme: u8) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut h);
+    theme.hash(&mut h);
+    std::mem::discriminant(&app.lang).hash(&mut h);
+    app.verbose.hash(&mut h);
+    stable_len.hash(&mut h);
+    for msg in app.history.iter().take(stable_len) {
+        msg_fold_key(msg, app.verbose, app.lang, width, theme).hash(&mut h);
+    }
+    // Reserve 0 as the "never built" sentinel so an (astronomically unlikely)
+    // zero hash can't read as an always-valid empty cache.
+    h.finish().max(1)
+}
+
 /// Hash a message's load-bearing CONTENT into a stable u64 — the part of the
 /// [`MsgFoldCache`] key that changes when the message's rendered text changes.
 /// Covers the role (which selects the render path) and every field the renderer
@@ -4351,62 +4450,120 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
 
     let w = usize::from(area.width).max(1);
     let theme_gen = theme::theme_id();
-    // R1 — settled-message render cache: whole-invalidate on a width/theme
-    // change, then advance the per-frame generation so untouched entries can be
-    // swept after the walk. Fail-open: a borrow conflict just skips the cache and
-    // every message re-folds (the prior behaviour).
-    if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
-        cache.begin_frame(w, theme_gen);
-    }
 
-    // Fold the transcript into visual rows. The welcome banner folds fresh each
-    // frame (tiny); every transcript MESSAGE folds through the settled-message
-    // cache, so a long, mostly-settled conversation costs a per-message CLONE
-    // instead of a markdown re-parse + re-fold. Folding per message then
-    // concatenating is identical to folding the concatenation (the fold is
-    // independent per row), so the painted output is byte-for-byte unchanged.
-    let mut folded: Vec<Line<'static>> = Vec::new();
-    // Per-row soft-wrap flag, in lockstep with `folded`: `folded_wraps[i]` is true
-    // when row `i` is a soft-wrap continuation of row `i-1` (same logical line), so
-    // a drag-copy rejoins a wrapped paragraph into one line instead of breaking at
-    // every fold point. `push_wrapped` keeps the two vectors aligned.
-    let mut folded_wraps: Vec<bool> = Vec::new();
+    // ── R7: whole-transcript assembly cache ─────────────────────────────
+    // The STABLE PREFIX is the leading run of render-cacheable messages (their
+    // folded bytes are fully determined by [`msg_fold_key`] inputs); everything
+    // from the first volatile message onward (live streaming tail, a `Running`
+    // tool row) is the TAIL, re-folded fresh every frame exactly as before.
+    let stable_len = app
+        .history
+        .iter()
+        .enumerate()
+        .take_while(|(i, m)| message_is_render_cacheable(app, m, *i))
+        .count();
+    let sig = transcript_prefix_sig(app, stable_len, w, theme_gen);
+    // Fail-open: a borrow conflict (re-entrant render) falls back to a local
+    // throwaway cache — a fresh rebuild, the prior behaviour, never a panic.
+    let mut asm_guard = app.transcript_cache.try_borrow_mut().ok();
+    let mut asm_local = TranscriptCache::new();
+    let asm: &mut TranscriptCache = match asm_guard.as_mut() {
+        Some(a) => a,
+        None => &mut asm_local,
+    };
+    // Pushes one logical line's folded visual rows + their soft-wrap flags
+    // (`wraps[i]` marks row `i` a continuation of row `i-1`, so a drag-copy can
+    // rejoin a wrapped paragraph) keeping the two vectors in lockstep.
     let push_wrapped =
-        |folded: &mut Vec<Line<'static>>, wraps: &mut Vec<bool>, rows: Vec<Line<'static>>| {
+        |lines: &mut Vec<Line<'static>>, wraps: &mut Vec<bool>, rows: Vec<Line<'static>>| {
             for (i, l) in rows.into_iter().enumerate() {
-                folded.push(l);
+                lines.push(l);
                 wraps.push(i > 0);
             }
         };
-    for l in welcome_lines(app) {
-        push_wrapped(
-            &mut folded,
-            &mut folded_wraps,
-            prefold_line_filled(&l, w, 0, None, None),
-        );
+    let rebuilt = asm.sig != sig;
+    if rebuilt {
+        // R1 — settled-message render cache: whole-invalidate on a width/theme
+        // change, then advance the per-frame generation so untouched entries can
+        // be swept after the walk. Bracketed here (not every frame) because the
+        // per-message cache is only consulted on a rebuild walk — sweeping on a
+        // signature-hit frame would evict every entry it never touched.
+        if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
+            cache.begin_frame(w, theme_gen);
+        }
+        asm.lines.clear();
+        asm.wraps.clear();
+        // Fold the stable prefix into visual rows. Every message folds through
+        // the settled-message cache, so only changed messages re-parse markdown.
+        // Folding per message then concatenating is identical to folding the
+        // concatenation (the fold is independent per row), so the assembled
+        // output is byte-for-byte what the old whole-walk produced.
+        for l in welcome_lines(app) {
+            push_wrapped(
+                &mut asm.lines,
+                &mut asm.wraps,
+                prefold_line_filled(&l, w, 0, None, None),
+            );
+        }
+        for (msg_idx, msg) in app.history.iter().take(stable_len).enumerate() {
+            // Top gap before each message for breathing room (Claude Code:
+            // marginTop=1).
+            if msg_idx > 0 {
+                push_wrapped(
+                    &mut asm.lines,
+                    &mut asm.wraps,
+                    prefold_line_filled(&Line::from(""), w, 0, None, None),
+                );
+            }
+            let (lines, wraps) = message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
+            asm.lines.extend(lines);
+            asm.wraps.extend(wraps);
+        }
+        // Derive the selection layer's logical text + gutter per row ONCE per
+        // rebuild (it used to be re-derived every frame — an O(total) String
+        // build per wheel tick).
+        asm.rows.clear();
+        asm.gutters.clear();
+        asm.rows.reserve(asm.lines.len());
+        asm.gutters.reserve(asm.lines.len());
+        for l in &asm.lines {
+            let (logical, gutter) = logical_row_and_gutter(l);
+            asm.rows.push(logical);
+            asm.gutters.push(gutter);
+        }
+        asm.sig = sig;
     }
-    for (msg_idx, msg) in app.history.iter().enumerate() {
-        // Top gap before each message for breathing room (Claude Code: marginTop=1).
+
+    // The volatile tail: the first non-cacheable message onward. Folded fresh
+    // every frame (its content / spinner glyph changes per frame); empty on a
+    // settled chat, so a pure scroll frame skips message work entirely.
+    let mut tail_lines: Vec<Line<'static>> = Vec::new();
+    let mut tail_wraps: Vec<bool> = Vec::new();
+    for (msg_idx, msg) in app.history.iter().enumerate().skip(stable_len) {
         if msg_idx > 0 {
             push_wrapped(
-                &mut folded,
-                &mut folded_wraps,
+                &mut tail_lines,
+                &mut tail_wraps,
                 prefold_line_filled(&Line::from(""), w, 0, None, None),
             );
         }
         let (lines, wraps) = message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
-        folded.extend(lines);
-        folded_wraps.extend(wraps);
+        tail_lines.extend(lines);
+        tail_wraps.extend(wraps);
     }
-    // Drop cache entries not touched this frame (a content edit, a collapse
-    // toggle, a message that fell out of history) so the cache self-bounds to the
-    // messages actually rendered.
-    if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
-        cache.end_frame();
+    if rebuilt {
+        // Drop per-message cache entries not touched by this rebuild walk (a
+        // content edit, a collapse toggle, a message that fell out of history)
+        // so the cache self-bounds to the messages actually rendered. Only after
+        // the tail walk — cacheable tail messages touch their entries too.
+        if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
+            cache.end_frame();
+        }
     }
 
     // The live waiting indicator below builds its own throwaway rows (animated
-    // spinner — never cached); they fold onto `folded` after the message walk.
+    // spinner — never cached); they fold onto the volatile tail after the
+    // message walk.
     let mut rendered: Vec<RenderedRow> = Vec::new();
     // Live waiting indicator — an animated spinner + verb + ticking elapsed,
     // pinned just above the input while the base replies, so a sent message
@@ -4471,35 +4628,31 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // `disp_width().div_ceil(w)` and let `Paragraph::wrap` fold the line a
     // *different* way (its own unicode-width pass), so the scroll offset and the
     // painted rows disagreed — long/CJK sessions scattered glyphs and smeared
-    // stale cells. Now the folded `Vec<Line>` length **is** the row count, so the
+    // stale cells. Now the folded row count **is** the row count, so the
     // estimate equals reality and the scroll offset lands on the right row.
     // Continuation rows are indented by each line's `hang` so wrapped paragraphs
     // stay aligned under their bullet/prefix.
     //
-    // `folded` already holds the cached transcript (welcome banner + every
-    // message); fold the live waiting indicator's own rows onto its end. Folding
-    // per group then concatenating equals folding the concatenation — the fold is
-    // independent per row — so the painted output is byte-for-byte unchanged.
+    // The cached prefix + `tail_lines` together hold the whole transcript
+    // (welcome banner + every message); fold the live waiting indicator's own
+    // rows onto the tail's end. Folding per group then concatenating equals
+    // folding the concatenation — the fold is independent per row — so the
+    // painted output is byte-for-byte unchanged.
     {
         let (lines, wraps) = fold_rows(&rendered, w);
-        folded.extend(lines);
-        folded_wraps.extend(wraps);
+        tail_lines.extend(lines);
+        tail_wraps.extend(wraps);
     }
     // Bound the retained scrollback by VISUAL rows (post-fold), keeping the most
     // recent `MAX_RENDER_ROWS`. Doing it here — not on logical lines up top —
     // means `total` (and the `hidden_above` derived from it) equals exactly what
     // is paintable + reachable, so Home/PageUp can always reach the top of the
     // kept history instead of clamping short of truncated-but-uncounted rows.
-    // `folded_wraps` is split in lockstep so the soft-wrap flags stay aligned with
-    // the rows that survive (the new first row's flag is harmless — extraction
-    // never reads a leading continuation).
-    let cut = folded.len().saturating_sub(MAX_RENDER_ROWS);
-    if cut > 0 {
-        folded = folded.split_off(cut);
-        if folded_wraps.len() >= cut {
-            folded_wraps = folded_wraps.split_off(cut);
-        }
-    }
+    // The trim is arithmetic now (`cut` virtual front rows are dropped at
+    // publication + paint time) — the cached prefix is never mutated.
+    let prefix_len = asm.lines.len();
+    let total_uncut = prefix_len + tail_lines.len();
+    let cut = total_uncut.saturating_sub(MAX_RENDER_ROWS);
     // Re-base offsets for the selection / search highlights: the stored rows
     // index the PREVIOUS frame's trimmed window, so a change in `cut` shifts where
     // the same content now lives. `replace` swaps in this frame's `cut` and hands
@@ -4507,7 +4660,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // (paint-only — `render` holds `&App`, so the stored selection is left for the
     // next mouse event to re-anchor against the freshly published rows).
     let prev_cut = app.transcript_cut.replace(cut);
-    let total = folded.len();
+    let total = total_uncut - cut;
     // Self-heal (long-run garble): if the transcript RE-BASED (the
     // `MAX_RENDER_ROWS` front-trim first crossed in) or SHRANK (a fold / collapse
     // / `/compact` / `/clear` / the live indicator removed at settle), request a
@@ -4586,37 +4739,65 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // the user's offset so older content comes into view. At offset 0 the view
     // auto-sticks to the newest line (the default).
     let scroll_rows = hidden_above.saturating_sub(user_offset);
-    let scroll = u16::try_from(scroll_rows).unwrap_or(u16::MAX);
 
     // ── In-app text-selection layer (the Claude-Code drag-to-copy) ──
-    // `folded` is the exact `Vec<Line>` about to be painted: its index IS the
-    // content-row coordinate the selection uses. Publish a plain-text snapshot of
-    // every row, the paintable transcript rectangle, and the index of the row
-    // painted at its top — the event loop maps a mouse `(col,row)` against these.
-    // The cache holds the LOGICAL row text (leading role-spine / hang-indent
-    // gutter stripped, trailing bg padding trimmed) so a drag-copy is clean — no
-    // `▎`, no leading indent, no trailing-space runs polluting the clipboard. The
-    // stripped gutter width is published per row so a screen column still maps to
-    // the right logical char index. When the scroll-hint title is shown it steals
-    // the top row, so content actually begins at `area.top + 1` with one row less
-    // height; publish that adjusted rect so a click lands on the right content row.
+    // The published rows mirror the virtual `prefix + tail` transcript minus the
+    // front-trim: their index IS the content-row coordinate the selection uses.
+    // Publish a plain-text snapshot of every row — the event loop maps a mouse
+    // `(col,row)` against these, and a drag can span rows far outside the
+    // viewport. The cache holds the LOGICAL row text (leading role-spine /
+    // hang-indent gutter stripped, trailing bg padding trimmed) so a drag-copy is
+    // clean — no `▎`, no leading indent, no trailing-space runs polluting the
+    // clipboard. The stripped gutter width is published per row so a screen
+    // column still maps to the right logical char index.
+    //
+    // R7 — publication is INCREMENTAL: when the prefix signature and the
+    // front-trim are unchanged (every pure-scroll / animation frame), the
+    // published prefix Strings are left untouched and only the small volatile
+    // tail is swapped; a content or trim change re-publishes in full from the
+    // cached per-row text.
     {
         let mut rows = app.transcript_rows.borrow_mut();
         let mut gutters = app.transcript_gutters.borrow_mut();
-        rows.clear();
-        gutters.clear();
-        rows.reserve(folded.len());
-        gutters.reserve(folded.len());
-        for l in &folded {
+        let mut wrapsv = app.transcript_row_wraps.borrow_mut();
+        // Prefix rows that survive the front-trim; `cut` beyond the prefix eats
+        // into the tail instead.
+        let kept_prefix = prefix_len.saturating_sub(cut);
+        if asm.published_sig != sig || asm.published_cut != cut {
+            rows.clear();
+            gutters.clear();
+            wrapsv.clear();
+            rows.reserve(total);
+            gutters.reserve(total);
+            wrapsv.reserve(total);
+            let from = prefix_len - kept_prefix; // == min(cut, prefix_len)
+            rows.extend_from_slice(&asm.rows[from..]);
+            gutters.extend_from_slice(&asm.gutters[from..]);
+            wrapsv.extend_from_slice(&asm.wraps[from..]);
+            asm.published_sig = sig;
+            asm.published_cut = cut;
+        } else {
+            // Same prefix, same trim: drop last frame's tail rows, keep the
+            // prefix Strings as-is (no O(total) re-publish on a scroll frame).
+            rows.truncate(kept_prefix);
+            gutters.truncate(kept_prefix);
+            wrapsv.truncate(kept_prefix);
+        }
+        // Append the fresh tail (skipping any rows the trim reached into). The
+        // per-row soft-wrap flags stay in lockstep so a drag-copy can rejoin a
+        // wrapped logical line; any length skew fails open (a missing flag ⇒ a
+        // real line break).
+        let tail_skip = cut.saturating_sub(prefix_len);
+        for (l, wr) in tail_lines.iter().zip(tail_wraps.iter()).skip(tail_skip) {
             let (logical, gutter) = logical_row_and_gutter(l);
             rows.push(logical);
             gutters.push(gutter);
+            wrapsv.push(*wr);
         }
-        // Publish the per-row soft-wrap flags so a drag-copy can rejoin a wrapped
-        // logical line (no mid-line breaks). In lockstep with `rows`; any length
-        // skew fails open (a missing flag ⇒ a real line break).
-        *app.transcript_row_wraps.borrow_mut() = folded_wraps;
     }
+    // When the scroll-hint title is shown it steals the top row, so content
+    // actually begins at `area.top + 1` with one row less height; publish that
+    // adjusted rect so a click lands on the right content row.
     let content_top = if title_shown {
         area.y.saturating_add(1)
     } else {
@@ -4631,10 +4812,32 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         .set((area.x, content_top, area.width, content_height));
     app.transcript_first_visible.set(scroll_rows);
 
-    // Re-style the selected span(s) with the selection background. Only the rows
-    // inside the normalized selection range are rebuilt; everything else paints
-    // unchanged. Fail-open: a mapping error on any row just leaves that row
-    // un-highlighted (never a panic).
+    // ── R7: materialize ONLY the visible window ──
+    // The old path handed the WHOLE folded transcript to `Paragraph` with a row
+    // scroll — ratatui still walks (and grapheme-segments) every scrolled-past
+    // line, so a bottom-pinned or scrolled frame cost O(total history). Slicing
+    // the exact viewport rows out of the cached prefix + fresh tail and painting
+    // them with no scroll offset produces the identical cells at O(viewport).
+    // Rows are cloned (≤ one screen) because the highlight passes below restyle
+    // them in place — the cached prefix itself is never mutated.
+    let win_start = scroll_rows;
+    let win_end = (win_start + viewport).min(total);
+    let mut visible: Vec<Line<'static>> = Vec::with_capacity(win_end.saturating_sub(win_start));
+    for i in win_start..win_end {
+        let v = i + cut; // virtual (pre-trim) row index
+        visible.push(if v < prefix_len {
+            asm.lines[v].clone()
+        } else {
+            tail_lines[v - prefix_len].clone()
+        });
+    }
+
+    // Re-style the selected span(s) with the selection background. Only the
+    // visible rows inside the normalized selection range are rebuilt; everything
+    // else paints unchanged (off-screen selected rows have nothing to paint —
+    // the copy path reads `transcript_rows`, not the painted lines). Fail-open:
+    // a mapping error on any row just leaves that row un-highlighted (never a
+    // panic).
     if let Some(sel) = app.selection {
         if !sel.is_empty() {
             // Re-base a LOCAL copy of the selection onto this frame's window (a
@@ -4646,28 +4849,34 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 let mut sel = sel;
                 sel.anchor.0 = a.unwrap_or(0);
                 sel.cursor.0 = c.unwrap_or(0);
-                apply_selection_highlight(&mut folded, &sel, &app.transcript_gutters.borrow());
+                apply_selection_highlight(
+                    &mut visible,
+                    &sel,
+                    &app.transcript_gutters.borrow(),
+                    win_start,
+                );
             }
         }
     }
 
-    // Feature B — paint the in-transcript search matches over the same folded
+    // Feature B — paint the in-transcript search matches over the same visible
     // rows. The matches were computed against `transcript_rows` (their indices
-    // ARE these visual-row coords), so the spans land exactly where the text is —
+    // ARE these content-row coords), so the spans land exactly where the text is —
     // re-based by the `cut` delta so a marathon-session front-trim can't offset them.
     if let Some(search) = &app.search {
         if !search.matches.is_empty() {
             apply_search_highlight(
-                &mut folded,
+                &mut visible,
                 search,
                 &app.transcript_gutters.borrow(),
                 prev_cut,
                 cut,
+                win_start,
             );
         }
     }
 
-    let para = Paragraph::new(folded).scroll((scroll, 0));
+    let para = Paragraph::new(visible);
 
     // Two-way scroll indicator: how many rows are hidden ABOVE the current view
     // and BELOW it, so the user always knows there's more in either direction
@@ -5350,27 +5559,51 @@ fn is_gutter_glyph(c: char) -> bool {
 }
 
 /// Paint the in-app text-selection highlight onto the already-folded transcript
-/// rows. `folded` is the exact `Vec<Line>` about to be rendered (its index is
-/// the content-row coordinate); `sel` is the live selection. Only the rows in
-/// the normalized range are rebuilt — a single-row selection highlights
-/// `[anchor.col, cursor.col)`, a multi-row one highlights the first row from
-/// `anchor.col` to its end, every middle row fully, and the last row up to
-/// `cursor.col`. Fail-open: an out-of-range row index is skipped, never a panic.
+/// rows. `folded` is the exact `Vec<Line>` about to be rendered, whose first
+/// row sits at content-row coordinate `win_start` (`0` when the whole
+/// transcript is passed); `sel` is the live selection in content-row
+/// coordinates. Only the visible rows in the normalized range are rebuilt — a
+/// single-row selection highlights `[anchor.col, cursor.col)`, a multi-row one
+/// highlights the first row from `anchor.col` to its end, every middle row
+/// fully, and the last row up to `cursor.col`. A selection edge that lies
+/// outside the window clips to a full-row edge inside it (its rows are painted
+/// as middle rows). Fail-open: an out-of-range row index is skipped, never a
+/// panic.
 ///
-/// `gutters[i]` is the leading-gutter width stripped from cached row `i` (see
-/// [`logical_row_and_gutter`]); the selection columns are in LOGICAL coordinates,
-/// so each is shifted right by the row's gutter to index the decorated line.
+/// `gutters[i]` is the leading-gutter width stripped from cached row `i` in
+/// CONTENT coordinates (see [`logical_row_and_gutter`]); the selection columns
+/// are in LOGICAL coordinates, so each is shifted right by the row's gutter to
+/// index the decorated line.
 fn apply_selection_highlight(
     folded: &mut [Line<'static>],
     sel: &crate::selection::Selection,
     gutters: &[usize],
+    win_start: usize,
 ) {
     let g = |row: usize| gutters.get(row).copied().unwrap_or(0);
     let shift = |row: usize, col: usize| col.saturating_add(g(row));
     let ((sr, sc), (er, ec)) = sel.normalized();
     let sc = shift(sr, sc);
     let ec = shift(er, ec);
-    apply_selection_highlight_cols(folded, sr, sc, er, ec);
+    // Clip the content-row span to the visible window: entirely outside → no-op;
+    // an edge row scrolled off the top/bottom becomes a full-row edge at the
+    // window boundary (exactly what the old whole-transcript paint produced for
+    // the rows that are actually on screen).
+    let win_end = win_start.saturating_add(folded.len()); // exclusive
+    if folded.is_empty() || er < win_start || sr >= win_end {
+        return;
+    }
+    let (vsr, vsc) = if sr < win_start {
+        (0, 0)
+    } else {
+        (sr - win_start, sc)
+    };
+    let (ver, vec) = if er >= win_end {
+        (folded.len() - 1, usize::MAX)
+    } else {
+        (er - win_start, ec)
+    };
+    apply_selection_highlight_cols(folded, vsr, vsc, ver, vec);
 }
 
 /// The column-space-agnostic core of [`apply_selection_highlight`]: highlights
@@ -5421,13 +5654,17 @@ fn highlight_row(line: &Line<'static>, from: usize, to: usize) -> Line<'static> 
 /// rows, mirroring [`apply_selection_highlight`]: each match's logical char span
 /// is shifted right by its row's gutter width and washed — the FOCUSED match
 /// (`search.current`) with [`theme::MATCH_CUR_BG`], every other match with
-/// [`theme::SELECTION_BG`]. Fail-open: an out-of-range row index is skipped.
+/// [`theme::SELECTION_BG`]. `folded`'s first row sits at content-row coordinate
+/// `win_start` (`0` when the whole transcript is passed); a match outside the
+/// visible window is skipped — it has no cell to paint. Fail-open: an
+/// out-of-range row index is skipped.
 fn apply_search_highlight(
     folded: &mut [Line<'static>],
     search: &crate::app::SearchState,
     gutters: &[usize],
     prev_cut: usize,
     cut: usize,
+    win_start: usize,
 ) {
     let other_bg = theme::SELECTION_BG();
     let cur_bg = theme::MATCH_CUR_BG();
@@ -5435,6 +5672,10 @@ fn apply_search_highlight(
         // Re-base the stored match row onto this frame's trimmed window; a match
         // that scrolled off the top is skipped (a no-op when `cut == prev_cut`).
         let Some(row_idx) = rebase_content_row(m.row, prev_cut, cut) else {
+            continue;
+        };
+        // Map into the visible window; an off-screen match paints nothing.
+        let Some(local) = row_idx.checked_sub(win_start) else {
             continue;
         };
         let shift = gutters.get(row_idx).copied().unwrap_or(0);
@@ -5445,7 +5686,7 @@ fn apply_search_highlight(
         } else {
             other_bg
         };
-        if let Some(row) = folded.get_mut(row_idx) {
+        if let Some(row) = folded.get_mut(local) {
             *row = highlight_row_bg(row, from, to, bg);
         }
     }
@@ -8735,7 +8976,7 @@ mod tests {
             anchor: (0, 6),
             cursor: (2, 4),
         };
-        apply_selection_highlight(&mut folded, &sel, &[]);
+        apply_selection_highlight(&mut folded, &sel, &[], 0);
         // Row 0: chars [6,end) highlighted ("line").
         assert_eq!(
             selected_mask(&folded[0]),
@@ -8760,7 +9001,7 @@ mod tests {
             anchor: (0, 0),
             cursor: (0, 3),
         };
-        apply_selection_highlight(&mut folded, &sel, &[2]);
+        apply_selection_highlight(&mut folded, &sel, &[2], 0);
         assert_eq!(
             selected_mask(&folded[0]),
             vec![false, false, true, true, true, false, false],
@@ -8806,7 +9047,7 @@ mod tests {
             // checks); the focused one would use the brighter MATCH_CUR_BG.
             current: 1,
         };
-        apply_search_highlight(&mut folded, &search, &[], 0, 5);
+        apply_search_highlight(&mut folded, &search, &[], 0, 5, 0);
         assert!(
             selected_mask(&folded[2]).iter().all(|&b| b),
             "the match repaints the re-based row 2 (7 - 5), not the stale row 7"
@@ -9458,6 +9699,358 @@ mod tests {
             &mk(ToolStatus::Aborted),
             0
         ));
+    }
+
+    /// Perf micro-benchmark for the reported VS Code wheel-scroll lag: builds a
+    /// multi-thousand-visual-row transcript and times 100 scrolled repaints (the
+    /// per-wheel-tick cost a burst of wheel events multiplies). Not a correctness
+    /// gate — no time assertion; run manually with
+    /// `cargo test -p umadev-tui --release bench_scrolled_transcript -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual perf benchmark; run with --release --ignored --nocapture"]
+    fn bench_scrolled_transcript_100_frames() {
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        for i in 0..250 {
+            let (role, body) = if i % 2 == 0 {
+                (
+                    ChatRole::You,
+                    format!("question {i}: keep the transcript smooth with a long history"),
+                )
+            } else {
+                let mut b = format!("# Answer {i}\n\n");
+                for j in 0..18 {
+                    b.push_str(&format!(
+                        "line {j}: some **markdown** prose with `inline code` and a long \
+                         tail that wraps at narrow widths to exercise the folding path \
+                         中文内容也要覆盖到，避免只测 ASCII 宽度。\n"
+                    ));
+                }
+                (ChatRole::Host, b)
+            };
+            push_msg(&mut app, role, &body);
+        }
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap(); // warm the fold caches
+        let max = app.transcript_max_scroll.get();
+        assert!(
+            max > 3000,
+            "expected a multi-thousand-row scrollback, got {max}"
+        );
+        let start = std::time::Instant::now();
+        for i in 0..100usize {
+            // Emulate wheel scrolling: 3 rows per frame, wandering through history.
+            app.transcript_scroll.set((i * 3) % max);
+            terminal.draw(|f| render(f, &app)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bench: 100 scrolled frames over {max}+ rows took {elapsed:?} ({:?}/frame)",
+            elapsed / 100
+        );
+    }
+
+    // --- R7 whole-transcript assembly cache ---------------------------------
+
+    /// Render into a sized terminal and return the full styled buffer.
+    fn render_buffer(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// A chat app with `n` alternating user/host messages (multi-line, with
+    /// markdown + CJK so the fold path is exercised).
+    fn chat_app_with_history(n: usize) -> App {
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        for i in 0..n {
+            let (role, body) = if i % 2 == 0 {
+                (ChatRole::You, format!("question {i} line one\nline two"))
+            } else {
+                (
+                    ChatRole::Host,
+                    format!("answer {i} with **bold** `code` and 一段中文正文 that wraps"),
+                )
+            };
+            push_msg(&mut app, role, &body);
+        }
+        app
+    }
+
+    /// The core equivalence the O(viewport) paint rests on: slicing the exact
+    /// visible rows out of the pre-folded list and painting them with NO scroll
+    /// offset produces byte-for-byte the same cells as handing `Paragraph` the
+    /// whole list with a row scroll (the old O(total) path).
+    #[test]
+    fn viewport_slice_paints_identically_to_paragraph_row_scroll() {
+        let lines: Vec<Line<'static>> = (0..300)
+            .map(|i| Line::from(format!("row {i} — content 中文宽字符 tail")))
+            .collect();
+        let (w, h) = (48u16, 24u16);
+        for k in [0usize, 3, 120, 276] {
+            let mut t1 = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let all = lines.clone();
+            t1.draw(|f| {
+                f.render_widget(
+                    Paragraph::new(all).scroll((u16::try_from(k).unwrap(), 0)),
+                    f.area(),
+                );
+            })
+            .unwrap();
+            let mut t2 = Terminal::new(TestBackend::new(w, h)).unwrap();
+            let slice: Vec<Line<'static>> =
+                lines.iter().skip(k).take(usize::from(h)).cloned().collect();
+            t2.draw(|f| f.render_widget(Paragraph::new(slice), f.area()))
+                .unwrap();
+            assert_eq!(
+                t1.backend().buffer(),
+                t2.backend().buffer(),
+                "slice paint must equal paragraph scroll at offset {k}"
+            );
+        }
+    }
+
+    /// A signature-HIT frame (the pure-scroll fast path) paints byte-for-byte
+    /// what a full REBUILD frame paints, at every scroll position — the cache
+    /// can only skip work, never change a cell.
+    #[test]
+    fn cached_scroll_frame_paints_identically_to_a_rebuild() {
+        let app = {
+            let a = chat_app_with_history(40);
+            // Prime: first frame builds the assembly cache (and settles the
+            // scroll-anchor baselines).
+            let _ = render_buffer(&a, 80, 20);
+            a
+        };
+        let max = app.transcript_max_scroll.get();
+        assert!(max > 10, "history must overflow the viewport, got {max}");
+        for off in [0usize, 1, max / 2, max] {
+            app.transcript_scroll.set(off);
+            // Signature-hit frame: assembled prefix reused, viewport sliced.
+            let hit = render_buffer(&app, 80, 20);
+            let sig = app.transcript_cache.borrow().signature();
+            assert_ne!(sig, 0, "the assembly cache must be built");
+            // Force a full rebuild of the SAME state, then paint again.
+            app.transcript_cache.replace(super::TranscriptCache::new());
+            let rebuilt = render_buffer(&app, 80, 20);
+            assert_eq!(
+                app.transcript_cache.borrow().signature(),
+                sig,
+                "the rebuild must land on the same signature"
+            );
+            assert_eq!(
+                hit, rebuilt,
+                "cache-hit and rebuild frames must paint identically at offset {off}"
+            );
+        }
+    }
+
+    /// Invalidation: a width change, an APPEND, the verbose reveal, and a
+    /// per-message fold toggle each flip the assembly signature (a stale prefix
+    /// can never survive an input that changes its bytes).
+    #[test]
+    fn assembly_cache_invalidates_on_width_append_verbose_and_fold_toggle() {
+        let mut app = chat_app_with_history(12);
+        let _ = render_buffer(&app, 100, 30);
+        let sig_w100 = app.transcript_cache.borrow().signature();
+        let rows_w100 = app.transcript_cache.borrow().prefix_rows();
+        assert_ne!(sig_w100, 0);
+        assert!(rows_w100 > 0);
+        // Width change → new signature + a re-folded prefix.
+        let _ = render_buffer(&app, 90, 30);
+        let sig_w90 = app.transcript_cache.borrow().signature();
+        assert_ne!(sig_w90, sig_w100, "width is part of the signature");
+        // Append → new signature, and the new message is painted.
+        push_msg(&mut app, ChatRole::Host, "freshly appended reply");
+        let buf = render_buffer(&app, 90, 30);
+        let sig_appended = app.transcript_cache.borrow().signature();
+        assert_ne!(sig_appended, sig_w90, "an append re-signs the prefix");
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("freshly appended reply"),
+            "the appended message must paint on the next frame"
+        );
+        // Global verbose reveal → new signature.
+        app.verbose = !app.verbose;
+        let _ = render_buffer(&app, 90, 30);
+        let sig_verbose = app.transcript_cache.borrow().signature();
+        assert_ne!(
+            sig_verbose, sig_appended,
+            "verbose is part of the signature"
+        );
+        // A per-message collapse toggle → new signature.
+        app.history[0].collapsed = !app.history[0].collapsed;
+        let _ = render_buffer(&app, 90, 30);
+        assert_ne!(
+            app.transcript_cache.borrow().signature(),
+            sig_verbose,
+            "a fold toggle re-signs the prefix"
+        );
+    }
+
+    /// A pure-scroll frame reuses the published selection-layer rows verbatim
+    /// (no O(total) String re-publish per wheel tick), while an append still
+    /// extends them — the drag-copy layer always sees the current transcript.
+    #[test]
+    fn scroll_frame_reuses_published_rows_and_append_extends_them() {
+        let mut app = chat_app_with_history(30);
+        let _ = render_buffer(&app, 80, 20);
+        let sig1 = app.transcript_cache.borrow().signature();
+        let rows1 = app.transcript_rows.borrow().clone();
+        let wraps1 = app.transcript_row_wraps.borrow().clone();
+        assert!(!rows1.is_empty());
+        // Scroll-only frame: same signature, identical published rows.
+        app.transcript_scroll.set(7);
+        let _ = render_buffer(&app, 80, 20);
+        assert_eq!(
+            app.transcript_cache.borrow().signature(),
+            sig1,
+            "a pure scroll must not re-sign the prefix"
+        );
+        assert_eq!(
+            *app.transcript_rows.borrow(),
+            rows1,
+            "a pure scroll must not change the published rows"
+        );
+        assert_eq!(
+            *app.transcript_row_wraps.borrow(),
+            wraps1,
+            "a pure scroll must not change the published wrap flags"
+        );
+        // Append: the published rows grow and carry the new text at the end.
+        push_msg(&mut app, ChatRole::You, "one more appended question");
+        let _ = render_buffer(&app, 80, 20);
+        let rows2 = app.transcript_rows.borrow();
+        assert!(rows2.len() > rows1.len(), "an append must extend the rows");
+        assert!(
+            rows2
+                .iter()
+                .rev()
+                .take(4)
+                .any(|r| r.contains("one more appended question")),
+            "the appended text must be published for the selection layer"
+        );
+    }
+
+    /// The live streaming tail stays VOLATILE: its growth repaints every frame
+    /// even though the settled prefix signature is untouched (the cache must
+    /// never serve a stale tail).
+    #[test]
+    fn live_stream_tail_repaints_while_the_prefix_stays_cached() {
+        let mut app = chat_app_with_history(10);
+        push_msg(&mut app, ChatRole::Host, "partial reply");
+        app.stream_text_active = true; // last Host text msg = the live tail
+        let _ = render_buffer(&app, 90, 24);
+        let sig = app.transcript_cache.borrow().signature();
+        // The tail grows in place — the prefix signature must NOT change, yet
+        // the new text must paint on the very next frame.
+        if let MessageBody::Text(s) = &mut app.history.back_mut().unwrap().kind {
+            s.push_str(" grew longer");
+        }
+        let buf = render_buffer(&app, 90, 24);
+        assert_eq!(
+            app.transcript_cache.borrow().signature(),
+            sig,
+            "the live tail is outside the cached prefix"
+        );
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains("grew longer"),
+            "the streamed growth must paint immediately: {text}"
+        );
+    }
+
+    /// The two-way scroll indicator (`↑ N · ↓ M`) publishes the same numbers
+    /// through the cached path — the rows-above/rows-below math is untouched.
+    #[test]
+    fn scroll_indicator_math_is_unchanged_by_the_cache() {
+        let app = chat_app_with_history(60);
+        let _ = render_buffer(&app, 80, 20); // prime (also settles anchors)
+        let max = app.transcript_max_scroll.get();
+        assert!(max > 9, "need an overflowing transcript, got {max}");
+        app.transcript_scroll.set(9);
+        let buf = render_buffer(&app, 80, 20);
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        let above = max - 9;
+        assert!(
+            text.contains(&format!("↑ {above} · ↓ 9")),
+            "indicator must show {above} above / 9 below: {text}"
+        );
+        // Back at the bottom the both-ways hint is gone (only the above-count
+        // variant remains — its exact phrasing is per-language, so assert on
+        // the count + the absence of the below arm).
+        app.transcript_scroll.set(0);
+        let buf = render_buffer(&app, 80, 20);
+        let text: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            text.contains(&max.to_string()) && !text.contains("· ↓"),
+            "pinned to bottom shows only the above count: {text}"
+        );
+    }
+
+    /// A selection that spans PAST the visible window highlights the on-screen
+    /// rows as full middle rows (the windowed clip), and one entirely off-screen
+    /// paints nothing — never a panic, never a wrong row.
+    #[test]
+    fn windowed_selection_highlight_clips_to_the_visible_rows() {
+        let mk = || {
+            vec![
+                Line::from("row zero"),
+                Line::from("row one"),
+                Line::from("row two"),
+            ]
+        };
+        let sel_bg = theme::SELECTION_BG();
+        let has_bg = |line: &Line<'_>| line.spans.iter().any(|s| s.style.bg == Some(sel_bg));
+        // Selection rows 2..=20 over a window showing content rows 5..8: every
+        // visible row is a full middle row → all highlighted.
+        let mut win = mk();
+        let sel = crate::selection::Selection {
+            anchor: (2, 1),
+            cursor: (20, 3),
+        };
+        apply_selection_highlight(&mut win, &sel, &[], 5);
+        assert!(
+            win.iter().all(has_bg),
+            "rows inside a selection spanning past the window are fully washed"
+        );
+        // The same selection against a window ABOVE it paints nothing.
+        let mut before = mk();
+        apply_selection_highlight(&mut before, &sel, &[], 0);
+        assert!(
+            !before.iter().take(2).any(has_bg),
+            "rows before the selection start stay unwashed"
+        );
+        // A selection wholly below the window is a no-op.
+        let mut after = mk();
+        let far = crate::selection::Selection {
+            anchor: (100, 0),
+            cursor: (120, 2),
+        };
+        apply_selection_highlight(&mut after, &far, &[], 5);
+        assert!(
+            !after.iter().any(has_bg),
+            "an off-screen selection paints nothing"
+        );
     }
 
     #[test]

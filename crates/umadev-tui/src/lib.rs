@@ -6249,6 +6249,33 @@ fn frame_budget_allows_draw(
     force_full_repaint || draw_now || (needs_redraw && since_last_draw >= budget)
 }
 
+/// Whether an input event may COALESCE onto the budgeted redraw cadence
+/// (`needs_redraw`) instead of forcing an immediate frame (`draw_now`).
+///
+/// High-frequency mouse motion — the wheel (VS Code's terminal emits a dense
+/// burst of `ScrollUp`/`ScrollDown` per flick) and button-held drag — only
+/// moves scroll/selection state, so painting once per [`FRAME_MIN`] shows the
+/// exact same final frame; letting each event bypass the budget made a wheel
+/// burst pay one full transcript paint PER EVENT (the reported "scrolling is
+/// extremely laggy" in the VS Code terminal). Everything else — keys, paste,
+/// resize, focus, clicks/releases — stays immediate so typing latency is
+/// untouched. A trailing coalesced event still paints within one budget via
+/// the frame-deadline `select!` arm.
+fn input_event_coalesces(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::Mouse(me) if matches!(
+            me.kind,
+            MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+                | MouseEventKind::Drag(_)
+                | MouseEventKind::Moved
+        )
+    )
+}
+
 /// How many CONSECUTIVE legacy-input errors park the input arm. A single
 /// transient `Some(Err(_))` from `crossterm::EventStream` (the Windows default)
 /// must NOT disable the keyboard — only a sustained run of errors (a genuinely
@@ -7093,10 +7120,20 @@ async fn event_loop(
                 }
             }
             maybe_key = input.next(), if !input_closed => {
-                // R3 — input (key / mouse / paste / resize) is latency-sensitive:
+                // R3 — input (key / paste / resize / click) is latency-sensitive:
                 // draw the next frame immediately rather than waiting on the
-                // streaming budget, so keystrokes and scrolling never feel laggy.
-                draw_now = true;
+                // streaming budget, so keystrokes never feel laggy. High-frequency
+                // mouse motion (wheel notches, held-button drags) instead COALESCES
+                // onto the ~16ms budget: a VS Code-style burst of wheel events
+                // applies every scroll delta but pays at most one paint per budget
+                // (each event bypassing the budget was the reported scroll lag);
+                // the frame-deadline arm below flushes the final state within one
+                // budget, so the scroll still feels live.
+                if matches!(&maybe_key, Some(Ok(ev)) if input_event_coalesces(ev)) {
+                    needs_redraw = true;
+                } else {
+                    draw_now = true;
+                }
                 // Legacy path: a `None` (stdin EOF) or a SUSTAINED run of `Err`
                 // means the stream is dead — park this arm so we don't busy-spin
                 // re-polling a closed FD (the owned reader never returns `None`, so
@@ -8770,6 +8807,95 @@ mod tests {
             Duration::from_millis(0),
             FRAME_MIN,
         ));
+    }
+
+    /// One raw mouse event of the given kind at (0, 0) with no modifiers.
+    fn mouse_ev(kind: MouseEventKind) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// Scroll-lag fix — high-frequency mouse motion (wheel notches, held-button
+    /// drags) COALESCES onto the budgeted cadence; keys, paste, resize and
+    /// clicks stay immediate so typing latency is untouched.
+    #[test]
+    fn wheel_and_drag_coalesce_keys_and_clicks_stay_immediate() {
+        // Coalesced: the burst-prone motion events.
+        assert!(input_event_coalesces(&mouse_ev(MouseEventKind::ScrollUp)));
+        assert!(input_event_coalesces(&mouse_ev(MouseEventKind::ScrollDown)));
+        assert!(input_event_coalesces(&mouse_ev(MouseEventKind::ScrollLeft)));
+        assert!(input_event_coalesces(&mouse_ev(
+            MouseEventKind::ScrollRight
+        )));
+        assert!(input_event_coalesces(&mouse_ev(MouseEventKind::Drag(
+            MouseButton::Left
+        ))));
+        assert!(input_event_coalesces(&mouse_ev(MouseEventKind::Moved)));
+        // Immediate: discrete gestures + everything typed.
+        assert!(!input_event_coalesces(&mouse_ev(MouseEventKind::Down(
+            MouseButton::Left
+        ))));
+        assert!(!input_event_coalesces(&mouse_ev(MouseEventKind::Up(
+            MouseButton::Left
+        ))));
+        assert!(!input_event_coalesces(&Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        ))));
+        assert!(!input_event_coalesces(&Event::Paste("hello".into())));
+        assert!(!input_event_coalesces(&Event::Resize(80, 24)));
+        assert!(!input_event_coalesces(&Event::FocusGained));
+    }
+
+    /// Scroll-lag fix — a VS Code-style burst of wheel events inside one frame
+    /// budget yields exactly ONE draw decision (the budget gate), where the same
+    /// burst of KEY events would draw every time. Models the event-loop wiring:
+    /// a coalesced event sets `needs_redraw`, an immediate one sets `draw_now`,
+    /// and `frame_budget_allows_draw` gates the paint.
+    #[test]
+    fn a_wheel_burst_within_one_budget_draws_once() {
+        let count_draws = |ev: &Event| -> usize {
+            let mut draws = 0usize;
+            // Last paint just happened; 20 events land 0.5ms apart (the whole
+            // burst fits inside one 16ms budget).
+            let mut since_last_draw = Duration::ZERO;
+            let mut needs_redraw = false;
+            for _ in 0..20 {
+                let draw_now = !input_event_coalesces(ev);
+                if !draw_now {
+                    needs_redraw = true;
+                }
+                if frame_budget_allows_draw(
+                    false,
+                    draw_now,
+                    needs_redraw,
+                    since_last_draw,
+                    FRAME_MIN,
+                ) {
+                    draws += 1;
+                    since_last_draw = Duration::ZERO;
+                    needs_redraw = false;
+                } else {
+                    since_last_draw += Duration::from_micros(500);
+                }
+            }
+            // The frame-deadline arm flushes any still-pending redraw once the
+            // budget elapses.
+            if frame_budget_allows_draw(false, false, needs_redraw, FRAME_MIN, FRAME_MIN) {
+                draws += 1;
+            }
+            draws
+        };
+        let wheel = mouse_ev(MouseEventKind::ScrollUp);
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        // 20 wheel notches inside one budget → all deltas applied, ONE paint
+        // (the deadline flush). 20 keys → 20 immediate paints (latency wins).
+        assert_eq!(count_draws(&wheel), 1, "a wheel burst must coalesce");
+        assert_eq!(count_draws(&key), 20, "keys must never be coalesced");
     }
 
     // --- M1: cancel-drain absolute-deadline bound ---------------------------

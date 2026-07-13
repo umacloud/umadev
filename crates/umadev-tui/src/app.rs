@@ -2618,6 +2618,19 @@ pub struct App {
     /// [`crate::ui::MsgFoldCache`].
     pub(crate) msg_fold_cache: std::cell::RefCell<crate::ui::MsgFoldCache>,
 
+    /// **R7 — whole-transcript assembly cache.** One level above
+    /// [`Self::msg_fold_cache`]: the fully ASSEMBLED folded rows of the settled
+    /// message prefix (welcome banner + gaps + messages, in order) plus the
+    /// derived selection-layer text, validated by a single signature over every
+    /// render input. A frame whose signature matches — every scroll frame on a
+    /// settled chat — skips the per-message walk, the cache-hit row clones, and
+    /// the O(total) selection-text re-publish; the paint then materializes only
+    /// the visible window, so a wheel tick costs O(viewport) instead of
+    /// O(history) (the reported VS Code scroll lag). Fully fail-open: a borrow
+    /// conflict rebuilds fresh, byte-for-byte identical to the uncached path.
+    /// See [`crate::ui::TranscriptCache`].
+    pub(crate) transcript_cache: std::cell::RefCell<crate::ui::TranscriptCache>,
+
     /// Wall-clock of the LAST sign of life from the base — any worker stream
     /// event, host output line, or progress note. Drives the honest "stall"
     /// signal: when a phase is running but nothing has arrived for >3s (and no
@@ -2898,6 +2911,7 @@ impl App {
             stream_text_active: false,
             stream_md_cache: std::cell::RefCell::new(crate::ui::StreamMarkdownCache::default()),
             msg_fold_cache: std::cell::RefCell::new(crate::ui::MsgFoldCache::new()),
+            transcript_cache: std::cell::RefCell::new(crate::ui::TranscriptCache::new()),
             last_output_at: None,
             tool_in_progress: false,
             long_op_in_progress: false,
