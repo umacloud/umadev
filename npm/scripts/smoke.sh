@@ -233,7 +233,39 @@ if [[ "$UPD_OUT" == *"npm-called: install"* ]]; then
 fi
 echo "✓ smoke.sh: an already-latest install short-circuits"
 
-# ── 6. The exact reported split: package.json is current but the optional
+# ── 6. npm may nest replacement optional dependencies under the main package
+# during a global upgrade. That matching copy must win over a stale hoisted one.
+NESTED_ROOT="$UPD_TMP/nested/node_modules"
+make_install "$NESTED_ROOT"
+mkdir -p "$NESTED_ROOT/umadev/node_modules/@umacloud/cli-$PLATFORM/bin"
+cp "$NPM_ROOT/cli-$PLATFORM/package.json" \
+  "$NESTED_ROOT/umadev/node_modules/@umacloud/cli-$PLATFORM/"
+cp "$NPM_ROOT/cli-$PLATFORM/bin/umadev" \
+  "$NESTED_ROOT/umadev/node_modules/@umacloud/cli-$PLATFORM/bin/umadev"
+cat > "$NESTED_ROOT/@umacloud/cli-$PLATFORM/bin/umadev" <<STUB
+#!/bin/sh
+echo "umadev 0.0.1"
+STUB
+chmod +x "$NESTED_ROOT/@umacloud/cli-$PLATFORM/bin/umadev" \
+  "$NESTED_ROOT/umadev/node_modules/@umacloud/cli-$PLATFORM/bin/umadev"
+node -e '
+  const path = require("node:path");
+  const shim = require(process.argv[1]);
+  const pkgRoot = process.argv[2];
+  const resolved = shim.resolveInstalledBinary(pkgRoot);
+  const expected = path.join(pkgRoot, "node_modules");
+  if (!resolved || !resolved.startsWith(expected)) {
+    console.error(`nested platform package was not preferred: ${resolved}`);
+    process.exit(1);
+  }
+  if (!shim.versionStateMatches(shim.installedVersionState(pkgRoot), process.argv[3])) {
+    console.error("nested platform package did not form a consistent version state");
+    process.exit(1);
+  }
+' "$NPM_ROOT/umadev/bin/cli.js" "$NESTED_ROOT/umadev" "$INSTALLED_VERSION"
+echo "✓ smoke.sh: a nested replacement platform package is resolved first"
+
+# ── 7. The exact reported split: package.json is current but the optional
 # platform executable is stale. This MUST repair, never short-circuit on the
 # main package and never print success before executing the replacement binary.
 cat > "$UPD_TMP/node_modules/@umacloud/cli-$PLATFORM/bin/umadev" <<STUB
@@ -264,7 +296,7 @@ if [[ "$UPD_OUT" == *"Nothing to do"* ]] ||
 fi
 echo "✓ smoke.sh: a package/executable version split is detected and repaired"
 
-# ── 7. A ROOT-OWNED install (`sudo npm i -g`) must be REFUSED with the repair, not
+# ── 8. A ROOT-OWNED install (`sudo npm i -g`) must be REFUSED with the repair, not
 # handed to a package manager that dies with EACCES half-way through and aborts the
 # whole global transaction (taking the user's other global packages with it).
 #

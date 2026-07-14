@@ -60,8 +60,14 @@ function platformPackage() {
 function resolveInstalledBinary(pkgRoot = PACKAGE_ROOT) {
   const pkg = platformPackage();
   const bin = binaryName();
-  const installed = path.join(path.dirname(pkgRoot), ...pkg.split('/'), 'bin', bin);
-  if (fs.existsSync(installed)) return installed;
+  // npm can keep replacement optional dependencies nested under the main
+  // package during a global upgrade. Prefer that copy because it belongs to
+  // this exact main-package version; fresh installs are normally hoisted.
+  const nested = path.join(pkgRoot, 'node_modules', ...pkg.split('/'), 'bin', bin);
+  if (fs.existsSync(nested)) return nested;
+
+  const hoisted = path.join(path.dirname(pkgRoot), ...pkg.split('/'), 'bin', bin);
+  if (fs.existsSync(hoisted)) return hoisted;
 
   // Local dev — both packages live as siblings under npm/. Use the mapped
   // package name so win32-arm64 correctly reuses cli-win32-x64.
