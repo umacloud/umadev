@@ -12,11 +12,11 @@ export const i18n = {
   zh: {
     nav: { product: "产品首页", docs: "文档中心", gallery: "形象相册", changelog: "更新日志", contributors: "荣誉殿堂" },
     hero: {
-      badge: "v1.0.x · MIT 开源 · Rust 单二进制",
-      title1: "一句需求",
-      titleHi: "一支开发团队",
-      title2: "交付商业级应用",
-      sub: "产品经理、架构师、设计师、前端、后端、QA、安全、DevOps —— 八个专家角色像真实团队一样分工协作，借你已登录的 Claude Code / Codex / OpenCode 大脑，把一句需求做成能上线、能交付、能审计的商业级应用。独立开发者，也瞬间拥有一整支有工程纪律的团队。",
+      badge: "真实开发团队 Agent · MIT 开源 · Rust 单二进制",
+      title1: "一个 Agent",
+      titleHi: "一整支开发团队",
+      title2: "驱动你的底座干活",
+      sub: "UmaDev 不提供模型，也不替代 Claude Code / Codex / OpenCode。它把你已经登录的底座装进一套真实团队工作系统：产品、架构、设计、前后端、QA、安全和 DevOps 分工协作，先判断任务，再计划、执行、交叉评审、验收和交付。",
       cta1: "快速开始",
       cta2: "阅读文档",
       copy: "复制",
@@ -24,7 +24,7 @@ export const i18n = {
       stats: [
         ["8", "专家角色"],
         ["113", "治理规则"],
-        ["418", "知识库文档"],
+        ["5", "任务路径"],
         ["3", "本机底座"],
       ],
     },
@@ -168,9 +168,9 @@ export const i18n = {
       title: "治理、质量门、知识库——团队交付的底座",
       desc: "光有分工还不够商业级。团队的每一次交付，都带着规则、质量门和证据链——这是它和「让 AI 随手写一段」的根本区别。",
       blocks: [
-        { stat: "113", unit: "条治理规则", title: "治理", desc: "规范层 25 条 clause，实现层 113 条规则。四个入口：写入前 hook、CI 扫描、MCP server、质量门补扫。", bullets: ["不用 emoji 当图标 · 不写硬编码色", "不写密钥 · 危险命令 · 注入代码", "Rust unwrap · Go panic · Python bare except"] },
+        { stat: "113", unit: "条治理规则", title: "治理", desc: "规范层 34 条正式 clause，实现层 113 条内容检查。写入前 hook、CI、MCP server 与质量门共同兜底。", bullets: ["不用 emoji 当图标 · 不写硬编码色", "不写密钥 · 危险命令 · 注入代码", "覆盖 20 种语言的工程风险"] },
         { stat: "90", unit: "分默认通过线", title: "质量门", desc: "交付前验收，不只看文件在不在，而是逐项检查证据。", bullets: ["PRD 目标 / 范围 / 验收标准", "前端调用与后端契约是否一致", "构建 / 测试 / lint / typecheck 结果", "审计日志与合规映射"] },
-        { stat: "418", unit: "份知识文档", title: "知识库", desc: "给 AI 看的工程标准库，BM25 + 可选向量混合检索，RRF 融合排序。完整语料随二进制内置，首次运行自动解压到 ~/.umadev/knowledge，零配置下发到每个用户项目。", bullets: ["产品 · 架构 · 前后端 · 数据库", "安全 · 测试 · CI/CD · 运维", "可加入团队自有知识库"] },
+        { stat: "LOCAL", unit: "本地双通道知识", title: "知识与记忆", desc: "精选工程语料、项目事实、踩坑经验与 repo-map 一起进入当前任务上下文；BM25 与本地向量经 RRF 融合，向量不可用时自动降级。", bullets: ["语料数量持续增长，不写死为产品协议", "本地检索默认不上传项目语料", "可加入团队自有知识库"] },
       ],
       compliance: "合规映射",
       standards: ["SOC 2", "ISO 27001", "EU AI Act"],
@@ -196,7 +196,7 @@ export const i18n = {
     galleryPage: { title: "形象相册", sub: "UmaDev 的 IP 形象集 —— 点击任意一张放大查看。" },
     logPage: { title: "更新日志", sub: "UmaDev 各版本的新增、改进与安全更新。", current: "最新", more: "展开其余 {n} 项", less: "收起" },
     footer: {
-      blurb: "一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活，把一句需求做成能上线、可审计的商业级应用。",
+      blurb: "一个模拟真实开发团队工作的 Agent，驱动你已经在用的 Claude Code / Codex / OpenCode 干活，把需求变成能运行、可验证、可交付的真实项目。",
       cols: [
         { h: "产品", links: [{ t: "流水线设计" }, { t: "运行模式" }, { t: "治理规则" }, { t: "质量门" }, { t: "知识库" }] },
         { h: "文档", links: [{ t: "快速体验" }, { t: "命令大全" }, { t: "配置" }, { t: "Rust 架构" }, { t: "规范 SPEC" }] },
@@ -269,11 +269,11 @@ export const i18n = {
   en: {
     nav: { product: "Home", docs: "Docs", gallery: "Gallery", changelog: "Changelog", contributors: "Contributors" },
     hero: {
-      badge: "v1.0.x · MIT licensed · Single Rust binary",
+      badge: "REAL DEV TEAM AGENT · MIT LICENSED · SINGLE RUST BINARY",
       title1: "One coding agent",
       titleHi: "a whole dev team",
       title2: "ships products",
-      sub: "Product manager, architect, designer, frontend, backend, QA, security, DevOps — eight specialists collaborate like a real team, borrowing the Claude Code / Codex / OpenCode brain you already logged into, to turn one idea into a shippable, deliverable, auditable commercial-grade app. A solo dev gets a full, disciplined team in an instant.",
+      sub: "UmaDev provides no model and does not replace Claude Code, Codex, or OpenCode. It puts the backend you already logged into inside a real team system: product, architecture, design, frontend, backend, QA, security, and DevOps route, plan, build, cross-review, verify, and deliver together.",
       cta1: "Get started",
       cta2: "Read the docs",
       copy: "Copy",
@@ -281,7 +281,7 @@ export const i18n = {
       stats: [
         ["8", "Specialist roles"],
         ["113", "Governance rules"],
-        ["418", "Knowledge docs"],
+        ["5", "Task routes"],
         ["3", "Local backends"],
       ],
     },
@@ -425,9 +425,9 @@ export const i18n = {
       title: "Governance, quality gate, knowledge — the floor under the team's delivery",
       desc: "A division of labor alone isn't commercial-grade. Every delivery from the team ships with rules, a quality gate and an evidence chain — the difference between this and “let the AI knock something out.”",
       blocks: [
-        { stat: "113", unit: "governance rules", title: "Governance", desc: "25 spec clauses, 113 implementation rules. Four entry points: pre-write hook, CI scan, MCP server, quality-gate sweep.", bullets: ["No emoji icons · no hardcoded colors", "No secrets · dangerous commands · injection", "Rust unwrap · Go panic · Python bare except"] },
+        { stat: "113", unit: "governance rules", title: "Governance", desc: "34 spec clauses, 113 implementation rules. Four entry points: pre-write hook, CI scan, MCP server, quality-gate sweep.", bullets: ["No emoji icons · no hardcoded colors", "No secrets · dangerous commands · injection", "Rust unwrap · Go panic · Python bare except"] },
         { stat: "90", unit: "default pass score", title: "Quality gate", desc: "Pre-delivery acceptance — not just “does the file exist”, but evidence checked item by item.", bullets: ["PRD goals / scope / acceptance criteria", "Frontend calls match the backend contract", "Build / test / lint / typecheck results", "Audit logs and compliance mapping"] },
-        { stat: "418", unit: "knowledge docs", title: "Knowledge base", desc: "An engineering-standards library for the AI — hybrid BM25 + optional vector retrieval, RRF fused ranking. The full corpus is bundled into the binary and auto-extracted to ~/.umadev/knowledge on first run, so it reaches every user project with zero config.", bullets: ["Product · architecture · FE/BE · database", "Security · testing · CI/CD · ops", "Add your team’s own knowledge"] },
+        { stat: "LOCAL", unit: "dual-channel knowledge", title: "Knowledge & memory", desc: "Curated engineering standards, project facts, recalled pitfalls, and the repo map enter the current task context. BM25 and a local vector channel are RRF-fused and fail open when vectors are unavailable.", bullets: ["The corpus evolves; its file count is not a protocol", "Local retrieval does not upload project content by default", "Add your team's own knowledge"] },
       ],
       compliance: "Compliance mapping",
       standards: ["SOC 2", "ISO 27001", "EU AI Act"],
@@ -534,7 +534,7 @@ export const docs = {
           id: "quickstart",
           title: "快速开始",
           blocks: [
-            { p: "UmaDev 是一支本地运行的 AI 开发团队 Agent —— 八个专家角色由一个协调者调度。推荐用 npm 安装预编译二进制，npm 只是分发壳，真正运行的是 Rust 编译出的 umadev 二进制。" },
+            { p: "UmaDev 是一个模拟真实开发团队工作的本地 Agent。它不提供模型，而是驱动你已经登录的 Claude Code、Codex 或 OpenCode：先判断任务规模，再由协调者调度产品、架构、设计、前后端、QA、安全和 DevOps 八个角色完成计划、执行、评审、验证与交付。npm 只是预编译 Rust 二进制的分发壳。" },
             { c: "npm install -g umadev" },
             { p: "Linux 上不要用 sudo 装。npm 默认前缀 /usr/local 属主是 root，普通用户 npm i -g 会 EACCES；而 sudo npm i -g 会在前缀里留下 root 属主的目录树，之后你以普通用户执行的每一条 npm 全局命令（npm update -g、npm i -g 任何包）都会 EACCES 并整体回滚，连带你的底座 CLI（@anthropic-ai/claude-code、@openai/codex）也再也更新不动。请换一个你自己拥有的前缀：" },
             { c: "npm config set prefix ~/.npm-global\nexport PATH=\"$HOME/.npm-global/bin:$PATH\"   # 写进 ~/.zshrc 或 ~/.bashrc\nnpm install -g umadev" },
@@ -558,7 +558,7 @@ export const docs = {
           blocks: [
             { p: "在一个空项目里运行 umadev init 然后 umadev，输入：" },
             { c: "做一个课程预约小程序，用户可以查看课程、选择时间、预约、取消预约，管理员可以管理课程和预约记录。" },
-            { p: "UmaDev 会依次：理清需求 → 联网调研竞品 → 生成 PRD → 生成架构 → 生成 UI/UX → 拆执行计划 → 实现前端 → 暂停预览 → 实现后端 → 跑质量门 → 生成交付包。" },
+            { p: "底座会先把它判断为完整 Build。协调者随后创建可见依赖计划，按步召集角色：澄清与调研 → PRD / 架构 / UIUX → 文档确认 → 执行计划 → 前端预览确认 → 后端 → 质量与安全验证 → 交付证明。你可以在运行中继续追问，或用 /plan 调整后续步骤。" },
           ] satisfies DocBlock[],
         },
       ],
@@ -566,25 +566,30 @@ export const docs = {
     {
       cat: "核心概念",
       items: [
-        { id: "how", title: "UmaDev 如何工作", blocks: [{ p: "整体架构可以理解成四层：TUI/CLI 是你和 UmaDev 交流的地方；团队协调者决定现在哪个角色做哪个阶段、何时暂停继续；Runtime/底座把任务交给 Claude Code / Codex CLI / OpenCode 写真实代码；治理/质量/证据检查产物是否合规并打包交付。" }] satisfies DocBlock[] },
+        { id: "how", title: "UmaDev 如何工作", blocks: [{ p: "UmaDev 自己不持有模型端点。你输入任务后，它让当前底座在一个新的只读判断会话里选择 Chat、Explain、QuickEdit、Debug 或 Build。需要写代码时，协调者拥有计划并驱动主会话逐步完成；角色评审在独立只读分叉里给出结构化结论；确定性规则、测试与运行证据负责最后验收。" }] satisfies DocBlock[] },
+        { id: "team", title: "真实团队模型", blocks: [{ p: "八个专家角色分别负责产品、架构、UI/UX、前端、后端、QA、安全和 DevOps。主会话保持单写者，避免多个 Agent 同时改主干；评审角色使用新的只读会话交叉检查，所有角色只通过计划与团队黑板交接。" }] satisfies DocBlock[] },
+        { id: "routing", title: "任务按比例路由", blocks: [{ cmds: [["Chat", "普通对话，只带稳定身份与语言上下文"], ["Explain", "只读解释，加入有界代码上下文"], ["QuickEdit", "小范围修改，快速执行与验证"], ["Debug", "围绕错误、日志和相关文件定位修复"], ["Build", "创建可见计划，按需召集团队并生成交付证据"]] }] satisfies DocBlock[] },
+        { id: "plan", title: "可见计划与运行中转向", blocks: [{ p: "真实构建会生成 .umadev/plan.json。协调者按依赖逐步推进，界面实时显示进度；你在执行中提出的新要求会折入下一步。/plan 可查看计划，也可用 skip、veto、add、up、down 调整步骤。" }] satisfies DocBlock[] },
+        { id: "continuity", title: "会话、上下文与记忆", blocks: [{ p: "对话会持久化；/compact 压缩上下文、/resume 恢复会话、切换底座时，UmaDev 会携带对话摘要、当前计划、团队黑板、项目事实和运行状态。验证过的踩坑经验、项目事实与运行笔记会在后续任务中按需召回。" }] satisfies DocBlock[] },
         { id: "quality", title: "质量门是什么", blocks: [{ p: "质量门是交付前验收，不只是看文件是否存在，而是检查 PRD、架构、UI/UX、前后端契约、构建测试结果、密钥泄露风险、审计日志和合规映射。" }, { c: "[quality]\nthreshold = 90\nskip_checks = []" }] satisfies DocBlock[] },
-        { id: "knowledge", title: "知识库是什么", blocks: [{ p: "UmaDev 内置 416 份 markdown 知识文件，覆盖产品、架构、前后端、数据库、安全、测试、CI/CD、运维、移动端、行业和专家方法论。" }, { c: "umadev knowledge-manage add ./team-docs --name team-docs\numadev knowledge-manage search \"支付 webhook 幂等\"" }] satisfies DocBlock[] },
+        { id: "knowledge", title: "知识库是什么", blocks: [{ p: "UmaDev 内置持续演进的工程标准语料，并把它与 repo-map、项目事实和踩坑记忆一起按任务召回。默认检索是纯 Rust BM25 + 本地向量模型的双通道 RRF 融合，并用 HyDE 扩展查询；本地向量不可用时自动降级为 BM25。语料数量会持续增长，不作为产品协议。" }, { c: "umadev knowledge-manage add ./team-docs --name team-docs\numadev knowledge-manage search \"支付 webhook 幂等\"" }] satisfies DocBlock[] },
       ],
     },
     {
       cat: "配置与能力",
       items: [
         { id: "config", title: "配置文件", blocks: [{ p: "首次运行会写入 ~/.umadev/config.toml(语言 + 默认底座);项目级可用 .umadevrc 覆盖。质量门阈值与跳过项放在项目根配置里。" }, { c: "# ~/.umadev/config.toml\nbackend = \"claude-code\"\nlang = \"zh-CN\"" }] satisfies DocBlock[] },
-        { id: "env", title: "环境变量", blocks: [{ cmds: [["UMADEV_WORKER_TIMEOUT", "单次底座调用超时(秒)"], ["UMADEV_MODEL_BUILD", "前端 / 后端阶段用的模型(覆盖)"], ["UMADEV_MODEL_PLAN", "调研 / 文档 / 质量阶段用的模型(覆盖)"]] }] satisfies DocBlock[] },
+        { id: "env", title: "环境变量", blocks: [{ cmds: [["UMADEV_WORKER_TIMEOUT", "单次底座调用超时（秒）"], ["UMADEV_VERIFY_TIMEOUT_SECS", "验证步骤的全局超时"], ["UMADEV_THEME", "终端主题：dark 或 light"], ["UMADEV_NO_GOAL_MODE", "设为 1 关闭 /goal 持续目标模式"], ["UMADEV_CONTINUOUS", "设为 0 退出持续单会话路径"], ["UMADEV_ALLOW_CLOUD_EMBED", "仅在同时显式提供 OPENAI_EMBED_KEY 时允许远程嵌入；默认关闭"]] }] satisfies DocBlock[] },
         { id: "model-share", title: "底座与模型共享", blocks: [{ p: "UmaDev 不持有模型端点。它驱动你已登录的底座 CLI,自动读取并沿用底座当前配置的模型与推理强度——不强加任何 --model。底座用官方登录还是接了第三方 / 本地模型,跑的就是那个。" }] satisfies DocBlock[] },
         { id: "design", title: "不像 AI 生成的 UI", blocks: [{ p: "前端阶段强制使用 UIUX 文档声明的设计系统:图标库、设计 token、字体、组件骨架。一套反 AI-slop 设计法把命名禁令(默认 indigo、紫渐变、emoji 图标、虚构指标、模板骨架)做成硬规则;设计审查对照它,不符合就自动打回重做。" }] satisfies DocBlock[] },
       ],
     },
     {
-      cat: "流水线详解",
+      cat: "任务路由与完整构建",
       items: [
-        { id: "phases", title: "九个阶段", blocks: [{ p: "UmaDev 把「AI 写代码」拆成九个有序阶段,每个阶段产出真实文件,关键节点设人在环确认门。" }, { cmds: [["1 research", "联网调研竞品 / 领域规范 / 真实评价"], ["2 docs", "并发生成 PRD · 架构 · UI/UX 三份核心文档"], ["3 docs_confirm", "确认门:你确认文档方向后再继续"], ["4 spec", "拆执行计划与任务清单"], ["5 frontend", "驱动底座实现前端,带设计一致性审查"], ["6 preview_confirm", "确认门:预览前端后再继续"], ["7 backend", "实现后端,带前后端契约校验"], ["8 quality", "质量门:契约 / 安全 / 设计 / 构建测试"], ["9 delivery", "打包 proof pack 与成绩单"]] }] satisfies DocBlock[] },
-        { id: "gates", title: "确认门与人在环", blocks: [{ p: "两道确认门(docs_confirm、preview_confirm)让你在文档方向与前端预览两个关键点确认后再继续,而不是 AI 一口气跑完。门处可 /continue 通过,或 /revise 带反馈重做本阶段。" }] satisfies DocBlock[] },
+        { id: "phases", title: "完整构建主链", blocks: [{ p: "只有完整产品 Build 才展开这条最深路径；Chat、Explain、小修和 Debug 不会被强迫穿过整条流水线。需求澄清是进入主链前的微阶段，随后是九阶段主链，每一步都有明确负责人和产物。" }, { cmds: [["1 research", "联网调研竞品 / 领域规范 / 真实评价"], ["2 docs", "生成 PRD · 架构 · UI/UX 三份核心文档"], ["3 docs_confirm", "确认门：确认文档方向后再继续"], ["4 spec", "拆执行计划与任务清单"], ["5 frontend", "驱动底座实现前端，带设计一致性审查"], ["6 preview_confirm", "确认门：预览前端后再继续"], ["7 backend", "实现后端，带前后端契约校验"], ["8 quality", "质量门：契约 / 安全 / 设计 / 构建测试"], ["9 delivery", "打包 proof pack、成绩单与评审报告"]] }] satisfies DocBlock[] },
+        { id: "gates", title: "确认门与人在环", blocks: [{ p: "guarded 模式下，docs_confirm 与 preview_confirm 会真正暂停，分别等待你确认文档方向和前端预览；/continue 通过，/revise 带反馈重做。auto 模式可以自动继续，但推送、PR、部署等不可逆外部动作仍然确认。" }] satisfies DocBlock[] },
+        { id: "trust", title: "信任梯度", blocks: [{ cmds: [["plan", "只读规划与解释，不进入写入执行"], ["guarded", "默认模式，可逆工作自动推进，关键动作确认"], ["auto", "自动推进可逆工作；不可逆外部动作仍确认"]] }] satisfies DocBlock[] },
         { id: "revise", title: "重做、修订与回滚", blocks: [{ cmds: [["/revise <反馈>", "带具体反馈重做当前阶段"], ["/continue", "通过当前确认门进入下一阶段"], ["umadev rollback", "回滚到某阶段的文件快照重来"]] }] satisfies DocBlock[] },
       ],
     },
@@ -607,8 +612,8 @@ export const docs = {
     {
       cat: "命令大全",
       items: [
-        { id: "tui", title: "TUI 斜杠命令", blocks: [{ cmds: [["/claude · /codex · /opencode", "切换驱动的本机底座 CLI"], ["/continue", "通过当前确认门"], ["/revise <反馈>", "带反馈重做本阶段"], ["/preview", "启动前端 dev server"], ["/verify", "合规报告 + 证据链"]] }] satisfies DocBlock[] },
-        { id: "cli", title: "终端 CLI 子命令", blocks: [{ cmds: [["umadev init", "脚手架工作区"], ["umadev", "启动聊天 TUI"], ["umadev doctor", "自检"], ["umadev verify", "合规 + 证据链状态"], ["umadev ci", "对源文件跑治理"], ["umadev mcp serve", "作为 MCP server 运行"]] }] satisfies DocBlock[] },
+        { id: "tui", title: "TUI 斜杠命令", blocks: [{ cmds: [["/claude · /codex · /opencode", "切换驱动的本机底座 CLI，并携带当前上下文"], ["/goal <目标>", "持续工作直到目标真正达成"], ["/plan", "查看或调整可见依赖计划"], ["/continue · /revise <反馈>", "通过确认门或带反馈重做"], ["/preview · /deploy", "打开前端预览；识别并预览部署命令"], ["/pr create", "用评审报告与 proof pack 创建 PR"], ["/sessions · /resume <id> · /compact", "列出、恢复、压缩持久化会话"], ["/logs", "显示或隐藏底座实时进程输出"], ["/status · /verify", "查看底座/运行状态；生成验证与证据状态"]] }] satisfies DocBlock[] },
+        { id: "cli", title: "终端 CLI 子命令", blocks: [{ cmds: [["umadev init", "初始化项目与 .umadev 工作区"], ["umadev", "启动持续会话 TUI"], ["umadev doctor", "自检安装、底座与权限问题"], ["umadev verify", "运行合规、证据与交付验证"], ["umadev deploy --run", "确认后执行部署并写 deploy-proof.json"], ["umadev ci", "对源文件跑同一套治理"], ["umadev mcp serve", "把治理与计划状态暴露为 MCP 工具"], ["umadev knowledge-manage", "管理团队自有知识"]] }] satisfies DocBlock[] },
       ],
     },
   ],
@@ -620,7 +625,7 @@ export const docs = {
           id: "quickstart",
           title: "Quick start",
           blocks: [
-            { p: "UmaDev is a locally-run AI development team agent — eight specialists scheduled by one coordinator. Install the prebuilt binary with npm; npm is just the distribution shell, while the actual binary is Rust-compiled." },
+            { p: "UmaDev is a local agent that works like a real development team. It provides no model; it drives the Claude Code, Codex, or OpenCode you already logged into. A coordinator routes the task, then schedules eight specialist roles across planning, execution, review, verification, and delivery. npm is only the distribution shell for the prebuilt Rust binary." },
             { c: "npm install -g umadev" },
             { p: "On Linux, do not install with sudo. npm's default prefix (/usr/local) is root-owned, so npm i -g fails with EACCES — and sudo npm i -g writes a root-owned tree into the prefix, after which every later non-root npm command on it (npm update -g, npm i -g anything) fails with EACCES and npm aborts the whole transaction, so your other global packages — including your base CLI (@anthropic-ai/claude-code, @openai/codex) — can no longer be updated either. Use a prefix you own:" },
             { c: "npm config set prefix ~/.npm-global\nexport PATH=\"$HOME/.npm-global/bin:$PATH\"   # add to ~/.zshrc or ~/.bashrc\nnpm install -g umadev" },
@@ -635,31 +640,36 @@ export const docs = {
             { c: "/preview     # after frontend\n/deploy      # after delivery" },
           ] satisfies DocBlock[],
         },
-        { id: "example", title: "A full example", blocks: [{ p: "Enter one requirement, and UmaDev clarifies it, researches competitors, writes PRD / architecture / UI/UX, creates the execution plan, builds frontend and backend, runs the quality gate, and produces a proof pack." }] satisfies DocBlock[] },
+        { id: "example", title: "A full example", blocks: [{ p: "The base first routes a full product requirement as Build. The coordinator creates a visible dependency plan, then schedules clarification and research, PRD / architecture / UIUX, docs confirmation, execution planning, frontend preview confirmation, backend, quality and security verification, and delivery proof. You can keep steering while it runs or change later steps with /plan." }] satisfies DocBlock[] },
       ],
     },
     {
       cat: "Concepts",
       items: [
-        { id: "how", title: "How UmaDev works", blocks: [{ p: "Think of it as four layers: TUI/CLI, the team coordinator, runtime/backend, and governance/quality/evidence. The backend writes real code while UmaDev owns the division of labor, gates, rules and delivery evidence." }] satisfies DocBlock[] },
+        { id: "how", title: "How UmaDev works", blocks: [{ p: "UmaDev owns no model endpoint. It asks the current base to classify each turn in a fresh read-only session as Chat, Explain, QuickEdit, Debug, or Build. When code must change, the coordinator owns the plan and drives the main session step by step; role critics return structured verdicts from independent read-only forks; deterministic rules, tests, and runtime evidence perform final acceptance." }] satisfies DocBlock[] },
+        { id: "team", title: "The real-team model", blocks: [{ p: "Eight specialists own product, architecture, UI/UX, frontend, backend, QA, security, and DevOps. The main session remains the single writer, while critics cross-review in fresh read-only sessions. Roles hand off only through the plan and shared blackboard." }] satisfies DocBlock[] },
+        { id: "routing", title: "Task-proportional routing", blocks: [{ cmds: [["Chat", "Conversation with only stable identity and language context"], ["Explain", "Read-only explanation with bounded code context"], ["QuickEdit", "A scoped change with fast execution and verification"], ["Debug", "A repair centered on errors, logs, and related files"], ["Build", "A visible plan, the needed team, and delivery evidence"]] }] satisfies DocBlock[] },
+        { id: "plan", title: "Visible plan & live steering", blocks: [{ p: "A real build writes .umadev/plan.json. The coordinator advances its dependencies step by step and renders live progress. New direction entered during the run feeds the next step; /plan can view the plan or skip, veto, add, move up, and move down steps." }] satisfies DocBlock[] },
+        { id: "continuity", title: "Sessions, context & memory", blocks: [{ p: "Chats persist. /compact, /resume, and base switching carry the transcript summary, current plan, team blackboard, project facts, and run state. Verified pitfalls, facts, and run notes are recalled into later tasks when useful." }] satisfies DocBlock[] },
         { id: "quality", title: "What the quality gate is", blocks: [{ p: "The quality gate verifies PRD, architecture, UI/UX, FE/BE contract alignment, build/test/lint/typecheck results, secret leaks, audit logs and compliance mapping." }, { c: "[quality]\nthreshold = 90\nskip_checks = []" }] satisfies DocBlock[] },
-        { id: "knowledge", title: "What the knowledge base is", blocks: [{ p: "UmaDev ships 416 markdown knowledge files: product, architecture, frontend, backend, data, security, testing, CI/CD, operations, industries and expert methodologies." }, { c: "umadev knowledge-manage add ./team-docs --name team-docs\numadev knowledge-manage search \"payment webhook idempotency\"" }] satisfies DocBlock[] },
+        { id: "knowledge", title: "What the knowledge base is", blocks: [{ p: "UmaDev ships an evolving corpus of engineering standards and retrieves it together with the repo map, project facts, and recalled pitfalls. Retrieval uses pure-Rust BM25 plus a local vector channel fused with RRF, with HyDE expansion; if vectors are unavailable it falls back to BM25. The corpus grows and its file count is not a product protocol." }, { c: "umadev knowledge-manage add ./team-docs --name team-docs\numadev knowledge-manage search \"payment webhook idempotency\"" }] satisfies DocBlock[] },
       ],
     },
     {
       cat: "Configuration & capabilities",
       items: [
         { id: "config", title: "Config files", blocks: [{ p: "First run writes ~/.umadev/config.toml (language + default backend); a project-level .umadevrc overrides it. Quality-gate threshold and skips live in the project config." }, { c: "# ~/.umadev/config.toml\nbackend = \"claude-code\"\nlang = \"en\"" }] satisfies DocBlock[] },
-        { id: "env", title: "Environment variables", blocks: [{ cmds: [["UMADEV_WORKER_TIMEOUT", "Per backend-call timeout (seconds)"], ["UMADEV_MODEL_BUILD", "Model for the frontend / backend phases (override)"], ["UMADEV_MODEL_PLAN", "Model for the research / docs / quality phases (override)"]] }] satisfies DocBlock[] },
+        { id: "env", title: "Environment variables", blocks: [{ cmds: [["UMADEV_WORKER_TIMEOUT", "Per base-call timeout in seconds"], ["UMADEV_VERIFY_TIMEOUT_SECS", "Global timeout for verification steps"], ["UMADEV_THEME", "Force the terminal theme to dark or light"], ["UMADEV_NO_GOAL_MODE", "Set to 1 to disable persistent /goal mode"], ["UMADEV_CONTINUOUS", "Set to 0 to opt out of the continuous single-session path"], ["UMADEV_ALLOW_CLOUD_EMBED", "Allow remote embeddings only when OPENAI_EMBED_KEY is also explicitly set; off by default"]] }] satisfies DocBlock[] },
         { id: "model-share", title: "Backends & model sharing", blocks: [{ p: "UmaDev owns no model endpoint. It drives your already-logged-in backend CLI and reuses whatever model and reasoning effort that CLI is configured with — it imposes no --model. Whether the base uses its official login or your own third-party / local model, that is exactly what runs." }] satisfies DocBlock[] },
         { id: "design", title: "UI that doesn't look AI-generated", blocks: [{ p: "The frontend phase binds the design system declared in the UI/UX doc: icon library, design tokens, typography, component skeleton. An anti-AI-slop design law turns named bans (default indigo, purple gradients, emoji icons, invented metrics, template skeletons) into hard rules; the design review checks against it and auto-rejects UI that drifts." }] satisfies DocBlock[] },
       ],
     },
     {
-      cat: "The pipeline in detail",
+      cat: "Routing & full builds",
       items: [
-        { id: "phases", title: "The nine phases", blocks: [{ p: "UmaDev splits \"AI writes code\" into nine ordered phases. Each produces real files, with human-in-the-loop gates at the key moments." }, { cmds: [["1 research", "Competitors / domain standards / real reviews"], ["2 docs", "PRD · architecture · UI/UX, drafted concurrently"], ["3 docs_confirm", "Gate: you confirm the docs direction"], ["4 spec", "Execution plan + task breakdown"], ["5 frontend", "Backend builds the frontend, with a design-conformance review"], ["6 preview_confirm", "Gate: preview the frontend, then continue"], ["7 backend", "Backend code, with FE/BE contract validation"], ["8 quality", "Quality gate: contract / security / design / build-test"], ["9 delivery", "Package the proof pack + scorecard"]] }] satisfies DocBlock[] },
-        { id: "gates", title: "Gates & human-in-the-loop", blocks: [{ p: "Two gates (docs_confirm, preview_confirm) let you confirm the docs direction and the frontend preview before continuing, instead of the AI running end-to-end blind. At a gate: /continue to pass, or /revise with feedback to redo the phase." }] satisfies DocBlock[] },
+        { id: "phases", title: "The full-build path", blocks: [{ p: "Only a full product Build expands into this deepest path. Chat, Explain, small edits, and Debug do not traverse the full pipeline. Clarification is a micro-phase before the nine-stage main chain, and every step has an owner and artifact." }, { cmds: [["1 research", "Competitors / domain standards / real reviews"], ["2 docs", "PRD · architecture · UI/UX"], ["3 docs_confirm", "Gate: confirm the docs direction"], ["4 spec", "Execution plan + task breakdown"], ["5 frontend", "Build the frontend with design-conformance review"], ["6 preview_confirm", "Gate: preview the frontend, then continue"], ["7 backend", "Backend implementation with FE/BE contract validation"], ["8 quality", "Contract / security / design / build-test quality gate"], ["9 delivery", "Proof pack, scorecard, and review report"]] }] satisfies DocBlock[] },
+        { id: "gates", title: "Gates & human-in-the-loop", blocks: [{ p: "In guarded mode, docs_confirm and preview_confirm genuinely pause for your docs-direction and frontend-preview decisions. /continue passes; /revise redoes the work with feedback. Auto may continue reversible work, but outward irreversible actions such as push, PR creation, and deploy still confirm." }] satisfies DocBlock[] },
+        { id: "trust", title: "Trust tiers", blocks: [{ cmds: [["plan", "Read-only planning and explanation; no write execution"], ["guarded", "Default: reversible work advances, key actions confirm"], ["auto", "Reversible work advances automatically; irreversible outward actions still confirm"]] }] satisfies DocBlock[] },
         { id: "revise", title: "Revise, redo & rollback", blocks: [{ cmds: [["/revise <feedback>", "Redo the current phase with specific feedback"], ["/continue", "Pass the current gate into the next phase"], ["umadev rollback", "Roll back to a phase file snapshot and redo"]] }] satisfies DocBlock[] },
       ],
     },
@@ -682,8 +692,8 @@ export const docs = {
     {
       cat: "Commands",
       items: [
-        { id: "tui", title: "TUI slash commands", blocks: [{ cmds: [["/claude · /codex · /opencode", "Switch local backend CLI"], ["/continue", "Pass the current gate"], ["/revise <feedback>", "Redo with feedback"], ["/preview", "Start the frontend dev server"], ["/verify", "Compliance report + evidence chain"]] }] satisfies DocBlock[] },
-        { id: "cli", title: "Terminal CLI subcommands", blocks: [{ cmds: [["umadev init", "Scaffold a workspace"], ["umadev", "Start the chat TUI"], ["umadev doctor", "Self-check"], ["umadev verify", "Compliance + evidence status"], ["umadev ci", "Run governance on files"], ["umadev mcp serve", "Run as an MCP server"]] }] satisfies DocBlock[] },
+        { id: "tui", title: "TUI slash commands", blocks: [{ cmds: [["/claude · /codex · /opencode", "Switch the local base while carrying current context"], ["/goal <objective>", "Keep working until the objective is actually met"], ["/plan", "View or steer the live dependency plan"], ["/continue · /revise <feedback>", "Pass a gate or redo with feedback"], ["/preview · /deploy", "Open the frontend preview; detect and preview deploy"], ["/pr create", "Create a PR with the review report and proof pack"], ["/sessions · /resume <id> · /compact", "List, resume, and compact persistent chats"], ["/logs", "Show or hide the base's live process output"], ["/status · /verify", "Inspect base/run status; generate verification evidence"]] }] satisfies DocBlock[] },
+        { id: "cli", title: "Terminal CLI subcommands", blocks: [{ cmds: [["umadev init", "Initialize the project and .umadev workspace"], ["umadev", "Start the continuous-session TUI"], ["umadev doctor", "Diagnose installation, base, and permission issues"], ["umadev verify", "Run compliance, evidence, and delivery verification"], ["umadev deploy --run", "Execute a confirmed deploy and write deploy-proof.json"], ["umadev ci", "Run the same governance over source files"], ["umadev mcp serve", "Expose governance and plan status as MCP tools"], ["umadev knowledge-manage", "Manage team-owned knowledge"]] }] satisfies DocBlock[] },
       ],
     },
   ],

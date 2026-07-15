@@ -71,214 +71,6 @@ export function ScrambledHoverText({ text, className }: { text: string; classNam
     </span>
   );
 }
-
-
-export function FloatingDiagnosticTerminal({
-  setLang,
-  setView,
-  setHeroSlideIndex,
-  setMode,
-  setStageIndex,
-}: {
-  setLang: (l: Lang) => void;
-  setView: (v: View) => void;
-  setHeroSlideIndex: (s: number | ((prev: number) => number)) => void;
-  setMode: (m: string) => void;
-  setStageIndex: (i: number) => void;
-}) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [logs, setLogs] = useState<string[]>([
-    "UMADEV CORE DIAGNOSTICS v1.0.6",
-    "Initializing MCP channels... OK",
-    "Status: ONLINE [SECURE_MODE]",
-    "Type /help for diagnostic commands."
-  ]);
-  const [inputValue, setInputValue] = useState("");
-  const bodyRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (bodyRef.current) {
-      bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
-    }
-  }, [logs, isOpen]);
-
-  const handleCommand = (cmdStr: string) => {
-    const raw = cmdStr.trim();
-    if (!raw) return;
-
-    setLogs((prev) => [...prev, `umadev_hud > ${raw}`]);
-    const tokens = raw.split(/\s+/);
-    const cmd = tokens[0].toLowerCase();
-    const arg = tokens[1]?.toLowerCase();
-
-    setTimeout(() => {
-      if (cmd === "/help" || cmd === "help") {
-        setLogs((prev) => [
-          ...prev,
-          "--- Active HUD Controller Commands ---",
-          "  /lang <zh|en>     - Switch language",
-          "  /slide <1-3|next> - Switch Hero visual slides",
-          "  /mode <id>        - Switch base (claude-code | codex | opencode)",
-          "  /stage <1-3>      - Switch pipeline stage",
-          "  /view <home|docs> - Navigate page views",
-          "  /stats            - Print system & browser diagnostics",
-          "  /scan             - Run code & secret checks",
-          "  /governance       - Verify governance checklists",
-          "  /clear            - Clear console screen"
-        ]);
-      } else if (cmd === "/clear" || cmd === "clear") {
-        setLogs([]);
-      } else if (cmd === "/lang") {
-        if (arg === "en") {
-          setLang("en");
-          setLogs((prev) => [...prev, "System: Language set to ENGLISH."]);
-        } else if (arg === "zh") {
-          setLang("zh");
-          setLogs((prev) => [...prev, "系统：语言切换为【中文】。"]);
-        } else {
-          setLogs((prev) => [...prev, "Usage: /lang <zh|en>"]);
-        }
-      } else if (cmd === "/slide") {
-        const val = parseInt(arg, 10);
-        if (arg === "next") {
-          setHeroSlideIndex((prev) => (prev + 1) % 3);
-          setLogs((prev) => [...prev, "System: Rotated to next hero slide."]);
-        } else if (val >= 1 && val <= 3) {
-          setHeroSlideIndex(val - 1);
-          setLogs((prev) => [...prev, `System: Loaded hero slide ${val}.`]);
-        } else {
-          setLogs((prev) => [...prev, "Usage: /slide <1-3|next>"]);
-        }
-      } else if (cmd === "/mode") {
-        const valid = ["claude-code", "codex", "opencode"];
-        if (valid.includes(arg)) {
-          setMode(arg);
-          setLogs((prev) => [...prev, `System: Base switched to ${arg}.`]);
-        } else {
-          setLogs((prev) => [...prev, "Usage: /mode <claude-code|codex|opencode>"]);
-        }
-      } else if (cmd === "/stage") {
-        const val = parseInt(arg, 10);
-        if (val >= 1 && val <= 3) {
-          setStageIndex(val - 1);
-          setLogs((prev) => [...prev, `System: Pipeline stage set to ${val}.`]);
-        } else {
-          setLogs((prev) => [...prev, "Usage: /stage <1-3>"]);
-        }
-      } else if (cmd === "/view") {
-        if (arg === "home" || arg === "docs") {
-          setView(arg);
-          setLogs((prev) => [...prev, `System: Navigating to ${arg.toUpperCase()} view.`]);
-        } else {
-          setLogs((prev) => [...prev, "Usage: /view <home|docs>"]);
-        }
-      } else if (cmd === "/stats" || cmd === "stats") {
-        const res = typeof window !== "undefined" ? `${window.screen.width}x${window.screen.height}` : "Unknown";
-        const ua = typeof navigator !== "undefined" ? navigator.userAgent.split(" ").slice(-2).join(" ") : "Unknown";
-        const conn = typeof navigator !== "undefined" && (navigator as unknown as { connection?: { rtt?: number; downlink?: number } }).connection
-          ? `RTT: ${(navigator as unknown as { connection: { rtt: number } }).connection.rtt}ms, Speed: ${(navigator as unknown as { connection: { downlink: number } }).connection.downlink}Mbps`
-          : "N/A";
-        setLogs((prev) => [
-          ...prev,
-          "--- Browser & System Diagnostics ---",
-          `  Resolution  : ${res}`,
-          `  UserAgent   : ${ua}`,
-          `  Network     : ${conn}`,
-          `  App Status  : ONLINE (Ready)`,
-          `  Engine      : Next.js 16.2.9 (Turbopack)`
-        ]);
-      } else if (cmd === "/scan" || cmd === "scan") {
-        setLogs((prev) => [
-          ...prev,
-          "Scanning workspace... [■■■■■■■■■■] 100%",
-          "  -> Found 9 modules in Rust workspace",
-          "  -> 0 hardcoded secrets detected",
-          "  -> 0 clippy warnings",
-          "  -> Quality Gate: 94% PASS"
-        ]);
-      } else if (cmd === "/governance" || cmd === "governance") {
-        setLogs((prev) => [
-          ...prev,
-          "Checking 113 governance rules...",
-          "  [RULE_01] No raw unwraps - PASS",
-          "  [RULE_02] Secure MCP transport - PASS",
-          "  [RULE_03] No hardcoded styles - PASS",
-          "Governance Status: SECURE / FAILS OPEN"
-        ]);
-      } else if (cmd === "/deploy" || cmd === "deploy") {
-        setLogs((prev) => [
-          ...prev,
-          "Triggering local deploy simulator...",
-          "  Running subprocess: next build...",
-          "  Deploying static bundle to GitHub Pages...",
-          "  Success! Domain: umadev.dev/preview"
-        ]);
-      } else if (cmd === "/proof" || cmd === "proof") {
-        setLogs((prev) => [
-          ...prev,
-          "Compiling Proof Pack...",
-          "  Archiving .umadev/audit/session.jsonl...",
-          "  Generating scorecard-v1.0.6.html...",
-          "  Created delivery: release/proof-pack.zip"
-        ]);
-      } else {
-        setLogs((prev) => [
-          ...prev,
-          `Error: Command "${raw}" not recognized. Type /help for assistance.`
-        ]);
-      }
-    }, 100);
-
-    setInputValue("");
-  };
-
-  return (
-    <>
-      {!isOpen && (
-        <button
-          className={styles.hudFloatBtn}
-          onClick={() => setIsOpen(true)}
-          title="Open system diagnostics console"
-        >
-          <span className={styles.hudPulseLight} />
-          <span>SYS_OK: 94%</span>
-        </button>
-      )}
-
-      {isOpen && (
-        <div className={styles.hudOverlayTerm}>
-          <div className={styles.hudTermHeader}>
-            <span>SYS DIAGNOSTICS</span>
-            <button onClick={() => setIsOpen(false)}>×</button>
-          </div>
-          <div className={styles.hudTermBody} ref={bodyRef}>
-            {logs.map((log, i) => (
-              <div key={i} className={styles.hudTermLine}>
-                {log}
-              </div>
-            ))}
-          </div>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleCommand(inputValue);
-            }}
-            className={styles.hudTermForm}
-          >
-            <span>&gt;</span>
-            <input
-              type="text"
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              placeholder="Type /help..."
-              autoFocus
-            />
-          </form>
-        </div>
-      )}
-    </>
-  );
-}
 export default function Home({ initialView }: { initialView?: View } = {}) {
   const [lang, setLang] = useState<Lang>("zh");
   const [view, setView] = useState<View>(initialView ?? "home");
@@ -347,9 +139,10 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
-  // Synchronize language selection to localStorage
+  // Keep persisted preference and document semantics aligned with the visible copy.
   useEffect(() => {
     localStorage.setItem("umadev_lang", lang);
+    document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
   }, [lang]);
 
   // Sync initial view from URL pathname and handle browser back/forward buttons
@@ -512,24 +305,24 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     let title = "";
     if (view === "home") {
       title = lang === "zh"
-        ? "UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
-        : "UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
+        ? "UmaDev — 一个模拟真实开发团队、驱动你的底座干活的 Agent"
+        : "UmaDev — One agent. A whole development team at work.";
     } else if (view === "docs") {
       title = lang === "zh"
-        ? "文档中心 | UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
-        : "Documentation | UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
+        ? "文档中心 | UmaDev 真实开发团队 Agent"
+        : "Documentation | UmaDev real dev team agent";
     } else if (view === "gallery") {
       title = lang === "zh"
-        ? "形象相册 | UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
-        : "Mascot Gallery | UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
+        ? "形象相册 | UmaDev"
+        : "Mascot Gallery | UmaDev";
     } else if (view === "changelog") {
       title = lang === "zh"
-        ? "更新日志 | UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
-        : "Changelog | UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
+        ? "更新日志 | UmaDev"
+        : "Changelog | UmaDev";
     } else if (view === "contributors") {
       title = lang === "zh"
-        ? "特别贡献荣誉殿堂 | UmaDev - 一个模拟真实开发团队工作的 Agent,指挥你已经在用的 Claude Code / Codex / OpenCode 干活"
-        : "Special Contributors | UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use";
+        ? "荣誉殿堂 | UmaDev"
+        : "Hall of Fame | UmaDev";
     }
 
     document.title = title;
@@ -539,8 +332,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
       descMeta.setAttribute(
         "content",
         lang === "zh"
-          ? "UmaDev 是一个模拟真实开发团队来工作的 Coding Agent：产品经理、架构师、设计师、前端、后端、QA、安全、DevOps 八个角色分工协作，借你已登录的 Claude Code / Codex / OpenCode 大脑，把一句需求做成能上线的商业级应用。"
-          : "UmaDev is a coding agent that works like a real dev team — eight specialists collaborating to turn one idea into a shippable, commercial-grade app, borrowing your logged-in Claude Code / Codex / OpenCode brain."
+          ? "UmaDev 驱动你已登录的 Claude Code、Codex 或 OpenCode，由八个专家角色完成任务路由、可视计划、独立评审、持续上下文、真实验证与交付证明。"
+          : "UmaDev drives your logged-in Claude Code, Codex, or OpenCode with task routing, a visible plan, eight specialist roles, independent review, persistent context, deterministic verification, and delivery evidence."
       );
     }
   }, [lang, view]);
@@ -722,7 +515,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   <div className={styles.heroMeta}>
                     <span className={styles.heroMetaDot} />
                     <span className={styles.heroMetaText}>
-                      {lang === "zh" ? "AI 开发团队协调器 · 本地运行" : "AI DEV TEAM ORCHESTRATOR · RUNS LOCAL"}
+                      v{releases[lang][0].ver} · {lang === "zh" ? "真实开发团队 Agent · 驱动你的本机底座" : "REAL DEV TEAM AGENT · DRIVES YOUR LOCAL BASE"}
                     </span>
                   </div>
 
@@ -732,16 +525,16 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
                   <h2 className={styles.heroStatement}>
                     {lang === "zh" ? (
-                      <>一句需求，<br /><span>交付一个真项目。</span></>
+                      <>一个 Agent，<br /><span>带着整支团队干活。</span></>
                     ) : (
-                      <>One requirement.<br /><span>A real product shipped.</span></>
+                      <>One agent.<br /><span>A whole team at work.</span></>
                     )}
                   </h2>
 
                   <p className={styles.heroDescription}>
                     {lang === "zh"
-                      ? "像真实开发团队一样，依次完成调研、PRD、架构、UI/UX、前后端、质量门和交付证明；实际编码由你已经登录的本机底座完成。"
-                      : "Work like a real development team across research, PRD, architecture, UI/UX, frontend, backend, quality gates, and delivery proof — using the local CLI you are already signed into."}
+                      ? "UmaDev 不提供模型，也不替代 Claude Code、Codex 或 OpenCode。它让你已登录的底座进入一套真实团队工作系统：先判断任务，再由产品、架构、设计、前后端、QA、安全和 DevOps 计划、执行、独立评审、验收与交付。"
+                      : "UmaDev provides no model and does not replace Claude Code, Codex, or OpenCode. It puts your logged-in base inside a real team system that routes, plans, builds, independently reviews, verifies, and delivers."}
                   </p>
 
                   <div className={styles.heroActionRow}>
@@ -753,8 +546,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   </div>
 
                   <dl className={styles.heroFacts}>
+                    <div><dt>8</dt><dd>{lang === "zh" ? "专家角色" : "SPECIALIST ROLES"}</dd></div>
                     <div><dt>3</dt><dd>{lang === "zh" ? "本机底座" : "LOCAL BASES"}</dd></div>
-                    <div><dt>9</dt><dd>{lang === "zh" ? "交付阶段" : "DELIVERY PHASES"}</dd></div>
                     <div><dt>113</dt><dd>{lang === "zh" ? "治理检查" : "GOVERNANCE CHECKS"}</dd></div>
                   </dl>
                 </div>
@@ -768,7 +561,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
                   <div className={styles.heroPrompt}>
                     <span>{lang === "zh" ? "你的需求" : "YOUR BRIEF"}</span>
-                    <p>{lang === "zh" ? "做一个能上线的产品，而不只是一段代码。" : "Build a product that can ship, not just a piece of code."}</p>
+                    <p>{lang === "zh" ? "驱动我已登录的 Codex，把支付模块做到可上线。" : "Drive my logged-in Codex and make the payments module production-ready."}</p>
                   </div>
 
                   <div className={styles.heroPhaseTrack} aria-hidden="true">
@@ -786,7 +579,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                       <div className={styles.heroLiveStage} key={stage.key}>
                         <div className={styles.heroStageIndex}>{String(activeStageIdx + 1).padStart(2, "0")}</div>
                         <div className={styles.heroStageCopy}>
-                          <span>{lang === "zh" ? "当前角色正在工作" : "ACTIVE TEAM ROLE"}</span>
+                          <span>{lang === "zh" ? "团队正在执行计划" : "TEAM EXECUTING THE PLAN"}</span>
                           <h3>{stage.label}</h3>
                           <p>{stage.role}</p>
                         </div>
@@ -811,8 +604,8 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
                   <div className={styles.heroSystemFoot}>
                     <div><span>BASE</span><strong>CLAUDE CODE / CODEX / OPENCODE</strong></div>
-                    <div><span>GATE</span><strong>QUALITY 90+</strong></div>
-                    <div><span>PROOF</span><strong>JSONL + SCORECARD</strong></div>
+                    <div><span>PLAN</span><strong>OWNED DAG · LIVE STEERING</strong></div>
+                    <div><span>PROOF</span><strong>VERIFY · SCORECARD</strong></div>
                   </div>
                 </div>
               </div>
@@ -881,44 +674,44 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
             {/* ROLE / PROBLEM */}
             <section className={styles.painSection}>
               <h2 className={styles.painTitle}>
-                {lang === "zh" ? "解决问题" : "What it solves"}
+                {lang === "zh" ? "不是套壳" : "Not a wrapper"}
               </h2>
 
               <div className={styles.painGrid}>
                 <div className={`${styles.painCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
                   <span className={styles.painCardTagCross}>✕ {lang === "zh" ? "常见" : "COMMON"}</span>
                   <p className={styles.painCardText}>
-                    {lang === "zh" ? "AI 一上来就写代码，没有 PRD、没有架构、没有验收标准。" : "LLMs start coding immediately without any PRD, architecture specifications, or acceptance criteria."}
+                    {lang === "zh" ? "每句话都走同一套重流程，小修也开一整条流水线。" : "Every request enters the same heavy workflow, even a one-line fix."}
                   </p>
                 </div>
                 <div className={`${styles.painCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
                   <span className={styles.painCardTagCross}>✕ {lang === "zh" ? "常见" : "COMMON"}</span>
                   <p className={styles.painCardText}>
-                    {lang === "zh" ? "前端做完了，后端接口路径对不上。UI 像模板，颜色字体很随意。" : "Frontend gets built, but backend API paths mismatch. UI looks generic with template-like aesthetics."}
+                    {lang === "zh" ? "一个模型既写代码又给自己验收，最后只剩一句“完成了”。" : "One model writes the code and certifies its own work, ending with a vague 'done'."}
                   </p>
                 </div>
                 <div className={`${styles.painCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
                   <span className={styles.painCardTagCross}>✕ {lang === "zh" ? "常见" : "COMMON"}</span>
                   <p className={styles.painCardText}>
-                    {lang === "zh" ? "写了占位代码、假数据、TODO，却说「完成了」。改一次需求上下文就乱。" : "AI writes placeholder code, fake mocks, and TODOs, yet claims done. A single change causes context drift."}
+                    {lang === "zh" ? "长任务看不到计划，换会话、切底座或压缩上下文就丢进度。" : "Long jobs hide the plan, then lose progress across sessions, base switches, or compaction."}
                   </p>
                 </div>
                 <div className={`${styles.painCardActive} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
-                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "角色阵容" : "ROLES"}</span>
+                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "按任务组队" : "ROUTES THE WORK"}</span>
                   <p className={styles.painCardActiveText}>
-                    {lang === "zh" ? "产品经理 + 架构师 + UI/UX 审稿人 + 技术负责人 + QA + 交付经理。" : "Product Manager + Architect + UI/UX Designer + Tech Lead + QA + DevOps."}
+                    {lang === "zh" ? "底座先独立判断 Chat / Explain / QuickEdit / Debug / Build；小事快速做，真构建才展开计划与团队。" : "The base independently routes Chat / Explain / QuickEdit / Debug / Build. Small work stays small; real builds get the plan and team."}
                   </p>
                 </div>
                 <div className={`${styles.painCardActive} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
-                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "交付闭环" : "CLOSED-LOOP"}</span>
+                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "独立交叉评审" : "INDEPENDENT REVIEW"}</span>
                   <p className={styles.painCardActiveText}>
-                    {lang === "zh" ? "你只输入一句需求，它负责把「AI 写代码」变成一个完整、可上线、可审计的项目交付过程。" : "You enter a single prompt, and it orchestrates the process into a complete, shippable, auditable delivery."}
+                    {lang === "zh" ? "主会话保持单写者；产品、架构、设计、QA、安全等角色在新的只读会话里审查，结构化结论回到同一计划。" : "The main session stays single-writer while product, architecture, design, QA, and security review in fresh read-only sessions."}
                   </p>
                 </div>
                 <div className={`${styles.painCardActive} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
-                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "质量红线" : "QUALITY GATES"}</span>
+                  <span className={styles.painCardTagCheck}>✓ UmaDev {lang === "zh" ? "计划与证据" : "PLAN & PROOF"}</span>
                   <p className={styles.painCardActiveText}>
-                    {lang === "zh" ? "113 条覆盖安全、接口对账与 UI 规范的治理规则，编译测试全绿、审计证据链齐全才放行交付。" : "113 rules check safety, contracts, and UI code. Only releases when tests pass and audit log is verified."}
+                    {lang === "zh" ? "可见 DAG 逐步推进，随时 /plan 调整；确定性底线、运行证明、部署证明和交付包共同决定是否真的完成。" : "A visible DAG advances step by step and stays steerable with /plan; deterministic checks and runtime/deploy evidence decide completion."}
                   </p>
                 </div>
               </div>
@@ -928,7 +721,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
             <section id="pipeline" className={styles.pipelineSection}>
               <div className={styles.pipelineHeader}>
                 <h2 className={styles.pipelineTitle}>
-                  {lang === "zh" ? "交付流水线" : "Delivery pipeline"}
+                  {lang === "zh" ? "完整构建" : "Full build"}
                 </h2>
               </div>
 
@@ -1035,9 +828,9 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
               <div className={styles.statsGrid}>
                 {[
-                  { count: 113, label: lang === "zh" ? "条治理规则 + 审计" : "Governance Rules + Audit", color: "#00d2ff", active: false },
-                  { count: 416, label: lang === "zh" ? "份内置知识文件" : "Embedded Knowledge Files", color: "#ff2a85", active: false },
-                  { count: 9, label: lang === "zh" ? "个可治理交付阶段" : "Verifiable Delivery Phases", color: "#00d2ff", active: false },
+                  { count: 34, label: lang === "zh" ? "条正式规范 Clause" : "Normative Spec Clauses", color: "#00d2ff", active: false },
+                  { count: 113, label: lang === "zh" ? "条内容治理检查" : "Governance Content Checks", color: "#ff2a85", active: false },
+                  { count: 2, label: lang === "zh" ? "道真正暂停的人工确认门" : "Human Gates That Actually Pause", color: "#00d2ff", active: false },
                   { count: 90, label: lang === "zh" ? "默认质量门通过线" : "Default Quality Gate Bar", color: "#00d2ff", active: true, suffix: lang === "zh" ? "分" : " pts" },
                 ].map((item, idx) => (
                   <div
@@ -1063,26 +856,26 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
               </div>
             </section>
 
-            {/* CRATES SECTION */}
+            {/* CURRENT CAPABILITIES */}
             <section className={styles.cratesSection}>
               <div className={styles.cratesHeader}>
                 <h2 className={styles.cratesTitle}>
-                  {lang === "zh" ? "Rust 工作区" : "Rust workspace"}
+                  {lang === "zh" ? "像一支团队" : "Works like a team"}
                 </h2>
               </div>
 
               <div className={styles.cratesGrid}>
                 {[
-                  ["umadev", lang === "zh" ? "主程序" : "CLI Core", lang === "zh" ? "CLI · TUI · doctor · hook · CI · MCP" : "CLI · TUI · doctor · hook · CI · MCP"],
-                  ["umadev-spec", lang === "zh" ? "规则说明书" : "Spec Definition", lang === "zh" ? "UMADEV_HOST_SPEC_V1 数据" : "UMADEV_HOST_SPEC_V1 static spec representation"],
-                  ["umadev-governance", lang === "zh" ? "质检和红线" : "Governance Compliance", lang === "zh" ? "113 条规则 · 审计 · 合规映射" : "113 rules check · audit trails · SOC 2 compliance mapper"],
-                  ["umadev-agent", lang === "zh" ? "项目总监" : "Orchestrator Agent", lang === "zh" ? "9 阶段 runner · gate · 质量门" : "9-phase workflow runner · gate triggers · quality checkpoint"],
-                  ["umadev-runtime", lang === "zh" ? "统一大脑接口" : "Runtime Interface", lang === "zh" ? "Offline · HTTP runtime · trait" : "Offline templates · HTTP channel drivers · base trait"],
-                  ["umadev-host", lang === "zh" ? "驱动外部 CLI" : "Base CLI Drivers", lang === "zh" ? "Claude Code · Codex · OpenCode" : "Claude Code · Codex · OpenCode subprocess hooks"],
-                  ["umadev-contract", lang === "zh" ? "API 对账员" : "Contract Alignment", lang === "zh" ? "OpenAPI 契约 · 路径校验" : "OpenAPI verification · frontend Axios / fetch path check"],
-                  ["umadev-knowledge", lang === "zh" ? "知识检索" : "RAG Hybrid Search", lang === "zh" ? "BM25 · chunk · 可选 vector" : "BM25 lexical channel · Candle vector embeddings RRF fuser"],
-                  ["umadev-tui", lang === "zh" ? "终端界面" : "Terminal TUI Layout", lang === "zh" ? "ratatui 聊天 UI · 预览部署" : "Ratatui interactive chat · local preview logs · action diffs"],
-                  ["umadev-i18n", lang === "zh" ? "多语言" : "Internationalization", lang === "zh" ? "简中 · 繁中 · English" : "zh-CN · zh-TW · English translation dicts"],
+                  ["ROUTE", lang === "zh" ? "先判断，再开工" : "Route before work", lang === "zh" ? "Chat · Explain · QuickEdit · Debug · Build 五条路径，投入与任务规模匹配。" : "Chat · Explain · QuickEdit · Debug · Build: effort stays proportional to the task."],
+                  ["PLAN", lang === "zh" ? "协调者拥有计划" : "Coordinator-owned plan", lang === "zh" ? "依赖 DAG 写入 .umadev/plan.json，逐步执行，而不是让底座一口气盲跑。" : "An owned dependency DAG lives in .umadev/plan.json and advances step by step."],
+                  ["TEAM", lang === "zh" ? "八个专家角色" : "Eight specialist roles", lang === "zh" ? "产品、架构、设计、前端、后端、QA、安全、DevOps 各自对产物负责。" : "Product, architecture, design, frontend, backend, QA, security, and DevOps own artifacts."],
+                  ["REVIEW", lang === "zh" ? "单写者，独立评审" : "Single writer, independent critics", lang === "zh" ? "主会话负责写入；角色评审在新的只读分叉中进行，避免多人同时改主干。" : "The main session writes; role critics review in fresh read-only forks."],
+                  ["STEER", lang === "zh" ? "运行中也能转向" : "Steer while it runs", lang === "zh" ? "追问和新要求折回下一步；用 /plan 跳过、否决、新增或重排任务。" : "Questions and new direction feed the next step; /plan can skip, veto, add, or reorder."],
+                  ["CONTEXT", lang === "zh" ? "长任务不断线" : "Long-running continuity", lang === "zh" ? "会话持久化、压缩、恢复和底座切换都会携带对话、计划与团队黑板。" : "Resume, compaction, and base switching carry transcript, plan, and blackboard context."],
+                  ["CODEBASE", lang === "zh" ? "理解现有代码库" : "Understands the repository", lang === "zh" ? "repo-map 解析符号与 import 边，按任务把最相关文件和结构交给底座。" : "The repo map resolves symbols and import edges, then ranks files relevant to the task."],
+                  ["MEMORY", lang === "zh" ? "项目越做越懂" : "Learns the project", lang === "zh" ? "项目事实、踩坑、验证过的经验和运行笔记跨任务保留，并在需要时召回。" : "Project facts, pitfalls, verified lessons, and run notes persist and are recalled when useful."],
+                  ["NATIVE", lang === "zh" ? "底座能力不打折" : "Native base tools preserved", lang === "zh" ? "搜索、研究、子 Agent 与后台任务继续可用；完成前会收齐后台结果。" : "Search, research, sub-agents, and background tasks stay available and are collected before completion."],
+                  ["TRUST", lang === "zh" ? "可控的自动化" : "Controlled autonomy", lang === "zh" ? "plan / guarded / auto 信任梯度；推送、部署等不可逆动作始终需要确认。" : "Plan / guarded / auto trust tiers; irreversible push and deploy actions always confirm."],
                 ].map(([name, role, desc], i) => (
                   <div
                     key={name}
@@ -1104,8 +897,13 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
               <div className={styles.retrieveGrid}>
                 <div className={styles.reveal}>
                   <h2 className={styles.retrieveTitle}>
-                    {lang === "zh" ? "工程知识库" : "Knowledge base"}
+                    {lang === "zh" ? "理解你的项目" : "Understands your project"}
                   </h2>
+                  <p style={{ maxWidth: "540px", marginTop: "18px", color: "#9aa1ad", lineHeight: 1.8, fontSize: "15px" }}>
+                    {lang === "zh"
+                      ? "不是把一大段通用 Prompt 塞给底座。UmaDev 会把代码结构、当前任务、项目事实、踩坑经验和相关工程标准压缩成这一轮真正需要的上下文。"
+                      : "It does not dump a generic mega-prompt into the base. UmaDev composes the repository structure, current task, project facts, recalled pitfalls, and relevant standards into the context this turn needs."}
+                  </p>
                   <div className={`${styles.mono} ${styles.reveal}`} style={{ display: "flex", flexDirection: "column", gap: "8px", fontSize: "13.5px", color: "#8a8f9c", marginTop: "24px" }}>
                     <span><span style={{ color: "#00d2ff" }}>$</span> umadev knowledge-manage add ./team-docs</span>
                     <span><span style={{ color: "#00d2ff" }}>$</span> umadev knowledge-manage search {lang === "zh" ? '"支付 webhook 幂等"' : '"payment webhook idempotency"'}</span>
@@ -1115,11 +913,11 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                 <div className={`${styles.reveal}`} style={{ position: "relative", padding: "30px", borderRadius: "20px", background: "#0c0e14", border: "1px solid rgba(255, 255, 255, 0.08)", overflow: "hidden" }}>
                   <div className={styles.mono} style={{ display: "flex", flexDirection: "column", gap: "11px", fontSize: "13px" }}>
                     {[
-                      { num: "01", name: lang === "zh" ? "分词" : "Tokenization", desc: lang === "zh" ? "中文 + 英文" : "CJK bigram + English", color: "#ff2a85" },
-                      { num: "02", name: lang === "zh" ? "BM25 检索" : "BM25 Retrieval", desc: lang === "zh" ? "top-k 命中工程标准" : "top-k lexical matches", color: "#00d2ff" },
-                      { num: "03", name: lang === "zh" ? "向量检索" : "Vector Search", desc: lang === "zh" ? "OPENAI_EMBED_KEY 可选" : "local candles / optional OpenAI API", color: "#ff2a85" },
-                      { num: "04", name: lang === "zh" ? "RRF 融合排序" : "RRF Fusion Re-ranking", desc: lang === "zh" ? "合并两路结果" : "reciprocal rank fusion blending", color: "#00d2ff" },
-                      { num: "05", name: lang === "zh" ? "注入当前阶段 prompt" : "Prompt Context Injection", desc: lang === "zh" ? "→ 底座" : "→ base CLI input stream", color: "#00d2ff" },
+                      { num: "01", name: lang === "zh" ? "任务路由" : "Task route", desc: lang === "zh" ? "只取当前路径需要的上下文" : "only the context this route needs", color: "#ff2a85" },
+                      { num: "02", name: lang === "zh" ? "repo-map" : "Repo map", desc: lang === "zh" ? "符号 · import 边 · 相关文件" : "symbols · import edges · ranked files", color: "#00d2ff" },
+                      { num: "03", name: lang === "zh" ? "本地混合检索" : "Local hybrid retrieval", desc: lang === "zh" ? "BM25 + 本地向量 + HyDE" : "BM25 + local vectors + HyDE", color: "#ff2a85" },
+                      { num: "04", name: lang === "zh" ? "项目记忆" : "Project memory", desc: lang === "zh" ? "事实 · 踩坑 · 经验 · 运行笔记" : "facts · pitfalls · lessons · run notes", color: "#00d2ff" },
+                      { num: "05", name: lang === "zh" ? "按需注入" : "Proportional firmware", desc: lang === "zh" ? "→ 你已登录的底座" : "→ your logged-in base", color: "#00d2ff" },
                     ].map((step) => (
                       <div key={step.num} style={{ display: "flex", alignItems: "center", gap: "12px", padding: "12px 14px", borderRadius: "10px", background: "#0a0b10", borderLeft: `2px solid ${step.color}` }}>
                         <span style={{ color: step.color, fontSize: "12px" }}>{step.num}</span>
@@ -1143,19 +941,19 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
               <div className={styles.deliverGrid}>
                 <div className={`${styles.deliverCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
                   <div className={styles.deliverCardPath}>output/</div>
-                  <h3 className={styles.deliverCardTitle}>{lang === "zh" ? "过程文档" : "Process Documents"}</h3>
-                  <p className={styles.deliverCardDesc}>clarify · research · prd · architecture · uiux · execution-plan · quality-gate</p>
+                  <h3 className={styles.deliverCardTitle}>{lang === "zh" ? "团队黑板" : "Team blackboard"}</h3>
+                  <p className={styles.deliverCardDesc}>PRD · architecture · UI/UX · OpenAPI · execution plan · open decisions</p>
                 </div>
                 <div className={`${styles.deliverCard} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
                   <div className={styles.deliverCardPath}>.umadev/audit/</div>
-                  <h3 className={styles.deliverCardTitle}>{lang === "zh" ? "证据链" : "Evidence Logs"}</h3>
-                  <p className={styles.deliverCardDesc}>tool-calls.jsonl · frontend-api-calls.jsonl · verify.jsonl · 状态与合规映射</p>
+                  <h3 className={styles.deliverCardTitle}>{lang === "zh" ? "真实验证" : "Runtime evidence"}</h3>
+                  <p className={styles.deliverCardDesc}>runtime-proof.json · deploy-proof.json · contract reconciliation · security review</p>
                 </div>
                 <div className={`${styles.deliverCardActive} ${styles.reveal} ${styles.tilt}`} onMouseMove={handleTiltMove} onMouseLeave={handleTiltLeave}>
                   <div className={styles.deliverCardPathActive}>release/</div>
-                  <h3 className={styles.deliverCardTitleActive}>{lang === "zh" ? "最终交付包" : "Release Package"}</h3>
+                  <h3 className={styles.deliverCardTitleActive}>{lang === "zh" ? "可审阅的交接" : "Reviewable handoff"}</h3>
                   <p className={styles.deliverCardDescActive}>
-                    {lang === "zh" ? "proof-pack-*.zip 与 scorecard-*.html —— 给团队、客户、审计方看的交付证明。" : "proof-pack-*.zip and scorecard-*.html —— evidence verification package for clients and auditors."}
+                    {lang === "zh" ? "评审报告、scorecard、proof pack、PR 正文与可访问地址——让“完成”有可检查的依据。" : "Review report, scorecard, proof pack, PR body, and live URL — so 'done' has inspectable evidence."}
                   </p>
                 </div>
               </div>
@@ -1166,7 +964,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
               <div className={styles.spaceCtaOverlay} />
               <div className={styles.spaceCtaContent}>
                 <h2 className={styles.spaceCtaTitle}>
-                  {lang === "zh" ? "开始交付" : "Start shipping"}
+                  {lang === "zh" ? "把你的底座，变成一支团队" : "Turn your base into a team"}
                 </h2>
                 <div className={styles.spaceCtaConsole}>
                   <span className={styles.spaceCtaConsolePrompt}>$</span> npm install -g umadev
@@ -1514,7 +1312,7 @@ const pageHeroVisuals: Record<PageHeroVariant, { art: string; ip: string; label:
     art: "/assets/umadev/vectors/docs-orbit.svg",
     ip: "/assets/umadev/generated/docs-ip.png",
     label: "UmaDev / Documentation",
-    metrics: ["113 GOVERNANCE", "09 PHASES", "03 LOCAL BASES"],
+    metrics: ["08 TEAM ROLES", "05 TASK ROUTES", "03 LOCAL BASES"],
   },
   gallery: {
     art: "/assets/umadev/vectors/gallery-aperture.svg",

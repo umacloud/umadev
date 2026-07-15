@@ -22,18 +22,18 @@ const jetBrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000"),
-  title: "UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use",
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "https://umadev.goder.ai"),
+  title: "UmaDev — 一个模拟真实开发团队、驱动你的底座干活的 Agent",
   description:
-    "UmaDev is a coding agent that works like a real dev team — product manager, architect, designer, frontend, backend, QA, security, DevOps — borrowing your logged-in Claude Code / Codex / OpenCode brain to turn one idea into a shippable, commercial-grade app.",
+    "UmaDev 驱动你已登录的 Claude Code、Codex 或 OpenCode，由八个专家角色完成任务路由、可视计划、独立评审、真实验证与交付证明。",
   icons: {
     icon: asset("/assets/umadev-icon.png"),
     apple: asset("/assets/umadev-icon.png"),
   },
   openGraph: {
-    title: "UmaDev — a coding agent that works like a real dev team, commanding the Claude Code / Codex / OpenCode you already use",
+    title: "UmaDev — One agent. A whole development team at work.",
     description:
-      "A coding agent that works like a real dev team — eight specialists collaborating to turn your idea into a shippable, commercial-grade app — PRD, API contract, design system, build, tests, security audit and a delivery proof pack.",
+      "Drive your logged-in Claude Code, Codex, or OpenCode with task routing, a visible plan, eight specialist roles, independent review, persistent context, deterministic verification, and delivery evidence.",
     type: "website",
     images: [{ url: asset("/assets/wide-1.png"), width: 1672, height: 941 }],
   },
