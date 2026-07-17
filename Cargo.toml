@@ -86,7 +86,7 @@ similar = "2.7"
 # --- governance / parsing ---
 regex = "1.10"
 sha2 = "0.10"
-getrandom = "0.2"
+getrandom = "0.4"
 
 # --- time ---
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
