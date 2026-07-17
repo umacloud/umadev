@@ -222,7 +222,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     writer.flush().expect("flush whole-draft clear key");
 
     let command_capture_start = captured.lock().expect("lock terminal capture").len();
-    const SUBMIT_SYNC: &str = "⚑";
+    const SUBMIT_SYNC: &str = "@";
     writer
         .write_all(format!("/quit {SUBMIT_SYNC}").as_bytes())
         .expect("type synchronized /quit command");
