@@ -216,10 +216,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "20"
-      - name: Verify deterministic TUI terminal contracts
-        run: cargo test -p umadev-tui --lib terminal_contract_ -- --test-threads=1
       - name: Verify native PTY / ConPTY startup, input, and teardown
         run: cargo test -p umadev --test terminal_pty -- --test-threads=1
+      - name: Verify deterministic TUI terminal contracts
+        run: cargo test -p umadev-tui --lib terminal_contract_ -- --test-threads=1
       - name: Verify cross-platform npm update contracts
         run: node --test npm/scripts/terminal-contract.test.cjs
 
