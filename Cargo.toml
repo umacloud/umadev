@@ -85,7 +85,7 @@ similar = "2.7"
 
 # --- governance / parsing ---
 regex = "1.10"
-sha2 = "0.10"
+sha2 = "0.11"
 getrandom = "0.2"
 
 # --- time ---
