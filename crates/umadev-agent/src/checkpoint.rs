@@ -381,9 +381,19 @@ const CHECKPOINT_SCAN_WINDOWS: &[usize] = &[200, 1_000, 5_000];
 /// are filtered out; they remain restorable by id. Empty when none / `git` missing.
 #[must_use]
 pub fn list_checkpoints(project_root: &Path) -> Vec<Checkpoint> {
+    list_user_checkpoints_with(|window| try_list_checkpoints_limited(project_root, window))
+}
+
+fn list_user_checkpoints_with(
+    mut scan: impl FnMut(usize) -> Option<Vec<Checkpoint>>,
+) -> Vec<Checkpoint> {
     let mut newest: Vec<Checkpoint> = Vec::new();
     for &window in CHECKPOINT_SCAN_WINDOWS {
-        let scanned = list_checkpoints_limited(project_root, window);
+        let Some(scanned) = scan(window) else {
+            // A transient read failure is not proof that history is exhausted.
+            // The next wider window doubles as a bounded retry.
+            continue;
+        };
         let exhausted = scanned.len() < window; // the window covered the whole history
         newest = scanned
             .into_iter()
@@ -403,10 +413,14 @@ pub fn list_checkpoints(project_root: &Path) -> Vec<Checkpoint> {
 /// long run with >50 commits) is still resettable-to - the display cap must never shrink the
 /// set of ids a user is allowed to rewind to.
 fn list_checkpoints_limited(project_root: &Path, limit: usize) -> Vec<Checkpoint> {
+    try_list_checkpoints_limited(project_root, limit).unwrap_or_default()
+}
+
+fn try_list_checkpoints_limited(project_root: &Path, limit: usize) -> Option<Vec<Checkpoint>> {
     // `--all` so checkpoints that a rewind moved off the linear HEAD history
     // (the pre-rewind snapshot + any forward checkpoints, preserved under a
     // `umadev-saved-*` ref by restore_checkpoint) are still listed.
-    let Some(out) = git(
+    let out = git(
         project_root,
         &[
             "log",
@@ -415,23 +429,23 @@ fn list_checkpoints_limited(project_root: &Path, limit: usize) -> Vec<Checkpoint
             "-n",
             &limit.to_string(),
         ],
-    ) else {
-        return Vec::new();
-    };
+    )?;
     if !out.status.success() {
-        return Vec::new();
+        return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, '\u{1f}');
-            Some(Checkpoint {
-                id: parts.next()?.to_string(),
-                when: parts.next()?.to_string(),
-                label: parts.next().unwrap_or("").to_string(),
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(3, '\u{1f}');
+                Some(Checkpoint {
+                    id: parts.next()?.to_string(),
+                    when: parts.next()?.to_string(),
+                    label: parts.next().unwrap_or("").to_string(),
+                })
             })
-        })
-        .collect()
+            .collect(),
+    )
 }
 
 /// Resolve `id` to the CANONICAL short id of a checkpoint in `list` — the only commits a
@@ -2814,6 +2828,32 @@ mod tests {
             !list.iter().any(|c| is_internal_label(&c.label)),
             "internal machinery snapshots stay hidden"
         );
+    }
+
+    #[test]
+    fn a_transient_history_read_failure_does_not_claim_history_is_exhausted() {
+        let internal = Checkpoint {
+            id: "internal".to_string(),
+            label: TEMP_REWIND_HEAD_LABEL.to_string(),
+            when: "2026-07-17T00:00:00Z".to_string(),
+        };
+        let user = Checkpoint {
+            id: "user".to_string(),
+            label: "run-baseline".to_string(),
+            when: "2026-07-16T00:00:00Z".to_string(),
+        };
+        let mut reads = 0;
+        let list = list_user_checkpoints_with(|window| {
+            reads += 1;
+            match reads {
+                1 => Some(vec![internal.clone(); window]),
+                2 => None,
+                _ => Some(vec![internal.clone(), user.clone()]),
+            }
+        });
+
+        assert_eq!(reads, 3, "the wider window is also a bounded retry");
+        assert_eq!(list, vec![user]);
     }
 
     /// A marker as a given process/boot/host would have written it.
