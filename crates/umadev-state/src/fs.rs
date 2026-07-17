@@ -39,12 +39,12 @@ pub fn metadata_is_real_file(meta: &fs::Metadata) -> bool {
 
 #[must_use]
 pub fn real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| metadata_is_real_dir(&meta))
+    symlink_metadata_path(path).is_ok_and(|meta| metadata_is_real_dir(&meta))
 }
 
 #[must_use]
 pub fn real_file(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| metadata_is_real_file(&meta))
+    symlink_metadata_path(path).is_ok_and(|meta| metadata_is_real_file(&meta))
 }
 
 pub fn ensure_real_child_dir(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
@@ -61,19 +61,19 @@ pub fn ensure_real_child_dir(parent: &Path, name: &str) -> std::io::Result<PathB
         ));
     }
     let child = parent.join(name);
-    match fs::symlink_metadata(&child) {
+    match symlink_metadata_path(&child) {
         Ok(meta) if metadata_is_real_dir(&meta) => Ok(child),
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "managed path is not a real directory",
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::create_dir(&child) {
+            match create_dir_path(&child) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
-            fs::symlink_metadata(&child)
+            symlink_metadata_path(&child)
                 .ok()
                 .filter(metadata_is_real_dir)
                 .map(|_| child)
@@ -89,7 +89,7 @@ pub fn ensure_real_child_dir(parent: &Path, name: &str) -> std::io::Result<PathB
 }
 
 fn safe_file_or_absent(path: &Path) -> std::io::Result<bool> {
-    match fs::symlink_metadata(path) {
+    match symlink_metadata_path(path) {
         Ok(meta) => Ok(metadata_is_real_file(&meta)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error),
@@ -110,6 +110,9 @@ fn open_read_no_follow(path: &Path) -> std::io::Result<File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
+    #[cfg(windows)]
+    let file = retry_transient_windows_fs(|| options.open(path))?;
+    #[cfg(not(windows))]
     let file = options.open(path)?;
     if !file
         .metadata()
@@ -137,7 +140,14 @@ fn open_temp_no_follow(path: &Path) -> std::io::Result<File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    options.open(path)
+    #[cfg(windows)]
+    {
+        retry_transient_windows_fs(|| options.open(path))
+    }
+    #[cfg(not(windows))]
+    {
+        options.open(path)
+    }
 }
 
 fn sibling(path: &Path, suffix: &str) -> std::io::Result<PathBuf> {
@@ -153,14 +163,14 @@ fn pending_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 #[cfg(windows)]
-fn retry_transient_windows_fs(
-    mut operation: impl FnMut() -> std::io::Result<()>,
-) -> std::io::Result<()> {
+fn retry_transient_windows_fs<T>(
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let started = std::time::Instant::now();
-    let retry_for = std::time::Duration::from_millis(500);
+    let retry_for = std::time::Duration::from_secs(2);
     loop {
         match operation() {
-            Ok(()) => return Ok(()),
+            Ok(value) => return Ok(value),
             Err(error)
                 if matches!(error.raw_os_error(), Some(5 | 32 | 33))
                     && started.elapsed() < retry_for =>
@@ -170,6 +180,26 @@ fn retry_transient_windows_fs(
             Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(windows)]
+fn symlink_metadata_path(path: &Path) -> std::io::Result<fs::Metadata> {
+    retry_transient_windows_fs(|| fs::symlink_metadata(path))
+}
+
+#[cfg(not(windows))]
+fn symlink_metadata_path(path: &Path) -> std::io::Result<fs::Metadata> {
+    fs::symlink_metadata(path)
+}
+
+#[cfg(windows)]
+fn create_dir_path(path: &Path) -> std::io::Result<()> {
+    retry_transient_windows_fs(|| fs::create_dir(path))
+}
+
+#[cfg(not(windows))]
+fn create_dir_path(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path)
 }
 
 #[cfg(windows)]
@@ -204,7 +234,7 @@ fn remove_dir_path(path: &Path) -> std::io::Result<()> {
 
 fn recover_pending(path: &Path) -> std::io::Result<()> {
     let pending = pending_path(path)?;
-    match fs::symlink_metadata(&pending) {
+    match symlink_metadata_path(&pending) {
         Ok(meta) if !metadata_is_real_file(&meta) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -215,7 +245,7 @@ fn recover_pending(path: &Path) -> std::io::Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     }
-    match fs::symlink_metadata(path) {
+    match symlink_metadata_path(path) {
         Ok(meta) if metadata_is_real_file(&meta) => remove_file_path(&pending),
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -231,7 +261,7 @@ fn rename_replacing(temp: &Path, target: &Path) -> std::io::Result<()> {
     // Windows can briefly deny a rename while an antivirus scanner, indexer,
     // or another just-closing handle still owns the file. Retry only those
     // transient native errors (5/32/33); the helper has a hard 500 ms deadline.
-    match fs::symlink_metadata(target) {
+    match symlink_metadata_path(target) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return rename_path(temp, target);
         }
@@ -371,9 +401,9 @@ pub fn read_bounded(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
 
 pub fn remove_regular_file(path: &Path) -> std::io::Result<bool> {
     recover_pending(path)?;
-    match fs::symlink_metadata(path) {
+    match symlink_metadata_path(path) {
         Ok(meta) if metadata_is_real_file(&meta) => {
-            fs::remove_file(path)?;
+            remove_file_path(path)?;
             Ok(true)
         }
         Ok(_) => Err(std::io::Error::new(
@@ -388,7 +418,7 @@ pub fn remove_regular_file(path: &Path) -> std::io::Result<bool> {
 /// Remove an empty managed directory without following a link or mount-like
 /// reparse point. Windows transient sharing conflicts are retried briefly.
 pub fn remove_empty_dir(path: &Path) -> std::io::Result<bool> {
-    match fs::symlink_metadata(path) {
+    match symlink_metadata_path(path) {
         Ok(meta) if metadata_is_real_dir(&meta) => {
             remove_dir_path(path)?;
             Ok(true)
@@ -400,6 +430,12 @@ pub fn remove_empty_dir(path: &Path) -> std::io::Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// Create one directory without accepting an existing entry. Windows transient
+/// sharing conflicts are retried for a bounded interval.
+pub fn create_dir(path: &Path) -> std::io::Result<()> {
+    create_dir_path(path)
 }
 
 #[cfg(test)]
@@ -456,7 +492,7 @@ mod tests {
         let mut permanent_attempts = 0;
         let error = retry_transient_windows_fs(|| {
             permanent_attempts += 1;
-            Err(std::io::Error::from_raw_os_error(87))
+            Err::<(), _>(std::io::Error::from_raw_os_error(87))
         })
         .unwrap_err();
         assert_eq!(error.raw_os_error(), Some(87));

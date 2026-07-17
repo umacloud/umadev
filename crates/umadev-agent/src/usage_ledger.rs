@@ -621,7 +621,7 @@ fn acquire_ledger_lock_with_timeout(
     let path = parent.join(LOCK_DIR);
     let started = Instant::now();
     loop {
-        match fs::create_dir(&path) {
+        match umadev_state::fs::create_dir(&path) {
             Ok(()) => {
                 let owner = LockOwner {
                     created_at_ms: now_ms(),

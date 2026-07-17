@@ -155,7 +155,7 @@ fn acquire_with_timing(
     let lock = lock_root.join(format!("{}.lock", store.id()));
     let started = Instant::now();
     loop {
-        match std::fs::create_dir(&lock) {
+        match crate::fs::create_dir(&lock) {
             Ok(()) => {
                 let owner = LockOwner {
                     version: OWNER_VERSION,

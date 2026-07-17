@@ -56,7 +56,7 @@
 //! or a failed write degrades to "no recipe" and behaves exactly as before — this
 //! module NEVER panics and NEVER returns an error that could block a delivery.
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -701,13 +701,8 @@ fn read_bounded(path: &Path, max_bytes: u64) -> Option<String> {
         }
         _ => return None,
     };
-    let mut file = open_no_follow(&selected, true, false, false)?;
-    if file.metadata().ok()?.len() > max_bytes {
-        return None;
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    Some(text)
+    let bytes = umadev_state::fs::read_bounded(&selected, max_bytes).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 fn safe_text(value: &str) -> bool {
@@ -946,104 +941,13 @@ fn render_jsonl(store: &[Recipe]) -> String {
     buf
 }
 
-/// Atomically write `body` to `path` via a unique temp file + rename, so a reader (or
-/// a concurrent writer) never observes a torn file. Best-effort cleanup of the temp on
-/// rename failure. Mirrors [`crate::project_facts`]' atomic writer.
+/// Commit recipe state through the shared no-follow, crash-safe state writer.
 fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    if !real_dir(dir) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "recipe parent is not a real directory",
-        ));
-    }
+    // Recover backups created by pre-1.0.56 Windows builds before switching to
+    // the single shared persistence implementation.
     #[cfg(windows)]
     recover_atomic_backup(path)?;
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if !metadata_is_real_file(&meta) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "recipe target is not a real file",
-            ));
-        }
-    }
-    let stamp = unique_nonce("atomic");
-    let tmp = dir.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("recipes"),
-        stamp,
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut file = options.open(&tmp)?;
-    if !file.metadata().is_ok_and(|m| metadata_is_real_file(&m)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "recipe temp is not a real file",
-        ));
-    }
-    if let Err(error) = file
-        .write_all(body.as_bytes())
-        .and_then(|()| file.sync_all())
-    {
-        drop(file);
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-    drop(file);
-
-    #[cfg(unix)]
-    let result = std::fs::rename(&tmp, path);
-
-    // Windows cannot replace an existing destination with `rename`, so retain a
-    // stable backup until the fully-synced replacement is installed.
-    #[cfg(windows)]
-    let result = {
-        let backup = atomic_backup_path(path);
-        let had_target = std::fs::symlink_metadata(path).is_ok();
-        if !had_target {
-            std::fs::rename(&tmp, path)
-        } else {
-            match std::fs::rename(path, &backup) {
-                Ok(()) => match std::fs::rename(&tmp, path) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&backup);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        let _ = std::fs::rename(&backup, path);
-                        Err(error)
-                    }
-                },
-                Err(error) => Err(error),
-            }
-        }
-    };
-
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    #[cfg(unix)]
-    if result.is_ok() {
-        if let Ok(directory) = std::fs::File::open(dir) {
-            let _ = directory.sync_all();
-        }
-    }
-    result
+    umadev_state::fs::atomic_write(path, body.as_bytes())
 }
 
 #[cfg(windows)]
@@ -1120,8 +1024,8 @@ impl Drop for CrossProcessStoreLock {
         if owner.nonce != self.nonce {
             return;
         }
-        let _ = std::fs::remove_file(self.path.join(LOCK_OWNER_FILE));
-        let _ = std::fs::remove_dir(&self.path);
+        let _ = umadev_state::fs::remove_regular_file(&self.path.join(LOCK_OWNER_FILE));
+        let _ = umadev_state::fs::remove_empty_dir(&self.path);
     }
 }
 
@@ -1147,10 +1051,10 @@ fn reclaim_stale_lock(lock: &Path) {
     };
     let tomb = parent.join(format!(".recipes.lock.stale.{}", unique_nonce("stale")));
     if std::fs::rename(lock, &tomb).is_ok() {
-        let _ = std::fs::remove_file(tomb.join(LOCK_OWNER_FILE));
+        let _ = umadev_state::fs::remove_regular_file(&tomb.join(LOCK_OWNER_FILE));
         // Refuse recursive deletion: an unexpected extra entry is safer isolated
         // under the unique tomb name than followed/deleted.
-        let _ = std::fs::remove_dir(tomb);
+        let _ = umadev_state::fs::remove_empty_dir(&tomb);
     }
 }
 
@@ -1160,7 +1064,7 @@ fn acquire_cross_process_lock(dir: &Path) -> Option<CrossProcessStoreLock> {
     }
     let lock = dir.join(STORE_LOCK_DIR);
     for _ in 0..LOCK_WAIT_ATTEMPTS {
-        match std::fs::create_dir(&lock) {
+        match umadev_state::fs::create_dir(&lock) {
             Ok(()) => {
                 let owner = LockOwner {
                     created_at_ms: now_ms(),
@@ -1168,7 +1072,7 @@ fn acquire_cross_process_lock(dir: &Path) -> Option<CrossProcessStoreLock> {
                 };
                 let body = serde_json::to_string(&owner).ok()?;
                 if write_atomic(&lock.join(LOCK_OWNER_FILE), &body).is_err() {
-                    let _ = std::fs::remove_dir(&lock);
+                    let _ = umadev_state::fs::remove_empty_dir(&lock);
                     return None;
                 }
                 return Some(CrossProcessStoreLock {
