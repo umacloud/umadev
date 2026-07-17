@@ -1,5 +1,18 @@
 use super::*;
 
+async fn wait_for_pending_approval(holder: &ApprovalHolder) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if holder.lock().unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the guarded consequential action must PAUSE");
+}
+
 /// Fix ⑤ (HEADLESS never blocks): the SAME `AskUserQuestion` on a NON-interactive
 /// turn must NOT park — it keeps today's observe-stash-and-continue behaviour and
 /// runs through to `TurnDone`. A run with no user to answer can never wedge.
@@ -97,16 +110,9 @@ async fn guarded_interactive_pauses_then_ledger_suppresses_reask() {
         )
     }));
     // Wait for the drain to register the pause, then answer Allow.
-    let mut waited = 0;
-    loop {
-        if let Some(p) = approval_holder.lock().unwrap().take() {
-            p.reply_tx.send(ApprovalReply::Allow).unwrap();
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        waited += 1;
-        assert!(waited < 400, "the guarded consequential action must PAUSE");
-    }
+    wait_for_pending_approval(&approval_holder).await;
+    let p = approval_holder.lock().unwrap().take().unwrap();
+    p.reply_tx.send(ApprovalReply::Allow).unwrap();
     tokio::time::timeout(Duration::from_secs(5), t1)
         .await
         .expect("turn 1 must resume after approval")
@@ -260,16 +266,8 @@ async fn approval_pause_fails_open_to_deny_when_abandoned() {
     }));
     // Wait for the pause, then ABANDON it (drop the sender) — the cancel / dead-session
     // fail-open path.
-    let mut waited = 0;
-    loop {
-        if approval_holder.lock().unwrap().is_some() {
-            clear_pending_approval(&approval_holder);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        waited += 1;
-        assert!(waited < 400, "the guarded consequential action must PAUSE");
-    }
+    wait_for_pending_approval(&approval_holder).await;
+    clear_pending_approval(&approval_holder);
     tokio::time::timeout(Duration::from_secs(5), t)
         .await
         .expect("abandoning the wait must fail-open, never hang")

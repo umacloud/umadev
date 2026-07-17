@@ -94,12 +94,28 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     // Wait for a rendered frame rather than racing startup on slower Windows CI,
     // then prove that the full input decoder and slash-command route can quit it.
     let render_deadline = Instant::now() + Duration::from_secs(15);
+    let mut cursor_position_answered = false;
     loop {
-        let rendered = captured
-            .lock()
-            .expect("lock terminal capture")
-            .windows(b"UmaDev".len())
-            .any(|window| window == b"UmaDev");
+        let (rendered, requested_cursor_position) = {
+            let bytes = captured.lock().expect("lock terminal capture");
+            (
+                bytes
+                    .windows(b"UmaDev".len())
+                    .any(|window| window == b"UmaDev"),
+                bytes.windows(4).any(|window| window == b"\x1b[6n"),
+            )
+        };
+        if requested_cursor_position && !cursor_position_answered {
+            // A real terminal emulator answers DSR cursor-position queries. ConPTY
+            // transports the bytes but portable-pty does not emulate that reply.
+            writer
+                .write_all(b"\x1b[1;1R")
+                .expect("answer terminal cursor-position query");
+            writer
+                .flush()
+                .expect("flush terminal cursor-position response");
+            cursor_position_answered = true;
+        }
         if rendered {
             break;
         }
