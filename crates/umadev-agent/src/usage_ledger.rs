@@ -512,7 +512,7 @@ impl Drop for LedgerLock {
             .is_some_and(|owner| owner.nonce == self.nonce);
         if owned {
             let _ = umadev_state::fs::remove_regular_file(&owner_path);
-            let _ = fs::remove_dir(&self.path);
+            let _ = umadev_state::fs::remove_empty_dir(&self.path);
         }
     }
 }
@@ -604,7 +604,7 @@ fn reclaim_stale_lock(lock_path: &Path) -> bool {
         return false;
     }
     let _ = umadev_state::fs::remove_regular_file(&tomb.join(LOCK_OWNER));
-    let _ = fs::remove_dir(&tomb);
+    let _ = umadev_state::fs::remove_empty_dir(&tomb);
     true
 }
 
@@ -630,7 +630,7 @@ fn acquire_ledger_lock_with_timeout(
                 };
                 let bytes = serde_json::to_vec(&owner).map_err(std::io::Error::other)?;
                 if let Err(error) = umadev_state::fs::atomic_write(&path.join(LOCK_OWNER), &bytes) {
-                    let _ = fs::remove_dir(&path);
+                    let _ = umadev_state::fs::remove_empty_dir(&path);
                     return Err(error);
                 }
                 return Ok(LedgerLock {

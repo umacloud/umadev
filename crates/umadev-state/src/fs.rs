@@ -152,6 +152,56 @@ fn pending_path(path: &Path) -> std::io::Result<PathBuf> {
     sibling(path, "umadev-replace-pending")
 }
 
+#[cfg(windows)]
+fn retry_transient_windows_fs(
+    mut operation: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
+    let retry_for = std::time::Duration::from_millis(500);
+    loop {
+        match operation() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(error.raw_os_error(), Some(5 | 32 | 33))
+                    && started.elapsed() < retry_for =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn rename_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    retry_transient_windows_fs(|| fs::rename(from, to))
+}
+
+#[cfg(not(windows))]
+fn rename_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn remove_file_path(path: &Path) -> std::io::Result<()> {
+    retry_transient_windows_fs(|| fs::remove_file(path))
+}
+
+#[cfg(not(windows))]
+fn remove_file_path(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path)
+}
+
+#[cfg(windows)]
+fn remove_dir_path(path: &Path) -> std::io::Result<()> {
+    retry_transient_windows_fs(|| fs::remove_dir(path))
+}
+
+#[cfg(not(windows))]
+fn remove_dir_path(path: &Path) -> std::io::Result<()> {
+    fs::remove_dir(path)
+}
+
 fn recover_pending(path: &Path) -> std::io::Result<()> {
     let pending = pending_path(path)?;
     match fs::symlink_metadata(&pending) {
@@ -166,24 +216,33 @@ fn recover_pending(path: &Path) -> std::io::Result<()> {
         Err(error) => return Err(error),
     }
     match fs::symlink_metadata(path) {
-        Ok(meta) if metadata_is_real_file(&meta) => fs::remove_file(pending),
+        Ok(meta) if metadata_is_real_file(&meta) => remove_file_path(&pending),
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "unsafe replacement target",
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::rename(pending, path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => rename_path(&pending, path),
         Err(error) => Err(error),
     }
 }
 
 #[cfg(windows)]
 fn rename_replacing(temp: &Path, target: &Path) -> std::io::Result<()> {
-    if fs::rename(temp, target).is_ok() {
-        return Ok(());
-    }
-    if fs::symlink_metadata(target).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    {
-        return fs::rename(temp, target);
+    // Windows can briefly deny a rename while an antivirus scanner, indexer,
+    // or another just-closing handle still owns the file. Retry only those
+    // transient native errors (5/32/33); the helper has a hard 500 ms deadline.
+    match fs::symlink_metadata(target) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return rename_path(temp, target);
+        }
+        Ok(metadata) if metadata_is_real_file(&metadata) => {}
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe replacement target",
+            ));
+        }
+        Err(error) => return Err(error),
     }
     let pending = pending_path(target)?;
     if !safe_file_or_absent(target)? || !safe_file_or_absent(&pending)? {
@@ -192,13 +251,13 @@ fn rename_replacing(temp: &Path, target: &Path) -> std::io::Result<()> {
             "unsafe replacement path",
         ));
     }
-    fs::rename(target, &pending)?;
-    match fs::rename(temp, target) {
+    rename_path(target, &pending)?;
+    match rename_path(temp, target) {
         Ok(()) => {
-            let _ = fs::remove_file(pending);
+            let _ = remove_file_path(&pending);
             Ok(())
         }
-        Err(error) => match fs::rename(&pending, target) {
+        Err(error) => match rename_path(&pending, target) {
             Ok(()) => Err(error),
             Err(restore) => Err(std::io::Error::new(
                 error.kind(),
@@ -326,6 +385,23 @@ pub fn remove_regular_file(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Remove an empty managed directory without following a link or mount-like
+/// reparse point. Windows transient sharing conflicts are retried briefly.
+pub fn remove_empty_dir(path: &Path) -> std::io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if metadata_is_real_dir(&meta) => {
+            remove_dir_path(path)?;
+            Ok(true)
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "refusing to remove a non-directory managed path",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +436,31 @@ mod tests {
             std::io::ErrorKind::AlreadyExists
         );
         assert_eq!(read_bounded(&path, 16).unwrap(), b"one");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transient_windows_file_conflicts_are_retried_but_other_errors_are_not() {
+        let mut transient_attempts = 0;
+        retry_transient_windows_fs(|| {
+            transient_attempts += 1;
+            if transient_attempts < 3 {
+                Err(std::io::Error::from_raw_os_error(32))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(transient_attempts, 3);
+
+        let mut permanent_attempts = 0;
+        let error = retry_transient_windows_fs(|| {
+            permanent_attempts += 1;
+            Err(std::io::Error::from_raw_os_error(87))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(87));
+        assert_eq!(permanent_attempts, 1);
     }
 
     #[cfg(unix)]

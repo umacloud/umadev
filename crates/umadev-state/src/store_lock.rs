@@ -52,7 +52,7 @@ impl Drop for StoreLock {
             return;
         }
         let _ = crate::fs::remove_regular_file(&owner_path);
-        let _ = std::fs::remove_dir(&self.path);
+        let _ = crate::fs::remove_empty_dir(&self.path);
     }
 }
 
@@ -140,7 +140,7 @@ fn reclaim_stale_lock(lock: &Path, stale_after: Duration) -> bool {
     let _ = crate::fs::remove_regular_file(&isolated.join(OWNER_FILE));
     // Never recursively delete an unexpected entry. The stale lock is already
     // isolated under a unique name, so leaving it is safer than following it.
-    let _ = std::fs::remove_dir(&isolated);
+    let _ = crate::fs::remove_empty_dir(&isolated);
     true
 }
 
@@ -166,7 +166,7 @@ fn acquire_with_timing(
                 let bytes = serde_json::to_vec(&owner).map_err(std::io::Error::other)?;
                 if let Err(error) = crate::fs::atomic_write(&lock.join(OWNER_FILE), &bytes) {
                     let _ = crate::fs::remove_regular_file(&lock.join(OWNER_FILE));
-                    let _ = std::fs::remove_dir(&lock);
+                    let _ = crate::fs::remove_empty_dir(&lock);
                     return Err(error);
                 }
                 let confirmed = read_owner(&lock.join(OWNER_FILE));
