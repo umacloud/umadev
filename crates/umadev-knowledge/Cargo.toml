@@ -45,7 +45,7 @@ tokio = { workspace = true, optional = true }
 # with `--features vector-local`.
 candle-core = { version = "0.8", optional = true }
 candle-nn = { version = "0.8", optional = true }
-candle-transformers = { version = "0.8", optional = true }
+candle-transformers = { version = "0.11", optional = true }
 tokenizers = { version = "0.20", optional = true, default-features = false, features = [
     "onig",
 ] }
