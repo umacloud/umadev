@@ -228,27 +228,27 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     loop {
         let rendered = {
             let bytes = captured.lock().expect("lock terminal capture");
-            bytes[command_capture_start..]
-                .windows(b"/quit".len())
-                .any(|window| window == b"/quit")
+            let raw = String::from_utf8_lossy(&bytes[command_capture_start..]);
+            umadev_agent::base_error::strip_ansi(&raw).contains(">_ /quit")
         };
         if rendered {
             break;
         }
-        assert!(
-            Instant::now() < command_deadline,
-            "UmaDev did not render the intentional /quit command"
-        );
+        if Instant::now() >= command_deadline {
+            let bytes = captured.lock().expect("lock terminal capture").clone();
+            let raw = String::from_utf8_lossy(&bytes[command_capture_start..]);
+            let visible = umadev_agent::base_error::strip_ansi(&raw);
+            panic!(
+                "UmaDev did not render the intentional /quit command; visible terminal tail: {visible}"
+            );
+        }
         thread::sleep(Duration::from_millis(25));
     }
     // Windows intentionally treats a sub-30ms Enter as part of a raw console
     // paste burst so an embedded pasted newline cannot submit a partial prompt.
     // Model a real, distinct submit keypress outside that documented window.
     thread::sleep(Duration::from_millis(75));
-    // ConPTY's UTF-8 input pipe uses the Windows CRLF line terminator; Unix
-    // raw PTYs deliver the Enter key as a single carriage return.
-    let submit: &[u8] = if cfg!(windows) { b"\r\n" } else { b"\r" };
-    writer.write_all(submit).expect("press Enter after /quit");
+    writer.write_all(b"\r").expect("press Enter after /quit");
     writer.flush().expect("flush /quit submit key");
 
     let deadline = Instant::now() + Duration::from_secs(15);
