@@ -214,6 +214,12 @@ mod tests {
             .expect("parse leaf pid");
         let leaf = ProcessWaitHandle::open(leaf_pid).expect("open live leaf process");
 
+        assert!(
+            root.try_wait()
+                .expect("poll root fixture before Job teardown")
+                .is_none(),
+            "root fixture exited before Job teardown"
+        );
         // Closing the final Job handle is the behavior used by session teardown.
         drop(job);
         assert_eq!(
@@ -221,14 +227,10 @@ mod tests {
             windows_sys::Win32::Foundation::WAIT_OBJECT_0,
             "Job close did not terminate the descendant process"
         );
-        let root_status = tokio::time::timeout(Duration::from_secs(5), root.wait())
+        tokio::time::timeout(Duration::from_secs(5), root.wait())
             .await
             .expect("Job close did not terminate the root process in time")
             .expect("wait for root fixture");
-        assert!(
-            !root_status.success(),
-            "a Job-terminated root must not report successful completion"
-        );
     }
 
     #[cfg(windows)]
