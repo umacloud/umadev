@@ -48,7 +48,7 @@ semver = "1"
 # ACP v1 wire types only. Transport/process ownership stays in umadev-host so
 # Windows shims, bounded stderr, cancellation, and child cleanup remain shared.
 agent-client-protocol-schema = "=1.4.0"
-toml = "0.8"
+toml = "1.1"
 # Format-preserving TOML editor — used by the MCP manager to parse-merge
 # codex's ~/.codex config.toml `[mcp_servers]` table without clobbering the
 # user's existing keys, comments, or formatting. Already in the tree via `toml`.
