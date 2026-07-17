@@ -52,7 +52,7 @@ toml = "0.8"
 # Format-preserving TOML editor — used by the MCP manager to parse-merge
 # codex's ~/.codex config.toml `[mcp_servers]` table without clobbering the
 # user's existing keys, comments, or formatting. Already in the tree via `toml`.
-toml_edit = "0.22"
+toml_edit = "0.25"
 
 # --- error handling ---
 anyhow = "1"
