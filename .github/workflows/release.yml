@@ -541,7 +541,7 @@ jobs:
 
       - name: Attest binary provenance
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: dist/umadev-${{ matrix.target }}${{ matrix.ext }}
 
@@ -595,7 +595,7 @@ jobs:
           test -s "sbom/$file"
           (cd sbom && sha256sum "$file" > "$file.sha256" && sha256sum -c "$file.sha256")
       - name: Attest release SBOM provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: sbom/*
       - name: Verify binary artifact set and checksums
@@ -664,7 +664,7 @@ jobs:
           (cd model && sha256sum -c config.json.sha256 tokenizer.json.sha256 model.safetensors.sha256)
           ls -la model
       - name: Attest embedding model provenance
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
           subject-path: model/*
       # Keep a new Release private until every asset has uploaded and its bytes
