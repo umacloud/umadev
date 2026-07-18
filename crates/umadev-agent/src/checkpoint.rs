@@ -375,6 +375,14 @@ const DISPLAY_CHECKPOINTS: usize = 50;
 /// them) — a run that never reaches the first window pays exactly what it paid before.
 const CHECKPOINT_SCAN_WINDOWS: &[usize] = &[200, 1_000, 5_000];
 
+/// A shadow-repo history read is attempted this many times before it is reported
+/// as unreadable. The read can transiently fail under load — a brief index lock, a
+/// slow fsync — and a false "unreadable" on the WIDEST scan window makes
+/// [`list_user_checkpoints_with`] give up and drop every real checkpoint out of the
+/// `/rewind` picker (the newest window can legitimately be all-internal, so the
+/// wider read is the only thing between a long run and an empty picker).
+const GIT_READ_ATTEMPTS: usize = 3;
+
 /// List checkpoints a USER may want to rewind to, newest first (capped at
 /// the display-checkpoint limit). Internal machinery snapshots (see the internal
 /// `is_internal_label` classifier)
@@ -416,7 +424,11 @@ fn list_checkpoints_limited(project_root: &Path, limit: usize) -> Vec<Checkpoint
     try_list_checkpoints_limited(project_root, limit).unwrap_or_default()
 }
 
-fn try_list_checkpoints_limited(project_root: &Path, limit: usize) -> Option<Vec<Checkpoint>> {
+/// A SINGLE shadow-repo history read, or `None` when the read itself failed (git
+/// could not be spawned, or it exited non-zero). A successful read of an empty
+/// range returns `Some(vec![])`: an UNREADABLE window and an EXHAUSTED one are
+/// different facts, and only the former is a candidate for retry.
+fn read_history_once(project_root: &Path, limit: usize) -> Option<Vec<Checkpoint>> {
     // `--all` so checkpoints that a rewind moved off the linear HEAD history
     // (the pre-rewind snapshot + any forward checkpoints, preserved under a
     // `umadev-saved-*` ref by restore_checkpoint) are still listed.
@@ -446,6 +458,25 @@ fn try_list_checkpoints_limited(project_root: &Path, limit: usize) -> Option<Vec
             })
             .collect(),
     )
+}
+
+/// [`read_history_once`] with a bounded retry so a transient read failure on a
+/// scan window is not mistaken for "no history" — see [`GIT_READ_ATTEMPTS`]. A
+/// genuinely empty range returns on the first attempt (it is `Some`, not a
+/// failure), so this never spins on real history.
+fn try_list_checkpoints_limited(project_root: &Path, limit: usize) -> Option<Vec<Checkpoint>> {
+    read_history_with_retry(|| read_history_once(project_root, limit))
+}
+
+fn read_history_with_retry(
+    mut once: impl FnMut() -> Option<Vec<Checkpoint>>,
+) -> Option<Vec<Checkpoint>> {
+    for _ in 0..GIT_READ_ATTEMPTS {
+        if let Some(history) = once() {
+            return Some(history);
+        }
+    }
+    None
 }
 
 /// Resolve `id` to the CANONICAL short id of a checkpoint in `list` — the only commits a
@@ -2854,6 +2885,48 @@ mod tests {
 
         assert_eq!(reads, 3, "the wider window is also a bounded retry");
         assert_eq!(list, vec![user]);
+    }
+
+    #[test]
+    fn a_transiently_unreadable_window_is_retried_before_being_called_empty() {
+        // The regression this guards: a shadow-repo read that fails a couple of
+        // times under load (an index lock, a slow fsync) must not be reported as
+        // "no history" — on the widest window that would empty the /rewind picker
+        // while the user's checkpoints sit right there in the shadow repo.
+        let mut attempts = 0;
+        let got = read_history_with_retry(|| {
+            attempts += 1;
+            if attempts < GIT_READ_ATTEMPTS {
+                None
+            } else {
+                Some(vec![Checkpoint {
+                    id: "abc".to_string(),
+                    label: "run-baseline".to_string(),
+                    when: "2026-07-19T00:00:00Z".to_string(),
+                }])
+            }
+        });
+        assert_eq!(
+            attempts, GIT_READ_ATTEMPTS,
+            "the read is retried, not abandoned on the first failure"
+        );
+        assert_eq!(
+            got.map(|v| v.len()),
+            Some(1),
+            "the retry recovers the history"
+        );
+
+        // A window that never becomes readable still fails open to None, bounded.
+        let mut calls = 0;
+        let never = read_history_with_retry(|| {
+            calls += 1;
+            None::<Vec<Checkpoint>>
+        });
+        assert!(
+            never.is_none(),
+            "a persistently unreadable window fails open"
+        );
+        assert_eq!(calls, GIT_READ_ATTEMPTS, "the retry is bounded");
     }
 
     /// A marker as a given process/boot/host would have written it.
