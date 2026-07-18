@@ -9723,3 +9723,166 @@ fn typing_after_an_input_selection_clears_the_stale_highlight() {
 
 #[path = "tests/tail_interaction_tests.rs"]
 mod tail_interaction_tests;
+
+// ---------------------------------------------------------------------------
+// Frozen plan rehydration after a TRANSIENT (rate-limit) abort.
+// ---------------------------------------------------------------------------
+
+/// Persist a 3-step director plan under `root` — one `done`, one `active` (the
+/// step that was mid-flight), one `pending` — so a transient-abort rehydrate has
+/// real `.umadev/plan.json` to read and we can assert each status maps correctly.
+fn save_three_step_plan(root: &std::path::Path) {
+    use umadev_agent::critics::Seat;
+    use umadev_agent::plan_state::{
+        AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus,
+    };
+    let step = |id: &str, seat: Seat, status: StepStatus| PlanStep {
+        id: id.to_string(),
+        title: format!("{id} title"),
+        seat,
+        kind: StepKind::Build,
+        depends_on: Vec::new(),
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence: Vec::new(),
+        files: StepFiles::default(),
+        status,
+    };
+    let plan = Plan {
+        steps: vec![
+            step("scaffold", Seat::Architect, StepStatus::Done),
+            step("api", Seat::BackendEngineer, StepStatus::Active),
+            step("ui", Seat::FrontendEngineer, StepStatus::Pending),
+        ],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    umadev_agent::plan_state::save(&plan, root).expect("persist test plan");
+}
+
+/// The rendered status of the plan row with `id` (helper for the assertions).
+fn row_status(app: &App, id: &str) -> Option<String> {
+    app.plan_steps
+        .iter()
+        .find(|s| s.id == id)
+        .map(|s| s.status.clone())
+}
+
+#[test]
+fn transient_abort_rehydrates_the_plan_panel_frozen_not_live() {
+    let (mut app, tmp) = temp_app();
+    save_three_step_plan(tmp.path());
+    // Seed a stale LIVE panel state (as if a run had been ticking) so we prove the
+    // abort clears it and then repaints from disk, rather than leaving old rows.
+    app.plan_steps = vec![PlanStepRow {
+        id: "stale".to_string(),
+        title: "stale live row".to_string(),
+        status: "active".to_string(),
+        seat: "architect".to_string(),
+    }];
+
+    // A rate-limit abort routed through the real event path (ABORT_SENTINEL note).
+    let reason = "API Error: Request rejected (429) · exceeded the 5-hour usage quota";
+    app.apply_engine(EngineEvent::Note(format!(
+        "{}{reason}",
+        crate::ABORT_SENTINEL
+    )));
+
+    // The panel came back from disk, frozen.
+    assert!(app.plan_frozen, "a transient abort marks the panel frozen");
+    assert_eq!(
+        app.plan_steps.len(),
+        3,
+        "the saved 3-step plan is rehydrated"
+    );
+    assert!(
+        app.plan_steps.iter().all(|s| s.id != "stale"),
+        "the stale live row is gone — the panel was repainted from the saved plan"
+    );
+    // No live spinner: the step that was ACTIVE at the abort shows PAUSED, and no
+    // row is left `active` (the "· running" suffix / working roster key off it).
+    assert_eq!(row_status(&app, "api").as_deref(), Some("paused"));
+    assert!(
+        app.plan_steps.iter().all(|s| s.status != "active"),
+        "no rehydrated row is live-active — the panel is frozen"
+    );
+    // Persisted done/pending statuses are preserved verbatim.
+    assert_eq!(row_status(&app, "scaffold").as_deref(), Some("done"));
+    assert_eq!(row_status(&app, "ui").as_deref(), Some("pending"));
+
+    // The discoverability hint is decided by the engine-side helper on exactly the
+    // same conditions (it is emitted in `run_director_loop`'s Failed arm).
+    assert_eq!(
+        umadev_agent::transient_resume_hint(reason, tmp.path()).as_deref(),
+        Some(umadev_i18n::tl("run.transient_resume_hint")),
+        "the transient abort surfaces the /continue discoverability hint"
+    );
+}
+
+#[test]
+fn a_fresh_plan_post_clears_the_frozen_panel_and_shows_the_new_plan() {
+    let (mut app, tmp) = temp_app();
+    save_three_step_plan(tmp.path());
+    let reason = "429 too many requests";
+    app.apply_engine(EngineEvent::Note(format!(
+        "{}{reason}",
+        crate::ABORT_SENTINEL
+    )));
+    assert!(
+        app.plan_frozen,
+        "precondition: the panel is frozen after abort"
+    );
+
+    // A genuine new build posts a brand-new plan — the frozen rows must be gone,
+    // the frozen flag cleared, and only the new plan's steps shown (no stale carry).
+    app.apply_engine(EngineEvent::PlanPosted {
+        steps: vec!["newstep · fresh work (backend-engineer)".to_string()],
+        statuses: vec!["pending".to_string()],
+        done: 0,
+        total: 1,
+    });
+    assert!(!app.plan_frozen, "a fresh plan post clears the frozen flag");
+    assert_eq!(app.plan_steps.len(), 1, "only the new plan's steps remain");
+    assert_eq!(app.plan_steps[0].id, "newstep");
+    assert!(
+        app.plan_steps
+            .iter()
+            .all(|s| s.id != "api" && s.id != "scaffold"),
+        "no frozen rows from the interrupted run bleed into the fresh plan"
+    );
+}
+
+#[test]
+fn a_hard_or_planless_abort_does_not_repopulate_the_panel() {
+    // Hard failure (auth) even WITH a resumable plan on disk → no false panel.
+    let (mut app, tmp) = temp_app();
+    save_three_step_plan(tmp.path());
+    app.apply_engine(EngineEvent::Note(format!(
+        "{}Error 401 Unauthorized: invalid api key",
+        crate::ABORT_SENTINEL
+    )));
+    assert!(
+        app.plan_steps.is_empty() && !app.plan_frozen,
+        "a hard auth abort leaves the panel cleared, never a frozen false panel"
+    );
+
+    // Transient reason but NO plan on disk → nothing to rehydrate.
+    let (mut app2, _tmp2) = temp_app();
+    app2.apply_engine(EngineEvent::Note(format!(
+        "{}429 too many requests",
+        crate::ABORT_SENTINEL
+    )));
+    assert!(
+        app2.plan_steps.is_empty() && !app2.plan_frozen,
+        "a transient abort with no saved plan surfaces no panel"
+    );
+}
+
+#[test]
+fn frozen_step_status_maps_active_to_paused_only() {
+    use super::frozen_plan::frozen_step_status;
+    use umadev_agent::plan_state::StepStatus;
+    assert_eq!(frozen_step_status(StepStatus::Active), "paused");
+    assert_eq!(frozen_step_status(StepStatus::Done), "done");
+    assert_eq!(frozen_step_status(StepStatus::Pending), "pending");
+    assert_eq!(frozen_step_status(StepStatus::Blocked), "blocked");
+}

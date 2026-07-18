@@ -150,7 +150,8 @@ pub use director::{
 };
 pub use director_loop::{
     drive_director_loop, drive_director_loop_resume, drive_director_loop_routed,
-    has_resumable_director_plan, has_resumable_run, run_post_build_qc, DirectorLoopOutcome,
+    has_resumable_director_plan, has_resumable_run, run_post_build_qc, transient_resume_hint,
+    DirectorLoopOutcome,
 };
 pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use execution_contract::{ContractViolation, ExecutionContract};

@@ -1970,6 +1970,12 @@ async fn run_director_loop(
                 // terminal state (so the bar shows a real aborted state) + clear
                 // `thinking` via the terminal Failed decision.
                 sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
+                // Discoverability: on a TRANSIENT abort with a plan still resumable
+                // on disk, point the user at `/continue`. A plain Note (no sentinel),
+                // so it lands AFTER the abort note above. Fail-open (no plan → skip).
+                if let Some(hint) = umadev_agent::transient_resume_hint(&reason, &root) {
+                    sink.emit(EngineEvent::Note(hint));
+                }
                 let _ = route_tx.send(RouteDecision::Failed(reason));
             }
             umadev_agent::DirectorLoopOutcome::PausedAtGate { gate } => {

@@ -43,6 +43,7 @@ use crate::config::UserConfig;
 use crate::prompt_queue_ui::PromptQueueUi;
 
 mod backend;
+mod frozen_plan;
 pub(crate) mod host_input;
 mod lessons_view;
 mod memory_view;
@@ -1346,6 +1347,9 @@ fn plan_step_glyph(status: &str) -> &'static str {
         "done" => "[x]",
         "active" => "[~]",
         "blocked" => "[!]",
+        // A step that was mid-flight when a transient abort froze the plan — shown
+        // paused (`[=]`), a static state distinct from the live `[~]` spinner.
+        "paused" => "[=]",
         _ => "[ ]",
     }
 }
@@ -3718,6 +3722,13 @@ pub struct App {
     /// `true` collapses the live plan checklist panel to a one-line summary
     /// (toggled by `/plan` with no args). Default expanded.
     pub plan_collapsed: bool,
+    /// `true` when the checklist was rehydrated from disk after a **transient**
+    /// abort — a FROZEN, interrupted view of the saved plan, not a live run. The
+    /// renderer keys off this to draw a static "interrupted — /continue to resume"
+    /// header instead of the live "· running" spinner. Set only by
+    /// [`Self::rehydrate_frozen_plan_if_transient`]; cleared by every reset path and
+    /// by a fresh plan post, so it never bleeds into a new build. Default `false`.
+    pub plan_frozen: bool,
 
     /// **Team-review verdicts** (Wave 1 deliverable 3) — each reviewing seat's
     /// structured verdict, pushed by [`EngineEvent::CriticVerdict`]. Rendered as
@@ -4140,6 +4151,7 @@ impl App {
             transient_status: None,
             plan_steps: Vec::new(),
             plan_collapsed: false,
+            plan_frozen: false,
             critic_verdicts: Vec::new(),
             critics_collapsed: false,
             critic_round_open: false,
@@ -5335,6 +5347,9 @@ impl App {
         // A bailed round is terminal — drop the live plan / team-review panel so
         // its last (now stale) state doesn't hang under the transcript.
         self.clear_live_panels();
+        // ...but a TRANSIENT abort with a resumable plan brings the checklist back
+        // FROZEN (see the method) so the saved plan doesn't vanish; fail-open.
+        self.rehydrate_frozen_plan_if_transient(&body);
         self.push(ChatRole::System, body);
         // M2 — an honest abort fires no further gate/completion, so a steer
         // message parked in `queued_steer` (the pipeline-run queue) would stay
@@ -8098,6 +8113,10 @@ impl App {
         // and seals any open review round (a re-plan starts a clean review cycle).
         // A re-plan also starts a fresh handoff timeline.
         self.plan_collapsed = false;
+        // A genuine plan post (fresh build OR a `/continue` resume re-post) is a
+        // LIVE plan — it fully replaces `plan_steps` above, so any prior FROZEN
+        // interrupted panel is gone and its static header must not linger.
+        self.plan_frozen = false;
         self.critic_round_open = false;
         self.handoffs.clear();
         // The director path posts a plan WITHOUT a `PipelineStarted` (it set
@@ -11884,6 +11903,9 @@ impl App {
     fn clear_live_panels(&mut self) {
         self.plan_steps.clear();
         self.plan_collapsed = false;
+        // A cleared panel is never frozen — a transient rehydrate re-arms this
+        // right after calling here; every other terminal/reset path leaves it off.
+        self.plan_frozen = false;
         self.critic_verdicts.clear();
         self.critics_collapsed = false;
         self.critic_round_open = false;
@@ -12400,6 +12422,7 @@ impl App {
                 // A cleared transcript also clears the live plan / review panel +
                 // the last-intent chip — nothing from the prior conversation lingers.
                 self.plan_steps.clear();
+                self.plan_frozen = false;
                 self.critic_verdicts.clear();
                 self.handoffs.clear();
                 self.last_intent_class = None;

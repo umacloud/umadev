@@ -3316,13 +3316,22 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                 Style::default().fg(theme::TEXT_MUTED()),
             )));
         } else {
+            // A FROZEN plan (rehydrated after a transient abort) draws a static
+            // "interrupted — /continue to resume" header in the warning tone, with
+            // NO "· running" suffix — the run is paused, not in flight. A live plan
+            // keeps the normal title, primary tone, and active-step suffix.
+            let (header_key, header_color, header_suffix) = if app.plan_frozen {
+                ("plan.panel.interrupted", theme::WARNING(), String::new())
+            } else {
+                ("plan.panel.title", theme::PRIMARY(), active_suffix)
+            };
             lines.push(Line::from(Span::styled(
                 format!(
-                    " {} {done}/{total}{active_suffix}",
-                    umadev_i18n::t(app.lang, "plan.panel.title")
+                    " {} {done}/{total}{header_suffix}",
+                    umadev_i18n::t(app.lang, header_key)
                 ),
                 Style::default()
-                    .fg(theme::PRIMARY())
+                    .fg(header_color)
                     .add_modifier(Modifier::BOLD),
             )));
             for step in &app.plan_steps {
@@ -3502,6 +3511,10 @@ fn checklist_glyph(status: &str) -> (String, ratatui::style::Color) {
         "active" => ("[~]".to_string(), theme::WARNING()),
         // [!] blocked.
         "blocked" => ("[!]".to_string(), theme::ERROR()),
+        // [=] paused — a step frozen mid-flight by a transient abort. A static
+        // state (never the live `[~]` spinner), muted so it reads as "interrupted,
+        // waiting for /continue", not "actively running".
+        "paused" => ("[=]".to_string(), theme::TEXT_MUTED()),
         // [ ] pending (and any unrecognised status).
         _ => ("[ ]".to_string(), theme::TEXT_MUTED()),
     }

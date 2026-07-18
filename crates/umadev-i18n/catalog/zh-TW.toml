@@ -334,6 +334,8 @@
 "base.plan.panel.title" = "底座計畫"
 "plan.panel.collapsed" = "計畫 {}/{} — /plan 展開"
 "plan.panel.active_step" = "步驟 {}/{} · 進行中"
+"plan.panel.interrupted" = "計畫(已中斷 —— /continue 繼續)"
+"run.transient_resume_hint" = "底座限流或暫時中斷 —— 本輪計畫已儲存,輸入 `/continue` 繼續未完成的步驟"
 "plan.summary.header" = "任務總結 — {} 完成 · {} 進行中 · {} 堵塞 · {} 未完成"
 "plan.panel.more_hint" = "上滑或 /plan 檢視全部"
 "plan.none" = "暫無計畫。完整建置或一次深思熟慮的任務會在這裡生成計畫。"

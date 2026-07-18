@@ -111,7 +111,7 @@ mod quality_evidence;
 mod resume;
 
 use quality_evidence::{has_reproduction_test, runtime_proof_blocking};
-pub use resume::{has_resumable_director_plan, has_resumable_run};
+pub use resume::{has_resumable_director_plan, has_resumable_run, transient_resume_hint};
 use resume::{load_resumable_plan, record_artifact_versions};
 
 /// The hard ceiling on auto-QC feedback-fix rounds in one `/run`. One round is: the
