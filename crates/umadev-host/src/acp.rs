@@ -641,7 +641,11 @@ impl AcpVendor {
         match (self, windows) {
             (Self::Grok, true) => "irm https://x.ai/cli/install.ps1 | iex",
             (Self::Grok, false) => "curl -fsSL https://x.ai/cli/install.sh | bash",
-            (Self::Kimi, _) => "npm install -g @moonshot-ai/kimi-code@0.26.0",
+            // Unpinned on purpose: the probe accepts ANY installed Kimi Code that
+            // answers `--version` (the audited version only gates the enhanced
+            // capabilities), so a user who is genuinely missing the CLI should be
+            // sent to the CURRENT release, never a stale pinned one.
+            (Self::Kimi, _) => "npm install -g @moonshot-ai/kimi-code",
         }
     }
 
@@ -9065,7 +9069,7 @@ mod tests {
 
         assert_eq!(
             AcpVendor::Kimi.install_hint(),
-            "npm install -g @moonshot-ai/kimi-code@0.26.0"
+            "npm install -g @moonshot-ai/kimi-code"
         );
         for profile in [
             BasePermissionProfile::Plan,
