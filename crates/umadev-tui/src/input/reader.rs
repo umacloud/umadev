@@ -505,6 +505,28 @@ impl InputSource {
     }
 }
 
+/// Test-only: a hermetic owned source — no stdin reader thread, no SIGWINCH, a
+/// pre-closed channel — carrying a pre-captured OSC 11 background classification
+/// (`background_reply`). Lets the reply-apply path be exercised without a live
+/// terminal (e.g. `None` for the "terminal never answered" fail-open case).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn owned_test_source(background_reply: Option<bool>) -> InputSource {
+    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    InputSource::Owned(Box::new(OwnedInput {
+        rx,
+        tokenizer: Tokenizer::for_stdin(),
+        decoder: Decoder::new(),
+        queue: VecDeque::new(),
+        flush_deadline: None,
+        esc_interval: esc_flush_interval(),
+        paste_interval: paste_flush_interval(),
+        winch: None,
+        closed: true,
+        background_reply,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

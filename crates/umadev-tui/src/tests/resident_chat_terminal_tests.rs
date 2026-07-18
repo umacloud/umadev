@@ -2772,11 +2772,38 @@ fn poll_detected_resize_runs_the_same_heal_as_an_event_resize() {
     // too, not just one frame. It deliberately does NOT contaminate: a resize
     // shows OUR cells at the wrong geometry (drift), not foreign bytes, so it
     // must not pay an ED(2) erase + its (0,0) cursor sweep.
+    let (mut terminal, _tap) = recording_terminal(20, 3);
     let mut last_resize_at = None;
-    apply_resize_heal(&mut last_resize_at);
+    apply_resize_heal(&mut terminal, false, &mut last_resize_at);
     assert!(
         last_resize_at.is_some_and(|t| t.elapsed() < RESIZE_HEAL_WINDOW),
         "a detected resize opens the resize heal window for the settle frames"
+    );
+}
+
+#[test]
+fn a_resize_re_fires_the_background_theme_query_when_allowed() {
+    // Trigger #2 — a resize can accompany a live terminal-theme switch (dragging
+    // the window to a display with a different profile, an OS day/night flip that
+    // also reflowed), so the shared resize reaction re-fires the OSC 11
+    // background query. With the guard satisfied (`allow = true`) the query bytes
+    // hit the wire; the throttle-free discrete event always probes.
+    let (mut terminal, tap) = recording_terminal(20, 3);
+    let mut last_resize_at = None;
+    apply_resize_heal(&mut terminal, true, &mut last_resize_at);
+    assert!(
+        tap.drain().contains("\x1b]11;?"),
+        "a resize must re-fire the OSC 11 background-color query"
+    );
+
+    // …and when the guard is NOT satisfied (`allow = false` — a pinned theme, the
+    // legacy reader, or an explicit UMADEV_THEME) no query is emitted.
+    let (mut terminal, tap) = recording_terminal(20, 3);
+    let mut last_resize_at = None;
+    apply_resize_heal(&mut terminal, false, &mut last_resize_at);
+    assert!(
+        !tap.drain().contains("\x1b]11;?"),
+        "a pinned / non-owned theme must NOT be re-probed on resize"
     );
 }
 
@@ -3083,7 +3110,7 @@ fn focus_gain_reasserts_the_dec_modes_and_opens_the_heal_window() {
     // multi-frame heal window so the terminal's own settle-redraw can't win.
     let (mut terminal, tap) = recording_terminal(20, 3);
     let mut last_focus_gained_at = None;
-    apply_focus_heal(&mut terminal, true, &mut last_focus_gained_at);
+    apply_focus_heal(&mut terminal, true, false, &mut last_focus_gained_at);
     let wire = tap.drain();
 
     assert!(
@@ -3105,6 +3132,149 @@ fn focus_gain_reasserts_the_dec_modes_and_opens_the_heal_window() {
     assert!(
         last_focus_gained_at.is_some_and(|t| t.elapsed() < FOCUS_HEAL_WINDOW),
         "focus return opens the heal window for the terminal's multi-frame settle"
+    );
+}
+
+#[test]
+fn focus_gain_re_fires_the_background_theme_query_when_allowed() {
+    // Trigger #1 (the DOMINANT live-theme-switch case) — the user changed the
+    // terminal theme (in prefs, or the OS flipped day/night) while the window was
+    // unfocused, then returned. Focus-in must re-fire the OSC 11 background query
+    // so the palette re-detects. With the guard satisfied (`allow = true`) the
+    // query bytes hit the wire alongside the mode reassert + heal-window open.
+    let (mut terminal, tap) = recording_terminal(20, 3);
+    let mut last_focus_gained_at = None;
+    apply_focus_heal(&mut terminal, true, true, &mut last_focus_gained_at);
+    assert!(
+        tap.drain().contains("\x1b]11;?"),
+        "focus return must re-fire the OSC 11 background-color query"
+    );
+
+    // …and a pinned theme / non-owned reader (`allow = false`) still re-asserts
+    // the DEC modes on focus return but sends NO query — the pin is respected.
+    let (mut terminal, tap) = recording_terminal(20, 3);
+    let mut last_focus_gained_at = None;
+    apply_focus_heal(&mut terminal, true, false, &mut last_focus_gained_at);
+    let wire = tap.drain();
+    assert!(
+        !wire.contains("\x1b]11;?"),
+        "a pinned / non-owned theme must NOT be re-probed on focus return"
+    );
+    assert!(
+        wire.contains("\x1b[?1004h"),
+        "…but the focus-return mode reassert still runs regardless of the theme guard"
+    );
+}
+
+#[test]
+fn maybe_reprobe_background_only_writes_when_allowed_and_never_blocks() {
+    // Trigger fail-open contract — the emit primitive is a best-effort write that
+    // NEVER blocks: with `allow = true` the query is on the wire, with
+    // `allow = false` nothing is written. A terminal that never answers simply
+    // produces no reply (there is nothing here that awaits one), so a re-probe
+    // against a silent terminal changes nothing and cannot stall the loop.
+    let (mut terminal, tap) = recording_terminal(20, 3);
+    maybe_reprobe_background(&mut terminal, true);
+    assert!(
+        tap.drain().contains("\x1b]11;?"),
+        "an allowed re-probe emits the OSC 11 query"
+    );
+    let (mut terminal, tap) = recording_terminal(20, 3);
+    maybe_reprobe_background(&mut terminal, false);
+    assert!(
+        tap.drain().is_empty(),
+        "a disallowed re-probe emits nothing (guard respected, fail-open)"
+    );
+}
+
+#[test]
+fn should_reprobe_background_respects_owned_reader_and_the_pin() {
+    // Only the OWNED reader can consume a reply, and a pinned palette (an explicit
+    // UMADEV_THEME, or a manual `/theme light|dark` — both folded into `pinned` by
+    // `theme_pinned`) must not even be queried — so NONE of the automatic triggers
+    // can flip a palette the user pinned.
+    assert!(
+        should_reprobe_background(true, false),
+        "owned + unpinned → probe"
+    );
+    assert!(
+        !should_reprobe_background(false, false),
+        "the legacy reader has no response lane → never probe"
+    );
+    assert!(
+        !should_reprobe_background(true, true),
+        "a pinned theme (UMADEV_THEME or /theme light|dark) → never probe on any trigger"
+    );
+}
+
+#[test]
+fn idle_background_reprobe_is_throttled_to_the_interval() {
+    // Trigger #3 — the idle-tick safety net re-probes at a LOW cadence: the first
+    // idle tick always probes, a second tick INSIDE the interval does not (two
+    // ticks closer than the interval ⇒ exactly one query), and the next tick PAST
+    // the interval probes again. Driven by the elapsed gap, the same way the
+    // loop's other throttle predicates (`resume_gap_elapsed`, `preedit_cleanup_due`)
+    // are tested — no real clock needed.
+    assert!(
+        theme_reprobe_due(None),
+        "the first idle tick always re-probes"
+    );
+    assert!(
+        !theme_reprobe_due(Some(THEME_REPROBE_INTERVAL / 2)),
+        "a second tick inside the interval must NOT re-probe (throttled to one query)"
+    );
+    assert!(
+        theme_reprobe_due(Some(THEME_REPROBE_INTERVAL)),
+        "a tick at/after the interval re-probes again"
+    );
+}
+
+#[test]
+fn background_reply_flips_only_on_a_real_change_and_never_when_pinned() {
+    // Trigger #4 + #5 — the reply-apply decision. A re-probe reply that MATCHES
+    // the current classification is a NO-OP (no needless full repaint from the
+    // idle re-probe); a reply that DIFFERS flips. And when the palette is pinned
+    // (UMADEV_THEME or `/theme light|dark`, both folded into `pinned`), a reply of
+    // the OPPOSITE theme is ignored — so a focus-in / idle re-probe can never
+    // override the user's pin. Args: (reply_is_light, pinned, current_is_light);
+    // current = dark here (`current_is_light = false`).
+    assert!(
+        background_reply_should_apply(true, false, false),
+        "a differing reply (light vs current dark), unpinned → flip"
+    );
+    assert!(
+        !background_reply_should_apply(false, false, false),
+        "a reply that re-confirms the current theme → no-op (no repaint)"
+    );
+    assert!(
+        !background_reply_should_apply(true, true, false),
+        "the opposite theme is ignored while the palette is pinned (/theme or UMADEV_THEME)"
+    );
+}
+
+#[test]
+fn a_re_probe_that_never_gets_a_reply_changes_nothing() {
+    // Fail-open — a re-probe against a terminal that never answers OSC 11 leaves
+    // the source with no captured reply, so `apply_background_theme_reply` early-
+    // returns: no palette change, no forced repaint, no panic, no block.
+    use crate::input::reader::owned_test_source;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = App::new(
+        "offline",
+        crate::config::UserConfig::default(),
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
+    );
+    let mut input = owned_test_source(None);
+    let mut draw_now = false;
+    apply_background_theme_reply(&mut app, &mut input, &mut draw_now);
+    assert!(
+        !draw_now,
+        "a re-probe with no reply must not force a redraw (fail-open)"
+    );
+    assert!(
+        !app.take_terminal_contaminated(),
+        "…and must not contaminate the terminal / change the palette"
     );
 }
 

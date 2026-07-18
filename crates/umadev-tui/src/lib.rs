@@ -8155,9 +8155,23 @@ fn size_poll_detected_resize(prev: Option<(u16, u16)>, polled: Option<(u16, u16)
 /// erasing (a real size change is erased anyway by ratatui's own `autoresize` →
 /// `Terminal::resize` → `clear`, inside `draw`). Never an immediate heal here —
 /// that would blank/repaint outside the frame's synchronized-update bracket.
-/// The new dimensions themselves are picked up by that autoresize. Fail-open:
-/// only a timestamp is set.
-fn apply_resize_heal(last_resize_at: &mut Option<Instant>) {
+/// The new dimensions themselves are picked up by that autoresize.
+///
+/// A resize also RE-FIRES the OSC 11 background query (`allow_reprobe`), because
+/// a resize can accompany a live terminal-theme switch — dragging the window to a
+/// display with a different profile, or an OS day/night flip that also reflowed —
+/// so the palette re-detects. The re-probe is guarded + best-effort (see
+/// [`maybe_reprobe_background`]): a no-op on a pinned theme and on a terminal that
+/// ignores the query. Fail-open: only a timestamp is set and a best-effort query
+/// emitted; neither can block the loop.
+fn apply_resize_heal<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    allow_reprobe: bool,
+    last_resize_at: &mut Option<Instant>,
+) where
+    B: ratatui::backend::Backend + std::io::Write,
+{
+    maybe_reprobe_background(terminal, allow_reprobe);
     *last_resize_at = Some(Instant::now());
 }
 
@@ -8266,17 +8280,72 @@ where
 ///    makes OUR repaint the last word. It is an in-place repaint
 ///    ([`HealMode::Invalidate`]), not an erase: what is on screen is our own
 ///    cells, mis-placed — not foreign bytes.
+/// 3. **Re-fire the OSC 11 background query** (`allow_reprobe`). Focus return is
+///    the DOMINANT live-theme-switch case: the user changed the terminal theme
+///    in preferences (or the OS flipped day/night) while away, then returned —
+///    so re-detect on the way back. Guarded + best-effort (see
+///    [`maybe_reprobe_background`]): a no-op on a pinned theme and on a terminal
+///    that never answers OSC 11. Focus LOSS never reaches here, so it never
+///    re-probes.
 ///
-/// Fail-open: a mode-write error is ignored.
+/// Fail-open: a mode-write / query-write error is ignored.
 fn apply_focus_heal<B>(
     terminal: &mut ratatui::Terminal<B>,
     mouse_on: bool,
+    allow_reprobe: bool,
     last_focus_gained_at: &mut Option<Instant>,
 ) where
     B: ratatui::backend::Backend + std::io::Write,
 {
     reassert_terminal_modes(terminal, mouse_on);
+    maybe_reprobe_background(terminal, allow_reprobe);
     *last_focus_gained_at = Some(Instant::now());
+}
+
+/// Emit the OSC 11 terminal-background query when `allow` — the ONE guarded,
+/// best-effort primitive every automatic re-probe trigger (focus-in, resize, the
+/// idle tick) and `/theme auto` share. The decision to probe is factored out into
+/// [`should_reprobe_background`] so callers pass a precomputed `allow`; here we
+/// only WRITE (or not).
+///
+/// The write is best-effort (`let _ =`): a terminal that ignores OSC 11 simply
+/// never replies, so nothing changes and nothing blocks (fail-open). The reply,
+/// when it comes, flows through the same owned reader as keystrokes and is applied
+/// by [`apply_background_theme_reply`] — which re-checks the pin and short-circuits
+/// an unchanged classification, so an idle re-probe that re-confirms the current
+/// theme costs nothing on screen.
+fn maybe_reprobe_background<B>(terminal: &mut ratatui::Terminal<B>, allow: bool)
+where
+    B: ratatui::backend::Backend + std::io::Write,
+{
+    if allow {
+        let _ = request_background_color(terminal.backend_mut());
+    }
+}
+
+/// Whether the palette is PINNED against automatic re-detection — either an
+/// explicit `UMADEV_THEME` or a manual `/theme light|dark`. A pinned palette is
+/// never re-queried by any automatic trigger and never overwritten by a probe
+/// reply, so a live terminal-theme switch can never disturb the user's explicit
+/// choice. `/theme auto` releases the manual pin.
+fn theme_pinned() -> bool {
+    theme_override().is_some() || ui::theme_locked()
+}
+
+/// Whether an automatic re-probe should actually emit the OSC 11 query: only on
+/// the OWNED reader (the legacy stream has no response lane) and only when the
+/// palette is not pinned (see [`theme_pinned`]). Pure, for unit-testing the guard
+/// without touching process-global theme state.
+fn should_reprobe_background(use_owned: bool, pinned: bool) -> bool {
+    use_owned && !pinned
+}
+
+/// Whether the idle-tick background re-probe is due: the first idle tick always
+/// probes (`None`), then no more often than [`THEME_REPROBE_INTERVAL`]. Pure —
+/// driven by the elapsed gap (like [`resume_gap_elapsed`] / [`preedit_cleanup_due`])
+/// so the throttle is unit-testable without a real clock.
+fn theme_reprobe_due(since_last: Option<Duration>) -> bool {
+    since_last.is_none_or(|elapsed| elapsed >= THEME_REPROBE_INTERVAL)
 }
 
 /// Unix job-control resume signal (SIGCONT) the event loop selects on (R5). On
@@ -8497,6 +8566,17 @@ const RESIZE_HEAL_WINDOW: Duration = Duration::from_millis(300);
 /// the non-sync path (a confirmed-sync terminal already swaps atomically), and it only opens
 /// on an ACTUAL focus/resume event — never periodically — so an idle screen never flickers.
 const FOCUS_HEAL_WINDOW: Duration = Duration::from_millis(450);
+
+/// The idle-tick live-theme re-detection cadence: the SHORTEST gap between two
+/// idle-driven OSC 11 background queries. Focus-in and resize re-probe
+/// immediately (rare, discrete events); this THROTTLED idle probe is the safety
+/// net that catches an OS day/night auto-switch or a theme change that produced
+/// NO focus/resize event. Kept conservative so it is negligible I/O — a single
+/// tiny query at most every few seconds, and only while the screen is settled
+/// (never mid-stream). A terminal that ignores OSC 11 never replies, and a
+/// matching reply is a no-op, so the cadence is invisible until a real light↔dark
+/// flip happens.
+const THEME_REPROBE_INTERVAL: Duration = Duration::from_secs(3);
 
 /// M1 — the bounded budget the cancel-drain branch waits for an aborting task to
 /// wind down before forcing the post-cancel cleanup. Captured ONCE as an
@@ -9707,15 +9787,36 @@ fn transfer_queued_director_steer(app: &mut App, steer: &umadev_agent::SteerInta
     intake.extend(consumed);
 }
 
+/// Whether a freshly parsed OSC 11 classification should REPLACE the active
+/// palette. Two guards, both mandatory:
+///
+/// - **Pin.** A pinned palette (`pinned`, see [`theme_pinned`]) wins over any
+///   probe reply — so none of the automatic re-probe triggers (focus-in, resize,
+///   the idle tick) can flip a palette the user pinned. `/theme auto` releases
+///   the pin, after which a fresh reply is honoured again.
+/// - **No-op guard.** The reply must actually DIFFER from what is on screen.
+///   Without this, the low-frequency idle re-probe would force a full repaint on
+///   every reply even when the classification is unchanged; guarding on the flip
+///   means only a real light↔dark change repaints.
+///
+/// Pure, for unit-testing the decision without touching process-global state.
+fn background_reply_should_apply(
+    reply_is_light: bool,
+    pinned: bool,
+    current_is_light: bool,
+) -> bool {
+    !pinned && reply_is_light != current_is_light
+}
+
 fn apply_background_theme_reply(app: &mut App, input: &mut InputSource, draw_now: &mut bool) {
     let Some(is_light) = input.take_background_reply() else {
         return;
     };
-    // An explicit `UMADEV_THEME` or a manual `/theme light|dark` pin both win
-    // over a probe reply: the reply is still drained (so it never leaks as
-    // input), just not applied. `/theme auto` releases the pin and re-fires the
-    // query, so a fresh reply then lands here.
-    if theme_override().is_none() && !ui::theme_locked() {
+    // The reply is ALWAYS drained above (so it never leaks as input); it is only
+    // APPLIED when nothing pins the theme AND it actually differs from the
+    // current palette (see `background_reply_should_apply`). The differ-check is
+    // what keeps the idle re-probe from repainting on every re-confirmed reply.
+    if background_reply_should_apply(is_light, theme_pinned(), ui::is_light_theme()) {
         ui::set_light_theme(is_light);
         app.contaminate_terminal();
         *draw_now = true;
@@ -9992,6 +10093,14 @@ async fn event_loop(
     // clear+repaint window afterwards so the terminal's own multi-frame redraw on focus
     // return can't leave stale cells behind (see FOCUS_HEAL_WINDOW).
     let mut last_focus_gained_at: Option<Instant> = None;
+    // Live-theme re-detection throttle: Instant of the last idle-tick OSC 11
+    // background re-probe, so an OS day/night auto-switch (which fires no
+    // focus/resize event) is caught without hammering the terminal. Bounded by
+    // THEME_REPROBE_INTERVAL; `None` until the first idle re-probe. Focus-in and
+    // resize re-probe unconditionally (rare discrete events) and do not consult
+    // it — a redundant back-to-back query is harmless (a matching reply is a
+    // no-op).
+    let mut last_theme_reprobe_at: Option<Instant> = None;
     // R5 resume-gap threshold + the last time any input event arrived. A long
     // gap before the next event looks like a sleep/wake / re-attach.
     let resume_threshold = resume_gap();
@@ -10491,11 +10600,14 @@ async fn event_loop(
                     // applied the synchronous heuristic; here we re-fire the OSC
                     // 11 query so a terminal that supports it re-answers and the
                     // async `apply_background_theme_reply` refines the palette.
-                    // Guarded like the startup query: only the owned reader can
-                    // consume a reply, and an explicit `UMADEV_THEME` still wins.
-                    if use_owned && theme_override().is_none() {
-                        let _ = request_background_color(terminal.backend_mut());
-                    }
+                    // The SAME guarded send path as every automatic re-probe
+                    // (focus-in, resize, the idle tick): only the owned reader can
+                    // consume a reply, and an explicit `UMADEV_THEME` still wins
+                    // (the pin was just released, so `theme_locked()` is false).
+                    maybe_reprobe_background(
+                        terminal,
+                        should_reprobe_background(use_owned, theme_pinned()),
+                    );
                     app.contaminate_terminal();
                 }
             }
@@ -11092,8 +11204,15 @@ async fn event_loop(
                     // away. The new dimensions themselves are picked up by ratatui's
                     // autoresize inside `terminal.draw`; recording them as the poll
                     // baseline keeps the tick's size poll from re-firing on a resize
-                    // this event path already healed. Fail-open.
-                    apply_resize_heal(&mut last_resize_at);
+                    // this event path already healed. It ALSO re-fires the OSC 11
+                    // background query (a resize can accompany a live theme
+                    // switch); guarded + best-effort so a pinned theme / an
+                    // unanswering terminal is a no-op. Fail-open.
+                    apply_resize_heal(
+                        terminal,
+                        should_reprobe_background(use_owned, theme_pinned()),
+                        &mut last_resize_at,
+                    );
                     last_known_size = Some((*w, *h));
                 } else if let Some(Ok(Event::FocusGained)) = &maybe_key {
                     // Focus regained (DEC mode 1004). While the window was
@@ -11108,10 +11227,19 @@ async fn event_loop(
                     // on unix: returning to a well-behaved xterm just repaints one
                     // clean frame).
                     // The ONE focus-return reaction: re-assert the DEC modes ConPTY
-                    // strips while unfocused (incl. the load-bearing autowrap-off)
-                    // AND open the multi-frame focus-heal window. See
+                    // strips while unfocused (incl. the load-bearing autowrap-off),
+                    // re-fire the OSC 11 background query (focus return is the
+                    // dominant live-theme-switch case: the user changed the terminal
+                    // theme, or the OS flipped day/night, while away), AND open the
+                    // multi-frame focus-heal window. Guarded + best-effort so a
+                    // pinned theme / an unanswering terminal is a no-op. See
                     // [`apply_focus_heal`].
-                    apply_focus_heal(terminal, app.mouse_scroll, &mut last_focus_gained_at);
+                    apply_focus_heal(
+                        terminal,
+                        app.mouse_scroll,
+                        should_reprobe_background(use_owned, theme_pinned()),
+                        &mut last_focus_gained_at,
+                    );
                 } else if let Some(Ok(Event::Mouse(me))) = &maybe_key {
                     handle_mouse_event(app, terminal, *me);
                 } else if let Some(Ok(Event::Paste(pasted))) = &maybe_key {
@@ -11253,7 +11381,11 @@ async fn event_loop(
                 }
                 let polled = terminal.size().ok().map(|s| (s.width, s.height));
                 if size_poll_detected_resize(last_known_size, polled) {
-                    apply_resize_heal(&mut last_resize_at);
+                    apply_resize_heal(
+                        terminal,
+                        should_reprobe_background(use_owned, theme_pinned()),
+                        &mut last_resize_at,
+                    );
                     // Repaint promptly at the new size — an idle screen has no
                     // other draw trigger pending.
                     draw_now = true;
@@ -11274,6 +11406,23 @@ async fn event_loop(
                 if animate_live {
                     draw_now = true;
                     app.tick();
+                }
+                // Live terminal-theme re-detection (idle safety net). At a LOW
+                // cadence, and ONLY while the screen is settled — never mid-stream,
+                // where `animate_live` is true and injecting the query bytes into a
+                // streaming render must be avoided — re-fire the OSC 11 background
+                // query. This catches an OS day/night auto-switch or a theme change
+                // that produced NO focus/resize event (the focus-in and resize arms
+                // cover those). Throttled by THEME_REPROBE_INTERVAL so it is
+                // negligible I/O; guarded + best-effort so a pinned theme / an
+                // unanswering terminal is a no-op, and a reply that re-confirms the
+                // current theme never repaints (`apply_background_theme_reply`).
+                if !animate_live && theme_reprobe_due(last_theme_reprobe_at.map(|t| t.elapsed())) {
+                    maybe_reprobe_background(
+                        terminal,
+                        should_reprobe_background(use_owned, theme_pinned()),
+                    );
+                    last_theme_reprobe_at = Some(Instant::now());
                 }
                 // Flush any leaked-mouse-seq candidate that never completed — a
                 // lone `Esc` (or a partial `Esc [`) the user pressed and then
