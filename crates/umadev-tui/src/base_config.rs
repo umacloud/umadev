@@ -167,6 +167,49 @@ pub fn detect_base_reasoning(backend_id: &str, project_root: &std::path::Path) -
     }
 }
 
+/// The base config a FULL session re-establish RE-DETECTS before the bounded
+/// auto-recovery retry re-opens the session — the equivalent of what a manual
+/// `/codex` re-select does, driven automatically when a live session goes stale.
+///
+/// The reported failure mode: the user changes the base's UPSTREAM config (a proxy
+/// tier / reasoning-effort / model switch in their Codex/ChatGPT proxy) mid-session,
+/// so the running session's START-time model + negotiated capabilities fall out of
+/// sync and every turn errors. Reopening while REUSING the cached model / RESUMING
+/// the same session just re-enters the stale state. Re-detecting here mirrors the
+/// `/codex` path: the caller reopens COLD (no resume) so `initialize` re-negotiates
+/// capabilities from scratch, and this supplies the base's freshly-read model +
+/// reasoning effort for that reopen and for the refreshed status display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReestablishConfig {
+    /// The base's freshly RE-DETECTED model, or the caller's fallback when the base
+    /// pins none (its own login default still drives it — UmaDev owns no model).
+    pub(crate) model: String,
+    /// The base's freshly RE-DETECTED reasoning effort to surface, or `None` when the
+    /// base pins none — so a stale effort is never shown.
+    pub(crate) reasoning: Option<String>,
+}
+
+/// RE-DETECT the base's model + reasoning effort for a full session re-establish.
+///
+/// Fail-open: a base that pins no explicit model keeps `fallback_model`; a base with
+/// no explicit effort yields `reasoning == None`. Read-only config reads only; never
+/// panics.
+#[must_use]
+pub(crate) fn redetect_base_config(
+    backend_id: &str,
+    project_root: &std::path::Path,
+    fallback_model: &str,
+) -> ReestablishConfig {
+    let model = detect_base_model(backend_id, project_root)
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .unwrap_or_else(|| fallback_model.to_string());
+    let reasoning = detect_base_reasoning(backend_id, project_root)
+        .map(|effort| effort.trim().to_string())
+        .filter(|effort| !effort.is_empty());
+    ReestablishConfig { model, reasoning }
+}
+
 /// Read a top-level string field from a JSON config file (fail-open `None`).
 fn json_top_string(path: &std::path::Path, key: &str) -> Option<String> {
     let v = json_value(path)?;
@@ -542,6 +585,53 @@ fn kimi_context_for_model(value: &toml::Value, model: &str) -> Option<u64> {
         })
         .and_then(|size| u64::try_from(size).ok())
         .filter(|size| *size > 0)
+}
+
+#[cfg(test)]
+mod reestablish_tests {
+    use super::redetect_base_config;
+
+    #[test]
+    fn redetect_reads_the_base_config_live_not_a_cached_value() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        std::fs::write(
+            root.join(".codex/config.toml"),
+            "model = \"gpt-5.6\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+
+        // The cached (start-time) model is deliberately different: a re-establish must
+        // RE-DETECT from the base's own config, not echo the stale cached value.
+        let re = redetect_base_config("codex", root, "stale-cached-model");
+        assert_eq!(re.model, "gpt-5.6");
+        assert_eq!(re.reasoning.as_deref(), Some("high"));
+
+        // The user raises the upstream effort (the reported flow). A fresh re-detect
+        // must pick up the CHANGED value — proving the config is read live, not cached.
+        std::fs::write(
+            root.join(".codex/config.toml"),
+            "model = \"gpt-5.6\"\nmodel_reasoning_effort = \"xhigh\"\n",
+        )
+        .unwrap();
+        let re = redetect_base_config("codex", root, "stale-cached-model");
+        assert_eq!(
+            re.reasoning.as_deref(),
+            Some("xhigh"),
+            "the CHANGED effort is surfaced after re-establish, not the start-time value"
+        );
+    }
+
+    #[test]
+    fn redetect_is_fail_open_when_the_base_pins_no_model_or_effort() {
+        // An unknown/offline base pins nothing and reads no home config: the fallback
+        // model is kept and no effort is shown (never a fabricated/stale one).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let re = redetect_base_config("offline", tmp.path(), "fallback-model");
+        assert_eq!(re.model, "fallback-model");
+        assert_eq!(re.reasoning, None);
+    }
 }
 
 #[cfg(test)]

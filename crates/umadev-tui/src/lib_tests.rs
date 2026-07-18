@@ -7093,6 +7093,80 @@ async fn chat_first_turn_unknown_failure_auto_redrives_once_and_recovers() {
     );
 }
 
+/// The reported upstream-config-change bug: the user changes the base's reasoning
+/// effort (in their proxy / base config) mid-session, the live session goes stale
+/// and errors, and the inline retry must do a FULL re-establish equivalent to a
+/// manual `/codex` — RE-DETECTING the base config so the CURRENT effort (`xhigh`),
+/// not the stale start-time value, is what the refreshed status surfaces.
+#[tokio::test]
+async fn chat_reestablish_surfaces_the_redetected_reasoning_effort() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    // The base's CURRENT (post-change) config: the effort is now `xhigh`. The project
+    // config wins over any home config, so this is hermetic.
+    std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    std::fs::write(
+        tmp.path().join(".claude/settings.json"),
+        "{\"effortLevel\":\"xhigh\"}",
+    )
+    .unwrap();
+
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let holder = ChatSessionHolder::new(None);
+    let (recovery, _rec_sent, _rec_ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("recovered".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let stale_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stale = StaleFirstTurnSession {
+        holder: holder.clone(),
+        recovery: Some(ResidentChat::ReadOnlyPrimed(Box::new(recovery))),
+        ended: stale_ended.clone(),
+        emitted: false,
+    };
+    *holder.lock().await = Some(ResidentChat::ReadOnlyPrimed(Box::new(stale)));
+    holder.permissions.store(
+        permission_profile_to_u8(umadev_runtime::BasePermissionProfile::Plan),
+        std::sync::atomic::Ordering::Release,
+    );
+
+    let mut turn = chat_turn(
+        "hello after an upstream effort change",
+        holder.clone(),
+        sink.clone(),
+        route_tx.clone(),
+        tmp.path().to_path_buf(),
+    );
+    turn.mode = umadev_agent::TrustMode::Plan;
+    turn.permissions = umadev_runtime::BasePermissionProfile::Plan;
+    drive_chat_session_turn(turn).await;
+
+    // The turn recovered on the re-established session (not a dead-end Failed).
+    assert!(
+        matches!(route_rx.try_recv(), Ok(RouteDecision::AgenticDone { .. })),
+        "the full re-establish recovered the turn in place"
+    );
+    // The re-establish surfaced the RE-DETECTED effort (`xhigh`) — proving the display
+    // refreshes from the base's CURRENT config, not the stale start-time value.
+    let mut saw_new_effort = false;
+    while let Ok(ev) = engine_rx.try_recv() {
+        if let EngineEvent::Note(note) = ev {
+            if note.contains("xhigh") {
+                saw_new_effort = true;
+            }
+        }
+    }
+    assert!(
+        saw_new_effort,
+        "the refreshed reasoning effort from the re-detected config is surfaced"
+    );
+}
+
 /// A KNOWN-transient first-turn failure (429 rate limit) on a live base is NOT
 /// auto-re-driven (an immediate fresh session can't clear a rate limit): it surfaces
 /// exactly ONCE, via the CHAT-turn i18n key (`chat.turn_failed`) — never the phantom

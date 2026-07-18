@@ -5081,7 +5081,10 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         text,
         input,
         backend,
-        model,
+        // Both are RE-DERIVED by the full session re-establish in the recovery retry
+        // (the auto `/codex` equivalent), so the reopen is COLD on the base's current
+        // config rather than the stale start-time model / resumed session.
+        mut model,
         project_root,
         slug,
         design_system,
@@ -5089,7 +5092,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         conversation,
         mode,
         permissions,
-        resume_session_id,
+        mut resume_session_id,
         chat_session,
         pending_ask,
         sink,
@@ -6699,13 +6702,42 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                                     },
                                 )
                             {
-                                // The loop reacquires a fresh session; surface the retry explicitly.
+                                // FULL re-establish — the in-loop equivalent of a manual
+                                // `/codex` re-select. The stale-session signature
+                                // (`BaseFailure::Unknown` on a still-alive base) is exactly
+                                // what an UPSTREAM config change produces (a proxy tier /
+                                // reasoning-effort / model switch): the session's START-time
+                                // model + negotiated capabilities are now out of sync, so a
+                                // bare reopen that reused the cached model and RESUMED the
+                                // same session would just re-enter the stale state and fail
+                                // again. Instead end the stale session, DROP the resume
+                                // pointer so the reopen is COLD (re-runs `initialize` →
+                                // RE-NEGOTIATES capabilities from scratch, never reloading the
+                                // stale ones), and RE-DETECT the base's model + reasoning
+                                // effort from its own config. Still the SINGLE retry (`attempt`
+                                // bounds the loop); fail-open (re-detect that finds nothing
+                                // keeps the fallback model and shows no stale effort).
                                 let _ = session.end().await;
+                                let reestablished = base_config::redetect_base_config(
+                                    &backend,
+                                    &project_root,
+                                    &model,
+                                );
+                                model = reestablished.model;
+                                resume_session_id = None;
                                 attempt = 1;
                                 sink.emit(EngineEvent::Note(umadev_i18n::tlf(
                                     "chat.turn_failed_retrying",
                                     &[&backend, &enriched],
                                 )));
+                                // Refresh the shown reasoning effort from the re-detected
+                                // config so the status is no longer stale (mirrors `/codex`).
+                                if let Some(reasoning) = reestablished.reasoning.as_deref() {
+                                    sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                                        "model.reasoning",
+                                        &[reasoning],
+                                    )));
+                                }
                                 continue 'attempt;
                             }
                             // Keep a live session after a transient failure. The helper chooses
