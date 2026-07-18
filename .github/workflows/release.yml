@@ -729,10 +729,17 @@ jobs:
             # A failed earlier attempt may have left extra or stale assets on
             # the hidden draft. Clear them first so every retry reconstructs
             # the same manifest instead of preserving an unpublishable draft.
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-              --jq '.assets[].id' | while read -r asset_id; do
-                [[ -z "$asset_id" ]] || gh api --method DELETE \
-                  "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            #
+            # Enumerate + delete assets through `gh release` (which resolves a
+            # DRAFT by its tag), NOT the REST `/releases/tags/{tag}` endpoint,
+            # which only ever returns PUBLISHED releases and 404s on a draft —
+            # aborting the very first publish, since the release is a draft when
+            # this runs.
+            gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '.assets[].name' | while read -r asset_name; do
+                [[ -z "$asset_name" ]] || gh release delete-asset \
+                  "$GITHUB_REF_NAME" "$asset_name" \
+                  --repo "$GITHUB_REPOSITORY" --yes
               done
             gh release upload "$GITHUB_REF_NAME" "${release_files[@]}" \
               --repo "$GITHUB_REPOSITORY" \
