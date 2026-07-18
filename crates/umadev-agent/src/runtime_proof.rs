@@ -2199,9 +2199,19 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let start = std::time::Instant::now();
         let outcome = wait_for_boot(&mut rx, "http://127.0.0.1:1", 1).await;
+        // The load-bearing assertion: the 1s-budget wait returns Timeout rather
+        // than hanging or misclassifying an unbound port.
         assert_eq!(outcome, BootOutcome::Timeout);
+        // A genuine hang never returns, so it is caught by the test harness's own
+        // timeout, not by this bound. This bound only guards against a pathological
+        // multi-minute delay — so it is generous: `#[tokio::test]` runs on a
+        // single-thread runtime whose timer only fires when the thread is scheduled,
+        // and on a saturated CI runner (this file's Windows leg has compiled for ~10
+        // minutes before the tests even start) the thread can be descheduled long
+        // past a 1s logical budget. 60s still flags a real multi-minute hang while
+        // tolerating scheduler starvation.
         assert!(
-            start.elapsed() < Duration::from_secs(15),
+            start.elapsed() < Duration::from_secs(60),
             "boot wait must be bounded, not a multi-minute hang"
         );
         drop(tx);
