@@ -6157,7 +6157,11 @@ fn mode_prefix_width(app: &App) -> u16 {
         4 // "[?]" + space
     } else if app.active_gate.is_some() {
         7
-    } else if app.run_started && !app.finished {
+    } else if app.is_pipeline_active() {
+        // Mirror `mode_icon` EXACTLY (which shows `[run]` only for a genuinely live
+        // run): a terminal aborted / degraded block reads as `>_` there, so the
+        // prefix width must be 3 too — otherwise the input text is indented 6 cols
+        // under a 3-col marker.
         6
     } else {
         3
@@ -6585,6 +6589,12 @@ fn input_placeholder(app: &App) -> std::borrow::Cow<'static, str> {
         // run is still in flight (which the bare `run_started` branch below would
         // wrongly imply, since `run_started` stays set on an aborted block).
         umadev_i18n::t(app.lang, "input.aborted").into()
+    } else if app.degraded {
+        // The block ended TERMINALLY short of delivery on placeholder templates /
+        // a failed hard gate — point at `/redo`, NOT the bare `run_started`
+        // "running" hint below (which stays set on a degraded block). Checked after
+        // `thinking` above so a live re-drive still reads as running (Scenario B).
+        umadev_i18n::t(app.lang, "input.degraded").into()
     } else if app.run_started {
         umadev_i18n::t(app.lang, "input.running").into()
     } else if let Some(tip) = app.first_run_example_tip() {
@@ -6896,6 +6906,12 @@ fn status_text_and_color(app: &App) -> Option<(String, Color)> {
         // silently make a wedged run show stale phase progress. Checked before
         // `run_started` because `mark_block_aborted` leaves `run_started` set.
         format!("[aborted] {}", umadev_i18n::t(app.lang, "status.aborted"))
+    } else if app.degraded {
+        // Terminal DEGRADED/incomplete end (base offline placeholders / failed hard
+        // gate). Reads `[degraded] … /redo` DIRECTLY here — checked after `thinking`
+        // (returned above) so a live re-drive never shows a stale terminal, and
+        // before `run_started` so a degraded block never reads the running heartbeat.
+        format!("[degraded] {}", umadev_i18n::t(app.lang, "status.degraded"))
     } else if app.active_gate.is_some() {
         // A2#12: a run parked at a confirmation gate reads as PAUSED — the
         // dedicated `status.paused` copy existed but was never rendered, so the

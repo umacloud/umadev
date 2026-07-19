@@ -55,6 +55,7 @@
 "model.reasoning" = "reasoning effort {} (from the base config; UmaDev does not override)"
 "input.idle" = "Ask anything…"
 "input.aborted" = "this round was aborted — type a new requirement to try again"
+"input.degraded" = "this round degraded / incomplete — fix the base, then /redo for real output"
 # Rotating idle-empty placeholders: example requirements (echoing the welcome
 # examples) + command hints, rotated once per submit; special states (running /
 # gate / finished) take priority and never rotate. The `Enter submit` /
@@ -77,6 +78,7 @@
 # Status
 "status.ready" = "Ready"
 "status.aborted" = "this round was aborted"
+"status.degraded" = "degraded / incomplete — fix the base, then /redo"
 "status.stopping" = "stopping…"
 "status.thinking" = "thinking…"
 "status.using_tool" = "using"

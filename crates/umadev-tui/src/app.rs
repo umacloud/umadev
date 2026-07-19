@@ -1208,6 +1208,48 @@ fn classify_live_meta(text: &str) -> Option<LiveMetaIntent> {
         .then_some(LiveMetaIntent::Progress)
 }
 
+/// One derived truth for the run's lifecycle, so the status label, the elapsed
+/// timer, the mode marker and the input placeholder all read the SAME state
+/// instead of independently inspecting the raw run flags (which drifted apart).
+/// Derived by [`App::run_state`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RunState {
+    /// Actively working — a live turn is thinking, OR a block's phase clock is
+    /// running and we are not parked at a gate. The elapsed `[time]` timer runs
+    /// IFF the state is `Running`.
+    Running,
+    /// Parked at a confirmation gate, awaiting the user's decision.
+    PausedAtGate,
+    /// A full run reached delivery cleanly (`[ok] delivered`).
+    Delivered,
+    /// A block ended TERMINALLY short of delivery because the base degraded to
+    /// placeholder templates or failed a hard gate — fixable with `/redo`.
+    Degraded,
+    /// A block errored out before producing any phase (an honest hard abort).
+    Aborted,
+    /// No run in flight.
+    Idle,
+}
+
+/// `true` when a progress `Note` carries one of the runner's STABLE,
+/// language-independent DEGRADED / failed markers — the signal a terminal
+/// [`EngineEvent::BlockCompleted`] short of delivery uses to tell a genuine
+/// degrade/failure (→ `[degraded] … /redo`) apart from a CLEAN short-circuit
+/// (docs-only / light pipeline / clean `/redo` → a plain finished stop).
+///
+/// These three markers are runner-internal tags (not translated prose — the
+/// runner's own tests assert them as stable), so matching them never breaks
+/// under i18n:
+/// - `[WARN][降级]` — a phase fell back to an offline placeholder template;
+/// - `UD-EVID-003` — the blocked-quality-gate hard-stop evidence code;
+/// - `未产出任何真实代码文件` — the "no real code produced" hard failure.
+#[must_use]
+fn note_signals_degraded(note: &str) -> bool {
+    note.contains("[WARN][降级]")
+        || note.contains("UD-EVID-003")
+        || note.contains("未产出任何真实代码文件")
+}
+
 /// Status of one pipeline phase.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum PhaseStatus {
@@ -3354,6 +3396,24 @@ pub struct App {
     /// status bar as an explicit "aborted" terminal state so a wedged run no
     /// longer masquerades as idle "ready / 0/9". Cleared when a new run starts.
     pub aborted: bool,
+    /// `true` when the LAST block ended TERMINALLY short of delivery because the
+    /// base **degraded** to placeholder templates or failed a hard gate (base
+    /// offline → `[WARN][降级]`, no real code produced, or a blocked quality gate).
+    /// Unlike [`Self::aborted`] (a block that errored before producing any phase),
+    /// a degraded block returns `Ok` with a non-`Delivery` `final_phase`, so it
+    /// never trips `ABORT_SENTINEL`. Distinct from [`Self::finished`] so the status
+    /// bar reads a terminal "降级/未完成 — /redo" state (timer STOPPED) instead of a
+    /// misleading `[ok] delivered` or a forever-ticking `[run] 运行中`. Cleared when
+    /// a new run / working turn starts.
+    pub degraded: bool,
+    /// Sticky within one run: set the moment a degraded/failed SIGNAL streams past
+    /// (`[WARN][降级]` placeholder banner, the `UD-EVID-003` blocked-quality-gate
+    /// code, or the "no real code produced" failure) so a terminal
+    /// [`EngineEvent::BlockCompleted`] short of delivery can tell a genuine
+    /// degrade/failure apart from a CLEAN short-circuit (a docs-only task, a light
+    /// small-change pipeline, a clean single-phase `/redo`). Reset at each new run /
+    /// working turn. Fail-open: an unseen signal reads the exit as a clean stop.
+    pub run_degraded_seen: bool,
 
     /// Background-run **task registry**: the active mutating run (if any) plus a
     /// short history of recent finished/stopped ones. A `/run` registers a
@@ -4086,6 +4146,8 @@ impl App {
             finished: false,
             run_started: false,
             aborted: false,
+            degraded: false,
+            run_degraded_seen: false,
             tasks: Vec::new(),
             task_seq: 0,
             bell_enabled: bell_enabled_from_env(std::env::var("UMADEV_BELL").ok().as_deref()),
@@ -5263,16 +5325,30 @@ impl App {
             .active_gate
             .map(|g| format!(" · [gate] {}", g.id_str()))
             .unwrap_or_default();
-        let done_label = if self.finished {
-            " · [ok] delivered".to_string()
-        } else if self.aborted {
-            // Explicit terminal state — never let an aborted run read as idle.
-            format!(
-                " · [aborted] {}",
-                umadev_i18n::t(self.lang, "status.aborted")
-            )
-        } else {
-            String::new()
+        // The single derived truth (see `run_state`) drives BOTH the terminal
+        // label and the elapsed timer, so they can never disagree: a degraded exit
+        // reads `[degraded]` with the timer STOPPED (never `[run] 运行中` still
+        // ticking), and a live re-drive reads Running (never a stale `[aborted]`).
+        let state = self.run_state();
+        let done_label = match state {
+            RunState::Delivered => " · [ok] delivered".to_string(),
+            RunState::Aborted => {
+                // Explicit terminal state — never let an aborted run read as idle.
+                format!(
+                    " · [aborted] {}",
+                    umadev_i18n::t(self.lang, "status.aborted")
+                )
+            }
+            RunState::Degraded => {
+                // Terminal, but NOT a delivery: the base degraded to placeholder
+                // templates / failed a hard gate. Show the honest `/redo` state
+                // instead of a false `[ok] delivered` or a live `[run]`.
+                format!(
+                    " · [degraded] {}",
+                    umadev_i18n::t(self.lang, "status.degraded")
+                )
+            }
+            RunState::Running | RunState::PausedAtGate | RunState::Idle => String::new(),
         };
         let ds_short = self
             .config
@@ -5280,11 +5356,12 @@ impl App {
             .as_deref()
             .map(|s| format!(" · [design] {s}"))
             .unwrap_or_default();
-        // Total wall-clock since the block started, shown while running so
-        // the user has a clear "it's been N minutes" signal.
+        // Total wall-clock since the block started, shown ONLY while genuinely
+        // Running so the user has a clear "it's been N minutes" signal — a paused,
+        // delivered, aborted, degraded or idle state stops the counter.
         let total_elapsed = self
             .run_started_at
-            .filter(|_| !self.finished && self.active_gate.is_none())
+            .filter(|_| state == RunState::Running)
             .map(|t| format!(" · [time] {}", fmt_elapsed(t.elapsed().as_secs())))
             .unwrap_or_default();
         self.status = format!(
@@ -5293,16 +5370,61 @@ impl App {
         );
     }
 
+    /// One derived truth for the run's lifecycle so the status LABEL, the elapsed
+    /// TIMER, the mode marker and the input placeholder can never disagree with the
+    /// real run state. Every status surface derives from this instead of reading the
+    /// raw `thinking` / `run_started_at` / `active_gate` / `finished` / `aborted` /
+    /// `degraded` flags independently (which drifted out of sync: a degraded build
+    /// kept `[run] 运行中` with the `[time]` timer ticking, and a base-failure
+    /// re-drive read `[aborted]` while it was demonstrably thinking).
+    ///
+    /// **Live activity wins over any stale terminal flag.** A re-drive on the
+    /// director/chat path sets `thinking` WITHOUT re-emitting `PipelineStarted` /
+    /// `PhaseStarted`, so a leftover `aborted` / `degraded` / `finished` from the
+    /// PRIOR block must never mask a turn that is provably working — hence the
+    /// `thinking` check comes first.
+    #[must_use]
+    pub fn run_state(&self) -> RunState {
+        if self.thinking || (self.run_started_at.is_some() && self.active_gate.is_none()) {
+            RunState::Running
+        } else if self.active_gate.is_some() {
+            RunState::PausedAtGate
+        } else if self.finished {
+            RunState::Delivered
+        } else if self.degraded {
+            RunState::Degraded
+        } else if self.aborted {
+            RunState::Aborted
+        } else {
+            RunState::Idle
+        }
+    }
+
+    /// Clear the TERMINAL run flags (`aborted` / `finished` / `degraded`) because a
+    /// genuinely new working turn just began on the director/chat path (a posted
+    /// plan, a ticking plan step). That path emits no `PipelineStarted` /
+    /// `PhaseStarted`, so without this a leftover terminal flag from the PRIOR block
+    /// would survive and a status surface reading the raw flag could paint
+    /// `[aborted]` / `[degraded]` / `[ok]` over a turn that is demonstrably working
+    /// (Scenario B). Leaves the per-run `run_degraded_seen` latch alone — callers
+    /// that start a brand-new run reset it explicitly.
+    fn clear_stale_terminal_on_live_turn(&mut self) {
+        self.aborted = false;
+        self.finished = false;
+        self.degraded = false;
+    }
+
     /// `true` while the user has started a run that hasn't reached
     /// delivery yet. Used by the Esc-to-quit confirmation.
     ///
-    /// An **aborted** block is NOT active: the run is over (it produced zero
-    /// phases and bailed), so it must not keep claiming the workspace or block a
-    /// fresh `/run`. Without this, an aborted run would stay "active" forever and
-    /// a retry would be wrongly refused as "a pipeline is already running".
+    /// An **aborted** OR **degraded** block is NOT active: the run is over (it
+    /// bailed / stopped short of delivery), so it must not keep claiming the
+    /// workspace or block a fresh `/run`. Without this, such a run would stay
+    /// "active" forever and a retry would be wrongly refused as "a pipeline is
+    /// already running" — and the header would keep painting `[run] 运行中`.
     #[must_use]
     pub fn is_pipeline_active(&self) -> bool {
-        self.run_started && !self.finished && !self.aborted
+        self.run_started && !self.finished && !self.aborted && !self.degraded
     }
 
     /// Shared truth for Esc, Ctrl-C, and `/cancel`. A Director paused at a gate
@@ -5337,6 +5459,10 @@ impl App {
         // timers are cleared, gated on how long the run had been going.
         self.arm_completion_bell(self.run_started_at.or(self.thinking_started));
         self.aborted = true;
+        // `aborted` and `degraded` are mutually-exclusive terminal states — an
+        // honest hard abort clears any prior degraded flag so `run_state` reads a
+        // single unambiguous terminal.
+        self.degraded = false;
         // The run errored out (not a user cancel) → its task is a Failed row.
         self.mark_active_task(TaskStatus::Failed);
         self.active_gate = None;
@@ -8152,6 +8278,15 @@ impl App {
         _done: usize,
         total: usize,
     ) {
+        // **Scenario B — a genuine new working turn on the director/chat path.** A
+        // posted plan is the reliable "a build is live" signal here (this path emits
+        // no `PipelineStarted` / `PhaseStarted`), so any TERMINAL flag left over from
+        // a PRIOR block is stale. `run_state` already lets `thinking` win, but
+        // clearing the raw flags — and the per-run degrade latch — keeps every
+        // surface that reads them honest (no `[aborted]` / `[degraded]` over a turn
+        // that is demonstrably working).
+        self.clear_stale_terminal_on_live_turn();
+        self.run_degraded_seen = false;
         self.plan_steps = steps
             .iter()
             .enumerate()
@@ -8200,6 +8335,11 @@ impl App {
     /// appended so the panel never silently loses a transition. Fail-open: an
     /// unrecognised status string renders as a neutral pending dot.
     fn apply_plan_step_status(&mut self, id: &str, title: &str, status: &str) {
+        // A ticking plan step is a live director turn (e.g. a `/continue` resume
+        // may drive steps without re-posting the plan) — clear any stale terminal
+        // flag so a prior block's `[aborted]` / `[degraded]` / `[ok]` never reads
+        // over a turn that is demonstrably working (Scenario B).
+        self.clear_stale_terminal_on_live_turn();
         // A step transition means the director is between review bursts (a build
         // step is running, or a review step just (de)activated) — seal the open
         // review round so the NEXT verdict clears the prior round's seats instead
@@ -8497,9 +8637,11 @@ impl App {
                 // Surface the run as a manageable background task (idempotent — a
                 // gate-anchored `Continue` block re-emits this and REUSES the task).
                 self.register_run_task(&requirement);
-                // A fresh block clears any prior aborted terminal state — this
-                // run is live again.
+                // A fresh block clears any prior aborted / degraded terminal state
+                // (and the per-run degrade latch) — this run is live again.
                 self.aborted = false;
+                self.degraded = false;
+                self.run_degraded_seen = false;
                 self.run_started_at = Some(std::time::Instant::now());
                 self.push(
                     ChatRole::UmaDev,
@@ -8541,10 +8683,14 @@ impl App {
                 // A phase is STARTING — the run is demonstrably alive and
                 // progressing, so any prior terminal flag is stale. Clearing it
                 // here keeps the status/placeholder honest if a single block
-                // aborted earlier and the director then recovered into a new phase
-                // (otherwise the run kept advancing under a frozen "本轮已中止").
+                // aborted / degraded earlier and the director then recovered into a
+                // new phase (otherwise the run kept advancing under a frozen
+                // "本轮已中止" / "[degraded]"). The per-run `run_degraded_seen` latch is
+                // NOT reset here: degraded phases must accumulate ACROSS a block so
+                // the end-of-block summary still classifies the exit correctly.
                 self.aborted = false;
                 self.finished = false;
+                self.degraded = false;
                 // Fresh phase → fresh stall clock; nothing has stalled yet.
                 self.last_output_at = Some(std::time::Instant::now());
                 self.tool_in_progress = false;
@@ -8828,6 +8974,53 @@ impl App {
                     // already in scrollback) and drop the live plan / team-review
                     // panel so a finished run stops rendering a stale live list.
                     self.finalize_live_panels();
+                } else if paused_at.is_none() {
+                    // **Scenario A — a block ended without a gate and SHORT of
+                    // Delivery.** Every such exit is TERMINAL (each gate-anchored
+                    // block stops and waits for an explicit continue), so a
+                    // `final_phase != Delivery` completion is the run's end — but the
+                    // old handler had no `else`, so it silently ignored it: the timer
+                    // kept ticking and the header stayed `[run] 运行中` forever. Stop
+                    // the live counters + activity for ANY such exit, then classify:
+                    //   - a DEGRADED / failed exit (base offline → placeholder
+                    //     templates, no real code produced, or a blocked quality gate
+                    //     — each streamed a stable degrade/fail marker we latched in
+                    //     `run_degraded_seen`) sets the `degraded` terminal flag so the
+                    //     bar reads `[degraded] … /redo` (NOT a false `[ok] delivered`);
+                    //   - a CLEAN short-circuit that legitimately ends before Delivery
+                    //     (a docs-only task settling at its docs gate, a light
+                    //     small-change / refactor pipeline, a clean single-phase
+                    //     `/redo`) settles as `finished` so it drops out of the active
+                    //     "运行中" state. Fail-open: an unmarked exit reads as clean.
+                    self.arm_completion_bell(self.run_started_at);
+                    self.run_started_at = None;
+                    self.phase_started_at = None;
+                    // The run is over — stop every worker-stall / heartbeat animation.
+                    self.thinking = false;
+                    self.tool_in_progress = false;
+                    self.long_op_in_progress = false;
+                    self.last_output_at = None;
+                    self.transient_status = None;
+                    // A late-queued steer never hit a gate gap on a terminal exit —
+                    // surface it rather than silently drop it (mirrors the abort +
+                    // delivery paths) so the "queued N" chip clears.
+                    if !self.queued_steer.is_empty() {
+                        let text = self.queued_steer.drain(..).collect::<Vec<_>>().join("\n");
+                        self.push(
+                            ChatRole::System,
+                            umadev_i18n::tf(self.lang, "run.queued_unsent", &[&text]),
+                        );
+                    }
+                    if self.run_degraded_seen {
+                        self.degraded = true;
+                        self.mark_active_task(TaskStatus::Failed);
+                    } else {
+                        self.finished = true;
+                        self.mark_active_task(TaskStatus::Done);
+                    }
+                    // Settle the live plan / team-review panel so a terminal run
+                    // stops rendering a stale live list under the transcript.
+                    self.finalize_live_panels();
                 }
             }
             EngineEvent::BackendProbed {
@@ -8991,6 +9184,18 @@ impl App {
                 if let Some(body) = note.strip_prefix(crate::ABORT_SENTINEL) {
                     self.mark_block_aborted(body.to_string());
                     return;
+                }
+                // Latch a DEGRADED / failed signal as it streams past, so a terminal
+                // `BlockCompleted` short of delivery can tell a genuine degrade apart
+                // from a clean short-circuit (docs-only / light / clean `/redo`). The
+                // runner tags these with STABLE, language-independent markers (proven
+                // stable by its own tests), so this never leans on translated prose:
+                //   - `[WARN][降级]` — a phase fell back to an offline placeholder
+                //     template (the exact Scenario-A banner the user reported);
+                //   - `UD-EVID-003` — the blocked-quality-gate hard-stop evidence code;
+                //   - "未产出任何真实代码文件" — the "no real code produced" hard failure.
+                if note_signals_degraded(&note) {
+                    self.run_degraded_seen = true;
                 }
                 // A bare progress Note must NOT clear `thinking`. A route is
                 // still in flight here (its TERMINAL outcome arrives as a

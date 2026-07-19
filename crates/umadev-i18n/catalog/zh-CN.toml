@@ -55,6 +55,7 @@
 "model.reasoning" = "思考强度 {}(底座配置,umadev 不覆盖)"
 "input.idle" = "问我任何事…"
 "input.aborted" = "本轮已中止 —— 重新输入需求再试"
+"input.degraded" = "本轮降级/未完成 —— 修好底座后用 /redo 重跑拿真实产物"
 # 空闲输入框的轮换占位:示例需求（呼应欢迎语示例）+ 命令提示,每次提交后轮换一条;
 # 运行中/闸门/已完成等特殊状态优先,不参与轮换。原先常驻底部状态栏的
 # 「Enter 提交」「/help 查看全部命令」提示移到了这里。
@@ -76,6 +77,7 @@
 # 状态
 "status.ready" = "就绪"
 "status.aborted" = "本轮已中止"
+"status.degraded" = "降级/未完成 —— 修好底座后 /redo 重跑"
 "status.stopping" = "正在停止…"
 "status.thinking" = "正在思考…"
 "status.using_tool" = "调用工具"

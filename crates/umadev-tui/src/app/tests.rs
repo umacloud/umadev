@@ -6737,6 +6737,220 @@ fn ordinary_progress_note_does_not_abort() {
 }
 
 #[test]
+fn degraded_block_completion_reads_degraded_and_stops_timer() {
+    // SCENARIO A: the base failed and phases DEGRADED to placeholder templates,
+    // then the block returned `Ok` with a non-`Delivery` `final_phase` (no gate)
+    // — no `ABORT_SENTINEL`. The old handler had no `else`, so the timer kept
+    // ticking and the bar stayed `[run] 运行中`. It must now read a terminal
+    // `[degraded]` with the elapsed timer STOPPED.
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.phase_started_at = Some(std::time::Instant::now());
+    assert!(app.is_pipeline_active(), "live before the degraded exit");
+
+    // The runner's block-end summary carries the stable `[WARN][降级]` banner
+    // (the exact one the user saw), latched as it streams past.
+    app.apply_engine(EngineEvent::Note(
+        "[WARN][降级] 本次有 2 个阶段因底座离线只产出了占位模板(非真实交付) \
+         …… 修好底座后用 /redo 重跑以拿到真实产物。"
+            .into(),
+    ));
+    assert!(app.run_degraded_seen, "the degrade banner is latched");
+
+    app.apply_engine(EngineEvent::BlockCompleted {
+        final_phase: Phase::Backend,
+        paused_at: None,
+    });
+
+    assert_eq!(app.run_state(), RunState::Degraded);
+    assert!(app.degraded, "flagged degraded");
+    assert!(
+        !app.finished,
+        "a degrade is NOT a clean delivery — never print `[ok] delivered`"
+    );
+    assert!(
+        app.run_started_at.is_none() && app.phase_started_at.is_none(),
+        "the elapsed timer STOPS (not still ticking '运行中')"
+    );
+    assert!(
+        !app.is_pipeline_active(),
+        "a degraded run is terminal, not active"
+    );
+
+    app.refresh_status();
+    assert!(
+        app.status.contains("[degraded]"),
+        "top bar reads degraded: {}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("[time]"),
+        "no live timer segment: {}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("[ok] delivered"),
+        "not a false delivery: {}",
+        app.status
+    );
+}
+
+#[test]
+fn blocked_quality_gate_completion_reads_degraded() {
+    // A hard-blocked quality gate returns `Ok { final_phase: Quality, paused_at:
+    // None }`, tagged with the stable `UD-EVID-003` evidence code — a terminal
+    // degrade/failure, not a clean short-circuit.
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.apply_engine(EngineEvent::Note(
+        "[warn] 质量门未通过(得分 41/100)— 阻断 delivery(UD-EVID-003)。".into(),
+    ));
+    assert!(app.run_degraded_seen);
+    app.apply_engine(EngineEvent::BlockCompleted {
+        final_phase: Phase::Quality,
+        paused_at: None,
+    });
+    assert_eq!(app.run_state(), RunState::Degraded);
+    assert!(app.degraded && !app.finished);
+    assert!(app.run_started_at.is_none(), "timer stopped");
+}
+
+#[test]
+fn no_real_code_failure_completion_reads_degraded() {
+    // The "no real code produced" hard failure exits at `Backend/None` with its
+    // stable Chinese marker — degraded, not a clean stop.
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.apply_engine(EngineEvent::Note(
+        "[fail] 未产出任何真实代码文件 —— 流水线停止,未交付。".into(),
+    ));
+    assert!(app.run_degraded_seen);
+    app.apply_engine(EngineEvent::BlockCompleted {
+        final_phase: Phase::Backend,
+        paused_at: None,
+    });
+    assert_eq!(app.run_state(), RunState::Degraded);
+    assert!(app.degraded && !app.finished);
+}
+
+#[test]
+fn clean_short_circuit_completion_is_finished_not_degraded() {
+    // A docs-only task legitimately ends before Delivery (settles at its docs
+    // gate) with NO degrade/fail signal — it must settle as a CLEAN finish, never
+    // be mislabeled `[degraded] /redo`, and stop the timer (not hang on `运行中`).
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.apply_engine(EngineEvent::Note(
+        "[plan] 任务类型 Docs — 仅产出文档/调研,已在文档确认门完成,无需进入实现阶段。".into(),
+    ));
+    assert!(
+        !app.run_degraded_seen,
+        "a clean note is NOT a degrade signal"
+    );
+    app.apply_engine(EngineEvent::BlockCompleted {
+        final_phase: Phase::DocsConfirm,
+        paused_at: None,
+    });
+    assert!(!app.degraded, "a clean short-circuit is not degraded");
+    assert!(app.finished, "it settled cleanly");
+    assert_eq!(app.run_state(), RunState::Delivered);
+    assert!(
+        app.run_started_at.is_none(),
+        "the timer stops on a clean short-circuit too"
+    );
+    assert!(!app.is_pipeline_active());
+}
+
+#[test]
+fn director_redrive_after_abort_reads_running_not_aborted() {
+    // SCENARIO B: a base-failure recovery / model-switch re-drives on the
+    // director path, which sets `thinking` WITHOUT a `PipelineStarted` /
+    // `PhaseStarted`. The stale `aborted=true` from the prior block must NOT read
+    // as `[aborted]` while the run is demonstrably working.
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    // A genuine hard abort of the prior block.
+    app.apply_engine(EngineEvent::Note(format!(
+        "{}本轮已中止:底座连接失败",
+        crate::ABORT_SENTINEL
+    )));
+    assert_eq!(app.run_state(), RunState::Aborted);
+    app.refresh_status();
+    assert!(app.status.contains("[aborted]"), "aborted before re-drive");
+
+    // The re-drive begins: `thinking` flips on (no PipelineStarted on this path).
+    app.thinking = true;
+    assert_eq!(
+        app.run_state(),
+        RunState::Running,
+        "a live thinking re-drive reads Running, never the stale Aborted"
+    );
+    app.refresh_status();
+    assert!(
+        !app.status.contains("[aborted]"),
+        "the stale [aborted] is GONE from the top bar while working: {}",
+        app.status
+    );
+
+    // A posted plan on the director path ALSO clears the raw stale flag (honest).
+    app.apply_engine(EngineEvent::PlanPosted {
+        steps: vec!["s1 · scaffold".into()],
+        statuses: vec!["running".into()],
+        done: 0,
+        total: 1,
+    });
+    assert!(!app.aborted, "a live plan clears the stale aborted flag");
+}
+
+#[test]
+fn normal_delivery_completion_reads_delivered_unchanged() {
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.apply_engine(EngineEvent::BlockCompleted {
+        final_phase: Phase::Delivery,
+        paused_at: None,
+    });
+    assert_eq!(app.run_state(), RunState::Delivered);
+    assert!(app.finished && !app.degraded);
+    app.refresh_status();
+    assert!(app.status.contains("[ok] delivered"), "{}", app.status);
+}
+
+#[test]
+fn gate_pause_reads_paused_at_gate() {
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.active_gate = Some(umadev_agent::gates::Gate::DocsConfirm);
+    app.run_started_at = None; // a real gate pause nulls the live counter
+    assert_eq!(app.run_state(), RunState::PausedAtGate);
+    app.refresh_status();
+    assert!(
+        !app.status.contains("[time]"),
+        "no live timer at a gate: {}",
+        app.status
+    );
+}
+
+#[test]
+fn note_signals_degraded_matches_stable_markers_only() {
+    assert!(note_signals_degraded("[WARN][降级] 占位模板"));
+    assert!(note_signals_degraded("… 阻断 delivery(UD-EVID-003)。"));
+    assert!(note_signals_degraded(
+        "[fail] 未产出任何真实代码文件 —— 停止"
+    ));
+    // A clean progress / completion note is NOT a degrade signal.
+    assert!(!note_signals_degraded("[plan] 仅产出文档/调研,已完成"));
+    assert!(!note_signals_degraded("[redo] backend 阶段已重跑完成"));
+}
+
+#[test]
 fn host_output_lands_in_history_as_host_role() {
     let mut app = fresh_app(Some("offline"));
     app.apply_engine(EngineEvent::HostOutput {

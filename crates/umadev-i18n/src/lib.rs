@@ -530,6 +530,10 @@ mod tests {
             "input.aborted",
             "status.aborted",
             "tui.hint.aborted",
+            // Terminal DEGRADED/incomplete run state (a block ended short of
+            // delivery on placeholder templates / a failed hard gate → /redo).
+            "input.degraded",
+            "status.degraded",
             "config.save_failed_note",
             "chat.claims_unverified",
             // Resident chat-turn failure (drive_chat_session_turn): a base TURN error
