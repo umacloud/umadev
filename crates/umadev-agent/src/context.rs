@@ -21,17 +21,19 @@
 //!    work needs. [`crate::experts::agentic_team_identity`] + a route-derived
 //!    seat persona.
 //! 2. **心法 / anti-slop** — the team's craft law
-//!    ([`crate::experts::agentic_engineering_rules`]); surfaced for work-class
-//!    turns, skipped for pure chat.
+//!    ([`crate::experts::agentic_engineering_rules`]) + the design / anti-slop
+//!    law; ALWAYS-ON (every turn, decoupled from intent class). The standards are
+//!    UmaDev's differentiator: a chat turn the base later promotes to a build
+//!    (`react_to_first_write`) writes real code too, and in-turn firmware cannot be
+//!    re-injected mid-stream — so the craft must already lead the prompt.
 //! 3. **Repo-map slice (JIT, brownfield-aware)** — a token-budgeted,
 //!    scope-personalised signature outline of the user's OWN code via
 //!    [`umadev_knowledge::repo_map`], so the base understands the existing
 //!    codebase ("explain this code", "fix the bug in checkout", "add a field"
-//!    all become repo-aware). Injected only when the project is non-empty (a
-//!    greenfield/blank repo emits nothing — no scan, no tokens) and the turn
-//!    is work-class (anything but pure chat). Higher priority than the curated
-//!    knowledge digest: on a brownfield repo, the user's real structure is a
-//!    sharper signal than a generic standard.
+//!    all become repo-aware). Injected on EVERY turn (part of the always-on
+//!    standards core); a greenfield/blank repo still emits nothing — no scan, no
+//!    tokens. Higher priority than the curated knowledge digest: on a brownfield
+//!    repo, the user's real structure is a sharper signal than a generic standard.
 //! 4. **Pitfall memory (JIT)** — high-signal recorded pitfalls that match the
 //!    project's tech-stack fingerprint + the requirement, via
 //!    [`crate::lessons::relevant_lessons_for_prompt`] (a small digest, not the
@@ -45,8 +47,10 @@
 //! The whole prompt is bounded by [`FIRMWARE_BUDGET`]. Layers are appended in
 //! the priority order above and the FIRST layer that would overflow is
 //! truncated (head-kept) so the highest-priority material always survives:
-//! identity beats 心法 beats memory beats knowledge. A chat turn injects only
-//! the (short) identity — no retrieval — so day-to-day conversation stays fast.
+//! identity beats 心法 beats memory beats knowledge. A chat turn carries the
+//! always-on standards core (identity + craft + anti-slop + repo-map) but skips
+//! the slow JIT retrieval (pitfall memory + curated knowledge), so day-to-day
+//! conversation stays fast while still leading with the team's craft.
 //!
 //! ## KV-cache-stable prefix (base-I/O economy)
 //!
@@ -166,16 +170,6 @@ impl FirmwareTier {
     }
 }
 
-/// Whether a route should carry the brownfield repo-map slice. Anything but pure
-/// [`RouteClass::Chat`] benefits: an `Explain` ("explain this code") wants the
-/// outline even though it injects no craft/knowledge; a `QuickEdit` / `Debug` /
-/// `Build` all act on the existing code. Pure chat stays repo-map-free (fast +
-/// no scan). The greenfield (empty-repo) skip is enforced separately by the slice
-/// itself returning empty.
-fn route_wants_repo_map(route: &RoutePlan) -> bool {
-    route.class != RouteClass::Chat
-}
-
 /// Byte budget for the ingested project agent-instruction files (see
 /// [`project_agent_instructions`]). Modest on purpose: these are hard constraints
 /// that lead the stable head, not a place to dump a whole doc tree.
@@ -267,32 +261,34 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         fw.push_block(&lang_directive);
     }
 
-    // ── Layer 2: 心法 / anti-slop (work-class only) ──────────────────────────
-    if tier.wants_craft() {
-        fw.push_block(agentic_engineering_rules());
-        // The full design law leads EVERY work turn, not just a deliberate /run
-        // build: a chat-promoted build (the light resident-session path) writes real
-        // UI too, and its visual quality is exactly the "moat" the user judges.
-        // Without this, a UI built from chat skipped the design system and read as
-        // AI-slop.
-        //
-        // SCOPED TO ITS REGISTER (UD-CODE-007). The law used to apply MARKETING
-        // rules universally — ban system fonts, demand 3x type jumps + extreme
-        // weights, demand a textured background, demand an orchestrated page-load
-        // reveal. Right for a landing page; WRONG for a dashboard / admin / devtool,
-        // where a familiar neutral face is CORRECT, the scale is a fixed 1.125–1.2,
-        // and page-load choreography is a defect. So we inject exactly ONE register
-        // half on top of the register-independent core.
-        //
-        // The register comes from the project's OWN declaration (the UIUX doc's
-        // `## Visual direction`), falling back to the user's words. Fail-open:
-        // `Register::Unknown` emits core + brand — byte-for-byte the law's historical
-        // reach — so a turn we cannot classify is never under-governed. Cost: one
-        // small directory read (like the charter / facts reads below), and the result
-        // is STABLE for a project, so the KV-cache prefix still holds turn to turn.
-        let register = crate::design_system::register_for_root(root, requirement);
-        fw.push_block(&anti_slop_law(register));
+    // ── Layer 2: 心法 / anti-slop (ALWAYS-ON standards core) ──────────────────
+    // The craft law and the design / anti-slop law are UmaDev's differentiator, and
+    // by the user's decision they must reach the base on EVERY turn — DECOUPLED from
+    // any intent classification. A chat turn the base then promotes to a build
+    // (`react_to_first_write`) writes real UI/code too, and its quality is exactly the
+    // "moat"; in-turn firmware cannot be re-injected mid-stream, so the standards must
+    // already lead the prompt before the first token. Both blocks are cheap (a static
+    // string + one small directory read), so always-on costs even a pure-chat turn
+    // almost nothing. Only the heavier build overlay + the JIT retrieval below scale
+    // by class.
+    fw.push_block(agentic_engineering_rules());
+    // SCOPED TO ITS REGISTER (UD-CODE-007): exactly ONE register half on top of the
+    // register-independent core. The register comes from the project's OWN declaration
+    // (the UIUX doc's `## Visual direction`), falling back to the user's words.
+    // Fail-open: `Register::Unknown` emits core + brand — byte-for-byte the law's
+    // historical reach — so a turn we cannot classify is never under-governed. Cost:
+    // one small directory read, STABLE for a project, so the KV-cache prefix still
+    // holds turn to turn.
+    let register = crate::design_system::register_for_root(root, requirement);
+    fw.push_block(&anti_slop_law(register));
 
+    // ── Work-class build OVERLAY (scaled by class; pure chat skips it) ────────
+    // The heavier, project-specific durable-memory blocks — the user's charter, the
+    // ingested agent-instruction files, the parking-lot + run-notes discipline, the
+    // recalled facts / open decisions. These are the "build overlay" that the user's
+    // decision keeps class-scaled: a pure chat turn stays cheap (identity + craft +
+    // repo-map only), while any work-class turn carries the full project context.
+    if tier.wants_craft() {
         // ── The team's CHARTER (only when the user has EDITED it) ────────────
         // The constitution (`.umadev/constitution.md`) makes the firmware's
         // non-negotiables a thing the user can read AND edit. When the user has
@@ -414,11 +410,12 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // A scope-personalised signature outline of the user's OWN code, so the base
     // understands the existing codebase before it touches it. Pushed FIRST in the
     // JIT tail (ahead of memory + knowledge): on a brownfield repo, the user's real
-    // structure is the sharper signal. Injected only when the route is work-class
-    // (anything but pure chat) AND the repo is non-empty — a greenfield repo yields
-    // an empty slice (no scan past the cached index, no tokens spent). The slice is
-    // personalised by `route.scope` (the path hints the router surfaced) so the
-    // files the turn is about rank first. Fail-open: empty/unreadable repo → skip.
+    // structure is the sharper signal. Injected on EVERY turn (part of the always-on
+    // standards core, decoupled from intent class) — a greenfield/empty repo still
+    // yields an empty slice (no scan past the cached index, no tokens spent), so a
+    // pure chat on a blank repo stays free. The slice is personalised by `route.scope`
+    // (the path hints the router surfaced) so the files the turn is about rank first.
+    // Fail-open: empty/unreadable repo → skip.
     //
     // ── Layer 4: pitfall memory ── recorded pitfalls matching this project's
     // tech-stack fingerprint + the requirement ("what bit us here" beats "a
@@ -431,7 +428,9 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // of ms to seconds on a cold cache. Hoist all three onto the blocking pool in
     // ONE `spawn_blocking` so the async runtime stays free. Fail-open: a join error
     // (panicked layer) collapses to empty layers, never blocking the turn.
-    let want_repo = route_wants_repo_map(route);
+    // Repo-map is ALWAYS-ON (the greenfield skip is enforced by the slice itself
+    // returning empty), so the base is repo-aware on every turn, chat included; only
+    // the slow pitfall-memory + curated-knowledge retrieval below stays work-class.
     let want_jit = tier.wants_jit();
     let root_buf = root.to_path_buf();
     let scope = route.scope.clone();
@@ -442,11 +441,7 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // keeps the seat-agnostic behaviour; an unknown seat fails open the same way.
     let seat = route.team.first().map(|s| s.role_id().to_string());
     let (repo_map, memory, knowledge) = tokio::task::spawn_blocking(move || {
-        let repo_map = if want_repo {
-            repo_map_layer(&root_buf, &scope)
-        } else {
-            String::new()
-        };
+        let repo_map = repo_map_layer(&root_buf, &scope);
         let memory = if want_jit {
             memory_layer(&root_buf, &req, seat.as_deref())
         } else {
@@ -1106,25 +1101,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_route_injects_only_the_light_identity() {
-        // A pure chat turn must stay light: the (short) identity, NO craft law,
-        // NO knowledge/memory retrieval block.
+    async fn chat_route_carries_the_always_on_standards_core() {
+        // A0: the standards are UmaDev's differentiator and must reach the base on
+        // EVERY turn, decoupled from intent class. A pure chat turn now leads with the
+        // identity + the craft law + the design / anti-slop law (all absent before) —
+        // but still SKIPS the slow JIT retrieval (pitfall memory + curated knowledge)
+        // and the class-scaled build overlay, so day-to-day chat stays fast.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let r = route(RouteClass::Chat, Depth::Fast, Vec::new());
         let fw = compose_firmware(tmp.path(), &r, "你好,在吗?").await;
         assert!(fw.to_lowercase().contains("umadev"), "carries identity");
         assert!(fw.to_lowercase().contains("director"));
-        // The compact craft block + the anti-slop law are work-class only.
+        // The always-on standards core now leads a chat turn too.
         assert!(
-            !fw.contains("HOW YOUR TEAM BUILDS"),
-            "chat must not carry the craft law: {fw}"
+            fw.contains("HOW YOUR TEAM BUILDS"),
+            "chat now carries the craft law (always-on standards): {fw}"
         );
         assert!(
-            !fw.contains("ANTI-AI-SLOP"),
-            "chat must not carry anti-slop"
+            fw.contains("DESIGN LAW"),
+            "chat now carries the design / anti-slop law (always-on standards)"
         );
-        // And it stays small (well under the budget).
-        assert!(fw.chars().count() < ALWAYS_ON_RESERVE);
+        // …but the SLOW JIT retrieval stays work-class (no knowledge / memory block).
+        assert!(!fw.contains("Lessons from prior runs"));
+        assert!(!fw.contains("YOUR TEAM'S EXPERIENCE"));
     }
 
     #[tokio::test]
@@ -1358,23 +1358,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pure_chat_skips_the_repo_map_even_on_a_brownfield_repo() {
-        // Pure chat stays light: even with real code on disk, a chat turn carries no
-        // repo-map (no scan, fast day-to-day conversation).
+    async fn chat_on_a_brownfield_repo_now_carries_the_repo_map() {
+        // A0: repo-map is part of the always-on standards core, so even a pure chat
+        // turn on a brownfield repo is repo-aware (it was skipped before). The
+        // greenfield skip still keeps a blank repo free (covered separately).
         let tmp = tempfile::TempDir::new().unwrap();
         seed_brownfield(tmp.path());
         let r = route(RouteClass::Chat, Depth::Fast, Vec::new());
         let fw = compose_firmware(tmp.path(), &r, "你好,在吗?").await;
         assert!(
-            !fw.contains("YOUR CODEBASE"),
-            "chat must not carry the repo-map slice: {fw}"
+            fw.contains("YOUR CODEBASE"),
+            "chat now carries the repo-map slice (always-on standards): {fw}"
         );
     }
 
     #[tokio::test]
-    async fn explain_on_a_brownfield_repo_gets_repo_map_even_though_light_tier() {
-        // "explain this code" routes to Explain (Light tier — no craft/knowledge) but
-        // STILL needs the repo-map: understanding the existing code is the whole task.
+    async fn explain_on_a_brownfield_repo_gets_repo_map_and_standards() {
+        // "explain this code" routes to Explain (no slow JIT retrieval) but STILL needs
+        // the repo-map (understanding the existing code is the whole task) AND, per A0,
+        // the always-on craft law — the standards are decoupled from intent class.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
         let tmp = tempfile::TempDir::new().unwrap();
         seed_brownfield(tmp.path());
         let r = route(RouteClass::Explain, Depth::Fast, Vec::new());
@@ -1383,8 +1386,16 @@ mod tests {
             fw.contains("YOUR CODEBASE"),
             "explain on a brownfield repo carries the repo-map slice: {fw}"
         );
-        // Light tier still holds: no craft law / anti-slop on an explain turn.
-        assert!(!fw.contains("HOW YOUR TEAM BUILDS"), "explain stays Light");
+        // Always-on standards: an explain turn now leads with the craft law too.
+        assert!(
+            fw.contains("HOW YOUR TEAM BUILDS"),
+            "explain now carries the craft law (always-on standards)"
+        );
+        // The slow JIT retrieval still stays off for an explain turn.
+        assert!(
+            !fw.contains("YOUR TEAM'S EXPERIENCE"),
+            "no JIT knowledge on explain"
+        );
     }
 
     #[tokio::test]

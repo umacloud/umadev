@@ -868,7 +868,11 @@ async fn resident_chat_uses_fork_model_to_downgrade_build_floor_before_write() {
                 );
             }
             EngineEvent::IntentDecided { class, .. } => {
-                assert_eq!(class, "quick_edit");
+                // A3: a reactive write now surfaces a BUILD-shaped intent card (the base
+                // wrote code, so a build is visibly underway), even though the Brain
+                // verdict + the completion semantics stay QuickEdit — no flagship QC runs
+                // (asserted above) and `director_build` stays false.
+                assert_eq!(class, "build");
             }
             _ => {}
         }

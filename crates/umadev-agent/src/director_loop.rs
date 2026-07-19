@@ -634,8 +634,8 @@ pub enum DirectorLoopOutcome {
 /// (see the `color_permission` module docs for why this is not a fail-open violation — it
 /// never blocks the host, it only declines to disarm a check).
 ///
-/// Fail-open: a write failure is swallowed, and the readers then default to full strictness.
-async fn persist_run_governance_context(session: &mut dyn BaseSession, options: &RunOptions) {
+/// Fail-open: a write failure is swallowed, readers then default to strict. `pub` so the resident chat path can persist the SAME floor before its first write (Stage A / A1).
+pub async fn persist_run_governance_context(session: &mut dyn BaseSession, options: &RunOptions) {
     let permission =
         crate::color_permission::consult_color_permission(session, &options.requirement).await;
     let _ = crate::planner::persist_project_context_with_color(

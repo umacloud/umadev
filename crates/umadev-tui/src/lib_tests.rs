@@ -3420,14 +3420,15 @@ async fn light_path_firmware_is_route_tiered_via_compose_firmware() {
     // HIGH #3 / MEDIUM #6: the LIGHT path now injects firmware through
     // `compose_firmware`, sized by the turn's route — NOT a keyword table.
     //
-    // (1) A pure CHAT turn carries ONLY the always-on identity: no craft / no
-    //     anti-slop / no knowledge — a greeting stays light.
+    // (1) A pure CHAT turn now carries the ALWAYS-ON standards core (identity +
+    //     craft + anti-slop), decoupled from intent class (A0) — a greeting leads
+    //     with the team's craft, while the slow JIT retrieval still stays off.
     let chat = captured_system_for_route(&chat_route(), "你好").await;
     let chat_lower = chat.to_lowercase();
     assert!(chat_lower.contains("umadev"), "identity is always-on");
     assert!(
-        !chat.contains("emoji") && !chat.contains("Lucide"),
-        "a chat turn must NOT carry the engineering craft block (identity only)"
+        chat.contains("emoji"),
+        "a chat turn now carries the engineering craft block (always-on standards)"
     );
     // The reality scaffold is still appended on every light turn.
     assert!(chat.contains("FULL tool access"));
@@ -3449,10 +3450,10 @@ async fn light_path_firmware_is_route_tiered_via_compose_firmware() {
 }
 
 #[tokio::test]
-async fn light_path_quick_edit_carries_craft_but_chat_does_not() {
-    // A QuickEdit (a small work turn) sits between chat and build: it carries the
-    // craft law (so a small edit still respects the visual + engineering moat)
-    // but pays for no full build ceremony. Pure chat carries neither.
+async fn light_path_quick_edit_and_chat_both_carry_craft() {
+    // A0: the craft law is ALWAYS-ON, so BOTH a QuickEdit and pure chat now lead with
+    // it (the standards are decoupled from intent class). The remaining tier
+    // difference is the slower JIT retrieval + build overlay, not the craft itself.
     let edit =
         captured_system_for_route(&test_route(umadev_agent::RouteClass::QuickEdit), "改个文案")
             .await;
@@ -3462,8 +3463,8 @@ async fn light_path_quick_edit_carries_craft_but_chat_does_not() {
     );
     let chat = captured_system_for_route(&chat_route(), "谢谢").await;
     assert!(
-        !chat.contains("emoji"),
-        "pure chat must NOT carry the craft law"
+        chat.contains("emoji"),
+        "pure chat now carries the craft law too (always-on standards)"
     );
 }
 
@@ -4823,10 +4824,7 @@ async fn reactive_first_write_isolates_and_keeps_branch_clean() {
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
     let target = tmp.path().join("src");
-    let reactive = Arc::new(ReactiveBuild::new(
-        true,
-        umadev_agent::deterministic_route("做一个登录页"),
-    ));
+    let reactive = Arc::new(ReactiveBuild::new(true, "做一个登录页"));
     let spy = WriteSpy {
         tool_name: "Write",
         reply: "Created src/App.tsx",
@@ -4909,10 +4907,7 @@ async fn pure_chat_reply_does_not_isolate_or_lock() {
     let (sink, mut rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let reactive = Arc::new(ReactiveBuild::new(
-        true,
-        umadev_agent::deterministic_route("解释一下这段代码"),
-    ));
+    let reactive = Arc::new(ReactiveBuild::new(true, "解释一下这段代码"));
     // A spy that only READS + replies (no write tool, no effect).
     let spy = WriteSpy {
         tool_name: "Read",
@@ -4980,10 +4975,7 @@ async fn chat_first_reply_is_one_streaming_call_no_triage() {
         streaming_calls: Arc::clone(&streaming_calls),
         fail: false,
     };
-    let reactive = Arc::new(ReactiveBuild::new(
-        true,
-        umadev_agent::deterministic_route("你好，能帮我做什么？"),
-    ));
+    let reactive = Arc::new(ReactiveBuild::new(true, "你好，能帮我做什么？"));
     let tmp = tempfile::TempDir::new().unwrap();
     drive_agentic_stream(
         &spy,
@@ -6286,6 +6278,238 @@ async fn native_command_failure_is_not_automatically_replayed() {
     assert_eq!(inputs.lock().unwrap().len(), 1, "no automatic resend");
     assert_eq!(fork_calls.load(Ordering::SeqCst), 0);
     assert!(matches!(route_rx.try_recv(), Ok(RouteDecision::Failed(_))));
+}
+
+// ── Stage A: reactive governance QC on the resident chat path ─────────────────
+//
+// A0 injects the standards firmware on every turn (covered in the agent crate);
+// these cover A1 (governance context persisted before the first write), A2 (the
+// observed build routed through `run_post_build_qc`, flag-gated by
+// `UMADEV_REACTIVE_QC`), and A3 (a Build-shaped intent card on promotion), plus
+// the cheap-chat + doc-latch safety rails. The pre-action barrier itself is
+// UNTOUCHED — Stage A is purely additive.
+
+/// RAII: force the Stage-A reactive-QC flag on/off for the CURRENT THREAD, clearing
+/// it on drop (even on a panic). Per-thread (not the process-global env), so it can
+/// never leak into the parallel runner's other resident-write tests and flip their
+/// verdicts — each `#[tokio::test]` drives on its own current-thread runtime, so the
+/// override is seen throughout its drive and by no one else.
+struct ReactiveQcOverride;
+
+impl ReactiveQcOverride {
+    fn force(enabled: bool) -> Self {
+        set_reactive_qc_override(Some(enabled));
+        Self
+    }
+}
+
+impl Drop for ReactiveQcOverride {
+    fn drop(&mut self) {
+        set_reactive_qc_override(None);
+    }
+}
+
+/// One base turn batch that writes ONE file `rel` via a `Write` tool call, then
+/// reports done — the scripted shape of a chat turn the base reacts to by writing.
+fn write_tool_turn(rel: &str) -> Vec<umadev_runtime::SessionEvent> {
+    vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Write".into(),
+            input: serde_json::json!({"file_path": rel, "content": "export const A = 1;"}),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "wrote the file".into(),
+        },
+        umadev_runtime::SessionEvent::TextDelta("Done.".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]
+}
+
+/// Drive ONE resident chat turn on a scripted base (a `FakeChatSession` pre-loaded
+/// `Primed`, so the intent consult falls open to the DETERMINISTIC route — never
+/// `Brain` — hence `routed_build` is always false and only the REACTIVE path can
+/// trip governance QC). `write` optionally names a file the base's tool actually
+/// creates on disk (the send effect), so the honesty floor sees real source.
+/// Returns every engine event + terminal route decision the turn emitted.
+async fn drive_resident_turn(
+    root: &std::path::Path,
+    requirement: &str,
+    events: Vec<umadev_runtime::SessionEvent>,
+    write: Option<&'static str>,
+) -> (Vec<EngineEvent>, Vec<RouteDecision>) {
+    let (writer, _sent, _ended) = FakeChatSession::new(vec![events]);
+    let writer = match write {
+        Some(rel) => {
+            let target = root.join(rel);
+            writer.with_send_effect(move || {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(&target, "export const A = 1;\n").unwrap();
+            })
+        }
+        None => writer,
+    };
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut turn = chat_turn(
+        requirement,
+        holder,
+        Arc::new(sink),
+        route_tx,
+        root.to_path_buf(),
+    );
+    turn.interactive = false;
+    drive_chat_session_turn(turn).await;
+    let mut engine = Vec::new();
+    while let Ok(event) = engine_rx.try_recv() {
+        engine.push(event);
+    }
+    let mut routes = Vec::new();
+    while let Ok(decision) = route_rx.try_recv() {
+        routes.push(decision);
+    }
+    (engine, routes)
+}
+
+/// True if the events carry `run_post_build_qc`'s opening note (the flagship QC
+/// pass actually ran on this turn).
+fn ran_governance_qc(events: &[EngineEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("构建完成")))
+}
+
+/// True if a BUILD-shaped intent card was emitted (`react_to_first_write` promoted
+/// the turn).
+fn saw_build_intent_card(events: &[EngineEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, EngineEvent::IntentDecided { class, .. } if class == "build"))
+}
+
+#[tokio::test]
+async fn resident_reactive_write_runs_governance_qc_when_flagged() {
+    // A1 + A2 + A3, the load-bearing case: a chat-seeded resident turn whose base
+    // writes ONE real code file, with `UMADEV_REACTIVE_QC` set, now (A1) persists the
+    // governance context BEFORE the write, (A3) surfaces a Build-shaped card, and (A2)
+    // routes the observed build through the SAME `run_post_build_qc` the `/run` path
+    // uses.
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, _routes) = drive_resident_turn(
+        tmp.path(),
+        "做一个登录页",
+        write_tool_turn("src/App.tsx"),
+        Some("src/App.tsx"),
+    )
+    .await;
+
+    assert!(
+        tmp.path().join(".umadev/governance-context.json").exists(),
+        "A1: the governance context was persisted before the first write"
+    );
+    assert!(
+        saw_build_intent_card(&events),
+        "A3: a Build-shaped intent card was emitted on promotion: {events:?}"
+    );
+    assert!(
+        ran_governance_qc(&events),
+        "A2: run_post_build_qc ran on the reactive build: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn resident_reactive_write_skips_qc_without_the_flag() {
+    // A2 is FLAG-GATED: the identical reactive write, with `UMADEV_REACTIVE_QC` UNSET,
+    // must NOT run the governance QC (the kill switch works without a revert). The
+    // always-on additive pieces — A1's governance context + A3's Build card — still
+    // stand (they are decoupled from the flag).
+    let _qc = ReactiveQcOverride::force(false);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, _routes) = drive_resident_turn(
+        tmp.path(),
+        "做一个登录页",
+        write_tool_turn("src/App.tsx"),
+        Some("src/App.tsx"),
+    )
+    .await;
+
+    assert!(
+        !ran_governance_qc(&events),
+        "reactive QC must NOT run without UMADEV_REACTIVE_QC: {events:?}"
+    );
+    assert!(
+        tmp.path().join(".umadev/governance-context.json").exists(),
+        "A1 governance context is additive, not flag-gated"
+    );
+    assert!(
+        saw_build_intent_card(&events),
+        "A3 Build card is additive, not flag-gated: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn resident_pure_chat_stays_cheap_even_with_the_flag() {
+    // A pure-chat turn that writes NOTHING must stay cheap even with the flag ON: no
+    // governance QC, no run-lock, no branch isolation (all keyed off an observed write).
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let batch = vec![
+        umadev_runtime::SessionEvent::TextDelta("这段代码做的是……".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let (events, _routes) = drive_resident_turn(tmp.path(), "解释一下这段代码", batch, None).await;
+
+    assert!(
+        !ran_governance_qc(&events),
+        "a pure-chat turn runs no governance QC: {events:?}"
+    );
+    assert!(
+        !tmp.path().join(".umadev/run.lock").exists(),
+        "a pure-chat turn takes no run-lock"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Note(n) if n.contains("umadev/"))),
+        "a pure-chat turn never isolates: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn resident_single_doc_write_is_not_a_team_build() {
+    // The `is_doc_artifact_path` latch holds: a single PRD/doc write is legitimate
+    // pre-development work and must NOT flip the turn into a code build — so neither the
+    // Build-shaped card nor the team governance QC fire, even with the flag ON.
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, _routes) = drive_resident_turn(
+        tmp.path(),
+        "整理一份需求文档",
+        write_tool_turn("output/prd.md"),
+        Some("output/prd.md"),
+    )
+    .await;
+
+    assert!(
+        !ran_governance_qc(&events),
+        "a doc-only write runs no team QC: {events:?}"
+    );
+    assert!(
+        !saw_build_intent_card(&events),
+        "a doc-only write emits no Build-shaped card: {events:?}"
+    );
 }
 
 #[tokio::test]

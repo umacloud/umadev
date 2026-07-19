@@ -2390,9 +2390,16 @@ struct ReactiveBuild {
     /// The whole reaction no-ops when this is false (mirrors the `director_build &&
     /// host_cli` gate the up-front `/run` lock uses).
     host_cli: bool,
-    /// Model-selected route (or deterministic availability fallback). A write proves that
-    /// work happened; it does not upgrade a QuickEdit or Debug into a Build.
-    route: RoutePlan,
+    /// The Build-shaped route to SHOW (and, when the reactive QC is enabled, to size the
+    /// critic roster from) once a real write promotes this chat turn to a build. Derived
+    /// ONCE at construction from the requirement via [`umadev_agent::router::for_run`], so
+    /// the intent card + the reactive governance QC reflect the build the base actually
+    /// started rather than the QuickEdit/Chat seed the turn opened on (Stage A / A3). A
+    /// write proves that work happened; the ORIGINAL route class is deliberately NOT
+    /// carried here — the completion semantics (`director_build`) stay a separate fact, so
+    /// a QuickEdit that writes still does not receive the full-build completion card.
+    /// Deterministic + cheap (no fork, no I/O).
+    build_card_route: RoutePlan,
     /// Latched the first time a write tool is seen, so the lock + isolation + intent
     /// card fire exactly once for the rest of the (possibly hundreds-of-write) turn.
     reacted: std::sync::atomic::AtomicBool,
@@ -2411,11 +2418,14 @@ struct ReactiveBuild {
 }
 
 impl ReactiveBuild {
-    /// A fresh, un-triggered reactive context for a host-or-not chat turn.
-    fn new(host_cli: bool, route: RoutePlan) -> Self {
+    /// A fresh, un-triggered reactive context for a host-or-not chat turn. `requirement`
+    /// is the user's message this turn; it seeds the Build-shaped [`Self::build_card_route`]
+    /// (via [`umadev_agent::router::for_run`]) that the promotion surfaces once a real
+    /// write is observed.
+    fn new(host_cli: bool, requirement: &str) -> Self {
         Self {
             host_cli,
-            route,
+            build_card_route: umadev_agent::router::for_run(requirement),
             reacted: std::sync::atomic::AtomicBool::new(false),
             became_build: std::sync::atomic::AtomicBool::new(false),
             prepared: std::sync::atomic::AtomicBool::new(false),
@@ -2489,6 +2499,37 @@ fn native_command_postcondition_route() -> RoutePlan {
     }
 }
 
+/// Whether the STAGE A reactive governance QC (A2) is enabled for this turn — the
+/// `UMADEV_REACTIVE_QC` kill switch. Reads the process env in production so the
+/// wiring can be disabled without a revert. In test builds a per-thread override
+/// takes precedence ([`set_reactive_qc_override`]), so a test can toggle the flag
+/// deterministically WITHOUT mutating the process-global env — which would otherwise
+/// leak into concurrently-running resident-write tests and flip their verdicts.
+fn reactive_qc_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = REACTIVE_QC_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
+    std::env::var_os("UMADEV_REACTIVE_QC").is_some()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override for [`reactive_qc_enabled`]. `None` → read the env flag;
+    /// `Some(_)` → force that value. Thread-local so it never leaks across the
+    /// parallel test runner's threads (each `#[tokio::test]` drives on its own
+    /// current-thread runtime).
+    static REACTIVE_QC_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: force [`reactive_qc_enabled`] on/off for the current thread, or clear
+/// the override with `None`. Prefer the RAII guard in the tests over calling this
+/// directly so the override is always cleared (even on a panic).
+#[cfg(test)]
+fn set_reactive_qc_override(value: Option<bool>) {
+    REACTIVE_QC_OVERRIDE.with(|cell| cell.set(value));
+}
+
 /// Whether the model-routed turn owes the flagship governance/team QC pass.
 ///
 /// A `Build` owes that pass because of the user's requested outcome, even when a
@@ -2555,8 +2596,9 @@ fn is_doc_artifact_path(path: &str) -> bool {
 /// On the first real write it, in order and all **fail-open**:
 /// 1. marks `became_build` as a workspace-write fact. This drives source honesty,
 ///    but does not upgrade QuickEdit/Debug into Director or a full completion card;
-/// 2. surfaces the already-authorized route card and a one-line mutation note
-///    (`chat.build_detected`);
+/// 2. surfaces a BUILD-shaped intent card (`build_card_route`, derived at construction)
+///    and a one-line mutation note (`chat.build_detected`) — a write means the turn IS
+///    a build, so the card reflects that rather than the QuickEdit/Chat seed;
 /// 3. takes the single-writer run-lock (a chat-build serializes with other
 ///    workspace-mutating runs); a lock that can't be taken is swallowed (NOT the
 ///    `/run` hard-abort: a chat-build losing the race to another run is better
@@ -2584,9 +2626,12 @@ fn react_to_first_write(
     }
     // (1) Record mutation truth; Director ownership remains a separate route fact.
     reactive.became_build.store(true, Ordering::SeqCst);
-    // (2) Surface the request's actual tier; a write alone does not authorize an
-    // upgrade from QuickEdit/Debug into a full Build.
-    sink.emit(EngineEvent::intent_decided(&reactive.route));
+    // (2) Surface a BUILD-shaped intent card (A3): the base just wrote real files, so
+    // the turn IS a build — the card, the source hard-gate, and the reactive governance
+    // QC must reflect that, not the QuickEdit/Chat seed the turn opened on. The
+    // Build-shaped route was derived once at construction (`for_run`), so this is a pure
+    // event emission (no fork, no I/O).
+    sink.emit(EngineEvent::intent_decided(&reactive.build_card_route));
     sink.emit(EngineEvent::Note(
         umadev_i18n::tl("chat.build_detected").to_string(),
     ));
@@ -2747,8 +2792,7 @@ async fn run_agentic(
         // as a build (`director_build` true) — that path grabbed the lock + isolated
         // up-front above, so a second reaction would be redundant. The context
         // internally no-ops for a non-host brain, so passing it is always safe.
-        let reactive =
-            (!director_build).then(|| Arc::new(ReactiveBuild::new(host_cli, route.clone())));
+        let reactive = (!director_build).then(|| Arc::new(ReactiveBuild::new(host_cli, &task)));
         drive_agentic_stream(
             brain.as_ref(),
             &task,
@@ -5212,6 +5256,9 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
     let mut targeted_verification_passed: bool;
     let mut potential_shell_write: bool;
     let mut entry_task: Option<umadev_agent::task_lifecycle::EntryTaskTracker> = None;
+    // A1: whether this turn already persisted its governance context (color / design-
+    // token rule book). Set once so a rare clean-session retry does not re-consult.
+    let mut governance_context_persisted = false;
 
     let (truncated, mut session, postcondition) = 'attempt: loop {
         // Acquire the session + its first directive for THIS attempt -- identical on the
@@ -5773,7 +5820,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         // Fresh per-attempt accumulators (a retry restarts stream + build detection;
         // safe because a retry only follows a CLEAN first-attempt failure).
         text_acc = String::new();
-        reactive = Arc::new(ReactiveBuild::new(!native_command, route.clone()));
+        reactive = Arc::new(ReactiveBuild::new(!native_command, &text));
         targeted_verification_passed = false;
         potential_shell_write = false;
         if let Some(guard) = prepared_run_lock.take() {
@@ -5814,6 +5861,34 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             umadev_runtime::TurnStatus,
             Option<umadev_runtime::Usage>,
         )> = None;
+
+        // A1: persist the governance context (the color / design-token rule book) BEFORE
+        // the first write, so a chat turn the base then promotes to a build reads the
+        // SAME rulebook a `/run` would — the PreToolUse hook + `umadev ci` + the design
+        // floor are other processes that consult the persisted decision, and a reactive
+        // build previously left them reading `ProjectContext::unknown()`. Decoupled from
+        // any intent classification (the user's decision), and gated to the paths where a
+        // write is even possible: a native command carries its own contract, and a
+        // read-only turn writes nothing. Cheap + fail-open: the color consult short-
+        // circuits unless the requirement names a flagged hue, and any failure is
+        // swallowed inside `persist_run_governance_context`. Its own base permit is scoped
+        // to this block so it drops before the turn's `_base_permit` below (deadlock-free).
+        if !native_command && !execution_read_only && !governance_context_persisted {
+            let gov_opts = RunOptions {
+                project_root: project_root.clone(),
+                requirement: text.clone(),
+                slug: slug.clone(),
+                model: model.clone(),
+                backend: backend.clone(),
+                design_system: design_system.clone(),
+                seed_template: seed_template.clone(),
+                mode,
+                strict_coverage: umadev_agent::strict_coverage_from_env(),
+            };
+            let _gov_permit = umadev_agent::base_gate::base_permit().await;
+            umadev_agent::persist_run_governance_context(session.as_mut(), &gov_opts).await;
+            governance_context_persisted = true;
+        }
 
         // Send the directive into the (resident or fresh) session. A send error means
         // the session is dead -- report an honest CHAT-turn failure (never a phantom
@@ -6822,7 +6897,23 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
     let routed_build = !native_command
         && route_source == Some(umadev_agent::RouteSource::Brain)
         && should_run_flagship_qc(&route);
-    if routed_build {
+    // A2: the reactive tail. When the base wrote a real (non-doc) code file on a turn
+    // seeded as Chat/QuickEdit, `react_to_first_write` latched `became_build`, but the
+    // flagship governance QC never ran — the ONLY gate was the Brain pre-verdict
+    // (`routed_build`). Route that OBSERVED build through the SAME `run_post_build_qc`
+    // the `/run` path uses, behind the `UMADEV_REACTIVE_QC` env flag so this stall-
+    // adjacent wiring can be disabled without a revert. It drives bounded fix turns on
+    // the LIVE resident session, but they are bounded by `MAX_QC_ROUNDS` + the wall-clock
+    // `run_budget()` deadline and settle fail-open on a dead/hung session (an `Err` from
+    // the fix turn returns a dirty-but-settled gate), so a base that wedges during rework
+    // never wedges the chat surface. Keyed off `became_build`, so a pure-chat turn (no
+    // write) and a single doc-only write (the `is_doc_artifact_path` latch) never trip it.
+    let reactive_qc = !routed_build
+        && reactive
+            .became_build
+            .load(std::sync::atomic::Ordering::SeqCst)
+        && reactive_qc_enabled();
+    if routed_build || reactive_qc {
         let qc_opts = RunOptions {
             project_root: project_root.clone(),
             requirement: text.clone(),
@@ -6834,7 +6925,15 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             mode,
             strict_coverage: umadev_agent::strict_coverage_from_env(),
         };
-        let mut qc_route = route.clone();
+        // The Brain pre-verdict already sized a build team; the reactive path takes the
+        // Build-shaped route derived from the OBSERVED build (class=Build, kind from the
+        // text, team from `tier0_team` — the same `for_run` shape the intent card shows)
+        // so the critic roster is non-empty for a real reactive build.
+        let mut qc_route = if routed_build {
+            route.clone()
+        } else {
+            reactive.build_card_route.clone()
+        };
         let produced_no_source = umadev_agent::acceptance::source_files(&project_root).is_empty();
         if produced_no_source || umadev_agent::planner::is_document_task(&text) {
             qc_route.team = Vec::new();
