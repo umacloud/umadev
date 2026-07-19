@@ -1,6 +1,6 @@
 {
   "name": "umadev",
-  "version": "1.0.58",
+  "version": "1.0.59",
   "description": "UmaDev: a Rust coding agent coordinating a real development team over five first-class base CLIs — Claude Code, Codex, OpenCode, Grok Build, and Kimi Code.",
   "keywords": [
     "ai",
@@ -38,11 +38,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@umacloud/cli-darwin-arm64": "1.0.58",
-    "@umacloud/cli-darwin-x64": "1.0.58",
-    "@umacloud/cli-linux-x64": "1.0.58",
-    "@umacloud/cli-linux-arm64": "1.0.58",
-    "@umacloud/cli-win32-x64": "1.0.58",
-    "@umacloud/knowledge": "1.0.58"
+    "@umacloud/cli-darwin-arm64": "1.0.59",
+    "@umacloud/cli-darwin-x64": "1.0.59",
+    "@umacloud/cli-linux-x64": "1.0.59",
+    "@umacloud/cli-linux-arm64": "1.0.59",
+    "@umacloud/cli-win32-x64": "1.0.59",
+    "@umacloud/knowledge": "1.0.59"
   }
 }
