@@ -5311,10 +5311,6 @@ struct FakeChatSession {
     /// approval-pause tests assert on (Allow / Deny). Shared with the test via
     /// [`Self::with_responses`].
     responded: Arc<std::sync::Mutex<Vec<umadev_runtime::ApprovalDecision>>>,
-    /// Read-only child sessions returned by `fork()`, FIFO. Empty by default so
-    /// existing tests exercise the deterministic fail-open route; model-routing
-    /// integration tests opt in with [`Self::with_fork`].
-    forks: std::collections::VecDeque<Box<dyn umadev_runtime::BaseSession>>,
     /// Optional test-only filesystem effects, one per writer `send_turn`. This
     /// lets an integration test model a `Bash` command that really writes after
     /// the production pre-turn git snapshot has been taken.
@@ -5340,7 +5336,6 @@ impl FakeChatSession {
                 id: None,
                 exit_status: None,
                 responded: Arc::new(std::sync::Mutex::new(Vec::new())),
-                forks: std::collections::VecDeque::new(),
                 send_effects: std::collections::VecDeque::new(),
             },
             sent,
@@ -5362,11 +5357,6 @@ impl FakeChatSession {
     /// it — exercises the per-turn id-capture path (claude / codex behaviour).
     fn with_id(mut self, id: &str) -> Self {
         self.id = Some(id.to_string());
-        self
-    }
-
-    fn with_fork(mut self, fork: Box<dyn umadev_runtime::BaseSession>) -> Self {
-        self.forks.push_back(fork);
         self
     }
 
@@ -5394,11 +5384,11 @@ impl umadev_runtime::BaseSession for FakeChatSession {
     async fn fork(
         &mut self,
     ) -> Result<Box<dyn umadev_runtime::BaseSession>, umadev_runtime::SessionError> {
-        self.forks.pop_front().ok_or_else(|| {
-            umadev_runtime::SessionError::ForkUnsupported(
-                "fake has no scripted read-only fork".to_string(),
-            )
-        })
+        // Stage B removed the pre-action read-only fork consult, so the resident chat
+        // path never forks this fake anymore. Kept as a fail-open trait impl.
+        Err(umadev_runtime::SessionError::ForkUnsupported(
+            "fake has no scripted read-only fork".to_string(),
+        ))
     }
 
     async fn send_turn(&mut self, directive: String) -> Result<(), umadev_runtime::SessionError> {
@@ -5464,93 +5454,6 @@ fn typed_test_report(input: &TurnInput, capabilities: SessionCapabilities) -> De
             .collect(),
         encoded_bytes: Some(128),
         receipt: DeliveryReceiptStage::TransportWritten,
-    }
-}
-
-/// Read-only route child that also accepts one ordered structured execution
-/// turn. It proves the resident TUI calls `send_input`, not the legacy
-/// text-only `send_turn`, after semantic routing hands the child back.
-struct TypedRouteSession {
-    stage: u8,
-    current: std::collections::VecDeque<umadev_runtime::SessionEvent>,
-    received: Arc<std::sync::Mutex<Vec<TurnInput>>>,
-}
-
-#[async_trait::async_trait]
-impl umadev_runtime::BaseSession for TypedRouteSession {
-    fn capabilities(&self) -> SessionCapabilities {
-        SessionCapabilities {
-            text_input: InputDelivery::Native,
-            image_input: InputDelivery::Native,
-            file_input: InputDelivery::MaterializedText,
-            ..SessionCapabilities::default()
-        }
-    }
-
-    async fn send_turn(&mut self, _directive: String) -> Result<(), umadev_runtime::SessionError> {
-        if self.stage != 0 {
-            return Err(SessionError::Send(
-                "typed route fake received an unexpected text turn".to_string(),
-            ));
-        }
-        self.stage = 1;
-        self.current = vec![
-            umadev_runtime::SessionEvent::TextDelta(
-                serde_json::json!({
-                    "class": "chat",
-                    "authorization": "read_only",
-                    "kind": "light",
-                    "complexity": "simple",
-                    "confidence": 0.99
-                })
-                .to_string(),
-            ),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ]
-        .into();
-        Ok(())
-    }
-
-    async fn send_input(&mut self, input: TurnInput) -> Result<DeliveryReport, SessionError> {
-        if self.stage != 1 {
-            return Err(SessionError::Send(
-                "typed route fake received input before routing".to_string(),
-            ));
-        }
-        self.stage = 2;
-        self.received.lock().unwrap().push(input.clone());
-        self.current = vec![
-            umadev_runtime::SessionEvent::TextDelta("typed input received".to_string()),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ]
-        .into();
-        Ok(typed_test_report(&input, self.capabilities()))
-    }
-
-    async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
-        self.current.pop_front()
-    }
-
-    async fn respond(
-        &mut self,
-        _req_id: &str,
-        _decision: umadev_runtime::ApprovalDecision,
-    ) -> Result<(), umadev_runtime::SessionError> {
-        Ok(())
-    }
-
-    async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
-        Ok(())
-    }
-
-    async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
-        Ok(())
     }
 }
 
@@ -7889,5 +7792,3 @@ async fn interactive_askuserquestion_parks_and_waits_same_session() {
 
 #[path = "tests/resident_chat_terminal_tests.rs"]
 mod resident_chat_terminal_tests;
-
-include!("execution_postcondition_integration_tests.rs");

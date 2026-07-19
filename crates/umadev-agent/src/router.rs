@@ -1276,10 +1276,21 @@ fn apply_route_ceilings(
     apply_mode_ceiling(apply_authorization_ceiling(plan, requirement), mode)
 }
 
-/// Apply user-authored read-only constraints after model routing. The model owns
+/// Apply user-authored read-only constraints to a route. The base model owns
 /// semantic intent, but it cannot turn an explicit "do not modify" or an
 /// unambiguous past-work/status query into write authority.
-fn apply_authorization_ceiling(mut plan: RoutePlan, requirement: &str) -> RoutePlan {
+///
+/// This is the ONE piece of routing logic the resident chat driver keeps after the
+/// pre-action intent barrier was removed: it is re-homed onto that turn's fixed
+/// default route so an explicit "只分析别改 / do not modify / read-only" request still
+/// forces a non-mutating, non-isolating turn in every trust mode (the driver also
+/// mirrors it at the execution layer via [`requirement_demands_read_only`], which jails
+/// the base in a read-only session so it cannot write even under Auto). A no-op on an
+/// already-non-mutating plan; the internal wording belts (`explicit_read_only_request` /
+/// `explicit_observation_only_request`) stay deliberately narrow so the model still owns
+/// every ambiguous case.
+#[must_use]
+pub fn apply_authorization_ceiling(mut plan: RoutePlan, requirement: &str) -> RoutePlan {
     if (explicit_read_only_request(requirement) || explicit_observation_only_request(requirement))
         && plan.class.mutates_workspace()
     {

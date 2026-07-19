@@ -779,313 +779,30 @@ async fn fallback_write_records_build_truth_without_flagship_qc() {
     );
 }
 
-/// Production-path proof that the resident TUI obeys the model's semantic
-/// decision in the DOWNWARD direction before the writer acts. The same text is
-/// a deterministic BackendOnly/Build, but the read-only fork recognises a
-/// bounded optimization and returns QuickEdit; only that lane reaches writer.
+/// Plan trust mode is enforced by the session-permission layer, INDEPENDENT of
+/// routing. Stage B removed the pre-action verdict, so there is no model class to
+/// "cap" — a build-shaped request under Plan simply runs a resident read-only reply
+/// and never enters the Director or writes Director workflow state. This proves the
+/// Plan guardrail still holds without the barrier.
 #[tokio::test]
-async fn resident_chat_uses_fork_model_to_downgrade_build_floor_before_write() {
+async fn plan_mode_build_request_stays_a_resident_read_only_reply() {
     let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("app.ts"), "export const x = 1;").unwrap();
-    let (sink, mut engine_rx) = ChannelSink::new();
+    let (sink, _engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let (fork, fork_sent, fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "backend_only",
-                "complexity": "simple",
-                "confidence": 0.96
-            })
-            .to_string(),
-        ),
+    // A real Plan-mode base cannot write, so it just replies — no write tool.
+    let (fake, sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("当前是规划模式，我先说明实现方案。".into()),
         umadev_runtime::SessionEvent::TurnDone {
             status: umadev_runtime::TurnStatus::Completed,
             usage: None,
         },
     ]]);
-    let (writer, writer_sent, _writer_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Edit".into(),
-            input: serde_json::json!({ "file_path": "app.ts" }),
-        },
-        umadev_runtime::SessionEvent::ToolResult {
-            ok: true,
-            summary: "edit applied".into(),
-        },
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Bash".into(),
-            input: serde_json::json!({ "command": "npm run lint" }),
-        },
-        umadev_runtime::SessionEvent::ToolResult {
-            ok: true,
-            summary: "lint passed".into(),
-        },
-        umadev_runtime::SessionEvent::TextDelta("optimized the hot path".into()),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let writer = writer.with_fork(Box::new(fork));
-    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer)),
-    )));
-
-    drive_chat_session_turn(chat_turn(
-        "优化后端代码，提升接口性能",
-        holder,
-        sink,
-        route_tx,
-        tmp.path().to_path_buf(),
-    ))
-    .await;
-
-    assert!(matches!(
-        route_rx.try_recv(),
-        Ok(RouteDecision::AgenticDone { .. })
-    ));
-    assert_eq!(fork_sent.lock().unwrap().len(), 1, "one model triage turn");
-    assert!(
-        fork_ended.load(std::sync::atomic::Ordering::SeqCst),
-        "the read-only intent fork is closed"
+    // Pin the parked permissions to Plan so the resident is REUSED (identity match).
+    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex_with_permissions(
+        tokio::sync::Mutex::new(Some(ResidentChat::Primed(Box::new(fake)))),
+        umadev_runtime::BasePermissionProfile::Plan,
     );
-    let writer_directives = writer_sent.lock().unwrap();
-    assert_eq!(writer_directives.len(), 1, "no team/QC writer re-drive");
-    assert!(writer_directives[0].contains("Model-decided route: quick_edit / fast"));
-    assert!(writer_directives[0].contains("smallest necessary edit"));
-    drop(writer_directives);
-
-    while let Ok(event) = engine_rx.try_recv() {
-        match event {
-            EngineEvent::Note(note) => {
-                assert!(
-                    !(note.contains("honesty + QC") || note.contains("team ·")),
-                    "model-routed QuickEdit must not launch flagship QC: {note}"
-                );
-            }
-            EngineEvent::IntentDecided { class, .. } => {
-                // A3: a reactive write now surfaces a BUILD-shaped intent card (the base
-                // wrote code, so a build is visibly underway), even though the Brain
-                // verdict + the completion semantics stay QuickEdit — no flagship QC runs
-                // (asserted above) and `director_build` stays false.
-                assert_eq!(class, "build");
-            }
-            _ => {}
-        }
-    }
-}
-
-#[tokio::test]
-async fn model_read_only_route_executes_on_sandboxed_child_not_writer() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let (sink, _engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (readonly, readonly_sent, readonly_ended) = FakeChatSession::new(vec![
-        vec![
-            umadev_runtime::SessionEvent::TextDelta(
-                serde_json::json!({
-                    "class": "chat",
-                    "authorization": "read_only",
-                    "kind": "light",
-                    "complexity": "simple",
-                    "confidence": 0.99
-                })
-                .to_string(),
-            ),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ],
-        vec![
-            umadev_runtime::SessionEvent::TextDelta("当然，可以正常聊。".into()),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ],
-    ]);
-    let (writer, writer_sent, writer_ended) = FakeChatSession::new(Vec::new());
-    let writer = writer.with_fork(Box::new(readonly));
-    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer)),
-    )));
-
-    drive_chat_session_turn(chat_turn(
-        "我们正常聊聊天",
-        holder.clone(),
-        sink,
-        route_tx,
-        tmp.path().to_path_buf(),
-    ))
-    .await;
-
-    match route_rx.try_recv() {
-        Ok(RouteDecision::AgenticDone {
-            reply,
-            director_build,
-            ..
-        }) => {
-            assert_eq!(reply, "当然，可以正常聊。");
-            assert!(!director_build);
-        }
-        other => panic!("expected read-only reply, got {other:?}"),
-    }
-    assert!(
-        writer_sent.lock().unwrap().is_empty(),
-        "writer saw no user turn"
-    );
-    for _ in 0..20 {
-        if writer_ended.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(writer_ended.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(!readonly_ended.load(std::sync::atomic::Ordering::SeqCst));
-    let directives = readonly_sent.lock().unwrap().clone();
-    assert_eq!(directives.len(), 2, "one triage turn + one answer turn");
-    assert!(directives[1].contains("read-only answer"));
-    assert!(matches!(
-        *holder.lock().await,
-        Some(ResidentChat::ReadOnlyPrimed(_))
-    ));
-}
-
-#[tokio::test]
-async fn resident_turn_sends_ordered_typed_input_and_surfaces_its_receipt() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let image = tmp.path().join("图 像.png");
-    let file = tmp.path().join("需求 文档.md");
-    std::fs::write(&image, b"\x89PNG\r\n\x1a\n").unwrap();
-    std::fs::write(&file, "# requirement\n").unwrap();
-    let input = TurnInput::new(vec![
-        TurnInputBlock::Text {
-            text: "前 ".to_string(),
-        },
-        TurnInputBlock::Image {
-            path: image.clone(),
-        },
-        TurnInputBlock::Text {
-            text: " 中 ".to_string(),
-        },
-        TurnInputBlock::File {
-            path: file.clone(),
-            mode: umadev_runtime::FileInputMode::MaterializeText,
-        },
-        TurnInputBlock::Text {
-            text: " 后".to_string(),
-        },
-    ]);
-    let received: Arc<std::sync::Mutex<Vec<TurnInput>>> = Arc::default();
-    let readonly = TypedRouteSession {
-        stage: 0,
-        current: std::collections::VecDeque::new(),
-        received: Arc::clone(&received),
-    };
-    let (writer, writer_sent, _writer_ended) = FakeChatSession::new(Vec::new());
-    let writer = writer.with_fork(Box::new(readonly));
-    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer)),
-    )));
-    let (sink, mut engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let turn = ChatSessionTurn {
-        input,
-        ..chat_turn(
-            "前 [图片 1] 中 [文件 1] 后",
-            holder,
-            sink,
-            route_tx,
-            tmp.path().to_path_buf(),
-        )
-    };
-
-    drive_chat_session_turn(turn).await;
-
-    assert!(matches!(
-        route_rx.try_recv(),
-        Ok(RouteDecision::AgenticDone { reply, .. }) if reply == "typed input received"
-    ));
-    assert!(
-        writer_sent.lock().unwrap().is_empty(),
-        "the full-access parent never receives the read-only typed turn"
-    );
-    let received = received.lock().unwrap();
-    assert_eq!(received.len(), 1);
-    let blocks = &received[0].blocks;
-    assert_eq!(
-        blocks.iter().map(TurnInputBlock::kind).collect::<Vec<_>>(),
-        vec![
-            TurnInputBlockKind::Text,
-            TurnInputBlockKind::Image,
-            TurnInputBlockKind::Text,
-            TurnInputBlockKind::File,
-            TurnInputBlockKind::Text,
-        ]
-    );
-    assert!(matches!(&blocks[1], TurnInputBlock::Image { path } if path == &image));
-    assert!(matches!(&blocks[3], TurnInputBlock::File { path, .. } if path == &file));
-    drop(received);
-
-    let mut saw_receipt = false;
-    while let Ok(event) = engine_rx.try_recv() {
-        if let EngineEvent::TransientStatus(Some(status)) = event {
-            saw_receipt |= status.contains("Native")
-                && status.contains("MaterializedText")
-                && status.contains("image/png");
-        }
-    }
-    assert!(
-        saw_receipt,
-        "the state area receives the actual delivery report"
-    );
-}
-
-#[tokio::test]
-async fn plan_mode_caps_mutating_model_verdict_before_director_or_disk_write() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let (sink, _engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (readonly, readonly_sent, _readonly_ended) = FakeChatSession::new(vec![
-        vec![
-            umadev_runtime::SessionEvent::TextDelta(
-                serde_json::json!({
-                    "class": "build",
-                    "authorization": "mutating",
-                    "kind": "greenfield",
-                    "complexity": "complex",
-                    "confidence": 0.99
-                })
-                .to_string(),
-            ),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ],
-        vec![
-            umadev_runtime::SessionEvent::TextDelta(
-                "当前是规划模式，我先为你说明实现方案。".into(),
-            ),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ],
-    ]);
-    let (writer, writer_sent, writer_ended) = FakeChatSession::new(Vec::new());
-    let writer = writer.with_fork(Box::new(readonly));
-    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::ReadOnlyPrimed(Box::new(writer)),
-    )));
     let mut turn = chat_turn(
         "构建一个完整应用",
         holder,
@@ -1100,73 +817,190 @@ async fn plan_mode_caps_mutating_model_verdict_before_director_or_disk_write() {
 
     match route_rx.try_recv() {
         Ok(RouteDecision::AgenticDone {
-            reply,
             director_build,
+            reply,
             ..
         }) => {
+            assert!(!director_build, "Plan mode cannot enter the Director");
             assert!(reply.contains("规划模式"));
-            assert!(!director_build, "Plan mode cannot enter Director");
         }
         other => panic!("expected a read-only Plan reply, got {other:?}"),
     }
     assert!(
         route_rx.try_recv().is_err(),
-        "Plan mode must not emit DirectorStarted before the terminal reply"
+        "Plan mode emits no DirectorStarted transition"
     );
-    assert!(writer_sent.lock().unwrap().is_empty(), "writer saw no turn");
-    for _ in 0..20 {
-        if writer_ended.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert!(writer_ended.load(std::sync::atomic::Ordering::SeqCst));
-    let directives = readonly_sent.lock().unwrap().clone();
     assert_eq!(
-        directives.len(),
-        2,
-        "one triage turn + one read-only answer"
+        sent.lock().unwrap().len(),
+        1,
+        "one resident reply, no QC re-drive"
     );
-    assert!(directives[1].contains("This is read-only."));
-    assert!(directives[1].contains("Model-decided route: explain / fast"));
+    assert!(
+        !tmp.path().join(".umadev/run.lock").exists(),
+        "a read-only reply takes no writer lock"
+    );
     assert!(
         !tmp.path().join(".umadev/workflow-state.json").exists(),
-        "Plan-mode natural language must not create Director workflow state"
+        "Plan-mode natural language creates no Director workflow state"
     );
 }
 
+/// B1 + B2: a build-shaped request with NO explicit `/run` no longer forks to
+/// `run_director_loop` before acting. It runs on the resident writer session and is
+/// upgraded REACTIVELY the moment the base writes real code — the Build-shaped card,
+/// the reactive governance QC (with the flag on), and the governance context all fire
+/// off the OBSERVED write, not a pre-action verdict, and NO `DirectorStarted`
+/// transition is ever emitted from chat.
 #[tokio::test]
-async fn model_clarification_pauses_before_writer_lock_branch_or_turn() {
+async fn build_shaped_chat_reaches_resident_writer_and_upgrades_on_first_write() {
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, routes) = drive_resident_turn(
+        tmp.path(),
+        "做一个完整的后台管理系统",
+        write_tool_turn("src/admin.tsx"),
+        Some("src/admin.tsx"),
+    )
+    .await;
+
+    assert!(
+        !routes
+            .iter()
+            .any(|r| matches!(r, RouteDecision::DirectorStarted { .. })),
+        "an implicit build never dispatches the Director from chat: {routes:?}"
+    );
+    assert!(
+        routes.iter().any(|r| matches!(
+            r,
+            RouteDecision::AgenticDone {
+                director_build: false,
+                ..
+            }
+        )),
+        "the reactive build settles as a resident turn, not a Director build: {routes:?}"
+    );
+    assert!(
+        saw_build_intent_card(&events),
+        "the observed write surfaces a Build-shaped card: {events:?}"
+    );
+    assert!(
+        ran_governance_qc(&events),
+        "the observed build runs the reactive governance QC: {events:?}"
+    );
+    assert!(
+        tmp.path().join(".umadev/governance-context.json").exists(),
+        "the governance context was persisted before the first write"
+    );
+}
+
+/// B4 — the ONE routing rule kept from the removed barrier: an EXPLICIT read-only
+/// request ("只分析，不要修改任何文件") forces a non-mutating, non-isolating turn in EVERY
+/// trust mode (Guarded AND Auto), so the base is jailed read-only and cannot write even
+/// under Auto. Observed via the read-only park disposition plus the absence of any
+/// write-side governance (no writer lock, no persisted governance context).
+#[tokio::test]
+async fn explicit_read_only_request_stays_read_only_in_guarded_and_auto() {
+    for (mode, perms) in [
+        (
+            umadev_agent::TrustMode::Guarded,
+            umadev_runtime::BasePermissionProfile::Guarded,
+        ),
+        (
+            umadev_agent::TrustMode::Auto,
+            umadev_runtime::BasePermissionProfile::Auto,
+        ),
+    ] {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (sink, _engine_rx) = ChannelSink::new();
+        let sink = Arc::new(sink);
+        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Start from a read-only-primed resident so the read-only verdict is KEPT: a
+        // write-capable fake would (in production) be reopened as a real PLAN session, a
+        // reopen unit tests deliberately short-circuit.
+        let (fake, _sent, _ended) = FakeChatSession::new(vec![vec![
+            umadev_runtime::SessionEvent::TextDelta("这是只读分析结论……".into()),
+            umadev_runtime::SessionEvent::TurnDone {
+                status: umadev_runtime::TurnStatus::Completed,
+                usage: None,
+            },
+        ]]);
+        // Pin the parked permissions to this mode so the read-only-primed resident is
+        // REUSED (identity match), not treated as stale and reopened.
+        let holder: ChatSessionHolder = ChatSessionHolder::from_mutex_with_permissions(
+            tokio::sync::Mutex::new(Some(ResidentChat::ReadOnlyPrimed(Box::new(fake)))),
+            perms,
+        );
+        let mut turn = chat_turn(
+            "只分析，不要修改任何文件",
+            holder.clone(),
+            sink,
+            route_tx,
+            tmp.path().to_path_buf(),
+        );
+        turn.mode = mode;
+        turn.permissions = perms;
+
+        drive_chat_session_turn(turn).await;
+
+        assert!(
+            matches!(
+                route_rx.try_recv(),
+                Ok(RouteDecision::AgenticDone {
+                    director_build: false,
+                    ..
+                })
+            ),
+            "an explicit read-only turn settles as a resident reply in {mode:?}"
+        );
+        assert!(
+            matches!(*holder.lock().await, Some(ResidentChat::ReadOnlyPrimed(_))),
+            "the turn stayed read-only (parked read-only) in {mode:?}"
+        );
+        assert!(
+            !tmp.path().join(".umadev/run.lock").exists(),
+            "a read-only turn takes no writer lock in {mode:?}"
+        );
+        assert!(
+            !tmp.path().join(".umadev/governance-context.json").exists(),
+            "a read-only turn persists no write-side governance context in {mode:?}"
+        );
+    }
+}
+
+/// The reported bug: a read-only "find the repo" request used to be stranded — a
+/// low-confidence fallback verdict jailed the base in plan mode, where it could not use
+/// tools and re-planned forever. Under the reactive model the base just ACTS on a
+/// write-capable resident session, so it freely uses read-only tools (no plan-mode jail,
+/// no ExitPlanMode deadlock) and settles as an ordinary resident reply.
+#[tokio::test]
+async fn find_the_repo_read_only_request_runs_and_is_not_stranded() {
     let tmp = tempfile::TempDir::new().unwrap();
     let (sink, _engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (fork, _fork_sent, fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "build",
-                "authorization": "mutating",
-                "kind": "greenfield",
-                "complexity": "medium",
-                "clarify_question": "这个入口面向哪类用户？",
-                "clarify_options": ["管理员", "普通用户"],
-                "confidence": 0.62
-            })
-            .to_string(),
-        ),
+    // The base inspects with a read-only tool (Grep), then answers — a healthy "find X"
+    // turn, NOT a stranded "I can't use tools this turn" dead-end.
+    let (fake, sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::ToolCall {
+            name: "Grep".into(),
+            input: serde_json::json!({ "pattern": "fn main" }),
+        },
+        umadev_runtime::SessionEvent::ToolResult {
+            ok: true,
+            summary: "src/main.rs".into(),
+        },
+        umadev_runtime::SessionEvent::TextDelta("源码在 src/main.rs。".into()),
         umadev_runtime::SessionEvent::TurnDone {
             status: umadev_runtime::TurnStatus::Completed,
             usage: None,
         },
     ]]);
-    let (writer, writer_sent, writer_ended) = FakeChatSession::new(Vec::new());
-    let writer = writer.with_fork(Box::new(fork));
     let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer)),
+        ResidentChat::Primed(Box::new(fake)),
     )));
 
     drive_chat_session_turn(chat_turn(
-        "给这个入口加一套登录流程",
+        "找 tm 的源码在哪里",
         holder.clone(),
         sink,
         route_tx,
@@ -1176,86 +1010,67 @@ async fn model_clarification_pauses_before_writer_lock_branch_or_turn() {
 
     match route_rx.try_recv() {
         Ok(RouteDecision::AgenticDone {
-            reply,
             director_build,
+            reply,
             ..
         }) => {
             assert!(!director_build);
-            assert!(reply.contains("这个入口面向哪类用户？"));
-            assert!(reply.contains("1. 管理员"));
-            assert!(reply.contains("2. 普通用户"));
+            assert_eq!(reply, "源码在 src/main.rs。");
         }
-        other => panic!("expected clarification reply, got {other:?}"),
+        other => panic!("a read-only inspection must run, not strand, got {other:?}"),
     }
-    assert!(
-        writer_sent.lock().unwrap().is_empty(),
-        "writer was never driven"
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "one resident turn, no reroute"
     );
-    assert!(fork_ended.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(
-        !writer_ended.load(std::sync::atomic::Ordering::SeqCst),
-        "the untouched resident session is parked, not closed"
-    );
-    assert!(holder.lock().await.is_some());
     assert!(
         !tmp.path().join(".umadev/run.lock").exists(),
-        "clarification never acquires the writer lock"
+        "a read-only inspection takes no writer lock"
     );
 }
 
+/// Risk #1 — a build done through `Bash` (a heredoc / generator) emits NO Write/Edit
+/// tool event, but a shell `ToolCall` still reads as a potential write, so
+/// `react_to_first_write` fires off it: the turn is promoted to a build and, with the
+/// reactive QC flag on, runs the SAME governance QC a `Write`-driven build does. A
+/// Bash-only build is therefore never left ungoverned.
 #[tokio::test]
-async fn quick_edit_write_skips_flagship_qc_and_team_review() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
+async fn bash_heredoc_build_is_governed_by_the_reactive_engine() {
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = init_git_repo();
+    let target = tmp.path().join("src/app.tsx");
     let (sink, mut engine_rx) = ChannelSink::new();
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "light",
-                "complexity": "simple",
-                "confidence": 0.97
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let (fake, sent, _ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Edit".into(),
-            input: serde_json::json!({ "file_path": "app.ts" }),
-        },
-        umadev_runtime::SessionEvent::ToolResult {
-            ok: true,
-            summary: "edit applied".into(),
-        },
+    // A Bash write with no Write/Edit tool — the base scaffolds via a heredoc and a real
+    // file lands via the send effect (mirrors the pre-turn snapshot → post-turn git-diff
+    // path production uses when no tool event names the write).
+    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
         umadev_runtime::SessionEvent::ToolCall {
             name: "Bash".into(),
-            input: serde_json::json!({ "command": "npm run lint" }),
+            input: serde_json::json!({ "command": "cat > src/app.tsx <<'EOF'\n...\nEOF" }),
         },
         umadev_runtime::SessionEvent::ToolResult {
             ok: true,
-            summary: "lint passed".into(),
+            summary: "scaffolded src/app.tsx".into(),
         },
-        umadev_runtime::SessionEvent::TextDelta("updated SEO metadata".into()),
+        umadev_runtime::SessionEvent::TextDelta("built it via bash".into()),
         umadev_runtime::SessionEvent::TurnDone {
             status: umadev_runtime::TurnStatus::Completed,
             usage: None,
         },
     ]]);
-    let fake = fake.with_fork(Box::new(intent_fork));
+    let writer = writer.with_send_effect(move || {
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "export const App = () => null;\n").unwrap();
+    });
     let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(fake)),
+        ResidentChat::Primed(Box::new(writer)),
     )));
 
     drive_chat_session_turn(chat_turn(
-        "帮我搞一下 SEO",
+        "用脚本生成一个登录页面",
         holder,
         sink,
         route_tx,
@@ -1270,584 +1085,23 @@ async fn quick_edit_write_skips_flagship_qc_and_team_review() {
             ..
         })
     ));
-    assert_eq!(
-        sent.lock().unwrap().len(),
-        1,
-        "a QuickEdit never sends a QC/review turn"
-    );
-    while let Ok(event) = engine_rx.try_recv() {
-        if let EngineEvent::Note(note) = event {
-            assert!(
-                !(note.contains("构建完成")
-                    || note.contains("honesty + QC")
-                    || note.contains("team ·")),
-                "QuickEdit must not launch flagship QC/team review: {note}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn quick_edit_write_without_targeted_verification_is_not_completed() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
-    let (sink, _engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "light",
-                "complexity": "simple",
-                "confidence": 0.99
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Edit".into(),
-            input: serde_json::json!({ "file_path": "app.ts" }),
-        },
-        umadev_runtime::SessionEvent::TextDelta("updated metadata".into()),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
-    )));
-
-    drive_chat_session_turn(chat_turn(
-        "只改一下 SEO 标题",
-        holder.clone(),
-        sink,
-        route_tx,
-        tmp.path().to_path_buf(),
-    ))
-    .await;
-
-    match route_rx.try_recv() {
-        Ok(RouteDecision::Failed(note)) => assert_eq!(
-            note,
-            umadev_i18n::tl("intent.targeted_verification_missing")
-        ),
-        other => panic!("unverified scoped write must be blocked, got {other:?}"),
-    }
-    assert!(
-        holder.lock().await.is_some(),
-        "session remains available to verify"
-    );
-    let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1);
-    assert_eq!(runs.len(), 1);
-    assert_eq!(
-        runs[0].tasks[0].state,
-        umadev_agent::task_lifecycle::AgentTaskState::Failed,
-        "an unverified resident write is durably failed"
-    );
-}
-
-#[tokio::test]
-async fn quick_edit_codex_output_delta_never_settles_verifier_early() {
-    // Exercise both verdicts with the exact Codex process-log order:
-    // completed Write, started verifier, non-terminal outputDelta, then the
-    // real item/completed verdict. The delta must neither consume the FIFO
-    // entry nor mint a green result from optimistic-looking progress text.
-    for final_ok in [false, true] {
-        let tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
-        let (sink, _engine_rx) = ChannelSink::new();
-        let sink = Arc::new(sink);
-        let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-            umadev_runtime::SessionEvent::TextDelta(
-                serde_json::json!({
-                    "class": "quick_edit",
-                    "authorization": "mutating",
-                    "kind": "light",
-                    "complexity": "simple",
-                    "confidence": 0.99
-                })
-                .to_string(),
-            ),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ]]);
-        let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
-            umadev_runtime::SessionEvent::ToolCall {
-                name: "Write".into(),
-                input: serde_json::json!({ "file_path": "app.ts" }),
-            },
-            umadev_runtime::SessionEvent::ToolResult {
-                ok: true,
-                summary: "file written".into(),
-            },
-            umadev_runtime::SessionEvent::ToolCall {
-                name: "Bash".into(),
-                input: serde_json::json!({ "command": "cargo test -q" }),
-            },
-            umadev_runtime::SessionEvent::ToolOutputDelta(
-                "running: 42 checks passed so far\n".into(),
-            ),
-            umadev_runtime::SessionEvent::ToolResult {
-                ok: final_ok,
-                summary: if final_ok {
-                    "all tests passed".into()
-                } else {
-                    "final test failed".into()
-                },
-            },
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ]]);
-        let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-            ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
-        )));
-
-        drive_chat_session_turn(chat_turn(
-            "只改一下 SEO 标题",
-            holder,
-            sink,
-            route_tx,
-            tmp.path().to_path_buf(),
-        ))
-        .await;
-
-        let decision = route_rx.try_recv();
-        if final_ok {
-            assert!(
-                matches!(&decision, Ok(RouteDecision::AgenticDone { .. })),
-                "the real successful terminal result should verify: {decision:?}"
-            );
-        } else {
-            assert!(
-                matches!(
-                    &decision,
-                    Ok(RouteDecision::Failed(note))
-                        if note == umadev_i18n::tl("intent.targeted_verification_missing")
-                ),
-                "optimistic progress cannot hide the failed terminal result: {decision:?}"
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn quick_edit_verification_before_last_write_is_not_completed() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
-    let (sink, _engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "light",
-                "complexity": "simple",
-                "confidence": 0.99
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Bash".into(),
-            input: serde_json::json!({ "command": "cargo test -q" }),
-        },
-        umadev_runtime::SessionEvent::ToolResult {
-            ok: true,
-            summary: "tests passed".into(),
-        },
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Edit".into(),
-            input: serde_json::json!({ "file_path": "app.ts" }),
-        },
-        umadev_runtime::SessionEvent::TextDelta("updated metadata".into()),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
-    )));
-
-    drive_chat_session_turn(chat_turn(
-        "只改一下 SEO 标题",
-        holder,
-        sink,
-        route_tx,
-        tmp.path().to_path_buf(),
-    ))
-    .await;
-
-    assert!(matches!(
-        route_rx.try_recv(),
-        Ok(RouteDecision::Failed(note))
-            if note == umadev_i18n::tl("intent.targeted_verification_missing")
-    ));
-}
-
-#[tokio::test]
-async fn quick_edit_successful_verifier_then_arbitrary_shell_write_is_not_completed() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
-    let (sink, _engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "light",
-                "complexity": "simple",
-                "confidence": 0.99
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Bash".into(),
-            input: serde_json::json!({ "command": "cargo test -q" }),
-        },
-        umadev_runtime::SessionEvent::ToolResult {
-            ok: true,
-            summary: "tests passed".into(),
-        },
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Bash".into(),
-            input: serde_json::json!({ "command": "touch app.ts" }),
-        },
-        umadev_runtime::SessionEvent::ToolResult {
-            ok: true,
-            summary: "command completed".into(),
-        },
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
-    )));
-
-    drive_chat_session_turn(chat_turn(
-        "只改一下 SEO 标题",
-        holder,
-        sink,
-        route_tx,
-        tmp.path().to_path_buf(),
-    ))
-    .await;
-
-    assert!(matches!(
-        route_rx.try_recv(),
-        Ok(RouteDecision::Failed(note))
-            if note == umadev_i18n::tl("intent.targeted_verification_missing")
-    ));
-}
-
-#[tokio::test]
-async fn quick_edit_keeps_fifo_across_output_delta_then_failed_verifier() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("app.ts"), "export const title = 'old';").unwrap();
-    let (sink, _engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "light",
-                "complexity": "simple",
-                "confidence": 0.99
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Edit".into(),
-            input: serde_json::json!({ "file_path": "app.ts" }),
-        },
-        umadev_runtime::SessionEvent::ToolCall {
-            name: "Bash".into(),
-            input: serde_json::json!({ "command": "cargo test -q" }),
-        },
-        // Codex process logs stream this while the command is still running.
-        // It must not consume either queued call or manufacture a green result.
-        umadev_runtime::SessionEvent::ToolOutputDelta("running tests...\n".into()),
-        // Result 1 belongs to Edit; it must not be mistaken for the queued test.
-        umadev_runtime::SessionEvent::ToolResult {
-            ok: true,
-            summary: "edit applied".into(),
-        },
-        // The actual verifier failed, so the turn remains unverified.
-        umadev_runtime::SessionEvent::ToolResult {
-            ok: false,
-            summary: "test failed".into(),
-        },
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer.with_fork(Box::new(intent_fork)))),
-    )));
-
-    drive_chat_session_turn(chat_turn(
-        "只改一下 SEO 标题",
-        holder,
-        sink,
-        route_tx,
-        tmp.path().to_path_buf(),
-    ))
-    .await;
-
-    assert!(matches!(
-        route_rx.try_recv(),
-        Ok(RouteDecision::Failed(note))
-            if note == umadev_i18n::tl("intent.targeted_verification_missing")
-    ));
-}
-
-#[tokio::test]
-async fn routed_build_without_write_tool_still_runs_source_gate_and_flagship_qc() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let (sink, mut engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "build",
-                "authorization": "mutating",
-                "kind": "greenfield",
-                "complexity": "medium",
-                "confidence": 0.99
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    // The writer CLAIMS completion but emits no Write/Edit/Bash tool and leaves
-    // an empty workspace. A second batch lets the bounded QC repair turn settle.
-    let (writer, sent, ended) = FakeChatSession::new(vec![
-        vec![
-            umadev_runtime::SessionEvent::TextDelta("I implemented the entire application".into()),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ],
-        vec![umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        }],
-        vec![umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        }],
-        vec![umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        }],
-        vec![umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        }],
-    ]);
-    let writer = writer
-        .with_id("director-session-1")
-        .with_fork(Box::new(intent_fork));
-    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer)),
-    )));
-
-    drive_chat_session_turn(chat_turn(
-        "构建一个完整应用",
-        holder,
-        sink,
-        route_tx,
-        tmp.path().to_path_buf(),
-    ))
-    .await;
-
-    assert_eq!(
-        route_rx.try_recv(),
-        Ok(RouteDecision::DirectorStarted {
-            requirement: "构建一个完整应用".to_string(),
-        }),
-        "the UI learns about a model-promoted director before it settles"
-    );
-    match route_rx.try_recv() {
-        Ok(RouteDecision::Failed(reason)) => assert!(
-            reason.contains("ZERO real source files")
-                || reason.contains("0 source file(s)")
-                || reason.contains("没有任何真实源码"),
-            "the objective source rejection is the terminal result: {reason}"
-        ),
-        other => panic!("expected an honest failed completion, got {other:?}"),
-    }
-    assert!(
-        sent.lock().unwrap().len() >= 2,
-        "the routed Build must enter the QC pass even without a write tool"
-    );
-    let mut saw_source_abort = false;
-    let mut saw_director_intent = false;
+    let mut saw_qc = false;
+    let mut saw_build_card = false;
     while let Ok(event) = engine_rx.try_recv() {
         match event {
-            EngineEvent::Note(note) => {
-                saw_source_abort |= note.contains(ABORT_SENTINEL);
-            }
-            EngineEvent::IntentDecided { class, .. } => {
-                saw_director_intent |= class == "build";
-            }
+            EngineEvent::Note(n) if n.contains("构建完成") => saw_qc = true,
+            EngineEvent::IntentDecided { class, .. } if class == "build" => saw_build_card = true,
             _ => {}
         }
     }
     assert!(
-        saw_source_abort,
-        "a phantom Build completion must hit the source-present hard gate"
+        saw_build_card,
+        "a Bash write promotes the turn to a build (react_to_first_write fires off the shell tool)"
     );
     assert!(
-        saw_director_intent,
-        "a healthy model Build must enter the routed director workflow"
+        saw_qc,
+        "a Bash-only build still runs the reactive governance QC"
     );
-    assert!(
-        ended.load(std::sync::atomic::Ordering::SeqCst),
-        "the director owns and settles the reused resident writer"
-    );
-    let state = umadev_agent::read_workflow_state(tmp.path())
-        .expect("a natural-language director build writes workflow state");
-    assert_eq!(state.requirement, "构建一个完整应用");
-    assert_eq!(state.base_session_id.as_deref(), Some("director-session-1"));
-}
-
-#[tokio::test]
-async fn successful_routed_build_hands_exact_director_session_back() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("app.ts"), "export const ready = true;\n").unwrap();
-    let (sink, _engine_rx) = ChannelSink::new();
-    let sink = Arc::new(sink);
-    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "build",
-                "authorization": "mutating",
-                "kind": "greenfield",
-                "complexity": "medium",
-                "confidence": 0.99
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
-    let (writer, _sent, ended) = FakeChatSession::new(vec![
-        vec![
-            umadev_runtime::SessionEvent::TextDelta("Implemented and verified.".into()),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ],
-        vec![umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        }],
-    ]);
-    let passing_critic = || {
-        FakeChatSession::new(vec![vec![
-            umadev_runtime::SessionEvent::TextDelta(
-                serde_json::json!({
-                    "accepts": true,
-                    "blocking": [],
-                    "remediation": [],
-                    "advisory": [],
-                    "evidence": ["scripted quality-review fixture"]
-                })
-                .to_string(),
-            ),
-            umadev_runtime::SessionEvent::TurnDone {
-                status: umadev_runtime::TurnStatus::Completed,
-                usage: None,
-            },
-        ]])
-        .0
-    };
-    let writer = writer
-        .with_id("director-success-1")
-        .with_fork(Box::new(intent_fork))
-        // The greenfield route's quality roster is frontend, backend, QA and
-        // security. Keep the integration fixture aligned with that real
-        // review contract instead of silently exercising unavailable critics.
-        .with_fork(Box::new(passing_critic()))
-        .with_fork(Box::new(passing_critic()))
-        .with_fork(Box::new(passing_critic()))
-        .with_fork(Box::new(passing_critic()));
-    let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
-        ResidentChat::Primed(Box::new(writer)),
-    )));
-
-    drive_chat_session_turn(chat_turn(
-        "构建一个完整应用",
-        holder,
-        sink,
-        route_tx,
-        tmp.path().to_path_buf(),
-    ))
-    .await;
-
-    assert!(matches!(
-        route_rx.try_recv(),
-        Ok(RouteDecision::DirectorStarted { .. })
-    ));
-    match route_rx.try_recv() {
-        Ok(RouteDecision::AgenticDone {
-            director_build: true,
-            base_session_id,
-            ..
-        }) => assert_eq!(base_session_id.as_deref(), Some("director-success-1")),
-        other => panic!("expected successful director completion, got {other:?}"),
-    }
-    assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -1910,23 +1164,9 @@ async fn bash_file_change_is_post_turn_work_but_quick_edit_skips_flagship_qc() {
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "light",
-                "complexity": "simple",
-                "scope": ["src/generated.rs"],
-                "confidence": 0.98
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
+    // No routing fork under the reactive model: the base just acts. A Bash write is
+    // real work (the post-turn git delta proves it), but with no reactive-QC flag it
+    // never launches the flagship team QC.
     let (writer, sent, _ended) = FakeChatSession::new(vec![vec![
         umadev_runtime::SessionEvent::ToolCall {
             name: "Bash".into(),
@@ -1950,12 +1190,10 @@ async fn bash_file_change_is_post_turn_work_but_quick_edit_skips_flagship_qc() {
             usage: None,
         },
     ]]);
-    let writer = writer
-        .with_fork(Box::new(intent_fork))
-        .with_send_effect(move || {
-            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-            std::fs::write(target, "pub fn generated() {}\n").unwrap();
-        });
+    let writer = writer.with_send_effect(move || {
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, "pub fn generated() {}\n").unwrap();
+    });
     let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
         ResidentChat::Primed(Box::new(writer)),
     )));
@@ -1979,7 +1217,8 @@ async fn bash_file_change_is_post_turn_work_but_quick_edit_skips_flagship_qc() {
     assert_eq!(
         sent.lock().unwrap().len(),
         1,
-        "a Bash-backed QuickEdit is real work but never launches flagship QC"
+        "a Bash-backed change is real work but, with no reactive-QC flag, never launches \
+         the flagship team QC"
     );
     let mut saw_real_change = false;
     while let Ok(event) = engine_rx.try_recv() {
@@ -1991,7 +1230,7 @@ async fn bash_file_change_is_post_turn_work_but_quick_edit_skips_flagship_qc() {
                 !(note.contains("构建完成")
                     || note.contains("honesty + QC")
                     || note.contains("team ·")),
-                "QuickEdit must stay on targeted verification: {note}"
+                "an unflagged reactive write runs no flagship QC: {note}"
             );
         }
     }
@@ -2009,23 +1248,9 @@ async fn docs_only_write_does_not_become_code_build_or_run_flagship_qc() {
     let sink = Arc::new(sink);
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    let (intent_fork, _fork_sent, _fork_ended) = FakeChatSession::new(vec![vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "docs_only",
-                "complexity": "simple",
-                "scope": ["README.md"],
-                "confidence": 0.99
-            })
-            .to_string(),
-        ),
-        umadev_runtime::SessionEvent::TurnDone {
-            status: umadev_runtime::TurnStatus::Completed,
-            usage: None,
-        },
-    ]]);
+    // No routing fork under the reactive model. A single doc/markdown write is
+    // legitimate pre-development work: the `is_doc_artifact_path` latch keeps
+    // `react_to_first_write` from firing, so the turn never becomes a code build.
     let (writer, sent, _ended) = FakeChatSession::new(vec![vec![
         umadev_runtime::SessionEvent::ToolCall {
             name: "Write".into(),
@@ -2037,9 +1262,8 @@ async fn docs_only_write_does_not_become_code_build_or_run_flagship_qc() {
             usage: None,
         },
     ]]);
-    let writer = writer
-        .with_fork(Box::new(intent_fork))
-        .with_send_effect(move || std::fs::write(target, "# Documentation\n").unwrap());
+    let writer =
+        writer.with_send_effect(move || std::fs::write(target, "# Documentation\n").unwrap());
     let holder: ChatSessionHolder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
         ResidentChat::Primed(Box::new(writer)),
     )));
@@ -2060,13 +1284,13 @@ async fn docs_only_write_does_not_become_code_build_or_run_flagship_qc() {
             ..
         })
     ));
-    assert_eq!(sent.lock().unwrap().len(), 1, "DocsOnly has no QC turn");
-    let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1);
-    assert_eq!(runs.len(), 1);
-    assert_eq!(
-        runs[0].tasks[0].state,
-        umadev_agent::task_lifecycle::AgentTaskState::Succeeded,
-        "a real docs diff that passed its scope contract is durable success"
+    assert_eq!(sent.lock().unwrap().len(), 1, "a doc write has no QC turn");
+    // A doc-only write never latches a build, so — like a pure chat — it opens no
+    // durable writer-ledger run (the up-front entry task was keyed off a mutating seed
+    // route, which no longer exists).
+    assert!(
+        umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 1).is_empty(),
+        "a doc-only write does not enter the durable writer ledger"
     );
     while let Ok(event) = engine_rx.try_recv() {
         if let EngineEvent::Note(note) = event {

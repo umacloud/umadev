@@ -46,7 +46,6 @@ mod interaction_bridge;
 pub mod link;
 mod preview;
 mod prompt_queue_ui;
-mod read_only_gate;
 pub mod selection;
 mod session_slot;
 mod tool_effects;
@@ -525,6 +524,16 @@ enum RouteDecision {
     /// workflow. This is a non-terminal state transition: it lets the UI route
     /// input typed while the build is running into the director's live steering
     /// intake (or the deferred-chat queue) before the terminal outcome arrives.
+    ///
+    /// Stage B removed the pre-action barrier that was this variant's ONLY emitter:
+    /// an implicit "build me X" chat turn no longer dispatches the director up front
+    /// (it runs on the resident writer and is upgraded reactively). The variant + its
+    /// event-loop consumer are retained (and `#[allow(dead_code)]`d) so a future
+    /// reactive director-promotion can re-emit it without re-plumbing the UI; a Stage-C
+    /// cleanup may remove it. The explicit `/run` path sets `director_run_in_flight`
+    /// directly and never needed this decision.
+    // TODO(stage-c): delete this variant + its consumer arm if no reactive re-emitter lands.
+    #[allow(dead_code)]
     DirectorStarted {
         /// The current request, used to register the live task on the UI thread.
         requirement: String,
@@ -2458,6 +2467,41 @@ fn light_default_route() -> RoutePlan {
         scope: Vec::new(),
         needs_clarify: None,
         est_budget: Budget::for_route(RouteClass::QuickEdit, Depth::Fast),
+        confidence: 0.5,
+    }
+}
+
+/// The FIXED seed route for a resident chat turn under the reactive model (Stage B).
+///
+/// UmaDev is REACTIVE, NOT PREDICTIVE: it no longer pre-classifies the user's intent
+/// before the base acts. The base's own brain runs the turn, and a real workspace write
+/// promotes it to a build reactively ([`react_to_first_write`]). So this seed carries NO
+/// guess about the turn — it is a light, NON-mutating `Explain` / `Light` / `Fast` route
+/// chosen for two exact properties:
+///
+/// 1. `Explain` does NOT [`umadev_agent::RouteClass::mutates_workspace`], so the turn
+///    takes NO up-front run-lock, branch isolation, or execution postcondition — a pure
+///    "你好" or a read-only "find the repo" inspection stays cheap. The lock + isolation
+///    are established REACTIVELY on the first real write instead.
+/// 2. `Explain` is NOT `Chat`, so [`umadev_agent::compose_firmware`] still injects the
+///    always-on standards core (identity + craft law + anti-slop law + repo-map slice) —
+///    the moat reaches the base on EVERY turn, decoupled from any classification, so a
+///    turn the base then promotes to a build already had the standards leading its prompt.
+///
+/// The authorization ceiling ([`umadev_agent::apply_authorization_ceiling`]) is applied
+/// on top of this at the call site so an explicit read-only request still lands
+/// non-mutating. Deterministic + allocation-light; fail-open by construction.
+#[must_use]
+fn resident_default_route() -> RoutePlan {
+    use umadev_agent::{Budget, Depth, RouteClass, TaskKind};
+    RoutePlan {
+        class: RouteClass::Explain,
+        kind: TaskKind::Light,
+        depth: Depth::Fast,
+        team: Vec::new(),
+        scope: Vec::new(),
+        needs_clarify: None,
+        est_budget: Budget::for_route(RouteClass::Explain, Depth::Fast),
         confidence: 0.5,
     }
 }
@@ -4554,20 +4598,6 @@ fn with_turn_firmware(firmware: Option<&str>, directive: String) -> String {
     }
 }
 
-/// Render the router's one batched clarification without driving a writer. The
-/// user can answer naturally on the next turn; the bounded conversation transcript
-/// carries this exact question and options back into the next model route.
-fn route_clarification_reply(question: &umadev_agent::ClarifyQuestion) -> String {
-    let mut out = question.question.trim().to_string();
-    for (index, option) in question.options.iter().enumerate() {
-        let option = option.trim();
-        if !option.is_empty() {
-            out.push_str(&format!("\n{}. {option}", index + 1));
-        }
-    }
-    out
-}
-
 /// Per-turn authority boundary for a resident session. Native base memory and
 /// project guidance remain useful context, but only the latest request grants work.
 fn scoped_chat_directive(text: &str, route: &RoutePlan) -> String {
@@ -5146,7 +5176,10 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         interactive,
         approval_holder,
         host_input_holder,
-        steer_holder,
+        // Stage B removed the up-front director dispatch, the only consumer of the
+        // steering channel on this resident chat path (a resident turn is not a
+        // Director run). Bound-but-unused so the field is still destructured.
+        steer_holder: _steer_holder,
         live_input_hub,
     } = turn;
     let native_command = dispatch == ResidentTurnKind::NativeCommand;
@@ -5206,20 +5239,30 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         };
         (text, input)
     };
-    // Start with a bounded fallback. Before the writer receives this turn, the
-    // resident base gets one read-only fork consult whose valid semantic decision
-    // replaces this in either direction (Explain ↔ Build included).
-    let mut route = if native_command {
+    // B1 — REACTIVE, NOT PREDICTIVE. The resident turn no longer forks the base to
+    // pre-decide chat/edit/build before acting; the base's own brain just runs the turn
+    // and a real workspace write promotes it to a build the moment it happens
+    // (`react_to_first_write`). So the seed is a FIXED light default, not a text-derived
+    // guess: `Explain` / `Light` / `Fast` ([`resident_default_route`]), which carries the
+    // always-on standards firmware WITHOUT the up-front run-lock / branch isolation a
+    // mutating seed would trigger (those are keyed off `mutates_workspace()` and are
+    // re-established reactively on the first write). A native command keeps its own
+    // write-capable postcondition contract untouched.
+    //
+    // B4 — the ONE routing rule that must survive: an explicit "只分析别改 / do not
+    // modify / read-only" request STILL lands non-mutating. The authorization ceiling is
+    // re-homed onto this default route (a no-op on the already-`Explain` seed, but it
+    // keeps the guarantee if the seed ever changes) and, load-bearing, also drives
+    // `execution_read_only` below so the base is jailed read-only in EVERY trust mode.
+    let route = if native_command {
         native_command_postcondition_route()
     } else {
-        umadev_agent::deterministic_route(&text)
+        umadev_agent::apply_authorization_ceiling(resident_default_route(), &text)
     };
-    let mut route_source: Option<umadev_agent::RouteSource> = None;
-    let routing_context = if native_command {
-        String::new()
-    } else {
-        bounded_route_context(&conversation, &text)
-    };
+    // Provenance is no longer pre-decided — there is no brain verdict. Kept as a `None`
+    // constant so the reactive tail (`routed_build` / scoped-write verification) stays a
+    // no-op; the reactive engine (`became_build`) is what drives governance/QC now.
+    let route_source: Option<umadev_agent::RouteSource> = None;
 
     // Legacy/read-only fact snapshot (git missing → fact omitted). Mutating
     // resident turns use the stronger content post-condition captured after route.
@@ -5358,119 +5401,32 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             acquired
         };
 
-        // PRE-ACTION intent barrier: ask the configured base model on a read-only
-        // fork before the writer sees the request. This is an extra short inference,
-        // not a second cold writer process. A valid model decision is authoritative
-        // upward or downward; a missing/invalid answer uses the conservative
-        // deterministic fallback. On the rare clean-session retry, re-consult only
-        // when the previous attempt had to fall back.
-        let mut readonly_route_session = None;
-        if !native_command && route_source != Some(umadev_agent::RouteSource::Brain) {
-            let opts = route_floor_options(&project_root, &text, mode);
-            let _route_permit = umadev_agent::base_gate::base_permit().await;
-            let (decided, readonly_session) =
-                umadev_agent::route_with_context_and_readonly_session(
-                    Some(session.as_mut()),
-                    &opts,
-                    &text,
-                    &routing_context,
-                )
-                .await;
-            readonly_route_session = readonly_session;
-            route = decided.plan;
-            route_source = Some(decided.source);
-        }
-
-        // A typed clarification is a PAUSE, not permission to start doing work.
-        // Park the untouched parent session in its original warm/primed state and
-        // surface the one batched question directly — before a run-lock, branch,
-        // tool call, or writer directive can exist.
-        if !native_command {
-            if let Some(question) = route.needs_clarify.as_ref() {
-                if let Some(mut readonly) = readonly_route_session.take() {
-                    let _ = tokio::time::timeout(Duration::from_secs(2), readonly.end()).await;
-                }
-                let reply = route_clarification_reply(question);
-                let base_session_id = session.session_id().map(str::to_string);
-                let parent_profile = execution_permission_profile(parent_read_only, permissions);
-                let base_resume_identity = base_session_id.as_ref().and_then(|_| {
-                    session.resume_identity().cloned().or_else(|| {
-                        crate::session_slot::requested_resume_identity(
-                            &backend,
-                            &project_root,
-                            parent_profile,
-                        )
-                    })
-                });
-                let resident = park_after_chat_failure(
-                    session,
-                    &attempt_directive,
-                    false,
-                    &backend,
-                    parent_read_only,
-                    parent_profile,
-                    turn_generation,
-                );
-                let _ = chat_session
-                    .park_for_launch(
-                        turn_generation,
-                        &backend,
-                        &project_root,
-                        parent_profile,
-                        resident,
-                    )
-                    .await;
-                cancel_entry_task(
-                    &mut entry_task,
-                    "retry was rerouted to an intent clarification",
-                );
-                let _ = route_tx.send(RouteDecision::AgenticDone {
-                    reply,
-                    director_build: false,
-                    base_session_id,
-                    base_resume_identity,
-                });
-                return;
-            }
-        }
-
-        // Enforce the model's read-only verdict at the execution layer. A healthy
-        // intent child already runs in the base's PLAN/read-only sandbox, so reuse
-        // it for Chat/Explain and retire the full-access parent. When the fork was
-        // unavailable, reopen a fresh PLAN session rather than trusting a prompt on
-        // a write-capable process. Conversely, a mutating turn never reuses a prior
-        // read-only resident; it reopens the configured writer permissions.
-        // A non-mutating route normally runs read-only, but a read-only verdict from
-        // the DETERMINISTIC FALLBACK (the brain intent consult timed out / was
-        // unavailable, so a keyword classifier guessed) is unreliable: a keyword-miss
-        // on a real build lands non-mutating and would jail the base in claude's plan
-        // mode, where it tries the unexposed ExitPlanMode and re-plans forever (the
-        // reported deadlock, in Guarded AND Auto). [`read_only_gate::turn_executes_read_only`]
-        // refuses to jail on that low-confidence guess ONLY under an execution-capable
-        // trust mode (`permissions != Plan`) and only when the user did not explicitly
-        // ask for read-only; a confident brain verdict, Plan mode, and native commands
-        // are unchanged.
-        execution_read_only = read_only_gate::turn_executes_read_only(
-            !native_command && !route.class.mutates_workspace(),
-            route_source,
-            umadev_agent::requirement_demands_read_only(&text),
-            permissions != umadev_runtime::BasePermissionProfile::Plan,
-        );
+        // B4 re-homed to the execution layer. A turn runs read-only when EITHER the user
+        // EXPLICITLY asked for it ("只分析别改" / "do not modify" / "what changed?" — the one
+        // routing rule kept from the removed pre-action barrier, jailing the base so it
+        // cannot write even under Auto) OR the trust tier is Plan (the session-permission
+        // layer is read-only by the user's own choice, so the resident read-only session is
+        // reused rather than needlessly reopened). Every OTHER turn (Guarded / Auto with no
+        // read-only wording) runs on the write-capable resident session and the base just
+        // ACTS: it uses read-only tools freely for a "find the repo" inspection (no
+        // plan-mode jail, so no ExitPlanMode re-plan deadlock), Guarded still approval-gates
+        // any real write, Auto is pre-authorized, and `react_to_first_write` attaches
+        // governance the moment a write lands. Native commands stay writable/native.
+        execution_read_only = !native_command
+            && (umadev_agent::requirement_demands_read_only(&text)
+                || permissions == umadev_runtime::BasePermissionProfile::Plan);
         if execution_read_only {
             cancel_entry_task(
                 &mut entry_task,
-                "retry was rerouted to a read-only resident turn",
+                "an explicit read-only request runs a non-mutating resident turn",
             );
-        }
-        if execution_read_only {
-            if let Some(readonly) = readonly_route_session.take() {
-                detach_session_close(session);
-                session = readonly;
-                attempt_directive = AttemptDirective::Bare;
-            } else if !parent_read_only {
-                // Scripted unit sessions intentionally default to ForkUnsupported;
-                // keep those local fakes in-process. Production never trusts that
-                // write-capable fallback and reopens a PLAN session below.
+            // Reconcile the acquired session with the read-only verdict: a write-capable
+            // parent is retired for a fresh PLAN session (production); a parent that is
+            // already read-only is kept as-is.
+            if !parent_read_only {
+                // Scripted unit sessions intentionally default to ForkUnsupported; keep
+                // those local fakes in-process. Production never trusts a prompt on a
+                // write-capable process and reopens a PLAN session below.
                 #[cfg(test)]
                 {
                     execution_read_only = false;
@@ -5518,114 +5474,58 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     }
                 }
             }
-        } else {
-            if let Some(mut readonly) = readonly_route_session.take() {
-                let _ = tokio::time::timeout(Duration::from_secs(2), readonly.end()).await;
-            }
-            if parent_read_only {
-                detach_session_close(session);
-                match open_warm_chat_session_for_turn(
-                    &backend,
-                    &model,
-                    &project_root,
-                    permissions,
-                    None,
-                    turn_generation,
-                    interactive,
-                    &chat_session,
-                )
-                .await
-                {
-                    Ok(w) => {
-                        session = w.session;
-                        attempt_directive = AttemptDirective::FrontLoaded {
-                            firmware: w.firmware,
-                        };
-                    }
-                    Err(TurnSessionOpenError::Cancelled) => {
-                        let _ = route_tx.send(RouteDecision::AuthCancelled {
-                            turn: auth_cancel_turn.clone(),
-                            note: umadev_i18n::tl("auth.grok.cancelled").to_string(),
-                        });
-                        return;
-                    }
-                    Err(TurnSessionOpenError::Open(error)) => {
-                        fail_entry_task(
-                            &mut entry_task,
-                            "resident writer session could not be opened",
-                            error.to_string(),
-                        );
-                        let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
-                            "continuous.tui_session_unavailable",
-                            &[&error.to_string()],
-                        )));
-                        return;
-                    }
+        } else if parent_read_only {
+            // A write-capable turn must not run on a parked read-only session; reopen the
+            // configured writer permissions.
+            detach_session_close(session);
+            match open_warm_chat_session_for_turn(
+                &backend,
+                &model,
+                &project_root,
+                permissions,
+                None,
+                turn_generation,
+                interactive,
+                &chat_session,
+            )
+            .await
+            {
+                Ok(w) => {
+                    session = w.session;
+                    attempt_directive = AttemptDirective::FrontLoaded {
+                        firmware: w.firmware,
+                    };
+                }
+                Err(TurnSessionOpenError::Cancelled) => {
+                    let _ = route_tx.send(RouteDecision::AuthCancelled {
+                        turn: auth_cancel_turn.clone(),
+                        note: umadev_i18n::tl("auth.grok.cancelled").to_string(),
+                    });
+                    return;
+                }
+                Err(TurnSessionOpenError::Open(error)) => {
+                    fail_entry_task(
+                        &mut entry_task,
+                        "resident writer session could not be opened",
+                        error.to_string(),
+                    );
+                    let _ = route_tx.send(RouteDecision::Failed(umadev_i18n::tlf(
+                        "continuous.tui_session_unavailable",
+                        &[&error.to_string()],
+                    )));
+                    return;
                 }
             }
         }
 
-        // This is the model-owned boundary between ordinary assistance and the
-        // product workflow. Every real Build (lean or deep), plus a deliberately
-        // sized Debug, runs through the SAME director engine as `/run`: owned plan,
-        // gates, sized team, mechanical acceptance and bounded QC. The already-open
-        // resident writer is handed in so the transition adds no extra writer cold
-        // start and preserves the native conversation. QuickEdit and fast Debug stay
-        // in the resident single-writer lane below.
-        let has_typed_attachments = input
-            .blocks
-            .iter()
-            .any(|block| !matches!(block, TurnInputBlock::Text { .. }));
-        if !native_command
-            && route_source == Some(umadev_agent::RouteSource::Brain)
-            && route.uses_director_workflow()
-            && !has_typed_attachments
-        {
-            // Classification happens off the render thread. Tell the UI as soon as
-            // the model has crossed the director boundary so input typed during
-            // the run is split into live steering vs deferred conversation. Waiting
-            // until AgenticDone/Failed would leave a chat-originated build looking
-            // like an ordinary resident turn for its entire lifetime.
-            let _ = route_tx.send(RouteDecision::DirectorStarted {
-                requirement: text.clone(),
-            });
-            let options = RunOptions {
-                project_root: project_root.clone(),
-                requirement: text.clone(),
-                slug: slug.clone(),
-                model: model.clone(),
-                backend: backend.clone(),
-                design_system: design_system.clone(),
-                seed_template: seed_template.clone(),
-                mode,
-                strict_coverage: umadev_agent::strict_coverage_from_env(),
-            };
-            cancel_entry_task(
-                &mut entry_task,
-                "retry was rerouted to the director task plan",
-            );
-            run_director_loop(
-                options,
-                sink.clone(),
-                route_tx.clone(),
-                permissions,
-                conversation.clone(),
-                Some(route),
-                true,
-                false,
-                steer_holder.clone(),
-                approval_holder.clone(),
-                host_input_holder.clone(),
-                Some(session),
-            )
-            .await;
-            return;
-        }
-        if route.uses_director_workflow() && has_typed_attachments {
-            sink.emit(EngineEvent::Note(
-                umadev_i18n::tl("input.director.resident_delivery").to_string(),
-            ));
-        }
+        // B2 — the up-front director-workflow dispatch is REMOVED. There is no pre-action
+        // verdict to promote a "build me X" chat turn into `run_director_loop` before the
+        // base acts. A build-shaped request now runs on the resident writer session like
+        // any other turn and is upgraded REACTIVELY the moment it writes real code
+        // (`react_to_first_write` → lock + isolation + Build card, and the reactive
+        // governance QC on the post-turn tail). The EXPLICIT `/run` entry keeps its own
+        // pre-built plan/checklist and its `run_director_loop` path entirely unchanged —
+        // only this IMPLICIT chat pre-classification is gone.
 
         // Acquire the cross-entry writer lock before branch isolation and before
         // freezing filesystem truth. Otherwise a second process could finish a

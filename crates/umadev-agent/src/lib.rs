@@ -220,9 +220,10 @@ pub use review::{
     write_review_report, ReviewClaim, ReviewReport, Verdict,
 };
 pub use router::{
-    deterministic_route, looks_like_work_request, requirement_demands_read_only, route,
-    route_with_context_and_readonly_session, route_with_context_and_source, route_with_source,
-    Budget, ClarifyQuestion, Depth, RouteClass, RoutePlan, RouteSource, RoutedIntent,
+    apply_authorization_ceiling, deterministic_route, looks_like_work_request,
+    requirement_demands_read_only, route, route_with_context_and_readonly_session,
+    route_with_context_and_source, route_with_source, Budget, ClarifyQuestion, Depth, RouteClass,
+    RoutePlan, RouteSource, RoutedIntent,
 };
 pub use runner::{
     setup_run_isolation, strict_coverage_from_env, AgentRunner, RunOptions, RunReport,
