@@ -66,7 +66,8 @@ use umadev_runtime::{
 use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{
-    isolate_process_tree, kill_isolated_process_tree, reap_isolated_process_tree, END_REAP_BUDGET,
+    isolate_process_tree, kill_isolated_process_tree_blocking, reap_isolated_process_tree,
+    END_REAP_BUDGET,
 };
 
 /// How many events the stdout-reader task may buffer ahead of the consumer.
@@ -347,6 +348,13 @@ pub struct ClaudeSession {
     /// `&mut self`. `kill_on_drop(true)` still fires when the struct (and so the
     /// `Child`) drops; `end()` kills through the lock.
     child: std::sync::Mutex<Child>,
+    /// Windows kill-on-close Job Object holding the base's whole process tree so a
+    /// native grandchild can't orphan once the Node trampoline exits (`taskkill`
+    /// walks only the live parent chain). Terminated in `end`/`Drop`. `None` off
+    /// Windows / when the OS refused nested job assignment (the process-group
+    /// fallback in [`crate::kill_isolated_process_tree`] stands).
+    #[cfg(windows)]
+    process_job: Option<umadev_process::KillOnCloseJob>,
     stdin: ChildStdin,
     events: mpsc::Receiver<SessionEvent>,
     /// Exact unresolved control payloads, keyed by Claude request id. Needed to
@@ -534,11 +542,18 @@ impl ClaudeSession {
         // Own process group so teardown signals the WHOLE tree at once. A
         // direct-child kill would orphan any tool/subagent subprocess the base
         // spawned (and, on an npm trampoline install, the native base grandchild)
-        // by reparenting it to init. See [`kill_isolated_process_tree`].
+        // by reparenting it to init. See [`crate::kill_isolated_process_tree`].
         isolate_process_tree(&mut cmd);
 
         let mut child = crate::spawn_retrying_etxtbsy(&mut cmd)
             .map_err(|e| SessionError::Start(spawn_err(program, &e)))?;
+        // Windows: attach the base's whole tree to a kill-on-close Job Object BEFORE
+        // any protocol traffic, so the native `claude` grandchild an npm trampoline
+        // execs is torn down on teardown instead of orphaning once the trampoline
+        // exits (taskkill walks only the LIVE parent chain). `None` off Windows / if
+        // the OS refuses nested job assignment — the process group is the fallback.
+        #[cfg(windows)]
+        let process_job = umadev_process::KillOnCloseJob::attach(&child);
 
         let stdin = child
             .stdin
@@ -574,6 +589,8 @@ impl ClaudeSession {
 
         Ok(Self {
             child: std::sync::Mutex::new(child),
+            #[cfg(windows)]
+            process_job,
             stdin,
             events: rx,
             pending_controls,
@@ -738,10 +755,16 @@ impl Drop for ClaudeSession {
         // A dropped session (timed-out / cancelled turn, or teardown that skipped
         // `end()`) must kill the whole process GROUP so no tool/subagent (or, on
         // an npm trampoline install, native base) grandchild is orphaned to init.
-        // Fail-open — a contended/poisoned lock falls back to `kill_on_drop`.
-        if let Ok(mut child) = self.child.try_lock() {
-            kill_isolated_process_tree(&mut child);
+        // Windows: terminate the Job Object first (reaches a grandchild taskkill
+        // can't). The blocking group-kill recovers a poisoned lock and briefly
+        // spins on contention so the group kill still fires (a bare `try_lock`
+        // skipped it on poison/contention); fail-open to `kill_on_drop` on overrun.
+        #[cfg(windows)]
+        if let Some(job) = self.process_job.take() {
+            job.terminate();
+            drop(job);
         }
+        kill_isolated_process_tree_blocking(&self.child);
     }
 }
 
@@ -932,6 +955,15 @@ impl BaseSession for ClaudeSession {
         // direct-child kill would reparent tool/subagent grandchildren to init.
         // On overrun we fail open to kill_on_drop. Consistent with codex /
         // opencode `end()`.
+        //
+        // Windows: terminate the Job Object FIRST so the native `claude` grandchild
+        // is killed even after the trampoline has exited (taskkill can no longer
+        // reach it); the group reap below is the cross-platform backstop.
+        #[cfg(windows)]
+        if let Some(job) = self.process_job.take() {
+            job.terminate();
+            drop(job);
+        }
         reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
         self.stderr_drain.shutdown().await;
         Ok(())

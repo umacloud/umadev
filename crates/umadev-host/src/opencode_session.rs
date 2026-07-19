@@ -97,7 +97,8 @@ use umadev_runtime::{
 use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{
-    isolate_process_tree, kill_isolated_process_tree, reap_isolated_process_tree, END_REAP_BUDGET,
+    isolate_process_tree, kill_isolated_process_tree, kill_isolated_process_tree_blocking,
+    reap_isolated_process_tree, END_REAP_BUDGET,
 };
 
 /// How many events the SSE-reader task may buffer ahead of the consumer.
@@ -137,6 +138,13 @@ pub struct OpenCodeSession {
     /// do a non-blocking `try_wait()` peek without forcing the trait method to
     /// take `&mut self`; `kill_on_drop(true)` still fires on drop.
     child: std::sync::Mutex<Child>,
+    /// Windows kill-on-close Job Object holding the `opencode serve` tree so a
+    /// native server grandchild an npm trampoline execs is torn down on teardown
+    /// instead of orphaning once the trampoline exits (`taskkill` walks only the
+    /// live parent chain). Terminated in `end`/`Drop`. `None` off Windows / when
+    /// the OS refused nested job assignment (the process group is the fallback).
+    #[cfg(windows)]
+    process_job: Option<umadev_process::KillOnCloseJob>,
     /// Bounded tail of the server child's STDERR, captured by the drain task,
     /// surfaced via [`BaseSession::stderr_tail`] to explain *why* a base went
     /// idle (a bad model / not logged in / a config error opencode prints to
@@ -530,11 +538,26 @@ struct HttpCtx {
     directory: String,
 }
 
+/// The pieces of a freshly spawned `opencode serve` process, kept together so the
+/// caller can move the child into the session while a Windows kill-on-close Job
+/// Object — attached BEFORE the trampoline execs its native grandchild — rides
+/// along into the same struct.
+struct SpawnedServe {
+    child: Child,
+    /// Windows kill-on-close Job Object over the whole `serve` tree; `None` off
+    /// Windows / when the OS refused nested job assignment.
+    #[cfg(windows)]
+    process_job: Option<umadev_process::KillOnCloseJob>,
+    stderr: StderrTail,
+    stderr_drain: StderrDrain,
+    http: HttpCtx,
+}
+
 async fn spawn_serve(
     program: &str,
     workspace: &Path,
     serve_timeout: Duration,
-) -> Result<(Child, StderrTail, StderrDrain, HttpCtx), SessionError> {
+) -> Result<SpawnedServe, SessionError> {
     let password = random_password();
     let (prog, lead) = spawn_parts(program);
     let mut cmd = Command::new(prog);
@@ -554,6 +577,14 @@ async fn spawn_serve(
 
     let mut child = crate::spawn_retrying_etxtbsy(&mut cmd)
         .map_err(|e| SessionError::Start(spawn_err(program, &e)))?;
+    // Windows: attach the kill-on-close Job Object BEFORE reading the listening URL.
+    // The trampoline may already have exec'd the native `opencode serve` grandchild
+    // by the time it prints the URL, and a Job only captures descendants spawned
+    // AFTER assignment — so a late attach would miss the grandchild that `taskkill`
+    // can no longer reach once the trampoline exits. `None` off Windows / if the OS
+    // refuses nested assignment (the process group is the fallback).
+    #[cfg(windows)]
+    let process_job = umadev_process::KillOnCloseJob::attach(&child);
     let stdout = child
         .stdout
         .take()
@@ -567,12 +598,24 @@ async fn spawn_serve(
         Err(error) => {
             // `serve` start timed out / failed: kill the whole tree, not just the
             // trampoline, so no native `opencode serve` grandchild is orphaned.
+            // Windows: terminate the Job Object (reaches a grandchild taskkill can't).
+            #[cfg(windows)]
+            if let Some(job) = &process_job {
+                job.terminate();
+            }
             kill_isolated_process_tree(&mut child);
             return Err(SessionError::Start(error));
         }
     };
     let http = HttpCtx::new(base_url, &password, workspace);
-    Ok((child, stderr, stderr_drain, http))
+    Ok(SpawnedServe {
+        child,
+        #[cfg(windows)]
+        process_job,
+        stderr,
+        stderr_drain,
+        http,
+    })
 }
 
 impl OpenCodeSession {
@@ -675,8 +718,15 @@ impl OpenCodeSession {
         crate::opencode::ensure_opencode_version_permits(program, workspace, permissions)
             .await
             .map_err(SessionError::Start)?;
-        let (mut child, stderr_tail, stderr_drain, http) =
-            spawn_serve(program, workspace, serve_timeout).await?;
+        let spawned = spawn_serve(program, workspace, serve_timeout).await?;
+        let mut child = spawned.child;
+        // Held for the session lifetime on Windows; drops (killing any surviving
+        // tree member) if an early error return below skips `Self` construction.
+        #[cfg(windows)]
+        let process_job = spawned.process_job;
+        let stderr_tail = spawned.stderr;
+        let stderr_drain = spawned.stderr_drain;
+        let http = spawned.http;
 
         // Open the one session for the whole run. The ruleset follows the permission
         // profile: Auto is wildcard-allow, Guarded is ask-by-default with a narrow
@@ -701,6 +751,8 @@ impl OpenCodeSession {
 
         Ok(Self {
             child: std::sync::Mutex::new(child),
+            #[cfg(windows)]
+            process_job,
             stderr: stderr_tail,
             stderr_drain,
             http,
@@ -766,10 +818,17 @@ impl OpenCodeSession {
             .map_err(SessionError::Start)
             .map_err(crate::redaction::sanitize_session_error)?;
 
-        let (mut child, stderr, stderr_drain, http) =
-            spawn_serve(program, workspace, serve_timeout)
-                .await
-                .map_err(crate::redaction::sanitize_session_error)?;
+        let spawned = spawn_serve(program, workspace, serve_timeout)
+            .await
+            .map_err(crate::redaction::sanitize_session_error)?;
+        let mut child = spawned.child;
+        // Held for the session lifetime on Windows; drops (killing any surviving
+        // tree member) if an early error return below skips `Self` construction.
+        #[cfg(windows)]
+        let process_job = spawned.process_job;
+        let stderr = spawned.stderr;
+        let stderr_drain = spawned.stderr_drain;
+        let http = spawned.http;
 
         if let Err(error) = http.get_session(session_id).await {
             kill_isolated_process_tree(&mut child);
@@ -800,6 +859,8 @@ impl OpenCodeSession {
         };
         Ok(Self {
             child: std::sync::Mutex::new(child),
+            #[cfg(windows)]
+            process_job,
             stderr,
             stderr_drain,
             http,
@@ -844,10 +905,16 @@ impl Drop for OpenCodeSession {
         // A dropped session (timed-out / cancelled turn, or normal teardown that
         // skipped `end()`) must kill the whole process GROUP: killing only the
         // direct child can leave a native `opencode serve` grandchild orphaned.
-        // Fail-open — a contended/poisoned lock falls back to `kill_on_drop`.
-        if let Ok(mut child) = self.child.try_lock() {
-            kill_isolated_process_tree(&mut child);
+        // Windows: terminate the Job Object first (reaches a grandchild taskkill
+        // can't). The blocking group-kill recovers a poisoned lock and briefly
+        // spins on contention so the group kill still fires (a bare `try_lock`
+        // skipped it on poison/contention); fail-open to `kill_on_drop` on overrun.
+        #[cfg(windows)]
+        if let Some(job) = self.process_job.take() {
+            job.terminate();
+            drop(job);
         }
+        kill_isolated_process_tree_blocking(&self.child);
     }
 }
 
@@ -1088,6 +1155,14 @@ impl BaseSession for OpenCodeSession {
             .finish_session(&self.session_id, self.lifecycle)
             .await;
         self.pending_interactions.clear();
+        // Windows: terminate the Job Object first so the native `opencode serve`
+        // grandchild dies even after the trampoline has exited (taskkill can no
+        // longer reach it); the group reap below is the cross-platform backstop.
+        #[cfg(windows)]
+        if let Some(job) = self.process_job.take() {
+            job.terminate();
+            drop(job);
+        }
         reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
         self.stderr_drain.shutdown().await;
         Ok(())

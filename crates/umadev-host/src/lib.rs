@@ -598,21 +598,82 @@ pub(crate) fn kill_isolated_process_tree(child: &mut tokio::process::Child) {
 }
 
 /// Terminate an isolated process tree and reap its direct child within `budget`.
+///
+/// A **poisoned** child mutex (another holder panicked while the lock was held)
+/// must NOT disable the group kill — stopping orphaned tool/subagent/native-base
+/// grandchildren after a cancel or timeout is exactly what this exists to do. The
+/// guard is recovered via [`std::sync::PoisonError::into_inner`] so the tree is
+/// always signalled before we wait (previously a poisoned lock `return`ed early,
+/// silently skipping the kill and leaking the whole group). Fail-open: the
+/// reap-wait is bounded by `budget`, and a poisoned/contended lock during the
+/// wait just falls through to the child's own `kill_on_drop(true)`.
 pub(crate) async fn reap_isolated_process_tree(
     child: &std::sync::Mutex<tokio::process::Child>,
     budget: Duration,
 ) {
-    match child.lock() {
-        Ok(mut guard) => kill_isolated_process_tree(&mut guard),
-        Err(_) => return,
+    {
+        let mut guard = child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        kill_isolated_process_tree(&mut guard);
     }
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        let reaped = matches!(child.try_lock().map(|mut g| g.try_wait()), Ok(Ok(Some(_))));
+        let reaped = match child.try_lock() {
+            Ok(mut guard) => matches!(guard.try_wait(), Ok(Some(_))),
+            // A poisoned guard is still usable — recover it so a panic in another
+            // holder cannot stop us from observing the reap.
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                matches!(poisoned.into_inner().try_wait(), Ok(Some(_)))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        };
         if reaped || tokio::time::Instant::now() >= deadline {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Bounded spin budget for acquiring a session's child lock from a synchronous
+/// `Drop`. A poisoned guard is recovered immediately; only genuine *contention*
+/// spins, and only until this budget elapses — after which teardown fails open to
+/// the child's own `kill_on_drop(true)`. Kept small so `Drop` never stalls a
+/// runtime worker thread.
+const DROP_KILL_LOCK_BUDGET: Duration = Duration::from_millis(50);
+
+/// Kill an isolated child's whole process group from a synchronous `Drop`,
+/// recovering a **poisoned** guard and briefly blocking on **contention** so the
+/// group kill still fires instead of silently degrading to a direct-child-only
+/// `kill_on_drop`.
+///
+/// The four session `Drop` impls previously used `if let Ok(mut child) =
+/// self.child.try_lock()`, which skipped the group kill on BOTH a poisoned lock
+/// AND momentary contention — orphaning the tool/subagent (and, on an npm
+/// trampoline install, native-base) grandchildren the group kill exists to stop.
+/// This recovers the poison and spins for at most [`DROP_KILL_LOCK_BUDGET`] on
+/// contention. Fail-open: on overrun it returns and lets `kill_on_drop(true)` be
+/// the backstop, so teardown never hangs.
+pub(crate) fn kill_isolated_process_tree_blocking(child: &std::sync::Mutex<tokio::process::Child>) {
+    let deadline = Instant::now() + DROP_KILL_LOCK_BUDGET;
+    loop {
+        match child.try_lock() {
+            Ok(mut guard) => {
+                kill_isolated_process_tree(&mut guard);
+                return;
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                kill_isolated_process_tree(&mut poisoned.into_inner());
+                return;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    // Fail-open: `kill_on_drop(true)` on the child is the backstop.
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 }
 
@@ -681,7 +742,10 @@ async fn drain_and_wait(
         loop {
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                let _ = child.start_kill();
+                // Group-kill: the child is isolated in its own process group, so a
+                // direct-child kill would orphan any tool/subagent (or npm-trampoline
+                // native-base) grandchild. See `kill_isolated_process_tree`.
+                kill_isolated_process_tree(child);
                 let _ = child.wait().await;
                 return Err(format!(
                     "`{program}` timed out after {}s",
@@ -704,7 +768,7 @@ async fn drain_and_wait(
                     stdout_buf.extend_from_slice(&chunk[..n]);
                 }
                 Ok(Err(e)) => {
-                    let _ = child.start_kill();
+                    kill_isolated_process_tree(child);
                     let _ = child.wait().await;
                     return Err(format!("`{program}` stdout read error: {e}"));
                 }
@@ -712,7 +776,7 @@ async fn drain_and_wait(
                     // The wait that elapsed was the hard-ceiling remaining time
                     // (idle is not armed before the first byte) — a true silent
                     // hang, reported as the overall timeout.
-                    let _ = child.start_kill();
+                    kill_isolated_process_tree(child);
                     let _ = child.wait().await;
                     return Err(format!(
                         "`{program}` timed out after {}s",
@@ -723,7 +787,7 @@ async fn drain_and_wait(
                     // **Idle timeout** — output started, then no further byte for
                     // `idle_timeout` (a base that hangs while holding the stdout
                     // pipe open). Kill + return a distinguishable, retriable error.
-                    let _ = child.start_kill();
+                    kill_isolated_process_tree(child);
                     let _ = child.wait().await;
                     let bytes = stdout_buf.len();
                     return Err(format!(
@@ -743,7 +807,7 @@ async fn drain_and_wait(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("`{program}` failed: {e}")),
         Err(_) => {
-            let _ = child.start_kill();
+            kill_isolated_process_tree(child);
             let _ = child.wait().await;
             return Err(format!(
                 "`{program}` timed out after {}s",
@@ -1238,6 +1302,13 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    // Own process group so a kill on the timeout/idle/read-error path (see
+    // `drain_and_wait`) tears down the WHOLE tree at once. An npm-installed base is
+    // a Node trampoline that execs the native base as a grandchild; a direct-child
+    // kill would reparent that grandchild (and any shell/subagent it spawned) to
+    // init so it keeps writing files after a cancel/timeout. This mirrors the four
+    // continuous session drivers.
+    isolate_process_tree(&mut cmd);
 
     let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -1246,6 +1317,13 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
             format!("failed to spawn `{}`: {e}", call.program)
         }
     })?;
+    // Windows: the process-group flag only enables Ctrl-events; a leaked grandchild
+    // survives once the trampoline exits (taskkill walks the LIVE parent chain). A
+    // kill-on-close Job Object captures every descendant, so dropping it (any return
+    // path) or an explicit group-kill terminates the real base too. Held for the
+    // call's lifetime; on the happy path the child has already exited (no-op).
+    #[cfg(windows)]
+    let _process_job = umadev_process::KillOnCloseJob::attach(&child);
 
     // M4: write the prompt CONCURRENTLY with draining stdout, not before it. A
     // `write_all` that fully completes before any stdout read DEADLOCKS when the
@@ -1386,8 +1464,15 @@ pub(crate) async fn run_auth_status(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    // Own process group so a probe that hangs and trips `auth_probe_timeout` is
+    // group-killed (an npm-trampoline base's native grandchild would otherwise
+    // orphan) — same isolation the one-shot generation paths use.
+    isolate_process_tree(&mut cmd);
 
     let mut child = spawn_retrying_etxtbsy(&mut cmd).ok()?;
+    // Windows kill-on-close Job Object backstop; held for the probe's lifetime.
+    #[cfg(windows)]
+    let _process_job = umadev_process::KillOnCloseJob::attach(&child);
     // Close stdin immediately (EOF) so a status command that peeks stdin in a
     // non-interactive context returns instead of blocking to the timeout.
     drop(child.stdin.take());
@@ -1460,6 +1545,10 @@ pub(crate) async fn run_subprocess_streaming(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    // Own process group so a kill on the idle/hard-timeout/read-error path below
+    // group-kills the whole tree, not just the direct Node child (see
+    // `run_subprocess` / the continuous session drivers).
+    isolate_process_tree(&mut cmd);
 
     let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -1468,6 +1557,10 @@ pub(crate) async fn run_subprocess_streaming(
             format!("failed to spawn `{}`: {e}", call.program)
         }
     })?;
+    // Windows kill-on-close Job Object: the real backstop once the trampoline exits
+    // and taskkill can no longer walk to the native grandchild. Held for the call.
+    #[cfg(windows)]
+    let _process_job = umadev_process::KillOnCloseJob::attach(&child);
 
     // M4: write the prompt CONCURRENTLY with streaming stdout (see
     // `run_subprocess`) — a >64 KiB prompt that fully writes before any stdout
@@ -1558,7 +1651,9 @@ pub(crate) async fn run_subprocess_streaming(
         loop {
             let remaining = call.timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
-                let _ = child.start_kill();
+                // Group-kill the isolated tree (see `isolate_process_tree` above):
+                // a direct-child kill would orphan the native base grandchild.
+                kill_isolated_process_tree(&mut child);
                 let _ = child.wait().await;
                 return Err(format!(
                     "`{}` timed out after {}s",
@@ -1595,7 +1690,7 @@ pub(crate) async fn run_subprocess_streaming(
                     }
                 }
                 Ok(Err(e)) => {
-                    let _ = child.start_kill();
+                    kill_isolated_process_tree(&mut child);
                     let _ = child.wait().await;
                     return Err(format!("`{}` stdout read error: {e}", call.program));
                 }
@@ -1604,7 +1699,7 @@ pub(crate) async fn run_subprocess_streaming(
                     // (the idle sub-timeout is not armed before the first line),
                     // so a timeout here means we hit `call.timeout` with no output
                     // at all — a true hang, reported as the overall timeout.
-                    let _ = child.start_kill();
+                    kill_isolated_process_tree(&mut child);
                     let _ = child.wait().await;
                     return Err(format!(
                         "`{}` timed out after {}s",
@@ -1617,7 +1712,7 @@ pub(crate) async fn run_subprocess_streaming(
                     // line for `idle_timeout` (the stream-json hang scenario,
                     // #53584). Kill + return a distinguishable error so callers
                     // can retry.
-                    let _ = child.start_kill();
+                    kill_isolated_process_tree(&mut child);
                     let _ = child.wait().await;
                     let lines_so_far = all_lines.len();
                     return Err(format!(
@@ -1639,7 +1734,7 @@ pub(crate) async fn run_subprocess_streaming(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(format!("`{}` failed: {e}", call.program)),
         Err(_) => {
-            let _ = child.start_kill();
+            kill_isolated_process_tree(&mut child);
             let _ = child.wait().await;
             if let Some(writer) = stdin_writer {
                 let _ = reap_bounded(writer).await;
@@ -3609,6 +3704,141 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "tearing down an already-dead child must return promptly"
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_executable_script(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn unix_process_alive(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_group_kills_a_grandchild_on_timeout() {
+        // Fix #1: the one-shot generation path is process-group isolated, so a kill
+        // on the timeout branch tears down the WHOLE tree — not just the direct
+        // child. The fake base spawns a GRANDCHILD sleeper in its group (standing in
+        // for an npm trampoline's native base), publishes its pid, then hangs; the
+        // hard timeout must group-kill and reap the grandchild, not orphan it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fakebase");
+        write_executable_script(
+            &script,
+            "#!/bin/sh\nsleep 300 &\nprintf '%s' \"$!\" > gc.pid\nwait\n",
+        );
+        let call = SubprocessCall {
+            program: script.to_str().unwrap(),
+            args: &[],
+            prompt: "",
+            channel: PromptChannel::Arg,
+            workspace: dir.path(),
+            timeout: Duration::from_millis(400),
+            env: &[],
+        };
+        let started = tokio::time::Instant::now();
+        let result = run_subprocess(call).await;
+        assert!(result.is_err(), "the hung fake base must trip the timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the idle/hard timeout must fire, not wait the full ceiling"
+        );
+        // The grandchild pid was published to the workspace cwd.
+        let pid_path = dir.path().join("gc.pid");
+        let mut grandchild: Option<i32> = None;
+        for _ in 0..250 {
+            if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                grandchild = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let Some(grandchild) = grandchild else {
+            return; // fail-open: the shim never launched the grandchild here
+        };
+        let mut reaped = false;
+        for _ in 0..250 {
+            if !unix_process_alive(grandchild) {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "the one-shot timeout path must group-kill the grandchild, not orphan it to PPID 1"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_isolated_process_tree_recovers_a_poisoned_lock_and_still_kills() {
+        // Fix #3: a panic while another holder had the child lock POISONS the mutex.
+        // The reap must recover the poisoned guard (not bail early) so the group
+        // kill still fires — otherwise a cancel/timeout leaks the whole base tree.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("300").kill_on_drop(true);
+        isolate_process_tree(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleep");
+        let m = std::sync::Mutex::new(child);
+        // Poison the mutex: panic while holding the guard.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.lock().unwrap();
+            panic!("poison the child lock");
+        }));
+        assert!(m.is_poisoned(), "the lock must be poisoned for this test");
+        reap_isolated_process_tree(&m, Duration::from_secs(5)).await;
+        // Despite the poison, the child was killed AND reaped by the recovered path.
+        let mut guard = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            matches!(guard.try_wait(), Ok(Some(_))),
+            "a poisoned lock must still be recovered and the child killed + reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_isolated_process_tree_blocking_recovers_a_poisoned_lock() {
+        // Fix #3 (Drop path): the blocking helper must recover a poisoned guard so
+        // a session `Drop` still group-kills instead of degrading to kill_on_drop.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("300").kill_on_drop(true);
+        isolate_process_tree(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleep");
+        let m = std::sync::Mutex::new(child);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = m.lock().unwrap();
+            panic!("poison the child lock");
+        }));
+        assert!(m.is_poisoned());
+        kill_isolated_process_tree_blocking(&m);
+        // The helper kills but does not itself reap; try_wait reaps once dead. The
+        // guard is scoped OUT of the await so no lock is held across a suspend point.
+        let mut dead = false;
+        for _ in 0..250 {
+            let reaped = {
+                let mut guard = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                matches!(guard.try_wait(), Ok(Some(_)))
+            };
+            if reaped {
+                dead = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dead,
+            "the blocking Drop helper must recover the poison and kill the child"
         );
     }
 

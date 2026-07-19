@@ -104,19 +104,22 @@ impl KimiSourceProfile {
         matches!(self.source_match, KimiSourceMatch::AuditedVersion)
     }
 
-    /// Whether the peer is recognizably Kimi Code at all — the official identity
-    /// plus a parseable version — regardless of whether that version is the exact
-    /// source-audited one. This is what a session gate should require: a genuinely
-    /// different program (a name collision, e.g. the retired Python `kimi`, or a
-    /// malformed identity) is rejected, while a newer Kimi Code release is allowed
-    /// to run on the baseline contract (the audited enhancements stay gated behind
-    /// [`Self::is_audited_version`]).
+    /// Whether the peer is recognizably Kimi Code at all — i.e. it reported the
+    /// official `agentInfo.name` (`"Kimi Code CLI"`), regardless of whether the
+    /// reported version is the audited one, a newer release, or even missing /
+    /// unparseable (a git-describe string, a date, or an empty `agentVersion`).
+    ///
+    /// This is what a session gate should require: a genuinely DIFFERENT program
+    /// (a name collision, e.g. the retired Python `kimi`) is [`KimiSourceMatch::
+    /// NotKimiCode`] and stays rejected, but a real Kimi Code whose version is
+    /// merely un-SemVer must NOT be hard-refused — it degrades to the baseline ACP
+    /// contract ("any installed version, degrade don't block"). Only the audited
+    /// enhancements stay gated, behind [`Self::is_audited_version`].
     #[must_use]
     pub const fn is_kimi_code_identity(&self) -> bool {
-        matches!(
-            self.source_match,
-            KimiSourceMatch::AuditedVersion | KimiSourceMatch::OutsideAuditedRange
-        )
+        // Name matched ⇒ it is Kimi Code. A missing/malformed VERSION only means we
+        // cannot enable the audited enhancements, not that the peer is impostor.
+        !matches!(self.source_match, KimiSourceMatch::NotKimiCode)
     }
 }
 
@@ -206,6 +209,41 @@ mod tests {
             profile("Kimi Code CLI", Some("latest")).source_match(),
             KimiSourceMatch::MalformedAgentVersion
         );
+    }
+
+    #[test]
+    fn a_real_kimi_with_an_unparseable_version_degrades_instead_of_being_refused() {
+        // Fix #4: "any installed version, degrade don't block". A genuine Kimi Code
+        // whose reported version is not strict SemVer — a git-describe string, a
+        // date, a label, an empty string, or a missing `agentVersion` — must still
+        // be RECOGNIZED as Kimi Code (so the session gate lets it run on the
+        // baseline contract) rather than hard-refused. Only the audited enhancements
+        // stay gated behind `is_audited_version`.
+        for version in [
+            Some("2024-05-01"),        // a date
+            Some("v1.2.3-9-gabc1234"), // git-describe
+            Some("nightly"),           // a label
+            Some(""),                  // empty agentVersion
+            None,                      // missing agentVersion
+        ] {
+            let p = profile("Kimi Code CLI", version);
+            assert!(
+                p.is_kimi_code_identity(),
+                "a real Kimi Code with version {version:?} must be recognized, not refused"
+            );
+            assert!(
+                !p.is_audited_version(),
+                "a non-SemVer/missing version must NOT unlock the audited enhancements"
+            );
+        }
+        // A genuinely DIFFERENT program on PATH (a name collision) is still refused,
+        // even with the exact audited version string.
+        let impostor = profile("kimi", Some(KIMI_CODE_SOURCE_VERSION));
+        assert!(
+            !impostor.is_kimi_code_identity(),
+            "a different `kimi` (name mismatch) must still be rejected"
+        );
+        assert_eq!(impostor.source_match(), KimiSourceMatch::NotKimiCode);
     }
 
     #[test]

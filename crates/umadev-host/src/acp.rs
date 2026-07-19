@@ -78,10 +78,10 @@ use crate::session_bootstrap::{
 };
 use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{
-    default_workspace, govern_root_env, home_dir, isolate_process_tree, kill_isolated_process_tree,
-    merge_prompt, reap_isolated_process_tree, resolve_program, run_subprocess, spawn_parts,
-    spawn_retrying_etxtbsy, AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
-    TerminalTextSanitizer, END_REAP_BUDGET,
+    default_workspace, govern_root_env, home_dir, isolate_process_tree,
+    kill_isolated_process_tree_blocking, merge_prompt, reap_isolated_process_tree, resolve_program,
+    run_subprocess, spawn_parts, spawn_retrying_etxtbsy, AuthState, HostDriver, ProbeResult,
+    PromptChannel, SubprocessCall, TerminalTextSanitizer, END_REAP_BUDGET,
 };
 
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -155,7 +155,14 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, AcpRespon
 type PendingReceiver = oneshot::Receiver<Result<Value, AcpResponseError>>;
 type ApprovalMap = Arc<Mutex<HashMap<String, PendingHostRequest>>>;
 type SharedWriter = Arc<Mutex<Option<ChildStdin>>>;
-type LatestUsage = Arc<Mutex<Option<Usage>>>;
+/// The latest per-prompt usage seen on the stream, KEYED by the prompt it belongs
+/// to so the prompt-queue's single shared slot can't misattribute one prompt's
+/// tokens to the next. A usage frame is tagged with its prompt (the frame's own
+/// `prompt_id` when present, else the currently active prompt); a completion drains
+/// it only for a MATCHING key (see [`take_usage_for`]). An untagged (`None`) frame
+/// stays a fallback any completion may take, preserving the pre-keying behavior for
+/// a base whose usage frame carries no prompt id.
+type LatestUsage = Arc<Mutex<Option<KeyedUsage>>>;
 type ActiveSessionId = Arc<RwLock<Option<String>>>;
 type ReplaySessionState = Arc<Mutex<ReplaySessionStateAccumulator>>;
 type BackgroundProcesses = Arc<Mutex<BackgroundProcessTracker>>;
@@ -392,6 +399,69 @@ impl BackgroundProcessTracker {
 struct ActivePromptRecord {
     prompt_id: String,
     request_id: u64,
+}
+
+/// Per-prompt usage tagged with the prompt it belongs to, so a settled prompt's
+/// late usage frame can't be taken by the NEXT prompt's completion.
+#[derive(Debug, Clone)]
+struct KeyedUsage {
+    /// The prompt this usage belongs to; `None` when the frame carried no prompt
+    /// attribution (then any completion may take it, as before keying).
+    prompt_id: Option<String>,
+    usage: Usage,
+}
+
+/// The prompt id of the currently active prompt, if one is set.
+fn active_prompt_id(active: &ActivePrompt) -> Option<String> {
+    active
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|record| record.prompt_id.clone()))
+}
+
+/// The prompt id carried by a `session/update` frame, if any (`prompt_id` /
+/// `promptId`, at the frame root or under `update`).
+fn usage_event_prompt_id(params: &Value) -> Option<String> {
+    let update = params.get("update").unwrap_or(params);
+    update
+        .get("prompt_id")
+        .or_else(|| update.get("promptId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Tag a captured usage frame with the prompt it belongs to and stash it as the
+/// latest. Prefers the frame's OWN `prompt_id`; falls back to the currently active
+/// prompt so an in-order frame during a live turn is attributed correctly. A late
+/// frame for an already-settled prompt therefore keeps that prompt's id and is NOT
+/// taken by the next prompt (see [`take_usage_for`]).
+async fn record_stream_usage(
+    latest_usage: &LatestUsage,
+    active_prompt: &ActivePrompt,
+    params: &Value,
+    usage: Usage,
+) {
+    let prompt_id = usage_event_prompt_id(params).or_else(|| active_prompt_id(active_prompt));
+    *latest_usage.lock().await = Some(KeyedUsage { prompt_id, usage });
+}
+
+/// Drain the latest usage for `prompt_id`, but ONLY when the stored frame is tagged
+/// for THIS prompt (or carries no attribution — the legacy fallback). A frame
+/// tagged for a DIFFERENT prompt is LEFT in place so its rightful completion still
+/// finds it, and this prompt falls back to inline/estimate — never another
+/// prompt's tokens. This is what stops the prompt-queue's shared slot from tagging
+/// prompt B with prompt A's late usage frame.
+async fn take_usage_for(latest_usage: &LatestUsage, prompt_id: &str) -> Option<Usage> {
+    let mut guard = latest_usage.lock().await;
+    let is_ours = guard
+        .as_ref()
+        .is_some_and(|keyed| keyed.prompt_id.as_deref().is_none_or(|id| id == prompt_id));
+    if is_ours {
+        guard.take().map(|keyed| keyed.usage)
+    } else {
+        None
+    }
 }
 
 fn take_active_prompt(
@@ -2877,7 +2947,7 @@ impl AcpSession {
                     None,
                 ),
             };
-            let streamed_usage = latest_usage.lock().await.take();
+            let streamed_usage = take_usage_for(&latest_usage, &prompt_id).await;
             let usage = inline_usage.or(streamed_usage);
             if take_active_prompt(&active_prompt, &prompt_id).is_some() {
                 let terminal = session_routes
@@ -2986,7 +3056,7 @@ impl AcpSession {
                 ),
             };
             queued_prompts.lock().await.remove(&prompt_id);
-            let streamed_usage = latest_usage.lock().await.take();
+            let streamed_usage = take_usage_for(&latest_usage, &prompt_id).await;
             let usage = inline_usage.or(streamed_usage);
             if take_active_prompt(&active_prompt, &prompt_id).is_some() {
                 let terminal = session_routes
@@ -3749,9 +3819,11 @@ impl Drop for AcpSession {
             job.terminate();
             drop(job);
         }
-        if let Ok(mut child) = self.child.try_lock() {
-            kill_isolated_process_tree(&mut child);
-        }
+        // The blocking group-kill recovers a poisoned lock and briefly spins on
+        // contention so the group kill still fires — a bare `try_lock` skipped it on
+        // poison/contention, degrading to a direct-child-only `kill_on_drop` and
+        // orphaning tool/subagent grandchildren. Fail-open to `kill_on_drop`.
+        kill_isolated_process_tree_blocking(&self.child);
     }
 }
 
@@ -4388,7 +4460,7 @@ async fn handle_session_update_message(
         return;
     }
     if let Some(usage) = usage_from_event(params) {
-        *context.latest_usage.lock().await = Some(usage);
+        record_stream_usage(&context.latest_usage, &context.active_prompt, params, usage).await;
     }
     for event in parse_session_update(params, tools) {
         if !matches!(event, SessionEvent::TurnDone { .. }) {
@@ -4409,7 +4481,7 @@ async fn handle_grok_session_notification(
     }
     if !replaying {
         if let Some(usage) = usage_from_event(params) {
-            *context.latest_usage.lock().await = Some(usage);
+            record_stream_usage(&context.latest_usage, &context.active_prompt, params, usage).await;
         }
         if handle_grok_turn_completed(params, context).await {
             return;
@@ -4655,7 +4727,7 @@ async fn handle_grok_turn_completed(params: &Value, context: &ReaderContext) -> 
         .and_then(Value::as_str);
     let status = grok_turn_status(stop_reason, detail);
     if prompt_id.starts_with("subagent-completed-") {
-        let streamed_usage = context.latest_usage.lock().await.take();
+        let streamed_usage = take_usage_for(&context.latest_usage, prompt_id).await;
         let usage = usage_from_event(params).or(streamed_usage);
         let terminal = context
             .session_routes
@@ -4686,7 +4758,7 @@ async fn handle_grok_turn_completed(params: &Value, context: &ReaderContext) -> 
         .await
         .remove(&active_prompt.request_id);
     context.queued_prompts.lock().await.remove(prompt_id);
-    let streamed_usage = context.latest_usage.lock().await.take();
+    let streamed_usage = take_usage_for(&context.latest_usage, prompt_id).await;
     let usage = usage_from_event(params).or(streamed_usage);
     let terminal = context
         .session_routes
@@ -8154,13 +8226,16 @@ fn validate_initialize(vendor: AcpVendor, result: &Value) -> Result<(), SessionE
             "ACP agent did not negotiate protocol version 1".to_string(),
         ));
     }
-    // For Kimi, require the peer to be RECOGNIZABLY Kimi Code (official identity +
-    // a parseable version) — a genuinely different program on PATH (a name
-    // collision, e.g. the retired Python `kimi`) is still rejected with a clear
-    // error. But a newer Kimi Code release is NOT rejected on version: it degrades
-    // exactly like Grok, running on the baseline ACP contract with the enhanced
-    // source-verified capabilities simply off (`kimi_source_contract == false` in
-    // `negotiated_capabilities`). So a routine Kimi upgrade keeps working.
+    // For Kimi, require only that the peer report the official Kimi Code identity
+    // (`agentInfo.name == "Kimi Code CLI"`) — a genuinely different program on PATH
+    // (a name collision, e.g. the retired Python `kimi`) is still rejected with a
+    // clear error. A real Kimi Code is NOT rejected on its version, even when that
+    // version is a newer release OR unparseable/missing (a git-describe string, a
+    // date, an empty `agentVersion`): it degrades exactly like Grok, running on the
+    // baseline ACP contract with the enhanced source-verified capabilities simply
+    // off (`kimi_source_contract == false` in `negotiated_capabilities`). So a
+    // routine Kimi upgrade — or a dev build with a non-SemVer version — keeps
+    // working ("any installed version, degrade don't block").
     if matches!(vendor, AcpVendor::Kimi)
         && !kimi_source_profile_from_initialize(result).is_kimi_code_identity()
     {
@@ -8681,6 +8756,59 @@ mod background_control_tests;
 mod tests {
     use super::*;
     use std::io::{BufRead as _, Cursor, Write as _};
+
+    #[tokio::test]
+    async fn prompt_queue_usage_is_not_cross_attributed_between_prompts() {
+        // Fix #7: the prompt queue shares ONE `latest_usage` slot. A usage frame is
+        // tagged with the prompt it belongs to, and a completion drains it only for
+        // a MATCHING key — so prompt B can never be tagged with prompt A's tokens.
+        let latest: LatestUsage = Arc::new(Mutex::new(None));
+        let active_a: ActivePrompt = Arc::new(RwLock::new(Some(ActivePromptRecord {
+            prompt_id: "prompt-a".to_string(),
+            request_id: 1,
+        })));
+
+        // A usage frame WITHOUT its own prompt id is tagged with the active prompt.
+        record_stream_usage(&latest, &active_a, &json!({}), Usage::exact(100, 40)).await;
+        // The NEXT prompt's completion must NOT steal it (key mismatch).
+        assert!(
+            take_usage_for(&latest, "prompt-b").await.is_none(),
+            "prompt B must not drain prompt A's usage"
+        );
+        // A's own completion still finds it.
+        let usage_a = take_usage_for(&latest, "prompt-a")
+            .await
+            .expect("prompt A drains its own usage");
+        assert_eq!(usage_a.input_tokens, 100);
+        assert_eq!(usage_a.output_tokens, 40);
+        assert!(
+            latest.lock().await.is_none(),
+            "a matched drain clears the slot"
+        );
+
+        // The late-frame-after-settle race: a frame that carries its OWN prompt id
+        // for the ALREADY-SETTLED prompt A, captured while prompt B is now active,
+        // is keyed by the FRAME's id (A) — so B's completion still can't take it.
+        let active_b: ActivePrompt = Arc::new(RwLock::new(Some(ActivePromptRecord {
+            prompt_id: "prompt-b".to_string(),
+            request_id: 2,
+        })));
+        record_stream_usage(
+            &latest,
+            &active_b,
+            &json!({"update":{"prompt_id":"prompt-a"}}),
+            Usage::exact(7, 3),
+        )
+        .await;
+        assert!(
+            take_usage_for(&latest, "prompt-b").await.is_none(),
+            "a late frame tagged for A must not be attributed to B"
+        );
+        assert!(
+            take_usage_for(&latest, "prompt-a").await.is_some(),
+            "A's own late frame is still drainable by A"
+        );
+    }
 
     fn fixture_path(name: &str) -> PathBuf {
         std::env::temp_dir().join("umadev-acp-fixtures").join(name)

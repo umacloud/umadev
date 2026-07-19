@@ -101,7 +101,8 @@ use umadev_runtime::{
 use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{
-    isolate_process_tree, kill_isolated_process_tree, reap_isolated_process_tree, END_REAP_BUDGET,
+    isolate_process_tree, kill_isolated_process_tree_blocking, reap_isolated_process_tree,
+    END_REAP_BUDGET,
 };
 
 const MAX_INPUT_FRAME_BYTES: usize = 32 * 1024 * 1024;
@@ -213,10 +214,13 @@ pub fn codex_sandbox_override() -> Option<String> {
 ///   wrong approval is bounded. This is the 1.0.55 behavior.
 /// - **Auto** → `danger-full-access`; the user has pre-authorized full access.
 ///
-/// An explicit override (env / project config) still wins on Guarded and Auto —
-/// so a user who genuinely needs network-heavy work under Guarded can opt in —
-/// but the DEFAULT no longer hands full filesystem/process/network access to an
-/// approved command in the default mode.
+/// An explicit override (env / project config) may only NARROW Guarded (e.g. to
+/// `read-only`) — it can never WIDEN a Guarded session to `danger-full-access`:
+/// a `.umadevrc`/env knob must not hand full disk/process/network access to a
+/// session the user deliberately kept approval-gated. On Auto (already
+/// full-trust) an override still wins either direction. So the DEFAULT never
+/// hands full access to an approved command, and neither can a config knob under
+/// Guarded — only Auto opts into full access.
 ///
 /// (The read-only critic fork — [`thread_start_params_readonly`] — is NEVER driven
 /// by this: its `read-only` sandbox is the single-writer invariant, not a knob.)
@@ -233,22 +237,42 @@ pub(crate) fn codex_sandbox_mode(permissions: BasePermissionProfile) -> &'static
     )
 }
 
-/// Pure policy core for [`codex_sandbox_mode`]. Plan is always read-only; an
-/// explicit restriction wins for the writable tiers; otherwise Auto receives the
-/// complete development environment while Guarded is confined to the workspace.
+/// Pure policy core for [`codex_sandbox_mode`]. Plan is always read-only. On Auto
+/// (full-trust) an override wins in either direction, defaulting to the complete
+/// development environment. On Guarded the default is workspace-write and an
+/// override may only NARROW it — a config knob can never widen a Guarded session
+/// to `danger-full-access` (see [`clamp_guarded_sandbox`]).
 fn resolve_codex_launch_sandbox(
     full_access: bool,
     auto_approve: bool,
     configured: Option<&str>,
 ) -> &'static str {
     if !full_access {
-        "read-only"
-    } else if configured.is_some() {
-        resolve_codex_sandbox(configured)
-    } else if auto_approve {
-        "danger-full-access"
-    } else {
-        "workspace-write"
+        return "read-only";
+    }
+    match (auto_approve, configured) {
+        // Auto: the user pre-authorized full access; an explicit override (narrow
+        // OR widen) is honored, defaulting to the full development environment.
+        (true, None) => "danger-full-access",
+        (true, Some(raw)) => resolve_codex_sandbox(Some(raw)),
+        // Guarded: workspace-write by default. An override may only NARROW (e.g. to
+        // read-only); `danger-full-access` is clamped back to the workspace-write
+        // ceiling so a `.umadevrc`/env knob can't widen an approval-gated session
+        // to full disk/process/network access.
+        (false, None) => "workspace-write",
+        (false, Some(raw)) => clamp_guarded_sandbox(resolve_codex_sandbox(Some(raw))),
+    }
+}
+
+/// Clamp a configured codex sandbox to the Guarded ceiling (`workspace-write`): a
+/// `.umadevrc`/env override may narrow a Guarded session to `read-only`, but
+/// `danger-full-access` is downgraded to `workspace-write`. Auto is never routed
+/// through this — only Guarded, whose whole point is a bounded blast radius.
+fn clamp_guarded_sandbox(sandbox: &'static str) -> &'static str {
+    match sandbox {
+        "read-only" => "read-only",
+        // workspace-write stays; danger-full-access is clamped down to the ceiling.
+        _ => "workspace-write",
     }
 }
 
@@ -383,10 +407,39 @@ type MainThreadId = Arc<RwLock<Option<String>>>;
 ///
 /// codex streams per-turn usage in a SEPARATE `thread/tokenUsage/updated`
 /// notification (and some versions inline it on `turn/completed`); the reader
-/// stashes the most-recent parse here, and `emit_turn_done` drains it onto the
+/// stashes the most-recent parse here, and `build_turn_done` drains it onto the
 /// `TurnDone` so `/usage` is truthful on the DEFAULT loop. `None` until the base
 /// reports usage → the consumer estimates instead (fail-open).
 type LatestUsage = Arc<Mutex<Option<Usage>>>;
+
+/// A `turn/completed` whose emission is briefly HELD so a `thread/tokenUsage/
+/// updated` frame that races just AFTER it can still be attached (F3 ordering).
+struct DeferredTurnDone {
+    status: TurnStatus,
+    usage: Option<Usage>,
+}
+
+/// Reader-owned state for the trailing-usage attach. Shared (`Arc<Mutex>`) so the
+/// reader loop can flush a held TurnDone on an idle grace / EOF while the
+/// dispatcher folds a trailing usage frame into it.
+#[derive(Default)]
+struct TrailingUsageState {
+    /// Whether this base has EVER reported per-turn usage. Only then is a completed
+    /// turn briefly deferred to catch a racing usage frame — a base that never
+    /// reports usage keeps today's immediate emission (no between-turns latency).
+    reports_usage: bool,
+    /// A completed turn held for the immediately-following usage frame.
+    pending: Option<DeferredTurnDone>,
+}
+type TrailingUsage = Arc<Mutex<TrailingUsageState>>;
+
+/// How long the reader waits, after a `turn/completed` that carried no usage, for
+/// a trailing `thread/tokenUsage/updated` frame before flushing the held TurnDone
+/// without usage. Only armed for a base that reports usage, and only until the
+/// next frame — so a healthy turn is delayed at most once, briefly, and only when
+/// the stream falls idle right at the completion boundary.
+const TRAILING_USAGE_GRACE: Duration = Duration::from_millis(250);
+
 /// Bound on the translated-event channel. Matches the claude / opencode drivers
 /// (both cap at 256) so a flooding base can't grow the queue without limit.
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -410,6 +463,7 @@ struct CodexReaderState {
     next_id: NextRequestId,
     main_thread_id: MainThreadId,
     latest_usage: LatestUsage,
+    trailing_usage: TrailingUsage,
     event_tx: EventTx,
 }
 
@@ -426,6 +480,7 @@ struct CodexDispatchContext<'a> {
     next_id: Option<&'a NextRequestId>,
     main_thread_id: &'a MainThreadId,
     latest_usage: &'a LatestUsage,
+    trailing_usage: &'a TrailingUsage,
     event_tx: &'a EventTx,
 }
 
@@ -487,6 +542,14 @@ pub struct CodexSession {
     /// `try_wait()` peek without forcing the trait method to take `&mut self`.
     /// Kept so it is killed on drop (`kill_on_drop`).
     child: std::sync::Mutex<tokio::process::Child>,
+    /// Windows kill-on-close Job Object holding the `codex app-server` tree so the
+    /// native app-server grandchild an npm trampoline execs is torn down on
+    /// teardown instead of orphaning once the trampoline exits (`taskkill` walks
+    /// only the live parent chain). Terminated in `end`/`Drop`. `None` off Windows
+    /// / when the OS refused nested job assignment (the process group is the
+    /// fallback).
+    #[cfg(windows)]
+    process_job: Option<umadev_process::KillOnCloseJob>,
     /// Bounded tail of the app-server's STDERR, captured by the drain task,
     /// surfaced via [`BaseSession::stderr_tail`] to explain *why* a base went
     /// idle (a bad model / not logged in / a config error codex prints to stderr
@@ -551,6 +614,11 @@ impl CodexSession {
         handshake_budget: Duration,
     ) -> Result<Self, SessionError> {
         let mut child = spawn_app_server(program, workspace)?;
+        // Windows kill-on-close Job Object over the whole app-server tree (see the
+        // `process_job` field); attached before any handshake traffic so the native
+        // grandchild is captured. `None` off Windows / if the OS refuses it.
+        #[cfg(windows)]
+        let process_job = umadev_process::KillOnCloseJob::attach(&child);
         let stdin = take_pipe(child.stdin.take(), "stdin")?;
         let stdout = take_pipe(child.stdout.take(), "stdout")?;
         // Drain stderr on its own task so a chatty base can never fill (and then
@@ -574,6 +642,7 @@ impl CodexSession {
         let next_id: NextRequestId = Arc::new(AtomicI64::new(1));
         let main_thread_id: MainThreadId = Arc::new(RwLock::new(None));
         let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
+        let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
 
         // Reader task: the single owner of stdout. Splits every line into
@@ -590,6 +659,7 @@ impl CodexSession {
                 next_id: Arc::clone(&next_id),
                 main_thread_id: Arc::clone(&main_thread_id),
                 latest_usage: Arc::clone(&latest_usage),
+                trailing_usage,
                 event_tx: event_tx.clone(),
             },
         ));
@@ -610,6 +680,8 @@ impl CodexSession {
             workspace: workspace.to_path_buf(),
             model: model.to_string(),
             child: std::sync::Mutex::new(child),
+            #[cfg(windows)]
+            process_job,
             stderr: stderr_tail,
             stderr_drain,
         };
@@ -660,6 +732,11 @@ impl CodexSession {
         handshake_budget: Duration,
     ) -> Result<Self, SessionError> {
         let mut child = spawn_app_server(program, workspace)?;
+        // Windows kill-on-close Job Object over the whole app-server tree (see the
+        // `process_job` field); attached before any handshake traffic so the native
+        // grandchild is captured. `None` off Windows / if the OS refuses it.
+        #[cfg(windows)]
+        let process_job = umadev_process::KillOnCloseJob::attach(&child);
         let stdin = take_pipe(child.stdin.take(), "stdin")?;
         let stdout = take_pipe(child.stdout.take(), "stdout")?;
         let stderr_tail = StderrTail::new();
@@ -678,6 +755,7 @@ impl CodexSession {
         let next_id: NextRequestId = Arc::new(AtomicI64::new(1));
         let main_thread_id: MainThreadId = Arc::new(RwLock::new(Some(thread_id.to_string())));
         let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
+        let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         tokio::spawn(reader_loop(
             stdout,
@@ -691,6 +769,7 @@ impl CodexSession {
                 next_id: Arc::clone(&next_id),
                 main_thread_id: Arc::clone(&main_thread_id),
                 latest_usage: Arc::clone(&latest_usage),
+                trailing_usage,
                 event_tx: event_tx.clone(),
             },
         ));
@@ -710,6 +789,8 @@ impl CodexSession {
             workspace: workspace.to_path_buf(),
             model: model.to_string(),
             child: std::sync::Mutex::new(child),
+            #[cfg(windows)]
+            process_job,
             stderr: stderr_tail,
             stderr_drain,
         };
@@ -741,6 +822,11 @@ impl CodexSession {
         handshake_budget: Duration,
     ) -> Result<Self, SessionError> {
         let mut child = spawn_app_server(program, workspace)?;
+        // Windows kill-on-close Job Object over the whole app-server tree (see the
+        // `process_job` field); attached before any handshake traffic so the native
+        // grandchild is captured. `None` off Windows / if the OS refuses it.
+        #[cfg(windows)]
+        let process_job = umadev_process::KillOnCloseJob::attach(&child);
         let stdin = take_pipe(child.stdin.take(), "stdin")?;
         let stdout = take_pipe(child.stdout.take(), "stdout")?;
         let stderr_tail = StderrTail::new();
@@ -759,6 +845,7 @@ impl CodexSession {
         let next_id: NextRequestId = Arc::new(AtomicI64::new(1));
         let main_thread_id: MainThreadId = Arc::new(RwLock::new(None));
         let latest_usage: LatestUsage = Arc::new(Mutex::new(None));
+        let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         tokio::spawn(reader_loop(
             stdout,
@@ -772,6 +859,7 @@ impl CodexSession {
                 next_id: Arc::clone(&next_id),
                 main_thread_id: Arc::clone(&main_thread_id),
                 latest_usage: Arc::clone(&latest_usage),
+                trailing_usage,
                 event_tx: event_tx.clone(),
             },
         ));
@@ -793,6 +881,8 @@ impl CodexSession {
             workspace: workspace.to_path_buf(),
             model: model.to_string(),
             child: std::sync::Mutex::new(child),
+            #[cfg(windows)]
+            process_job,
             stderr: stderr_tail,
             stderr_drain,
         };
@@ -1342,7 +1432,8 @@ fn take_pipe<T>(pipe: Option<T>, which: &str) -> Result<T, SessionError> {
 /// a Node trampoline that execs the native `codex app-server` as a grandchild;
 /// killing only the direct child would reparent that native process to init
 /// (PPID 1) and leak it. The group lets [`reap_isolated_process_tree`] /
-/// [`kill_isolated_process_tree`] terminate the trampoline AND the native server.
+/// [`crate::kill_isolated_process_tree`] terminate the trampoline AND the native
+/// server.
 fn spawn_app_server(
     program: &str,
     workspace: &Path,
@@ -1390,10 +1481,31 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, state: CodexReaderStat
         next_id: Some(&state.next_id),
         main_thread_id: &state.main_thread_id,
         latest_usage: &state.latest_usage,
+        trailing_usage: &state.trailing_usage,
         event_tx: &state.event_tx,
     };
     let terminal_reason = loop {
-        match read_bounded_codex_frame(&mut reader, MAX_OUTPUT_FRAME_BYTES).await {
+        // A `turn/completed` with no usage yet may be HELD (see `complete_turn`)
+        // for a `thread/tokenUsage/updated` that races just after it. While one is
+        // held, bound the next read so an idle stream flushes it instead of
+        // stalling the turn; the frame normally arrives well within the grace.
+        let read = if state.trailing_usage.lock().await.pending.is_some() {
+            let Ok(result) = tokio::time::timeout(
+                TRAILING_USAGE_GRACE,
+                read_bounded_codex_frame(&mut reader, MAX_OUTPUT_FRAME_BYTES),
+            )
+            .await
+            else {
+                // No trailing usage within the grace → emit the held TurnDone, then
+                // resume normal (unbounded) reads on the next iteration.
+                flush_pending_turn_done(&state.trailing_usage, &state.event_tx).await;
+                continue;
+            };
+            result
+        } else {
+            read_bounded_codex_frame(&mut reader, MAX_OUTPUT_FRAME_BYTES).await
+        };
+        match read {
             Ok(Some(CodexFrameRead::Line(line_buf))) => {
                 let line = String::from_utf8_lossy(&line_buf);
                 dispatch_line_attributed(
@@ -1410,6 +1522,10 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, state: CodexReaderStat
             Err(_) => break "codex app-server stdout could not be read",
         }
     };
+    // A turn completed just before EOF and was held for a usage frame that never
+    // arrived: emit it before the terminal `Failed` so the successful turn's
+    // TurnDone still lands (mirrors the pre-defer inline-emit-then-EOF ordering).
+    flush_pending_turn_done(&state.trailing_usage, &state.event_tx).await;
     // EOF or a read error → the app-server is gone. Tell any in-flight turn it
     // failed (fail-open) and wake every pending request so no caller hangs.
     //
@@ -1567,6 +1683,7 @@ async fn dispatch_line(
     let main_thread_id: MainThreadId = Arc::new(RwLock::new(None));
     let item_targets: ItemTargetMap = Arc::new(Mutex::new(HashMap::new()));
     let early_cancel: EarlyCancel = Arc::new(AtomicBool::new(false));
+    let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
     let mut collab = CodexCollabTracker::default();
     let dispatch = CodexDispatchContext {
         pending,
@@ -1578,6 +1695,7 @@ async fn dispatch_line(
         next_id: None,
         main_thread_id: &main_thread_id,
         latest_usage,
+        trailing_usage: &trailing_usage,
         event_tx,
     };
     dispatch_line_attributed(line, &dispatch, &mut collab).await;
@@ -2336,6 +2454,27 @@ async fn handle_notification(
     let show_logs = crate::process_logs::show_process_logs();
     let main = notification_is_main(&params, context.main_thread_id);
     let active_turn = turn_reference_is_active(&params, context.turn_id).await;
+    // F3 trailing-usage attach: a `turn/completed` with no usage is briefly HELD
+    // (see `complete_turn`) so a `thread/tokenUsage/updated` racing just AFTER it
+    // can still attach — its `active_turn` is already false (the turn id was
+    // cleared), so it would otherwise be dropped by the guards below. If THIS frame
+    // is that usage, fold it in and emit the held TurnDone; ANY OTHER frame flushes
+    // the held TurnDone first (preserving prev-turn → next-turn ordering) and is
+    // then processed normally. Bounded to the immediately-following frame.
+    if context.trailing_usage.lock().await.pending.is_some() {
+        if method == "thread/tokenUsage/updated" && main {
+            let folded = parse_codex_usage(&params);
+            let held = context.trailing_usage.lock().await.pending.take();
+            if let Some(mut done) = held {
+                if let Some(usage) = folded {
+                    done.usage = Some(usage);
+                }
+                emit_deferred_turn_done(done, context.event_tx).await;
+            }
+            return;
+        }
+        flush_pending_turn_done(context.trailing_usage, context.event_tx).await;
+    }
     match method {
         // Capture the in-flight turn id so interrupt / steer can target it.
         "turn/started" if main => {
@@ -2387,18 +2526,20 @@ async fn handle_notification(
         }
         // F3: codex streams per-turn token usage in this dedicated notification
         // (kept separate from `turn/completed` so the protocol shape stays stable).
-        // Stash the latest parse so `emit_turn_done` can attach the REAL usage.
+        // Stash the latest parse so `complete_turn` can attach the REAL usage (and
+        // mark that this base reports usage, arming the trailing-usage defer).
         "thread/tokenUsage/updated" if main && active_turn => {
-            capture_usage(&params, context.latest_usage).await;
+            capture_usage(&params, context.latest_usage, context.trailing_usage).await;
         }
         // The turn ended — the authoritative phase-done boundary.
         "turn/completed" if main && active_turn && turn_id_of(&params).is_some() => {
             context.early_cancel.store(false, Ordering::Release);
             context.item_targets.lock().await.clear();
-            emit_turn_done(
+            complete_turn(
                 &params,
                 context.turn_id,
                 context.latest_usage,
+                context.trailing_usage,
                 context.event_tx,
             )
             .await;
@@ -2411,11 +2552,14 @@ async fn handle_notification(
 }
 
 /// Stash the REAL token usage from a `thread/tokenUsage/updated` notification so
-/// the next `turn/completed` can carry it. Fail-open: an unparseable payload is a
-/// no-op (the prior value, if any, stands; absent → the consumer estimates).
-async fn capture_usage(params: &Value, latest_usage: &LatestUsage) {
+/// the next `turn/completed` can carry it, and record that this base reports usage
+/// (which arms the trailing-usage defer in [`complete_turn`] for a frame that
+/// races just after completion). Fail-open: an unparseable payload is a no-op (the
+/// prior value, if any, stands; absent → the consumer estimates).
+async fn capture_usage(params: &Value, latest_usage: &LatestUsage, trailing_usage: &TrailingUsage) {
     if let Some(u) = parse_codex_usage(params) {
         *latest_usage.lock().await = Some(u);
+        trailing_usage.lock().await.reports_usage = true;
     }
 }
 
@@ -2899,20 +3043,20 @@ fn added_lines_of_diff(diff: &str) -> String {
     out
 }
 
-/// Emit a [`SessionEvent::TurnDone`] from a `turn/completed` payload and clear
-/// the in-flight turn id.
+/// Build a [`DeferredTurnDone`] from a `turn/completed` payload and clear the
+/// in-flight turn id.
 ///
 /// F3: attach the REAL per-turn token usage so `/usage` is truthful on the
 /// DEFAULT loop. Prefer usage inlined on the `turn/completed` params (some codex
 /// versions carry it there); otherwise drain the latest `thread/tokenUsage/updated`
 /// value. The accumulator is reset to `None` either way so a stale count can't
-/// leak into the NEXT turn. Fail-open: no usage anywhere → `None` (estimate).
-async fn emit_turn_done(
+/// leak into the NEXT turn. Fail-open: no usage anywhere → `None` (estimate — but
+/// see [`complete_turn`], which briefly defers to catch a racing usage frame).
+async fn build_turn_done(
     params: &Value,
     turn_id: &TurnId,
     latest_usage: &LatestUsage,
-    event_tx: &EventTx,
-) {
+) -> DeferredTurnDone {
     let status = params
         .get("turn")
         .and_then(|t| t.get("status"))
@@ -2926,18 +3070,80 @@ async fn emit_turn_done(
         let streamed = guard.take();
         inline.or(streamed)
     };
-    // BLOCKING send (not try_send): the TERMINAL TurnDone must never be dropped under
-    // backpressure, else the turn never ends and the run blocks to its wall-clock deadline
-    // (V1 - the same fix already applied to the EOF terminal). Safe here: turn/completed
-    // only arrives during a live turn the consumer is draining.
+    DeferredTurnDone {
+        status: map_turn_status(status, params),
+        usage,
+    }
+}
+
+/// Emit a [`SessionEvent::TurnDone`] (the terminal, guaranteed-delivery send).
+///
+/// BLOCKING send (not `try_send`): the TERMINAL TurnDone must never be dropped
+/// under backpressure, else the turn never ends and the run blocks to its
+/// wall-clock deadline (V1 — the same fix already applied to the EOF terminal).
+/// Safe here: a completion only lands during a live turn the consumer is draining.
+async fn emit_deferred_turn_done(done: DeferredTurnDone, event_tx: &EventTx) {
     let _ = emit_critical_event(
         event_tx,
         SessionEvent::TurnDone {
-            status: map_turn_status(status, params),
-            usage,
+            status: done.status,
+            usage: done.usage,
         },
     )
     .await;
+}
+
+/// Build + emit a `turn/completed` terminal in one step. The live reader always
+/// routes through [`complete_turn`] (for the trailing-usage defer); this one-step
+/// form is retained for the critical-delivery unit tests.
+#[cfg(test)]
+async fn emit_turn_done(
+    params: &Value,
+    turn_id: &TurnId,
+    latest_usage: &LatestUsage,
+    event_tx: &EventTx,
+) {
+    let done = build_turn_done(params, turn_id, latest_usage).await;
+    emit_deferred_turn_done(done, event_tx).await;
+}
+
+/// Handle a `turn/completed`: build the terminal TurnDone (clearing the turn id +
+/// draining any usage seen so far) and either emit it immediately — the fast path,
+/// with UNCHANGED latency, taken whenever usage is already in hand — or, when this
+/// base reports usage but none has landed yet, DEFER it so a `thread/tokenUsage/
+/// updated` frame that races just AFTER completion still attaches (instead of the
+/// turn silently falling back to a `chars/4` estimate). The reader flushes a held
+/// TurnDone on the immediately-following frame, a short idle grace, or EOF, so the
+/// defer is bounded and a turn never hangs. A base that never reports usage is
+/// never deferred — it keeps today's immediate emission (no between-turns delay).
+async fn complete_turn(
+    params: &Value,
+    turn_id: &TurnId,
+    latest_usage: &LatestUsage,
+    trailing_usage: &TrailingUsage,
+    event_tx: &EventTx,
+) {
+    let done = build_turn_done(params, turn_id, latest_usage).await;
+    if done.usage.is_some() {
+        emit_deferred_turn_done(done, event_tx).await;
+        return;
+    }
+    let mut trailing = trailing_usage.lock().await;
+    if trailing.reports_usage {
+        trailing.pending = Some(done);
+    } else {
+        drop(trailing);
+        emit_deferred_turn_done(done, event_tx).await;
+    }
+}
+
+/// Emit a held (deferred) TurnDone as-is because no trailing usage frame arrived
+/// (idle grace / EOF / an unrelated next frame). A no-op when nothing is held.
+async fn flush_pending_turn_done(trailing_usage: &TrailingUsage, event_tx: &EventTx) {
+    let pending = trailing_usage.lock().await.pending.take();
+    if let Some(done) = pending {
+        emit_deferred_turn_done(done, event_tx).await;
+    }
 }
 
 /// Map a codex turn `status` string to a [`TurnStatus`].
@@ -3464,6 +3670,14 @@ impl BaseSession for CodexSession {
         // so a direct-child kill would leak it (reparented to PPID 1). On overrun
         // we fail open to kill_on_drop. Consistent with claude / opencode `end()`.
         let _ = self.interrupt().await;
+        // Windows: terminate the Job Object first so the native `codex app-server`
+        // grandchild dies even after the trampoline has exited (taskkill can no
+        // longer reach it); the group reap below is the cross-platform backstop.
+        #[cfg(windows)]
+        if let Some(job) = self.process_job.take() {
+            job.terminate();
+            drop(job);
+        }
         reap_isolated_process_tree(&self.child, END_REAP_BUDGET).await;
         self.stderr_drain.shutdown().await;
         Ok(())
@@ -3495,11 +3709,17 @@ impl Drop for CodexSession {
         // timed-out or cancelled turn whose session is simply dropped) MUST also
         // kill the whole process GROUP: killing only the direct Node trampoline
         // leaves the native `codex app-server` grandchild reparented to init
-        // (PPID 1), which is the leak this fixes. Fail-open — a contended/poisoned
-        // lock falls back to the child's own `kill_on_drop(true)`.
-        if let Ok(mut child) = self.child.try_lock() {
-            kill_isolated_process_tree(&mut child);
+        // (PPID 1), which is the leak this fixes. Windows: terminate the Job Object
+        // first (reaches a grandchild taskkill can't). The blocking group-kill
+        // recovers a poisoned lock and briefly spins on contention so the group
+        // kill still fires (a bare `try_lock` skipped it on poison/contention);
+        // fail-open to the child's own `kill_on_drop(true)` on overrun.
+        #[cfg(windows)]
+        if let Some(job) = self.process_job.take() {
+            job.terminate();
+            drop(job);
         }
+        kill_isolated_process_tree_blocking(&self.child);
     }
 }
 
@@ -3570,6 +3790,10 @@ fn interrupt_params(thread_id: &str, turn_id: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Used only by the unix e2e group-kill test; kept out of the non-test import
+    // set so it does not read as unused when tests are compiled out.
+    #[cfg(unix)]
+    use crate::kill_isolated_process_tree;
 
     /// Parse a JSON test fixture from a string literal. Building deeply nested
     /// fixtures this way (instead of the `json!` macro) keeps the test source's
@@ -3711,6 +3935,141 @@ mod tests {
         assert_eq!(resolve_codex_sandbox(None), "workspace-write");
         assert_eq!(resolve_codex_sandbox(Some("")), "workspace-write");
         assert_eq!(resolve_codex_sandbox(Some("yolo-root")), "workspace-write");
+    }
+
+    #[test]
+    fn a_config_override_cannot_widen_guarded_past_workspace_write() {
+        // Fix #5: Guarded's whole point is a bounded blast radius. A `.umadevrc`/env
+        // override may NARROW it (to read-only), but must NEVER widen an
+        // approval-gated session to full disk/process/network access —
+        // `danger-full-access` is clamped back to the workspace-write ceiling.
+        assert_eq!(
+            resolve_codex_launch_sandbox(true, false, Some("danger-full-access")),
+            "workspace-write",
+            "a config knob must not widen Guarded to full access"
+        );
+        assert_eq!(
+            resolve_codex_launch_sandbox(true, false, Some("read-only")),
+            "read-only",
+            "an override may still NARROW Guarded"
+        );
+        assert_eq!(
+            resolve_codex_launch_sandbox(true, false, Some("workspace-write")),
+            "workspace-write"
+        );
+        assert_eq!(
+            resolve_codex_launch_sandbox(true, false, None),
+            "workspace-write",
+            "the Guarded default is unchanged"
+        );
+        // Auto is full-trust: an override wins in EITHER direction and the default
+        // stays full access — the Guarded clamp does not touch it.
+        assert_eq!(
+            resolve_codex_launch_sandbox(true, true, Some("danger-full-access")),
+            "danger-full-access"
+        );
+        assert_eq!(
+            resolve_codex_launch_sandbox(true, true, None),
+            "danger-full-access"
+        );
+        assert_eq!(
+            resolve_codex_launch_sandbox(true, true, Some("read-only")),
+            "read-only",
+            "Auto may narrow too"
+        );
+        // Plan is always read-only regardless of any override.
+        assert_eq!(
+            resolve_codex_launch_sandbox(false, false, Some("danger-full-access")),
+            "read-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_usage_attaches_from_a_frame_after_turn_completed() {
+        // Fix #6: a base that reports usage but whose `thread/tokenUsage/updated`
+        // frame races just AFTER `turn/completed` must still have that usage
+        // attached — the completion is briefly HELD and the trailing frame folds in,
+        // so the turn does not silently fall back to a chars/4 estimate.
+        let pending = empty_pending();
+        let host_requests = empty_approvals();
+        let item_targets: ItemTargetMap = Arc::new(Mutex::new(HashMap::new()));
+        let turn_id: TurnId = Arc::new(Mutex::new(None));
+        let early_cancel: EarlyCancel = Arc::new(AtomicBool::new(false));
+        let main_thread_id: MainThreadId = Arc::new(RwLock::new(None));
+        let latest_usage = empty_usage();
+        let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
+        let (tx, mut rx) = chan();
+        let dispatch = CodexDispatchContext {
+            pending: &pending,
+            host_requests: &host_requests,
+            item_targets: &item_targets,
+            turn_id: &turn_id,
+            early_cancel: &early_cancel,
+            stdin: None,
+            next_id: None,
+            main_thread_id: &main_thread_id,
+            latest_usage: &latest_usage,
+            trailing_usage: &trailing_usage,
+            event_tx: &tx,
+        };
+        let mut collab = CodexCollabTracker::default();
+
+        // Turn A: usage arrives BEFORE completion (the normal path) — this also
+        // marks the base as a usage reporter, arming the trailing-usage defer.
+        set_turn_id(&turn_id, Some("turn-a".to_string())).await;
+        dispatch_line_attributed(
+            r#"{"method":"thread/tokenUsage/updated","params":{"turnId":"turn-a","input_tokens":10,"output_tokens":5,"total_tokens":15,"cached_input_tokens":0,"reasoning_output_tokens":0}}"#,
+            &dispatch,
+            &mut collab,
+        )
+        .await;
+        dispatch_line_attributed(
+            r#"{"method":"turn/completed","params":{"turnId":"turn-a","turn":{"id":"turn-a","status":"completed"}}}"#,
+            &dispatch,
+            &mut collab,
+        )
+        .await;
+        let SessionEvent::TurnDone { usage: Some(_), .. } =
+            rx.try_recv().expect("turn A completes")
+        else {
+            panic!("turn A must complete immediately with its usage");
+        };
+
+        // Turn B: completion lands with NO usage yet → held, no TurnDone yet.
+        set_turn_id(&turn_id, Some("turn-b".to_string())).await;
+        dispatch_line_attributed(
+            r#"{"method":"turn/completed","params":{"turnId":"turn-b","turn":{"id":"turn-b","status":"completed"}}}"#,
+            &dispatch,
+            &mut collab,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "turn B's TurnDone is HELD for the racing usage frame, not emitted yet"
+        );
+
+        // The usage frame arrives AFTER completion (turn id already cleared) → folded.
+        dispatch_line_attributed(
+            r#"{"method":"thread/tokenUsage/updated","params":{"turnId":"turn-b","input_tokens":20,"output_tokens":8,"total_tokens":28,"cached_input_tokens":0,"reasoning_output_tokens":0}}"#,
+            &dispatch,
+            &mut collab,
+        )
+        .await;
+        let SessionEvent::TurnDone {
+            usage: Some(usage),
+            status,
+        } = rx
+            .try_recv()
+            .expect("turn B completes once its usage attaches")
+        else {
+            panic!("turn B's TurnDone must carry the after-completion usage");
+        };
+        assert!(matches!(status, TurnStatus::Completed));
+        assert_eq!(
+            usage.input_tokens, 20,
+            "the trailing frame's tokens attached"
+        );
+        assert_eq!(usage.output_tokens, 8);
     }
 
     #[test]
@@ -4967,6 +5326,7 @@ mod tests {
         let mut collab = CodexCollabTracker::default();
         let (tx, mut rx) = chan();
         *turn_id.lock().await = Some("tm".to_string());
+        let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
         let dispatch = CodexDispatchContext {
             pending: &pending,
             host_requests: &approvals,
@@ -4977,6 +5337,7 @@ mod tests {
             next_id: None,
             main_thread_id: &main_thread_id,
             latest_usage: &latest_usage,
+            trailing_usage: &trailing_usage,
             event_tx: &tx,
         };
 
@@ -5013,6 +5374,7 @@ mod tests {
         let latest_usage = empty_usage();
         let (tx, mut rx) = chan();
         let mut collab = CodexCollabTracker::default();
+        let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
         let dispatch = CodexDispatchContext {
             pending: &pending,
             host_requests: &host_requests,
@@ -5023,6 +5385,7 @@ mod tests {
             next_id: None,
             main_thread_id: &main_thread_id,
             latest_usage: &latest_usage,
+            trailing_usage: &trailing_usage,
             event_tx: &tx,
         };
 
@@ -5093,6 +5456,7 @@ mod tests {
         let mut collab = CodexCollabTracker::default();
         let (tx, mut rx) = chan();
         *turn_id.lock().await = Some("tm".to_string());
+        let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
         let dispatch = CodexDispatchContext {
             pending: &pending,
             host_requests: &approvals,
@@ -5103,6 +5467,7 @@ mod tests {
             next_id: None,
             main_thread_id: &main_thread_id,
             latest_usage: &latest_usage,
+            trailing_usage: &trailing_usage,
             event_tx: &tx,
         };
 
@@ -5406,6 +5771,7 @@ mod tests {
         let (tx, mut rx) = chan();
         let mut collab = CodexCollabTracker::default();
         *turn_id.lock().await = Some("turn-1".to_string());
+        let trailing_usage: TrailingUsage = Arc::new(Mutex::new(TrailingUsageState::default()));
         let dispatch = CodexDispatchContext {
             pending: &pending,
             host_requests: &host_requests,
@@ -5416,6 +5782,7 @@ mod tests {
             next_id: None,
             main_thread_id: &main_thread_id,
             latest_usage: &latest_usage,
+            trailing_usage: &trailing_usage,
             event_tx: &tx,
         };
 
