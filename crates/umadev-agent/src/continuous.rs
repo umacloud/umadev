@@ -392,11 +392,38 @@ pub async fn run_block(
         match outcome {
             PhaseResult::Done => {}
             PhaseResult::Failed(reason) => {
-                events.emit(EngineEvent::Note(umadev_i18n::tlf(
-                    "continuous.phase_failed",
-                    &[phase.id(), &reason],
-                )));
-                return RunOutcome::HardStop(format!("phase {} failed: {reason}", phase.id()));
+                // CAPABILITY DEGRADE (research is advisory): the base is ALIVE and
+                // answered, but the gateway refused an optional hosted tool it reached
+                // for (a hosted `web_search`). Research already degrades on truncation /
+                // empty output; extend that to a base TURN FAILURE of the tight
+                // CapabilityUnsupported class so the whole multi-phase build no longer
+                // HARD-STOPS just because web research was refused. Gated STRICTLY on
+                // `phase == Research` AND the capability class — a genuine failure (any
+                // class) or a failure in any OTHER phase still hard-stops below, and the
+                // zero-source / quality floors downstream are untouched. On degrade we
+                // ensure a local-knowledge research brief exists via the EXISTING
+                // `phases::run_research(options, None)` stub, then fall through so this
+                // phase completes and the block continues to Docs.
+                if phase == Phase::Research
+                    && crate::base_error::is_capability_degradable(&crate::base_error::classify(
+                        None,
+                        None,
+                        Some(&reason),
+                    ))
+                {
+                    events.emit(EngineEvent::Note(
+                        crate::director_loop::capability_degrade_note().to_string(),
+                    ));
+                    // Fail-open: a write error is advisory — the deterministic floors
+                    // downstream still own reality, so a missing stub never wedges a run.
+                    let _ = crate::phases::run_research(options, None);
+                } else {
+                    events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                        "continuous.phase_failed",
+                        &[phase.id(), &reason],
+                    )));
+                    return RunOutcome::HardStop(format!("phase {} failed: {reason}", phase.id()));
+                }
             }
         }
         events.emit(EngineEvent::PhaseCompleted { phase });
@@ -2205,6 +2232,13 @@ async fn drive_rework_turn_with_idle_and_memories(
     // A positive live set after the bound makes the rework incomplete; no
     // background signal still preserves today's fail-open behavior.
     let mut bg = crate::bg_agents::BgAgentTracker::new();
+    // Capability degrade (bounded SINGLE re-drive): a research/planning summon whose
+    // hosted web tool the gateway refused is re-driven ONCE — told to proceed on local
+    // knowledge WITHOUT web research — instead of silently ending the step not-done and
+    // stranding the seat-driven build. Gated strictly on the tight capability class AND
+    // this directive's research/planning framing (see the `TurnStatus::Failed` handling
+    // in the `TurnDone` arm below); a code rework never matches the framing.
+    let mut capability_redriven = false;
     // Idle watchdog (P1-11): this rework pump (reused by `governance_catchup` /
     // `review_and_rework` / the director's `summon`) was a naked
     // `next_event().await` — a base that hangs mid-rework would freeze every
@@ -2446,6 +2480,42 @@ async fn drive_rework_turn_with_idle_and_memories(
                 // State-only resident-chat event; rework execution is unchanged.
             }
             SessionEvent::TurnDone { status, usage } => {
+                // CAPABILITY DEGRADE (research/planning summon only): the base is ALIVE
+                // and answered, but the gateway refused ONE optional hosted tool it
+                // reached for (a hosted `web_search`). On the research/planning seam,
+                // re-drive ONCE — telling the base to proceed on LOCAL KNOWLEDGE without
+                // web research — instead of ending the step not-done. Gated STRICTLY on
+                // the tight capability class AND this directive's research/planning
+                // framing, bounded to a single re-drive within the run `deadline`; a code
+                // rework never matches the framing, and a second failure settles honestly.
+                if let TurnStatus::Failed(ref reason) = status {
+                    if !capability_redriven
+                        && std::time::Instant::now() < deadline
+                        && crate::base_error::is_capability_degradable(
+                            &crate::base_error::classify(None, None, Some(reason)),
+                        )
+                        && crate::director_loop::is_research_or_planning_directive(&directive)
+                    {
+                        capability_redriven = true;
+                        events.emit(EngineEvent::Note(
+                            crate::director_loop::capability_degrade_note().to_string(),
+                        ));
+                        let redirective = format!(
+                            "{directive}{}",
+                            crate::director_loop::local_knowledge_without_web_directive()
+                        );
+                        est_tokens = crate::director_loop::approx_tokens(&redirective);
+                        if session.send_turn(redirective).await.is_ok() {
+                            // Fresh attempt: the refused turn produced no usable output.
+                            text.clear();
+                            pitfalls.clear();
+                            in_tool_call = false;
+                            tool_activity.clear();
+                            continue;
+                        }
+                        // Send failed → the session is going away; settle honestly below.
+                    }
+                }
                 // Outstanding-background-agents guard: a CLEAN finish while the
                 // doer's own background sub-agents still run is a premature settle
                 // (the step would be verified against work that hasn't landed, and
@@ -3948,6 +4018,215 @@ mod tests {
             }
             other => panic!("expected hard stop on empty code run, got {other:?}"),
         }
+    }
+
+    // ── Capability degrade: a refused hosted web_search during research ─────
+
+    /// The user's screenshot-confirmed repro as a base-reported turn FAILURE: a lite
+    /// model / CC-Switch proxy rejects a hosted `web_search`. Classifies as the tight
+    /// [`crate::base_error::BaseFailure::CapabilityUnsupported`] class.
+    fn web_search_refused_turn() -> SessionEvent {
+        SessionEvent::TurnDone {
+            status: TurnStatus::Failed(
+                "GPT-5.6 Responses Lite 不支持 hosted tool 类型 web_search; 请使用客户端扩展工具"
+                    .to_string(),
+            ),
+            usage: None,
+        }
+    }
+
+    /// A GENUINE (non-capability) failure — a real auth 401 — for the "must still
+    /// hard-fail" negative cases.
+    fn auth_failed_turn() -> SessionEvent {
+        SessionEvent::TurnDone {
+            status: TurnStatus::Failed("HTTP 401 Unauthorized: invalid api key".to_string()),
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn research_capability_rejection_degrades_and_continues_to_docs() {
+        // THE BUG FIX: a standard build must NOT halt when the base's web_search is
+        // refused during research. The research turn fails with the proxy 400, the
+        // pipeline DEGRADES to local knowledge (writing the research stub), and the
+        // build continues to Docs and pauses at the docs gate as usual — never a hard
+        // stop that forces the user into /quick.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, rec) = sink();
+        // research turn: web_search refused; docs turn: clean.
+        let mut session = FakeBaseSession::new(vec![vec![web_search_refused_turn()], vec![done()]]);
+        let sent = session.sent_handle();
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+
+        assert_eq!(
+            outcome,
+            RunOutcome::PausedAtGate(Gate::DocsConfirm),
+            "a refused web_search degrades research, it does not halt the build"
+        );
+        // Both directives ran (research, then docs) — the build proceeded past research.
+        assert_eq!(sent.lock().unwrap().len(), 2, "research + docs both drove");
+        // The degrade was surfaced (never silent).
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(s) if s.contains("web_search"))),
+            "the research degrade note was surfaced"
+        );
+        // A local-knowledge research brief exists for Docs to build on.
+        assert!(
+            tmp.path().join("output/demo-research.md").exists(),
+            "the fallback research brief was written"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_rejection_outside_research_still_hard_stops() {
+        // The SAME capability class in a CODE phase (Backend) is NOT advisory — only
+        // the research seam degrades. This is what keeps the degrade from ever
+        // swallowing a build-phase failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Auto,
+        );
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![web_search_refused_turn()]]);
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Backend).await;
+        match outcome {
+            RunOutcome::HardStop(reason) => {
+                assert!(reason.contains("backend"), "backend hard-stopped: {reason}");
+            }
+            other => panic!("a capability rejection in Backend must hard-stop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn genuine_failure_in_research_still_hard_stops() {
+        // A real auth failure in research is NOT the capability class → still a hard
+        // stop. The degrade must never swallow a genuine failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard with login",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![auth_failed_turn()]]);
+
+        let outcome = run_block(&mut session, &options, &events, Phase::Research).await;
+        assert!(
+            matches!(outcome, RunOutcome::HardStop(_)),
+            "a genuine auth failure in research must hard-stop, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rework_pump_degrades_a_research_capability_rejection_once() {
+        // The seat-driven build path (director `summon` → this pump): a
+        // research/planning summon whose web_search is refused is re-driven ONCE on
+        // local knowledge, so the step converges instead of stranding the build.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, rec) = sink();
+        let mut session = FakeBaseSession::new(vec![
+            vec![web_search_refused_turn()],
+            vec![
+                SessionEvent::TextDelta("done from local knowledge".to_string()),
+                done(),
+            ],
+        ]);
+        let sent = session.sent_handle();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+
+        let rework = drive_rework_turn_capturing(
+            &mut session,
+            &options,
+            &events,
+            "Produce the research brief: competitive analysis and similar products.".to_string(),
+            deadline,
+        )
+        .await;
+
+        assert!(rework.done, "the degraded research summon converged");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 2, "re-driven exactly once");
+        assert!(
+            sent[1].contains("LOCAL KNOWLEDGE"),
+            "the re-drive carried the no-web-research directive: {}",
+            sent[1]
+        );
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(s) if s.contains("web_search"))),
+            "the degrade note was surfaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn rework_pump_does_not_degrade_a_code_capability_rejection() {
+        // The same class on a CODE rework directive (no research framing) is NOT
+        // degraded — the summon ends not-done, exactly as before. This proves the
+        // research/planning framing gate is real, not a rubber stamp.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![web_search_refused_turn()]]);
+        let sent = session.sent_handle();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+
+        let rework = drive_rework_turn_capturing(
+            &mut session,
+            &options,
+            &events,
+            "Implement the login API route in src/api/login.ts; validate inputs and run the build."
+                .to_string(),
+            deadline,
+        )
+        .await;
+
+        assert!(!rework.done, "a code rework is not degraded");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "no re-drive on a code directive"
+        );
+    }
+
+    #[tokio::test]
+    async fn rework_pump_does_not_degrade_a_genuine_failure() {
+        // A real auth failure on a research directive is NOT the capability class →
+        // not degraded (never swallow a genuine failure).
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::new(vec![vec![auth_failed_turn()]]);
+        let sent = session.sent_handle();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+
+        let rework = drive_rework_turn_capturing(
+            &mut session,
+            &options,
+            &events,
+            "Produce the research brief with competitive analysis.".to_string(),
+            deadline,
+        )
+        .await;
+
+        assert!(!rework.done, "a genuine failure is not degraded");
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "no re-drive on a genuine failure"
+        );
     }
 
     // ── NeedApproval routing under trust modes ─────────────────────────────

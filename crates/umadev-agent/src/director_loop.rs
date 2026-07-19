@@ -2273,6 +2273,73 @@ pub(crate) fn wrapup_suppression_note() -> &'static str {
      blocking-item rework)."
 }
 
+/// Whether a turn's directive is a RESEARCH / PLANNING / core-doc-authoring turn —
+/// the advisory seam where a base legitimately reaches for live web research (and so
+/// where a gateway's refusal of a hosted `web_search` may be DEGRADED past instead of
+/// hard-failing the whole build). Pure substring scan over the lowercased directive.
+///
+/// This is the SECONDARY gate the capability degrade is bound to (the primary being
+/// the tight [`crate::base_error::is_capability_degradable`] class): the two together
+/// are what confine the degrade to the research/planning seam and keep a genuine code
+/// failure — never this class, and never on one of these directives — on its honest
+/// hard-fail path.
+///
+/// The markers are curated to fire on UmaDev's OWN research/planning/doc-authoring
+/// directives (the `research_prompt` / coach research framing, the "produce the three
+/// core documents" docs framing, and the `output/<slug>-{research,prd,architecture,
+/// uiux}.md` deliverable paths a doc-authoring seat step names) while staying ABSENT
+/// from the universal build preamble ([`crate::experts::agentic_engineering_rules`]),
+/// the per-step goal/route frames, and a pure frontend/backend code step's directive —
+/// so a code turn does not read as a research turn.
+#[must_use]
+pub(crate) fn is_research_or_planning_directive(directive: &str) -> bool {
+    let hay = directive.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "research",             // research brief / research phase / product research
+        "web search",           // the research method's live-web instruction
+        "web_search",           // the hosted tool the gateway refused, named in-directive
+        "search wide",          // research_prompt's "SEARCH WIDE first"
+        "product researcher",   // the research persona
+        "design strategist",    // the research persona
+        "competitive analysis", // a research-brief section
+        "similar products",     // a research-brief section
+        "market positioning",   // a research-brief section
+        "discovery section",    // the research Discovery section
+        "product requirements", // the PRD authoring frame
+        "core document",        // "produce ALL THREE core documents"
+        "-research.md",         // the research deliverable path
+        "-prd.md",              // the PRD deliverable path (doc authoring)
+        "-architecture.md",     // the architecture deliverable path (doc authoring)
+        "-uiux.md",             // the UIUX deliverable path (doc authoring)
+    ];
+    MARKERS.iter().any(|m| hay.contains(m))
+}
+
+/// The directive addendum appended for a ONE-SHOT capability degrade re-drive: it
+/// tells the base its hosted web tool was refused by the gateway and to PROCEED on
+/// LOCAL KNOWLEDGE WITHOUT web research rather than stalling. Deliberately harmless to
+/// append to any turn — a turn that was not going to web-search is unaffected — so the
+/// degrade can only ever help, never corrupt a real code turn.
+#[must_use]
+pub(crate) fn local_knowledge_without_web_directive() -> &'static str {
+    "\n\n## Web research is unavailable — proceed on LOCAL KNOWLEDGE\n\
+     The gateway for this model REJECTED your hosted web-search tool, so it cannot be \
+     used on this run. Do NOT attempt `web_search` or any hosted web tool again. \
+     Complete this step NOW using only the local knowledge provided, the requirement, \
+     and your own domain reasoning — where you would have cited live competitor / \
+     market data, mark it as an assumption to verify rather than stopping. Do not ask \
+     me and do not abandon the step; produce the deliverable and end your turn."
+}
+
+/// The user-facing Note emitted when a research/planning turn degrades past a refused
+/// hosted web tool. Bilingual literal (no i18n key needed for a single operator line),
+/// matching the `team ·`-style operator notes this loop already emits.
+#[must_use]
+pub(crate) fn capability_degrade_note() -> &'static str {
+    "team · 底座的 web_search 被网关拒绝 — 研究阶段降级为本地知识,继续构建 \
+     (base web_search rejected by the gateway — research degraded to local knowledge, continuing)"
+}
+
 /// The directive (Change 2) that drives the ONE integrated final report at convergence,
 /// AFTER the review → rework loop has settled. Because the base session is CONTINUOUS
 /// (it accumulated the full build + every rework across steps), the base can produce a
@@ -5545,6 +5612,13 @@ async fn drive_one_turn_with_backoff_and_memories(
     // re-drive has already fired (a SINGLE re-drive).
     let mut transient_retries: u32 = 0;
     let mut watchdog_retried = false;
+    // Capability degrade (bounded SINGLE re-drive): a research/planning turn whose
+    // hosted web tool the gateway refused is re-driven ONCE, told to proceed on local
+    // knowledge WITHOUT web research, instead of hard-failing the whole build. Gated
+    // strictly on the tight capability class AND this directive's research/planning
+    // framing (see the `TurnStatus::Failed` arm below); a genuine build failure is
+    // never this class, and a second failure falls through to the honest hard-fail.
+    let mut capability_redriven = false;
     // Tool-aware idle grace: while the base is plausibly mid-tool (a tool-use event
     // seen, no result yet) it is legitimately SILENT for minutes (a docker build / a
     // compile / npm install / a long test), so the next wait uses the extended tool
@@ -5982,6 +6056,38 @@ async fn drive_one_turn_with_backoff_and_memories(
                 }
                 TurnStatus::Failed(reason) => {
                     record_turn_usage(options, events, usage, est_tokens);
+                    let failure = crate::base_error::classify(None, None, Some(&reason));
+                    // CAPABILITY DEGRADE (research/planning turns only): the base is
+                    // ALIVE and answered, but the gateway refused ONE optional hosted
+                    // tool it reached for (a hosted `web_search`). On the advisory
+                    // research/planning seam this must NOT hard-fail the whole build —
+                    // re-drive ONCE, telling the base to proceed on LOCAL KNOWLEDGE
+                    // without web research. Gated STRICTLY on the tight capability class
+                    // AND this directive's research/planning framing, and bounded to a
+                    // single re-drive within the run `deadline`; a genuine build failure
+                    // is never this class, a non-research turn never matches the framing,
+                    // and a SECOND failure falls through to the honest hard-fail below.
+                    if crate::base_error::is_capability_degradable(&failure)
+                        && is_research_or_planning_directive(&directive)
+                        && !capability_redriven
+                        && std::time::Instant::now() < deadline
+                    {
+                        capability_redriven = true;
+                        events.emit(EngineEvent::Note(capability_degrade_note().to_string()));
+                        let redirective =
+                            format!("{directive}{}", local_knowledge_without_web_directive());
+                        if let Err(e) = session.send_turn(redirective.clone()).await {
+                            return Err(format!("session send: {e}"));
+                        }
+                        // Fresh attempt: the refused turn produced no usable output.
+                        est_tokens = approx_tokens(&redirective);
+                        text.clear();
+                        pitfalls.clear();
+                        in_tool_call = false;
+                        tool_activity.clear();
+                        ran_build_tool = false;
+                        continue;
+                    }
                     // Visible bounded backoff-retry on a TRANSIENT base failure (a 429
                     // rate limit, an overloaded base, a network blip): the base hit a
                     // RECOVERABLE hiccup, so emit a COUNTDOWN Note (never a silent wait),
@@ -5992,7 +6098,6 @@ async fn drive_one_turn_with_backoff_and_memories(
                     // classifier reads the base's OWN error text only (this `reason`),
                     // never an idle/ended settle, so an idle hang is never mistaken for a
                     // transient API error. Fail-open: the caller still NAMES the fix.
-                    let failure = crate::base_error::classify(None, None, Some(&reason));
                     if crate::base_error::is_transient(&failure)
                         && transient_retries < MAX_TRANSIENT_RETRIES
                         && std::time::Instant::now() < deadline

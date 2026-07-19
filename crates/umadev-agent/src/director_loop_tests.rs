@@ -481,6 +481,97 @@ async fn turn_done_real_usage_flows_through_drive_one_turn() {
     }
 }
 
+/// A base-reported turn FAILURE carrying the user's screenshot-confirmed proxy 400:
+/// a lite model / CC-Switch proxy rejects a hosted `web_search`.
+fn web_search_refused_turn() -> Vec<SessionEvent> {
+    vec![SessionEvent::TurnDone {
+        status: TurnStatus::Failed(
+            "GPT-5.6 Responses Lite 不支持 hosted tool 类型 web_search; 请使用客户端扩展工具"
+                .to_string(),
+        ),
+        usage: None,
+    }]
+}
+
+#[tokio::test]
+async fn drive_one_turn_degrades_a_research_capability_rejection_once() {
+    // The reported bug on the director turn pump: a research/planning turn whose
+    // hosted web_search the gateway refused is re-driven ONCE — told to proceed on
+    // local knowledge — instead of failing the whole build. The proxy 400 classifies
+    // as CapabilityUnsupported and the directive reads as research, so the pump
+    // degrades and the second (clean) turn wins.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, rec) = sink();
+    let turns = vec![
+        web_search_refused_turn(),
+        text_turn("research brief written from local knowledge"),
+    ];
+    let mut sess = FakeSession::new(turns, false, "");
+    let sent = sess.sent_handle();
+    let out = drive_one_turn(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        "Produce the research brief: competitive analysis and similar products.".to_string(),
+        IdleBudget::new(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        ),
+        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+    )
+    .await;
+    match out {
+        Ok(r) => assert_eq!(r.text, "research brief written from local knowledge"),
+        Err(e) => panic!("a research capability rejection must degrade + recover, got Err: {e}"),
+    }
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 2, "the turn was re-driven exactly once");
+    assert!(
+        sent[1].contains("LOCAL KNOWLEDGE"),
+        "the re-drive appended the no-web-research directive: {}",
+        sent[1]
+    );
+    assert!(
+        rec.events()
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Note(s) if s.contains("web_search"))),
+        "a degrade note was surfaced"
+    );
+}
+
+#[tokio::test]
+async fn drive_one_turn_does_not_degrade_a_code_step_capability_rejection() {
+    // The SAME capability class on a CODE directive (no research framing) is NOT
+    // degraded — it fails honestly. This proves the framing gate is real, so the
+    // degrade can never swallow a genuine build-step failure.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(vec![web_search_refused_turn()], false, "");
+    let sent = sess.sent_handle();
+    let out = drive_one_turn(
+        &mut sess,
+        &opts(tmp.path()),
+        &events,
+        "Implement the login API route in src/api/login.ts; validate inputs and run the build."
+            .to_string(),
+        IdleBudget::new(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        ),
+        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+    )
+    .await;
+    assert!(
+        out.is_err(),
+        "a non-research capability rejection is NOT degraded"
+    );
+    assert_eq!(
+        sent.lock().unwrap().len(),
+        1,
+        "no re-drive on a code directive"
+    );
+}
+
 #[tokio::test]
 async fn session_state_update_flows_through_director_turn_pump() {
     use umadev_runtime::{SessionMode, SessionStateUpdate};

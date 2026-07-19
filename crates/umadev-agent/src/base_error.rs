@@ -52,6 +52,19 @@ pub enum BaseFailure {
     /// The base is overloaded / at capacity / busy (529, codex JSON-RPC
     /// `-32001`). Transient — retry or switch model/base.
     Overloaded,
+    /// The base is ALIVE and answering, but the gateway/proxy refused ONE optional
+    /// HOSTED tool the base reached for (e.g. a hosted `web_search` a lite model or a
+    /// CC-Switch-style proxy does not expose). This is a CAPABILITY GAP in the
+    /// gateway, not a base failure: the base did not crash, hit a limit, lose auth,
+    /// or overflow context — it simply cannot use that one tool on this turn.
+    ///
+    /// Distinct handling: a UmaDev pipeline treats this as DEGRADABLE for an advisory
+    /// research/planning turn ([`is_capability_degradable`]) — proceed WITHOUT the
+    /// refused tool (fall back to local knowledge) rather than hard-stopping the whole
+    /// multi-phase build. It is deliberately NOT [`is_transient`]: re-issuing the SAME
+    /// call is futile (the gateway will refuse it again every time), so only re-driving
+    /// the turn WITHOUT the tool recovers — never a blind backoff-and-retry.
+    CapabilityUnsupported,
     /// The base process exited non-zero and nothing else matched; carries the
     /// captured exit code (`-1` when the process died without a parseable code,
     /// e.g. killed by a signal).
@@ -90,6 +103,16 @@ pub fn classify(
     let hay = hay.as_str();
 
     // Ordered, most-specific first. The first family to fire wins.
+    //
+    // Capability-rejection is checked FIRST, above auth/rate/overload: it names a
+    // SPECIFIC refused hosted tool (a gateway that answers the turn but rejects one
+    // tool), which is a more actionable — and more degradable — signal than the
+    // generic families below. Its markers are TIGHT (they require a hosted-tool /
+    // tool-name / client-tool token, never a bare status code), so a real auth 401,
+    // a bare HTTP 400, a network error, or a 429/529 never fall in here.
+    if is_capability_unsupported(hay) {
+        return BaseFailure::CapabilityUnsupported;
+    }
     if is_auth(hay) {
         return BaseFailure::Auth;
     }
@@ -130,6 +153,23 @@ pub fn is_transient(f: &BaseFailure) -> bool {
     )
 }
 
+/// Whether a [`BaseFailure`] is **capability-degradable** — the base is ALIVE and
+/// answering, but the gateway refused ONE optional hosted tool it reached for (a
+/// hosted `web_search`). An advisory research/planning turn can DEGRADE past this by
+/// proceeding on local knowledge WITHOUT the refused tool, so the whole build no
+/// longer hard-stops on a capability gap the proxy — not UmaDev — imposed.
+///
+/// This is intentionally DISJOINT from [`is_transient`]: a capability rejection is
+/// not a hiccup a blind retry can clear (the gateway refuses the SAME call every
+/// time), so it earns a re-drive WITHOUT the tool, never a backoff-and-retry. It is
+/// true ONLY for [`BaseFailure::CapabilityUnsupported`]; every other class (auth,
+/// context, exited, rate limit, overloaded, network, unknown) is `false`, so a
+/// genuine build failure is never degraded away. Pure.
+#[must_use]
+pub fn is_capability_degradable(f: &BaseFailure) -> bool {
+    matches!(f, BaseFailure::CapabilityUnsupported)
+}
+
 /// The per-base, actionable, localized diagnosis for a [`BaseFailure`].
 ///
 /// Returns a short imperative line that names the CONCRETE next command for THIS
@@ -149,7 +189,13 @@ pub fn actionable_message(f: &BaseFailure, backend: &str) -> String {
         BaseFailure::Network { ssl: true } => umadev_i18n::tl("base.fail.network.ssl").to_string(),
         BaseFailure::Context => umadev_i18n::tl("base.fail.context").to_string(),
         BaseFailure::Exited(code) => umadev_i18n::tlf("base.fail.exited", &[&code.to_string()]),
-        BaseFailure::Unknown => String::new(),
+        // The pipeline handles this class by DEGRADING (re-drive without the refused
+        // tool — see [`is_capability_degradable`]), not by asking the user to run a
+        // command, so there is no actionable remediation line to prepend. Fail-open
+        // like `Unknown`: an empty prefix keeps the raw base error verbatim, so if a
+        // capability rejection ever reaches a non-degradable seam the user still sees
+        // exactly what the gateway said.
+        BaseFailure::CapabilityUnsupported | BaseFailure::Unknown => String::new(),
     }
 }
 
@@ -299,6 +345,60 @@ fn auth_key(backend: &str) -> &'static str {
 // ---------------------------------------------------------------------------
 // Family detectors — each a pure substring scan over the lowercased haystack.
 // ---------------------------------------------------------------------------
+
+/// A gateway refused ONE optional HOSTED tool the base reached for (the base is
+/// alive and answering — this is a capability gap, not a base failure). The trigger
+/// case is a lite model / CC-Switch-style proxy that rejects a hosted `web_search`
+/// with e.g. `"…不支持 hosted tool 类型 web_search; 请使用客户端扩展工具"` or the
+/// English `"this model does not support the hosted tool web_search; use a
+/// client-side tool"`.
+///
+/// TIGHT by construction so it never over-matches a real failure: it fires ONLY when
+/// the evidence names a hosted-tool / client-tool token OR pairs a concrete
+/// tool-name/tool-type token with an explicit "unsupported" signal. A bare `HTTP
+/// 400`, an auth `401 unauthorized`, a network/SSL error, and a `429`/`529` name NO
+/// refused tool, so none of them land here (verified by the near-miss unit tests).
+fn is_capability_unsupported(hay: &str) -> bool {
+    // Unambiguous hosted/client tool-rejection phrases — each one, on its own, names
+    // a hosted-tool capability the gateway refused, so any single hit is enough.
+    const STRONG: &[&str] = &[
+        "hosted tool",
+        "hosted_tool",
+        "hosted web tool",
+        "unsupported tool",
+        "客户端扩展工具", // proxy: "use the client-side extension tool"
+        "客户端工具",     // shorter proxy variant
+        "client-side tool",
+        "client side tool",
+        "client-side extension",
+    ];
+    if STRONG.iter().any(|m| hay.contains(m)) {
+        return true;
+    }
+    // Otherwise require BOTH a concrete tool-name / tool-type token AND an explicit
+    // "unsupported" signal, together — so a bare status code, an auth failure, or a
+    // network error (none of which name a refused tool) can never combine into a
+    // false positive.
+    const TOOL_TOKEN: &[&str] = &[
+        "web_search",
+        "web search",
+        "tool type",
+        "tool 类型", // proxy: "hosted tool 类型 web_search"
+        "tool_type",
+    ];
+    const UNSUPPORTED: &[&str] = &[
+        "not supported",
+        "unsupported",
+        "doesn't support",
+        "does not support",
+        "not support",
+        "不支持",
+        "无法使用",
+    ];
+    let tool = TOOL_TOKEN.iter().any(|m| hay.contains(m));
+    let unsupported = UNSUPPORTED.iter().any(|m| hay.contains(m));
+    tool && unsupported
+}
 
 /// Not logged in / unauthorized / bad-or-expired key (401/403).
 fn is_auth(hay: &str) -> bool {
@@ -555,6 +655,116 @@ mod tests {
         assert!(!is_transient(&BaseFailure::Context));
         assert!(!is_transient(&BaseFailure::Exited(2)));
         assert!(!is_transient(&BaseFailure::Unknown));
+        // A capability rejection is NOT transient — retrying the same call is futile,
+        // it must be DEGRADED (re-drive without the tool), never backed-off-and-retried.
+        assert!(!is_transient(&BaseFailure::CapabilityUnsupported));
+    }
+
+    #[test]
+    fn capability_unsupported_from_the_exact_proxy_string() {
+        // The user's screenshot-confirmed repro: a CC-Switch proxy rejects a hosted
+        // web_search on a lite model with this exact Chinese message.
+        let proxy =
+            "GPT-5.6 Responses Lite 不支持 hosted tool 类型 web_search; 请使用客户端扩展工具";
+        assert_eq!(
+            classify(None, None, Some(proxy)),
+            BaseFailure::CapabilityUnsupported
+        );
+        // The same rejection worded in English (a different gateway).
+        assert_eq!(
+            classify(
+                None,
+                Some("Error: this model does not support the hosted tool web_search; use a client-side tool instead"),
+                None,
+            ),
+            BaseFailure::CapabilityUnsupported
+        );
+        // The pairing form: a tool-name/tool-type token + an explicit unsupported
+        // signal, with NO standalone "hosted tool" phrase present.
+        assert_eq!(
+            classify(
+                None,
+                Some("tool type web_search is not supported by this model"),
+                None
+            ),
+            BaseFailure::CapabilityUnsupported
+        );
+    }
+
+    #[test]
+    fn capability_unsupported_does_not_over_match_real_failures() {
+        // A real AUTH 401 names no refused tool → Auth, never capability.
+        assert_eq!(
+            classify(None, Some("HTTP 401 Unauthorized: invalid api key"), None),
+            BaseFailure::Auth
+        );
+        // A BARE 400 (no tool token, no unsupported+tool pairing) → not capability.
+        assert_ne!(
+            classify(None, Some("HTTP 400 Bad Request"), None),
+            BaseFailure::CapabilityUnsupported
+        );
+        // A network / SSL failure → Network, never capability.
+        assert_eq!(
+            classify(None, Some("connect ETIMEDOUT: request timed out"), None),
+            BaseFailure::Network { ssl: false }
+        );
+        assert_eq!(
+            classify(None, Some("SSL handshake failed"), None),
+            BaseFailure::Network { ssl: true }
+        );
+        // A 429 rate limit and a 529 overloaded → their own classes, never capability.
+        assert_eq!(
+            classify(None, Some("429 Too Many Requests"), None),
+            BaseFailure::RateLimit
+        );
+        assert_eq!(
+            classify(None, Some("HTTP 529 overloaded"), None),
+            BaseFailure::Overloaded
+        );
+        // Bare "unsupported" with no tool token, or a bare tool name with no
+        // "unsupported" signal, must NOT combine into a false positive.
+        assert_ne!(
+            classify(None, Some("this operation is unsupported"), None),
+            BaseFailure::CapabilityUnsupported
+        );
+        assert_ne!(
+            classify(
+                None,
+                Some("the base used web search to find the answer"),
+                None
+            ),
+            BaseFailure::CapabilityUnsupported
+        );
+    }
+
+    #[test]
+    fn is_capability_degradable_only_for_the_new_class() {
+        // True ONLY for the new class — so degrade wiring can never fire on a genuine
+        // failure of any other kind.
+        assert!(is_capability_degradable(
+            &BaseFailure::CapabilityUnsupported
+        ));
+        for f in [
+            BaseFailure::Auth,
+            BaseFailure::RateLimit,
+            BaseFailure::Overloaded,
+            BaseFailure::Network { ssl: false },
+            BaseFailure::Network { ssl: true },
+            BaseFailure::Context,
+            BaseFailure::Exited(1),
+            BaseFailure::Unknown,
+        ] {
+            assert!(!is_capability_degradable(&f), "not degradable: {f:?}");
+        }
+    }
+
+    #[test]
+    fn diagnose_turn_failure_keeps_the_raw_capability_rejection_verbatim() {
+        // Fail-open: a capability rejection has no actionable command to prepend, so
+        // the user still sees the gateway's real words (the degrade path handles
+        // recovery; this only governs what surfaces if it reaches a hard seam).
+        let raw = "GPT-5.6 Responses Lite 不支持 hosted tool 类型 web_search; 请使用客户端扩展工具";
+        assert_eq!(diagnose_turn_failure(raw, "codex"), raw);
     }
 
     #[test]
