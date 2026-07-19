@@ -528,13 +528,22 @@ fn is_create_request(requirement: &str) -> bool {
 /// fallback (class, depth). Deterministic and intentionally cautious: on the
 /// healthy path the model replaces this semantic guess in either direction.
 fn floor_class_depth(kind: TaskKind, is_work: bool, requirement: &str) -> (RouteClass, Depth) {
-    // Empty / whitespace → chat (nothing to do).
+    // Empty / whitespace → Chat. This is the ONLY deterministic case that forbids
+    // tools: there is genuinely nothing to inspect or do, so a toolless conversational
+    // turn is correct.
     if requirement.trim().is_empty() {
         return (RouteClass::Chat, Depth::Fast);
     }
-    // A non-work message (greeting / opinion / chit-chat) is Chat.
+    // A message the keyword table can't read as work (e.g. "找 tm 的源码在哪里" — a
+    // read-only "where is X" the list doesn't cover) must NOT fall through to a toolless
+    // Chat. A deterministic FALLBACK is an "I can't classify" guess, and forbidding
+    // read-only tools on a guess strands the base — told "I can't use tools this turn" —
+    // on a request it could answer just by looking. Read-only inspection can never harm
+    // the workspace, so the safe floor is Explain (read/search allowed), not Chat.
+    // Toolless Chat is reserved for empty input (above) or a CONFIDENT brain "chat"
+    // verdict — never a fallback guess.
     if !is_work {
-        return (RouteClass::Chat, Depth::Fast);
+        return (RouteClass::Explain, Depth::Fast);
     }
     match kind {
         // A real product / greenfield build → the deliberate path.
@@ -1000,10 +1009,14 @@ async fn consult_route(
 /// UmaDev depends on
 /// the base ecosystem, so the base's own model is the judge of "chat vs. a small
 /// edit vs. a real build" — far better than any keyword table. There is
-/// intentionally **no deterministic keyword classifier** in this path: if the
-/// brain is unreachable the product cannot run anyway, and a failed / garbage
-/// consult degrades to the lightest path ([`RouteClass::Chat`]) so the turn still
-/// reaches the base (which will surface any real connectivity error itself).
+/// intentionally **no deterministic keyword classifier** in this path. Degradation is
+/// tiered by what failed: a completely UNREACHABLE brain still passes the turn through
+/// as a bare [`RouteClass::Chat`] (the base can't act at all, so tools are moot, and
+/// it surfaces any real connectivity error itself), but a reply that PARSES yet garbles
+/// its `class` field defaults to the read-only inspection lane ([`RouteClass::Explain`])
+/// — a fallback guess must never FORBID read/search tools, which can't harm the
+/// workspace. Toolless Chat is reserved for empty input or a CONFIDENT brain "chat"
+/// verdict, never an "I can't classify" fallback.
 ///
 /// `runtime` is a freshly-built brain (`build_brain`) the caller owns; this fn does
 /// not mutate the workspace and opens no session.
@@ -1116,7 +1129,12 @@ fn brain_to_route_in_mode(
     requirement: &str,
     mode: crate::trust::TrustMode,
 ) -> RoutePlan {
-    let mut class = parse_class(&brain.class).unwrap_or(RouteClass::Chat);
+    // An unparseable/garbled `class` field is a FALLBACK, not a confident verdict:
+    // default it to the read-only inspection lane (Explain), never a toolless Chat —
+    // forbidding read/search tools on a degraded reply strands a reachable base that
+    // could still answer by looking. A CONFIDENTLY parsed "chat" verdict is honored as
+    // Chat (see `parse_class`); only the unrecognized-value default moved Chat → Explain.
+    let mut class = parse_class(&brain.class).unwrap_or(RouteClass::Explain);
     // Default kind: a mutating class (build / quick-edit / debug) whose `kind` field
     // is unparseable must NOT fall back to `Light` — `Light` convenes ZERO team, so a
     // brain that says "build, complex" but garbles `kind` would silently lose the
@@ -1894,6 +1912,39 @@ mod tests {
         assert!(p.team.is_empty());
     }
 
+    #[test]
+    fn brain_garbled_class_defaults_to_explain_not_chat() {
+        // A reply that parses as JSON but whose `class` field is UNRECOGNIZED ("mystery")
+        // is a FALLBACK, not a verdict: it defaults to the read-only Explain lane, never a
+        // toolless Chat — a degraded reply must not forbid read/search tools the base
+        // could use to answer. No `authorization` → still read-only, no team.
+        let garbled = brain_to_route(
+            &BrainRoute {
+                class: "mystery".to_string(),
+                kind: "light".to_string(),
+                complexity: "simple".to_string(),
+                ..Default::default()
+            },
+            "找 tm 的源码在哪里",
+        );
+        assert_eq!(garbled.class, RouteClass::Explain);
+        assert!(!garbled.class.mutates_workspace());
+        assert!(garbled.team.is_empty());
+
+        // The flip side stays Chat: a CONFIDENTLY parsed "chat" verdict is an explicit
+        // brain decision, not a fallback guess, so it is honored as a toolless Chat.
+        let confident_chat = brain_to_route(
+            &BrainRoute {
+                class: "chat".to_string(),
+                kind: "light".to_string(),
+                complexity: "simple".to_string(),
+                ..Default::default()
+            },
+            "你好",
+        );
+        assert_eq!(confident_chat.class, RouteClass::Chat);
+    }
+
     #[tokio::test]
     async fn brain_prose_then_json_retry_recovers_a_build() {
         // LOW #1: the brain narrates intent on the FIRST reply (no JSON) — a real
@@ -2021,12 +2072,19 @@ mod tests {
 
     #[tokio::test]
     async fn brain_unavailable_degrades_to_chat_not_a_keyword_guess() {
-        // Offline / unreachable brain → the lightest path (Chat), NOT a keyword
-        // classifier. We depend on the base ecosystem; there is no deterministic
-        // fallback classifier on this path by design.
+        // A fully OFFLINE / unreachable brain → the base can't act at all this turn, so
+        // the lightest pass-through (Chat) is fine and we still avoid a keyword
+        // classifier. This is DISTINCT from a REACHABLE brain whose reply garbles
+        // `class` — that defaults to read-only Explain (see
+        // `brain_garbled_class_defaults_to_explain_not_chat`), because there the base CAN
+        // look and a fallback must never forbid read-only tools.
         let offline = umadev_runtime::OfflineRuntime::new(RuntimeKind::Anthropic);
         let p = route_via_brain(&offline, "做一个待办应用").await;
-        assert_eq!(p.class, RouteClass::Chat, "no brain → pass-through chat");
+        assert_eq!(
+            p.class,
+            RouteClass::Chat,
+            "unreachable brain → pass-through chat"
+        );
     }
 
     #[test]
@@ -2079,12 +2137,32 @@ mod tests {
     // ── Tier-0 deterministic classification ──
 
     #[tokio::test]
-    async fn tier0_greeting_is_chat_no_session() {
+    async fn tier0_non_work_fallback_is_read_only_explain_no_session() {
+        // No brain: a message the keyword table can't read as work ("你好,在吗?") must NOT
+        // fall through to a toolless Chat. A deterministic fallback is an "I can't
+        // classify" guess, and read-only tools can't harm the workspace, so the safe
+        // floor is Explain (read/search allowed), not Chat. Still Fast, still no team.
         let p = route(None, &opts(), "你好,在吗?").await;
-        assert_eq!(p.class, RouteClass::Chat);
+        assert_eq!(p.class, RouteClass::Explain);
         assert_eq!(p.depth, Depth::Fast);
         assert!(p.team.is_empty());
         assert!(p.needs_clarify.is_none());
+    }
+
+    #[tokio::test]
+    async fn reported_find_source_request_floors_to_explain_not_chat() {
+        // Regression for the reported mis-route: "找 tm 的源码在哪里" (find where tm's
+        // source is) is a READ-ONLY inspection, but the keyword table doesn't cover
+        // "找/源码/在哪里", so is_work=false. Before the fix it fell to a toolless Chat and
+        // the base was told "I can't use tools this turn" and looped. With the read-only
+        // fallback floor the deterministic route is Explain, so the base can actually go
+        // look — and NO keyword was added to make this happen.
+        for req in ["找 tm 的源码在哪里", "where is the repo"] {
+            let p = route(None, &opts(), req).await;
+            assert_eq!(p.class, RouteClass::Explain, "{req}");
+            assert!(!p.class.mutates_workspace(), "{req}");
+            assert!(p.team.is_empty(), "{req}");
+        }
     }
 
     #[tokio::test]
@@ -2245,6 +2323,10 @@ mod tests {
 
     #[tokio::test]
     async fn tier0_empty_requirement_is_chat() {
+        // Empty/whitespace is the ONE deterministic case that still forbids tools: there
+        // is genuinely nothing to inspect or do, so a toolless Chat is correct (a
+        // non-empty non-work message instead floors to read-only Explain — see
+        // `tier0_non_work_fallback_is_read_only_explain_no_session`).
         let p = route(None, &opts(), "   ").await;
         assert_eq!(p.class, RouteClass::Chat);
     }

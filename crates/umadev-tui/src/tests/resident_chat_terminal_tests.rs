@@ -2320,12 +2320,22 @@ fn first_chat_directive_prefixes_firmware_only_for_non_claude() {
 
 #[test]
 fn scope_contract_is_route_sized_and_history_is_not_authority() {
-    let read = scoped_chat_directive(
-        "what is Rust?",
-        &umadev_agent::deterministic_route("what is Rust?"),
-    );
+    // The toolless Chat lane. A deterministic fallback no longer PICKS Chat for a bare
+    // question ("what is Rust?" now floors to read-only Explain so the base may look), so
+    // exercise the toolless-Chat directive via an explicit Chat class — the lane text is
+    // what this asserts, plus the shared "context only" authority framing.
+    let mut chat_route = umadev_agent::deterministic_route("what is Rust?");
+    chat_route.class = umadev_agent::RouteClass::Chat;
+    let read = scoped_chat_directive("what is Rust?", &chat_route);
     assert!(read.contains("without tools, commands, file writes, reviews, or QC"));
     assert!(read.contains("context only"));
+
+    // The fix at the directive boundary: a bare question now floors to Explain (read/
+    // search allowed), NOT toolless Chat, so a read-only "where is X" is never stranded.
+    assert_eq!(
+        umadev_agent::deterministic_route("what is Rust?").class,
+        umadev_agent::RouteClass::Explain
+    );
 
     let mut explain_route = umadev_agent::deterministic_route("what is Rust?");
     explain_route.class = umadev_agent::RouteClass::Explain;
