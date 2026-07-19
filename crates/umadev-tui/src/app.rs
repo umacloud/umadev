@@ -9281,8 +9281,13 @@ impl App {
                     self.push(ChatRole::Host, trimmed);
                 }
             }
-            EngineEvent::TurnUsage { usage } => {
+            EngineEvent::TurnUsage { usage, est_tokens } => {
+                // The base's REAL reported usage drives the session total; the
+                // estimate is tracked in a strictly-separate sibling field (never
+                // summed) and surfaces only as a labeled lower-bound fallback when
+                // the base has reported nothing all session.
                 self.session_usage.apply(usage);
+                self.session_usage.observe_estimate(est_tokens);
                 self.maybe_nudge_compaction();
             }
             EngineEvent::BaseModel { id } => {

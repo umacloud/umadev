@@ -1047,6 +1047,9 @@
 # 元信息行的常驻整轮 token / 成本计量。精确、下界和未知状态不能混淆。
 "tui.gauge.tokens" = "▍ {} tokens"
 "tui.gauge.tokens_lower_bound" = "▍ ≥{} tokens"
+# 仅当底座未上报真实用量时显示的明确估算下界（chars/4），绝不冒充底座自己的数字。
+# `· 估算` 标记使其与上面真实的 tokens_lower_bound 明显区分。
+"tui.gauge.tokens_estimate" = "▍ ≥{} tokens · 估算"
 "tui.gauge.usage_unknown" = "▍ 用量未知"
 "tui.meta.model" = "模型 {}"
 "tui.gauge.cost" = "≈${}"
@@ -1054,6 +1057,7 @@
 "tui.gauge.cost_unknown" = "成本未知"
 "tui.wait.tokens" = "{} token"
 "tui.wait.tokens_lower_bound" = "≥{} token"
+"tui.wait.tokens_estimate" = "≥{} token · 估算"
 "tui.wait.usage_unknown" = "用量未知"
 "tui.gauge.context" = "上下文 {}/{} · {}%"
 # 空闲时双击 Esc 回退提示(Feature B):第一次 Esc 预备,第二次把上一条消息载回输入框编辑并重发。

@@ -1066,6 +1066,10 @@
 # reports remain visually distinct.
 "tui.gauge.tokens" = "▍ {} tokens"
 "tui.gauge.tokens_lower_bound" = "▍ ≥{} tokens"
+# Clearly-labeled estimate shown ONLY when the base reports no real usage — a
+# `chars/4` lower bound, never passed off as the base's own count. The `· est.`
+# tag keeps it visibly distinct from the real `tokens_lower_bound` above.
+"tui.gauge.tokens_estimate" = "▍ ≥{} tokens · est."
 "tui.gauge.usage_unknown" = "▍ usage unknown"
 "tui.meta.model" = "model {}"
 "tui.gauge.cost" = "≈${}"
@@ -1073,6 +1077,7 @@
 "tui.gauge.cost_unknown" = "cost unknown"
 "tui.wait.tokens" = "{} token"
 "tui.wait.tokens_lower_bound" = "≥{} token"
+"tui.wait.tokens_estimate" = "≥{} token · est."
 "tui.wait.usage_unknown" = "usage unknown"
 # Live context-window occupancy gauge (Feature: ctx usage). `{}` are the current
 # context size, the exact configured context window, and the rounded percent —

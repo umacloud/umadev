@@ -2192,6 +2192,64 @@ static OPENCODE_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// flake). Poison-robust so a panic in one never cascades.
 static GOAL_MODE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[test]
+fn chat_turn_usage_carries_a_labeled_estimate_and_routes_it_to_the_ledger() {
+    // A proxy/relay turn where the base reports NO real usage. The chat path must
+    // still (a) carry a deterministic chars/4 estimate of prompt + reply on the
+    // TurnUsage event so the gauge can show a clearly-LABELED lower bound — while
+    // the base's own (absent) usage rides through untouched — and (b) hand that
+    // SAME estimate (never zero, never a fabricated real count) to `/usage`.
+    //
+    // The recorded number lands in ~/.umadev (HOME), so — mirroring the default
+    // loop's `turn_done_real_usage_flows_through_drive_one_turn` — we assert the
+    // routed VALUE and the emitted event, not the process-global ledger file
+    // (reading it would race every sibling test that also records usage).
+    let prompt = "please refactor the login handler and add a regression test";
+    let reply = "done — split the handler, added coverage, everything is green";
+    let expected_est = umadev_agent::director_loop::approx_tokens(prompt)
+        .saturating_add(umadev_agent::director_loop::approx_tokens(reply));
+    assert!(
+        expected_est > 0,
+        "a non-empty relay turn has a non-zero estimate"
+    );
+
+    // (b) With no real usage, the value routed to `record_estimated_usage` is the
+    // estimate itself — this is what keeps `/usage` honest on relayed chat turns.
+    assert_eq!(
+        umadev_agent::director_loop::real_or_estimated_tokens(None, expected_est),
+        expected_est,
+        "the ledger receives the estimate, not zero, when the base reports nothing"
+    );
+    // …and a REAL base report wins over the estimate for the ledger too — the
+    // estimate is only ever the fallback, never summed with the real count.
+    let real = umadev_runtime::Usage::exact(400, 100);
+    assert_eq!(
+        umadev_agent::director_loop::real_or_estimated_tokens(Some(real), expected_est),
+        real.total_tokens,
+        "a real base report wins over the estimate for the ledger"
+    );
+
+    // (a) The emitted event carries the estimate ALONGSIDE the base's (absent) real
+    // usage — the strictly-separate signal the live gauge reads.
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    emit_chat_turn_usage(&sink, "grok-build", None, prompt, reply);
+    let ev = engine_rx.try_recv().expect("a TurnUsage event was emitted");
+    match ev {
+        EngineEvent::TurnUsage { usage, est_tokens } => {
+            assert!(
+                usage.is_none(),
+                "the base's own (absent) usage is passed through untouched"
+            );
+            assert_eq!(
+                est_tokens, expected_est,
+                "the estimate is the chars/4 approximation of prompt + reply"
+            );
+        }
+        other => panic!("expected TurnUsage, got {other:?}"),
+    }
+}
+
 /// Serializes the theme-detection tests: they all read/write the process-global
 /// UMADEV_THEME / COLORFGBG / TERM_PROGRAM env vars, so without this a set_var in
 /// one could leak into a concurrent sibling reader and flip its verdict.

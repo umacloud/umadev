@@ -5735,6 +5735,7 @@ fn session_tokens_accumulate_across_turns_and_reset_on_clear() {
     // The base reports per-turn usage; the gauge total sums input+output.
     a.apply_engine(EngineEvent::TurnUsage {
         usage: Some(Usage::exact(1_200, 800)),
+        est_tokens: 0,
     });
     assert_eq!(
         a.session_usage.tokens(),
@@ -5743,6 +5744,7 @@ fn session_tokens_accumulate_across_turns_and_reset_on_clear() {
     );
     a.apply_engine(EngineEvent::TurnUsage {
         usage: Some(Usage::exact(500, 500)),
+        est_tokens: 0,
     });
     assert_eq!(
         a.session_usage.tokens(),

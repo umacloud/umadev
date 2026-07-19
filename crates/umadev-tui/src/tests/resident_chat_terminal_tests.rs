@@ -478,7 +478,7 @@ async fn chat_reuses_one_resident_session_across_turns() {
         if matches!(&ev, EngineEvent::IntentDecided { .. }) {
             saw_intent = true;
         }
-        if matches!(&ev, EngineEvent::TurnUsage { usage: Some(usage) } if *usage == reported_usage)
+        if matches!(&ev, EngineEvent::TurnUsage { usage: Some(usage), .. } if *usage == reported_usage)
         {
             saw_usage = true;
         }

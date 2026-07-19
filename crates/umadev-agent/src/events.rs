@@ -119,11 +119,19 @@ pub enum EngineEvent {
     /// A human-readable progress note (free-form).
     Note(String),
     /// Whole-prompt usage as reported by the base, emitted exactly once per
-    /// completed base turn. `None` means unknown; an incomplete report is a
-    /// lower bound rather than an exact zero/total.
+    /// completed base turn. `usage` is `None`/incomplete when the base reports
+    /// nothing (some proxy/relay setups); an incomplete report is a lower bound
+    /// rather than an exact zero/total.
     TurnUsage {
         /// Typed quality-bearing whole-prompt report, or unknown.
         usage: Option<Usage>,
+        /// The deterministic `chars/4` estimate (prompt + reply) for this turn.
+        /// It rides alongside the REAL `usage` but is kept STRICTLY separate from
+        /// it: the live meter surfaces it ONLY as a clearly-LABELED lower-bound
+        /// fallback when the base has reported no real usage all session — it is
+        /// never summed with, nor passed off as, the base's own count. Zero when
+        /// no estimate is available (nothing sent yet).
+        est_tokens: u64,
     },
     /// The base reported the EXACT model it resolved for the live session (from
     /// the session `init` frame — see `umadev_runtime::SessionEvent::SessionModel`).

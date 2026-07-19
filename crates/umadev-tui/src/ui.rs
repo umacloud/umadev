@@ -4525,6 +4525,17 @@ fn token_gauge_text(app: &App) -> Option<String> {
         return None;
     }
     if app.session_usage.is_incomplete() && app.session_usage.tokens() == 0 {
+        // The base reported no REAL usage this session. If a deterministic estimate
+        // exists, show it as a CLEARLY-LABELED lower bound (`≥N tokens · est.`) —
+        // never passed off as the base's own count. Otherwise the honest "unknown".
+        let est = app.session_usage.est_tokens();
+        if est > 0 {
+            return Some(umadev_i18n::tf(
+                app.lang,
+                "tui.gauge.tokens_estimate",
+                &[&fmt_token_count(est)],
+            ));
+        }
         return Some(umadev_i18n::t(app.lang, "tui.gauge.usage_unknown").to_string());
     }
     let token_key = if app.session_usage.is_incomplete() {
@@ -4549,6 +4560,16 @@ fn waiting_usage_text(app: &App) -> Option<String> {
         return None;
     }
     if app.session_usage.is_incomplete() && app.session_usage.tokens() == 0 {
+        // Same policy as the meta-row gauge: a labeled estimate lower bound beats a
+        // bare "usage unknown" when the base reports nothing, else stay honest.
+        let est = app.session_usage.est_tokens();
+        if est > 0 {
+            return Some(umadev_i18n::tf(
+                app.lang,
+                "tui.wait.tokens_estimate",
+                &[&fmt_token_count(est)],
+            ));
+        }
         return Some(umadev_i18n::t(app.lang, "tui.wait.usage_unknown").to_string());
     }
     let key = if app.session_usage.is_incomplete() {
@@ -9844,6 +9865,47 @@ mod tests {
             token_gauge_text(&app).as_deref(),
             Some("▍ 1.2K tokens · cost unknown"),
             "missing source cost is unknown, not a free or estimated bill"
+        );
+    }
+
+    #[test]
+    fn token_gauge_shows_labeled_estimate_only_when_the_base_reports_no_real_usage() {
+        let mut app = app_with(Some("grok-build"));
+        app.lang = umadev_i18n::Lang::En;
+
+        // The base reported nothing (None) but this turn carried a chars/4 estimate:
+        // the gauge shows a CLEARLY-LABELED lower bound, not a bare "usage unknown".
+        app.session_usage.apply(None);
+        app.session_usage.observe_estimate(12_000);
+        assert_eq!(
+            token_gauge_text(&app).as_deref(),
+            Some("▍ ≥12K tokens · est."),
+            "a labeled estimate replaces the bare unknown when the base reports nothing"
+        );
+        // The waiting-row gauge mirrors the same labeled-estimate policy.
+        assert_eq!(
+            waiting_usage_text(&app).as_deref(),
+            Some("≥12K token · est.")
+        );
+
+        // No estimate either → the honest "usage unknown" is preserved.
+        app.session_usage.reset();
+        app.session_usage.apply(None);
+        assert_eq!(
+            token_gauge_text(&app).as_deref(),
+            Some("▍ usage unknown"),
+            "with no real usage AND no estimate the gauge stays honestly unknown"
+        );
+
+        // A REAL report wins over any estimate: the real count is shown, never the
+        // estimate, and the two are never summed (12K est + 2K real is NOT 14K).
+        app.session_usage.reset();
+        app.session_usage.observe_estimate(12_000);
+        app.session_usage.apply(Some(Usage::exact(1_600, 400)));
+        assert_eq!(
+            token_gauge_text(&app).as_deref(),
+            Some("▍ 2.0K tokens · cost unknown"),
+            "a real base-reported count wins over the estimate and is never summed with it"
         );
     }
 

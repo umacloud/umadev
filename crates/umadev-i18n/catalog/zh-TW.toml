@@ -1048,6 +1048,9 @@
 # 參考費率(僅供參考)。
 "tui.gauge.tokens" = "▍ {} tokens"
 "tui.gauge.tokens_lower_bound" = "▍ ≥{} tokens"
+# 僅當底座未回報真實用量時顯示的明確估算下界(chars/4),絕不冒充底座自己的數字。
+# `· 估算` 標記使其與上方真實的 tokens_lower_bound 明顯區分。
+"tui.gauge.tokens_estimate" = "▍ ≥{} tokens · 估算"
 "tui.gauge.usage_unknown" = "▍ 用量未知"
 "tui.meta.model" = "模型 {}"
 "tui.gauge.cost" = "≈${}"
@@ -1055,6 +1058,7 @@
 "tui.gauge.cost_unknown" = "成本未知"
 "tui.wait.tokens" = "{} token"
 "tui.wait.tokens_lower_bound" = "≥{} token"
+"tui.wait.tokens_estimate" = "≥{} token · 估算"
 "tui.wait.usage_unknown" = "用量未知"
 "tui.gauge.context" = "上下文 {}/{} · {}%"
 # 閒置時連按兩次 Esc 回退提示(Feature B):第一次 Esc 預備,第二次把上一則訊息載回輸入框編輯並重送。

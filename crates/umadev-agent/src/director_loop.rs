@@ -6462,16 +6462,18 @@ async fn drive_one_turn_with_backoff_and_memories(
 /// A cheap, deterministic token estimate for a piece of text — `~chars/4`, the
 /// standard rough heuristic (the continuous-session stream surfaces no real usage on
 /// `TurnDone`, so this is the honest fallback that keeps `/usage` non-empty on the
-/// default loop). Never panics; an empty string is 0. `pub(crate)` so the shared
-/// rework pump (`continuous::drive_rework_turn_with_idle`) estimates identically.
-pub(crate) fn approx_tokens(s: &str) -> u64 {
+/// default loop). Never panics; an empty string is 0. `pub` so the shared rework pump
+/// (`continuous::drive_rework_turn_with_idle`) AND the TUI's chat hot path estimate
+/// identically.
+pub fn approx_tokens(s: &str) -> u64 {
     (s.chars().count() as u64).div_ceil(4)
 }
 
 /// Record an estimated-token usage row for the default loop, attributed to the
-/// canonical "build" phase. `pub(crate)` so the shared rework pump records usage the
-/// same way the single-turn loop does. Fail-open: a zero estimate is a no-op.
-pub(crate) fn record_estimated_usage(backend: &str, est_tokens: u64) {
+/// canonical "build" phase. `pub` so the shared rework pump — and the TUI's chat hot
+/// path — record usage the same way the single-turn loop does. Fail-open: a zero
+/// estimate is a no-op.
+pub fn record_estimated_usage(backend: &str, est_tokens: u64) {
     if est_tokens == 0 {
         return;
     }
@@ -6485,8 +6487,9 @@ pub(crate) fn record_estimated_usage(backend: &str, est_tokens: u64) {
 ///
 /// "Tokens" here is `input + output` (the same single-number convention
 /// `record_usage` already uses). Fail-open: a `None` usage simply yields the
-/// estimate; the real path can never make `/usage` read lower than honest.
-pub(crate) fn real_or_estimated_tokens(usage: Option<Usage>, est_tokens: u64) -> u64 {
+/// estimate; the real path can never make `/usage` read lower than honest. `pub` so
+/// the TUI's chat hot path records the ledger identically.
+pub fn real_or_estimated_tokens(usage: Option<Usage>, est_tokens: u64) -> u64 {
     match usage {
         // An incomplete empty report is explicitly "unknown/lower bound 0",
         // not proof that the turn was free. Preserve any non-zero lower bound;
@@ -6508,11 +6511,16 @@ pub(crate) fn record_turn_usage(
     usage: Option<Usage>,
     est_tokens: u64,
 ) {
-    // Surface the base's REAL reported usage to the live UI session total — only
-    // the real path (an estimate is not the base's own number, so we don't inflate
-    // the live count with it). The ledger row below still records the estimate
-    // fallback so `/usage` stays honest.
-    events.emit(EngineEvent::TurnUsage { usage });
+    // Surface the base's REAL reported usage to the live UI session total. The
+    // estimate rides ALONGSIDE (never summed into the real count): an estimate is
+    // not the base's own number, so it can never inflate the live real total — the
+    // meter keeps the two strictly separate and shows the estimate ONLY as a
+    // clearly-LABELED lower-bound fallback when the base has reported nothing all
+    // session (a conscious, documented reversal of the former "live gauge is
+    // real-only" policy — a labeled floor beats a bare "usage unknown", and the real
+    // number still wins the instant the base reports one). The ledger row below still
+    // records the estimate fallback so `/usage` stays honest.
+    events.emit(EngineEvent::TurnUsage { usage, est_tokens });
     record_estimated_usage(
         &options.backend,
         real_or_estimated_tokens(usage, est_tokens),

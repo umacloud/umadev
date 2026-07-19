@@ -3381,10 +3381,10 @@ async fn drive_agentic_stream(
     brain: &dyn Runtime,
     task: &str,
     model: &str,
-    // The base's raw id, threaded by callers for parity with the pipeline path.
-    // A turn-failure note no longer names the base (that leaked the raw id to the
-    // user), so this is currently unused here — kept to avoid churning every caller.
-    _label: &str,
+    // The base's raw id, threaded by callers for parity with the pipeline path. A
+    // turn-failure note no longer names the base to the user, but the id keys this
+    // turn's row in the `/usage` ledger (see the estimate wiring below).
+    label: &str,
     project_root: &std::path::Path,
     director_build: bool,
     route: &RoutePlan,
@@ -3502,11 +3502,12 @@ async fn drive_agentic_stream(
     match brain.complete_streaming(request, &on_event).await {
         Ok(resp) => {
             // (0) Surface the base's REAL token usage for this turn so the UI's live
-            // session total reflects true consumption (the base's own numbers), not
-            // an estimate or the all-time ledger.
-            sink.emit(EngineEvent::TurnUsage {
-                usage: Some(resp.usage),
-            });
+            // session total reflects true consumption (the base's own numbers). A
+            // deterministic chars/4 estimate of prompt + reply rides alongside so the
+            // gauge can fall back to a clearly-LABELED lower bound if the base
+            // reported nothing, and records this turn to `/usage` (real when present,
+            // else the estimate) — never inflating the live real count.
+            emit_chat_turn_usage(sink, label, Some(resp.usage), task, &resp.text);
             // (2) Post-turn fact check — snapshot git AGAIN and diff against the
             // pre-turn snapshot to get the files THIS turn actually changed on
             // disk. Fail-open: if either snapshot is missing (non-git / git
@@ -5091,6 +5092,34 @@ struct ChatRedriveFacts {
     base_alive: bool,
 }
 
+/// Surface one chat turn's usage to the live meter AND record it to the `/usage`
+/// ledger, mirroring the default loop's `director_loop::record_turn_usage`.
+///
+/// The base's REAL `usage` drives the live session total (an estimate is never
+/// passed off as the base's own count). The deterministic `chars/4` estimate of
+/// prompt + reply rides ALONGSIDE it in the event so the gauge can show a
+/// clearly-LABELED lower bound when the base reports nothing (some proxy/relay
+/// setups), and the SAME turn is recorded to the ledger — the base's real number
+/// when present, else the estimate — so `/usage` stays honest for switched/relayed
+/// chat turns even while the live gauge stays estimate-only. The real live count is
+/// NEVER inflated by the estimate: the two are kept strictly separate downstream.
+/// Fail-open: a zero estimate records nothing.
+fn emit_chat_turn_usage(
+    sink: &Arc<ChannelSink>,
+    backend: &str,
+    usage: Option<umadev_runtime::Usage>,
+    prompt: &str,
+    reply: &str,
+) {
+    let est_tokens = umadev_agent::director_loop::approx_tokens(prompt)
+        .saturating_add(umadev_agent::director_loop::approx_tokens(reply));
+    sink.emit(EngineEvent::TurnUsage { usage, est_tokens });
+    umadev_agent::director_loop::record_estimated_usage(
+        backend,
+        umadev_agent::director_loop::real_or_estimated_tokens(usage, est_tokens),
+    );
+}
+
 fn chat_turn_should_auto_redrive(
     attempt: u8,
     failure_reason: &str,
@@ -6285,7 +6314,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                             !snapshot.entries.is_empty() || snapshot.running_prompt_id.is_some()
                         }) =>
                 {
-                    sink.emit(EngineEvent::TurnUsage { usage });
+                    emit_chat_turn_usage(&sink, &backend, usage, &text, &text_acc);
                     deferred_queue_done = Some((status, usage));
                     continue;
                 }
@@ -6748,7 +6777,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                 }
                 umadev_runtime::SessionEvent::TurnDone { status, usage } => {
                     if !turn_usage_was_emitted {
-                        sink.emit(EngineEvent::TurnUsage { usage });
+                        emit_chat_turn_usage(&sink, &backend, usage, &text, &text_acc);
                     }
                     if bg.outstanding() == 0
                         || !matches!(&status, umadev_runtime::TurnStatus::Completed)

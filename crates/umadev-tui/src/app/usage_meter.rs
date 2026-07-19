@@ -4,6 +4,11 @@ use umadev_runtime::Usage;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionUsageMeter {
     tokens: u64,
+    /// The session-cumulative deterministic `chars/4` estimate. Kept STRICTLY
+    /// separate from the real `tokens` — it is NEVER summed with them and is
+    /// surfaced (via [`SessionUsageMeter::est_tokens`]) ONLY as a clearly-LABELED
+    /// lower-bound fallback when the base has reported no real usage all session.
+    est_tokens: u64,
     seen: bool,
     incomplete: bool,
     cost_usd_ticks: Option<i64>,
@@ -34,12 +39,31 @@ impl SessionUsageMeter {
         self.exact_context_input = (!usage.usage_incomplete).then_some(usage.input_tokens);
     }
 
+    /// Accumulate this turn's deterministic `chars/4` estimate (prompt + reply),
+    /// tracked in a sibling field so it can back a clearly-LABELED lower bound when
+    /// the base reports no real usage. It is NEVER folded into the real [`tokens`]
+    /// total — the two stay strictly separate, and the estimate is surfaced only
+    /// while `tokens == 0` (see [`SessionUsageMeter::est_tokens`] and the gauge).
+    /// Fail-open: a zero estimate is a harmless no-op.
+    ///
+    /// [`tokens`]: SessionUsageMeter::tokens
+    pub(crate) fn observe_estimate(&mut self, est_tokens: u64) {
+        self.est_tokens = self.est_tokens.saturating_add(est_tokens);
+    }
+
     pub(crate) fn reset(&mut self) {
         *self = Self::default();
     }
 
     pub(crate) const fn tokens(&self) -> u64 {
         self.tokens
+    }
+
+    /// The session-cumulative `chars/4` estimate — a deliberately-labeled lower
+    /// bound the gauge shows ONLY when the base reported no real usage
+    /// (`is_incomplete() && tokens() == 0`), never as the base's own count.
+    pub(crate) const fn est_tokens(&self) -> u64 {
+        self.est_tokens
     }
 
     pub(crate) const fn has_report(&self) -> bool {
@@ -105,5 +129,48 @@ mod tests {
         assert_eq!(meter.exact_cost_usd_ticks(), Some(30));
         meter.apply(Some(Usage::exact(1, 1)));
         assert_eq!(meter.exact_cost_usd_ticks(), None);
+    }
+
+    #[test]
+    fn estimate_accumulates_separately_and_never_merges_with_real_tokens() {
+        let mut meter = SessionUsageMeter::default();
+        // Two relay turns report no real usage but carry an estimate each.
+        meter.apply(None);
+        meter.observe_estimate(120);
+        meter.apply(None);
+        meter.observe_estimate(80);
+        assert_eq!(meter.tokens(), 0, "no real usage was ever reported");
+        assert_eq!(
+            meter.est_tokens(),
+            200,
+            "the estimate accumulates across turns in its own field"
+        );
+        assert!(meter.is_incomplete());
+
+        // A real report lands: it drives the REAL total and does NOT absorb the
+        // estimate. The estimate keeps its own tally; the gauge simply stops
+        // showing it once there is a real number (tokens > 0).
+        meter.apply(Some(Usage::exact(300, 200)));
+        meter.observe_estimate(50);
+        assert_eq!(
+            meter.tokens(),
+            500,
+            "the real count is the base's own number, never the estimate"
+        );
+        assert_eq!(
+            meter.est_tokens(),
+            250,
+            "the estimate stays strictly separate — never summed into the real total"
+        );
+    }
+
+    #[test]
+    fn reset_clears_the_estimate_too() {
+        let mut meter = SessionUsageMeter::default();
+        meter.observe_estimate(999);
+        assert_eq!(meter.est_tokens(), 999);
+        meter.reset();
+        assert_eq!(meter.est_tokens(), 0, "/clear starts a fresh estimate");
+        assert_eq!(meter.tokens(), 0);
     }
 }
