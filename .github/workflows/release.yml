@@ -835,12 +835,11 @@ jobs:
           NPM_CONFIG_PROVENANCE: "true"
         run: ./npm/scripts/publish.sh
 
-  deploy-website:
-    name: deploy release website
-    needs: publish-npm
-    if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/website-pages.yml
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
+# NOTE: the website is deployed to GitHub Pages by website-pages.yml, which fires on
+# every push to main — including the release version-bump commit (it edits
+# umadev-website/src/app/content.ts). A second deploy job here raced that push-triggered
+# run for the single github-pages environment, and the loser was marked a FAILED "Active"
+# deployment (a red X on the release even though the site was live). The release no longer
+# deploys Pages itself; the version-bump push owns the one deployment. The website BUILD is
+# still a hard publish gate in the `gate` job above ("Build website before any package can
+# be published"), so a broken site still blocks the release.
