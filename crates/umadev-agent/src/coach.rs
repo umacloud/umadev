@@ -1306,7 +1306,9 @@ fn render_spec(slug: &str, req: &str) -> String {
            ```\n\
          - `## Sprint breakdown` — 2-3 sprints, each with:\n\
            - Sprint goal (one sentence)\n\
-           - Tasks (numbered, each scoped to < 4 hours), **grouped by feature module + layer**\n\
+           - Tasks (numbered, each scoped to the smallest independently-verifiable \
+             change — one module/layer — NOT a human-hour budget; you execute at \
+             machine speed), **grouped by feature module + layer**\n\
            - Deliverable (what's shippable at sprint end)\n\
          - `## Coding standards` — the rules the dev (worker) MUST follow:\n\
            - Layering: controller(传输) → service(用例/事务/收发DTO) → domain(规则/不贫血) → repository(只持久化); deps inward\n\
@@ -1328,7 +1330,7 @@ fn render_spec(slug: &str, req: &str) -> String {
          ### 2. Task list — `.umadev/changes/<change-id>/tasks.md`\n\n\
          Each task cites the functional requirement(s) it satisfies, so progress \
          and rework are traceable to the spec (Kiro-style):\n\
-         `- [ ] [Sprint N] <description> _(FR-001, FR-003)_ (est: Xh)`\n\
+         `- [ ] [Sprint N] <description> _(FR-001, FR-003)_ (est: N steps)`\n\
          Every P0/P1 functional requirement MUST be covered by at least one task — \
          do not silently drop a requirement.\n\n\
          ## Input\n\n{req}\n\n\
@@ -1811,6 +1813,45 @@ mod tests {
         assert!(body.contains("output/demo-prd.md"));
         assert!(body.contains("output/demo-architecture.md"));
         assert!(body.contains("output/demo-uiux.md"));
+    }
+
+    #[test]
+    fn spec_prompt_scopes_tasks_in_ai_steps_not_human_hours() {
+        // The execution-plan template used to ask the base to scope tasks by human-hour
+        // budget ("< 4 hours") and to write a human-hour estimate ("est: Xh") per task.
+        // UmaDev executes at machine speed, so those framings are wrong and undersell
+        // AI speed — the template now scopes by the smallest verifiable change and
+        // estimates in AI steps.
+        let tmp = TempDir::new().unwrap();
+        let body = render_coach_prompt(&opts(tmp.path()), Phase::Spec);
+        // The reframed, AI-execution scope + estimate.
+        assert!(
+            body.contains("smallest independently-verifiable change"),
+            "tasks are scoped by verifiable change, not hours: {body}"
+        );
+        assert!(body.contains("machine speed"));
+        assert!(
+            body.contains("(est: N steps)"),
+            "per-task estimate is in AI steps, not hours"
+        );
+        // No human-hour ASK survives in the base prompt — the tokens the base could
+        // copy into a wrong estimate. (The reframed text still NAMES the human-hour
+        // budget in negation, so we ban the concrete ask, not the corrective mention.)
+        assert!(
+            !body.contains("< 4 hours"),
+            "no human-hour task budget: {body}"
+        );
+        assert!(
+            !body.contains("est: Xh") && !body.contains("(est: Xh)"),
+            "no human-hour estimate field: {body}"
+        );
+        // The only surviving "hour(s)" mention must be the negated correction, never a
+        // fresh ask for a duration estimate.
+        assert!(
+            !body.to_lowercase().contains("scoped to < ")
+                && !body.to_lowercase().contains("hours)"),
+            "no residual human-hour duration ask: {body}"
+        );
     }
 
     #[test]

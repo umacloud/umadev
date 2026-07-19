@@ -81,7 +81,8 @@ use std::path::{Path, PathBuf};
 use umadev_governance::redaction::{redact_json, redact_text};
 
 use crate::experts::{
-    agentic_engineering_rules, agentic_team_identity, anti_slop_law, excerpt, persona_for_role,
+    agentic_engineering_rules, agentic_team_identity, anti_slop_law, excerpt,
+    machine_speed_effort_law, persona_for_role,
 };
 use crate::memory_control::{capture_enabled, recall_enabled, MemoryScope, MemoryStore};
 use crate::router::{RouteClass, RoutePlan};
@@ -272,6 +273,16 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
     // almost nothing. Only the heavier build overlay + the JIT retrieval below scale
     // by class.
     fw.push_block(agentic_engineering_rules());
+    // EFFORT FRAMING (always-on, like the craft law): the base defaults to HUMAN-labor
+    // estimates ("a few hours", "a 2-week sprint") because it is trained on human dev
+    // text, but UmaDev drives it at MACHINE speed — those estimates are wrong and
+    // undersell the product's core value (AI speed). This byte-static block reframes
+    // every estimate the base emits into AI-EXECUTION terms (steps / a realistic AI
+    // wall-clock in minutes). Injected here, in the always-on standards core, so it
+    // reaches chat, plan, AND build — an effort estimate can surface on any turn, and
+    // firmware cannot be re-injected mid-stream. Cost: one static string in the
+    // KV-cache-stable head.
+    fw.push_block(machine_speed_effort_law());
     // SCOPED TO ITS REGISTER (UD-CODE-007): exactly ONE register half on top of the
     // register-independent core. The register comes from the project's OWN declaration
     // (the UIUX doc's `## Visual direction`), falling back to the user's words.
@@ -1143,6 +1154,42 @@ mod tests {
         assert!(
             fw.contains("DESIGN LAW"),
             "the design law is present on a build"
+        );
+    }
+
+    #[tokio::test]
+    async fn always_on_effort_framing_reaches_chat_and_build() {
+        // The machine-speed effort-framing standard is part of the always-on core, so
+        // it must lead BOTH a pure chat turn (where the base may casually estimate "a
+        // few hours") and a real build turn (where it plans the work) — an estimate can
+        // surface on any turn and firmware cannot be re-injected mid-stream.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let chat = route(RouteClass::Chat, Depth::Fast, Vec::new());
+        let chat_fw = compose_firmware(tmp.path(), &chat, "这个功能大概要多久?").await;
+        assert!(
+            chat_fw.contains("HOW YOU FRAME EFFORT"),
+            "chat carries the effort-framing standard: {chat_fw}"
+        );
+        assert!(
+            chat_fw.to_lowercase().contains("machine speed") && chat_fw.contains("AI-EXECUTION"),
+            "chat effort standard frames effort in AI-execution terms"
+        );
+
+        let build = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let build_fw = compose_firmware(tmp.path(), &build, "做一个待办事项 SaaS 产品").await;
+        assert!(
+            build_fw.contains("HOW YOU FRAME EFFORT"),
+            "build carries the effort-framing standard: {build_fw}"
+        );
+        assert!(
+            build_fw.to_lowercase().contains("machine speed") && build_fw.contains("AI-EXECUTION"),
+            "build effort standard frames effort in AI-execution terms"
         );
     }
 

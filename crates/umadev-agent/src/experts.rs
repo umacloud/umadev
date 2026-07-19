@@ -1138,6 +1138,33 @@ pub fn agentic_engineering_rules() -> &'static str {
      only then write the final report."
 }
 
+/// The machine-speed EFFORT-FRAMING law — an always-on standard that corrects the
+/// base's default human-labor estimate framing.
+///
+/// The base is an LLM trained on human-authored dev text, so it reflexively quotes
+/// effort in HUMAN-developer time ("this will take a few hours", "a 2-week sprint",
+/// "~40 person-hours"). But UmaDev drives that same base at MACHINE speed — the work
+/// a human would bill as "a few hours" finishes in minutes — so a human-labor estimate
+/// is not merely wrong, it undersells the product's core value (AI speed). This law
+/// reframes every estimate the base emits into AI-EXECUTION terms (steps / tool calls,
+/// or a realistic AI wall-clock in minutes). It is a byte-static `&'static str`,
+/// injected into the always-on standards core ([`crate::context::compose_firmware`])
+/// alongside the craft + anti-slop law so it reaches the base on EVERY turn — chat,
+/// plan, and build — since an estimate can surface in any of them and firmware cannot
+/// be re-injected mid-stream. Kept to a couple of sentences so it does not bloat the
+/// KV-cache-stable prefix.
+#[must_use]
+pub fn machine_speed_effort_law() -> &'static str {
+    "HOW YOU FRAME EFFORT: you are an AI development team executing at machine \
+     speed, not a human dev shop. Express effort and progress in AI-EXECUTION \
+     terms — the number of steps / tool calls, or a realistic AI wall-clock \
+     (usually a few minutes) — NEVER in human-developer time (person-hours / \
+     person-days / person-weeks / 'a few hours' / 'a 2-week sprint'). If you must \
+     give a time, give the realistic AI range ('usually a few minutes'), not a \
+     human-labor estimate. Scope work as the smallest independently-verifiable \
+     steps, not by human-hour size."
+}
+
 /// The director's build-turn preamble — the USB / smart-hardware model of
 /// `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` (simplified: NO marker protocol).
 ///
@@ -1770,6 +1797,29 @@ mod tests {
         assert!(
             p.len() < SPEC_PREAMBLE.len() + anti_slop_law(Register::Unknown).len(),
             "agentic rules must be a compact distillation"
+        );
+    }
+
+    #[test]
+    fn machine_speed_effort_law_bans_human_time_and_asks_for_ai_terms() {
+        let p = machine_speed_effort_law();
+        // Frames the team as machine-speed, not a human dev shop.
+        assert!(p.to_lowercase().contains("machine speed"));
+        // Demands AI-execution terms (steps / tool calls, or an AI wall-clock).
+        assert!(p.contains("AI-EXECUTION"));
+        assert!(p.to_lowercase().contains("step"));
+        assert!(p.to_lowercase().contains("minute"));
+        // Explicitly forbids the human-labor framing the base defaults to.
+        assert!(p.contains("NEVER"));
+        assert!(
+            p.contains("person-hours") || p.to_lowercase().contains("human-developer time"),
+            "names the human-labor framing it forbids"
+        );
+        // Stays compact so it does not bloat the KV-cache-stable prefix — a fraction
+        // of the full anti-slop law.
+        assert!(
+            p.len() < anti_slop_law(Register::Unknown).len(),
+            "effort law must be a couple of sentences, not a wall of text"
         );
     }
 
