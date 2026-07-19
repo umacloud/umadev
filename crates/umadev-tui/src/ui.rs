@@ -6451,6 +6451,10 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         Some(umadev_i18n::t(app.lang, "tui.hint.running").into())
     } else if app.finished {
         Some(umadev_i18n::t(app.lang, "tui.hint.finished").into())
+    } else if app.budget_paused {
+        // Resumable budget pause — the hint points at `/continue`, NOT the
+        // "type a new requirement" abort line (the run's plan is saved).
+        Some(umadev_i18n::t(app.lang, "tui.hint.budget_paused").into())
     } else if app.aborted {
         // Aborted round — the hint must match the `[aborted]` status, not the
         // "wait for the next gate" line a live run shows.
@@ -6584,6 +6588,10 @@ fn input_placeholder(app: &App) -> std::borrow::Cow<'static, str> {
         umadev_i18n::t(app.lang, "input.running").into()
     } else if app.finished {
         umadev_i18n::t(app.lang, "input.finished").into()
+    } else if app.budget_paused {
+        // Parked at the wall-clock budget — point at `/continue` (the plan is saved),
+        // NOT the "re-enter a requirement" abort line nor the bare "running" hint.
+        umadev_i18n::t(app.lang, "input.budget_paused").into()
     } else if app.aborted {
         // The round bailed — tell the user to re-enter a requirement, NOT that a
         // run is still in flight (which the bare `run_started` branch below would
@@ -6899,7 +6907,15 @@ fn status_text_and_color(app: &App) -> Option<(String, Color)> {
         // bottom-right stays empty so there's no duplicate / lingering tool name.
         return None;
     }
-    let text = if app.aborted {
+    let text = if app.budget_paused {
+        // A run parked at its wall-clock budget reads as `[paused]` DIRECTLY (never
+        // `[aborted]`): the plan is saved and `/continue` finishes it. Checked before
+        // `aborted`/`run_started` because the pause leaves `run_started` set.
+        format!(
+            "[paused] {}",
+            umadev_i18n::t(app.lang, "status.budget_paused")
+        )
+    } else if app.aborted {
         // Dedicated terminal branch — an aborted round reads as `[aborted]`
         // DIRECTLY, instead of leaning on `app.status` carrying the right text.
         // That coupling was fragile: a future `refresh_status` change could

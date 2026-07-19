@@ -2682,7 +2682,11 @@ fn continuous_report(outcome: &umadev_agent::RunOutcome, requirement: &str) -> R
             paused_at: Some(*gate),
             completed: Vec::new(),
         },
-        RunOutcome::Completed => RunReport {
+        // A budget pause is a RESUMABLE settle, never a failure — reported like a
+        // Completed settle (non-failing, no gate). The legacy continuous pipeline does
+        // not itself produce a budget pause (the director path owns those), so the
+        // shared arm is defensive.
+        RunOutcome::Completed | RunOutcome::PausedAtBudget { .. } => RunReport {
             final_phase: completed_phase,
             paused_at: None,
             completed: Vec::new(),
@@ -2834,6 +2838,16 @@ enum DirectorOutcome {
         /// The confirmation gate that still needs a user decision.
         gate: Gate,
     },
+    /// The Director stopped because its wall-clock budget was exhausted while
+    /// resumable work remained. Like [`Self::Paused`] this is a successful CLI
+    /// settle (exit 0), NOT a failure: the plan is checkpointed on disk and
+    /// `umadev continue` re-drives only the remaining steps.
+    PausedAtBudget {
+        /// Completed steps at the pause.
+        done: usize,
+        /// Total steps in the plan.
+        total: usize,
+    },
     /// The director finished its turn cleanly and every applicable mechanical
     /// completion gate passed.
     Done,
@@ -2866,6 +2880,10 @@ fn director_outcome_report(outcome: &DirectorOutcome) -> String {
                 &[umadev_i18n::tl(gate.human_label_key())],
             )
         }
+        DirectorOutcome::PausedAtBudget { done, total } => umadev_i18n::tlf(
+            "run.budget_pause_resume_hint",
+            &[&done.to_string(), &total.to_string()],
+        ),
         DirectorOutcome::Done => umadev_i18n::tl("director.run_done").to_string(),
         DirectorOutcome::HardStop(reason) => {
             umadev_i18n::tlf("continuous.hardstop_report", &[reason])
@@ -3021,6 +3039,11 @@ async fn drive_director_run(
         // (not failed) run and point at the resume surface.
         DirectorLoopOutcome::PausedAtGate { gate } => {
             return Ok(DirectorOutcome::Paused { gate });
+        }
+        // A budget pause is a resumable, non-failing settle (exit 0): the plan is
+        // checkpointed and `umadev continue` re-drives the remaining steps.
+        DirectorLoopOutcome::PausedAtBudget { done, total } => {
+            return Ok(DirectorOutcome::PausedAtBudget { done, total });
         }
     };
 
@@ -4391,6 +4414,11 @@ async fn drive_director_continue(
         umadev_agent::DirectorLoopOutcome::Failed(reason) => DirectorOutcome::HardStop(reason),
         umadev_agent::DirectorLoopOutcome::PausedAtGate { gate } => {
             DirectorOutcome::Paused { gate }
+        }
+        // A budget pause even on a RESUME is still resumable — `umadev continue`
+        // again drives whatever remains. Non-failing settle (exit 0).
+        umadev_agent::DirectorLoopOutcome::PausedAtBudget { done, total } => {
+            DirectorOutcome::PausedAtBudget { done, total }
         }
     };
     println!("{}", director_outcome_report(&settled));
@@ -8166,6 +8194,14 @@ mod tests {
         assert!(!director_outcome_is_failure(&DirectorOutcome::Paused {
             gate: Gate::DocsConfirm,
         }));
+        // A budget pause is an honest resumable success too — exit 0, `/continue`.
+        assert!(!director_outcome_is_failure(
+            &DirectorOutcome::PausedAtBudget { done: 2, total: 6 }
+        ));
+        // Its report is the `/continue` resume hint, never the completed-build line.
+        let report =
+            director_outcome_report(&DirectorOutcome::PausedAtBudget { done: 2, total: 6 });
+        assert_ne!(report, umadev_i18n::tl("director.run_done"));
         assert!(director_outcome_is_failure(&DirectorOutcome::HardStop(
             "session died".into()
         )));
@@ -8222,6 +8258,11 @@ mod tests {
         assert!(!run_outcome_is_failure(&RunOutcome::PausedAtGate(
             Gate::DocsConfirm
         )));
+        // A budget pause is a RESUMABLE settle — never a failure exit.
+        assert!(!run_outcome_is_failure(&RunOutcome::PausedAtBudget {
+            done: 2,
+            total: 6
+        }));
         assert!(!run_outcome_is_failure(&RunOutcome::Completed));
         assert!(run_outcome_is_failure(&RunOutcome::HardStop(
             "no code".into()

@@ -128,29 +128,56 @@ pub fn has_resumable_director_plan(root: &Path) -> bool {
     load_resumable_plan(root).is_some()
 }
 
-/// A ONE-LINE localized discoverability hint to emit when a director run aborts on
-/// a **transient** base failure (a rate limit / an overloaded base / a network
-/// blip — [`crate::base_error::is_transient`]) AND its plan is still resumable on
-/// disk: the plan was saved and `/continue` picks up the unfinished steps.
+/// Whether `reason` is a RUN-TIME-BUDGET-exhaustion reason — the terminal string a
+/// budget-stopped build carries ("run time budget exhausted …", from
+/// `plan_incomplete_reason` / the single-turn twin, both wrapped by
+/// `qc_incomplete_reason`). This is the string-matching fallback for the surfaces
+/// that see only a reason string (not the typed
+/// [`crate::director_loop::DirectorLoopOutcome::PausedAtBudget`]); prefer keying off
+/// the typed outcome wherever the flow has it. A budget reason is DISTINCT from a
+/// transient (429 / network), auth, or generic failure — none of those contain this
+/// marker — so it never mis-classifies a real failure as a resumable budget pause.
+/// Pure.
+#[must_use]
+pub fn is_budget_pause_reason(reason: &str) -> bool {
+    reason.contains("run time budget exhausted")
+}
+
+/// A ONE-LINE localized discoverability hint to emit when a director run stops with a
+/// still-resumable plan on disk AND the stop was either a **transient** base failure
+/// (a rate limit / an overloaded base / a network blip — [`crate::base_error::is_transient`])
+/// OR a **run-time-budget** exhaustion ([`is_budget_pause_reason`]): the plan was
+/// saved and `/continue` picks up the unfinished steps.
 ///
-/// Without it a rate-limited run reads as "it just stopped": the saved plan is
-/// invisible unless the user happens to know `/continue` exists. Returns `Some`
-/// only when BOTH facts hold (transient reason + resumable plan); a hard failure
-/// (auth / context / a non-zero exit) or a run with nothing left to resume yields
-/// `None` so no misleading "you can continue" line is shown.
+/// Without it a rate-limited or budget-stopped run reads as "it just stopped": the
+/// saved plan is invisible unless the user happens to know `/continue` exists.
+/// Returns `Some` only when a resumable plan exists AND the reason is transient or a
+/// budget pause; a hard failure (auth / context / a non-zero exit) or a run with
+/// nothing left to resume yields `None` so no misleading "you can continue" line is
+/// shown. A budget pause fills the hint with the plan's `done/total` step counts so
+/// the user sees exactly where the run parked.
 ///
 /// Fail-open by construction: classification is a pure scan of `reason` and the
 /// resumable check is best-effort file IO — an unclassifiable reason or an
-/// unreadable plan simply yields `None` (the abort is never blocked). Pure aside
-/// from the read-only plan probe.
+/// unreadable plan simply yields `None` (the stop is never blocked). Pure aside from
+/// the read-only plan probe.
 #[must_use]
 pub fn transient_resume_hint(reason: &str, root: &Path) -> Option<String> {
+    // The plan must still be resumable for EITHER hint — probe once and read its
+    // progress for the budget-pause variant (done/total).
+    let plan = load_resumable_plan(root)?;
     let failure = crate::base_error::classify(None, None, Some(reason.trim()));
-    if crate::base_error::is_transient(&failure) && has_resumable_director_plan(root) {
-        Some(umadev_i18n::tl("run.transient_resume_hint").to_string())
-    } else {
-        None
+    if crate::base_error::is_transient(&failure) {
+        return Some(umadev_i18n::tl("run.transient_resume_hint").to_string());
     }
+    if is_budget_pause_reason(reason) {
+        let (done, total) = plan.progress();
+        return Some(umadev_i18n::tlf(
+            "run.budget_pause_resume_hint",
+            &[&done.to_string(), &total.to_string()],
+        ));
+    }
+    None
 }
 
 /// Whether `root` contains any run state that a fresh session can resume.
@@ -237,6 +264,58 @@ mod tests {
         assert!(
             transient_resume_hint("429 too many requests", root).is_none(),
             "a completed plan has nothing left to /continue"
+        );
+    }
+
+    #[test]
+    fn is_budget_pause_reason_matches_only_the_budget_reasons() {
+        // The two terminal budget strings (plan-path + single-turn twin) both carry
+        // the "run time budget exhausted" marker.
+        assert!(is_budget_pause_reason(
+            "director build incomplete: run time budget exhausted; 2 plan step(s) unfinished"
+        ));
+        assert!(is_budget_pause_reason(
+            "director build incomplete: run time budget exhausted before auto-QC cleared"
+        ));
+        // A transient / auth / generic failure is NOT a budget pause.
+        assert!(!is_budget_pause_reason(
+            "API Error: Request rejected (429) · exceeded the 5-hour usage quota"
+        ));
+        assert!(!is_budget_pause_reason(
+            "Error 401 Unauthorized: invalid api key"
+        ));
+        assert!(!is_budget_pause_reason(
+            "director build incomplete: auto-QC settled without a clean verdict"
+        ));
+    }
+
+    #[test]
+    fn resume_hint_fires_for_a_budget_pause_with_done_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A resumable plan (one still-pending step) + a budget reason → the budget
+        // resume hint, filled with the plan's done/total (0/1 here).
+        save_plan(root, StepStatus::Pending);
+        let hint = transient_resume_hint(
+            "director build incomplete: run time budget exhausted; 1 plan step(s) unfinished",
+            root,
+        )
+        .expect("a budget pause with a resumable plan surfaces the /continue hint");
+        assert_eq!(
+            hint,
+            umadev_i18n::tlf("run.budget_pause_resume_hint", &["0", "1"]),
+            "the budget hint carries done/total from the persisted plan"
+        );
+    }
+
+    #[test]
+    fn budget_resume_hint_is_none_without_a_resumable_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A budget reason but no saved plan → no hint (nothing to resume).
+        assert!(
+            transient_resume_hint("run time budget exhausted", root).is_none(),
+            "a budget reason with no saved plan surfaces no hint"
         );
     }
 }

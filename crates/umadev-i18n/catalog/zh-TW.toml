@@ -55,6 +55,7 @@
 "model.reasoning" = "思考強度 {}(底座設定,umadev 不覆寫)"
 "input.idle" = "問我任何事…"
 "input.aborted" = "本輪已中止 —— 重新輸入需求再試"
+"input.budget_paused" = "[paused] /continue 續跑剩餘步驟,或輸入新需求"
 "input.degraded" = "本輪降級/未完成 —— 修好底座後用 /redo 重跑拿真實產物"
 # 閒置輸入框的輪換佔位:範例需求（呼應歡迎語範例）+ 指令提示,每次送出後輪換一條;
 # 執行中/閘門/已完成等特殊狀態優先,不參與輪換。原先常駐底部狀態列的
@@ -77,6 +78,7 @@
 # 狀態
 "status.ready" = "就緒"
 "status.aborted" = "本輪已中止"
+"status.budget_paused" = "已到時間上限暫停"
 "status.degraded" = "降級/未完成 —— 修好底座後 /redo 重跑"
 "status.stopping" = "正在停止…"
 "status.thinking" = "正在思考…"
@@ -337,6 +339,7 @@
 "plan.panel.active_step" = "步驟 {}/{} · 進行中"
 "plan.panel.interrupted" = "計畫(已中斷 —— /continue 繼續)"
 "run.transient_resume_hint" = "底座限流或暫時中斷 —— 本輪計畫已儲存,輸入 `/continue` 繼續未完成的步驟"
+"run.budget_pause_resume_hint" = "已到時間上限,本輪已暫停在第 {}/{} 步 —— 輸入 `/continue` 續跑剩餘步驟"
 "plan.summary.header" = "任務總結 — {} 完成 · {} 進行中 · {} 堵塞 · {} 未完成"
 "plan.panel.more_hint" = "上滑或 /plan 檢視全部"
 "plan.none" = "暫無計畫。完整建置或一次深思熟慮的任務會在這裡生成計畫。"
@@ -1025,6 +1028,7 @@
 "tui.hint.finished" = "[ok] 已完成 —— 輸入新需求可重新開始"
 "tui.hint.running" = "[wait] 流水線執行中 —— 等待下一個閘門"
 "tui.hint.aborted" = "[aborted] 本輪已停止 —— 重新輸入需求再啟動"
+"tui.hint.budget_paused" = "[paused] 已到時間上限 —— 輸入 /continue 續跑剩餘步驟"
 # 斜線命令面板浮層標題
 "tui.palette.title" = "斜線命令"
 # @檔案引用 輸入聯想浮層標題 + 提示

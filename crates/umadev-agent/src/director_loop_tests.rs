@@ -3001,6 +3001,89 @@ fn run_budget_reads_env_and_falls_back_safely() {
 }
 
 #[test]
+fn run_budget_absolute_is_the_sliding_window_times_the_multiplier() {
+    let _env = EnvRestore::set("UMADEV_RUN_BUDGET_SECS", "100");
+    assert_eq!(
+        run_budget_absolute(),
+        Duration::from_secs(100 * u64::from(RUN_BUDGET_ABSOLUTE_MULT)),
+        "the absolute ceiling is the sliding idle window × the multiplier"
+    );
+    // Saturating: a huge idle window can never overflow the multiply.
+    std::env::set_var("UMADEV_RUN_BUDGET_SECS", u64::MAX.to_string());
+    let _ = run_budget_absolute(); // must not panic
+    std::env::remove_var("UMADEV_RUN_BUDGET_SECS");
+}
+
+#[test]
+fn budget_exhausted_slides_on_productivity_but_keeps_an_absolute_cap() {
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    let idle = Duration::from_secs(30);
+    // Absolute cap far in the future; last productivity JUST happened → NOT exhausted
+    // (a build that keeps producing is never cut mid-progress).
+    let hard_cap = now + Duration::from_secs(3_600);
+    assert!(
+        !budget_exhausted(now, hard_cap, now, idle),
+        "a just-productive build under the absolute cap is not exhausted"
+    );
+    // A productive event resets `last_progress` to `now`, so even long after the run
+    // started the sliding window is fresh → still not exhausted.
+    let much_later = now + Duration::from_secs(1_000);
+    assert!(
+        !budget_exhausted(much_later, hard_cap, much_later, idle),
+        "a productive event resets the sliding window — the build keeps running"
+    );
+    // STALLED: no productivity for a full idle window → exhausted (a stuck build
+    // still winds down), even though the absolute cap is far away.
+    let stalled_since = now;
+    let after_idle = now + idle + Duration::from_secs(1);
+    assert!(
+        budget_exhausted(after_idle, hard_cap, stalled_since, idle),
+        "a full idle window with no productivity exhausts the budget"
+    );
+    // ABSOLUTE CAP: even a CONTINUOUSLY productive build (last_progress == now)
+    // stops once the hard cap is reached — the pathology backstop.
+    let tight_cap = now + Duration::from_secs(10);
+    let past_cap = now + Duration::from_secs(11);
+    assert!(
+        budget_exhausted(past_cap, tight_cap, past_cap, idle),
+        "the absolute cap stops even a continuously-productive build"
+    );
+}
+
+#[test]
+fn sliding_deadline_clamps_the_idle_window_to_the_absolute_cap() {
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    let idle = Duration::from_secs(30);
+    // Idle window ends before the cap → the sliding deadline IS last_progress + idle.
+    let far_cap = now + Duration::from_secs(3_600);
+    assert_eq!(sliding_deadline(far_cap, now, idle), now + idle);
+    // Idle window would exceed the cap → clamped to the cap (never past the ceiling).
+    let near_cap = now + Duration::from_secs(5);
+    assert_eq!(sliding_deadline(near_cap, now, idle), near_cap);
+}
+
+#[test]
+fn is_productive_event_only_slides_on_real_content() {
+    // Content-bearing frames are productivity (slide the budget); pure control
+    // frames are not (they can't hold a stalled build's budget open forever).
+    assert!(is_productive_event(&SessionEvent::TextDelta("hi".into())));
+    assert!(is_productive_event(&SessionEvent::ToolCall {
+        name: "Bash".into(),
+        input: serde_json::json!({"command": "cargo build"}),
+    }));
+    assert!(is_productive_event(&SessionEvent::ToolResult {
+        ok: true,
+        summary: "ok".into(),
+    }));
+    assert!(!is_productive_event(&SessionEvent::TurnDone {
+        status: TurnStatus::Completed,
+        usage: None,
+    }));
+}
+
+#[test]
 fn seat_driven_decision_is_router_driven_with_an_escape_hatch() {
     // Wave A: the build-path decision is AUTOMATIC from the route (no user flag,
     // no new classifier — it reuses the router's own `depth` signal). A DELIBERATE
@@ -3030,10 +3113,12 @@ fn seat_driven_decision_is_router_driven_with_an_escape_hatch() {
 }
 
 #[tokio::test]
-async fn deliberate_build_winds_down_gracefully_at_the_time_budget() {
+async fn deliberate_build_pauses_resumably_at_the_time_budget() {
     // A deliberate build whose wall-clock budget is ALREADY spent drives its
-    // first step, then stops scheduling new steps and settles via the final gate
-    // (graceful — never a mid-write abort, never unbounded). The honest budget
+    // first step, then stops scheduling new steps and — because resumable steps
+    // remain — settles as a RESUMABLE `PausedAtBudget` (never a hard `Failed`, never
+    // a mid-write abort, never unbounded). The plan is checkpointed for `/continue`:
+    // the completed step stays `Done`, the rest stay `Pending`. The honest budget
     // note fires.
     use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3083,11 +3168,41 @@ async fn deliberate_build_winds_down_gracefully_at_the_time_budget() {
         already_past,
     )
     .await;
-    let DirectorLoopOutcome::Failed(reason) = outcome else {
-        panic!("a budget-stopped partial plan must not report Done: {outcome:?}");
+    let DirectorLoopOutcome::PausedAtBudget { done, total } = outcome else {
+        panic!("a budget-stopped partial plan must PAUSE for resume, not fail/Done: {outcome:?}");
     };
-    assert!(reason.contains("run time budget exhausted"), "{reason}");
-    assert!(reason.contains("step `step b` remains Pending"), "{reason}");
+    assert_eq!(
+        (done, total),
+        (1, 3),
+        "one step landed Done, three total — the pause carries plan.progress()"
+    );
+    // The plan is checkpointed for `/continue`: the completed step is Done, the rest
+    // stay Pending (resumable — `load_resumable_plan` only resets Active→Pending, and
+    // readiness scheduling never re-runs a Done step).
+    let saved = plan_state::load(tmp.path()).expect("the plan is persisted for resume");
+    let status = |id: &str| {
+        saved
+            .steps
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("step {id} present"))
+            .status
+    };
+    assert_eq!(
+        status("a"),
+        StepStatus::Done,
+        "the driven step is checkpointed Done"
+    );
+    assert_eq!(
+        status("b"),
+        StepStatus::Pending,
+        "the unrun step stays Pending"
+    );
+    assert_eq!(
+        status("c"),
+        StepStatus::Pending,
+        "the unrun step stays Pending"
+    );
     assert!(
         rec.events().iter().any(|e| matches!(
             e,
@@ -3095,6 +3210,70 @@ async fn deliberate_build_winds_down_gracefully_at_the_time_budget() {
         )),
         "the graceful budget wind-down note fires: {:?}",
         rec.events()
+    );
+}
+
+#[tokio::test]
+async fn budget_stop_with_no_remaining_steps_settles_not_a_pause() {
+    // The pause is produced ONLY when resumable (Pending/Active) work remains. A
+    // budget stop on a plan whose every step is already terminal (here: a single
+    // step that lands Done) must settle Done/Failed via the normal path — NEVER a
+    // non-resumable `PausedAtBudget` that would strand the run with nothing to drive.
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let step = PlanStep {
+        files: plan_state::StepFiles {
+            create: vec!["src/only.rs".to_string()],
+            modify: Vec::new(),
+        },
+        id: "only".to_string(),
+        title: "step only".to_string(),
+        seat: crate::critics::Seat::FrontendEngineer,
+        kind: StepKind::Build,
+        depends_on: vec![],
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence: Vec::new(),
+        status: StepStatus::Pending,
+    };
+    let plan = Plan {
+        steps: vec![step],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    let turns = vec![text_turn("step only done"), text_turn("final gate ok")];
+    let mut sess = FakeSession::new(turns, true, "");
+    let o = opts(tmp.path());
+    let route = build_route();
+    // The budget is spent, but after the single step drives there is nothing left
+    // Pending/Active — the terminal guard must NOT pause.
+    let already_past = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    let outcome = drive_director_loop_with_idle(
+        &mut sess,
+        &o,
+        &events,
+        "GO".into(),
+        Some(plan),
+        Some(&route),
+        IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+        already_past,
+    )
+    .await;
+    assert!(
+        !matches!(outcome, DirectorLoopOutcome::PausedAtBudget { .. }),
+        "a fully-terminal plan must never produce a non-resumable budget pause: {outcome:?}"
+    );
+    // It settles via the normal terminal path (Done or Failed), never a pause — the
+    // guard only produces a pause when resumable Pending/Active work remains.
+    assert!(
+        matches!(
+            outcome,
+            DirectorLoopOutcome::Done { .. } | DirectorLoopOutcome::Failed(_)
+        ),
+        "a fully-terminal plan settles Done/Failed, not a pause: {outcome:?}"
     );
 }
 
@@ -6590,6 +6769,57 @@ fn resume_step(
         evidence: Vec::new(),
         status,
     }
+}
+
+#[tokio::test]
+async fn a_budget_paused_plan_resumes_only_the_remaining_steps() {
+    // A `PausedAtBudget` checkpoints the plan exactly like a gate pause: the completed
+    // steps stay Done, the rest Pending. Resuming it (`/continue`) rides the SAME
+    // `drive_director_loop_resume` path as a `PausedAtGate` resume — `load_resumable_plan`
+    // keeps Done steps, and readiness scheduling never re-drives them. Prove the Done
+    // step's work is NOT re-sent while the Pending step IS driven.
+    use crate::plan_state::{Plan, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let persisted = Plan {
+        steps: vec![
+            resume_step("alpha", "ALPHA_SCAFFOLD the project", &[], StepStatus::Done),
+            resume_step(
+                "beta",
+                "BETA_FEATURE the remaining work",
+                &["alpha"],
+                StepStatus::Pending,
+            ),
+        ],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    plan_state::save(&persisted, tmp.path()).expect("persist the budget-paused plan");
+
+    let mut sess = FakeSession::new(
+        vec![text_turn("Built BETA. Done.")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let sent = sess.sent_handle();
+    let o = opts(tmp.path());
+    let route = build_route();
+    let outcome = drive_director_loop_resume(&mut sess, &o, &events, &route).await;
+    assert!(
+        matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+        "the budget-paused plan resumes and drives its remaining steps to Done: {outcome:?}"
+    );
+
+    let sent = sent.lock().unwrap();
+    assert!(
+        sent.iter().any(|d| d.contains("BETA_FEATURE")),
+        "the Pending step IS driven on resume: {sent:?}"
+    );
+    assert!(
+        !sent.iter().any(|d| d.contains("ALPHA_SCAFFOLD")),
+        "the already-Done step is NEVER re-driven on resume (zero re-runs): {sent:?}"
+    );
 }
 
 #[test]

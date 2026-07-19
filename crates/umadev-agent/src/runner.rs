@@ -1895,6 +1895,11 @@ impl<R: Runtime> AgentRunner<R> {
             crate::continuous::RunOutcome::PausedAtGate(gate) => {
                 task.wait(&format!("waiting at {}", gate.id_str()))
             }
+            crate::continuous::RunOutcome::PausedAtBudget { done, total } => {
+                // A budget pause is resumable, not a failure — park the task the same
+                // way a gate pause does (`/continue` re-drives the remaining steps).
+                task.wait(&format!("paused at the time budget ({done}/{total} steps)"))
+            }
             crate::continuous::RunOutcome::Completed => {
                 task.succeed("continuous pipeline completed", Vec::new())
             }

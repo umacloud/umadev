@@ -111,7 +111,9 @@ mod quality_evidence;
 mod resume;
 
 use quality_evidence::{has_reproduction_test, runtime_proof_blocking};
-pub use resume::{has_resumable_director_plan, has_resumable_run, transient_resume_hint};
+pub use resume::{
+    has_resumable_director_plan, has_resumable_run, is_budget_pause_reason, transient_resume_hint,
+};
 use resume::{load_resumable_plan, record_artifact_versions};
 
 /// The hard ceiling on auto-QC feedback-fix rounds in one `/run`. One round is: the
@@ -289,6 +291,12 @@ const DEFAULT_RUN_BUDGET_SECS: u64 = 1_800;
 /// final gate on what's already built, and exits with an honest "budget reached"
 /// note — never a hard abort mid-write. A non-positive / unparseable value falls
 /// back to the default (fail-open: a bad env never removes the ceiling).
+///
+/// This is the SLIDING idle window (see [`sliding_deadline`]): a build is bounded by
+/// this much wall-clock of NO base productivity, not this much wall-clock TOTAL. A
+/// build that keeps producing (real tool-calls / text) resets the window and runs on
+/// up to the ABSOLUTE ceiling [`run_budget_absolute`], so a slow-but-progressing
+/// build is never guillotined mid-progress.
 pub(crate) fn run_budget() -> Duration {
     let secs = std::env::var("UMADEV_RUN_BUDGET_SECS")
         .ok()
@@ -296,6 +304,81 @@ pub(crate) fn run_budget() -> Duration {
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_RUN_BUDGET_SECS);
     Duration::from_secs(secs)
+}
+
+/// How many times the sliding idle window ([`run_budget`]) a build may run in TOTAL
+/// wall-clock — even while CONTINUOUSLY productive — before the ABSOLUTE hard ceiling
+/// stops it. The idle window slides on base productivity so a slow-but-progressing
+/// build is not cut mid-progress; this multiplier is the pathology backstop that
+/// still bounds a base that emits forever without ever converging. 4× keeps the
+/// absolute ceiling generous (a full deliberate build) yet finite.
+pub(crate) const RUN_BUDGET_ABSOLUTE_MULT: u32 = 4;
+
+/// The ABSOLUTE wall-clock ceiling for ONE build loop: [`run_budget`] ×
+/// [`RUN_BUDGET_ABSOLUTE_MULT`]. Unlike the sliding idle window this NEVER moves —
+/// it is the hard cap a continuously-emitting base can never run past. Saturating so
+/// an enormous `UMADEV_RUN_BUDGET_SECS` can never overflow the multiply.
+pub(crate) fn run_budget_absolute() -> Duration {
+    run_budget().saturating_mul(RUN_BUDGET_ABSOLUTE_MULT)
+}
+
+/// Whether the run budget is EXHAUSTED at `now`, given the ABSOLUTE hard cap
+/// `hard_cap`, the SLIDING idle window `idle`, and the instant of the last genuine
+/// base productivity `last_progress`. Exhausted iff EITHER the absolute ceiling is
+/// reached OR the base has been unproductive for a full idle window. Pure + total:
+/// the sliding term saturates so a huge `idle` can never overflow the add. This is
+/// the ONE predicate every build-turn/step budget check keys off, so a
+/// slow-but-progressing build (each productive event resets `last_progress`) is
+/// bounded only by `hard_cap`, while a stalled one still stops after `idle`.
+#[must_use]
+pub(crate) fn budget_exhausted(
+    now: std::time::Instant,
+    hard_cap: std::time::Instant,
+    last_progress: std::time::Instant,
+    idle: Duration,
+) -> bool {
+    now >= hard_cap || now.saturating_duration_since(last_progress) >= idle
+}
+
+/// The EFFECTIVE deadline instant for the next idle wait: the sliding idle window
+/// (`last_progress + idle`) clamped to never exceed the ABSOLUTE `hard_cap`. Threaded
+/// as the run-budget `deadline` into [`next_event_idle`] so a live-but-silent tool is
+/// allowed a FULL idle window from when it last produced (not from run start), while
+/// the absolute cap remains the hard ceiling. Total: an `idle` add overflow saturates
+/// to `hard_cap` (via the clamp), never panics.
+#[must_use]
+pub(crate) fn sliding_deadline(
+    hard_cap: std::time::Instant,
+    last_progress: std::time::Instant,
+    idle: Duration,
+) -> std::time::Instant {
+    last_progress
+        .checked_add(idle)
+        .map_or(hard_cap, |dl| dl.min(hard_cap))
+}
+
+/// Whether `ev` is GENUINE base productivity — a real content-bearing frame (text,
+/// reasoning, a tool call / result / output) as opposed to a pure control frame
+/// (session/model/state/queue housekeeping). Only a productive event slides the run
+/// budget's idle window (resets `last_progress`), so a base that merely emits control
+/// noise cannot hold the budget open forever, while one that is actually writing code
+/// / running tools keeps the window fresh. Pure.
+#[must_use]
+pub(crate) fn is_productive_event(ev: &SessionEvent) -> bool {
+    matches!(
+        ev,
+        SessionEvent::TextDelta(_)
+            | SessionEvent::ThinkingDelta(_)
+            | SessionEvent::ToolCall { .. }
+            | SessionEvent::ToolCallCorrelated { .. }
+            | SessionEvent::ToolProgressCorrelated { .. }
+            | SessionEvent::ToolOutputDelta(_)
+            | SessionEvent::ToolOutputDeltaCorrelated { .. }
+            | SessionEvent::ToolOutputSnapshot(_)
+            | SessionEvent::ToolOutputSnapshotCorrelated { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::ToolResultCorrelated { .. }
+    )
 }
 
 /// A short, fixed ceiling on the best-effort `interrupt()` issued when the idle
@@ -594,6 +677,26 @@ pub enum DirectorLoopOutcome {
         /// The gate now awaiting the user's confirmation.
         gate: crate::gates::Gate,
     },
+    /// The run's wall-clock budget was exhausted mid-build WHILE resumable work
+    /// remained — a first-class RESUMABLE PAUSE, never a hard failure. The plan was
+    /// checkpointed (the completed steps `Done`, the rest still `Pending`) exactly as
+    /// [`Self::PausedAtGate`], so `/continue` ([`drive_director_loop_resume`]) drives
+    /// ONLY the remaining steps (readiness scheduling never re-runs a `Done` step).
+    ///
+    /// This is the alternative to guillotining a legitimately-progressing build into
+    /// an unrecoverable ABORT: a run that stopped only because the clock ran out keeps
+    /// its in-progress plan and points the user at the resume door, rather than forcing
+    /// them to re-enter the whole requirement. Produced ONLY when ≥1 `Pending`/`Active`
+    /// step remains (a fully-terminal plan settles [`Self::Done`]/[`Self::Failed`]
+    /// instead — a pause with nothing left would strand the run). Unlike a gate pause
+    /// this is NOT gated on a hosting UI: the plan is on disk and `/continue` resumes it
+    /// from any surface (TUI or headless CLI).
+    PausedAtBudget {
+        /// Completed steps at the pause (`plan.progress().0`).
+        done: usize,
+        /// Total steps in the plan (`plan.progress().1`).
+        total: usize,
+    },
 }
 
 /// Persist this run's derived governance context to `.umadev/governance-context.json`,
@@ -765,7 +868,13 @@ pub async fn drive_director_loop_routed(
     // per-event timeout, so planning time was unattributed to the run budget (a slow
     // plan could eat minutes the build then didn't account for). The drain is now
     // bounded by this same deadline.
-    let deadline = std::time::Instant::now() + run_budget();
+    //
+    // The `deadline` is the ABSOLUTE hard ceiling ([`run_budget_absolute`]); the
+    // SLIDING idle window ([`run_budget`]) is applied INSIDE each turn/step pump
+    // (see [`sliding_deadline`] / [`budget_exhausted`]) so a slow-but-progressing
+    // build is not cut mid-progress — only a stalled one (a full idle window with no
+    // base productivity) or one that runs past the absolute cap winds down.
+    let deadline = std::time::Instant::now() + run_budget_absolute();
 
     // 2. Synthesise + persist + post the owned plan. Fail-open at every step: a
     //    `None` plan (offline / no fork / unparseable) simply means no checklist —
@@ -868,8 +977,9 @@ pub async fn drive_director_loop_resume(
         &[&done.to_string(), &total.to_string()],
     )));
 
-    // One shared clock for the resumed build (same as a fresh routed run).
-    let deadline = std::time::Instant::now() + run_budget();
+    // One shared clock for the resumed build (same as a fresh routed run): the
+    // ABSOLUTE hard ceiling, with the sliding idle window applied inside the pumps.
+    let deadline = std::time::Instant::now() + run_budget_absolute();
     let idle = IdleBudget::from_env();
     // Drive ONLY the remaining steps. `drive_plan_steps` schedules by readiness, so
     // the already-Done steps are skipped and only the Pending ones drive; it persists
@@ -973,9 +1083,11 @@ fn settle_recipe_for_outcome(
         DirectorLoopOutcome::Done { .. } => crate::recipes::RecipeOutcome::Pass,
         DirectorLoopOutcome::Failed(_) => crate::recipes::RecipeOutcome::Fail,
         DirectorLoopOutcome::Planned { .. } => crate::recipes::RecipeOutcome::Unknown,
-        // A gate pause is not terminal. The active marker carries this exact receipt
-        // into `drive_director_loop_resume`, where it will settle once.
-        DirectorLoopOutcome::PausedAtGate { .. } => return,
+        // A gate OR budget pause is not terminal. The active marker carries this exact
+        // receipt into `drive_director_loop_resume`, where it will settle once.
+        DirectorLoopOutcome::PausedAtGate { .. } | DirectorLoopOutcome::PausedAtBudget { .. } => {
+            return
+        }
     };
     let _ = crate::recipes::settle_recipe_receipt(dir, receipt, outcome);
 }
@@ -1286,6 +1398,24 @@ async fn drive_director_loop_with_idle(
     // SIZING calibration: exhausting the bounded rounds means the work outran the
     // single-turn sizing → HEAVY actual outcome. Advisory, fail-open.
     record_run_sizing(options, route, crate::sizing_calibration::SizeRank::Heavy);
+    // RESUMABLE BUDGET PAUSE (Stage 2, single-turn twin): if the ONLY reason this
+    // loop fell through was the wall-clock budget AND the persisted plan still has
+    // resumable steps, offer `/continue` (`PausedAtBudget`) instead of a hard
+    // `Failed` — the plan was just persisted above, so a resume re-drives only what's
+    // left. A run with no plan, or one with nothing `Pending`/`Active`, is not
+    // resumable and settles Failed as before. `budget_reached` is set only by the
+    // wall-clock round check, never by a QC/verification failure.
+    if budget_reached {
+        if let Some(p) = plan.as_ref() {
+            if p.steps
+                .iter()
+                .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active))
+            {
+                let (done, total) = p.progress();
+                return DirectorLoopOutcome::PausedAtBudget { done, total };
+            }
+        }
+    }
     let reason = if budget_reached {
         "run time budget exhausted before auto-QC cleared"
     } else {
@@ -1468,6 +1598,15 @@ async fn drive_plan_steps(
     // copy so a non-clean terminal outcome can explain the failure to the caller.
     let mut incomplete_evidence: Vec<(String, String)> = Vec::new();
     let mut budget_reached = false;
+    // SLIDING run-budget clock (Stage 3): the instant of the last genuine base
+    // productivity at the SCHEDULING level — reset whenever a step actually made
+    // progress. The between-steps ceiling below keys off it via [`budget_exhausted`]
+    // so a build that keeps completing steps is never cut between them (bounded only
+    // by the ABSOLUTE cap `deadline`), while a run that stalls a full idle window
+    // still winds down. `run_budget()` is the sliding idle window (`deadline` is the
+    // absolute ceiling). Read once so a mid-run env flip can't race the checks.
+    let idle_window = run_budget();
+    let mut last_progress = std::time::Instant::now();
     // SELF-EVOLUTION: run-scoped set of recurring-pitfall signatures a reflection has
     // already been attempted for, so `drive_build_step` fires the (forked, fail-open)
     // reflection consult AT MOST ONCE per signature per run. Bounded by construction.
@@ -1491,8 +1630,19 @@ async fn drive_plan_steps(
         // scheduling NEW steps and fall through to the final gate on what's already
         // built — a thorough deliberate build can never run unbounded, but we never
         // abort mid-write. The first step always runs (a budget can't be so small it
-        // starves the very first doer turn).
-        if transitions > 0 && std::time::Instant::now() >= deadline {
+        // starves the very first doer turn). SLIDING (Stage 3): `budget_exhausted`
+        // stops only when the ABSOLUTE cap `deadline` is reached OR a full idle window
+        // elapsed since the last step made progress — so a build that keeps completing
+        // steps is never guillotined between them. A budget stop here becomes a
+        // RESUMABLE `PausedAtBudget` (not `Failed`) at the terminal return below.
+        if transitions > 0
+            && budget_exhausted(
+                std::time::Instant::now(),
+                deadline,
+                last_progress,
+                idle_window,
+            )
+        {
             events.emit(EngineEvent::Note(
                 "team · time budget reached — finalizing what's complete (raise \
                  UMADEV_RUN_BUDGET_SECS for a longer run)"
@@ -1737,6 +1887,16 @@ async fn drive_plan_steps(
         // a step that actually ticked Done moves the phase; a Blocked step leaves it.
         // Fail-open. This is what keeps `/status` honest as the build progresses.
         sync_phase_from_plan(plan, options);
+
+        // SLIDING run-budget reset (Stage 3): a step that made genuine forward
+        // progress is base productivity at the scheduling level — slide the between-
+        // steps idle window so a build that keeps completing (even slow) steps is
+        // never guillotined between them (bounded only by the ABSOLUTE cap). A step
+        // that drove NOTHING forward does not reset it, so a truly stalled run still
+        // winds down to a resumable budget pause.
+        if made_progress {
+            last_progress = std::time::Instant::now();
+        }
 
         if status == StepStatus::Done && made_progress {
             let kind = match step.kind {
@@ -2023,9 +2183,29 @@ async fn drive_plan_steps(
         route,
         run_actual_size_from_plan(plan),
     );
-    Some(match incomplete_reason {
-        Some(reason) => DirectorLoopOutcome::Failed(reason),
-        None => DirectorLoopOutcome::Done { reply: last_reply },
+    // RESUMABLE BUDGET PAUSE (Stage 2): the run stopped ONLY because its wall-clock
+    // budget was exhausted AND resumable work remains (≥1 `Pending`/`Active` step) —
+    // surface a first-class `PausedAtBudget` instead of a hard `Failed`, so the
+    // in-progress plan (checkpointed just above by `persist_plan_ref` +
+    // `emit_plan_completion_summary`) is offered to `/continue` rather than lost to a
+    // forced re-entry. The remaining-work guard mirrors `confirm_gate_after_step`: a
+    // fully-terminal plan (everything Done/Blocked) is NOT resumable, so it settles
+    // Done/Failed via `incomplete_reason`. `budget_reached` is set ONLY at the
+    // between-steps budget break above (never by the circuit breaker or a genuine
+    // verification failure), so a real failure is never disguised as a pause.
+    let budget_resumable = budget_reached
+        && plan
+            .steps
+            .iter()
+            .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active));
+    Some(if budget_resumable {
+        let (done, total) = plan.progress();
+        DirectorLoopOutcome::PausedAtBudget { done, total }
+    } else {
+        match incomplete_reason {
+            Some(reason) => DirectorLoopOutcome::Failed(reason),
+            None => DirectorLoopOutcome::Done { reply: last_reply },
+        }
     })
 }
 
@@ -5625,6 +5805,15 @@ async fn drive_one_turn_with_backoff_and_memories(
     // window; otherwise the base default — so a truly hung base still settles.
     let mut in_tool_call = false;
     let mut tool_activity = ToolActivity::default();
+    // SLIDING run-budget clock (Stage 3): the instant of the last genuine base
+    // productivity WITHIN this turn — reset by every content-bearing event (see
+    // [`is_productive_event`]). The turn/tool budget checks below key off it via
+    // [`sliding_deadline`] / [`budget_exhausted`], so a turn that keeps producing
+    // (streaming text, a live tool) is NOT cut at a fixed wall-clock instant — it
+    // runs on up to the ABSOLUTE cap `deadline`, while a genuinely silent one still
+    // winds down after a full idle window. `run_budget()` is that idle window.
+    let idle_window = run_budget();
+    let mut last_progress = std::time::Instant::now();
     // Did the base ACTUALLY run a build/test/lint runner this turn? Set from the OBSERVED
     // tool-call stream below (not the reply prose), it is the corroboration the auto-QC
     // requires before a green CLAIM is trusted to skip UmaDev's own build/test read. Reset
@@ -5650,7 +5839,13 @@ async fn drive_one_turn_with_backoff_and_memories(
         // the pitfalls seen so far, and return the accumulated text as a completed-ish
         // turn — so the caller treats it as "this turn produced what it produced" and
         // the between-step deadline checks wind the run down to the final gate.
-        if std::time::Instant::now() >= deadline {
+        //
+        // SLIDING (Stage 3): `eff` is the sliding budget deadline — the idle window
+        // from the last productive event, clamped to the absolute cap `deadline`. A
+        // streaming turn keeps resetting `last_progress`, so `eff` stays ahead and the
+        // turn runs to the absolute cap; a silent one settles after one idle window.
+        let eff = sliding_deadline(deadline, last_progress, idle_window);
+        if std::time::Instant::now() >= eff {
             let _ = tokio::time::timeout(
                 Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
                 session.interrupt(),
@@ -5680,7 +5875,7 @@ async fn drive_one_turn_with_backoff_and_memories(
         // every main-session pump (here + `continuous::drive_phase` /
         // `drive_rework_turn`), so the protection can't be "fixed in one, forgotten in
         // another".
-        let ev = match next_event_idle(session, idle, in_tool_call, Some(deadline)).await {
+        let ev = match next_event_idle(session, idle, in_tool_call, Some(eff)).await {
             IdleEvent::Event(ev) => ev,
             IdleEvent::SessionEnded { exit, stderr_tail } => {
                 // `None` = the session ended (process dead / EOF). Per the
@@ -5710,7 +5905,7 @@ async fn drive_one_turn_with_backoff_and_memories(
                 // mark the run Failed and SKIP run_auto_qc + finalize (losing the QC +
                 // delivery purely because the deadline happened to land mid-tool rather
                 // than mid-stream).
-                if in_tool_call && std::time::Instant::now() >= deadline {
+                if in_tool_call && std::time::Instant::now() >= eff {
                     let _ = tokio::time::timeout(
                         Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
                         session.interrupt(),
@@ -5787,6 +5982,12 @@ async fn drive_one_turn_with_backoff_and_memories(
         // Update the mid-tool state from this event BEFORE handling it: a tool-use
         // arms the extended grace for the next wait, a tool-result disarms it.
         in_tool_call = tool_activity.observe(&ev);
+        // SLIDING run-budget reset (Stage 3): a content-bearing event is genuine base
+        // productivity — slide the idle window so a turn that keeps producing runs on
+        // up to the absolute cap. A pure control frame does not reset it.
+        if is_productive_event(&ev) {
+            last_progress = std::time::Instant::now();
+        }
         // Feed the outstanding-background-agents guard (cheap, fail-open).
         bg.observe(&ev);
         let event_tool_call_id = ev.tool_call_id().map(str::to_owned);

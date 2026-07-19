@@ -1220,6 +1220,12 @@ pub enum RunState {
     Running,
     /// Parked at a confirmation gate, awaiting the user's decision.
     PausedAtGate,
+    /// Parked because the wall-clock budget was exhausted while resumable steps
+    /// remained (Stage 1/2). Reads like a pause — the timer stops and the label is
+    /// `[paused]`, never `[aborted]`/`[degraded]` — and the hint points at
+    /// `/continue`. Distinct from [`Self::PausedAtGate`]: there is no gate card, just
+    /// a resumable plan on disk.
+    PausedAtBudget,
     /// A full run reached delivery cleanly (`[ok] delivered`).
     Delivered,
     /// A block ended TERMINALLY short of delivery because the base degraded to
@@ -3297,6 +3303,15 @@ pub struct App {
     /// approval / revision routing on it — a director pause resumes via
     /// `drive_director_loop_resume`, never a legacy gate block.
     pub(crate) director_gate_paused: bool,
+    /// A DIRECTOR build is parked because its wall-clock budget was exhausted while
+    /// resumable steps remained (Stage 1/2): set by
+    /// [`Self::record_run_paused_at_budget`] when the terminal `RunPausedAtBudget`
+    /// decision lands, cleared when a fresh run / resume begins
+    /// ([`Self::clear_stale_terminal_on_live_turn`]). It reads as a PAUSE (never
+    /// aborted / degraded) so the status label + timer stop honestly and the hint
+    /// points at `/continue`; there is NO gate to approve, so it does not set
+    /// `active_gate` or `director_gate_paused`.
+    pub(crate) budget_paused: bool,
     /// A Director `GateOpened` event that arrived before the Director session was
     /// fully ended. The gate is staged here and becomes interactive only when the
     /// matching terminal `RunPausedAtGate` decision lands, preventing approval or
@@ -4114,6 +4129,7 @@ impl App {
             run_session_handed_to_chat: false,
             director_run_in_flight: false,
             director_gate_paused: false,
+            budget_paused: false,
             pending_director_gate: None,
             gate_query_in_flight: false,
             gate_query_epoch: 0,
@@ -5348,6 +5364,14 @@ impl App {
                     umadev_i18n::t(self.lang, "status.degraded")
                 )
             }
+            RunState::PausedAtBudget => {
+                // Resumable budget pause — a `[paused]` label (timer stopped), never
+                // `[aborted]`. The `/continue` hint carries the done/total detail.
+                format!(
+                    " · [paused] {}",
+                    umadev_i18n::t(self.lang, "status.budget_paused")
+                )
+            }
             RunState::Running | RunState::PausedAtGate | RunState::Idle => String::new(),
         };
         let ds_short = self
@@ -5385,10 +5409,18 @@ impl App {
     /// `thinking` check comes first.
     #[must_use]
     pub fn run_state(&self) -> RunState {
-        if self.thinking || (self.run_started_at.is_some() && self.active_gate.is_none()) {
+        if self.thinking {
+            // Live activity wins over any stale terminal/pause flag (a re-drive).
             RunState::Running
         } else if self.active_gate.is_some() {
             RunState::PausedAtGate
+        } else if self.budget_paused {
+            // A budget pause reads as a PAUSE (timer stopped, not aborted). Checked
+            // before the `run_started_at` Running fallback so a parked run whose
+            // `run_started_at` was already cleared can't read Running/Idle.
+            RunState::PausedAtBudget
+        } else if self.run_started_at.is_some() && self.active_gate.is_none() {
+            RunState::Running
         } else if self.finished {
             RunState::Delivered
         } else if self.degraded {
@@ -5412,6 +5444,9 @@ impl App {
         self.aborted = false;
         self.finished = false;
         self.degraded = false;
+        // A resumed / fresh working turn clears a prior budget pause too, so its
+        // `[paused]` label / hint can't paint over a turn that is demonstrably working.
+        self.budget_paused = false;
     }
 
     /// `true` while the user has started a run that hasn't reached
@@ -5424,7 +5459,10 @@ impl App {
     /// already running" — and the header would keep painting `[run] 运行中`.
     #[must_use]
     pub fn is_pipeline_active(&self) -> bool {
-        self.run_started && !self.finished && !self.aborted && !self.degraded
+        // A budget pause is terminal-for-now (the run stopped, awaiting `/continue`),
+        // so it is NOT active — a fresh `/run` or a `/continue` must not be refused as
+        // "a pipeline is already running", exactly like an aborted/degraded round.
+        self.run_started && !self.finished && !self.aborted && !self.degraded && !self.budget_paused
     }
 
     /// Shared truth for Esc, Ctrl-C, and `/cancel`. A Director paused at a gate
@@ -5479,9 +5517,10 @@ impl App {
         // A bailed round is terminal — drop the live plan / team-review panel so
         // its last (now stale) state doesn't hang under the transcript.
         self.clear_live_panels();
-        // ...but a TRANSIENT abort with a resumable plan brings the checklist back
-        // FROZEN (see the method) so the saved plan doesn't vanish; fail-open.
-        self.rehydrate_frozen_plan_if_transient(&body);
+        // ...but a RESUMABLE stop (a transient abort OR a run-time-budget pause that
+        // reached this path) with a resumable plan brings the checklist back FROZEN
+        // (see the method) so the saved plan doesn't vanish; fail-open.
+        self.rehydrate_frozen_plan_if_resumable(&body);
         self.push(ChatRole::System, body);
         // M2 — an honest abort fires no further gate/completion, so a steer
         // message parked in `queued_steer` (the pipeline-run queue) would stay
@@ -8637,10 +8676,11 @@ impl App {
                 // Surface the run as a manageable background task (idempotent — a
                 // gate-anchored `Continue` block re-emits this and REUSES the task).
                 self.register_run_task(&requirement);
-                // A fresh block clears any prior aborted / degraded terminal state
-                // (and the per-run degrade latch) — this run is live again.
+                // A fresh block clears any prior aborted / degraded / budget-paused
+                // terminal state (and the per-run degrade latch) — this run is live again.
                 self.aborted = false;
                 self.degraded = false;
+                self.budget_paused = false;
                 self.run_degraded_seen = false;
                 self.run_started_at = Some(std::time::Instant::now());
                 self.push(
@@ -11398,6 +11438,66 @@ impl App {
             .filter(|(staged, _)| *staged == gate)
             .and_then(|(_, choice)| choice);
         self.apply_engine(EngineEvent::GateOpened { gate, choice });
+        self.refresh_status();
+    }
+
+    /// A DIRECTOR build parked because its wall-clock budget was exhausted while
+    /// resumable steps remained (Stage 1/2) — the terminal `RunPausedAtBudget`
+    /// decision's recorder. Mirrors [`Self::record_run_paused_at_gate`] but for a
+    /// PAUSE with no gate: it clears the in-flight "thinking…" state and the live
+    /// counters (so the timer stops and the status reads `[paused]`, NEVER
+    /// `[aborted]`), arms [`Self::budget_paused`] so `run_state` reads
+    /// [`RunState::PausedAtBudget`], keeps the plan panel visible in a FROZEN
+    /// (interrupted) form so the user can see what was saved, and pushes the
+    /// `/continue` resume hint carrying `done/total`.
+    ///
+    /// This deliberately does NOT route through [`Self::mark_block_aborted`]: a budget
+    /// pause is a resumable settle, not an honest hard abort — the plan is intact on
+    /// disk and `/continue` re-drives only the remaining steps.
+    pub(crate) fn record_run_paused_at_budget(&mut self, done: usize, total: usize) {
+        // An away user should hear that the run parked (same as the abort/deliver
+        // paths). Arm before the timers are cleared, gated on how long it had run.
+        self.arm_completion_bell(self.run_started_at.or(self.thinking_started));
+        self.thinking = false;
+        self.thinking_started = None;
+        self.agentic_in_flight = false;
+        self.tool_in_progress = false;
+        self.long_op_in_progress = false;
+        self.stream_text_active = false;
+        self.stream_tool_batch = None;
+        self.collapse_thinking_block();
+        self.reset_stream_md_cache();
+        // The writer session is gone; what remains is the parked plan on disk.
+        self.director_run_in_flight = false;
+        self.budget_paused = true;
+        // Stop every live counter so the status bar reflects a real paused state.
+        self.run_started_at = None;
+        self.phase_started_at = None;
+        self.last_output_at = None;
+        self.transient_status = None;
+        // Keep the plan panel: drop the LIVE panel, then bring the saved plan back in
+        // a FROZEN (interrupted) form so the user sees the completed / remaining steps
+        // and that `/continue` resumes them. Fail-open (no readable plan → empty).
+        self.clear_live_panels();
+        self.rehydrate_frozen_plan_now();
+        // The one-line resume hint carrying where the run parked (done/total steps).
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(
+                self.lang,
+                "run.budget_pause_resume_hint",
+                &[&done.to_string(), &total.to_string()],
+            ),
+        );
+        // A parked run fires no gate/completion, so drain any queued steer (same as
+        // the abort path) so its "queued N" chip can't stay falsely lit forever.
+        if !self.queued_steer.is_empty() {
+            let text = self.queued_steer.drain(..).collect::<Vec<_>>().join("\n");
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "run.queued_dropped", &[&text]),
+            );
+        }
         self.refresh_status();
     }
 

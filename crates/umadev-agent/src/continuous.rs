@@ -142,6 +142,18 @@ pub enum RunOutcome {
     /// pause point — the session stays alive, context retained, for the next
     /// block to resume from).
     PausedAtGate(Gate),
+    /// The run paused because its wall-clock budget was exhausted while resumable
+    /// work remained — a first-class RESUMABLE pause (never a failure), mirroring
+    /// [`crate::director_loop::DirectorLoopOutcome::PausedAtBudget`]. The plan is
+    /// checkpointed on disk (completed steps `Done`, the rest `Pending`), so
+    /// `/continue` drives only what's left. Carries the (done, total) step counts
+    /// for the resume hint.
+    PausedAtBudget {
+        /// Completed steps at the pause.
+        done: usize,
+        /// Total steps in the plan.
+        total: usize,
+    },
     /// The run drove all the way through delivery.
     Completed,
     /// The run stopped on a HARD signal (zero real source produced when the
@@ -265,10 +277,12 @@ pub async fn run_block(
     let idle = crate::director_loop::IdleBudget::from_env();
     // The run's wall-clock ceiling. The legacy phase walk has no `deadline` of its
     // own (the director loop owns one; this path predates it), so derive it the SAME
-    // way here — `now + run_budget()` — and thread it into every phase / rework pump
-    // so an ACTIVE base can't run one phase turn unbounded past the budget. A
-    // GRACEFUL ceiling: the pump settles the turn on what's built, never aborts.
-    let deadline = std::time::Instant::now() + crate::director_loop::run_budget();
+    // way here and thread it into every phase / rework pump so an ACTIVE base can't
+    // run one phase turn unbounded past the budget. A GRACEFUL ceiling: the pump
+    // settles the turn on what's built, never aborts. The `deadline` is the ABSOLUTE
+    // cap; the SLIDING idle window is applied inside each pump (Stage 3), so a
+    // slow-but-progressing turn is not cut mid-progress.
+    let deadline = std::time::Instant::now() + crate::director_loop::run_budget_absolute();
 
     // Persist the project's governance context BEFORE any phase writes a file, so
     // the out-of-process PreToolUse hook (which reads `.umadev/governance-context.
@@ -565,6 +579,11 @@ async fn drive_phase(
     // silent for minutes, so the next wait uses the extended tool window.
     let mut in_tool_call = false;
     let mut tool_activity = ToolActivity::default();
+    // SLIDING run-budget clock (Stage 3): the idle window (`run_budget()`) resets on
+    // every productive event, so a phase turn that keeps producing runs on up to the
+    // absolute cap `deadline`; a silent one still winds down after one idle window.
+    let idle_window = crate::director_loop::run_budget();
+    let mut last_progress = std::time::Instant::now();
     // The compatibility phase walk is opt-in, but it still owns a writer
     // session. Keep its settle semantics aligned with the director/rework pumps:
     // a clean turn end is not completion while known background agents are live.
@@ -577,8 +596,10 @@ async fn drive_phase(
         // one `next_event_idle` issues on an idle hang), an honest note, then
         // `PhaseResult::Done` (mirroring this pump's `TurnDone`-Completed path, which
         // records no usage) so the block winds down to its terminal phase rather than
-        // hard-aborting mid-write.
-        if std::time::Instant::now() >= deadline {
+        // hard-aborting mid-write. SLIDING (Stage 3): `eff` clamps the idle window to
+        // the absolute cap; a streaming turn keeps `eff` ahead.
+        let eff = crate::director_loop::sliding_deadline(deadline, last_progress, idle_window);
+        if std::time::Instant::now() >= eff {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS),
                 session.interrupt(),
@@ -597,13 +618,8 @@ async fn drive_phase(
             }
             return PhaseResult::Done;
         }
-        let ev = match crate::director_loop::next_event_idle(
-            session,
-            idle,
-            in_tool_call,
-            Some(deadline),
-        )
-        .await
+        let ev = match crate::director_loop::next_event_idle(session, idle, in_tool_call, Some(eff))
+            .await
         {
             crate::director_loop::IdleEvent::Event(ev) => ev,
             crate::director_loop::IdleEvent::SessionEnded { exit, stderr_tail } => {
@@ -636,6 +652,11 @@ async fn drive_phase(
         };
         // Arm/disarm the tool-grace from this event before handling it.
         in_tool_call = tool_activity.observe(&ev);
+        // SLIDING run-budget reset (Stage 3): a content-bearing event slides the idle
+        // window so a producing phase turn runs on up to the absolute cap.
+        if crate::director_loop::is_productive_event(&ev) {
+            last_progress = std::time::Instant::now();
+        }
         bg.observe(&ev);
         let event_tool_call_id = ev.tool_call_id().map(str::to_owned);
         match ev {
@@ -2223,6 +2244,12 @@ async fn drive_rework_turn_with_idle_and_memories(
     // an in-flight tool gets the extended window before the watchdog calls it a hang.
     let mut in_tool_call = false;
     let mut tool_activity = ToolActivity::default();
+    // SLIDING run-budget clock (Stage 3): the idle window (`run_budget()`) resets on
+    // every productive event so a rework/doer turn that keeps producing (a slow build
+    // step writing code / running a long test) runs on up to the absolute cap
+    // `deadline` instead of being guillotined at a fixed wall-clock instant.
+    let idle_window = crate::director_loop::run_budget();
+    let mut last_progress = std::time::Instant::now();
     // Outstanding-background-agents guard (the premature-final-report fix): this
     // pump drives the director loop's DOER steps (`director::summon`), where the
     // base may dispatch its own background sub-agents and then end the turn while
@@ -2255,8 +2282,11 @@ async fn drive_rework_turn_with_idle_and_memories(
         // (no `TurnDone` → no real usage, F3), and return the accumulated text as a
         // completed turn (`done: true`) — so the step scheduler treats it as "this
         // step produced what it produced" and the between-step deadline winds the run
-        // down to the final gate rather than re-driving past the budget.
-        if std::time::Instant::now() >= deadline {
+        // down to the final gate rather than re-driving past the budget. SLIDING
+        // (Stage 3): `eff` clamps the idle window to the absolute cap; a producing
+        // turn keeps `eff` ahead, so only a stalled turn or the absolute cap settles.
+        let eff = crate::director_loop::sliding_deadline(deadline, last_progress, idle_window);
+        if std::time::Instant::now() >= eff {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS),
                 session.interrupt(),
@@ -2278,13 +2308,8 @@ async fn drive_rework_turn_with_idle_and_memories(
                 skill_receipt,
             };
         }
-        let ev = match crate::director_loop::next_event_idle(
-            session,
-            idle,
-            in_tool_call,
-            Some(deadline),
-        )
-        .await
+        let ev = match crate::director_loop::next_event_idle(session, idle, in_tool_call, Some(eff))
+            .await
         {
             crate::director_loop::IdleEvent::Event(ev) => ev,
             // Session ended mid-rework (incl. a base that died mid-tool, caught by the
@@ -2332,6 +2357,11 @@ async fn drive_rework_turn_with_idle_and_memories(
         };
         // Arm/disarm the tool-grace from this event before handling it.
         in_tool_call = tool_activity.observe(&ev);
+        // SLIDING run-budget reset (Stage 3): a content-bearing event slides the idle
+        // window so a producing rework/doer turn runs on up to the absolute cap.
+        if crate::director_loop::is_productive_event(&ev) {
+            last_progress = std::time::Instant::now();
+        }
         // Feed the outstanding-background-agents guard (cheap, fail-open).
         bg.observe(&ev);
         let event_tool_call_id = ev.tool_call_id().map(str::to_owned);

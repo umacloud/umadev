@@ -6939,6 +6939,56 @@ fn gate_pause_reads_paused_at_gate() {
 }
 
 #[test]
+fn budget_pause_presents_as_paused_not_aborted() {
+    // The RunPausedAtBudget terminal decision: the run reads as a PAUSE (timer
+    // stopped, `[paused]` label — NEVER `[aborted]`/`[degraded]`), the in-flight
+    // state clears, the budget-pause marker arms, and the `/continue` resume hint
+    // (carrying done/total) lands in the transcript. Mirrors the gate-pause path.
+    let mut app = fresh_app(Some("offline"));
+    app.run_started = true;
+    app.run_started_at = Some(std::time::Instant::now());
+    app.thinking = true;
+    app.agentic_in_flight = true;
+    app.director_run_in_flight = true;
+
+    app.record_run_paused_at_budget(2, 6);
+
+    // Reads paused, never a stale abort/degrade; the live counters stopped.
+    assert_eq!(app.run_state(), RunState::PausedAtBudget);
+    assert!(app.budget_paused, "the budget-pause marker is armed");
+    assert!(!app.aborted && !app.degraded && !app.finished);
+    assert!(!app.thinking && !app.agentic_in_flight && !app.director_run_in_flight);
+    assert!(app.run_started_at.is_none(), "the live timer is stopped");
+    // The run is not "active" (a fresh /run or /continue must not be refused).
+    assert!(!app.is_pipeline_active());
+
+    app.refresh_status();
+    assert!(
+        app.status.contains("[paused]") && !app.status.contains("[aborted]"),
+        "the status bar reads [paused], never [aborted]: {}",
+        app.status
+    );
+    assert!(
+        !app.status.contains("[time]"),
+        "no live timer at a budget pause: {}",
+        app.status
+    );
+    // The resume hint (with done/total) landed in the transcript.
+    assert!(
+        app.history
+            .back()
+            .is_some_and(|m| m.body().contains("/continue") && m.body().contains("2/6")),
+        "the /continue resume hint carries done/total"
+    );
+
+    // A fresh live turn clears the pause so its label can't paint over live work.
+    app.thinking = true;
+    app.clear_stale_terminal_on_live_turn();
+    assert!(!app.budget_paused);
+    assert_eq!(app.run_state(), RunState::Running);
+}
+
+#[test]
 fn note_signals_degraded_matches_stable_markers_only() {
     assert!(note_signals_degraded("[WARN][降级] 占位模板"));
     assert!(note_signals_degraded("… 阻断 delivery(UD-EVID-003)。"));

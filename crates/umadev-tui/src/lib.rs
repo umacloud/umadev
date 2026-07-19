@@ -632,6 +632,18 @@ enum RouteDecision {
         /// The gate the run parked at.
         gate: Gate,
     },
+    /// A director build PAUSED because its wall-clock budget was exhausted while
+    /// resumable work remained. The agent checkpointed the plan (completed steps
+    /// `Done`, the rest `Pending`); this terminal decision clears "thinking", keeps
+    /// the plan panel visible (frozen), and arms the budget-pause marker so
+    /// `/continue` re-drives ONLY the remaining steps. Unlike a gate pause it renders
+    /// NO gate card — just the resume hint carrying `done/total`.
+    RunPausedAtBudget {
+        /// Completed steps at the pause.
+        done: usize,
+        /// Total steps in the plan.
+        total: usize,
+    },
     /// A read-only question asked while a confirmation gate remains open was
     /// answered. The app validates the generation before atomically displaying
     /// and recording the body; unlike AgenticDone, this must not clear or advance
@@ -1538,6 +1550,12 @@ fn spawn_continuous_block(
                 // `GateOpened` event already drove the gate card.
                 *holder.lock().await = Some(PermissionedSession::new(session, session_identity));
             }
+            Ok(umadev_agent::RunOutcome::PausedAtBudget { .. }) => {
+                // Budget pause on the legacy continuous path: resumable, not a
+                // failure. Park the live session back like a gate pause so a
+                // `/continue` block resumes it with context retained.
+                *holder.lock().await = Some(PermissionedSession::new(session, session_identity));
+            }
             Ok(umadev_agent::RunOutcome::Completed) => {
                 // Run settled — close the session and clear the holder.
                 let _ = session.end().await;
@@ -2043,6 +2061,15 @@ async fn run_director_loop(
                 // app's director-pause marker so approval / a revision resume the
                 // director loop instead of the legacy gate blocks.
                 let _ = route_tx.send(RouteDecision::RunPausedAtGate { gate });
+            }
+            umadev_agent::DirectorLoopOutcome::PausedAtBudget { done, total } => {
+                // RESUMABLE budget pause (Stage 1/2): the run stopped only because its
+                // wall-clock budget was exhausted while resumable steps remained. The
+                // loop already checkpointed the plan; present this as a PAUSE, never an
+                // abort — NO ABORT_SENTINEL, no gate card. The terminal decision keeps
+                // the plan panel (frozen), pushes the resume hint carrying done/total,
+                // and arms the budget-pause marker so `/continue` finishes the rest.
+                let _ = route_tx.send(RouteDecision::RunPausedAtBudget { done, total });
             }
         }
     }
@@ -10952,6 +10979,13 @@ async fn event_loop(
                 // drained — the gate awaits the user's answer.
                 Some(RouteDecision::RunPausedAtGate { gate }) => {
                     app.record_run_paused_at_gate(gate);
+                }
+                // A director build parked at the wall-clock budget (Stage 1/2).
+                // Resumable, not aborted: keep the plan panel, arm the budget-pause
+                // marker, show the `/continue` hint. Queued chat is NOT drained — the
+                // run is parked awaiting the user's `/continue`.
+                Some(RouteDecision::RunPausedAtBudget { done, total }) => {
+                    app.record_run_paused_at_budget(done, total);
                 }
                 Some(RouteDecision::GateQueryDone { epoch, reply }) => {
                     if app.record_gate_query_done(epoch, reply) {

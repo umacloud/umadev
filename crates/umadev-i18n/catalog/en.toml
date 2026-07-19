@@ -55,6 +55,7 @@
 "model.reasoning" = "reasoning effort {} (from the base config; UmaDev does not override)"
 "input.idle" = "Ask anything…"
 "input.aborted" = "this round was aborted — type a new requirement to try again"
+"input.budget_paused" = "[paused] /continue to finish the remaining steps, or type a new requirement"
 "input.degraded" = "this round degraded / incomplete — fix the base, then /redo for real output"
 # Rotating idle-empty placeholders: example requirements (echoing the welcome
 # examples) + command hints, rotated once per submit; special states (running /
@@ -78,6 +79,7 @@
 # Status
 "status.ready" = "Ready"
 "status.aborted" = "this round was aborted"
+"status.budget_paused" = "paused at the time budget"
 "status.degraded" = "degraded / incomplete — fix the base, then /redo"
 "status.stopping" = "stopping…"
 "status.thinking" = "thinking…"
@@ -343,6 +345,7 @@
 "plan.panel.active_step" = "step {}/{} · running"
 "plan.panel.interrupted" = "Plan (interrupted — /continue to resume)"
 "run.transient_resume_hint" = "Rate-limited or briefly interrupted — this run's plan is saved; type `/continue` to resume the unfinished steps."
+"run.budget_pause_resume_hint" = "Time budget reached — this run paused at step {}/{}; type `/continue` to finish the remaining steps."
 "plan.summary.header" = "Task summary — {} done · {} in progress · {} blocked · {} not started"
 "plan.panel.more_hint" = "scroll up or /plan for all"
 "plan.none" = "No active plan. A build or a deliberate turn posts one here."
@@ -1041,6 +1044,7 @@
 "tui.hint.finished" = "[ok] complete — new requirement to start again"
 "tui.hint.running" = "[wait] pipeline running — wait for the next gate"
 "tui.hint.aborted" = "[aborted] this round stopped — type a new requirement to start again"
+"tui.hint.budget_paused" = "[paused] time budget reached — type /continue to finish the remaining steps"
 # Slash-command palette popover title
 "tui.palette.title" = "slash commands"
 # @-file-mention typeahead popover title + prompt hint
