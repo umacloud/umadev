@@ -81,7 +81,7 @@ unicode-width = "0.2"
 # tree transitively; pinned here so the TUI can depend on it directly. The
 # dependency-light constraint only binds the spec / governance / contract crates,
 # not the TUI.
-similar = "2.7"
+similar = "3.1"
 
 # --- governance / parsing ---
 regex = "1.10"
