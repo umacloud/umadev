@@ -48,11 +48,11 @@ semver = "1"
 # ACP v1 wire types only. Transport/process ownership stays in umadev-host so
 # Windows shims, bounded stderr, cancellation, and child cleanup remain shared.
 agent-client-protocol-schema = "=1.4.0"
-toml = "0.8"
+toml = "1.1"
 # Format-preserving TOML editor — used by the MCP manager to parse-merge
 # codex's ~/.codex config.toml `[mcp_servers]` table without clobbering the
 # user's existing keys, comments, or formatting. Already in the tree via `toml`.
-toml_edit = "0.22"
+toml_edit = "0.25"
 
 # --- error handling ---
 anyhow = "1"
@@ -68,7 +68,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # modes have one shared Crossterm 0.28 runtime.
 ratatui = { version = "=0.30.2", default-features = false, features = ["layout-cache", "macros", "std", "underline-color"] }
 ratatui-crossterm = { version = "=0.1.2", default-features = false, features = ["crossterm_0_28", "underline-color"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 # Unicode display-width table (zero-width combining marks / variation selectors
 # / wide CJK / emoji) for correct terminal cursor + wrap math in the TUI editor.
 # Already in the tree via ratatui; pinned here so the TUI can depend on it
@@ -81,12 +81,12 @@ unicode-width = "0.2"
 # tree transitively; pinned here so the TUI can depend on it directly. The
 # dependency-light constraint only binds the spec / governance / contract crates,
 # not the TUI.
-similar = "2.7"
+similar = "3.1"
 
 # --- governance / parsing ---
 regex = "1.10"
-sha2 = "0.10"
-getrandom = "0.2"
+sha2 = "0.11"
+getrandom = "0.4"
 
 # --- time ---
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
@@ -96,7 +96,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # --- archive ---
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # Embed the curated `knowledge/` corpus into the shipped binary so end users get
 # the full commercial-engineering KB with zero setup (extracted to
 # ~/.umadev/knowledge on first run). Text-only corpus → fast compile, ~5.5M.
