@@ -58,6 +58,14 @@ pub fn detect_base_model(backend_id: &str, project_root: &std::path::Path) -> Op
                 .as_str()
                 .map(str::to_string)
         }),
+        // Grok Build: `.grok/config.toml` `[models] default` — the model used for
+        // new sessions (docs.x.ai/build/settings/reference). UmaDev may pin `--model`
+        // at launch, but when it does not, THIS is the model the base runs on.
+        "grok-build" => grok_config(project_root, home.as_deref())?
+            .get("models")?
+            .get("default")?
+            .as_str()
+            .map(str::to_string),
         _ => None,
     }
 }
@@ -76,6 +84,12 @@ pub fn detect_base_context_window(backend_id: &str, project_root: &std::path::Pa
         let value = kimi_config(home.as_deref())?;
         let model = value.get("default_model")?.as_str()?;
         return kimi_context_for_model(&value, model);
+    }
+    if backend_id == "grok-build" {
+        let home = config::home_dir();
+        let value = grok_config(project_root, home.as_deref())?;
+        let model = value.get("models")?.get("default")?.as_str()?;
+        return grok_context_for_model(&value, model);
     }
     if backend_id != "opencode" {
         return None;
@@ -104,6 +118,10 @@ pub fn detect_base_context_window_for_model(
         }
         let home = config::home_dir();
         return kimi_context_for_model(&kimi_config(home.as_deref())?, model);
+    }
+    if backend_id == "grok-build" {
+        let home = config::home_dir();
+        return grok_context_for_model(&grok_config(project_root, home.as_deref())?, model.trim());
     }
     if backend_id != "opencode" {
         return None;
@@ -162,6 +180,13 @@ pub fn detect_base_reasoning(backend_id: &str, project_root: &std::path::Path) -
                 .and_then(toml::Value::as_bool)
                 .map(|enabled| if enabled { "on" } else { "off" }.to_string())
         }),
+        // Grok Build: `.grok/config.toml` `[models] default_reasoning_effort` — the
+        // default effort for the default model (docs.x.ai/build/settings/reference).
+        "grok-build" => grok_config(project_root, home.as_deref())?
+            .get("models")?
+            .get("default_reasoning_effort")?
+            .as_str()
+            .map(str::to_string),
         // opencode: effort is baked into the model variant — no separate field.
         _ => None,
     }
@@ -572,6 +597,34 @@ fn kimi_config(home: Option<&std::path::Path>) -> Option<toml::Value> {
     toml::from_str(&text).ok()
 }
 
+/// Parse Grok Build's `.grok/config.toml` (a project-root override first, then the
+/// user's `~/.grok/config.toml`) into a TOML value, purely to DISPLAY the model /
+/// effort / context the base runs on. Fail-open: an absent / unreadable / malformed
+/// file at either location yields `None`, never a panic.
+fn grok_config(project_root: &std::path::Path, home: Option<&std::path::Path>) -> Option<toml::Value> {
+    let candidates = [
+        Some(project_root.join(".grok/config.toml")),
+        home.map(|h| h.join(".grok/config.toml")),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .find_map(|text| toml::from_str::<toml::Value>(&text).ok())
+}
+
+/// Read Grok Build's exact context window for `model` from its config: the
+/// `[model."<id>"] context_window` field (docs.x.ai/build/settings/reference).
+/// Fail-open: an absent / non-integer / oversized value yields `None`.
+fn grok_context_for_model(value: &toml::Value, model: &str) -> Option<u64> {
+    value
+        .get("model")?
+        .get(model)?
+        .get("context_window")
+        .and_then(toml::Value::as_integer)
+        .and_then(|n| u64::try_from(n).ok())
+}
+
 fn kimi_context_for_model(value: &toml::Value, model: &str) -> Option<u64> {
     let entry = value.get("models")?.get(model)?;
     entry
@@ -631,6 +684,62 @@ mod reestablish_tests {
         let re = redetect_base_config("offline", tmp.path(), "fallback-model");
         assert_eq!(re.model, "fallback-model");
         assert_eq!(re.reasoning, None);
+    }
+}
+
+#[cfg(test)]
+mod grok_tests {
+    use super::{detect_base_context_window, detect_base_model, detect_base_reasoning};
+
+    #[test]
+    fn reads_model_effort_and_context_from_grok_config_toml() {
+        // Grok Build's `.grok/config.toml` schema (docs.x.ai/build/settings/reference):
+        // `[models] default` + `default_reasoning_effort`, and a per-model
+        // `[model."<id>"] context_window`. A project-root override is read first, so
+        // this is hermetic regardless of the dev machine's own `~/.grok/config.toml`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".grok")).unwrap();
+        std::fs::write(
+            root.join(".grok/config.toml"),
+            "[models]\ndefault = \"grok-4.5\"\ndefault_reasoning_effort = \"high\"\n\n\
+             [model.\"grok-4.5\"]\ncontext_window = 1000000\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            detect_base_model("grok-build", root).as_deref(),
+            Some("grok-4.5"),
+            "the [models] default model is surfaced for Grok, like every other base"
+        );
+        assert_eq!(
+            detect_base_reasoning("grok-build", root).as_deref(),
+            Some("high"),
+            "the [models] default_reasoning_effort is surfaced for Grok"
+        );
+        assert_eq!(
+            detect_base_context_window("grok-build", root),
+            Some(1_000_000),
+            "the [model.<id>] context_window is surfaced for Grok"
+        );
+    }
+
+    #[test]
+    fn grok_config_with_only_mcp_servers_is_fail_open_none() {
+        // A real `.grok/config.toml` may hold ONLY `[mcp_servers.*]` (that is all
+        // UmaDev writes into it) with no `[models]` — that must yield None (no
+        // fabricated model / effort / context), never a panic.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".grok")).unwrap();
+        std::fs::write(
+            root.join(".grok/config.toml"),
+            "[mcp_servers.example]\ncommand = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(detect_base_model("grok-build", root), None);
+        assert_eq!(detect_base_reasoning("grok-build", root), None);
+        assert_eq!(detect_base_context_window("grok-build", root), None);
     }
 }
 

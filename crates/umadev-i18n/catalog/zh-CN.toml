@@ -791,6 +791,7 @@
 "base.fail.auth.codex" = "codex 未登录或鉴权失败 — 运行 `codex login`(或检查 API key),然后用 /continue 续上"
 "base.fail.auth.opencode" = "opencode 未登录或鉴权失败 — 运行 `opencode auth login`(或检查 API key),然后用 /continue 续上"
 "base.fail.auth.kimi" = "Kimi Code 未登录 — 请在终端运行 `kimi login`,然后用 /continue 续上;UmaDev 不会自动打开登录浏览器"
+"base.fail.auth.grok" = "Grok Build 未登录 — 请在终端运行 `grok login`,然后用 /continue 续上;UmaDev 不会自动打开登录浏览器"
 "base.fail.auth.generic" = "底座未登录或鉴权失败 — 运行底座的登录命令(或检查 API key),然后用 /continue 续上"
 "base.fail.ratelimit" = "底座触发限流 — 等待其重置(见下方底座的原始信息),或用 /model 切换模型,或换个底座"
 "base.fail.overloaded" = "底座过载(忙)— 稍后重试,或用 /model 切到更轻量的模型,或换个底座"

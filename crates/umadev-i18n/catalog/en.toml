@@ -801,6 +801,7 @@
 "base.fail.auth.codex" = "codex not logged in / auth failed — run `codex login` (or check your API key), then /continue"
 "base.fail.auth.opencode" = "opencode not logged in / auth failed — run `opencode auth login` (or check your API key), then /continue"
 "base.fail.auth.kimi" = "Kimi Code is not logged in — run `kimi login` in your terminal, then /continue; UmaDev never opens a login browser automatically"
+"base.fail.auth.grok" = "Grok Build is not logged in — run `grok login` in your terminal, then /continue; UmaDev never opens a login browser automatically"
 "base.fail.auth.generic" = "Base not logged in / auth failed — run the base's login command (or check your API key), then /continue"
 "base.fail.ratelimit" = "Base hit a rate limit — wait for it to reset (see the base's message below), or /model to switch model, or switch base"
 "base.fail.overloaded" = "Base is overloaded (busy) — retry shortly, or /model to a lighter model, or switch base"

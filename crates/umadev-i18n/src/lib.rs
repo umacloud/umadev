@@ -353,6 +353,8 @@ mod tests {
             "base.fail.auth.claude",
             "base.fail.auth.codex",
             "base.fail.auth.opencode",
+            "base.fail.auth.kimi",
+            "base.fail.auth.grok",
             "base.fail.auth.generic",
             "base.fail.ratelimit",
             "base.fail.overloaded",

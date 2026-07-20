@@ -338,6 +338,7 @@ fn auth_key(backend: &str) -> &'static str {
         "codex" => "base.fail.auth.codex",
         "opencode" => "base.fail.auth.opencode",
         "kimi-code" | "kimi" => "base.fail.auth.kimi",
+        "grok-build" | "grok" => "base.fail.auth.grok",
         _ => "base.fail.auth.generic",
     }
 }
@@ -605,6 +606,23 @@ mod tests {
         // Fail-open floor: nothing captured → Unknown, no panic.
         assert_eq!(classify(None, None, None), BaseFailure::Unknown);
         assert_eq!(classify(None, Some(""), Some("")), BaseFailure::Unknown);
+    }
+
+    #[test]
+    fn backend_auth_remediation_is_specific_for_every_base() {
+        // Every first-class base must NAME its OWN login command on an auth failure —
+        // a base that lands on the generic "run the base's login command" fallback is
+        // the exact Grok gap this guards against (Grok had a `grok login` hint the auth
+        // remediation never surfaced). These are the CANONICAL backend ids production
+        // actually passes (the same 5 as host::BACKEND_IDS); the short aliases some
+        // arms also accept are a defensive extra, not the path under test.
+        for id in ["claude-code", "codex", "opencode", "grok-build", "kimi-code"] {
+            assert_ne!(
+                auth_key(id),
+                "base.fail.auth.generic",
+                "base `{id}` must have a base-specific auth remediation, not the generic fallback"
+            );
+        }
     }
 
     #[test]
