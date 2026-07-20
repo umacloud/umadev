@@ -616,7 +616,13 @@ mod tests {
         // remediation never surfaced). These are the CANONICAL backend ids production
         // actually passes (the same 5 as host::BACKEND_IDS); the short aliases some
         // arms also accept are a defensive extra, not the path under test.
-        for id in ["claude-code", "codex", "opencode", "grok-build", "kimi-code"] {
+        for id in [
+            "claude-code",
+            "codex",
+            "opencode",
+            "grok-build",
+            "kimi-code",
+        ] {
             assert_ne!(
                 auth_key(id),
                 "base.fail.auth.generic",

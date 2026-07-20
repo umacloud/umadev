@@ -601,7 +601,10 @@ fn kimi_config(home: Option<&std::path::Path>) -> Option<toml::Value> {
 /// user's `~/.grok/config.toml`) into a TOML value, purely to DISPLAY the model /
 /// effort / context the base runs on. Fail-open: an absent / unreadable / malformed
 /// file at either location yields `None`, never a panic.
-fn grok_config(project_root: &std::path::Path, home: Option<&std::path::Path>) -> Option<toml::Value> {
+fn grok_config(
+    project_root: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Option<toml::Value> {
     let candidates = [
         Some(project_root.join(".grok/config.toml")),
         home.map(|h| h.join(".grok/config.toml")),

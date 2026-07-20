@@ -486,7 +486,13 @@ impl ClaudeSession {
         Self::spawn_with_args(
             &program,
             workspace,
-            &resume_session_args_for_profile(session_id, append_system, permissions, max_turns, model),
+            &resume_session_args_for_profile(
+                session_id,
+                append_system,
+                permissions,
+                max_turns,
+                model,
+            ),
             session_id,
         )
         .await
@@ -3748,8 +3754,13 @@ mod tests {
 
         // An empty id and the offline/test placeholders never inject a bogus --model.
         for placeholder in ["", "offline", "stub", "m"] {
-            let args =
-                session_args_for_profile("sid-e", None, BasePermissionProfile::Auto, None, placeholder);
+            let args = session_args_for_profile(
+                "sid-e",
+                None,
+                BasePermissionProfile::Auto,
+                None,
+                placeholder,
+            );
             assert!(
                 !args.iter().any(|a| a == "--model"),
                 "no --model is injected for the placeholder id `{placeholder}`"
@@ -3776,7 +3787,8 @@ mod tests {
         }
 
         std::env::set_var("UMADEV_NO_SKIP_PERMS", "1");
-        let tightened = session_args_for_profile("sid-t", None, BasePermissionProfile::Auto, None, "");
+        let tightened =
+            session_args_for_profile("sid-t", None, BasePermissionProfile::Auto, None, "");
         let p = tightened
             .iter()
             .position(|a| a == "--permission-mode")

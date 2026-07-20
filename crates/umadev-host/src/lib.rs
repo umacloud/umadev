@@ -2697,9 +2697,16 @@ pub async fn session_for_resume(
         "claude-code" => {
             // `None` → unbounded resumed main line (today's behavior); see `session_for`.
             // Forward the model so a `/continue` resumes on the user's chosen model.
-            let s = ClaudeSession::resume(workspace, append_system, resume_id, permissions, None, model)
-                .await
-                .map_err(redaction::sanitize_session_error)?;
+            let s = ClaudeSession::resume(
+                workspace,
+                append_system,
+                resume_id,
+                permissions,
+                None,
+                model,
+            )
+            .await
+            .map_err(redaction::sanitize_session_error)?;
             Ok(Box::new(s))
         }
         "codex" => {

@@ -5879,7 +5879,9 @@ mod tests {
         let (events, _rec) = sink();
         let mut session = FakeBaseSession::new(vec![
             vec![SessionEvent::TurnDone {
-                status: TurnStatus::Failed("Error: the base is overloaded, please retry".to_string()),
+                status: TurnStatus::Failed(
+                    "Error: the base is overloaded, please retry".to_string(),
+                ),
                 usage: None,
             }],
             vec![SessionEvent::TurnDone {
@@ -5916,7 +5918,10 @@ mod tests {
             2,
             "the SAME phase directive is re-driven once after the transient backoff"
         );
-        assert_eq!(sent[0], sent[1], "the re-drive sends the identical directive");
+        assert_eq!(
+            sent[0], sent[1],
+            "the re-drive sends the identical directive"
+        );
     }
 
     #[tokio::test]
@@ -5927,9 +5932,7 @@ mod tests {
         let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
         let (events, _rec) = sink();
         let mut session = FakeBaseSession::new(vec![vec![SessionEvent::TurnDone {
-            status: TurnStatus::Failed(
-                "Error: authentication_error — invalid api key".to_string(),
-            ),
+            status: TurnStatus::Failed("Error: authentication_error — invalid api key".to_string()),
             usage: None,
         }]]);
         let sent = session.sent_handle();

@@ -1064,10 +1064,14 @@ mod tests {
                 );
             } else {
                 assert!(
-                    args.windows(2).any(|w| w[0] == "--sandbox" && w[1] == sandbox),
+                    args.windows(2)
+                        .any(|w| w[0] == "--sandbox" && w[1] == sandbox),
                     "profile {profile:?} emits --sandbox {sandbox}: {args:?}"
                 );
-                assert!(!has_bypass, "profile {profile:?} emits no bypass flag: {args:?}");
+                assert!(
+                    !has_bypass,
+                    "profile {profile:?} emits no bypass flag: {args:?}"
+                );
             }
             assert!(args
                 .iter()
