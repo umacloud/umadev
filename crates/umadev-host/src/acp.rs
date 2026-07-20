@@ -2071,10 +2071,22 @@ impl AcpSession {
             })
         });
         if !login_advertised {
-            return Err(SessionError::Start(
-                "Kimi Code did not advertise its audited terminal login method; update Kimi Code or run `kimi doctor`"
-                    .to_string(),
-            ));
+            // VERSION TOLERANCE (the "any installed version" mandate): only the AUDITED
+            // Kimi contract is held to advertising the exact `login` auth method. A
+            // non-audited / newer Kimi may rename its auth method, or omit `authMethods`
+            // entirely when the user is ALREADY logged in (a plausible ACP-server
+            // behavior) — refusing the session there would break a genuine, logged-in
+            // Kimi Code, which is the single most likely way "any version" breaks in
+            // practice. So for a non-audited Kimi, DEGRADE: skip the explicit `login`
+            // probe and let `session/new`'s own `-32000` auth-required gate surface the
+            // honest "run `kimi login`" message. Fail-open, never a false refusal.
+            if self.negotiated.kimi_source_contract {
+                return Err(SessionError::Start(
+                    "Kimi Code did not advertise its audited terminal login method; update Kimi Code or run `kimi doctor`"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
         }
         match self
             .request_bounded_with_rpc_code(
@@ -2094,12 +2106,33 @@ impl AcpSession {
     }
 
     async fn apply_requested_kimi_model(&mut self, setup: &Value) -> Result<(), SessionError> {
-        if !self.negotiated.kimi_source_contract {
-            return Ok(());
+        if self.negotiated.kimi_source_contract {
+            // AUDITED contract: model selection is a hard guarantee — surface any failure.
+            return self.apply_kimi_model_selection(setup).await;
         }
+        // NON-AUDITED (the "any installed version" mandate): still honor the user's
+        // requested model when the build advertises the STANDARD `model` config option —
+        // Grok already passes `--model` for any version, and this closes the Kimi
+        // asymmetry so a user on a newer Kimi no longer has their `/model` choice
+        // silently dropped. But a model-selection LIMITATION on an unaudited build must
+        // DEGRADE to the base's own default, never BLOCK startup, so any error here is
+        // swallowed (strictly better than today's unconditional skip).
+        if let Err(_e) = self.apply_kimi_model_selection(setup).await {
+            // Best-effort: the build exposes no model channel or rejected the selection.
+            // Keep the session on the base default rather than failing the open.
+        }
+        Ok(())
+    }
+
+    /// The core Kimi model-selection contract: adopt the session's current model when
+    /// the user pinned none, otherwise validate the requested model against the
+    /// advertised catalog and set it via `session/set_config_option`. Returns an error
+    /// when the build exposes no model config option / catalog or rejects the selection.
+    /// The AUDITED path surfaces that error; the non-audited path degrades on it.
+    async fn apply_kimi_model_selection(&mut self, setup: &Value) -> Result<(), SessionError> {
         let Some(current) = extract_session_model(setup) else {
             return Err(SessionError::Start(
-                "Kimi Code session did not return its audited model config option".to_string(),
+                "Kimi Code session did not return a model config option".to_string(),
             ));
         };
         if self.model.trim().is_empty() {
@@ -2631,11 +2664,16 @@ impl AcpSession {
         let Some(mode_id) =
             select_session_mode(setup, self.vendor, self.permissions, source_contract)
         else {
-            return if matches!(self.vendor, AcpVendor::Kimi) {
+            return if matches!(self.vendor, AcpVendor::Kimi)
+                && kimi_missing_mode_is_fatal(source_contract, self.permissions)
+            {
                 Err(SessionError::Start(
                     "Kimi Code did not advertise the required mode config option".to_string(),
                 ))
             } else {
+                // Grok (launch-boundary authoritative) OR a non-audited Kimi under
+                // Guarded/Auto whose mode catalog shape differs: DEGRADE on the base's
+                // own default mode instead of blocking a working build.
                 Ok(())
             };
         };
@@ -8403,6 +8441,21 @@ fn validate_grok_auth_gate(result: &Value) -> Result<(), SessionError> {
     Err(SessionError::Start(detail))
 }
 
+/// Whether a Kimi session whose mode config option is ABSENT (in the shape UmaDev
+/// recognizes) must FAIL rather than degrade. Kimi has no launch-level sandbox — the
+/// ACP session mode is its ONLY permission boundary — so this fails CLOSED exactly
+/// where correctness demands and DEGRADES where the "any installed version" mandate
+/// demands:
+///   - AUDITED contract (`source_contract`): the option MUST be advertised → fatal.
+///   - Plan (read-only): we cannot PROVE a read-only boundary without the mode, so we
+///     refuse rather than run a possibly-writable base under a read-only promise.
+///   - Guarded / Auto on a NON-audited build: those profiles permit writes anyway, so
+///     a newer/renamed mode catalog degrades (proceed on the base's own default mode).
+/// Grok never reaches this — its launch flags are the authoritative boundary.
+fn kimi_missing_mode_is_fatal(source_contract: bool, permissions: BasePermissionProfile) -> bool {
+    source_contract || matches!(permissions, BasePermissionProfile::Plan)
+}
+
 fn select_session_mode(
     setup: &Value,
     vendor: AcpVendor,
@@ -9246,6 +9299,41 @@ mod tests {
         assert!(
             validate_initialize(AcpVendor::Kimi, &wrong_program).is_err(),
             "a different `kimi` on PATH (wrong ACP identity) is still rejected"
+        );
+    }
+
+    #[test]
+    fn kimi_missing_mode_fails_closed_only_where_correctness_requires() {
+        // SECURITY INVARIANT: Kimi's ONLY permission boundary is the ACP session mode.
+        // When a non-audited Kimi's mode catalog shape differs, we must still fail CLOSED
+        // for Plan (read-only) and for the audited contract, but DEGRADE for Guarded/Auto
+        // (which permit writes anyway) so a newer Kimi build is not blocked outright.
+
+        // Audited contract: the mode option is a hard guarantee → fatal in every profile.
+        for profile in [
+            BasePermissionProfile::Plan,
+            BasePermissionProfile::Guarded,
+            BasePermissionProfile::Auto,
+        ] {
+            assert!(
+                kimi_missing_mode_is_fatal(true, profile),
+                "the audited Kimi contract must fail closed when its mode option is absent"
+            );
+        }
+
+        // Non-audited: Plan MUST fail closed (read-only can't be proven without the mode)…
+        assert!(
+            kimi_missing_mode_is_fatal(false, BasePermissionProfile::Plan),
+            "Plan (read-only) must fail closed even on a non-audited Kimi build"
+        );
+        // …but Guarded/Auto DEGRADE (those profiles permit writes) rather than block.
+        assert!(
+            !kimi_missing_mode_is_fatal(false, BasePermissionProfile::Guarded),
+            "Guarded on a non-audited Kimi degrades to the base default, not a hard block"
+        );
+        assert!(
+            !kimi_missing_mode_is_fatal(false, BasePermissionProfile::Auto),
+            "Auto on a non-audited Kimi degrades to the base default, not a hard block"
         );
     }
 
