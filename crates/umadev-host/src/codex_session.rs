@@ -2428,14 +2428,24 @@ fn notification_is_main(params: &Value, main_thread_id: &MainThreadId) -> bool {
 /// attribution remains compatible with older app-server notifications, but an
 /// explicitly different or stale turn is never allowed into this turn's event
 /// stream or approval surface.
-async fn turn_reference_is_active(params: &Value, turn_id: &TurnId) -> bool {
-    let referenced = params
+/// Extract the turn id a frame references, accepting EVERY spelling codex uses on
+/// its frames: a top-level `turnId` or `turn_id`, or the nested `turn.id`. `None`
+/// only when the frame carries no turn reference at all. Shared by
+/// [`turn_reference_is_active`] AND the `turn/completed` emit guard so both key off
+/// the same lenient extraction — a `turn/completed` that reports its id as top-level
+/// `turnId` (a spelling codex already uses elsewhere) must not be silently dropped
+/// while `active_turn` accepts it, which would hang the turn until the idle watchdog.
+fn referenced_turn_id(params: &Value) -> Option<String> {
+    params
         .get("turnId")
         .or_else(|| params.get("turn_id"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(|| turn_id_of(params));
-    let Some(referenced) = referenced else {
+        .or_else(|| turn_id_of(params))
+}
+
+async fn turn_reference_is_active(params: &Value, turn_id: &TurnId) -> bool {
+    let Some(referenced) = referenced_turn_id(params) else {
         return true;
     };
     turn_id.lock().await.as_deref() == Some(referenced.as_str())
@@ -2531,8 +2541,11 @@ async fn handle_notification(
         "thread/tokenUsage/updated" if main && active_turn => {
             capture_usage(&params, context.latest_usage, context.trailing_usage).await;
         }
-        // The turn ended — the authoritative phase-done boundary.
-        "turn/completed" if main && active_turn && turn_id_of(&params).is_some() => {
+        // The turn ended — the authoritative phase-done boundary. Gate on the SAME
+        // lenient turn-id extraction `active_turn` uses (not just nested `turn.id`), so
+        // a completion that reports its id as top-level `turnId` completes the turn
+        // instead of being dropped into an idle-watchdog hang.
+        "turn/completed" if main && active_turn && referenced_turn_id(&params).is_some() => {
             context.early_cancel.store(false, Ordering::Release);
             context.item_targets.lock().await.clear();
             complete_turn(
@@ -3800,6 +3813,28 @@ mod tests {
     /// literal brace depth shallow.
     fn v(s: &str) -> Value {
         serde_json::from_str(s).expect("valid json fixture")
+    }
+
+    #[test]
+    fn referenced_turn_id_accepts_every_spelling_codex_uses() {
+        // #7: the `turn/completed` emit guard must key off the SAME lenient extraction
+        // `active_turn` uses, so a completion that reports its id as top-level `turnId`
+        // (or `turn_id`) is not dropped into an idle-watchdog hang. All three spellings
+        // resolve; a frame with no turn reference at all is None (fail-open → completes
+        // the sole active turn).
+        assert_eq!(
+            referenced_turn_id(&v(r#"{"turnId":"t-1"}"#)).as_deref(),
+            Some("t-1")
+        );
+        assert_eq!(
+            referenced_turn_id(&v(r#"{"turn_id":"t-2"}"#)).as_deref(),
+            Some("t-2")
+        );
+        assert_eq!(
+            referenced_turn_id(&v(r#"{"turn":{"id":"t-3"}}"#)).as_deref(),
+            Some("t-3")
+        );
+        assert_eq!(referenced_turn_id(&v(r#"{"other":1}"#)), None);
     }
 
     /// A throwaway event channel pair for the pure translators.

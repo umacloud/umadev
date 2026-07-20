@@ -189,12 +189,15 @@ impl CodexDriver {
     /// - `--skip-git-repo-check`: UmaDev workspaces are frequently
     ///   `output/` + `.umadev/` scratch dirs that aren't git repos;
     ///   codex otherwise refuses to run.
-    /// - `--sandbox`: Plan is hard-pinned to `read-only`; Guarded/Auto use the
-    ///   complete development environment unless `.umadevrc` restricts it.
+    /// - `--sandbox`: Plan is hard-pinned to `read-only`; Guarded uses
+    ///   `workspace-write` unless `.umadevrc` restricts it. Emitted for every
+    ///   profile EXCEPT Auto+full-access (which uses the bypass flag below instead).
     /// - `--dangerously-bypass-approvals-and-sandbox`: Auto only, and only when
-    ///   the resolved sandbox is already `danger-full-access`. It is never
-    ///   allowed to erase a project restriction. `UMADEV_NO_SKIP_PERMS=1`
-    ///   tightens Auto back to ordinary host approvals.
+    ///   the resolved sandbox is already `danger-full-access`. Emitted ALONE (it
+    ///   disables the sandbox entirely, so a paired `--sandbox` is redundant and
+    ///   clap-conflicts on some codex builds → exit 2). It is never allowed to erase
+    ///   a project restriction. `UMADEV_NO_SKIP_PERMS=1` tightens Auto back to
+    ///   ordinary host approvals (and thus back to an explicit `--sandbox`).
     /// - `--color never`: don't emit ANSI escape sequences that would
     ///   later need stripping. (`run_subprocess` strips them anyway,
     ///   but this is cleaner at the source.)
@@ -232,8 +235,21 @@ impl CodexDriver {
         let mut args = vec![
             self.exec_subcmd.clone(),
             "--skip-git-repo-check".to_string(),
-            "--sandbox".to_string(),
-            sandbox.to_string(),
+        ];
+        // Emit EXACTLY ONE of the two sandbox controls, never both.
+        // `--dangerously-bypass-approvals-and-sandbox` disables the sandbox ENTIRELY,
+        // so pairing it with `--sandbox danger-full-access` is at best redundant (the
+        // bypass wins, the `--sandbox` value is ignored) and — on codex builds that put
+        // the two flags in a clap `conflicts_with` group — a hard `exit 2` that drops
+        // EVERY Auto one-shot to the offline scaffold. So Auto+full-access emits the
+        // bypass flag ALONE; every other profile emits `--sandbox <mode>` as before.
+        if bypass {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        } else {
+            args.push("--sandbox".to_string());
+            args.push(sandbox.to_string());
+        }
+        args.extend([
             "--config".to_string(),
             format!("approval_policy=\"{approval}\""),
             "--color".to_string(),
@@ -244,10 +260,7 @@ impl CodexDriver {
             // ("OpenAI Codex vX … user … codex … tokens used"). Without this,
             // `complete` returned that whole banner as the "answer".
             "--json".to_string(),
-        ];
-        if bypass {
-            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-        }
+        ]);
         args
     }
 }
@@ -782,44 +795,35 @@ impl HostDriver for CodexDriver {
         if crate::any_env_set(&["OPENAI_API_KEY"]) {
             return AuthState::LoggedIn;
         }
-        // 2. Stored credential file (`$CODEX_HOME/auth.json`, default ~/.codex).
-        if codex_auth_file().is_some_and(|p| p.is_file()) {
-            return AuthState::LoggedIn;
-        }
-        // 3. Authoritative subcommand. `codex login status` exits 0 + prints
-        //    "Logged in …" when authenticated; require success so a non-zero
-        //    "Not logged in" (or any error) is classified / fail-open.
-        match run_auth_status(
+        // 2. Authoritative subcommand — the ONLY evidence of a LIVE login. `codex login
+        //    status` exits 0 + prints "Logged in …" when authenticated. This runs BEFORE
+        //    any credential-file check: a stale / expired / revoked `$CODEX_HOME/auth.json`
+        //    still sits on disk long after it stopped working, so trusting mere file
+        //    presence (as this did before) showed a green "logged in" that failed at the
+        //    first real turn — violating the "never a false LoggedIn" contract. `false` =
+        //    capture the output regardless of exit code, so the non-zero "Not logged in"
+        //    codex returns when logged out is classified, not swallowed into Unknown.
+        if let Some(out) = run_auth_status(
             &self.program,
             &["login".to_string(), "status".to_string()],
             false,
         )
         .await
         {
-            Some(out) => {
-                let lower = out.to_ascii_lowercase();
-                if lower.contains("not logged in") || lower.contains("not authenticated") {
-                    AuthState::NotLoggedIn
-                } else if lower.contains("logged in") {
-                    AuthState::LoggedIn
-                } else {
-                    AuthState::Unknown
-                }
+            let lower = out.to_ascii_lowercase();
+            if lower.contains("not logged in") || lower.contains("not authenticated") {
+                return AuthState::NotLoggedIn;
+            } else if lower.contains("logged in") {
+                return AuthState::LoggedIn;
             }
-            None => AuthState::Unknown,
         }
+        // 3. The status subcommand was indeterminate (missing/renamed on an older codex,
+        //    or timed out). A stored `auth.json` is a WEAK, stale-prone signal — it proves
+        //    a login was once configured, never that it is live — so we stay Unknown
+        //    (fail-open), never a false LoggedIn. The picker then shows "installed, auth
+        //    unknown" rather than a green light that lies.
+        AuthState::Unknown
     }
-}
-
-/// The Codex credential file path: `$CODEX_HOME/auth.json`, where `CODEX_HOME`
-/// defaults to `~/.codex` (per the Codex auth docs). Returns `None` when no home
-/// dir can be derived (fail-open: the caller then tries `codex login status`).
-fn codex_auth_file() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("CODEX_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| crate::home_dir().map(|h| h.join(".codex")))?;
-    Some(home.join("auth.json"))
 }
 
 #[cfg(test)]
@@ -1043,18 +1047,31 @@ mod tests {
             let args = CodexDriver::default()
                 .with_permissions(profile)
                 .base_args_with_sandbox(false, sandbox);
-            assert!(args
-                .windows(2)
-                .any(|w| w[0] == "--sandbox" && w[1] == sandbox));
+            let has_sandbox = args.windows(2).any(|w| w[0] == "--sandbox");
+            let has_bypass = args
+                .iter()
+                .any(|a| a == "--dangerously-bypass-approvals-and-sandbox");
+            // EXACTLY ONE sandbox control, never both (some codex builds clap-conflict
+            // on the pair → exit 2 → offline scaffold).
+            assert!(
+                has_sandbox ^ has_bypass,
+                "profile {profile:?} must emit exactly one of --sandbox / bypass: {args:?}"
+            );
+            if bypass {
+                assert!(
+                    has_bypass && !has_sandbox,
+                    "Auto+full-access emits the bypass flag ALONE, no redundant --sandbox: {args:?}"
+                );
+            } else {
+                assert!(
+                    args.windows(2).any(|w| w[0] == "--sandbox" && w[1] == sandbox),
+                    "profile {profile:?} emits --sandbox {sandbox}: {args:?}"
+                );
+                assert!(!has_bypass, "profile {profile:?} emits no bypass flag: {args:?}");
+            }
             assert!(args
                 .iter()
                 .any(|a| a == &format!("approval_policy=\"{approval}\"")));
-            assert_eq!(
-                args.iter()
-                    .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
-                bypass,
-                "profile {profile:?}: {args:?}"
-            );
         }
 
         let tightened = CodexDriver::default()
@@ -1235,19 +1252,6 @@ mod tests {
         }
     }
 
-    // `codex_auth_file` honors `$CODEX_HOME`, defaulting to `~/.codex/auth.json`.
-    #[test]
-    fn codex_auth_file_honors_codex_home() {
-        // Crate-wide auth-env lock; this sync test takes it via `blocking_lock`.
-        let _g = crate::AUTH_ENV_TEST_LOCK.blocking_lock();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let codex_home = EnvRestore::capture("CODEX_HOME");
-        codex_home.set(tmp.path());
-        let p = codex_auth_file().unwrap();
-        assert!(p.ends_with("auth.json"));
-        assert!(p.starts_with(tmp.path()));
-    }
-
     // The `auth.json` existence path: an empty CODEX_HOME (no file) + no
     // OPENAI_API_KEY + a missing binary → the only signals are absent, so a
     // missing-binary `login status` fails → Unknown (fail-open, never LoggedIn).
@@ -1265,6 +1269,30 @@ mod tests {
             state,
             AuthState::Unknown,
             "no creds + no status command must fail-open to Unknown, not LoggedIn"
+        );
+    }
+
+    // #8 FIX: a stale / expired / revoked `auth.json` still sits on disk long after
+    // it stopped working. Mere file presence must NOT read as LoggedIn — only the
+    // authoritative `codex login status` proves a LIVE login. With the file present
+    // but no OPENAI_API_KEY and a missing status binary, probe stays Unknown, never a
+    // false green "logged in" that fails at the first real turn.
+    #[tokio::test]
+    async fn probe_auth_does_not_trust_a_stale_auth_json_file() {
+        let _g = crate::AUTH_ENV_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let codex_home = EnvRestore::capture("CODEX_HOME");
+        let openai_key = EnvRestore::capture("OPENAI_API_KEY");
+        codex_home.set(tmp.path());
+        openai_key.remove();
+        // A leftover credential file — the exact stale-login case the old
+        // file-presence short-circuit mis-read as LoggedIn.
+        std::fs::write(tmp.path().join("auth.json"), "{\"tokens\":{}}").unwrap();
+        let d = CodexDriver::with_program("umadev-fake-codex-xyz");
+        assert_eq!(
+            d.probe_auth().await,
+            AuthState::Unknown,
+            "a stale auth.json on disk must never be trusted as a live login"
         );
     }
 
