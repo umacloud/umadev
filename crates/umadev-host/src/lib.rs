@@ -2592,7 +2592,10 @@ pub async fn session_for(
             // (today's behavior, fail-open). The optional per-run turn ceiling
             // (`umadev_agent::router::Depth::max_turns`) is a caller-threaded backstop;
             // the read-only critic fork is already capped LOW at the session layer.
-            let s = ClaudeSession::start(workspace, append_system, permissions, None)
+            // Thread the user's selected model through so the continuous (default)
+            // claude path honors `/model` — codex/opencode already forward it below;
+            // dropping it here silently ran claude on its OWN config default.
+            let s = ClaudeSession::start(workspace, append_system, permissions, None, model)
                 .await
                 .map_err(redaction::sanitize_session_error)?;
             Ok(Box::new(s))
@@ -2693,7 +2696,8 @@ pub async fn session_for_resume(
     match backend_id {
         "claude-code" => {
             // `None` → unbounded resumed main line (today's behavior); see `session_for`.
-            let s = ClaudeSession::resume(workspace, append_system, resume_id, permissions, None)
+            // Forward the model so a `/continue` resumes on the user's chosen model.
+            let s = ClaudeSession::resume(workspace, append_system, resume_id, permissions, None, model)
                 .await
                 .map_err(redaction::sanitize_session_error)?;
             Ok(Box::new(s))

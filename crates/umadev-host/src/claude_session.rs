@@ -409,6 +409,9 @@ impl ClaudeSession {
         append_system: Option<&str>,
         permissions: BasePermissionProfile,
         max_turns: Option<u32>,
+        // The user's selected model id/alias (empty = run claude's own default) —
+        // emitted as `--model` so the continuous (default) path honors `/model`.
+        model: &str,
     ) -> Result<Self, SessionError> {
         // Resolve the SAME way the single-shot driver does: honor UMADEV_CLAUDE_BIN, else on
         // Windows prefer the REAL `@anthropic-ai/claude-code/bin/claude.exe` over the bare
@@ -421,7 +424,7 @@ impl ClaudeSession {
         Self::spawn_with_args(
             &program,
             workspace,
-            &session_args_for_profile(&session_id, append_system, permissions, max_turns),
+            &session_args_for_profile(&session_id, append_system, permissions, max_turns, model),
             &session_id,
         )
         .await
@@ -469,6 +472,9 @@ impl ClaudeSession {
         session_id: &str,
         permissions: BasePermissionProfile,
         max_turns: Option<u32>,
+        // The user's selected model — emitted as `--model` on resume too, so a
+        // `/continue` re-opens on the same model the user chose.
+        model: &str,
     ) -> Result<Self, SessionError> {
         // Resolve the SAME way the single-shot driver does: honor UMADEV_CLAUDE_BIN, else on
         // Windows prefer the REAL `@anthropic-ai/claude-code/bin/claude.exe` over the bare
@@ -480,7 +486,7 @@ impl ClaudeSession {
         Self::spawn_with_args(
             &program,
             workspace,
-            &resume_session_args_for_profile(session_id, append_system, permissions, max_turns),
+            &resume_session_args_for_profile(session_id, append_system, permissions, max_turns, model),
             session_id,
         )
         .await
@@ -1612,7 +1618,9 @@ pub fn session_args(
     } else {
         BasePermissionProfile::Guarded
     };
-    session_args_for_profile(session_id, append_system, permissions, max_turns)
+    // The autonomous-bool wrapper (start_with_program + tests) pins no model — the
+    // continuous model selection flows through ClaudeSession::start/resume instead.
+    session_args_for_profile(session_id, append_system, permissions, max_turns, "")
 }
 
 fn session_args_for_profile(
@@ -1620,6 +1628,12 @@ fn session_args_for_profile(
     append_system: Option<&str>,
     permissions: BasePermissionProfile,
     max_turns: Option<u32>,
+    // The model id/alias the user selected. Emitted as `--model <id>` (skipping an
+    // empty id and the offline/test placeholders) so the CONTINUOUS session honors
+    // the user's `/model` choice exactly like the one-shot driver and like codex /
+    // opencode — without this the default (persistent-goal) claude path silently ran
+    // on claude's OWN config default, ignoring the selection.
+    model: &str,
 ) -> Vec<String> {
     let (permission_mode, allowed_tools) = claude_permission_args_for_profile(permissions);
     let mut args = vec![
@@ -1649,6 +1663,7 @@ fn session_args_for_profile(
         "--allowedTools".to_string(),
         allowed_tools.to_string(),
     ];
+    args.extend(crate::model_args(model));
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
         args.push("--append-system-prompt".to_string());
@@ -1689,7 +1704,7 @@ pub fn resume_session_args(
     } else {
         BasePermissionProfile::Guarded
     };
-    resume_session_args_for_profile(session_id, append_system, permissions, max_turns)
+    resume_session_args_for_profile(session_id, append_system, permissions, max_turns, "")
 }
 
 fn resume_session_args_for_profile(
@@ -1697,6 +1712,10 @@ fn resume_session_args_for_profile(
     append_system: Option<&str>,
     permissions: BasePermissionProfile,
     max_turns: Option<u32>,
+    // The user's selected model — emitted as `--model <id>` on resume too, so a
+    // `/continue` re-opens the conversation on the SAME model the user chose (see
+    // [`session_args_for_profile`]). Empty / placeholder ids are skipped.
+    model: &str,
 ) -> Vec<String> {
     let (permission_mode, allowed_tools) = claude_permission_args_for_profile(permissions);
     let mut args = vec![
@@ -1718,6 +1737,7 @@ fn resume_session_args_for_profile(
         "--allowedTools".to_string(),
         allowed_tools.to_string(),
     ];
+    args.extend(crate::model_args(model));
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
         args.push("--append-system-prompt".to_string());
@@ -3639,7 +3659,7 @@ mod tests {
             "guarded → default (claude asks → NeedApproval, human in the loop)"
         );
 
-        let plan = session_args_for_profile("sid-p", None, BasePermissionProfile::Plan, None);
+        let plan = session_args_for_profile("sid-p", None, BasePermissionProfile::Plan, None, "");
         let p_idx = plan.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(plan[p_idx + 1], "plan");
         let tools_idx = plan.iter().position(|a| a == "--allowedTools").unwrap();
@@ -3695,6 +3715,49 @@ mod tests {
     }
 
     #[test]
+    fn session_args_emit_the_selected_model_and_skip_placeholders() {
+        // The HIGH audit finding: the continuous (default) claude path silently dropped
+        // the user's /model choice. Both the fresh and resume arg builders must now emit
+        // `--model <id>` for a real id, and skip it for an empty / placeholder id so a
+        // default run never injects a bogus --model.
+        let fresh = session_args_for_profile(
+            "sid-m",
+            None,
+            BasePermissionProfile::Auto,
+            None,
+            "claude-opus-4-8",
+        );
+        let m = fresh
+            .iter()
+            .position(|a| a == "--model")
+            .expect("the fresh continuous session passes --model");
+        assert_eq!(fresh[m + 1], "claude-opus-4-8");
+
+        let resumed = resume_session_args_for_profile(
+            "sid-m",
+            None,
+            BasePermissionProfile::Auto,
+            None,
+            "claude-opus-4-8",
+        );
+        let rm = resumed
+            .iter()
+            .position(|a| a == "--model")
+            .expect("a /continue resume passes --model too");
+        assert_eq!(resumed[rm + 1], "claude-opus-4-8");
+
+        // An empty id and the offline/test placeholders never inject a bogus --model.
+        for placeholder in ["", "offline", "stub", "m"] {
+            let args =
+                session_args_for_profile("sid-e", None, BasePermissionProfile::Auto, None, placeholder);
+            assert!(
+                !args.iter().any(|a| a == "--model"),
+                "no --model is injected for the placeholder id `{placeholder}`"
+            );
+        }
+    }
+
+    #[test]
     fn bypass_override_is_confined_to_auto_and_no_skip_tightens_it() {
         let _lock = PERM_ENV_LOCK
             .lock()
@@ -3707,13 +3770,13 @@ mod tests {
             (BasePermissionProfile::Guarded, "default"),
             (BasePermissionProfile::Auto, "bypassPermissions"),
         ] {
-            let args = session_args_for_profile("sid-b", None, profile, None);
+            let args = session_args_for_profile("sid-b", None, profile, None, "");
             let p = args.iter().position(|a| a == "--permission-mode").unwrap();
             assert_eq!(args[p + 1], expected, "profile {profile:?}: {args:?}");
         }
 
         std::env::set_var("UMADEV_NO_SKIP_PERMS", "1");
-        let tightened = session_args_for_profile("sid-t", None, BasePermissionProfile::Auto, None);
+        let tightened = session_args_for_profile("sid-t", None, BasePermissionProfile::Auto, None, "");
         let p = tightened
             .iter()
             .position(|a| a == "--permission-mode")
@@ -3918,8 +3981,8 @@ mod tests {
             BasePermissionProfile::Guarded,
             BasePermissionProfile::Auto,
         ] {
-            let fresh = session_args_for_profile("fresh-id", None, profile, None);
-            let resumed = resume_session_args_for_profile("resume-id", None, profile, None);
+            let fresh = session_args_for_profile("fresh-id", None, profile, None, "");
+            let resumed = resume_session_args_for_profile("resume-id", None, profile, None, "");
             for flag in ["--permission-mode", "--allowedTools"] {
                 let fresh_value = fresh
                     .iter()
