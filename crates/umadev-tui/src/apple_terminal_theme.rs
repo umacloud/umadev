@@ -91,8 +91,8 @@ pub(crate) fn background_is_light(raw: &str) -> Option<bool> {
 /// see [`crate::theme_pinned`]). Every other terminal and OS is excluded, so
 /// `osascript` never runs for them.
 #[must_use]
-pub(crate) fn should_probe(target_os: &str, term_program: Option<&str>, pinned: bool) -> bool {
-    target_os == "macos" && term_program == Some("Apple_Terminal") && !pinned
+pub(crate) fn should_probe(target_os: &str, is_apple_terminal: bool, pinned: bool) -> bool {
+    target_os == "macos" && is_apple_terminal && !pinned
 }
 
 /// Runtime gate: wire the real environment into [`should_probe`]. Reads the
@@ -101,10 +101,9 @@ pub(crate) fn should_probe(target_os: &str, term_program: Option<&str>, pinned: 
 /// predicate stays hermetically testable.
 #[must_use]
 fn probe_allowed() -> bool {
-    let term_program = std::env::var("TERM_PROGRAM").ok();
     should_probe(
         std::env::consts::OS,
-        term_program.as_deref().map(str::trim),
+        crate::is_apple_terminal(),
         crate::theme_pinned(),
     )
 }
@@ -229,26 +228,27 @@ mod tests {
 
     #[test]
     fn gate_true_only_for_macos_apple_terminal_unpinned() {
-        assert!(should_probe("macos", Some("Apple_Terminal"), false));
+        assert!(should_probe("macos", true, false));
     }
 
     #[test]
     fn gate_skips_when_pinned() {
         // A `/theme` or `UMADEV_THEME` pin blocks the probe entirely.
-        assert!(!should_probe("macos", Some("Apple_Terminal"), true));
+        assert!(!should_probe("macos", true, true));
     }
 
     #[test]
     fn gate_skips_other_os() {
-        assert!(!should_probe("linux", Some("Apple_Terminal"), false));
-        assert!(!should_probe("windows", Some("Apple_Terminal"), false));
+        assert!(!should_probe("linux", true, false));
+        assert!(!should_probe("windows", true, false));
     }
 
     #[test]
-    fn gate_skips_other_terminal_or_missing_term_program() {
-        assert!(!should_probe("macos", Some("iTerm.app"), false));
-        assert!(!should_probe("macos", Some("WezTerm"), false));
-        assert!(!should_probe("macos", None, false));
+    fn gate_skips_when_not_apple_terminal() {
+        // Neither `$TERM_PROGRAM` nor `$__CFBundleIdentifier` identified Terminal.app
+        // (iTerm/WezTerm/…): the osascript "tell Terminal" probe would target the wrong
+        // app, so it must not run.
+        assert!(!should_probe("macos", false, false));
     }
 
     #[test]

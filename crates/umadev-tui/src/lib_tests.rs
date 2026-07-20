@@ -2149,6 +2149,46 @@ fn run_path_passes_no_model_override_to_the_base() {
     );
 }
 
+#[test]
+fn shift_tab_cycles_only_between_writable_tiers_never_read_only_plan() {
+    use umadev_agent::TrustMode;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = App::new(
+        "proj".to_string(),
+        crate::config::UserConfig::default(),
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
+    );
+
+    // Auto → Guarded (NOT Plan). The reported bug: Shift+Tab from Auto landed in
+    // read-only Plan, stripping ALL write permission ("current turn is read-only,
+    // cannot write files") while the footer promised "转手动" (writable manual).
+    app.trust_mode_override = Some(TrustMode::Auto);
+    app.cycle_approval_mode();
+    assert_eq!(app.effective_trust_mode(), TrustMode::Guarded);
+
+    // Guarded → Auto (the other half of the writable toggle).
+    app.cycle_approval_mode();
+    assert_eq!(app.effective_trust_mode(), TrustMode::Auto);
+
+    // From read-only Plan, Shift+Tab EXITS to the writable manual tier so a user
+    // who chose /mode plan can escape read-only without hunting for a command.
+    app.trust_mode_override = Some(TrustMode::Plan);
+    app.cycle_approval_mode();
+    assert_eq!(app.effective_trust_mode(), TrustMode::Guarded);
+
+    // Exhaustive invariant: NO starting tier + Shift+Tab ever yields read-only Plan.
+    for start in [TrustMode::Plan, TrustMode::Guarded, TrustMode::Auto] {
+        app.trust_mode_override = Some(start);
+        app.cycle_approval_mode();
+        assert_ne!(
+            app.effective_trust_mode(),
+            TrustMode::Plan,
+            "Shift+Tab from {start:?} must never strand the user in read-only Plan"
+        );
+    }
+}
+
 fn msg(role: &str, content: &str) -> Message {
     Message {
         role: role.into(),
@@ -2301,6 +2341,7 @@ fn detect_light_bg_defaults_dark_for_an_unknown_terminal() {
     let _theme = EnvRestore::remove("UMADEV_THEME");
     let _fgbg = EnvRestore::remove("COLORFGBG");
     let _prog = EnvRestore::remove("TERM_PROGRAM");
+    let _cf = EnvRestore::remove("__CFBundleIdentifier");
     assert!(
         !detect_light_bg(),
         "an unknown terminal with no hints stays on the dark default"
@@ -2315,9 +2356,47 @@ fn detect_light_bg_is_light_for_apple_terminal_without_other_hints() {
     let _theme = EnvRestore::remove("UMADEV_THEME");
     let _fgbg = EnvRestore::remove("COLORFGBG");
     let _prog = EnvRestore::set("TERM_PROGRAM", "Apple_Terminal");
+    let _cf = EnvRestore::remove("__CFBundleIdentifier");
     assert!(
         detect_light_bg(),
-        "Terminal.app answers no probe and ships a white profile, so default light"
+        "Terminal.app ships a white profile, so default light"
+    );
+}
+
+#[test]
+fn detect_light_bg_is_light_via_cfbundleidentifier_when_term_program_stripped() {
+    // The reported bug: a shell rc / wrapper strips $TERM_PROGRAM, so the old
+    // TERM_PROGRAM-only check missed Terminal.app and fell to the dark default →
+    // invisible near-white text on the stock WHITE profile. The OS-stamped
+    // $__CFBundleIdentifier survives and still identifies Terminal.app.
+    let _guard = THEME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _theme = EnvRestore::remove("UMADEV_THEME");
+    let _fgbg = EnvRestore::remove("COLORFGBG");
+    let _prog = EnvRestore::remove("TERM_PROGRAM");
+    let _cf = EnvRestore::set("__CFBundleIdentifier", "com.apple.Terminal");
+    assert!(
+        detect_light_bg(),
+        "Terminal.app identified via __CFBundleIdentifier defaults light even with TERM_PROGRAM stripped"
+    );
+}
+
+#[test]
+fn apple_terminal_ignores_a_stale_dark_colorfgbg() {
+    // The other half of the bug: Apple Terminal.app does NOT natively set COLORFGBG,
+    // so a COLORFGBG=…;0 injected by a shell framework must NOT override the white
+    // profile into a dark palette (unreadable). Apple-light is checked BEFORE COLORFGBG.
+    let _guard = THEME_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _theme = EnvRestore::remove("UMADEV_THEME");
+    let _fgbg = EnvRestore::set("COLORFGBG", "15;0"); // bg=0 → the rxvt "dark" hint
+    let _prog = EnvRestore::set("TERM_PROGRAM", "Apple_Terminal");
+    let _cf = EnvRestore::remove("__CFBundleIdentifier");
+    assert!(
+        detect_light_bg(),
+        "a stale framework COLORFGBG must not force dark onto Terminal.app's white profile"
     );
 }
 
@@ -2329,6 +2408,7 @@ fn umadev_theme_dark_overrides_the_apple_terminal_heuristic() {
     let _theme = EnvRestore::set("UMADEV_THEME", "dark");
     let _fgbg = EnvRestore::remove("COLORFGBG");
     let _prog = EnvRestore::set("TERM_PROGRAM", "Apple_Terminal");
+    let _cf = EnvRestore::remove("__CFBundleIdentifier");
     assert!(
         !detect_light_bg(),
         "an explicit UMADEV_THEME=dark wins over the Terminal.app heuristic"

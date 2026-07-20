@@ -7738,10 +7738,50 @@ type Term = Terminal<AnchoredBackend<Stdout>>;
 /// drain / async reply then refine it for terminals that answer the query.
 #[must_use]
 pub fn detect_light_bg() -> bool {
-    theme_override()
-        .or_else(theme_from_colorfgbg)
-        .or_else(theme_from_apple_terminal)
+    resolve_light_bg(
+        theme_override(),
+        is_apple_terminal(),
+        theme_from_colorfgbg(),
+    )
+}
+
+/// Pure SYNC first-paint precedence (hermetically testable — no env reads):
+///  1. an explicit `UMADEV_THEME` override always wins;
+///  2. then Apple Terminal.app defaults LIGHT — its stock profile is WHITE and it does
+///     NOT natively set `$COLORFGBG`, so a framework-injected COLORFGBG (base16-shell,
+///     an oh-my-zsh theme, an iTerm-integration leftover) must NOT override it into a
+///     dark palette that paints near-white text on a white terminal (the reported bug);
+///  3. then COLORFGBG for every OTHER terminal;
+///  4. else the dark default.
+///
+/// This is only the starting point: the async real-bg probe (a live OSC 11 reply, or
+/// the osascript fallback) refines it to dark for a genuinely dark Terminal.app profile.
+fn resolve_light_bg(
+    override_: Option<bool>,
+    is_apple_terminal: bool,
+    colorfgbg: Option<bool>,
+) -> bool {
+    override_
+        .or_else(|| is_apple_terminal.then_some(true))
+        .or(colorfgbg)
         .unwrap_or(false)
+}
+
+/// True when we are running inside macOS Terminal.app, detected via EITHER the
+/// `$TERM_PROGRAM` marker OR the `$__CFBundleIdentifier` the OS stamps on processes
+/// launched from Terminal.app. The second signal is the fix for a shell rc / wrapper
+/// that strips `$TERM_PROGRAM`: without it the theme fell through to the dark default
+/// and painted invisible near-white text on Terminal.app's stock WHITE profile.
+#[must_use]
+pub(crate) fn is_apple_terminal() -> bool {
+    if std::env::var("TERM_PROGRAM").ok().as_deref().map(str::trim) == Some("Apple_Terminal") {
+        return true;
+    }
+    std::env::var("__CFBundleIdentifier")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        == Some("com.apple.Terminal")
 }
 
 fn theme_override() -> Option<bool> {
@@ -7770,23 +7810,6 @@ fn theme_from_colorfgbg() -> Option<bool> {
     Some(!(bg_num <= 6 || bg_num == 8))
 }
 
-/// Apple Terminal.app fallback. Terminal.app answers NEITHER `$COLORFGBG` NOR
-/// the OSC 11 background query, and its stock "Basic" profile is WHITE — so with
-/// no other signal it would fall to the dark default and paint near-white text
-/// on a white background (unreadable). When `$TERM_PROGRAM` identifies
-/// Terminal.app and nothing else has decided, default to light. This heuristic
-/// is deliberately narrow: every other terminal either defaults dark or answers
-/// the OSC 11 probe, so the dark default still stands for them. A dark-profile
-/// Terminal.app user forces `UMADEV_THEME=dark`, which is checked first (in
-/// [`detect_light_bg`]) and always wins.
-fn theme_from_apple_terminal() -> Option<bool> {
-    if std::env::var("TERM_PROGRAM").ok()?.trim() == "Apple_Terminal" {
-        Some(true)
-    } else {
-        None
-    }
-}
-
 fn request_background_color<W: std::io::Write>(out: &mut W) -> std::io::Result<()> {
     out.write_all(b"\x1b]11;?\x1b\\")?;
     out.flush()
@@ -7794,10 +7817,13 @@ fn request_background_color<W: std::io::Write>(out: &mut W) -> std::io::Result<(
 
 /// How long the pre-paint OSC 11 drain waits for a terminal to answer the
 /// background-color query before giving up (fail-open) and painting the first
-/// frame with the startup default. Short enough to be imperceptible on a
-/// terminal that never answers (Apple Terminal.app — already covered by the
-/// `TERM_PROGRAM` heuristic), long enough for a terminal that DOES answer to
-/// reply first (real terminals respond within a few milliseconds).
+/// frame with the startup default. Short enough to be imperceptible on a terminal
+/// that never answers (the startup default already covers it), long enough for a
+/// terminal that DOES answer to reply first (real terminals — modern Apple
+/// Terminal.app included — respond within a few milliseconds). A reply that lands
+/// AFTER this window is still applied live by [`apply_background_theme_reply`], so
+/// missing it here only costs a one-frame flash of the startup default, never a
+/// wrong palette for the session.
 const FIRST_PAINT_THEME_PROBE: Duration = Duration::from_millis(120);
 
 /// Set true by [`setup_terminal`] ONCE it has confirmed the terminal supports
@@ -10276,23 +10302,28 @@ async fn event_loop(
         let _ = request_background_color(terminal.backend_mut());
         // Give a terminal that supports OSC 11 a brief, bounded window to answer
         // BEFORE the first frame, so it gets the correct palette immediately
-        // instead of flashing the startup-default dark theme until the async
-        // reply lands. Fail-open: a terminal that never answers (Apple
-        // Terminal.app — already covered by the `TERM_PROGRAM` heuristic) waits
-        // at most `FIRST_PAINT_THEME_PROBE`, and a parse miss leaves the default.
+        // instead of flashing the startup-default theme until the async reply
+        // lands. Modern Apple Terminal.app DOES answer OSC 11 (contrary to a stale
+        // assumption this code once carried), so this usually resolves the real
+        // background here. Fail-open: a terminal that never answers waits at most
+        // `FIRST_PAINT_THEME_PROBE` and a parse miss leaves the startup default —
+        // for Apple Terminal.app that default is already LIGHT (its stock white
+        // profile), so a probe miss never strands it on unreadable dark. A reply
+        // that lands later is still applied by `apply_background_theme_reply`.
         // Any keystrokes typed during the window stay queued for the loop below.
         input.prime_background_theme(FIRST_PAINT_THEME_PROBE).await;
         if let Some(is_light) = input.take_background_reply() {
             ui::set_light_theme(is_light);
         }
     }
-    // Apple Terminal.app never answers OSC 11, so the prime above always misses
-    // for it and the palette rests on the static default-light heuristic. Kick off
-    // the AppleScript real-background probe at STARTUP to refine that verdict. It
-    // runs fully async (off this path) and its result lands on `apple_theme_rx`
-    // AFTER the first paint — never a blocking wait, so a slow / denied TCC prompt
-    // can't hang launch. The gate inside makes it a no-op for every non-macOS /
-    // non-Terminal.app / pinned case (no process spawned).
+    // Belt-and-suspenders for Apple Terminal.app: kick off the AppleScript
+    // real-background probe at STARTUP too. OSC 11 is the primary path (and now the
+    // default is LIGHT for it, so a probe miss can't strand it on dark), but this
+    // reads the REAL profile background as a macOS fallback — useful for a genuinely
+    // dark Terminal.app profile whose OSC 11 reply was lost. It runs fully async
+    // (off this path) and lands on `apple_theme_rx` AFTER the first paint — never a
+    // blocking wait, so a slow / denied TCC prompt can't hang launch. The gate
+    // inside makes it a no-op for every non-macOS / non-Terminal.app / pinned case.
     apple_terminal_theme::spawn_probe(&apple_theme_tx);
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     let mut clipboard_image_in_flight = false;
