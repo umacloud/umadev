@@ -589,13 +589,20 @@ fn role_span(text: impl Into<String>, role: SynRole, modifier: Modifier) -> Span
 /// indented by exactly this many columns (see [`prefold_line`]'s `spine` arg).
 const GUTTER_W: usize = 2;
 
-/// The role-spine glyph (`▎`, U+258E "left one-quarter block"), built from its
-/// codepoint so the source carries no literal pictographic glyph (same policy
+/// The role-spine glyph (`│`, U+2502 "box drawings light vertical"), built from
+/// its codepoint so the source carries no literal pictographic glyph (same policy
 /// as [`assistant_marker`]). It is exactly one display column; followed by one
 /// space it forms the [`GUTTER_W`]-wide left gutter under which a turn's body
 /// and every wrapped continuation row align.
+///
+/// A CENTERED vertical was chosen over the old left-quarter block `▎` (U+258E) so
+/// the bar sits directly UNDER the row-0 speaker marker — the record circle
+/// [`assistant_marker`] renders centered in its cell, so a left-hugging `▎` left
+/// the dot floating to the right of the spine (a visible dot/bar misalignment on
+/// every AI turn). `│` and the circle share the cell's center, so the dot now caps
+/// one unbroken vertical thread.
 fn spine_glyph() -> char {
-    char::from_u32(0x258E).unwrap_or('|')
+    char::from_u32(0x2502).unwrap_or('|')
 }
 
 /// The colored role-spine span for the FIRST row of a turn: `▎ ` (glyph + space,
@@ -5964,22 +5971,26 @@ fn logical_row_and_gutter(line: &Line<'static>) -> (String, usize) {
 }
 
 /// True for the single-column glyphs that can lead a transcript row's 2-column
-/// left gutter and are NOT real content: the role spine `▎`, the row-0 assistant
+/// left gutter and are NOT real content: the role spine `│`, the row-0 assistant
 /// seat markers (`⏺` macOS / `●`), and the tool-row status glyphs (`●` ok/fail,
-/// `○` queued/aborted, and the braille / `⋯` spinner frames). Anchored on the
-/// known codepoints — kept in lockstep with [`assistant_marker`],
-/// [`tool_status_glyph`], [`spine_glyph`], and `app::SPINNER_FRAMES` — so a
+/// `○` queued/aborted, and the braille / `⋯` spinner frames). The spine is compared
+/// against [`spine_glyph`] DIRECTLY (not a hardcoded codepoint) so a future spine
+/// change can never again leave the gutter unrecognized — the exact bug that leaked
+/// the bar into a drag-copy when the spine moved from `▎` to `│`. The remaining
+/// markers stay anchored on their known codepoints, in lockstep with
+/// [`assistant_marker`], [`tool_status_glyph`], and `app::SPINNER_FRAMES`, so a
 /// content line that merely starts with an ordinary character is never mistaken
 /// for a gutter.
 fn is_gutter_glyph(c: char) -> bool {
-    matches!(
-        c,
-        '\u{258E}' // ▎ role spine (U+258E)
-        | '\u{23FA}' // ⏺ assistant seat marker, macOS (U+23FA)
-        | '\u{25CF}' // ● assistant seat marker, other / tool ok|fail (U+25CF)
-        | '\u{25CB}' // ○ tool queued|aborted (U+25CB)
-        | '\u{22EF}' // ⋯ spinner static / animations off (U+22EF)
-    ) || ('\u{2800}'..='\u{28FF}').contains(&c) // ⠋… braille spinner frames
+    c == spine_glyph() // role spine — always in lockstep with the rendered glyph
+        || matches!(
+            c,
+            '\u{23FA}' // ⏺ assistant seat marker, macOS (U+23FA)
+            | '\u{25CF}' // ● assistant seat marker, other / tool ok|fail (U+25CF)
+            | '\u{25CB}' // ○ tool queued|aborted (U+25CB)
+            | '\u{22EF}' // ⋯ spinner static / animations off (U+22EF)
+        )
+        || ('\u{2800}'..='\u{28FF}').contains(&c) // ⠋… braille spinner frames
 }
 
 /// Paint the in-app text-selection highlight onto the already-folded transcript
@@ -10251,7 +10262,7 @@ mod tests {
     #[test]
     fn logical_row_and_gutter_strips_spine_and_trailing_padding() {
         // A wrapped continuation row: spine glyph + hang space, then content. The
-        // logical text drops the `▎`-gutter and the gutter width is 2.
+        // logical text drops the `│`-gutter and the gutter width is 2.
         let spine = spine_glyph();
         let cont = Line::from(vec![
             Span::raw(format!("{spine} ")),
