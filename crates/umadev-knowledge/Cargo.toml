@@ -46,7 +46,7 @@ tokio = { workspace = true, optional = true }
 candle-core = { version = "0.8", optional = true }
 candle-nn = { version = "0.8", optional = true }
 candle-transformers = { version = "0.8", optional = true }
-tokenizers = { version = "0.20", optional = true, default-features = false, features = [
+tokenizers = { version = "0.23", optional = true, default-features = false, features = [
     "onig",
 ] }
 
