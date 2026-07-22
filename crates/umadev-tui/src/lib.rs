@@ -1746,10 +1746,8 @@ async fn run_director_loop(
             }
         };
 
-        // Git-as-trust (Wave 6): isolate this director build onto `umadev/<slug>`
-        // and snapshot the run baseline before the base writes anything — never on
-        // the user's default/working branch, never auto-merged/pushed. Fail-open:
-        // a non-git dir / dirty tree / any error just runs in the working tree.
+        // Isolate the build and snapshot its baseline before writes. Fail open when
+        // isolation is unavailable; never auto-merge or push the resulting branch.
         let isolation = if resume {
             umadev_agent::setup_run_isolation(&root, &options.effective_slug())
         } else {
@@ -2944,10 +2942,8 @@ async fn run_agentic(
         } else {
             None
         };
-        // Git-as-trust (Wave 6): a HOST director build mutates the workspace →
-        // isolate onto `umadev/<slug>` + baseline before any write (only for the
-        // lock-holding host director path; a normal free-text turn AND a non-host
-        // would-be build take no lock and are not isolated). Fail-open; idempotent.
+        // Isolate only the lock-holding host director path before it writes.
+        // Free-text turns remain in place; isolation is fail-open and idempotent.
         if lock_and_isolate {
             let slug = project_root
                 .file_name()

@@ -7434,8 +7434,8 @@ mod knowledge_feedback_tests;
 
 #[test]
 fn reported_regression_deterministic_blockers_defer_critic_review() {
-    assert!(super::should_run_critic_review(&[]));
-    assert!(!super::should_run_critic_review(&[
+    assert!(super::quality_evidence::should_run_critic_review(&[]));
+    assert!(!super::quality_evidence::should_run_critic_review(&[
         "scope: historical file is not part of this run".to_string(),
     ]));
 }

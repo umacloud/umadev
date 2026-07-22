@@ -1,3 +1,10 @@
+pub(super) const DEFERRED_CRITIC_REVIEW_NOTE: &str =
+    "team · deterministic blockers found — deferring critic review until the repaired candidate is clean";
+
+pub(super) fn should_run_critic_review(deterministic_blockers: &[String]) -> bool {
+    deterministic_blockers.is_empty()
+}
+
 /// Read a written `runtime-proof.json` and, if it recorded a real (non-skipped)
 /// FAILURE to boot/answer, return a blocking line. A missing file → `None` (the
 /// runtime check simply wasn't run this loop — neutral, never a fabricated fail).
