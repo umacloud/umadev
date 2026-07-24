@@ -186,39 +186,53 @@ pub fn migrate_fence(project_root: &Path) -> io::Result<RunLockFenceMigration> {
         }
     })?;
 
-    let before = umadev_state::fs::read_bounded(&path, 4 * 1024)?;
-    let outcome = if before == V2_FENCE {
-        RunLockFenceMigration::AlreadyCurrent
-    } else if !before.is_empty() && V2_FENCE.starts_with(&before) {
-        rewrite_fence_in_place(&path, &before)?;
-        RunLockFenceMigration::RepairedPartial
-    } else {
-        let text =
-            std::str::from_utf8(&before).map_err(|_| unsafe_legacy_migration_error(&path))?;
-        let owner = Owner::parse(text).ok_or_else(|| unsafe_legacy_migration_error(&path))?;
-        let liveness = classify_claim_owner(
-            ClaimOwner {
-                pid: owner.pid,
-                host: &owner.host,
-                boot: &owner.boot,
-            },
-            &hostname(),
-            &boot_id(),
-            std::process::id(),
-            pid_is_alive(owner.pid),
-        );
-        let explicitly_migratable = liveness == OwnerLiveness::Abandoned
-            || (liveness == OwnerLiveness::AgeOnly && older_than_stale(&owner, &path))
-            || (owner.host.is_empty() && older_than_stale(&owner, &path));
-        if owner.protocol != 0 || owner.pid == 0 || !explicitly_migratable {
-            return Err(unsafe_legacy_migration_error(&path));
+    let result = (|| -> io::Result<RunLockFenceMigration> {
+        let before = umadev_state::fs::read_bounded(&path, 4 * 1024)?;
+        let outcome = if before == V2_FENCE {
+            RunLockFenceMigration::AlreadyCurrent
+        } else if !before.is_empty() && V2_FENCE.starts_with(&before) {
+            rewrite_fence_in_place(&path, &before)?;
+            RunLockFenceMigration::RepairedPartial
+        } else {
+            let text =
+                std::str::from_utf8(&before).map_err(|_| unsafe_legacy_migration_error(&path))?;
+            let owner = Owner::parse(text).ok_or_else(|| unsafe_legacy_migration_error(&path))?;
+            let liveness = classify_claim_owner(
+                ClaimOwner {
+                    pid: owner.pid,
+                    host: &owner.host,
+                    boot: &owner.boot,
+                },
+                &hostname(),
+                &boot_id(),
+                std::process::id(),
+                pid_is_alive(owner.pid),
+            );
+            let explicitly_migratable = liveness == OwnerLiveness::Abandoned
+                || (liveness == OwnerLiveness::AgeOnly && older_than_stale(&owner, &path))
+                || (owner.host.is_empty() && older_than_stale(&owner, &path));
+            if owner.protocol != 0 || owner.pid == 0 || !explicitly_migratable {
+                return Err(unsafe_legacy_migration_error(&path));
+            }
+            rewrite_fence_in_place(&path, &before)?;
+            RunLockFenceMigration::MigratedLegacy
+        };
+        Ok(outcome)
+    })();
+
+    // Explicitly release both kernel locks on every semantic rejection. Relying
+    // only on descriptor drop left a short self-contention window on Linux when
+    // doctor immediately retried another malformed legacy row in the same process.
+    let guard_unlock = FileExt::unlock(&guard);
+    let namespace_unlock = FileExt::unlock(&namespace_guard);
+    match result {
+        Err(error) => Err(error),
+        Ok(outcome) => {
+            guard_unlock?;
+            namespace_unlock?;
+            Ok(outcome)
         }
-        rewrite_fence_in_place(&path, &before)?;
-        RunLockFenceMigration::MigratedLegacy
-    };
-    FileExt::unlock(&guard)?;
-    FileExt::unlock(&namespace_guard)?;
-    Ok(outcome)
+    }
 }
 
 fn rewrite_fence_in_place(path: &Path, expected: &[u8]) -> io::Result<()> {
