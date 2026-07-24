@@ -291,8 +291,8 @@ fn staleness_uses_owner_ts_not_mtime() {
 ///
 /// 1. A shared / network workspace: machine B NEVER has machine A's boot id, so B
 ///    reclaimed A's live lock on every single acquire.
-/// 2. Our own `boot_id()` returns "" when the OS won't say (`wmic` is REMOVED in current
-///    Windows; `sysctl` can fail to spawn) → "" ≠ the recorded boot → a LIVE LOCAL lock
+/// 2. Our own `boot_id()` returns "" when every platform provider is unavailable
+///    → "" ≠ the recorded boot → a LIVE LOCAL lock
 ///    reclaimed.
 /// 3. macOS recomputes `kern.boottime` on every clock correction, so the boot string can
 ///    change WITHIN one boot, under a live holder.
@@ -369,6 +369,38 @@ fn a_boot_id_mismatch_never_reclaims_a_live_lock() {
         "another host's lock is decided by AGE — never by our own process table, and never \
              by a boot id that means nothing across machines"
     );
+}
+
+#[test]
+fn windows_boot_provider_outputs_share_one_strict_dmtf_identity() {
+    let expected = "20260724010203.123456+480";
+    assert_eq!(
+        owner::windows_dmtf_boot_id(format!("LastBootUpTime={expected}\r\n").as_bytes()).as_deref(),
+        Some(expected)
+    );
+    assert_eq!(
+        owner::windows_dmtf_boot_id(format!("{expected}\r\n").as_bytes()).as_deref(),
+        Some(expected)
+    );
+
+    let mut utf16 = vec![0xff, 0xfe];
+    for unit in expected.encode_utf16() {
+        utf16.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_eq!(
+        owner::windows_dmtf_boot_id(&utf16).as_deref(),
+        Some(expected)
+    );
+    for invalid in [
+        b"warning only".as_slice(),
+        b"20260724010203.123456Z480",
+        b"20260724010203.12345+480",
+        b"20260724010203.123456+48x",
+        b"2026\xff0724010203.123456+480",
+        b"\xff\xfe2",
+    ] {
+        assert!(owner::windows_dmtf_boot_id(invalid).is_none());
+    }
 }
 
 /// The same blocker, end-to-end through the real lock file: an ALIVE local owner
@@ -484,6 +516,7 @@ fn kernel_guard_allows_only_one_stale_reclaimer_at_a_time() {
     assert!(successor.is_owned());
 }
 
+#[cfg(unix)]
 #[test]
 fn external_namespace_guard_survives_managed_lock_path_replacement() {
     let tmp = tempfile::TempDir::new().expect("tmp");
@@ -505,6 +538,36 @@ fn external_namespace_guard_survives_managed_lock_path_replacement() {
     );
 
     drop(first);
+    let successor = RunLock::acquire_for_run(root).expect("outer guard released");
+    assert!(successor.is_owned());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_blocks_managed_lock_path_replacement_while_the_guard_is_open() {
+    let tmp = tempfile::TempDir::new().expect("tmp");
+    let root = tmp.path();
+    let first = RunLock::acquire_for_run(root).expect("first writer");
+    let managed = root.join(".umadev");
+    let moved = root.join(".umadev.old");
+
+    let error = std::fs::rename(&managed, &moved)
+        .expect_err("Windows must not replace a directory containing an open guard");
+    assert!(
+        error.kind() == io::ErrorKind::PermissionDenied
+            || matches!(error.raw_os_error(), Some(5 | 32)),
+        "{error}"
+    );
+    assert!(managed.is_dir());
+    assert!(!moved.exists());
+    let second = RunLock::acquire_for_run(root)
+        .expect_err("the first writer must remain exclusive after the rejected replacement");
+    assert_eq!(second.kind(), io::ErrorKind::WouldBlock, "{second}");
+
+    drop(first);
+    umadev_state::fs::retry_transient(|| std::fs::rename(&managed, &moved))
+        .expect("the namespace is replaceable after guard release");
+    std::fs::create_dir(&managed).unwrap();
     let successor = RunLock::acquire_for_run(root).expect("outer guard released");
     assert!(successor.is_owned());
 }
@@ -842,7 +905,7 @@ fn doctor_offline_fix_migrates_old_cross_host_and_boot_conflicted_rows() {
     let remote = tempfile::TempDir::new().expect("tmp");
     write_lock(
         remote.path(),
-        "pid=12345 host=retired-build-host ts=1 boot=old-boot",
+        &format!("pid={DEAD_PID} host=retired-build-host ts=1 boot=old-boot"),
     );
     assert_eq!(
         migrate_fence(remote.path()).unwrap(),
@@ -851,19 +914,28 @@ fn doctor_offline_fix_migrates_old_cross_host_and_boot_conflicted_rows() {
     );
 
     let rebooted = tempfile::TempDir::new().expect("tmp");
-    write_lock(
-        rebooted.path(),
-        &format!(
-            "pid={} host={} ts=1 boot=definitely-not-this-boot",
-            std::process::id(),
-            hostname()
-        ),
+    let local_boot = boot_id();
+    let legacy = format!(
+        "pid={} host={} ts=1 boot=definitely-not-this-boot",
+        std::process::id(),
+        hostname()
     );
-    assert_eq!(
-        migrate_fence(rebooted.path()).unwrap(),
-        RunLockFenceMigration::MigratedLegacy,
-        "an old boot-conflicted row is recoverable under explicit offline authority"
-    );
+    write_lock(rebooted.path(), &legacy);
+    if local_boot.is_empty() {
+        let error = migrate_fence(rebooted.path())
+            .expect_err("an unknown local boot id must keep a live local owner fail-closed");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(rebooted.path().join(".umadev/run.lock")).unwrap(),
+            legacy
+        );
+    } else {
+        assert_eq!(
+            migrate_fence(rebooted.path()).unwrap(),
+            RunLockFenceMigration::MigratedLegacy,
+            "an old boot-conflicted row is recoverable under explicit offline authority"
+        );
+    }
 
     let host_unknown = tempfile::TempDir::new().expect("tmp");
     write_lock(host_unknown.path(), &format!("pid={DEAD_PID} ts=1"));
@@ -871,6 +943,17 @@ fn doctor_offline_fix_migrates_old_cross_host_and_boot_conflicted_rows() {
         migrate_fence(host_unknown.path()).unwrap(),
         RunLockFenceMigration::MigratedLegacy
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_boot_id_provider_supports_reboot_safe_owner_classification() {
+    let first = boot_id();
+    assert!(
+        !first.is_empty(),
+        "Windows must provide a stable boot id through WMIC or PowerShell CIM"
+    );
+    assert_eq!(boot_id(), first);
 }
 
 #[cfg(unix)]

@@ -47,6 +47,7 @@ const NORMAL_ALLOWLIST: &[(&str, &[&str])] = &[
             "umadev-governance",
             "umadev-i18n",
             "umadev-knowledge",
+            "umadev-process",
             "umadev-runtime",
             "umadev-spec",
             "umadev-state",

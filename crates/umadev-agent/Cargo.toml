@@ -15,6 +15,7 @@ umadev-runtime = { workspace = true }
 umadev-knowledge = { workspace = true }
 umadev-contract = { workspace = true }
 umadev-i18n = { workspace = true }
+umadev-process = { workspace = true }
 umadev-state = { workspace = true }
 
 async-trait = { workspace = true }

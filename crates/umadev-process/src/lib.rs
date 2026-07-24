@@ -30,13 +30,28 @@ impl KillOnCloseJob {
     /// their explicit process-tree fallback in that case.
     #[allow(unsafe_code)]
     pub fn attach(child: &tokio::process::Child) -> Option<Self> {
+        let process = child.raw_handle()? as windows_sys::Win32::Foundation::HANDLE;
+        Self::attach_handle(process)
+    }
+
+    /// Create, configure, and attach a kill-on-close Job Object to a synchronous
+    /// standard-library child.
+    #[allow(unsafe_code)]
+    pub fn attach_std(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle as _;
+
+        let process = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        Self::attach_handle(process)
+    }
+
+    #[allow(unsafe_code)]
+    fn attach_handle(process: windows_sys::Win32::Foundation::HANDLE) -> Option<Self> {
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
             SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
 
-        let process = child.raw_handle()? as windows_sys::Win32::Foundation::HANDLE;
         // SAFETY: null optional inputs and the information pointer match the
         // synchronous Win32 signatures and remain valid throughout each call.
         unsafe {
@@ -95,6 +110,127 @@ pub const fn has_kill_on_close_job() -> bool {
     cfg!(windows)
 }
 
+/// Run a trusted executable below the Windows system directory with bounded
+/// time and output. Relative paths containing anything except normal
+/// components are rejected.
+#[cfg(windows)]
+pub fn windows_system_command_stdout(
+    relative_program: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    use std::path::Component;
+    use std::process::Stdio;
+
+    if max_bytes == 0
+        || relative_program.is_absolute()
+        || relative_program
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    let program = windows_system_directory()?.join(relative_program);
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Attaching before the command output is consumed makes every subsequently
+    // created descendant part of the same kill-on-close lifetime. If Windows
+    // rejects assignment (for example because of an incompatible outer Job),
+    // fail closed instead of running a command whose process tree cannot be
+    // bounded.
+    let Some(job) = KillOnCloseJob::attach_std(&child) else {
+        let _ = child.kill();
+        return None;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        job.terminate();
+        return None;
+    };
+    let (output_tx, output_rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout
+            .take(
+                u64::try_from(max_bytes)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            )
+            .read_to_end(&mut bytes)
+            .ok()
+            .map(|_| bytes);
+        let _ = output_tx.send(result);
+    });
+
+    let started_at = std::time::Instant::now();
+    let deadline = started_at.checked_add(timeout).unwrap_or(started_at);
+    let mut status = None;
+    let mut output = None;
+    loop {
+        if output.is_none() {
+            match output_rx.try_recv() {
+                Ok(Some(bytes)) if bytes.len() <= max_bytes => output = Some(bytes),
+                Ok(Some(_)) | Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(child_status)) if child_status.success() => status = Some(child_status),
+            Ok(Some(_)) | Err(_) => break,
+            Ok(None) => {}
+        }
+        if status.is_some() && output.is_some() {
+            return output;
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+    }
+
+    // Terminating and then closing the Job reaches descendants that still hold
+    // the inherited stdout pipe. Crucially, the reader thread is detached: this
+    // function never performs an unbounded join or wait after its deadline.
+    job.terminate();
+    drop(job);
+    let _ = child.kill();
+    None
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_system_directory() -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt as _;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    loop {
+        // SAFETY: `buffer` is writable for the advertised length. The API
+        // returns either a copied length or the required capacity.
+        let length =
+            unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), u32::try_from(buffer.len()).ok()?) };
+        if length == 0 {
+            return None;
+        }
+        let length = usize::try_from(length).ok()?;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            return Some(std::path::PathBuf::from(OsString::from_wide(&buffer)));
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
@@ -107,6 +243,132 @@ mod tests {
     #[test]
     fn job_support_matches_target() {
         assert_eq!(super::has_kill_on_close_job(), cfg!(windows));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_windows_system_command_is_bounded_and_confined() {
+        let output = super::windows_system_command_stdout(
+            Path::new("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 100; Write-Output umadev-system-command",
+            ],
+            Duration::from_secs(3),
+            1024,
+        )
+        .expect("run PowerShell from the OS-reported system directory");
+        assert!(String::from_utf8_lossy(&output).contains("umadev-system-command"));
+        assert!(super::windows_system_command_stdout(
+            Path::new("../cmd.exe"),
+            &["/C", "echo rejected"],
+            Duration::from_secs(1),
+            1024,
+        )
+        .is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_windows_system_command_enforces_zero_timeout_and_output_cap() {
+        let started = Instant::now();
+        assert!(super::windows_system_command_stdout(
+            Path::new("cmd.exe"),
+            &["/D", "/C", "echo should-not-complete"],
+            Duration::ZERO,
+            1024,
+        )
+        .is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "zero timeout was not bounded"
+        );
+
+        assert!(super::windows_system_command_stdout(
+            Path::new("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 100; [Console]::Out.Write(('x' * 1024))",
+            ],
+            Duration::from_secs(3),
+            32,
+        )
+        .is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_windows_system_command_keeps_output_closed_before_exit() {
+        let output = super::windows_system_command_stdout(
+            Path::new("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::Out.Write('output-before-exit'); \
+                 [Console]::Out.Close(); \
+                 Start-Sleep -Milliseconds 300",
+            ],
+            Duration::from_secs(3),
+            1024,
+        )
+        .expect("retain complete output while waiting for the process to exit");
+        assert_eq!(output, b"output-before-exit");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trusted_windows_system_command_timeout_kills_stdout_descendant() {
+        let fixture_dir = FixtureDir::new();
+        let leaf_pid_path = fixture_dir.0.join("system-command-leaf-pid");
+        let escaped_pid_path = leaf_pid_path.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "Start-Sleep -Milliseconds 100; \
+             $p=Start-Process -PassThru -NoNewWindow \
+             -FilePath \"$env:SystemRoot\\System32\\ping.exe\" \
+             -ArgumentList @('-n','30','127.0.0.1'); \
+             [IO.File]::WriteAllText('{escaped_pid_path}', [string]$p.Id)"
+        );
+
+        let started = Instant::now();
+        assert!(super::windows_system_command_stdout(
+            Path::new("WindowsPowerShell/v1.0/powershell.exe"),
+            &[
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script
+            ],
+            Duration::from_secs(3),
+            4096,
+        )
+        .is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "descendant-held stdout exceeded the command timeout bound"
+        );
+
+        wait_for_path_sync(&leaf_pid_path, Duration::from_secs(2));
+        let leaf_pid = std::fs::read_to_string(&leaf_pid_path)
+            .expect("read system command leaf pid")
+            .trim()
+            .parse::<u32>()
+            .expect("parse system command leaf pid");
+        if let Ok(leaf) = ProcessWaitHandle::open(leaf_pid) {
+            assert_eq!(
+                leaf.wait(Duration::from_secs(2)),
+                windows_sys::Win32::Foundation::WAIT_OBJECT_0,
+                "timed-out system command left its stdout descendant alive"
+            );
+        }
     }
 
     #[cfg(windows)]

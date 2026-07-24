@@ -267,9 +267,10 @@ pub(crate) fn git_index_command(
     index: &Path,
     args: &[&str],
 ) -> Result<(), ResidentExecutionBlocked> {
+    let index = git_index_env_path(index)?;
     let output = git_std_command(root)
         .args(args)
-        .env("GIT_INDEX_FILE", index)
+        .env("GIT_INDEX_FILE", &index)
         .output()
         .map_err(|error| {
             git_commit_blocked(
@@ -294,9 +295,10 @@ pub(crate) fn git_index_required_text(
     args: &[&str],
     code: &'static str,
 ) -> Result<String, ResidentExecutionBlocked> {
+    let index = git_index_env_path(index)?;
     let output = git_std_command(root)
         .args(args)
-        .env("GIT_INDEX_FILE", index)
+        .env("GIT_INDEX_FILE", &index)
         .output()
         .map_err(|error| {
             git_commit_blocked(
@@ -325,13 +327,14 @@ pub(crate) fn git_index_logical_entries(
     index: &Path,
 ) -> Result<Vec<u8>, ResidentExecutionBlocked> {
     let mut canonical = Vec::new();
+    let index = git_index_env_path(index)?;
     for args in [
         ["ls-files", "--stage", "-z"].as_slice(),
         ["ls-files", "-v", "-z"].as_slice(),
     ] {
         let output = git_std_command(root)
             .args(args)
-            .env("GIT_INDEX_FILE", index)
+            .env("GIT_INDEX_FILE", &index)
             .output()
             .map_err(|error| {
                 git_commit_blocked(
@@ -352,6 +355,46 @@ pub(crate) fn git_index_logical_entries(
         canonical.push(0xff);
     }
     Ok(canonical)
+}
+
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
+fn git_index_env_path(index: &Path) -> Result<PathBuf, ResidentExecutionBlocked> {
+    Ok(index.to_path_buf())
+}
+
+#[cfg(windows)]
+fn git_index_env_path(index: &Path) -> Result<PathBuf, ResidentExecutionBlocked> {
+    use std::ffi::OsString;
+    use std::path::{Component, Prefix};
+
+    let mut components = index.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Ok(index.to_path_buf());
+    };
+    let mut plain = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", drive as char)),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut root = OsString::from(r"\\");
+            root.push(server);
+            root.push("\\");
+            root.push(share);
+            PathBuf::from(root)
+        }
+        Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+            return Err(git_commit_blocked(
+                "git-index-path-unverifiable",
+                "Git 不支持该临时 index 设备路径 / Git cannot use this temporary-index device path",
+            ));
+        }
+        _ => return Ok(index.to_path_buf()),
+    };
+    for component in components {
+        if !matches!(component, Component::RootDir) {
+            plain.push(component.as_os_str());
+        }
+    }
+    Ok(plain)
 }
 
 pub(crate) fn git_stage_zero_entry(
@@ -406,4 +449,31 @@ pub(crate) fn git_stage_zero_entry(
         ));
     }
     Ok(Some((fields[0].to_string(), fields[1].to_string())))
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::git_index_env_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn git_index_env_path_converts_only_supported_verbatim_paths() {
+        assert_eq!(
+            git_index_env_path(Path::new(r"\\?\C:\项目 with space\.git\index")).unwrap(),
+            PathBuf::from(r"C:\项目 with space\.git\index")
+        );
+        assert_eq!(
+            git_index_env_path(Path::new(r"\\?\UNC\server\share\项目\.git\index")).unwrap(),
+            PathBuf::from(r"\\server\share\项目\.git\index")
+        );
+        assert_eq!(
+            git_index_env_path(Path::new(r"C:\plain\.git\index")).unwrap(),
+            PathBuf::from(r"C:\plain\.git\index")
+        );
+        assert!(git_index_env_path(Path::new(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\index"
+        ))
+        .is_err());
+        assert!(git_index_env_path(Path::new(r"\\.\C:\device\index")).is_err());
+    }
 }

@@ -75,7 +75,7 @@ pub(super) fn holder_is_self(path: &Path) -> bool {
     // A recorded boot-id that differs from THIS boot means the lock predates a reboot, so a
     // matching PID is a RECYCLED pid, not us - never treat that as self (else the routing
     // layer queues input into a run that no longer exists). Empty on EITHER side = unknown =
-    // "matches": an unreadable local boot id (`sysctl` absent, `wmic` gone in current Windows)
+    // "matches": an unreadable local boot id (platform provider unavailable)
     // must not make us stop recognising our OWN lock.
     let same_boot = owner.boot.is_empty() || local_boot.is_empty() || owner.boot == local_boot;
     owner.pid == std::process::id() && same_host && same_boot
@@ -183,12 +183,17 @@ pub(crate) fn classify_claim_owner(
 /// PID is meaningless, so an owner-liveness probe against a recycled PID must never be
 /// allowed to keep a dead owner's claim alive.
 pub(crate) fn boot_id() -> String {
+    static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT_ID.get_or_init(detect_boot_id).clone()
+}
+
+fn detect_boot_id() -> String {
     #[cfg(target_os = "linux")]
     if let Ok(id) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
         return id.split_whitespace().collect();
     }
     #[cfg(target_os = "macos")]
-    if let Ok(out) = std::process::Command::new("sysctl")
+    if let Ok(out) = std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", "kern.boottime"])
         .output()
     {
@@ -198,25 +203,74 @@ pub(crate) fn boot_id() -> String {
                 .collect();
         }
     }
-    // Windows: the OS last-boot-up timestamp is stable within a boot and changes on every
-    // reboot, so it works as a boot-id. wmic is present on essentially all current Windows;
-    // when it is absent we fall through to empty (the age fallback still frees a stale lock).
     #[cfg(windows)]
-    if let Ok(out) = std::process::Command::new("wmic")
-        .args(["os", "get", "lastbootuptime", "/value"])
-        .output()
-    {
-        if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if let Some(v) = s.split('=').nth(1) {
-                let tok: String = v.split_whitespace().collect();
-                if !tok.is_empty() {
-                    return tok;
-                }
-            }
-        }
+    if let Some(id) = windows_boot_id() {
+        return id;
     }
     String::new()
+}
+
+#[cfg(windows)]
+fn windows_boot_id() -> Option<String> {
+    let wmic = umadev_process::windows_system_command_stdout(
+        std::path::Path::new("wbem/WMIC.exe"),
+        &["os", "get", "lastbootuptime", "/value"],
+        std::time::Duration::from_secs(2),
+        4 * 1024,
+    );
+    if let Some(value) = wmic.as_deref().and_then(windows_dmtf_boot_id) {
+        return Some(value);
+    }
+
+    let powershell = umadev_process::windows_system_command_stdout(
+        std::path::Path::new("WindowsPowerShell/v1.0/powershell.exe"),
+        &[
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$boot=(Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime; [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime($boot)",
+        ],
+        std::time::Duration::from_secs(5),
+        4 * 1024,
+    )?;
+    windows_dmtf_boot_id(&powershell)
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_dmtf_boot_id(output: &[u8]) -> Option<String> {
+    let text = if output.contains(&0) || output.starts_with(&[0xff, 0xfe]) {
+        let bytes = output.strip_prefix(&[0xff, 0xfe]).unwrap_or(output);
+        if !bytes.len().is_multiple_of(2) {
+            return None;
+        }
+        let units = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        String::from_utf16(&units).ok()?
+    } else {
+        std::str::from_utf8(output).ok()?.to_string()
+    };
+    text.trim_start_matches('\u{feff}')
+        .lines()
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("LastBootUpTime=").unwrap_or(line)
+        })
+        .find(|value| valid_windows_dmtf_boot_id(value))
+        .map(str::to_string)
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn valid_windows_dmtf_boot_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 25
+        && bytes[..14].iter().all(u8::is_ascii_digit)
+        && bytes[14] == b'.'
+        && bytes[15..21].iter().all(u8::is_ascii_digit)
+        && matches!(bytes[21], b'+' | b'-')
+        && bytes[22..].iter().all(u8::is_ascii_digit)
 }
 
 /// `true` when the lock at `path` belongs to a crashed/abandoned run and may be
