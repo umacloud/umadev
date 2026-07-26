@@ -6790,7 +6790,11 @@ async fn scheduler_parks_operational_review_without_blocking_the_plan() {
     seed_source(tmp.path());
     let (events, _rec) = sink();
     let mut sess = FakeSession::new(vec![text_turn("must never build")], true, "")
-        .with_fork_replies(["not a verdict", r#"{"accepts":true,"blocking":[]}"#]);
+        .with_fork_replies([
+            "not a verdict",
+            "still not a verdict",
+            r#"{"accepts":true,"blocking":[]}"#,
+        ]);
     let remaining_forks = Arc::clone(sess.fork_replies.as_ref().unwrap());
     let sent = sess.sent_handle();
     let mut plan = Plan {
@@ -6836,7 +6840,7 @@ async fn scheduler_parks_operational_review_without_blocking_the_plan() {
         matches!(
             &outcome,
             Some(DirectorLoopOutcome::PausedAtOperational { reason, .. })
-                if reason.contains("required review unavailable")
+                if reason.contains("required review") && reason.contains("unavailable")
         ),
         "the operational-review pause must own the terminal result: {outcome:?}"
     );
@@ -6847,13 +6851,151 @@ async fn scheduler_parks_operational_review_without_blocking_the_plan() {
     assert_eq!(
         remaining_forks.lock().unwrap().len(),
         1,
-        "the second scripted fork stays unused: no blocked-subtree replan/final review ran"
+        "the sentinel stays unused after the seat's one bounded fresh-session retry"
     );
     assert_eq!(plan.steps[0].status, StepStatus::Active);
     assert_eq!(plan.steps[1].status, StepStatus::Pending);
     let persisted = crate::plan_state::load(tmp.path()).expect("paused plan persisted");
     assert_eq!(persisted.steps[0].status, StepStatus::Active);
     assert_eq!(persisted.steps[1].status, StepStatus::Pending);
+}
+
+#[tokio::test]
+async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases_run() {
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, rec) = sink();
+    let mut options = opts(tmp.path());
+    options.backend = "codex".to_string();
+    let route = build_route();
+    let mut plan = Plan {
+        steps: vec![
+            PlanStep {
+                files: plan_state::StepFiles::default(),
+                id: "review".into(),
+                title: "Security review".into(),
+                seat: crate::critics::Seat::FrontendEngineer,
+                kind: StepKind::Review,
+                depends_on: vec![],
+                acceptance: AcceptanceSpec::ReviewClean,
+                evidence: Vec::new(),
+                status: StepStatus::Pending,
+            },
+            PlanStep {
+                files: test_step_files("must-not-run"),
+                id: "build".into(),
+                title: "Unrelated source repair".into(),
+                seat: crate::critics::Seat::BackendEngineer,
+                kind: StepKind::Build,
+                depends_on: vec!["review".into()],
+                acceptance: AcceptanceSpec::SourcePresent,
+                evidence: Vec::new(),
+                status: StepStatus::Pending,
+            },
+        ],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+
+    let mut first = FakeSession::new(vec![text_turn("source repair must never run")], true, "")
+        .with_fork_replies(["not a verdict", "still not a verdict"]);
+    let first_sent = first.sent_handle();
+    let first_outcome = drive_plan_steps(
+        &mut first,
+        &options,
+        &events,
+        &route,
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+    assert!(matches!(
+        first_outcome,
+        Some(DirectorLoopOutcome::PausedAtOperational { .. })
+    ));
+    assert!(first_sent.lock().unwrap().is_empty());
+    assert!(matches!(
+        load_operational_review_checkpoint(tmp.path()),
+        Some(OperationalReviewCheckpoint::StepReview {
+            consecutive_outages: 1,
+            ..
+        })
+    ));
+
+    let mut repeated = FakeSession::new(vec![text_turn("source repair must never run")], true, "")
+        .with_fork_replies(["not a verdict", "still not a verdict"]);
+    let repeated_sent = repeated.sent_handle();
+    let repeated_outcome =
+        drive_director_loop_resume(&mut repeated, &options, &events, &route).await;
+    assert!(matches!(
+        &repeated_outcome,
+        Some(DirectorLoopOutcome::Failed(reason))
+            if reason.contains("stopped incomplete") && reason.contains("new /run")
+    ));
+    assert!(
+        repeated_sent.lock().unwrap().is_empty(),
+        "neither outage boundary may start source repair"
+    );
+    assert!(matches!(
+        load_operational_review_checkpoint(tmp.path()),
+        Some(OperationalReviewCheckpoint::StepReview {
+            consecutive_outages: 2,
+            ..
+        })
+    ));
+    let persisted = crate::plan_state::load(tmp.path()).expect("terminal plan persisted");
+    assert!(persisted
+        .steps
+        .iter()
+        .all(|step| step.status == StepStatus::Blocked));
+    assert!(has_resumable_director_plan(tmp.path()));
+    assert!(
+        !has_resumable_run(tmp.path()),
+        "a terminal review circuit remains internally routable to the Failed guard, \
+         but must never be advertised to users as resumable"
+    );
+
+    // Match the hosted caller's exact `Some => return it, None => fresh run`
+    // fallback. The durable circuit must return `Some(Failed)` before loading a
+    // Pending/Active step, otherwise this branch would replay the whole task.
+    let mut caller = FakeSession::new(vec![text_turn("fresh run must never start")], true, "")
+        .with_fork_replies([r#"{"accepts":true,"blocking":[]}"#]);
+    let caller_sent = caller.sent_handle();
+    let resumed = drive_director_loop_resume(&mut caller, &options, &events, &route).await;
+    let caller_outcome = match resumed {
+        Some(outcome) => outcome,
+        None => {
+            drive_director_loop_routed(
+                &mut caller,
+                &options,
+                &events,
+                "MUST NOT REPLAY".to_string(),
+                Some(&route),
+            )
+            .await
+        }
+    };
+    assert!(matches!(
+        caller_outcome,
+        DirectorLoopOutcome::Failed(reason)
+            if reason.contains("cannot be continued") && reason.contains("new /run")
+    ));
+    assert!(
+        caller_sent.lock().unwrap().is_empty(),
+        "terminal /continue must not fall back to a new writer turn"
+    );
+    assert!(
+        cancel_operational_review_pause(tmp.path(), "superseded by a new /run").unwrap(),
+        "an explicitly fresh run can clear the terminal receipt idempotently"
+    );
+    assert!(!has_resumable_director_plan(tmp.path()));
+    assert!(rec.events().iter().any(|event| matches!(
+        event,
+        EngineEvent::Note(note)
+            if note.contains("send a new requirement") && note.contains("no reviewer outage")
+    )));
 }
 
 fn step_checkpoint_review_clean_build_plan() -> crate::plan_state::Plan {
@@ -6887,7 +7029,11 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
     let mut plan = step_checkpoint_review_clean_build_plan();
 
     let mut first = FakeSession::new(vec![text_turn("implementation complete")], true, "")
-        .with_fork_replies(["not a verdict", r#"{"accepts":true,"blocking":[]}"#]);
+        .with_fork_replies([
+            "not a verdict",
+            r#"{"accepts":true,"blocking":[]}"#,
+            "still not a verdict",
+        ]);
     let first_sent = first.sent_handle();
     let first_outcome = drive_plan_steps(
         &mut first,
@@ -6919,6 +7065,7 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
         qc_source_fingerprint,
         required_seats,
         review_only,
+        ..
     } = first_checkpoint
     else {
         panic!("expected a step-review checkpoint");
@@ -6942,10 +7089,11 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
         drive_director_loop_resume(&mut repeated, &options, &events, &rerouted).await;
     assert!(
         matches!(
-            repeated_outcome,
-            Some(DirectorLoopOutcome::PausedAtOperational { .. })
+            &repeated_outcome,
+            Some(DirectorLoopOutcome::Failed(reason))
+                if reason.contains("stopped incomplete") && reason.contains("new /run")
         ),
-        "a repeated reviewer outage remains parked: {repeated_outcome:?}"
+        "the second identical outage boundary opens the bounded circuit: {repeated_outcome:?}"
     );
     assert!(
         repeated_sent.lock().unwrap().is_empty(),
@@ -6953,8 +7101,8 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
     );
     assert_eq!(
         repeated_forks.lock().unwrap().len(),
-        1,
-        "the saved two-seat roster is retried exactly once, ignoring the new one-seat route"
+        0,
+        "the saved two-seat roster plus the unavailable seat's one retry consume the fixture"
     );
     assert!(
         rec.events().iter().any(|event| matches!(
@@ -6983,14 +7131,15 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
     assert!(matches!(
         load_operational_review_checkpoint(tmp.path()),
         Some(OperationalReviewCheckpoint::StepReview {
-            step_id,
-            qc_source_fingerprint: repeated_fingerprint,
-            required_seats: Some(seats),
-            review_only: true,
-        }) if step_id == "reviewed-build"
-            && repeated_fingerprint == qc_source_fingerprint
-            && seats == route.team
+            consecutive_outages: 2,
+            ..
+        })
     ));
+    let persisted = crate::plan_state::load(tmp.path()).expect("terminal plan persisted");
+    assert!(persisted
+        .steps
+        .iter()
+        .all(|step| step.status == crate::plan_state::StepStatus::Blocked));
 }
 
 #[tokio::test]
@@ -7210,8 +7359,11 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
         open_questions: Vec::new(),
     };
 
-    let mut first = FakeSession::new(vec![], true, "")
-        .with_fork_replies(["not a verdict", r#"{"accepts":true,"blocking":[]}"#]);
+    let mut first = FakeSession::new(vec![], true, "").with_fork_replies([
+        "not a verdict",
+        "still not a verdict",
+        "unused sentinel",
+    ]);
     let first_forks = Arc::clone(first.fork_replies.as_ref().unwrap());
     let first_outcome = drive_plan_steps(
         &mut first,
@@ -7230,7 +7382,7 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
     assert_eq!(
         first_forks.lock().unwrap().len(),
         1,
-        "the initial final gate made exactly one reviewer call"
+        "the initial final gate consumed the first attempt and its one fresh-session retry"
     );
     assert!(matches!(
         load_operational_review_checkpoint(tmp.path()),
@@ -7245,8 +7397,8 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
     );
 
     // A resident turn can hand this final-review cursor to `/continue`.
-    // Bind a real parked entry ledger and prove that repeated outages keep the
-    // same run resumable instead of minting or orphaning another writer.
+    // Bind a real parked entry ledger and prove a recovered reviewer settles the
+    // same run without minting or orphaning another writer.
     let resident_run_id = {
         let mut task = crate::task_lifecycle::EntryTaskTracker::begin(
             tmp.path(),
@@ -7264,6 +7416,7 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
     let OperationalReviewCheckpoint::FinalGateReview {
         qc_source_fingerprint,
         required_seats,
+        consecutive_outages,
         ..
     } = checkpoint
     else {
@@ -7275,47 +7428,10 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
             qc_source_fingerprint,
             required_seats,
             entry_task_run_id: Some(resident_run_id.clone()),
+            consecutive_outages,
         },
     )
     .unwrap();
-
-    let mut repeated_outage =
-        FakeSession::new(vec![], true, "").with_fork_replies(["not a verdict"]);
-    let repeated_forks = Arc::clone(repeated_outage.fork_replies.as_ref().unwrap());
-    let repeated_outcome =
-        drive_director_loop_resume(&mut repeated_outage, &options, &events, &route).await;
-    assert!(
-        matches!(
-            repeated_outcome,
-            Some(DirectorLoopOutcome::PausedAtOperational { .. })
-        ),
-        "a repeated reviewer outage must remain a pause: {repeated_outcome:?}"
-    );
-    assert!(
-        repeated_forks.lock().unwrap().is_empty(),
-        "the repeated outage consumes exactly one final-review attempt"
-    );
-    let resident_ledger =
-        crate::task_lifecycle::AgentTaskLedger::open(tmp.path(), &resident_run_id).unwrap();
-    assert_eq!(
-        resident_ledger.task("entry").map(|task| task.state),
-        Some(crate::task_lifecycle::AgentTaskState::Waiting),
-        "the exact resident run remains parked"
-    );
-    assert!(matches!(
-        load_operational_review_checkpoint(tmp.path()),
-        Some(OperationalReviewCheckpoint::FinalGateReview {
-            entry_task_run_id: Some(run_id),
-            ..
-        }) if run_id == resident_run_id
-    ));
-    assert_eq!(
-        rec.count(
-            |event| matches!(event, EngineEvent::Note(note) if note == "team · verify build-test")
-        ),
-        verify_reads_after_pause,
-        "a repeated outage retries only review, not build/test or Docker"
-    );
 
     let mut resumed = FakeSession::new(vec![text_turn("final report")], true, "")
         .with_fork_replies([r#"{"accepts":true,"blocking":[]}"#, "not a verdict"]);
@@ -7490,6 +7606,7 @@ async fn resident_final_review_semantic_blocker_fails_same_run_and_closes_resume
     let OperationalReviewCheckpoint::FinalGateReview {
         qc_source_fingerprint,
         required_seats,
+        consecutive_outages,
         ..
     } = checkpoint
     else {
@@ -7501,6 +7618,7 @@ async fn resident_final_review_semantic_blocker_fails_same_run_and_closes_resume
             qc_source_fingerprint,
             required_seats,
             entry_task_run_id: Some(resident_run_id.clone()),
+            consecutive_outages,
         },
     )
     .unwrap();
@@ -7613,8 +7731,8 @@ async fn mixed_review_pauses_without_repairing_or_rechecking() {
         .with_fork_replies([
             r#"{"accepts":false,"blocking":["missing regression test"]}"#,
             "not a verdict",
-            r#"{"accepts":true,"blocking":[]}"#,
-            r#"{"accepts":true,"blocking":[]}"#,
+            "still not a verdict",
+            "unused sentinel",
         ]);
     let sent = sess.sent_handle();
     let step = PlanStep {
@@ -8082,7 +8200,8 @@ async fn post_build_qc_mixed_review_retains_semantic_evidence_without_repair_or_
     let mut session = FakeSession::new(Vec::new(), true, "").with_fork_replies([
         r#"{"accepts":false,"blocking":["missing regression test"]}"#,
         "not a verdict",
-        r#"{"accepts":true,"blocking":[]}"#,
+        "still not a verdict",
+        "unused sentinel",
     ]);
     let remaining = Arc::clone(session.fork_replies.as_ref().unwrap());
     let sent = session.sent_handle();
@@ -8769,4 +8888,47 @@ fn reported_regression_deterministic_blockers_defer_critic_review() {
     assert!(!super::quality_evidence::should_run_critic_review(&[
         "scope: historical file is not part of this run".to_string(),
     ]));
+}
+
+#[test]
+fn file_contains_rejects_oversized_evidence_instead_of_matching_a_prefix() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("evidence.txt");
+    let mut body = b"needle".to_vec();
+    body.resize(super::DIRECTOR_EVIDENCE_FILE_BYTES + 1, b'x');
+    std::fs::write(&path, body).unwrap();
+    match file_contains_outcome(tmp.path(), "evidence.txt", "needle") {
+        EvidenceOutcome::Gap(message) => assert!(message.contains("unavailable")),
+        _ => panic!("oversized evidence must fail closed"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn file_contains_rejects_symlinked_evidence() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), "needle").unwrap();
+    symlink(outside.path(), tmp.path().join("evidence.txt")).unwrap();
+    assert!(matches!(
+        file_contains_outcome(tmp.path(), "evidence.txt", "needle"),
+        EvidenceOutcome::Gap(_)
+    ));
+}
+
+#[test]
+fn file_contains_supports_a_relative_project_root() {
+    let tmp = tempfile::Builder::new()
+        .prefix("umadev-director-relative-")
+        .tempdir_in(".")
+        .unwrap();
+    std::fs::write(tmp.path().join("evidence.txt"), "needle").unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let relative = tmp.path().strip_prefix(cwd).unwrap_or(tmp.path());
+    assert!(matches!(
+        file_contains_outcome(relative, "evidence.txt", "needle"),
+        EvidenceOutcome::Pass
+    ));
 }

@@ -136,15 +136,40 @@ pub fn resolve_claude_program() -> String {
 /// the shim spawn failure this works around does not occur on Unix.
 #[cfg(windows)]
 fn npm_global_claude_binary() -> Option<String> {
-    let out = std::process::Command::new("npm.cmd")
+    const NPM_ROOT_TIMEOUT: Duration = Duration::from_secs(3);
+    const NPM_ROOT_STDOUT_BYTES: usize = 64 * 1024;
+    const NPM_ROOT_STDERR_BYTES: usize = 16 * 1024;
+
+    let mut command = std::process::Command::new("npm.cmd");
+    command
         .args(["root", "-g"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+        .env("CI", "1")
+        .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
+        .env("NPM_CONFIG_FUND", "false")
+        .env("NPM_CONFIG_AUDIT", "false");
+    let out = umadev_process::run_bounded_std_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: NPM_ROOT_TIMEOUT,
+            stdout_bytes: NPM_ROOT_STDOUT_BYTES,
+            stderr_bytes: NPM_ROOT_STDERR_BYTES,
+            reader_grace: Duration::from_millis(500),
+        },
+    )
+    .ok()?;
+    if out.timed_out
+        || out.stdout_truncated
+        || out.stderr_truncated
+        || !out.status.is_some_and(|status| status.success())
+    {
         return None;
     }
-    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    npm_global_claude_binary_from_stdout(&out.stdout)
+}
+
+#[cfg(any(windows, test))]
+fn npm_global_claude_binary_from_stdout(stdout: &[u8]) -> Option<String> {
+    let root = std::str::from_utf8(stdout).ok()?.trim();
     if root.is_empty() {
         return None;
     }
@@ -460,6 +485,7 @@ impl Runtime for ClaudeCodeDriver {
         req: CompletionRequest,
         on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
     ) -> Result<CompletionResponse, RuntimeError> {
+        let call_started = std::time::Instant::now();
         let prompt = merge_prompt(&req);
         // Streaming args: same session strategy as `complete()` (pinned
         // `--session-id` on the first call, exact `--resume` later), but with the
@@ -487,7 +513,7 @@ impl Runtime for ClaudeCodeDriver {
 
         // Accumulate the raw stream so a mid-stream failure can salvage whatever
         // the base already produced instead of cold-restarting a whole new run.
-        let stream_buf = std::sync::Mutex::new(String::new());
+        let stream_buf = crate::StreamingFallbackBuffer::new();
         let result = run_subprocess_streaming(
             SubprocessCall {
                 program: &program,
@@ -499,10 +525,7 @@ impl Runtime for ClaudeCodeDriver {
                 env: &govern_env,
             },
             &|line: &str| {
-                if let Ok(mut b) = stream_buf.lock() {
-                    b.push_str(line);
-                    b.push('\n');
-                }
+                stream_buf.push_line(line);
                 if let Some(ev) = parse_claude_stream_line(line) {
                     on_event(ev);
                 }
@@ -549,7 +572,7 @@ impl Runtime for ClaudeCodeDriver {
                 // (it was shown to the user live) before paying for a full
                 // cold-restart `complete` (worst case another whole timeout).
                 tracing::debug!(error = %e, "streaming failed, falling back to non-streaming");
-                let partial = stream_buf.into_inner().unwrap_or_default();
+                let partial = stream_buf.into_string();
                 if let Some(text) = salvage_partial_stream(&partial) {
                     let usage = extract_usage(&partial);
                     return Ok(crate::redaction::sanitize_completion_response(
@@ -561,9 +584,21 @@ impl Runtime for ClaudeCodeDriver {
                         },
                     ));
                 }
+                let stream_error = crate::map_subprocess_error(&e);
+                // A streaming timeout already consumed this logical call's
+                // wall-clock budget. Re-running the same prompt in non-streaming
+                // mode would silently double it; the runner's bounded retry owns
+                // transient recovery instead.
+                if matches!(stream_error, RuntimeError::Timeout(_, _)) {
+                    return Err(stream_error);
+                }
+                let remaining = timeout.saturating_sub(call_started.elapsed());
+                if remaining.is_zero() {
+                    return Err(stream_error);
+                }
                 drop(args);
                 drop(prompt);
-                self.complete(req).await
+                self.clone().with_timeout(remaining).complete(req).await
             }
         }
     }
@@ -1094,6 +1129,28 @@ fn parse_claude_auth_status(out: &str) -> AuthState {
 mod tests {
     use super::*;
     use umadev_runtime::StreamEvent;
+
+    #[test]
+    fn npm_global_claude_path_parser_rejects_untrusted_or_missing_output() {
+        assert_eq!(npm_global_claude_binary_from_stdout(b""), None);
+        assert_eq!(npm_global_claude_binary_from_stdout(&[0xff, 0xfe]), None);
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let binary = temp
+            .path()
+            .join("@anthropic-ai")
+            .join("claude-code")
+            .join("bin")
+            .join("claude.exe");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"test binary").unwrap();
+        let stdout = format!("{}\r\n", temp.path().display());
+
+        assert_eq!(
+            npm_global_claude_binary_from_stdout(stdout.as_bytes()),
+            Some(binary.to_string_lossy().into_owned())
+        );
+    }
 
     struct EnvRestore {
         key: &'static str,

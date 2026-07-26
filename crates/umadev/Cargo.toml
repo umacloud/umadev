@@ -19,6 +19,7 @@ umadev-agent = { workspace = true, features = ["vector"] }
 umadev-contract = { workspace = true }
 umadev-runtime = { workspace = true }
 umadev-host = { workspace = true }
+umadev-process = { workspace = true }
 umadev-tui = { workspace = true }
 umadev-i18n = { workspace = true }
 umadev-state = { workspace = true }
@@ -40,6 +41,8 @@ toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 unicode-width = { workspace = true }
+libc = "0.2"
+same-file = "1"
 
 [features]
 default = []

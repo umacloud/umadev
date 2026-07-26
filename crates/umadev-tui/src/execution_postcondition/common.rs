@@ -102,17 +102,56 @@ pub(crate) fn snapshot_blocked(error: WorkspaceSnapshotError) -> ResidentExecuti
 /// Snapshot the working tree as `git status --porcelain` for legacy reality
 /// prompt/fact rendering. Execution-contract enforcement uses the stronger
 /// content-fingerprint baseline above.
-pub(crate) fn git_status_porcelain(root: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["status", "--porcelain"])
-        .output()
+const GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const GIT_STATUS_STDOUT_BYTES: usize = 256 * 1024;
+const GIT_STATUS_STDERR_BYTES: usize = 16 * 1024;
+const GIT_STATUS_READER_GRACE: Duration = Duration::from_millis(500);
+
+fn git_status_options() -> umadev_process::BoundedCommandOptions {
+    umadev_process::BoundedCommandOptions {
+        timeout: GIT_STATUS_TIMEOUT,
+        stdout_bytes: GIT_STATUS_STDOUT_BYTES,
+        stderr_bytes: GIT_STATUS_STDERR_BYTES,
+        reader_grace: GIT_STATUS_READER_GRACE,
+    }
+}
+
+async fn run_git_status_command(
+    command: tokio::process::Command,
+    options: umadev_process::BoundedCommandOptions,
+) -> Option<String> {
+    let output = umadev_process::run_bounded_command(command, options)
+        .await
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+    if output.timed_out
+        || output.stdout_truncated
+        || !output.status.is_some_and(|status| status.success())
+    {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Async hot-path snapshot used before and after ordinary resident turns. Git
+/// owns a dedicated process tree, has a hard deadline, and drains only bounded
+/// output; an incomplete snapshot is discarded instead of being treated as a
+/// truthful partial status.
+pub(crate) async fn git_status_porcelain_bounded(root: &Path) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command.arg("-C").arg(root).args(["status", "--porcelain"]);
+    run_git_status_command(command, git_status_options()).await
+}
+
+/// Compare a prior complete status with a fresh bounded snapshot. Any missing,
+/// timed-out, or truncated side stays `None`, so callers never label a partial
+/// repository view as the turn's real changed-file set.
+pub(crate) async fn changed_files_after_git_status(
+    before: Option<&str>,
+    root: &Path,
+) -> Option<Vec<String>> {
+    let before = before?;
+    let after = git_status_porcelain_bounded(root).await?;
+    Some(changed_files_between(before, &after))
 }
 
 pub(crate) fn porcelain_path(line: &str) -> Option<String> {
@@ -182,4 +221,62 @@ pub(crate) fn agentic_fact_line(changed: Option<&[String]>, claimed: bool) -> Op
         list.push_str(&format!(" ... (+{})", changed.len() - MAX_FACT_PATHS));
     }
     Some(format!("[note] 本轮实际文件变更: {list}"))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{changed_files_after_git_status, run_git_status_command, GIT_STATUS_READER_GRACE};
+    use std::time::{Duration, Instant};
+
+    fn options(timeout: Duration, stdout_bytes: usize) -> umadev_process::BoundedCommandOptions {
+        umadev_process::BoundedCommandOptions {
+            timeout,
+            stdout_bytes,
+            stderr_bytes: 1_024,
+            reader_grace: GIT_STATUS_READER_GRACE,
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_git_status_accepts_complete_output_and_reaps_descendants() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 30 & printf ' M file.txt\\n'; exit 0"]);
+        let started = Instant::now();
+        let status = run_git_status_command(command, options(Duration::from_secs(3), 1_024)).await;
+        assert_eq!(status.as_deref(), Some(" M file.txt\n"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "git-status helper waited for a descendant that inherited its pipes"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_git_status_discards_timeout_and_truncated_output() {
+        let mut slow = tokio::process::Command::new("sh");
+        slow.args(["-c", "printf partial; sleep 30"]);
+        assert!(
+            run_git_status_command(slow, options(Duration::from_millis(50), 1_024))
+                .await
+                .is_none(),
+            "a timed-out status must fail open, never expose a partial snapshot"
+        );
+
+        let mut flood = tokio::process::Command::new("sh");
+        flood.args(["-c", "head -c 4096 /dev/zero | tr '\\0' x"]);
+        assert!(
+            run_git_status_command(flood, options(Duration::from_secs(3), 32))
+                .await
+                .is_none(),
+            "a capped status must fail open, never expose a truncated snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_diff_requires_a_complete_before_snapshot() {
+        assert!(
+            changed_files_after_git_status(None, std::path::Path::new("."))
+                .await
+                .is_none()
+        );
+    }
 }

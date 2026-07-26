@@ -16,6 +16,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+const MAX_DERIVED_DOC_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DERIVED_INPUT_BYTES: usize = 6 * 1024 * 1024;
+
 /// One entity in the materialized data model (a table / struct the app persists).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataModelEntity {
@@ -202,8 +205,12 @@ pub fn parse_acceptance(prd_md: &str) -> Vec<String> {
 /// swallowed.
 #[must_use]
 pub fn materialize(project_root: &Path, slug: &str) -> DerivedContracts {
-    let read = |name: &str| {
-        std::fs::read_to_string(project_root.join(format!("output/{slug}-{name}.md")))
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_DERIVED_INPUT_BYTES, MAX_DERIVED_DOC_BYTES);
+    let mut read = |name: &str| {
+        let path = project_root.join(format!("output/{slug}-{name}.md"));
+        budget
+            .read_utf8_beneath(project_root, &path)
             .unwrap_or_default()
     };
     let contracts = DerivedContracts {

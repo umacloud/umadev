@@ -261,8 +261,14 @@ fn rewrite_fence_in_place(path: &Path, expected: &[u8]) -> io::Result<()> {
             "workspace run-lock fence changed type during migration",
         ));
     }
-    let mut observed = Vec::new();
-    file.read_to_end(&mut observed)?;
+    let mut observed = Vec::with_capacity(expected.len().saturating_add(1));
+    std::io::Read::by_ref(&mut file)
+        .take(
+            u64::try_from(expected.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        )
+        .read_to_end(&mut observed)?;
     if observed != expected {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,

@@ -1160,11 +1160,16 @@ pub fn finalize(
 /// finding). Only a proof that positively records a fingerprint that no longer matches
 /// is stale. See [`crate::freshness`].
 fn stale_proof_artifacts(root: &std::path::Path) -> Vec<String> {
+    const MAX_RUNTIME_PROOF_BYTES: usize = 4 * 1024 * 1024;
     let mut stale = Vec::new();
     let rel = crate::runtime_proof::runtime_proof_rel_path();
-    if let Some(proof) = std::fs::read_to_string(root.join(rel))
-        .ok()
-        .and_then(|b| serde_json::from_str::<crate::runtime_proof::RuntimeProof>(&b).ok())
+    if let Some(proof) = crate::bounded_fs::read_utf8_beneath(
+        root,
+        std::path::Path::new(rel),
+        MAX_RUNTIME_PROOF_BYTES,
+    )
+    .ok()
+    .and_then(|b| serde_json::from_str::<crate::runtime_proof::RuntimeProof>(&b).ok())
     {
         if proof.is_stale(root) {
             stale.push(format!("`{rel}`"));

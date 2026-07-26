@@ -30,6 +30,9 @@ use crate::runner::RunOptions;
 
 /// Subdirectory under `.umadev/` where coach prompts live.
 pub const COACH_DIR: &str = ".umadev/coach";
+const MAX_COACH_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_COACH_INPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_COACH_INPUT_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 
 /// Write the coach prompt for `phase` to `.umadev/coach/<NN>-<phase>.md`.
 ///
@@ -486,7 +489,9 @@ fn merge_dual_channel(
 /// Returns an empty string if no MCP servers are configured.
 pub(crate) fn load_mcp_tools(project_root: &std::path::Path) -> String {
     let path = project_root.join(".mcp.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) =
+        crate::bounded_fs::read_utf8_beneath(project_root, &path, MAX_COACH_METADATA_BYTES)
+    else {
         return String::new();
     };
     let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -903,7 +908,9 @@ fn detect_declared_archetype(opts: &RunOptions) -> Option<String> {
         .project_root
         .join("output")
         .join(format!("{}-uiux.md", opts.effective_slug()));
-    let content = fs::read_to_string(&path).ok()?;
+    let content =
+        crate::bounded_fs::read_utf8_beneath(&opts.project_root, &path, MAX_COACH_INPUT_BYTES)
+            .ok()?;
     let lower = content.to_lowercase();
     let section = heading_section(&lower, "visual direction")?;
     let mentioned: Vec<&str> = DESIGN_ARCHETYPES
@@ -950,6 +957,8 @@ fn heading_section(lower: &str, keyword: &str) -> Option<String> {
 /// anyway. Returns a ready-to-inject block.
 pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> String {
     let mut inject = String::new();
+    let mut read_budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_COACH_INPUT_TOTAL_BYTES, MAX_COACH_INPUT_BYTES);
 
     // Resolve the EFFECTIVE design system, in priority order:
     //   1. explicit user choice (`/design <name>`)
@@ -995,7 +1004,7 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
         .project_root
         .join("knowledge/design-systems")
         .join(format!("{ds_name}.md"));
-    if let Ok(content) = fs::read_to_string(&path) {
+    if let Ok(content) = read_budget.read_utf8_beneath(&opts.project_root, &path) {
         inject.push_str("\n\n## 设计系统(绑定契约 · BINDING DESIGN CONTRACT)\n\n");
         inject.push_str(&source_note);
         inject.push_str(
@@ -1020,7 +1029,7 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
             .project_root
             .join("knowledge/design-systems/anti-ai-slop.md");
         if phase == Phase::Frontend {
-            if let Ok(slop) = fs::read_to_string(&slop_path) {
+            if let Ok(slop) = read_budget.read_utf8_beneath(&opts.project_root, &slop_path) {
                 inject.push_str("\n\n");
                 inject.push_str(&render_knowledge_file_reference(
                     opts,
@@ -1029,7 +1038,7 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
                     umadev_knowledge::PromptReferenceKind::DesignSystem,
                 ));
             }
-        } else if slop_path.exists() {
+        } else if crate::bounded_fs::is_real_file_beneath(&opts.project_root, &slop_path) {
             inject.push_str(
                 "\n\n> 设计原则(精简)：先 commit 一个方向(Motif)+真实参照，反 generic —— \
                  distinctive 字体(非 Inter/Roboto 当主字)、OKLCH、主色+sharp accent、contextual 阴影、\
@@ -1039,21 +1048,23 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
         }
         // Point at the concrete per-product-type palette/font starter table so
         // the worker doesn't start from a blank page and reflex to generic.
-        if opts
-            .project_root
-            .join("knowledge/design-systems/product-type-design-map.md")
-            .exists()
-        {
+        if crate::bounded_fs::is_real_file_beneath(
+            &opts.project_root,
+            &opts
+                .project_root
+                .join("knowledge/design-systems/product-type-design-map.md"),
+        ) {
             inject.push_str(
                 "\n\n> 起步调色板与字体对：先查 `knowledge/design-systems/product-type-design-map.md` \
                  取最接近本产品类型的一行(已做 WCAG 调整的 Primary/Accent/Background + 字体对)，再据所选档位细化。\n",
             );
         }
-        if opts
-            .project_root
-            .join("knowledge/design-systems/aesthetic-families.md")
-            .exists()
-        {
+        if crate::bounded_fs::is_real_file_beneath(
+            &opts.project_root,
+            &opts
+                .project_root
+                .join("knowledge/design-systems/aesthetic-families.md"),
+        ) {
             inject.push_str(
                 "> 若上面的默认档位不完全契合，可查 `knowledge/design-systems/aesthetic-families.md` \
                  从全光谱家族里**具名 commit 一个**(neumorphism/cyberpunk/bento/spatial…)，绝不回退 generic。\n",
@@ -1066,7 +1077,7 @@ pub(crate) fn load_design_system_inject(opts: &RunOptions, phase: Phase) -> Stri
             .project_root
             .join("knowledge/seed-templates")
             .join(format!("{}.md", opts.seed_template));
-        if let Ok(content) = fs::read_to_string(&path) {
+        if let Ok(content) = read_budget.read_utf8_beneath(&opts.project_root, &path) {
             inject.push_str("\n\n## Active seed template\n\n");
             inject.push_str("The user selected this template via `/template ");
             inject.push_str(&opts.seed_template);
@@ -1738,6 +1749,33 @@ mod tests {
         let inject = load_design_system_inject(&o, Phase::Frontend);
         assert!(inject.contains("产品类型")); // the keyword-table note
         assert!(inject.contains("--serif-base")); // editorial-clean from the table
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coach_inputs_do_not_follow_links_outside_the_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let external_mcp = outside.path().join("mcp.json");
+        std::fs::write(
+            &external_mcp,
+            r#"{"mcpServers":{"leaked-secret":{"command":"secret"}}}"#,
+        )
+        .unwrap();
+        symlink(&external_mcp, workspace.path().join(".mcp.json")).unwrap();
+        assert!(load_mcp_tools(workspace.path()).is_empty());
+
+        let external_design = outside.path().join("design.md");
+        std::fs::write(&external_design, "EXTERNAL-DESIGN-SENTINEL").unwrap();
+        let design_dir = workspace.path().join("knowledge/design-systems");
+        std::fs::create_dir_all(&design_dir).unwrap();
+        symlink(&external_design, design_dir.join("modern-minimal.md")).unwrap();
+        let mut options = opts(workspace.path());
+        options.design_system = "modern-minimal".into();
+        assert!(!load_design_system_inject(&options, Phase::Frontend)
+            .contains("EXTERNAL-DESIGN-SENTINEL"));
     }
 
     fn opts(root: &Path) -> RunOptions {

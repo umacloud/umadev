@@ -209,6 +209,9 @@ fn artifact_versions_path(project_root: &std::path::Path) -> std::path::PathBuf 
     project_root.join(".umadev").join("artifact-versions.json")
 }
 
+const MAX_ARTIFACT_VERSION_BYTES: usize = 1024 * 1024;
+const MAX_SCRATCH_NOTE_BYTES: usize = 1024 * 1024;
+
 /// Read the persisted `artifact-name -> last-seen version` map. Fail-open: a
 /// missing or corrupt store yields an empty map (versioning is an optimisation,
 /// never a blocker).
@@ -216,10 +219,14 @@ fn artifact_versions_path(project_root: &std::path::Path) -> std::path::PathBuf 
 pub fn read_artifact_versions(
     project_root: &std::path::Path,
 ) -> std::collections::BTreeMap<String, String> {
-    std::fs::read_to_string(artifact_versions_path(project_root))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    crate::bounded_fs::read_utf8_beneath(
+        project_root,
+        &artifact_versions_path(project_root),
+        MAX_ARTIFACT_VERSION_BYTES,
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str(&s).ok())
+    .unwrap_or_default()
 }
 
 /// Persist the `artifact-name -> version` map (best-effort; a write error is
@@ -293,7 +300,12 @@ pub fn write_scratch(project_root: &std::path::Path, key: &str, content: &str) {
 /// Read a private scratch note for `key`. `None` if absent/unreadable.
 #[must_use]
 pub fn read_scratch(project_root: &std::path::Path, key: &str) -> Option<String> {
-    std::fs::read_to_string(scratch_path(project_root, key)).ok()
+    crate::bounded_fs::read_utf8_beneath(
+        project_root,
+        &scratch_path(project_root, key),
+        MAX_SCRATCH_NOTE_BYTES,
+    )
+    .ok()
 }
 
 /// GC the whole private scratch lane (call at run end). Best-effort.

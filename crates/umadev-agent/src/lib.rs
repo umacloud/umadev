@@ -45,6 +45,7 @@ pub mod base_error;
 pub mod base_gate;
 pub mod bg_agents;
 pub mod blocker;
+pub(crate) mod bounded_fs;
 pub mod checkpoint;
 pub mod coach;
 pub mod color_permission;
@@ -64,6 +65,7 @@ pub mod error_kb;
 pub mod events;
 pub mod execution_contract;
 pub mod experts;
+pub(crate) mod external_command;
 pub mod fact_extract;
 pub mod first_pass;
 pub mod freshness;
@@ -131,8 +133,9 @@ pub use constitution::{
 };
 pub use context::{compose_firmware, project_context, FIRMWARE_BUDGET};
 pub use continuous::{
-    continuous_enabled_from_env, legacy_pipeline_from_env, run_block as run_continuous_block,
-    ReviewKind, RunOutcome,
+    continuous_enabled_from_env, legacy_operational_review_circuit_reason,
+    legacy_operational_review_pending, legacy_operational_review_terminal_reason,
+    legacy_pipeline_from_env, run_block as run_continuous_block, ReviewKind, RunOutcome,
 };
 pub use critics::{
     append_team_ledger, docs_team_for_kind, preview_team_for_kind, quality_team_for_kind,
@@ -152,9 +155,10 @@ pub use director_loop::{
     cancel_operational_review_pause, checkpoint_post_build_review_pause, drive_director_loop,
     drive_director_loop_resume, drive_director_loop_routed, has_resumable_director_plan,
     has_resumable_run, is_budget_pause_reason, persist_run_governance_context, run_post_build_qc,
-    transient_resume_hint, DirectorLoopOutcome, PostBuildOperationalPause, PostBuildQcOutcome,
+    terminal_review_circuit_reason, transient_resume_hint, DirectorLoopOutcome,
+    PostBuildOperationalPause, PostBuildQcOutcome,
 };
-pub use events::{ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
+pub use events::{ChannelReceiver, ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use execution_contract::{ContractViolation, ExecutionContract};
 pub use first_pass::{
     autonomy_default as first_pass_autonomy_default, class_kind as first_pass_class_kind,

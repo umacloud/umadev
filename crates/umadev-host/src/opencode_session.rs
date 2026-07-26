@@ -98,7 +98,7 @@ use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{
     isolate_process_tree, kill_isolated_process_tree, kill_isolated_process_tree_blocking,
-    reap_isolated_process_tree, END_REAP_BUDGET,
+    reap_isolated_process_tree, try_exit_isolated_process_tree, END_REAP_BUDGET,
 };
 
 /// How many events the SSE-reader task may buffer ahead of the consumer.
@@ -584,7 +584,9 @@ async fn spawn_serve(
     // can no longer reach once the trampoline exits. `None` off Windows / if the OS
     // refuses nested assignment (the process group is the fallback).
     #[cfg(windows)]
-    let process_job = umadev_process::KillOnCloseJob::attach(&child);
+    let process_job = Some(umadev_process::KillOnCloseJob::attach(&mut child).map_err(
+        |error| SessionError::Start(format!("failed to secure OpenCode process tree: {error}")),
+    )?);
     let stdout = child
         .stdout
         .take()
@@ -1176,7 +1178,7 @@ impl BaseSession for OpenCodeSession {
     fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
         // Non-blocking peek at the `opencode serve` child (lock + try_wait both
         // never block); a contended lock / try_wait error fails open to None.
-        self.child.try_lock().ok()?.try_wait().ok().flatten()
+        try_exit_isolated_process_tree(&self.child)
     }
 }
 

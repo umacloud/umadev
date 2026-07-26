@@ -1180,10 +1180,9 @@ async fn process_timeout_and_bounded_output_helpers_work_without_hooks() {
         &mut noisy_transaction,
     )
     .await
-    .unwrap();
+    .unwrap_err();
     noisy_transaction.disarm();
-    assert!(!noisy.status.success());
-    assert!(noisy.stderr.len() <= 64 * 1024);
+    assert!(noisy.note.contains("git-output-limit-exceeded"));
 
     let mut timeout_transaction = GitTransactionGuard::new(root.path(), baseline);
     let started = std::time::Instant::now();
@@ -1201,6 +1200,28 @@ async fn process_timeout_and_bounded_output_helpers_work_without_hooks() {
     let note = timeout_transaction.finish_failure(timeout).into_note();
     assert!(note.contains("test-process-timeout"), "{note}");
     assert!(started.elapsed() < Duration::from_secs(5));
+
+    let marker = root.path().join(".descendant-survived");
+    let mut descendant_transaction = GitTransactionGuard::new(root.path(), baseline);
+    let timeout = git_mutating_output(
+        root.path(),
+        &[
+            "-c",
+            "alias.umadev-descendant=!(sleep 1; : > .descendant-survived) & sleep 30",
+            "umadev-descendant",
+        ],
+        &[],
+        Duration::from_millis(150),
+        "test-descendant-timeout",
+        "git descendant helper",
+        &mut descendant_transaction,
+    )
+    .await
+    .unwrap_err();
+    let note = descendant_transaction.finish_failure(timeout).into_note();
+    assert!(note.contains("test-descendant-timeout"), "{note}");
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(!marker.exists(), "Git descendant survived timeout cleanup");
 }
 
 #[cfg(unix)]

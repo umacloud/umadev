@@ -1,7 +1,7 @@
 use super::{
     bounded_text, combined_git_failure, git_command_failed, git_commit_blocked, git_optional_text,
-    git_output, git_required_text, kill_process_group_sync, GitCommitBaseline, GitIndexSnapshot,
-    Path, PathBuf, ResidentExecutionBlocked,
+    git_output, git_required_text, GitCommitBaseline, GitIndexSnapshot, Path, PathBuf,
+    ResidentExecutionBlocked,
 };
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -17,7 +17,6 @@ pub(crate) struct GitTransactionGuard {
     pub(crate) expected_tree: Option<String>,
     pub(crate) owned_commit: Option<String>,
     reflog_action: String,
-    pub(crate) active_process_group: Option<u32>,
     pub(crate) armed: bool,
 }
 
@@ -111,7 +110,6 @@ impl GitTransactionGuard {
             expected_tree: None,
             owned_commit: None,
             reflog_action: format!("umadev-host-commit-{}-{nonce:x}-{id}", std::process::id()),
-            active_process_group: None,
             armed: true,
         }
     }
@@ -202,16 +200,7 @@ impl GitTransactionGuard {
         Ok(())
     }
 
-    pub(crate) fn arm_process(&mut self, pid: Option<u32>) {
-        self.active_process_group = pid;
-    }
-
-    pub(crate) fn clear_process(&mut self) {
-        self.active_process_group = None;
-    }
-
     pub(crate) fn disarm(&mut self) {
-        self.active_process_group = None;
         self.armed = false;
     }
 
@@ -256,9 +245,6 @@ impl GitTransactionGuard {
     }
 
     pub(crate) fn recover_sync(&mut self) -> Result<(), ResidentExecutionBlocked> {
-        if let Some(pid) = self.active_process_group.take() {
-            kill_process_group_sync(pid);
-        }
         self.rollback_owned_head_sync()?;
         self.restore_original_index_guarded()
     }

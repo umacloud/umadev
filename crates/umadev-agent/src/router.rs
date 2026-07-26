@@ -47,7 +47,7 @@ mod git_commit;
 use git_commit::{
     git_commit_control_text, git_commit_request_has_additional_work,
     git_commit_request_is_question_or_negated, git_commit_scope_text,
-    request_is_git_commit_diagnostic,
+    request_is_git_commit_diagnostic, unquoted_lowercase_text,
 };
 pub use git_commit::{
     parse_git_commit_intent, parse_host_git_commit_request, request_explicitly_confirms_git_commit,
@@ -1627,8 +1627,104 @@ fn apply_mode_ceiling(mut plan: RoutePlan, mode: crate::trust::TrustMode) -> Rou
     plan
 }
 
+/// Whether an `except` clause names a concrete file/directory scope. An
+/// exception for prose ("except tell me why") must never erase a whole-turn
+/// read-only instruction, while `except src/app.rs` is a genuine scoped edit.
+fn read_only_exception_has_path_scope(text: &str) -> bool {
+    fn scoped_edit(fragment: &str) -> bool {
+        let tokens = fragment
+            .split(|ch: char| {
+                ch.is_whitespace()
+                    || matches!(
+                        ch,
+                        ',' | '，' | ';' | '；' | ':' | '：' | '?' | '？' | '!' | '！'
+                    )
+            })
+            .map(|token| {
+                token.trim_matches(|ch: char| {
+                    matches!(
+                        ch,
+                        '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '。' | '、'
+                    )
+                })
+            })
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        let path_index = tokens.iter().position(|token| {
+            let lower = token.to_ascii_lowercase();
+            let has_separator = token.contains('/') || token.contains('\\');
+            let has_file_extension = token.rsplit_once('.').is_some_and(|(stem, extension)| {
+                !stem.is_empty()
+                    && !extension.is_empty()
+                    && extension.len() <= 16
+                    && extension
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '+'))
+            });
+            has_separator
+                || has_file_extension
+                || matches!(
+                    lower.as_str(),
+                    "makefile" | "dockerfile" | "readme" | "license"
+                )
+        });
+        let Some(path_index) = path_index else {
+            return false;
+        };
+        if path_index == 0 {
+            return true;
+        }
+
+        // A path mentioned after "tell/explain" is the topic of a read-only
+        // answer, not an edit exception. Only a direct path or an explicit
+        // positive mutation verb before the first path lifts the ceiling.
+        let prefix = tokens[..path_index].join(" ").to_ascii_lowercase();
+        if [
+            "explain",
+            "tell",
+            "describe",
+            "summarize",
+            "analyse",
+            "analyze",
+            "解释",
+            "解釋",
+            "告诉",
+            "告訴",
+            "说明",
+            "說明",
+            "分析",
+            "总结",
+            "總結",
+        ]
+        .iter()
+        .any(|word| prefix.contains(word))
+        {
+            return false;
+        }
+        [
+            "edit", "modify", "change", "fix", "update", "write", "修改", "改动", "改動", "修复",
+            "修復", "更新", "写入", "寫入",
+        ]
+        .iter()
+        .any(|word| prefix.contains(word))
+    }
+
+    if let Some((_, exception)) = text.split_once("except") {
+        return scoped_edit(exception);
+    }
+    if let Some((_, exception)) = text.split_once("除了") {
+        return scoped_edit(exception);
+    }
+    if let Some((_, exception)) = text.split_once('除') {
+        if let Some((scope, _)) = exception.split_once("以外") {
+            return scoped_edit(scope);
+        }
+    }
+    false
+}
+
 fn explicit_read_only_request(requirement: &str) -> bool {
-    let q = requirement.to_lowercase();
+    let q = unquoted_lowercase_text(requirement);
     // Do not turn a quoted label, a negated constraint, or a scope qualifier into
     // a blanket denial of write authority. The model owns those semantic cases;
     // this deterministic belt recognises only unambiguous whole-turn constraints.
@@ -1656,6 +1752,21 @@ fn explicit_read_only_request(requirement: &str) -> bool {
     .iter()
     .any(|needle| q.contains(needle))
     {
+        return false;
+    }
+    // A positive scoped edit remains writable. Without this exception,
+    // "do not modify any file except app.rs" was promoted to a blanket
+    // read-only ceiling even though the sentence expressly grants one file.
+    let has_except_wording = [
+        "do not modify any file except",
+        "do not change any file except",
+        "without modifying any file except",
+    ]
+    .iter()
+    .any(|needle| q.contains(needle))
+        || ((q.contains("除了") || q.contains('除') && q.contains("以外"))
+            && (q.contains("不要修改任何文件") || q.contains("不要改动任何文件")));
+    if has_except_wording && read_only_exception_has_path_scope(&q) {
         return false;
     }
 

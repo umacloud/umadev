@@ -2,14 +2,22 @@ use std::sync::Arc;
 
 use umadev_agent::{ChannelSink, EngineEvent, EventSink};
 
+/// Keep the Unix process-group leader alive for as long as the stored preview
+/// handle exists. The actual dev command runs as its child; if an npm/pnpm
+/// wrapper exits after launching node/vite, this owner remains an unreaped,
+/// unambiguous PGID anchor until `ManagedChild` tears the group down.
+#[cfg(unix)]
+const PREVIEW_OWNER_SCRIPT: &str =
+    "\"$@\" & child=$!; wait \"$child\"; while :; do sleep 3600; done";
+
 /// Split a worker-recorded run command like `cd web && npm run dev` into
 /// (`working_dir`, `program`, `args`), ready to feed a raw
 /// `tokio::process::Command::new(program).args(args)`.
 ///
 /// Windows-aware (mirrors `deploy.rs` / `verify.rs` / `runtime_proof.rs`): the
 /// `cd X && <prog> ...` shape routes the bare program through
-/// [`umadev_host::spawn_parts`], so a Windows npm/pnpm `.cmd` shim runs via
-/// `cmd /c <prog>.cmd ...` instead of failing `CreateProcess` with os error 193;
+/// [`umadev_host::spawn_parts`], so a Windows npm/pnpm `.cmd` shim is resolved
+/// explicitly and Rust's hardened batch-argument encoder handles its argv;
 /// the catch-all fallback shells out via `cmd /c` on Windows and `sh -c` on Unix
 /// (Windows has no `sh`). Without this the preview dev-server never booted on
 /// Windows — `npm run dev` spawned a non-existent `sh`, and `cd web && npm run
@@ -31,7 +39,7 @@ pub(super) fn parse_run_command(
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
                 // Route the bare program through `spawn_parts` (resolves the real
-                // binary + routes a Windows `.cmd`/`.bat` shim through `cmd /c`),
+                // binary + safely preserves a Windows `.cmd`/`.bat` shim target),
                 // then append the original args after whatever lead it produced.
                 let (program, mut spawn_args) = umadev_host::spawn_parts(prog);
                 spawn_args.extend(args.iter().map(std::string::ToString::to_string));
@@ -99,34 +107,17 @@ pub(super) fn port_is_free(url: &str) -> bool {
 
 /// Cross-platform best-effort browser open (sync variant for the event loop).
 pub(super) fn open_url(url: &str) -> std::io::Result<()> {
-    // REAP the launcher on a detached thread. The OS URL-launcher (`open` /
-    // `xdg-open` / `cmd start`) hands off to the browser and exits within ms;
-    // dropping the `Child` without `wait()` leaves a defunct (zombie) process on
-    // Unix that accumulates over every `/preview` / auto-open (P1).
-    #[allow(dead_code)]
-    fn reap(child: std::process::Child) {
-        std::thread::spawn(move || {
-            let mut child = child;
-            let _ = child.wait();
-        });
+    if !crate::link::is_safe_url(url) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "preview target must be a safe http(s) URL",
+        ));
     }
-    #[cfg(target_os = "macos")]
-    {
-        reap(std::process::Command::new("open").arg(url).spawn()?);
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        reap(std::process::Command::new("xdg-open").arg(url).spawn()?);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        reap(
-            std::process::Command::new("cmd")
-                .args(["/C", "start", "", url])
-                .spawn()?,
-        );
-    }
-    Ok(())
+    // One opener implementation for transcript links and previews. In
+    // particular Windows uses `explorer <url>` as a literal argv value, never
+    // `cmd /C start`, so `&` in a URL cannot become a command separator. The
+    // shared helper also nulls stdio and reaps the short-lived launcher.
+    crate::link::spawn_opener(url)
 }
 
 /// Start a preview dev server in the background and optionally open its URL once
@@ -145,7 +136,7 @@ pub(super) fn open_url(url: &str) -> std::io::Result<()> {
 /// (the manual `/preview` opens it; the automatic post-build preview does NOT —
 /// it only surfaces the clickable URL so the build flow never steals focus).
 pub(super) fn start_preview_server(
-    preview_server: &std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
+    preview_server: &std::sync::Arc<std::sync::Mutex<Option<umadev_process::ManagedChild>>>,
     sink: &Arc<ChannelSink>,
     url: &str,
     command: &str,
@@ -153,39 +144,38 @@ pub(super) fn start_preview_server(
     open_browser: bool,
 ) {
     let (dir, prog, args) = parse_run_command(command, project_root);
-    let mut cmd = tokio::process::Command::new(prog);
-    cmd.args(&args)
-        .current_dir(&dir)
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(PREVIEW_OWNER_SCRIPT)
+            .arg("umadev-preview-owner")
+            .arg(prog)
+            .args(args);
+        cmd
+    };
+    #[cfg(not(unix))]
+    let mut cmd = {
+        let mut cmd = tokio::process::Command::new(prog);
+        cmd.args(args);
+        cmd
+    };
+    cmd.current_dir(&dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    // Detach the preview server into its OWN session (no controlling terminal)
-    // so its — or a descendant's — direct /dev/tty writes can't paint over the
-    // alt-screen. The unsafe `setsid`/`pre_exec` seam lives in `umadev-agent`
-    // because this crate is `#![forbid(unsafe_code)]`. Safe: all three stdio
-    // streams are null above. Fail-open.
-    umadev_agent::detach_from_controlling_terminal(&mut cmd);
+        .stderr(std::process::Stdio::null());
     // Port-conflict guard: if the port is already bound (the user's own
     // Vite/Next/Express), DON'T spawn a second server — it would either fail or
     // bind a different port while we open the wrong URL. Open / surface what's
     // already running instead.
     if port_is_free(url) {
-        match cmd.spawn() {
+        match umadev_process::ManagedChild::spawn_detached(cmd) {
             Ok(child) => {
                 if let Ok(mut g) = preview_server.lock() {
-                    // Reap any PREVIOUS preview server before overwriting the
-                    // handle. A bare `*g = Some(child)` drops the old `Child`
-                    // without killing its process GROUP — and the dev server forks
-                    // the real node/vite as a setsid-detached grandchild (see
-                    // `detach_from_controlling_terminal` above), so the prior port
-                    // would LEAK across rebuilds. The manual `/preview` path guards
-                    // this upstream; the auto-preview path did not, so centralise
-                    // the reap here where the handle is actually stored.
-                    if let Some(mut old) = g.take() {
-                        let _ = umadev_agent::kill_process_group(&old);
-                        let _ = old.start_kill();
-                    }
+                    // Dropping the previous managed handle synchronously kills
+                    // its whole group/job and schedules a bounded direct-child
+                    // reap before this slot starts owning the replacement.
+                    drop(g.take());
                     *g = Some(child);
                 }
                 sink.emit(EngineEvent::Note(

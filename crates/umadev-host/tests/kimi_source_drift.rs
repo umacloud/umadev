@@ -318,8 +318,8 @@ fn audited_kimi_baseline_matches_the_standard_acp_contract() {
         &hook_runtime,
         "native Pre/PostToolUse lifecycle",
         &[
-            "onBeforeExecuteTool.register('externalHooks'",
-            "ctx.decision = { block: true, reason }",
+            "toolExecutor.onBeforeExecuteTool(async (event) =>",
+            "event.veto(denyToolExecution(reason))",
             "onDidExecuteTool.register('externalHooks'",
             "toolInput",
             "toolCallId",

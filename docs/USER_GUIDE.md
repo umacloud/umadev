@@ -219,7 +219,7 @@ research → docs → ⏸ docs_confirm → spec → frontend → ⏸ preview_con
 | `/continue` or `c` | Approve the current gate (Plan mode never resumes execution) |
 | `/revise <text>` | Request changes at a gate |
 | `/cancel` | Stop the active run without resuming it on the next turn |
-| `/run [slug] <req>` | Start a new run in Guarded/Auto; Plan mode remains read-only |
+| `/run [--slug <slug>] <req>` | Start a new run in Guarded/Auto; use `--slug` to override the project slug; Plan mode remains read-only |
 | `/redo` | Re-run current requirement |
 | `/diff <artifact>` | View an artifact (prd/architecture/uiux) |
 

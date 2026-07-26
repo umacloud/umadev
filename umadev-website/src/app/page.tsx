@@ -143,7 +143,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
   // Auto language detection based on browser locale
   useEffect(() => {
-    /* eslint-disable react-hooks/set-state-in-effect */
+    /* eslint-disable react-hooks-js/set-state-in-effect */
     const savedLang = localStorage.getItem("umadev_lang") as Lang | null;
     if (savedLang === "zh" || savedLang === "en") {
       setLang(savedLang);
@@ -155,7 +155,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
     } else {
       setLang("en");
     }
-    /* eslint-enable react-hooks/set-state-in-effect */
+    /* eslint-enable react-hooks-js/set-state-in-effect */
   }, []);
 
   // Keep persisted preference and document semantics aligned with the visible copy.
@@ -166,7 +166,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
   // Sync initial view from URL pathname and handle browser back/forward buttons
   useEffect(() => {
-    /* eslint-disable react-hooks/set-state-in-effect */
+    /* eslint-disable react-hooks-js/set-state-in-effect */
     if (typeof window !== "undefined") {
       const pathToView = (path: string): View => {
         const cleanPath = path.replace(process.env.NEXT_PUBLIC_BASE_PATH ?? "", "").replace(/\/$/, "");
@@ -188,7 +188,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
       window.addEventListener("popstate", handlePopState);
       return () => window.removeEventListener("popstate", handlePopState);
     }
-    /* eslint-enable react-hooks/set-state-in-effect */
+    /* eslint-enable react-hooks-js/set-state-in-effect */
   }, [initialView, view]);
 
   const scrollProgressRef = useRef<HTMLDivElement | null>(null);
@@ -566,7 +566,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
 
                   <dl className={styles.heroFacts}>
                     <div><dt>8</dt><dd>{lang === "zh" ? "专家角色" : "SPECIALIST ROLES"}</dd></div>
-                    <div><dt>4</dt><dd>{lang === "zh" ? "本机底座" : "LOCAL BASES"}</dd></div>
+                    <div><dt>5</dt><dd>{lang === "zh" ? "本机底座" : "LOCAL BASES"}</dd></div>
                     <div><dt>113</dt><dd>{lang === "zh" ? "治理检查" : "GOVERNANCE CHECKS"}</dd></div>
                   </dl>
                 </div>
@@ -622,7 +622,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   </div>
 
                   <div className={styles.heroSystemFoot}>
-                    <div><span>BASE</span><strong>4 FIRST-CLASS / DEEP</strong></div>
+                    <div><span>BASE</span><strong>5 FIRST-CLASS / DEEP</strong></div>
                     <div><span>PLAN</span><strong>OWNED DAG · LIVE STEERING</strong></div>
                     <div><span>PROOF</span><strong>VERIFY · SCORECARD</strong></div>
                   </div>
@@ -645,6 +645,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                       <span className={styles.marqueeItem}>Codex</span><span className={styles.marqueeSepPurple}>◆</span>
                       <span className={styles.marqueeItem}>OpenCode</span><span className={styles.marqueeSep}>◆</span>
                       <span className={styles.marqueeItem}>Grok Build</span><span className={styles.marqueeSep}>◆</span>
+                      <span className={styles.marqueeItem}>Kimi Code</span><span className={styles.marqueeSep}>◆</span>
                       <span className={styles.marqueeText}>{lang === "zh" ? "UmaDev 不持有模型 API Key · 不保存登录 · 底座用它自己的模型" : "NO UMADEV-OWNED MODEL API KEY · NO LOGIN SAVED · BASE USES ITS OWN MODEL"}</span><span className={styles.marqueeSepPurple}>◆</span>
                     </React.Fragment>
                   ))}

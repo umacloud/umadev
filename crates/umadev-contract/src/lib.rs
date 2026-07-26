@@ -56,7 +56,8 @@ pub mod render;
 pub mod validate;
 
 pub use backend::{
-    extract_backend_routes, path_has_checkable_segment, route_registered, BackendRoute,
+    extract_backend_routes, extract_backend_routes_from_content, path_has_checkable_segment,
+    route_registered, BackendRoute,
 };
 pub use derive::{
     derive_endpoints_from_requirement, extract_entities, fields_for_entity, merge_specs,

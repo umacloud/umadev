@@ -24,9 +24,13 @@
 //!   never a panic or a destructive fallback.
 
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
 
 use crate::review::{build_review_report, render_review_md};
+
+const PR_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const PR_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+const PR_PROBE_BYTES: usize = 4 * 1024 * 1024;
 
 /// One readiness precondition for opening a PR automatically, and whether it
 /// holds. Kept as data so the renderer + the manual-steps hint are pure
@@ -171,8 +175,8 @@ pub fn assess_readiness(project_root: &Path) -> PrReadiness {
     };
     let has_changes = is_repo && git_has_pr_changes(project_root);
     let has_remote = is_repo && git_has_github_remote(project_root);
-    let gh_present = gh_on_path();
-    let gh_authed = gh_present && gh_logged_in();
+    let gh_present = gh_on_path(project_root);
+    let gh_authed = gh_present && gh_logged_in(project_root);
 
     let checks = vec![
         ReadinessCheck {
@@ -671,35 +675,42 @@ fn git_has_github_remote(project_root: &Path) -> bool {
 }
 
 /// `true` iff `gh` resolves on PATH (a `gh --version` succeeds).
-fn gh_on_path() -> bool {
-    Command::new("gh")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+fn gh_on_path(project_root: &Path) -> bool {
+    crate::external_command::bounded_gh_output(
+        project_root,
+        &["--version"],
+        PR_PROBE_TIMEOUT,
+        64 * 1024,
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
 }
 
 /// `true` iff `gh auth status` reports a logged-in account.
-fn gh_logged_in() -> bool {
-    Command::new("gh")
-        .args(["auth", "status"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+fn gh_logged_in(project_root: &Path) -> bool {
+    crate::external_command::bounded_gh_output(
+        project_root,
+        &["auth", "status"],
+        PR_PROBE_TIMEOUT,
+        256 * 1024,
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
 }
 
 /// Run a git subcommand in `project_root`, returning stdout on success. Any
 /// spawn error / non-zero exit → `None` (fail-open).
 fn run_git(project_root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()
-        .ok()?;
+    let out = crate::external_command::bounded_git_output(
+        project_root,
+        args,
+        PR_GIT_TIMEOUT,
+        PR_PROBE_BYTES,
+    )?;
     if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    String::from_utf8(out.stdout).ok()
 }
 
 #[cfg(test)]
@@ -902,10 +913,7 @@ mod tests {
     // ---- branch isolation (Wave 6) ---------------------------------------
 
     fn git_available() -> bool {
-        Command::new("git")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
+        run_git(Path::new("."), &["--version"]).is_some()
     }
 
     /// Init a real git repo with one commit on `main`, returning the temp dir.
@@ -913,11 +921,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         let run = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .unwrap();
+            run_git(root, args).unwrap();
         };
         run(&["init", "-q", "-b", default]);
         run(&["config", "user.email", "t@t"]);
@@ -1020,11 +1024,7 @@ mod tests {
         let root = tmp.path();
         // First run creates umadev/x and we hop back to main to simulate a later run.
         let _ = ensure_isolation_branch(root, "x");
-        Command::new("git")
-            .args(["switch", "main"])
-            .current_dir(root)
-            .output()
-            .unwrap();
+        run_git(root, &["switch", "main"]).unwrap();
         assert_eq!(git_current_branch(root), "main");
         // Second run with the same slug must SWITCH to the existing branch, not
         // recreate it (created:false), and never force.
@@ -1052,11 +1052,7 @@ mod tests {
         let tmp = init_repo("main");
         let root = tmp.path();
         let run = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .unwrap();
+            run_git(root, args).unwrap();
         };
         // First run makes umadev/app from the seed commit.
         let first = ensure_isolation_branch(root, "app");
@@ -1108,11 +1104,7 @@ mod tests {
         let tmp = init_repo("main");
         let root = tmp.path();
         let run = |args: &[&str]| {
-            Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .output()
-                .unwrap();
+            run_git(root, args).unwrap();
         };
         let _ = ensure_isolation_branch(root, "x");
         run(&["switch", "main"]); // main and umadev/x are at the same commit here

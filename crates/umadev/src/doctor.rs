@@ -35,6 +35,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+const MAX_DOCTOR_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_DOCTOR_NOTES_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DOCTOR_ENTRIES: usize = 1_024;
+
+fn doctor_utf8(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let bytes = umadev_state::fs::read_bounded(path, max_bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// Single check result row.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CheckResult {
@@ -329,11 +339,48 @@ fn node_version_row(raw: Option<&str>) -> CheckResult {
 /// Doctor row: the Node.js runtime version, warning when it is below the npm
 /// launcher's supported floor.
 fn check_node_version() -> CheckResult {
-    let raw = match std::process::Command::new("node").arg("--version").output() {
-        Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
-        _ => None,
+    const NODE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const NODE_PROBE_STDOUT_BYTES: usize = 1024;
+    const NODE_PROBE_STDERR_BYTES: usize = 4 * 1024;
+
+    let mut command = umadev_host::std_command("node");
+    command.arg("--version").env("CI", "1");
+    let output = match umadev_process::run_bounded_std_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: NODE_PROBE_TIMEOUT,
+            stdout_bytes: NODE_PROBE_STDOUT_BYTES,
+            stderr_bytes: NODE_PROBE_STDERR_BYTES,
+            reader_grace: std::time::Duration::from_millis(500),
+        },
+    ) {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return node_version_row(None);
+        }
+        Err(_) => return node_probe_warning("could not start the version probe"),
     };
-    node_version_row(raw.as_deref())
+    if output.timed_out {
+        return node_probe_warning("version probe timed out");
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        return node_probe_warning("version probe output exceeded its safety limit");
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        return node_probe_warning("version probe exited unsuccessfully");
+    }
+    let Ok(raw) = std::str::from_utf8(&output.stdout) else {
+        return node_probe_warning("version probe returned non-UTF-8 output");
+    };
+    node_version_row(Some(raw))
+}
+
+fn node_probe_warning(reason: &str) -> CheckResult {
+    CheckResult {
+        name: NODE_CHECK.to_string(),
+        status: Status::Warning,
+        detail: format!("could not safely inspect `node --version`: {reason}"),
+    }
 }
 
 /// Check whether `git` is available — `/checkpoint` and `/rewind` use a shadow
@@ -402,7 +449,8 @@ fn check_claude_hook(workspace: &Path) -> CheckResult {
         if !path.is_file() {
             return Ok(Vec::new());
         }
-        let content = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let content =
+            doctor_utf8(path, MAX_DOCTOR_CONFIG_BYTES).map_err(|error| error.to_string())?;
         let value = serde_json::from_str::<serde_json::Value>(&content)
             .map_err(|error| format!("invalid JSON: {error}"))?;
         Ok(value
@@ -1112,15 +1160,41 @@ fn check_embedded_spec() -> CheckResult {
 }
 
 fn check_workspace_writable(workspace: &Path) -> CheckResult {
-    let probe = workspace.join(".umadev-doctor-probe");
+    let probe_name = format!(".umadev-doctor-probe-{}", std::process::id());
     let res = (|| -> std::io::Result<()> {
-        if let Some(parent) = probe.parent() {
-            fs::create_dir_all(parent)?;
+        let workspace = fs::canonicalize(workspace)?;
+        if !umadev_state::fs::real_dir(&workspace) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "workspace is not a real directory",
+            ));
         }
-        let mut f = fs::File::create(&probe)?;
-        f.write_all(b"ok")?;
-        f.sync_data()?;
-        fs::remove_file(&probe)?;
+        let probe = workspace.join(&probe_name);
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(&probe)?;
+        if !umadev_state::fs::metadata_is_real_file(&file.metadata()?) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "writability probe is not a regular file",
+            ));
+        }
+        let write_result = file.write_all(b"ok").and_then(|()| file.sync_data());
+        drop(file);
+        let remove_result = umadev_state::fs::remove_regular_file(&probe).map(|_| ());
+        write_result?;
+        remove_result?;
         Ok(())
     })();
     match res {
@@ -1183,6 +1257,22 @@ fn check_workspace_rewind_marker(workspace: &Path, fix: bool) -> CheckResult {
             status: Status::Failed,
             detail: umadev_i18n::tlf("doctor.rewind_marker_unrecoverable", &[&head]),
         },
+        TempRewindState::Invalid {
+            detail,
+            cleared: true,
+        } => CheckResult {
+            name,
+            status: Status::Warning,
+            detail: umadev_i18n::tlf("doctor.rewind_marker_invalid_cleared", &[&detail]),
+        },
+        TempRewindState::Invalid {
+            detail,
+            cleared: false,
+        } => CheckResult {
+            name,
+            status: Status::Failed,
+            detail: umadev_i18n::tlf("doctor.rewind_marker_invalid", &[&detail]),
+        },
     }
 }
 
@@ -1231,11 +1321,14 @@ fn check_delivery_readiness(workspace: &Path) -> CheckResult {
     }
     // Find any delivery-notes file.
     let delivery_notes = fs::read_dir(&output).ok().and_then(|rd| {
-        rd.filter_map(Result::ok).map(|e| e.path()).find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains("delivery-notes"))
-        })
+        rd.filter_map(Result::ok)
+            .take(MAX_DOCTOR_ENTRIES)
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("delivery-notes"))
+            })
     });
     let Some(notes_path) = delivery_notes else {
         return CheckResult {
@@ -1244,7 +1337,7 @@ fn check_delivery_readiness(workspace: &Path) -> CheckResult {
             detail: "pipeline has not reached delivery phase yet".to_string(),
         };
     };
-    let notes = fs::read_to_string(&notes_path).unwrap_or_default();
+    let notes = doctor_utf8(&notes_path, MAX_DOCTOR_NOTES_BYTES).unwrap_or_default();
     // Does the worker record a concrete deploy command (not the placeholder)?
     let has_deploy_cmd = notes
         .split("## Deploy command")
@@ -1297,7 +1390,7 @@ pub fn check_ecosystem(workspace: &Path) -> CheckResult {
     // `.mcp.json` means the host discovers NONE of the user's servers, so it's
     // a Warning, not silently OK.
     let mcp_path = workspace.join(".mcp.json");
-    match std::fs::read_to_string(&mcp_path) {
+    match doctor_utf8(&mcp_path, MAX_DOCTOR_CONFIG_BYTES) {
         Ok(text) if text.trim().is_empty() => {}
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => {
@@ -1323,7 +1416,11 @@ pub fn check_ecosystem(workspace: &Path) -> CheckResult {
     let skills_dir = workspace.join(".umadev").join("skills");
     let skill_count = std::fs::read_dir(&skills_dir).map_or(0, |rd| {
         rd.filter_map(Result::ok)
-            .filter(|e| e.path().is_dir())
+            .take(MAX_DOCTOR_ENTRIES)
+            .filter(|entry| {
+                std::fs::symlink_metadata(entry.path())
+                    .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_dir(&metadata))
+            })
             .count()
     });
     if skill_count > 0 {
@@ -1335,7 +1432,7 @@ pub fn check_ecosystem(workspace: &Path) -> CheckResult {
     // Custom knowledge registry (`{ "entries": { name: ... } }`). Same rule:
     // a corrupt registry is a Warning, not a silent zero.
     let knowledge_reg = workspace.join(".umadev").join("knowledge.json");
-    match std::fs::read_to_string(&knowledge_reg) {
+    match doctor_utf8(&knowledge_reg, MAX_DOCTOR_CONFIG_BYTES) {
         Ok(text) if text.trim().is_empty() => {}
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => {
@@ -1414,6 +1511,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let r = check_workspace_writable(tmp.path());
         assert_eq!(r.status, Status::Passed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_writable_probe_never_follows_an_existing_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        symlink(
+            &victim,
+            tmp.path()
+                .join(format!(".umadev-doctor-probe-{}", std::process::id())),
+        )
+        .unwrap();
+
+        assert_eq!(check_workspace_writable(tmp.path()).status, Status::Failed);
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep");
     }
 
     #[tokio::test]
@@ -1752,6 +1868,10 @@ mod tests {
         let none = node_version_row(None);
         assert_eq!(none.status, Status::Passed);
         assert!(none.detail.contains("not on PATH"));
+
+        let unsafe_probe = node_probe_warning("version probe timed out");
+        assert_eq!(unsafe_probe.status, Status::Warning);
+        assert!(unsafe_probe.detail.contains("timed out"));
     }
 
     #[test]
@@ -1975,6 +2095,27 @@ mod tests {
             check_workspace_rewind_marker(root, true).status,
             Status::Passed
         );
+    }
+
+    #[test]
+    fn doctor_surfaces_and_removes_a_damaged_rewind_marker() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join(".umadev/temp-rewind.json");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{{ damaged").unwrap();
+
+        let report = check_workspace_rewind_marker(tmp.path(), false);
+        assert_eq!(report.status, Status::Failed);
+        assert!(
+            report.detail.contains("damaged")
+                || report.detail.contains("损坏")
+                || report.detail.contains("損壞")
+        );
+        assert!(marker.exists());
+
+        let fixed = check_workspace_rewind_marker(tmp.path(), true);
+        assert_eq!(fixed.status, Status::Warning);
+        assert!(!marker.exists());
     }
 
     #[test]

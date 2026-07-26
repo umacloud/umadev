@@ -34,12 +34,9 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// Upper bound on an in-flight bracketed-paste body before it is force-closed.
 /// A pure MEMORY ceiling: a stream that keeps sending body bytes forever
 /// without a terminator (a misbehaving terminal) never goes fd-idle, so the
-/// reader's paste-window flush never fires — without a ceiling the buffer
-/// grows unbounded. 8 MiB is generous headroom for a real paste yet bounds the
-/// failure. (An end marker that never arrives on an IDLE fd is the reader's
-/// job: its paste-state-aware flush force-closes the paste — see
-/// `super::reader`.) Checked in [`Decoder::append_paste`].
-const PASTE_BUF_CAP: usize = 8 * 1024 * 1024;
+/// reader's paste-window flush never fires. Kept equal to the application paste
+/// envelope so the overflow sentinel is rejected before it can be duplicated.
+const PASTE_BUF_CAP: usize = 1024 * 1024;
 
 /// One decoded input event. Mirrors the surface the TUI event loop already
 /// switches on; [`InputEvent::Response`] is a terminal reply to a query we sent
@@ -72,6 +69,9 @@ pub struct Decoder {
     in_paste: bool,
     /// The accumulated paste body.
     paste_buf: String,
+    /// An oversized paste emitted one bounded rejection sentinel; ignore the
+    /// remaining body until its real end marker instead of treating it as keys.
+    discarding_paste: bool,
 }
 
 impl Decoder {
@@ -88,6 +88,8 @@ impl Decoder {
             Token::Text(text) => {
                 if self.in_paste {
                     self.append_paste(&text)
+                } else if self.discarding_paste {
+                    Vec::new()
                 } else {
                     decode_text(&text)
                 }
@@ -99,13 +101,21 @@ impl Decoder {
     fn feed_sequence(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
         if bytes == PASTE_START {
             self.in_paste = true;
+            self.discarding_paste = false;
             self.paste_buf.clear();
             return Vec::new();
         }
         if bytes == PASTE_END {
+            if self.discarding_paste {
+                self.discarding_paste = false;
+                return Vec::new();
+            }
             let body = std::mem::take(&mut self.paste_buf);
             self.in_paste = false;
             return vec![InputEvent::Paste(body)];
+        }
+        if self.discarding_paste {
+            return Vec::new();
         }
         if self.in_paste {
             // A sequence inside a paste is literal body text (bracketed paste
@@ -124,13 +134,23 @@ impl Decoder {
     /// what was buffered as a `Paste` so no input is lost and memory stays
     /// bounded. Returns the forced paste, or empty while the paste stays open.
     fn append_paste(&mut self, s: &str) -> Vec<InputEvent> {
-        self.paste_buf.push_str(s);
-        if self.paste_buf.len() > PASTE_BUF_CAP {
-            let body = std::mem::take(&mut self.paste_buf);
-            self.in_paste = false;
-            return vec![InputEvent::Paste(body)];
+        let room = PASTE_BUF_CAP.saturating_sub(self.paste_buf.len());
+        if s.len() <= room {
+            self.paste_buf.push_str(s);
+            return Vec::new();
         }
-        Vec::new()
+        // Keep only enough of the next scalar to make an over-cap sentinel.
+        // The application rejects it and the decoder discards the rest of this
+        // paste until PASTE_END, so neither memory nor the input can be flooded.
+        let mut take = room.saturating_add(1).min(s.len());
+        while take < s.len() && !s.is_char_boundary(take) {
+            take += 1;
+        }
+        self.paste_buf.push_str(&s[..take]);
+        let body = std::mem::take(&mut self.paste_buf);
+        self.in_paste = false;
+        self.discarding_paste = true;
+        vec![InputEvent::Paste(body)]
     }
 
     /// Whether the decoder is between a paste-start and paste-end marker.
@@ -142,7 +162,7 @@ impl Decoder {
     /// lone-ESC timeout (the old paste-wedge).
     #[must_use]
     pub fn in_paste(&self) -> bool {
-        self.in_paste
+        self.in_paste || self.discarding_paste
     }
 
     /// Force-close an open paste, delivering the accumulated body and
@@ -154,10 +174,14 @@ impl Decoder {
     /// `in_paste = true` forever, silently swallowing every later keystroke.
     /// `None` when no paste is open.
     pub fn force_close_paste(&mut self) -> Option<InputEvent> {
-        if !self.in_paste {
+        if !self.in_paste && !self.discarding_paste {
             return None;
         }
         self.in_paste = false;
+        if self.discarding_paste {
+            self.discarding_paste = false;
+            return None;
+        }
         Some(InputEvent::Paste(std::mem::take(&mut self.paste_buf)))
     }
 }
@@ -798,7 +822,10 @@ mod tests {
             ),
             other => panic!("expected a force-closed paste, got {} events", other.len()),
         }
-        // The decoder is no longer wedged: a later keystroke decodes to a key again.
+        assert!(d.in_paste(), "overflow discards until the real end marker");
+        assert!(d.feed_token(Token::Text("must-not-leak".into())).is_empty());
+        assert!(d.feed_token(Token::Sequence(PASTE_END.to_vec())).is_empty());
+        assert!(!d.in_paste());
         assert_eq!(
             one_key(&d.feed_token(Token::Text("x".into()))).code,
             KeyCode::Char('x')

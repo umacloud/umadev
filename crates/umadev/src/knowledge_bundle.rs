@@ -120,7 +120,10 @@ pub fn ensure_staged() {
 
 /// Whether the staged corpus on disk already matches this build (marker hit).
 fn is_current(root: &Path, want: &str) -> bool {
-    std::fs::read_to_string(root.join(VERSION_MARKER)).is_ok_and(|got| got.trim() == want)
+    umadev_state::fs::read_bounded(&root.join(VERSION_MARKER), 4 * 1024)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|got| got.trim() == want)
 }
 
 /// Extract the embedded corpus fresh into `root`, then drop the version marker.
@@ -135,7 +138,7 @@ fn stage(root: &Path, version: &str) -> std::io::Result<()> {
     extract_dir(&KNOWLEDGE, root)?;
     // Marker written LAST: if anything above failed we never claim "current",
     // so the next launch re-stages.
-    std::fs::write(root.join(VERSION_MARKER), version)?;
+    umadev_state::fs::atomic_write(&root.join(VERSION_MARKER), version.as_bytes())?;
     Ok(())
 }
 
@@ -149,7 +152,7 @@ fn extract_dir(dir: &Dir<'_>, dest: &Path) -> std::io::Result<()> {
         if name.to_string_lossy().starts_with('.') {
             continue;
         }
-        std::fs::write(dest.join(name), file.contents())?;
+        umadev_state::fs::atomic_write(&dest.join(name), file.contents())?;
     }
     for sub in dir.dirs() {
         let Some(name) = sub.path().file_name() else {

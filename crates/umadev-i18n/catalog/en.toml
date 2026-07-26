@@ -50,6 +50,12 @@
 "live_meta.changes.none" = "This turn is confirmed to have no file changes."
 "live_meta.changes.none_yet" = "No file changes have been observed for this turn yet."
 "live_meta.changes.git_status" = "git status currently shows {} file(s): {}\nCaution: no turn-scoped Diff record is available, so this may include changes that existed before the run began."
+"live_meta.permissions.state" = "Permission is decided per turn; the first message does not lock the resident session, and a later explicit edit request is re-evaluated. Current trust mode: `{}`. No restart is needed."
+"live_meta.permissions.codex_sandbox" = "Codex's effective launch sandbox for the current trust mode is `{}`."
+"live_meta.permissions.ready" = "State the file or feature to change and the intended result; UmaDev will automatically open a writable session for that turn."
+"live_meta.permissions.plan" = "Plan mode intentionally blocks writes. Enter `/mode guarded` or `/mode auto`, then submit the concrete edit request again. No restart is needed."
+"live_meta.permissions.codex_read_only" = "Codex's effective launch sandbox is `read-only`. Enter `/sandbox workspace-write` to rebuild the resident session immediately, then submit the concrete edit request again. UmaDev does not need a restart."
+"live_meta.permissions.other_base" = "Guarded/Auto requests a writable session for concrete edit requests; the base, platform, or enterprise policy may still constrain actual capabilities."
 "model.synced" = "synced driving model {} (from {}) — the agent runs on the base's own model"
 "model.synced_default" = "{} pins no model in config — the agent runs on its login/default model (the real model shows after a run)"
 "model.reasoning" = "reasoning effort {} (from the base config; UmaDev does not override)"
@@ -253,6 +259,7 @@
 "attach.image" = "Image"
 "attach.file" = "File"
 "attach.paste" = "pasted {} lines"
+"attach.paste_limit" = "Paste not added: one paste is limited to 1 MiB and stashed text to 2 MiB per turn. Attach a file or paste smaller sections."
 "attach.rejected" = "Attachment not added: {} (local path hidden)."
 "attach.reason.count" = "a turn supports at most 16 attachments"
 "attach.reason.unavailable" = "the file is unavailable or unreadable"
@@ -352,11 +359,12 @@
 "run.budget_pause_resume_hint" = "Time budget reached — this run paused at step {}/{}; type `/continue` to finish the remaining steps."
 "run.operational_pause_resume_hint" = "Required review service is temporarily unavailable ({}) — this run paused at step {}/{} without changing code or failing the plan. Type `/continue` to retry this step."
 "plan.summary.header" = "Task summary — {} done · {} in progress · {} blocked · {} not started"
-"plan.panel.more_hint" = "scroll up or /plan for all"
+"plan.panel.more_hint" = "/plan shows the full plan and team"
 "plan.none" = "No active plan. A build or a deliberate turn posts one here."
 "plan.queue.section" = "Queued work — {} item(s) waiting"
 "plan.queue.next_turn" = "  {}. [next turn] {}"
 "plan.queue.current_task" = "  {}. [current-task adjustment] {}"
+"plan.queue.native" = "  {}. [base-native queue] {}"
 "plan.review.title" = "Team review"
 "plan.review.accept" = "accepts"
 "plan.review.block" = "{} must-fix"
@@ -366,6 +374,7 @@
 "plan.review.note.summary" = "Team review settled — {} accept · {} blocking (full verdicts above)."
 "plan.review.section" = "Team review — {} accept · {} blocking"
 "plan.review.fix" = "fix: {}"
+"plan.review.advisory" = "advisory: {}"
 "plan.review.next_step" = "Next: /run to have the team apply the fixes, or /revise <guidance>"
 "plan.steer.usage" = "/plan — show plan · /plan skip <id> · /plan add <text> · /plan veto <id> · /plan up <id> · /plan down <id> · /plan collapse"
 "plan.steer.skip" = "Skipping step `{}` — folded into the next directive."
@@ -436,6 +445,7 @@
 "constitution.footer" = "Enforcement is fail-open: a bug in the governor never blocks your work, but these non-negotiables are checked before every file write and surfaced in review. Run /constitution any time to read this charter."
 "constitution.overlay_title" = "Team Charter"
 "constitution.edit_hint" = "You can read and edit this charter at {} — your edits become the team's charter and are never overwritten."
+"constitution.plan_preview" = "Plan mode: showing the default charter without creating {}. Switch to guarded/auto and run /constitution to create it."
 "constitution.generated" = "Generated the team charter at {} from the rules this team enforces."
 
 # Help
@@ -465,8 +475,8 @@
 "session.resume_goal" = "[goal] Last time a goal was left unfinished: next step \"{}\" (step {}/{} done). /continue to pick it back up · or just say whether to continue."
 
 # Codex high-risk sandbox liability warning (only shown for danger-full-access on codex)
-"codex.sandbox.danger_warning" = "WARNING: UmaDev will launch this project's Codex base sessions with danger-full-access — you assume all risk to your system environment. A separately opened Codex window has its own permission setting and may show a different mode.\n  To revert: set [codex] sandbox_mode = \"workspace-write\" in .umadevrc, then restart."
-"codex.sandbox.windows_hint" = "Note (Windows + Codex): the current sandbox BLOCKS the network, local dev ports and git, so a full-stack build (npm install / a dev server / git) cannot complete; and codex\u2019s Windows sandbox helper fails with \u201cmodule not found\u201d on some machines. For full-stack work run /sandbox danger-full-access to open it up (UmaDev still audits everything)."
+"codex.sandbox.danger_warning" = "WARNING: UmaDev will launch this project's Codex base sessions with danger-full-access — you assume all risk to your system environment. A separately opened Codex window has its own permission setting and may show a different mode.\n  To revert: enter `/sandbox workspace-write` to rebuild the session immediately; UmaDev does not need a restart."
+"codex.sandbox.windows_hint" = "Note (Windows + Codex): the current sandbox BLOCKS the network, local dev ports and git, so a full-stack build (npm install / a dev server / git) cannot complete; and codex\u2019s Windows sandbox helper fails with \u201cmodule not found\u201d on some machines. For full-stack work use `/mode auto`, then `/sandbox danger-full-access` if it is not already configured (UmaDev still audits everything)."
 
 # /sandbox — view / change the Codex base launch sandbox in-app (no .umadevrc hand-edit)
 "sandbox.current" = "Codex sandbox is currently: {}\n  (applies to the codex base only — it controls what the codex worker may touch when it runs)"
@@ -477,6 +487,7 @@
 "sandbox.codex_only" = "Note: the active base isn't codex, so this only takes effect once you switch to the codex base (/codex)."
 "sandbox.set" = "Codex sandbox set to {} — active this session and saved to .umadevrc."
 "sandbox.danger_set" = "Codex sandbox set to danger-full-access — active this session and saved to .umadevrc. Local ports / network / git are now unblocked; you accept all risk to your system environment."
+"sandbox.clamped" = "Saved the requested Codex sandbox `{}`, but trust mode `{}` currently clamps the actual launch sandbox to `{}`. UmaDev has not claimed wider access. Use `/mode auto` for danger-full-access, or `/mode guarded`/`/mode auto` for workspace-write; the resident session rebuilds immediately without restarting UmaDev."
 "sandbox.persist_failed" = "[warn] Applied for this session, but could not save to .umadevrc (it will revert on next launch): {}"
 "sandbox.busy_no_change" = "A Codex turn is still running. Cancel it first, then change /sandbox; UmaDev will rebuild the resident Codex session with the new permissions."
 
@@ -579,6 +590,7 @@
 "run.gate_line.guarded" = "Guarded mode: the two checkpoints (confirm the core docs / confirm the frontend preview) pause for your approval; press shift+Tab or /auto to auto-approve. Starting now…"
 "run.gate_line.plan" = "Plan mode: read out the plan only, no code written (/mode guarded or auto to execute). Starting the pipeline…"
 "run.cancelled" = "[cancelled] The current run is stopped, back to the prompt. Artifacts from completed phases stay in output/; you can /continue or type a new requirement next time."
+"run.operational_cancelled" = "[cancelled] The paused review and its resume cursor were closed. Completed artifacts remain; type a new requirement or use /run to start a fresh run."
 
 # /init manifest
 "init.design_files" = "\n  design infrastructure: {} files written to knowledge/"
@@ -646,6 +658,7 @@
 "memory.clear_cache_preview" = "Preview (not executed)\n\nThis clears the rebuildable project cache: {}. Authoritative memory is unaffected.\n\nConfirm by adding `--yes` to the same command."
 "memory.clear_cache_ok" = "[ok] rebuildable cache {} cleared · files={} · bytes={}. Authoritative memory was not deleted."
 "cancel.none_running" = "No pipeline is running — nothing to cancel. Type a requirement to start fresh, or /quit to exit."
+"cancel.operational_cleanup_failed" = "The paused review could not be cancelled completely, so its recovery cursor was kept: {}"
 "clear.busy" = "Work is still active or paused at a confirmation gate. Use /cancel and wait for it to stop before /clear."
 "slash.did_you_mean" = " did you mean `/{}`?"
 "slash.unknown" = "Unknown command `/{}`.{} Type /help for the full list."
@@ -659,6 +672,7 @@
 "backend.workflow_handoff" = "Workflow base changed from {} to {}. The requirement, plan, and existing artifacts are preserved, but the previous base's session id will not be reused across vendors; this run starts a fresh vendor session."
 "backend.busy_no_switch" = "A run is in progress on the current base — /cancel it before switching the base, so the run and its session stay coherent."
 "backend.switch_unavailable" = "Did not switch to `{}`: the current probe confirms that it is unavailable. Run `{}` first, then retry the switch."
+"backend.switch_probe_pending" = "Did not switch to `{}` yet: its startup probe is still pending. Retry after the base status appears."
 "backend.switch_login_unverified" = "Did not switch to `{}` yet: login could not be verified. Run `{}` first; if this is a local/third-party setup that needs no login, enter the same switch command again to continue deliberately."
 "backend.active_unavailable" = "Configured base `{}` is unavailable, so this request was not started. Run `{}` or switch to another ready base; then submit the preserved input again."
 "chat.busy_cancel_first" = "A run or turn is in progress — /cancel it first; resuming or compacting now would corrupt the active session."
@@ -672,7 +686,7 @@
 
 # /run and /redo
 "run.busy_reopen" = "A pipeline is running — /cancel it before starting again, to avoid two pipelines writing the same workspace."
-"run.usage" = "Usage: /run [slug] <requirement>\n  Example: /run my-app build a login system\n  Example: /run build a todo list (slug auto-uses the directory name)"
+"run.usage" = "Usage: /run [--slug <slug>] <requirement>\n  Example: /run --slug my-project build a login system\n  Example: /run build an end-to-end test suite (slug auto-uses the directory name)"
 "goal.busy_reopen" = "A task is already running — /cancel it before /goal, to avoid two tasks writing the same workspace."
 "goal.usage" = "Usage: /goal <objective>\n  Example: /goal build a shippable todo app with login and reminders\n  Set a goal and I'll lead the team toward it until it's met (mapping to a vendor-exposed persistent goal capability when available, otherwise maintaining it through the coordinator)."
 "goal.starting" = "[goal] Goal received: \"{}\". I'll drive the team toward it until it's done and the build/quality checks pass (/cancel to stop mid-way)."
@@ -1022,6 +1036,8 @@
 "tui.scroll.above" = "↑ {} lines above"
 # Toast after a drag-select copy ({} = number of characters copied to clipboard)
 "tui.copied" = "Copied {} characters"
+"tui.copy_failed" = "Clipboard write failed; nothing was copied"
+"tui.copy_too_large" = "Selection is too large for the remote clipboard (maximum {} UTF-8 bytes); nothing was copied"
 # Ctrl+click opened a URL / file from the transcript ({} = the opened target; iTerm2's native Cmd+click is unaffected)
 "tui.link.opened" = "Opened {}"
 "tui.link.open_failed" = "Could not open {}"
@@ -1189,6 +1205,7 @@
 "tui.bang.spawn_failed" = "failed to run: {}"
 "tui.bang.timeout" = "command timed out"
 "tui.bang.no_output" = "(no output)"
+"tui.local.output_truncated" = "[older command output truncated]"
 # Slash-command descriptions that the help overlay + palette share (one source).
 # Most commands reuse the tui.help.* strings above; these cover the verbs that
 # previously had only an English palette hint (or none) and are now registry-owned.
@@ -1232,6 +1249,7 @@
 "agentic.inspecting" = "[agentic] inspecting the repo…"
 "agentic.working_on" = "[agentic] working on: {}"
 "agentic.done" = "[agentic] done."
+"stream.compacted" = "[note] Merged {} intermediate live updates to cap memory; the complete final reply is shown above."
 # Slash-command inline pushes (app.rs)
 "slash.history_cleared" = "history cleared."
 "slash.gate_approved" = "[ok] approved {} — continuing…"
@@ -1326,6 +1344,7 @@
 "checkpoint.workspace_in_past_halt" = "Stopped: the workspace is at an earlier state (a temporary evidence rewind could not be undone). No further steps will be driven — writing more code onto a tree that is in the past would build on files that are not yours. Restart UmaDev and it will put the tree back at the present before doing anything else."
 "checkpoint.temp_rewind_recovery_failed" = "Workspace still at an earlier state: a previous run was killed while the source tree was temporarily rewound for evidence, and UmaDev could not put it back automatically. Your work is safe in the snapshot 「{}」. The marker 「{}」 is kept, so the next start retries. To restore it by hand, run: 「{}」 (`umadev rollback <id>` restores a checkpoint's files, but the reset just failed in this workspace — which is why this one has to be done by hand)."
 "checkpoint.temp_rewind_unrecoverable" = "Check your source tree: a previous run was killed while it was temporarily rewound for evidence, and the snapshot it recorded 「{}」 is not one this workspace can identify — so UmaDev will NOT reset your files to it. Nothing was touched, and no further work will be driven onto this tree until it is back at the present. The marker 「{}」 is kept; if your files look like an earlier state, recover them from your own git history (`umadev rollback` cannot help with this id — it is not one this workspace can identify; `umadev history` lists the ones it can). Once your files are the way you want them, run `umadev doctor --fix` to clear this stop — it removes the stale marker above and changes no file in your work-tree. (`umadev doctor` alone reports it without changing anything.)"
+"checkpoint.temp_rewind_marker_invalid" = "Stopped without changing your files: the temporary-rewind marker 「{}」 exists but cannot be trusted ({}). UmaDev cannot prove where the present workspace was, so it will not write more work or reset to an unknown state. Inspect your source, recover it from your own git history if needed, then run `umadev doctor --fix` to remove the invalid marker."
 "checkpoint.heal_rescue_label" = "workspace as it stood before the automatic repair (includes anything you wrote while it was rewound)"
 "checkpoint.rollback_pre_label" = "auto: workspace as it stood before rolling back to {}"
 "checkpoint.none_to_restore" = "There are no checkpoints to roll back to yet."
@@ -1338,6 +1357,8 @@
 "doctor.rewind_marker_recoverable" = "A temporary rewind marker is present and names the snapshot 「{}」, which this workspace CAN identify. Nothing to fix here: the next `umadev` start will put your files back at the present by itself. (Leaving the marker in place is what lets it do that — `--fix` deliberately does not remove this one.)"
 "doctor.rewind_marker_unrecoverable" = "STALE REWIND MARKER — this is what makes every `umadev run` abort immediately. The marker names the snapshot 「{}」, which this workspace can no longer identify (its shadow checkpoint repo is gone or unreadable), so the automatic repair refuses to reset your files to it — and reaches the same refusal on every start, forever. Re-run with `umadev doctor --fix` to clear it. Clearing the marker changes NO file in your work-tree; it only stops UmaDev from re-raising a halt it can never act on. Check your source first — if it looks like an earlier state, recover it from your own git history."
 "doctor.rewind_marker_cleared" = "Cleared the stale rewind marker (it named the snapshot 「{}」, which this workspace cannot identify). No file in your work-tree was changed. `umadev run` will start again — check that your source is the way you want it first."
+"doctor.rewind_marker_invalid" = "The rewind marker is unreadable or damaged ({}). UmaDev has halted writes because it cannot safely recover from this marker. Inspect your source first, then run `umadev doctor --fix` to remove the marker without changing work-tree files."
+"doctor.rewind_marker_invalid_cleared" = "Removed the unreadable or damaged rewind marker ({}). No work-tree file was changed. Check that your source is the state you want before starting another run."
 "doctor.run_lock_fence_name" = "workspace run-lock fence"
 "doctor.run_lock_fence_absent" = "No compatibility fence exists yet — it will be created by the first writable run."
 "doctor.run_lock_fence_current" = "The v2 compatibility-fence bytes are complete; writable lock capability is verified again at run time."
@@ -1374,6 +1395,8 @@
 "config.overlay.title" = " config — Esc close "
 "config.overlay.heading" = "Configuration\n=============\n\n"
 "config.overlay.worker" = "worker:          {}\n"
+"config.overlay.trust_mode" = "trust mode:      {}\n"
+"config.overlay.codex_sandbox" = "Codex sandbox:   {}\n"
 "config.overlay.worker_unset" = "(use picker to select)"
 "config.overlay.model" = "model:           (the base's own — UmaDev never sets one)\n"
 "config.overlay.design" = "design system:   {}\n"
@@ -1394,7 +1417,7 @@
 "config.overlay.custom_knowledge" = "custom knowledge:    {}\n"
 "config.overlay.project_header" = "\n## Project Config\n\n"
 "config.overlay.no_rc" = "  no .umadevrc — using defaults (threshold=90, rounds=3)\n"
-"config.overlay.how_to_change" = "\n## How to change\n\n  /claude /codex /opencode /grok /kimi\n                                  switch base CLI (or /offline)\n  (model)                       set it in the base — UmaDev never overrides it\n  /manual  /auto                review mode: pause vs autonomous\n  /design <name>                switch design system\n  /template <name>              switch seed template\n  /run <slug> <req>             set slug + requirement\n  edit .umadevrc               project-level overrides\n"
+"config.overlay.how_to_change" = "\n## How to change\n\n  /claude /codex /opencode /grok /kimi\n                                  switch base CLI (or /offline)\n  (model)                       set it in the base — UmaDev never overrides it\n  /mode plan|guarded|auto       switch per-turn trust mode\n  /sandbox <mode>               change Codex launch sandbox and rebuild now\n  /design <name>                switch design system\n  /template <name>              switch seed template\n  /run [--slug <slug>] <req>    set an optional slug + requirement\n  edit .umadevrc               project-level overrides\n"
 
 # /status overlay
 "status.overlay.title" = " status — Esc close "

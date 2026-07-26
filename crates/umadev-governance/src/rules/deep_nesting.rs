@@ -62,7 +62,11 @@ pub fn check_deep_nesting(file_path: &str, content: &str) -> Decision {
             _ => {
                 opener.push(ch);
                 if opener.len() > 512 {
-                    opener.drain(..opener.len() - 256);
+                    let mut split = opener.len() - 256;
+                    while split < opener.len() && !opener.is_char_boundary(split) {
+                        split += 1;
+                    }
+                    opener.drain(..split);
                 }
             }
         }

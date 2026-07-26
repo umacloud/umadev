@@ -8,7 +8,9 @@
 //! Events are *observational*: emitting one never changes pipeline
 //! behavior, and a sink that drops every event is always valid.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use umadev_runtime::Usage;
@@ -203,6 +205,17 @@ pub enum EngineEvent {
         /// What kind of stream event this is.
         event: umadev_runtime::StreamEvent,
     },
+    /// The live presentation stream exceeded its in-memory envelope, so one or
+    /// more **intermediate display-only** events were coalesced. Control events,
+    /// gates, plan state, usage, and terminal events are never represented by
+    /// this count. A UI should retain this fact until the turn settles; the
+    /// terminal `AgenticDone` reply remains the authoritative complete answer.
+    StreamCompacted {
+        /// Number of intermediate events omitted from the live stream.
+        events: u64,
+        /// Saturating sum of their dynamic UTF-8 payload bytes.
+        bytes: u64,
+    },
     /// **The router decided how to handle this turn** (Wave 1, L1). Emitted once,
     /// before any work, so a UI can render an "intent card" — what UmaDev decided
     /// (chat vs build), how deep, who it'll convene, the rough budget, and a
@@ -354,26 +367,295 @@ impl EventSink for NullSink {
     fn emit(&self, _event: EngineEvent) {}
 }
 
-/// Forwards events into an async channel — the TUI's input.
-#[derive(Debug, Clone)]
+/// Maximum queued display-only events. Critical/control events use the same
+/// globally ordered queue but do not consume this budget, so a token flood can
+/// never crowd out a gate or terminal state.
+const CHANNEL_LOSSY_EVENT_CAP: usize = 512;
+/// Maximum dynamic payload bytes retained for queued display-only events.
+const CHANNEL_LOSSY_BYTE_CAP: usize = 2 * 1024 * 1024;
+/// A single display event larger than this is omitted rather than briefly
+/// exceeding the aggregate envelope.
+const CHANNEL_LOSSY_SINGLE_EVENT_CAP: usize = 128 * 1024;
+
+#[derive(Debug)]
+struct QueuedEvent {
+    sequence: u64,
+    event: EngineEvent,
+    lossy_bytes: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct CompactedEvents {
+    first_sequence: u64,
+    events: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct ChannelState {
+    queue: VecDeque<QueuedEvent>,
+    next_sequence: u64,
+    lossy_events: usize,
+    lossy_bytes: usize,
+    compacted: Option<CompactedEvents>,
+}
+
+impl ChannelState {
+    fn next_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        sequence
+    }
+
+    fn record_compaction(&mut self, sequence: u64, bytes: usize) {
+        let compacted = self.compacted.get_or_insert(CompactedEvents {
+            first_sequence: sequence,
+            ..CompactedEvents::default()
+        });
+        compacted.events = compacted.events.saturating_add(1);
+        compacted.bytes = compacted.bytes.saturating_add(bytes as u64);
+    }
+
+    fn pop(&mut self) -> Option<EngineEvent> {
+        let compacted_is_next = self.compacted.as_ref().is_some_and(|compacted| {
+            self.queue
+                .front()
+                .is_none_or(|queued| compacted.first_sequence < queued.sequence)
+        });
+        if compacted_is_next {
+            let compacted = self.compacted.take()?;
+            return Some(EngineEvent::StreamCompacted {
+                events: compacted.events,
+                bytes: compacted.bytes,
+            });
+        }
+        let queued = self.queue.pop_front()?;
+        if let Some(bytes) = queued.lossy_bytes {
+            self.lossy_events = self.lossy_events.saturating_sub(1);
+            self.lossy_bytes = self.lossy_bytes.saturating_sub(bytes);
+        }
+        Some(queued.event)
+    }
+}
+
+#[derive(Debug)]
+struct ChannelShared {
+    state: Mutex<ChannelState>,
+    notify: tokio::sync::Notify,
+    senders: AtomicUsize,
+    receiver_closed: AtomicBool,
+}
+
+impl ChannelShared {
+    fn state(&self) -> std::sync::MutexGuard<'_, ChannelState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Forwards events into a bounded, globally ordered async queue — the TUI's
+/// input. High-volume presentation events are bounded by count and bytes;
+/// low-volume workflow/control events are never displaced by that budget.
+#[derive(Debug)]
 pub struct ChannelSink {
-    tx: tokio::sync::mpsc::UnboundedSender<EngineEvent>,
+    shared: Arc<ChannelShared>,
+}
+
+impl Clone for ChannelSink {
+    fn clone(&self) -> Self {
+        self.shared.senders.fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl Drop for ChannelSink {
+    fn drop(&mut self) {
+        if self.shared.senders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.shared.notify.notify_waiters();
+        }
+    }
+}
+
+/// Receiver half returned by [`ChannelSink::new`]. Its `recv`/`try_recv`
+/// surface intentionally mirrors Tokio MPSC so existing UI loops can apply a
+/// bounded event source without special polling machinery.
+#[derive(Debug)]
+pub struct ChannelReceiver {
+    shared: Arc<ChannelShared>,
 }
 
 impl ChannelSink {
     /// Build a sink plus the receiver the UI loop should poll.
     #[must_use]
-    pub fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<EngineEvent>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self { tx }, rx)
+    pub fn new() -> (Self, ChannelReceiver) {
+        let shared = Arc::new(ChannelShared {
+            state: Mutex::new(ChannelState::default()),
+            notify: tokio::sync::Notify::new(),
+            senders: AtomicUsize::new(1),
+            receiver_closed: AtomicBool::new(false),
+        });
+        (
+            Self {
+                shared: Arc::clone(&shared),
+            },
+            ChannelReceiver { shared },
+        )
     }
 }
 
 impl EventSink for ChannelSink {
     fn emit(&self, event: EngineEvent) {
-        // A closed receiver just means the UI went away; drop silently.
-        let _ = self.tx.send(event);
+        if self.shared.receiver_closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = self.shared.state();
+        // Close can race the optimistic check above. Recheck while holding the
+        // queue lock so an emitter that lost that race cannot repopulate a
+        // receiver-less queue after `ChannelReceiver::drop` cleared it.
+        if self.shared.receiver_closed.load(Ordering::Acquire) {
+            return;
+        }
+        let sequence = state.next_sequence();
+        if let Some(bytes) = lossy_payload_bytes(&event) {
+            let fits = bytes <= CHANNEL_LOSSY_SINGLE_EVENT_CAP
+                && state.lossy_events < CHANNEL_LOSSY_EVENT_CAP
+                && state.lossy_bytes.saturating_add(bytes) <= CHANNEL_LOSSY_BYTE_CAP;
+            if !fits {
+                state.record_compaction(sequence, bytes);
+                drop(state);
+                self.shared.notify.notify_one();
+                return;
+            }
+            state.lossy_events += 1;
+            state.lossy_bytes += bytes;
+            state.queue.push_back(QueuedEvent {
+                sequence,
+                event,
+                lossy_bytes: Some(bytes),
+            });
+        } else {
+            state.queue.push_back(QueuedEvent {
+                sequence,
+                event,
+                lossy_bytes: None,
+            });
+        }
+        drop(state);
+        self.shared.notify.notify_one();
     }
+}
+
+impl ChannelReceiver {
+    /// Wait for the next globally ordered event, or return `None` after every
+    /// sink clone has gone away and the bounded queue is empty.
+    pub async fn recv(&mut self) -> Option<EngineEvent> {
+        loop {
+            let notified = self.shared.notify.notified();
+            {
+                let mut state = self.shared.state();
+                if let Some(event) = state.pop() {
+                    return Some(event);
+                }
+                if self.shared.senders.load(Ordering::Acquire) == 0 {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Return the next ready event without waiting.
+    pub fn try_recv(&mut self) -> Result<EngineEvent, tokio::sync::mpsc::error::TryRecvError> {
+        let mut state = self.shared.state();
+        if let Some(event) = state.pop() {
+            return Ok(event);
+        }
+        if self.shared.senders.load(Ordering::Acquire) == 0 {
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        } else {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        }
+    }
+
+    /// Atomically discard every queued event and any pending compaction marker.
+    /// Cancellation paths use this after the producer task has settled so a
+    /// partial turn cannot leak presentation state into the next one.
+    pub fn clear(&mut self) {
+        let mut state = self.shared.state();
+        state.queue.clear();
+        state.compacted = None;
+        state.lossy_events = 0;
+        state.lossy_bytes = 0;
+    }
+}
+
+impl Drop for ChannelReceiver {
+    fn drop(&mut self) {
+        self.shared.receiver_closed.store(true, Ordering::Release);
+        self.clear();
+    }
+}
+
+fn lossy_payload_bytes(event: &EngineEvent) -> Option<usize> {
+    match event {
+        EngineEvent::HostOutput { line, .. } => Some(line.len()),
+        EngineEvent::TransientStatus(status) => {
+            Some(status.as_ref().map_or(0, std::string::String::len))
+        }
+        EngineEvent::WorkerStream { event } => Some(stream_event_bytes(event)),
+        _ => None,
+    }
+}
+
+fn stream_event_bytes(event: &umadev_runtime::StreamEvent) -> usize {
+    use umadev_runtime::StreamEvent;
+    match event {
+        StreamEvent::Text { delta }
+        | StreamEvent::ToolOutputDelta { delta }
+        | StreamEvent::ThinkingDelta(delta) => delta.len(),
+        StreamEvent::ToolUse { name, detail, edit } => name
+            .len()
+            .saturating_add(detail.len())
+            .saturating_add(tool_edit_bytes(edit.as_ref())),
+        StreamEvent::ToolUseCorrelated {
+            call_id,
+            name,
+            detail,
+            edit,
+        } => call_id
+            .len()
+            .saturating_add(name.len())
+            .saturating_add(detail.len())
+            .saturating_add(tool_edit_bytes(edit.as_ref())),
+        StreamEvent::ToolProgressCorrelated { call_id, title } => {
+            call_id.len().saturating_add(title.len())
+        }
+        StreamEvent::ToolOutputDeltaCorrelated { call_id, delta } => {
+            call_id.len().saturating_add(delta.len())
+        }
+        StreamEvent::ToolOutputSnapshot { output } => output.len(),
+        StreamEvent::ToolOutputSnapshotCorrelated { call_id, output } => {
+            call_id.len().saturating_add(output.len())
+        }
+        StreamEvent::ToolResult { summary, .. } => summary.len(),
+        StreamEvent::ToolResultCorrelated {
+            call_id, summary, ..
+        } => call_id.len().saturating_add(summary.len()),
+        StreamEvent::Warning { message } => message.len(),
+        StreamEvent::Thinking => 0,
+    }
+}
+
+fn tool_edit_bytes(edit: Option<&umadev_runtime::ToolEdit>) -> usize {
+    edit.map_or(0, |edit| {
+        edit.path
+            .len()
+            .saturating_add(edit.before.len())
+            .saturating_add(edit.after.len())
+    })
 }
 
 /// Captures every event in memory — for tests.
@@ -485,6 +767,150 @@ mod tests {
         drop(rx);
         // Must not panic even though nobody is listening.
         sink.emit(EngineEvent::Note("nobody home".into()));
+    }
+
+    #[test]
+    fn channel_sink_bounds_stream_flood_without_losing_critical_tail() {
+        let (sink, mut rx) = ChannelSink::new();
+        for index in 0..(CHANNEL_LOSSY_EVENT_CAP * 8) {
+            sink.emit(EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::Text {
+                    delta: format!("token-{index}"),
+                },
+            });
+        }
+        sink.emit(EngineEvent::PlanStepStatus {
+            id: "ship".into(),
+            title: "Ship".into(),
+            status: "done".into(),
+        });
+        sink.emit(EngineEvent::GateOpened {
+            gate: Gate::PreviewConfirm,
+            choice: None,
+        });
+        sink.emit(EngineEvent::BlockCompleted {
+            final_phase: Phase::Delivery,
+            paused_at: Some(Gate::PreviewConfirm),
+        });
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.len() <= CHANNEL_LOSSY_EVENT_CAP + 4,
+            "stream side of the queue must stay bounded: {}",
+            events.len()
+        );
+        let compacted = events
+            .iter()
+            .position(|event| matches!(event, EngineEvent::StreamCompacted { .. }))
+            .expect("flood must surface one compaction boundary");
+        let plan = events
+            .iter()
+            .position(|event| matches!(event, EngineEvent::PlanStepStatus { .. }))
+            .expect("plan control event must survive the flood");
+        let gate = events
+            .iter()
+            .position(|event| matches!(event, EngineEvent::GateOpened { .. }))
+            .expect("gate must survive the flood");
+        let terminal = events
+            .iter()
+            .position(|event| matches!(event, EngineEvent::BlockCompleted { .. }))
+            .expect("terminal control event must survive the flood");
+        assert!(compacted < plan && plan < gate && gate < terminal);
+        assert!(matches!(
+            events[compacted],
+            EngineEvent::StreamCompacted { events, .. }
+                if events == (CHANNEL_LOSSY_EVENT_CAP * 7) as u64
+        ));
+    }
+
+    #[test]
+    fn channel_sink_enforces_stream_byte_and_single_event_caps() {
+        let (sink, mut rx) = ChannelSink::new();
+        sink.emit(EngineEvent::HostOutput {
+            phase: Phase::Frontend,
+            line: "x".repeat(CHANNEL_LOSSY_SINGLE_EVENT_CAP + 1),
+        });
+        for _ in 0..32 {
+            sink.emit(EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::Text {
+                    delta: "y".repeat(CHANNEL_LOSSY_SINGLE_EVENT_CAP),
+                },
+            });
+        }
+        let mut retained_bytes = 0usize;
+        let mut compacted = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                EngineEvent::WorkerStream {
+                    event: umadev_runtime::StreamEvent::Text { delta },
+                } => retained_bytes += delta.len(),
+                EngineEvent::StreamCompacted { events, bytes } => {
+                    compacted = Some((events, bytes));
+                }
+                _ => {}
+            }
+        }
+        assert!(retained_bytes <= CHANNEL_LOSSY_BYTE_CAP);
+        let (events, bytes) = compacted.expect("oversized payloads must be compacted");
+        assert!(events > 1);
+        assert!(bytes > CHANNEL_LOSSY_SINGLE_EVENT_CAP as u64);
+    }
+
+    #[test]
+    fn channel_sink_preserves_global_order_without_pressure() {
+        let (sink, mut rx) = ChannelSink::new();
+        let expected = vec![
+            EngineEvent::Note("before".into()),
+            EngineEvent::WorkerStream {
+                event: umadev_runtime::StreamEvent::Text {
+                    delta: "middle".into(),
+                },
+            },
+            EngineEvent::TurnUsage {
+                usage: None,
+                est_tokens: 3,
+            },
+            EngineEvent::Note("after".into()),
+        ];
+        for event in &expected {
+            sink.emit(event.clone());
+        }
+        let actual = (0..expected.len())
+            .map(|_| rx.try_recv().expect("event must be ready"))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn channel_receiver_closes_only_after_all_sink_clones_and_tail() {
+        let (sink, mut rx) = ChannelSink::new();
+        let clone = sink.clone();
+        sink.emit(EngineEvent::Note("tail".into()));
+        drop(sink);
+        drop(clone);
+        assert_eq!(rx.recv().await, Some(EngineEvent::Note("tail".into())));
+        assert_eq!(rx.recv().await, None);
+    }
+
+    #[test]
+    fn channel_receiver_clear_drops_compaction_state_before_next_turn() {
+        let (sink, mut rx) = ChannelSink::new();
+        for _ in 0..=CHANNEL_LOSSY_EVENT_CAP {
+            sink.emit(EngineEvent::TransientStatus(Some("working".into())));
+        }
+        rx.clear();
+        sink.emit(EngineEvent::Note("next turn".into()));
+        assert_eq!(
+            rx.try_recv().expect("next event must remain"),
+            EngineEvent::Note("next turn".into())
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     // ── Wave 1 visible-event constructors flatten the typed primitives ──

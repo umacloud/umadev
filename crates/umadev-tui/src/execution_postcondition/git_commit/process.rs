@@ -2,8 +2,11 @@ use super::{
     git_commit_blocked, git_output, git_tokio_command, Duration, GitTransactionGuard, Path,
     ResidentExecutionBlocked,
 };
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+const MUTATION_OUTPUT_LIMIT: usize = 64 * 1024;
+const MUTATION_REAP_GRACE: Duration = Duration::from_secs(1);
 
 pub(crate) async fn git_mutating_output(
     root: &Path,
@@ -86,202 +89,125 @@ async fn git_mutating_output_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(command.as_std_mut(), 0);
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = umadev_process::ManagedChild::spawn(command).map_err(|error| {
         git_commit_blocked(
             "git-command-unavailable",
             &format!("无法执行 Git 事务命令 / unable to execute Git transaction: {error}"),
         )
     })?;
-    transaction.arm_process(child.id());
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| git_commit_blocked("git-output-invalid", "Git stdout pipe 不可用"))?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| git_commit_blocked("git-output-invalid", "Git stderr pipe 不可用"))?;
-    let stdout_task = tokio::spawn(read_bounded_output_tail(stdout));
-    let stderr_task = tokio::spawn(read_bounded_output_tail(stderr));
-    if let Some(input) = input {
-        let mut stdin = child.stdin.take().ok_or_else(|| {
+    let stdin = if input.is_some() {
+        Some(child.take_stdin().ok_or_else(|| {
             git_commit_blocked(
                 "git-input-invalid",
                 "Git stdin pipe 不可用 / Git stdin unavailable",
             )
-        })?;
-        let write = async {
-            stdin.write_all(input).await?;
+        })?)
+    } else {
+        None
+    };
+
+    // The readers and optional writer are ordinary futures owned by this
+    // stack frame, rather than detached tasks. Dropping the outer future closes
+    // every pipe before `ManagedChild` tears down the complete process tree.
+    let completed = tokio::time::timeout(timeout, async {
+        let write_input = async move {
+            let Some(mut stdin) = stdin else {
+                return Ok::<(), std::io::Error>(());
+            };
+            let bytes = input.unwrap_or_default();
+            stdin.write_all(bytes).await?;
             stdin.shutdown().await
         };
-        match tokio::time::timeout(timeout, write).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                terminate_git_process_tree(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
-                return Err(git_commit_blocked(
-                    "git-input-failed",
-                    &format!("无法写入 Git stdin / unable to write Git stdin: {error}"),
-                ));
-            }
-            Err(_) => {
-                terminate_git_process_tree(&mut child).await;
-                stdout_task.abort();
-                stderr_task.abort();
-                return Err(git_commit_blocked(
-                    timeout_code,
-                    &format!(
-                        "{command_label} stdin 超过 {} 秒并已终止 / stdin timed out and was terminated",
-                        timeout.as_secs_f64(),
-                    ),
-                ));
-            }
-        }
-    }
-    let status = if let Ok(result) = tokio::time::timeout(timeout, child.wait()).await {
-        transaction.clear_process();
-        result.map_err(|error| {
-            git_commit_blocked(
-                "git-command-unavailable",
-                &format!("无法等待 Git 事务命令 / unable to wait for Git transaction: {error}"),
-            )
-        })?
-    } else {
-        terminate_git_process_tree(&mut child).await;
-        stdout_task.abort();
-        stderr_task.abort();
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
+        tokio::join!(
+            child.wait(),
+            read_bounded_output_tail(stdout, MUTATION_OUTPUT_LIMIT),
+            read_bounded_output_tail(stderr, MUTATION_OUTPUT_LIMIT),
+            write_input,
+        )
+    })
+    .await;
+    let Ok((status, stdout, stderr, write)) = completed else {
+        let _ = child.terminate_and_reap(MUTATION_REAP_GRACE).await;
         return Err(git_commit_blocked(
             timeout_code,
             &format!(
-                "{command_label} 超过 {} 秒并已终止 / command timed out and was terminated",
+                "{command_label} 超过 {} 秒并已终止完整进程树 / command timed out and its process tree was terminated",
                 timeout.as_secs_f64(),
             ),
         ));
     };
-    let stdout = stdout_task
-        .await
-        .map_err(|error| {
-            git_commit_blocked(
-                "git-output-invalid",
-                &format!("读取 Git stdout 任务失败 / Git stdout task failed: {error}"),
-            )
-        })?
-        .map_err(|error| {
-            git_commit_blocked(
-                "git-output-invalid",
-                &format!("读取 Git stdout 失败 / unable to read Git stdout: {error}"),
-            )
-        })?;
-    let stderr = stderr_task
-        .await
-        .map_err(|error| {
-            git_commit_blocked(
-                "git-output-invalid",
-                &format!("读取 Git stderr 任务失败 / Git stderr task failed: {error}"),
-            )
-        })?
-        .map_err(|error| {
-            git_commit_blocked(
-                "git-output-invalid",
-                &format!("读取 Git stderr 失败 / unable to read Git stderr: {error}"),
-            )
-        })?;
+    let status = status.map_err(|error| {
+        git_commit_blocked(
+            "git-command-unavailable",
+            &format!("无法等待 Git 事务命令 / unable to wait for Git transaction: {error}"),
+        )
+    })?;
+    let stdout = stdout.map_err(|error| {
+        git_commit_blocked(
+            "git-output-invalid",
+            &format!("读取 Git stdout 失败 / unable to read Git stdout: {error}"),
+        )
+    })?;
+    let stderr = stderr.map_err(|error| {
+        git_commit_blocked(
+            "git-output-invalid",
+            &format!("读取 Git stderr 失败 / unable to read Git stderr: {error}"),
+        )
+    })?;
+    write.map_err(|error| {
+        git_commit_blocked(
+            "git-input-failed",
+            &format!("无法写入 Git stdin / unable to write Git stdin: {error}"),
+        )
+    })?;
+    if stdout.truncated || stderr.truncated {
+        return Err(git_commit_blocked(
+            "git-output-limit-exceeded",
+            &format!(
+                "{command_label} 输出超过每路 {MUTATION_OUTPUT_LIMIT} bytes 上限,拒绝使用截断结果 / Git mutation output exceeded its hard limit; truncated output was rejected"
+            ),
+        ));
+    }
     Ok(std::process::Output {
         status,
-        stdout,
-        stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
     })
 }
 
-pub(crate) async fn read_bounded_output_tail<R>(mut reader: R) -> Result<Vec<u8>, std::io::Error>
+#[derive(Debug)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn read_bounded_output_tail<R>(
+    mut reader: R,
+    max_retained_bytes: usize,
+) -> Result<CapturedOutput, std::io::Error>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    const MAX_RETAINED_BYTES: usize = 64 * 1024;
-    let mut retained = Vec::with_capacity(MAX_RETAINED_BYTES);
-    let mut chunk = [0u8; 8 * 1024];
+    let mut retained = umadev_process::BoundedTail::new(max_retained_bytes);
+    let mut chunk = [0u8; 1024];
     loop {
         let read = reader.read(&mut chunk).await?;
         if read == 0 {
             break;
         }
-        if read >= MAX_RETAINED_BYTES {
-            retained.clear();
-            retained.extend_from_slice(&chunk[read - MAX_RETAINED_BYTES..read]);
-            continue;
-        }
-        let overflow = retained
-            .len()
-            .saturating_add(read)
-            .saturating_sub(MAX_RETAINED_BYTES);
-        if overflow > 0 {
-            retained.drain(..overflow);
-        }
-        retained.extend_from_slice(&chunk[..read]);
+        retained.push(&chunk[..read]);
     }
-    Ok(retained)
-}
-
-pub(crate) async fn terminate_git_process_tree(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        #[cfg(unix)]
-        {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                tokio::process::Command::new("kill")
-                    .arg("-KILL")
-                    .arg("--")
-                    .arg(format!("-{pid}"))
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status(),
-            )
-            .await;
-        }
-        #[cfg(windows)]
-        {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(2),
-                tokio::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/T", "/F"])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status(),
-            )
-            .await;
-        }
-    }
-    let _ = child.kill().await;
-}
-
-pub(crate) fn kill_process_group_sync(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg("--")
-            .arg(format!("-{pid}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    let truncated = retained.truncated();
+    Ok(CapturedOutput {
+        bytes: retained.into_bytes(),
+        truncated,
+    })
 }
 
 pub(crate) fn git_required_text(

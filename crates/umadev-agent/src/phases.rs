@@ -8,7 +8,7 @@
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,39 @@ use umadev_spec::Phase;
 
 use crate::fswalk::{classify_no_follow, EntryKind};
 use crate::runner::RunOptions;
+
+/// Hard ceilings for project-controlled text consulted by automatic phases.
+const MAX_PHASE_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PHASE_SCAN_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PHASE_SCAN_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PHASE_LOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OPS_SCAN_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_OPS_SCAN_ENTRIES: usize = 8_192;
+const MAX_SOURCE_SCAN_ENTRIES: usize = 40_000;
+const MAX_SOURCE_SCAN_FILES: usize = 2_000;
+const MAX_SLOP_SCAN_ENTRIES: usize = 4_096;
+
+fn read_phase_artifact(project_root: &Path, path: impl AsRef<Path>) -> String {
+    crate::bounded_fs::read_utf8_beneath(project_root, path.as_ref(), MAX_PHASE_ARTIFACT_BYTES)
+        .unwrap_or_default()
+}
+
+fn read_scan_file(project_root: &Path, path: impl AsRef<Path>) -> Option<String> {
+    crate::bounded_fs::read_utf8_beneath(project_root, path.as_ref(), MAX_PHASE_SCAN_FILE_BYTES)
+        .ok()
+}
+
+fn read_scan_file_with_budget(
+    project_root: &Path,
+    path: impl AsRef<Path>,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) -> Option<String> {
+    budget.read_utf8_beneath(project_root, path.as_ref()).ok()
+}
+
+fn read_phase_log(project_root: &Path, path: impl AsRef<Path>) -> Option<String> {
+    crate::bounded_fs::read_utf8_beneath(project_root, path.as_ref(), MAX_PHASE_LOG_BYTES).ok()
+}
 
 /// What the phase produced. Returned for tracing / tests.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -615,17 +648,18 @@ fn score_path(path: &str, keywords: &[String]) -> usize {
     let p = path.to_ascii_lowercase();
     let path_hits = keywords.iter().filter(|k| p.contains(k.as_str())).count();
     // Content-level check: read first 500 chars for keyword matches.
-    let content_hits = std::fs::read_to_string(path).map_or(0, |body| {
-        let lower: String = body
-            .chars()
-            .take(500)
-            .collect::<String>()
-            .to_ascii_lowercase();
-        keywords
-            .iter()
-            .filter(|k| lower.contains(k.as_str()))
-            .count()
-    });
+    let content_hits = crate::bounded_fs::read_utf8(Path::new(path), MAX_PHASE_SCAN_FILE_BYTES)
+        .map_or(0, |body| {
+            let lower: String = body
+                .chars()
+                .take(500)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            keywords
+                .iter()
+                .filter(|k| lower.contains(k.as_str()))
+                .count()
+        });
     path_hits * 2 + content_hits
 }
 
@@ -635,25 +669,27 @@ fn score_corpus_file(file: &umadev_knowledge::CorpusFile, keywords: &[String]) -
         .iter()
         .filter(|keyword| relative.contains(keyword.as_str()))
         .count();
-    let content_hits = std::fs::read_to_string(file.path()).map_or(0, |body| {
-        let lower = body
-            .chars()
-            .take(500)
-            .collect::<String>()
-            .to_ascii_lowercase();
-        keywords
-            .iter()
-            .filter(|keyword| lower.contains(keyword.as_str()))
-            .count()
-    });
+    let content_hits = crate::bounded_fs::read_utf8(file.path(), MAX_PHASE_SCAN_FILE_BYTES)
+        .ok()
+        .map_or(0, |body| {
+            let lower = body
+                .chars()
+                .take(500)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            keywords
+                .iter()
+                .filter(|keyword| lower.contains(keyword.as_str()))
+                .count()
+        });
     path_hits * 2 + content_hits
 }
 
 /// Read the first `limit` chars from `file`, trimmed and cleaned.
 /// Returns a placeholder if the file is unreadable.
 fn read_excerpt(file: &Path, limit: usize) -> String {
-    match fs::read_to_string(file) {
-        Ok(body) => {
+    match crate::bounded_fs::read_utf8(file, MAX_PHASE_SCAN_FILE_BYTES).ok() {
+        Some(body) => {
             let trimmed = body.trim_start();
             let mut excerpt: String = trimmed.chars().take(limit).collect();
             if trimmed.chars().count() > limit {
@@ -661,7 +697,7 @@ fn read_excerpt(file: &Path, limit: usize) -> String {
             }
             excerpt
         }
-        Err(_) => "_(unreadable)_".to_string(),
+        None => "_(unreadable)_".to_string(),
     }
 }
 
@@ -681,7 +717,7 @@ pub fn run_research(opts: &RunOptions, generated_body: Option<&str>) -> io::Resu
     let knowledge_digest = summarise_knowledge_corpus(&knowledge_corpus(&opts.project_root));
 
     let research_path = output_dir.join(format!("{slug}-research.md"));
-    let existing_on_disk = fs::read_to_string(&research_path).unwrap_or_default();
+    let existing_on_disk = read_phase_artifact(&opts.project_root, &research_path);
     let research_body = match generated_body {
         Some(text) if !text.trim().is_empty() => prefer_richer(text, &existing_on_disk),
         _ => {
@@ -765,11 +801,13 @@ pub fn run_docs(opts: &RunOptions, content: &DocsContent) -> io::Result<PhaseOut
     // offline template). This handles the case where the worker writes a
     // full document to disk via Edit tool but returns only a summary to
     // stdout — we keep the richer disk version.
-    write_preferring_richer(&prd, &content.prd, || render_prd(&slug, &opts.requirement))?;
-    write_preferring_richer(&arch, &content.architecture, || {
+    write_preferring_richer(&opts.project_root, &prd, &content.prd, || {
+        render_prd(&slug, &opts.requirement)
+    })?;
+    write_preferring_richer(&opts.project_root, &arch, &content.architecture, || {
         render_architecture(&slug, &opts.requirement)
     })?;
-    write_preferring_richer(&uiux, &content.uiux, || {
+    write_preferring_richer(&opts.project_root, &uiux, &content.uiux, || {
         render_uiux(&slug, &opts.requirement)
     })?;
 
@@ -820,7 +858,7 @@ pub fn run_spec(opts: &RunOptions) -> io::Result<PhaseOutput> {
     // so an empty / leftover-skeleton / offline run still gets a deterministic
     // artifact.
     let skeleton = render_execution_plan(&slug, &opts.requirement);
-    let current = fs::read_to_string(&plan).unwrap_or_default();
+    let current = read_phase_artifact(&opts.project_root, &plan);
     let is_skeleton_stub = current.contains("Skeleton execution plan");
     let keep_base = current.trim().len() > 200 && !is_skeleton_stub;
     let body = if keep_base { current } else { skeleton };
@@ -1057,7 +1095,7 @@ pub fn run_quality_with_kind(
 
     // UD-ART-001 — research artifact (content check, not just file-exists)
     let research_path = output_dir.join(format!("{slug}-research.md"));
-    let research_text = fs::read_to_string(&research_path).unwrap_or_default();
+    let research_text = read_phase_artifact(&opts.project_root, &research_path);
     let research_defects = review_document_structure(
         &research_text,
         &[
@@ -1076,9 +1114,11 @@ pub fn run_quality_with_kind(
     ));
 
     // Discovery section in research
-    let research_content = fs::read_to_string(output_dir.join(format!("{slug}-research.md")))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let research_content = read_phase_artifact(
+        &opts.project_root,
+        output_dir.join(format!("{slug}-research.md")),
+    )
+    .to_ascii_lowercase();
     let has_discovery = research_content.contains("## discovery")
         || research_content.contains("target audience")
         || research_content.contains("design direction");
@@ -1102,8 +1142,10 @@ pub fn run_quality_with_kind(
     });
 
     // UD-ART-002 — three core docs (content checks, not just file-exists)
-    let prd_text =
-        fs::read_to_string(output_dir.join(format!("{slug}-prd.md"))).unwrap_or_default();
+    let prd_text = read_phase_artifact(
+        &opts.project_root,
+        output_dir.join(format!("{slug}-prd.md")),
+    );
     let prd_defects = review_document_structure(
         &prd_text,
         &[
@@ -1148,8 +1190,10 @@ pub fn run_quality_with_kind(
         weight: 2.0,
     });
 
-    let arch_text =
-        fs::read_to_string(output_dir.join(format!("{slug}-architecture.md"))).unwrap_or_default();
+    let arch_text = read_phase_artifact(
+        &opts.project_root,
+        output_dir.join(format!("{slug}-architecture.md")),
+    );
     let arch_defects = review_document_structure(
         &arch_text,
         &[
@@ -1167,8 +1211,10 @@ pub fn run_quality_with_kind(
         2.0,
     ));
 
-    let uiux_text =
-        fs::read_to_string(output_dir.join(format!("{slug}-uiux.md"))).unwrap_or_default();
+    let uiux_text = read_phase_artifact(
+        &opts.project_root,
+        output_dir.join(format!("{slug}-uiux.md")),
+    );
     let uiux_defects = review_document_structure(
         &uiux_text,
         &[
@@ -1190,7 +1236,7 @@ pub fn run_quality_with_kind(
     // UD-ART-003 — execution plan (content-validated)
     {
         let pp = output_dir.join(format!("{slug}-execution-plan.md"));
-        let pt = fs::read_to_string(&pp).unwrap_or_default();
+        let pt = read_phase_artifact(&opts.project_root, &pp);
         let pl = pt.lines().filter(|l| !l.trim().is_empty()).count();
         let hs = pt.lines().any(|l| l.trim_start().starts_with("## "));
         let (st, sc, det) = if pt.is_empty() {
@@ -1275,6 +1321,7 @@ pub fn run_quality_with_kind(
         .project_root
         .join(".umadev/audit/frontend-api-calls.jsonl");
     checks.push(evidence_check(
+        &opts.project_root,
         "API audit log",
         "UD-EVID-001 — frontend-api-calls.jsonl present and non-empty",
         &api_log,
@@ -1284,6 +1331,7 @@ pub fn run_quality_with_kind(
     // UD-EVID-002 — tool-call audit
     let tool_log = opts.project_root.join(".umadev/audit/tool-calls.jsonl");
     checks.push(evidence_check(
+        &opts.project_root,
         "Tool-call audit log",
         "UD-EVID-002 — tool-calls.jsonl present and non-empty",
         &tool_log,
@@ -1291,7 +1339,7 @@ pub fn run_quality_with_kind(
     ));
 
     // UD-CODE-001 / UD-CODE-002 — violations in audit log
-    let (emoji_blocks, color_blocks) = count_code_violations(&tool_log);
+    let (emoji_blocks, color_blocks) = count_code_violations(&opts.project_root, &tool_log);
     checks.push(violation_check(
         "Emoji block events",
         "UD-CODE-001 — no emoji-as-icon attempted in this run",
@@ -1314,7 +1362,7 @@ pub fn run_quality_with_kind(
     // single spec clause — Lorem ipsum / generic headings / purple→pink
     // gradients are caught as design-quality signals (the pre-write hook
     // attributes the gradient/color part to UD-CODE-002).
-    let slop_issues = count_slop_violations(&output_dir);
+    let slop_issues = count_slop_violations(&opts.project_root, &output_dir);
     let slop_detail = if slop_issues == 0 {
         "No AI template patterns detected in output artifacts".to_string()
     } else {
@@ -1392,7 +1440,7 @@ pub fn run_quality_with_kind(
 
     // Dark mode check — does the UIUX doc define dark mode tokens?
     let uiux_path = output_dir.join(format!("{slug}-uiux.md"));
-    let dark_mode = check_dark_mode_support(&uiux_path);
+    let dark_mode = check_dark_mode_support(&opts.project_root, &uiux_path);
     checks.push(QualityCheck {
         name: "Dark mode support".to_string(),
         category: "quality".to_string(),
@@ -1403,7 +1451,8 @@ pub fn run_quality_with_kind(
         weight: 1.0,
     });
 
-    let uiux_score = i32::try_from(score_uiux_completeness(&uiux_path)).unwrap_or(100);
+    let uiux_score =
+        i32::try_from(score_uiux_completeness(&opts.project_root, &uiux_path)).unwrap_or(100);
     checks.push(QualityCheck {
         name: "Design system completeness".to_string(),
         category: "quality".to_string(),
@@ -1422,12 +1471,12 @@ pub fn run_quality_with_kind(
     });
 
     // === Contract-layer checks (require parsing the architecture doc) ===
-    let arch_text = fs::read_to_string(
+    let arch_text = read_phase_artifact(
+        &opts.project_root,
         opts.project_root
             .join("output")
             .join(format!("{slug}-architecture.md")),
-    )
-    .unwrap_or_default();
+    );
     let arch_spec = umadev_contract::parse_architecture(&arch_text, &format!("{slug} API"));
     let derived = umadev_contract::derive_endpoints_from_requirement(&opts.requirement);
     let contract_spec = umadev_contract::merge_specs(&arch_spec, &derived);
@@ -1492,7 +1541,7 @@ pub fn run_quality_with_kind(
         .project_root
         .join("output")
         .join(format!("{slug}-prd.md"));
-    let prd_text = fs::read_to_string(&prd_path).unwrap_or_default();
+    let prd_text = read_phase_artifact(&opts.project_root, &prd_path);
     let prd_routes = umadev_contract::extract_prd_routes(&prd_text);
     let prd_violations = umadev_contract::validate_prd_vs_contract(&prd_routes, &contract_spec);
     checks.push(QualityCheck {
@@ -1942,8 +1991,14 @@ pub fn run_quality_with_kind(
     })
 }
 
-fn evidence_check(name: &str, desc: &str, path: &Path, weight: f32) -> QualityCheck {
-    let lines = file_line_count(path);
+fn evidence_check(
+    project_root: &Path,
+    name: &str,
+    desc: &str,
+    path: &Path,
+    weight: f32,
+) -> QualityCheck {
+    let lines = file_line_count(project_root, path);
     let status = if lines > 0 { "passed" } else { "warning" };
     let score = if lines > 0 { 100 } else { 60 };
     QualityCheck {
@@ -1980,9 +2035,7 @@ fn violation_check(name: &str, desc: &str, blocks: usize, weight: f32) -> Qualit
 
 fn verify_results_check(project_root: &Path) -> Option<QualityCheck> {
     let path = project_root.join(".umadev/audit/verify.jsonl");
-    let Ok(content) = fs::read_to_string(&path) else {
-        return None;
-    };
+    let content = read_phase_log(project_root, &path)?;
     #[derive(serde::Deserialize)]
     struct VRow {
         #[serde(default)]
@@ -2039,7 +2092,10 @@ fn verify_results_check(project_root: &Path) -> Option<QualityCheck> {
 /// box) → a neutral `warning` nudge to install one.
 fn security_scan_check(project_root: &Path) -> Option<QualityCheck> {
     let path = project_root.join(crate::security::security_scan_rel_path());
-    let body = fs::read_to_string(&path).ok()?;
+    let body = read_phase_artifact(project_root, &path);
+    if body.is_empty() {
+        return None;
+    }
     let scan: crate::security::SecurityScan = serde_json::from_str(&body).ok()?;
     let (status, score) = if scan.has_findings() {
         ("warning", 60)
@@ -2125,8 +2181,10 @@ fn weighted_avg(checks: &[QualityCheck]) -> f32 {
     weighted / total_weight
 }
 
-fn file_line_count(path: &Path) -> usize {
-    fs::read_to_string(path).map_or(0, |t| t.lines().filter(|l| !l.trim().is_empty()).count())
+fn file_line_count(project_root: &Path, path: &Path) -> usize {
+    read_phase_log(project_root, path).map_or(0, |text| {
+        text.lines().filter(|line| !line.trim().is_empty()).count()
+    })
 }
 
 /// Verdict of the ops-artifacts audit — what the BASE actually shipped.
@@ -2143,9 +2201,16 @@ struct OpsAudit {
 }
 
 /// Read `path` and report whether it holds non-trivial content containing
-/// `needle`. Fail-open: an unreadable or blank file reads as `false`.
-fn ops_file_has(path: &Path, needle: &str) -> bool {
-    fs::read_to_string(path).is_ok_and(|c| !c.trim().is_empty() && c.contains(needle))
+/// `needle`. Fail-open: an unreadable, over-budget, or blank file reads as
+/// `false`.
+fn ops_file_has(
+    project_root: &Path,
+    path: &Path,
+    needle: &str,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) -> bool {
+    read_scan_file_with_budget(project_root, path, budget)
+        .is_some_and(|content| !content.trim().is_empty() && content.contains(needle))
 }
 
 /// `true` when the base shipped a container build in the project root — a
@@ -2153,10 +2218,12 @@ fn ops_file_has(path: &Path, needle: &str) -> bool {
 /// `FROM` stage. Only the root is inspected (the conventional home for a
 /// top-level service image). Fail-open on any read error.
 fn base_has_container_build(project_root: &Path) -> bool {
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_OPS_SCAN_TOTAL_BYTES, MAX_PHASE_SCAN_FILE_BYTES);
     let Ok(rd) = fs::read_dir(project_root) else {
         return false;
     };
-    for entry in rd.flatten() {
+    for entry in rd.take(MAX_OPS_SCAN_ENTRIES).flatten() {
         let path = entry.path();
         if !matches!(classify_no_follow(&path), EntryKind::File) {
             continue;
@@ -2165,7 +2232,7 @@ fn base_has_container_build(project_root: &Path) -> bool {
         let Some(name) = fname.to_str() else { continue };
         let is_candidate =
             name == "Dockerfile" || name.starts_with("Dockerfile.") || name == "Containerfile";
-        if is_candidate && ops_file_has(&path, "FROM") {
+        if is_candidate && ops_file_has(project_root, &path, "FROM", &mut budget) {
             return true;
         }
     }
@@ -2176,9 +2243,24 @@ fn base_has_container_build(project_root: &Path) -> bool {
 /// `.github/workflows/` declaring `jobs:`, or a conventional top-level GitLab /
 /// CircleCI config with real content. Fail-open on any read error.
 fn base_has_ci_pipeline(project_root: &Path) -> bool {
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_OPS_SCAN_TOTAL_BYTES, MAX_PHASE_SCAN_FILE_BYTES);
     let wf_dir = project_root.join(".github/workflows");
-    if let Ok(rd) = fs::read_dir(&wf_dir) {
-        for entry in rd.flatten() {
+    if crate::bounded_fs::is_real_directory_beneath(project_root, &wf_dir) {
+        let Ok(rd) = fs::read_dir(&wf_dir) else {
+            return ops_file_has(
+                project_root,
+                &project_root.join(".gitlab-ci.yml"),
+                "script:",
+                &mut budget,
+            ) || ops_file_has(
+                project_root,
+                &project_root.join(".circleci/config.yml"),
+                "jobs:",
+                &mut budget,
+            );
+        };
+        for entry in rd.take(MAX_OPS_SCAN_ENTRIES).flatten() {
             let path = entry.path();
             if !matches!(classify_no_follow(&path), EntryKind::File) {
                 continue;
@@ -2187,13 +2269,22 @@ fn base_has_ci_pipeline(project_root: &Path) -> bool {
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml"));
-            if is_yaml && ops_file_has(&path, "jobs:") {
+            if is_yaml && ops_file_has(project_root, &path, "jobs:", &mut budget) {
                 return true;
             }
         }
     }
-    ops_file_has(&project_root.join(".gitlab-ci.yml"), "script:")
-        || ops_file_has(&project_root.join(".circleci/config.yml"), "jobs:")
+    ops_file_has(
+        project_root,
+        &project_root.join(".gitlab-ci.yml"),
+        "script:",
+        &mut budget,
+    ) || ops_file_has(
+        project_root,
+        &project_root.join(".circleci/config.yml"),
+        "jobs:",
+        &mut budget,
+    )
 }
 
 /// `true` when the base shipped database migrations: at least one `.sql` file
@@ -2208,29 +2299,57 @@ fn base_has_migrations(project_root: &Path) -> bool {
         "database/migrations",
         "prisma/migrations",
     ];
-    DIRS.iter()
-        .any(|dir| migrations_dir_has_ddl(&project_root.join(dir)))
+    let mut remaining_entries = MAX_OPS_SCAN_ENTRIES;
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_OPS_SCAN_TOTAL_BYTES, MAX_PHASE_SCAN_FILE_BYTES);
+    DIRS.iter().any(|dir| {
+        migrations_dir_has_ddl(
+            project_root,
+            &project_root.join(dir),
+            &mut remaining_entries,
+            &mut budget,
+        )
+    })
 }
 
 /// Scan a migrations directory (and its immediate subdirectories) for a `.sql`
 /// file that contains real DDL. Fail-open on any read error.
-fn migrations_dir_has_ddl(dir: &Path) -> bool {
+fn migrations_dir_has_ddl(
+    project_root: &Path,
+    dir: &Path,
+    remaining_entries: &mut usize,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) -> bool {
+    if !crate::bounded_fs::is_real_directory_beneath(project_root, dir) {
+        return false;
+    }
     let Ok(rd) = fs::read_dir(dir) else {
         return false;
     };
-    for entry in rd.flatten() {
+    for entry in rd {
+        let Some(next_remaining) = remaining_entries.checked_sub(1) else {
+            return false;
+        };
+        *remaining_entries = next_remaining;
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
         match classify_no_follow(&path) {
             EntryKind::File => {
-                if sql_file_has_ddl(&path) {
+                if sql_file_has_ddl(project_root, &path, budget) {
                     return true;
                 }
             }
             EntryKind::Dir => {
                 if let Ok(sub) = fs::read_dir(&path) {
-                    for e in sub.flatten() {
+                    for e in sub {
+                        let Some(next_remaining) = remaining_entries.checked_sub(1) else {
+                            return false;
+                        };
+                        *remaining_entries = next_remaining;
+                        let Ok(e) = e else { continue };
                         let p = e.path();
-                        if matches!(classify_no_follow(&p), EntryKind::File) && sql_file_has_ddl(&p)
+                        if matches!(classify_no_follow(&p), EntryKind::File)
+                            && sql_file_has_ddl(project_root, &p, budget)
                         {
                             return true;
                         }
@@ -2245,12 +2364,16 @@ fn migrations_dir_has_ddl(dir: &Path) -> bool {
 
 /// `true` when `path` is a `.sql` file whose content declares a table
 /// (`CREATE TABLE` / `ALTER TABLE`, case-insensitive). Fail-open on read error.
-fn sql_file_has_ddl(path: &Path) -> bool {
+fn sql_file_has_ddl(
+    project_root: &Path,
+    path: &Path,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) -> bool {
     if path.extension().and_then(|e| e.to_str()) != Some("sql") {
         return false;
     }
-    fs::read_to_string(path).is_ok_and(|c| {
-        let upper = c.to_ascii_uppercase();
+    read_scan_file_with_budget(project_root, path, budget).is_some_and(|content| {
+        let upper = content.to_ascii_uppercase();
         upper.contains("CREATE TABLE") || upper.contains("ALTER TABLE")
     })
 }
@@ -2279,10 +2402,10 @@ fn audit_ops_artifacts(project_root: &Path) -> OpsAudit {
     OpsAudit { present, details }
 }
 
-fn count_code_violations(tool_log: &Path) -> (usize, usize) {
+fn count_code_violations(project_root: &Path, tool_log: &Path) -> (usize, usize) {
     let mut emoji = 0;
     let mut color = 0;
-    if let Ok(text) = fs::read_to_string(tool_log) {
+    if let Some(text) = read_phase_log(project_root, tool_log) {
         for line in text.lines() {
             let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
@@ -2349,21 +2472,21 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
     // graduation below AND the wording of the captured-pattern lesson (we must
     // never sediment "passed the quality gate" when it did not pass). Fail-open:
     // a missing/unreadable gate file reads as "not passed".
-    let quality_passed = fs::read_to_string(
+    let quality_passed = Some(read_phase_artifact(
+        &opts.project_root,
         opts.project_root
             .join(format!("output/{slug}-quality-gate.json")),
-    )
-    .ok()
+    ))
     .and_then(|j| serde_json::from_str::<QualityReport>(&j).ok())
     .is_some_and(|r| r.passed);
 
     // 0. Capture validated patterns (D2: success -> sediment -> retrieval loop)
-    let arch_text = fs::read_to_string(
+    let arch_text = read_phase_artifact(
+        &opts.project_root,
         opts.project_root
             .join("output")
             .join(format!("{slug}-architecture.md")),
-    )
-    .unwrap_or_default();
+    );
     let arch_spec = umadev_contract::parse_architecture(&arch_text, &format!("{slug} API"));
     let derived = umadev_contract::derive_endpoints_from_requirement(&opts.requirement);
     let contract_spec = umadev_contract::merge_specs(&arch_spec, &derived);
@@ -2415,8 +2538,8 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
         .project_root
         .join("output")
         .join(format!("{slug}-frontend-notes.md"));
-    if fe_notes.is_file() {
-        if let Ok(text) = fs::read_to_string(&fe_notes) {
+    if crate::bounded_fs::is_real_file_beneath(&opts.project_root, &fe_notes) {
+        if let Some(text) = read_scan_file(&opts.project_root, &fe_notes) {
             let _ = extract_api_urls(fe_notes.to_string_lossy().as_ref(), &text);
         }
     }
@@ -2429,7 +2552,9 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
         .project_root
         .join("output")
         .join(format!("{slug}-delivery-notes.md"));
-    if !delivery_notes.is_file() {
+    if fs::symlink_metadata(&delivery_notes)
+        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    {
         let placeholder = format!(
             "# Delivery notes — {slug}\n\n\
              > Deployment recipe produced by the worker at the delivery phase.\n\n\
@@ -2448,7 +2573,7 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
         );
         let _ = fs::write(&delivery_notes, placeholder);
     }
-    if delivery_notes.is_file() {
+    if crate::bounded_fs::is_real_file_beneath(&opts.project_root, &delivery_notes) {
         artifacts.push(delivery_notes);
     }
 
@@ -2534,15 +2659,17 @@ fn write_scorecard_html(
     run_id: &str,
     zip_path: &Path,
 ) -> io::Result<PathBuf> {
-    let report: Option<QualityReport> =
-        fs::read_to_string(project_root.join(format!("output/{slug}-quality-gate.json")))
-            .ok()
-            .and_then(|j| serde_json::from_str(&j).ok());
+    let report: Option<QualityReport> = serde_json::from_str(&read_phase_artifact(
+        project_root,
+        project_root.join(format!("output/{slug}-quality-gate.json")),
+    ))
+    .ok();
     let score = report.as_ref().map_or(0, |r| r.total_score);
     let passed = report.as_ref().is_some_and(|r| r.passed);
-    let has_compliance = project_root
-        .join(format!("output/{slug}-compliance-mapping.json"))
-        .is_file();
+    let has_compliance = crate::bounded_fs::is_real_file_beneath(
+        project_root,
+        &project_root.join(format!("output/{slug}-compliance-mapping.json")),
+    );
     let zip_sha = umadev_governance::compliance::file_sha256(zip_path)
         .unwrap_or_else(|| "(unavailable)".to_string());
     let date = Utc::now().format("%Y-%m-%d").to_string();
@@ -2598,7 +2725,8 @@ fn write_scorecard_html(
         ("Architecture", format!("output/{slug}-architecture.md")),
         ("UI/UX", format!("output/{slug}-uiux.md")),
     ] {
-        let produced = project_root.join(&rel).is_file();
+        let produced =
+            crate::bounded_fs::is_real_file_beneath(project_root, &project_root.join(&rel));
         let (cls, state) = if produced {
             ("ok", "已产出 · produced")
         } else {
@@ -2666,20 +2794,504 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+const PROOF_PACK_MAX_FILES: usize = 1_024;
+const PROOF_PACK_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const PROOF_PACK_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const PROOF_PACK_MAX_DEPTH: usize = 6;
+const PROOF_PACK_MAX_VISITED_ENTRIES: usize = 16_384;
+const PROOF_PACK_MAX_DIRECTORIES: usize = 4_096;
+const PROOF_PACK_COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+struct ProofPackLimits {
+    files: usize,
+    file_bytes: u64,
+    total_bytes: u64,
+    depth: usize,
+    entries: usize,
+    directories: usize,
+}
+
+const PROOF_PACK_LIMITS: ProofPackLimits = ProofPackLimits {
+    files: PROOF_PACK_MAX_FILES,
+    file_bytes: PROOF_PACK_MAX_FILE_BYTES,
+    total_bytes: PROOF_PACK_MAX_TOTAL_BYTES,
+    depth: PROOF_PACK_MAX_DEPTH,
+    entries: PROOF_PACK_MAX_VISITED_ENTRIES,
+    directories: PROOF_PACK_MAX_DIRECTORIES,
+};
+
+#[derive(Default)]
+struct ProofTraversalBudget {
+    visited_entries: usize,
+    visited_directories: usize,
+}
+
+impl ProofTraversalBudget {
+    fn visit_entry(&mut self, relative: &Path, limits: ProofPackLimits) -> io::Result<()> {
+        let next = self
+            .visited_entries
+            .checked_add(1)
+            .ok_or_else(|| proof_pack_error("proof-pack visited-entry count overflow"))?;
+        if next > limits.entries {
+            return Err(proof_pack_error(format!(
+                "proof-pack visited-entry budget exceeded at {}: {next} > {}",
+                relative.display(),
+                limits.entries
+            )));
+        }
+        self.visited_entries = next;
+        Ok(())
+    }
+
+    fn visit_directory(&mut self, relative: &Path, limits: ProofPackLimits) -> io::Result<()> {
+        let next = self
+            .visited_directories
+            .checked_add(1)
+            .ok_or_else(|| proof_pack_error("proof-pack directory count overflow"))?;
+        if next > limits.directories {
+            return Err(proof_pack_error(format!(
+                "proof-pack directory-count budget exceeded at {}: {next} > {}",
+                relative.display(),
+                limits.directories
+            )));
+        }
+        self.visited_directories = next;
+        Ok(())
+    }
+}
+
+struct ProofPackTarget {
+    relative: PathBuf,
+    archive_name: String,
+}
+
+#[derive(Clone, Copy)]
+enum ProofPathKind {
+    File,
+    Directory,
+}
+
+#[cfg(windows)]
+fn proof_path_is_link(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn proof_path_is_link(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn proof_pack_error(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+/// Convert a workspace-relative path to a portable, non-escaping ZIP entry.
+/// Backslashes and colons are rejected even on Unix because common Windows ZIP
+/// extractors can interpret them as separators or drive/stream syntax.
+fn proof_pack_archive_name(relative: &Path) -> io::Result<String> {
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(proof_pack_error(format!(
+            "proof-pack target is not a non-empty relative path: {}",
+            relative.display()
+        )));
+    }
+
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(proof_pack_error(format!(
+                "proof-pack target contains an escaping path component: {}",
+                relative.display()
+            )));
+        };
+        let part = part.to_str().ok_or_else(|| {
+            proof_pack_error(format!(
+                "proof-pack target is not valid UTF-8: {}",
+                relative.display()
+            ))
+        })?;
+        if part.is_empty() || part.contains(['\\', ':']) {
+            return Err(proof_pack_error(format!(
+                "proof-pack target contains an unsafe archive component: {}",
+                relative.display()
+            )));
+        }
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        return Err(proof_pack_error("proof-pack target has no archive name"));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Inspect every component below the canonical workspace root without
+/// following links. A missing optional path is `None`; an existing symlink,
+/// special entry, or wrong-kind component is a hard packaging error.
+fn inspect_proof_path(
+    root: &Path,
+    relative: &Path,
+    expected: ProofPathKind,
+) -> io::Result<Option<fs::Metadata>> {
+    let _ = proof_pack_archive_name(relative)?;
+    let mut cursor = root.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(proof_pack_error(format!(
+                "proof-pack target escapes the workspace: {}",
+                relative.display()
+            )));
+        };
+        cursor.push(part);
+        let metadata = match fs::symlink_metadata(&cursor) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot inspect proof-pack target {}: {error}",
+                        relative.display()
+                    ),
+                ));
+            }
+        };
+        let file_type = metadata.file_type();
+        if proof_path_is_link(&metadata) {
+            return Err(proof_pack_error(format!(
+                "proof-pack target contains a symlink: {}",
+                relative.display()
+            )));
+        }
+        let is_last = components.peek().is_none();
+        if !is_last && !file_type.is_dir() {
+            return Err(proof_pack_error(format!(
+                "proof-pack target has a non-directory ancestor: {}",
+                relative.display()
+            )));
+        }
+        if is_last {
+            let matches = match expected {
+                ProofPathKind::File => file_type.is_file(),
+                ProofPathKind::Directory => file_type.is_dir(),
+            };
+            if !matches {
+                return Err(proof_pack_error(format!(
+                    "proof-pack target is a special entry or has the wrong type: {}",
+                    relative.display()
+                )));
+            }
+            let canonical = fs::canonicalize(&cursor).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot resolve proof-pack target {}: {error}",
+                        relative.display()
+                    ),
+                )
+            })?;
+            if !canonical.starts_with(root) {
+                return Err(proof_pack_error(format!(
+                    "proof-pack target escapes the workspace: {}",
+                    relative.display()
+                )));
+            }
+            return Ok(Some(metadata));
+        }
+    }
+    Err(proof_pack_error("proof-pack target has no path components"))
+}
+
+fn add_proof_file(
+    root: &Path,
+    relative: PathBuf,
+    targets: &mut Vec<ProofPackTarget>,
+    expected_total: &mut u64,
+    limits: ProofPackLimits,
+    required: bool,
+) -> io::Result<()> {
+    let archive_name = proof_pack_archive_name(&relative)?;
+    let Some(metadata) = inspect_proof_path(root, &relative, ProofPathKind::File)? else {
+        if required {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "proof-pack target vanished during discovery: {}",
+                    relative.display()
+                ),
+            ));
+        }
+        return Ok(());
+    };
+    let file_count = targets
+        .len()
+        .checked_add(2) // generated README plus this target
+        .ok_or_else(|| proof_pack_error("proof-pack file count overflow"))?;
+    if file_count > limits.files {
+        return Err(proof_pack_error(format!(
+            "proof-pack file-count budget exceeded: {file_count} > {}",
+            limits.files
+        )));
+    }
+    if metadata.len() > limits.file_bytes {
+        return Err(proof_pack_error(format!(
+            "proof-pack per-file byte budget exceeded for {archive_name}: {} > {}",
+            metadata.len(),
+            limits.file_bytes
+        )));
+    }
+    let next_total = expected_total
+        .checked_add(metadata.len())
+        .ok_or_else(|| proof_pack_error("proof-pack total byte count overflow"))?;
+    if next_total > limits.total_bytes {
+        return Err(proof_pack_error(format!(
+            "proof-pack total-byte budget exceeded: {next_total} > {}",
+            limits.total_bytes
+        )));
+    }
+    *expected_total = next_total;
+    targets.push(ProofPackTarget {
+        relative,
+        archive_name,
+    });
+    Ok(())
+}
+
+fn collect_proof_directory(
+    root: &Path,
+    relative: &Path,
+    targets: &mut Vec<ProofPackTarget>,
+    expected_total: &mut u64,
+    traversal: &mut ProofTraversalBudget,
+    depth: usize,
+    limits: ProofPackLimits,
+) -> io::Result<()> {
+    let Some(_) = inspect_proof_path(root, relative, ProofPathKind::Directory)? else {
+        return Ok(());
+    };
+    traversal.visit_directory(relative, limits)?;
+    let directory = root.join(relative);
+    let entries = fs::read_dir(&directory).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot enumerate proof-pack directory {}: {error}",
+                relative.display()
+            ),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot enumerate proof-pack directory {}: {error}",
+                    relative.display()
+                ),
+            )
+        })?;
+        let child = relative.join(entry.file_name());
+        traversal.visit_entry(&child, limits)?;
+        let child_path = root.join(&child);
+        let metadata = fs::symlink_metadata(&child_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot inspect proof-pack target {}: {error}",
+                    child.display()
+                ),
+            )
+        })?;
+        let file_type = metadata.file_type();
+        if proof_path_is_link(&metadata) {
+            return Err(proof_pack_error(format!(
+                "proof-pack target contains a symlink: {}",
+                child.display()
+            )));
+        }
+        if file_type.is_dir() {
+            if depth >= limits.depth {
+                return Err(proof_pack_error(format!(
+                    "proof-pack directory-depth budget exceeded at {} (max {})",
+                    child.display(),
+                    limits.depth
+                )));
+            }
+            collect_proof_directory(
+                root,
+                &child,
+                targets,
+                expected_total,
+                traversal,
+                depth + 1,
+                limits,
+            )?;
+        } else if file_type.is_file() {
+            add_proof_file(root, child, targets, expected_total, limits, true)?;
+        } else {
+            return Err(proof_pack_error(format!(
+                "proof-pack target is a special entry: {}",
+                child.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn open_proof_file(root: &Path, target: &ProofPackTarget) -> io::Result<File> {
+    let before =
+        inspect_proof_path(root, &target.relative, ProofPathKind::File)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "proof-pack target vanished before reading: {}",
+                    target.relative.display()
+                ),
+            )
+        })?;
+    let path = root.join(&target.relative);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(&path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot open proof-pack target {} without following links: {error}",
+                target.relative.display()
+            ),
+        )
+    })?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        return Err(proof_pack_error(format!(
+            "proof-pack target is no longer a regular file: {}",
+            target.relative.display()
+        )));
+    }
+    let after =
+        inspect_proof_path(root, &target.relative, ProofPathKind::File)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "proof-pack target vanished after opening: {}",
+                    target.relative.display()
+                ),
+            )
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if before.dev() != opened.dev()
+            || before.ino() != opened.ino()
+            || after.dev() != opened.dev()
+            || after.ino() != opened.ino()
+        {
+            return Err(proof_pack_error(format!(
+                "proof-pack target changed identity while opening: {}",
+                target.relative.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (before, after);
+    Ok(file)
+}
+
+fn proof_pack_readme(slug: &str) -> String {
+    format!(
+        "# Proof Pack — {slug}\n\n\
+         Generated by UmaDev v{version} at {ts}.\n\n\
+         ## Contents\n\n\
+         | File | Purpose |\n\
+         |---|---|\n\
+         | `output/{slug}-research.md` | Competitive research + discovery |\n\
+         | `output/{slug}-prd.md` | Product Requirements Document |\n\
+         | `output/{slug}-architecture.md` | System architecture + API surface |\n\
+         | `output/{slug}-uiux.md` | Design system (tokens, typography, components) |\n\
+         | `output/{slug}-execution-plan.md` | Task breakdown |\n\
+         | `output/{slug}-frontend-notes.md` | Frontend implementation checklist |\n\
+         | `output/{slug}-backend-notes.md` | Backend implementation checklist |\n\
+         | `output/{slug}-quality-gate.json` | Quality gate scores (per-check) |\n\
+         | `output/{slug}-quality-gate.md` | Human-readable quality report |\n\
+         | `output/{slug}-review-report.md` | PR-ready review checklist (CI/contract/acceptance/security/runtime/rollback) |\n\
+         | `output/{slug}-compliance-mapping.json` | SOC2/ISO27001/EU-AI-Act mapping |\n\
+         | `.umadev/audit/security-scan.json` | Pre-PR security scan: leaked-secret + dependency advisories |\n\
+         | `.umadev/audit/runtime-proof.json` | Runtime evidence: dev server booted + routes answered |\n\
+         | `.umadev/audit/deploy-proof.json` | Deploy evidence: platform + command + live URL + status |\n\
+         | `.umadev/audit/tool-calls.jsonl` | Audit trail |\n\
+         | `knowledge/design-systems/*.md` | Design system definitions |\n\
+         | `knowledge/seed-templates/*.md` | Page structure templates |\n\n\
+         ## How to review\n\n\
+         1. Start with `output/{slug}-prd.md` — verify the scope is correct\n\
+         2. Check `output/{slug}-architecture.md` — verify API surface makes sense\n\
+         3. Check `output/{slug}-uiux.md` — verify design tokens and dark mode\n\
+         4. Check `output/{slug}-quality-gate.md` — verify every check passed\n",
+        version = env!("CARGO_PKG_VERSION"),
+        ts = Utc::now().format("%Y-%m-%d %H:%M UTC"),
+    )
+}
+
 fn build_and_zip_proof_pack(
     project_root: &Path,
     zip_path: &Path,
     slug: &str,
 ) -> io::Result<Vec<String>> {
-    let file = File::create(zip_path)?;
-    let mut zw = zip::ZipWriter::new(file);
-    let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    build_and_zip_proof_pack_with_limits(project_root, zip_path, slug, PROOF_PACK_LIMITS)
+}
 
-    let mut manifest = Vec::new();
+fn build_and_zip_proof_pack_with_limits(
+    project_root: &Path,
+    zip_path: &Path,
+    slug: &str,
+    limits: ProofPackLimits,
+) -> io::Result<Vec<String>> {
+    let root = fs::canonicalize(project_root)?;
+    if !fs::symlink_metadata(&root)?.file_type().is_dir() {
+        return Err(proof_pack_error(
+            "proof-pack workspace root is not a directory",
+        ));
+    }
+    let readme = proof_pack_readme(slug);
+    let readme_bytes = u64::try_from(readme.len())
+        .map_err(|_| proof_pack_error("proof-pack README byte count overflow"))?;
+    if limits.files < 1 {
+        return Err(proof_pack_error(
+            "proof-pack file-count budget exceeded by generated README",
+        ));
+    }
+    if readme_bytes > limits.file_bytes {
+        return Err(proof_pack_error(format!(
+            "proof-pack per-file byte budget exceeded for README.md: {readme_bytes} > {}",
+            limits.file_bytes
+        )));
+    }
+    if readme_bytes > limits.total_bytes {
+        return Err(proof_pack_error(format!(
+            "proof-pack total-byte budget exceeded by README.md: {readme_bytes} > {}",
+            limits.total_bytes
+        )));
+    }
+
+    let mut expected_total = readme_bytes;
+    let mut targets = Vec::new();
+    let mut traversal = ProofTraversalBudget::default();
 
     // Glob targets
-    let mut targets: Vec<PathBuf> = Vec::new();
     for name in [
         format!("output/{slug}-research.md"),
         format!("output/{slug}-prd.md"),
@@ -2716,99 +3328,134 @@ fn build_and_zip_proof_pack(
         crate::deploy::deploy_proof_rel_path().to_string(),
         ".umadev/workflow-state.json".to_string(),
     ] {
-        let p = project_root.join(&name);
-        if p.is_file() {
-            targets.push(p);
-        }
+        add_proof_file(
+            &root,
+            PathBuf::from(name),
+            &mut targets,
+            &mut expected_total,
+            limits,
+            false,
+        )?;
     }
     // Include design system + seed template files if present
     for dir in ["knowledge/design-systems", "knowledge/seed-templates"] {
-        let d = project_root.join(dir);
-        if d.is_dir() {
-            walk_files(&d, &mut targets, 0);
-        }
+        collect_proof_directory(
+            &root,
+            Path::new(dir),
+            &mut targets,
+            &mut expected_total,
+            &mut traversal,
+            0,
+            limits,
+        )?;
     }
     // recursively include .umadev/changes/ and .umadev/decisions/
     for dir in [".umadev/changes", ".umadev/decisions"] {
-        let d = project_root.join(dir);
-        if d.is_dir() {
-            walk_files(&d, &mut targets, 0);
+        collect_proof_directory(
+            &root,
+            Path::new(dir),
+            &mut targets,
+            &mut expected_total,
+            &mut traversal,
+            0,
+            limits,
+        )?;
+    }
+    targets.sort_unstable_by(|left, right| left.archive_name.cmp(&right.archive_name));
+    for pair in targets.windows(2) {
+        if pair[0].archive_name == pair[1].archive_name {
+            return Err(proof_pack_error(format!(
+                "proof-pack has duplicate archive entry: {}",
+                pair[0].archive_name
+            )));
         }
     }
 
-    // Add a README.md so reviewers know what each file is
-    let readme = format!(
-        "# Proof Pack — {slug}\n\n\
-         Generated by UmaDev v{version} at {ts}.\n\n\
-         ## Contents\n\n\
-         | File | Purpose |\n\
-         |---|---|\n\
-         | `output/{slug}-research.md` | Competitive research + discovery |\n\
-         | `output/{slug}-prd.md` | Product Requirements Document |\n\
-         | `output/{slug}-architecture.md` | System architecture + API surface |\n\
-         | `output/{slug}-uiux.md` | Design system (tokens, typography, components) |\n\
-         | `output/{slug}-execution-plan.md` | Task breakdown |\n\
-         | `output/{slug}-frontend-notes.md` | Frontend implementation checklist |\n\
-         | `output/{slug}-backend-notes.md` | Backend implementation checklist |\n\
-         | `output/{slug}-quality-gate.json` | Quality gate scores (per-check) |\n\
-         | `output/{slug}-quality-gate.md` | Human-readable quality report |\n\
-         | `output/{slug}-review-report.md` | PR-ready review checklist (CI/contract/acceptance/security/runtime/rollback) |\n\
-         | `output/{slug}-compliance-mapping.json` | SOC2/ISO27001/EU-AI-Act mapping |\n\
-         | `.umadev/audit/security-scan.json` | Pre-PR security scan: leaked-secret + dependency advisories |\n\
-         | `.umadev/audit/runtime-proof.json` | Runtime evidence: dev server booted + routes answered |\n\
-         | `.umadev/audit/deploy-proof.json` | Deploy evidence: platform + command + live URL + status |\n\
-         | `.umadev/audit/tool-calls.jsonl` | Audit trail |\n\
-         | `knowledge/design-systems/*.md` | Design system definitions |\n\
-         | `knowledge/seed-templates/*.md` | Page structure templates |\n\n\
-         ## How to review\n\n\
-         1. Start with `output/{slug}-prd.md` — verify the scope is correct\n\
-         2. Check `output/{slug}-architecture.md` — verify API surface makes sense\n\
-         3. Check `output/{slug}-uiux.md` — verify design tokens and dark mode\n\
-         4. Check `output/{slug}-quality-gate.md` — verify every check passed\n",
-        version = env!("CARGO_PKG_VERSION"),
-        ts = Utc::now().format("%Y-%m-%d %H:%M UTC"),
-    );
-    if zw.start_file("README.md", opts).is_ok() {
-        let _ = zw.write_all(readme.as_bytes());
+    static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_name = zip_path
+        .file_name()
+        .ok_or_else(|| proof_pack_error("proof-pack output path has no file name"))?;
+    let mut temp_name = file_name.to_os_string();
+    temp_name.push(format!(".{}.{}.part", std::process::id(), sequence));
+    let temp_path = zip_path.with_file_name(temp_name);
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+
+    let result = (|| -> io::Result<Vec<String>> {
+        let mut zw = zip::ZipWriter::new(file);
+        let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        let mut manifest = Vec::with_capacity(targets.len() + 1);
+        let mut total_written = readme_bytes;
+
+        zw.start_file("README.md", options)?;
+        zw.write_all(readme.as_bytes())?;
         manifest.push("README.md".to_string());
-    }
 
-    for t in &targets {
-        let rel = t.strip_prefix(project_root).unwrap_or(t.as_path());
-        let name = rel
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
-        if zw.start_file(&name, opts).is_err() {
-            continue;
-        }
-        if let Ok(mut f) = File::open(t) {
-            let mut buf = Vec::new();
-            if f.read_to_end(&mut buf).is_ok() {
-                let _ = zw.write_all(&buf);
+        let mut buffer = vec![0_u8; PROOF_PACK_COPY_BUFFER_BYTES].into_boxed_slice();
+        for target in &targets {
+            let mut source = open_proof_file(&root, target)?;
+            let current_len = source.metadata()?.len();
+            if current_len > limits.file_bytes {
+                return Err(proof_pack_error(format!(
+                    "proof-pack per-file byte budget exceeded for {}: {current_len} > {}",
+                    target.archive_name, limits.file_bytes
+                )));
             }
-        }
-        manifest.push(name);
-    }
-    zw.finish()?;
-    Ok(manifest)
-}
+            let current_total = total_written
+                .checked_add(current_len)
+                .ok_or_else(|| proof_pack_error("proof-pack total byte count overflow"))?;
+            if current_total > limits.total_bytes {
+                return Err(proof_pack_error(format!(
+                    "proof-pack total-byte budget exceeded before reading {}: {current_total} > {}",
+                    target.archive_name, limits.total_bytes
+                )));
+            }
 
-fn walk_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 6 {
-        return;
-    }
-    let Ok(rd) = fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        // No-follow: never pack a file reached THROUGH a symlink — a link inside
-        // the packed dirs could otherwise pull a file from OUTSIDE the workspace
-        // into the proof-pack zip, and a dir-symlink cycle could recurse.
-        match classify_no_follow(&p) {
-            EntryKind::Dir => walk_files(&p, out, depth + 1),
-            EntryKind::File => out.push(p),
-            EntryKind::Skip => {}
+            zw.start_file(&target.archive_name, options)?;
+            let mut file_written = 0_u64;
+            loop {
+                let read_bytes = source.read(buffer.as_mut())?;
+                if read_bytes == 0 {
+                    break;
+                }
+                let read = u64::try_from(read_bytes)
+                    .map_err(|_| proof_pack_error("proof-pack read byte count overflow"))?;
+                file_written = file_written
+                    .checked_add(read)
+                    .ok_or_else(|| proof_pack_error("proof-pack file byte count overflow"))?;
+                if file_written > limits.file_bytes {
+                    return Err(proof_pack_error(format!(
+                        "proof-pack per-file byte budget exceeded while reading {}: {file_written} > {}",
+                        target.archive_name, limits.file_bytes
+                    )));
+                }
+                total_written = total_written
+                    .checked_add(read)
+                    .ok_or_else(|| proof_pack_error("proof-pack total byte count overflow"))?;
+                if total_written > limits.total_bytes {
+                    return Err(proof_pack_error(format!(
+                        "proof-pack total-byte budget exceeded while reading {}: {total_written} > {}",
+                        target.archive_name, limits.total_bytes
+                    )));
+                }
+                zw.write_all(&buffer[..read_bytes])?;
+            }
+            manifest.push(target.archive_name.clone());
         }
+        let completed = zw.finish()?;
+        completed.sync_all()?;
+        drop(completed);
+        fs::rename(&temp_path, zip_path)?;
+        Ok(manifest)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
     }
+    result
 }
 
 /// Whether a state-changing endpoint is public-by-convention (so missing auth
@@ -2882,11 +3529,15 @@ const SECRET_LEAK_SKIP_DIRS: &[&str] = &[
 /// unreadable file is simply not scanned.
 fn scan_secret_leaks(project_root: &Path) -> (usize, Vec<String>) {
     let mut files: Vec<PathBuf> = Vec::new();
-    collect_code_files(project_root, &mut files, 0);
+    collect_code_files(project_root, &mut files);
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        MAX_PHASE_SCAN_TOTAL_BYTES,
+        MAX_PHASE_SCAN_FILE_BYTES,
+    );
     let mut scanned = 0usize;
     let mut offenders: Vec<String> = Vec::new();
     for p in &files {
-        let Ok(content) = fs::read_to_string(p) else {
+        let Some(content) = read_scan_file_with_budget(project_root, p, &mut budget) else {
             continue;
         };
         scanned += 1;
@@ -2910,12 +3561,27 @@ fn scan_secret_leaks(project_root: &Path) -> (usize, Vec<String>) {
 /// config / env / no-extension surface where secrets most often leak. Skips noise
 /// dirs. A `.env` FILE starts with a dot too, but the dot rule only skips DIRS,
 /// so `.env` is still collected below.
-fn collect_code_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 8 {
+fn collect_code_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut remaining_entries = MAX_SOURCE_SCAN_ENTRIES;
+    collect_code_files_inner(dir, out, 0, &mut remaining_entries);
+}
+
+fn collect_code_files_inner(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    remaining_entries: &mut usize,
+) {
+    if depth > 8 || out.len() >= MAX_SOURCE_SCAN_FILES || *remaining_entries == 0 {
         return;
     }
     let Ok(rd) = fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
+    for e in rd {
+        let Some(next_remaining) = remaining_entries.checked_sub(1) else {
+            return;
+        };
+        *remaining_entries = next_remaining;
+        let Ok(e) = e else { continue };
         let p = e.path();
         // No-follow: keep the secret-leak scan inside the workspace — a symlink
         // is never traversed, so it can't be steered OUT of the tree or cycled.
@@ -2925,7 +3591,7 @@ fn collect_code_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
                 if name.starts_with('.') || SECRET_LEAK_SKIP_DIRS.contains(&name) {
                     continue;
                 }
-                collect_code_files(&p, out, depth + 1);
+                collect_code_files_inner(&p, out, depth + 1, remaining_entries);
             }
             EntryKind::File => {
                 let code_ext = p
@@ -2944,6 +3610,9 @@ fn collect_code_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if code_ext || umadev_governance::is_config_secret_path(name) {
                     out.push(p);
+                    if out.len() >= MAX_SOURCE_SCAN_FILES {
+                        return;
+                    }
                 }
             }
             EntryKind::Skip => {}
@@ -2958,12 +3627,27 @@ const DESIGN_SCAN_EXT: &[&str] = &[
 
 /// Recursively collect UI/style source files for the design-quality scan
 /// (skips dot-dirs and the usual build/vendor dirs).
-fn collect_design_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 8 || out.len() > 800 {
+fn collect_design_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut remaining_entries = MAX_SOURCE_SCAN_ENTRIES;
+    collect_design_files_inner(dir, out, 0, &mut remaining_entries);
+}
+
+fn collect_design_files_inner(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    remaining_entries: &mut usize,
+) {
+    if depth > 8 || out.len() >= 800 || *remaining_entries == 0 {
         return;
     }
     let Ok(rd) = fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
+    for e in rd {
+        let Some(next_remaining) = remaining_entries.checked_sub(1) else {
+            return;
+        };
+        *remaining_entries = next_remaining;
+        let Ok(e) = e else { continue };
         let p = e.path();
         // No-follow: keep the design-quality scan inside the workspace — a
         // symlink is never traversed, so it can't escape the tree or cycle.
@@ -2973,12 +3657,15 @@ fn collect_design_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
                 if name.starts_with('.') || SECRET_LEAK_SKIP_DIRS.contains(&name) {
                     continue;
                 }
-                collect_design_files(&p, out, depth + 1);
+                collect_design_files_inner(&p, out, depth + 1, remaining_entries);
             }
             EntryKind::File => {
                 if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
                     if DESIGN_SCAN_EXT.contains(&ext) {
                         out.push(p);
+                        if out.len() >= 800 {
+                            return;
+                        }
                     }
                 }
             }
@@ -2993,7 +3680,7 @@ fn collect_design_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 /// drops the score hard; SOFT tells (buzzwords, bounce easing, …) nibble it.
 fn check_code_design_quality(project_root: &Path) -> (String, i32, String) {
     let mut files = Vec::new();
-    collect_design_files(project_root, &mut files, 0);
+    collect_design_files(project_root, &mut files);
     if files.is_empty() {
         return (
             "passed".to_string(),
@@ -3001,10 +3688,14 @@ fn check_code_design_quality(project_root: &Path) -> (String, i32, String) {
             "no UI source files to scan (offline / docs-only run)".to_string(),
         );
     }
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        MAX_PHASE_SCAN_TOTAL_BYTES,
+        MAX_PHASE_SCAN_FILE_BYTES,
+    );
     let (mut hard, mut soft) = (0usize, 0usize);
     let mut samples: Vec<String> = Vec::new();
     for f in files.iter().take(400) {
-        let Ok(content) = fs::read_to_string(f) else {
+        let Some(content) = read_scan_file_with_budget(project_root, f, &mut budget) else {
             continue;
         };
         let name = f
@@ -3061,7 +3752,7 @@ fn check_code_design_quality(project_root: &Path) -> (String, i32, String) {
 /// contract means the worker drifted off the chosen design system. Returns
 /// `(status, score, details)`.
 fn check_font_contract_conformance(project_root: &Path, uiux_path: &Path) -> (String, i32, String) {
-    let contract_text = fs::read_to_string(uiux_path).unwrap_or_default();
+    let contract_text = read_phase_artifact(project_root, uiux_path);
     if contract_text.trim().is_empty() {
         return (
             "passed".to_string(),
@@ -3078,10 +3769,14 @@ fn check_font_contract_conformance(project_root: &Path, uiux_path: &Path) -> (St
         );
     }
     let mut files = Vec::new();
-    collect_design_files(project_root, &mut files, 0);
+    collect_design_files(project_root, &mut files);
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        MAX_PHASE_SCAN_TOTAL_BYTES,
+        MAX_PHASE_SCAN_FILE_BYTES,
+    );
     let mut used: Vec<String> = Vec::new();
     for f in files.iter().take(400) {
-        if let Ok(content) = fs::read_to_string(f) {
+        if let Some(content) = read_scan_file_with_budget(project_root, f, &mut budget) {
             for font in umadev_governance::extract_fonts(&content) {
                 if !used.contains(&font) {
                     used.push(font);
@@ -3128,11 +3823,12 @@ fn check_font_contract_conformance(project_root: &Path, uiux_path: &Path) -> (St
 
 /// Pick `override` text when non-empty, else compute the deterministic fallback.
 fn write_preferring_richer(
+    project_root: &Path,
     path: &Path,
     stdout_text: &Option<String>,
     fallback: impl FnOnce() -> String,
 ) -> io::Result<()> {
-    let existing = fs::read_to_string(path).unwrap_or_default();
+    let existing = read_phase_artifact(project_root, path);
     let candidate = pick(stdout_text, fallback);
     let body = prefer_richer(&candidate, &existing);
     fs::write(path, body)
@@ -3152,7 +3848,7 @@ fn check_api_url_consistency(opts: &RunOptions, slug: &str) -> (String, i32, Str
         .project_root
         .join("output")
         .join(format!("{slug}-architecture.md"));
-    let arch_content = fs::read_to_string(&arch_path).unwrap_or_default();
+    let arch_content = read_phase_artifact(&opts.project_root, &arch_path);
 
     let mut api_paths: Vec<String> = Vec::new();
     for line in arch_content.lines() {
@@ -3184,11 +3880,11 @@ fn check_api_url_consistency(opts: &RunOptions, slug: &str) -> (String, i32, Str
         .project_root
         .join("output")
         .join(format!("{slug}-frontend-notes.md"));
-    let fe_content = fs::read_to_string(&fe_notes_path).unwrap_or_default();
+    let fe_content = read_phase_artifact(&opts.project_root, &fe_notes_path);
     let api_log = opts
         .project_root
         .join(".umadev/audit/frontend-api-calls.jsonl");
-    let api_log_content = fs::read_to_string(&api_log).unwrap_or_default();
+    let api_log_content = read_phase_log(&opts.project_root, &api_log).unwrap_or_default();
     // Also fold in the paths the contract extractor found in the REAL generated
     // frontend source tree (not just the worker-notes blob / audit log). UD-
     // CODE-003 is about the delivered code matching the architecture, so the
@@ -3236,8 +3932,8 @@ fn check_api_url_consistency(opts: &RunOptions, slug: &str) -> (String, i32, Str
 }
 
 /// Check if the UIUX document defines dark mode tokens.
-fn check_dark_mode_support(uiux_path: &Path) -> (String, i32, String) {
-    let content = fs::read_to_string(uiux_path).unwrap_or_default();
+fn check_dark_mode_support(project_root: &Path, uiux_path: &Path) -> (String, i32, String) {
+    let content = read_phase_artifact(project_root, uiux_path);
     let lower = content.to_ascii_lowercase();
     let has_dark = lower.contains("prefers-color-scheme")
         || lower.contains("dark mode")
@@ -3426,16 +4122,26 @@ fn check_prd_arch_alignment(prd_text: &str, arch_text: &str) -> (String, i32, St
 /// prohibition context (lines containing `no`, `without`, `not`, `avoid`,
 /// `never`, `forbid`, `ban`, `prohibit`). A doc saying `no "lorem ipsum"`
 /// is *enforcing* the rule, not violating it.
-fn count_slop_violations(output_dir: &Path) -> usize {
+fn count_slop_violations(project_root: &Path, output_dir: &Path) -> usize {
     let prohibitive = [
         "no ", "no\"", "no'", "without", "not ", "avoid", "never ", "forbid", "ban ", "prohibit",
     ];
     let is_prohibited =
         |line_lower: &str| -> bool { prohibitive.iter().any(|neg| line_lower.contains(neg)) };
     let mut count = 0;
-    if let Ok(rd) = fs::read_dir(output_dir) {
-        for entry in rd.flatten() {
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        MAX_PHASE_SCAN_TOTAL_BYTES,
+        MAX_PHASE_SCAN_FILE_BYTES,
+    );
+    if crate::bounded_fs::is_real_directory_beneath(project_root, output_dir) {
+        let Ok(rd) = fs::read_dir(output_dir) else {
+            return 0;
+        };
+        for entry in rd.take(MAX_SLOP_SCAN_ENTRIES).flatten() {
             let p = entry.path();
+            if !matches!(classify_no_follow(&p), EntryKind::File) {
+                continue;
+            }
             if p.extension().and_then(|s| s.to_str()) != Some("md") {
                 continue;
             }
@@ -3444,7 +4150,7 @@ fn count_slop_violations(output_dir: &Path) -> usize {
             if fname.contains("quality-gate") {
                 continue;
             }
-            if let Ok(content) = fs::read_to_string(&p) {
+            if let Some(content) = read_scan_file_with_budget(project_root, &p, &mut budget) {
                 for line in content.lines() {
                     let lower = line.to_ascii_lowercase();
                     let is_slop = lower.contains("lorem ipsum")
@@ -3464,8 +4170,8 @@ fn count_slop_violations(output_dir: &Path) -> usize {
 /// Score UIUX document completeness. Checks for key sections:
 /// color palette, typography, spacing, icon library, components,
 /// accessibility. Each section found = +16 points (max ~100).
-fn score_uiux_completeness(path: &Path) -> u32 {
-    let content = fs::read_to_string(path).unwrap_or_default();
+fn score_uiux_completeness(project_root: &Path, path: &Path) -> u32 {
+    let content = read_phase_artifact(project_root, path);
     let lower = content.to_ascii_lowercase();
     if lower.is_empty() {
         return 0;
@@ -3646,9 +4352,10 @@ fn audit(opts: &RunOptions, tool_name: &str, target: &Path, clause: &str, reason
 /// the index treats a missing dir as empty.
 pub fn knowledge_root(project_root: &Path) -> std::path::PathBuf {
     let local = project_root.join("knowledge");
-    let has_content = std::fs::read_dir(&local)
-        .map(|mut d| d.next().is_some())
-        .unwrap_or(false);
+    let has_content = crate::bounded_fs::is_real_directory_beneath(project_root, &local)
+        && std::fs::read_dir(&local)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
     if has_content {
         return local;
     }
@@ -3748,7 +4455,12 @@ pub fn missing_core_docs(opts: &RunOptions) -> Vec<String> {
     [CoreDoc::Prd, CoreDoc::Architecture, CoreDoc::Uiux]
         .into_iter()
         .map(|doc| doc.rel_name(&slug))
-        .filter(|rel| !opts.project_root.join(rel).is_file())
+        .filter(|rel| {
+            !crate::bounded_fs::is_real_file_beneath(
+                &opts.project_root,
+                &opts.project_root.join(rel),
+            )
+        })
         .collect()
 }
 
@@ -3959,6 +4671,28 @@ mod tests {
     use crate::test_support::NoBundledCorpus;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn multi_file_scan_budget_never_returns_a_partial_next_file() {
+        let tmp = TempDir::new().unwrap();
+        let first = tmp.path().join("first.txt");
+        let second = tmp.path().join("second.txt");
+        fs::write(&first, "abc").unwrap();
+        fs::write(&second, "de").unwrap();
+        let mut budget = crate::bounded_fs::Utf8ReadBudget::new(4, 3);
+
+        assert_eq!(
+            read_scan_file_with_budget(tmp.path(), &first, &mut budget).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(budget.remaining_bytes(), 1);
+        assert_eq!(
+            read_scan_file_with_budget(tmp.path(), &second, &mut budget),
+            None,
+            "the scanner must skip a complete over-budget file, never inspect a prefix"
+        );
+        assert_eq!(budget.remaining_bytes(), 1);
+    }
 
     #[test]
     fn knowledge_chunk_prompt_boundary_preserves_provenance_and_contains_hostile_text() {
@@ -4893,9 +5627,206 @@ mod tests {
         assert!(fs::metadata(zip).unwrap().len() > 0);
     }
 
+    fn proof_pack_test_paths(root: &Path) -> (PathBuf, PathBuf) {
+        let release = root.join("release");
+        fs::create_dir_all(&release).unwrap();
+        (release.join("proof.zip"), release)
+    }
+
+    #[test]
+    fn proof_pack_streams_regular_files_into_the_archive() {
+        let workspace = TempDir::new().unwrap();
+        let changes = workspace.path().join(".umadev/changes");
+        fs::create_dir_all(&changes).unwrap();
+        let payload = vec![b'x'; PROOF_PACK_COPY_BUFFER_BYTES * 3 + 17];
+        fs::write(changes.join("streamed.bin"), &payload).unwrap();
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+
+        let manifest = build_and_zip_proof_pack(workspace.path(), &zip_path, "demo").unwrap();
+        assert!(manifest
+            .iter()
+            .any(|entry| entry == ".umadev/changes/streamed.bin"));
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut packed = Vec::new();
+        archive
+            .by_name(".umadev/changes/streamed.bin")
+            .unwrap()
+            .read_to_end(&mut packed)
+            .unwrap();
+        assert_eq!(packed, payload);
+    }
+
+    #[test]
+    fn proof_pack_file_count_budget_fails_closed() {
+        let workspace = TempDir::new().unwrap();
+        let output = workspace.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("demo-prd.md"), "prd").unwrap();
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+        let error = build_and_zip_proof_pack_with_limits(
+            workspace.path(),
+            &zip_path,
+            "demo",
+            ProofPackLimits {
+                files: 1,
+                file_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+                depth: PROOF_PACK_MAX_DEPTH,
+                entries: PROOF_PACK_MAX_VISITED_ENTRIES,
+                directories: PROOF_PACK_MAX_DIRECTORIES,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("file-count budget exceeded"));
+        assert!(!zip_path.exists());
+    }
+
+    #[test]
+    fn proof_pack_per_file_budget_fails_closed() {
+        let workspace = TempDir::new().unwrap();
+        let output = workspace.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        let readme_len = u64::try_from(proof_pack_readme("demo").len()).unwrap();
+        fs::write(
+            output.join("demo-prd.md"),
+            vec![b'x'; usize::try_from(readme_len + 1).unwrap()],
+        )
+        .unwrap();
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+        let error = build_and_zip_proof_pack_with_limits(
+            workspace.path(),
+            &zip_path,
+            "demo",
+            ProofPackLimits {
+                files: 10,
+                file_bytes: readme_len,
+                total_bytes: u64::MAX,
+                depth: PROOF_PACK_MAX_DEPTH,
+                entries: PROOF_PACK_MAX_VISITED_ENTRIES,
+                directories: PROOF_PACK_MAX_DIRECTORIES,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("per-file byte budget exceeded"));
+        assert!(!zip_path.exists());
+    }
+
+    #[test]
+    fn proof_pack_total_byte_budget_fails_closed() {
+        let workspace = TempDir::new().unwrap();
+        let output = workspace.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("demo-prd.md"), "four").unwrap();
+        let readme_len = u64::try_from(proof_pack_readme("demo").len()).unwrap();
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+        let error = build_and_zip_proof_pack_with_limits(
+            workspace.path(),
+            &zip_path,
+            "demo",
+            ProofPackLimits {
+                files: 10,
+                file_bytes: readme_len,
+                total_bytes: readme_len + 3,
+                depth: PROOF_PACK_MAX_DEPTH,
+                entries: PROOF_PACK_MAX_VISITED_ENTRIES,
+                directories: PROOF_PACK_MAX_DIRECTORIES,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("total-byte budget exceeded"));
+        assert!(!zip_path.exists());
+    }
+
+    #[test]
+    fn proof_pack_visited_entry_budget_fails_closed_on_wide_empty_tree() {
+        let workspace = TempDir::new().unwrap();
+        let changes = workspace.path().join(".umadev/changes");
+        fs::create_dir_all(&changes).unwrap();
+        for index in 0..64 {
+            fs::create_dir(changes.join(format!("empty-{index}"))).unwrap();
+        }
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+        let error = build_and_zip_proof_pack_with_limits(
+            workspace.path(),
+            &zip_path,
+            "demo",
+            ProofPackLimits {
+                entries: 8,
+                directories: 128,
+                ..PROOF_PACK_LIMITS
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("visited-entry budget exceeded"));
+        assert!(!zip_path.exists());
+    }
+
+    #[test]
+    fn proof_pack_directory_budget_fails_closed_on_deep_empty_tree() {
+        let workspace = TempDir::new().unwrap();
+        let changes = workspace.path().join(".umadev/changes");
+        let mut cursor = changes.clone();
+        for index in 0..8 {
+            cursor = cursor.join(format!("level-{index}"));
+            fs::create_dir_all(&cursor).unwrap();
+        }
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+        let error = build_and_zip_proof_pack_with_limits(
+            workspace.path(),
+            &zip_path,
+            "demo",
+            ProofPackLimits {
+                depth: 64,
+                entries: 64,
+                directories: 3,
+                ..PROOF_PACK_LIMITS
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("directory-count budget exceeded"));
+        assert!(!zip_path.exists());
+    }
+
+    #[test]
+    fn proof_pack_depth_budget_fails_closed_on_deep_empty_tree() {
+        let workspace = TempDir::new().unwrap();
+        let changes = workspace.path().join(".umadev/changes");
+        fs::create_dir_all(changes.join("one/two/three")).unwrap();
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+        let error = build_and_zip_proof_pack_with_limits(
+            workspace.path(),
+            &zip_path,
+            "demo",
+            ProofPackLimits {
+                depth: 1,
+                entries: 64,
+                directories: 64,
+                ..PROOF_PACK_LIMITS
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("directory-depth budget exceeded"));
+        assert!(!zip_path.exists());
+    }
+
+    #[test]
+    fn proof_pack_rejects_archive_path_escape() {
+        let workspace = TempDir::new().unwrap();
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+        let error = build_and_zip_proof_pack(workspace.path(), &zip_path, "../escape").unwrap_err();
+        assert!(error.to_string().contains("escaping path component"));
+        assert!(!zip_path.exists());
+    }
+
     #[cfg(unix)]
     #[test]
-    fn walk_files_no_follow_symlinks_out_and_cycle_terminates() {
+    fn proof_pack_rejects_symlinks_in_included_trees() {
         use std::os::unix::fs::symlink;
         // OUTSIDE the workspace: a file that must NEVER be packed into the zip.
         let outside = TempDir::new().unwrap();
@@ -4904,28 +5835,32 @@ mod tests {
         // A packed subtree with a real file, an escaping dir symlink, and a
         // self-cycle symlink.
         let ws = TempDir::new().unwrap();
-        let sub = ws.path().join("changes");
+        let sub = ws.path().join(".umadev/changes");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("real.md"), "in-tree\n").unwrap();
         symlink(outside.path(), sub.join("escape")).unwrap();
         symlink(&sub, sub.join("loop")).unwrap();
+        let (zip_path, _) = proof_pack_test_paths(ws.path());
 
-        // Terminates: the escaping / cyclic dir symlink is never descended.
-        let mut out = Vec::new();
-        walk_files(&sub, &mut out, 0);
+        let error = build_and_zip_proof_pack(ws.path(), &zip_path, "demo").unwrap_err();
+        assert!(error.to_string().contains("contains a symlink"));
+        assert!(!zip_path.exists());
+    }
 
-        assert!(
-            out.iter().any(|p| p.ends_with("real.md")),
-            "in-tree file must still be packed: {out:?}"
-        );
-        assert!(
-            !out.iter().any(|p| p.ends_with("outside.md")),
-            "proof pack must not include files reached via an escaping symlink: {out:?}"
-        );
-        assert!(
-            !out.iter().any(|p| p.to_string_lossy().contains("escape")),
-            "walk must not traverse an escaping symlink: {out:?}"
-        );
+    #[cfg(unix)]
+    #[test]
+    fn proof_pack_rejects_special_files() {
+        use std::os::unix::net::UnixListener;
+
+        let workspace = TempDir::new().unwrap();
+        let changes = workspace.path().join(".umadev/changes");
+        fs::create_dir_all(&changes).unwrap();
+        let _socket = UnixListener::bind(changes.join("evidence.sock")).unwrap();
+        let (zip_path, _) = proof_pack_test_paths(workspace.path());
+
+        let error = build_and_zip_proof_pack(workspace.path(), &zip_path, "demo").unwrap_err();
+        assert!(error.to_string().contains("special entry"));
+        assert!(!zip_path.exists());
     }
 
     // ---- smart knowledge digest ----
@@ -5682,7 +6617,7 @@ mod tests {
     #[test]
     fn score_uiux_completeness_returns_zero_for_missing() {
         let tmp = TempDir::new().unwrap();
-        let score = score_uiux_completeness(&tmp.path().join("nonexistent.md"));
+        let score = score_uiux_completeness(tmp.path(), &tmp.path().join("nonexistent.md"));
         assert_eq!(score, 0);
     }
 
@@ -5778,7 +6713,13 @@ mod tests {
     #[test]
     fn evidence_check_works_with_missing_file() {
         let tmp = TempDir::new().unwrap();
-        let check = evidence_check("Test", "desc", &tmp.path().join("nonexistent.jsonl"), 1.0);
+        let check = evidence_check(
+            tmp.path(),
+            "Test",
+            "desc",
+            &tmp.path().join("nonexistent.jsonl"),
+            1.0,
+        );
         assert_eq!(check.status, "warning");
         assert_eq!(check.score, 60);
     }
@@ -5794,7 +6735,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            count_slop_violations(tmp.path()),
+            count_slop_violations(tmp.path(), tmp.path()),
             0,
             "prohibition context should not count"
         );
@@ -5809,7 +6750,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            count_slop_violations(tmp.path()) > 0,
+            count_slop_violations(tmp.path(), tmp.path()) > 0,
             "actual slop must be counted"
         );
     }
@@ -5825,7 +6766,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            count_slop_violations(tmp.path()),
+            count_slop_violations(tmp.path(), tmp.path()),
             0,
             "quality-gate report should be skipped"
         );

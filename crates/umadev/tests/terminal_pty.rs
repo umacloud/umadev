@@ -221,6 +221,54 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     writer.write_all(&[0x03]).expect("clear pasted draft");
     writer.flush().expect("flush whole-draft clear key");
 
+    // Windows terminals do not all deliver paste through bracketed-paste
+    // sequences. Exercise the legacy ConPTY/raw-key path as one burst too: an
+    // embedded CRLF must become a newline in the draft, never an Enter that
+    // submits the first `/quit` line. This is deliberately a native integration
+    // check rather than an App-level synthetic event test because timing and
+    // CRLF decoding are the contract under test.
+    #[cfg(windows)]
+    {
+        const RAW_PASTE_PROBE: &str = "/quit\r\n原始多行粘贴界";
+        writer
+            .write_all(RAW_PASTE_PROBE.as_bytes())
+            .expect("send raw ConPTY multiline paste burst");
+        writer.flush().expect("flush raw ConPTY paste burst");
+
+        let raw_paste_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let rendered_marker = captured
+                .lock()
+                .expect("lock terminal capture")
+                .as_slice()
+                .windows("界".len())
+                .any(|window| window == "界".as_bytes());
+            if rendered_marker {
+                break;
+            }
+            if Instant::now() >= raw_paste_deadline {
+                let bytes = captured.lock().expect("lock terminal capture").clone();
+                panic!(
+                    "UmaDev did not render a raw multiline paste through ConPTY: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            child
+                .try_wait()
+                .expect("poll after raw pasted newline")
+                .is_none(),
+            "a raw ConPTY paste newline submitted /quit instead of remaining atomic"
+        );
+
+        writer
+            .write_all(&[0x03])
+            .expect("clear raw multiline pasted draft");
+        writer.flush().expect("flush raw pasted-draft clear key");
+    }
+
     let command_capture_start = captured.lock().expect("lock terminal capture").len();
     const SUBMIT_SYNC: &str = "@";
     writer

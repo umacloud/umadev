@@ -6,6 +6,31 @@ use umadev_runtime::{
 };
 
 use crate::app::SubmittedTurn;
+use crate::local_command::LocalCommandResult;
+
+pub(super) const fn should_start_director(
+    route_source: Option<umadev_agent::RouteSource>,
+    uses_director_workflow: bool,
+    has_typed_attachments: bool,
+    execution_read_only: bool,
+) -> bool {
+    matches!(route_source, Some(umadev_agent::RouteSource::Brain))
+        && uses_director_workflow
+        && !has_typed_attachments
+        && !execution_read_only
+}
+
+pub(super) const fn should_run_routed_qc(
+    native_command: bool,
+    route_source: Option<umadev_agent::RouteSource>,
+    flagship_qc: bool,
+    execution_read_only: bool,
+) -> bool {
+    !native_command
+        && matches!(route_source, Some(umadev_agent::RouteSource::Brain))
+        && flagship_qc
+        && !execution_read_only
+}
 
 /// Terminal or interim signal from a model/host-routed turn.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -45,6 +70,8 @@ pub(super) enum RouteDecision {
     HostGitDone {
         result: std::result::Result<String, String>,
     },
+    /// A bounded TUI-owned shell/helper command settled.
+    LocalCommandDone(LocalCommandResult),
     /// A Plan/read-only Director entry performed no execution.
     RunNotExecuted,
     /// A routed turn failed to produce a usable reply.
@@ -77,6 +104,7 @@ impl RouteDecision {
                 | Self::AuthCancelled { .. }
                 | Self::AgenticDone { .. }
                 | Self::HostGitDone { .. }
+                | Self::LocalCommandDone(_)
                 | Self::RunNotExecuted
                 | Self::Failed(_)
                 | Self::RunPausedAtGate { .. }
@@ -86,5 +114,32 @@ impl RouteDecision {
                 | Self::GateQueryFailed { .. }
                 | Self::DeployDone { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_brain_build_never_transfers_to_director() {
+        assert!(!should_start_director(
+            Some(umadev_agent::RouteSource::Brain),
+            true,
+            false,
+            true,
+        ));
+        assert!(should_start_director(
+            Some(umadev_agent::RouteSource::Brain),
+            true,
+            false,
+            false,
+        ));
+        assert!(!should_run_routed_qc(
+            false,
+            Some(umadev_agent::RouteSource::Brain),
+            true,
+            true,
+        ));
     }
 }

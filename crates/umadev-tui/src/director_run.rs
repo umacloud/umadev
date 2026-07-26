@@ -125,6 +125,34 @@ pub(super) async fn run_director_loop(
             }
         };
 
+        // A persisted terminal review circuit is a caller-level failure receipt,
+        // not a resumable session. Settle it before isolation, workflow writes,
+        // firmware work, or any base login/ACP handshake; the inner resume guard
+        // remains as defense against stale direct callers and fallback.
+        if resume {
+            if let Some(reason) = umadev_agent::terminal_review_circuit_reason(&root) {
+                sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
+                let _ = route_tx.send(RouteDecision::Failed(reason));
+                return;
+            }
+        }
+
+        // A fresh run supersedes an operational-review pause, but settlement
+        // must use the OLD workflow identity. Do this before writing the new
+        // requirement/backend baseline; otherwise the old plan is reopened
+        // under a fabricated new ledger and its real Waiting task is orphaned.
+        if !resume && options.mode.executes() {
+            if let Err(error) = umadev_agent::cancel_operational_review_pause(
+                &root,
+                "superseded by an explicitly fresh run",
+            ) {
+                let reason = format!("parked operational review could not be superseded: {error}");
+                sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
+                let _ = route_tx.send(RouteDecision::Failed(reason));
+                return;
+            }
+        }
+
         // Isolate the build and snapshot its baseline before writes. Fail open when
         // isolation is unavailable; never auto-merge or push the resulting branch.
         let isolation = if resume {

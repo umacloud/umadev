@@ -10,6 +10,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
 
 // ─── Theme tokens — UmaDev brand cyan, dark + light aware ─────────────────
 // The brand color is cyan (#06b6d4 / #0891b2), chosen because it reads as
@@ -930,14 +931,14 @@ fn truncate_spans(spans: &[Span<'static>], max: usize) -> Vec<Span<'static>> {
             out.push(s.clone());
             used += w;
         } else {
-            // Take as many leading chars of this span as fit.
+            // Take as many leading visible grapheme clusters as fit.
             let mut piece = String::new();
-            for ch in s.content.chars() {
-                let cw = disp_width(&ch.to_string());
+            for grapheme in s.content.graphemes(true) {
+                let cw = disp_width(grapheme);
                 if used + cw > keep {
                     break;
                 }
-                piece.push(ch);
+                piece.push_str(grapheme);
                 used += cw;
             }
             if !piece.is_empty() {
@@ -1300,6 +1301,7 @@ pub(crate) struct MsgFoldCache {
 struct FoldEntry {
     lines: Vec<Line<'static>>,
     wraps: Vec<bool>,
+    join_space_counts: Vec<usize>,
     generation: u64,
 }
 
@@ -1333,22 +1335,33 @@ impl MsgFoldCache {
     /// because the caller mutates the assembled transcript in place (selection /
     /// search highlight, the scrollback row cap); it is still far cheaper than a
     /// markdown re-parse.
-    fn get(&mut self, key: u64) -> Option<(Vec<Line<'static>>, Vec<bool>)> {
+    fn get(&mut self, key: u64) -> Option<(Vec<Line<'static>>, Vec<bool>, Vec<usize>)> {
         let generation = self.generation;
         let entry = self.map.get_mut(&key)?;
         entry.generation = generation;
-        Some((entry.lines.clone(), entry.wraps.clone()))
+        Some((
+            entry.lines.clone(),
+            entry.wraps.clone(),
+            entry.join_space_counts.clone(),
+        ))
     }
 
     /// Store the freshly folded rows + their soft-wrap flags for `key`, touched
     /// this frame.
-    fn put(&mut self, key: u64, lines: Vec<Line<'static>>, wraps: Vec<bool>) {
+    fn put(
+        &mut self,
+        key: u64,
+        lines: Vec<Line<'static>>,
+        wraps: Vec<bool>,
+        join_space_counts: Vec<usize>,
+    ) {
         let generation = self.generation;
         self.map.insert(
             key,
             FoldEntry {
                 lines,
                 wraps,
+                join_space_counts,
                 generation,
             },
         );
@@ -1404,11 +1417,17 @@ pub(crate) struct TranscriptCache {
     lines: Vec<Line<'static>>,
     /// Per-row soft-wrap continuation flags, in lockstep with `lines`.
     wraps: Vec<bool>,
+    /// Source-space runs represented at soft boundaries, in lockstep with `lines`.
+    join_space_counts: Vec<usize>,
     /// The selection layer's logical text per row (gutter-stripped), derived
     /// once per rebuild instead of once per frame.
     rows: Vec<String>,
     /// The stripped leading-gutter width per row, in lockstep with `rows`.
     gutters: Vec<usize>,
+    /// The stripped leading-gutter Unicode scalar length per row. This is the
+    /// prefix shift for scalar-indexed selection/search painting; unlike
+    /// `gutters`, it counts a zero-width VS15 marker.
+    gutter_scalars: Vec<usize>,
     /// Signature the currently PUBLISHED `App::transcript_rows` (and gutters /
     /// wraps) prefix was built from; when it and `published_cut` both match,
     /// a frame only swaps the small volatile tail instead of re-publishing
@@ -1425,8 +1444,10 @@ impl TranscriptCache {
             sig: 0,
             lines: Vec::new(),
             wraps: Vec::new(),
+            join_space_counts: Vec::new(),
             rows: Vec::new(),
             gutters: Vec::new(),
+            gutter_scalars: Vec::new(),
             published_sig: 0,
             published_cut: 0,
         }
@@ -1585,20 +1606,27 @@ fn message_is_render_cacheable(app: &App, msg: &crate::app::ChatMessage, msg_idx
 /// applied to one message's rows so the result can be cached. Pure and
 /// width-local; folding per message then concatenating is identical to folding
 /// the concatenation, because the fold is independent per row.
-fn fold_rows(rows: &[RenderedRow], w: usize) -> (Vec<Line<'static>>, Vec<bool>) {
+fn fold_rows(rows: &[RenderedRow], w: usize) -> (Vec<Line<'static>>, Vec<bool>, Vec<usize>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut wraps: Vec<bool> = Vec::new();
+    let mut join_space_counts: Vec<usize> = Vec::new();
     for row in rows {
-        let folded = prefold_line_filled(&row.line, w, row.hang, row.spine, row.fill_bg);
+        let folded = prefold_line_with_boundaries(&row.line, w, row.hang, row.spine, row.fill_bg);
         // The first visual row of a logical line is a real line; every row AFTER it
         // is a soft-wrap continuation (joined on drag-copy). Keeps `lines`/`wraps`
         // in lockstep so the selection can rejoin a wrapped line into one.
-        for (i, l) in folded.into_iter().enumerate() {
+        for (i, (l, join_space_count)) in folded
+            .lines
+            .into_iter()
+            .zip(folded.join_space_counts)
+            .enumerate()
+        {
             lines.push(l);
             wraps.push(i > 0);
+            join_space_counts.push(join_space_count);
         }
     }
-    (lines, wraps)
+    (lines, wraps, join_space_counts)
 }
 
 /// Build + fold one transcript message into its visual rows, served from the
@@ -1613,7 +1641,7 @@ fn message_folded_lines(
     area: Rect,
     w: usize,
     theme_gen: u8,
-) -> (Vec<Line<'static>>, Vec<bool>) {
+) -> (Vec<Line<'static>>, Vec<bool>, Vec<usize>) {
     if message_is_render_cacheable(app, msg, msg_idx) {
         let key = msg_fold_key(msg, app.verbose, app.lang, w, theme_gen);
         if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
@@ -1621,11 +1649,12 @@ fn message_folded_lines(
                 return folded;
             }
         }
-        let (lines, wraps) = fold_rows(&build_message_rows(app, msg, msg_idx, area), w);
+        let (lines, wraps, join_space_counts) =
+            fold_rows(&build_message_rows(app, msg, msg_idx, area), w);
         if let Ok(mut cache) = app.msg_fold_cache.try_borrow_mut() {
-            cache.put(key, lines.clone(), wraps.clone());
+            cache.put(key, lines.clone(), wraps.clone(), join_space_counts.clone());
         }
-        (lines, wraps)
+        (lines, wraps, join_space_counts)
     } else {
         fold_rows(&build_message_rows(app, msg, msg_idx, area), w)
     }
@@ -2164,13 +2193,24 @@ fn highlight_block_synoptic(lang: &str, body: &str) -> Option<Vec<Vec<Span<'stat
 /// regex-free, allocation-light scan that recognises comments, string/char
 /// literals, numbers, keywords (per language family), type-ish identifiers
 /// (CamelCase / known primitives), and diff markers — emitting [`SynRole`] tags
-/// only. An unknown language falls back to plaintext with string/number/comment
-/// heuristics. Never panics (char-boundary safe). The cached entry point is
+/// only. An explicit plain-text fence bypasses tokenization entirely; an unknown
+/// language still falls back to lightweight string/number/comment heuristics.
+/// Never panics (char-boundary safe). The cached entry point is
 /// [`highlight_code_line`] (P3).
 fn highlight_code_line_uncached(line: &str, lang: Option<&str>) -> Vec<Span<'static>> {
+    let lang = lang.unwrap_or("");
+    // Explicit plain text must bypass the unknown-language guesses; otherwise a
+    // path segment such as `-function-` is miscolored as a language keyword.
+    if matches!(lang, "text" | "txt" | "plaintext" | "plain") {
+        return vec![role_span(
+            line.to_string(),
+            SynRole::Text,
+            Modifier::empty(),
+        )];
+    }
+
     // Diff hunks: color the whole line by its first column (but NOT the
     // `+++`/`---` file headers, which carry no add/del meaning).
-    let lang = lang.unwrap_or("");
     let diffish =
         matches!(lang, "diff" | "patch") || line.starts_with("+++") || line.starts_with("---");
     if diffish && line.starts_with('+') && !line.starts_with("+++") {
@@ -3297,7 +3337,7 @@ fn gate_choice_lines(app: &App, choice: &umadev_agent::GateChoice) -> Vec<Line<'
                 format!("  {marker} {n}. "),
                 Style::default().fg(marker_color),
             ),
-            Span::styled(truncate_display(label, 56), label_style),
+            Span::styled(compact_display(label), label_style),
         ]));
     }
     // Hint: how to drive the picker, and that free-text is still available.
@@ -3308,7 +3348,7 @@ fn gate_choice_lines(app: &App, choice: &umadev_agent::GateChoice) -> Vec<Line<'
     lines
 }
 
-fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
+fn plan_panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     // A live structured gate choice takes over the panel as a picker: the plan is
     // paused AT the gate, so the user's attention belongs on the decision. Shown
     // only while the input box is empty — the instant the user starts typing a
@@ -3317,7 +3357,7 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
     // Fail-open: a `None`/empty choice falls straight through to the plan/review.
     if app.input.is_empty() {
         if let Some(choice) = app.gate_choice.as_ref().filter(|c| c.is_renderable()) {
-            return gate_choice_lines(app, choice);
+            return clip_panel_lines(gate_choice_lines(app, choice), usize::from(width));
         }
     }
 
@@ -3390,7 +3430,7 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {mark} "), Style::default().fg(color)),
                     Span::styled(
-                        truncate_display(&step.title, 56),
+                        compact_display(&step.title),
                         if step.status == "done" {
                             Style::default().fg(theme::TEXT_MUTED())
                         } else if step.status == "active" {
@@ -3426,7 +3466,7 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {mark} "), Style::default().fg(color)),
                 Span::styled(
-                    truncate_display(&entry.content, 56),
+                    compact_display(&entry.content),
                     if status == "done" {
                         Style::default().fg(theme::TEXT_MUTED())
                     } else if status == "active" {
@@ -3502,7 +3542,7 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                     .blocking
                     .first()
                     .or_else(|| c.advisory.first())
-                    .map(|s| format!(": {}", truncate_display(s, 44)))
+                    .map(|s| format!(": {}", compact_display(s)))
                     .unwrap_or_default();
                 lines.push(Line::from(vec![
                     Span::styled(format!("  {mark} "), Style::default().fg(color)),
@@ -3527,7 +3567,7 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
                                 umadev_i18n::tf(
                                     app.lang,
                                     "plan.review.fix",
-                                    &[&truncate_display(fix, 56)],
+                                    &[&compact_display(fix)],
                                 )
                             ),
                             Style::default().fg(theme::TEXT_MUTED()),
@@ -3545,7 +3585,7 @@ fn plan_panel_lines(app: &App, _width: u16) -> Vec<Line<'static>> {
             }
         }
     }
-    lines
+    clip_panel_lines(lines, usize::from(width))
 }
 
 /// The checklist glyph + colour for a plan step status. Built from codepoints so
@@ -3581,7 +3621,7 @@ fn roster_seat_line(lang: umadev_i18n::Lang, seat: &RosterSeat) -> Line<'static>
     let mut spans = vec![
         Span::styled(format!("  {glyph} "), Style::default().fg(color)),
         Span::styled(
-            truncate_display(&seat_display_name(lang, &seat.role), 24),
+            compact_display(&seat_display_name(lang, &seat.role)),
             Style::default()
                 .fg(theme::TEXT())
                 .add_modifier(Modifier::BOLD),
@@ -3636,17 +3676,63 @@ fn review_block_glyph() -> String {
     char::from_u32(0x2717).unwrap_or('x').to_string()
 }
 
-/// Truncate a string to `max` DISPLAY characters with an ellipsis, so a long
-/// step title / finding can't overflow the panel row (the panel renders without
-/// `wrap`, mirroring the transcript's pre-fold model). Char-safe.
-fn truncate_display(s: &str, max: usize) -> String {
-    let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() <= max {
-        return one_line;
+/// Normalize model-owned panel text to one physical terminal row. Width clipping
+/// happens after styled spans are assembled, so prefixes and verdict chips share
+/// the same real column budget.
+fn compact_display(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Clip every styled row to the panel's actual width. The conservative CJK width
+/// table prevents a Chinese-locale terminal from hard-wrapping ambiguous glyphs;
+/// grapheme iteration keeps combining and ZWJ sequences atomic.
+fn clip_panel_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| clip_panel_line(line, width))
+        .collect()
+}
+
+fn clip_panel_line(mut line: Line<'static>, width: usize) -> Line<'static> {
+    let full_width: usize = line
+        .spans
+        .iter()
+        .map(|span| disp_width_cjk(span.content.as_ref()))
+        .sum();
+    if full_width <= width {
+        return line;
     }
-    let mut t: String = one_line.chars().take(max.saturating_sub(1)).collect();
-    t.push('…');
-    t
+
+    let ellipsis = "…";
+    let ellipsis_width = disp_width_cjk(ellipsis);
+    let content_budget = width.saturating_sub(ellipsis_width);
+    let mut used = 0usize;
+    let mut clipped = Vec::new();
+    'spans: for span in &line.spans {
+        let mut content = String::new();
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = disp_width_cjk(grapheme);
+            if used + grapheme_width > content_budget {
+                if !content.is_empty() {
+                    clipped.push(Span::styled(content, span.style));
+                }
+                break 'spans;
+            }
+            content.push_str(grapheme);
+            used += grapheme_width;
+        }
+        if !content.is_empty() {
+            clipped.push(Span::styled(content, span.style));
+        }
+    }
+    if width >= ellipsis_width {
+        clipped.push(Span::styled(
+            ellipsis.to_string(),
+            Style::default().fg(theme::TEXT_MUTED()),
+        ));
+    }
+    line.spans = clipped;
+    line
 }
 
 /// Render the live plan / team-review panel into `area`. A thin top rule
@@ -3665,10 +3751,9 @@ fn render_plan_panel(
     }
     let shown: Vec<Line<'static>> = if lines.len() > inner_rows {
         // Keep the head visible (title + first steps) and mark the clip with a
-        // HINT — the clipped rows (usually the tail of the team-review verdicts)
-        // are not lost: the full per-seat verdicts are in the transcript above,
-        // and `/plan` re-prints the checklist. Telling the user HOW is the whole
-        // point ("… +N" alone read as a dead end).
+        // HINT — the clipped rows are not lost: `/plan` writes every checklist,
+        // roster, and review row into the scrollable transcript. The panel itself
+        // is not scrollable, so never tell the user that wheel/up-arrow controls it.
         let mut v: Vec<Line<'static>> = lines
             .iter()
             .take(inner_rows.saturating_sub(1))
@@ -4909,13 +4994,21 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // Pushes one logical line's folded visual rows + their soft-wrap flags
     // (`wraps[i]` marks row `i` a continuation of row `i-1`, so a drag-copy can
     // rejoin a wrapped paragraph) keeping the two vectors in lockstep.
-    let push_wrapped =
-        |lines: &mut Vec<Line<'static>>, wraps: &mut Vec<bool>, rows: Vec<Line<'static>>| {
-            for (i, l) in rows.into_iter().enumerate() {
-                lines.push(l);
-                wraps.push(i > 0);
-            }
-        };
+    let push_wrapped = |lines: &mut Vec<Line<'static>>,
+                        wraps: &mut Vec<bool>,
+                        join_space_counts: &mut Vec<usize>,
+                        folded: PrefoldedLine| {
+        for (i, (l, join_space_count)) in folded
+            .lines
+            .into_iter()
+            .zip(folded.join_space_counts)
+            .enumerate()
+        {
+            lines.push(l);
+            wraps.push(i > 0);
+            join_space_counts.push(join_space_count);
+        }
+    };
     let rebuilt = asm.sig != sig;
     if rebuilt {
         // R1 — settled-message render cache: whole-invalidate on a width/theme
@@ -4928,6 +5021,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         }
         asm.lines.clear();
         asm.wraps.clear();
+        asm.join_space_counts.clear();
         // Fold the stable prefix into visual rows. Every message folds through
         // the settled-message cache, so only changed messages re-parse markdown.
         // Folding per message then concatenating is identical to folding the
@@ -4937,7 +5031,8 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             push_wrapped(
                 &mut asm.lines,
                 &mut asm.wraps,
-                prefold_line_filled(&l, w, 0, None, None),
+                &mut asm.join_space_counts,
+                prefold_line_with_boundaries(&l, w, 0, None, None),
             );
         }
         for (msg_idx, msg) in app.history.iter().take(stable_len).enumerate() {
@@ -4947,25 +5042,32 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 push_wrapped(
                     &mut asm.lines,
                     &mut asm.wraps,
-                    prefold_line_filled(&Line::from(""), w, 0, None, None),
+                    &mut asm.join_space_counts,
+                    prefold_line_with_boundaries(&Line::from(""), w, 0, None, None),
                 );
             }
-            let (lines, wraps) = message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
+            let (lines, wraps, join_space_counts) =
+                message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
             asm.lines.extend(lines);
             asm.wraps.extend(wraps);
+            asm.join_space_counts.extend(join_space_counts);
         }
         // Derive the selection layer's logical text + gutter per row ONCE per
         // rebuild (it used to be re-derived every frame — an O(total) String
         // build per wheel tick).
         asm.rows.clear();
         asm.gutters.clear();
+        asm.gutter_scalars.clear();
         asm.rows.reserve(asm.lines.len());
         asm.gutters.reserve(asm.lines.len());
+        asm.gutter_scalars.reserve(asm.lines.len());
         for l in &asm.lines {
-            let (logical, gutter) = logical_row_and_gutter(l);
+            let (logical, gutter, gutter_scalars) = logical_row_and_gutter(l);
             asm.rows.push(logical);
             asm.gutters.push(gutter);
+            asm.gutter_scalars.push(gutter_scalars);
         }
+        restore_soft_wrap_spaces(&mut asm.rows, &asm.join_space_counts);
         asm.sig = sig;
     }
 
@@ -4974,17 +5076,21 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // settled chat, so a pure scroll frame skips message work entirely.
     let mut tail_lines: Vec<Line<'static>> = Vec::new();
     let mut tail_wraps: Vec<bool> = Vec::new();
+    let mut tail_join_space_counts: Vec<usize> = Vec::new();
     for (msg_idx, msg) in app.history.iter().enumerate().skip(stable_len) {
         if msg_idx > 0 {
             push_wrapped(
                 &mut tail_lines,
                 &mut tail_wraps,
-                prefold_line_filled(&Line::from(""), w, 0, None, None),
+                &mut tail_join_space_counts,
+                prefold_line_with_boundaries(&Line::from(""), w, 0, None, None),
             );
         }
-        let (lines, wraps) = message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
+        let (lines, wraps, join_space_counts) =
+            message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
         tail_lines.extend(lines);
         tail_wraps.extend(wraps);
+        tail_join_space_counts.extend(join_space_counts);
     }
     if rebuilt {
         // Drop per-message cache entries not touched by this rebuild walk (a
@@ -5070,9 +5176,10 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // folding the concatenation — the fold is independent per row — so the
     // painted output is byte-for-byte unchanged.
     {
-        let (lines, wraps) = fold_rows(&rendered, w);
+        let (lines, wraps, join_space_counts) = fold_rows(&rendered, w);
         tail_lines.extend(lines);
         tail_wraps.extend(wraps);
+        tail_join_space_counts.extend(join_space_counts);
     }
     // Bound the retained scrollback by VISUAL rows (post-fold), keeping the most
     // recent `MAX_RENDER_ROWS`. Doing it here — not on logical lines up top —
@@ -5171,6 +5278,20 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // auto-sticks to the newest line (the default).
     let scroll_rows = hidden_above.saturating_sub(user_offset);
 
+    // The volatile tail is small and changes per frame; derive its selectable
+    // logical rows once, then restore any whitespace that existed at a soft
+    // word-wrap boundary but could not occupy a terminal cell at the edge.
+    let mut tail_rows: Vec<String> = Vec::with_capacity(tail_lines.len());
+    let mut tail_gutters: Vec<usize> = Vec::with_capacity(tail_lines.len());
+    let mut tail_gutter_scalars: Vec<usize> = Vec::with_capacity(tail_lines.len());
+    for line in &tail_lines {
+        let (logical, gutter, gutter_scalars) = logical_row_and_gutter(line);
+        tail_rows.push(logical);
+        tail_gutters.push(gutter);
+        tail_gutter_scalars.push(gutter_scalars);
+    }
+    restore_soft_wrap_spaces(&mut tail_rows, &tail_join_space_counts);
+
     // ── In-app text-selection layer (the Claude-Code drag-to-copy) ──
     // The published rows mirror the virtual `prefix + tail` transcript minus the
     // front-trim: their index IS the content-row coordinate the selection uses.
@@ -5187,13 +5308,14 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // published prefix Strings are left untouched and only the small volatile
     // tail is swapped; a content or trim change re-publishes in full from the
     // cached per-row text.
+    let kept_prefix = prefix_len.saturating_sub(cut);
+    let tail_skip = cut.saturating_sub(prefix_len);
     {
         let mut rows = app.transcript_rows.borrow_mut();
         let mut gutters = app.transcript_gutters.borrow_mut();
         let mut wrapsv = app.transcript_row_wraps.borrow_mut();
         // Prefix rows that survive the front-trim; `cut` beyond the prefix eats
         // into the tail instead.
-        let kept_prefix = prefix_len.saturating_sub(cut);
         if asm.published_sig != sig || asm.published_cut != cut {
             rows.clear();
             gutters.clear();
@@ -5218,11 +5340,14 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
         // per-row soft-wrap flags stay in lockstep so a drag-copy can rejoin a
         // wrapped logical line; any length skew fails open (a missing flag ⇒ a
         // real line break).
-        let tail_skip = cut.saturating_sub(prefix_len);
-        for (l, wr) in tail_lines.iter().zip(tail_wraps.iter()).skip(tail_skip) {
-            let (logical, gutter) = logical_row_and_gutter(l);
-            rows.push(logical);
-            gutters.push(gutter);
+        for ((logical, gutter), wr) in tail_rows
+            .iter()
+            .zip(tail_gutters.iter())
+            .zip(tail_wraps.iter())
+            .skip(tail_skip)
+        {
+            rows.push(logical.clone());
+            gutters.push(*gutter);
             wrapsv.push(*wr);
         }
     }
@@ -5262,6 +5387,19 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             tail_lines[v - prefix_len].clone()
         });
     }
+    // Highlight coordinates are scalar-indexed, unlike mouse display columns.
+    // Materialize only the visible prefix lengths so pure scroll/animation
+    // frames stay O(viewport), not O(retained transcript).
+    let visible_gutter_scalars: Vec<usize> = (win_start..win_end)
+        .map(|row| {
+            let virtual_row = row + cut;
+            if virtual_row < prefix_len {
+                asm.gutter_scalars[virtual_row]
+            } else {
+                tail_gutter_scalars[virtual_row - prefix_len]
+            }
+        })
+        .collect();
 
     // Re-style the selected span(s) with the selection background. Only the
     // visible rows inside the normalized selection range are rebuilt; everything
@@ -5280,12 +5418,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 let mut sel = sel;
                 sel.anchor.0 = a.unwrap_or(0);
                 sel.cursor.0 = c.unwrap_or(0);
-                apply_selection_highlight(
-                    &mut visible,
-                    &sel,
-                    &app.transcript_gutters.borrow(),
-                    win_start,
-                );
+                apply_selection_highlight(&mut visible, &sel, &visible_gutter_scalars, win_start);
             }
         }
     }
@@ -5299,7 +5432,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             apply_search_highlight(
                 &mut visible,
                 search,
-                &app.transcript_gutters.borrow(),
+                &visible_gutter_scalars,
                 prev_cut,
                 cut,
                 win_start,
@@ -5434,34 +5567,35 @@ fn pad_to_width(s: &str, width: usize) -> String {
 /// Truncate `s` to at most `max` WORST-CASE display columns (ambiguous = 2,
 /// see [`disp_width_cjk`]), char-aligned so a glyph is never split. Used by
 /// the meta row's right-pinned status so it can never physically overflow a
-/// terminal that renders `·` / `—` two cells wide.
+/// terminal that renders `·` / `—` two cells wide. Extended graphemes remain
+/// atomic even when their scalars span a ZWJ/skin-tone sequence.
 fn truncate_to_width_cjk(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut col = 0usize;
-    for c in s.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let cw = unicode_width::UnicodeWidthStr::width_cjk(grapheme);
         if col + cw > max {
             break;
         }
-        out.push(c);
+        out.push_str(grapheme);
         col += cw;
     }
     out
 }
 
-/// Truncate `s` to at most `max` display columns (CJK = 2), char-aligned so a
-/// wide glyph is never split. Returns the kept prefix; the caller decides
+/// Truncate `s` to at most `max` display columns (CJK = 2), grapheme-aligned so
+/// a visible glyph is never split. Returns the kept prefix; the caller decides
 /// whether to add an ellipsis. Used by the status row so a long CJK phase
 /// string can never overflow a narrow terminal.
 fn truncate_to_width(s: &str, max: usize) -> String {
     let mut out = String::new();
     let mut col = 0usize;
-    for c in s.chars() {
-        let cw = char_width(c);
+    for grapheme in s.graphemes(true) {
+        let cw = disp_width(grapheme);
         if col + cw > max {
             break;
         }
-        out.push(c);
+        out.push_str(grapheme);
         col += cw;
     }
     out
@@ -5476,18 +5610,18 @@ pub(crate) fn wrap_input_rows(text: &str, width: u16) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut col = 0usize;
-    for c in text.chars() {
-        if c == '\n' {
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\n" {
             rows.push(std::mem::take(&mut cur));
             col = 0;
             continue;
         }
-        let cw = char_width(c);
+        let cw = disp_width(grapheme);
         if col + cw > w && col > 0 {
             rows.push(std::mem::take(&mut cur));
             col = 0;
         }
-        cur.push(c);
+        cur.push_str(grapheme);
         col += cw;
     }
     rows.push(cur);
@@ -5510,22 +5644,38 @@ pub(crate) fn caret_in_wrapped(text: &str, cursor: usize, width: u16) -> (u16, u
     let w = width.max(1) as usize;
     let mut row = 0usize;
     let mut col = 0usize;
-    for c in text.chars().take(cursor) {
-        if c == '\n' {
+    let mut consumed = 0usize;
+    for grapheme in text.graphemes(true) {
+        let grapheme_chars = grapheme.chars().count();
+        if consumed.saturating_add(grapheme_chars) > cursor {
+            break;
+        }
+        if grapheme == "\n" {
             row += 1;
             col = 0;
+            consumed += grapheme_chars;
             continue;
         }
-        let cw = char_width(c);
+        let cw = disp_width(grapheme);
         if col + cw > w && col > 0 {
             row += 1;
             col = 0;
         }
         col += cw;
+        consumed += grapheme_chars;
     }
     // Row is exactly full and more text follows the caret → the next glyph wraps,
     // so the caret shows at the head of the next row instead of on the border.
-    if col >= w && text.chars().nth(cursor).is_some_and(|c| c != '\n') {
+    let has_more_non_newline = text
+        .graphemes(true)
+        .scan(0usize, |start, grapheme| {
+            let here = *start;
+            *start += grapheme.chars().count();
+            Some((here, *start, grapheme))
+        })
+        .find(|(_, end, _)| *end > cursor)
+        .is_some_and(|(_, _, grapheme)| grapheme != "\n");
+    if col >= w && has_more_non_newline {
         row += 1;
         col = 0;
     }
@@ -5542,13 +5692,13 @@ pub(crate) fn wrapped_row_count(text: &str, width: u16) -> u16 {
     let w = width.max(1) as usize;
     let mut rows = 1usize;
     let mut col = 0usize;
-    for c in text.chars() {
-        if c == '\n' {
+    for grapheme in text.graphemes(true) {
+        if grapheme == "\n" {
             rows += 1;
             col = 0;
             continue;
         }
-        let cw = char_width(c);
+        let cw = disp_width(grapheme);
         if col + cw > w && col > 0 {
             rows += 1;
             col = 0;
@@ -5571,18 +5721,19 @@ pub(crate) fn offset_at_wrapped(text: &str, target_row: u16, target_col: u16, wi
     let mut row = 0usize;
     let mut col = 0usize;
     let mut idx = 0usize; // char index of the glyph we're about to place
-    for c in text.chars() {
-        if c == '\n' {
+    for grapheme in text.graphemes(true) {
+        let grapheme_chars = grapheme.chars().count();
+        if grapheme == "\n" {
             if row == target_row {
                 // Caret can sit at end-of-line before a hard newline.
                 return idx;
             }
             row += 1;
             col = 0;
-            idx += 1;
+            idx += grapheme_chars;
             continue;
         }
-        let cw = char_width(c);
+        let cw = disp_width(grapheme);
         if col + cw > w && col > 0 {
             if row == target_row {
                 // Soft-wrap: the target row ended just before this glyph.
@@ -5591,11 +5742,11 @@ pub(crate) fn offset_at_wrapped(text: &str, target_row: u16, target_col: u16, wi
             row += 1;
             col = 0;
         }
-        if row == target_row && col >= target_col {
+        if row == target_row && (col >= target_col || col.saturating_add(cw) > target_col) {
             return idx;
         }
         col += cw;
-        idx += 1;
+        idx += grapheme_chars;
     }
     // Reached the end of the text: the caret clamps to the very end (which is
     // also the end of the final row, where any target_col past the content lands).
@@ -5740,6 +5891,30 @@ fn emit_run(cur: &mut Vec<Span<'static>>, run: &[(char, Style)]) {
     }
 }
 
+/// One user-perceived glyph with the original per-scalar styles retained.
+/// Folding operates on these units so a ZWJ emoji, flag, skin-tone sequence, or
+/// base+combining-mark cluster can never be divided between terminal rows.
+struct StyledGrapheme {
+    chars: Vec<(char, Style)>,
+    width: usize,
+}
+
+impl StyledGrapheme {
+    fn is_space(&self) -> bool {
+        self.chars.len() == 1 && self.chars[0].0 == ' '
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PrefoldedLine {
+    lines: Vec<Line<'static>>,
+    /// Number of source spaces represented by the soft boundary before visual
+    /// row `i`. Painted trailing spaces are trimmed from the logical copy cache,
+    /// so the cache restores the complete run on the previous logical row.
+    join_space_counts: Vec<usize>,
+}
+
+#[cfg(test)]
 fn prefold_line_filled(
     line: &Line<'static>,
     width: usize,
@@ -5747,19 +5922,35 @@ fn prefold_line_filled(
     spine: Option<Color>,
     fill_bg: Option<Color>,
 ) -> Vec<Line<'static>> {
+    prefold_line_with_boundaries(line, width, hang, spine, fill_bg).lines
+}
+
+fn prefold_line_with_boundaries(
+    line: &Line<'static>,
+    width: usize,
+    hang: usize,
+    spine: Option<Color>,
+    fill_bg: Option<Color>,
+) -> PrefoldedLine {
     let w = width.max(1);
     let hang = hang.min(w.saturating_sub(1)); // never indent past the usable width
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut join_space_counts: Vec<usize> = Vec::new();
     // Accumulator for the current visual row: the spans built so far + the
     // display column we've filled. The first row starts at column 0; every
     // continuation row starts after the hanging indent.
     let mut cur: Vec<Span<'static>> = Vec::new();
     let mut col = 0usize;
     let mut started_continuation = false;
+    let mut current_join_space_count = 0usize;
 
     // Right-pad one finished row to `w` columns with bg-tinted spaces, then push
     // it. When `fill_bg` is None this just pushes the row unchanged.
-    let push_padded = |out: &mut Vec<Line<'static>>, mut row: Vec<Span<'static>>, filled: usize| {
+    let push_padded = |out: &mut Vec<Line<'static>>,
+                       joins: &mut Vec<usize>,
+                       mut row: Vec<Span<'static>>,
+                       filled: usize,
+                       join_space_count: usize| {
         if let Some(bg) = fill_bg {
             if filled < w {
                 row.push(Span::styled(
@@ -5769,6 +5960,7 @@ fn prefold_line_filled(
             }
         }
         out.push(Line::from(row));
+        joins.push(join_space_count);
     };
 
     // Emit the accumulated row and start a fresh continuation row (with hang).
@@ -5776,10 +5968,17 @@ fn prefold_line_filled(
     // glyph; the rest is padding. CJK-safe: the glyph is one display column and
     // the pad is plain spaces, so the total indent is exactly `hang` columns.
     macro_rules! flush_row {
-        () => {{
-            push_padded(&mut out, std::mem::take(&mut cur), col);
+        ($join_space_count:expr) => {{
+            push_padded(
+                &mut out,
+                &mut join_space_counts,
+                std::mem::take(&mut cur),
+                col,
+                current_join_space_count,
+            );
             col = 0;
             started_continuation = true;
+            current_join_space_count = $join_space_count;
             if hang > 0 {
                 if let Some(bar) = spine {
                     let mut g = String::with_capacity(2);
@@ -5796,11 +5995,11 @@ fn prefold_line_filled(
         }};
     }
 
-    // Flatten to (char, style) so we can wrap at WORD boundaries (a space, or
-    // either side of a wide/CJK char) instead of mid-word. A run of narrow,
-    // non-space chars is one unbreakable "word"; a space or a wide char is its own
-    // unit. An over-wide word (or a CJK run) still hard-breaks char-by-char, so a
-    // single long token can never overflow. Per-char style is preserved.
+    // Flatten the spans, then segment the WHOLE row into extended grapheme
+    // clusters. Segmenting after concatenation is load-bearing: a base scalar
+    // and its combining mark (or an emoji + ZWJ continuation) may arrive in
+    // adjacent styled spans. Each cluster keeps the source scalar styles but is
+    // placed atomically, so no visual row can contain half a visible glyph.
     let mut chars: Vec<(char, Style)> = Vec::new();
     for span in &line.spans {
         let st = span.style;
@@ -5815,58 +6014,90 @@ fn prefold_line_filled(
             chars.push((ch, st));
         }
     }
+    let flat: String = chars.iter().map(|(ch, _)| *ch).collect();
+    let mut graphemes: Vec<StyledGrapheme> = Vec::new();
+    let mut char_offset = 0usize;
+    for grapheme in flat.graphemes(true) {
+        let n = grapheme.chars().count();
+        let styled = chars[char_offset..char_offset + n].to_vec();
+        graphemes.push(StyledGrapheme {
+            chars: styled,
+            width: disp_width(grapheme),
+        });
+        char_offset += n;
+    }
     let row_floor = |started: bool| if started { hang } else { 0 };
     let usable_word = w.saturating_sub(hang).max(1);
     let mut i = 0usize;
-    while i < chars.len() {
-        let (ch, st) = chars[i];
-        if ch != ' ' && char_width(ch) == 1 {
-            // Gather a word: a run of narrow, non-space chars.
+    let mut trailing_source_spaces = 0usize;
+    while i < graphemes.len() {
+        if !graphemes[i].is_space() && graphemes[i].width == 1 {
+            // Gather a word: a run of narrow, non-space grapheme clusters.
             let start = i;
-            while i < chars.len() && chars[i].0 != ' ' && char_width(chars[i].0) == 1 {
+            while i < graphemes.len() && !graphemes[i].is_space() && graphemes[i].width == 1 {
                 i += 1;
             }
-            let word = &chars[start..i];
-            let ww = word.len(); // all narrow → 1 col each
+            let word = &graphemes[start..i];
+            let ww = word.len(); // all units are one display cell
             if col + ww <= w {
-                emit_run(&mut cur, word);
+                for unit in word {
+                    emit_run(&mut cur, &unit.chars);
+                }
                 col += ww;
+                trailing_source_spaces = 0;
             } else if ww <= usable_word && col > row_floor(started_continuation) {
                 // The whole word fits on a fresh row — wrap before it (no mid-word).
-                flush_row!();
-                emit_run(&mut cur, word);
+                flush_row!(trailing_source_spaces);
+                for unit in word {
+                    emit_run(&mut cur, &unit.chars);
+                }
                 col += ww;
+                trailing_source_spaces = 0;
             } else {
-                // Over-wide word — hard-break char by char (the only safe option).
-                for &(c2, s2) in word {
+                // Over-wide word — hard-break by grapheme (never by scalar).
+                for unit in word {
                     if col + 1 > w && col > row_floor(started_continuation) {
-                        flush_row!();
+                        flush_row!(trailing_source_spaces);
                     }
-                    cur.push(Span::styled(c2.to_string(), s2));
+                    emit_run(&mut cur, &unit.chars);
                     col += 1;
+                    trailing_source_spaces = 0;
                 }
             }
-        } else if ch == ' ' {
+        } else if graphemes[i].is_space() {
+            let st = graphemes[i].chars[0].1;
+            trailing_source_spaces = trailing_source_spaces.saturating_add(1);
             // A space: drop it when it would lead a freshly-wrapped row, else place.
             if col + 1 > w && col > row_floor(started_continuation) {
-                flush_row!();
+                flush_row!(trailing_source_spaces);
             } else if !(started_continuation && col == hang) {
                 cur.push(Span::styled(" ".to_string(), st));
                 col += 1;
+            } else {
+                current_join_space_count = trailing_source_spaces;
             }
             i += 1;
         } else {
-            // A wide / CJK char — break before it if the row is full, then place.
-            let cw = char_width(ch);
+            // A wide/CJK/emoji grapheme — break before the WHOLE cluster if the
+            // row is full, then place every styled scalar atomically.
+            let unit = &graphemes[i];
+            let cw = unit.width;
             if col + cw > w && col > row_floor(started_continuation) {
-                flush_row!();
+                flush_row!(trailing_source_spaces);
             }
-            cur.push(Span::styled(ch.to_string(), st));
+            emit_run(&mut cur, &unit.chars);
             col += cw;
+            trailing_source_spaces = 0;
             i += 1;
         }
     }
-    push_padded(&mut out, cur, col);
+    push_padded(
+        &mut out,
+        &mut join_space_counts,
+        cur,
+        col,
+        current_join_space_count,
+    );
     // Keep every zero-width combining mark / variation selector welded to the
     // base char it modifies. The fold flattens spans to chars and re-emits, so a
     // mark (e.g. the marker's VS15 text-presentation pin, or a user's accent)
@@ -5878,7 +6109,10 @@ fn prefold_line_filled(
     for line in &mut out {
         coalesce_combining_marks(&mut line.spans);
     }
-    out
+    PrefoldedLine {
+        lines: out,
+        join_space_counts,
+    }
 }
 
 /// Fold every non-empty **zero display-width** span (a combining mark / variation
@@ -5901,8 +6135,59 @@ fn coalesce_combining_marks(spans: &mut Vec<Span<'static>>) {
     }
 }
 
-/// Reduce one painted (decorated) transcript row to the LOGICAL text a drag-copy
-/// should yield, plus the leading-gutter display width that was stripped.
+/// Restore every source space represented by a soft boundary on the row before
+/// it. The logical-row cleaner trims painted trailing spaces, while the renderer
+/// cannot paint overflow or leading continuation spaces; drag-copy nevertheless
+/// must reproduce the source exactly. Appending only to the cached logical row
+/// keeps the visible continuation row's mouse geometry intact.
+fn restore_soft_wrap_spaces(rows: &mut [String], join_space_counts: &[usize]) {
+    for i in 1..rows.len().min(join_space_counts.len()) {
+        rows[i - 1].extend(std::iter::repeat_n(' ', join_space_counts[i]));
+    }
+}
+
+/// Count source indentation inside a fenced-code row. The Markdown renderer
+/// emits two separate code-background runs: a decoration-only gutter with no
+/// foreground, followed by syntax-colored source text. The legacy copy cleaner
+/// flattened both and mistook source indentation for UI gutter. Recovering the
+/// latter lets us keep the existing visual-gutter cleanup without changing
+/// selection geometry for every other row type.
+fn fenced_code_source_indent(line: &Line<'static>) -> usize {
+    let mut saw_decoration = false;
+    let mut source_started = false;
+    let mut indent = 0usize;
+    for span in &line.spans {
+        let is_code = span.style.bg == Some(theme::CODE_BG());
+        if !is_code {
+            if saw_decoration || source_started {
+                break;
+            }
+            continue;
+        }
+        if span.style.fg.is_none() && span.content.chars().all(|ch| ch == ' ') {
+            saw_decoration = true;
+            continue;
+        }
+        if saw_decoration {
+            source_started = true;
+            for ch in span.content.chars() {
+                if ch == ' ' {
+                    indent += 1;
+                } else {
+                    return indent;
+                }
+            }
+        }
+    }
+    if source_started {
+        indent
+    } else {
+        0
+    }
+}
+
+/// Reduce one painted transcript row to the logical text a drag-copy should
+/// yield, plus both coordinate-space measurements of the stripped gutter.
 ///
 /// The painted row is `[gutter][content][trailing bg padding]`, where the gutter
 /// is the role-spine glyph (`▎`) plus its hang-indent spaces (repainted down
@@ -5911,24 +6196,29 @@ fn coalesce_combining_marks(spans: &mut Vec<Span<'static>>) {
 /// so copying them pollutes the clipboard (the just-shipped selection feature's
 /// defect): spurious `▎` / indent prefixes and runs of trailing spaces.
 ///
-/// This returns `(logical, gutter)`:
+/// This returns `(logical, display_width, scalar_len)`:
 /// - `logical` = the content with the leading spine-glyph gutter removed and any
 ///   trailing whitespace trimmed (so a wrapped continuation row and a user-bubble
 ///   row both copy clean — no `▎`, no leading indent, no trailing-space padding).
-/// - `gutter` = the display columns dropped from the front, so the caller can map
-///   a screen column to the right logical char index (`screen_to_content`
-///   subtracts it) and paint the highlight on the DECORATED line (whose char
-///   indices are shifted right by exactly this much).
+/// - `display_width` = terminal cells dropped from the front. Mouse mapping
+///   subtracts this value because pointer coordinates are display columns.
+/// - `scalar_len` = Rust `char`s dropped from the front. Selection and search
+///   highlighting add this value because their ranges index Unicode scalars.
+///
+/// The two values intentionally differ for `glyph + U+FE0E + space`: VS15 has
+/// zero display width but still occupies one scalar index in the decorated row.
 ///
 /// The gutter is detected by its leading glyph: the role spine `▎`, OR — on the
 /// FIRST row of a turn — the assistant seat marker (`⏺`/`●`), OR — on a tool row
 /// — a status glyph (`●`/`○`/spinner), followed by an optional zero-width VS15
 /// pin and the run of hang spaces after it. A row with no such glyph has gutter 0
 /// and only its trailing whitespace trimmed. Pure + fail-open.
-fn logical_row_and_gutter(line: &Line<'static>) -> (String, usize) {
+fn logical_row_and_gutter(line: &Line<'static>) -> (String, usize, usize) {
+    let source_indent = fenced_code_source_indent(line);
     let full: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     let mut chars = full.chars().peekable();
-    let mut gutter = 0usize;
+    let mut gutter_display_width = 0usize;
+    let mut gutter_scalar_len = 0usize;
     // A 2-column left gutter leads with a gutter glyph, an OPTIONAL zero-width
     // VS15 (`U+FE0E`) text-presentation pin the assistant marker carries, then AT
     // LEAST one hang space. Requiring the trailing space keeps a content line that
@@ -5954,20 +6244,28 @@ fn logical_row_and_gutter(line: &Line<'static>) -> (String, usize) {
         // Drop the gutter glyph, the optional VS15 (zero display width — no gutter
         // cost), and the hang-indent spaces that follow.
         let g = chars.next().unwrap_or(' ');
-        gutter += char_width(g);
+        gutter_display_width += char_width(g);
+        gutter_scalar_len += 1;
         if chars.peek() == Some(&'\u{FE0E}') {
             chars.next();
+            gutter_scalar_len += 1;
         }
         while chars.peek() == Some(&' ') {
             chars.next();
-            gutter += 1;
+            gutter_display_width += 1;
+            gutter_scalar_len += 1;
         }
     }
     let logical: String = chars.collect();
     // Trim trailing whitespace (the user-bubble bg padding, and any incidental
     // trailing spaces) — never copied.
-    let logical = logical.trim_end().to_string();
-    (logical, gutter)
+    let mut logical = logical.trim_end().to_string();
+    if source_indent > 0 {
+        logical.insert_str(0, &" ".repeat(source_indent));
+        gutter_display_width = gutter_display_width.saturating_sub(source_indent);
+        gutter_scalar_len = gutter_scalar_len.saturating_sub(source_indent);
+    }
+    (logical, gutter_display_width, gutter_scalar_len)
 }
 
 /// True for the single-column glyphs that can lead a transcript row's 2-column
@@ -6005,17 +6303,22 @@ fn is_gutter_glyph(c: char) -> bool {
 /// as middle rows). Fail-open: an out-of-range row index is skipped, never a
 /// panic.
 ///
-/// `gutters[i]` is the leading-gutter width stripped from cached row `i` in
-/// CONTENT coordinates (see [`logical_row_and_gutter`]); the selection columns
-/// are in LOGICAL coordinates, so each is shifted right by the row's gutter to
-/// index the decorated line.
+/// `gutter_scalars[i]` is the leading-gutter Unicode scalar length for visible
+/// row `win_start + i` (see [`logical_row_and_gutter`]); selection columns are
+/// shifted by that scalar prefix to index the decorated line. Terminal display
+/// width is deliberately not used here.
 fn apply_selection_highlight(
     folded: &mut [Line<'static>],
     sel: &crate::selection::Selection,
-    gutters: &[usize],
+    gutter_scalars: &[usize],
     win_start: usize,
 ) {
-    let g = |row: usize| gutters.get(row).copied().unwrap_or(0);
+    let g = |row: usize| {
+        row.checked_sub(win_start)
+            .and_then(|local| gutter_scalars.get(local))
+            .copied()
+            .unwrap_or(0)
+    };
     let shift = |row: usize, col: usize| col.saturating_add(g(row));
     let ((sr, sc), (er, ec)) = sel.normalized();
     let sc = shift(sr, sc);
@@ -6087,7 +6390,7 @@ fn highlight_row(line: &Line<'static>, from: usize, to: usize) -> Line<'static> 
 
 /// Paint the in-transcript search matches (Feature B) onto the already-folded
 /// rows, mirroring [`apply_selection_highlight`]: each match's logical char span
-/// is shifted right by its row's gutter width and washed — the FOCUSED match
+/// is shifted right by its row's gutter scalar length and washed — the FOCUSED match
 /// (`search.current`) with [`theme::MATCH_CUR_BG`], every other match with
 /// [`theme::SELECTION_BG`]. `folded`'s first row sits at content-row coordinate
 /// `win_start` (`0` when the whole transcript is passed); a match outside the
@@ -6096,7 +6399,7 @@ fn highlight_row(line: &Line<'static>, from: usize, to: usize) -> Line<'static> 
 fn apply_search_highlight(
     folded: &mut [Line<'static>],
     search: &crate::app::SearchState,
-    gutters: &[usize],
+    gutter_scalars: &[usize],
     prev_cut: usize,
     cut: usize,
     win_start: usize,
@@ -6113,7 +6416,7 @@ fn apply_search_highlight(
         let Some(local) = row_idx.checked_sub(win_start) else {
             continue;
         };
-        let shift = gutters.get(row_idx).copied().unwrap_or(0);
+        let shift = gutter_scalars.get(local).copied().unwrap_or(0);
         let from = m.start.saturating_add(shift);
         let to = m.end.saturating_add(shift);
         let bg = if i == search.current {
@@ -6147,32 +6450,33 @@ fn rebase_content_row(row: usize, prev_cut: usize, cut: usize) -> Option<usize> 
 /// applying background `bg` to the chars whose (line-wide) char index falls in
 /// `[from, to)`. See [`highlight_row`] for the coordinate-space contract.
 fn highlight_row_bg(line: &Line<'static>, from: usize, to: usize, bg: Color) -> Line<'static> {
-    let sel_bg = bg;
-    let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
-    let mut idx = 0usize; // running char index across the whole line
+    let mut styled_chars: Vec<(char, Style)> = Vec::new();
     for span in &line.spans {
-        // Group this span's chars into selected / unselected runs, preserving
-        // the original style and adding the selection bg to the selected run.
-        let base = span.style;
-        let mut buf = String::new();
-        let mut buf_selected = false;
-        let flush = |buf: &mut String, selected: bool, out: &mut Vec<Span<'static>>| {
-            if buf.is_empty() {
-                return;
+        styled_chars.extend(span.content.chars().map(|ch| (ch, span.style)));
+    }
+    let flat: String = styled_chars.iter().map(|(ch, _)| *ch).collect();
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len());
+    let mut scalar_offset = 0usize;
+    let mut style_offset = 0usize;
+    for grapheme in flat.graphemes(true) {
+        let n = grapheme.chars().count();
+        let end = scalar_offset.saturating_add(n);
+        // Select a WHOLE visible glyph when the requested scalar range touches
+        // any part of it. Normal mouse/search coordinates are already cluster
+        // aligned; this overlap rule protects stale offsets from splitting it.
+        let selected = end > from && scalar_offset < to;
+        for &(ch, base) in &styled_chars[style_offset..style_offset + n] {
+            let style = if selected { base.bg(bg) } else { base };
+            if let Some(last) = out.last_mut().filter(|span| span.style == style) {
+                let mut text = last.content.to_string();
+                text.push(ch);
+                last.content = text.into();
+            } else {
+                out.push(Span::styled(ch.to_string(), style));
             }
-            let style = if selected { base.bg(sel_bg) } else { base };
-            out.push(Span::styled(std::mem::take(buf), style));
-        };
-        for ch in span.content.chars() {
-            let in_sel = idx >= from && idx < to;
-            if !buf.is_empty() && in_sel != buf_selected {
-                flush(&mut buf, buf_selected, &mut out);
-            }
-            buf.push(ch);
-            buf_selected = in_sel;
-            idx += 1;
         }
-        flush(&mut buf, buf_selected, &mut out);
+        scalar_offset = end;
+        style_offset += n;
     }
     Line::from(out)
 }
@@ -6430,7 +6734,8 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
     // `None` mid-turn (the activity indicator above the input already proves
     // motion). Reused by both the gate-branch meta row and the normal one.
     let status = status_text_and_color(app);
-    let status_priority = app.copy_toast_text().is_some();
+    let status_priority =
+        app.copy_toast_text().is_some() || crate::clipboard::clipboard_feedback_active();
     // Context line beneath the input box: model / backend / state tag. `None`
     // when idle — the keyboard / `/help` hints that used to sit here
     // permanently now rotate through the input-box placeholder instead
@@ -6931,6 +7236,16 @@ fn render_mention_popover(frame: &mut Frame, input_area: Rect, app: &App, matche
 /// line just to print one word; `meta_row` now right-aligns this onto the same
 /// line as the backend / trust-mode / hint chrome.
 fn status_text_and_color(app: &App) -> Option<(String, Color)> {
+    if let Some((feedback, copied)) = crate::clipboard::clipboard_feedback_text(app.lang) {
+        return Some((
+            feedback,
+            if copied {
+                theme::SUCCESS()
+            } else {
+                theme::ERROR()
+            },
+        ));
+    }
     if let Some(toast) = app.copy_toast_text() {
         return Some((toast.to_string(), theme::SUCCESS()));
     }
@@ -7192,6 +7507,30 @@ mod tests {
     use umadev_agent::{EngineEvent, Gate};
     use umadev_runtime::Usage;
     use umadev_spec::Phase;
+
+    fn copy_plain_line_after_fold(source: &str, width: usize) -> (String, Vec<String>, Vec<usize>) {
+        let rendered = [RenderedRow::plain(
+            Line::from(Span::raw(source.to_string())),
+            0,
+        )];
+        let (lines, wraps, join_space_counts) = fold_rows(&rendered, width);
+        let mut rows: Vec<String> = lines
+            .iter()
+            .map(|line| logical_row_and_gutter(line).0)
+            .collect();
+        restore_soft_wrap_spaces(&mut rows, &join_space_counts);
+        let end_row = rows.len().saturating_sub(1);
+        let end_col = rows.get(end_row).map_or(0, |row| row.chars().count());
+        let selection = crate::selection::Selection {
+            anchor: (0, 0),
+            cursor: (end_row, end_col),
+        };
+        (
+            crate::selection::extract_wrapped(&rows, &wraps, &selection),
+            rows,
+            join_space_counts,
+        )
+    }
 
     #[test]
     fn cjk_ascii_mixed_text_renders_complete_in_every_inline_context() {
@@ -7708,6 +8047,57 @@ mod tests {
         assert!(
             has_role(&lines, theme::SynRole::Number),
             "number highlighted"
+        );
+    }
+
+    #[test]
+    fn markdown_plaintext_fence_does_not_invent_syntax_inside_prose_or_paths() {
+        const BODY: &str = "授权修改 docs/mom/standard-mom-function-plan.md；MOM C 42 true";
+        let lines = markdown_to_lines(&format!("```text\n{BODY}\n```"), Color::White);
+        let txt = md_text(&lines);
+        assert!(txt.contains(BODY), "plain-text content is preserved: {txt}");
+
+        let code_spans: Vec<&Span<'static>> = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| {
+                span.style.bg == Some(theme::CODE_BG()) && !span.content.trim().is_empty()
+            })
+            .collect();
+        assert_eq!(
+            code_spans.len(),
+            1,
+            "one verbatim source row remains one semantic span"
+        );
+        assert_eq!(code_spans[0].content.as_ref(), BODY);
+        assert_eq!(
+            code_spans[0].style.fg,
+            Some(theme::syn_color(theme::SynRole::Text)),
+            "`function`, uppercase prose and numbers stay plain text"
+        );
+    }
+
+    #[test]
+    fn plaintext_aliases_bypass_tokenization_but_javascript_still_highlights_function() {
+        const BODY: &str = "standard-mom-function-plan.md MOM 42 true";
+        for lang in ["text", "txt", "plaintext", "plain"] {
+            let spans = highlight_code_line_uncached(BODY, Some(lang));
+            assert_eq!(spans.len(), 1, "{lang} remains one verbatim span");
+            assert_eq!(spans[0].content.as_ref(), BODY, "{lang} preserves content");
+            assert_eq!(
+                spans[0].style.fg,
+                Some(theme::syn_color(theme::SynRole::Text)),
+                "{lang} must not infer programming-language roles"
+            );
+        }
+
+        let javascript = highlight_code_line_uncached("function render() {}", Some("javascript"));
+        let keyword = theme::syn_color(theme::SynRole::Keyword);
+        assert!(
+            javascript
+                .iter()
+                .any(|span| span.content == "function" && span.style.fg == Some(keyword)),
+            "a real JavaScript fence still highlights `function`"
         );
     }
 
@@ -8377,6 +8767,128 @@ mod tests {
     }
 
     #[test]
+    fn narrow_plan_panel_clips_by_terminal_columns_without_hard_wrapping_cjk() {
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::ZhCn;
+        app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            statuses: vec!["active".into()],
+            steps: vec![format!(
+                "s1 · {} (frontend-engineer)",
+                "这是一个需要在窄终端中安全显示且不能发生硬换行的超长中文计划步骤".repeat(2)
+            )],
+            done: 0,
+            total: 1,
+        });
+        app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
+            seat: "qa-engineer".into(),
+            accepts: false,
+            blocking: vec!["必须补充中文窄窗口回归测试并验证组合字符".repeat(2)],
+            remediation: vec!["在四十四列终端运行确定性渲染测试".repeat(2)],
+            advisory: vec![],
+        });
+
+        let lines = plan_panel_lines(&app, 44);
+        assert!(
+            lines.iter().all(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| disp_width_cjk(span.content.as_ref()))
+                    .sum::<usize>()
+                    <= 44
+            }),
+            "every styled row stays inside the real panel width"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.as_ref().contains('…'))
+            }),
+            "clipped content carries an explicit ellipsis"
+        );
+
+        let screen = render_chat_to_string(&app, 44, 12);
+        assert!(!screen.is_empty(), "44x12 render remains live");
+    }
+
+    #[test]
+    fn slash_plan_keeps_the_full_mixed_plan_and_team_reachable_at_44x12() {
+        let mut app = app_with(Some("grok-build"));
+        app.lang = umadev_i18n::Lang::En;
+        let seats = [
+            "product-manager",
+            "architect",
+            "uiux-designer",
+            "frontend-engineer",
+            "backend-engineer",
+            "qa-engineer",
+            "security-engineer",
+            "devops-engineer",
+        ];
+        app.apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            statuses: vec!["active".into(); 20],
+            steps: (0..20)
+                .map(|index| {
+                    format!(
+                        "s{index} · preserve complete narrow-terminal step {index} ({})",
+                        seats[index % seats.len()]
+                    )
+                })
+                .collect(),
+            done: 0,
+            total: 20,
+        });
+        app.apply_engine(umadev_agent::EngineEvent::BaseSessionState {
+            backend_id: "grok-build".to_string(),
+            update: umadev_runtime::SessionStateUpdate::PlanReplaced {
+                entries: vec![umadev_runtime::SessionPlanEntry {
+                    content: "native plan row remains reachable".to_string(),
+                    priority: umadev_runtime::SessionPlanEntryPriority::High,
+                    status: umadev_runtime::SessionPlanEntryStatus::InProgress,
+                }],
+            },
+        });
+        app.apply_engine(umadev_agent::EngineEvent::CriticVerdict {
+            seat: "security-engineer".into(),
+            accepts: false,
+            blocking: vec!["review blocker remains reachable".into()],
+            remediation: vec!["review fix remains reachable".into()],
+            advisory: vec!["review advisory remains reachable".into()],
+        });
+        for ch in "/plan".chars() {
+            let _ = app.apply_key(crossterm::event::KeyCode::Char(ch));
+        }
+        let _ = app.apply_key(crossterm::event::KeyCode::Enter);
+
+        let _ = render_chat_to_string(&app, 44, 12);
+        let transcript = app.transcript_rows.borrow().join("\n");
+        let compact_transcript = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+        for expected in [
+            "s19",
+            "Base plan",
+            "native plan row remains reachable",
+            "Team",
+            "Security",
+            "review blocker remains reachable",
+            "review fix remains reachable",
+            "review advisory remains reachable",
+        ] {
+            assert!(
+                compact_transcript.contains(expected),
+                "missing {expected}: {transcript}"
+            );
+        }
+        assert!(app.transcript_max_scroll.get() > 0, "fixture must overflow");
+
+        app.transcript_scroll_to_top();
+        let _ = render_chat_to_string(&app, 44, 12);
+        assert_eq!(app.transcript_scroll(), app.transcript_max_scroll.get());
+        app.transcript_scroll_to_bottom();
+        let _ = render_chat_to_string(&app, 44, 12);
+        assert_eq!(app.transcript_scroll(), 0);
+    }
+
+    #[test]
     fn clipped_panel_tail_carries_a_how_to_see_more_hint() {
         // Defect 1: a clipped panel's "… +N" tail must tell the user HOW to read
         // the rest (the full verdicts are in the scrollable transcript / `/plan`),
@@ -8546,6 +9058,23 @@ mod tests {
                 "caret col must equal the painted width of its row for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn input_wrap_and_caret_keep_extended_emoji_clusters_atomic() {
+        let emoji = "🧑🏽‍💻";
+        let text = format!("A{emoji}B");
+        let rows = wrap_input_rows(&text, 2);
+        assert_eq!(rows, vec!["A", emoji, "B"]);
+
+        let after_emoji = 1 + emoji.chars().count();
+        assert_eq!(
+            caret_in_wrapped(&text, after_emoji, 2),
+            (2, 0),
+            "a full emoji row advances the caret to the next paintable cell"
+        );
+        assert_eq!(offset_at_wrapped(&text, 1, 1, 2), 1);
+        assert_eq!(offset_at_wrapped(&text, 1, 2, 2), after_emoji);
     }
 
     #[test]
@@ -10117,6 +10646,47 @@ mod tests {
     }
 
     #[test]
+    fn vs15_gutter_uses_scalar_prefix_for_selection_and_search_highlights() {
+        // `● + VS15 + space` paints as a two-cell gutter but occupies three Rust
+        // `char` indices. Using the display width as the highlight shift selects
+        // the space and misses the first content glyph.
+        let line = Line::from(Span::raw("●\u{FE0E} hello"));
+        let (logical, display_width, scalar_len) = logical_row_and_gutter(&line);
+        assert_eq!(logical, "hello");
+        assert_eq!(display_width, 2, "mouse coordinates remain cell-based");
+        assert_eq!(scalar_len, 3, "VS15 remains part of the scalar prefix");
+
+        let sel = crate::selection::Selection {
+            anchor: (0, 0),
+            cursor: (0, 1),
+        };
+        let mut selected = vec![line.clone()];
+        apply_selection_highlight(&mut selected, &sel, &[scalar_len], 0);
+        assert_eq!(
+            selected_mask(&selected[0]),
+            vec![false, false, false, true, false, false, false, false],
+            "logical first glyph is selected; VS15 gutter stays untouched"
+        );
+
+        let search = crate::app::SearchState {
+            query: "h".into(),
+            matches: vec![crate::app::SearchMatch {
+                row: 0,
+                start: 0,
+                end: 1,
+            }],
+            current: 1,
+        };
+        let mut searched = vec![line];
+        apply_search_highlight(&mut searched, &search, &[scalar_len], 0, 0, 0);
+        assert_eq!(
+            selected_mask(&searched[0]),
+            vec![false, false, false, true, false, false, false, false],
+            "search uses the same scalar prefix and highlights the first glyph"
+        );
+    }
+
+    #[test]
     fn rebase_content_row_shifts_by_the_trim_delta() {
         // Low finding — after a `MAX_RENDER_ROWS` front split_off, a stored
         // selection / match row indexes the PREVIOUS frame's window, so it must
@@ -10205,8 +10775,13 @@ mod tests {
             ),
             RenderedRow::plain(Line::from(Span::raw("standalone")), 0),
         ];
-        let (lines, wraps) = fold_rows(&rows, 12);
+        let (lines, wraps, join_space_counts) = fold_rows(&rows, 12);
         assert_eq!(lines.len(), wraps.len(), "lines and wraps stay in lockstep");
+        assert_eq!(
+            lines.len(),
+            join_space_counts.len(),
+            "word-boundary metadata stays in lockstep"
+        );
         assert!(lines.len() > 3, "the long line wrapped into several rows");
         // The first row of the first logical line is NOT a continuation.
         assert!(!wraps[0], "row 0 is a real logical line start");
@@ -10220,19 +10795,56 @@ mod tests {
     }
 
     #[test]
+    fn soft_wrap_copy_preserves_every_space_in_a_boundary_run() {
+        const SOURCE: &str = "abcd    efgh";
+        let (copied, rows, join_space_counts) = copy_plain_line_after_fold(SOURCE, 6);
+
+        assert_eq!(copied, SOURCE, "soft wrapping must not collapse spaces");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the source crosses exactly one soft boundary"
+        );
+        assert_eq!(
+            join_space_counts[1], 4,
+            "the boundary records the complete source-space run"
+        );
+    }
+
+    #[test]
+    fn soft_wrap_copy_preserves_unicode_graphemes_and_spaces_together() {
+        const COMBINING: &str = "e\u{301}";
+        const ZWJ_EMOJI: &str = "👩🏽‍💻";
+        const FLAG: &str = "🇨🇳";
+        const SOURCE: &str = "e\u{301}👩🏽‍💻    中文🇨🇳";
+        let (copied, rows, join_space_counts) = copy_plain_line_after_fold(SOURCE, 5);
+
+        assert_eq!(
+            copied, SOURCE,
+            "copy keeps all scalars and separators exactly"
+        );
+        assert_eq!(
+            join_space_counts.iter().copied().max(),
+            Some(4),
+            "the Unicode boundary retains all four spaces"
+        );
+        for grapheme in [COMBINING, ZWJ_EMOJI, FLAG] {
+            assert!(
+                rows.iter().any(|row| row.contains(grapheme)),
+                "extended grapheme {grapheme:?} must remain inside one visual row"
+            );
+        }
+    }
+
+    #[test]
     fn soft_wrapped_selection_copies_as_one_rejoined_line() {
         // R4(b) end-to-end: render a message whose body wraps, then a selection
         // spanning the wrap copies WITHOUT the mid-line break — `extract_wrapped`
         // rejoins the visual rows via the published `transcript_row_wraps`.
+        const SOURCE: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega and then several more words to be sure this paragraph folds across rows";
         let mut app = app_with(Some("offline"));
         app.history.clear();
-        push_msg(
-            &mut app,
-            ChatRole::Host,
-            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu \
-             nu xi omicron pi rho sigma tau upsilon phi chi psi omega and then \
-             several more words to be sure this paragraph folds across rows",
-        );
+        push_msg(&mut app, ChatRole::Host, SOURCE);
         // Render wide enough that the chat surface paints (a too-narrow terminal
         // bails), but with a body long enough to fold across several visual rows so
         // the per-row caches (rows / wraps) get published with a continuation.
@@ -10251,16 +10863,41 @@ mod tests {
             "the wrapped body produced a continuation row"
         );
         let cont = cont.unwrap();
-        // Select from the start of the wrapped line's first row through the end of
-        // its continuation row.
+        let start = cont - 1;
+        let mut end = cont;
+        while end + 1 < wraps.len() && wraps[end + 1] {
+            end += 1;
+        }
+        // Select the entire logical line, across every visual continuation.
         let sel = crate::selection::Selection {
-            anchor: (cont - 1, 0),
-            cursor: (cont, rows[cont].chars().count()),
+            anchor: (start, 0),
+            cursor: (end, rows[end].chars().count()),
         };
         let copied = crate::selection::extract_wrapped(&rows, &wraps, &sel);
-        assert!(
-            !copied.contains('\n'),
-            "a soft-wrapped line copies as ONE line (no mid-line break): {copied:?}"
+        assert_eq!(
+            copied, SOURCE,
+            "soft wrapping must preserve every word separator exactly"
+        );
+    }
+
+    #[test]
+    fn fenced_code_copy_preserves_source_indentation() {
+        let mut app = app_with(Some("offline"));
+        app.history.clear();
+        push_msg(
+            &mut app,
+            ChatRole::Host,
+            "```python\nif ok:\n    child()\n```",
+        );
+        let _ = render_chat_at(&app, 80, 24);
+        let rows = app.transcript_rows.borrow();
+        let row = rows
+            .iter()
+            .find(|row| row.contains("child()"))
+            .expect("rendered code row");
+        assert_eq!(
+            row, "    child()",
+            "UI gutters are removed, but Python source indentation is data"
         );
     }
 
@@ -10273,9 +10910,10 @@ mod tests {
             Span::raw(format!("{spine} ")),
             Span::raw("wrapped tail"),
         ]);
-        let (logical, gutter) = logical_row_and_gutter(&cont);
+        let (logical, gutter, gutter_scalars) = logical_row_and_gutter(&cont);
         assert_eq!(logical, "wrapped tail");
         assert_eq!(gutter, 2);
+        assert_eq!(gutter_scalars, 2);
         assert!(
             !logical.contains(spine),
             "no spine glyph leaks into the copy"
@@ -10291,9 +10929,10 @@ mod tests {
             Span::raw("user said hi"),
             Span::raw("      "), // the fill_bg padding out to full width
         ]);
-        let (logical, gutter) = logical_row_and_gutter(&bubble);
+        let (logical, gutter, gutter_scalars) = logical_row_and_gutter(&bubble);
         assert_eq!(logical, "user said hi");
         assert_eq!(gutter, 2);
+        assert_eq!(gutter_scalars, 2);
         assert!(
             !logical.ends_with(' '),
             "no trailing-space padding in the copy"
@@ -10301,17 +10940,19 @@ mod tests {
 
         // A plain row with no spine: gutter 0, content kept, trailing trimmed.
         let plain = Line::from(Span::raw("plain content   "));
-        let (logical, gutter) = logical_row_and_gutter(&plain);
+        let (logical, gutter, gutter_scalars) = logical_row_and_gutter(&plain);
         assert_eq!(logical, "plain content");
         assert_eq!(gutter, 0);
+        assert_eq!(gutter_scalars, 0);
 
         // A CR left behind by a Windows CRLF producer is a line terminator, not
         // selectable content. The cached logical row must never leak it into the
         // clipboard (the extractor itself joins logical rows with `\n`).
         let crlf_tail = Line::from(Span::raw("Windows 行\r   "));
-        let (logical, gutter) = logical_row_and_gutter(&crlf_tail);
+        let (logical, gutter, gutter_scalars) = logical_row_and_gutter(&crlf_tail);
         assert_eq!(logical, "Windows 行");
         assert_eq!(gutter, 0);
+        assert_eq!(gutter_scalars, 0);
         assert!(!logical.contains('\r'));
     }
 
@@ -10329,12 +10970,17 @@ mod tests {
             Span::raw(marker.clone()),
             Span::raw("标准MES平台设计"),
         ]);
-        let (logical, gutter) = logical_row_and_gutter(&first);
+        let (logical, gutter, gutter_scalars) = logical_row_and_gutter(&first);
         assert_eq!(
             logical, "标准MES平台设计",
             "the reply copies without the marker"
         );
         assert_eq!(gutter, GUTTER_W, "the marker gutter is the standard width");
+        assert_eq!(
+            gutter_scalars,
+            marker.chars().count(),
+            "VS15 counts for scalar-indexed painting even though it has no width"
+        );
         assert!(
             !logical.starts_with('\u{23FA}') && !logical.starts_with('\u{25CF}'),
             "no stray seat-marker glyph leaks into the copy: {logical:?}"
@@ -10346,27 +10992,29 @@ mod tests {
             Span::raw("\u{25CF} "),
             Span::raw("Read (src/main.rs)"),
         ]);
-        let (logical, gutter) = logical_row_and_gutter(&tool);
+        let (logical, gutter, gutter_scalars) = logical_row_and_gutter(&tool);
         assert_eq!(logical, "Read (src/main.rs)", "the tool name copies clean");
         assert_eq!(gutter, GUTTER_W);
+        assert_eq!(gutter_scalars, 2);
 
         // A spinner (running) tool glyph is also gutter.
         let running = Line::from(vec![
             Span::raw(format!("{} ", crate::app::SPINNER_FRAMES[0])),
             Span::raw("Bash (cargo build)"),
         ]);
-        let (logical, _gutter) = logical_row_and_gutter(&running);
+        let (logical, _gutter, _gutter_scalars) = logical_row_and_gutter(&running);
         assert_eq!(logical, "Bash (cargo build)");
 
         // Guard against a FALSE positive: real prose that starts with a `●` glyph
         // with NO following space is content, not a gutter — it must be kept.
         let content = Line::from(Span::raw("\u{25CF}bullet-jammed text"));
-        let (logical, gutter) = logical_row_and_gutter(&content);
+        let (logical, gutter, gutter_scalars) = logical_row_and_gutter(&content);
         assert_eq!(
             logical, "\u{25CF}bullet-jammed text",
             "no-space glyph stays content"
         );
         assert_eq!(gutter, 0);
+        assert_eq!(gutter_scalars, 0);
     }
 
     #[test]
@@ -10395,6 +11043,18 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(back, "正在思考问题");
+    }
+
+    #[test]
+    fn prefold_never_splits_an_extended_emoji_grapheme() {
+        let emoji = "🧑🏽‍💻";
+        let line = Line::from(Span::raw(format!("A{emoji}B")));
+        let rows = prefold_line(&line, 2, 0, None);
+        let text: Vec<String> = rows
+            .iter()
+            .map(|row| row.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, vec!["A", emoji, "B"]);
     }
 
     #[test]
@@ -11176,8 +11836,8 @@ mod tests {
         // The self-bounding sweep: only this frame's entries survive.
         let mut c = MsgFoldCache::new();
         c.begin_frame(40, 0);
-        c.put(1, vec![Line::from("a")], vec![false]);
-        c.put(2, vec![Line::from("b")], vec![false]);
+        c.put(1, vec![Line::from("a")], vec![false], vec![0]);
+        c.put(2, vec![Line::from("b")], vec![false], vec![0]);
         assert_eq!(c.len(), 2);
         // Next frame touches only key 1; key 2 falls out at end_frame.
         c.begin_frame(40, 0);

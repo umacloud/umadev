@@ -70,13 +70,11 @@ pub(super) fn step_items(
     }
 }
 
-/// Unpack the auth tag `spawn_probe` packed onto a probe `detail`. Returns
-/// `(auth_mark, login_cmd, install_cmd, human_detail)`. **Fail-open**: a `detail`
-/// with no sentinel (an external emitter, an older build) yields
-/// `(Unknown, "", "", detail)`.
-pub(crate) fn parse_probe_detail(detail: &str) -> (AuthMark, String, String, String) {
+/// Unpack the generation and auth metadata packed by `spawn_probe`.
+pub(crate) fn parse_probe_detail(detail: &str) -> (Option<u64>, AuthMark, String, String, String) {
     let Some(rest) = detail.strip_prefix(PROBE_AUTH_SENTINEL) else {
         return (
+            None,
             AuthMark::Unknown,
             String::new(),
             String::new(),
@@ -85,6 +83,7 @@ pub(crate) fn parse_probe_detail(detail: &str) -> (AuthMark, String, String, Str
     };
     let Some((meta, human)) = rest.split_once(PROBE_AUTH_SENTINEL) else {
         return (
+            None,
             AuthMark::Unknown,
             String::new(),
             String::new(),
@@ -92,10 +91,13 @@ pub(crate) fn parse_probe_detail(detail: &str) -> (AuthMark, String, String, Str
         );
     };
     let mut auth = AuthMark::Unknown;
+    let mut generation = None;
     let mut login = String::new();
     let mut install = String::new();
     for field in meta.split('|') {
-        if let Some(value) = field.strip_prefix("auth=") {
+        if let Some(value) = field.strip_prefix("generation=") {
+            generation = value.parse().ok();
+        } else if let Some(value) = field.strip_prefix("auth=") {
             auth = AuthMark::from_tag(value);
         } else if let Some(value) = field.strip_prefix("login=") {
             login = value.to_string();
@@ -103,7 +105,7 @@ pub(crate) fn parse_probe_detail(detail: &str) -> (AuthMark, String, String, Str
             install = value.to_string();
         }
     }
-    (auth, login, install, human.to_string())
+    (generation, auth, login, install, human.to_string())
 }
 
 pub(super) fn refresh_picker_with_probes(items: &mut [PickerItem], probes: &[BackendInfo]) {
@@ -121,6 +123,14 @@ pub(super) fn refresh_picker_with_probes(items: &mut [PickerItem], probes: &[Bac
 }
 
 impl App {
+    /// Begin one fresh asynchronous probe generation. Clearing stale rows makes
+    /// every `/backend` decision wait for the current result for that target.
+    pub(crate) fn begin_backend_probe(&mut self) -> u64 {
+        self.backends.clear();
+        self.backend_probe_generation = self.backend_probe_generation.wrapping_add(1).max(1);
+        self.backend_probe_generation
+    }
+
     /// Switch the active base only after its latest probe has established a
     /// usable execution path. Authentication remains a two-step override because
     /// local and third-party configurations can make that probe inconclusive.
@@ -137,12 +147,20 @@ impl App {
         }
 
         let id = backend.unwrap_or("offline").to_string();
-        if let Some(probe) = backend.and_then(|target| {
+        let probe = backend.and_then(|target| {
             self.backends
                 .iter()
                 .find(|candidate| candidate.id == target)
                 .cloned()
-        }) {
+        });
+        if backend.is_some() && self.backend_probe_generation != 0 && probe.is_none() {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "backend.switch_probe_pending", &[&id]),
+            );
+            return Action::None;
+        }
+        if let Some(probe) = probe {
             match probe.auth {
                 AuthMark::NotInstalled | AuthMark::Unknown if !probe.ready => {
                     let fix = if probe.install_cmd.trim().is_empty() {

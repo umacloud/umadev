@@ -16,7 +16,8 @@
 //! unknown servers + unknown top-level keys (and, for TOML, comments and
 //! formatting via `toml_edit`), inserts/removes just the named server, and
 //! writes back **atomically** (temp + rename). A bug or unmodelled shape never
-//! wipes the user's config.
+//! wipes the user's config. `--backend all` additionally snapshots all five
+//! files and rolls the whole set back if any target fails.
 //!
 //! ## Usage
 //! ```bash
@@ -30,6 +31,27 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+const MAX_MCP_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+fn read_config(path: &Path) -> std::io::Result<String> {
+    if let Some(parent) = path.parent() {
+        match std::fs::symlink_metadata(parent) {
+            Ok(metadata) if !umadev_state::fs::metadata_is_real_dir(&metadata) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "MCP config parent is not a real directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let bytes = umadev_state::fs::read_bounded(path, MAX_MCP_CONFIG_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
 
 /// Which base CLI a `mcp-manage` operation targets. Mirrors
 /// [`umadev_host::BACKEND_IDS`]; each writes a different config file/format.
@@ -105,31 +127,137 @@ impl Backend {
     }
 }
 
+#[derive(Debug)]
+struct ConfigSnapshot {
+    path: PathBuf,
+    original: Option<(Vec<u8>, Option<std::fs::Permissions>)>,
+    missing_dirs: Vec<PathBuf>,
+}
+
+fn snapshot_config(project_root: &Path, backend: Backend) -> std::io::Result<ConfigSnapshot> {
+    let path = project_root.join(backend.config_rel_path());
+    match umadev_state::fs::read_bounded(&path, MAX_MCP_CONFIG_BYTES) {
+        Ok(bytes) => {
+            let permissions = std::fs::symlink_metadata(&path)
+                .ok()
+                .filter(umadev_state::fs::metadata_is_real_file)
+                .map(|metadata| metadata.permissions());
+            Ok(ConfigSnapshot {
+                path,
+                original: Some((bytes, permissions)),
+                missing_dirs: Vec::new(),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut missing_dirs = Vec::new();
+            let mut current = path.parent();
+            while let Some(directory) = current {
+                if !directory.starts_with(project_root) {
+                    break;
+                }
+                match std::fs::symlink_metadata(directory) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing_dirs.push(directory.to_path_buf());
+                    }
+                    _ => break,
+                }
+                if directory == project_root {
+                    break;
+                }
+                current = directory.parent();
+            }
+            Ok(ConfigSnapshot {
+                path,
+                original: None,
+                missing_dirs,
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_config(snapshot: &ConfigSnapshot) -> std::io::Result<()> {
+    if let Some((original, permissions)) = &snapshot.original {
+        let current = umadev_state::fs::read_bounded(&snapshot.path, MAX_MCP_CONFIG_BYTES).ok();
+        if current.as_deref() != Some(original.as_slice()) {
+            umadev_state::fs::atomic_write(&snapshot.path, original)?;
+        }
+        if let Some(permissions) = permissions {
+            std::fs::set_permissions(&snapshot.path, permissions.clone())?;
+        }
+        return Ok(());
+    }
+
+    umadev_state::fs::remove_regular_file(&snapshot.path)?;
+    for directory in &snapshot.missing_dirs {
+        match umadev_state::fs::remove_empty_dir(directory) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn mutate_all<T>(
+    project_root: &Path,
+    mut operation: impl FnMut(Backend) -> std::io::Result<T>,
+) -> std::io::Result<Vec<(Backend, T)>> {
+    let snapshots = Backend::ALL
+        .into_iter()
+        .map(|backend| {
+            snapshot_config(project_root, backend).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("could not snapshot {} MCP config: {error}", backend.id()),
+                )
+            })
+        })
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut completed = Vec::with_capacity(Backend::ALL.len());
+
+    for (index, backend) in Backend::ALL.into_iter().enumerate() {
+        match operation(backend) {
+            Ok(value) => completed.push((backend, value)),
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                for snapshot in snapshots[..=index].iter().rev() {
+                    if let Err(rollback_error) = restore_config(snapshot) {
+                        rollback_errors
+                            .push(format!("{}: {rollback_error}", snapshot.path.display()));
+                    }
+                }
+                let rollback = if rollback_errors.is_empty() {
+                    "all target configs were rolled back".to_string()
+                } else {
+                    format!("rollback was incomplete ({})", rollback_errors.join("; "))
+                };
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("{} MCP operation failed: {error}; {rollback}", backend.id()),
+                ));
+            }
+        }
+    }
+    Ok(completed)
+}
+
 /// Atomically write `bytes` to `path` (temp file in the same dir + rename).
 /// A same-filesystem rename is atomic on POSIX, so a crash mid-write never
 /// leaves a truncated config that a reader's parser would choke on. The temp
 /// name carries the pid so concurrent writers don't share + clobber it.
 ///
-/// On Windows `rename` won't replace an existing target, so on a rename error
-/// we fall back to a direct write — less crash-safe, but it keeps install/
-/// remove working cross-platform instead of failing whenever the file exists.
 fn atomic_write(path: &Path, bytes: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let fname = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("config");
-    let tmp = path.with_file_name(format!(".{fname}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        std::fs::write(path, bytes).map_err(|_| e)?;
-    }
-    Ok(())
+    umadev_state::fs::atomic_write(path, bytes.as_bytes())
 }
 
 /// One MCP server configuration entry (matches Claude Code's `.mcp.json` format).
@@ -180,7 +308,7 @@ impl McpConfig {
 
     /// Load a standard `mcpServers` JSON object from an explicit base path.
     fn load_path(path: &Path) -> std::io::Result<Self> {
-        match std::fs::read_to_string(path) {
+        match read_config(path) {
             Ok(text) if text.trim().is_empty() => Ok(Self::default()),
             Ok(text) => serde_json::from_str(&text).map_err(|e| {
                 std::io::Error::new(
@@ -307,6 +435,19 @@ pub fn install(
     }
 }
 
+/// Install one server for every first-class base as one logical operation.
+/// If any target fails, every earlier target is restored to its exact original
+/// bytes (and files/directories created by this operation are removed).
+pub fn install_all(
+    project_root: &Path,
+    name: &str,
+    entry: &McpServerEntry,
+) -> std::io::Result<Vec<(Backend, PathBuf)>> {
+    mutate_all(project_root, |backend| {
+        install(backend, project_root, name, entry)
+    })
+}
+
 /// Remove a named MCP server from the chosen base's config file.
 /// Returns `(path, was_present)`.
 ///
@@ -333,6 +474,15 @@ pub fn remove(
         Backend::GrokBuild => grok::remove(project_root, name),
         Backend::KimiCode => kimi::remove(project_root, name),
     }
+}
+
+/// Remove one server from every first-class base as one logical operation.
+/// A failure in any target restores every earlier removal before returning.
+pub fn remove_all(
+    project_root: &Path,
+    name: &str,
+) -> std::io::Result<Vec<(Backend, (PathBuf, bool))>> {
+    mutate_all(project_root, |backend| remove(backend, project_root, name))
 }
 
 /// List all MCP servers the chosen base would discover from its config file.
@@ -484,7 +634,7 @@ mod codex {
     /// A file that EXISTS but isn't valid TOML returns `Err` — we must not treat
     /// it as empty and then overwrite it, wiping the user's codex config.
     fn load_doc(path: &Path) -> std::io::Result<DocumentMut> {
-        match std::fs::read_to_string(path) {
+        match super::read_config(path) {
             Ok(text) if text.trim().is_empty() => Ok(DocumentMut::new()),
             Ok(text) => text.parse::<DocumentMut>().map_err(|e| {
                 std::io::Error::new(
@@ -519,10 +669,19 @@ mod codex {
 
         // Ensure `[mcp_servers]` is a table (create it implicit-of-dotted so the
         // serialized form is the idiomatic `[mcp_servers.<name>]`).
-        if !doc.get("mcp_servers").is_some_and(Item::is_table_like) {
-            let mut t = Table::new();
-            t.set_implicit(true);
-            doc["mcp_servers"] = Item::Table(t);
+        match doc.get("mcp_servers") {
+            None => {
+                let mut table = Table::new();
+                table.set_implicit(true);
+                doc["mcp_servers"] = Item::Table(table);
+            }
+            Some(item) if item.is_table_like() => {}
+            Some(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mcp_servers exists but is not table-like; refusing to replace it",
+                ));
+            }
         }
         let Some(servers) = doc["mcp_servers"].as_table_like_mut() else {
             return Err(std::io::Error::new(
@@ -567,6 +726,15 @@ mod codex {
             return Ok((path.to_path_buf(), false));
         }
         let mut doc = load_doc(path)?;
+        if doc
+            .get("mcp_servers")
+            .is_some_and(|item| !item.is_table_like())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mcp_servers exists but is not table-like",
+            ));
+        }
         let removed = doc
             .get_mut("mcp_servers")
             .and_then(Item::as_table_like_mut)
@@ -587,8 +755,14 @@ mod codex {
             return Ok(vec![]);
         }
         let doc = load_doc(path)?;
-        let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table_like) else {
-            return Ok(vec![]);
+        let servers = match doc.get("mcp_servers") {
+            None => return Ok(vec![]),
+            Some(item) => item.as_table_like().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mcp_servers exists but is not table-like",
+                )
+            })?,
         };
         let mut out = Vec::new();
         for (name, item) in servers.iter() {
@@ -640,7 +814,7 @@ mod opencode {
     /// # Errors
     /// A file that EXISTS but isn't valid JSON returns `Err` (don't overwrite).
     fn load_root(path: &Path) -> std::io::Result<Map<String, Value>> {
-        match std::fs::read_to_string(path) {
+        match super::read_config(path) {
             Ok(text) if text.trim().is_empty() => Ok(Map::new()),
             Ok(text) => match serde_json::from_str::<Value>(&text) {
                 Ok(Value::Object(map)) => Ok(map),
@@ -693,12 +867,13 @@ mod opencode {
         let mcp = root
             .entry("mcp")
             .or_insert_with(|| Value::Object(Map::new()));
-        if !mcp.is_object() {
-            *mcp = Value::Object(Map::new());
-        }
-        if let Some(map) = mcp.as_object_mut() {
-            map.insert(name.to_string(), server);
-        }
+        let map = mcp.as_object_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mcp exists but is not an object; refusing to replace it",
+            )
+        })?;
+        map.insert(name.to_string(), server);
 
         let json = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
         atomic_write(&path, &(json + "\n"))?;
@@ -711,6 +886,12 @@ mod opencode {
             return Ok((path, false));
         }
         let mut root = load_root(&path)?;
+        if root.get("mcp").is_some_and(|mcp| !mcp.is_object()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "mcp exists but is not an object",
+            ));
+        }
         let removed = root
             .get_mut("mcp")
             .and_then(Value::as_object_mut)
@@ -728,8 +909,14 @@ mod opencode {
             return Ok(vec![]);
         }
         let root = load_root(&path)?;
-        let Some(mcp) = root.get("mcp").and_then(Value::as_object) else {
-            return Ok(vec![]);
+        let mcp = match root.get("mcp") {
+            None => return Ok(vec![]),
+            Some(value) => value.as_object().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mcp exists but is not an object",
+                )
+            })?,
         };
         let mut out = Vec::new();
         for (name, server) in mcp {
@@ -858,6 +1045,30 @@ mod tests {
             McpConfig::load(tmp.path()).is_err(),
             "must error, not silently return empty (which would overwrite)"
         );
+    }
+
+    #[test]
+    fn load_rejects_oversized_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".mcp.json"),
+            vec![b' '; usize::try_from(MAX_MCP_CONFIG_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(McpConfig::load(tmp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_fifo_without_blocking() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join(".mcp.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(McpConfig::load(tmp.path()).is_err());
     }
 
     #[test]
@@ -1062,6 +1273,18 @@ mod tests {
     }
 
     #[test]
+    fn codex_rejects_a_non_table_mcp_servers_value_without_clobbering() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join(".codex/config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "mcp_servers = \"user-value\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        assert!(install(Backend::Codex, tmp.path(), "x", &npx_entry()).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
     fn codex_url_server_writes_url_key() {
         let tmp = tempfile::TempDir::new().unwrap();
         let entry = parse_command("https://mcp.example.com/sse");
@@ -1130,6 +1353,17 @@ mod tests {
     }
 
     #[test]
+    fn opencode_rejects_a_non_object_mcp_value_without_clobbering() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("opencode.json");
+        let original = r#"{"mcp":"user-value","future":true}"#;
+        std::fs::write(&path, original).unwrap();
+
+        assert!(install(Backend::OpenCode, tmp.path(), "x", &npx_entry()).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
     fn list_missing_config_is_empty_not_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(list(Backend::Codex, tmp.path()).unwrap().is_empty());
@@ -1146,6 +1380,127 @@ mod tests {
         let (_, removed) = remove(Backend::ClaudeCode, tmp.path(), "gh").unwrap();
         assert!(removed);
         assert!(list(Backend::ClaudeCode, tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn all_backend_install_and_remove_succeed_as_one_operation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let installed = install_all(tmp.path(), "gh", &npx_entry()).unwrap();
+        assert_eq!(installed.len(), Backend::ALL.len());
+        for backend in Backend::ALL {
+            assert_eq!(list(backend, tmp.path()).unwrap().len(), 1, "{backend:?}");
+        }
+
+        let removed = remove_all(tmp.path(), "gh").unwrap();
+        assert_eq!(removed.len(), Backend::ALL.len());
+        assert!(removed.iter().all(|(_, (_, was_present))| *was_present));
+        for backend in Backend::ALL {
+            assert!(list(backend, tmp.path()).unwrap().is_empty(), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn all_backend_install_restores_exact_prior_bytes_after_late_parse_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude_path = tmp.path().join(".mcp.json");
+        let codex_path = tmp.path().join(".codex/config.toml");
+        let opencode_path = tmp.path().join("opencode.json");
+        std::fs::create_dir_all(codex_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &claude_path,
+            b"{\"mcpServers\":{\"old\":{\"command\":\"old\"}},\"keep\":1}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &codex_path,
+            b"# keep this byte-for-byte\nmodel = \"o3\"\n\n[mcp_servers.old]\ncommand = \"old\"\n",
+        )
+        .unwrap();
+        std::fs::write(&opencode_path, b"{not valid json,,,\n").unwrap();
+        let before = [
+            std::fs::read(&claude_path).unwrap(),
+            std::fs::read(&codex_path).unwrap(),
+            std::fs::read(&opencode_path).unwrap(),
+        ];
+
+        let error = install_all(tmp.path(), "new", &npx_entry()).unwrap_err();
+        assert!(error.to_string().contains("opencode"), "{error}");
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        assert_eq!(std::fs::read(claude_path).unwrap(), before[0]);
+        assert_eq!(std::fs::read(codex_path).unwrap(), before[1]);
+        assert_eq!(std::fs::read(opencode_path).unwrap(), before[2]);
+    }
+
+    #[test]
+    fn all_backend_install_removes_new_files_and_dirs_when_a_later_target_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let invalid = b"{\"mcp\":false,\"keep\":42}\n";
+        std::fs::write(tmp.path().join("opencode.json"), invalid).unwrap();
+
+        assert!(install_all(tmp.path(), "new", &npx_entry()).is_err());
+        assert!(!tmp.path().join(".mcp.json").exists());
+        assert!(!tmp.path().join(".codex").exists());
+        assert_eq!(
+            std::fs::read(tmp.path().join("opencode.json")).unwrap(),
+            invalid
+        );
+    }
+
+    #[test]
+    fn all_backend_transaction_rolls_back_an_injected_post_write_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let error = mutate_all(tmp.path(), |backend| {
+            let path = install(backend, tmp.path(), "new", &npx_entry())?;
+            if backend == Backend::GrokBuild {
+                return Err(std::io::Error::other(
+                    "injected failure after the target write",
+                ));
+            }
+            Ok(path)
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("grok-build"), "{error}");
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        for backend in Backend::ALL {
+            assert!(
+                !tmp.path().join(backend.config_rel_path()).exists(),
+                "{backend:?} retained a partial write"
+            );
+        }
+        assert!(!tmp.path().join(".codex").exists());
+        assert!(!tmp.path().join(".grok").exists());
+    }
+
+    #[test]
+    fn all_backend_remove_restores_earlier_removals_after_late_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for backend in Backend::ALL {
+            install(backend, tmp.path(), "gh", &npx_entry()).unwrap();
+        }
+        let grok_path = tmp.path().join(Backend::GrokBuild.config_rel_path());
+        std::fs::write(&grok_path, b"not = [valid toml\n").unwrap();
+        let before = Backend::ALL
+            .map(|backend| std::fs::read(tmp.path().join(backend.config_rel_path())).unwrap());
+
+        let error = remove_all(tmp.path(), "gh").unwrap_err();
+        assert!(error.to_string().contains("grok-build"), "{error}");
+        assert!(error.to_string().contains("rolled back"), "{error}");
+        for (index, backend) in Backend::ALL.into_iter().enumerate() {
+            assert_eq!(
+                std::fs::read(tmp.path().join(backend.config_rel_path())).unwrap(),
+                before[index],
+                "{backend:?} was not restored"
+            );
+        }
+        for backend in [
+            Backend::ClaudeCode,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::KimiCode,
+        ] {
+            assert_eq!(list(backend, tmp.path()).unwrap().len(), 1, "{backend:?}");
+        }
     }
 
     #[test]

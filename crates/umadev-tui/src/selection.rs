@@ -19,8 +19,20 @@
 //! wiring (in `lib.rs`) and the highlight rendering (in `ui.rs`) stay thin; this
 //! module is where the testable logic lives.
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 /// How long the transient clipboard confirmation remains in the status area.
 pub(crate) const COPY_TOAST_TTL: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Maximum UTF-8 payload accepted by the remote OSC 52 clipboard path.
+///
+/// OSC 52 limits vary by terminal and multiplexer. Keeping the raw payload at
+/// 64 KiB bounds both the base64 allocation and the synchronous terminal write
+/// while remaining large enough for ordinary source-code selections. Oversized
+/// selections are rejected explicitly by the clipboard layer; they are never
+/// silently truncated into a misleading partial copy.
+pub(crate) const OSC52_MAX_TEXT_BYTES: usize = 64 * 1024;
 
 /// Ephemeral clipboard feedback. It lives with selection state instead of the
 /// main application state machine because it never enters chat history or the
@@ -189,15 +201,39 @@ pub fn screen_to_content(
     // span holds the cursor.
     let mut acc = 0usize;
     let mut content_col = 0usize;
-    for ch in rows[content_row].chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in rows[content_row].graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if acc.saturating_add(w) > display_off {
             break;
         }
         acc = acc.saturating_add(w);
-        content_col += 1;
+        content_col += grapheme.chars().count();
     }
     Some((content_row, content_col))
+}
+
+/// Slice a string whose public coordinates are Unicode-scalar (char) offsets,
+/// while refusing to cut an extended grapheme cluster in half. Mouse-derived
+/// offsets already land on cluster boundaries; the overlap rule is the
+/// fail-safe for stale/adversarial offsets that point inside a ZWJ emoji,
+/// flag, skin-tone sequence, or base+combining-mark cluster.
+fn grapheme_safe_slice(s: &str, from: usize, to: usize) -> String {
+    if to <= from {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut char_start = 0usize;
+    for grapheme in s.graphemes(true) {
+        let char_end = char_start.saturating_add(grapheme.chars().count());
+        if char_end > from && char_start < to {
+            out.push_str(grapheme);
+        }
+        if char_start >= to {
+            break;
+        }
+        char_start = char_end;
+    }
+    out
 }
 
 /// Extract the selected text from the cached `rows` for `sel`.
@@ -233,7 +269,7 @@ pub fn extract(rows: &[String], sel: &Selection) -> String {
         if to <= from {
             return String::new();
         }
-        s.chars().skip(from).take(to - from).collect()
+        grapheme_safe_slice(s, from, to)
     };
     if sr >= er {
         // Single effective row (start row == clamped end row): one substring.
@@ -288,7 +324,7 @@ pub fn extract_wrapped(rows: &[String], wraps: &[bool], sel: &Selection) -> Stri
         if to <= from {
             return String::new();
         }
-        s.chars().skip(from).take(to - from).collect()
+        grapheme_safe_slice(s, from, to)
     };
     if sr >= er {
         let end_col = if sr == er { ec } else { usize::MAX };
@@ -347,8 +383,9 @@ pub fn base64_encode(data: &[u8]) -> String {
 /// inside the alternate screen, where the terminal's own selection is suppressed
 /// by mouse capture. `c` targets the primary (system) clipboard.
 #[must_use]
-pub fn osc52_sequence(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
+pub fn osc52_sequence(text: &str) -> Option<String> {
+    (text.len() <= OSC52_MAX_TEXT_BYTES)
+        .then(|| format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes())))
 }
 
 /// Wrap an escape sequence in **tmux's DCS passthrough** so tmux forwards it to
@@ -369,13 +406,9 @@ pub fn tmux_passthrough(seq: &str) -> String {
 /// command targets the FAR host, and a bare OSC 52 is eaten by tmux — only the
 /// passthrough-wrapped form reaches the terminal the user is actually sitting at.
 #[must_use]
-pub fn osc52_for(text: &str, in_tmux: bool) -> String {
-    let seq = osc52_sequence(text);
-    if in_tmux {
-        tmux_passthrough(&seq)
-    } else {
-        seq
-    }
+pub fn osc52_for(text: &str, in_tmux: bool) -> Option<String> {
+    let seq = osc52_sequence(text)?;
+    Some(if in_tmux { tmux_passthrough(&seq) } else { seq })
 }
 
 /// Pure decision: which clipboard path to PREFER for the current environment.
@@ -565,6 +598,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn screen_to_content_never_lands_inside_extended_emoji_graphemes() {
+        let rows = vec!["A🧑🏽‍💻B👨‍👩‍👧‍👦C".to_string()];
+        let area = (0u16, 0u16, 40u16, 1u16);
+        let first_emoji_end = 1 + "🧑🏽‍💻".chars().count();
+        let family_end = first_emoji_end + 1 + "👨‍👩‍👧‍👦".chars().count();
+
+        assert_eq!(
+            screen_to_content(1, 0, area, 0, &rows, &[]),
+            Some((0, 1)),
+            "the first cell of an emoji resolves to its cluster start"
+        );
+        assert_eq!(
+            screen_to_content(3, 0, area, 0, &rows, &[]),
+            Some((0, first_emoji_end)),
+            "the cell after an emoji resolves after the whole cluster"
+        );
+        assert_eq!(
+            screen_to_content(6, 0, area, 0, &rows, &[]),
+            Some((0, family_end)),
+            "the family ZWJ sequence is one selectable terminal glyph"
+        );
+    }
+
     // ── Normalization ─────────────────────────────────────────────────────
     #[test]
     fn normalized_orders_anchor_before_cursor() {
@@ -674,6 +731,19 @@ mod tests {
     }
 
     #[test]
+    fn extract_expands_stale_offsets_to_whole_grapheme_clusters() {
+        let emoji = "🧑🏽‍💻";
+        let rows = vec![format!("a{emoji}z")];
+        // Deliberately point inside the multi-scalar emoji. A stale coordinate
+        // must copy the whole visible glyph, never orphan a modifier or ZWJ.
+        let sel = Selection {
+            anchor: (0, 2),
+            cursor: (0, 3),
+        };
+        assert_eq!(extract(&rows, &sel), emoji);
+    }
+
+    #[test]
     fn extract_out_of_range_indices_fail_open_to_empty() {
         let rows = vec!["short".to_string()];
         // Row index past the end → "".
@@ -703,8 +773,8 @@ mod tests {
         // wraps marks rows 1 and 2 as continuations, so the whole span copies as
         // one line — no mid-line breaks at the fold points.
         let rows = vec![
-            "the quick".to_string(),
-            "brown".to_string(),
+            "the quick ".to_string(),
+            "brown ".to_string(),
             "fox".to_string(),
         ];
         let wraps = vec![false, true, true];
@@ -712,7 +782,7 @@ mod tests {
             anchor: (0, 0),
             cursor: (2, 3),
         };
-        assert_eq!(extract_wrapped(&rows, &wraps, &sel), "the quickbrownfox");
+        assert_eq!(extract_wrapped(&rows, &wraps, &sel), "the quick brown fox");
     }
 
     #[test]
@@ -720,7 +790,7 @@ mod tests {
         // Two logical lines, the first wrapped over two rows. Row 1 is a
         // continuation (joined), row 2 is a fresh logical line (newline kept).
         let rows = vec![
-            "first half".to_string(),
+            "first half ".to_string(),
             "second half".to_string(),
             "next line".to_string(),
         ];
@@ -731,7 +801,7 @@ mod tests {
         };
         assert_eq!(
             extract_wrapped(&rows, &wraps, &sel),
-            "first halfsecond half\nnext line"
+            "first half second half\nnext line"
         );
     }
 
@@ -783,7 +853,7 @@ mod tests {
     #[test]
     fn osc52_wraps_base64_in_the_exact_escape_bytes() {
         // ESC ] 52 ; c ; <b64> BEL — assert the exact byte sequence.
-        let seq = osc52_sequence("foobar");
+        let seq = osc52_sequence("foobar").expect("small payload");
         assert_eq!(seq, "\u{1b}]52;c;Zm9vYmFy\u{07}");
         assert_eq!(seq.as_bytes()[0], 0x1b, "starts with ESC");
         assert_eq!(*seq.as_bytes().last().unwrap(), 0x07, "ends with BEL");
@@ -793,7 +863,7 @@ mod tests {
     #[test]
     fn tmux_passthrough_wraps_and_doubles_esc() {
         // `ESC P tmux ; <payload, ESC doubled> ESC \`.
-        let seq = osc52_sequence("foobar"); // "\x1b]52;c;Zm9vYmFy\x07"
+        let seq = osc52_sequence("foobar").expect("small payload");
         let wrapped = tmux_passthrough(&seq);
         assert!(wrapped.starts_with("\x1bPtmux;"), "opens with the tmux DCS");
         assert!(
@@ -817,9 +887,19 @@ mod tests {
         );
         assert_eq!(
             osc52_for("hi", true),
-            tmux_passthrough(&osc52_sequence("hi")),
+            osc52_sequence("hi").map(|seq| tmux_passthrough(&seq)),
             "inside tmux the OSC 52 is wrapped for passthrough"
         );
+    }
+
+    #[test]
+    fn osc52_rejects_oversized_utf8_payload_without_truncating() {
+        let at_limit = "x".repeat(OSC52_MAX_TEXT_BYTES);
+        assert!(osc52_sequence(&at_limit).is_some());
+
+        let over_limit = format!("{at_limit}好");
+        assert!(osc52_sequence(&over_limit).is_none());
+        assert!(osc52_for(&over_limit, true).is_none());
     }
 
     // ── clipboard path routing ────────────────────────────────────────────

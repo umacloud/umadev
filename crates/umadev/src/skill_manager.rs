@@ -23,6 +23,18 @@
 
 use std::path::{Path, PathBuf};
 
+const MAX_SKILL_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_SKILL_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SKILL_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_PROJECT_TEXT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_INSTALLED_SKILLS: usize = 1_024;
+
+fn bounded_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let bytes = umadev_state::fs::read_bounded(path, max_bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// A Skill manifest — describes what the skill provides.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillManifest {
@@ -74,8 +86,18 @@ impl SkillRegistry {
 
     /// Install a skill from a source directory (must contain `manifest.json`).
     pub fn install(&self, source_dir: &Path) -> std::io::Result<SkillInstallResult> {
-        let manifest_path = source_dir.join("manifest.json");
-        let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|e| {
+        if !umadev_state::fs::real_dir(source_dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "skill source must be a real directory",
+            ));
+        }
+        let manifest_bytes = umadev_state::fs::read_bounded_beneath(
+            source_dir,
+            Path::new("manifest.json"),
+            MAX_SKILL_MANIFEST_BYTES,
+        )
+        .map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!(
@@ -84,7 +106,7 @@ impl SkillRegistry {
                 ),
             )
         })?;
-        let manifest: SkillManifest = serde_json::from_str(&manifest_text).map_err(|e| {
+        let manifest: SkillManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("invalid manifest.json: {e}"),
@@ -94,8 +116,9 @@ impl SkillRegistry {
         // A malicious manifest name (`../../..`) would escape skills_dir.
         safe_component(&manifest.name)?;
         reject_learned_skill_reserved_name(&manifest.name)?;
-        let dest = self.skills_dir().join(&manifest.name);
-        std::fs::create_dir_all(&dest)?;
+        let umadev_dir = umadev_state::fs::ensure_real_child_dir(&self.project_root, ".umadev")?;
+        let skills_dir = umadev_state::fs::ensure_real_child_dir(&umadev_dir, "skills")?;
+        let dest = umadev_state::fs::ensure_real_child_dir(&skills_dir, &manifest.name)?;
 
         // Write the manifest FIRST, atomically, so the install is recoverable
         // from the very first byte we commit: if any later step (knowledge
@@ -111,52 +134,59 @@ impl SkillRegistry {
 
         // Copy knowledge docs.
         let mut knowledge_copied = 0;
-        let knowledge_dest = self
-            .project_root
-            .join("knowledge")
-            .join("skills")
-            .join(&manifest.name);
+        let knowledge_root = umadev_state::fs::ensure_real_child_dir(
+            &umadev_state::fs::ensure_real_child_dir(&self.project_root, "knowledge")?,
+            "skills",
+        )?;
+        let knowledge_dest =
+            umadev_state::fs::ensure_real_child_dir(&knowledge_root, &manifest.name)?;
+        let mut total_bytes = 0_u64;
         for rel_path in &manifest.knowledge {
             // A traversal path (`../../../etc/passwd`) would copy arbitrary host
             // files into the project — skip it rather than honour it.
             if !is_safe_relpath(rel_path) {
                 continue;
             }
-            let src = source_dir.join(rel_path);
-            // A SYMLINK clears the lexical `is_safe_relpath` check (its own path
-            // components are all `Normal`) yet can point at any host file —
-            // `fs::copy` would follow it and pull, say, ~/.ssh/id_rsa into the
-            // RAG index. `symlink_metadata` doesn't follow the link, so we can
-            // skip a symlinked source rather than honour it.
-            let Ok(meta) = std::fs::symlink_metadata(&src) else {
-                continue; // missing / unreadable
-            };
-            if meta.file_type().is_symlink() {
-                continue; // refuse to follow a symlink out of the skill dir
-            }
-            if meta.file_type().is_file() {
-                // Preserve the manifest-relative subpath — flattening to the
-                // basename let `a/guide.md` and `b/guide.md` silently overwrite
-                // each other. `is_safe_relpath` (above) guarantees `rel_path` is
-                // all-`Normal`, so the join stays under `knowledge_dest`. Mirrors
-                // knowledge_manager's subpath-preserving copy.
-                let copy_dst = knowledge_dest.join(rel_path);
-                std::fs::create_dir_all(copy_dst.parent().unwrap_or(&knowledge_dest))?;
-                std::fs::copy(&src, &copy_dst)?;
-                knowledge_copied += 1;
-            } else {
-                // A non-file, non-symlink entry (e.g. a directory) is an invalid
-                // knowledge declaration — surface it as an install error rather
-                // than silently dropping it. The manifest is already committed
-                // (above), so the failed install stays recoverable.
+            let rel = Path::new(rel_path);
+            let remaining = MAX_SKILL_TOTAL_BYTES.saturating_sub(total_bytes);
+            if remaining == 0 {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "knowledge entry `{rel_path}` is not a regular file (a directory?); \
-                         list individual `.md` files in the manifest"
-                    ),
+                    std::io::ErrorKind::InvalidData,
+                    format!("skill knowledge exceeds {MAX_SKILL_TOTAL_BYTES} bytes"),
                 ));
             }
+            let bytes = match umadev_state::fs::read_bounded_beneath(
+                source_dir,
+                rel,
+                MAX_SKILL_DOCUMENT_BYTES.min(remaining),
+            ) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(error);
+                }
+                Err(_)
+                    if std::fs::symlink_metadata(source_dir.join(rel)).is_ok_and(|metadata| {
+                        umadev_state::fs::metadata_is_real_dir(&metadata)
+                    }) =>
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "knowledge entry `{rel_path}` is a directory; list individual files"
+                        ),
+                    ));
+                }
+                Err(_) => None,
+            };
+            let Some(bytes) = bytes else { continue };
+            // Preserve the manifest-relative subpath while creating each
+            // destination directory as a real child (never through a link).
+            let parent = ensure_relative_parent(&knowledge_dest, rel.parent())?;
+            let copy_dst = parent.join(rel.file_name().unwrap_or_default());
+            umadev_state::fs::atomic_write(&copy_dst, &bytes)?;
+            total_bytes =
+                total_bytes.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            knowledge_copied += 1;
         }
 
         // Append system prompt to CLAUDE.md.
@@ -164,7 +194,11 @@ impl SkillRegistry {
             false
         } else {
             let claude_md = self.project_root.join("CLAUDE.md");
-            let existing = std::fs::read_to_string(&claude_md).unwrap_or_default();
+            let existing = match bounded_text(&claude_md, MAX_PROJECT_TEXT_BYTES) {
+                Ok(existing) => existing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error),
+            };
             let marker = format!("<!-- skill:{} -->", manifest.name);
             if existing.contains(&marker) {
                 false
@@ -182,8 +216,9 @@ impl SkillRegistry {
 
         // Merge the skill's declared governance clauses into rules.toml so the
         // engine actually enforces them (honesty fix: the old impl only COUNTED
-        // them). Fail-open — never fails the install.
-        let rules_added = self.merge_skill_rules(&manifest.rules);
+        // them). A present but unreadable/unparseable file is surfaced rather
+        // than falsely reporting the clauses as enforced.
+        let rules_added = self.merge_skill_rules(&manifest.rules)?;
 
         Ok(SkillInstallResult {
             name: manifest.name,
@@ -197,57 +232,81 @@ impl SkillRegistry {
     /// the project's `.umadev/rules.toml`: remove each declared clause id from
     /// the `[disabled]` opt-out list. Governance enforces every clause by
     /// default, so "enable a clause" concretely means "make sure it isn't
-    /// disabled". Idempotent + fail-open — a missing rules.toml means the clauses
-    /// are already in force (nothing to write); an unparseable file is left
-    /// untouched (governance's own loader already warns and enforces all rules).
+    /// disabled". Idempotent: a missing rules.toml means the clauses are already
+    /// in force (nothing to write); unreadable/unparseable files are errors so an
+    /// install cannot claim enforcement it did not verify.
     /// Returns the number of declared clauses now guaranteed enforced.
-    fn merge_skill_rules(&self, clauses: &[String]) -> usize {
+    fn merge_skill_rules(&self, clauses: &[String]) -> std::io::Result<usize> {
         if clauses.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let path = self.project_root.join(".umadev").join("rules.toml");
         // Absent file → every clause is enforced by default; the skill's
         // declared clauses are already in force.
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return clauses.len();
+        let text = match bounded_text(&path, MAX_PROJECT_TEXT_BYTES) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(clauses.len());
+            }
+            Err(error) => return Err(error),
         };
-        // Do NOT clobber a file we can't parse — governance's loader falls back
-        // to all-rules-on, which enforces the skill's clauses anyway.
-        let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
-            return clauses.len();
-        };
+        // Do not clobber a file we cannot parse or claim that its clauses were
+        // updated. Surface the error to the install caller.
+        let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is not valid TOML: {error}", path.display()),
+            )
+        })?;
         let want: std::collections::HashSet<String> =
             clauses.iter().map(|c| c.to_ascii_lowercase()).collect();
         let mut changed = false;
-        if let Some(arr) = doc
-            .get_mut("disabled")
-            .and_then(toml_edit::Item::as_table_like_mut)
-            .and_then(|t| t.get_mut("clauses"))
-            .and_then(toml_edit::Item::as_array_mut)
-        {
-            let before = arr.len();
-            arr.retain(|v| {
-                v.as_str()
-                    .is_none_or(|s| !want.contains(&s.to_ascii_lowercase()))
-            });
-            changed = arr.len() != before;
+        if let Some(disabled) = doc.get_mut("disabled") {
+            let table = disabled.as_table_like_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "rules.toml disabled section is not table-like",
+                )
+            })?;
+            if let Some(clauses_item) = table.get_mut("clauses") {
+                let clauses_array = clauses_item.as_array_mut().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "rules.toml disabled.clauses is not an array",
+                    )
+                })?;
+                let before = clauses_array.len();
+                clauses_array.retain(|value| {
+                    value
+                        .as_str()
+                        .is_none_or(|clause| !want.contains(&clause.to_ascii_lowercase()))
+                });
+                changed = clauses_array.len() != before;
+            }
         }
         if changed {
-            let _ = atomic_write(&path, &doc.to_string());
+            atomic_write(&path, &doc.to_string())?;
         }
-        clauses.len()
+        Ok(clauses.len())
     }
 
     /// List all installed skills.
     pub fn list(&self) -> Vec<SkillManifest> {
         let dir = self.skills_dir();
         let mut skills = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let manifest_path = entry.path().join("manifest.json");
-                if let Ok(text) = std::fs::read_to_string(&manifest_path) {
-                    if let Ok(manifest) = serde_json::from_str::<SkillManifest>(&text) {
-                        skills.push(manifest);
+        if umadev_state::fs::real_dir(&dir) {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten().take(MAX_INSTALLED_SKILLS) {
+                    if !std::fs::symlink_metadata(entry.path())
+                        .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_dir(&metadata))
+                    {
+                        continue;
+                    }
+                    let manifest_path = entry.path().join("manifest.json");
+                    if let Ok(text) = bounded_text(&manifest_path, MAX_SKILL_MANIFEST_BYTES) {
+                        if let Ok(manifest) = serde_json::from_str::<SkillManifest>(&text) {
+                            skills.push(manifest);
+                        }
                     }
                 }
             }
@@ -267,22 +326,41 @@ impl SkillRegistry {
                 format!("skill '{name}' is not installed"),
             ));
         }
+        if !umadev_state::fs::real_dir(&dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "installed skill path is not a real directory",
+            ));
+        }
 
         // Load manifest to know what to clean up.
         let manifest_path = dir.join("manifest.json");
-        let manifest = std::fs::read_to_string(&manifest_path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<SkillManifest>(&text).ok());
-        if let Some(manifest) = manifest {
-            let knowledge_dir = self
-                .project_root
-                .join("knowledge")
-                .join("skills")
-                .join(name);
-            let _ = std::fs::remove_dir_all(&knowledge_dir);
-            if !manifest.system_prompt.is_empty() {
-                remove_managed_prompt_block(&self.project_root, name);
-            }
+        let manifest_text = bounded_text(&manifest_path, MAX_SKILL_MANIFEST_BYTES)?;
+        let manifest = serde_json::from_str::<SkillManifest>(&manifest_text).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is not a valid skill manifest: {error}",
+                    manifest_path.display()
+                ),
+            )
+        })?;
+        let knowledge_dir = self
+            .project_root
+            .join("knowledge")
+            .join("skills")
+            .join(name);
+        if knowledge_dir.exists() && !umadev_state::fs::real_dir(&knowledge_dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "skill knowledge path is not a real directory",
+            ));
+        }
+        if !manifest.system_prompt.is_empty() {
+            remove_managed_prompt_block(&self.project_root, name)?;
+        }
+        if knowledge_dir.exists() {
+            std::fs::remove_dir_all(&knowledge_dir)?;
         }
 
         // Remove the skill directory.
@@ -291,13 +369,24 @@ impl SkillRegistry {
     }
 }
 
-fn remove_managed_prompt_block(project_root: &Path, name: &str) {
+fn remove_managed_prompt_block(project_root: &Path, name: &str) -> std::io::Result<()> {
     let claude_md = project_root.join("CLAUDE.md");
-    let Ok(content) = std::fs::read_to_string(&claude_md) else {
-        return;
+    let content = match bounded_text(&claude_md, MAX_PROJECT_TEXT_BYTES) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     };
     let start_marker = format!("<!-- skill:{name} -->");
+    if !content.contains(&start_marker) {
+        return Ok(());
+    }
     let end_marker = format!("<!-- /skill:{name} -->");
+    if content.matches(&start_marker).count() != content.matches(&end_marker).count() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("CLAUDE.md has an incomplete managed block for skill `{name}`"),
+        ));
+    }
     let mut cleaned = String::new();
     let mut skip = false;
     for line in content.lines() {
@@ -314,24 +403,34 @@ fn remove_managed_prompt_block(project_root: &Path, name: &str) {
             cleaned.push('\n');
         }
     }
-    let _ = atomic_write(&claude_md, &cleaned);
+    atomic_write(&claude_md, &cleaned)
 }
 
-/// Atomically write `content` to `path` (write a per-process temp file in the
-/// same dir, then rename). A same-filesystem rename is atomic on POSIX, so a
-/// crash mid-write never leaves a truncated manifest a later `list()` would
-/// choke on — readers see either the old file or the complete new one. Falls
-/// back to a direct write only if the rename itself fails (cross-device).
 fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, content)?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        // Last resort: a direct write. Less crash-safe, but better than failing
-        // the install outright on a filesystem that rejects the rename.
-        std::fs::write(path, content).map_err(|_| e)?;
+    umadev_state::fs::atomic_write(path, content.as_bytes())
+}
+
+fn ensure_relative_parent(base: &Path, relative: Option<&Path>) -> std::io::Result<PathBuf> {
+    let mut current = base.to_path_buf();
+    let Some(relative) = relative else {
+        return Ok(current);
+    };
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "skill knowledge path escaped its destination",
+            ));
+        };
+        let name = name.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "skill knowledge path is not valid UTF-8",
+            )
+        })?;
+        current = umadev_state::fs::ensure_real_child_dir(&current, name)?;
     }
-    Ok(())
+    Ok(current)
 }
 
 /// Reject a name that isn't a single safe path component (`..` / absolute /
@@ -691,5 +790,102 @@ mod tests {
             .join("evil")
             .join("guide.md");
         assert!(!landed.exists(), "symlinked secret must not be copied in");
+    }
+
+    #[test]
+    fn remove_refuses_a_corrupt_manifest_without_partial_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        let source = make_skill_dir(tmp.path(), "kept-skill");
+        registry.install(&source).unwrap();
+        let skill_dir = tmp.path().join(".umadev/skills/kept-skill");
+        let knowledge = tmp.path().join("knowledge/skills/kept-skill/guide.md");
+        std::fs::write(skill_dir.join("manifest.json"), "{ damaged").unwrap();
+
+        let error = registry.remove("kept-skill").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(skill_dir.exists());
+        assert!(knowledge.exists());
+        assert!(std::fs::read_to_string(tmp.path().join("CLAUDE.md"))
+            .unwrap()
+            .contains("<!-- skill:kept-skill -->"));
+    }
+
+    #[test]
+    fn install_refuses_to_claim_rules_from_invalid_toml() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        let rules = tmp.path().join(".umadev/rules.toml");
+        std::fs::write(&rules, "[disabled\nclauses = [").unwrap();
+        let source = make_skill_dir(tmp.path(), "strict-rules");
+
+        let error = registry.install(&source).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read_to_string(&rules).unwrap(),
+            "[disabled\nclauses = ["
+        );
+    }
+
+    #[test]
+    fn install_refuses_to_claim_rules_from_wrong_field_shape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        let rules = tmp.path().join(".umadev/rules.toml");
+        let original = "[disabled]\nclauses = \"UD-ARCH-001\"\n";
+        std::fs::write(&rules, original).unwrap();
+        let source = make_skill_dir(tmp.path(), "wrong-rules-shape");
+
+        let error = registry.install(&source).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(&rules).unwrap(), original);
+    }
+
+    #[test]
+    fn remove_refuses_an_incomplete_prompt_block_without_truncating_claude_md() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        let source = make_skill_dir(tmp.path(), "broken-prompt");
+        registry.install(&source).unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+        let damaged = std::fs::read_to_string(&claude_md)
+            .unwrap()
+            .replace("<!-- /skill:broken-prompt -->", "user content after block");
+        std::fs::write(&claude_md, &damaged).unwrap();
+
+        let error = registry.remove("broken-prompt").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read_to_string(&claude_md).unwrap(), damaged);
+        assert!(tmp.path().join(".umadev/skills/broken-prompt").exists());
+        assert!(tmp
+            .path()
+            .join("knowledge/skills/broken-prompt/guide.md")
+            .exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_surfaces_prompt_read_errors_before_deleting_skill_data() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        let source = make_skill_dir(tmp.path(), "linked-prompt");
+        registry.install(&source).unwrap();
+        let claude_md = tmp.path().join("CLAUDE.md");
+        std::fs::remove_file(&claude_md).unwrap();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "# Outside").unwrap();
+        symlink(&outside, &claude_md).unwrap();
+
+        assert!(registry.remove("linked-prompt").is_err());
+        assert!(tmp.path().join(".umadev/skills/linked-prompt").exists());
+        assert!(tmp
+            .path()
+            .join("knowledge/skills/linked-prompt/guide.md")
+            .exists());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "# Outside");
     }
 }

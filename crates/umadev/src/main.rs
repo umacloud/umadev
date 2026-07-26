@@ -48,6 +48,7 @@ mod skill_manager;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -61,6 +62,17 @@ use umadev_agent::{
 use umadev_governance::{compliance::write_compliance_mapping, record_tool_call};
 use umadev_runtime::{OfflineRuntime, RuntimeKind};
 use umadev_spec::{CLAUSES, PHASE_CHAIN, SPEC_VERSION};
+
+const MAX_HOOK_STDIN_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PROJECT_CONTROL_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_AUDIT_DISPLAY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PROJECT_DIRECTORY_ENTRIES: usize = 4_096;
+
+fn managed_utf8(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let bytes = umadev_state::fs::read_bounded(path, max_bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
 
 /// UmaDev — a coach for AI coding hosts.
 #[derive(Debug, Parser)]
@@ -1324,8 +1336,14 @@ fn cmd_guide() -> Result<()> {
 fn cmd_hook(check: String, scoped_project_root: Option<PathBuf>) -> Result<()> {
     // Read the PreToolUse payload from stdin.
     use std::io::Read;
-    let mut stdin = String::new();
-    let _ = std::io::stdin().read_to_string(&mut stdin);
+    let mut bytes = Vec::new();
+    let mut limited = std::io::stdin().take(MAX_HOOK_STDIN_BYTES.saturating_add(1));
+    let stdin = match limited.read_to_end(&mut bytes) {
+        Ok(_) if u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_HOOK_STDIN_BYTES => {
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+        _ => String::new(),
+    };
     // Load the per-project policy from .umadev/rules.toml (fail-open default).
     let actual_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let project_root = scoped_project_root.as_deref().map_or_else(
@@ -1602,19 +1620,34 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
         println!("Aborted. Nothing was removed.");
         return Ok(());
     }
-    // 1. Global config + data (~/.umadev and/or $XDG_CONFIG_HOME/umadev).
+    // 1. This project's governance hooks. Keep the binary and global state if
+    // any hook cannot be removed, otherwise a stale hook would point at a
+    // command the rest of this uninstall is about to delete.
+    let mut hook_failures = Vec::new();
+    if let Err(error) = hook::uninstall_claude_hook(&root) {
+        hook_failures.push(format!("Claude Code: {error}"));
+    }
+    if let Err(error) = hook::uninstall_kimi_hook(&root) {
+        hook_failures.push(format!("Kimi Code: {error}"));
+    }
+    let git_root = find_git_root_from(&root).unwrap_or_else(|| root.clone());
+    if let Err(error) = uninstall_pre_commit_hook(&git_root) {
+        hook_failures.push(format!("git pre-commit: {error}"));
+    }
+    if !hook_failures.is_empty() {
+        anyhow::bail!(
+            "governance hook removal was incomplete; the binary was kept so remaining hooks do not point at a missing command: {}",
+            hook_failures.join("; ")
+        );
+    }
+    println!("[ok] Removed this project's governance hooks (if present).");
+    // 2. Global config + data (~/.umadev and/or $XDG_CONFIG_HOME/umadev).
     for d in &state_dirs {
         match std::fs::remove_dir_all(d) {
             Ok(()) => println!("[ok] Removed {}", d.display()),
             Err(e) => println!("[!] Could not remove {} ({e}).", d.display()),
         }
     }
-    // 2. This project's governance hooks (best-effort; fail-open).
-    let _ = hook::uninstall_claude_hook(&root);
-    let _ = hook::uninstall_kimi_hook(&root);
-    let git_root = find_git_root_from(&root).unwrap_or_else(|| root.clone());
-    let _ = uninstall_pre_commit_hook(&git_root);
-    println!("[ok] Removed this project's governance hooks (if present).");
     // 3. The binary LAST (so the steps above ran on a live binary). An npm
     //    install is removed via npm so the package metadata is cleaned too; a
     //    manual/dev binary is unlinked directly (safe while running on Unix).
@@ -1622,12 +1655,29 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
         .as_ref()
         .is_some_and(|p| p.to_string_lossy().contains("node_modules"));
     if npm_managed {
-        match umadev_host::std_command("npm")
+        let mut command = umadev_host::std_command("npm");
+        command
             .args(["uninstall", "-g", "umadev"])
-            .status()
-        {
-            Ok(s) if s.success() => println!("[ok] npm uninstall -g umadev"),
-            _ => println!("[!] Run `npm uninstall -g umadev` to remove the binary."),
+            .env("CI", "1")
+            .env("NO_COLOR", "1")
+            .env("NPM_CONFIG_AUDIT", "false")
+            .env("NPM_CONFIG_FUND", "false")
+            .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
+            .env("NPM_CONFIG_YES", "true");
+        match bounded_cli_output(
+            command,
+            Duration::from_secs(120),
+            1024 * 1024,
+            256 * 1024,
+        ) {
+            Ok(output) if output.status.success() => println!("[ok] npm uninstall -g umadev"),
+            Ok(output) => println!(
+                "[!] npm uninstall failed: {}. Run `npm uninstall -g umadev` to remove the binary.",
+                safe_command_detail(&output.stderr)
+            ),
+            Err(error) => println!(
+                "[!] npm uninstall could not complete safely: {error}. Run `npm uninstall -g umadev` to verify removal."
+            ),
         }
     } else if let Some(e) = exe {
         match std::fs::remove_file(&e) {
@@ -1799,9 +1849,10 @@ fn cmd_mcp_manage(
     project_root: Option<PathBuf>,
 ) -> Result<()> {
     let root = resolve_workspace_root(project_root);
+    let all_backends = backend == "all";
 
     // `all` fans out over the five bases; otherwise a single base.
-    let backends: Vec<mcp_manager::Backend> = if backend == "all" {
+    let backends: Vec<mcp_manager::Backend> = if all_backends {
         mcp_manager::Backend::ALL.to_vec()
     } else {
         vec![mcp_manager::Backend::parse(&backend)?]
@@ -1822,8 +1873,18 @@ fn cmd_mcp_manage(
             // whitespace (the old path) mangled a quoted multi-word arg like
             // `-- node "my server.js"` into `["node","my","server.js"]`.
             let entry = mcp_manager::parse_command_parts(&command);
-            for b in &backends {
-                let path = mcp_manager::install(*b, &root, &server_name, &entry)?;
+            let installed = if all_backends {
+                mcp_manager::install_all(&root, &server_name, &entry)?
+            } else {
+                backends
+                    .iter()
+                    .map(|backend| {
+                        mcp_manager::install(*backend, &root, &server_name, &entry)
+                            .map(|path| (*backend, path))
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?
+            };
+            for (b, path) in installed {
                 println!("[ok] Installed MCP server '{server_name}' for {}.", b.id());
                 println!("  → {}", path.display());
             }
@@ -1850,8 +1911,18 @@ fn cmd_mcp_manage(
         "remove" | "rm" | "delete" => {
             let server_name = name.ok_or_else(|| anyhow::anyhow!("server name required"))?;
             let mut any_removed = false;
-            for b in &backends {
-                let (_, removed) = mcp_manager::remove(*b, &root, &server_name)?;
+            let removed = if all_backends {
+                mcp_manager::remove_all(&root, &server_name)?
+            } else {
+                backends
+                    .iter()
+                    .map(|backend| {
+                        mcp_manager::remove(*backend, &root, &server_name)
+                            .map(|result| (*backend, result))
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?
+            };
+            for (b, (_, removed)) in removed {
                 if removed {
                     any_removed = true;
                     println!("[ok] Removed MCP server '{server_name}' from {}.", b.id());
@@ -2024,7 +2095,7 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
         |p| p.to_string_lossy().to_string(),
     );
     // If the hook exists and already has our marker, it's idempotent.
-    if let Ok(existing) = std::fs::read_to_string(&hook_path) {
+    if let Ok(existing) = managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
         if existing.contains(PRE_COMMIT_MARKER) {
             return Ok(hook_path);
         }
@@ -2045,15 +2116,18 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
     // user's content. Either way UmaDev governance executes before any early
     // exit/exec in the user's script can skip it. A fresh hook is just shebang +
     // our block.
-    let script = match std::fs::read_to_string(&hook_path) {
+    let script = match managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
         Ok(existing) if existing.starts_with("#!") => {
             let (shebang, body) = existing.split_once('\n').unwrap_or((existing.as_str(), ""));
             format!("{shebang}\n{our_block}\n{body}")
         }
         Ok(existing) => format!("#!/bin/sh\n{our_block}\n{existing}"),
-        Err(_) => format!("#!/bin/sh\n{our_block}"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            format!("#!/bin/sh\n{our_block}")
+        }
+        Err(error) => return Err(error.into()),
     };
-    std::fs::write(&hook_path, script)?;
+    umadev_state::fs::atomic_write(&hook_path, script.as_bytes())?;
     // Make it executable (Unix).
     #[cfg(unix)]
     {
@@ -2069,25 +2143,42 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
 /// hook is absent or is not ours.
 fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
     let hook_path = project_root.join(".git/hooks/pre-commit");
-    let content = std::fs::read_to_string(&hook_path).unwrap_or_default();
+    let content = match managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
     let Some(start) = content.find(PRE_COMMIT_MARKER) else {
         return Ok(()); // absent or not ours — nothing to do.
     };
     // Strip ONLY our own block, keeping everything before AND after it: a current
     // install PREPENDS the block (so the user's hook is BELOW ours), while an
-    // older UmaDev appended it (user hook ABOVE). Prefer the explicit end marker
-    // to bound our block precisely; fall back to marker -> EOF for the legacy
-    // appended format that predates the end marker. Whatever the layout, the
-    // user's own hook lines are preserved.
-    let end = match content[start..].find(PRE_COMMIT_END_MARKER) {
-        Some(rel) => {
-            let end_marker_pos = start + rel;
-            // Consume through the end-marker's own line terminator.
-            content[end_marker_pos..]
-                .find('\n')
-                .map_or(content.len(), |nl| end_marker_pos + nl + 1)
+    // older UmaDev appended it (user hook ABOVE). Prefer the explicit end marker;
+    // legacy marker-to-EOF removal is accepted only when no content follows the
+    // command, so a damaged prefixed block cannot consume the user's hook.
+    let end = if let Some(rel) = content[start..].find(PRE_COMMIT_END_MARKER) {
+        let end_marker_pos = start + rel;
+        // Consume through the end-marker's own line terminator.
+        content[end_marker_pos..]
+            .find('\n')
+            .map_or(content.len(), |nl| end_marker_pos + nl + 1)
+    } else {
+        let tail = &content[start..];
+        let Some(command_pos) = tail.rfind(" ci --changed-only") else {
+            anyhow::bail!(
+                "pre-commit hook has an incomplete UmaDev block; refusing to remove user content"
+            );
+        };
+        let after_command = &tail[command_pos + " ci --changed-only".len()..];
+        let (command_suffix, after_command_line) = after_command
+            .split_once('\n')
+            .unwrap_or((after_command, ""));
+        if !command_suffix.trim().is_empty() || !after_command_line.trim().is_empty() {
+            anyhow::bail!(
+                "pre-commit hook has no UmaDev end marker before user content; refusing to truncate it"
+            );
         }
-        None => content.len(),
+        content.len()
     };
     let before = content[..start].trim_end();
     let after = content[end..].trim();
@@ -2104,10 +2195,10 @@ fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
     // `#!/bin/sh` shebang or empty) — remove it cleanly.
     if kept.is_empty() || kept == "#!/bin/sh" {
         if hook_path.exists() {
-            std::fs::remove_file(&hook_path)?;
+            umadev_state::fs::remove_regular_file(&hook_path)?;
         }
     } else {
-        std::fs::write(&hook_path, format!("{kept}\n"))?;
+        umadev_state::fs::atomic_write(&hook_path, format!("{kept}\n").as_bytes())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2192,13 +2283,23 @@ fn open_log_file() -> Option<std::fs::File> {
 /// tree. Returns `None` on any IO failure. Split out from [`open_log_file`] so
 /// it is testable without mutating the process-global `HOME`.
 fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
-    let dir = home.join(".umadev").join("logs");
-    std::fs::create_dir_all(&dir).ok()?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("umadev.log"))
-        .ok()
+    let state_dir = umadev_state::fs::ensure_real_child_dir(home, ".umadev").ok()?;
+    let dir = umadev_state::fs::ensure_real_child_dir(&state_dir, "logs").ok()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(dir.join("umadev.log")).ok()?;
+    umadev_state::fs::metadata_is_real_file(&file.metadata().ok()?).then_some(file)
 }
 
 fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) -> Result<()> {
@@ -2226,7 +2327,8 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
 \n[pipeline]\nskip_phases = []         # e.g. [\"research\"]\nmax_review_rounds = 3    # doc structural review retries\nauto_approve_gates = true # autonomous mode: auto-approve all gates (like /goal)\n\
 \n[knowledge]\nenabled = true           # enable curated expert-knowledge retrieval\nengine = \"hybrid\"        # local vector + BM25; falls back to BM25 if unavailable\ntop_k = 6                # knowledge chunks injected per phase\n\
 \n[codex]\n# Codex main-worker access: danger-full-access (default) gives normal development\n# access to subprocesses, network, local ports, git, and the filesystem. Set\n# workspace-write or read-only here only when you intentionally want to restrict it.\nsandbox_mode = \"danger-full-access\"\n";
-        let _ = std::fs::write(&umadevrc, template);
+        umadev_state::fs::atomic_write(&umadevrc, template.as_bytes())
+            .with_context(|| format!("write {}", umadevrc.display()))?;
         println!("  config:  {}", umadevrc.display());
     }
 
@@ -2260,7 +2362,8 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
              finishing the file. Configure: `.umadev/rules.toml`.\n",
             version = env!("CARGO_PKG_VERSION"),
         );
-        let _ = std::fs::write(&claude_md, claude_content);
+        umadev_state::fs::atomic_write(&claude_md, claude_content.as_bytes())
+            .with_context(|| format!("write {}", claude_md.display()))?;
         println!("  claude:  {}", claude_md.display());
     }
 
@@ -2278,7 +2381,8 @@ opencode.json
 # Machine-local Claude Code hooks contain this installation's executable path.
 .claude/settings.local.json
 ";
-        let _ = std::fs::write(&gitignore, content);
+        umadev_state::fs::atomic_write(&gitignore, content.as_bytes())
+            .with_context(|| format!("write {}", gitignore.display()))?;
         println!("  gitignore: {}", gitignore.display());
     }
 
@@ -2396,12 +2500,16 @@ async fn cmd_tui() -> Result<()> {
     // after an in-session `/claude` switch) its file writes are governed live.
     // Idempotent + merges; inert for codex/opencode/offline (they don't read
     // `.claude/settings.local.json`), so it's safe to install unconditionally.
-    let _ = hook::install_claude_hook(&project_root);
+    if let Err(error) = hook::install_claude_hook(&project_root) {
+        eprintln!("[warn] Claude Code governance hook was not installed: {error}");
+    }
     // Kimi's registry is user-level rather than project-local, so only touch it
     // when Kimi is the user's selected base. Each installed command still
     // carries an exact project scope and immediately fails open elsewhere.
     if umadev_tui::config::load().backend.as_deref() == Some("kimi-code") {
-        let _ = hook::install_kimi_hook(&project_root);
+        if let Err(error) = hook::install_kimi_hook(&project_root) {
+            eprintln!("[warn] Kimi Code governance hook was not installed: {error}");
+        }
     }
     let opts = umadev_tui::LaunchOptions {
         project_root,
@@ -3240,6 +3348,21 @@ async fn handle_cli_git_operation(
     Ok(true)
 }
 
+/// Settle a parked review using its persisted OLD run identity before a fresh
+/// CLI `/run` writes any new baseline or opens a base session.
+fn settle_operational_review_before_fresh_run(project_root: &Path) -> Result<()> {
+    umadev_agent::cancel_operational_review_pause(
+        project_root,
+        "superseded by an explicitly fresh run",
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "parked operational review could not be superseded; its recovery cursor was kept: {error}"
+        )
+    })
+}
+
 async fn cmd_run(args: RunArgs) -> Result<()> {
     // Reject an empty / whitespace-only requirement up front with a helpful
     // message, rather than running the whole pipeline on nothing.
@@ -3283,6 +3406,12 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         // runner reads this snapshot, never the live env (which races in parallel).
         strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
+
+    // This MUST precede backend probing/session creation and `runner.start()`:
+    // the cancellation helper reopens the exact old plan/task ledger using the
+    // currently persisted backend + requirement. A fresh baseline written first
+    // would fabricate a new ledger identity and orphan the old Waiting task.
+    settle_operational_review_before_fresh_run(&project_root)?;
 
     // Two modes:
     //   --backend <host>  → drive a logged-in base CLI as the worker
@@ -4179,9 +4308,11 @@ async fn drive_gate_block(
         // produces nothing would silently swap engines mid-run). The continuous path
         // also never emits a `ClarifyGate`, so that gate is excluded for symmetry.
         let continuous_origin = state.note.contains("continuous session");
+        let operational_review_resume =
+            umadev_agent::legacy_operational_review_pending(project_root);
         if mode == GateBlock::Continue
-            && continuous_origin
-            && gate != Gate::ClarifyGate
+            && (continuous_origin || operational_review_resume)
+            && (gate != Gate::ClarifyGate || operational_review_resume)
             && umadev_agent::continuous_enabled_from_env()
         {
             let launch_permissions = base_permissions(trust);
@@ -4238,7 +4369,12 @@ async fn drive_gate_block(
                     let requirement = opts.requirement.clone();
                     let runner =
                         AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), opts);
-                    runner.start().context("failed to start agent")?;
+                    // A review-only continuation owns the persisted operational
+                    // cursor. `start()` would overwrite that cursor immediately
+                    // before `run_block` reads it and restart source work.
+                    if !operational_review_resume {
+                        runner.start().context("failed to start agent")?;
+                    }
                     let live_session_id = session.session_id().map(str::to_string);
                     let live_resume_identity = live_session_id.as_ref().and_then(|_| {
                         session_resume_identity(
@@ -4264,6 +4400,9 @@ async fn drive_gate_block(
                     let _ = printer.await;
                     let outcome = outcome?;
                     print_continuous_report(project_root, &label, &requirement, &outcome);
+                    if run_outcome_is_failure(&outcome) {
+                        anyhow::bail!("`umadev continue` halted before completion (hard stop)");
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -4341,11 +4480,26 @@ async fn cmd_continue(
     };
     reject_replayed_git_requirement(&state.requirement)?;
 
+    if let Some(reason) = umadev_agent::legacy_operational_review_terminal_reason(&project_root) {
+        anyhow::bail!(
+            "{reason}. This exhausted review boundary is terminal; run `umadev run` to start a fresh run"
+        );
+    }
+    let legacy_review_pending = umadev_agent::legacy_operational_review_pending(&project_root);
+
+    // A terminal Director review circuit owns this `/continue`. Refuse before
+    // backend probe/login/session creation so repeated commands cannot look hung
+    // on vendor handshakes. The inner resume guard still prevents fresh fallback
+    // for direct/programmatic callers.
+    if let Some(reason) = umadev_agent::terminal_review_circuit_reason(&project_root) {
+        anyhow::bail!("{reason}");
+    }
+
     // Director runs persist a typed plan whose Done/Pending statuses are the
     // authoritative resume point. Route these runs back into the Director
     // scheduler before interpreting the legacy phase/gate state; otherwise a
     // CLI `continue` re-runs a fixed gate block and discards the completed DAG.
-    if umadev_agent::has_resumable_director_plan(&project_root) {
+    if !legacy_review_pending && umadev_agent::has_resumable_director_plan(&project_root) {
         return Box::pin(drive_director_continue(
             &project_root,
             &state,
@@ -4355,22 +4509,26 @@ async fn cmd_continue(
     }
     let gate = resolve_active_gate(&state)?;
 
-    // Record the approval as evidence
-    let clause = match gate {
-        Gate::ClarifyGate => "UD-FLOW-001",
-        Gate::DocsConfirm => "UD-FLOW-002",
-        Gate::PreviewConfirm => "UD-FLOW-003",
-    };
-    let _ = record_tool_call(
-        &project_root,
-        "umadev/cli.continue",
-        "",
-        "approved",
-        clause,
-        &format!("user approved gate {}", gate.id_str()),
-        "",
-        None,
-    );
+    // A review-only retry is not a human gate approval. Keep approval evidence
+    // limited to real confirm gates so an infrastructure retry cannot forge a
+    // product decision in the audit trail.
+    if !legacy_review_pending {
+        let clause = match gate {
+            Gate::ClarifyGate => "UD-FLOW-001",
+            Gate::DocsConfirm => "UD-FLOW-002",
+            Gate::PreviewConfirm => "UD-FLOW-003",
+        };
+        let _ = record_tool_call(
+            &project_root,
+            "umadev/cli.continue",
+            "",
+            "approved",
+            clause,
+            &format!("user approved gate {}", gate.id_str()),
+            "",
+            None,
+        );
+    }
 
     drive_gate_block(
         &project_root,
@@ -4716,7 +4874,7 @@ fn cmd_history(project_root: Option<PathBuf>) -> Result<()> {
             let snap_path = project_root
                 .join(".umadev/history")
                 .join(format!("{ts}.json"));
-            let phase = std::fs::read_to_string(&snap_path)
+            let phase = managed_utf8(&snap_path, MAX_PROJECT_CONTROL_BYTES)
                 .ok()
                 .and_then(|t| serde_json::from_str::<WorkflowState>(&t).ok())
                 .map_or("?".to_string(), |s| s.phase);
@@ -5587,6 +5745,7 @@ async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> 
     let mut packs: Vec<_> = std::fs::read_dir(&release)
         .map(|rd| {
             rd.filter_map(Result::ok)
+                .take(MAX_PROJECT_DIRECTORY_ENTRIES)
                 .filter(|e| {
                     let n = e.file_name();
                     let s = n.to_string_lossy();
@@ -5609,7 +5768,7 @@ async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> 
     // --- pre-PR security scan (UD-SEC-003) ---
     println!("\n## Security scan");
     let scan_path = project_root.join(umadev_agent::security_scan_rel_path());
-    match std::fs::read_to_string(&scan_path)
+    match managed_utf8(&scan_path, MAX_PROJECT_CONTROL_BYTES)
         .ok()
         .and_then(|b| serde_json::from_str::<umadev_agent::SecurityScan>(&b).ok())
     {
@@ -5644,7 +5803,7 @@ async fn cmd_verify(project_root: Option<PathBuf>, runtime: bool) -> Result<()> 
     // knows whether the product is live and, if not, how to ship it.
     println!("\n## Deploy");
     let deploy_proof_path = project_root.join(umadev_agent::deploy_proof_rel_path());
-    if let Some(p) = std::fs::read_to_string(&deploy_proof_path)
+    if let Some(p) = managed_utf8(&deploy_proof_path, MAX_PROJECT_CONTROL_BYTES)
         .ok()
         .and_then(|b| serde_json::from_str::<umadev_agent::DeployProof>(&b).ok())
     {
@@ -5886,6 +6045,7 @@ fn latest_quality_report(root: &Path) -> Option<(PathBuf, bool, i64)> {
     let mut candidates: Vec<_> = std::fs::read_dir(&dir)
         .ok()?
         .filter_map(Result::ok)
+        .take(MAX_PROJECT_DIRECTORY_ENTRIES)
         .map(|e| e.path())
         .filter(|p| {
             p.extension().and_then(|s| s.to_str()) == Some("json")
@@ -5896,7 +6056,7 @@ fn latest_quality_report(root: &Path) -> Option<(PathBuf, bool, i64)> {
         .collect();
     candidates.sort();
     let latest = candidates.last()?.clone();
-    let body = std::fs::read_to_string(&latest).ok()?;
+    let body = managed_utf8(&latest, MAX_PROJECT_CONTROL_BYTES).ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
     let passed = v.get("passed")?.as_bool().unwrap_or(false);
     let total = v.get("total_score")?.as_i64().unwrap_or(0);
@@ -6086,7 +6246,7 @@ fn pr_artifact_paths(project_root: &Path, slug: &str) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(project_root.join(dir)) else {
             continue;
         };
-        for entry in entries.flatten() {
+        for entry in entries.flatten().take(MAX_PROJECT_DIRECTORY_ENTRIES) {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if name.starts_with(&doc_prefix) || name.starts_with(&pack_prefix) {
@@ -6174,7 +6334,7 @@ fn cmd_pr(
     if let Some(parent) = body_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&body_path, &body) {
+    match umadev_state::fs::atomic_write(&body_path, body.as_bytes()) {
         Ok(()) => println!(
             "{}",
             umadev_i18n::tf(lang, "pr.body_written", &[&body_path.display().to_string()])
@@ -6370,7 +6530,8 @@ fn cmd_pr(
         None,
     );
     let body_arg = body_path.to_string_lossy().to_string();
-    let gh_out = std::process::Command::new("gh")
+    let mut gh_command = umadev_host::std_command("gh");
+    gh_command
         .args([
             "pr",
             "create",
@@ -6384,23 +6545,31 @@ fn cmd_pr(
             &body_arg,
         ])
         .current_dir(&project_root)
-        .output();
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_PAGER", "cat")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("TERM", "dumb");
+    let gh_out = bounded_cli_output(
+        gh_command,
+        Duration::from_secs(120),
+        1024 * 1024,
+        256 * 1024,
+    );
     match gh_out {
         Ok(out) if out.status.success() => {
-            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let url = safe_command_detail(&out.stdout);
             println!("{}", umadev_i18n::tf(lang, "pr.opened", &[&url]));
             println!("{}", umadev_i18n::t(lang, "pr.review_loop"));
         }
         Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let err = safe_command_detail(&out.stderr);
             println!("{}", umadev_i18n::tf(lang, "pr.create_failed", &[&err]));
             return pr_fallback(&readiness, &slug, &body_rel, lang);
         }
-        Err(e) => {
-            println!(
-                "{}",
-                umadev_i18n::tf(lang, "pr.create_failed", &[&e.to_string()])
-            );
+        Err(error) => {
+            println!("{}", umadev_i18n::tf(lang, "pr.create_failed", &[&error]));
             return pr_fallback(&readiness, &slug, &body_rel, lang);
         }
     }
@@ -6410,30 +6579,137 @@ fn cmd_pr(
 /// Run a git subcommand in `project_root` for the PR flow, printing an actionable
 /// notice on error. Returns `true` on success. Never panics, never `--force`.
 fn run_pr_git(project_root: &Path, args: &[&str]) -> bool {
-    match std::process::Command::new("git")
-        .args(args)
-        .current_dir(project_root)
-        .output()
-    {
+    let command = pr_git_command(project_root, args);
+    let timeout = if args.first() == Some(&"push") {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(30)
+    };
+    match bounded_cli_output(command, timeout, 4 * 1024 * 1024, 256 * 1024) {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr);
+            let err = safe_command_detail(&out.stderr);
             let lang = umadev_i18n::current();
             println!(
                 "{}",
-                umadev_i18n::tf(lang, "pr.git_failed", &[&args.join(" "), err.trim()])
+                umadev_i18n::tf(lang, "pr.git_failed", &[&args.join(" "), &err])
             );
             false
         }
-        Err(e) => {
+        Err(error) => {
             let lang = umadev_i18n::current();
             println!(
                 "{}",
-                umadev_i18n::tf(lang, "pr.git_failed", &[&args.join(" "), &e.to_string()])
+                umadev_i18n::tf(lang, "pr.git_failed", &[&args.join(" "), &error])
             );
             false
         }
     }
+}
+
+#[cfg(windows)]
+const PR_INERT_HOOKS: &str = "core.hooksPath=NUL";
+#[cfg(not(windows))]
+const PR_INERT_HOOKS: &str = "core.hooksPath=/dev/null";
+#[cfg(windows)]
+const PR_EMPTY_ATTRIBUTES: &str = "core.attributesFile=NUL";
+#[cfg(not(windows))]
+const PR_EMPTY_ATTRIBUTES: &str = "core.attributesFile=/dev/null";
+
+fn pr_git_command(project_root: &Path, args: &[&str]) -> std::process::Command {
+    let mut command = umadev_host::std_command("git");
+    for (key, _) in std::env::vars_os() {
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("GIT_")
+            || matches!(upper.as_str(), "EMAIL" | "SSH_ASKPASS" | "GCM_INTERACTIVE")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .arg("--no-pager")
+        .arg("--literal-pathspecs")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            PR_INERT_HOOKS,
+            "-c",
+            PR_EMPTY_ATTRIBUTES,
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "tag.gpgSign=false",
+            "-c",
+            "gc.auto=0",
+        ])
+        .arg("-C")
+        .arg(project_root)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GIT_PAGER", "cat");
+    command
+}
+
+fn bounded_cli_output(
+    command: std::process::Command,
+    timeout: Duration,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+) -> std::result::Result<std::process::Output, String> {
+    let output = umadev_process::run_bounded_std_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout,
+            stdout_bytes,
+            stderr_bytes,
+            reader_grace: Duration::from_secs(1),
+        },
+    )
+    .map_err(|error| format!("command unavailable: {error}"))?;
+    if output.timed_out || output.status.is_none() {
+        return Err(format!(
+            "command timed out after {:.1}s; external state may be unknown, inspect it before retrying",
+            timeout.as_secs_f64()
+        ));
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        return Err(format!(
+            "command output exceeded its safety limit (stdout {stdout_bytes} bytes, stderr {stderr_bytes} bytes); truncated output was rejected"
+        ));
+    }
+    Ok(std::process::Output {
+        status: output
+            .status
+            .expect("a completed bounded command has an exit status"),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn safe_command_detail(bytes: &[u8]) -> String {
+    const MAX_CHARS: usize = 2_000;
+    let decoded = String::from_utf8_lossy(bytes);
+    let cleaned = umadev_agent::base_error::strip_ansi(&decoded)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let count = cleaned.chars().count();
+    cleaned
+        .chars()
+        .skip(count.saturating_sub(MAX_CHARS))
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Common failure exit for the `--create` path: print the safe, force-free
@@ -6472,7 +6748,8 @@ fn print_state(s: &WorkflowState) {
 }
 
 fn line_count(path: &std::path::Path) -> usize {
-    std::fs::read_to_string(path).map_or(0, |t| t.lines().filter(|l| !l.trim().is_empty()).count())
+    managed_utf8(path, MAX_AUDIT_DISPLAY_BYTES)
+        .map_or(0, |t| t.lines().filter(|l| !l.trim().is_empty()).count())
 }
 
 fn resolve_root(project_root: Option<PathBuf>) -> Result<PathBuf> {
@@ -6603,6 +6880,68 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_git_available() -> bool {
+        bounded_cli_output(
+            pr_git_command(Path::new("."), &["--version"]),
+            Duration::from_secs(5),
+            64 * 1024,
+            64 * 1024,
+        )
+        .is_ok_and(|output| output.status.success())
+    }
+
+    fn run_test_git(root: &Path, args: &[&str]) -> std::process::Output {
+        bounded_cli_output(
+            pr_git_command(root, args),
+            Duration::from_secs(10),
+            1024 * 1024,
+            1024 * 1024,
+        )
+        .unwrap_or_else(|error| panic!("git {args:?} could not run safely: {error}"))
+    }
+
+    #[test]
+    fn pr_git_children_are_noninteractive_and_use_inert_hooks() {
+        use std::ffi::OsStr;
+
+        let command = pr_git_command(Path::new("."), &["status", "--porcelain"]);
+        let env = command.get_envs().collect::<Vec<_>>();
+        let value = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == OsStr::new(name))
+                .and_then(|(_, value)| *value)
+        };
+        assert_eq!(value("GIT_TERMINAL_PROMPT"), Some(OsStr::new("0")));
+        assert_eq!(value("GCM_INTERACTIVE"), Some(OsStr::new("Never")));
+        assert!(command
+            .get_args()
+            .any(|arg| arg == OsStr::new(PR_INERT_HOOKS)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_bounded_output_rejects_flood_and_hang_but_preserves_nonzero() {
+        let mut flood = std::process::Command::new("sh");
+        flood.args(["-c", "head -c 65536 /dev/zero"]);
+        let error = bounded_cli_output(flood, Duration::from_secs(2), 1024, 1024).unwrap_err();
+        assert!(error.contains("truncated output"), "{error}");
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("descendant-survived");
+        let mut hang = std::process::Command::new("sh");
+        hang.env("UMADEV_TEST_MARKER", &marker)
+            .args(["-c", "(sleep 1; : > \"$UMADEV_TEST_MARKER\") & sleep 30"]);
+        let error = bounded_cli_output(hang, Duration::from_millis(150), 1024, 1024).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(!marker.exists());
+
+        let mut failure = std::process::Command::new("sh");
+        failure.args(["-c", "exit 7"]);
+        let output = bounded_cli_output(failure, Duration::from_secs(2), 1024, 1024).unwrap();
+        assert!(!output.status.success());
+    }
 
     fn sample_curated_lesson(
         title: &str,
@@ -6788,11 +7127,7 @@ mod tests {
         // rollback then moved it FURTHER backwards from a state that was never the
         // user's. `resolve_root` is the one choke point every workspace verb passes
         // through, so the tree a verb is about to act on is the tree that gets healed.
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .map_or(true, |o| !o.status.success())
-        {
+        if !test_git_available() {
             return;
         }
         let elsewhere = tempfile::tempdir().unwrap();
@@ -6840,11 +7175,7 @@ mod tests {
         //
         // So: heal a real workspace, take the command OUT OF THE NOTE THE USER IS HANDED,
         // run exactly that, and require the user's file content back on disk.
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .map_or(true, |o| !o.status.success())
-        {
+        if !test_git_available() {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -6938,11 +7269,7 @@ mod tests {
         // the user could commit — a tree still stranded in the past by a run killed inside a
         // temporary evidence rewind: an earlier step's source, judged as if it were the
         // change being made. Heal first, then gate.
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .map_or(true, |o| !o.status.success())
-        {
+        if !test_git_available() {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
@@ -7093,6 +7420,22 @@ mod tests {
         assert!(body.contains("ci --changed-only"));
         uninstall_pre_commit_hook(root).unwrap();
         assert!(!hook_path.exists(), "a UmaDev-only hook is removed cleanly");
+    }
+
+    #[test]
+    fn pre_commit_uninstall_refuses_an_incomplete_prefixed_block() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let path = hooks.join("pre-commit");
+        let original = format!(
+            "#!/bin/sh\n{PRE_COMMIT_MARKER}\numadev ci --changed-only\necho keep-user-hook\n"
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        assert!(uninstall_pre_commit_hook(root).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
     }
 
     #[test]
@@ -7325,6 +7668,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cli_fresh_run_settles_old_review_ledger_before_writing_new_identity() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/lib.rs"), "pub fn old_run() {}\n").unwrap();
+        let old_options = director_test_opts(tmp.path());
+        let route = umadev_agent::router::for_run(&old_options.requirement);
+        let events: Arc<dyn umadev_agent::EventSink> =
+            Arc::new(umadev_agent::RecordingSink::default());
+        let mut entry = umadev_agent::task_lifecycle::EntryTaskTracker::begin(
+            tmp.path(),
+            "old-resident-run",
+            "resident-edit",
+            "finish the old requirement",
+        )
+        .unwrap();
+        let old_run_id = entry.run_id().to_string();
+        let qc = umadev_agent::PostBuildQcOutcome {
+            reply: String::new(),
+            clean: false,
+            blocking: Vec::new(),
+            operational_unavailable: vec!["review unavailable: timed out".to_string()],
+        };
+        umadev_agent::checkpoint_post_build_review_pause(
+            &old_options,
+            &route,
+            &qc,
+            &events,
+            Some(&old_run_id),
+            None,
+            None,
+        )
+        .unwrap();
+        entry.wait("required reviewer unavailable").unwrap();
+        drop(entry);
+        let ledger_dirs_before = std::fs::read_dir(tmp.path().join(".umadev/agent-tasks"))
+            .unwrap()
+            .count();
+
+        // This is the exact CLI preflight called before probe/session/start.
+        settle_operational_review_before_fresh_run(tmp.path()).unwrap();
+        let old_ledger =
+            umadev_agent::task_lifecycle::AgentTaskLedger::open(tmp.path(), &old_run_id).unwrap();
+        assert_eq!(
+            old_ledger.task("entry").map(|task| task.state),
+            Some(umadev_agent::task_lifecycle::AgentTaskState::Cancelled)
+        );
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join(".umadev/agent-tasks"))
+                .unwrap()
+                .count(),
+            ledger_dirs_before,
+            "settling the old cursor must not fabricate a replacement ledger"
+        );
+
+        let mut new_options = old_options;
+        new_options.requirement = "build the genuinely new requirement".to_string();
+        let runner = AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), new_options);
+        runner.start().unwrap();
+        assert_eq!(
+            umadev_agent::read_workflow_state(tmp.path())
+                .expect("fresh baseline")
+                .requirement,
+            "build the genuinely new requirement"
+        );
+    }
+
     fn proportional_director_test_opts(root: &Path) -> RunOptions {
         let mut options = director_test_opts(root);
         // This exact goal is intentionally Light/Fast: the smoke below verifies a
@@ -7495,6 +7905,52 @@ mod tests {
             .expect("Plan mode settles read-only before opening a backend");
         let saved = umadev_agent::plan_state::load(root).unwrap();
         assert_eq!(saved.steps[0].status, StepStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn cli_continue_refuses_a_terminal_review_before_backend_probe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Delivery);
+        state.requirement = "finish the existing product".to_string();
+        state.slug = "terminal-review".to_string();
+        state.active_gate = "not-a-legacy-gate".to_string();
+        state.backend = "definitely-not-an-installed-backend".to_string();
+        state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Auto);
+        umadev_agent::write_workflow_state(root, &state).unwrap();
+        let checkpoint_path = root
+            .join(".umadev")
+            .join("director-operational-review.json");
+        std::fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "kind": "final-gate-review",
+                "qc_source_fingerprint": null,
+                "consecutive_outages": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
+
+        let error = Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+            .await
+            .expect_err("an exhausted review boundary cannot be continued")
+            .to_string();
+
+        assert!(
+            error.contains("cannot be continued") && error.contains("review"),
+            "terminal review evidence must own the result: {error}"
+        );
+        assert!(
+            !error.contains("definitely-not-an-installed-backend"),
+            "backend resolution happened before the terminal review preflight: {error}"
+        );
+        assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        assert!(
+            !root.join(".umadev/agent-tasks").exists(),
+            "a refused continuation must not fabricate a task ledger"
+        );
     }
 
     #[tokio::test]
@@ -7802,12 +8258,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(args)
-                .output()
-                .unwrap();
+            let output = run_test_git(root, args);
             assert!(
                 output.status.success(),
                 "git {args:?}: {}",
@@ -8096,6 +8547,7 @@ mod tests {
         // mutation, so this can't flake other tests that read HOME.
         let tmp = std::env::temp_dir().join(format!("umadev-logtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir(&tmp).unwrap();
         let f = open_log_file_in(&tmp);
         assert!(f.is_some(), "a writable home yields a log file");
         assert!(
@@ -8106,6 +8558,20 @@ mod tests {
             "the log file is created on disk"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_log_file_rejects_fifo_without_blocking() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let logs = tmp.path().join(".umadev/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(logs.join("umadev.log"))
+            .status()
+            .unwrap()
+            .success());
+        assert!(open_log_file_in(tmp.path()).is_none());
     }
 
     /// BackendArg must cover EXACTLY the ids that umadev-host registers

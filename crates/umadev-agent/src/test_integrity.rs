@@ -98,6 +98,13 @@ const HARNESS_FILES: &[&str] = &[
     ".nycrc.json",
 ];
 
+const MAX_TEST_FILE_BYTES: usize = 1024 * 1024;
+const MAX_TEST_SCAN_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TEST_SURFACE_FILES: usize = 800;
+const MAX_TEST_SCAN_ENTRIES: usize = 20_000;
+const MAX_IMPL_SURFACE_BYTES: usize = 1_500_000;
+const MAX_PACKAGE_JSON_BYTES: usize = 1024 * 1024;
+
 /// Per-file test metrics captured in a [`TestSnapshot`] — the comparable surface
 /// the before/after diff reasons over.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -138,6 +145,10 @@ pub struct TestSnapshot {
     harness: BTreeMap<String, u64>,
     /// The `scripts.test` value from `package.json`, if present.
     test_command: Option<String>,
+    /// False when any directory/file or the aggregate budget prevented a full
+    /// snapshot. Comparing an incomplete snapshot would turn unavailable input
+    /// into fabricated "deleted test" findings.
+    complete: bool,
 }
 
 impl TestSnapshot {
@@ -150,14 +161,43 @@ impl TestSnapshot {
 }
 
 /// Capture the project's test surface into a [`TestSnapshot`]. Bounded and
-/// fail-open: skips heavy/vendor dirs, caps the files it reads, and treats any IO
-/// error as "absent" rather than erroring. Call this immediately BEFORE a build
-/// step's doer turn; pass the result to [`check`] after the turn.
+/// fail-open: skips heavy/vendor dirs, caps the files it reads, and marks the
+/// snapshot incomplete on any unavailable input. [`check`] never compares an
+/// incomplete snapshot. Call this immediately BEFORE a build step's doer turn;
+/// pass the result to [`check`] after the turn.
 #[must_use]
 pub fn snapshot(project_root: &Path) -> TestSnapshot {
-    let mut snap = TestSnapshot::default();
-    walk(project_root, project_root, &mut snap, 0);
-    snap.test_command = read_test_command(project_root);
+    let mut snap = TestSnapshot {
+        complete: true,
+        ..TestSnapshot::default()
+    };
+    let root_is_real_directory = std::fs::canonicalize(project_root)
+        .ok()
+        .and_then(|path| std::fs::symlink_metadata(path).ok())
+        .is_some_and(|metadata| umadev_state::fs::metadata_is_real_dir(&metadata));
+    if !root_is_real_directory {
+        snap.complete = false;
+        return snap;
+    }
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        MAX_TEST_SCAN_BYTES,
+        MAX_TEST_FILE_BYTES.max(MAX_PACKAGE_JSON_BYTES),
+    );
+    let mut entries_seen = 0usize;
+    walk(
+        project_root,
+        project_root,
+        &mut snap,
+        &mut budget,
+        &mut entries_seen,
+        0,
+    );
+    if snap.complete {
+        match read_test_command(project_root, &mut budget) {
+            Ok(command) => snap.test_command = command,
+            Err(_) => snap.complete = false,
+        }
+    }
     snap
 }
 
@@ -174,12 +214,15 @@ pub fn check(project_root: &Path, before: Option<&TestSnapshot>) -> Vec<String> 
     let Some(before) = before else {
         return Vec::new(); // no baseline → cannot determine integrity → fail-open
     };
-    if before.is_empty() {
+    if !before.complete || before.is_empty() {
         // Nothing existed to protect before this step; only additions are
         // possible, and additions are never a violation. Fail-open.
         return Vec::new();
     }
     let after = snapshot(project_root);
+    if !after.complete {
+        return Vec::new();
+    }
     let mut out = Vec::new();
 
     // --- Test files: deletions, removed test functions, weakened assertions ---
@@ -325,7 +368,9 @@ fn hardcoded_literal_findings(
     if candidates.is_empty() {
         return Vec::new();
     }
-    let impl_src = impl_surface(project_root);
+    let Some(impl_src) = impl_surface(project_root) else {
+        return Vec::new();
+    };
     if impl_src.is_empty() {
         return Vec::new();
     }
@@ -361,15 +406,36 @@ fn truncate_literal(lit: &str) -> String {
 
 /// Bounded recursive walk: classify each file as a harness config or a test file
 /// and record it into `snap`. Mirrors the depth/skip bounds of the acceptance
-/// scan. Fail-open: an unreadable dir is skipped silently.
-fn walk(root: &Path, dir: &Path, snap: &mut TestSnapshot, depth: usize) {
-    if depth > 8 || snap.tests.len() + snap.harness.len() > 800 {
+/// scan. An unreadable directory marks the whole snapshot incomplete so a
+/// missing entry cannot be misreported as a deleted test.
+fn walk(
+    root: &Path,
+    dir: &Path,
+    snap: &mut TestSnapshot,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+    entries_seen: &mut usize,
+    depth: usize,
+) {
+    if depth > 8 || snap.tests.len() + snap.harness.len() >= MAX_TEST_SURFACE_FILES {
+        snap.complete = false;
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
+        snap.complete = false;
         return;
     };
-    for e in rd.flatten() {
+    for entry in rd {
+        *entries_seen = entries_seen.saturating_add(1);
+        if *entries_seen > MAX_TEST_SCAN_ENTRIES
+            || snap.tests.len() + snap.harness.len() >= MAX_TEST_SURFACE_FILES
+        {
+            snap.complete = false;
+            return;
+        }
+        let Ok(e) = entry else {
+            snap.complete = false;
+            return;
+        };
         let p = e.path();
         // No-follow: a symlinked dir/file is skipped so the test snapshot never
         // walks OUT of the workspace or loops through a symlink cycle. A real
@@ -380,7 +446,10 @@ fn walk(root: &Path, dir: &Path, snap: &mut TestSnapshot, depth: usize) {
                 if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                     continue;
                 }
-                walk(root, &p, snap, depth + 1);
+                walk(root, &p, snap, budget, entries_seen, depth + 1);
+                if !snap.complete {
+                    return;
+                }
                 continue;
             }
             EntryKind::Skip => continue,
@@ -397,9 +466,11 @@ fn walk(root: &Path, dir: &Path, snap: &mut TestSnapshot, depth: usize) {
 
         // Harness config (matched by exact name) — record a content hash.
         if HARNESS_FILES.contains(&name_lower.as_str()) {
-            if let Ok(content) = read_capped(&p) {
-                snap.harness.insert(rel, hash_str(&content));
-            }
+            let Ok(content) = budget.read_utf8_beneath(root, &p) else {
+                snap.complete = false;
+                return;
+            };
+            snap.harness.insert(rel, hash_str(&content));
             continue;
         }
         // Test file? Code ext + path/name heuristic, or a Rust file with inline
@@ -413,8 +484,9 @@ fn walk(root: &Path, dir: &Path, snap: &mut TestSnapshot, depth: usize) {
         if !CODE_EXT.contains(&ext.as_str()) {
             continue;
         }
-        let Ok(content) = read_capped(&p) else {
-            continue;
+        let Ok(content) = budget.read_utf8_beneath(root, &p) else {
+            snap.complete = false;
+            return;
         };
         if is_test_file(&rel_lower, &name_lower, &ext, &content) {
             snap.tests.insert(rel, file_metrics(&content));
@@ -422,23 +494,14 @@ fn walk(root: &Path, dir: &Path, snap: &mut TestSnapshot, depth: usize) {
     }
 }
 
-/// Read a file, capped at 1 MiB so a pathological file can't blow the budget.
-fn read_capped(path: &Path) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
-    let capped = if bytes.len() > 1_048_576 {
-        &bytes[..1_048_576]
-    } else {
-        &bytes[..]
-    };
-    Ok(String::from_utf8_lossy(capped).into_owned())
-}
-
 /// Concatenate the project's NON-test implementation source (bounded ~1.5 MB) —
 /// the surface the hard-coded-literal heuristic searches for the impl's own
 /// output. Reuses the shared bounded [`crate::acceptance::source_files`] collector
 /// and filters out the test files.
-fn impl_surface(project_root: &Path) -> String {
+fn impl_surface(project_root: &Path) -> Option<String> {
     let mut buf = String::new();
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_IMPL_SURFACE_BYTES, MAX_TEST_FILE_BYTES);
     for f in crate::acceptance::source_files(project_root) {
         let name_lower = f
             .file_name()
@@ -462,19 +525,16 @@ fn impl_surface(project_root: &Path) -> String {
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let Ok(content) = read_capped(&f) else {
-            continue;
+        let Ok(content) = budget.read_utf8_beneath(project_root, &f) else {
+            return None;
         };
         if is_test_file(&rel_lower, &name_lower, &ext, &content) {
             continue; // skip test files — we want the IMPLEMENTATION surface
         }
         buf.push_str(&content);
         buf.push('\n');
-        if buf.len() > 1_500_000 {
-            break;
-        }
     }
-    buf
+    Some(buf)
 }
 
 /// Identify a test file by the universal conventions: name markers
@@ -724,15 +784,27 @@ fn count_token(haystack: &str, token: &str) -> usize {
     count
 }
 
-/// Read `package.json`'s `scripts.test` value, if present. Fail-open: a missing /
-/// unparseable file, or no `test` script, yields `None`.
-fn read_test_command(project_root: &Path) -> Option<String> {
-    let body = std::fs::read_to_string(project_root.join("package.json")).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
-    json.get("scripts")?
-        .get("test")?
-        .as_str()
-        .map(str::to_string)
+/// Read `package.json`'s `scripts.test` value, if present. Missing or
+/// unparseable JSON yields `Ok(None)`; an unavailable/oversized file is an
+/// incomplete snapshot and therefore an error to the caller.
+fn read_test_command(
+    project_root: &Path,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) -> std::io::Result<Option<String>> {
+    let path = project_root.join("package.json");
+    let body = match budget.read_utf8_beneath(project_root, &path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return Ok(None);
+    };
+    Ok(json
+        .get("scripts")
+        .and_then(|scripts| scripts.get("test"))
+        .and_then(|test| test.as_str())
+        .map(str::to_string))
 }
 
 /// A stable, dependency-free 64-bit content hash (FNV-1a) — enough to detect that
@@ -1172,6 +1244,24 @@ mod tests {
         );
         let findings = check(tmp.path(), Some(&before));
         assert!(findings.is_empty(), "reorder is clean: {findings:?}");
+    }
+
+    #[test]
+    fn an_oversized_after_snapshot_cannot_fabricate_a_deleted_test() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "tests/app.test.js", GOOD_TEST);
+        let before = snapshot(tmp.path());
+        assert!(before.complete);
+
+        let file = fs::File::create(tmp.path().join("tests/app.test.js")).unwrap();
+        file.set_len((MAX_TEST_FILE_BYTES + 1) as u64).unwrap();
+        drop(file);
+        let after = snapshot(tmp.path());
+        assert!(!after.complete);
+        assert!(
+            check(tmp.path(), Some(&before)).is_empty(),
+            "unavailable after-state is not evidence that the test was deleted"
+        );
     }
 
     #[cfg(unix)]

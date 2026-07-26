@@ -50,6 +50,12 @@
 "live_meta.changes.none" = "本輪已確認沒有檔案變更。"
 "live_meta.changes.none_yet" = "目前尚未觀察到本輪檔案變更。"
 "live_meta.changes.git_status" = "目前 git status 顯示 {} 個檔案：{}\n注意：沒有可用的本輪 Diff 記錄，這些狀態可能包含執行開始前就存在的變更。"
+"live_meta.permissions.state" = "權限按回合判斷；第一則訊息不會鎖死常駐會話，後續明確的修改要求會重新判定。目前信任模式：`{}`。無需重新啟動。"
+"live_meta.permissions.codex_sandbox" = "Codex 在目前信任模式下的實際啟動沙箱：`{}`。"
+"live_meta.permissions.ready" = "直接說明要修改哪個檔案或功能及目標即可；UmaDev 會自動為該回合開啟可寫會話。"
+"live_meta.permissions.plan" = "目前 Plan 模式主動禁止寫入；輸入 `/mode guarded` 或 `/mode auto`，再提交具體修改要求即可，無需重新啟動。"
+"live_meta.permissions.codex_read_only" = "目前 Codex 啟動沙箱確為 `read-only`；輸入 `/sandbox workspace-write` 即時重建常駐會話，再提交具體修改要求，無需重新啟動 UmaDev。"
+"live_meta.permissions.other_base" = "Guarded/Auto 會為具體修改要求申請可寫會話；底座、平台或企業政策仍可能限制實際能力。"
 "model.synced" = "已同步驅動模型 {}(來自 {})—— Agent 就用底座這個模型工作"
 "model.synced_default" = "{} 未在設定裡固定模型 —— Agent 用它的登入/預設模型驅動(執行後可見真實模型)"
 "model.reasoning" = "思考強度 {}(底座設定,umadev 不覆寫)"
@@ -247,6 +253,7 @@
 "attach.image" = "圖片"
 "attach.file" = "檔案"
 "attach.paste" = "貼上 {} 行"
+"attach.paste_limit" = "未貼上：單次最多 1 MiB，每輪暫存文字最多 2 MiB。請改用檔案附件或分段貼上。"
 "attach.rejected" = "未加入附件：{}（本機路徑已隱藏）。"
 "attach.reason.count" = "每輪最多支援 16 個附件"
 "attach.reason.unavailable" = "檔案不可用或無法讀取"
@@ -346,11 +353,12 @@
 "run.budget_pause_resume_hint" = "已到時間上限,本輪已暫停在第 {}/{} 步 —— 輸入 `/continue` 續跑剩餘步驟"
 "run.operational_pause_resume_hint" = "所需評審服務暫時不可用（{}）—— 本輪已暫停在第 {}/{} 步，沒有改動原始碼或判定計畫失敗；輸入 `/continue` 重試目前步驟"
 "plan.summary.header" = "任務總結 — {} 完成 · {} 進行中 · {} 堵塞 · {} 未完成"
-"plan.panel.more_hint" = "上滑或 /plan 檢視全部"
+"plan.panel.more_hint" = "/plan 檢視完整計畫與團隊"
 "plan.none" = "暫無計畫。完整建置或一次深思熟慮的任務會在這裡生成計畫。"
 "plan.queue.section" = "排隊任務 — {} 條待處理"
 "plan.queue.next_turn" = "  {}. [下一輪] {}"
 "plan.queue.current_task" = "  {}. [目前任務調整] {}"
+"plan.queue.native" = "  {}. [底座原生佇列] {}"
 "plan.review.title" = "團隊評審"
 "plan.review.accept" = "通過"
 "plan.review.block" = "{} 個必改"
@@ -360,6 +368,7 @@
 "plan.review.note.summary" = "團隊評審已收斂 — {} 通過 · {} 攔截(完整評審見上)。"
 "plan.review.section" = "團隊評審 — {} 通過 · {} 攔截"
 "plan.review.fix" = "建議:{}"
+"plan.review.advisory" = "改進建議:{}"
 "plan.review.next_step" = "下一步:輸入 /run 讓團隊按上面的建議修復,或 /revise <補充指引>"
 "plan.steer.usage" = "/plan — 檢視計畫 · /plan skip <id> · /plan add <文字> · /plan veto <id> · /plan up <id> · /plan down <id> · /plan collapse"
 "plan.steer.skip" = "跳過步驟 `{}`——折進下一條指令。"
@@ -430,6 +439,7 @@
 "constitution.footer" = "強制執行採用 fail-open:治理器自身的 bug 絕不會阻塞你的工作,但這些不可妥協原則會在每次檔案寫入前被檢查,並在評審中呈現。隨時執行 /constitution 查看本憲章。"
 "constitution.overlay_title" = "團隊憲章"
 "constitution.edit_hint" = "你可以在 {} 閱讀並編輯本憲章 —— 你的修改會成為團隊憲章,永不被覆寫。"
+"constitution.plan_preview" = "計畫模式:目前只預覽預設憲章,不會建立 {}。切換到 guarded/auto 後再次執行 /constitution 即可寫入。"
 "constitution.generated" = "已在 {} 依據團隊強制執行的規則產生團隊憲章。"
 
 # 說明
@@ -459,8 +469,8 @@
 "session.resume_goal" = "[目標] 上次有個目標沒做完:下一步「{}」(已完成 {}/{} 步)。/continue 接上 · 或直接說要不要繼續。"
 
 # Codex 高危沙箱責任警告(僅在 codex 且 danger-full-access 時顯示)
-"codex.sandbox.danger_warning" = "警告:UmaDev 將以 danger-full-access 啟動本專案中的 Codex 底座工作階段 —— 請自行承擔系統環境風險。單獨開啟的 Codex 視窗有自己的權限設定，顯示可能不同。\n  關閉:在 .umadevrc 中設定 [codex] sandbox_mode = \"workspace-write\" 後重新啟動。"
-"codex.sandbox.windows_hint" = "提示(Windows + Codex):目前沙箱會封鎖網路、本地 dev 埠與 git,全端建置(npm install / dev server / git)無法完成;且 codex 的 Windows 沙箱輔助程序在部分機器上會因缺少執行階段而報「找不到指定的模組」。做全端開發請執行 /sandbox danger-full-access 放開(UmaDev 仍全程稽核)。"
+"codex.sandbox.danger_warning" = "警告:UmaDev 將以 danger-full-access 啟動本專案中的 Codex 底座工作階段 —— 請自行承擔系統環境風險。單獨開啟的 Codex 視窗有自己的權限設定，顯示可能不同。\n  關閉:輸入 `/sandbox workspace-write` 即時重建工作階段，無需重新啟動 UmaDev。"
+"codex.sandbox.windows_hint" = "提示(Windows + Codex):目前沙箱會封鎖網路、本地 dev 埠與 git,全端建置(npm install / dev server / git)無法完成;且 codex 的 Windows 沙箱輔助程序在部分機器上會因缺少執行階段而報「找不到指定的模組」。做全端開發請先用 `/mode auto`，尚未設定時再輸入 `/sandbox danger-full-access`（UmaDev 仍全程稽核）。"
 
 # /sandbox —— 在應用內查看 / 修改 Codex 底座啟動沙箱(無需手改 .umadevrc)
 "sandbox.current" = "Codex 沙箱目前為:{}\n  (僅對 codex 底座生效 —— 它決定 codex 執行時能動到哪些東西)"
@@ -471,6 +481,7 @@
 "sandbox.codex_only" = "提示:目前底座不是 codex,這項設定要切到 codex 底座(/codex)後才生效。"
 "sandbox.set" = "Codex 沙箱已設為 {} —— 本次工作階段生效,並已寫入 .umadevrc。"
 "sandbox.danger_set" = "Codex 沙箱已設為 danger-full-access —— 本次工作階段生效,並已寫入 .umadevrc。本機連接埠 / 網路 / git 已解除限制,系統環境風險由你承擔。"
+"sandbox.clamped" = "已儲存所要求的 Codex 沙箱 `{}`，但目前信任模式 `{}` 會把實際啟動沙箱限制為 `{}`；UmaDev 不會聲稱已取得更高權限。danger-full-access 請用 `/mode auto`，workspace-write 請用 `/mode guarded` 或 `/mode auto`；常駐工作階段會立即重建，無需重新啟動 UmaDev。"
 "sandbox.persist_failed" = "[warn] 本次工作階段已生效,但無法寫入 .umadevrc(下次啟動會恢復):{}"
 "sandbox.busy_no_change" = "Codex 目前仍在執行。請先取消本輪,再修改 /sandbox;UmaDev 會依新權限重建常駐 Codex 工作階段。"
 
@@ -569,6 +580,7 @@
 "run.gate_line.guarded" = "目前守護模式:兩處檢查點(確認核心文件 / 確認前端預覽)會停下等你逐項審批;按 shift+Tab 或 /auto 可切自動通過。已開始…"
 "run.gate_line.plan" = "目前計劃模式:只讀出計劃、不寫程式碼(/mode guarded 或 auto 才執行)。流水線啟動中…"
 "run.cancelled" = "[已取消] 目前執行已停止,回到輸入。已完成階段的產物保留在 output/,下次 /continue 或輸入新需求都可以。"
+"run.operational_cancelled" = "[已取消] 已關閉暫停的評審及其恢復指標。已完成產物仍會保留；請輸入新需求或使用 /run 開始新一輪。"
 
 # /init manifest
 "init.design_files" = "\n  設計基礎設施: {} 檔案寫入 knowledge/"
@@ -636,6 +648,7 @@
 "memory.clear_cache_preview" = "預覽（尚未執行）\n\n將清除專案範圍內的可重建快取:{}。權威記憶不受影響。\n\n確認:在同一命令末尾加 `--yes`。"
 "memory.clear_cache_ok" = "[ok] 已清除可重建快取 {} · 檔案={} · 位元組={}。權威記憶沒有被刪除。"
 "cancel.none_running" = "沒有正在執行的流水線 — 無需取消。直接輸入需求開新一輪,或 /quit 退出。"
+"cancel.operational_cleanup_failed" = "無法完整取消已暫停的評審任務，因此保留了恢復指標：{}"
 "clear.busy" = "任務仍在執行或暫停於確認 Gate。請先用 /cancel 並等待停止完成，再執行 /clear。"
 "slash.did_you_mean" = " 是想用 `/{}` 嗎?"
 "slash.unknown" = "未知指令 `/{}`。{} 輸入 /help 看完整列表。"
@@ -649,6 +662,7 @@
 "backend.workflow_handoff" = "工作流程底座已從 {} 切換到 {}。需求、計畫和既有產物會繼續使用，但舊底座的工作階段 ID 不會跨底座重用；本次將啟動新的廠商工作階段。"
 "backend.busy_no_switch" = "目前底座上有執行進行中 —— 請先 /cancel 再切換底座,以免執行與其會話錯配。"
 "backend.switch_unavailable" = "未切換到底座 `{}`:目前探測確認它不可用。請先執行 `{}`，再重試切換。"
+"backend.switch_probe_pending" = "尚未切換到底座 `{}`：啟動探測仍在進行。請在底座狀態出現後重試。"
 "backend.switch_login_unverified" = "尚未切換到底座 `{}`:無法確認登入狀態。請先執行 `{}`；如果這是無需登入的本地/第三方設定，請再次輸入同一切換命令確認繼續。"
 "backend.active_unavailable" = "目前設定的底座 `{}` 不可用，本次請求尚未啟動。請先執行 `{}` 或切換到其他已就緒底座；修復後原輸入可直接再次提交。"
 "chat.busy_cancel_first" = "有執行或對話進行中 —— 請先 /cancel;此時切換工作階段或壓縮會破壞目前工作階段。"
@@ -662,7 +676,7 @@
 
 # /run and /redo
 "run.busy_reopen" = "流水線正在跑 — 先 /cancel 停掉再重開,避免兩個流水線同時寫同一個工作區。"
-"run.usage" = "用法:/run [slug] <需求>\n  範例:/run my-app 做一個登入系統\n  範例:/run 做一個 todo list (slug 自動用目錄名)"
+"run.usage" = "用法:/run [--slug <slug>] <需求>\n  範例:/run --slug my-project 做一個登入系統\n  範例:/run 建立端到端測試套件 (slug 自動用目錄名)"
 "goal.busy_reopen" = "已經有任務在跑 — 先 /cancel 停掉再 /goal,避免兩個任務同時寫同一個工作區。"
 "goal.usage" = "用法:/goal <目標>\n  範例:/goal 做一個能上線的待辦應用,帶登入和提醒\n  設定一個目標後,我會帶團隊朝它一直做到達成(廠商暴露專屬持續目標能力時直接映射,否則由協調者持續維持)。"
 "goal.starting" = "[goal] 收到目標:\"{}\"。我會帶團隊朝它持續推進,直到做完、建置/品質校驗通過為止(中途想停用 /cancel)。"
@@ -1011,6 +1025,8 @@
 "tui.scroll.above" = "↑ 上方還有 {} 行"
 # 拖曳選擇複製後的提示({} = 複製到剪貼簿的字元數)
 "tui.copied" = "已複製 {} 個字元"
+"tui.copy_failed" = "剪貼簿寫入失敗，本次未複製"
+"tui.copy_too_large" = "所選內容超過遠端剪貼簿上限（最多 {} 個 UTF-8 位元組），本次未複製"
 # Ctrl+點擊開啟記錄裡的連結 / 檔案({} = 開啟的目標;iTerm2 原生 Cmd+點擊不受影響)
 "tui.link.opened" = "已開啟 {}"
 "tui.link.open_failed" = "無法開啟 {}"
@@ -1166,6 +1182,7 @@
 "tui.bang.spawn_failed" = "無法執行:{}"
 "tui.bang.timeout" = "命令逾時"
 "tui.bang.no_output" = "(無輸出)"
+"tui.local.output_truncated" = "[較早的命令輸出已截斷]"
 # 說明浮層 + 命令面板共用的斜線命令描述(單一來源)。
 # 多數命令沿用上面的 tui.help.* 文案;以下涵蓋此前只有英文面板提示(或沒有提示)、
 # 現在改由註冊表統一管理的命令。
@@ -1209,6 +1226,7 @@
 "agentic.inspecting" = "[agentic] 正在檢視儲存庫…"
 "agentic.working_on" = "[agentic] 正在處理:{}"
 "agentic.done" = "[agentic] 完成。"
+"stream.compacted" = "[提示] 為限制記憶體占用，已合併 {} 則中間即時進度；上方已恢復完整最終回覆。"
 # 斜線命令內聯輸出(app.rs)
 "slash.history_cleared" = "對話歷史已清空。"
 "slash.gate_approved" = "[ok] 已通過{} —— 繼續…"
@@ -1303,6 +1321,7 @@
 "checkpoint.workspace_in_past_halt" = "已停止:工作區停在更早的狀態(一次暫時取證回退沒能撤銷)。不會再排程後續步驟——在一棵停在過去的樹上繼續寫程式碼,等於在不屬於你的檔案上添磚加瓦。重啟 UmaDev,它會先把工作區放回現在,再做別的事。"
 "checkpoint.temp_rewind_recovery_failed" = "工作區仍停在更早的狀態:上一次執行在暫時回退取證期間被強制結束,UmaDev 無法自動把原始碼樹放回來。你的成果完整保存在快照「{}」裡。標記檔「{}」已保留,下次啟動會再試一次。要手動恢復,請執行:「{}」(`umadev rollback <id>` 本來可以恢復檢查點裡的檔案,但這個工作區剛剛 reset 失敗——正因如此,這一步只能手動做)。"
 "checkpoint.temp_rewind_unrecoverable" = "請檢查你的原始碼樹:上一次執行在暫時回退取證期間被強制結束,而它記錄的快照「{}」在本工作區裡無法識別,所以 UmaDev 不會把你的檔案重置到這個未知的提交上——什麼都沒動,而且在這棵樹回到現在之前,不會再往上面寫任何東西。標記檔「{}」已保留;如果你的程式碼看起來停在更早的狀態,請用你自己的 git 歷史恢復(`umadev rollback` 對這個 id 無能為力——它不是本工作區能識別的檢查點;`umadev history` 會列出能識別的那些)。等檔案恢復成你想要的樣子後,執行 `umadev doctor --fix` 即可解除這個停止狀態——它會清掉上面那個陳舊標記,不會改動工作區裡的任何檔案。(單獨執行 `umadev doctor` 只報告、不改任何東西。)"
+"checkpoint.temp_rewind_marker_invalid" = "已停止且沒有改動你的檔案:暫時回退標記「{}」存在,但無法安全信任({})。UmaDev 無法證明工作區目前狀態的位置,因此不會繼續寫入,也不會重置到未知狀態。請先檢查原始碼,必要時用你自己的 git 歷史恢復,然後執行 `umadev doctor --fix` 刪除無效標記。"
 "checkpoint.heal_rescue_label" = "工作區自動修復前的現場(含你在回退期間寫下的改動)"
 "checkpoint.rollback_pre_label" = "auto: 回滾到 {} 前的現場"
 "checkpoint.none_to_restore" = "還沒有任何檢查點可回滾。"
@@ -1315,6 +1334,8 @@
 "doctor.rewind_marker_recoverable" = "存在一個暫時回退標記，它指向快照「{}」，而本工作區能識別該快照。這裡不需要修：下次啟動 `umadev` 時它會自己把你的檔案放回現在。（保留這個標記正是它能做到這件事的前提——`--fix` 故意不會刪除它。）"
 "doctor.rewind_marker_unrecoverable" = "陳舊的回退標記——這就是每次 `umadev run` 都立即中止的原因。該標記指向快照「{}」，而本工作區已無法識別它（影子檢查點倉庫不見了或讀不了），所以自動修復拒絕把你的檔案 reset 到它——而且每次啟動都會得出同樣的拒絕，永遠如此。執行 `umadev doctor --fix` 可以清掉它。清掉標記不會改動工作區裡的任何檔案，只是讓 UmaDev 不再反覆拋出一個它根本無法處理的停止。請先檢查你的原始碼——如果它看起來停在更早的狀態，請用你自己的 git 歷史恢復。"
 "doctor.rewind_marker_cleared" = "已清除陳舊的回退標記（它指向快照「{}」，本工作區無法識別）。工作區裡的檔案一個都沒動。`umadev run` 可以重新啟動了——請先確認你的原始碼是你想要的樣子。"
+"doctor.rewind_marker_invalid" = "回退標記不可讀或已損壞({})。UmaDev 無法安全恢復,因此已停止寫入。請先檢查原始碼,再執行 `umadev doctor --fix` 刪除該標記;這不會改動工作區檔案。"
+"doctor.rewind_marker_invalid_cleared" = "已刪除不可讀或損壞的回退標記({})。工作區檔案沒有被改動。再次執行前請確認原始碼正是你想要的狀態。"
 "doctor.run_lock_fence_name" = "工作區執行鎖相容柵欄"
 "doctor.run_lock_fence_absent" = "尚未建立相容柵欄——第一次可寫執行時會自動建立。"
 "doctor.run_lock_fence_current" = "v2 相容柵欄內容完整；可寫鎖能力會在實際執行時再次驗證。"
@@ -1351,6 +1372,8 @@
 "config.overlay.title" = " 設定 — Esc 關閉 "
 "config.overlay.heading" = "設定\n=============\n\n"
 "config.overlay.worker" = "工作底座:      {}\n"
+"config.overlay.trust_mode" = "信任模式:      {}\n"
+"config.overlay.codex_sandbox" = "Codex 實際沙箱: {}\n"
 "config.overlay.worker_unset" = "(用選擇器挑選)"
 "config.overlay.model" = "模型:          (由底座自行決定 —— UmaDev 從不設定)\n"
 "config.overlay.design" = "設計體系:      {}\n"
@@ -1371,7 +1394,7 @@
 "config.overlay.custom_knowledge" = "自訂知識:      {}\n"
 "config.overlay.project_header" = "\n## 專案設定\n\n"
 "config.overlay.no_rc" = "  無 .umadevrc —— 使用預設值 (閾值=90, 輪數=3)\n"
-"config.overlay.how_to_change" = "\n## 如何修改\n\n  /claude /codex /opencode /grok /kimi\n                                  切換底座 CLI (或 /offline)\n  (模型)                        在底座裡設定 —— UmaDev 從不覆寫\n  /manual  /auto                評審模式: 暫停 vs 自主\n  /design <name>                切換設計體系\n  /template <name>              切換種子範本\n  /run <slug> <req>             設定識別碼 + 需求\n  編輯 .umadevrc                專案級覆寫\n"
+"config.overlay.how_to_change" = "\n## 如何修改\n\n  /claude /codex /opencode /grok /kimi\n                                  切換底座 CLI (或 /offline)\n  (模型)                        在底座裡設定 —— UmaDev 從不覆寫\n  /mode plan|guarded|auto       切換信任模式（逐回合生效）\n  /sandbox <mode>               修改 Codex 啟動沙箱並即時重建會話\n  /design <name>                切換設計體系\n  /template <name>              切換種子範本\n  /run [--slug <slug>] <req>    設定可選識別碼 + 需求\n  編輯 .umadevrc                專案級覆寫\n"
 
 # /status overlay
 "status.overlay.title" = " 狀態 — Esc 關閉 "

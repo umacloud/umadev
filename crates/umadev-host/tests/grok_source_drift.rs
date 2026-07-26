@@ -206,7 +206,7 @@ fn audited_grok_baseline_matches_the_wire_contract() {
         &root,
         "crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs",
     );
-    assert!(agent_ops.contains("\"use_oauth\" : true"));
+    assert!(agent_ops.contains("\"use_oauth\": true"));
 
     let updates = read(
         &root,
@@ -249,6 +249,105 @@ fn audited_grok_baseline_matches_the_wire_contract() {
         "crates/codegen/xai-grok-shell/src/session/turn_completion.rs"
     )
     .contains("TurnCompleted"));
+
+    // Standard session control stays on ACP while Grok's richer prompt queue,
+    // steering and background-task controls remain typed private extensions.
+    // Pin both sides so a source bump cannot leave UmaDev negotiating a method
+    // whose handler or required fields disappeared upstream.
+    assert_markers(
+        &acp_agent,
+        "standard session lifecycle",
+        &[
+            "async fn new_session(",
+            "async fn load_session(",
+            "async fn prompt(",
+            "async fn cancel(&self, args: acp::CancelNotification)",
+            "async fn set_session_mode(",
+            "async fn set_session_model(",
+            "\"x.ai/interject\" => crate::extensions::interject::handle",
+            "\"x.ai/queue/remove\"",
+            "| \"x.ai/queue/reorder\"",
+            "| \"x.ai/queue/clear\"",
+            "| \"x.ai/queue/edit\"",
+            "| \"x.ai/queue/interject\"",
+        ],
+    );
+
+    let interject = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/extensions/interject.rs",
+    );
+    assert_markers(
+        &interject,
+        "interject request",
+        &[
+            "struct InterjectRequest",
+            "session_id: String",
+            "text: String",
+            "interjection_id: Option<String>",
+            "content: Vec<acp::ContentBlock>",
+            "SessionCommand::Interject",
+            "\"status\": \"queued\"",
+        ],
+    );
+
+    let queue = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/agent/ext_parsers.rs",
+    );
+    assert_markers(
+        &queue,
+        "versioned prompt queue",
+        &[
+            "\"x.ai/queue/remove\"",
+            "\"expectedVersion\"",
+            "SessionCommand::RemoveQueuedPrompt",
+            "\"x.ai/queue/reorder\"",
+            "SessionCommand::ReorderQueue",
+            "\"x.ai/queue/clear\"",
+            "SessionCommand::ClearQueue",
+            "\"x.ai/queue/edit\"",
+            "SessionCommand::EditQueuedPrompt",
+            "\"x.ai/queue/interject\"",
+            "SessionCommand::InterjectQueuedPrompt",
+        ],
+    );
+    assert!(read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/prompt_queue.rs"
+    )
+    .contains("pub const QUEUE_CHANGED_METHOD: &str = \"x.ai/queue/changed\""));
+
+    let tasks = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/extensions/task.rs",
+    );
+    assert_markers(
+        &tasks,
+        "background task control",
+        &[
+            "\"x.ai/task/kill\"",
+            ".kill_background_task(&req.session_id, &req.task_id)",
+            "\"x.ai/task/list\"",
+            ".list_tasks(&req.session_id)",
+        ],
+    );
+
+    let tool_calls = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs",
+    );
+    assert_markers(
+        &tool_calls,
+        "standard tool lifecycle",
+        &[
+            "acp::SessionUpdate::ToolCall(",
+            "acp::ToolCallStatus::Pending",
+            "acp::SessionUpdate::ToolCallUpdate(",
+            "acp::ToolCallStatus::Completed",
+            "acp::ToolCallStatus::Failed",
+        ],
+    );
 }
 
 #[test]
@@ -306,7 +405,6 @@ fn audited_grok_baseline_matches_the_subagent_contract() {
         &subagent_request[spawned..child_prompt],
         "spawn-before-child-prompt",
         &[
-            "&ctx.parent_session_id",
             "child_session_id: child_session_id.0.to_string()",
             "parent_session_id: ctx.parent_session_id.clone()",
         ],
@@ -389,17 +487,17 @@ fn audited_grok_baseline_matches_the_subagent_contract() {
             "prompt_id: prompt_id.clone()",
         ],
     );
-    let finished = subagent_request
+    let finished = subagent
         .find("SessionUpdate::SubagentFinished {")
         .expect("missing audited SubagentFinished emission");
-    let wake = subagent_request[finished..]
+    let wake = subagent[finished..]
         .find("if will_wake {")
         .map(|offset| finished + offset)
         .expect("missing audited will_wake injection gate");
     assert_markers(
-        &subagent_request[finished..wake],
+        &subagent[finished..wake],
         "will_wake finish wire",
-        &["will_wake,", "ctx.parent_cmd_tx.as_ref()"],
+        &["will_wake,", "completion_data.parent_cmd_tx.as_ref()"],
     );
 
     // Progress is transient rather than replayed. Reconnect obtains an
@@ -417,8 +515,19 @@ fn audited_grok_baseline_matches_the_subagent_contract() {
             "struct ListRunningSubagentsResponse",
             "subagents: Vec<SubagentLiveSnapshotDto>",
             "\"x.ai/subagent/list_running\"",
-            "agent.list_running_subagents(&req.session_id)",
-            "resolve_running_list(seeds).await",
+            ".list_running_subagents(&req.session_id)",
+        ],
+    );
+    let agent_ops = read(
+        &root,
+        "crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs",
+    );
+    assert_markers(
+        &agent_ops,
+        "subagent coordinator resync",
+        &[
+            "pub(crate) async fn list_running_subagents(",
+            ".list_running(parent_session_id)",
         ],
     );
     let updates = read(

@@ -294,12 +294,14 @@ pub struct AgentTaskLedger {
 }
 
 impl AgentTaskLedger {
-    /// Open the newest resumable ledger for a logical plan, or mint a new run.
-    ///
-    /// Only a SHA-256 digest of `scope_key` is persisted. This keeps requirements
-    /// and credentials out of pointer metadata while making a gate/crash resume
-    /// deterministic across processes.
-    pub fn open_scoped(project_root: &Path, scope_key: &str) -> Result<Self, TaskLifecycleError> {
+    /// Open the newest unfinished ledger for a logical scope without creating a
+    /// pointer or journal when none exists. Cancellation/recovery callers use
+    /// this read-before-write surface so inspecting a resident-only pause can
+    /// never fabricate a Director ledger.
+    pub(crate) fn open_scoped_existing(
+        project_root: &Path,
+        scope_key: &str,
+    ) -> Result<Option<Self>, TaskLifecycleError> {
         let scope_sha256 = hex_digest(scope_key.as_bytes());
         let parent = project_root.join(".umadev").join("agent-tasks");
         let prefix = format!("scope-{}-", &scope_sha256[..20]);
@@ -342,10 +344,23 @@ impl AgentTaskLedger {
                     )
                 })
             {
-                return Ok(ledger);
+                return Ok(Some(ledger));
             }
         }
+        Ok(None)
+    }
 
+    /// Open the newest resumable ledger for a logical plan, or mint a new run.
+    ///
+    /// Only a SHA-256 digest of `scope_key` is persisted. This keeps requirements
+    /// and credentials out of pointer metadata while making a gate/crash resume
+    /// deterministic across processes.
+    pub fn open_scoped(project_root: &Path, scope_key: &str) -> Result<Self, TaskLifecycleError> {
+        let scope_sha256 = hex_digest(scope_key.as_bytes());
+        if let Some(ledger) = Self::open_scoped_existing(project_root, scope_key)? {
+            return Ok(ledger);
+        }
+        let parent = project_root.join(".umadev").join("agent-tasks");
         let run_id = mint_agent_run_id(&scope_sha256);
         let pointer = ScopedRunPointer {
             version: SCOPE_SCHEMA_VERSION,

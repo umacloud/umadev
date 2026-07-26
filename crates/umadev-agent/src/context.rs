@@ -75,7 +75,7 @@
 //! result is just the always-on identity, which is exactly the pre-Wave-2
 //! behaviour. This function NEVER returns an error and NEVER blocks the base.
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use umadev_governance::redaction::{redact_json, redact_text};
@@ -184,6 +184,10 @@ impl FirmwareTier {
 /// that lead the stable head, not a place to dump a whole doc tree.
 const AGENT_RULES_BUDGET: usize = 6000;
 
+/// Individual project-instruction files are user-controlled. Reject an
+/// oversized file rather than allocating it merely to keep a 6K prompt slice.
+const AGENT_RULE_FILE_MAX_BYTES: usize = 64 * 1024;
+
 /// Ingest the industry-standard agent-instruction files a repo may already carry from
 /// OTHER tools — `AGENTS.md` (the OpenAI/Codex open standard), `.cursorrules`,
 /// `.clinerules`, `.windsurfrules`, `.github/copilot-instructions.md` — into a single
@@ -202,7 +206,9 @@ fn project_agent_instructions(root: &Path, budget: usize) -> String {
     ];
     let mut out = String::new();
     for rel in FILES {
-        let Ok(body) = std::fs::read_to_string(root.join(rel)) else {
+        let Ok(body) =
+            crate::bounded_fs::read_utf8_beneath(root, &root.join(rel), AGENT_RULE_FILE_MAX_BYTES)
+        else {
             continue;
         };
         let body = body.trim();
@@ -755,14 +761,14 @@ fn open_run_notes_no_follow(path: &Path, append: bool, create: bool) -> Option<s
 }
 
 fn read_run_notes(root: &Path) -> Option<String> {
+    let trusted_root = std::fs::canonicalize(root).ok()?;
     let path = managed_run_notes_path(root, "run-notes.md", false)?;
-    let mut file = open_run_notes_no_follow(&path, false, false)?;
-    if file.metadata().ok()?.len() > MAX_RUN_NOTES_BYTES {
-        return None;
-    }
-    let mut body = String::new();
-    file.read_to_string(&mut body).ok()?;
-    Some(body)
+    crate::bounded_fs::read_utf8_beneath(
+        &trusted_root,
+        &path,
+        usize::try_from(MAX_RUN_NOTES_BYTES).ok()?,
+    )
+    .ok()
 }
 
 fn contains_redaction_marker(text: &str) -> bool {
@@ -1103,6 +1109,39 @@ mod tests {
         std::fs::write(root.join(".clinerules"), "x".repeat(20_000)).unwrap();
         let capped = project_agent_instructions(root, 500);
         assert!(capped.len() <= 500);
+    }
+
+    #[test]
+    fn project_agent_instructions_rejects_oversized_input() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("AGENTS.md"),
+            vec![b'x'; AGENT_RULE_FILE_MAX_BYTES + 1],
+        )
+        .unwrap();
+        assert!(project_agent_instructions(tmp.path(), AGENT_RULES_BUDGET).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_agent_instructions_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "must not enter firmware").unwrap();
+        symlink(outside.path(), tmp.path().join("AGENTS.md")).unwrap();
+        assert!(project_agent_instructions(tmp.path(), AGENT_RULES_BUDGET).is_empty());
+        std::fs::remove_file(tmp.path().join("AGENTS.md")).unwrap();
+
+        let linked_parent = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            linked_parent.path().join("copilot-instructions.md"),
+            "must not enter firmware through a parent link",
+        )
+        .unwrap();
+        symlink(linked_parent.path(), tmp.path().join(".github")).unwrap();
+        assert!(project_agent_instructions(tmp.path(), AGENT_RULES_BUDGET).is_empty());
     }
 
     /// A minimal [`RoutePlan`] for a given class/depth/team, so the tests drive
@@ -2356,6 +2395,20 @@ mod tests {
             "- OUTSIDE_MARKER\n"
         );
         assert!(!dir.join("run-notes.prev.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_notes_are_read_through_a_trusted_project_root_alias() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let real = parent.path().join("real-project");
+        let alias = parent.path().join("project-alias");
+        std::fs::create_dir_all(real.join(".umadev")).unwrap();
+        std::fs::write(real.join(".umadev/run-notes.md"), "- durable alias note\n").unwrap();
+        symlink(&real, &alias).unwrap();
+        assert!(run_notes_tail_block(&alias, RUN_NOTES_TAIL_LINES).contains("durable alias note"));
     }
 
     #[cfg(unix)]

@@ -795,13 +795,18 @@ function managerRunnable(mgr) {
 // abandoned temp dirs, and by the time we run, nothing in them is in use.
 // Fail-open: any error is ignored; a failed sweep must never block an upgrade.
 function sweepAbandonedStagingDirs(pkgRoot) {
-  const staging = /^\.(umadev|cli-|knowledge|model-)[^/\\]*$/;
   const roots = [
-    path.dirname(pkgRoot), // …/node_modules
-    path.join(path.dirname(pkgRoot), '@umacloud'), // …/node_modules/@umacloud
+    {
+      root: path.dirname(pkgRoot), // …/node_modules
+      staging: /^\.umadev-[^/\\]+$/,
+    },
+    {
+      root: path.join(path.dirname(pkgRoot), '@umacloud'), // …/node_modules/@umacloud
+      staging: /^\.(?:cli-(?:darwin-arm64|darwin-x64|linux-x64|linux-arm64|linux-musl-x64|linux-musl-arm64|win32-x64)|knowledge|model-e5-small)-[^/\\]+$/,
+    },
   ];
   let swept = 0;
-  for (const root of roots) {
+  for (const { root, staging } of roots) {
     let entries;
     try {
       entries = fs.readdirSync(root, { withFileTypes: true });
@@ -910,7 +915,14 @@ function registryLatestVersion() {
           res.setEncoding('utf8');
           res.on('data', (c) => {
             body += c;
-            if (body.length > 262144) req.destroy(); // a sane cap; never buffer a huge doc
+            if (body.length > 262144) {
+              // `ClientRequest.destroy()` without an Error is only guaranteed
+              // to emit `close`, not `error`; resolve here as well or a registry
+              // that streams an oversized/non-ending document can strand
+              // `umadev update` forever after the request has been destroyed.
+              req.destroy();
+              done(null);
+            }
           });
           res.on('end', () => {
             try {
@@ -1252,6 +1264,7 @@ module.exports = {
   invocationNeedsModel,
   platformKey,
   linuxLibcFromEvidence,
+  registryLatestVersion,
   NEEDS_MODEL,
   UPGRADE_COMMANDS,
   REPAIR_COMMANDS,

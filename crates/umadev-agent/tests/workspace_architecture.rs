@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use toml::Value;
 
 const HOTSPOT_LINES: &[(&str, usize)] = &[
-    ("crates/umadev-tui/src/app.rs", 18_500),
-    ("crates/umadev-tui/src/lib.rs", 11_792),
-    ("crates/umadev-agent/src/director_loop.rs", 7_159),
+    ("crates/umadev-tui/src/app.rs", 18_330),
+    ("crates/umadev-tui/src/lib.rs", 11_737),
+    ("crates/umadev-agent/src/director_loop.rs", 7_009),
     ("crates/umadev-governance/src/rules.rs", 8_913),
 ];
 
@@ -34,6 +34,7 @@ const NORMAL_ALLOWLIST: &[(&str, &[&str])] = &[
             "umadev-governance",
             "umadev-host",
             "umadev-i18n",
+            "umadev-process",
             "umadev-runtime",
             "umadev-spec",
             "umadev-state",
@@ -54,7 +55,7 @@ const NORMAL_ALLOWLIST: &[(&str, &[&str])] = &[
         ],
     ),
     ("umadev-contract", &["umadev-spec"]),
-    ("umadev-governance", &["umadev-spec"]),
+    ("umadev-governance", &["umadev-spec", "umadev-state"]),
     (
         "umadev-host",
         &[
@@ -76,6 +77,7 @@ const NORMAL_ALLOWLIST: &[(&str, &[&str])] = &[
             "umadev-agent",
             "umadev-host",
             "umadev-i18n",
+            "umadev-process",
             "umadev-runtime",
             "umadev-spec",
             "umadev-state",

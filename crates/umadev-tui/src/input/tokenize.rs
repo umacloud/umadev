@@ -43,6 +43,9 @@ const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 /// `\` — the final byte of the `ESC \` (ST) string terminator.
 const ST: u8 = 0x5c;
+/// Persistent ceiling for an unterminated terminal control sequence. Ordinary
+/// text is emitted immediately and never consumes this budget.
+const PENDING_SEQUENCE_CAP: usize = 64 * 1024;
 
 /// Whether `b` is a CSI parameter byte (`0..9 : ; < = > ?`).
 #[inline]
@@ -136,6 +139,12 @@ enum State {
     Dcs,
     /// Inside an APC string (`\x1b_` …) — consuming until BEL or `ESC \`.
     Apc,
+    /// An over-cap CSI/SS3 sequence: discard through its final byte.
+    DiscardCsi,
+    /// An over-cap ESC-intermediate sequence: discard through its wider final.
+    DiscardEscape,
+    /// An over-cap OSC/DCS/APC string: discard through BEL or `ESC \`.
+    DiscardString,
 }
 
 /// A streaming byte tokenizer for terminal input.
@@ -200,7 +209,7 @@ impl Tokenizer {
     /// this; a partial UTF-8 tail (ground state) does NOT count.
     #[must_use]
     pub fn has_pending_escape(&self) -> bool {
-        self.state != State::Ground && !self.buffer.is_empty()
+        self.state != State::Ground
     }
 
     /// The bytes currently buffered (incomplete sequence or partial UTF-8).
@@ -365,6 +374,41 @@ impl Tokenizer {
                         i += 1;
                     }
                 }
+                State::DiscardCsi => {
+                    i += 1;
+                    if is_csi_final(code) {
+                        state = State::Ground;
+                        text_start = i;
+                    }
+                }
+                State::DiscardEscape => {
+                    i += 1;
+                    if is_esc_final(code) {
+                        state = State::Ground;
+                        text_start = i;
+                    }
+                }
+                State::DiscardString => {
+                    if code == BEL {
+                        i += 1;
+                        state = State::Ground;
+                        text_start = i;
+                    } else if code == ESC && i + 1 < len && data[i + 1] == ST {
+                        i += 2;
+                        state = State::Ground;
+                        text_start = i;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            if i.saturating_sub(seq_start) > PENDING_SEQUENCE_CAP {
+                state = match state {
+                    State::Csi | State::Ss3 => State::DiscardCsi,
+                    State::EscapeIntermediate => State::DiscardEscape,
+                    State::Osc | State::Dcs | State::Apc => State::DiscardString,
+                    other => other,
+                };
             }
         }
 
@@ -378,6 +422,14 @@ impl Tokenizer {
                 push_text(&mut tokens, &tail[..complete]);
             }
             self.buffer = tail[complete..].to_vec();
+        } else if matches!(
+            state,
+            State::DiscardCsi | State::DiscardEscape | State::DiscardString
+        ) {
+            self.buffer.clear();
+            if flush {
+                self.state = State::Ground;
+            }
         } else if flush {
             // Force the incomplete sequence out as a final token.
             let remaining = &data[seq_start..];
@@ -565,6 +617,20 @@ mod tests {
                 Token::Text("rest".into()),
             ]
         );
+    }
+
+    #[test]
+    fn oversized_unterminated_osc_is_bounded_and_discarded_through_terminator() {
+        let mut tk = Tokenizer::for_stdin();
+        assert!(tk.feed(b"\x1b]0;").is_empty());
+        let chunk = vec![b'x'; 4096];
+        for _ in 0..=(PENDING_SEQUENCE_CAP / chunk.len()) {
+            assert!(tk.feed(&chunk).is_empty());
+            assert!(tk.pending().len() <= PENDING_SEQUENCE_CAP);
+        }
+        assert!(tk.has_pending_escape());
+        assert_eq!(tk.feed(b"hidden\x1b\\ok"), vec![Token::Text("ok".into())]);
+        assert!(!tk.has_pending_escape());
     }
 
     #[test]

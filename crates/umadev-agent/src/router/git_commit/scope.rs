@@ -114,7 +114,10 @@ fn git_scope_token_is_path(token: &str, quoted: bool) -> bool {
             .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_' | '+'))
 }
 
-pub(in crate::router) fn git_commit_control_text(requirement: &str) -> String {
+/// Lowercase projection of user-authored control text with every quoted region
+/// blanked out. Deterministic intent belts use this instead of matching raw
+/// prose, so a label such as “read-only analysis” cannot become authority.
+pub(in crate::router) fn unquoted_lowercase_text(requirement: &str) -> String {
     let lower = requirement.trim().to_lowercase();
     let mut outside = String::with_capacity(lower.len());
     let mut quotes = QuoteTracker::new(true);
@@ -129,6 +132,12 @@ pub(in crate::router) fn git_commit_control_text(requirement: &str) -> String {
             | QuoteEvent::Closed => outside.push(' '),
         }
     }
+
+    outside
+}
+
+pub(in crate::router) fn git_commit_control_text(requirement: &str) -> String {
+    let outside = unquoted_lowercase_text(requirement);
 
     let mut end = outside.len();
     for marker in [

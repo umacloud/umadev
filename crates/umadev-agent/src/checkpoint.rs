@@ -13,117 +13,55 @@
 //! This is the director's checkpoint — a phase-level safety net that composes
 //! with (does not replace) a base CLI's own per-edit checkpointing.
 
-use std::path::{Path, PathBuf};
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-/// Heavy paths excluded from checkpoints even without a project `.gitignore`, so
-/// a checkpoint never tries to snapshot `node_modules`, build output, or the
-/// user's real `.git`. Written to the shadow repo's `info/exclude` on init.
-const SHADOW_EXCLUDES: &[&str] = &[
-    "/.git/",
-    "node_modules/",
-    "target/",
-    "dist/",
-    "build/",
-    ".next/",
-    ".nuxt/",
-    ".output/",
-    ".turbo/",
-    ".venv/",
-    "coverage/",
-    "__pycache__/",
-    ".umadev/",
-    "*.log",
+const CHECKPOINT_EXCLUDED_DIRS: &[&str] = &[
+    ".git",
+    ".umadev",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".output",
+    ".turbo",
+    ".venv",
+    "coverage",
+    "__pycache__",
 ];
 
-/// The same heavy/dangerous paths as [`SHADOW_EXCLUDES`], expressed as git
-/// **exclude pathspecs** for the staging `git add`.
-///
-/// TRADE-OFF (P1/P2): the shadow `add` is now `-A --force` so it captures files
-/// the project `.gitignore` hides — an AI-written `.env.local`, ignored generated
-/// config, ignored snapshots — otherwise a "roll the whole run back" would
-/// silently leave those behind (the base wrote them, but a plain `git add -A`
-/// skips ignored paths, so they were never in a checkpoint to restore). `--force`
-/// overrides BOTH the project `.gitignore` and the shadow `info/exclude`, so to
-/// keep the shadow commit BOUNDED we re-assert the heavy set here as pathspecs:
-/// the real `.git`, dependency trees (`node_modules`, `.venv`), Python caches,
-/// build output (`target`/`dist`/`build`/`.next`/`.nuxt`/`.output`), log spew,
-/// and UmaDev's own `.umadev/` (which holds THIS shadow repo — force-adding it
-/// would be recursive). A user with some OTHER giant ignored artifact (a
-/// multi-GB dataset) is out of scope — the common heavy offenders are covered.
-/// EVERY entry here ships in BOTH a root-anchored (`x/**`) and a NESTED
-/// (`**/x/**`) form. A monorepo (`apps/web/.next/…`, `packages/api/dist/…`,
-/// `services/py/.venv/…`) is the mainstream layout, not the exception: a
-/// root-anchored-only pathspec leaves the nested twin of the same heavy dir
-/// force-added into every checkpoint — hundreds of MB per commit, two
-/// `reset --hard`s per temporary rewind, and a build artifact misread by the
-/// scope floor as an unclaimed new source file. The nested twin is the rule; a
-/// missing one is the bug.
-const SHADOW_ADD_EXCLUDE_PATHSPECS: &[&str] = &[
-    ":(exclude,glob).git/**",
-    ":(exclude,glob)**/.git/**",
-    ":(exclude,glob)node_modules/**",
-    ":(exclude,glob)**/node_modules/**",
-    ":(exclude,glob)target/**",
-    ":(exclude,glob)**/target/**",
-    ":(exclude,glob)dist/**",
-    ":(exclude,glob)**/dist/**",
-    ":(exclude,glob)build/**",
-    ":(exclude,glob)**/build/**",
-    ":(exclude,glob).next/**",
-    ":(exclude,glob)**/.next/**",
-    ":(exclude,glob).nuxt/**",
-    ":(exclude,glob)**/.nuxt/**",
-    ":(exclude,glob).output/**",
-    ":(exclude,glob)**/.output/**",
-    ":(exclude,glob).turbo/**",
-    ":(exclude,glob)**/.turbo/**",
-    ":(exclude,glob).venv/**",
-    ":(exclude,glob)**/.venv/**",
-    ":(exclude,glob)coverage/**",
-    ":(exclude,glob)**/coverage/**",
-    ":(exclude,glob)__pycache__/**",
-    ":(exclude,glob)**/__pycache__/**",
-    ":(exclude,glob).umadev/**",
-    ":(exclude,glob)**/.umadev/**",
-    ":(exclude,glob)*.log",
-    ":(exclude,glob)**/*.log",
-];
+const MAX_CHECKPOINT_ENTRIES: usize = 25_000;
+const MAX_CHECKPOINT_DEPTH: usize = 64;
+const MAX_CHECKPOINT_PATH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHECKPOINT_FILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CHECKPOINT_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+const MAX_FILE_AT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TEMP_REWIND_MARKER_BYTES: usize = 64 * 1024;
+const MAX_GIT_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GIT_STDERR_BYTES: usize = 1024 * 1024;
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_READER_GRACE: Duration = Duration::from_secs(2);
+static NEXT_GIT_INPUT: AtomicU64 = AtomicU64::new(0);
 
-/// Stage the whole work-tree into the shadow index — INCLUDING files the project
-/// `.gitignore` hides (`--force`), so a rollback can restore an AI-written
-/// `.env.local` / ignored config — while still excluding the heavy/dangerous
-/// paths in [`SHADOW_ADD_EXCLUDE_PATHSPECS`] so the checkpoint stays bounded and
-/// never pulls in `node_modules` / build output / the real `.git` / this shadow
-/// repo. A leading positive `.` guards the "exclude-only pathspec" edge across
-/// git versions.
-///
-/// **A PARTIAL add is a FAILURE, not a success.** The exit status used to be discarded, so
-/// a `git add` that errored on some paths and staged the rest still produced a "successful"
-/// checkpoint — one that silently does not contain everything it claims to. Everything
-/// downstream trusts that claim: [`restore_checkpoint`] tells the user "we snapshotted
-/// first, so this is itself undoable", and [`recover_abandoned_temp_rewind`] `reset --hard`s
-/// the work-tree on the strength of a rescue snapshot. A snapshot missing the very files
-/// the add could not read is exactly the one whose reset destroys them. So a non-zero exit
-/// yields `None` and the caller declines to act — `--force` means an ignored path is not an
-/// error, so a failure here is a real one.
-///
-/// Fail-open: `None` when `git` can't spawn OR the add did not fully succeed — the caller
-/// `?`-propagates and simply takes no checkpoint. The pipeline is never blocked.
-fn stage_all_including_ignored(project_root: &Path) -> Option<std::process::Output> {
-    let mut args: Vec<&str> = vec!["add", "-A", "--force", "--", "."];
-    args.extend_from_slice(SHADOW_ADD_EXCLUDE_PATHSPECS);
-    let out = git(project_root, &args)?;
-    if !out.status.success() {
-        tracing::warn!(
-            root = %project_root.display(),
-            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-            "the shadow-repo staging step did not fully succeed — refusing to write a \
-             checkpoint that would not contain everything it claims to"
-        );
-        return None;
-    }
-    Some(out)
+#[derive(Debug)]
+struct SnapshotFile {
+    path: String,
+    mode: u32,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct TreeFile {
+    path: String,
+    #[cfg(unix)]
+    mode: u32,
+    oid: String,
+    bytes: Vec<u8>,
 }
 
 /// One checkpoint entry, newest-first in [`list_checkpoints`].
@@ -142,8 +80,189 @@ fn git_dir(project_root: &Path) -> PathBuf {
     project_root.join(".umadev").join("checkpoints.git")
 }
 
-/// Run a shadow-git command (work-tree = project root). `None` if `git` can't be
-/// spawned at all.
+struct GitInputGuard(PathBuf);
+
+impl Drop for GitInputGuard {
+    fn drop(&mut self) {
+        let _ = umadev_state::fs::remove_regular_file(&self.0);
+    }
+}
+
+fn open_regular_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_file(&metadata))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Git input is not a regular non-link file",
+        ));
+    }
+    Ok(file)
+}
+
+fn git_input_file(
+    project_root: &Path,
+    bytes: &[u8],
+) -> std::io::Result<(std::fs::File, GitInputGuard)> {
+    let directory = git_dir(project_root);
+    for _ in 0..16 {
+        let sequence = NEXT_GIT_INPUT.fetch_add(1, Ordering::Relaxed);
+        let path = directory.join(format!("umadev-input-{}-{sequence}", std::process::id()));
+        match umadev_state::fs::write_new_private(&path, bytes) {
+            Ok(()) => {
+                let file = open_regular_no_follow(&path)?;
+                return Ok((file, GitInputGuard(path)));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique bounded Git input",
+    ))
+}
+
+fn hermetic_git_command(project_root: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    // Git treats environment variables as higher-priority repository routing
+    // and dynamic configuration. Remove the entire namespace first, including
+    // variables unknown to this version of UmaDev, then add only the fixed
+    // local-only policy below.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+
+    #[cfg(windows)]
+    const NULL_CONFIG: &str = "NUL";
+    #[cfg(not(windows))]
+    const NULL_CONFIG: &str = "/dev/null";
+    let hooks = git_dir(project_root).join("disabled-hooks");
+    let mut hooks_config = std::ffi::OsString::from("core.hooksPath=");
+    hooks_config.push(hooks.as_os_str());
+    command
+        .current_dir(project_root)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", NULL_CONFIG)
+        .env("GIT_CONFIG_GLOBAL", NULL_CONFIG)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GIT_AUTHOR_NAME", "UmaDev")
+        .env("GIT_AUTHOR_EMAIL", "umadev@local")
+        .env("GIT_COMMITTER_NAME", "UmaDev")
+        .env("GIT_COMMITTER_EMAIL", "umadev@local")
+        .arg("--no-optional-locks")
+        .arg("--git-dir")
+        .arg(git_dir(project_root))
+        .arg("--work-tree")
+        .arg(project_root)
+        .arg("-c")
+        .arg("user.name=UmaDev")
+        .arg("-c")
+        .arg("user.email=umadev@local")
+        .arg("-c")
+        .arg("commit.gpgsign=false")
+        .arg("-c")
+        .arg("tag.gpgsign=false")
+        .arg("-c")
+        .arg("core.autocrlf=false")
+        .arg("-c")
+        .arg("core.safecrlf=false")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("core.untrackedCache=false")
+        .arg("-c")
+        .arg(hooks_config)
+        .arg("-c")
+        .arg(format!("core.attributesFile={NULL_CONFIG}"))
+        .arg("-c")
+        .arg("credential.helper=")
+        .arg("-c")
+        .arg("core.askPass=")
+        .arg("-c")
+        .arg("gc.auto=0")
+        .args(args);
+    command
+}
+
+fn install_hermetic_shadow_config(project_root: &Path) -> std::io::Result<()> {
+    const CONFIG: &[u8] = b"[core]\n\
+        repositoryformatversion = 0\n\
+        bare = false\n\
+        autocrlf = false\n\
+        safecrlf = false\n\
+        fsmonitor = false\n\
+        untrackedCache = false\n\
+        hooksPath = disabled-hooks\n\
+        attributesFile = /dev/null\n\
+        [user]\n\
+        name = UmaDev\n\
+        email = umadev@local\n\
+        [commit]\n\
+        gpgsign = false\n\
+        [tag]\n\
+        gpgsign = false\n\
+        [gc]\n\
+        auto = 0\n";
+    let directory = git_dir(project_root);
+    if !umadev_state::fs::real_dir(&directory) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "shadow Git directory is not a real directory",
+        ));
+    }
+    umadev_state::fs::atomic_write(&directory.join("config"), CONFIG)
+}
+
+fn run_git(
+    project_root: &Path,
+    args: &[&str],
+    stdout_bytes: usize,
+    stdin: Option<std::fs::File>,
+) -> std::io::Result<umadev_process::BoundedCommandOutput> {
+    if args.first().copied() != Some("init") {
+        install_hermetic_shadow_config(project_root)?;
+    }
+    let command = hermetic_git_command(project_root, args);
+    let options = umadev_process::BoundedCommandOptions {
+        timeout: GIT_COMMAND_TIMEOUT,
+        stdout_bytes,
+        stderr_bytes: MAX_GIT_STDERR_BYTES,
+        reader_grace: GIT_READER_GRACE,
+    };
+    match stdin {
+        Some(file) => {
+            umadev_process::run_bounded_std_command_with_stdin_file(command, file, options)
+        }
+        None => umadev_process::run_bounded_std_command(command, options),
+    }
+}
+
+/// Run a shadow-git command (work-tree = project root). `None` if Git cannot be
+/// spawned, times out, exits without a status, or exceeds either output cap.
 ///
 /// The shadow repo is a BYTE-EXACT snapshot store, not a repository the user
 /// collaborates in — so it must be hermetic, and never inherit the user's global
@@ -162,33 +281,31 @@ fn git_dir(project_root: &Path) -> PathBuf {
 ///   not a snapshot store.
 /// - **`commit.gpgsign`** — a user who signs by default would have every internal
 ///   snapshot try to sign, which can prompt, stall, or simply fail.
-/// - **hooks** — committing a snapshot must never fire the user's pre-commit hooks
-///   (`--no-verify` is passed at the commit site).
+/// - **hooks/filters/attributes** — snapshots are imported as raw blobs rather
+///   than staged or committed through the work tree, and every remaining Git
+///   invocation uses a disabled hooks path and attributes file.
 fn git(project_root: &Path, args: &[&str]) -> Option<std::process::Output> {
-    Command::new("git")
-        .arg("--git-dir")
-        .arg(git_dir(project_root))
-        .arg("--work-tree")
-        .arg(project_root)
-        .args([
-            "-c",
-            "user.name=UmaDev",
-            "-c",
-            "user.email=umadev@local",
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "core.autocrlf=false",
-            "-c",
-            "core.safecrlf=false",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "gc.auto=0",
-        ])
-        .args(args)
-        .output()
-        .ok()
+    let output = run_git(project_root, args, MAX_GIT_STDOUT_BYTES, None).ok()?;
+    if output.timed_out || output.stdout_truncated || output.stderr_truncated {
+        return None;
+    }
+    Some(std::process::Output {
+        status: output.status?,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+fn git_with_input(
+    project_root: &Path,
+    args: &[&str],
+    bytes: &[u8],
+    stdout_bytes: usize,
+) -> std::io::Result<umadev_process::BoundedCommandOutput> {
+    let (file, guard) = git_input_file(project_root, bytes)?;
+    let result = run_git(project_root, args, stdout_bytes, Some(file));
+    drop(guard);
+    result
 }
 
 /// `true` when at least one checkpoint exists.
@@ -202,65 +319,362 @@ pub fn has_checkpoints(project_root: &Path) -> bool {
 /// Initialise the shadow repo on first use. Returns `false` (fail-open) when
 /// `git` is missing or init fails.
 fn ensure_init(project_root: &Path) -> bool {
-    let gd = git_dir(project_root);
-    if gd.join("HEAD").exists() {
-        return true;
-    }
-    if std::fs::create_dir_all(&gd).is_err() {
+    if !umadev_state::fs::real_dir(project_root) {
         return false;
+    }
+    let Ok(umadev_dir) = umadev_state::fs::ensure_real_child_dir(project_root, ".umadev") else {
+        return false;
+    };
+    let Ok(gd) = umadev_state::fs::ensure_real_child_dir(&umadev_dir, "checkpoints.git") else {
+        return false;
+    };
+    if gd.join("HEAD").exists() {
+        return umadev_state::fs::real_file(&gd.join("HEAD"));
     }
     let ok = git(project_root, &["init", "-q"]).is_some_and(|o| o.status.success());
     if ok {
-        // The shadow repo's own ignore file — keeps heavy dirs out of every
-        // checkpoint regardless of whether the project ships a `.gitignore`.
-        let info = gd.join("info");
-        let _ = std::fs::create_dir_all(&info);
-        let _ = std::fs::write(info.join("exclude"), SHADOW_EXCLUDES.join("\n"));
+        let _ = git(
+            project_root,
+            &["symbolic-ref", "HEAD", "refs/heads/umadev-checkpoints"],
+        );
     }
     ok
 }
 
+fn checkpoint_path_is_excluded(relative: &Path, directory: bool) -> bool {
+    let name = relative.file_name().and_then(|name| name.to_str());
+    if directory && name.is_some_and(|name| CHECKPOINT_EXCLUDED_DIRS.contains(&name)) {
+        return true;
+    }
+    !directory
+        && name.is_some_and(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("log"))
+        })
+}
+
+fn scan_checkpoint_files(project_root: &Path) -> std::io::Result<Vec<SnapshotFile>> {
+    struct ScanState {
+        entries_seen: usize,
+        path_bytes: usize,
+        content_bytes: usize,
+        files: Vec<SnapshotFile>,
+    }
+
+    fn scan_directory(
+        project_root: &Path,
+        relative_dir: &Path,
+        depth: usize,
+        state: &mut ScanState,
+    ) -> std::io::Result<()> {
+        if depth > MAX_CHECKPOINT_DEPTH {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("checkpoint tree exceeds depth {MAX_CHECKPOINT_DEPTH}"),
+            ));
+        }
+        let directory = project_root.join(relative_dir);
+        if relative_dir.as_os_str().is_empty() {
+            if !umadev_state::fs::real_dir(&directory) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "checkpoint root is not a real directory",
+                ));
+            }
+        } else if !crate::bounded_fs::is_real_directory_beneath(project_root, &directory) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "checkpoint tree contains a linked/reparse directory",
+            ));
+        }
+
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            state.entries_seen = state.entries_seen.saturating_add(1);
+            if state.entries_seen > MAX_CHECKPOINT_ENTRIES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("checkpoint tree exceeds {MAX_CHECKPOINT_ENTRIES} entries"),
+                ));
+            }
+            let relative = relative_dir.join(entry.file_name());
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            if umadev_state::fs::metadata_is_real_dir(&metadata) {
+                if checkpoint_path_is_excluded(&relative, true) {
+                    continue;
+                }
+                scan_directory(project_root, &relative, depth.saturating_add(1), state)?;
+                continue;
+            }
+            if !umadev_state::fs::metadata_is_real_file(&metadata) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "checkpoint path is a symlink, reparse point, or special file: {}",
+                        relative.display()
+                    ),
+                ));
+            }
+            if checkpoint_path_is_excluded(&relative, false) {
+                continue;
+            }
+            let path = relative.to_str().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "checkpoint path is not valid UTF-8",
+                )
+            })?;
+            #[cfg(windows)]
+            let path = path.replace('\\', "/");
+            #[cfg(not(windows))]
+            let path = path.to_string();
+            state.path_bytes = state.path_bytes.saturating_add(path.len());
+            if state.path_bytes > MAX_CHECKPOINT_PATH_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("checkpoint paths exceed {MAX_CHECKPOINT_PATH_BYTES} bytes"),
+                ));
+            }
+            if metadata.len() > u64::try_from(MAX_CHECKPOINT_FILE_BYTES).unwrap_or(u64::MAX) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("checkpoint file exceeds {MAX_CHECKPOINT_FILE_BYTES} bytes: {path}"),
+                ));
+            }
+            let announced = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+            if state.content_bytes.saturating_add(announced) > MAX_CHECKPOINT_TOTAL_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("checkpoint contents exceed {MAX_CHECKPOINT_TOTAL_BYTES} bytes"),
+                ));
+            }
+            let bytes = crate::bounded_fs::read_bytes_beneath(
+                project_root,
+                &entry.path(),
+                MAX_CHECKPOINT_FILE_BYTES,
+            )?;
+            state.content_bytes = state.content_bytes.saturating_add(bytes.len());
+            if state.content_bytes > MAX_CHECKPOINT_TOTAL_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("checkpoint contents exceed {MAX_CHECKPOINT_TOTAL_BYTES} bytes"),
+                ));
+            }
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt as _;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    0o100_644
+                } else {
+                    0o100_755
+                }
+            };
+            #[cfg(not(unix))]
+            let mode = 0o100_644;
+            state.files.push(SnapshotFile { path, mode, bytes });
+        }
+        Ok(())
+    }
+
+    let mut state = ScanState {
+        entries_seen: 0,
+        path_bytes: 0,
+        content_bytes: 0,
+        files: Vec::new(),
+    };
+    scan_directory(project_root, Path::new(""), 0, &mut state)?;
+    state
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(state.files)
+}
+
+fn fast_import_path(path: &str) -> String {
+    let mut quoted = String::with_capacity(path.len().saturating_add(2));
+    quoted.push('"');
+    for byte in path.bytes() {
+        match byte {
+            b' '..=b'~' if !matches!(byte, b'"' | b'\\') => quoted.push(char::from(byte)),
+            b'"' => quoted.push_str("\\\""),
+            b'\\' => quoted.push_str("\\\\"),
+            _ => quoted.push_str(&format!("\\{byte:03o}")),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn head_oid(project_root: &Path) -> Option<String> {
+    let output = git(project_root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|oid| {
+            (40..=64).contains(&oid.len()) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+fn import_snapshot(
+    project_root: &Path,
+    files: &[SnapshotFile],
+    label: &str,
+    parent: Option<&str>,
+) -> Option<(String, String)> {
+    if label.len() > 16 * 1024 {
+        return None;
+    }
+    let sequence = NEXT_GIT_INPUT.fetch_add(1, Ordering::Relaxed);
+    let reference = format!("refs/umadev/import-{}-{sequence}", std::process::id());
+    let commit_mark = files.len().saturating_add(1);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    let stream_limit = MAX_CHECKPOINT_TOTAL_BYTES
+        .saturating_add(MAX_CHECKPOINT_PATH_BYTES)
+        .saturating_add(MAX_CHECKPOINT_ENTRIES.saturating_mul(160))
+        .saturating_add(1024 * 1024);
+    let mut stream = Vec::new();
+    stream.extend_from_slice(b"feature done\n");
+    for (index, file) in files.iter().enumerate() {
+        stream.extend_from_slice(b"blob\nmark :");
+        stream.extend_from_slice((index + 1).to_string().as_bytes());
+        stream.extend_from_slice(b"\ndata ");
+        stream.extend_from_slice(file.bytes.len().to_string().as_bytes());
+        stream.push(b'\n');
+        stream.extend_from_slice(&file.bytes);
+        stream.push(b'\n');
+        if stream.len() > stream_limit {
+            return None;
+        }
+    }
+    stream.extend_from_slice(format!("commit {reference}\nmark :{commit_mark}\n").as_bytes());
+    stream.extend_from_slice(
+        format!(
+            "author UmaDev <umadev@local> {timestamp} +0000\n\
+             committer UmaDev <umadev@local> {timestamp} +0000\n\
+             data {}\n",
+            label.len()
+        )
+        .as_bytes(),
+    );
+    stream.extend_from_slice(label.as_bytes());
+    stream.push(b'\n');
+    if let Some(parent) = parent {
+        stream.extend_from_slice(format!("from {parent}\n").as_bytes());
+    }
+    stream.extend_from_slice(b"deleteall\n");
+    for (index, file) in files.iter().enumerate() {
+        stream.extend_from_slice(
+            format!(
+                "M {:o} :{} {}\n",
+                file.mode,
+                index + 1,
+                fast_import_path(&file.path)
+            )
+            .as_bytes(),
+        );
+        if stream.len() > stream_limit {
+            return None;
+        }
+    }
+    stream.extend_from_slice(format!("get-mark :{commit_mark}\ndone\n").as_bytes());
+    if stream.len() > stream_limit {
+        return None;
+    }
+
+    let output = git_with_input(
+        project_root,
+        &["fast-import", "--quiet", "--force"],
+        &stream,
+        4096,
+    )
+    .ok()?;
+    if output.timed_out
+        || output.stdout_truncated
+        || output.stderr_truncated
+        || !output.status.is_some_and(|status| status.success())
+    {
+        let _ = git(project_root, &["update-ref", "-d", &reference]);
+        return None;
+    }
+    let oid = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            (40..=64).contains(&line.len()) && line.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })?
+        .to_string();
+    Some((oid, reference))
+}
+
+fn delete_import_ref(project_root: &Path, reference: &str) {
+    let _ = git(project_root, &["update-ref", "-d", reference]);
+}
+
+fn promote_import(project_root: &Path, oid: &str, old_head: Option<&str>) -> bool {
+    let read = git(project_root, &["read-tree", oid]).is_some_and(|output| output.status.success());
+    if !read {
+        return false;
+    }
+    let updated = match old_head {
+        Some(old) => git(project_root, &["update-ref", "HEAD", oid, old]),
+        None => git(project_root, &["update-ref", "HEAD", oid]),
+    }
+    .is_some_and(|output| output.status.success());
+    if !updated {
+        match old_head {
+            Some(old) => {
+                let _ = git(project_root, &["read-tree", old]);
+            }
+            None => {
+                let _ = git(project_root, &["read-tree", "--empty"]);
+            }
+        }
+    }
+    updated
+}
+
+fn snapshot_import(project_root: &Path, label: &str) -> Option<(String, String, Option<String>)> {
+    let files = scan_checkpoint_files(project_root)
+        .map_err(|error| {
+            tracing::warn!(
+                root = %project_root.display(),
+                %error,
+                "bounded checkpoint scan refused the workspace"
+            );
+            error
+        })
+        .ok()?;
+    let parent = head_oid(project_root);
+    let (oid, reference) = import_snapshot(project_root, &files, label, parent.as_deref())?;
+    Some((oid, reference, parent))
+}
+
 /// Snapshot the whole workspace as a checkpoint labelled `label`. Returns the
 /// short commit id, or `None` (fail-open) if `git` is unavailable. An empty
-/// snapshot (nothing changed) still produces a checkpoint via `--allow-empty`.
+/// snapshot (nothing changed) still produces a checkpoint.
 ///
-/// A FAILED commit returns `None`, not the id of whatever HEAD happened to be. The
+/// A FAILED import returns `None`, not the id of whatever HEAD happened to be. The
 /// difference is load-bearing: callers treat the returned id as "the state I just saved",
 /// and one of them ([`recover_abandoned_temp_rewind`]) then `reset --hard`s the work-tree
 /// on the strength of that promise. Handing back a stale HEAD after an unwritable-shadow
-/// -repo commit failure would turn "I saved your files" into a lie, and the reset that
-/// trusted it would destroy them. `--allow-empty` means a *successful* commit always
-/// exits 0, so a non-zero status is a real failure, never "nothing to do".
+/// -repo import failure would turn "I saved your files" into a lie, and the restore that
+/// trusted it could destroy them. A non-zero status is a real failure, never
+/// "nothing to do".
 #[must_use]
 pub fn create_checkpoint(project_root: &Path, label: &str) -> Option<String> {
     if !ensure_init(project_root) {
         return None;
     }
-    stage_all_including_ignored(project_root)?;
-    let commit = git(
-        project_root,
-        &[
-            "-c",
-            "user.email=umadev@local",
-            "-c",
-            "user.name=UmaDev",
-            "commit",
-            "-q",
-            "--allow-empty",
-            // A snapshot of the user's tree must never fire the user's own git hooks.
-            "--no-verify",
-            "-m",
-            label,
-        ],
-    )?;
-    if !commit.status.success() {
+    let (oid, reference, parent) = snapshot_import(project_root, label)?;
+    let promoted = promote_import(project_root, &oid, parent.as_deref());
+    delete_import_ref(project_root, &reference);
+    if !promoted {
         return None;
     }
-    let head = git(project_root, &["rev-parse", "--short", "HEAD"])?;
-    head.status
-        .success()
-        .then(|| String::from_utf8_lossy(&head.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    Some(oid.chars().take(7).collect())
 }
 
 /// Snapshot the workspace at a PHASE boundary, but ONLY if the working tree
@@ -281,41 +695,18 @@ pub fn create_phase_checkpoint(project_root: &Path, label: &str) -> Option<Strin
     if !ensure_init(project_root) {
         return None;
     }
-    // Stage everything (including .gitignore'd product files, minus the heavy
-    // set — see `stage_all_including_ignored`), then ask whether the index
-    // differs from HEAD. `git diff --cached --quiet` exits 0 = no staged changes,
-    // 1 = changes. When there is no HEAD yet (fresh repo) the diff reports changes
-    // (or errors), so the baseline checkpoint is taken.
-    stage_all_including_ignored(project_root)?;
-    let has_head = has_checkpoints(project_root);
-    if has_head {
-        let clean =
-            git(project_root, &["diff", "--cached", "--quiet"]).is_some_and(|o| o.status.success());
-        if clean {
-            return None; // nothing changed since the last checkpoint
+    let (oid, reference, parent) = snapshot_import(project_root, label)?;
+    if let Some(old) = parent.as_deref() {
+        let unchanged = git(project_root, &["diff", "--quiet", old, &oid, "--"])
+            .is_some_and(|output| output.status.success());
+        if unchanged {
+            delete_import_ref(project_root, &reference);
+            return None;
         }
     }
-    git(
-        project_root,
-        &[
-            "-c",
-            "user.email=umadev@local",
-            "-c",
-            "user.name=UmaDev",
-            "commit",
-            "-q",
-            "--allow-empty",
-            // A snapshot of the user's tree must never fire the user's own git hooks.
-            "--no-verify",
-            "-m",
-            label,
-        ],
-    )?;
-    let head = git(project_root, &["rev-parse", "--short", "HEAD"])?;
-    head.status
-        .success()
-        .then(|| String::from_utf8_lossy(&head.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    let promoted = promote_import(project_root, &oid, parent.as_deref());
+    delete_import_ref(project_root, &reference);
+    promoted.then(|| oid.chars().take(7).collect())
 }
 
 /// The label of the snapshot [`begin_temp_rewind`] takes of the PRESENT before it
@@ -532,7 +923,384 @@ fn id_is_known_checkpoint(id: &str, list: &[Checkpoint]) -> bool {
     resolve_checkpoint_id(id, list).is_some()
 }
 
-/// Rewind the workspace files to checkpoint `id` (`git reset --hard`). The
+fn tree_revision(project_root: &Path, revision: &str) -> std::io::Result<String> {
+    if revision != "HEAD"
+        && (revision.is_empty()
+            || revision.len() > 64
+            || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid checkpoint revision",
+        ));
+    }
+    let spec = format!("{revision}^{{commit}}");
+    let output = git(project_root, &["rev-parse", "--verify", &spec]).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "checkpoint revision is unavailable",
+        )
+    })?;
+    if !output.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "checkpoint revision is unavailable",
+        ));
+    }
+    let oid = String::from_utf8(output.stdout)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid Git oid"))?;
+    let oid = oid.trim().to_string();
+    if !(40..=64).contains(&oid.len()) || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid Git oid",
+        ));
+    }
+    Ok(oid)
+}
+
+fn validated_tree_path(path: &str) -> std::io::Result<PathBuf> {
+    let relative = Path::new(path);
+    let count = relative.components().count();
+    let unsafe_path = relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || count > MAX_CHECKPOINT_DEPTH
+        || relative.components().enumerate().any(|(index, component)| {
+            !matches!(component, Component::Normal(_))
+                || component.as_os_str().to_str().is_none_or(|name| {
+                    (index + 1 < count && CHECKPOINT_EXCLUDED_DIRS.contains(&name))
+                        || (index + 1 == count
+                            && Path::new(name)
+                                .extension()
+                                .is_some_and(|extension| extension.eq_ignore_ascii_case("log")))
+                })
+        });
+    if unsafe_path {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "checkpoint tree contains an unsafe path",
+        ));
+    }
+    Ok(relative.to_path_buf())
+}
+
+fn read_tree_manifest(project_root: &Path, revision: &str) -> std::io::Result<Vec<TreeFile>> {
+    let revision = tree_revision(project_root, revision)?;
+    let output = run_git(
+        project_root,
+        &["ls-tree", "-r", "-z", "--full-tree", &revision],
+        MAX_GIT_STDOUT_BYTES,
+        None,
+    )?;
+    if output.timed_out || output.stdout_truncated || output.stderr_truncated {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint tree listing exceeded its bounded command envelope",
+        ));
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        return Err(std::io::Error::other("could not list checkpoint tree"));
+    }
+
+    let mut entries = Vec::new();
+    let mut path_bytes = 0_usize;
+    let mut paths = BTreeSet::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        if entries.len() >= MAX_CHECKPOINT_ENTRIES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint tree has too many entries",
+            ));
+        }
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed checkpoint tree record",
+            ));
+        };
+        let header = std::str::from_utf8(&record[..tab]).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid tree header")
+        })?;
+        let path = std::str::from_utf8(&record[tab + 1..]).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "non-UTF-8 tree path")
+        })?;
+        validated_tree_path(path)?;
+        path_bytes = path_bytes.saturating_add(path.len());
+        if path_bytes > MAX_CHECKPOINT_PATH_BYTES || !paths.insert(path.to_string()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint tree paths exceed their bound or are duplicated",
+            ));
+        }
+        let mut fields = header.split_ascii_whitespace();
+        let mode = u32::from_str_radix(fields.next().unwrap_or(""), 8).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid tree mode")
+        })?;
+        let kind = fields.next().unwrap_or("");
+        let oid = fields.next().unwrap_or("");
+        if !matches!(mode, 0o100_644 | 0o100_755)
+            || kind != "blob"
+            || !(40..=64).contains(&oid.len())
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || fields.next().is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint tree contains an unsupported object",
+            ));
+        }
+        entries.push(TreeFile {
+            path: path.to_string(),
+            #[cfg(unix)]
+            mode,
+            oid: oid.to_string(),
+            bytes: Vec::new(),
+        });
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn load_tree_bytes(project_root: &Path, entries: &mut [TreeFile]) -> std::io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut request = Vec::with_capacity(entries.len().saturating_mul(42));
+    for entry in entries.iter() {
+        request.extend_from_slice(entry.oid.as_bytes());
+        request.push(b'\n');
+    }
+    let output_cap = MAX_CHECKPOINT_TOTAL_BYTES
+        .saturating_add(entries.len().saturating_mul(128))
+        .saturating_add(1024);
+    let output = git_with_input(project_root, &["cat-file", "--batch"], &request, output_cap)?;
+    if output.timed_out || output.stdout_truncated || output.stderr_truncated {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint blobs exceeded their bounded command envelope",
+        ));
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        return Err(std::io::Error::other("could not read checkpoint blobs"));
+    }
+
+    let mut cursor = 0_usize;
+    let mut total = 0_usize;
+    for entry in entries.iter_mut() {
+        let newline = output.stdout[cursor..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| cursor + offset)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing cat-file header")
+            })?;
+        let header = std::str::from_utf8(&output.stdout[cursor..newline]).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid cat-file header")
+        })?;
+        let mut fields = header.split_ascii_whitespace();
+        let oid = fields.next().unwrap_or("");
+        let kind = fields.next().unwrap_or("");
+        let size = fields
+            .next()
+            .and_then(|size| size.parse::<usize>().ok())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid cat-file size")
+            })?;
+        if oid != entry.oid
+            || kind != "blob"
+            || fields.next().is_some()
+            || size > MAX_CHECKPOINT_FILE_BYTES
+            || total.saturating_add(size) > MAX_CHECKPOINT_TOTAL_BYTES
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint blob violates its size/type contract",
+            ));
+        }
+        let start = newline.saturating_add(1);
+        let end = start.checked_add(size).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "cat-file size overflow")
+        })?;
+        if output.stdout.get(end) != Some(&b'\n') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated cat-file blob",
+            ));
+        }
+        entry.bytes = output.stdout[start..end].to_vec();
+        total = total.saturating_add(size);
+        cursor = end.saturating_add(1);
+    }
+    if output.stdout[cursor..]
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected trailing cat-file output",
+        ));
+    }
+    Ok(())
+}
+
+fn load_tree(project_root: &Path, revision: &str) -> std::io::Result<Vec<TreeFile>> {
+    let mut entries = read_tree_manifest(project_root, revision)?;
+    load_tree_bytes(project_root, &mut entries)?;
+    Ok(entries)
+}
+
+fn validate_live_path(project_root: &Path, relative: &Path) -> std::io::Result<()> {
+    let mut cursor = project_root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(part) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe checkpoint path component",
+            ));
+        };
+        cursor.push(part);
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata)
+                if umadev_state::fs::metadata_is_real_dir(&metadata)
+                    || umadev_state::fs::metadata_is_real_file(&metadata) => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "checkpoint restore path contains a symlink/reparse/special entry",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_restore_parent(project_root: &Path, relative: &Path) -> std::io::Result<()> {
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    let mut cursor = project_root.to_path_buf();
+    for component in parent.components() {
+        let Component::Normal(part) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe checkpoint parent component",
+            ));
+        };
+        match umadev_state::fs::ensure_real_child_dir(&cursor, part.to_string_lossy().as_ref()) {
+            Ok(next) => cursor = next,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                cursor.push(part);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> std::io::Result<()> {
+    let from_paths = from
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let to_paths = to
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<BTreeSet<_>>();
+    for path in from_paths.union(&to_paths) {
+        let relative = validated_tree_path(path)?;
+        validate_live_path(project_root, &relative)?;
+    }
+
+    let mut removals = from_paths
+        .difference(&to_paths)
+        .map(|path| validated_tree_path(path))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    removals.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    let mut candidate_dirs = BTreeSet::new();
+    for relative in &removals {
+        let absolute = project_root.join(relative);
+        umadev_state::fs::remove_regular_file(&absolute)?;
+        let mut parent = relative.parent();
+        while let Some(directory) = parent.filter(|directory| !directory.as_os_str().is_empty()) {
+            candidate_dirs.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+    let mut candidate_dirs = candidate_dirs.into_iter().collect::<Vec<_>>();
+    candidate_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for directory in candidate_dirs {
+        match umadev_state::fs::remove_empty_dir(&project_root.join(directory)) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    for entry in to {
+        let relative = validated_tree_path(&entry.path)?;
+        ensure_restore_parent(project_root, &relative)?;
+        let absolute = project_root.join(&relative);
+        if std::fs::symlink_metadata(&absolute)
+            .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_dir(&metadata))
+        {
+            umadev_state::fs::remove_empty_dir(&absolute)?;
+        }
+        umadev_state::fs::atomic_write(&absolute, &entry.bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                &absolute,
+                std::fs::Permissions::from_mode(if entry.mode == 0o100_755 {
+                    0o755
+                } else {
+                    0o644
+                }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_snapshot_exact(project_root: &Path, target: &str) -> std::io::Result<()> {
+    let old_oid = tree_revision(project_root, "HEAD")?;
+    let target_oid = tree_revision(project_root, target)?;
+    if old_oid == target_oid {
+        return Ok(());
+    }
+    let current = load_tree(project_root, &old_oid)?;
+    let desired = load_tree(project_root, &target_oid)?;
+    if let Err(error) = apply_tree_once(project_root, &current, &desired) {
+        let _ = apply_tree_once(project_root, &desired, &current);
+        return Err(error);
+    }
+
+    let index_updated = git(project_root, &["read-tree", &target_oid])
+        .is_some_and(|output| output.status.success());
+    let ref_updated = index_updated
+        && git(project_root, &["update-ref", "HEAD", &target_oid, &old_oid])
+            .is_some_and(|output| output.status.success());
+    if !ref_updated {
+        let _ = git(project_root, &["read-tree", &old_oid]);
+        let _ = apply_tree_once(project_root, &desired, &current);
+        return Err(std::io::Error::other(
+            "could not atomically advance the shadow checkpoint ref",
+        ));
+    }
+    Ok(())
+}
+
+/// Rewind the workspace files to checkpoint `id` with the bounded byte-exact
+/// restore path. The
 /// CURRENT state is auto-checkpointed first, so a rewind is itself undoable.
 /// Untracked / excluded paths (`node_modules`, …) are left untouched.
 ///
@@ -595,13 +1363,7 @@ pub fn restore_checkpoint(project_root: &Path, id: &str) -> Result<(), String> {
         let branch = format!("umadev-saved-{sha}");
         let _ = git(project_root, &["branch", "-f", &branch, "HEAD"]);
     }
-    let out = git(project_root, &["reset", "--hard", &target])
-        .ok_or_else(|| umadev_i18n::tl("checkpoint.git_unavailable").to_string())?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-    }
+    restore_snapshot_exact(project_root, &target).map_err(|error| error.to_string())
 }
 
 // =====================================================================
@@ -777,9 +1539,9 @@ impl TempRewind {
         ok
     }
 
-    /// `git reset --hard <id>` over the shadow repo. `true` iff git ran and succeeded.
+    /// Byte-exact bounded restore from the shadow repo. `true` iff it succeeds.
     fn reset_hard(root: &Path, id: &str) -> bool {
-        git(root, &["reset", "--hard", "-q", id]).is_some_and(|o| o.status.success())
+        restore_snapshot_exact(root, id).is_ok()
     }
 }
 
@@ -1008,6 +1770,58 @@ pub enum TempRewindState {
         /// The unidentifiable head the marker named.
         head: String,
     },
+    /// A marker leaf exists but cannot be safely read or parsed. Automatic
+    /// recovery cannot trust it, so write-capable work remains halted until an
+    /// explicit doctor fix removes the leaf successfully.
+    Invalid {
+        /// Bounded diagnostic suitable for the doctor report.
+        detail: String,
+        /// Whether this invocation actually removed the invalid marker.
+        cleared: bool,
+    },
+}
+
+fn marker_is_definitely_absent(path: &Path, error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+        && std::fs::symlink_metadata(path)
+            .is_err_and(|metadata_error| metadata_error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn remove_marker_leaf_no_follow(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "rewind marker leaf is a directory",
+            ))
+        }
+        Ok(_) => {
+            umadev_state::fs::retry_transient(|| std::fs::remove_file(path))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn invalid_temp_rewind_state(
+    project_root: &Path,
+    path: &Path,
+    dry_run: bool,
+    detail: String,
+) -> TempRewindState {
+    mark_workspace_in_past(project_root, InPastReason::Unrecoverable);
+    if dry_run {
+        return TempRewindState::Invalid {
+            detail,
+            cleared: false,
+        };
+    }
+    let cleared = remove_marker_leaf_no_follow(path).unwrap_or(false);
+    if cleared {
+        clear_workspace_in_past(project_root);
+    }
+    TempRewindState::Invalid { detail, cleared }
 }
 
 /// Diagnose the temp-rewind crash marker for `project_root`, and clear it **only** when it
@@ -1030,13 +1844,35 @@ pub enum TempRewindState {
 /// asks for `--fix`.
 pub fn clear_temp_rewind_state(project_root: &Path, dry_run: bool) -> TempRewindState {
     let path = project_root.join(TEMP_REWIND_MARKER_REL);
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        return TempRewindState::Clean;
+    let body = match crate::bounded_fs::read_utf8_beneath(
+        project_root,
+        Path::new(TEMP_REWIND_MARKER_REL),
+        MAX_TEMP_REWIND_MARKER_BYTES,
+    ) {
+        Ok(body) => body,
+        Err(error) if marker_is_definitely_absent(&path, &error) => {
+            return TempRewindState::Clean;
+        }
+        Err(error) => {
+            return invalid_temp_rewind_state(
+                project_root,
+                &path,
+                dry_run,
+                format!("cannot safely read marker: {error}"),
+            );
+        }
     };
-    // A marker we cannot even parse names no head at all — it can never be acted on.
-    let head = serde_json::from_str::<TempRewindMarker>(&body)
-        .map(|m| m.head)
-        .unwrap_or_default();
+    let head = match serde_json::from_str::<TempRewindMarker>(&body) {
+        Ok(marker) => marker.head,
+        Err(error) => {
+            return invalid_temp_rewind_state(
+                project_root,
+                &path,
+                dry_run,
+                format!("marker JSON is invalid: {error}"),
+            );
+        }
+    };
     let recoverable = !head.is_empty()
         && has_checkpoints(project_root)
         && id_is_known_checkpoint(&head, &list_checkpoints_limited(project_root, 1000));
@@ -1044,7 +1880,13 @@ pub fn clear_temp_rewind_state(project_root: &Path, dry_run: bool) -> TempRewind
         return TempRewindState::Recoverable { head };
     }
     if !dry_run {
-        let _ = std::fs::remove_file(&path);
+        if let Err(error) = umadev_state::fs::remove_regular_file(&path) {
+            mark_workspace_in_past(project_root, InPastReason::Unrecoverable);
+            return TempRewindState::Invalid {
+                detail: format!("cannot remove stale marker: {error}"),
+                cleared: false,
+            };
+        }
         clear_workspace_in_past(project_root);
     }
     TempRewindState::ClearedUnrecoverable { head }
@@ -1108,10 +1950,10 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Write the crash marker. Fail-open: an unwritable marker does not stop the rewind
-/// (the in-process `Drop` guard is still the primary restore path) — it only removes
-/// the out-of-process backstop.
-fn write_temp_rewind_marker(root: &Path, head: &str, to: &str) {
+/// Write the crash marker atomically without following a link at either the
+/// managed directory or marker leaf. A rewind MUST NOT start unless this
+/// durable out-of-process recovery record was published successfully.
+fn write_temp_rewind_marker(root: &Path, head: &str, to: &str) -> bool {
     let marker = TempRewindMarker {
         head: head.to_string(),
         to: to.to_string(),
@@ -1120,18 +1962,19 @@ fn write_temp_rewind_marker(root: &Path, head: &str, to: &str) {
         boot: crate::run_lock::boot_id(),
         host: crate::run_lock::hostname(),
     };
-    let path = root.join(TEMP_REWIND_MARKER_REL);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if let Ok(body) = serde_json::to_string(&marker) {
-        let _ = std::fs::write(path, body);
-    }
+    let Ok(directory) = umadev_state::fs::ensure_real_child_dir(root, ".umadev") else {
+        return false;
+    };
+    let path = directory.join("temp-rewind.json");
+    serde_json::to_vec(&marker)
+        .ok()
+        .filter(|body| body.len() <= MAX_TEMP_REWIND_MARKER_BYTES)
+        .is_some_and(|body| umadev_state::fs::atomic_write(&path, &body).is_ok())
 }
 
 /// Delete the crash marker — called ONLY after the tree is verified back at head.
 fn clear_temp_rewind_marker(root: &Path) {
-    let _ = std::fs::remove_file(root.join(TEMP_REWIND_MARKER_REL));
+    let _ = umadev_state::fs::remove_regular_file(&root.join(TEMP_REWIND_MARKER_REL));
 }
 
 /// Workspace-integrity notices raised OUT OF BAND — outside any turn, before any UI exists.
@@ -1262,8 +2105,35 @@ fn older_than_temp_rewind_stale(m: &TempRewindMarker, now: u64) -> bool {
 #[must_use]
 pub fn recover_abandoned_temp_rewind(project_root: &Path) -> Option<String> {
     let path = project_root.join(TEMP_REWIND_MARKER_REL);
-    let body = std::fs::read_to_string(&path).ok()?;
-    let marker: TempRewindMarker = serde_json::from_str(&body).ok()?;
+    let body = match crate::bounded_fs::read_utf8_beneath(
+        project_root,
+        Path::new(TEMP_REWIND_MARKER_REL),
+        MAX_TEMP_REWIND_MARKER_BYTES,
+    ) {
+        Ok(body) => body,
+        Err(error) if marker_is_definitely_absent(&path, &error) => return None,
+        Err(error) => {
+            mark_workspace_in_past(project_root, InPastReason::Unrecoverable);
+            let detail = format!("cannot safely read marker: {error}");
+            tracing::warn!(marker = %path.display(), %detail, "temporary rewind marker is unusable");
+            return Some(umadev_i18n::tlf(
+                "checkpoint.temp_rewind_marker_invalid",
+                &[&path.display().to_string(), &detail],
+            ));
+        }
+    };
+    let marker: TempRewindMarker = match serde_json::from_str(&body) {
+        Ok(marker) => marker,
+        Err(error) => {
+            mark_workspace_in_past(project_root, InPastReason::Unrecoverable);
+            let detail = format!("marker JSON is invalid: {error}");
+            tracing::warn!(marker = %path.display(), %detail, "temporary rewind marker is unusable");
+            return Some(umadev_i18n::tlf(
+                "checkpoint.temp_rewind_marker_invalid",
+                &[&path.display().to_string(), &detail],
+            ));
+        }
+    };
 
     let alive = if marker.pid == 0 {
         None
@@ -1489,7 +2359,13 @@ pub fn begin_temp_rewind(project_root: &Path, to: &str) -> Option<TempRewind> {
     //    leaving it silently reverted to an earlier step. Written FIRST: a marker with
     //    no rewind is harmless (the recovery validates and no-ops); a rewind with no
     //    marker is the corruption we are closing.
-    write_temp_rewind_marker(project_root, &head, &to);
+    if !write_temp_rewind_marker(project_root, &head, &to) {
+        tracing::warn!(
+            root = %project_root.display(),
+            "refusing a temporary rewind because its crash-recovery marker could not be persisted"
+        );
+        return None;
+    }
     // 4. Now go back. A failed reset leaves the tree where it was (git is atomic
     //    enough here) — clear the marker we just wrote and let the caller skip.
     if !TempRewind::reset_hard(project_root, &to) {
@@ -1592,76 +2468,131 @@ pub fn changed_since(project_root: &Path, baseline_id: &str) -> Option<Vec<Chang
 
 /// [`run_diff_since_baseline`] against an explicit checkpoint id.
 ///
-/// Stages the work-tree into the shadow index first (the same `--force` staging every
-/// checkpoint uses, so untracked-but-real files are visible), then reads
-/// `diff --cached --name-status` against the baseline commit. The index is a scratch
-/// surface for the shadow repo — every checkpoint operation re-stages from scratch —
-/// so this is a read-only question as far as the user's workspace is concerned.
+/// Imports the current bounded, no-follow workspace view under a temporary ref,
+/// then compares that full tree to the baseline. The temporary ref is deleted
+/// before return and the shadow HEAD/index are never moved.
 #[must_use]
 pub fn run_diff_since(project_root: &Path, baseline_id: &str) -> RunDiff {
-    if !has_checkpoints(project_root) {
+    if !has_checkpoints(project_root)
+        || baseline_id.is_empty()
+        || baseline_id.len() > 64
+        || !baseline_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return RunDiff::Unavailable;
     }
-    if stage_all_including_ignored(project_root).is_none() {
-        return RunDiff::Unavailable;
-    }
-    let Some(out) = git(
-        project_root,
-        &[
-            "diff",
-            "--cached",
-            "--name-status",
-            "--no-renames",
-            baseline_id,
-        ],
-    ) else {
+    let Some((current, reference, _)) = snapshot_import(project_root, "auto: run diff") else {
         return RunDiff::Unavailable;
     };
-    if !out.status.success() {
-        return RunDiff::Unavailable;
-    }
-    let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut parts = line.split('\t');
-        let Some(status) = parts.next().map(str::trim) else {
-            continue;
-        };
-        let Some(path) = parts.next().map(str::trim).filter(|p| !p.is_empty()) else {
-            continue;
-        };
-        let added = match status.chars().next() {
-            Some('A') => true,
-            Some('M' | 'T' | 'D') => false,
-            _ => continue,
-        };
-        files.push(ChangedFile {
-            path: path.replace('\\', "/"),
-            added,
-        });
-        if files.len() > MAX_CHANGED_FILES {
-            // An enormous diff → no view, never a partial one. But SAY which it is: a
-            // floor that stands down silently teaches the user nothing.
-            tracing::warn!(
-                changed = files.len(),
-                cap = MAX_CHANGED_FILES,
-                "the run diff exceeded the analysis cap; scope checks stand down for this run"
-            );
-            return RunDiff::TooLarge(files.len());
+    let result = (|| {
+        let output = run_git(
+            project_root,
+            &[
+                "diff",
+                "--name-status",
+                "--no-renames",
+                "-z",
+                baseline_id,
+                &current,
+                "--",
+            ],
+            MAX_GIT_STDOUT_BYTES,
+            None,
+        )
+        .ok()?;
+        if output.stdout_truncated {
+            return Some(RunDiff::TooLarge(MAX_CHANGED_FILES.saturating_add(1)));
         }
-    }
-    RunDiff::Changed(files)
+        if output.timed_out
+            || output.stderr_truncated
+            || !output.status.is_some_and(|status| status.success())
+        {
+            return Some(RunDiff::Unavailable);
+        }
+        let mut fields = output.stdout.split(|byte| *byte == 0);
+        let mut files = Vec::new();
+        while let Some(status) = fields.next() {
+            if status.is_empty() {
+                break;
+            }
+            let Some(path) = fields.next().filter(|path| !path.is_empty()) else {
+                return Some(RunDiff::Unavailable);
+            };
+            let added = match status.first().copied() {
+                Some(b'A') => true,
+                Some(b'M' | b'T' | b'D') => false,
+                _ => return Some(RunDiff::Unavailable),
+            };
+            let Ok(path) = std::str::from_utf8(path) else {
+                return Some(RunDiff::Unavailable);
+            };
+            files.push(ChangedFile {
+                path: path.replace('\\', "/"),
+                added,
+            });
+            if files.len() > MAX_CHANGED_FILES {
+                tracing::warn!(
+                    changed = files.len(),
+                    cap = MAX_CHANGED_FILES,
+                    "the run diff exceeded the analysis cap; scope checks stand down for this run"
+                );
+                return Some(RunDiff::TooLarge(files.len()));
+            }
+        }
+        Some(RunDiff::Changed(files))
+    })()
+    .unwrap_or(RunDiff::Unavailable);
+    delete_import_ref(project_root, &reference);
+    result
 }
 
-/// The contents of `rel` AS OF checkpoint `id`, or `None` when the file did not exist
-/// there / is binary / `git` is unavailable (fail-open). Lets a caller compare a
-/// manifest's before-and-after without leaving the present.
+/// A bounded historical-file read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileAt {
+    /// Complete UTF-8 contents.
+    Content(String),
+    /// The revision/path was invalid or missing, Git failed/timed out, or the
+    /// blob was binary/non-UTF-8.
+    Unavailable,
+    /// The complete blob exceeded `MAX_FILE_AT_BYTES`; no partial tail is
+    /// exposed as though it were the whole file.
+    TooLarge(usize),
+}
+
+/// The complete contents of `rel` as of checkpoint `id`, with a hard read cap.
 #[must_use]
-pub fn file_at(project_root: &Path, id: &str, rel: &str) -> Option<String> {
+pub fn file_at(project_root: &Path, id: &str, rel: &str) -> FileAt {
+    if id.is_empty()
+        || id.len() > 64
+        || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || rel.len() > MAX_CHECKPOINT_PATH_BYTES
+        || validated_tree_path(rel).is_err()
+    {
+        return FileAt::Unavailable;
+    }
     let spec = format!("{id}:{rel}");
-    let out = git(project_root, &["show", &spec])?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    let Ok(output) = run_git(
+        project_root,
+        &["cat-file", "blob", &spec],
+        MAX_FILE_AT_BYTES,
+        None,
+    ) else {
+        return FileAt::Unavailable;
+    };
+    if output.stdout_truncated {
+        return FileAt::TooLarge(MAX_FILE_AT_BYTES.saturating_add(1));
+    }
+    if output.timed_out
+        || output.stderr_truncated
+        || !output.status.is_some_and(|status| status.success())
+    {
+        return FileAt::Unavailable;
+    }
+    if output.stdout.contains(&0) {
+        return FileAt::Unavailable;
+    }
+    String::from_utf8(output.stdout)
+        .map(FileAt::Content)
+        .unwrap_or(FileAt::Unavailable)
 }
 
 #[cfg(test)]
@@ -1669,10 +2600,175 @@ mod tests {
     use super::*;
 
     fn git_available() -> bool {
-        Command::new("git")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success())
+        let mut command = Command::new("git");
+        command.arg("--version");
+        umadev_process::run_bounded_std_command(
+            command,
+            umadev_process::BoundedCommandOptions {
+                timeout: Duration::from_secs(2),
+                stdout_bytes: 4096,
+                stderr_bytes: 4096,
+                reader_grace: Duration::from_secs(1),
+            },
+        )
+        .is_ok_and(|output| {
+            !output.timed_out && output.status.is_some_and(|status| status.success())
+        })
+    }
+
+    #[cfg(unix)]
+    const HERMETIC_FIXTURE_ROOT: &str = "UMADEV_CHECKPOINT_HERMETIC_ROOT";
+
+    #[cfg(unix)]
+    #[test]
+    fn hermetic_global_config_fixture() {
+        let Some(root) = std::env::var_os(HERMETIC_FIXTURE_ROOT) else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let original = b"line-one\r\nline-two\r\n";
+        std::fs::write(root.join("payload.txt"), original).unwrap();
+        let baseline = create_checkpoint(&root, "hermetic baseline").expect("baseline");
+        std::fs::write(root.join("payload.txt"), b"mutated\n").unwrap();
+        create_checkpoint(&root, "hermetic mutation").expect("mutation");
+        restore_checkpoint(&root, &baseline).expect("byte-exact restore");
+        assert_eq!(std::fs::read(root.join("payload.txt")).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_hooks_filters_dynamic_config_and_attributes_are_hermetic() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("workspace");
+        let hooks = temp.path().join("hooks");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&hooks).unwrap();
+        let marker = temp.path().join("hostile-ran");
+        let filter = temp.path().join("hostile-filter");
+        let hook = hooks.join("pre-commit");
+        let script = format!(
+            "#!/bin/sh\nprintf ran > '{}'\nsleep 30\ncat\n",
+            marker.display()
+        );
+        std::fs::write(&filter, &script).unwrap();
+        std::fs::write(&hook, &script).unwrap();
+        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = temp.path().join("hostile.gitconfig");
+        std::fs::write(
+            &config,
+            format!(
+                "[core]\n\thooksPath = {}\n[filter \"hostile\"]\n\tclean = {}\n\tsmudge = {}\n\trequired = true\n[commit]\n\tgpgsign = true\n",
+                hooks.display(),
+                filter.display(),
+                filter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".gitattributes"),
+            "* text eol=lf filter=hostile\n",
+        )
+        .unwrap();
+
+        let executable = std::env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "checkpoint::tests::hermetic_global_config_fixture",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(HERMETIC_FIXTURE_ROOT, &root)
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", &hooks);
+        let output = umadev_process::run_bounded_std_command(
+            command,
+            umadev_process::BoundedCommandOptions {
+                timeout: Duration::from_secs(8),
+                stdout_bytes: 64 * 1024,
+                stderr_bytes: 64 * 1024,
+                reader_grace: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        assert!(!output.timed_out, "hostile hook/filter escaped isolation");
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(!marker.exists(), "a global hook/filter executed");
+    }
+
+    #[test]
+    fn ignored_oversize_file_refuses_snapshot_before_reading_it() {
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join(".gitignore"), "huge.bin\n").unwrap();
+        let huge = std::fs::File::create(root.join("huge.bin")).unwrap();
+        huge.set_len(u64::try_from(MAX_CHECKPOINT_FILE_BYTES).unwrap() + 1)
+            .unwrap();
+        assert!(create_checkpoint(root, "must refuse huge ignored file").is_none());
+        assert!(!has_checkpoints(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_parent_and_fifo_are_rejected_without_blocking() {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("escape.txt"), "escape").unwrap();
+        symlink(outside.path(), temp.path().join("linked")).unwrap();
+        let started = std::time::Instant::now();
+        assert!(create_checkpoint(temp.path(), "reject parent link").is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::fs::remove_file(temp.path().join("linked")).unwrap();
+
+        let fifo = temp.path().join("fifo");
+        assert!(Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let started = std::time::Instant::now();
+        assert!(create_checkpoint(temp.path(), "reject fifo").is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn file_at_and_run_diff_never_return_truncated_half_truths() {
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("large.txt"), vec![b'x'; MAX_FILE_AT_BYTES + 1]).unwrap();
+        let baseline = create_checkpoint(root, "large baseline").unwrap();
+        assert!(matches!(
+            file_at(root, &baseline, "large.txt"),
+            FileAt::TooLarge(_)
+        ));
+
+        for index in 0..=MAX_CHANGED_FILES {
+            std::fs::write(root.join(format!("changed-{index}.txt")), b"x").unwrap();
+        }
+        assert!(matches!(
+            run_diff_since(root, &baseline),
+            RunDiff::TooLarge(count) if count > MAX_CHANGED_FILES
+        ));
     }
 
     #[test]
@@ -2355,6 +3451,65 @@ mod tests {
         assert!(begin_temp_rewind(tmp.path(), "anything").is_none());
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn temp_rewind_refuses_to_follow_a_crash_marker_symlink() {
+        use std::os::unix::fs::symlink;
+
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("umadev-marker-target-{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        std::fs::write(&outside, "do-not-touch").unwrap();
+
+        std::fs::write(root.join("src.rs"), "before").unwrap();
+        let pre = create_checkpoint(root, "pre-step").expect("checkpoint");
+        std::fs::write(root.join("src.rs"), "present").unwrap();
+        symlink(&outside, root.join(TEMP_REWIND_MARKER_REL)).unwrap();
+
+        assert!(
+            begin_temp_rewind(root, &pre).is_none(),
+            "without a durable marker the workspace must not move into the past"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src.rs")).unwrap(),
+            "present"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "do-not-touch");
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn temp_rewind_marker_fifo_is_rejected_without_blocking() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker_dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&marker_dir).unwrap();
+        let marker = marker_dir.join("temp-rewind.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&marker)
+            .status()
+            .unwrap()
+            .success());
+
+        let started = std::time::Instant::now();
+        assert!(recover_abandoned_temp_rewind(tmp.path()).is_some());
+        assert!(matches!(
+            clear_temp_rewind_state(tmp.path(), true),
+            TempRewindState::Invalid { cleared: false, .. }
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a marker FIFO must never wait for a writer"
+        );
+    }
+
     // ── Run-scoped diff (the scope-creep changed-file source) ──────────────────
 
     #[test]
@@ -2386,8 +3541,8 @@ mod tests {
 
         // The baseline's own content is readable without leaving the present.
         assert_eq!(
-            file_at(root, &run_baseline(root).unwrap().id, "existing.ts").as_deref(),
-            Some("v1")
+            file_at(root, &run_baseline(root).unwrap().id, "existing.ts"),
+            FileAt::Content("v1".to_string())
         );
     }
 
@@ -3209,8 +4364,8 @@ mod tests {
 
     #[test]
     fn recovery_is_harmless_without_a_marker_and_never_silent_when_it_stands_down() {
-        // FAIL-OPEN: no marker, a junk marker, a marker naming an unknown commit — each
-        // is a no-op, never a reset to something we did not write.
+        // No marker is a no-op. A junk marker or a marker naming an unknown commit
+        // never resets to something we did not write, and is surfaced loudly.
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("a.txt"), "live").unwrap();
@@ -3218,7 +4373,10 @@ mod tests {
 
         std::fs::create_dir_all(root.join(".umadev")).unwrap();
         std::fs::write(root.join(TEMP_REWIND_MARKER_REL), "{{{ not json").unwrap();
-        assert!(recover_abandoned_temp_rewind(root).is_none());
+        let invalid = recover_abandoned_temp_rewind(root)
+            .expect("a damaged recovery marker must halt writes and be surfaced");
+        assert!(invalid.contains("temp-rewind.json"));
+        clear_workspace_in_past(root);
 
         // A well-formed marker pointing at a commit that is NOT one of ours.
         let bogus = TempRewindMarker {

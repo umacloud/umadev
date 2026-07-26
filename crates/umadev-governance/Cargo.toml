@@ -10,6 +10,7 @@ description = "UmaDev governance kernel — pre-write rules, audit logs, evidenc
 
 [dependencies]
 umadev-spec = { workspace = true }
+umadev-state = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

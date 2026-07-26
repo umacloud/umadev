@@ -50,6 +50,12 @@
 "live_meta.changes.none" = "本轮已确认没有文件变更。"
 "live_meta.changes.none_yet" = "目前尚未观察到本轮文件变更。"
 "live_meta.changes.git_status" = "当前 git status 显示 {} 个文件：{}\n注意：没有可用的本轮 Diff 记录，这些状态可能包含运行开始前就存在的改动。"
+"live_meta.permissions.state" = "权限按回合判断；第一条消息不会锁死常驻会话，后续明确的修改请求会重新判定。当前信任模式：`{}`。无需重启。"
+"live_meta.permissions.codex_sandbox" = "Codex 在当前信任模式下的实际启动沙箱：`{}`。"
+"live_meta.permissions.ready" = "直接说明要改哪个文件或功能以及目标即可；UmaDev 会自动为该回合打开可写会话。"
+"live_meta.permissions.plan" = "当前 Plan 模式主动禁止写入；输入 `/mode guarded` 或 `/mode auto`，再提交具体修改请求即可，无需重启。"
+"live_meta.permissions.codex_read_only" = "当前 Codex 启动沙箱确为 `read-only`；输入 `/sandbox workspace-write` 即时重建常驻会话，再提交具体修改请求，无需重启 UmaDev。"
+"live_meta.permissions.other_base" = "Guarded/Auto 会为具体修改请求申请可写会话；底座、平台或企业策略仍可能限制实际能力。"
 "model.synced" = "已同步驱动模型 {}(来自 {})—— Agent 就用底座这个模型工作"
 "model.synced_default" = "{} 未在配置里固定模型 —— Agent 用它的登录/默认模型驱动(运行后可见真实模型)"
 "model.reasoning" = "思考强度 {}(底座配置,umadev 不覆盖)"
@@ -247,6 +253,7 @@
 "attach.image" = "图片"
 "attach.file" = "文件"
 "attach.paste" = "粘贴 {} 行"
+"attach.paste_limit" = "未粘贴：单次最多 1 MiB，每轮暂存文本最多 2 MiB。请改用文件附件或分段粘贴。"
 "attach.rejected" = "未添加附件：{}（本地路径已隐藏）。"
 "attach.reason.count" = "每轮最多支持 16 个附件"
 "attach.reason.unavailable" = "文件不可用或无法读取"
@@ -346,11 +353,12 @@
 "run.budget_pause_resume_hint" = "已到时间上限,本轮已暂停在第 {}/{} 步 —— 输入 `/continue` 续跑剩余步骤"
 "run.operational_pause_resume_hint" = "所需评审服务暂时不可用（{}）—— 本轮已暂停在第 {}/{} 步，没有改动源码或判定计划失败；输入 `/continue` 重试当前步骤"
 "plan.summary.header" = "任务总结 — {} 完成 · {} 进行中 · {} 堵塞 · {} 未完成"
-"plan.panel.more_hint" = "上滑或 /plan 查看全部"
+"plan.panel.more_hint" = "/plan 查看完整计划与团队"
 "plan.none" = "暂无计划。完整构建或一次深思熟虑的任务会在这里生成计划。"
 "plan.queue.section" = "排队任务 — {} 条待处理"
 "plan.queue.next_turn" = "  {}. [下一轮] {}"
 "plan.queue.current_task" = "  {}. [当前任务调整] {}"
+"plan.queue.native" = "  {}. [底座原生队列] {}"
 "plan.review.title" = "团队评审"
 "plan.review.accept" = "通过"
 "plan.review.block" = "{} 个必改"
@@ -360,6 +368,7 @@
 "plan.review.note.summary" = "团队评审已收敛 — {} 通过 · {} 拦截(完整评审见上)。"
 "plan.review.section" = "团队评审 — {} 通过 · {} 拦截"
 "plan.review.fix" = "建议:{}"
+"plan.review.advisory" = "改进建议:{}"
 "plan.review.next_step" = "下一步:输入 /run 让团队按上面的建议修复,或 /revise <补充指引>"
 "plan.steer.usage" = "/plan — 查看计划 · /plan skip <id> · /plan add <文本> · /plan veto <id> · /plan up <id> · /plan down <id> · /plan collapse"
 "plan.steer.skip" = "跳过步骤 `{}`——折进下一条指令。"
@@ -430,6 +439,7 @@
 "constitution.footer" = "强制执行采用 fail-open:治理器自身的 bug 绝不会阻塞你的工作,但这些不可妥协原则会在每次文件写入前被检查,并在评审中呈现。随时运行 /constitution 查看本宪章。"
 "constitution.overlay_title" = "团队宪章"
 "constitution.edit_hint" = "你可以在 {} 阅读并编辑本宪章 —— 你的修改会成为团队宪章,永不被覆盖。"
+"constitution.plan_preview" = "计划模式:当前只预览默认宪章,不会创建 {}。切换到 guarded/auto 后再次运行 /constitution 即可写入。"
 "constitution.generated" = "已在 {} 依据团队强制执行的规则生成团队宪章。"
 
 # 帮助
@@ -459,8 +469,8 @@
 "session.resume_goal" = "[目标] 上次有个目标没做完:下一步「{}」(已完成 {}/{} 步)。/continue 续上 · 或直接说要不要继续。"
 
 # Codex 高危沙箱责任警告(仅在 codex 且 danger-full-access 时显示)
-"codex.sandbox.danger_warning" = "警告:UmaDev 将以 danger-full-access 启动本项目中的 Codex 底座会话 —— 请自行承担系统环境风险。单独打开的 Codex 窗口有自己的权限设置，显示可能不同。\n  关闭:在 .umadevrc 中设置 [codex] sandbox_mode = \"workspace-write\" 后重启。"
-"codex.sandbox.windows_hint" = "提示(Windows + Codex):当前沙箱会屏蔽网络、本地 dev 端口和 git,全栈构建(npm install / dev server / git)无法完成;且 codex 的 Windows 沙箱辅助进程在部分机器上会因缺少运行时而报“找不到指定的模块”。做全栈开发请运行 /sandbox danger-full-access 放开(UmaDev 仍全程审计)。"
+"codex.sandbox.danger_warning" = "警告:UmaDev 将以 danger-full-access 启动本项目中的 Codex 底座会话 —— 请自行承担系统环境风险。单独打开的 Codex 窗口有自己的权限设置，显示可能不同。\n  关闭:输入 `/sandbox workspace-write` 即时重建会话，无需重启 UmaDev。"
+"codex.sandbox.windows_hint" = "提示(Windows + Codex):当前沙箱会屏蔽网络、本地 dev 端口和 git,全栈构建(npm install / dev server / git)无法完成;且 codex 的 Windows 沙箱辅助进程在部分机器上会因缺少运行时而报“找不到指定的模块”。做全栈开发请先用 `/mode auto`，尚未配置时再输入 `/sandbox danger-full-access`（UmaDev 仍全程审计）。"
 
 # /sandbox —— 在应用内查看 / 修改 Codex 底座启动沙箱(无需手改 .umadevrc)
 "sandbox.current" = "Codex 沙箱当前为:{}\n  (仅对 codex 底座生效 —— 它决定 codex 运行时能动到哪些东西)"
@@ -471,6 +481,7 @@
 "sandbox.codex_only" = "提示:当前底座不是 codex,这项设置要切到 codex 底座(/codex)后才生效。"
 "sandbox.set" = "Codex 沙箱已设为 {} —— 本次会话生效,并已写入 .umadevrc。"
 "sandbox.danger_set" = "Codex 沙箱已设为 danger-full-access —— 本次会话生效,并已写入 .umadevrc。本地端口 / 网络 / git 已解除限制,系统环境风险由你承担。"
+"sandbox.clamped" = "已保存所请求的 Codex 沙箱 `{}`，但当前信任模式 `{}` 会把实际启动沙箱限制为 `{}`；UmaDev 不会声称已经获得更高权限。danger-full-access 请用 `/mode auto`，workspace-write 请用 `/mode guarded` 或 `/mode auto`；常驻会话会即时重建，无需重启 UmaDev。"
 "sandbox.persist_failed" = "[warn] 本次会话已生效,但无法写入 .umadevrc(下次启动会恢复):{}"
 "sandbox.busy_no_change" = "Codex 当前仍在执行。请先取消本轮,再修改 /sandbox;UmaDev 会按新权限重建常驻 Codex 会话。"
 
@@ -569,6 +580,7 @@
 "run.gate_line.guarded" = "当前守护模式:两处检查点(确认核心文档 / 确认前端预览)会停下等你逐项审批;按 shift+Tab 或 /auto 可切自动通过。已开始…"
 "run.gate_line.plan" = "当前计划模式:只读出计划、不写代码(/mode guarded 或 auto 才执行)。流水线启动中…"
 "run.cancelled" = "[已取消] 当前运行已停止,回到输入。已完成阶段的产物保留在 output/,下次 /continue 或输入新需求都可以。"
+"run.operational_cancelled" = "[已取消] 已关闭暂停的评审及其恢复指针。已完成产物仍会保留；请输入新需求或使用 /run 开始新一轮。"
 
 # /init manifest
 "init.design_files" = "\n  设计基础设施: {} 文件写入 knowledge/"
@@ -636,6 +648,7 @@
 "memory.clear_cache_preview" = "预览（尚未执行）\n\n将清除项目范围内的可重建缓存:{}。权威记忆不受影响。\n\n确认:在同一命令末尾加 `--yes`。"
 "memory.clear_cache_ok" = "[ok] 已清除可重建缓存 {} · 文件={} · 字节={}。权威记忆没有被删除。"
 "cancel.none_running" = "没有正在运行的流水线 — 无需取消。直接输入需求开新一轮,或 /quit 退出。"
+"cancel.operational_cleanup_failed" = "无法完整取消已暂停的评审任务，因此保留了恢复指针：{}"
 "clear.busy" = "任务仍在运行或暂停在确认 Gate。请先用 /cancel 并等待停止完成，再执行 /clear。"
 "slash.did_you_mean" = " 是想用 `/{}` 吗?"
 "slash.unknown" = "未知命令 `/{}`。{} 输入 /help 看完整列表。"
@@ -649,6 +662,7 @@
 "backend.workflow_handoff" = "工作流底座已从 {} 切换到 {}。需求、计划和已有产物会继续使用，但旧底座的会话 ID 不会跨底座复用；本次将启动新的厂商会话。"
 "backend.busy_no_switch" = "当前底座上有运行进行中 —— 请先 /cancel 再切换底座,以免运行与其会话错配。"
 "backend.switch_unavailable" = "未切换到底座 `{}`:当前探测确认它不可用。请先执行 `{}`，再重试切换。"
+"backend.switch_probe_pending" = "尚未切换到底座 `{}`：启动探测仍在进行。请在底座状态出现后重试。"
 "backend.switch_login_unverified" = "尚未切换到底座 `{}`:无法确认登录状态。请先执行 `{}`；如果这是无需登录的本地/第三方配置，请再次输入同一切换命令确认继续。"
 "backend.active_unavailable" = "当前配置的底座 `{}` 不可用，本次请求尚未启动。请先执行 `{}` 或切换到其他已就绪底座；修复后原输入可直接再次提交。"
 "chat.busy_cancel_first" = "有运行或对话进行中 —— 请先 /cancel;此时切换会话或压缩会破坏当前会话。"
@@ -662,7 +676,7 @@
 
 # /run and /redo
 "run.busy_reopen" = "流水线正在跑 — 先 /cancel 停掉再重开,避免两个流水线同时写同一个工作区。"
-"run.usage" = "用法:/run [slug] <需求>\n  示例:/run my-app 做一个登录系统\n  示例:/run 做一个 todo list (slug 自动用目录名)"
+"run.usage" = "用法:/run [--slug <slug>] <需求>\n  示例:/run --slug my-project 做一个登录系统\n  示例:/run 构建端到端测试套件 (slug 自动用目录名)"
 "goal.busy_reopen" = "已经有任务在跑 — 先 /cancel 停掉再 /goal,避免两个任务同时写同一个工作区。"
 "goal.usage" = "用法:/goal <目标>\n  示例:/goal 做一个能上线的待办应用,带登录和提醒\n  设定一个目标后,我会带团队朝它一直干到达成(厂商暴露专属持续目标能力时直接映射,否则由协调者持续维持)。"
 "goal.starting" = "[goal] 收到目标:\"{}\"。我会带团队朝它持续推进,直到做完、构建/质量校验通过为止(中途想停用 /cancel)。"
@@ -1011,6 +1025,8 @@
 "tui.scroll.above" = "↑ 上方还有 {} 行"
 # 拖拽选择复制后的提示({} = 复制到剪贴板的字符数)
 "tui.copied" = "已复制 {} 个字符"
+"tui.copy_failed" = "剪贴板写入失败，本次未复制"
+"tui.copy_too_large" = "所选内容超过远程剪贴板上限（最多 {} 个 UTF-8 字节），本次未复制"
 # Ctrl+点击打开记录里的链接 / 文件({} = 打开的目标;iTerm2 原生 Cmd+点击不受影响)
 "tui.link.opened" = "已打开 {}"
 "tui.link.open_failed" = "无法打开 {}"
@@ -1165,6 +1181,7 @@
 "tui.bang.spawn_failed" = "无法执行:{}"
 "tui.bang.timeout" = "命令超时"
 "tui.bang.no_output" = "(无输出)"
+"tui.local.output_truncated" = "[较早的命令输出已截断]"
 # 帮助浮层 + 命令面板共享的斜杠命令描述(单一来源)。
 # 多数命令复用上面的 tui.help.* 文案;以下覆盖此前只有英文面板提示(或没有提示)、
 # 现在归注册表统一管理的命令。
@@ -1208,6 +1225,7 @@
 "agentic.inspecting" = "[agentic] 正在检视仓库…"
 "agentic.working_on" = "[agentic] 正在处理:{}"
 "agentic.done" = "[agentic] 完成。"
+"stream.compacted" = "[提示] 为限制内存占用，已合并 {} 条中间实时进度；上方已恢复完整最终回复。"
 # 斜杠命令内联输出(app.rs)
 "slash.history_cleared" = "对话历史已清空。"
 "slash.gate_approved" = "[ok] 已通过{} —— 继续…"
@@ -1302,6 +1320,7 @@
 "checkpoint.workspace_in_past_halt" = "已停止:工作区停在更早的状态(一次临时取证回退没能撤销)。不会再调度后续步骤——在一棵停在过去的树上继续写代码,等于在不属于你的文件上添砖加瓦。重启 UmaDev,它会先把工作区放回现在,再做别的事。"
 "checkpoint.temp_rewind_recovery_failed" = "工作区仍停在更早的状态:上一次运行在临时回退取证期间被强制结束,UmaDev 无法自动把源码树放回来。你的成果完整保存在快照「{}」里。标记文件「{}」已保留,下次启动会再试一次。要手动恢复,请执行:「{}」(`umadev rollback <id>` 本来可以恢复检查点里的文件,但这个工作区刚刚 reset 失败——正因如此,这一步只能手动做)。"
 "checkpoint.temp_rewind_unrecoverable" = "请检查你的源码树:上一次运行在临时回退取证期间被强制结束,而它记录的快照「{}」在本工作区里无法识别,所以 UmaDev 不会把你的文件重置到这个未知的提交上——什么都没动,并且在这棵树回到现在之前,不会再往上面写任何东西。标记文件「{}」已保留;如果你的代码看起来停在更早的状态,请用你自己的 git 历史恢复(`umadev rollback` 对这个 id 无能为力——它不是本工作区能识别的检查点;`umadev history` 会列出能识别的那些)。等文件恢复成你想要的样子后,执行 `umadev doctor --fix` 即可解除这个停止状态——它会清掉上面那个陈旧标记,不会改动工作区里的任何文件。(单独执行 `umadev doctor` 只报告、不改任何东西。)"
+"checkpoint.temp_rewind_marker_invalid" = "已停止且没有改动你的文件:临时回退标记「{}」存在,但无法安全信任({})。UmaDev 无法证明工作区当前状态的位置,因此不会继续写入,也不会重置到未知状态。请先检查源码,必要时用你自己的 git 历史恢复,然后执行 `umadev doctor --fix` 删除无效标记。"
 "checkpoint.heal_rescue_label" = "工作区自动修复前的现场(含你在回退期间写下的改动)"
 "checkpoint.rollback_pre_label" = "auto: 回滚到 {} 前的现场"
 "checkpoint.none_to_restore" = "还没有任何检查点可回滚。"
@@ -1314,6 +1333,8 @@
 "doctor.rewind_marker_recoverable" = "存在一个临时回退标记，它指向快照「{}」，而本工作区能识别该快照。这里不需要修：下次启动 `umadev` 时它会自己把你的文件放回现在。（保留这个标记正是它能做到这件事的前提——`--fix` 故意不会删除它。）"
 "doctor.rewind_marker_unrecoverable" = "陈旧的回退标记——这就是每次 `umadev run` 都立即中止的原因。该标记指向快照「{}」，而本工作区已无法识别它（影子检查点仓库不见了或读不了），所以自动修复拒绝把你的文件 reset 到它——而且每次启动都会得出同样的拒绝，永远如此。执行 `umadev doctor --fix` 可以清掉它。清掉标记不会改动工作区里的任何文件，只是让 UmaDev 不再反复抛出一个它根本无法处理的停止。请先检查你的源码——如果它看起来停在更早的状态，请用你自己的 git 历史恢复。"
 "doctor.rewind_marker_cleared" = "已清除陈旧的回退标记（它指向快照「{}」，本工作区无法识别）。工作区里的文件一个都没动。`umadev run` 可以重新启动了——请先确认你的源码是你想要的样子。"
+"doctor.rewind_marker_invalid" = "回退标记不可读或已损坏({})。UmaDev 无法安全恢复,因此已停止写入。请先检查源码,再执行 `umadev doctor --fix` 删除该标记;这不会改动工作区文件。"
+"doctor.rewind_marker_invalid_cleared" = "已删除不可读或损坏的回退标记({})。工作区文件没有被改动。再次运行前请确认源码正是你想要的状态。"
 "doctor.run_lock_fence_name" = "工作区运行锁兼容栅栏"
 "doctor.run_lock_fence_absent" = "尚未创建兼容栅栏——第一次可写运行时会自动创建。"
 "doctor.run_lock_fence_current" = "v2 兼容栅栏内容完整；可写锁能力会在实际运行时再次验证。"
@@ -1350,6 +1371,8 @@
 "config.overlay.title" = " 配置 — Esc 关闭 "
 "config.overlay.heading" = "配置\n=============\n\n"
 "config.overlay.worker" = "工作底座:      {}\n"
+"config.overlay.trust_mode" = "信任模式:      {}\n"
+"config.overlay.codex_sandbox" = "Codex 实际沙箱: {}\n"
 "config.overlay.worker_unset" = "(用选择器挑选)"
 "config.overlay.model" = "模型:          (由底座自行决定 —— UmaDev 从不设置)\n"
 "config.overlay.design" = "设计体系:      {}\n"
@@ -1370,7 +1393,7 @@
 "config.overlay.custom_knowledge" = "自定义知识:    {}\n"
 "config.overlay.project_header" = "\n## 项目配置\n\n"
 "config.overlay.no_rc" = "  无 .umadevrc —— 使用默认值 (阈值=90, 轮数=3)\n"
-"config.overlay.how_to_change" = "\n## 如何修改\n\n  /claude /codex /opencode /grok /kimi\n                                  切换底座 CLI (或 /offline)\n  (模型)                        在底座里设置 —— UmaDev 从不覆盖\n  /manual  /auto                评审模式: 暂停 vs 自主\n  /design <name>                切换设计体系\n  /template <name>              切换种子模板\n  /run <slug> <req>             设置标识 + 需求\n  编辑 .umadevrc                项目级覆盖\n"
+"config.overlay.how_to_change" = "\n## 如何修改\n\n  /claude /codex /opencode /grok /kimi\n                                  切换底座 CLI (或 /offline)\n  (模型)                        在底座里设置 —— UmaDev 从不覆盖\n  /mode plan|guarded|auto       切换信任模式（逐回合生效）\n  /sandbox <mode>               修改 Codex 启动沙箱并即时重建会话\n  /design <name>                切换设计体系\n  /template <name>              切换种子模板\n  /run [--slug <slug>] <req>    设置可选标识 + 需求\n  编辑 .umadevrc                项目级覆盖\n"
 
 # /status overlay
 "status.overlay.title" = " 状态 — Esc 关闭 "

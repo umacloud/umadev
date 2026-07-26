@@ -1,29 +1,7 @@
-//! TUI application model.
-//!
-//! 4.4+ design (Claude Code-style):
-//!
-//! - **Picker** — shown only on first launch (no `~/.umadev/config.toml`).
-//!   Up/Down through detected backends, Enter to confirm, choice saved.
-//! - **Chat** — the main screen. Persistent input box at the bottom,
-//!   scrolling message history above (user / umadev / host outputs /
-//!   gate prompts), status bar on top.
-//!
-//! Slash commands inside Chat (`/claude` `/codex` `/opencode` `/grok` `/kimi` `/offline`
-//! `/init` `/continue` `/revise` `/diff` `/spec` `/verify`
-//! `/doctor` `/help` `/quit` `/clear` `/history` `/commands`) plus normal
-//! text.
-//!
-//! Plain text is normally routed to the selected base. The only local exception
-//! is a small, exact set of live progress/change questions, which the shell can
-//! answer from its own task, plan, and diff state without steering the running
-//! agent. When a gate is open other text is a
-//! gate reply (approve / revise); otherwise it is routed to the selected
-//! **base** — one of five first-class choices —
-//! which decides
-//! for itself whether the message is conversation or a build request and
-//! replies accordingly — UmaDev is only the shell around that base. The
-//! running dialogue is kept in [`App::conversation`] and handed to the base
-//! on every turn, so chat has memory instead of being amnesiac one-shots.
+//! TUI application model: backend picker, persistent chat, gates, overlays, and
+//! editor interaction. Plain text normally goes to the selected base; only a
+//! small exact set of live state queries is answered locally. The conversation
+//! is retained and supplied on every turn.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -40,14 +18,18 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::UserConfig;
+use crate::local_command::{LocalCommandRequest, LocalCommandResult};
 use crate::prompt_queue_ui::PromptQueueUi;
 
 mod backend;
+mod dir_scan;
+mod file_index;
 mod frozen_plan;
 mod host_git;
 pub(crate) mod host_input;
 mod lessons_view;
 mod memory_view;
+pub(crate) mod permissions;
 mod plan_view;
 mod read_only_metric;
 mod run_pause;
@@ -57,6 +39,8 @@ mod usage_meter;
 
 pub(crate) use backend::{parse_probe_detail, PROBE_AUTH_SENTINEL};
 use backend::{refresh_picker_with_probes, step_items};
+#[cfg(test)]
+use file_index::collect_repo_files;
 use host_git::QueuedResidentKind;
 pub(crate) use host_git::ResidentDispatch;
 use lessons_view::{format_lessons_report, format_pitfalls_report};
@@ -70,87 +54,44 @@ const HISTORY_CAP: usize = 1000;
 const INPUT_HISTORY_CAP: usize = 100;
 const MAX_INPUT_HISTORY_BYTES: u64 = 1024 * 1024;
 const MAX_CHAT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Synchronous UI reads must stay bounded and reject special files.
+const MAX_UI_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_UI_STATE_BYTES: u64 = 2 * 1024 * 1024;
 const CLAUDE_SUBAGENT_STEM: &str = "↳ 子代理";
 const CLAUDE_SUBAGENT_WORKING: &str = "工作中…";
-/// Max background-run tasks kept in the registry. Single-writer means at most one
-/// is live; the rest are recent finished/stopped history rows shown by `/tasks`.
-/// The oldest settled task is dropped once the registry exceeds this.
+/// One live task plus recent settled rows shown by `/tasks`.
 const TASKS_CAP: usize = 12;
-/// A Host/UmaDev text body (or a tool result) past this many SOURCE lines is
-/// foldable: the renderer shows a head-N preview + a `… N more lines` summary
-/// until the user expands it (Ctrl+R). This is what stops a single 998-line base
-/// reply from flooding the whole transcript. Counted on raw `\n`-split lines
-/// (cheap, pre-wrap); a borderline message that wraps to more visual rows is
-/// fine — the head-N is generous.
+/// Source-line threshold for folding one chat/tool body.
 pub(crate) const FOLD_THRESHOLD: usize = 20;
-/// Head lines kept when a long GENERAL (text / non-shell) body is folded.
+/// Head lines kept for folded prose and shell output.
 pub(crate) const FOLD_HEAD_GENERAL: usize = 3;
-/// Head lines kept when a long SHELL (Bash) tool result is folded — shell output
-/// gets a deeper preview (the tail of a build log is usually the signal).
 pub(crate) const FOLD_HEAD_SHELL: usize = 10;
-/// **Hard render cap** for a single tool result / text body when it is shown
-/// EXPANDED (not the per-message Ctrl+R fold). Even content that is force-expanded
-/// — a failed tool's error, a non-collapsed reply, a freshly streamed wall — is
-/// capped to this many SOURCE lines + a `+N 行 (Ctrl+O 展开)` footer so one giant
-/// output can never dominate the transcript. Released by the global `verbose`
-/// (Ctrl+O) toggle, which renders the whole thing (still under the global
-/// `MAX_RENDER_ROWS` post-fold cap). Generous on purpose: only a pathological
-/// (hundreds/thousands of lines) output ever trips it, so normal replies are
-/// untouched.
+/// Expanded bodies remain capped until the global verbose toggle is enabled.
 pub(crate) const FOLD_HARD_CAP: usize = 120;
-/// Ingest cap (chars) for a long-running command row's result when process-log
-/// visibility (`/logs`) is on — generous enough to carry a real build log's tail
-/// (the host already bounds the output), while the renderer's [`FOLD_HARD_CAP`]
-/// line fold still keeps a multi-thousand-line log from dominating the transcript.
-/// OFF, the tight 200-char clip is kept (so a normal tool result never balloons).
+/// In-memory command-result tail retained while `/logs` is enabled.
 pub(crate) const PROCESS_LOG_PREVIEW_CHARS: usize = 8 * 1024;
-/// FIFO **fail-open floor** for the in-memory working transcript: when a
-/// token-budgeted compaction can't run (the summary `complete()` failed / the
-/// base is offline / the circuit breaker is tripped), the working view falls back
-/// to dropping the oldest down to this many messages — the original
-/// pre-compaction behaviour. The FULL transcript on disk is never trimmed, so a
-/// FIFO drop here only bounds the live prompt, it never loses durable history.
+/// Fail-open live transcript floor when semantic compaction is unavailable.
 const CONVERSATION_CAP: usize = 16;
-/// Absolute anti-unbounded safety net on the in-memory working transcript,
-/// applied **synchronously** after every recorded turn. Real compaction triggers
-/// at [`COMPACTION_TOKEN_BUDGET`] (well under this), so this is only ever hit when
-/// compaction is impossible (offline / breaker tripped) — it guarantees the live
-/// buffer can't grow without bound while the full transcript on disk keeps
-/// everything. Generous so it never fights the token-budget compactor.
+/// Absolute live transcript cap; durable chat history is unaffected.
 const CONVERSATION_HARD_CAP: usize = 64;
-/// Approximate-token threshold that TRIGGERS auto-compaction: when the working
-/// transcript's estimated cost (chars/4) crosses this, the older turns are folded
-/// into one structured summary and the recent tail kept verbatim. Deterministic
-/// trigger; only the summary text comes from the base.
+/// Approximate-token threshold for semantic compaction.
 const COMPACTION_TOKEN_BUDGET: usize = 3_000;
-/// Token budget for the verbatim RECENT tail kept un-folded during compaction —
-/// the most-recent suffix within this cost stays word-for-word, everything older
-/// is summarised. Smaller than [`COMPACTION_TOKEN_BUDGET`] so a fold actually
-/// reclaims context.
+/// Verbatim recent-tail budget retained during compaction.
 const COMPACTION_TAIL_BUDGET: usize = 1_200;
-/// Minimum number of most-recent messages always kept verbatim through a
-/// compaction, regardless of the tail token budget (so the immediate context is
-/// never folded away).
+/// Minimum number of recent messages kept verbatim.
 const COMPACTION_MIN_TAIL: usize = 4;
 /// Max chars in the input box.
 const INPUT_CAP: usize = 8192;
 
-/// Max gap between two consecutive key events for the later one to count as part of a PASTE
-/// BURST (a paste arrives back-to-back far faster than typing). Used ONLY on Windows to tell a
-/// pasted newline — which the Windows console delivers as a bare Enter, not a crossterm
-/// `Event::Paste` — from a genuine submit Enter (which follows a human-speed pause). Generous
-/// enough to cover the per-key redraw between paste keys, well below any human key interval.
+/// Windows key-gap threshold used to distinguish pasted Enter from submit.
 pub(crate) const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(30);
 
-/// A bracketed paste with MORE than this many lines collapses to a single
-/// `[粘贴 N 行]` chip (the full text is stashed and re-expanded on submit)
-/// instead of flooding the input box into unscrollable noise. Mirrors the
-/// image-attachment chip mechanism for bulky text.
+/// Large bracketed pastes collapse into one chip.
 const PASTE_CHIP_MIN_LINES: usize = 12;
-/// A bracketed paste with MORE than this many chars also collapses to a chip —
-/// catches a huge single-line paste (one 5 KB line is just as much noise as 40
-/// short ones). Either trigger fires the chip.
 const PASTE_CHIP_MIN_CHARS: usize = 1200;
+/// Hard memory envelope for bulky text parked behind paste chips.
+const MAX_PASTE_BYTES: usize = 1024 * 1024;
+const MAX_TOTAL_PASTE_BYTES: usize = 2 * 1024 * 1024;
 
 /// TUI-side fast rejection mirrors the host protocol's hard attachment envelope.
 /// The host re-validates immediately before every write, so these values are UX
@@ -158,6 +99,15 @@ const PASTE_CHIP_MIN_CHARS: usize = 1200;
 const MAX_TURN_ATTACHMENTS: usize = 16;
 const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
+
+fn read_bounded_utf8(path: &std::path::Path, max_bytes: u64) -> std::io::Result<String> {
+    String::from_utf8(umadev_state::fs::read_bounded(path, max_bytes)?).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("managed text is not UTF-8: {error}"),
+        )
+    })
+}
 
 #[derive(Debug, Default)]
 struct MemoryOptions {
@@ -682,6 +632,28 @@ pub(crate) enum FailedRouteOrigin {
     Director,
 }
 
+/// How output from a bounded TUI-owned local command is presented.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LocalCommandPresentation {
+    /// A user-authored `!cmd` shell invocation.
+    Shell,
+    /// Plain output from an UmaDev CLI subcommand.
+    UmaDev,
+    /// UmaDev CLI output wrapped in the localized MCP heading.
+    Mcp,
+    /// UmaDev CLI output wrapped in the localized skill heading.
+    Skill,
+}
+
+const fn local_command_call_id(presentation: LocalCommandPresentation) -> &'static str {
+    match presentation {
+        LocalCommandPresentation::Shell => "umadev:local-shell",
+        LocalCommandPresentation::UmaDev
+        | LocalCommandPresentation::Mcp
+        | LocalCommandPresentation::Skill => "umadev:local-cli",
+    }
+}
+
 /// What the event loop should do after a key press.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Action {
@@ -823,6 +795,15 @@ pub enum Action {
     /// synchronous heuristic; the event loop owns the `terminal` writer, so the
     /// escape query is issued there (mirrors [`Self::ForceRedraw`]).
     ReprobeTheme,
+    /// Run an explicit `!cmd` shell invocation off the render thread.
+    RunLocalShell(String),
+    /// Run one non-interactive UmaDev helper command off the render thread.
+    RunUmaDevCommand {
+        /// Exact argv tokens after the `umadev` executable.
+        args: Vec<String>,
+        /// Transcript output presentation.
+        presentation: LocalCommandPresentation,
+    },
 }
 
 /// Classify a typed reply to a PAUSED consequential-action approval (A2#5):
@@ -846,6 +827,7 @@ pub(crate) fn classify_approval_reply(text: &str) -> Option<bool> {
 enum LiveMetaIntent {
     Progress,
     Changes,
+    Permissions,
 }
 
 /// Bounded, trilingual live-meta classifier. It accepts polite/natural variants,
@@ -915,7 +897,6 @@ fn classify_live_meta(text: &str) -> Option<LiveMetaIntent> {
         "current status",
         "status update",
     ];
-
     let lowered = text.trim().to_lowercase();
     let normalized = lowered
         .trim_matches(|c: char| {
@@ -989,6 +970,9 @@ fn classify_live_meta(text: &str) -> Option<LiveMetaIntent> {
     );
     if chained_work {
         return None;
+    }
+    if permissions::is_pure_question(&normalized, &compact) {
+        return Some(LiveMetaIntent::Permissions);
     }
 
     let zh_scope = contains_any(
@@ -2431,134 +2415,13 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     Some(score)
 }
 
-/// True for a char allowed inside an `@`-file-mention token (`[\w./-]`, plus any
-/// Unicode alphanumeric so a non-ASCII path component still matches): word chars,
-/// underscore, dot, slash, dash. The `@`-typeahead reads the contiguous run of
-/// these immediately before the cursor as the partial path being filtered.
+/// True for a char allowed inside an `@`-file-mention token.
 fn is_mention_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '-')
 }
 
-/// Maximum number of repo files offered as `@`-mention candidates (bounds both
-/// the one-time scan and the per-frame filter cost).
-const MENTION_FILE_CAP: usize = 2000;
-/// Maximum directory depth the `@`-mention scan descends (a guard against a
-/// pathological tree; the user's files of interest are shallow).
-const MENTION_SCAN_DEPTH: usize = 12;
 /// Maximum number of ranked candidates shown in the `@`-mention popover at once.
 const MENTION_MATCH_CAP: usize = 50;
-
-/// Walk `root` and collect up to [`MENTION_FILE_CAP`] repo-relative file paths
-/// (`/`-separated, sorted) for the `@`-mention typeahead. Skips the noisy
-/// build / VCS / hidden directories (`target`, `node_modules`, and anything
-/// whose name starts with `.` — which covers `.git`, `.umadev`, dotfiles).
-/// Fail-open: an unreadable directory is skipped (never panics); a missing root
-/// yields an empty list. Uses an explicit work stack so a deep tree can't
-/// overflow the call stack, and `DirEntry::file_type` (no symlink follow) so a
-/// symlink loop can't make the walk diverge.
-fn collect_repo_files(root: &std::path::Path) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    while let Some((dir, depth)) = stack.pop() {
-        if out.len() >= MENTION_FILE_CAP {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue; // unreadable dir → skip (fail-open)
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                continue;
-            }
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
-                if depth < MENTION_SCAN_DEPTH {
-                    stack.push((entry.path(), depth + 1));
-                }
-            } else if ft.is_file() {
-                if let Ok(rel) = entry.path().strip_prefix(root) {
-                    out.push(rel.to_string_lossy().replace('\\', "/"));
-                    if out.len() >= MENTION_FILE_CAP {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-/// I9 — the repo file the first-run example tip names: the most recently
-/// MODIFIED source file under `root`, as a repo-relative `/`-separated path, so
-/// "重构 <file>" / "refactor <file>" points at something the user actually just
-/// touched. Bounded walk reusing the @-mention scan's skip rules (hidden dirs,
-/// `target`, `node_modules`) and caps. Restricted to common source extensions so
-/// the example never suggests acting on a lockfile or binary. `None` when the
-/// repo has no recognisable source file or is unreadable — the caller then falls
-/// back to a generic token. Fail-open: never panics.
-fn most_recently_modified_source_file(root: &std::path::Path) -> Option<String> {
-    const SRC_EXTS: &[&str] = &[
-        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "rb", "php", "c", "cc",
-        "cpp", "h", "hpp", "cs", "swift", "kt", "vue", "svelte", "css", "scss", "less", "html",
-    ];
-    let mut best: Option<(std::time::SystemTime, String)> = None;
-    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
-    let mut scanned = 0usize;
-    while let Some((dir, depth)) = stack.pop() {
-        if scanned >= MENTION_FILE_CAP {
-            break;
-        }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue; // unreadable dir → skip (fail-open)
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || name == "target" || name == "node_modules" {
-                continue;
-            }
-            let Ok(ft) = entry.file_type() else { continue };
-            if ft.is_dir() {
-                if depth < MENTION_SCAN_DEPTH {
-                    stack.push((entry.path(), depth + 1));
-                }
-                continue;
-            }
-            if !ft.is_file() {
-                continue;
-            }
-            scanned += 1;
-            let path = entry.path();
-            let is_src = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| SRC_EXTS.contains(&e.to_ascii_lowercase().as_str()));
-            if !is_src {
-                continue;
-            }
-            let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
-                continue;
-            };
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            // Keep the newest; a lexicographic tie-break on the path so an
-            // equal-mtime repo picks the same file deterministically each launch.
-            let better = match &best {
-                Some((t, cur)) => mtime > *t || (mtime == *t && rel.as_str() < cur.as_str()),
-                None => true,
-            };
-            if better {
-                best = Some((mtime, rel));
-            }
-        }
-    }
-    best.map(|(_, rel)| rel)
-}
 
 /// True for a RECOVERABLE, mid-turn base hiccup (rate-limit / overloaded / retry)
 /// that should surface as a transient live status line rather than a permanent
@@ -2836,7 +2699,7 @@ pub struct SearchState {
 /// One search hit: a char span on a single folded/visual transcript row, in
 /// LOGICAL (gutter-stripped) coordinates — the same space `transcript_rows`
 /// stores, so the renderer maps it to the decorated line by adding the row's
-/// gutter width (exactly as the selection highlight does).
+/// gutter Unicode-scalar length (exactly as the selection highlight does).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SearchMatch {
     /// Visual-row index into the folded transcript (== `transcript_rows` index).
@@ -2950,10 +2813,13 @@ pub struct App {
     pub mention_dismissed: bool,
     /// Lazily-built, cached list of repo-relative file paths (`/`-separated,
     /// sorted) — the `@`-mention candidate source. `None` until the first
-    /// `@`-token is typed, then built once by the internal mention-file indexer and
-    /// reused (the filesystem scan is NOT re-run per keystroke). Interior-mutable
-    /// so the pure `&App` renderer can populate it on first use.
+    /// `@`-token is typed, then received from the one-shot background workspace
+    /// index and reused (the filesystem scan is never run on the render thread).
     pub mention_files: std::cell::RefCell<Option<Vec<String>>>,
+    /// Shared background result for mention paths and the first-run example.
+    workspace_scan_handle: std::cell::RefCell<
+        Option<std::sync::Arc<std::sync::OnceLock<file_index::WorkspaceFileIndex>>>,
+    >,
 
     /// Bounded scrolling chat history (older lines roll off). This is the
     /// VISIBLE rendered surface (prose + tool rows + diff cards + plan memos +
@@ -3117,9 +2983,9 @@ pub struct App {
     /// cached row in [`Self::transcript_rows`] — the role-spine glyph + hang
     /// indent that decorates the painted line but must NOT be copied. The mouse
     /// mapping subtracts it (a click in the gutter resolves to column 0 of the
-    /// logical text) and the highlight adds it back (it paints the DECORATED line,
-    /// whose char indices are shifted right by the gutter). One entry per row, in
-    /// lockstep with `transcript_rows`. In a `RefCell` for the same borrow reason.
+    /// logical text). Highlight painting separately tracks a scalar-prefix length
+    /// because zero-width variation selectors are `char`s but not cells. In
+    /// lockstep with `transcript_rows`; `RefCell` permits renderer publication.
     pub transcript_gutters: std::cell::RefCell<Vec<usize>>,
 
     /// **Per-row soft-wrap flag** — `transcript_row_wraps[i] == true` marks cached
@@ -3545,6 +3411,8 @@ pub struct App {
 
     /// Detected host backends (asynchronously populated).
     pub backends: Vec<BackendInfo>,
+    /// Latest asynchronous probe generation; zero means no probe was launched.
+    pub(crate) backend_probe_generation: u64,
     /// `true` while the help overlay is open.
     pub show_help: bool,
     /// Scroll offset (in rows) for the help overlay, so it never crops on
@@ -3573,7 +3441,7 @@ pub struct App {
     pub history_search: Option<HistorySearchState>,
     /// Handle to a running dev-server subprocess spawned by `/preview`, so we
     /// can kill it on `/stop-preview` or quit. `None` when no preview is live.
-    pub preview_server: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
+    pub preview_server: std::sync::Arc<std::sync::Mutex<Option<umadev_process::ManagedChild>>>,
     /// Workspace root — surfaced in the status bar as a breadcrumb.
     pub project_root: std::path::PathBuf,
     /// When a pipeline is running and the user presses `q` / Esc, we
@@ -3738,6 +3606,10 @@ pub struct App {
     /// to the last Host message (typewriter effect) instead of pushing a new
     /// line. Set false by any non-text event (tool use, result, etc.).
     pub stream_text_active: bool,
+    /// Aggregate of live, display-only engine events compacted by the bounded
+    /// event queue during the current turn. The authoritative terminal reply
+    /// replaces any partial streamed prose before this is cleared.
+    stream_compacted: Option<(u64, u64)>,
 
     /// **P5a stable-prefix markdown cache** — interior-mutable so the pure
     /// `&App` renderer can reuse the closed-block render of the message
@@ -3867,8 +3739,8 @@ pub struct App {
 
     /// I9 — cached resolution of the repo file named by the first-run example
     /// tip (the most recently modified source file, or `None`). Interior-mutable
-    /// so the pure `&App` renderer can populate it on first use; the bounded FS
-    /// walk then runs at most once per session. Outer `None` = not yet computed.
+    /// so the renderer can poll the background index without touching the
+    /// filesystem. Outer `None` = not yet resolved.
     pub example_file: std::cell::RefCell<Option<Option<String>>>,
 }
 
@@ -4067,7 +3939,7 @@ impl App {
         // Main-worker default is `danger-full-access`; an explicit project or
         // launch override can restrict it. Plan mode is forced read-only by the
         // session driver regardless of this execution default.
-        let codex_sandbox = resolve_and_publish_codex_sandbox(&project_root);
+        permissions::resolve_and_publish_codex_sandbox(&project_root);
         let mode = if backend.is_some() || explicit_offline {
             AppMode::Chat
         } else {
@@ -4096,6 +3968,7 @@ impl App {
             mention_selected: 0,
             mention_dismissed: false,
             mention_files: std::cell::RefCell::new(None),
+            workspace_scan_handle: std::cell::RefCell::new(None),
             history: VecDeque::new(),
             transcript_scroll: std::cell::Cell::new(0),
             transcript_prev_hidden: std::cell::Cell::new(0),
@@ -4200,6 +4073,7 @@ impl App {
             config_trust_cache: std::cell::Cell::new(None),
             trust_ledger: umadev_agent::TrustLedger::load(&project_root),
             backends: Vec::new(),
+            backend_probe_generation: 0,
             show_help: false,
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
@@ -4245,6 +4119,7 @@ impl App {
             last_dispatched_chat: None,
             stream_tool_batch: None,
             stream_text_active: false,
+            stream_compacted: None,
             stream_md_cache: std::cell::RefCell::new(crate::ui::StreamMarkdownCache::default()),
             msg_fold_cache: std::cell::RefCell::new(crate::ui::MsgFoldCache::new()),
             transcript_cache: std::cell::RefCell::new(crate::ui::TranscriptCache::new()),
@@ -4263,6 +4138,7 @@ impl App {
             session_turns: 0,
             example_file: std::cell::RefCell::new(None),
         };
+        app.start_workspace_file_scan();
         app.load_history();
         // Reload the persisted background-task registry so recent / interrupted
         // runs survive a relaunch (fail-open: missing/corrupt file → no-op).
@@ -4278,7 +4154,7 @@ impl App {
             // Liability notice: if codex is the active base AND the high-risk
             // `danger-full-access` sandbox is resolved, push a loud red warning
             // last so it is the most-visible startup line.
-            app.maybe_warn_codex_sandbox(codex_sandbox);
+            app.maybe_warn_codex_sandbox(app.effective_codex_launch_sandbox());
         }
         app.refresh_status();
         app
@@ -4501,10 +4377,10 @@ impl App {
         let Some(chat_dir) = self.existing_chat_dir() else {
             return out;
         };
-        let Ok(entries) = std::fs::read_dir(chat_dir) else {
-            return out;
-        };
-        for entry in entries.flatten() {
+        for entry in dir_scan::scan_dir(&chat_dir).entries {
+            if !entry.is_file() {
+                continue;
+            }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
@@ -4513,12 +4389,12 @@ impl App {
                 continue;
             };
             if !Self::valid_chat_id(file_id)
-                || !std::fs::symlink_metadata(&path)
+                || !std::fs::symlink_metadata(path)
                     .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_file(&metadata))
             {
                 continue;
             }
-            let Ok(bytes) = umadev_state::fs::read_bounded(&path, MAX_CHAT_FILE_BYTES) else {
+            let Ok(bytes) = umadev_state::fs::read_bounded(path, MAX_CHAT_FILE_BYTES) else {
                 continue;
             };
             let Ok(session) = serde_json::from_slice::<ChatSession>(&bytes) else {
@@ -5502,6 +5378,7 @@ impl App {
             || self.active_gate.is_some()
             || self.director_gate_paused
             || self.gate_query_in_flight
+            || self.operational_pause_reason.is_some()
     }
 
     /// `true` when the interrupt is ARMED (a first Esc landed recently) — a second
@@ -5520,6 +5397,7 @@ impl App {
     /// terminal state instead of the misleading idle "ready / 0/9" look. A new
     /// `/run` (which fires `PipelineStarted`) clears the flag.
     fn mark_block_aborted(&mut self, body: String) {
+        self.stream_compacted = None;
         // Feature A — an honest abort/hard-stop (the run errored out, not a user
         // cancel) is a terminal state the away user should hear. Arm before the
         // timers are cleared, gated on how long the run had been going.
@@ -5529,6 +5407,12 @@ impl App {
         // honest hard abort clears any prior degraded flag so `run_state` reads a
         // single unambiguous terminal.
         self.degraded = false;
+        // A terminal failure after a resumed budget/operational pause supersedes
+        // the paused label. Keeping either marker would make `run_state()` show
+        // `[paused]` over the durable circuit-open receipt and keep cancel/resume
+        // affordances alive for a run that cannot continue.
+        self.budget_paused = false;
+        self.operational_pause_reason = None;
         // The run errored out (not a user cancel) → its task is a Failed row.
         self.mark_active_task(TaskStatus::Failed);
         // Clear the pipeline-live flag: an abort is terminal-for-now, so a leftover
@@ -5848,12 +5732,12 @@ impl App {
     }
 
     /// Mouse-up (left button) — finish the selection and copy it. When there is
-    /// a non-empty selection, extracts its text, shows a "copied N chars" toast
-    /// (kept private to this module) and returns `Some(text)` for the caller to
-    /// hand to `copy_to_clipboard` (which owns the native-command-vs-OSC 52
-    /// decision). The selection is KEPT highlighted so the user sees what was
-    /// copied; a later mouse-down elsewhere clears it. Returns `None` (leaving
-    /// any single-click selection in place) when nothing is selected — fail-open.
+    /// a non-empty selection, extracts its text and returns `Some(text)` for the
+    /// caller to hand to `copy_to_clipboard` (which owns both the platform write
+    /// and result-driven feedback). The selection is KEPT highlighted so the
+    /// user sees what was selected; a later mouse-down elsewhere clears it.
+    /// Returns `None` (leaving any single-click selection in place) when nothing
+    /// is selected — fail-open.
     #[must_use]
     pub fn selection_finish_copy(&mut self) -> Option<String> {
         // The button released: the drag is over (the span stays highlighted, but
@@ -5875,8 +5759,6 @@ impl App {
         if text.is_empty() {
             return None;
         }
-        let count = text.chars().count();
-        self.show_copy_toast(count);
         Some(text)
     }
 
@@ -5990,10 +5872,10 @@ impl App {
     }
 
     /// Mouse-up (left button) — finish an input-box selection and copy it. Mirrors
-    /// [`Self::selection_finish_copy`]: extracts the dragged text, shows the
-    /// "copied N chars" toast and returns `Some(text)` for the caller's clipboard
-    /// path (OSC 52 / native). The span stays highlighted so the user sees what was
-    /// copied; a later down elsewhere clears it. Returns `None` when nothing was
+    /// [`Self::selection_finish_copy`]: extracts the dragged text and returns
+    /// `Some(text)` for the caller's result-aware clipboard path (OSC 52 /
+    /// native). The span stays highlighted so the user sees what was selected;
+    /// a later down elsewhere clears it. Returns `None` when nothing was
     /// selected — fail-open.
     #[must_use]
     pub fn input_selection_finish_copy(&mut self) -> Option<String> {
@@ -6016,8 +5898,6 @@ impl App {
         if text.is_empty() {
             return None;
         }
-        let count = text.chars().count();
-        self.show_copy_toast(count);
         Some(text)
     }
 
@@ -6159,10 +6039,14 @@ impl App {
     /// exist.
     fn resumable_artifact_path(&self) -> Option<&'static str> {
         let output = self.project_root.join("output");
-        if std::fs::read_dir(&output).is_ok_and(|mut entries| entries.next().is_some()) {
+        if dir_scan::directory_has_real_entry(&output) {
             return Some("output/");
         }
-        if umadev_agent::read_workflow_state(&self.project_root).is_some() {
+        let terminal_review = umadev_agent::terminal_review_circuit_reason(&self.project_root)
+            .is_some()
+            || umadev_agent::legacy_operational_review_terminal_reason(&self.project_root)
+                .is_some();
+        if !terminal_review && umadev_agent::read_workflow_state(&self.project_root).is_some() {
             return Some(".umadev/");
         }
         None
@@ -6898,35 +6782,24 @@ impl App {
     /// case). A path-shaped image that fails validation is rejected without being
     /// echoed as prompt text; ordinary prose that merely mentions PNG stays text.
     pub fn handle_paste(&mut self, text: &str) {
-        // A paste is an edit — close the kill-coalesce + yank-pop windows so a
-        // following kill starts fresh and Alt+Y isn't mistaken for valid.
         self.reset_kill_yank();
+        if text.len() > MAX_PASTE_BYTES {
+            self.push_paste_rejection();
+            return;
+        }
         let text = Self::normalize_paste_text(text);
-        let lines: Vec<&str> = text.trim().lines().collect();
-        let all_images = !lines.is_empty()
-            && lines.iter().all(|l| {
+        let mut image_lines = text.trim().lines();
+        let all_images = image_lines.clone().next().is_some()
+            && image_lines.all(|l| {
                 let p = unquote_unescape(l.trim());
-                // Suffix alone is NOT enough to claim a paste is an image: prose
-                // like `see the dashboard.png` or a URL ending `.png` also matches
-                // `is_image_path`, and the old code then took the image branch,
-                // failed to attach the non-file, and `return`ed WITHOUT inserting
-                // anything — silently DISCARDING the pasted text (data loss). A
-                // dragged-in image is always a REAL local file, so require the path
-                // to exist before treating the paste as an attachment; otherwise the
-                // paste falls through to ordinary text insertion below.
+                // A suffix alone is ambiguous prose; dragged images are real files.
                 is_image_path(&p) && std::path::Path::new(&p).exists()
             });
         if all_images {
             let mut any = false;
-            for l in &lines {
+            for l in text.trim().lines() {
                 let p = unquote_unescape(l.trim());
-                // Reserve room for the WHOLE chip BEFORE attaching. Near INPUT_CAP
-                // `insert_str_at_cursor` would insert nothing (or a partial token),
-                // leaving the pushed attachment with no intact `[图片 N]` chip in the
-                // buffer — so `expand_attachments` finds no chip and SILENTLY DROPS
-                // the image on submit (an orphaned attachment). If the chip can't fit
-                // whole, skip this image rather than orphan it (the box is at cap —
-                // nothing more can be typed either).
+                // Never create an attachment whose complete visible chip cannot fit.
                 let need = self.image_chip(self.attachments.len() + 1).chars().count();
                 if INPUT_CAP.saturating_sub(self.input_len()) < need {
                     self.push_attachment_rejection("attach.reason.input_full");
@@ -6939,35 +6812,31 @@ impl App {
                     any = true;
                 }
             }
-            // Belt-and-suspenders: re-sync `attachments` to the chips actually in the
-            // buffer (mirrors every edit path), so no image can leave an orphaned
-            // backing ref even if a chip failed to land whole. Fail-open bookkeeping.
             if any {
                 self.reconcile_attachments();
             }
-            // Every line was intentionally an image attachment. A rejected file
-            // remains rejected; never fall through and paste its private path as
-            // ordinary prompt text.
+            // Rejected attachment paths must not fall through into prompt text.
             return;
         }
-        // A BULKY text paste (many lines or a huge single line) collapses to a
-        // `[粘贴 N 行]` chip with the full text parked in `text_stash`, so it
-        // doesn't flood the box into unscrollable noise; it expands back inline
-        // on submit. Same proven chip+stash+expand pattern as images.
+        // Bulky text is parked behind a chip and expanded only on submit.
         let lines = Self::paste_line_count(&text);
         let chars = text.chars().count();
         if lines > PASTE_CHIP_MIN_LINES || chars > PASTE_CHIP_MIN_CHARS {
+            let stashed_bytes = self
+                .text_stash
+                .iter()
+                .fold(0usize, |total, item| total.saturating_add(item.len()));
+            if stashed_bytes.saturating_add(text.len()) > MAX_TOTAL_PASTE_BYTES {
+                self.push_paste_rejection();
+                return;
+            }
             let chip = self.text_chip(&text);
-            // Reserve room for the WHOLE chip BEFORE stashing. Near INPUT_CAP,
-            // `insert_str_at_cursor` would otherwise land a partial token (or
-            // nothing), leaving `text_stash` with no intact chip to expand on
-            // submit. Same invariant as image attachments: backing data exists
-            // only when the visible token that references it landed whole.
+            // Backing data exists only when its complete visible chip can fit.
             let need = chip.chars().count();
             if INPUT_CAP.saturating_sub(self.input_len()) < need {
                 return;
             }
-            self.text_stash.push(text.clone());
+            self.text_stash.push(text);
             self.insert_str_at_cursor(&chip);
             if INPUT_CAP.saturating_sub(self.input_len()) > 0 {
                 self.insert_str_at_cursor(" ");
@@ -6976,6 +6845,14 @@ impl App {
         }
         // A small paste → verbatim (real text, the dominant case).
         self.insert_str_at_cursor(&text);
+    }
+
+    fn push_paste_rejection(&mut self) {
+        self.push(
+            ChatRole::System,
+            umadev_i18n::t(self.lang, "attach.paste_limit"),
+        );
+        self.refresh_status();
     }
 
     /// Validate a candidate image without ever echoing its local path. The host
@@ -7072,11 +6949,10 @@ impl App {
     /// is called before `clear_input`, so every backing path/stash is snapshotted
     /// while its chip-to-vector index is still valid.
     fn compose_submitted_turn(&self, raw: &str) -> SubmittedTurn {
-        #[derive(Clone)]
-        enum Marker {
+        enum Marker<'a> {
             Image(usize),
             File(usize),
-            Paste(String),
+            Paste(&'a str),
         }
 
         let mut markers: Vec<(usize, usize, Marker)> = Vec::new();
@@ -7103,7 +6979,7 @@ impl App {
                     continue;
                 }
                 claimed_pastes.push(start);
-                markers.push((start, start + token.len(), Marker::Paste(stash.clone())));
+                markers.push((start, start + token.len(), Marker::Paste(stash)));
                 break;
             }
         }
@@ -7137,8 +7013,8 @@ impl App {
                     }
                 }
                 Marker::Paste(text) => {
-                    append_text_block(&mut blocks, &text);
-                    display.push_str(&text);
+                    append_text_block(&mut blocks, text);
+                    display.push_str(text);
                 }
             }
             cursor = end;
@@ -7499,7 +7375,7 @@ impl App {
         Self::cmd(
             "run",
             &[],
-            Some("[slug] <req>"),
+            Some("[--slug <slug>] <req>"),
             CmdGroup::Pipeline,
             "tui.help.pipe.run",
         ),
@@ -8103,17 +7979,6 @@ impl App {
         None
     }
 
-    /// Build (once) + cache the repo-relative file list backing the `@`-mention
-    /// typeahead. The scan runs lazily on the first `@` and is then reused, so
-    /// typing stays fast (no per-keystroke filesystem walk). Fail-open.
-    fn ensure_mention_files(&self) {
-        if self.mention_files.borrow().is_some() {
-            return;
-        }
-        let files = collect_repo_files(&self.project_root);
-        *self.mention_files.borrow_mut() = Some(files);
-    }
-
     /// I9 — the first-run example tip layered above the idle placeholder: a short,
     /// rotating "试试 …" / "Try …" example (trilingual) that teaches the prompt
     /// surface by demonstration. Shown ONLY at the very start of a session — an
@@ -8193,19 +8058,6 @@ impl App {
             && !self.finished
             && !self.aborted
             && !self.run_started
-    }
-
-    /// I9 — cached lookup of the repo file named by the first-run example tip:
-    /// the most recently modified source file under the project root, or `None`.
-    /// The bounded FS walk runs at most once per session (interior-mutable cache)
-    /// so re-rendering the tip every frame stays free. Fail-open via the walk.
-    fn resolve_example_file(&self) -> Option<String> {
-        if let Some(cached) = self.example_file.borrow().as_ref() {
-            return cached.clone();
-        }
-        let chosen = most_recently_modified_source_file(&self.project_root);
-        *self.example_file.borrow_mut() = Some(chosen.clone());
-        chosen
     }
 
     /// The ranked `@`-mention candidates for the partial currently under the
@@ -8786,6 +8638,7 @@ impl App {
                 self.budget_paused = false;
                 self.operational_pause_reason = None;
                 self.run_degraded_seen = false;
+                self.stream_compacted = None;
                 self.run_started_at = Some(std::time::Instant::now());
                 self.push(
                     ChatRole::UmaDev,
@@ -9063,45 +8916,38 @@ impl App {
                     self.phase_started_at = None;
                     let lang = self.lang;
                     let release = self.project_root.join("release");
-                    let zip_info = std::fs::read_dir(&release)
-                        .ok()
-                        .and_then(|rd| {
-                            let mut zips: Vec<_> = rd
-                                .filter_map(Result::ok)
-                                .filter(|e| {
-                                    e.path().extension().and_then(|s| s.to_str()) == Some("zip")
-                                })
-                                .collect();
-                            zips.sort_by_key(std::fs::DirEntry::file_name);
-                            zips.last().map(|z| {
-                                let size =
-                                    std::fs::metadata(z.path()).map_or(0, |m| m.len() / 1024);
-                                umadev_i18n::tf(
-                                    lang,
-                                    "delivery.latest_zip",
-                                    &[&z.file_name().to_string_lossy(), &size.to_string()],
-                                )
-                            })
+                    let release_entries = dir_scan::scan_dir(&release).entries;
+                    let zip_info = release_entries
+                        .iter()
+                        .rfind(|entry| {
+                            entry.is_file()
+                                && entry.path().extension().and_then(|s| s.to_str()) == Some("zip")
+                        })
+                        .map(|zip| {
+                            let size = zip.file_len() / 1024;
+                            umadev_i18n::tf(
+                                lang,
+                                "delivery.latest_zip",
+                                &[&zip.file_name().to_string_lossy(), &size.to_string()],
+                            )
                         })
                         .unwrap_or_default();
                     // The shareable HTML scorecard sits next to the zip.
-                    let scorecard = std::fs::read_dir(&release)
-                        .ok()
-                        .and_then(|rd| {
-                            let mut cards: Vec<_> = rd
-                                .filter_map(Result::ok)
-                                .filter(|e| {
-                                    e.file_name().to_string_lossy().starts_with("scorecard-")
-                                })
-                                .collect();
-                            cards.sort_by_key(std::fs::DirEntry::file_name);
-                            cards.last().map(|c| {
-                                umadev_i18n::tf(
-                                    lang,
-                                    "delivery.scorecard",
-                                    &[&c.file_name().to_string_lossy()],
-                                )
-                            })
+                    let scorecard = release_entries
+                        .iter()
+                        .rfind(|entry| {
+                            entry.is_file()
+                                && entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with("scorecard-")
+                        })
+                        .map(|card| {
+                            umadev_i18n::tf(
+                                lang,
+                                "delivery.scorecard",
+                                &[&card.file_name().to_string_lossy()],
+                            )
                         })
                         .unwrap_or_default();
                     // Surface the local preview URL right in the completion
@@ -9177,12 +9023,12 @@ impl App {
                 ready,
                 detail,
             } => {
-                // The `BackendProbed` event only carries `{id, ready, detail}` (it
-                // lives in umadev-agent and we don't change it), so the honest auth
-                // state + the base's login/install commands ride along packed into
-                // `detail` by `spawn_probe`. Unpack here, fail-open to Unknown / no
-                // hint if the tag is absent (an external emitter, an older build).
-                let (auth, login_cmd, install_cmd, human) = parse_probe_detail(&detail);
+                let (generation, auth, login_cmd, install_cmd, human) = parse_probe_detail(&detail);
+                if self.backend_probe_generation != 0
+                    && generation != Some(self.backend_probe_generation)
+                {
+                    return;
+                }
                 // Update or append the probe row.
                 if let Some(existing) = self.backends.iter_mut().find(|b| b.id == backend_id) {
                     existing.ready = ready;
@@ -9627,6 +9473,13 @@ impl App {
                     }
                 }
             }
+            EngineEvent::StreamCompacted { events, bytes } => {
+                let (prior_events, prior_bytes) = self.stream_compacted.unwrap_or((0, 0));
+                self.stream_compacted = Some((
+                    prior_events.saturating_add(events),
+                    prior_bytes.saturating_add(bytes),
+                ));
+            }
         }
         self.refresh_status();
     }
@@ -10046,25 +9899,25 @@ impl App {
 
             // ---- exit handling ----
             KeyCode::Esc => {
+                // I6 — empty box + a chat turn parked behind the in-flight one →
+                // pull the most recent queued message back for editing (popping
+                // it) BEFORE interrupt/rewind handling. `thinking` is normally
+                // true while that queue exists, so checking interruption first
+                // would make the queue impossible to recall with Esc.
+                if self.input.is_empty() && self.recall_queued_chat() {
+                    return Action::None;
+                }
                 // Running → Esc INTERRUPTS (like Claude Code), but require a
                 // DELIBERATE double-press so a stray keypress can't nuke a long
                 // build: the first Esc ARMS (the indicator shows "再按 Esc 中断"),
                 // a second Esc within the window actually cancels. It never quits
                 // the app while a run is in flight.
-                if self.has_interruptible_work() {
+                if self.has_interruptible_work() || self.thinking {
                     if self.interrupt_armed() {
                         self.interrupt_armed_at = None;
                         return Action::Cancel;
                     }
                     self.interrupt_armed_at = Some(std::time::Instant::now());
-                    return Action::None;
-                }
-                // I6 — empty box + a chat turn parked behind the in-flight one →
-                // pull the most recent queued message back for editing (popping
-                // it) BEFORE the rewind/quit gesture, so a queued turn can be
-                // fixed (or dropped) before it sends. A no-op when the queue is
-                // empty, falling through to the rewind/quit arms below.
-                if self.input.is_empty() && self.recall_queued_chat() {
                     return Action::None;
                 }
                 // Idle, EMPTY input, with a prior user turn → double-Esc REWINDS:
@@ -10667,6 +10520,24 @@ impl App {
         })
     }
 
+    /// Paths from the bounded host-owned post-turn fact when structured diff
+    /// rows were unavailable. The fact format is emitted by UmaDev itself.
+    fn latest_turn_fact_paths(&self) -> Vec<String> {
+        self.latest_turn_fact()
+            .and_then(|fact| fact.split_once("[note] 本轮实际文件变更:"))
+            .map_or_else(Vec::new, |(_, paths)| {
+                paths
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .split(", ")
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+    }
+
     fn live_progress_reply(&self) -> String {
         let mut lines = vec![umadev_i18n::t(self.lang, "live_meta.progress.title").to_string()];
 
@@ -10767,27 +10638,18 @@ impl App {
             }
         }
 
-        let status_paths = crate::git_status_porcelain(&self.project_root)
-            .map(|snapshot| {
-                snapshot
-                    .lines()
-                    .filter_map(crate::porcelain_path)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if status_paths.is_empty() {
-            return umadev_i18n::t(self.lang, "live_meta.changes.none_yet").to_string();
-        }
-        let shown = status_paths
-            .iter()
-            .take(CAP)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" · ");
-        umadev_i18n::tf(
+        umadev_i18n::t(self.lang, "live_meta.changes.none_yet").to_string()
+    }
+
+    /// Answer from host-owned per-turn trust and sandbox state, not a base
+    /// model that could invent a restart ritual or sticky first-turn authority.
+    fn live_permissions_reply(&self) -> String {
+        let trust = self.effective_trust_mode();
+        permissions::reply(
             self.lang,
-            "live_meta.changes.git_status",
-            &[&status_paths.len().to_string(), &shown],
+            self.backend.as_deref(),
+            trust,
+            self.effective_codex_launch_sandbox(),
         )
     }
 
@@ -10795,6 +10657,7 @@ impl App {
         let reply = match intent {
             LiveMetaIntent::Progress => self.live_progress_reply(),
             LiveMetaIntent::Changes => self.live_changes_reply(),
+            LiveMetaIntent::Permissions => self.live_permissions_reply(),
         };
         self.push(ChatRole::You, text.clone());
         self.push(ChatRole::UmaDev, reply.clone());
@@ -10991,6 +10854,9 @@ impl App {
                 umadev_agent::RunningInputDisposition::Query
             ) {
                 return self.begin_gate_query(text);
+            }
+            if self.reject_director_execution_in_plan() {
+                return Action::None;
             }
             // ClarifyGate: non-"c" text is an answer (append to
             // answers file); "c" submits all answers + continues.
@@ -11201,6 +11067,9 @@ impl App {
         let Some(gate) = self.active_gate else {
             return Action::None;
         };
+        if self.reject_director_execution_in_plan() {
+            return Action::None;
+        }
         // Echo the chosen option so the transcript records the decision (the
         // picker panel itself is transient). Localize the label key via `t()`,
         // which returns a literal verbatim and a known key localized.
@@ -11333,6 +11202,7 @@ impl App {
     }
 
     pub(crate) fn record_route_failed(&mut self, note: String, origin: FailedRouteOrigin) {
+        self.stream_compacted = None;
         // Several session-open boundaries emit an abort event first (so the run is
         // marked aborted) and then send the same terminal reason through
         // `RouteDecision::Failed` (so task/session bookkeeping settles). Keep both
@@ -11403,6 +11273,7 @@ impl App {
     /// remains paired with a durable control boundary, while its exact typed
     /// blocks are restored into the editor and merged with any newer draft.
     pub(crate) fn record_auth_cancelled(&mut self, turn: SubmittedTurn, note: String) {
+        self.stream_compacted = None;
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
@@ -11431,6 +11302,7 @@ impl App {
     /// `record_route_failed`: no build completed, no failure occurred, and no
     /// completion bell/card or resumable build session should be created.
     pub(crate) fn record_run_not_executed(&mut self) {
+        self.stream_compacted = None;
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
@@ -11467,6 +11339,7 @@ impl App {
         base_session_id: Option<String>,
         base_resume_identity: Option<BaseResumeIdentity>,
     ) {
+        let compacted = self.stream_compacted.take();
         // Feature A — a long agentic turn just settled; alert the (possibly away)
         // user. Arm BEFORE clearing `thinking_started`, gated on its elapsed.
         self.arm_completion_bell(self.thinking_started);
@@ -11531,10 +11404,40 @@ impl App {
             self.persist_chat();
             return;
         }
+        if let Some((events, _bytes)) = compacted {
+            self.restore_compacted_final_reply(&reply, events);
+        }
         self.record_turn("assistant", reply);
         // Wave 5 / G11: persist after the assistant turn lands so the saved chat
         // holds complete user→assistant exchanges.
         self.persist_chat();
+    }
+
+    /// Replace partial prose from a compacted live stream with the terminal
+    /// reply, which is the base's authoritative complete answer. Structured tool
+    /// and diff rows stay in place; only Host text after the current user turn is
+    /// replaced. If no user boundary is present, fail open by appending the full
+    /// answer rather than risking removal of older history.
+    fn restore_compacted_final_reply(&mut self, reply: &str, events: u64) {
+        if let Some(user_boundary) = self
+            .history
+            .iter()
+            .rposition(|message| message.role == ChatRole::You)
+        {
+            let mut index = 0usize;
+            self.history.retain(|message| {
+                let retain = index <= user_boundary
+                    || message.role != ChatRole::Host
+                    || !matches!(&message.kind, MessageBody::Text(_));
+                index += 1;
+                retain
+            });
+        }
+        self.push(ChatRole::Host, reply.to_string());
+        self.push(
+            ChatRole::System,
+            umadev_i18n::tf(self.lang, "stream.compacted", &[&events.to_string()]),
+        );
     }
 
     /// A DIRECTOR build parked at a spec-MUST confirmation gate (A1-GAP1) — the
@@ -11545,6 +11448,7 @@ impl App {
     /// before this terminal decision is intentionally staged, then activated here
     /// only after the writer session is known to have ended.
     pub(crate) fn record_run_paused_at_gate(&mut self, gate: Gate) {
+        self.stream_compacted = None;
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
@@ -11578,6 +11482,7 @@ impl App {
             return false;
         }
         self.active_gate_query_epoch = None;
+        self.stream_compacted = None;
         self.gate_query_in_flight = false;
         self.thinking = false;
         self.thinking_started = None;
@@ -11604,6 +11509,7 @@ impl App {
             return false;
         }
         self.active_gate_query_epoch = None;
+        self.stream_compacted = None;
         self.gate_query_in_flight = false;
         self.thinking = false;
         self.thinking_started = None;
@@ -11633,6 +11539,7 @@ impl App {
 
     /// Settle a tracked deploy and release its single-task guard.
     pub(crate) fn record_deploy_done(&mut self, succeeded: bool) {
+        self.stream_compacted = None;
         self.arm_completion_bell(self.thinking_started);
         self.thinking = false;
         self.thinking_started = None;
@@ -12005,6 +11912,12 @@ impl App {
             return false;
         };
         let _ = self.queued_dispatch_kinds.pop_back();
+        // Queue recall is an editing gesture, not the second half of a prior
+        // interrupt/rewind/quit gesture. Do not let a stale arm cancel the
+        // in-flight command on the next Esc after the draft is restored.
+        self.interrupt_armed_at = None;
+        self.pending_quit_confirm = false;
+        self.pending_rewind = false;
         if let Some(turn) = self.take_queued_turn_input_back(&text) {
             self.restore_submitted_turn(turn);
             self.refresh_status();
@@ -12015,20 +11928,18 @@ impl App {
         // Land as a clean fresh draft: not mid history-recall, no armed
         // quit/rewind gesture carried over.
         self.input_history_idx = None;
-        self.pending_quit_confirm = false;
-        self.pending_rewind = false;
         // The "queued N" chip count just dropped — keep the status line honest.
         self.refresh_status();
         true
     }
 
-    /// Number of turns currently waiting to be sent — the chat-routing queue
-    /// plus a pending pipeline steer. Drives the persistent "queued N" chip so
-    /// the user can always see that parked input has NOT been lost, even after
-    /// the one-off System note scrolls away.
+    /// Number of turns currently waiting to be sent across every queue lane:
+    /// local chat, pipeline steering, and the base-owned native prompt queue.
+    /// Drives the persistent "queued N" chip so the user can always see that
+    /// parked input has NOT been lost, even after a one-off note scrolls away.
     #[must_use]
     pub fn queued_count(&self) -> usize {
-        self.queued_chat.len() + self.queued_steer.len()
+        self.queued_chat.len() + self.queued_steer.len() + self.prompt_queue.entries().len()
     }
 
     /// A clone of the conversation memory to hand to a routed turn (Wave 5 / G11).
@@ -12318,6 +12229,7 @@ impl App {
         self.pending_director_gate = None;
         self.gate_query_in_flight = false;
         self.active_gate_query_epoch = None;
+        self.stream_compacted = None;
         // A fresh run starts UNARMED: interrupt_armed_at is only cleared by the confirming
         // second Esc, so without this a stale arm from a PREVIOUS run (still inside its 3s
         // window) made a single Esc on the new run cancel it immediately - defeating the
@@ -12325,9 +12237,11 @@ impl App {
         self.interrupt_armed_at = None;
         // P5c: a reset ends any open reasoning block (collapse its placeholder).
         self.collapse_thinking_block();
-        // Drop any not-yet-fired queued steers so they can't bleed into a later
-        // run and fire at the wrong gate.
-        self.queued_steer.clear();
+        // A pre-run `/plan add ...` is an instruction for the run that is about
+        // to start, so preserve it across this reset. Step-relative edits belong
+        // to the old checklist and must not bleed into a replacement run.
+        self.queued_steer
+            .retain(|directive| directive.starts_with("Plan steering: ADD "));
         self.pending_steer = None;
         // A new run owns a fresh plan + review panel — the previous run's
         // checklist / verdicts must not bleed into it.
@@ -12560,13 +12474,18 @@ impl App {
         // Seal any half-streamed reply BEFORE the reset clears the stream flag, so
         // the user sees the partial answer is incomplete (not the whole reply).
         self.seal_interrupted_stream();
+        let cancelling_operational_pause = self.operational_pause_reason.is_some();
         if let Err(error) = umadev_agent::cancel_operational_review_pause(
             &self.project_root,
             "cancelled explicitly by the user",
         ) {
             self.push(
                 ChatRole::System,
-                format!("无法完整取消已暂停的评审任务，恢复指针已保留：{error}"),
+                umadev_i18n::tf(
+                    self.lang,
+                    "cancel.operational_cleanup_failed",
+                    &[error.as_str()],
+                ),
             );
         }
         self.reset_for_new_run();
@@ -12611,7 +12530,15 @@ impl App {
         self.cancelling = false;
         // A user cancel settles the live task as Stopped (resumable via /tasks).
         self.mark_active_task(TaskStatus::Stopped);
-        let cancelled = umadev_i18n::t(self.lang, "run.cancelled").to_string();
+        let cancelled = umadev_i18n::t(
+            self.lang,
+            if cancelling_operational_pause {
+                "run.operational_cancelled"
+            } else {
+                "run.cancelled"
+            },
+        )
+        .to_string();
         self.push(ChatRole::System, cancelled.clone());
         self.record_turn(
             "assistant",
@@ -12688,6 +12615,12 @@ impl App {
             // is not handed to the base as a chat turn.
             return Some(Action::None);
         }
+        // A shell string is intentionally opaque to UmaDev; it cannot be
+        // proven read-only. Plan is therefore a hard ceiling at the host
+        // boundary, before the async command task or process tree exists.
+        if self.reject_workspace_mutation_in_plan() {
+            return Some(Action::None);
+        }
         // A bang command can mutate the same workspace as the base. Keep it on
         // the single-writer boundary instead of running a second shell beside an
         // active/paused task.
@@ -12698,21 +12631,70 @@ impl App {
             );
             return Some(Action::None);
         }
-        let (ok, output) = run_bang_command(&self.project_root, cmd, self.lang);
-        self.push_shell_row(cmd, ok, output);
-        Some(Action::None)
+        Some(Action::RunLocalShell(cmd.to_string()))
     }
 
-    /// Append a finished `Bash` tool row for a one-off `!`-shell run: the command
-    /// as the row arg, its (already-bounded) output folded into the result
-    /// gutter. An OK run auto-collapses (long output folds to a head-N preview the
-    /// global Ctrl+O / latest-row Ctrl+R reveals); a failed run stays expanded so
-    /// the error is never hidden — mirroring the base-issued tool-row policy.
-    fn push_shell_row(&mut self, cmd: &str, ok: bool, output: String) {
+    /// Mark a TUI-owned local command as running before its async task starts.
+    pub(crate) fn begin_local_command(&mut self, request: &LocalCommandRequest) {
+        self.thinking = true;
+        self.thinking_started = Some(std::time::Instant::now());
+        self.last_output_at = None;
+        self.tool_in_progress = true;
+        self.push_tool_use_correlated(
+            local_command_call_id(request.presentation),
+            "Bash",
+            &request.display,
+        );
+        self.refresh_status();
+    }
+
+    /// Settle the exact local-command row without relying on transcript
+    /// adjacency: users can queue input or receive status notices while the
+    /// child is running, so "last row wins" would update the wrong message.
+    pub(crate) fn record_local_command_done(&mut self, result: LocalCommandResult) {
+        let call_id = local_command_call_id(result.request.presentation);
+        let target = self.history.iter().rposition(|message| {
+            message.role == ChatRole::Host
+                && matches!(
+                    &message.kind,
+                    MessageBody::Tool(tool)
+                        if tool.status == ToolStatus::Running
+                            && tool.call_id.as_deref() == Some(call_id)
+                )
+        });
+        if let Some(tool) = target
+            .and_then(|index| self.history.get_mut(index))
+            .and_then(|message| match &mut message.kind {
+                MessageBody::Tool(tool) => Some(tool),
+                _ => None,
+            })
+        {
+            tool.status = if result.ok {
+                ToolStatus::Ok
+            } else {
+                ToolStatus::Fail
+            };
+            tool.result = Some(result.output);
+            tool.progress = None;
+            tool.collapsed = result.ok;
+        } else {
+            self.push_local_command_row(&result.request.display, result.ok, result.output);
+        }
+        self.thinking = false;
+        self.thinking_started = None;
+        self.last_output_at = Some(std::time::Instant::now());
+        self.tool_in_progress = false;
+        self.transient_status = None;
+        self.refresh_status();
+    }
+
+    /// Append a terminal fallback row when the matching running row was lost
+    /// (for example after a lenient persisted-session recovery).
+    fn push_local_command_row(&mut self, command: &str, ok: bool, output: String) {
         // A one-off shell row is its own row; never fold it into a low-signal
         // read batch.
         self.stream_tool_batch = None;
-        let arg: String = cmd.chars().take(80).collect();
+        let arg: String = command.chars().take(80).collect();
         self.history.push_back(ChatMessage {
             role: ChatRole::Host,
             kind: MessageBody::Tool(ToolCall {
@@ -12734,6 +12716,12 @@ impl App {
     }
 
     fn native_command_action(&mut self, payload: String) -> Action {
+        // Base command catalogs do not carry a read-only/mutating capability
+        // bit. In Plan, forwarding an arbitrary advertised command would hand
+        // the vendor a writable native lane outside UmaDev's host boundary.
+        if self.reject_workspace_mutation_in_plan() {
+            return Action::None;
+        }
         if self
             .backend
             .as_deref()
@@ -12823,6 +12811,16 @@ impl App {
                 umadev_i18n::t(self.lang, "gate.query.busy"),
             );
             self.refresh_status();
+            return Some(Action::None);
+        }
+        // Plan is a real host-side read-only boundary, not only a prompt sent to
+        // the borrowed base. Classify every TUI-owned command that can write the
+        // workspace, launch arbitrary project code, or publish externally and
+        // reject it before dispatch. Read-only variants such as `/rewind` (list),
+        // `/design` (picker), and `/memory inventory` remain available.
+        if permissions::slash_mutates_workspace(canonical, rest)
+            && self.reject_workspace_mutation_in_plan()
+        {
             return Some(Action::None);
         }
         // Commands that write project metadata, snapshot/publish the workspace,
@@ -12965,15 +12963,27 @@ impl App {
                 if self.reject_replayed_host_git_operation(&replay_requirement) {
                     return Some(Action::None);
                 }
+                // A persisted operational-review circuit is a terminal receipt,
+                // not a paused run. Reject it here, before gate consumption,
+                // task registration, or any resumed base-session construction.
+                // `has_resumable_run()` also returns false for these receipts,
+                // but that truth alone would fall through to a generic/no-run
+                // hint and could still let an unrelated stale gate win.
+                let terminal_review =
+                    umadev_agent::legacy_operational_review_terminal_reason(&self.project_root)
+                        .or_else(|| {
+                            umadev_agent::terminal_review_circuit_reason(&self.project_root)
+                        });
+                if let Some(reason) = terminal_review {
+                    self.push(ChatRole::System, reason);
+                    return Some(Action::None);
+                }
                 // Plan may collect clarification, but it must never approve the
                 // docs/preview execution boundary or resume a mutating Director.
                 // Check before `take()` so the gate remains open and recoverable
                 // after the user switches to guarded/auto.
                 if self.effective_trust_mode() == umadev_agent::TrustMode::Plan
-                    && matches!(
-                        self.active_gate,
-                        Some(Gate::DocsConfirm | Gate::PreviewConfirm)
-                    )
+                    && self.active_gate.is_some()
                 {
                     self.reject_director_execution_in_plan();
                     Action::None
@@ -13145,10 +13155,23 @@ impl App {
                 // place. `/pr` is a dry run; `/pr create` opens the PR.
                 let wants_create = rest.eq_ignore_ascii_case("create");
                 self.push(ChatRole::UmaDev, umadev_i18n::t(self.lang, "pr.scanning"));
-                let output =
-                    self.run_subprocess_cli(if wants_create { "pr --create" } else { "pr" });
-                self.push(ChatRole::System, output);
-                Action::None
+                let args = if wants_create {
+                    // `/pr create` is already an explicit publication request.
+                    // The child has no stdin by design, so pass the CLI's
+                    // non-interactive confirmation flag instead of hanging on
+                    // an impossible prompt.
+                    vec![
+                        "pr".to_string(),
+                        "--create".to_string(),
+                        "--yes".to_string(),
+                    ]
+                } else {
+                    vec!["pr".to_string()]
+                };
+                Action::RunUmaDevCommand {
+                    args,
+                    presentation: LocalCommandPresentation::UmaDev,
+                }
             }
             "usage" => self.slash_usage(),
             "animations" => self.slash_toggle_animations(),
@@ -13195,22 +13218,14 @@ impl App {
             "memory" => self.slash_memory(rest),
             "team" => self.slash_team(rest),
             "constitution" => self.slash_constitution(),
-            "mcp" => {
-                let output = self.run_subprocess_cli("mcp-manage list");
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(self.lang, "slash.mcp_header", &[&output]),
-                );
-                Action::None
-            }
-            "skill" => {
-                let output = self.run_subprocess_cli("skill list");
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(self.lang, "slash.skill_header", &[&output]),
-                );
-                Action::None
-            }
+            "mcp" => Action::RunUmaDevCommand {
+                args: vec!["mcp-manage".to_string(), "list".to_string()],
+                presentation: LocalCommandPresentation::Mcp,
+            },
+            "skill" => Action::RunUmaDevCommand {
+                args: vec!["skill".to_string(), "list".to_string()],
+                presentation: LocalCommandPresentation::Skill,
+            },
             "adopt" => {
                 // Brownfield onboarding of the CURRENT workspace. Delegates to
                 // the `umadev adopt` subprocess (fail-open there) so the TUI
@@ -13220,9 +13235,10 @@ impl App {
                     ChatRole::UmaDev,
                     umadev_i18n::t(self.lang, "adopt.tui_running"),
                 );
-                let output = self.run_subprocess_cli("adopt");
-                self.push(ChatRole::System, output);
-                Action::None
+                Action::RunUmaDevCommand {
+                    args: vec!["adopt".to_string()],
+                    presentation: LocalCommandPresentation::UmaDev,
+                }
             }
             "cancel" => {
                 // P1-H: `/cancel` must also abort an in-flight AGENTIC round (the
@@ -13532,7 +13548,7 @@ impl App {
     }
 
     fn extract_design_preview_static(lang: umadev_i18n::Lang, path: &std::path::Path) -> String {
-        let Ok(content) = std::fs::read_to_string(path) else {
+        let Ok(content) = read_bounded_utf8(path, MAX_UI_ARTIFACT_BYTES) else {
             return umadev_i18n::t(lang, "design.preview.unreadable").to_string();
         };
         let mut preview = String::new();
@@ -13618,8 +13634,8 @@ impl App {
 
     fn list_md_stems(dir: &std::path::Path) -> Vec<String> {
         let mut names = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for entry in rd.flatten() {
+        for entry in dir_scan::scan_dir(dir).entries {
+            if entry.is_file() {
                 let p = entry.path();
                 if p.extension().and_then(|s| s.to_str()) == Some("md") {
                     if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
@@ -13680,23 +13696,36 @@ impl App {
         if self.reject_director_execution_in_plan() {
             return Action::None;
         }
-        // The first token is the optional run SLUG only when it UNAMBIGUOUSLY looks
-        // like one: ASCII alnum/-/_ AND carrying a separator (`-`/`_`), e.g.
-        // `todo-app`. A natural first word of a requirement ("create", "做一个", "做一个登录页")
-        // has no separator (or isn't ASCII), so it stays part of the requirement.
-        // Without this, `/run 做一个 登录页` treated "做一个" as a slug → slug_invalid,
-        // so ANY multi-word / Chinese requirement was rejected (user-reported).
-        let looks_like_slug = |t: &str| {
+        // A slug is accepted only through explicit `--slug` syntax. Positional
+        // slugs are indistinguishable from ordinary requirement text, including
+        // when a project happens to share that first word.
+        let valid_slug = |t: &str| {
             !t.is_empty()
                 && t.chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                && t.contains(['-', '_'])
         };
-        let (slug, req) = match arg.split_once(' ') {
-            Some((first, rest)) if !rest.trim().is_empty() && looks_like_slug(first) => {
-                (first.to_string(), rest.trim().to_string())
+        let (slug, req) = if let Some(explicit) = arg.strip_prefix("--slug=") {
+            match explicit.split_once(' ') {
+                Some((slug, rest)) if valid_slug(slug) && !rest.trim().is_empty() => {
+                    (slug.to_string(), rest.trim().to_string())
+                }
+                _ => {
+                    self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.usage"));
+                    return Action::None;
+                }
             }
-            _ => (String::new(), arg.to_string()),
+        } else if let Some(explicit) = arg.strip_prefix("--slug ") {
+            match explicit.split_once(' ') {
+                Some((slug, rest)) if valid_slug(slug) && !rest.trim().is_empty() => {
+                    (slug.to_string(), rest.trim().to_string())
+                }
+                _ => {
+                    self.push(ChatRole::System, umadev_i18n::t(self.lang, "run.usage"));
+                    return Action::None;
+                }
+            }
+        } else {
+            (String::new(), arg.to_string())
         };
         if !slug.is_empty() {
             if slug.contains(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_') {
@@ -13912,24 +13941,24 @@ impl App {
         let output_dir = self.project_root.join("output");
         if output_dir.is_dir() {
             body.push_str(&tr("status.overlay.artifacts_header"));
-            if let Ok(rd) = std::fs::read_dir(&output_dir) {
-                let mut entries: Vec<_> = rd.filter_map(Result::ok).collect();
-                entries.sort_by_key(std::fs::DirEntry::file_name);
-                for e in entries.iter().take(20) {
-                    let name = e.file_name();
-                    let size = std::fs::metadata(e.path()).map_or(0, |m| m.len());
-                    body.push_str(&trf(
-                        "status.overlay.artifact_row",
-                        &[&name.to_string_lossy(), &size.to_string()],
-                    ));
-                }
+            for entry in dir_scan::scan_dir(&output_dir)
+                .entries
+                .iter()
+                .filter(|entry| entry.is_file())
+                .take(20)
+            {
+                let size = entry.file_len();
+                body.push_str(&trf(
+                    "status.overlay.artifact_row",
+                    &[&entry.file_name().to_string_lossy(), &size.to_string()],
+                ));
             }
         }
         // Quality gate results
         let qg_path = output_dir.join(format!("{}-quality-gate.json", self.slug));
         if qg_path.is_file() {
             body.push_str(&tr("status.overlay.quality_header"));
-            if let Ok(qg_content) = std::fs::read_to_string(&qg_path) {
+            if let Ok(qg_content) = read_bounded_utf8(&qg_path, MAX_UI_STATE_BYTES) {
                 let score = crate::app::extract_json_number(&qg_content, "score");
                 let passed = crate::app::extract_json_bool(&qg_content, "passed");
                 let verdict = match passed {
@@ -13978,23 +14007,17 @@ impl App {
             );
             return;
         }
-        let mut zips: Vec<_> = std::fs::read_dir(&release)
-            .ok()
-            .map(|rd| {
-                rd.filter_map(Result::ok)
-                    .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("zip"))
-                    .collect()
-            })
-            .unwrap_or_default();
-        zips.sort_by_key(std::fs::DirEntry::file_name);
-        let Some(latest) = zips.last() else {
+        let entries = dir_scan::scan_dir(&release).entries;
+        let Some(latest) = entries.iter().rfind(|entry| {
+            entry.is_file() && entry.path().extension().and_then(|s| s.to_str()) == Some("zip")
+        }) else {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "export.release_empty"),
             );
             return;
         };
-        let size = std::fs::metadata(latest.path()).map_or(0, |m| m.len() / 1024);
+        let size = latest.file_len() / 1024;
         self.push(
             ChatRole::UmaDev,
             umadev_i18n::tf(
@@ -14344,33 +14367,6 @@ impl App {
         }
     }
 
-    /// Run a `umadev` CLI subcommand and return its stdout output.
-    /// Used by `/mcp`, `/skill` etc. to surface CLI results in the TUI.
-    fn run_subprocess_cli(&self, args: &str) -> String {
-        let bin = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("umadev"));
-        let mut cmd = std::process::Command::new(&bin);
-        cmd.current_dir(&self.project_root);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        for arg in args.split_whitespace() {
-            cmd.arg(arg);
-        }
-        match cmd.output() {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                if !stdout.is_empty() {
-                    stdout
-                } else if !stderr.is_empty() {
-                    stderr
-                } else {
-                    "(no output)".into()
-                }
-            }
-            Err(e) => format!("error running `umadev {args}`: {e}"),
-        }
-    }
-
     fn open_knowledge_overlay(&mut self) {
         let mut body = String::from("knowledge base\n==============\n\n");
         // Design systems
@@ -14402,21 +14398,24 @@ impl App {
         let kdir = self.project_root.join("knowledge");
         if kdir.is_dir() {
             let mut count = 0;
-            if let Ok(rd) = std::fs::read_dir(&kdir) {
-                let mut dirs: Vec<_> = rd
-                    .filter_map(Result::ok)
-                    .filter(|e| e.path().is_dir())
-                    .collect();
-                dirs.sort_by_key(std::fs::DirEntry::file_name);
-                for d in &dirs {
-                    let name = d.file_name();
-                    let n = name.to_string_lossy();
-                    if n == "design-systems" || n == "seed-templates" {
-                        continue;
-                    }
-                    let file_count = std::fs::read_dir(d.path()).map_or(0, Iterator::count);
-                    body.push_str(&format!("  [dir] {n}/ ({file_count} files)\n"));
-                    count += file_count;
+            let root_scan = dir_scan::scan_dir(&kdir);
+            let mut remaining = dir_scan::ENTRY_CAP.saturating_sub(root_scan.inspected);
+            for directory in root_scan.entries.iter().filter(|entry| entry.is_dir()) {
+                let name = directory.file_name().to_string_lossy();
+                if name == "design-systems" || name == "seed-templates" {
+                    continue;
+                }
+                let child_scan = dir_scan::scan_dir_with_cap(directory.path(), remaining);
+                remaining = remaining.saturating_sub(child_scan.inspected);
+                let file_count = child_scan
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.is_file())
+                    .count();
+                body.push_str(&format!("  [dir] {name}/ ({file_count} files)\n"));
+                count += file_count;
+                if remaining == 0 {
+                    break;
                 }
             }
             body.push_str(&format!("\n  Total: {count} knowledge files\n"));
@@ -14690,14 +14689,16 @@ impl App {
     /// contract locations reuse the agent's canonical relative paths.
     fn team_deliverable_status(&self) -> Vec<(&'static str, bool)> {
         let root = &self.project_root;
+        let output_entries = dir_scan::scan_dir(&root.join("output")).entries;
         // `output/*-{prd,architecture,uiux}.md` — match by suffix (slug-agnostic).
         let output_has = |suffix: &str| -> bool {
-            std::fs::read_dir(root.join("output"))
-                .ok()
-                .into_iter()
-                .flatten()
-                .flatten()
-                .any(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(suffix)))
+            output_entries.iter().any(|entry| {
+                entry.is_file()
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.ends_with(suffix))
+            })
         };
         let contract = root.join(".umadev/contracts/openapi.json").exists()
             || root.join(".umadev/contracts/openapi.yaml").exists();
@@ -14728,24 +14729,46 @@ impl App {
     /// existing (already user-edited) file is shown verbatim and NEVER clobbered.
     /// Read-only + fail-open: a write failure still shows the in-memory default.
     fn slash_constitution(&mut self) -> Action {
-        let doc = umadev_agent::ensure_constitution(&self.project_root);
+        let path = self
+            .project_root
+            .join(umadev_agent::constitution_rel_path());
+        // `/constitution` is primarily an inspection command. In Plan mode an
+        // existing charter can be read normally; when it does not exist, render
+        // the built-in default without materialising a new workspace file.
+        let (markdown, generated, default_preview) =
+            if self.effective_trust_mode() == umadev_agent::TrustMode::Plan {
+                match umadev_agent::read_constitution(&self.project_root) {
+                    Some(markdown) => (markdown, false, false),
+                    None => (umadev_agent::render_constitution(self.lang), false, true),
+                }
+            } else {
+                let doc = umadev_agent::ensure_constitution(&self.project_root);
+                (doc.markdown, doc.generated, false)
+            };
         self.overlay = Some(Overlay::from_body(
             umadev_i18n::t(self.lang, "constitution.overlay_title"),
-            &doc.markdown,
+            &markdown,
         ));
-        let path = doc.path.display().to_string();
+        let path = path.display().to_string();
         // First-time generation gets a one-line "generated from the rules" note;
         // every open notes where to edit it (and that edits are never overwritten).
-        if doc.generated {
+        if generated {
             self.push(
                 ChatRole::System,
                 umadev_i18n::tf(self.lang, "constitution.generated", &[&path]),
             );
         }
-        self.push(
-            ChatRole::System,
-            umadev_i18n::tf(self.lang, "constitution.edit_hint", &[&path]),
-        );
+        if default_preview {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "constitution.plan_preview", &[&path]),
+            );
+        } else {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::tf(self.lang, "constitution.edit_hint", &[&path]),
+            );
+        }
         Action::None
     }
 
@@ -14755,6 +14778,9 @@ impl App {
     fn slash_redo(&mut self, arg: &str) -> Action {
         if self.has_interruptible_work() || self.thinking {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "redo.busy"));
+            return Action::None;
+        }
+        if self.reject_director_execution_in_plan() {
             return Action::None;
         }
         let replay_requirement = self.resume_run_requirement();
@@ -14815,6 +14841,14 @@ impl App {
                 .backend
                 .as_deref()
                 .unwrap_or(&tr("config.overlay.worker_unset"))],
+        ));
+        body.push_str(&trf(
+            "config.overlay.trust_mode",
+            &[self.effective_trust_mode().as_str()],
+        ));
+        body.push_str(&trf(
+            "config.overlay.codex_sandbox",
+            &[self.effective_codex_launch_sandbox().as_codex_arg()],
         ));
         body.push_str(&tr("config.overlay.model"));
         body.push_str(&trf(
@@ -14896,7 +14930,7 @@ impl App {
     fn open_runs_overlay(&mut self) {
         let path = self.project_root.join(".umadev/runs.jsonl");
         let mut body = String::from("Run History\n===========\n\n");
-        match std::fs::read_to_string(&path) {
+        match read_bounded_utf8(&path, MAX_UI_ARTIFACT_BYTES) {
             Ok(content) if !content.trim().is_empty() => {
                 body.push_str("| # | Timestamp | Slug | Quality | Artifacts |\n");
                 body.push_str("|---|---|---|---|---|\n");
@@ -14927,7 +14961,7 @@ impl App {
         }
         // Phase timing
         let timing_path = self.project_root.join(".umadev/phase-timing.jsonl");
-        if let Ok(content) = std::fs::read_to_string(&timing_path) {
+        if let Ok(content) = read_bounded_utf8(&timing_path, MAX_UI_ARTIFACT_BYTES) {
             body.push_str("\n## Phase Timing (latest run)\n\n");
             body.push_str("| Phase | Duration |\n|---|---|\n");
             for line in content.lines().rev().take(9) {
@@ -15155,15 +15189,12 @@ impl App {
         body.push('\n');
         let experts_dir = self.project_root.join("knowledge/experts");
         if experts_dir.is_dir() {
-            let roles: Vec<_> = std::fs::read_dir(&experts_dir)
-                .ok()
-                .map(|rd| {
-                    rd.filter_map(Result::ok)
-                        .filter(|e| e.path().is_dir())
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let roles: Vec<_> = dir_scan::scan_dir(&experts_dir)
+                .entries
+                .into_iter()
+                .filter(dir_scan::Entry::is_dir)
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .collect();
             body.push_str(&umadev_i18n::tf(
                 lang,
                 "doctor.expert_roles",
@@ -15176,7 +15207,13 @@ impl App {
         }
         let knowledge_dir = self.project_root.join("knowledge");
         if knowledge_dir.is_dir() {
-            let md_count = walkdir_count_md(&knowledge_dir);
+            let md_count = dir_scan::count_files_recursive(
+                &knowledge_dir,
+                dir_scan::ENTRY_CAP,
+                dir_scan::RECURSIVE_DEPTH_CAP,
+                |path| path.extension().and_then(|value| value.to_str()) == Some("md"),
+            )
+            .matching_files;
             body.push_str(&umadev_i18n::tf(
                 lang,
                 "doctor.knowledge_files",
@@ -15219,7 +15256,7 @@ impl App {
             ] {
                 let p = audit_dir.join(name);
                 if p.is_file() {
-                    let lines = std::fs::read_to_string(&p)
+                    let lines = read_bounded_utf8(&p, MAX_UI_ARTIFACT_BYTES)
                         .map_or(0, |t| t.lines().filter(|l| !l.trim().is_empty()).count());
                     body.push_str(&umadev_i18n::tf(
                         lang,
@@ -15288,17 +15325,13 @@ impl App {
         // Output directory contents
         body.push_str("\n## Artifacts (output/)\n");
         let output_dir = self.project_root.join("output");
+        let output_entries = dir_scan::scan_dir(&output_dir).entries;
         if output_dir.is_dir() {
-            let mut entries: Vec<_> = std::fs::read_dir(&output_dir)
-                .ok()
-                .map(|rd| rd.filter_map(Result::ok).collect())
-                .unwrap_or_default();
-            entries.sort_by_key(std::fs::DirEntry::file_name);
-            if entries.is_empty() {
+            if output_entries.is_empty() {
                 body.push_str("  (empty)\n");
             } else {
-                for e in entries.iter().take(20) {
-                    body.push_str(&format!("  · {}\n", e.file_name().to_string_lossy()));
+                for entry in output_entries.iter().take(20) {
+                    body.push_str(&format!("  · {}\n", entry.file_name().to_string_lossy()));
                 }
             }
         } else {
@@ -15307,24 +15340,22 @@ impl App {
 
         // Quality gate — quick verdict so users don't have to open the JSON.
         body.push_str("\n## Quality gate\n");
-        let qg_paths: Vec<_> = std::fs::read_dir(&output_dir)
-            .ok()
-            .map(|rd| {
-                rd.filter_map(Result::ok)
-                    .filter(|e| {
-                        e.file_name()
-                            .to_string_lossy()
-                            .ends_with("-quality-gate.json")
-                    })
-                    .map(|e| e.path())
-                    .collect()
+        let qg_paths: Vec<_> = output_entries
+            .iter()
+            .filter(|entry| {
+                entry.is_file()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with("-quality-gate.json")
             })
-            .unwrap_or_default();
+            .map(dir_scan::Entry::path)
+            .collect();
         if qg_paths.is_empty() {
             body.push_str("  (quality phase has not produced a gate report yet)\n");
         } else {
             for p in &qg_paths {
-                let score_line = match std::fs::read_to_string(p) {
+                let score_line = match read_bounded_utf8(p, MAX_UI_STATE_BYTES) {
                     Ok(s) => {
                         let score = extract_json_number(&s, "score")
                             .map_or_else(|| "?".to_string(), |n| n.to_string());
@@ -15348,20 +15379,19 @@ impl App {
         body.push_str("\n## Proof packs (release/)\n");
         let release = self.project_root.join("release");
         if release.is_dir() {
-            let mut zips: Vec<_> = std::fs::read_dir(&release)
-                .ok()
-                .map(|rd| {
-                    rd.filter_map(Result::ok)
-                        .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("zip"))
-                        .collect()
+            let zips: Vec<_> = dir_scan::scan_dir(&release)
+                .entries
+                .into_iter()
+                .filter(|entry| {
+                    entry.is_file()
+                        && entry.path().extension().and_then(|value| value.to_str()) == Some("zip")
                 })
-                .unwrap_or_default();
-            zips.sort_by_key(std::fs::DirEntry::file_name);
+                .collect();
             if zips.is_empty() {
                 body.push_str("  (none — pipeline must reach delivery first)\n");
             } else {
                 for z in zips.iter().rev().take(3) {
-                    let size = std::fs::metadata(z.path()).map_or(0, |m| m.len() / 1024);
+                    let size = z.file_len() / 1024;
                     body.push_str(&format!(
                         "  · {} ({size} KiB)\n",
                         z.file_name().to_string_lossy()
@@ -15388,7 +15418,7 @@ impl App {
             .project_root
             .join("output")
             .join(format!("{slug}-{name}.md"));
-        let body = if let Ok(text) = std::fs::read_to_string(&candidate) {
+        let body = if let Ok(text) = read_bounded_utf8(&candidate, MAX_UI_ARTIFACT_BYTES) {
             text
         } else {
             // Fallback: list available artifacts so the user can pick.
@@ -15398,11 +15428,13 @@ impl App {
                 &[&candidate.display().to_string()],
             );
             let output_dir = self.project_root.join("output");
-            if let Ok(rd) = std::fs::read_dir(&output_dir) {
-                for entry in rd.flatten() {
-                    if entry.path().extension().and_then(|s| s.to_str()) == Some("md") {
-                        hint.push_str(&format!("  · {}\n", entry.file_name().to_string_lossy()));
-                    }
+            let output = dir_scan::scan_dir(&output_dir);
+            if output.errors == 0 {
+                for entry in output.entries.iter().filter(|entry| {
+                    entry.is_file()
+                        && entry.path().extension().and_then(|value| value.to_str()) == Some("md")
+                }) {
+                    hint.push_str(&format!("  · {}\n", entry.file_name().to_string_lossy()));
                 }
             } else {
                 hint.push_str(umadev_i18n::t(self.lang, "diff.no_output_dir"));
@@ -15502,16 +15534,16 @@ impl App {
     /// Returns `None` when the file is missing or the section is empty.
     #[must_use]
     pub fn preview_url_from_notes(&self) -> Option<String> {
-        let body = std::fs::read_to_string(self.frontend_notes_path()).ok()?;
+        let body = read_bounded_utf8(&self.frontend_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
         parse_notes_section(&body, "Preview URL")
             .map(str::to_string)
-            .filter(|u| u.starts_with("http"))
+            .filter(|u| crate::link::is_safe_url(u))
     }
 
     /// Extract the `## Run command` value from the frontend-notes file.
     #[must_use]
     pub fn run_command_from_notes(&self) -> Option<String> {
-        let body = std::fs::read_to_string(self.frontend_notes_path()).ok()?;
+        let body = read_bounded_utf8(&self.frontend_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
         parse_notes_section(&body, "Run command").map(str::to_string)
     }
 
@@ -15569,7 +15601,7 @@ impl App {
         if already {
             let url = self.effective_preview_url();
             if let Some(ref u) = url {
-                let _ = open_browser(u);
+                let _ = crate::preview::open_url(u);
                 self.push(
                     ChatRole::System,
                     umadev_i18n::tf(self.lang, "preview.already_running", &[u]),
@@ -15620,7 +15652,7 @@ impl App {
                 }
             }
             (None, Some(u), None) => {
-                let _ = open_browser(u);
+                let _ = crate::preview::open_url(u);
                 self.push(
                     ChatRole::System,
                     umadev_i18n::tf(self.lang, "preview.opened", &[u]),
@@ -15725,17 +15757,13 @@ impl App {
             lines.push(section);
         }
 
-        // Changed files — the real working-tree delta from `git status`. Capped
-        // for readability with a "+N more". Fail-open: a non-git workspace (or an
-        // empty delta) drops to listing the output directories that exist, so the
-        // card always shows SOMETHING concrete the build produced.
-        let changed: Vec<String> = crate::git_status_porcelain(&self.project_root)
-            .map(|snap| {
-                snap.lines()
-                    .filter_map(crate::porcelain_path)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // Changed files come only from this turn's already-recorded host diff/fact;
+        // rendering the completion card must never wait on Git. With no evidence,
+        // keep the existing concrete-directory fallback.
+        let mut changed = self.latest_turn_diff_paths();
+        if changed.is_empty() {
+            changed = self.latest_turn_fact_paths();
+        }
         if changed.is_empty() {
             // No git delta → at least name the product directories that exist.
             let dirs: Vec<&str> = ["src", "app", "public", "output", "release"]
@@ -15827,17 +15855,12 @@ impl App {
 
     /// `/stop-preview` — kill the background dev server if one is running.
     fn slash_stop_preview(&mut self) -> Action {
-        // Kill the whole process GROUP, not just the wrapper: `npm/pnpm run dev`
-        // forks the real node/vite server as a grandchild that a bare start_kill
-        // leaves holding the port (the "reported stopped but still running" bug).
-        // The preview child was spawned detached (its own session leader), so a
-        // group kill reaches the grandchild too.
+        // Taking and dropping the managed handle terminates its complete Unix
+        // process group / Windows Job Object, including node/vite descendants.
         let killed = self.preview_server.lock().is_ok_and(|mut g| {
-            g.take().is_some_and(|mut c| {
-                let _ = umadev_agent::kill_process_group(&c);
-                let _ = c.start_kill();
-                true
-            })
+            let killed = g.is_some();
+            drop(g.take());
+            killed
         });
         if killed {
             self.push(
@@ -15863,17 +15886,17 @@ impl App {
     /// Read the `## Deploy command` the worker recorded.
     #[must_use]
     pub fn deploy_command_from_notes(&self) -> Option<String> {
-        let body = std::fs::read_to_string(self.delivery_notes_path()).ok()?;
+        let body = read_bounded_utf8(&self.delivery_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
         parse_notes_section(&body, "Deploy command").map(str::to_string)
     }
 
     /// Read the `## Frontend URL` (live URL after a deploy).
     #[must_use]
     pub fn deploy_url_from_notes(&self) -> Option<String> {
-        let body = std::fs::read_to_string(self.delivery_notes_path()).ok()?;
+        let body = read_bounded_utf8(&self.delivery_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
         parse_notes_section(&body, "Frontend URL")
             .map(str::to_string)
-            .filter(|u| u.starts_with("http"))
+            .filter(|u| crate::link::is_safe_url(u))
     }
 
     /// `/deploy` — run the deploy command the worker recorded so the project
@@ -15985,6 +16008,13 @@ impl App {
             TrustMode::Plan | TrustMode::Auto => TrustMode::Guarded,
             TrustMode::Guarded => TrustMode::Auto,
         };
+        if self.codex_mode_change_requires_idle(next) {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
+            );
+            return;
+        }
         self.set_trust_mode(next);
         self.push(
             ChatRole::UmaDev,
@@ -16030,6 +16060,28 @@ impl App {
         mode
     }
 
+    /// Codex sandbox a newly opened worker will actually request for the
+    /// current trust tier. This uses the host driver's policy source of truth,
+    /// including Plan/Guarded ceilings, rather than displaying the raw config
+    /// value that may be clamped at launch.
+    fn effective_codex_launch_sandbox(&self) -> umadev_agent::config::CodexSandbox {
+        use umadev_agent::config::CodexSandbox;
+
+        CodexSandbox::parse_fail_open(umadev_host::codex_session::resolved_codex_launch_sandbox(
+            self.effective_trust_mode().base_permissions(),
+        ))
+    }
+
+    /// Codex fixes its approval policy and sandbox when a worker starts. A mode
+    /// change during a live Codex turn would update the chip/live approval gate
+    /// while the actual worker kept its old launch authority. Keep the current
+    /// mode until the user cancels; idle changes still rebuild the session.
+    fn codex_mode_change_requires_idle(&self, next: umadev_agent::TrustMode) -> bool {
+        self.backend.as_deref() == Some("codex")
+            && self.effective_trust_mode() != next
+            && (self.has_interruptible_work() || self.thinking)
+    }
+
     /// Drop the cached config-derived trust tier so the next
     /// [`effective_trust_mode`] re-reads `.umadevrc`. Call after anything that
     /// could change the on-disk `auto_approve_gates` (a `/mode` switch is held
@@ -16052,8 +16104,9 @@ impl App {
         } else {
             umadev_agent::TrustMode::Guarded
         };
-        if self.effective_trust_mode().is_downgrade_to(mode)
-            && (self.has_interruptible_work() || self.thinking)
+        if (self.effective_trust_mode().is_downgrade_to(mode)
+            && (self.has_interruptible_work() || self.thinking))
+            || self.codex_mode_change_requires_idle(mode)
         {
             self.push(
                 ChatRole::System,
@@ -16091,8 +16144,9 @@ impl App {
         }
         match umadev_agent::TrustMode::parse(arg) {
             Some(mode) => {
-                if self.effective_trust_mode().is_downgrade_to(mode)
-                    && (self.has_interruptible_work() || self.thinking)
+                if (self.effective_trust_mode().is_downgrade_to(mode)
+                    && (self.has_interruptible_work() || self.thinking))
+                    || self.codex_mode_change_requires_idle(mode)
                 {
                     self.push(
                         ChatRole::System,
@@ -16227,7 +16281,7 @@ impl App {
 
         // ── No arg: explain the current tier + the three options + WHY each. ──
         if arg.is_empty() {
-            let current = effective_codex_sandbox(&self.project_root);
+            let current = self.effective_codex_launch_sandbox();
             let mut body = umadev_i18n::tf(self.lang, "sandbox.current", &[current.as_codex_arg()]);
             for key in [
                 "sandbox.why.read_only",
@@ -16288,8 +16342,11 @@ impl App {
         // error still leaves the session env set; we just warn it didn't save.
         let persisted = umadev_agent::config::persist_codex_sandbox(&self.project_root, mode);
 
-        // The high-risk tier reuses the SAME loud red startup liability warning.
-        if mode.is_high_risk() {
+        // Report the launch sandbox the host will ACTUALLY use under the current
+        // trust ceiling. A Guarded/Plan clamp must never be described as if the
+        // requested wider tier already took effect.
+        let effective = self.effective_codex_launch_sandbox();
+        if effective.is_high_risk() {
             self.push(
                 ChatRole::Error,
                 umadev_i18n::t(self.lang, "codex.sandbox.danger_warning").to_string(),
@@ -16298,10 +16355,23 @@ impl App {
                 ChatRole::UmaDev,
                 umadev_i18n::t(self.lang, "sandbox.danger_set").to_string(),
             );
+        } else if effective != mode {
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::tf(
+                    self.lang,
+                    "sandbox.clamped",
+                    &[
+                        mode.as_codex_arg(),
+                        self.effective_trust_mode().as_str(),
+                        effective.as_codex_arg(),
+                    ],
+                ),
+            );
         } else {
             self.push(
                 ChatRole::UmaDev,
-                umadev_i18n::tf(self.lang, "sandbox.set", &[mode.as_codex_arg()]),
+                umadev_i18n::tf(self.lang, "sandbox.set", &[effective.as_codex_arg()]),
             );
         }
         // Remind that the change only bites once codex is the active base.
@@ -16546,7 +16616,7 @@ impl App {
                     .join("settings.json")
             })
             .unwrap_or_default();
-        let current = std::fs::read_to_string(&path)
+        let current = read_bounded_utf8(&path, MAX_UI_STATE_BYTES)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| {
@@ -16561,7 +16631,7 @@ impl App {
         // Read-merge-write so toggling animations never clobbers sibling keys in
         // settings.json, and write atomically (temp+rename) so a crash mid-write
         // can't corrupt it.
-        let mut root = std::fs::read_to_string(&path)
+        let mut root = read_bounded_utf8(&path, MAX_UI_STATE_BYTES)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .filter(serde_json::Value::is_object)
@@ -16679,9 +16749,11 @@ impl App {
     /// attach to a bug report. Closes the error-feedback loop.
     fn slash_bug(&mut self) -> Action {
         let slug = &self.slug;
-        let ws_state =
-            std::fs::read_to_string(self.project_root.join(".umadev/workflow-state.json"))
-                .unwrap_or_else(|_| "(no workflow state)".to_string());
+        let ws_state = read_bounded_utf8(
+            &self.project_root.join(".umadev/workflow-state.json"),
+            MAX_UI_STATE_BYTES,
+        )
+        .unwrap_or_else(|_| "(no workflow state)".to_string());
         let usage = umadev_agent::runner::usage_summary();
         let backend = self
             .backend
@@ -16715,7 +16787,7 @@ impl App {
                 .join("\n"),
         );
         let report_path = self.project_root.join("umadev-bug-report.md");
-        match std::fs::write(&report_path, &report) {
+        match umadev_state::fs::atomic_write(&report_path, report.as_bytes()) {
             Ok(()) => {
                 self.push(
                     ChatRole::System,
@@ -16747,20 +16819,19 @@ impl App {
     /// false "recorded" line. On a write failure the resume path would lose the
     /// answer silently, so the user must be told.
     fn append_clarify_answer(&self, answer: &str) -> std::io::Result<()> {
-        let path = self
-            .project_root
-            .join("output")
-            .join(format!("{}-clarify-answers.md", self.slug));
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let output = umadev_state::fs::ensure_real_child_dir(&self.project_root, "output")?;
+        let path = output.join(format!("{}-clarify-answers.md", self.slug));
+        let existing = match read_bounded_utf8(&path, MAX_UI_ARTIFACT_BYTES) {
+            Ok(body) => body,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
         let updated = if existing.trim().is_empty() {
             answer.to_string()
         } else {
             format!("{existing}\n{answer}")
         };
-        std::fs::write(&path, updated)
+        umadev_state::fs::atomic_write(&path, updated.as_bytes())
     }
 
     /// Called by `apply_engine` when the preview gate opens: surface the
@@ -17475,55 +17546,6 @@ fn settle_restored_row(mut row: ChatMessage) -> ChatMessage {
 /// Used by both the Ctrl+R toggle (to pick the row to flip) and the renderer (to
 /// decide whether to draw the head-N preview + summary). Cheap line count;
 /// fail-open (anything else → not foldable).
-/// Resolve the effective Codex launch sandbox and publish it into the codex
-/// driver's **thread-safe shared override** (`umadev_host::codex_session`).
-/// Precedence: an override already in effect (an external `UMADEV_CODEX_SANDBOX`
-/// launch env is seeded into that shared state on first read — advanced / CI) wins;
-/// otherwise the project's `.umadevrc` `[codex] sandbox_mode` is resolved
-/// (missing section → `danger-full-access`; an explicitly invalid value restricts
-/// to `workspace-write`) and published. Returns the effective mode so
-/// the caller can decide whether to warn.
-///
-/// Uses shared state, NOT a process-env `set_var`: the driver reads it from a
-/// background task while a turn streams, so a runtime setenv racing its getenv is
-/// UB. The launch env is read once (to seed the shared override), never mutated.
-fn resolve_and_publish_codex_sandbox(
-    project_root: &std::path::Path,
-) -> umadev_agent::config::CodexSandbox {
-    use umadev_agent::config::CodexSandbox;
-    // An override already in effect (seeded from an external launch env, or set
-    // earlier) is authoritative.
-    if let Some(v) = umadev_host::codex_session::codex_sandbox_override() {
-        if !v.trim().is_empty() {
-            return CodexSandbox::parse_fail_open(&v);
-        }
-    }
-    let _ = umadev_agent::config::migrate_legacy_generated_codex_sandbox(project_root);
-    // Otherwise publish the `.umadevrc` choice so the codex driver honors it.
-    let mode = umadev_agent::config::load_project_config(project_root)
-        .codex
-        .resolved_sandbox();
-    umadev_host::codex_session::set_codex_sandbox(Some(mode.as_codex_arg()));
-    mode
-}
-
-/// The Codex sandbox tier currently in effect, for DISPLAY (`/sandbox` with no
-/// arg). Reads the driver's shared sandbox override first (what the codex driver
-/// will actually use this session — seeded from the launch env at startup or set
-/// by `/sandbox <mode>`), falling back to the project's `.umadevrc`. Pure read;
-/// unlike [`resolve_and_publish_codex_sandbox`] it does NOT mutate any state.
-fn effective_codex_sandbox(project_root: &std::path::Path) -> umadev_agent::config::CodexSandbox {
-    use umadev_agent::config::CodexSandbox;
-    if let Some(v) = umadev_host::codex_session::codex_sandbox_override() {
-        if !v.trim().is_empty() {
-            return CodexSandbox::parse_fail_open(&v);
-        }
-    }
-    umadev_agent::config::load_project_config(project_root)
-        .codex
-        .resolved_sandbox()
-}
-
 /// Decide whether the high-risk codex-sandbox liability warning should fire: ONLY
 /// when codex is the active base AND the resolved sandbox is the high-risk
 /// `danger-full-access` tier. `read-only` / `workspace-write`, or any other base,
@@ -17715,7 +17737,7 @@ fn animations_enabled_default() -> bool {
                 .join("settings.json")
         })
         .unwrap_or_default();
-    std::fs::read_to_string(&path)
+    read_bounded_utf8(&path, MAX_UI_STATE_BYTES)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| {
@@ -17827,200 +17849,53 @@ fn new_chat_session_id() -> String {
     )
 }
 
-/// M3 — drain a child pipe into a buffer **capped at `cap` bytes**, on its own
-/// thread, returning the captured bytes. A dedicated thread per stream avoids the
-/// classic two-pipe deadlock (a single reader blocked on stdout while stderr's
-/// pipe fills). Reading stops at the cap (the read end is then dropped, so the
-/// child blocks on a full pipe / takes `EPIPE` and is killed at the run deadline)
-/// and on EOF or any read error — so a runaway emitter (`yes`, `cat /dev/zero`)
-/// can NEVER buffer unbounded into memory the way `Command::output()` does.
-fn spawn_capped_pipe_reader<R: std::io::Read + Send + 'static>(
-    src: Option<R>,
-    cap: usize,
-) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buf: Vec<u8> = Vec::new();
-        let Some(mut r) = src else {
-            return buf;
-        };
-        let mut chunk = [0u8; 8192];
-        loop {
-            match r.read(&mut chunk) {
-                // EOF or a read error: stop draining this stream.
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let room = cap.saturating_sub(buf.len());
-                    if room == 0 {
-                        break; // cap reached — stop reading + drop the pipe end
-                    }
-                    buf.extend_from_slice(&chunk[..n.min(room)]);
-                    if buf.len() >= cap {
-                        break;
-                    }
-                }
-            }
-        }
-        buf
+fn which_on_path(program: &str) -> bool {
+    if program.trim().is_empty() {
+        return false;
+    }
+    let path = std::path::Path::new(program);
+    if path.components().count() > 1 {
+        return executable_file(path);
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    #[cfg(windows)]
+    let extensions = {
+        let mut values = vec![String::new()];
+        values.extend(
+            std::env::var("PATHEXT")
+                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+                .split(';')
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        );
+        values
+    };
+    #[cfg(not(windows))]
+    let extensions = [String::new()];
+    std::env::split_paths(&paths).any(|directory| {
+        extensions
+            .iter()
+            .any(|extension| executable_file(&directory.join(format!("{program}{extension}"))))
     })
 }
 
-/// Run a one-off `!`-prefixed shell command in `root` and return
-/// `(success, combined_output)`. stdout + stderr are merged and bounded
-/// ([`bound_shell_output`]); a nonzero exit appends its code, a killed process a
-/// generic failure note, a spawn error an error line, and a >10s hang a timeout
-/// note — so the call ALWAYS returns and never panics or freezes the UI. The
-/// command is run via the platform shell (`sh -c` on unix, `cmd /C` on Windows)
-/// with its stdout/stderr **piped and drained incrementally into bounded
-/// buffers** ([`spawn_capped_pipe_reader`]); a command still running past the
-/// 10s budget is **killed and reaped** (no orphan left running, no unbounded
-/// memory) before the timeout note returns. NOT routed to the base — a local
-/// convenience shell. M3: the previous `Command::output()` on a worker thread
-/// buffered stdout/stderr to EOF in memory and never killed the child on
-/// timeout, so `!yes` / `!cat /dev/zero` / `!tail -f` could OOM + run on.
-fn run_bang_command(root: &std::path::Path, cmd: &str, lang: umadev_i18n::Lang) -> (bool, String) {
-    // Per-stream in-memory read cap (M3). Far above `bound_shell_output`'s
-    // 300-line / 16k-char display trim, so nothing visible is lost, yet a runaway
-    // stream is hard-bounded in memory.
-    const READ_CAP: usize = 256 * 1024;
-    const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
-    const POLL: std::time::Duration = std::time::Duration::from_millis(20);
-
-    #[cfg(windows)]
-    let mut command = std::process::Command::new("cmd");
-    #[cfg(windows)]
-    command.args(["/C", cmd]);
-    #[cfg(not(windows))]
-    let mut command = std::process::Command::new("sh");
-    #[cfg(not(windows))]
-    command.args(["-c", cmd]);
-
-    let mut child = match command
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                false,
-                umadev_i18n::tf(lang, "tui.bang.spawn_failed", &[&e.to_string()]),
-            );
-        }
+fn executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
     };
-
-    // Drain each stream on its own thread into a bounded buffer.
-    let h_out = spawn_capped_pipe_reader(child.stdout.take(), READ_CAP);
-    let h_err = spawn_capped_pipe_reader(child.stderr.take(), READ_CAP);
-
-    // Wait for exit, bounded; KILL + reap on the deadline so a hung command never
-    // runs on as an orphan (the readers then EOF and join).
-    let deadline = std::time::Instant::now() + BUDGET;
-    let (status, timed_out) = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break (Some(s), false),
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap + close pipes so readers EOF
-                    break (None, true);
-                }
-                std::thread::sleep(POLL);
-            }
-            Err(_) => break (None, false),
-        }
-    };
-
-    // Readers end on pipe EOF (after exit / kill) or at the cap; join their
-    // captured bytes. A join error (panicked reader — not expected) is treated
-    // as empty so the call still returns (fail-open).
-    let stdout_bytes = h_out.join().unwrap_or_default();
-    let stderr_bytes = h_err.join().unwrap_or_default();
-
-    let mut body = String::from_utf8_lossy(&stdout_bytes).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_bytes);
-    if !stderr.trim().is_empty() {
-        if !body.is_empty() && !body.ends_with('\n') {
-            body.push('\n');
-        }
-        body.push_str(&stderr);
+    if !metadata.is_file() {
+        return false;
     }
-    let bounded = bound_shell_output(&body);
-
-    if timed_out {
-        // The command was killed at the deadline — surface any partial output
-        // above the timeout note.
-        let note = umadev_i18n::t(lang, "tui.bang.timeout").to_string();
-        let text = if bounded.trim().is_empty() {
-            note
-        } else {
-            format!("{bounded}\n{note}")
-        };
-        return (false, text);
-    }
-
-    if let Some(status) = status {
-        if status.success() {
-            let text = if bounded.trim().is_empty() {
-                umadev_i18n::t(lang, "tui.bang.no_output").to_string()
-            } else {
-                bounded
-            };
-            return (true, text);
-        }
-        // A nonzero exit reports its code (or a generic note when the process
-        // was killed by a signal and has no code), keeping any output above it.
-        let note = match status.code() {
-            Some(code) => umadev_i18n::tf(lang, "tui.bang.exit", &[&code.to_string()]),
-            None => umadev_i18n::t(lang, "tui.bang.failed").to_string(),
-        };
-        let text = if bounded.trim().is_empty() {
-            note
-        } else {
-            format!("{bounded}\n{note}")
-        };
-        return (false, text);
-    }
-
-    // `try_wait` errored (rare) — report a generic failure, keeping any output.
-    let note = umadev_i18n::t(lang, "tui.bang.failed").to_string();
-    let text = if bounded.trim().is_empty() {
-        note
-    } else {
-        format!("{bounded}\n{note}")
-    };
-    (false, text)
-}
-
-/// Cap a one-off shell command's output so a chatty command can't flood the
-/// transcript: at most 300 lines, then a hard 16k-char ceiling. The folded
-/// tool-row renderer still applies its own head-N preview on top — this is the
-/// storage bound, not the display fold.
-fn bound_shell_output(body: &str) -> String {
-    const MAX_LINES: usize = 300;
-    const MAX_CHARS: usize = 16_000;
-    let mut out: String = body.lines().take(MAX_LINES).collect::<Vec<_>>().join("\n");
-    if out.chars().count() > MAX_CHARS {
-        out = out.chars().take(MAX_CHARS).collect();
-    }
-    out
-}
-
-fn which_on_path(program: &str) -> bool {
     #[cfg(unix)]
     {
-        std::process::Command::new("sh")
-            .args(["-c", &format!("command -v {program}")])
-            .output()
-            .is_ok_and(|o| o.status.success())
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        std::process::Command::new("cmd")
-            .args(["/C", &format!("where {program}")])
-            .output()
-            .is_ok_and(|o| o.status.success())
+        true
     }
 }
 
@@ -18043,30 +17918,6 @@ fn parse_notes_section<'a>(body: &'a str, heading: &str) -> Option<&'a str> {
         return Some(trimmed);
     }
     None
-}
-
-/// Best-effort cross-platform "open URL in default browser". Uses `open` on
-/// macOS, `xdg-open` on Linux, `start` on Windows. Failures are silent — the
-/// user can copy the URL manually.
-fn open_browser(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let prog = "open";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let prog = "xdg-open";
-    #[cfg(target_os = "windows")]
-    let prog = "cmd";
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new(prog)
-            .args(["/C", "start", "", url])
-            .spawn()?;
-        Ok(())
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new(prog).arg(url).spawn()?;
-        Ok(())
-    }
 }
 
 /// Tiny scalar extractors used by the `/verify` overlay so we don't need
@@ -18192,7 +18043,7 @@ fn gate_card(
     let mut warnings = Vec::new();
     for a in &artifacts {
         let path = project_root.join(a);
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let content = read_bounded_utf8(&path, MAX_UI_ARTIFACT_BYTES).unwrap_or_default();
         let lines = content.lines().count();
         let is_scaffold =
             content.contains("Offline scaffold") || content.contains("offline scaffold");
@@ -18220,7 +18071,7 @@ fn gate_card(
     // Quick quality indicators for docs_confirm
     if matches!(gate, Gate::DocsConfirm) {
         let uiux_path = project_root.join(format!("output/{slug}-uiux.md"));
-        if let Ok(content) = std::fs::read_to_string(&uiux_path) {
+        if let Ok(content) = read_bounded_utf8(&uiux_path, MAX_UI_ARTIFACT_BYTES) {
             let tokens = content.matches("--").count().to_string();
             let has_dark = content
                 .to_ascii_lowercase()
@@ -18317,27 +18168,6 @@ fn task_summary(requirement: &str) -> String {
     } else {
         first.to_string()
     }
-}
-
-fn walkdir_count_md_inner(d: &std::path::Path, c: &mut usize, depth: usize) {
-    if depth > 6 {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(d) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            walkdir_count_md_inner(&p, c, depth + 1);
-        } else if p.extension().and_then(|s| s.to_str()) == Some("md") {
-            *c += 1;
-        }
-    }
-}
-
-fn walkdir_count_md(dir: &std::path::Path) -> usize {
-    let mut count = 0;
-    walkdir_count_md_inner(dir, &mut count, 0);
-    count
 }
 
 const LESSONS_LINE_WIDTH: usize = 80;

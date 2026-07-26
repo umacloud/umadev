@@ -34,6 +34,33 @@ pub struct PlanTaskTracker {
 }
 
 impl PlanTaskTracker {
+    /// Open an unfinished plan ledger only when it already exists.
+    ///
+    /// Unlike [`Self::open`], this never mints a scoped pointer or journal. It is
+    /// intended for cancellation/settlement paths where the persisted plan may
+    /// belong solely to a resident entry task rather than a Director run.
+    pub fn open_existing(
+        project_root: &Path,
+        backend: &str,
+        requirement: &str,
+        plan: &Plan,
+    ) -> Result<Option<Self>, PlanTaskError> {
+        let scope = plan_scope(backend, requirement, plan)?;
+        let Some(ledger) = AgentTaskLedger::open_scoped_existing(project_root, &scope)? else {
+            return Ok(None);
+        };
+        if ledger.tasks().next().is_none() {
+            // A pointer may have been published immediately before a crash.
+            // There is no coordinator to settle, so cancellation must treat
+            // this as absent rather than failing on a missing `director` task.
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            logical_to_task: existing_step_tasks(&ledger, plan),
+            ledger,
+        }))
+    }
+
     /// Open or create the plan's ledger, recover a prior process, and reconcile
     /// already-settled plan steps without re-running them.
     pub fn open(
@@ -268,7 +295,11 @@ impl PlanTaskTracker {
         summary: &str,
         blockers: Vec<String>,
     ) -> Result<RunReadiness, PlanTaskError> {
-        if self.root_state()? == AgentTaskState::Waiting {
+        let root_state = self.root_state()?;
+        if root_state.is_terminal() {
+            return Ok(self.ledger.readiness());
+        }
+        if root_state == AgentTaskState::Waiting {
             self.ledger.resume(ROOT_TASK_ID)?;
         }
         if clean {
@@ -657,6 +688,31 @@ mod tests {
         assert_eq!(
             tracker.finish(true, "delivered", vec![]).unwrap(),
             RunReadiness::Succeeded
+        );
+    }
+
+    #[test]
+    fn open_existing_does_not_turn_an_empty_crash_pointer_into_a_fake_plan_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let scope = plan_scope("codex", "build API", &plan).unwrap();
+        let empty = AgentTaskLedger::open_scoped(temp.path(), &scope).unwrap();
+        assert!(empty.tasks().next().is_none());
+        let entries_before = std::fs::read_dir(temp.path().join(".umadev/agent-tasks"))
+            .unwrap()
+            .count();
+
+        assert!(
+            PlanTaskTracker::open_existing(temp.path(), "codex", "build API", &plan)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(".umadev/agent-tasks"))
+                .unwrap()
+                .count(),
+            entries_before,
+            "the settlement probe is read-only and never mints a ledger"
         );
     }
 

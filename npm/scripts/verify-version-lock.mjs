@@ -20,6 +20,27 @@ if (!/^\d+\.\d+\.\d+$/.test(cargoVersion)) {
   fail(`release version must be stable x.y.z, got ${cargoVersion}`);
 }
 
+// Cargo.lock is part of the release input, not a cache. A hand-edited
+// Cargo.toml can otherwise agree with npm while the committed lockfile still
+// names the previous workspace version; an unlocked Cargo command would then
+// silently rewrite it in CI and build bytes that were never committed.
+const cargoLock = fs.readFileSync(path.join(repoRoot, 'Cargo.lock'), 'utf8');
+const localCargoPackages = cargoLock
+  .split(/^\[\[package\]\]\s*$/m)
+  .slice(1)
+  .filter((block) => !/^source\s*=\s*/m.test(block))
+  .map((block) => ({
+    name: block.match(/^name\s*=\s*"([^"]+)"/m)?.[1],
+    version: block.match(/^version\s*=\s*"([^"]+)"/m)?.[1],
+  }))
+  .filter(({ name, version }) => name && version);
+if (localCargoPackages.length === 0) fail('Cargo.lock contains no local workspace packages');
+for (const { name, version } of localCargoPackages) {
+  if (version !== cargoVersion) {
+    fail(`Cargo.lock workspace package ${name}@${version} != Cargo ${cargoVersion}`);
+  }
+}
+
 const npmRoot = path.join(repoRoot, 'npm');
 const manifests = fs
   .readdirSync(npmRoot, { withFileTypes: true })
@@ -81,6 +102,12 @@ const website = fs.readFileSync(
   path.join(repoRoot, 'umadev-website', 'src', 'app', 'content.ts'),
   'utf8',
 );
+const changelog = fs.readFileSync(path.join(repoRoot, 'CHANGELOG.md'), 'utf8');
+const changelogVersion = changelog.match(/^## \[(\d+\.\d+\.\d+)\]/m)?.[1];
+if (!changelogVersion) fail('could not read the latest stable CHANGELOG.md version');
+if (changelogVersion !== cargoVersion) {
+  fail(`CHANGELOG ${changelogVersion} != Cargo ${cargoVersion}`);
+}
 
 // Kimi compatibility is runtime capability-driven, never exact-version pinned.
 // Keep current install surfaces on the unversioned package so routine upgrades do
@@ -122,5 +149,5 @@ if (process.env.GITHUB_REF?.startsWith('refs/tags/v')) {
 }
 
 console.log(
-  `version-lock: Cargo, website, tag, nine release packages, archived model manifest, and version-agnostic Kimi install surfaces agree on ${cargoVersion}`,
+  `version-lock: Cargo.toml, Cargo.lock, CHANGELOG, website, tag, nine release packages, archived model manifest, and version-agnostic Kimi install surfaces agree on ${cargoVersion}`,
 );

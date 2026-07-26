@@ -10,7 +10,7 @@ use natural::{
     trim_natural_commit_tail,
 };
 use quote::{QuoteEvent, QuoteTracker};
-pub(super) use scope::{git_commit_control_text, git_commit_scope_text};
+pub(super) use scope::{git_commit_control_text, git_commit_scope_text, unquoted_lowercase_text};
 
 /// The lossless, host-consumable shape of a Git commit request.
 #[derive(Debug, Clone, PartialEq, Eq)]

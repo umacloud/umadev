@@ -1,8 +1,10 @@
 use super::{
-    git_command_failed, git_commit_blocked, git_std_command, remove_git_environment_overrides,
-    BTreeSet, Path, ResidentExecutionBlocked,
+    bounded_git_command_output, git_command_failed, git_commit_blocked, git_std_command,
+    remove_git_environment_overrides, BTreeSet, GitCommandLimits, Path, ResidentExecutionBlocked,
 };
 use std::process::Command;
+
+const MAX_GIT_CONFIG_BYTES: usize = 512 * 1024;
 
 pub(crate) fn git_output_without_filter_programs(
     root: &Path,
@@ -13,12 +15,13 @@ pub(crate) fn git_output_without_filter_programs(
     for value in &overrides {
         command.arg("-c").arg(value);
     }
-    command.args(args).output().map_err(|error| {
-        git_commit_blocked(
-            "git-command-unavailable",
-            &format!("无法执行隔离的 Git 验证命令 / unable to execute isolated Git verification: {error}"),
-        )
-    })
+    command.args(args);
+    bounded_git_command_output(
+        command,
+        GitCommandLimits::default(),
+        "git-command-unavailable",
+        "isolated git",
+    )
 }
 
 fn configured_filter_overrides(root: &Path) -> Result<Vec<String>, ResidentExecutionBlocked> {
@@ -29,25 +32,20 @@ fn configured_filter_overrides(root: &Path) -> Result<Vec<String>, ResidentExecu
         .arg(root)
         .args(["config", "--null", "--list", "--includes"]);
     remove_git_environment_overrides(&mut command);
-    let output = command.output().map_err(|error| {
-        git_commit_blocked(
-            "git-config-unverifiable",
-            &format!(
-                "无法枚举 Git filter 配置 / unable to enumerate Git filter configuration: {error}"
-            ),
-        )
-    })?;
+    let output = bounded_git_command_output(
+        command,
+        GitCommandLimits {
+            stdout_bytes: MAX_GIT_CONFIG_BYTES,
+            ..GitCommandLimits::default()
+        },
+        "git-config-unverifiable",
+        "git config --null --list --includes",
+    )?;
     if !output.status.success() {
         return Err(git_command_failed(
             "git-config-unverifiable",
             "git config --list",
             &output,
-        ));
-    }
-    if output.stdout.len() > 512 * 1024 {
-        return Err(git_commit_blocked(
-            "git-config-invalid",
-            "Git config 过大,无法安全枚举 filter / Git configuration is too large to inspect safely",
         ));
     }
     let mut drivers = BTreeSet::new();

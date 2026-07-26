@@ -338,7 +338,7 @@ pub fn cancel_operational_review_pause(
             .and_then(|plan| operational_review_checkpoint_for_plan(project_root, plan))
     });
     let Some(checkpoint) = checkpoint else {
-        return Ok(false);
+        return crate::continuous::cancel_legacy_operational_review_pause(project_root);
     };
 
     if let Some(plan) = persisted_plan.as_ref() {
@@ -346,16 +346,18 @@ pub fn cancel_operational_review_pause(
         if let Some(state) = state.filter(|state| {
             !state.backend.trim().is_empty() && !state.requirement.trim().is_empty()
         }) {
-            let mut tracker = crate::plan_tasks::PlanTaskTracker::open(
+            let tracker = crate::plan_tasks::PlanTaskTracker::open_existing(
                 project_root,
                 &state.backend,
                 &state.requirement,
                 plan,
             )
             .map_err(|error| format!("could not reopen paused plan ledger: {error}"))?;
-            tracker
-                .finish(false, detail, vec![detail.to_string()])
-                .map_err(|error| format!("could not cancel paused plan ledger: {error}"))?;
+            if let Some(mut tracker) = tracker {
+                tracker
+                    .finish(false, detail, vec![detail.to_string()])
+                    .map_err(|error| format!("could not cancel paused plan ledger: {error}"))?;
+            }
         } else if !matches!(
             &checkpoint,
             OperationalReviewCheckpoint::FinalGateReview {
@@ -387,6 +389,7 @@ pub fn cancel_operational_review_pause(
         plan_state::save(&plan, project_root)
             .map_err(|error| format!("could not close paused plan cursor: {error}"))?;
     }
+    crate::continuous::cancel_legacy_operational_review_pause(project_root)?;
     clear_operational_review_checkpoint(project_root);
     Ok(true)
 }
@@ -438,11 +441,12 @@ pub fn checkpoint_post_build_review_pause(
     let plan_path = plan_state::save(&plan, &options.project_root)
         .map_err(|error| format!("could not persist post-build review plan: {error}"))?;
 
-    let checkpoint = OperationalReviewCheckpoint::FinalGateReview {
-        qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(&options.project_root),
-        required_seats: Some(route.team.clone()),
-        entry_task_run_id: entry_task_run_id.map(str::to_string),
-    };
+    let checkpoint = super::next_final_review_checkpoint(
+        None,
+        crate::freshness::workspace_qc_fingerprint(&options.project_root),
+        Some(route.team.clone()),
+        entry_task_run_id.map(str::to_string),
+    );
     if let Err(error) = save_operational_review_checkpoint(&options.project_root, &checkpoint) {
         if let Some(prior) = prior_plan.as_ref() {
             let _ = plan_state::save(prior, &options.project_root);

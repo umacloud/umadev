@@ -29,6 +29,72 @@ const SCAN_EXTENSIONS: &[&str] = &[
     "zsh",
 ];
 
+/// Production resource envelope for governance source reads. A source file is
+/// never materialized above 8 MiB, one run never scans more than 256 MiB, and
+/// at most four bounded readers may coexist inside a 40 MiB content-buffer
+/// envelope. The extra 8 KiB per worker is the fixed drain buffer used by Git
+/// blob capture.
+const DEFAULT_SCAN_LIMITS: ScanLimits = ScanLimits {
+    file_bytes: 8 * 1024 * 1024,
+    total_bytes: 256 * 1024 * 1024,
+    in_flight_bytes: 40 * 1024 * 1024,
+    workers: 4,
+    path_output_bytes: 16 * 1024 * 1024,
+    path_count: 100_000,
+    walk_entries: 500_000,
+    walk_depth: 64,
+};
+const CAPTURE_READ_CHUNK_BYTES: usize = 8 * 1024;
+const GOVERNANCE_CONTEXT_MAX_BYTES: u64 = 256 * 1024;
+const WORKFLOW_STATE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+struct ScanLimits {
+    file_bytes: usize,
+    total_bytes: u64,
+    in_flight_bytes: usize,
+    workers: usize,
+    path_output_bytes: usize,
+    path_count: usize,
+    walk_entries: usize,
+    walk_depth: usize,
+}
+
+impl ScanLimits {
+    fn validate(self) -> std::io::Result<()> {
+        let worker_bytes = self
+            .file_bytes
+            .checked_add(CAPTURE_READ_CHUNK_BYTES)
+            .ok_or_else(|| std::io::Error::other("CI scan byte budget overflow"))?;
+        if self.file_bytes == 0
+            || self.total_bytes == 0
+            || self.workers == 0
+            || self.in_flight_bytes < worker_bytes
+            || self.path_output_bytes == 0
+            || self.path_output_bytes == usize::MAX
+            || self.path_count == 0
+            || self.walk_entries == 0
+            || self.walk_depth == 0
+        {
+            return Err(std::io::Error::other(
+                "invalid CI scan budgets: every limit must be positive and one worker must fit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn worker_count(self, task_count: usize) -> usize {
+        let worker_bytes = self.file_bytes + CAPTURE_READ_CHUNK_BYTES;
+        let memory_workers = self.in_flight_bytes / worker_bytes;
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(self.workers)
+            .min(memory_workers)
+            .min(task_count)
+            .max(1)
+    }
+}
+
 /// Is `rel` a security-sensitive path that MUST be scanned by the bypass-immune
 /// floor REGARDLESS of its extension?
 ///
@@ -123,6 +189,9 @@ pub struct CiResult {
     pub governance_findings: usize,
     /// High/critical dependency findings returned by `npm audit`.
     pub npm_audit_findings: usize,
+    /// Selected files that could not be scanned within the declared resource
+    /// envelope or changed while being read. Enforcing mode fails closed.
+    pub scan_failures: usize,
     /// How the candidate file set was obtained.
     pub scan_scope: CiScanScope,
     /// Whether enforcing mode should fail CI.
@@ -153,6 +222,7 @@ impl CiScanScope {
     }
 }
 
+#[derive(Debug)]
 struct FileSelection {
     files: Vec<PathBuf>,
     scope: CiScanScope,
@@ -165,30 +235,273 @@ struct ScanTask {
 }
 
 struct FileScan {
+    ordinal: usize,
     rel: String,
     scanned: bool,
     findings: Vec<Decision>,
+    diagnostic: Option<String>,
+}
+
+struct PreparedScanTask<'a> {
+    ordinal: usize,
+    task: &'a ScanTask,
+    expected_bytes: usize,
+    worktree_metadata: Option<std::fs::Metadata>,
+    worktree_identity: Option<same_file::Handle>,
+}
+
+fn failed_scan(ordinal: usize, rel: &str, diagnostic: impl Into<String>) -> FileScan {
+    FileScan {
+        ordinal,
+        rel: rel.to_owned(),
+        scanned: false,
+        findings: Vec::new(),
+        diagnostic: Some(diagnostic.into()),
+    }
+}
+
+struct SourcePreflight {
+    bytes: usize,
+    worktree_metadata: Option<std::fs::Metadata>,
+    worktree_identity: Option<same_file::Handle>,
+}
+
+fn metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.file_type().is_symlink()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn workspace_regular_file_metadata(root: &Path, path: &Path) -> Result<std::fs::Metadata, String> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| "selected source escapes the workspace root".to_owned())?;
+    let components: Vec<_> = relative.components().collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("selected source has a non-normal workspace-relative path".to_owned());
+    }
+
+    let mut current = root.to_path_buf();
+    let mut final_metadata = None;
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("components were validated above")
+        };
+        current.push(name);
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| format!("cannot inspect selected source path: {error}"))?;
+        if metadata_is_link_like(&metadata) {
+            return Err(format!(
+                "selected source path contains a symlink or reparse point: {}",
+                current.display()
+            ));
+        }
+        if index + 1 == components.len() {
+            if !metadata.file_type().is_file() {
+                return Err("selected source is not a regular file".to_owned());
+            }
+            final_metadata = Some(metadata);
+        } else if !metadata.file_type().is_dir() {
+            return Err("selected source ancestor is not a directory".to_owned());
+        }
+    }
+
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("cannot canonicalize workspace root: {error}"))?;
+    let canonical_path = std::fs::canonicalize(path)
+        .map_err(|error| format!("cannot canonicalize selected source: {error}"))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err("selected source resolves outside the workspace root".to_owned());
+    }
+    final_metadata.ok_or_else(|| "selected source metadata is unavailable".to_owned())
+}
+
+fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
+fn open_source_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Opening a FIFO for reading can block before its type can be checked.
+        // `O_NONBLOCK` is inert for regular files and closes that denial-of-
+        // service path; `O_NOFOLLOW` rejects a linked leaf.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata_is_link_like(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "selected source is not a regular non-link file",
+        ));
+    }
+    Ok(file)
+}
+
+fn source_preflight(
+    task: &ScanTask,
+    root: &Path,
+    changed_only: bool,
+) -> Result<SourcePreflight, String> {
+    if changed_only {
+        let bytes = staged_blob_size(root, &task.rel)?;
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| format!("source is too large for this platform: {bytes} B"))?;
+        Ok(SourcePreflight {
+            bytes,
+            worktree_metadata: None,
+            worktree_identity: None,
+        })
+    } else {
+        let metadata = workspace_regular_file_metadata(root, &task.path)?;
+        let bytes = metadata.len();
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| format!("source is too large for this platform: {bytes} B"))?;
+        Ok(SourcePreflight {
+            bytes,
+            worktree_metadata: Some(metadata),
+            worktree_identity: Some(
+                same_file::Handle::from_path(&task.path)
+                    .map_err(|error| format!("cannot identify selected source: {error}"))?,
+            ),
+        })
+    }
+}
+
+fn read_worktree_source(
+    root: &Path,
+    path: &Path,
+    preflight: &std::fs::Metadata,
+    preflight_identity: &same_file::Handle,
+    max_bytes: usize,
+) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let before_open = workspace_regular_file_metadata(root, path)?;
+    let before_identity = same_file::Handle::from_path(path)
+        .map_err(|error| format!("cannot re-identify selected source: {error}"))?;
+    if &before_identity != preflight_identity || !same_file_snapshot(preflight, &before_open) {
+        return Err("selected source changed after size preflight".to_owned());
+    }
+    let mut file = open_source_no_follow(path)
+        .map_err(|error| format!("cannot open selected source: {error}"))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect opened source handle: {error}"))?;
+    let opened_identity = same_file::Handle::from_file(
+        file.try_clone()
+            .map_err(|error| format!("cannot clone opened source handle: {error}"))?,
+    )
+    .map_err(|error| format!("cannot identify opened source handle: {error}"))?;
+    if !opened.file_type().is_file()
+        || metadata_is_link_like(&opened)
+        || &opened_identity != preflight_identity
+        || !same_file_snapshot(preflight, &opened)
+    {
+        return Err("opened source does not match the preflighted regular file".to_owned());
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; CAPTURE_READ_CHUNK_BYTES];
+    loop {
+        let read = file
+            .read(&mut chunk)
+            .map_err(|error| format!("cannot read selected source: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        if read > remaining {
+            return Err(format!(
+                "source exceeded the per-file scan budget of {} B while being read",
+                max_bytes
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    let after_read = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck opened source handle: {error}"))?;
+    let current_path = workspace_regular_file_metadata(root, path)?;
+    let current_identity = same_file::Handle::from_path(path)
+        .map_err(|error| format!("cannot re-identify selected source after read: {error}"))?;
+    if opened_identity != current_identity
+        || !same_file_snapshot(&opened, &after_read)
+        || !same_file_snapshot(&opened, &current_path)
+        || opened.len() != bytes.len() as u64
+    {
+        return Err("selected source changed while it was being scanned".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|_| "selected source is not valid UTF-8".to_owned())
 }
 
 fn scan_task(
-    task: &ScanTask,
+    prepared: &PreparedScanTask<'_>,
     root: &Path,
     changed_only: bool,
     report_only: bool,
     policy: &Policy,
+    limits: ScanLimits,
 ) -> FileScan {
+    let task = prepared.task;
     let content = if changed_only {
-        read_staged_blob(root, &task.rel)
+        read_staged_blob(root, &task.rel, limits.file_bytes)
     } else {
-        std::fs::read_to_string(&task.path).ok()
-    };
-    let Some(content) = content else {
-        return FileScan {
-            rel: task.rel.clone(),
-            scanned: false,
-            findings: Vec::new(),
+        let Some(metadata) = prepared.worktree_metadata.as_ref() else {
+            return failed_scan(
+                prepared.ordinal,
+                &task.rel,
+                "worktree source preflight metadata is missing",
+            );
         };
+        let Some(identity) = prepared.worktree_identity.as_ref() else {
+            return failed_scan(
+                prepared.ordinal,
+                &task.rel,
+                "worktree source preflight identity is missing",
+            );
+        };
+        read_worktree_source(root, &task.path, metadata, identity, limits.file_bytes)
     };
+    let content = match content {
+        Ok(content) => content,
+        Err(error) => return failed_scan(prepared.ordinal, &task.rel, error),
+    };
+    if content.len() != prepared.expected_bytes {
+        return failed_scan(
+            prepared.ordinal,
+            &task.rel,
+            format!(
+                "source changed during CI scan (preflight {} B, read {} B); retry from a stable workspace",
+                prepared.expected_bytes,
+                content.len()
+            ),
+        );
+    }
 
     let floor = pre_write_floor_decision(&task.rel, &content);
     let findings = if report_only {
@@ -218,9 +531,11 @@ fn scan_task(
         }
     };
     FileScan {
+        ordinal: prepared.ordinal,
         rel: task.rel.clone(),
         scanned: true,
         findings,
+        diagnostic: None,
     }
 }
 
@@ -230,31 +545,102 @@ fn scan_tasks(
     changed_only: bool,
     report_only: bool,
     policy: &Policy,
+    limits: ScanLimits,
 ) -> Vec<FileScan> {
     if tasks.is_empty() {
         return Vec::new();
     }
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(8)
-        .min(tasks.len());
-    let chunk_size = tasks.len().div_ceil(workers);
 
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = tasks
+    let mut prepared = Vec::with_capacity(tasks.len());
+    let mut scans = Vec::new();
+    let mut selected_bytes = 0_u64;
+    let mut total_budget_exhausted = false;
+    for (ordinal, task) in tasks.iter().enumerate() {
+        if total_budget_exhausted {
+            scans.push(failed_scan(
+                ordinal,
+                &task.rel,
+                format!(
+                    "total source scan budget of {} B was already exhausted",
+                    limits.total_bytes
+                ),
+            ));
+            continue;
+        }
+        let preflight = match source_preflight(task, root, changed_only) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                scans.push(failed_scan(ordinal, &task.rel, error));
+                continue;
+            }
+        };
+        let bytes = preflight.bytes;
+        if bytes > limits.file_bytes {
+            scans.push(failed_scan(
+                ordinal,
+                &task.rel,
+                format!(
+                    "source is {bytes} B; per-file scan budget is {} B",
+                    limits.file_bytes
+                ),
+            ));
+            continue;
+        }
+        let Some(next_total) = selected_bytes.checked_add(bytes as u64) else {
+            scans.push(failed_scan(
+                ordinal,
+                &task.rel,
+                "total source byte count overflowed",
+            ));
+            total_budget_exhausted = true;
+            continue;
+        };
+        if next_total > limits.total_bytes {
+            scans.push(failed_scan(
+                ordinal,
+                &task.rel,
+                format!(
+                    "scanning this {bytes} B source would exceed the total scan budget of {} B",
+                    limits.total_bytes
+                ),
+            ));
+            total_budget_exhausted = true;
+            continue;
+        }
+        selected_bytes = next_total;
+        prepared.push(PreparedScanTask {
+            ordinal,
+            task,
+            expected_bytes: bytes,
+            worktree_metadata: preflight.worktree_metadata,
+            worktree_identity: preflight.worktree_identity,
+        });
+    }
+    if prepared.is_empty() {
+        scans.sort_by_key(|scan| scan.ordinal);
+        return scans;
+    }
+
+    let workers = limits.worker_count(prepared.len());
+    let chunk_size = prepared.len().div_ceil(workers);
+
+    let mut completed = std::thread::scope(|scope| {
+        let handles: Vec<_> = prepared
             .chunks(chunk_size)
             .map(|chunk| {
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|task| {
+                        .map(|prepared| {
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                scan_task(task, root, changed_only, report_only, policy)
+                                scan_task(prepared, root, changed_only, report_only, policy, limits)
                             }))
-                            .unwrap_or_else(|_| FileScan {
-                                rel: task.rel.clone(),
-                                scanned: false,
-                                findings: Vec::new(),
+                            .unwrap_or_else(|_| {
+                                failed_scan(
+                                    prepared.ordinal,
+                                    &prepared.task.rel,
+                                    "governance scanner panicked",
+                                )
                             })
                         })
                         .collect::<Vec<_>>()
@@ -268,7 +654,10 @@ fn scan_tasks(
             }
         }
         scans
-    })
+    });
+    scans.append(&mut completed);
+    scans.sort_by_key(|scan| scan.ordinal);
+    scans
 }
 
 /// Run the CI governance scan. Prints findings to stdout and returns the
@@ -277,6 +666,11 @@ fn scan_tasks(
 /// # Errors
 /// Returns an error only on a filesystem traversal failure.
 pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
+    run_with_scan_limits(opts, DEFAULT_SCAN_LIMITS)
+}
+
+fn run_with_scan_limits(opts: &CiOptions, limits: ScanLimits) -> std::io::Result<CiResult> {
+    limits.validate()?;
     let policy = Policy::load(&opts.project_root);
     // The run's own governance context — READ IT, don't assume. `umadev ci` is the surface
     // that actually BLOCKS (the PreToolUse hook downgrades every non-floor finding to a
@@ -295,7 +689,8 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
     // prevent. So each file is judged by the context of the nearest workspace that CONTAINS
     // it (memoized per directory; the single-workspace case resolves once and costs nothing).
     let mut contexts = ContextCache::new(&opts.project_root);
-    let selection = collect_source_files(&opts.project_root, opts.changed_only)?;
+    let selection =
+        collect_source_files_with_limits(&opts.project_root, opts.changed_only, limits)?;
     let mut result = CiResult {
         files_selected: selection.files.len(),
         scan_scope: selection.scope,
@@ -317,7 +712,14 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
         opts.changed_only,
         opts.report_only,
         &policy,
+        limits,
     ) {
+        if let Some(diagnostic) = scan.diagnostic {
+            result.scan_failures += 1;
+            let label = if opts.report_only { "WARN" } else { "BLOCK" };
+            println!("{label:<5}  UD-CI-RESOURCE  {}  {diagnostic}", scan.rel);
+            continue;
+        }
         if !scan.scanned {
             continue;
         }
@@ -364,8 +766,10 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
         }
     }
 
-    result.failed =
-        (result.governance_findings > 0 || result.npm_audit_findings > 0) && !opts.report_only;
+    result.failed = (result.governance_findings > 0
+        || result.npm_audit_findings > 0
+        || result.scan_failures > 0)
+        && !opts.report_only;
     println!("{}", scan_summary(&result, opts.report_only));
     Ok(result)
 }
@@ -395,11 +799,14 @@ pub fn run(opts: &CiOptions) -> std::io::Result<CiResult> {
 /// is the legitimately-purple project, and blocking it is the very bug this reader exists
 /// to avoid.
 fn load_project_context(root: &Path) -> ProjectContext {
-    let Ok(raw) = std::fs::read_to_string(root.join(".umadev").join("governance-context.json"))
-    else {
+    let Ok(raw) = umadev_state::fs::read_bounded_beneath(
+        root,
+        Path::new(".umadev/governance-context.json"),
+        GOVERNANCE_CONTEXT_MAX_BYTES,
+    ) else {
         return ProjectContext::unknown();
     };
-    let ctx = serde_json::from_str::<ProjectContext>(&raw).unwrap_or_else(|_| {
+    let ctx = serde_json::from_slice::<ProjectContext>(&raw).unwrap_or_else(|_| {
         // Malformed / partial JSON → strict.
         ProjectContext::unknown()
     });
@@ -449,7 +856,7 @@ impl<'a> ContextCache<'a> {
     fn resolve(&self, dir: &Path) -> ProjectContext {
         let mut at = Some(dir);
         while let Some(cur) = at {
-            if cur.join(".umadev").is_dir() {
+            if umadev_state::fs::real_dir(&cur.join(".umadev")) {
                 return load_project_context(cur);
             }
             if cur == self.root {
@@ -467,8 +874,15 @@ impl<'a> ContextCache<'a> {
 /// back to its age ([`ProjectContext::MAX_UNMATCHED_AGE_SECS`]) rather than being trusted
 /// forever. Fail-open: an unreadable / corrupt state file reads as `None`.
 fn workspace_requirement(root: &Path) -> Option<String> {
-    umadev_agent::state::read_workflow_state(root)
-        .map(|s| s.requirement)
+    let bytes = umadev_state::fs::read_bounded_beneath(
+        root,
+        Path::new(".umadev/workflow-state.json"),
+        WORKFLOW_STATE_MAX_BYTES,
+    )
+    .ok()?;
+    serde_json::from_slice::<umadev_agent::state::WorkflowState>(&bytes)
+        .ok()
+        .map(|state| state.requirement)
         .filter(|r| !r.trim().is_empty())
 }
 
@@ -482,7 +896,7 @@ fn now_secs() -> u64 {
 
 /// Render an honest summary of scan scope and counting semantics.
 fn scan_summary(result: &CiResult, report_only: bool) -> String {
-    let skipped = result.files_selected.saturating_sub(result.files_scanned);
+    let unscanned = result.files_selected.saturating_sub(result.files_scanned);
     let audit = if result.npm_audit_findings == 0 {
         String::new()
     } else {
@@ -509,14 +923,15 @@ fn scan_summary(result: &CiResult, report_only: bool) -> String {
     };
     format!(
         "\nUmaDev scope: {}.\n\
-         UmaDev excluded: untracked ignored files (full Git-worktree scope), unsupported types, generated/vendor, and non-allowlisted dot-directories.\n\
+         UmaDev excluded: untracked ignored files (full Git-worktree scope), unsupported types, generated/vendor, symlink/reparse paths, and non-allowlisted dot-directories.\n\
          UmaDev policy: path exclusions apply after the irreversible security floor.\n\
-         UmaDev: {} file(s) selected, {} scanned, {} unreadable/binary skipped; \
+         UmaDev: {} file(s) selected, {} scanned, {} unscanned, {} scan failure(s); \
          {governance}{audit}{mode}",
         result.scan_scope.description(),
         result.files_selected,
         result.files_scanned,
-        skipped,
+        unscanned,
+        result.scan_failures,
     )
 }
 
@@ -556,72 +971,72 @@ impl NpmAuditResult {
 /// to the registry and can stall indefinitely (a hung registry, a proxy, a
 /// broken lockfile). 60s is generous for a real audit yet bounds a stuck one.
 const NPM_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const NPM_AUDIT_OUTPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const CAPTURE_READER_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+const CAPTURE_STDERR_MAX_BYTES: usize = 64 * 1024;
 
-/// Run `cmd` to completion, capping the wait at `timeout`. Returns
-/// `Ok(Some(stdout))` when the child exits within budget, `Ok(None)` when it
-/// overruns (the child is killed + reaped — fail-open), or `Err(..)` only when
-/// the child can't be spawned or polled.
-///
-/// stdout is drained on a worker thread so a large report can't fill the OS
-/// pipe buffer and deadlock the poll loop; a killed child closes the pipe,
-/// which ends the read, so the thread always terminates.
+#[derive(Debug)]
+struct CapturedCommandOutput {
+    status: Option<std::process::ExitStatus>,
+    stdout: Vec<u8>,
+    timed_out: bool,
+    stdout_truncated: bool,
+}
+
+/// Run `cmd` with a hard wall-clock deadline, a hard retained-output limit, and
+/// whole-process-tree ownership. Stdout is continuously drained so a flooding
+/// producer cannot deadlock, but only `max_stdout_bytes` are retained.
+/// The tree is terminated even after the direct child exits, closing pipes held
+/// by background descendants before the bounded reader grace is awaited.
 fn run_capturing_with_timeout(
-    mut cmd: std::process::Command,
+    cmd: std::process::Command,
     timeout: std::time::Duration,
-) -> std::io::Result<Option<String>> {
-    use std::io::Read;
-    use std::process::Stdio;
-    use std::time::Instant;
-
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut buf = String::new();
-        if let Some(mut out) = stdout {
-            let _ = out.read_to_string(&mut buf);
-        }
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            break; // child exited within budget
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            // Do NOT join the reader here. A shell child can fork a grandchild
-            // (e.g. `sh -c "sleep 10"` -> `sleep`) that inherits the stdout pipe and
-            // holds it open until IT exits, so `read_to_string` would block far past
-            // our budget. On timeout we skip the audit and discard its output, so we
-            // detach the reader and return promptly (it ends when the pipe closes).
-            return Ok(None); // timed out — fail-open (skip), promptly
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    Ok(Some(reader.join().unwrap_or_default()))
+    max_stdout_bytes: usize,
+) -> std::io::Result<CapturedCommandOutput> {
+    let output = umadev_process::run_bounded_std_command(
+        cmd,
+        umadev_process::BoundedCommandOptions {
+            timeout,
+            stdout_bytes: max_stdout_bytes,
+            stderr_bytes: CAPTURE_STDERR_MAX_BYTES,
+            reader_grace: CAPTURE_READER_GRACE,
+        },
+    )?;
+    Ok(CapturedCommandOutput {
+        status: output.status,
+        stdout: output.stdout,
+        timed_out: output.timed_out,
+        // Callers parse stdout as a complete protocol value. Any truncated
+        // pipe means the helper exceeded its execution contract and must be
+        // rejected rather than partially trusted.
+        stdout_truncated: output.stdout_truncated || output.stderr_truncated,
+    })
 }
 
 /// Run `npm audit --json` and count vulnerabilities by severity (UD-SEC-016).
 /// Returns an error only if npm isn't available or the command can't be
 /// spawned; a successful run with zero vulns returns an all-zero result.
 ///
-/// **Bounded + fail-open.** The subprocess is capped at [`NPM_AUDIT_TIMEOUT`];
-/// if it overruns, the child is killed and an all-zero result is returned (the
-/// audit is SKIPPED, never hangs CI).
+/// **Bounded + fail-open.** The subprocess is capped at [`NPM_AUDIT_TIMEOUT`]
+/// and [`NPM_AUDIT_OUTPUT_MAX_BYTES`]. A timeout skips the optional audit; a
+/// truncated or malformed response is an error and is never reported as clean.
 fn npm_audit(project_root: &Path) -> std::io::Result<NpmAuditResult> {
     let mut cmd = umadev_host::std_command("npm");
     cmd.args(["audit", "--json"]).current_dir(project_root);
     // npm audit exits non-zero when vulns are found, but stdout still has JSON.
-    match run_capturing_with_timeout(cmd, NPM_AUDIT_TIMEOUT)? {
-        Some(text) => Ok(parse_npm_audit(&text).unwrap_or_default()),
-        None => Ok(NpmAuditResult::default()), // timed out → skip (fail-open)
+    let output = run_capturing_with_timeout(cmd, NPM_AUDIT_TIMEOUT, NPM_AUDIT_OUTPUT_MAX_BYTES)?;
+    if output.timed_out {
+        return Ok(NpmAuditResult::default());
     }
+    if output.stdout_truncated {
+        return Err(std::io::Error::other(format!(
+            "npm audit JSON exceeded the {} B capture budget",
+            NPM_AUDIT_OUTPUT_MAX_BYTES
+        )));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| std::io::Error::other("npm audit returned non-UTF-8 JSON"))?;
+    parse_npm_audit(&text).ok_or_else(|| std::io::Error::other("npm audit returned invalid JSON"))
 }
 
 /// Parse `npm audit --json` output into a severity-count summary.
@@ -658,25 +1073,37 @@ fn parse_npm_audit(text: &str) -> Option<NpmAuditResult> {
 
 /// Select governance-eligible files with an explicit, reproducible scope.
 fn collect_source_files(root: &Path, changed_only: bool) -> std::io::Result<FileSelection> {
+    collect_source_files_with_limits(root, changed_only, DEFAULT_SCAN_LIMITS)
+}
+
+fn collect_source_files_with_limits(
+    root: &Path,
+    changed_only: bool,
+    limits: ScanLimits,
+) -> std::io::Result<FileSelection> {
     if changed_only {
         return Ok(FileSelection {
-            files: git_changed_files(root)?,
+            files: git_changed_files_with_limits(root, limits)?,
             scope: CiScanScope::StagedIndex,
         });
     }
-    if let Some(files) = git_worktree_files(root) {
+    if let Some(files) = git_worktree_files(root, limits)? {
         return Ok(FileSelection {
             files,
             scope: CiScanScope::GitWorktree,
         });
     }
     let mut files = Vec::new();
-    walk_dir(root, &mut files);
+    walk_dir(root, &mut files, limits)?;
     sort_scan_files(root, &mut files);
     Ok(FileSelection {
         files,
         scope: CiScanScope::FilesystemFallback,
     })
+}
+
+fn selection_resource_error(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::other(format!("UD-CI-RESOURCE: {}", message.into()))
 }
 
 fn normalized_relative_path(root: &Path, path: &Path) -> String {
@@ -691,67 +1118,368 @@ fn sort_scan_files(root: &Path, files: &mut Vec<PathBuf>) {
     files.dedup();
 }
 
+const GIT_CONTROL_FILE_MAX_BYTES: u64 = 16 * 1024;
+
+#[derive(Debug, Clone)]
+struct TrustedGitRepository {
+    worktree: PathBuf,
+    git_dir: PathBuf,
+    index_file: Option<PathBuf>,
+}
+
+fn canonical_real_directory(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        selection_resource_error(format!(
+            "cannot resolve {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !umadev_state::fs::real_dir(&canonical) {
+        return Err(selection_resource_error(format!(
+            "{label} is not a real directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn read_git_control_file(root: &Path, relative: &Path) -> std::io::Result<Vec<u8>> {
+    umadev_state::fs::read_bounded_beneath(root, relative, GIT_CONTROL_FILE_MAX_BYTES).map_err(
+        |error| {
+            selection_resource_error(format!(
+                "cannot safely read Git control file {}: {error}",
+                root.join(relative).display()
+            ))
+        },
+    )
+}
+
+fn parse_git_dir_file(worktree: &Path) -> std::io::Result<PathBuf> {
+    let bytes = read_git_control_file(worktree, Path::new(".git"))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| selection_resource_error("the .git control file is not valid UTF-8"))?;
+    let value = text
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.chars().any(|c| matches!(c, '\r' | '\n')))
+        .ok_or_else(|| selection_resource_error("the .git control file is malformed"))?;
+    let value = Path::new(value);
+    let candidate = if value.is_absolute() {
+        value.to_path_buf()
+    } else {
+        worktree.join(value)
+    };
+    canonical_real_directory(&candidate, "Git directory")
+}
+
+fn discover_git_repository(
+    root: &Path,
+    honour_index_environment: bool,
+) -> std::io::Result<Option<TrustedGitRepository>> {
+    let worktree = canonical_real_directory(root, "CI project root")?;
+    let dot_git = worktree.join(".git");
+    let dot_git_metadata = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(selection_resource_error(format!(
+                "cannot inspect {}: {error}",
+                dot_git.display()
+            )))
+        }
+    };
+    if metadata_is_link_like(&dot_git_metadata) {
+        return Err(selection_resource_error(
+            "the repository .git entry is a symlink or reparse point",
+        ));
+    }
+    let git_dir = if dot_git_metadata.file_type().is_dir() {
+        canonical_real_directory(&dot_git, "Git directory")?
+    } else if dot_git_metadata.file_type().is_file() {
+        parse_git_dir_file(&worktree)?
+    } else {
+        return Err(selection_resource_error(
+            "the repository .git entry is neither a directory nor a gitdir file",
+        ));
+    };
+
+    let commondir_path = git_dir.join("commondir");
+    let common_dir = match std::fs::symlink_metadata(&commondir_path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata_is_link_like(&metadata) => {
+            let bytes = read_git_control_file(&git_dir, Path::new("commondir"))?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| selection_resource_error("Git commondir is not valid UTF-8"))?;
+            let value = text.trim();
+            if value.is_empty() || value.chars().any(|c| matches!(c, '\r' | '\n')) {
+                return Err(selection_resource_error("Git commondir is malformed"));
+            }
+            let value = Path::new(value);
+            let candidate = if value.is_absolute() {
+                value.to_path_buf()
+            } else {
+                git_dir.join(value)
+            };
+            canonical_real_directory(&candidate, "Git common directory")?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+        Ok(_) => {
+            return Err(selection_resource_error(
+                "Git commondir is not a regular non-link file",
+            ))
+        }
+        Err(error) => {
+            return Err(selection_resource_error(format!(
+                "cannot inspect Git commondir: {error}"
+            )))
+        }
+    };
+
+    let index_file = if honour_index_environment {
+        match std::env::var_os("GIT_INDEX_FILE") {
+            Some(raw) => Some(validate_git_index(&worktree, &git_dir, &common_dir, &raw)?),
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok(Some(TrustedGitRepository {
+        worktree,
+        git_dir,
+        index_file,
+    }))
+}
+
+fn validate_git_index(
+    worktree: &Path,
+    git_dir: &Path,
+    common_dir: &Path,
+    raw: &std::ffi::OsStr,
+) -> std::io::Result<PathBuf> {
+    let value = Path::new(raw);
+    if value.as_os_str().is_empty() {
+        return Err(selection_resource_error("GIT_INDEX_FILE is empty"));
+    }
+    let candidate = if value.is_absolute() {
+        value.to_path_buf()
+    } else {
+        worktree.join(value)
+    };
+    let metadata = std::fs::symlink_metadata(&candidate).map_err(|error| {
+        selection_resource_error(format!(
+            "cannot inspect GIT_INDEX_FILE {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() || metadata_is_link_like(&metadata) {
+        return Err(selection_resource_error(
+            "GIT_INDEX_FILE is not a regular non-link file",
+        ));
+    }
+    let canonical = std::fs::canonicalize(&candidate).map_err(|error| {
+        selection_resource_error(format!(
+            "cannot resolve GIT_INDEX_FILE {}: {error}",
+            candidate.display()
+        ))
+    })?;
+    if !canonical.starts_with(git_dir) && !canonical.starts_with(common_dir) {
+        return Err(selection_resource_error(format!(
+            "GIT_INDEX_FILE is outside this repository: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn sanitize_git_environment(command: &mut std::process::Command) {
+    // Explicit removals also scrub values a caller may already have assigned
+    // to this `Command`; the loop below covers future/unknown `GIT_*` names
+    // inherited from the parent process.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_DIFF_OPTS",
+        "GIT_PAGER",
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ] {
+        command.env_remove(key);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .env_remove("USERPROFILE")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", null_device())
+        .env("GIT_CONFIG_SYSTEM", null_device())
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+}
+
+fn null_device() -> &'static str {
+    if cfg!(windows) {
+        "NUL"
+    } else {
+        "/dev/null"
+    }
+}
+
+fn trusted_git_command(repo: &TrustedGitRepository) -> std::process::Command {
+    let mut command = umadev_host::std_command("git");
+    sanitize_git_environment(&mut command);
+    if let Some(index_file) = &repo.index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    }
+    command
+        .arg("--no-pager")
+        .arg("--literal-pathspecs")
+        .arg("--git-dir")
+        .arg(&repo.git_dir)
+        .arg("--work-tree")
+        .arg(&repo.worktree)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.untrackedCache=false"])
+        .args(["-c", "core.preloadIndex=false"])
+        .args(["-c", "core.quotePath=false"])
+        .args(["-c", "core.excludesFile="])
+        .args(["-c", "core.attributesFile="])
+        .current_dir(&repo.worktree);
+    command
+}
+
 /// In a Git worktree, scan tracked files plus untracked files not excluded by
-/// standard ignore rules. A failed command means Git metadata is unavailable,
-/// so the caller uses the documented filesystem fallback.
-fn git_worktree_files(root: &Path) -> Option<Vec<PathBuf>> {
-    let output = std::process::Command::new("git")
+/// standard ignore rules. A non-successful Git command means metadata is not
+/// available and selects the bounded filesystem fallback; timeout/truncation is
+/// a resource failure and never silently broadens the scan.
+fn git_worktree_files(root: &Path, limits: ScanLimits) -> std::io::Result<Option<Vec<PathBuf>>> {
+    let Some(repo) = discover_git_repository(root, false)? else {
+        return Ok(None);
+    };
+    let mut probe = trusted_git_command(&repo);
+    probe.args(["rev-parse", "--is-inside-work-tree"]);
+    let probe = capture_git_path_output(probe, limits, "git rev-parse")?;
+    if !probe.status.is_some_and(|status| status.success()) {
+        return Ok(None);
+    }
+    if probe.stdout != b"true\n" && probe.stdout != b"true\r\n" {
+        return Err(selection_resource_error(
+            "git rev-parse returned an unexpected worktree response",
+        ));
+    }
+
+    let mut command = trusted_git_command(&repo);
+    command
         .args([
-            "-c",
-            "core.quotePath=false",
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
         ])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+        .current_dir(root);
+    let output = capture_git_path_output(command, limits, "git ls-files")?;
+    if !output.status.is_some_and(|status| status.success()) {
+        return Err(selection_resource_error(
+            "git ls-files failed inside a detected worktree",
+        ));
     }
-    Some(scan_paths_from_git_output(root, &output.stdout))
+    scan_paths_from_git_output(root, &output.stdout, limits).map(Some)
 }
 
-/// Recursive directory walk collecting source files.
-fn walk_dir(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            // Skip deps/build/VCS directories.
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            // Skip build/VCS dirs and dot-dirs BY DEFAULT, but DESCEND into a small
-            // allowlist of security-relevant dot-dirs (.ssh / .aws / .github / ...) so a
-            // committed secret or a weakened workflow there is scanned (it was silently
-            // skipped by the blanket dot-prefix rule).
-            if should_skip_directory(name) {
+/// Iterative, non-symlink-following filesystem fallback with hard traversal and
+/// selection budgets. Every read-dir/metadata error fails closed rather than
+/// producing an incomplete clean result.
+fn walk_dir(root: &Path, files: &mut Vec<PathBuf>, limits: ScanLimits) -> std::io::Result<()> {
+    let mut stack = vec![(root.to_path_buf(), 0_usize)];
+    let mut entries_seen = 0_usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|error| {
+            selection_resource_error(format!("cannot read {}: {error}", dir.display()))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                selection_resource_error(format!(
+                    "cannot enumerate an entry below {}: {error}",
+                    dir.display()
+                ))
+            })?;
+            entries_seen = entries_seen.checked_add(1).ok_or_else(|| {
+                selection_resource_error("filesystem traversal entry count overflowed")
+            })?;
+            if entries_seen > limits.walk_entries {
+                return Err(selection_resource_error(format!(
+                    "filesystem fallback exceeded its {} entry budget",
+                    limits.walk_entries
+                )));
+            }
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                selection_resource_error(format!("cannot inspect {}: {error}", path.display()))
+            })?;
+            if metadata_is_link_like(&metadata) {
                 continue;
             }
-            walk_dir(&path, files);
-        } else if ft.is_file() {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            // Source by extension, OR a sensitive path regardless of extension, so
-            // a committed `.env` / `*.pem` / `credentials` reaches the floor in a
-            // full scan too (the same set the changed-only path pulls in).
-            if SCAN_EXTENSIONS.contains(&ext.as_str())
-                || is_sensitive_scan_path(&path.to_string_lossy())
-            {
-                files.push(path);
+            if metadata.file_type().is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                if should_skip_directory(name) {
+                    continue;
+                }
+                let next_depth = depth.checked_add(1).ok_or_else(|| {
+                    selection_resource_error("filesystem traversal depth overflowed")
+                })?;
+                if next_depth > limits.walk_depth {
+                    return Err(selection_resource_error(format!(
+                        "filesystem fallback exceeded its depth budget of {} at {}",
+                        limits.walk_depth,
+                        path.display()
+                    )));
+                }
+                stack.push((path, next_depth));
+            } else if metadata.file_type().is_file() {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if SCAN_EXTENSIONS.contains(&ext.as_str())
+                    || is_sensitive_scan_path(&path.to_string_lossy())
+                {
+                    files.push(path);
+                    if files.len() > limits.path_count {
+                        return Err(selection_resource_error(format!(
+                            "filesystem fallback selected more than {} files",
+                            limits.path_count
+                        )));
+                    }
+                }
             }
         }
     }
+    Ok(())
 }
 
 fn should_skip_directory(name: &str) -> bool {
@@ -785,16 +1513,72 @@ fn is_scan_candidate(path: &str) -> bool {
     SCAN_EXTENSIONS.contains(&ext.as_str()) || is_sensitive_scan_path(path)
 }
 
-fn scan_paths_from_git_output(root: &Path, output: &[u8]) -> Vec<PathBuf> {
-    let text = String::from_utf8_lossy(output);
-    let mut files: Vec<PathBuf> = text
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .filter(|path| is_scan_candidate(path))
-        .map(|path| root.join(path))
-        .collect();
+fn scan_paths_from_git_output(
+    root: &Path,
+    output: &[u8],
+    limits: ScanLimits,
+) -> std::io::Result<Vec<PathBuf>> {
+    if output.len() > limits.path_output_bytes {
+        return Err(selection_resource_error(format!(
+            "Git path output exceeded {} B",
+            limits.path_output_bytes
+        )));
+    }
+    let text = std::str::from_utf8(output)
+        .map_err(|_| selection_resource_error("Git returned a non-UTF-8 path list"))?;
+    let mut files = Vec::new();
+    let mut path_count = 0_usize;
+    for path in text.split('\0').filter(|path| !path.is_empty()) {
+        path_count = path_count
+            .checked_add(1)
+            .ok_or_else(|| selection_resource_error("Git path count overflowed"))?;
+        if path_count > limits.path_count {
+            return Err(selection_resource_error(format!(
+                "Git returned more than {} paths",
+                limits.path_count
+            )));
+        }
+        let relative = Path::new(path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(selection_resource_error(format!(
+                "Git returned a path outside the workspace: {path}"
+            )));
+        }
+        if is_scan_candidate(path) {
+            files.push(root.join(relative));
+        }
+    }
     sort_scan_files(root, &mut files);
-    files
+    Ok(files)
+}
+
+const GIT_PATH_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn capture_git_path_output(
+    command: std::process::Command,
+    limits: ScanLimits,
+    operation: &str,
+) -> std::io::Result<CapturedCommandOutput> {
+    let capture_bytes = limits
+        .path_output_bytes
+        .checked_add(1)
+        .ok_or_else(|| selection_resource_error("Git path capture budget overflowed"))?;
+    let output = run_capturing_with_timeout(command, GIT_PATH_LIST_TIMEOUT, capture_bytes)
+        .map_err(|error| selection_resource_error(format!("{operation} failed: {error}")))?;
+    if output.timed_out {
+        return Err(selection_resource_error(format!("{operation} timed out")));
+    }
+    if output.stdout_truncated || output.stdout.len() > limits.path_output_bytes {
+        return Err(selection_resource_error(format!(
+            "{operation} exceeded its {} B path-output budget",
+            limits.path_output_bytes
+        )));
+    }
+    Ok(output)
 }
 
 /// Get the files in the STAGED index that differ from `HEAD` — the exact set a
@@ -802,9 +1586,13 @@ fn scan_paths_from_git_output(root: &Path, output: &[u8]) -> Vec<PathBuf> {
 /// staged scope (`--cached`), NOT the working tree: a `git diff HEAD` would also
 /// include unstaged edits, blocking a commit on a violation that isn't part of
 /// it. With no commits yet, `--cached` compares against the empty tree (all
-/// staged files appear as new). Git failures yield an empty set (fail-open),
-/// never a broader tracked-file fallback that would violate `--changed-only`.
+/// staged files appear as new). Git failure is fail-closed because returning an
+/// empty set would incorrectly certify an unscanned commit as clean.
 fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    git_changed_files_with_limits(root, DEFAULT_SCAN_LIMITS)
+}
+
+fn git_changed_files_with_limits(root: &Path, limits: ScanLimits) -> std::io::Result<Vec<PathBuf>> {
     // `-c core.quotePath=false` + `-z`: emit NUL-separated, UNQUOTED paths so a
     // staged file with a non-ASCII (`café.tsx`) or spaced name is scanned rather
     // than dropped. At git's default (`core.quotePath=true`) such a path is
@@ -812,41 +1600,84 @@ fn git_changed_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     // yields `tsx"` and it silently falls out of SCAN_EXTENSIONS — a real
     // violation would never be scanned. `-z` also removes the quoting entirely,
     // so the raw path round-trips to `git show :<rel>` in `read_staged_blob`.
-    let output = std::process::Command::new("git")
+    let repo = discover_git_repository(root, true)?.ok_or_else(|| {
+        selection_resource_error("--changed-only requires a .git entry at the project root")
+    })?;
+    let mut command = trusted_git_command(&repo);
+    command
         .args([
-            "-c",
-            "core.quotePath=false",
             "diff",
+            "--no-ext-diff",
             "--name-only",
             "-z",
             "--cached",
             "--diff-filter=ACMR",
         ])
-        .current_dir(root)
-        .output();
-    let out = match output {
-        Ok(output) if output.status.success() => output.stdout,
-        _ => return Ok(Vec::new()),
-    };
-    Ok(scan_paths_from_git_output(root, &out))
+        .current_dir(root);
+    let output = capture_git_path_output(command, limits, "git diff --cached")?;
+    if !output.status.is_some_and(|status| status.success()) {
+        return Err(selection_resource_error("git diff --cached failed"));
+    }
+    scan_paths_from_git_output(root, &output.stdout, limits)
 }
 
-/// Read the STAGED content of `rel` (a workspace-relative, forward-slash path)
-/// from the git index via `git show :<rel>`. Returns `None` when the path isn't
-/// staged, the blob is binary/unreadable, or git is unavailable (fail-open: the
-/// caller skips the file).
-fn read_staged_blob(root: &Path, rel: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["show", &format!(":{rel}")])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+const GIT_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const GIT_SIZE_OUTPUT_MAX_BYTES: usize = 128;
+
+fn staged_blob_size(root: &Path, rel: &str) -> Result<u64, String> {
+    let repo = discover_git_repository(root, true)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "cannot find the Git repository for staged content".to_owned())?;
+    let mut command = trusted_git_command(&repo);
+    command
+        .args(["cat-file", "-s", &format!(":{rel}")])
+        .current_dir(root);
+    let output = run_capturing_with_timeout(command, GIT_BLOB_TIMEOUT, GIT_SIZE_OUTPUT_MAX_BYTES)
+        .map_err(|error| format!("cannot inspect staged blob size: {error}"))?;
+    if output.timed_out {
+        return Err("timed out while inspecting staged blob size".to_owned());
     }
-    // A staged binary blob isn't valid UTF-8 — treat as unreadable (skip), the
-    // same as the on-disk `read_to_string` path does.
-    String::from_utf8(output.stdout).ok()
+    if output.stdout_truncated {
+        return Err("staged blob size response exceeded its capture budget".to_owned());
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        return Err("git could not inspect the staged blob size".to_owned());
+    }
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "git returned a non-UTF-8 staged blob size".to_owned())?;
+    text.trim()
+        .parse::<u64>()
+        .map_err(|_| "git returned an invalid staged blob size".to_owned())
+}
+
+/// Read staged content through a bounded `git show` capture. The size is
+/// preflighted separately for the deterministic run-wide budget, while the
+/// capture limit independently closes the race where the index changes between
+/// preflight and read.
+fn read_staged_blob(root: &Path, rel: &str, max_bytes: usize) -> Result<String, String> {
+    let capture_bytes = max_bytes
+        .checked_add(1)
+        .ok_or_else(|| "staged blob capture budget overflowed".to_owned())?;
+    let repo = discover_git_repository(root, true)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "cannot find the Git repository for staged content".to_owned())?;
+    let mut command = trusted_git_command(&repo);
+    command.args(["show", &format!(":{rel}")]).current_dir(root);
+    let output = run_capturing_with_timeout(command, GIT_BLOB_TIMEOUT, capture_bytes)
+        .map_err(|error| format!("cannot read staged blob: {error}"))?;
+    if output.timed_out {
+        return Err("timed out while reading staged blob".to_owned());
+    }
+    if output.stdout_truncated || output.stdout.len() > max_bytes {
+        return Err(format!(
+            "staged blob exceeded the per-file scan budget of {max_bytes} B"
+        ));
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        return Err("git could not read the staged blob".to_owned());
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|_| "selected staged blob is not valid UTF-8".to_owned())
 }
 
 #[cfg(test)]
@@ -1104,6 +1935,49 @@ mod tests {
     }
 
     #[test]
+    fn oversized_governance_and_workflow_state_cannot_relax_ci() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("governance-context.json"),
+            vec![b'x'; usize::try_from(GOVERNANCE_CONTEXT_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow-state.json"),
+            vec![b'x'; usize::try_from(WORKFLOW_STATE_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(!load_project_context(tmp.path()).purple_allowed);
+        assert!(workspace_requirement(tmp.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_and_fifo_ci_context_inputs_are_rejected_without_blocking() {
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&dir).unwrap();
+        let outside = tmp.path().join("outside.json");
+        std::fs::write(&outside, r#"{"purple_allowed":true}"#).unwrap();
+        symlink(&outside, dir.join("governance-context.json")).unwrap();
+        assert!(!load_project_context(tmp.path()).purple_allowed);
+
+        assert!(std::process::Command::new("mkfifo")
+            .arg(dir.join("workflow-state.json"))
+            .status()
+            .unwrap()
+            .success());
+        let started = Instant::now();
+        assert!(workspace_requirement(tmp.path()).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
     fn ci_flags_violation() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("bad.tsx"), "<b>🔍</b>").unwrap();
@@ -1210,7 +2084,7 @@ mod tests {
         std::fs::write(tmp.path().join("readme.md"), "x").unwrap();
         std::fs::write(tmp.path().join("data.json"), "x").unwrap();
         let mut files = Vec::new();
-        walk_dir(tmp.path(), &mut files);
+        walk_dir(tmp.path(), &mut files, DEFAULT_SCAN_LIMITS).unwrap();
         let names: Vec<String> = files
             .iter()
             .map(|f| f.file_name().unwrap().to_string_lossy().to_string())
@@ -1276,7 +2150,7 @@ mod tests {
         }
 
         let mut files = Vec::new();
-        walk_dir(tmp.path(), &mut files);
+        walk_dir(tmp.path(), &mut files, DEFAULT_SCAN_LIMITS).unwrap();
         let names: std::collections::HashSet<String> = files
             .iter()
             .map(|file| file.file_name().unwrap().to_string_lossy().into_owned())
@@ -1325,6 +2199,115 @@ mod tests {
         git(dir, &["init", "-q"])
             && git(dir, &["config", "user.email", "t@t.test"])
             && git(dir, &["config", "user.name", "test"])
+    }
+
+    #[test]
+    fn git_environment_redirect_child() {
+        let Some(root) = std::env::var_os("UMADEV_CI_GIT_ENV_CHILD_ROOT") else {
+            return;
+        };
+        let result = git_changed_files(Path::new(&root));
+        if std::env::var_os("UMADEV_CI_GIT_EXPECT_REJECT").is_some() {
+            assert!(
+                result.is_err(),
+                "an external GIT_INDEX_FILE must fail closed"
+            );
+            return;
+        }
+        let files = result.unwrap();
+        assert!(files.iter().any(|path| path.ends_with("trusted.ts")));
+        assert!(files.iter().all(|path| !path.ends_with("attacker.ts")));
+    }
+
+    #[test]
+    fn staged_scope_ignores_git_repository_environment_redirects() {
+        let trusted = tempfile::TempDir::new().unwrap();
+        let attacker = tempfile::TempDir::new().unwrap();
+        if !init_repo(trusted.path()) || !init_repo(attacker.path()) {
+            return;
+        }
+        std::fs::write(
+            trusted.path().join("trusted.ts"),
+            "export const trusted = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            attacker.path().join("attacker.ts"),
+            "export const attacker = 1;\n",
+        )
+        .unwrap();
+        assert!(git(trusted.path(), &["add", "trusted.ts"]));
+        assert!(git(attacker.path(), &["add", "attacker.ts"]));
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ci::tests::git_environment_redirect_child",
+                "--nocapture",
+            ])
+            .env("UMADEV_CI_GIT_ENV_CHILD_ROOT", trusted.path())
+            .env("GIT_DIR", attacker.path().join(".git"))
+            .env("GIT_WORK_TREE", attacker.path())
+            .env("GIT_OBJECT_DIRECTORY", attacker.path().join(".git/objects"))
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn staged_scope_preserves_only_a_valid_repository_local_index() {
+        let trusted = tempfile::TempDir::new().unwrap();
+        if !init_repo(trusted.path()) {
+            return;
+        }
+        std::fs::write(
+            trusted.path().join("trusted.ts"),
+            "export const trusted = 1;\n",
+        )
+        .unwrap();
+        assert!(git(trusted.path(), &["add", "trusted.ts"]));
+        let alternate_index = trusted.path().join(".git/alternate-index");
+        std::fs::copy(trusted.path().join(".git/index"), &alternate_index).unwrap();
+
+        let valid = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ci::tests::git_environment_redirect_child",
+                "--nocapture",
+            ])
+            .env("UMADEV_CI_GIT_ENV_CHILD_ROOT", trusted.path())
+            .env("GIT_INDEX_FILE", &alternate_index)
+            .output()
+            .unwrap();
+        assert!(
+            valid.status.success(),
+            "repository-local alternate index was rejected:\n{}",
+            String::from_utf8_lossy(&valid.stderr)
+        );
+
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let rejected = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ci::tests::git_environment_redirect_child",
+                "--nocapture",
+            ])
+            .env("UMADEV_CI_GIT_ENV_CHILD_ROOT", trusted.path())
+            .env("UMADEV_CI_GIT_EXPECT_REJECT", "1")
+            .env("GIT_INDEX_FILE", outside.path())
+            .output()
+            .unwrap();
+        assert!(
+            rejected.status.success(),
+            "external alternate index did not fail closed:\n{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
     }
 
     #[test]
@@ -1602,13 +2585,14 @@ mod tests {
             files_blocked: 1,
             governance_findings: 3,
             npm_audit_findings: 2,
+            scan_failures: 1,
             scan_scope: CiScanScope::GitWorktree,
             failed: true,
         };
         let line = scan_summary(&result, true);
         assert!(line.contains("tracked + untracked non-ignored"), "{line}");
         assert!(line.contains("4 file(s) selected, 3 scanned"), "{line}");
-        assert!(line.contains("1 unreadable/binary skipped"), "{line}");
+        assert!(line.contains("1 unscanned, 1 scan failure(s)"), "{line}");
         assert!(line.contains("1 file(s) with a governance hit"), "{line}");
         assert!(line.contains("3 governance finding(s)"), "{line}");
         assert!(line.contains("count is complete"), "{line}");
@@ -1661,17 +2645,13 @@ mod tests {
     #[test]
     fn capturing_timeout_kills_a_stuck_child_fast() {
         use std::time::{Duration, Instant};
-        // A child that would run for 10s, capped at 200ms → returns None (skip)
-        // WELL before the child's own runtime, and quickly.
+        // A child that would run for 10s is torn down well before its runtime.
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg("sleep 10");
         let started = Instant::now();
-        let out = run_capturing_with_timeout(cmd, Duration::from_millis(200)).unwrap();
+        let out = run_capturing_with_timeout(cmd, Duration::from_millis(200), 1024).unwrap();
         let elapsed = started.elapsed();
-        assert!(
-            out.is_none(),
-            "an overrunning audit must be skipped, not returned"
-        );
+        assert!(out.timed_out, "an overrunning helper must report timeout");
         assert!(
             elapsed < Duration::from_secs(3),
             "the wait must be bounded, took {elapsed:?}"
@@ -1684,7 +2664,252 @@ mod tests {
         use std::time::Duration;
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c").arg("printf 'hello-audit'");
-        let out = run_capturing_with_timeout(cmd, Duration::from_secs(10)).unwrap();
-        assert_eq!(out.as_deref(), Some("hello-audit"));
+        let out = run_capturing_with_timeout(cmd, Duration::from_secs(10), 1024).unwrap();
+        assert!(!out.timed_out);
+        assert!(!out.stdout_truncated);
+        assert_eq!(out.stdout, b"hello-audit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capturing_closes_pipe_inherited_by_background_descendant() {
+        use std::time::{Duration, Instant};
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c").arg("sleep 30 & printf 'parent-done'");
+        let started = Instant::now();
+        let out = run_capturing_with_timeout(cmd, Duration::from_secs(5), 1024).unwrap();
+        assert!(!out.timed_out, "the direct shell exited normally");
+        assert_eq!(out.stdout, b"parent-done");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a descendant holding stdout must not keep the reader at EOF"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capturing_no_newline_flood_is_memory_and_time_bounded() {
+        use std::time::{Duration, Instant};
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("while :; do printf '0123456789abcdef'; done");
+        let started = Instant::now();
+        let out = run_capturing_with_timeout(cmd, Duration::from_millis(150), 1024).unwrap();
+        assert!(out.timed_out);
+        assert!(out.stdout_truncated);
+        assert_eq!(out.stdout.len(), 1024);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_open_rejects_fifo_without_blocking() {
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fifo = tmp.path().join("source.ts");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let started = Instant::now();
+        assert!(open_source_no_follow(&fifo).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn git_command_scrubs_redirect_and_execution_environment() {
+        let mut command = std::process::Command::new("git");
+        command
+            .env("GIT_DIR", "attacker")
+            .env("GIT_WORK_TREE", "attacker")
+            .env("GIT_OBJECT_DIRECTORY", "attacker")
+            .env("GIT_EXTERNAL_DIFF", "attacker")
+            .env("GIT_CONFIG_GLOBAL", "attacker");
+        sanitize_git_environment(&mut command);
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_EXTERNAL_DIFF",
+        ] {
+            assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&None));
+        }
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("GIT_CONFIG_GLOBAL")),
+            Some(&Some(std::ffi::OsStr::new(null_device())))
+        );
+    }
+
+    fn tiny_scan_limits(max_file_bytes: usize, max_total_bytes: u64) -> ScanLimits {
+        ScanLimits {
+            file_bytes: max_file_bytes,
+            total_bytes: max_total_bytes,
+            in_flight_bytes: max_file_bytes + CAPTURE_READ_CHUNK_BYTES,
+            workers: 1,
+            path_output_bytes: 1024,
+            path_count: 64,
+            walk_entries: 256,
+            walk_depth: 16,
+        }
+    }
+
+    #[test]
+    fn full_scan_fails_closed_on_oversized_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("huge.ts"), vec![b'x'; 65]).unwrap();
+
+        let result = run_with_scan_limits(
+            &CiOptions {
+                report_only: false,
+                changed_only: false,
+                project_root: tmp.path().to_path_buf(),
+            },
+            tiny_scan_limits(64, 1024),
+        )
+        .unwrap();
+        assert_eq!(result.files_scanned, 0);
+        assert_eq!(result.scan_failures, 1);
+        assert!(
+            result.failed,
+            "an unscanned selected source must fail closed"
+        );
+    }
+
+    #[test]
+    fn changed_only_fails_closed_on_oversized_staged_blob() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return;
+        }
+        std::fs::write(root.join("huge.ts"), vec![b'x'; 65]).unwrap();
+        assert!(git(root, &["add", "huge.ts"]));
+
+        let result = run_with_scan_limits(
+            &CiOptions {
+                report_only: false,
+                changed_only: true,
+                project_root: root.to_path_buf(),
+            },
+            tiny_scan_limits(64, 1024),
+        )
+        .unwrap();
+        assert_eq!(result.files_scanned, 0);
+        assert_eq!(result.scan_failures, 1);
+        assert!(result.failed, "an oversized staged blob must fail closed");
+    }
+
+    #[test]
+    fn full_scan_fails_closed_when_total_budget_is_exhausted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.ts"), vec![b'a'; 40]).unwrap();
+        std::fs::write(tmp.path().join("b.ts"), vec![b'b'; 40]).unwrap();
+        std::fs::write(tmp.path().join("c.ts"), vec![b'c'; 40]).unwrap();
+
+        let result = run_with_scan_limits(
+            &CiOptions {
+                report_only: false,
+                changed_only: false,
+                project_root: tmp.path().to_path_buf(),
+            },
+            tiny_scan_limits(64, 80),
+        )
+        .unwrap();
+        assert_eq!(result.files_scanned, 2);
+        assert_eq!(result.scan_failures, 1);
+        assert!(result.failed);
+    }
+
+    #[test]
+    fn git_path_listing_fails_closed_at_the_path_count_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return;
+        }
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(root.join(name), "export const value = 1;\n").unwrap();
+        }
+        assert!(git(root, &["add", "."]));
+        let mut limits = tiny_scan_limits(1024, 4096);
+        limits.path_count = 2;
+        let error = collect_source_files_with_limits(root, false, limits).unwrap_err();
+        assert!(error.to_string().contains("more than 2 paths"), "{error}");
+    }
+
+    #[test]
+    fn filesystem_fallback_fails_closed_at_depth_and_entry_budgets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("one/two")).unwrap();
+        std::fs::write(tmp.path().join("one/two/deep.ts"), "export const x = 1;\n").unwrap();
+        let mut depth_limits = tiny_scan_limits(1024, 4096);
+        depth_limits.walk_depth = 1;
+        let depth_error =
+            collect_source_files_with_limits(tmp.path(), false, depth_limits).unwrap_err();
+        assert!(
+            depth_error.to_string().contains("depth budget"),
+            "{depth_error}"
+        );
+
+        let entries_tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(entries_tmp.path().join("a.ts"), "export const a = 1;\n").unwrap();
+        std::fs::write(entries_tmp.path().join("b.ts"), "export const b = 1;\n").unwrap();
+        let mut entry_limits = tiny_scan_limits(1024, 4096);
+        entry_limits.walk_entries = 1;
+        let entry_error =
+            collect_source_files_with_limits(entries_tmp.path(), false, entry_limits).unwrap_err();
+        assert!(
+            entry_error.to_string().contains("entry budget"),
+            "{entry_error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_symlink_to_external_source_is_rejected_without_reading_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        if !init_repo(root) {
+            return;
+        }
+        let outside_file = outside.path().join("secret.ts");
+        std::fs::write(&outside_file, "export const leaked = '🚀';\n").unwrap();
+        std::os::unix::fs::symlink(&outside_file, root.join("linked.ts")).unwrap();
+        assert!(git(root, &["add", "linked.ts"]));
+
+        let result = run(&CiOptions {
+            report_only: false,
+            changed_only: false,
+            project_root: root.to_path_buf(),
+        })
+        .unwrap();
+        assert_eq!(result.files_scanned, 0);
+        assert_eq!(result.files_blocked, 0, "external content must not be read");
+        assert_eq!(result.scan_failures, 1);
+        assert!(result.failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_fallback_never_descends_through_directory_symlinks() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            outside.path().join("outside.ts"),
+            "export const x = '🚀';\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("linked-dir")).unwrap();
+
+        let selection =
+            collect_source_files_with_limits(tmp.path(), false, DEFAULT_SCAN_LIMITS).unwrap();
+        assert!(selection.files.is_empty());
+        assert_eq!(selection.scope, CiScanScope::FilesystemFallback);
     }
 }

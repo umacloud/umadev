@@ -160,13 +160,12 @@ impl App {
         true
     }
 
-    /// Refuse an explicit Director execution command while the session is in
-    /// Plan mode. Returns `true` when the command was consumed. This check lives
-    /// on the UI thread so `/run`, `/goal`, and cross-session resume settle before
-    /// task registration, run-lock/branch setup, workflow persistence, or host
-    /// session creation. Ordinary conversation remains available for read-only
-    /// research and planning.
-    pub(super) fn reject_director_execution_in_plan(&mut self) -> bool {
+    /// Refuse a workspace-mutating host action while the session is in Plan
+    /// mode. Returns `true` when the action was consumed. Keeping this check on
+    /// the UI thread means shell helpers, project commands, Director starts, and
+    /// resume paths all settle before they can spawn a process or persist state.
+    /// Ordinary conversation and genuinely read-only inspection stay available.
+    pub(super) fn reject_workspace_mutation_in_plan(&mut self) -> bool {
         if self.effective_trust_mode() != umadev_agent::TrustMode::Plan {
             return false;
         }
@@ -179,6 +178,12 @@ impl App {
             umadev_i18n::t(self.lang, "mode.plan.gate").to_string(),
         );
         true
+    }
+
+    /// Back-compatible name for Director-specific callers. Director execution
+    /// is one member of the same workspace-mutation boundary enforced above.
+    pub(crate) fn reject_director_execution_in_plan(&mut self) -> bool {
+        self.reject_workspace_mutation_in_plan()
     }
 
     /// Route a Git commit operation to the resident host transaction, or reject

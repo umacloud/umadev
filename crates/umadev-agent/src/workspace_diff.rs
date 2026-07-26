@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const DEFAULT_MAX_FILES: usize = 100_000;
+const DEFAULT_MAX_ENTRIES: usize = 200_000;
 const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_DEPTH: usize = 64;
 
@@ -69,6 +70,7 @@ pub enum WorkspaceSnapshotError {
 #[derive(Debug, Clone, Copy)]
 struct SnapshotLimits {
     files: usize,
+    entries: usize,
     bytes: u64,
     depth: usize,
 }
@@ -77,6 +79,7 @@ impl Default for SnapshotLimits {
     fn default() -> Self {
         Self {
             files: DEFAULT_MAX_FILES,
+            entries: DEFAULT_MAX_ENTRIES,
             bytes: DEFAULT_MAX_BYTES,
             depth: DEFAULT_MAX_DEPTH,
         }
@@ -90,6 +93,7 @@ struct SnapshotBuilder<'a> {
     root: &'a Path,
     limits: SnapshotLimits,
     files: usize,
+    visited_entries: usize,
     bytes: u64,
     entries: BTreeMap<String, FileFingerprint>,
 }
@@ -97,9 +101,10 @@ struct SnapshotBuilder<'a> {
 impl WorkspaceBaseline {
     /// Capture the current user-owned workspace tree.
     ///
-    /// The walk is bounded to 100,000 files, 2 GiB of file content, and 64
-    /// directory levels. It never follows symlinks; the link target text itself
-    /// is fingerprinted so replacing a link remains attributable.
+    /// The walk is bounded to 100,000 files, 200,000 directory entries, 2 GiB
+    /// of file content, and 64 directory levels. It never follows symlinks; the
+    /// link target text itself is fingerprinted so replacing a link remains
+    /// attributable.
     pub fn capture(root: &Path) -> Result<Self, WorkspaceSnapshotError> {
         Self::capture_with_limits(root, SnapshotLimits::default())
     }
@@ -108,19 +113,32 @@ impl WorkspaceBaseline {
         root: &Path,
         limits: SnapshotLimits,
     ) -> Result<Self, WorkspaceSnapshotError> {
-        if !root.is_dir() {
+        let root_metadata = std::fs::symlink_metadata(root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                WorkspaceSnapshotError::InvalidRoot(root.display().to_string())
+            } else {
+                WorkspaceSnapshotError::Io {
+                    path: ".".to_string(),
+                    reason: error.to_string(),
+                }
+            }
+        })?;
+        if !root_metadata.file_type().is_dir() || metadata_is_link_like(&root_metadata) {
             return Err(WorkspaceSnapshotError::InvalidRoot(
                 root.display().to_string(),
             ));
         }
+        let canonical_root =
+            std::fs::canonicalize(root).map_err(|error| io_error(root, root, &error))?;
         let mut builder = SnapshotBuilder {
-            root,
+            root: &canonical_root,
             limits,
             files: 0,
+            visited_entries: 0,
             bytes: 0,
             entries: BTreeMap::new(),
         };
-        builder.walk(root, 0)?;
+        builder.walk(&canonical_root, 0)?;
         Ok(Self {
             entries: builder.entries,
             limits,
@@ -147,10 +165,29 @@ impl SnapshotBuilder<'_> {
                 display_relative(self.root, dir)
             )));
         }
-        let mut children = std::fs::read_dir(dir)
-            .map_err(|error| io_error(self.root, dir, &error))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| io_error(self.root, dir, &error))?;
+        let before = safe_directory_metadata(self.root, dir)?;
+        let before_identity =
+            same_file::Handle::from_path(dir).map_err(|error| io_error(self.root, dir, &error))?;
+        let mut children = Vec::new();
+        for child in std::fs::read_dir(dir).map_err(|error| io_error(self.root, dir, &error))? {
+            self.visited_entries = self.visited_entries.saturating_add(1);
+            if self.visited_entries > self.limits.entries {
+                return Err(WorkspaceSnapshotError::Limit(format!(
+                    "directory entry count exceeded {}",
+                    self.limits.entries
+                )));
+            }
+            children.push(child.map_err(|error| io_error(self.root, dir, &error))?);
+        }
+        let after = safe_directory_metadata(self.root, dir)?;
+        let after_identity =
+            same_file::Handle::from_path(dir).map_err(|error| io_error(self.root, dir, &error))?;
+        if before_identity != after_identity || !same_file_snapshot(&before, &after) {
+            return Err(WorkspaceSnapshotError::Io {
+                path: display_relative(self.root, dir),
+                reason: "directory changed while it was enumerated".to_string(),
+            });
+        }
         children.sort_by_key(std::fs::DirEntry::file_name);
         for child in children {
             let path = child.path();
@@ -189,13 +226,46 @@ impl SnapshotBuilder<'_> {
         path: &Path,
         metadata: &std::fs::Metadata,
     ) -> Result<FileFingerprint, WorkspaceSnapshotError> {
-        self.add_bytes(metadata.len())?;
+        if metadata.len() > self.limits.bytes.saturating_sub(self.bytes) {
+            return Err(WorkspaceSnapshotError::Limit(format!(
+                "content exceeded {} bytes",
+                self.limits.bytes
+            )));
+        }
+        let preflight_identity = same_file::Handle::from_path(path)
+            .map_err(|error| io_error(self.root, path, &error))?;
+        let before_open = safe_regular_file_metadata(self.root, path)?;
+        if !same_file_snapshot(metadata, &before_open) {
+            return Err(WorkspaceSnapshotError::Io {
+                path: display_relative(self.root, path),
+                reason: "file changed before it could be opened".to_string(),
+            });
+        }
         let mut hasher = Sha256::new();
         hasher.update(b"f");
-        hash_permissions(&mut hasher, metadata);
+        hash_permissions(&mut hasher, &before_open);
         let mut file =
-            std::fs::File::open(path).map_err(|error| io_error(self.root, path, &error))?;
+            open_file_no_follow(path).map_err(|error| io_error(self.root, path, &error))?;
+        let opened = file
+            .metadata()
+            .map_err(|error| io_error(self.root, path, &error))?;
+        let opened_identity = same_file::Handle::from_file(
+            file.try_clone()
+                .map_err(|error| io_error(self.root, path, &error))?,
+        )
+        .map_err(|error| io_error(self.root, path, &error))?;
+        if !opened.file_type().is_file()
+            || metadata_is_link_like(&opened)
+            || opened_identity != preflight_identity
+            || !same_file_snapshot(&before_open, &opened)
+        {
+            return Err(WorkspaceSnapshotError::Io {
+                path: display_relative(self.root, path),
+                reason: "opened file does not match the preflighted regular file".to_string(),
+            });
+        }
         let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
+        let mut observed = 0_u64;
         loop {
             let read = file
                 .read(&mut buffer)
@@ -203,7 +273,26 @@ impl SnapshotBuilder<'_> {
             if read == 0 {
                 break;
             }
+            let read_bytes = u64::try_from(read).unwrap_or(u64::MAX);
+            observed = observed.saturating_add(read_bytes);
+            self.add_bytes(read_bytes)?;
             hasher.update(&buffer[..read]);
+        }
+        let after_read = file
+            .metadata()
+            .map_err(|error| io_error(self.root, path, &error))?;
+        let current_path = safe_regular_file_metadata(self.root, path)?;
+        let current_identity = same_file::Handle::from_path(path)
+            .map_err(|error| io_error(self.root, path, &error))?;
+        if opened_identity != current_identity
+            || !same_file_snapshot(&opened, &after_read)
+            || !same_file_snapshot(&opened, &current_path)
+            || opened.len() != observed
+        {
+            return Err(WorkspaceSnapshotError::Io {
+                path: display_relative(self.root, path),
+                reason: "file changed while it was fingerprinted".to_string(),
+            });
         }
         Ok(FileFingerprint(hasher.finalize().into()))
     }
@@ -214,6 +303,19 @@ impl SnapshotBuilder<'_> {
         metadata: &std::fs::Metadata,
     ) -> Result<FileFingerprint, WorkspaceSnapshotError> {
         let target = std::fs::read_link(path).map_err(|error| io_error(self.root, path, &error))?;
+        let after =
+            std::fs::symlink_metadata(path).map_err(|error| io_error(self.root, path, &error))?;
+        let confirmed =
+            std::fs::read_link(path).map_err(|error| io_error(self.root, path, &error))?;
+        if !metadata_is_link_like(&after)
+            || !same_file_snapshot(metadata, &after)
+            || target != confirmed
+        {
+            return Err(WorkspaceSnapshotError::Io {
+                path: display_relative(self.root, path),
+                reason: "symlink changed while it was fingerprinted".to_string(),
+            });
+        }
         let target = target.to_str().ok_or_else(|| {
             WorkspaceSnapshotError::NonUtf8Path(display_relative(self.root, path))
         })?;
@@ -235,6 +337,147 @@ impl SnapshotBuilder<'_> {
         }
         Ok(())
     }
+}
+
+fn metadata_is_link_like(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.file_type().is_symlink()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn same_file_snapshot(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && same_permissions(left, right)
+}
+
+#[cfg(unix)]
+fn same_permissions(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    left.permissions().mode() == right.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn same_permissions(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.permissions().readonly() == right.permissions().readonly()
+}
+
+fn safe_path_metadata(
+    root: &Path,
+    path: &Path,
+    want_directory: bool,
+) -> Result<std::fs::Metadata, WorkspaceSnapshotError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| WorkspaceSnapshotError::InvalidRoot(root.display().to_string()))?;
+    let components: Vec<_> = relative.components().collect();
+    if components
+        .iter()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(WorkspaceSnapshotError::Io {
+            path: display_relative(root, path),
+            reason: "path has a non-normal workspace-relative component".to_string(),
+        });
+    }
+
+    let mut current = root.to_path_buf();
+    let mut final_metadata = if components.is_empty() {
+        Some(std::fs::symlink_metadata(root).map_err(|error| io_error(root, root, &error))?)
+    } else {
+        None
+    };
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            unreachable!("workspace-relative components were validated")
+        };
+        current.push(name);
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| io_error(root, &current, &error))?;
+        if metadata_is_link_like(&metadata) {
+            return Err(WorkspaceSnapshotError::Io {
+                path: display_relative(root, &current),
+                reason: "path contains a symlink or reparse point".to_string(),
+            });
+        }
+        if index + 1 == components.len() {
+            final_metadata = Some(metadata);
+        } else if !metadata.file_type().is_dir() {
+            return Err(WorkspaceSnapshotError::Io {
+                path: display_relative(root, &current),
+                reason: "path ancestor is not a directory".to_string(),
+            });
+        }
+    }
+    let metadata = final_metadata.ok_or_else(|| WorkspaceSnapshotError::Io {
+        path: display_relative(root, path),
+        reason: "path metadata is unavailable".to_string(),
+    })?;
+    let expected_type = if want_directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    if !expected_type {
+        return Err(WorkspaceSnapshotError::Io {
+            path: display_relative(root, path),
+            reason: if want_directory {
+                "path is not a real directory".to_string()
+            } else {
+                "path is not a regular file".to_string()
+            },
+        });
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|error| io_error(root, path, &error))?;
+    if !canonical.starts_with(root) {
+        return Err(WorkspaceSnapshotError::Io {
+            path: display_relative(root, path),
+            reason: "path resolves outside the workspace root".to_string(),
+        });
+    }
+    Ok(metadata)
+}
+
+fn safe_directory_metadata(
+    root: &Path,
+    path: &Path,
+) -> Result<std::fs::Metadata, WorkspaceSnapshotError> {
+    safe_path_metadata(root, path, true)
+}
+
+fn safe_regular_file_metadata(
+    root: &Path,
+    path: &Path,
+) -> Result<std::fs::Metadata, WorkspaceSnapshotError> {
+    safe_path_metadata(root, path, false)
+}
+
+fn open_file_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    options.open(path)
 }
 
 fn diff_entries(
@@ -406,6 +649,7 @@ mod tests {
             root.path(),
             SnapshotLimits {
                 files: 1,
+                entries: 10,
                 bytes: 10,
                 depth: 10,
             },
@@ -416,12 +660,32 @@ mod tests {
             root.path(),
             SnapshotLimits {
                 files: 10,
+                entries: 10,
                 bytes: 1,
                 depth: 10,
             },
         )
         .unwrap_err();
         assert!(matches!(byte_error, WorkspaceSnapshotError::Limit(_)));
+    }
+
+    #[test]
+    fn directory_entry_budget_counts_empty_directories_before_collecting_them() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["one", "two", "three"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        let error = WorkspaceBaseline::capture_with_limits(
+            root.path(),
+            SnapshotLimits {
+                files: 10,
+                entries: 2,
+                bytes: 10,
+                depth: 10,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, WorkspaceSnapshotError::Limit(_)));
     }
 
     #[cfg(unix)]
@@ -440,6 +704,22 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         symlink(outside.path().join("b"), &link).unwrap();
         assert_eq!(before.changed_paths(root.path()).unwrap(), ["link"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cannot_be_used_as_the_snapshot_root() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        let alias = parent.path().join("alias");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        assert!(matches!(
+            WorkspaceBaseline::capture(&alias),
+            Err(WorkspaceSnapshotError::InvalidRoot(_))
+        ));
     }
 
     #[test]

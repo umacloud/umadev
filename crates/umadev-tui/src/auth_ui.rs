@@ -8,11 +8,13 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use umadev_host::session_bootstrap::{
     AuthChallenge, AuthControl, AuthControlError, AuthMethodSummary, AuthMode, AuthOffer,
     SafeAuthUrl, SensitiveText, SessionOpenId,
 };
+
+const MAX_MANUAL_CODE_BYTES: usize = 8_192;
 
 /// User command delivered to the one session-opening task that owns a prompt.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -299,6 +301,104 @@ pub(crate) enum AuthUiEffect {
     },
 }
 
+fn set_local_error(app: &mut crate::App, generation: u64, message: String) {
+    if let Some(auth) = app.auth_ui.as_mut() {
+        auth.set_local_error(generation, message);
+    }
+}
+
+fn copy_url(app: &mut crate::App, terminal: &mut crate::Term, generation: u64, url: SafeAuthUrl) {
+    if app
+        .auth_ui
+        .as_ref()
+        .is_none_or(|auth| auth.generation() != generation)
+    {
+        return;
+    }
+    let text = url.reveal().to_string();
+    if !crate::clipboard::copy_text_to_clipboard(app, terminal, &text) {
+        set_local_error(
+            app,
+            generation,
+            umadev_i18n::t(app.lang, "tui.copy_failed").to_string(),
+        );
+        return;
+    }
+    if crate::clipboard::clipboard_is_remote() {
+        app.transient_status = Some(umadev_i18n::t(app.lang, "auth.grok.url_copied").to_string());
+    } else {
+        app.transient_status = None;
+    }
+}
+
+/// Route one authentication-overlay key without adding another branch cluster
+/// to the main terminal event loop.
+pub(crate) fn handle_loop_key(
+    app: &mut crate::App,
+    chat_session_holder: &crate::ChatSessionHolder,
+    terminal: &mut crate::Term,
+    key: KeyEvent,
+) -> bool {
+    if app.auth_ui.is_none()
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return false;
+    }
+
+    let effect = app.auth_ui.as_mut().map_or(AuthUiEffect::None, |auth| {
+        auth.handle_key(key.code, key.modifiers)
+    });
+    match effect {
+        AuthUiEffect::None => {}
+        AuthUiEffect::Authorize {
+            generation,
+            method_id,
+        } => {
+            if !chat_session_holder
+                .auth_interaction
+                .authorize(generation, method_id)
+            {
+                set_local_error(
+                    app,
+                    generation,
+                    "authentication task is no longer available".to_string(),
+                );
+            }
+        }
+        AuthUiEffect::Cancel { generation } => {
+            let _ = chat_session_holder.auth_interaction.cancel(generation);
+            app.auth_ui = None;
+        }
+        AuthUiEffect::OpenUrl { generation, url } => {
+            if let Err(error) = crate::link::spawn_opener(url.reveal()) {
+                set_local_error(
+                    app,
+                    generation,
+                    umadev_i18n::tf(app.lang, "auth.grok.url_open_failed", &[&error.to_string()]),
+                );
+            }
+        }
+        AuthUiEffect::CopyUrl { generation, url } => {
+            copy_url(app, terminal, generation, url);
+        }
+        AuthUiEffect::SubmitCode { generation, code } => {
+            if let Err(error) = chat_session_holder
+                .auth_interaction
+                .submit_code(generation, code)
+            {
+                set_local_error(
+                    app,
+                    generation,
+                    umadev_i18n::tf(app.lang, "auth.grok.code_failed", &[&error.to_string()]),
+                );
+            }
+        }
+    }
+    true
+}
+
 /// Pure renderer/input state for one explicitly user-owned authentication flow.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AuthUiState {
@@ -479,6 +579,10 @@ impl AuthUiState {
             self.error = Some("authentication code cannot contain control characters".to_string());
             return true;
         }
+        if self.manual_code.0.len().saturating_add(text.len()) > MAX_MANUAL_CODE_BYTES {
+            self.error = Some("authentication code exceeds 8192 bytes".to_string());
+            return true;
+        }
         self.manual_code.0.push_str(text);
         self.error = None;
         true
@@ -550,8 +654,18 @@ impl AuthUiState {
                     self.error = None;
                 }
                 KeyCode::Char(character) => {
-                    self.manual_code.0.push(character);
-                    self.error = None;
+                    if self
+                        .manual_code
+                        .0
+                        .len()
+                        .saturating_add(character.len_utf8())
+                        <= MAX_MANUAL_CODE_BYTES
+                    {
+                        self.manual_code.0.push(character);
+                        self.error = None;
+                    } else {
+                        self.error = Some("authentication code exceeds 8192 bytes".to_string());
+                    }
                 }
                 _ => {}
             }
@@ -846,6 +960,28 @@ mod tests {
                 if code.reveal() == "secret-code"
         ));
         assert!(!format!("{state:?}").contains("secret-code"));
+    }
+
+    #[test]
+    fn manual_code_editor_rejects_input_beyond_the_protocol_limit() {
+        let mut state = AuthUiState::new(5, offer());
+        state.apply_event(AuthUiEvent::Starting {
+            generation: 5,
+            attempt_id: SessionOpenId::new(51),
+            method_id: "grok.com".to_string(),
+        });
+        state.apply_event(AuthUiEvent::Challenge {
+            generation: 5,
+            challenge: challenge(51, AuthMode::Loopback),
+        });
+        state.handle_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        state.handle_paste(&"x".repeat(MAX_MANUAL_CODE_BYTES));
+        state.handle_paste("secret-overflow");
+        assert_eq!(state.manual_code.0.len(), MAX_MANUAL_CODE_BYTES);
+        assert!(state.error.as_deref().unwrap().contains("8192"));
+        assert!(!format!("{state:?}").contains("secret-overflow"));
+        state.handle_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(state.manual_code.0.len(), MAX_MANUAL_CODE_BYTES);
     }
 
     #[tokio::test]

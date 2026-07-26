@@ -399,6 +399,13 @@ fn persisted_run_mode_preserves_plan_auto_and_safe_legacy_default() {
         assert_eq!(persisted_run_mode(tmp.path(), TrustMode::Guarded), expected);
     }
 
+    // A currently selected Plan mode is a non-widening ceiling even when the
+    // old workflow was created under Auto.
+    assert_eq!(
+        persisted_run_mode(tmp.path(), TrustMode::Plan),
+        TrustMode::Plan
+    );
+
     // A pre-profile workflow remains readable and resumes conservatively.
     let legacy = r#"{
             "phase": "frontend",
@@ -3660,6 +3667,45 @@ fn resident_route_sandbox_mechanically_follows_final_route_mutability() {
     assert!(!directive.contains("This is read-only"));
 }
 
+#[test]
+fn codex_read_only_sandbox_blocks_only_mutating_writer_routes() {
+    assert!(codex_read_only_sandbox_blocks_route(
+        "codex",
+        false,
+        false,
+        true,
+        "read-only",
+    ));
+    assert!(!codex_read_only_sandbox_blocks_route(
+        "codex",
+        false,
+        false,
+        true,
+        "workspace-write",
+    ));
+    assert!(!codex_read_only_sandbox_blocks_route(
+        "codex",
+        false,
+        true,
+        true,
+        "read-only",
+    ));
+    assert!(!codex_read_only_sandbox_blocks_route(
+        "codex",
+        false,
+        false,
+        false,
+        "read-only",
+    ));
+    assert!(!codex_read_only_sandbox_blocks_route(
+        "claude-code",
+        false,
+        false,
+        true,
+        "read-only",
+    ));
+}
+
 #[tokio::test]
 async fn agentic_failure_fails_open_to_downgrade() {
     // Fail-open: a streaming error must downgrade to a terminal `Failed`
@@ -4426,7 +4472,7 @@ async fn start_preview_server_registers_child_and_take_kills_it() {
     // (exactly what `run()`'s exit cleanup does).
     let (sink, _rx) = ChannelSink::new();
     let sink = Arc::new(sink);
-    let preview: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>> =
+    let preview: std::sync::Arc<std::sync::Mutex<Option<umadev_process::ManagedChild>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     // Retry across ephemeral ports for determinism under parallel tests: a free
     // port (`port_is_free` → we spawn) is found by bind(:0)+drop, but a CONCURRENT
@@ -4459,15 +4505,66 @@ async fn start_preview_server_registers_child_and_take_kills_it() {
         "dev-server child must be parked for exit cleanup"
     );
     // Exit cleanup: take + kill — must not leak.
-    let killed = preview
-        .lock()
-        .unwrap()
-        .take()
-        .is_some_and(|mut c| c.start_kill().is_ok());
+    let killed = preview.lock().unwrap().take().is_some();
     assert!(killed, "the parked child must be killable on exit");
     assert!(
         preview.lock().unwrap().is_none(),
         "the slot is cleared after take()"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn dropping_preview_handle_kills_a_descendant_tree() {
+    fn process_is_running(pid: i32) -> bool {
+        std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|output| {
+                let state = String::from_utf8_lossy(&output.stdout);
+                !state.trim().is_empty() && !state.trim().starts_with('Z')
+            })
+    }
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let leaf_path = tmp.path().join("preview-leaf.pid");
+    let (sink, _rx) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let preview: std::sync::Arc<std::sync::Mutex<Option<umadev_process::ManagedChild>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let url = format!("http://127.0.0.1:{port}");
+    let command = format!(
+        "sleep 30 & leaf=$!; printf '%s' \"$leaf\" > '{}'; wait",
+        leaf_path.display()
+    );
+
+    start_preview_server(&preview, &sink, &url, &command, tmp.path(), false);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let leaf = loop {
+        if let Ok(pid) = std::fs::read_to_string(&leaf_path)
+            .and_then(|body| body.parse::<libc::pid_t>().map_err(std::io::Error::other))
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "preview descendant did not publish its pid"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(process_is_running(leaf));
+
+    drop(preview.lock().unwrap().take());
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while process_is_running(leaf) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !process_is_running(leaf),
+        "dropping the preview owner left descendant {leaf} alive"
     );
 }
 
@@ -4763,6 +4860,110 @@ fn tui_continuous_default_on_with_opt_out() {
     assert!(!tui_continuous_enabled(), "UMADEV_LEGACY_RUN=1 opts out");
 }
 
+#[test]
+fn single_shot_fresh_run_settles_old_review_ledger_before_new_identity() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "pub fn old_run() {}\n").unwrap();
+    let old_options = RunOptions {
+        project_root: tmp.path().to_path_buf(),
+        requirement: "finish the old requirement".into(),
+        slug: "old-run".into(),
+        model: String::new(),
+        backend: "offline".into(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: umadev_agent::TrustMode::Guarded,
+        strict_coverage: false,
+    };
+    let route = umadev_agent::router::for_run(&old_options.requirement);
+    let events: Arc<dyn umadev_agent::EventSink> = Arc::new(umadev_agent::RecordingSink::default());
+    let mut entry = umadev_agent::task_lifecycle::EntryTaskTracker::begin(
+        tmp.path(),
+        "old-single-shot-owner",
+        "resident-edit",
+        &old_options.requirement,
+    )
+    .unwrap();
+    let old_run_id = entry.run_id().to_string();
+    let qc = umadev_agent::PostBuildQcOutcome {
+        reply: String::new(),
+        clean: false,
+        blocking: Vec::new(),
+        operational_unavailable: vec!["review unavailable: timed out".to_string()],
+    };
+    umadev_agent::checkpoint_post_build_review_pause(
+        &old_options,
+        &route,
+        &qc,
+        &events,
+        Some(&old_run_id),
+        None,
+        None,
+    )
+    .unwrap();
+    entry.wait("required reviewer unavailable").unwrap();
+    drop(entry);
+    let ledger_dirs_before = std::fs::read_dir(tmp.path().join(".umadev/agent-tasks"))
+        .unwrap()
+        .count();
+
+    // This is the exact pre-start helper used by Clarify/Initial/Light when the
+    // TUI is running the opt-in single-shot path.
+    settle_operational_review_before_fresh_block(&old_options, false).unwrap();
+    let old_ledger =
+        umadev_agent::task_lifecycle::AgentTaskLedger::open(tmp.path(), &old_run_id).unwrap();
+    assert_eq!(
+        old_ledger.task("entry").map(|task| task.state),
+        Some(umadev_agent::task_lifecycle::AgentTaskState::Cancelled)
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join(".umadev/agent-tasks"))
+            .unwrap()
+            .count(),
+        ledger_dirs_before,
+        "settling the old cursor must not fabricate a replacement ledger"
+    );
+
+    let mut new_options = old_options;
+    new_options.requirement = "build the genuinely new requirement".to_string();
+    AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), new_options)
+        .start()
+        .unwrap();
+    let state = umadev_agent::read_workflow_state(tmp.path()).unwrap();
+    assert_eq!(state.requirement, "build the genuinely new requirement");
+}
+
+#[test]
+fn single_shot_plan_preflight_does_not_consume_an_operational_cursor() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Quality);
+    state.requirement = "old read-only requirement".to_string();
+    state.note = "operational-review-pause:v1:quality (continuous session)".to_string();
+    umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
+    let before = std::fs::read(tmp.path().join(".umadev/workflow-state.json")).unwrap();
+    let options = RunOptions {
+        project_root: tmp.path().to_path_buf(),
+        requirement: "inspect only".into(),
+        slug: "plan".into(),
+        model: String::new(),
+        backend: "offline".into(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: umadev_agent::TrustMode::Plan,
+        strict_coverage: false,
+    };
+
+    settle_operational_review_before_fresh_block(&options, false).unwrap();
+
+    assert_eq!(
+        std::fs::read(tmp.path().join(".umadev/workflow-state.json")).unwrap(),
+        before,
+        "Plan/read-only preflight must perform zero persistence"
+    );
+    assert!(umadev_agent::legacy_operational_review_pending(tmp.path()));
+}
+
 /// Fail-open: when the persistent session can't open (an unknown backend id
 /// → `session_for` errors deterministically, no real base process spawned),
 /// `spawn_continuous_block` emits ONE honest terminal-abort note and the task
@@ -4794,6 +4995,7 @@ async fn continuous_block_fails_open_when_session_cannot_start() {
         holder.clone(),
         umadev_spec::Phase::Research,
         umadev_runtime::BasePermissionProfile::Guarded,
+        false,
     );
     // The task must FINISH (no hang) and not panic.
     handle.await.expect("continuous block task must not panic");
@@ -4817,6 +5019,129 @@ async fn continuous_block_fails_open_when_session_cannot_start() {
         holder.lock().await.is_none(),
         "no session parked after a failed start"
     );
+}
+
+fn seed_resident_review_pause(root: &std::path::Path) -> String {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn delivered() {}\n").unwrap();
+    let options = RunOptions {
+        project_root: root.to_path_buf(),
+        requirement: "finish the parked requirement".into(),
+        slug: "parked".into(),
+        model: String::new(),
+        backend: "claude-code".into(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: umadev_agent::TrustMode::Guarded,
+        strict_coverage: false,
+    };
+    let route = umadev_agent::router::for_run(&options.requirement);
+    let events: Arc<dyn umadev_agent::EventSink> = Arc::new(umadev_agent::RecordingSink::default());
+    let mut entry = umadev_agent::task_lifecycle::EntryTaskTracker::begin(
+        root,
+        "resident-review-owner",
+        "resident-edit",
+        &options.requirement,
+    )
+    .unwrap();
+    let run_id = entry.run_id().to_string();
+    umadev_agent::checkpoint_post_build_review_pause(
+        &options,
+        &route,
+        &umadev_agent::PostBuildQcOutcome {
+            reply: String::new(),
+            clean: false,
+            blocking: Vec::new(),
+            operational_unavailable: vec!["review host timed out".to_string()],
+        },
+        &events,
+        Some(&run_id),
+        None,
+        None,
+    )
+    .unwrap();
+    entry.wait("required reviewer unavailable").unwrap();
+    run_id
+}
+
+#[tokio::test]
+async fn continuous_fresh_run_settles_old_review_before_a_failed_session_start() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let old_run_id = seed_resident_review_pause(tmp.path());
+    let (sink, _rx) = ChannelSink::new();
+    let options = RunOptions {
+        project_root: tmp.path().to_path_buf(),
+        requirement: "new requirement".into(),
+        slug: "new".into(),
+        model: String::new(),
+        backend: "nonexistent-backend".into(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: umadev_agent::TrustMode::Guarded,
+        strict_coverage: false,
+    };
+    spawn_continuous_block(
+        options,
+        Arc::new(sink),
+        Arc::new(tokio::sync::Mutex::new(None)),
+        umadev_spec::Phase::Research,
+        umadev_runtime::BasePermissionProfile::Guarded,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let old_ledger =
+        umadev_agent::task_lifecycle::AgentTaskLedger::open(tmp.path(), &old_run_id).unwrap();
+    assert_eq!(
+        old_ledger.task("entry").map(|task| task.state),
+        Some(umadev_agent::task_lifecycle::AgentTaskState::Cancelled),
+        "fresh settlement happens before the failing session factory"
+    );
+    assert!(!tmp
+        .path()
+        .join(".umadev/director-operational-review.json")
+        .exists());
+}
+
+#[tokio::test]
+async fn continuous_resume_keeps_old_review_when_session_restart_fails() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let old_run_id = seed_resident_review_pause(tmp.path());
+    let (sink, _rx) = ChannelSink::new();
+    let options = RunOptions {
+        project_root: tmp.path().to_path_buf(),
+        requirement: "finish the parked requirement".into(),
+        slug: "parked".into(),
+        model: String::new(),
+        backend: "nonexistent-backend".into(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: umadev_agent::TrustMode::Guarded,
+        strict_coverage: false,
+    };
+    spawn_continuous_block(
+        options,
+        Arc::new(sink),
+        Arc::new(tokio::sync::Mutex::new(None)),
+        umadev_spec::Phase::Quality,
+        umadev_runtime::BasePermissionProfile::Guarded,
+        true,
+    )
+    .await
+    .unwrap();
+
+    let old_ledger =
+        umadev_agent::task_lifecycle::AgentTaskLedger::open(tmp.path(), &old_run_id).unwrap();
+    assert_eq!(
+        old_ledger.task("entry").map(|task| task.state),
+        Some(umadev_agent::task_lifecycle::AgentTaskState::Waiting),
+        "a failed resume must preserve the exact parked owner"
+    );
+    assert!(tmp
+        .path()
+        .join(".umadev/director-operational-review.json")
+        .exists());
 }
 
 /// MEDIUM #7: a director build STARTED from the chat TUI must write the same
@@ -4873,6 +5198,100 @@ async fn tui_director_build_writes_workflow_state_baseline() {
     // It is a fresh run baseline (phase research, no open gate).
     assert_eq!(state.phase, umadev_spec::Phase::Research.id());
     assert!(state.active_gate.is_empty());
+}
+
+#[tokio::test]
+async fn tui_director_terminal_review_preflight_skips_session_factory_and_baseline() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("src/lib.rs"), "pub fn delivered() {}\n").unwrap();
+    let options = RunOptions {
+        project_root: tmp.path().to_path_buf(),
+        requirement: "finish the parked build".into(),
+        slug: "parked".into(),
+        model: String::new(),
+        // If terminal preflight regresses, session_for reaches this deterministic
+        // unknown backend and emits its distinct session-unavailable failure.
+        backend: "nonexistent-backend".into(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: umadev_agent::TrustMode::Guarded,
+        strict_coverage: false,
+    };
+    let route = umadev_agent::router::for_run(&options.requirement);
+    let checkpoint_events: Arc<dyn umadev_agent::EventSink> =
+        Arc::new(umadev_agent::RecordingSink::default());
+    umadev_agent::checkpoint_post_build_review_pause(
+        &options,
+        &route,
+        &umadev_agent::PostBuildQcOutcome {
+            reply: String::new(),
+            clean: false,
+            blocking: Vec::new(),
+            operational_unavailable: vec!["qa reviewer timed out".to_string()],
+        },
+        &checkpoint_events,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let checkpoint_path = tmp.path().join(".umadev/director-operational-review.json");
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+    checkpoint["consecutive_outages"] = serde_json::json!(2);
+    std::fs::write(
+        &checkpoint_path,
+        serde_json::to_vec_pretty(&checkpoint).unwrap(),
+    )
+    .unwrap();
+    let workflow_path = tmp.path().join(".umadev/workflow-state.json");
+    let workflow_before = std::fs::read(&workflow_path).unwrap();
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    Box::pin(run_director_loop(
+        options,
+        Arc::new(sink),
+        route_tx,
+        Arc::new(tokio::sync::Mutex::new(None)),
+        umadev_runtime::BasePermissionProfile::Guarded,
+        Vec::new(),
+        None,
+        false,
+        true,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        Arc::new(std::sync::Mutex::new(None)),
+        Arc::new(std::sync::Mutex::new(None)),
+        None,
+    ))
+    .await;
+
+    let route_decision = route_rx.try_recv();
+    assert!(
+        matches!(
+            &route_decision,
+            Ok(RouteDecision::Failed(reason)) if reason.contains("cannot be continued")
+        ),
+        "terminal route result: {route_decision:?}"
+    );
+    let notes = std::iter::from_fn(|| engine_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            EngineEvent::Note(note) => Some(note),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(notes.contains("cannot be continued"));
+    assert!(
+        !notes.contains("session unavailable") && !notes.contains("nonexistent-backend"),
+        "the terminal preflight must return before constructing a base session: {notes}"
+    );
+    assert_eq!(
+        std::fs::read(&workflow_path).unwrap(),
+        workflow_before,
+        "terminal preflight must not replace the parked run's baseline"
+    );
 }
 
 fn workflow_state_with_session(backend: &str, session_id: &str) -> umadev_agent::WorkflowState {
@@ -5243,11 +5662,10 @@ fn git_branch(root: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A writable legacy route is locked and isolated before streaming. Its first
-/// real file write may then record build truth, but the tool callback never owns
-/// permission or lock acquisition.
+/// A writable legacy route is locked and isolated before streaming. Observing a
+/// write records reality without inflating a QuickEdit into a full Build.
 #[tokio::test]
-async fn prepared_legacy_write_uses_pre_send_isolation_and_records_build_truth() {
+async fn prepared_legacy_quick_edit_stays_proportional_after_a_write() {
     // A committed repo on its default branch — the only state in which
     // `setup_run_isolation` will create + switch to an isolation branch.
     let tmp = init_git_repo();
@@ -5269,7 +5687,7 @@ async fn prepared_legacy_write_uses_pre_send_isolation_and_records_build_truth()
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
     let target = tmp.path().join("src");
     let route = light_default_route();
-    let reactive = Arc::new(ReactiveBuild::new(true, "做一个登录页"));
+    let reactive = Arc::new(ReactiveBuild::new(true, &route));
     let guard = acquire_legacy_pre_send_writer_lock(
         tmp.path(),
         true,
@@ -5316,12 +5734,9 @@ async fn prepared_legacy_write_uses_pre_send_isolation_and_records_build_truth()
     )
     .await;
 
-    // The turn became a build: the terminal decision carries it (→ hand-back).
+    // A write is not permission to override the model-decided QuickEdit lane.
     match route_rx.try_recv() {
-        Ok(RouteDecision::AgenticDone { director_build, .. }) => assert!(
-            director_build,
-            "a chat turn that wrote a file is reactively a build"
-        ),
+        Ok(RouteDecision::AgenticDone { director_build, .. }) => assert!(!director_build),
         other => panic!("expected AgenticDone, got {other:?}"),
     }
     // It was already isolated before streaming; the write lands on that branch.
@@ -5344,7 +5759,7 @@ async fn prepared_legacy_write_uses_pre_send_isolation_and_records_build_truth()
             }
         }
     }
-    assert!(saw_build_note, "the reactive build note was surfaced");
+    assert!(saw_build_note, "the observed-write note was surfaced");
 }
 
 /// A pure chat reply (the base only emits text, never a write) stays a fast,
@@ -5668,14 +6083,15 @@ fn post_turn_git_truth_detects_bash_code_writes_but_not_docs() {
     // appearing in the before/after git delta must still classify the turn as
     // having written files, while a documentation-only delta must not trigger
     // the source-code floor.
+    let root = std::path::Path::new("/workspace");
     let code = vec!["src/generated.rs".to_string()];
-    assert!(wrote_code_files(false, Some(&code)));
+    assert!(wrote_code_files(root, false, Some(&code)));
 
     let docs = vec!["README.md".to_string(), "output/app-prd.md".to_string()];
-    assert!(!wrote_code_files(false, Some(&docs)));
-    assert!(!wrote_code_files(false, Some(&[])));
+    assert!(!wrote_code_files(root, false, Some(&docs)));
+    assert!(!wrote_code_files(root, false, Some(&[])));
     assert!(
-        wrote_code_files(true, Some(&[])),
+        wrote_code_files(root, true, Some(&[])),
         "an explicit non-doc Write/Edit remains the fail-open signal when git cannot show it"
     );
 }
@@ -5688,15 +6104,20 @@ fn post_turn_git_truth_detects_bash_code_writes_but_not_docs() {
 /// (never masks a real build).
 #[test]
 fn doc_artifact_writes_are_not_a_code_build() {
+    let root = std::path::Path::new("/workspace");
     for doc in [
         "output/app-prd.md",
+        "./output/runtime-state.json",
         "output/todo-srs.md",
         ".umadev/coach/CURRENT.md",
+        "./.umadev/session.json",
         "README.md",
         "docs/design.markdown",
         "/abs/path/output/x-uiux.md",
+        "/workspace/output/runtime-state.json",
+        "/workspace/.umadev/session.json",
     ] {
-        assert!(is_doc_artifact_path(doc), "`{doc}` is a doc artifact");
+        assert!(is_doc_artifact_path(root, doc), "`{doc}` is a doc artifact");
     }
     for code in [
         "src/app.ts",
@@ -5705,13 +6126,33 @@ fn doc_artifact_writes_are_not_a_code_build() {
         "index.html",
         "styles.css",
         "server.py",
+        "src/output/generated.rs",
+        "packages/widget/output/index.ts",
+        "packages/widget/.umadev/runtime.json",
+        "../output/escape.json",
+        "/workspace2/output/runtime-state.json",
+        "/workspace/output/../src/generated.rs",
         "", // empty path = treated as code so it NEVER masks a real build
     ] {
         assert!(
-            !is_doc_artifact_path(code),
+            !is_doc_artifact_path(root, code),
             "`{code}` is NOT a doc artifact"
         );
     }
+
+    let windows_root = std::path::Path::new(r"C:\repo");
+    assert!(is_doc_artifact_path(
+        windows_root,
+        r"C:\repo\.umadev\session.json"
+    ));
+    assert!(is_doc_artifact_path(
+        windows_root,
+        r"c:\REPO\output\runtime-state.json"
+    ));
+    assert!(!is_doc_artifact_path(
+        windows_root,
+        r"C:\repo2\output\runtime-state.json"
+    ));
 }
 
 /// Reactive build is OPT-IN per turn: with `reactive: None` (the explicit `/run`
@@ -8542,21 +8983,13 @@ async fn resident_reactive_build_completes_as_director_build_and_settles_ledger(
 }
 
 #[tokio::test]
-async fn resident_required_review_outage_pauses_without_success_repair_or_repeat() {
+async fn resident_fallback_build_review_outage_pauses_without_repair_or_repeat() {
     let _qc = ReactiveQcOverride::force(true);
     let tmp = tempfile::TempDir::new().unwrap();
-    let requirement = "完善大型企业级 SaaS 登录系统，包含前后端、安全校验和自动化测试".to_string();
+    let requirement =
+        "做一个完整的大型企业级 SaaS 登录系统，包含前后端、安全校验和自动化测试".to_string();
     let route_reply = vec![
-        umadev_runtime::SessionEvent::TextDelta(
-            serde_json::json!({
-                "class": "quick_edit",
-                "authorization": "mutating",
-                "kind": "light",
-                "complexity": "simple",
-                "confidence": 0.99
-            })
-            .to_string(),
-        ),
+        umadev_runtime::SessionEvent::TextDelta("intent unavailable".into()),
         umadev_runtime::SessionEvent::TurnDone {
             status: umadev_runtime::TurnStatus::Completed,
             usage: None,
@@ -8642,10 +9075,80 @@ async fn resident_required_review_outage_pauses_without_success_repair_or_repeat
 }
 
 #[tokio::test]
+async fn resident_brain_quick_edit_never_launches_team_qc_after_writing() {
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let route_reply = vec![
+        umadev_runtime::SessionEvent::TextDelta(
+            serde_json::json!({
+                "class": "quick_edit",
+                "authorization": "mutating",
+                "kind": "light",
+                "complexity": "simple",
+                "confidence": 0.99
+            })
+            .to_string(),
+        ),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let (intent, _intent_sent, _intent_ended) = FakeChatSession::new(vec![route_reply]);
+    let (writer, writer_sent, writer_ended) =
+        FakeChatSession::new(vec![write_tool_turn("src/lib.rs")]);
+    let target = tmp.path().join("src/lib.rs");
+    let writer = writer
+        .with_fork(Box::new(intent))
+        .with_send_effect(move || {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, "pub fn login() -> bool { true }\n").unwrap();
+        });
+    let chat_holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = chat_turn(
+        "修复登录校验里的一个小问题",
+        chat_holder.clone(),
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    let director_holder = turn.director_session_holder.clone();
+
+    drive_chat_session_turn(turn).await;
+
+    let routes = std::iter::from_fn(|| route_rx.try_recv().ok()).collect::<Vec<_>>();
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(routes.iter().any(|route| matches!(
+        route,
+        RouteDecision::AgenticDone {
+            director_build: false,
+            ..
+        }
+    )));
+    assert!(!routes.iter().any(|route| matches!(
+        route,
+        RouteDecision::RunPausedAtOperational { .. } | RouteDecision::Failed(_)
+    )));
+    assert!(!ran_governance_qc(&events), "{events:?}");
+    assert!(events.iter().any(
+        |event| matches!(event, EngineEvent::IntentDecided { class, .. } if class == "quick_edit")
+    ));
+    assert!(!saw_build_intent_card(&events));
+    assert_eq!(writer_sent.lock().unwrap().len(), 1);
+    assert!(!writer_ended.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(chat_holder.lock().await.is_some());
+    assert!(director_holder.lock().await.is_none());
+}
+
+#[tokio::test]
 async fn resident_claimed_build_without_write_fires_source_hardgate() {
     // H3: a base that CLAIMS a full build ("Done — I implemented …") but writes NOTHING
     // must be caught by the objective source-present hard-gate, not passed on an advisory
-    // line. No write leaves `became_build` false, but the build-SHAPED detection still arms
+    // line. No write is observed, but the Build-shaped route still arms
     // the gate; with ZERO real source on disk plus a reply that claims code, the
     // terminal-abort note FIRES.
     let tmp = tempfile::TempDir::new().unwrap();

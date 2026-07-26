@@ -336,7 +336,7 @@ fn opencode_config_values(
 }
 
 fn json_value(path: &std::path::Path) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = config::read_user_config(path).ok()?;
     json_text_value(&text)
 }
 
@@ -577,7 +577,7 @@ fn remove_json_trailing_commas(text: &str) -> String {
 
 /// Read a root string field from a TOML config file (fail-open `None`).
 fn toml_top_string(path: &std::path::Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = config::read_user_config(path).ok()?;
     let v: toml::Value = toml::from_str(&text).ok()?;
     v.get(key)?.as_str().map(str::to_string)
 }
@@ -594,7 +594,7 @@ fn kimi_config(home: Option<&std::path::Path>) -> Option<toml::Value> {
         .map(PathBuf::from)
         .or_else(|| home.map(|home| home.join(".kimi-code")))?
         .join("config.toml");
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = config::read_user_config(&path).ok()?;
     toml::from_str(&text).ok()
 }
 
@@ -613,7 +613,7 @@ fn grok_config(
     candidates
         .into_iter()
         .flatten()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .filter_map(|path| config::read_user_config(&path).ok())
         .find_map(|text| toml::from_str::<toml::Value>(&text).ok())
 }
 

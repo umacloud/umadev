@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 
 use crate::redaction::redact_text;
@@ -35,6 +35,7 @@ const MAX_LINES: usize = 20;
 /// first evicts the oldest line). ~4 KB is plenty for a base's error banner
 /// while staying a hard cap on memory.
 const MAX_BYTES: usize = 4 * 1024;
+const OVERSIZE_LINE_MARKER: &str = "[stderr line omitted: exceeded 4096-byte safety limit]";
 
 const DRAIN_SHUTDOWN_BUDGET: Duration = Duration::from_millis(250);
 
@@ -179,22 +180,46 @@ pub async fn drain_stderr_into<R>(stderr: R, tail: StderrTail)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut reader = BufReader::new(stderr);
-    let mut buf = Vec::new();
-    // read_until + from_utf8_lossy (NOT `.lines()`): Lines::next_line() returns Err on the
-    // FIRST non-UTF-8 byte and ends the drain FOR GOOD - a base emitting a locale-encoded
-    // path or binary noise on stderr would then stop being drained and could backpressure
-    // (a full pipe blocks the base stderr write -> stall). The stdout readers were already
-    // hardened this way; the shared stderr drain was not. Lossy decoding tolerates any bytes.
+    let mut reader = stderr;
+    let mut line_tail = umadev_process::BoundedTail::new(MAX_BYTES);
+    let mut chunk = [0_u8; 8192];
+    // Fixed-size reads + a bounded current-line tail preserve lossy decoding
+    // without `read_until`'s hidden unbounded Vec growth. We always keep reading
+    // after the tail fills so stderr can never backpressure the base.
     loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
-            // 0 bytes = EOF; an Err = the pipe is gone - either way, stop draining.
+        let read = match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(_) => {
-                let line = String::from_utf8_lossy(&buf);
-                tail.push(line.trim_end_matches(['\n', '\r']));
+            Ok(read) => read,
+        };
+        let mut start = 0;
+        for (index, byte) in chunk[..read].iter().enumerate() {
+            if *byte == b'\n' {
+                line_tail.push(&chunk[start..index]);
+                if line_tail.truncated() {
+                    // Redaction needs the line's identifying prefix. Keeping
+                    // only a bounded suffix first could discard
+                    // `Authorization: Bearer` and then persist the secret tail
+                    // verbatim, so suppress an oversize line as a unit.
+                    tail.push(OVERSIZE_LINE_MARKER);
+                } else {
+                    let bytes = line_tail.clone().into_bytes();
+                    let line = String::from_utf8_lossy(&bytes);
+                    tail.push(line.trim_end_matches('\r'));
+                }
+                line_tail.clear();
+                start = index + 1;
             }
+        }
+        line_tail.push(&chunk[start..read]);
+    }
+    // Match `read_until` semantics for a final unterminated line.
+    if line_tail.total_seen() > 0 {
+        if line_tail.truncated() {
+            tail.push(OVERSIZE_LINE_MARKER);
+        } else {
+            let bytes = line_tail.into_bytes();
+            let line = String::from_utf8_lossy(&bytes);
+            tail.push(line.trim_end_matches('\r'));
         }
     }
 }
@@ -316,6 +341,31 @@ mod tests {
         let snap = tail.snapshot().unwrap();
         assert!(snap.contains("err line one"));
         assert!(snap.contains("err line two"));
+    }
+
+    #[tokio::test]
+    async fn newline_free_oversize_stderr_is_safely_suppressed() {
+        let mut data = vec![b'x'; MAX_BYTES * 64];
+        data.extend_from_slice(b"TAIL-SENTINEL");
+        let tail = StderrTail::new();
+        drain_stderr_into(data.as_slice(), tail.clone()).await;
+        let snapshot = tail.snapshot().unwrap();
+        assert_eq!(snapshot, OVERSIZE_LINE_MARKER);
+        assert!(!snapshot.contains("TAIL-SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn oversize_bearer_line_cannot_leak_after_prefix_eviction() {
+        const SECRET_SUFFIX: &str = "SYNTH_LONG_BEARER_SECRET_SUFFIX_7F92";
+        let mut data = b"Authorization: Bearer ".to_vec();
+        data.extend(std::iter::repeat_n(b's', MAX_BYTES * 4));
+        data.extend_from_slice(SECRET_SUFFIX.as_bytes());
+        data.push(b'\n');
+        let tail = StderrTail::new();
+        drain_stderr_into(data.as_slice(), tail.clone()).await;
+        let snapshot = tail.snapshot().expect("oversize marker");
+        assert_eq!(snapshot, OVERSIZE_LINE_MARKER);
+        assert!(!snapshot.contains(SECRET_SUFFIX));
     }
 
     #[tokio::test]

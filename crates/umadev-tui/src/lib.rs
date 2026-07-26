@@ -46,11 +46,13 @@ mod host_git;
 pub mod input;
 mod interaction_bridge;
 pub mod link;
+mod local_command;
 mod preview;
 mod prompt_queue_ui;
 mod resident_host_git;
 mod resident_turn_support;
 mod route_decision;
+mod run_options;
 pub mod selection;
 mod session_slot;
 mod tool_effects;
@@ -96,14 +98,17 @@ use umadev_runtime::{
     SteerSemantics, ToolActivity, TurnInput, TurnInputBlock,
 };
 
+use crate::app::permissions::codex_read_only_sandbox_blocks_route;
 use crate::app::{Action, App, CompactionJob, FailedRouteOrigin, ResidentDispatch, SubmittedTurn};
 use crate::background_process_control::{
     spawn_background_process_control, BackgroundProcessRequest,
 };
 use crate::base_session_config::spawn_thinking_change;
-use crate::clipboard::{clipboard_in_tmux, clipboard_is_remote, copy_to_clipboard_native};
+use crate::clipboard::finish_mouse_selection_copy;
+#[cfg(test)]
+use crate::execution_postcondition::changed_files_between;
 use crate::execution_postcondition::{
-    agentic_fact_line, changed_files_between, git_status_porcelain, porcelain_path,
+    agentic_fact_line, changed_files_after_git_status, git_status_porcelain_bounded,
     ResidentExecutionPostcondition,
 };
 use crate::input::InputSource;
@@ -120,6 +125,7 @@ use crate::interaction_bridge::{
     clear_pending_host_input_if, live_trust_tier, parse_host_input_response,
     parse_user_input_response, trust_from_u8, trust_to_u8, PendingApproval, PendingHostInput,
 };
+use crate::local_command::LocalCommandRequest;
 use crate::preview::start_preview_server;
 #[cfg(test)]
 use crate::preview::{parse_run_command, port_is_free, url_host_port, wait_for_port};
@@ -129,6 +135,10 @@ use crate::resident_turn_support::{
     routed_turn_executes_read_only, select_resident_turn_payload,
 };
 use crate::route_decision::RouteDecision;
+use crate::run_options::{
+    current_run_options, persisted_run_mode, resume_run_options,
+    settle_operational_review_before_fresh_block, start_failed_note,
+};
 use crate::session_slot::{
     build_cold_judge_driver, build_host_driver, PermissionedSession, SessionHolder, SessionIdentity,
 };
@@ -170,23 +180,18 @@ impl LaunchOptions {
 /// Scope guard that kills the preview dev server on EVERY exit path from
 /// [`run`] — a clean return, an error propagated out of the event loop, AND a
 /// panic unwind (`panic = "unwind"` runs destructors). The dev server is
-/// setsid-detached (see [`preview::start_preview_server`]), so the whole
-/// process GROUP is killed — a bare `Child` drop (even with `kill_on_drop`)
-/// would reap only the direct wrapper and LEAK the real node/vite grandchild
-/// holding the port. Fail-open: a poisoned lock / empty handle is a no-op, and
-/// every kill is best-effort. Holds an `Arc` clone of `App::preview_server`, so
-/// draining it here also empties the app's handle (no double-kill).
+/// owned by a [`umadev_process::ManagedChild`], whose Drop terminates its whole
+/// Unix group / Windows Job Object and schedules a bounded direct-child reap.
+/// Holds an `Arc` clone of `App::preview_server`, so draining it here also
+/// empties the app's handle (no double-kill).
 struct PreviewServerGuard {
-    handle: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>>,
+    handle: std::sync::Arc<std::sync::Mutex<Option<umadev_process::ManagedChild>>>,
 }
 
 impl Drop for PreviewServerGuard {
     fn drop(&mut self) {
         if let Ok(mut g) = self.handle.lock() {
-            if let Some(mut child) = g.take() {
-                let _ = umadev_agent::kill_process_group(&child);
-                let _ = child.start_kill();
-            }
+            drop(g.take());
         }
     }
 }
@@ -246,16 +251,18 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     // exit below.
     set_terminal_title(app.backend.as_deref().unwrap_or("offline"));
     let result = event_loop(&mut terminal, &mut app, opts, win_console_guard.as_ref()).await;
+    clipboard::shutdown_clipboard_workers();
     clipboard_image::cleanup_old(&app.project_root);
-    // Graceful cleanup: kill any preview dev server the user started via
-    // /preview, so quitting UmaDev never leaves an orphaned process. Kill the whole
-    // process GROUP — the dev server (npm/pnpm) forks the real node/vite server as a
-    // grandchild that a bare start_kill would leave holding the port.
-    if let Ok(mut g) = app.preview_server.lock() {
-        if let Some(mut child) = g.take() {
-            let _ = umadev_agent::kill_process_group(&child);
-            let _ = child.start_kill();
-        }
+    // Graceful cleanup spends a fixed budget reaping the direct child after the
+    // managed handle terminates its whole group/job. The scope guard remains the
+    // cancellation/panic backstop when this async tail is not reached.
+    let preview_child = app
+        .preview_server
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(mut child) = preview_child {
+        let _ = child.terminate_and_reap(Duration::from_secs(1)).await;
     }
     restore_terminal(&mut terminal);
     if let Some(guard) = win_console_guard.as_ref() {
@@ -885,30 +892,30 @@ fn finalize_build_completion(app: &mut App, sink: &Arc<ChannelSink>) {
     }
 }
 
-/// Build the user-facing note for a failed `runner.start()`.
-///
-/// `WouldBlock` is NOT a hard error: it means THIS session already holds the
-/// run lock (the previous run is still finishing up its drop). Re-launching the
-/// run a beat later succeeds, so we surface a retriable hint instead of the
-/// generic `pipeline.start_failed` shout — the lock guard from the just-aborted
-/// run just hasn't been dropped yet.
-fn start_failed_note(e: &std::io::Error) -> String {
-    if e.kind() == std::io::ErrorKind::WouldBlock {
-        umadev_i18n::tl("run.busy_reopen").to_string()
-    } else {
-        umadev_i18n::tlf("pipeline.start_failed", &[&e.to_string()])
-    }
-}
-
 fn spawn_block(
     options: RunOptions,
     spec: BrainSpec,
     sink: Arc<ChannelSink>,
     block: Block,
+    resume_existing_state: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Some(note) = resident_host_git::replay_note(&options.requirement) {
             sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{note}")));
+            return;
+        }
+        // Settle a parked review against the OLD workflow identity before a
+        // genuinely fresh single-shot run can replace workflow-state.json.
+        // Resume/revise/redo paths preserve their cursor, and Plan mode remains
+        // read-only. This ordering prevents an orphaned Waiting ledger when the
+        // user switches from Director/continuous to the offline single-shot
+        // engine for the next explicit requirement.
+        if let Err(error) =
+            settle_operational_review_before_fresh_block(&options, resume_existing_state)
+        {
+            sink.emit(EngineEvent::Note(format!(
+                "{ABORT_SENTINEL}parked operational review could not be superseded: {error}"
+            )));
             return;
         }
         let label = spec.label();
@@ -1371,6 +1378,7 @@ fn spawn_continuous_block(
     holder: SessionHolder,
     start_after: umadev_spec::Phase,
     permissions: umadev_runtime::BasePermissionProfile,
+    resume_existing_state: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Some(note) = resident_host_git::replay_note(&options.requirement) {
@@ -1380,6 +1388,28 @@ fn spawn_continuous_block(
         let backend = options.backend.clone();
         let model = options.model.clone();
         let root = options.project_root.clone();
+        // Fresh-run settlement belongs to the OLD workflow identity and must
+        // precede even resident identity canonicalization or base login/ACP
+        // startup. Otherwise an unavailable backend leaves the old reviewer
+        // cursor and Waiting entry orphaned. Resume preserves that cursor; Plan
+        // mode is a no-session, zero-persistence ceiling.
+        if !options.mode.executes() {
+            sink.emit(EngineEvent::Note(
+                umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
+            ));
+            return;
+        }
+        if !resume_existing_state {
+            if let Err(error) = umadev_agent::cancel_operational_review_pause(
+                &root,
+                "superseded by an explicitly fresh run",
+            ) {
+                sink.emit(EngineEvent::Note(format!(
+                    "{ABORT_SENTINEL}parked operational review could not be superseded: {error}"
+                )));
+                return;
+            }
+        }
         let Some(session_identity) = SessionIdentity::for_launch(&backend, &root, permissions)
         else {
             sink.emit(EngineEvent::Note(format!(
@@ -1441,13 +1471,20 @@ fn spawn_continuous_block(
         // owns the single-writer run lock + the deterministic moat.
         let runner = AgentRunner::new(OfflineRuntime::new(RuntimeKind::Anthropic), options)
             .with_event_sink(sink.clone());
-        if let Err(e) = runner.start() {
-            sink.emit(EngineEvent::Note(format!(
-                "{ABORT_SENTINEL}{}",
-                start_failed_note(&e)
-            )));
-            let _ = session.end().await;
-            return;
+        // `start()` creates a NEW workflow state and therefore deliberately
+        // clears a terminal legacy review circuit for an explicit fresh `/run`.
+        // A `/continue`/gate resume must preserve the existing state: overwriting
+        // it here used to erase the operational-review cursor immediately before
+        // `run_block` tried to consume it, causing source work to restart.
+        if !resume_existing_state {
+            if let Err(e) = runner.start() {
+                sink.emit(EngineEvent::Note(format!(
+                    "{ABORT_SENTINEL}{}",
+                    start_failed_note(&e)
+                )));
+                let _ = session.end().await;
+                return;
+            }
         }
 
         match runner
@@ -1588,19 +1625,8 @@ fn surface_unsent_steer(app: &mut App, steer: &umadev_agent::SteerIntake) {
     app.surface_unsent_steer(leftover);
 }
 
-/// Resume a DIRECTOR build parked at a spec-MUST confirmation gate (A1-GAP1) —
-/// the approval (`c` / `/continue` / a picker Approve) and the free-text revision
-/// both land here. Re-attaches to the persisted `.umadev/plan.json` via
-/// `drive_director_loop_resume` on a fresh session (the persisted base session id
-/// restores the base's own context), driving ONLY the remaining steps — the
-/// already-`Done` doc/frontend steps are never re-run, and the transition-
-/// triggered gate check cannot re-fire for them.
-///
-/// `gate_revision` carries a revision typed at the gate: it is folded into the
-/// resumed run as a steering directive the loop drains at the next step boundary
-/// (`umadev_agent::interaction`), so the feedback is honoured in-context instead
-/// of restarting the producing block. Mirrors the `/run` arm's app-state setup
-/// (thinking flags, task registry, requirement recovery) exactly.
+/// Resume a Director from its persisted gate without re-running completed steps.
+/// Optional revision text enters durable memory and the next steering boundary.
 #[allow(clippy::too_many_arguments)]
 fn resume_director_after_gate(
     app: &mut App,
@@ -1613,6 +1639,9 @@ fn resume_director_after_gate(
     host_input_holder: &HostInputHolder,
     gate_revision: Option<(Gate, String)>,
 ) -> tokio::task::JoinHandle<()> {
+    if app.reject_director_execution_in_plan() {
+        return tokio::spawn(async {});
+    }
     let replay_requirement = app.resume_run_requirement();
     if app.reject_replayed_host_git_operation(&replay_requirement) {
         return tokio::spawn(async {});
@@ -1877,42 +1906,20 @@ fn route_floor_options(
     }
 }
 
-/// Reactive write-truth context for the resident/legacy streaming lanes. The model
-/// decides intent before execution; this observer remains a defence-in-depth fact
-/// signal when a base writes despite a lighter route or when the model consult was
-/// unavailable. `None` disables the reaction on explicit director paths.
-///
-/// Resident sessions that are actually write-capable acquire the writer lock and
-/// isolate before their input is sent; mechanically read-only Chat/Explain sessions
-/// do neither. A writable legacy streaming turn follows the same pre-send
-/// barrier; its callback only records an already-authorized write and never
-/// attempts late lock acquisition. The first observed `Write`/`Edit` then only
-/// flips the turn into a build and surfaces the intent card.
-/// Idempotent: `reacted` latches after the first write.
+/// Write-truth context for resident/legacy turns. Intent remains the model's
+/// proportional route; observing a write never upgrades QuickEdit/Debug to Build.
 struct ReactiveBuild {
     /// Whether a real **host CLI** drives this turn — only a host build mutates a
     /// workspace the lock/isolation protect (an offline turn writes nothing real).
     /// The whole reaction no-ops when this is false (mirrors the `director_build &&
     /// host_cli` gate the up-front `/run` lock uses).
     host_cli: bool,
-    /// The Build-shaped route to SHOW (and, when the reactive QC is enabled, to size the
-    /// critic roster from) once a real write promotes this chat turn to a build. Derived
-    /// ONCE at construction from the requirement via [`umadev_agent::router::for_run`], so
-    /// the intent card + the reactive governance QC reflect the build the base actually
-    /// started rather than the QuickEdit/Chat seed the turn opened on (Stage A / A3). A
-    /// write proves that work happened; the ORIGINAL route class is deliberately NOT
-    /// carried here — the completion semantics (`director_build`) stay a separate fact, so
-    /// a QuickEdit that writes still does not receive the full-build completion card.
-    /// Deterministic + cheap (no fork, no I/O).
-    build_card_route: RoutePlan,
-    /// Latched the first time a write tool is seen, so the build fact and intent
-    /// card fire exactly once for the rest of the turn.
+    /// Model/fallback route fixed before the writer received the request.
+    intent_route: RoutePlan,
+    /// Latched so the write fact and intent card fire once.
     reacted: std::sync::atomic::AtomicBool,
-    /// Set true once a write was observed — read after the stream to carry
-    /// `director_build: true` on the terminal `AgenticDone` (drives the Wave-5
-    /// session hand-back + the objective source-present hard-gate, exactly as a
-    /// pre-classified build would).
-    became_build: std::sync::atomic::AtomicBool,
+    /// Objective write observation; deliberately distinct from full-build intent.
+    observed_code_write: std::sync::atomic::AtomicBool,
     /// The actual resident session is write-capable and its run-lock, isolation,
     /// and filesystem baseline were established before `send_turn`.
     prepared: std::sync::atomic::AtomicBool,
@@ -1922,16 +1929,12 @@ struct ReactiveBuild {
 }
 
 impl ReactiveBuild {
-    /// A fresh, un-triggered reactive context for a host-or-not chat turn. `requirement`
-    /// is the user's message this turn; it seeds the Build-shaped [`Self::build_card_route`]
-    /// (via [`umadev_agent::router::for_run`]) that the promotion surfaces once a real
-    /// write is observed.
-    fn new(host_cli: bool, requirement: &str) -> Self {
+    fn new(host_cli: bool, route: &RoutePlan) -> Self {
         Self {
             host_cli,
-            build_card_route: umadev_agent::router::for_run(requirement),
+            intent_route: route.clone(),
             reacted: std::sync::atomic::AtomicBool::new(false),
-            became_build: std::sync::atomic::AtomicBool::new(false),
+            observed_code_write: std::sync::atomic::AtomicBool::new(false),
             prepared: std::sync::atomic::AtomicBool::new(false),
             lock: std::sync::Mutex::new(None),
         }
@@ -2003,32 +2006,8 @@ fn native_command_postcondition_route() -> RoutePlan {
     }
 }
 
-/// Whether the STAGE A reactive governance QC (A2) is enabled for this turn — the
-/// `UMADEV_REACTIVE_QC` kill switch.
-///
-/// A resident turn that was not promoted into the Director (for example an
-/// availability fallback or a fast route) may still write real code. That observed
-/// build should earn the same flagship team QC an explicit `/run` gets, so this
-/// defaults **ON**. The kill switch is a VALUE parse
-/// ([`reactive_qc_from_env_value`]) mirroring the shape of
-/// [`umadev_agent::continuous::legacy_pipeline_from_env`]: only an explicit
-/// `0` / `false` / `off` disables it; unset (or anything else) leaves it on. A bare
-/// `UMADEV_REACTIVE_QC=0` therefore DISABLES it, which the previous presence-only
-/// check did not.
-///
-/// Defaulting ON is stall-safe on the resident chat path: `run_post_build_qc` is
-/// bounded (a fixed QC-round cap + the sliding wall-clock `run_budget` deadline + a
-/// hard absolute ceiling + a stuck-loop detector) and fail-open on a dead/hung base,
-/// so it can never wedge the resident chat surface — verified against
-/// `umadev_agent::run_post_build_qc` → `run_final_gate`.
-///
-/// In test builds a per-thread override takes precedence ([`set_reactive_qc_override`])
-/// so a test toggles the flag deterministically WITHOUT mutating the process-global
-/// env (which would leak into concurrently-running resident-write tests). With no
-/// override AND no explicit env value, test builds stay OFF so the large scripted
-/// resident-write suite that never opts in remains cheap and deterministic; an
-/// explicit env value is still honored through the SAME value-parse, so the
-/// kill-switch wiring stays covered.
+/// Whether a fallback Build receives bounded flagship QC. QuickEdit/Debug never
+/// consult this switch; their targeted verification remains proportional.
 fn reactive_qc_enabled() -> bool {
     #[cfg(test)]
     if let Some(forced) = REACTIVE_QC_OVERRIDE.with(std::cell::Cell::get) {
@@ -2088,37 +2067,83 @@ fn should_run_flagship_qc(route: &RoutePlan) -> bool {
 /// edit files without ever producing one of those tool names. The before/after git
 /// snapshots close that gap. Documentation-only paths deliberately do not count as
 /// a *code* write, so a PRD/README turn never trips the source-code hard gate.
-fn wrote_code_files(explicit_code_write: bool, changed: Option<&[String]>) -> bool {
+fn wrote_code_files(
+    project_root: &std::path::Path,
+    explicit_code_write: bool,
+    changed: Option<&[String]>,
+) -> bool {
     explicit_code_write
         || changed.is_some_and(|files| {
             files
                 .iter()
-                .any(|path| !is_doc_artifact_path(path.as_str()))
+                .any(|path| !is_doc_artifact_path(project_root, path.as_str()))
         })
 }
 
-/// Whether a written file path is a DOCUMENTATION artifact (a planning doc / spec /
-/// markdown), NOT source code — so writing it must NOT flip a light chat turn into a
-/// code BUILD. Writing the PRD / architecture / UIUX / SRS under `output/`, a
-/// `.umadev/` internal, or any markdown doc is legitimate PRE-development work
-/// (research / docs / spec, before the user's go-ahead to build); flipping it to a
-/// build runs the source-present CODE floor, which then falsely fails a deliberately
-/// code-free docs turn with "claimed done but no source" — the reported spec-phase
-/// misjudgement. A subsequent REAL code write on the same turn still flips it (the
-/// one-shot latch is armed on the first NON-doc write). Conservative: only the clear
-/// doc surfaces count; an empty or unrecognised path is treated as code (never masks
-/// a real build). Does NOT touch the honesty floor itself — it only stops a pure-docs
-/// turn from being mislabelled a build in the first place.
-fn is_doc_artifact_path(path: &str) -> bool {
-    let p = path.trim().replace('\\', "/").to_ascii_lowercase();
+/// Classify markdown and UmaDev's root-level `output/` / `.umadev/` artifacts as
+/// documentation. Unknown paths remain code so this helper cannot hide a real write.
+/// Absolute tool paths are first reduced against the actual workspace root.
+fn is_doc_artifact_path(project_root: &std::path::Path, path: &str) -> bool {
+    let path = path.trim().replace('\\', "/");
+    if std::path::Path::new(&path.to_ascii_lowercase())
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "md" | "markdown"))
+    {
+        return true;
+    }
+    let root = project_root.to_string_lossy().replace('\\', "/");
+    let absolute_like = |value: &str| {
+        value.starts_with('/')
+            || (value.as_bytes().get(1) == Some(&b':') && value.as_bytes().get(2) == Some(&b'/'))
+    };
+    let relative = if absolute_like(&path) {
+        let root = root.trim_end_matches('/');
+        let case_insensitive =
+            path.as_bytes().get(1) == Some(&b':') || root.as_bytes().get(1) == Some(&b':');
+        let matches_root = if case_insensitive {
+            path.get(..root.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(root))
+        } else {
+            path.starts_with(root)
+        };
+        if !matches_root
+            || path
+                .as_bytes()
+                .get(root.len())
+                .is_some_and(|next| *next != b'/')
+        {
+            return false;
+        }
+        path.get(root.len()..)
+            .unwrap_or_default()
+            .trim_start_matches('/')
+    } else {
+        path.as_str()
+    };
+    let mut components = Vec::new();
+    for component in relative.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.pop().is_none() {
+                    return false;
+                }
+            }
+            value => components.push(value),
+        }
+    }
+    let normalized = components.join("/").to_ascii_lowercase();
+    let p = normalized.as_str();
     if p.is_empty() {
         return false;
     }
-    if p.contains("output/") || p.contains(".umadev/") {
+    // Only the first workspace-relative component is managed; `src/output/` is code.
+    if matches!(p, "output" | ".umadev") || p.starts_with("output/") || p.starts_with(".umadev/") {
         return true;
     }
     // Extension via `Path` (p is already lower-cased) — markdown is docs, not code.
-    std::path::Path::new(&p)
+    std::path::Path::new(p)
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| matches!(e, "md" | "markdown"))
@@ -2128,20 +2153,8 @@ fn is_doc_artifact_path(path: &str) -> bool {
 /// Writable resident sessions acquire and park their guard before `send_input`;
 /// this observer only records the first write and rejects an impossible unprepared
 /// event. Legacy streaming callbacks have a distinct pre-action helper below.
-/// Begin the durable writer ledger for a reactive build on its FIRST observed write
-/// (M4). The up-front [`umadev_agent::task_lifecycle::EntryTaskTracker::begin`] sits
-/// behind `route.class.mutates_workspace()`, which the read-only Explain seed the
-/// resident chat opens on never satisfies — so an implicit build (chat seed, base wrote
-/// real code) would otherwise stay untracked and skip the durable settlement, leaving a
-/// crash mid-write with no in-progress record. This mirrors the mutating-route scope,
-/// keyed off the OBSERVED build (`became_build`, set by [`react_to_first_write`] only for
-/// a real host build), exactly once (`entry_task` still `None`).
-///
-/// **Fail-open by contract**, like the rest of the reaction: a native command, an already
-/// open tracker, a not-yet-observed build, or a ledger that will not open all leave the
-/// tracker untouched and the turn running in place — never the up-front path's hard abort
-/// (a chat-build losing its ledger is better finished than killed). Extracted so the hot
-/// stream loop stays flat (no added control-flow nesting).
+/// Begin the durable writer ledger on the first observed write when an older path
+/// did not already open it. Failure remains non-fatal for the in-flight turn.
 fn maybe_begin_reactive_entry_task(
     reactive: &ReactiveBuild,
     native_command: bool,
@@ -2153,12 +2166,12 @@ fn maybe_begin_reactive_entry_task(
     if native_command
         || entry_task.is_some()
         || !reactive
-            .became_build
+            .observed_code_write
             .load(std::sync::atomic::Ordering::SeqCst)
     {
         return;
     }
-    let build_route = &reactive.build_card_route;
+    let build_route = &reactive.intent_route;
     let scope = format!(
         "resident-v1\0{backend}\0{}\0{}\0{requirement}",
         build_route.class.as_str(),
@@ -2179,8 +2192,8 @@ fn mark_reactive_write(reactive: &ReactiveBuild, sink: &Arc<ChannelSink>) -> boo
     if reactive.reacted.swap(true, Ordering::SeqCst) {
         return false;
     }
-    reactive.became_build.store(true, Ordering::SeqCst);
-    sink.emit(EngineEvent::intent_decided(&reactive.build_card_route));
+    reactive.observed_code_write.store(true, Ordering::SeqCst);
+    sink.emit(EngineEvent::intent_decided(&reactive.intent_route));
     sink.emit(EngineEvent::Note(
         umadev_i18n::tl("chat.build_detected").to_string(),
     ));
@@ -2392,7 +2405,7 @@ async fn run_agentic(
             && route.class.mutates_workspace()
             && effective_permissions.requests_full_access())
         .then(|| {
-            let reactive = Arc::new(ReactiveBuild::new(host_cli, &task));
+            let reactive = Arc::new(ReactiveBuild::new(host_cli, &route));
             if let Some(guard) = preflight_run_lock.take() {
                 let mut slot = reactive
                     .lock
@@ -2429,14 +2442,21 @@ async fn run_agentic(
 /// `root`, used only to give the agentic system prompt a sense of what is
 /// already modified. **Fail-open**: any failure returns `None` and the prompt
 /// simply omits the diff-stat section.
-fn git_diff_stat(root: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["diff", "--stat"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+async fn git_diff_stat(root: &std::path::Path) -> Option<String> {
+    let mut command = tokio::process::Command::new("git");
+    command.arg("-C").arg(root).args(["diff", "--stat"]);
+    let out = umadev_process::run_bounded_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: std::time::Duration::from_secs(5),
+            stdout_bytes: 256 * 1024,
+            stderr_bytes: 16 * 1024,
+            reader_grace: std::time::Duration::from_millis(500),
+        },
+    )
+    .await
+    .ok()?;
+    if out.timed_out || out.stdout_truncated || !out.status.is_some_and(|status| status.success()) {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -2798,11 +2818,9 @@ async fn drive_agentic_stream(
     // byte-for-byte unchanged.
     reactive: Option<&Arc<ReactiveBuild>>,
 ) {
-    // (1) Reality injection — snapshot the live git state BEFORE the turn so the
-    // base is anchored to the real tree, and keep `before` for the post-turn
-    // diff. Both are `Option` (fail-open: git missing -> None -> guards no-op).
-    let before = git_status_porcelain(project_root);
-    let diff_stat = git_diff_stat(project_root);
+    // Anchor the prompt to a bounded pre-turn snapshot; missing git stays fail-open.
+    let before = git_status_porcelain_bounded(project_root).await;
+    let diff_stat = git_diff_stat(project_root).await;
     // Firmware (HIGH #3 / MEDIUM #6): the LIGHT path now injects UmaDev's firmware
     // through the SAME `compose_firmware` the director-build path uses, sized by
     // THIS turn's typed route — pure chat carries only the identity, a quick edit
@@ -2883,6 +2901,7 @@ async fn drive_agentic_stream(
     // reactive build is disabled (non-chat path) — the write check then no-ops.
     let reactive_ctx = reactive.cloned();
     let reactive_sink = Arc::clone(sink);
+    let workspace_root_for_tools = project_root.to_path_buf();
     let legacy_barrier_failure = Arc::new(std::sync::Mutex::new(None::<String>));
     let legacy_barrier_failure_callback = Arc::clone(&legacy_barrier_failure);
     let on_event = move |ev: umadev_runtime::StreamEvent| {
@@ -2897,7 +2916,9 @@ async fn drive_agentic_stream(
             // Only a CODE write flips the turn to a build; writing a docs/spec artifact
             // (PRD / architecture / UIUX / SRS / any markdown) is legitimate pre-
             // development work and must NOT trigger the source-present code floor.
-            if is_workspace_write_tool(name) && !is_doc_artifact_path(detail) {
+            if is_workspace_write_tool(name)
+                && !is_doc_artifact_path(&workspace_root_for_tools, detail)
+            {
                 if let Err(reason) =
                     react_to_legacy_first_write(reactive_ctx.as_deref(), &reactive_sink)
                 {
@@ -2928,14 +2949,8 @@ async fn drive_agentic_stream(
             // reported nothing, and records this turn to `/usage` (real when present,
             // else the estimate) — never inflating the live real count.
             emit_chat_turn_usage(sink, label, Some(resp.usage), task, &resp.text);
-            // (2) Post-turn fact check — snapshot git AGAIN and diff against the
-            // pre-turn snapshot to get the files THIS turn actually changed on
-            // disk. Fail-open: if either snapshot is missing (non-git / git
-            // unavailable), `changed` is `None` and the fact line is skipped.
-            let changed = match (before.as_deref(), git_status_porcelain(project_root)) {
-                (Some(b), Some(a)) => Some(changed_files_between(b, &a)),
-                _ => None,
-            };
+            // Diff only two complete snapshots; missing git skips the fact line.
+            let changed = changed_files_after_git_status(before.as_deref(), project_root).await;
             // Emit the reality-anchored fact line to the transcript: the real
             // changed-file set, plus a `[warn]` when the base CLAIMED changes the
             // working tree does not show (likely a recited / hallucinated edit).
@@ -2967,10 +2982,13 @@ async fn drive_agentic_stream(
             // Any one makes the source-presence honesty floor applicable. Only the
             // resident-session path can run flagship QC; it applies the same routed-
             // Build predicate below in `drive_chat_session_turn`.
-            let explicit_code_write =
-                reactive.is_some_and(|r| r.became_build.load(std::sync::atomic::Ordering::SeqCst));
-            let wrote_files = wrote_code_files(explicit_code_write, changed.as_deref());
-            let effective_build = director_build || should_run_flagship_qc(route) || wrote_files;
+            let explicit_code_write = reactive.is_some_and(|r| {
+                r.observed_code_write
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            });
+            let wrote_files =
+                wrote_code_files(project_root, explicit_code_write, changed.as_deref());
+            let full_build = director_build || should_run_flagship_qc(route);
             // (4) Director-build hard-gate — the deterministic reality floor for
             // an explicit `/run` (Wave 1). The director was told to BUILD a full
             // product; after it reports done we OBJECTIVELY check whether real
@@ -2982,7 +3000,7 @@ async fn drive_agentic_stream(
             // stop). This verifies RESULT, it does not dictate the route: a
             // director that legitimately only answered a question (claimed no build)
             // is left alone. Fail-open: skipped entirely for a non-build turn.
-            if effective_build {
+            if full_build || wrote_files {
                 let source_obligation = director_build || should_run_flagship_qc(route);
                 if let Some(note) =
                     director_source_hardgate(project_root, &reply, source_obligation)
@@ -3015,7 +3033,7 @@ async fn drive_agentic_stream(
             // hand-back without a pre-spawn flag.
             let _ = route_tx.send(RouteDecision::AgenticDone {
                 reply,
-                director_build: effective_build,
+                director_build: full_build,
                 // The non-resident light path (offline brain) owns no resumable base
                 // session id — the resident host chat path carries one (see
                 // `drive_chat_session_turn`); fail-open `None` here.
@@ -4788,7 +4806,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         bounded_route_context(&conversation, &text)
     };
     // Read-only fact snapshot; writers use the routed post-condition below.
-    let before = git_status_porcelain(&project_root);
+    let before = git_status_porcelain_bounded(&project_root).await;
 
     // ── Bounded first-turn auto-recovery ─────────────────────────────────────────
     // One clean, mechanically read-only Unknown failure may retry on a fresh session.
@@ -5002,6 +5020,32 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             umadev_agent::requirement_demands_read_only(&text),
             permissions,
         );
+        let codex_sandbox = (backend == "codex")
+            .then(|| umadev_host::codex_session::resolved_codex_launch_sandbox(permissions));
+        if codex_read_only_sandbox_blocks_route(
+            &backend,
+            native_command,
+            execution_read_only,
+            route.class.mutates_workspace(),
+            codex_sandbox.unwrap_or_default(),
+        ) {
+            if let Some(mut readonly) = readonly_route_session.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(2), readonly.end()).await;
+            }
+            detach_session_close(session);
+            cancel_entry_task(
+                &mut entry_task,
+                "Codex launch sandbox is read-only for a mutating route",
+            );
+            let _ = route_tx.send(RouteDecision::InputRejected {
+                turn: SubmittedTurn {
+                    text: text.clone(),
+                    input: input.clone(),
+                },
+                note: umadev_i18n::tl("live_meta.permissions.codex_read_only").to_string(),
+            });
+            return;
+        }
         if execution_read_only {
             cancel_entry_task(
                 &mut entry_task,
@@ -5124,9 +5168,12 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             .iter()
             .any(|block| !matches!(block, TurnInputBlock::Text { .. }));
         if !native_command
-            && route_source == Some(umadev_agent::RouteSource::Brain)
-            && route.uses_director_workflow()
-            && !has_typed_attachments
+            && route_decision::should_start_director(
+                route_source,
+                route.uses_director_workflow(),
+                has_typed_attachments,
+                execution_read_only,
+            )
         {
             let _ = route_tx.send(RouteDecision::DirectorStarted {
                 requirement: text.clone(),
@@ -5384,7 +5431,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         };
 
         text_acc = String::new();
-        reactive = Arc::new(ReactiveBuild::new(!native_command, &text));
+        reactive = Arc::new(ReactiveBuild::new(!native_command, &route));
         targeted_verification_passed = false;
         targeted_verification_observed = false;
         potential_shell_write = false;
@@ -5799,8 +5846,8 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                 umadev_runtime::SessionEvent::ToolCall { name, input }
                 | umadev_runtime::SessionEvent::ToolCallCorrelated { name, input, .. } => {
                     let target = session_tool_target(&input);
-                    let explicit_code_write =
-                        is_workspace_write_tool(&name) && !is_doc_artifact_path(&target);
+                    let explicit_code_write = is_workspace_write_tool(&name)
+                        && !is_doc_artifact_path(&project_root, &target);
                     let mut effect = observed_tool_effect(&name, &input);
                     if is_workspace_write_tool(&name) && !explicit_code_write {
                         // A docs-only explicit write is not a source-code write and
@@ -6025,7 +6072,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                         && !native_command
                         && (route.class.mutates_workspace()
                             || reactive
-                                .became_build
+                                .observed_code_write
                                 .load(std::sync::atomic::Ordering::SeqCst))
                     {
                         capture_resident_tool_pitfall(&project_root, &slug, &text, &summary, &sink);
@@ -6055,7 +6102,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                         && !native_command
                         && (route.class.mutates_workspace()
                             || reactive
-                                .became_build
+                                .observed_code_write
                                 .load(std::sync::atomic::Ordering::SeqCst))
                     {
                         capture_resident_tool_pitfall(&project_root, &slug, &text, &summary, &sink);
@@ -6395,7 +6442,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                                         read_only: execution_read_only,
                                         clean_attempt: text_acc.trim().is_empty()
                                             && !reactive
-                                                .became_build
+                                                .observed_code_write
                                                 .load(std::sync::atomic::Ordering::SeqCst),
                                         base_alive: exit.is_none(),
                                     },
@@ -6499,27 +6546,21 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
 
     // `Write`/`Edit` is an early lock/isolation signal, not filesystem truth.
     let explicit_code_write = reactive
-        .became_build
+        .observed_code_write
         .load(std::sync::atomic::Ordering::SeqCst)
         || potential_shell_write;
-    let routed_build = !native_command
-        && route_source == Some(umadev_agent::RouteSource::Brain)
-        && should_run_flagship_qc(&route);
-    // A2: the reactive tail. When the base wrote a real (non-doc) code file on a turn
-    // seeded as Chat/QuickEdit, `react_to_first_write` latched `became_build`, but the
-    // flagship governance QC never ran — the ONLY gate was the Brain pre-verdict
-    // (`routed_build`). Route that OBSERVED build through the SAME `run_post_build_qc`
-    // the `/run` path uses, behind the `UMADEV_REACTIVE_QC` env flag so this stall-
-    // adjacent wiring can be disabled without a revert. It drives bounded fix turns on
-    // the LIVE resident session, but they are bounded by `MAX_QC_ROUNDS` + the wall-clock
-    // `run_budget()` deadline and settle fail-open on a dead/hung session (an `Err` from
-    // the fix turn returns a dirty-but-settled gate), so a base that wedges during rework
-    // never wedges the chat surface. Keyed off `became_build`, so a pure-chat turn (no
-    // write) and a single doc-only write (the `is_doc_artifact_path` latch) never trip it.
+    let routed_build = route_decision::should_run_routed_qc(
+        native_command,
+        route_source,
+        should_run_flagship_qc(&route),
+        execution_read_only,
+    );
+    // Only a Build route receives flagship QC. QuickEdit/Debug keep targeted checks.
     let reactive_qc = !routed_build
         && reactive
-            .became_build
+            .observed_code_write
             .load(std::sync::atomic::Ordering::SeqCst)
+        && should_run_flagship_qc(&route)
         && reactive_qc_enabled();
     let sink_dyn: Arc<dyn EventSink> = sink.clone();
     let mut post_build_qc_outcome = None;
@@ -6542,7 +6583,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         let mut qc_route = if routed_build {
             route.clone()
         } else {
-            reactive.build_card_route.clone()
+            reactive.intent_route.clone()
         };
         let produced_no_source = umadev_agent::acceptance::source_files(&project_root).is_empty();
         if produced_no_source || umadev_agent::planner::is_document_task(&text) {
@@ -6586,10 +6627,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             }
         }
     } else {
-        match (before.as_deref(), git_status_porcelain(&project_root)) {
-            (Some(b), Some(a)) => Some(changed_files_between(b, &a)),
-            _ => None,
-        }
+        changed_files_after_git_status(before.as_deref(), &project_root).await
     };
 
     // A required-review transport outage is a resumable operational boundary,
@@ -6707,16 +6745,20 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         }
     }
 
-    let wrote_files = wrote_code_files(explicit_code_write, final_changed.as_deref());
-    let became_build = !native_command && (routed_build || wrote_files);
-    // M5: rebuilt off the OBSERVED build (`became_build`) + the OBSERVED verification
+    let wrote_files =
+        wrote_code_files(&project_root, explicit_code_write, final_changed.as_deref());
+    let observed_write = !native_command && wrote_files;
+    let mutating_work = !native_command && (routed_build || observed_write);
+    let full_build =
+        !native_command && (routed_build || (observed_write && should_run_flagship_qc(&route)));
+    // M5: rebuilt off the observed work + the OBSERVED verification
     // result, not the dead `route_source == Some(Brain)` provenance (which pinned this
     // to always-false and let a base run `cargo test` red, then edit, and still settle
     // "successfully done"). It fires only when a verifier actually RAN this turn
     // (`targeted_verification_observed`) and did NOT come back green — a build that ran
     // no verifier at all is not blocked here (the flagship QC owns that), so an implicit
     // build that simply writes files is never falsely wedged.
-    let scoped_write_requires_verification = became_build && targeted_verification_observed;
+    let scoped_write_requires_verification = mutating_work && targeted_verification_observed;
     if scoped_write_requires_verification && !targeted_verification_passed {
         let profile = execution_permission_profile(execution_read_only, permissions);
         let resident = primed_resident(session, execution_read_only);
@@ -6734,7 +6776,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         return;
     }
     // H3: arm the objective source-present hard-gate for an OBSERVED build
-    // (`became_build`) OR a build-SHAPED turn (`build_card_route.class == Build`) that
+    // (`mutating_work`) OR a Build route that
     // wrote NOTHING AT ALL — so a base that CLAIMS "Done, I built your full app" but
     // produced no file is caught (zero real source + a reply that claims code) rather
     // than passing on an advisory fact line alone. Gated so it never false-fires on
@@ -6750,9 +6792,9 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
     };
     let claimed_empty_build = !native_command
         && !execution_read_only
-        && reactive.build_card_route.class == umadev_agent::RouteClass::Build
+        && reactive.intent_route.class == umadev_agent::RouteClass::Build
         && nothing_written;
-    let source_hardgate = (became_build || claimed_empty_build)
+    let source_hardgate = (mutating_work || claimed_empty_build)
         .then(|| director_source_hardgate(&project_root, &reply, false))
         .flatten();
     if let Some(note) = source_hardgate.as_ref() {
@@ -6822,11 +6864,8 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
 
     let _ = route_tx.send(RouteDecision::AgenticDone {
         reply,
-        // H2: this resident terminal follows OBSERVED write truth. A model-owned
-        // deliberate Build already transferred to the Director above; a fallback or
-        // fast resident turn that wrote real code is still a real build completion.
-        // A pure reply leaves `became_build` false and stays plain streamed chat.
-        director_build: became_build,
+        // Completion depth follows intent, not the mere existence of a write.
+        director_build: full_build,
         base_session_id,
         base_resume_identity,
     });
@@ -7016,7 +7055,7 @@ fn route_model_for_spec(_spec: &BrainSpec, fallback_model: String) -> String {
     fallback_model
 }
 
-fn spawn_probe(sink: Arc<ChannelSink>) {
+fn spawn_probe(sink: Arc<ChannelSink>, generation: u64) {
     tokio::spawn(async move {
         for status in umadev_host::probe_all().await {
             // The honest auth state (gap G10): a base can be installed yet not
@@ -7050,12 +7089,8 @@ fn spawn_probe(sink: Arc<ChannelSink>) {
                     )
                 })
                 .unwrap_or_default();
-            // Pack the structured auth metadata onto `detail` (the BackendProbed
-            // event can't grow fields — it lives in umadev-agent). The TUI
-            // unpacks via `parse_probe_detail`; `|` and the \u{1} sentinels never
-            // occur in a real version string / login command.
             let detail = format!(
-                "{s}auth={auth_tag}|login={login_cmd}|install={install_cmd}{s}{human}",
+                "{s}generation={generation}|auth={auth_tag}|login={login_cmd}|install={install_cmd}{s}{human}",
                 s = app::PROBE_AUTH_SENTINEL,
             );
             sink.emit(EngineEvent::BackendProbed {
@@ -8585,7 +8620,7 @@ fn handle_prepared_cancel(
     live_input_hub: &LiveInputHub,
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-    engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+    engine_rx: &mut umadev_agent::ChannelReceiver,
     route_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RouteDecision>,
 ) {
     if app.host_git_in_flight {
@@ -8646,36 +8681,6 @@ fn handle_prepared_cancel(
         sink,
         route_tx,
     );
-}
-
-fn set_auth_ui_error(app: &mut App, generation: u64, message: String) {
-    if let Some(auth) = app.auth_ui.as_mut() {
-        auth.set_local_error(generation, message);
-    }
-}
-
-fn copy_text_to_clipboard(app: &mut App, terminal: &mut Term, text: String) {
-    if clipboard_is_remote() {
-        use std::io::Write as _;
-        let seq = crate::selection::osc52_for(&text, clipboard_in_tmux());
-        let backend = terminal.backend_mut();
-        let _ = backend.write_all(seq.as_bytes());
-        let _ = backend.flush();
-        app.contaminate_terminal();
-    } else {
-        tokio::task::spawn_blocking(move || copy_to_clipboard_native(&text));
-    }
-}
-
-fn finish_mouse_selection_copy(app: &mut App, terminal: &mut Term) {
-    let copied = if app.input_selection_dragging {
-        app.input_selection_finish_copy()
-    } else {
-        app.selection_finish_copy()
-    };
-    if let Some(text) = copied {
-        copy_text_to_clipboard(app, terminal, text);
-    }
 }
 
 fn handle_mouse_event(app: &mut App, terminal: &mut Term, event: MouseEvent) {
@@ -8744,30 +8749,6 @@ fn start_manual_compaction(
     }
 }
 
-fn start_clipboard_image_capture(
-    app: &mut App,
-    in_flight: &mut bool,
-    tx: &tokio::sync::mpsc::UnboundedSender<clipboard_image::CaptureResult>,
-) {
-    use clipboard_image::Preflight;
-
-    let offline = matches!(app.brain_spec(), BrainSpec::Offline);
-    match clipboard_image::preflight(clipboard_is_remote(), clipboard_in_tmux(), offline) {
-        Preflight::Ready if !*in_flight => {
-            *in_flight = true;
-            let root = app.project_root.clone();
-            let tx = tx.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = tx.send(clipboard_image::capture(&root));
-            });
-        }
-        Preflight::Ready => {}
-        Preflight::Remote => app.push_clipboard_image_notice("clipboard.image.remote", &[]),
-        Preflight::Tmux => app.push_clipboard_image_notice("clipboard.image.tmux", &[]),
-        Preflight::Offline => app.push_clipboard_image_notice("clipboard.image.offline", &[]),
-    }
-}
-
 fn resolve_approval_reply(approval_holder: &ApprovalHolder, allow: bool) {
     if allow {
         allow_pending_approval(approval_holder);
@@ -8788,85 +8769,6 @@ fn publish_trust_after_key(
     }
 }
 
-fn handle_auth_ui_key(
-    app: &mut App,
-    chat_session_holder: &ChatSessionHolder,
-    terminal: &mut Term,
-    key: KeyEvent,
-) -> bool {
-    if app.auth_ui.is_none()
-        || key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        return false;
-    }
-
-    let effect = app
-        .auth_ui
-        .as_mut()
-        .map_or(crate::auth_ui::AuthUiEffect::None, |auth| {
-            auth.handle_key(key.code, key.modifiers)
-        });
-    match effect {
-        crate::auth_ui::AuthUiEffect::None => {}
-        crate::auth_ui::AuthUiEffect::Authorize {
-            generation,
-            method_id,
-        } => {
-            if !chat_session_holder
-                .auth_interaction
-                .authorize(generation, method_id)
-            {
-                set_auth_ui_error(
-                    app,
-                    generation,
-                    "authentication task is no longer available".to_string(),
-                );
-            }
-        }
-        crate::auth_ui::AuthUiEffect::Cancel { generation } => {
-            let _ = chat_session_holder.auth_interaction.cancel(generation);
-            app.auth_ui = None;
-        }
-        crate::auth_ui::AuthUiEffect::OpenUrl { generation, url } => {
-            if let Err(error) = crate::link::spawn_opener(url.reveal()) {
-                set_auth_ui_error(
-                    app,
-                    generation,
-                    umadev_i18n::tf(app.lang, "auth.grok.url_open_failed", &[&error.to_string()]),
-                );
-            }
-        }
-        crate::auth_ui::AuthUiEffect::CopyUrl { generation, url } => {
-            if app
-                .auth_ui
-                .as_ref()
-                .is_none_or(|auth| auth.generation() != generation)
-            {
-                return true;
-            }
-            let text = url.reveal().to_string();
-            copy_text_to_clipboard(app, terminal, text);
-            app.transient_status =
-                Some(umadev_i18n::t(app.lang, "auth.grok.url_copied").to_string());
-        }
-        crate::auth_ui::AuthUiEffect::SubmitCode { generation, code } => {
-            if let Err(error) = chat_session_holder
-                .auth_interaction
-                .submit_code(generation, code)
-            {
-                set_auth_ui_error(
-                    app,
-                    generation,
-                    umadev_i18n::tf(app.lang, "auth.grok.code_failed", &[&error.to_string()]),
-                );
-            }
-        }
-    }
-    true
-}
-
 #[allow(clippy::too_many_arguments)]
 fn route_replay_key(
     app: &mut App,
@@ -8879,7 +8781,7 @@ fn route_replay_key(
     needs_redraw: &mut bool,
     draw_now: &mut bool,
 ) -> Option<KeyEvent> {
-    if handle_auth_ui_key(app, chat_session_holder, terminal, key) {
+    if auth_ui::handle_loop_key(app, chat_session_holder, terminal, key) {
         *needs_redraw = true;
         *draw_now = true;
         return None;
@@ -8918,7 +8820,7 @@ fn handle_tick_flush_key(
     sink: &Arc<ChannelSink>,
     route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
 ) {
-    if handle_auth_ui_key(app, chat_session_holder, terminal, key) {
+    if auth_ui::handle_loop_key(app, chat_session_holder, terminal, key) {
         *draw_now = true;
         return;
     }
@@ -8978,7 +8880,7 @@ fn reset_idle_cancel_sessions(
     continuous_run_active: &mut bool,
     session_holder: &SessionHolder,
     chat_session_holder: &ChatSessionHolder,
-    engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineEvent>,
+    engine_rx: &mut umadev_agent::ChannelReceiver,
     route_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RouteDecision>,
 ) {
     // This slot is shared by the legacy continuous path and by a Director parked
@@ -8999,7 +8901,7 @@ fn reset_idle_cancel_sessions(
     if let Some(session) = parked {
         detach_resident_close(session);
     }
-    while engine_rx.try_recv().is_ok() {}
+    engine_rx.clear();
     while route_rx.try_recv().is_ok() {}
 }
 
@@ -9051,13 +8953,15 @@ fn apply_pending_auto_continue(
     continuous_run_active: bool,
     run_task: &mut Option<tokio::task::JoinHandle<()>>,
 ) {
-    if app.reject_replayed_host_git_operation(&app.requirement.clone()) {
-        app.pending_auto_continue = None;
-        return;
-    }
     let Some(gate) = app.pending_auto_continue.take() else {
         return;
     };
+    if app.reject_director_execution_in_plan() {
+        return;
+    }
+    if app.reject_replayed_host_git_operation(&app.requirement.clone()) {
+        return;
+    }
     app.active_gate = None;
     *run_task = Some(spawn_gate_continuation(
         app,
@@ -9082,13 +8986,15 @@ fn apply_pending_steer(
     continuous_run_active: bool,
     run_task: &mut Option<tokio::task::JoinHandle<()>>,
 ) {
-    if app.reject_replayed_host_git_operation(&app.requirement.clone()) {
-        app.pending_steer = None;
-        return;
-    }
     let Some(text) = app.pending_steer.take() else {
         return;
     };
+    if app.reject_director_execution_in_plan() {
+        return;
+    }
+    if app.reject_replayed_host_git_operation(&app.requirement.clone()) {
+        return;
+    }
     sink.emit(EngineEvent::Note(format!("queued steer: {text}")));
     if !continuous_run_active && app.director_gate_paused {
         let gate = app.active_gate.take().unwrap_or(Gate::DocsConfirm);
@@ -9119,6 +9025,7 @@ fn apply_pending_steer(
             session_holder.clone(),
             start_after,
             permissions,
+            true,
         )
     } else {
         let block = match gate {
@@ -9126,7 +9033,7 @@ fn apply_pending_steer(
             Some(Gate::ClarifyGate) => Block::Clarify,
             _ => Block::Initial,
         };
-        spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
+        spawn_block(run_opts, app.brain_spec(), sink.clone(), block, true)
     };
     *run_task = Some(task);
 }
@@ -9158,6 +9065,7 @@ fn spawn_gate_continuation(
             session_holder.clone(),
             continuous_resume_phase(gate),
             permissions,
+            true,
         )
     } else {
         spawn_block(
@@ -9165,6 +9073,7 @@ fn spawn_gate_continuation(
             app.brain_spec(),
             sink.clone(),
             Block::Continue(gate),
+            true,
         )
     }
 }
@@ -9182,6 +9091,9 @@ fn start_gate_continue(
     gate: Gate,
     continuous_run_active: bool,
 ) -> tokio::task::JoinHandle<()> {
+    if app.reject_director_execution_in_plan() {
+        return tokio::spawn(async {});
+    }
     let requirement = app.resume_run_requirement();
     if app.reject_replayed_host_git_operation(&requirement) {
         return tokio::spawn(async {});
@@ -9278,9 +9190,16 @@ fn start_requested_run(
             session_holder.clone(),
             umadev_spec::Phase::Research,
             permissions,
+            resume,
         )
     } else {
-        spawn_block(run_opts, app.brain_spec(), sink.clone(), Block::Clarify)
+        spawn_block(
+            run_opts,
+            app.brain_spec(),
+            sink.clone(),
+            Block::Clarify,
+            resume,
+        )
     };
     (task, continuous)
 }
@@ -9332,6 +9251,9 @@ fn start_revision(
     text: String,
     continuous_run_active: bool,
 ) -> tokio::task::JoinHandle<()> {
+    if app.reject_director_execution_in_plan() {
+        return tokio::spawn(async {});
+    }
     if app.reject_replayed_host_git_operation(&app.requirement.clone()) {
         return tokio::spawn(async {});
     }
@@ -9375,6 +9297,7 @@ fn start_revision(
             session_holder.clone(),
             start_after,
             permissions,
+            true,
         );
     }
 
@@ -9383,7 +9306,7 @@ fn start_revision(
         Some(Gate::ClarifyGate) => Block::Clarify,
         _ => Block::Initial,
     };
-    spawn_block(run_opts, app.brain_spec(), sink.clone(), block)
+    spawn_block(run_opts, app.brain_spec(), sink.clone(), block, true)
 }
 
 fn spawn_deploy_task(
@@ -9990,7 +9913,10 @@ async fn event_loop(
     let (apple_theme_tx, mut apple_theme_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
 
     // Probe in the background so the picker labels refresh as data arrives.
-    spawn_probe(sink.clone());
+    // Mark the generation before spawning: `/backend` must not race an empty
+    // probe table and treat "not received yet" as "ready".
+    let probe_generation = app.begin_backend_probe();
+    spawn_probe(sink.clone(), probe_generation);
 
     // Input source: the owned byte tokenizer (DEFAULT — UX maturity roadmap §2,
     // P1, the root fix for the leaked-mouse / phantom-Esc / Esc-latency bug
@@ -10302,7 +10228,7 @@ async fn event_loop(
                 // likewise a no-op, so the two share an arm.
                 Action::Quit | Action::None => {}
                 Action::PasteImage => {
-                    start_clipboard_image_capture(
+                    clipboard_image::start_capture(
                         app,
                         &mut clipboard_image_in_flight,
                         &clipboard_image_tx,
@@ -10349,7 +10275,8 @@ async fn event_loop(
                 Action::Reconfigure => {
                     // Re-opened the first-run guide — re-probe the
                     // host CLIs so their ready-state is current.
-                    spawn_probe(sink.clone());
+                    let probe_generation = app.begin_backend_probe();
+                    spawn_probe(sink.clone(), probe_generation);
                 }
                 Action::Continue(gate) => {
                     run_task = Some(start_gate_continue(
@@ -10466,6 +10393,7 @@ async fn event_loop(
                         app.brain_spec(),
                         sink.clone(),
                         Block::Light,
+                        false,
                     ));
                 }
                 Action::RedoPhase(phase) => {
@@ -10484,6 +10412,7 @@ async fn event_loop(
                         app.brain_spec(),
                         sink.clone(),
                         Block::Redo(phase),
+                        true,
                     ));
                 }
                 Action::LiveInput(turn) => {
@@ -10535,6 +10464,42 @@ async fn event_loop(
                         &route_tx,
                         payload,
                     ));
+                }
+                Action::RunLocalShell(command) => {
+                    if run_task.is_some() || app.thinking || app.cancelling {
+                        app.push_workspace_notice(umadev_i18n::t(
+                            app.lang,
+                            "chat.busy_cancel_first",
+                        ));
+                        continue;
+                    }
+                    let request = LocalCommandRequest::shell(&app.project_root, &command);
+                    app.begin_local_command(&request);
+                    let lang = app.lang;
+                    let route_tx = route_tx.clone();
+                    run_task = Some(tokio::spawn(async move {
+                        let result = local_command::run(request, lang).await;
+                        let _ = route_tx.send(RouteDecision::LocalCommandDone(result));
+                    }));
+                }
+                Action::RunUmaDevCommand { args, presentation } => {
+                    if run_task.is_some() || app.thinking || app.cancelling {
+                        app.push_workspace_notice(umadev_i18n::t(
+                            app.lang,
+                            "chat.busy_cancel_first",
+                        ));
+                        continue;
+                    }
+                    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+                    let request =
+                        LocalCommandRequest::umadev(&app.project_root, &borrowed, presentation);
+                    app.begin_local_command(&request);
+                    let lang = app.lang;
+                    let route_tx = route_tx.clone();
+                    run_task = Some(tokio::spawn(async move {
+                        let result = local_command::run(request, lang).await;
+                        let _ = route_tx.send(RouteDecision::LocalCommandDone(result));
+                    }));
                 }
                 Action::SetThinking(enabled) => {
                     spawn_thinking_change(
@@ -10924,6 +10889,21 @@ async fn event_loop(
                 Some(RouteDecision::HostGitDone { result }) => {
                     app.record_host_git_done(result);
                     run_task = resident_host_git::drain_after_settle(
+                        app,
+                        &chat_session_holder,
+                        &session_holder,
+                        &pending_ask_holder,
+                        &approval_holder,
+                        &host_input_holder,
+                        &steer_holder,
+                        &live_input_hub,
+                        &sink,
+                        &route_tx,
+                    );
+                }
+                Some(RouteDecision::LocalCommandDone(result)) => {
+                    app.record_local_command_done(result);
+                    run_task = drain_next_queued_chat(
                         app,
                         &chat_session_holder,
                         &session_holder,
@@ -11547,7 +11527,7 @@ async fn event_loop(
                 detach_parked_chat_session(&chat_session_holder);
                 // Drain any events the aborted task already queued (a buffered
                 // PipelineStarted / GateOpened) so they can't resurrect run state.
-                while engine_rx.try_recv().is_ok() {}
+                engine_rx.clear();
                 // Same for a route decision the aborted agentic turn already emitted:
                 // a late `AgenticDone` / `Failed` would otherwise append a stale reply
                 // AFTER the cancel reset.
@@ -11607,6 +11587,9 @@ async fn event_loop(
                     last_known_size = polled;
                 }
                 if app.expire_copy_toast(Instant::now()) {
+                    draw_now = true;
+                }
+                if crate::clipboard::take_clipboard_feedback_redraw() {
                     draw_now = true;
                 }
                 // R3 — the 80ms animation tick advances spinners / elapsed clocks
@@ -11748,44 +11731,6 @@ async fn event_loop(
     .await;
     close_parked_chat_on_quit(&chat_session_holder).await;
     Ok(())
-}
-
-fn current_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
-    RunOptions {
-        project_root: opts.project_root.clone(),
-        requirement: app.requirement.clone(),
-        slug: app.slug.clone(),
-        model: String::new(),
-        backend: app.backend.clone().unwrap_or_default(),
-        design_system: app.config.design_system.clone().unwrap_or_default(),
-        seed_template: app.config.seed_template.clone().unwrap_or_default(),
-        mode: app.effective_trust_mode(),
-        // Snapshot the strict-coverage opt-in once at the app boundary; the runner
-        // reads this captured flag, never the live env (which races in parallel).
-        strict_coverage: umadev_agent::strict_coverage_from_env(),
-    }
-}
-
-/// Resolve the permission posture for a continuation from the workflow that
-/// created it. Missing/corrupt state falls back to the caller's current explicit
-/// selection; a legacy state without the field resolves to Guarded in
-/// [`umadev_agent::WorkflowState::resolved_permission_profile`].
-fn persisted_run_mode(
-    project_root: &std::path::Path,
-    fallback: umadev_agent::TrustMode,
-) -> umadev_agent::TrustMode {
-    umadev_agent::read_workflow_state(project_root).map_or(fallback, |state| {
-        umadev_agent::TrustMode::from_base_permissions(state.resolved_permission_profile())
-    })
-}
-
-/// Build options for `/continue`, gate revision, and `/redo`: all contextual
-/// fields come from the live app as before, while permissions remain pinned to
-/// the originating workflow.
-fn resume_run_options(app: &App, opts: &LaunchOptions) -> RunOptions {
-    let mut run_opts = current_run_options(app, opts);
-    run_opts.mode = persisted_run_mode(&opts.project_root, run_opts.mode);
-    run_opts
 }
 
 #[cfg(test)]

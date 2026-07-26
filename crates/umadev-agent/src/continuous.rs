@@ -38,6 +38,7 @@
 //! - the plan was supposed to produce code and produced ZERO real source files →
 //!   HARD STOP, reported as a failure (never disguised as success).
 
+use std::path::Path;
 use std::sync::Arc;
 
 use umadev_runtime::{
@@ -54,6 +55,9 @@ use crate::events::{EngineEvent, EventSink};
 use crate::gates::Gate;
 use crate::knowledge_feedback::{commit_sent_memories, SentReceiptGuard};
 use crate::runner::RunOptions;
+
+const MAX_CONTINUOUS_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONTINUOUS_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 use crate::skills::{commit_skill_prompt_receipt, SkillPromptCandidate, SkillReceiptGuard};
 use crate::state::{write_workflow_state, WorkflowState};
 use crate::trust::requires_confirmation_with_ledger;
@@ -202,9 +206,24 @@ fn persist_state_complete(options: &RunOptions, phase: Phase) {
     persist_state_impl(options, phase, "", Some("Pipeline complete."));
 }
 
-const OPERATIONAL_REVIEW_DOCS: &str = "operational-review-pause:v1:docs";
-const OPERATIONAL_REVIEW_PREVIEW: &str = "operational-review-pause:v1:preview";
-const OPERATIONAL_REVIEW_QUALITY: &str = "operational-review-pause:v1:quality";
+const OPERATIONAL_REVIEW_DOCS: &str = "operational-review-pause:v1:docs (continuous session)";
+const OPERATIONAL_REVIEW_PREVIEW: &str = "operational-review-pause:v1:preview (continuous session)";
+const OPERATIONAL_REVIEW_QUALITY: &str = "operational-review-pause:v1:quality (continuous session)";
+const OPERATIONAL_REVIEW_DOCS_LEGACY: &str = "operational-review-pause:v1:docs";
+const OPERATIONAL_REVIEW_PREVIEW_LEGACY: &str = "operational-review-pause:v1:preview";
+const OPERATIONAL_REVIEW_QUALITY_LEGACY: &str = "operational-review-pause:v1:quality";
+const OPERATIONAL_REVIEW_CIRCUIT_DOCS: &str =
+    "operational-review-circuit-open:v1:docs (continuous session)";
+const OPERATIONAL_REVIEW_CIRCUIT_PREVIEW: &str =
+    "operational-review-circuit-open:v1:preview (continuous session)";
+const OPERATIONAL_REVIEW_CIRCUIT_QUALITY: &str =
+    "operational-review-circuit-open:v1:quality (continuous session)";
+const OPERATIONAL_REVIEW_CANCELLED_DOCS: &str =
+    "operational-review-cancelled:v1:docs (continuous session)";
+const OPERATIONAL_REVIEW_CANCELLED_PREVIEW: &str =
+    "operational-review-cancelled:v1:preview (continuous session)";
+const OPERATIONAL_REVIEW_CANCELLED_QUALITY: &str =
+    "operational-review-cancelled:v1:quality (continuous session)";
 
 fn operational_review_marker(kind: ReviewKind) -> &'static str {
     match kind {
@@ -214,14 +233,112 @@ fn operational_review_marker(kind: ReviewKind) -> &'static str {
     }
 }
 
-fn pending_operational_review(options: &RunOptions) -> Option<ReviewKind> {
-    let state = crate::state::read_workflow_state(&options.project_root)?;
-    match state.note.as_str() {
-        OPERATIONAL_REVIEW_DOCS => Some(ReviewKind::Docs),
-        OPERATIONAL_REVIEW_PREVIEW => Some(ReviewKind::Preview),
-        OPERATIONAL_REVIEW_QUALITY => Some(ReviewKind::Quality),
+fn operational_review_circuit_marker(kind: ReviewKind) -> &'static str {
+    match kind {
+        ReviewKind::Docs => OPERATIONAL_REVIEW_CIRCUIT_DOCS,
+        ReviewKind::Preview => OPERATIONAL_REVIEW_CIRCUIT_PREVIEW,
+        ReviewKind::Quality => OPERATIONAL_REVIEW_CIRCUIT_QUALITY,
+    }
+}
+
+fn operational_review_cancelled_marker(kind: ReviewKind) -> &'static str {
+    match kind {
+        ReviewKind::Docs => OPERATIONAL_REVIEW_CANCELLED_DOCS,
+        ReviewKind::Preview => OPERATIONAL_REVIEW_CANCELLED_PREVIEW,
+        ReviewKind::Quality => OPERATIONAL_REVIEW_CANCELLED_QUALITY,
+    }
+}
+
+fn review_kind_from_pending_marker(note: &str) -> Option<ReviewKind> {
+    match note {
+        OPERATIONAL_REVIEW_DOCS | OPERATIONAL_REVIEW_DOCS_LEGACY => Some(ReviewKind::Docs),
+        OPERATIONAL_REVIEW_PREVIEW | OPERATIONAL_REVIEW_PREVIEW_LEGACY => Some(ReviewKind::Preview),
+        OPERATIONAL_REVIEW_QUALITY | OPERATIONAL_REVIEW_QUALITY_LEGACY => Some(ReviewKind::Quality),
         _ => None,
     }
+}
+
+fn review_kind_from_circuit_marker(note: &str) -> Option<ReviewKind> {
+    match note {
+        OPERATIONAL_REVIEW_CIRCUIT_DOCS => Some(ReviewKind::Docs),
+        OPERATIONAL_REVIEW_CIRCUIT_PREVIEW => Some(ReviewKind::Preview),
+        OPERATIONAL_REVIEW_CIRCUIT_QUALITY => Some(ReviewKind::Quality),
+        _ => None,
+    }
+}
+
+fn review_kind_from_cancelled_marker(note: &str) -> Option<ReviewKind> {
+    match note {
+        OPERATIONAL_REVIEW_CANCELLED_DOCS => Some(ReviewKind::Docs),
+        OPERATIONAL_REVIEW_CANCELLED_PREVIEW => Some(ReviewKind::Preview),
+        OPERATIONAL_REVIEW_CANCELLED_QUALITY => Some(ReviewKind::Quality),
+        _ => None,
+    }
+}
+
+fn pending_operational_review(options: &RunOptions) -> Option<ReviewKind> {
+    let state = crate::state::read_workflow_state(&options.project_root)?;
+    review_kind_from_pending_marker(state.note.as_str())
+}
+
+/// Whether the legacy fixed pipeline has a saved read-only review boundary.
+///
+/// This probe is used by CLI/TUI resume routing so the marker is never mistaken
+/// for a generic interrupted phase and sent through the single-shot fallback.
+#[must_use]
+pub fn legacy_operational_review_pending(project_root: &Path) -> bool {
+    crate::state::read_workflow_state(project_root)
+        .and_then(|state| review_kind_from_pending_marker(state.note.as_str()))
+        .is_some()
+}
+
+/// Terminal reason for an exhausted legacy operational-review retry, if any.
+///
+/// The receipt deliberately remains on disk after the second identical outage:
+/// `/continue` must stop before opening a writer/reviewer session. A deliberate
+/// new `/run` replaces the workflow state through [`crate::runner::AgentRunner::start`].
+#[must_use]
+pub fn legacy_operational_review_circuit_reason(project_root: &Path) -> Option<String> {
+    let state = crate::state::read_workflow_state(project_root)?;
+    let kind = review_kind_from_circuit_marker(state.note.as_str())?;
+    Some(format!(
+        "required {} review infrastructure remained unavailable after one bounded /continue retry; the legacy review circuit is open. No source work was repeated. Start a new /run to retry with a fresh run",
+        kind_phase_label(kind)
+    ))
+}
+
+/// Terminal reason for any legacy operational-review receipt that must not be
+/// resumed, including an opened retry circuit and an explicit user cancel.
+#[must_use]
+pub fn legacy_operational_review_terminal_reason(project_root: &Path) -> Option<String> {
+    if let Some(reason) = legacy_operational_review_circuit_reason(project_root) {
+        return Some(reason);
+    }
+    let state = crate::state::read_workflow_state(project_root)?;
+    let kind = review_kind_from_cancelled_marker(state.note.as_str())?;
+    Some(format!(
+        "the paused {} review was cancelled explicitly; it cannot be continued. Start a new /run to begin again",
+        kind_phase_label(kind)
+    ))
+}
+
+/// Consume a pending or circuit-open legacy review boundary after explicit
+/// cancellation. The terminal receipt prevents phase inference from treating
+/// the old review as a process interruption; a fresh `/run` overwrites it.
+pub(crate) fn cancel_legacy_operational_review_pause(project_root: &Path) -> Result<bool, String> {
+    let Some(mut state) = crate::state::read_workflow_state(project_root) else {
+        return Ok(false);
+    };
+    let kind = review_kind_from_pending_marker(state.note.as_str())
+        .or_else(|| review_kind_from_circuit_marker(state.note.as_str()));
+    let Some(kind) = kind else {
+        return Ok(false);
+    };
+    state.note = operational_review_cancelled_marker(kind).to_string();
+    state.last_transition_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    write_workflow_state(project_root, &state)
+        .map_err(|error| format!("could not close legacy review cursor: {error}"))?;
+    Ok(true)
 }
 
 fn operational_checkpoint_phase(kind: ReviewKind) -> Phase {
@@ -251,6 +368,24 @@ fn pause_at_operational_review(
         done,
         total: plan.phases.len(),
     }
+}
+
+fn open_operational_review_circuit(
+    options: &RunOptions,
+    kind: ReviewKind,
+    review: &TeamReviewResult,
+) -> RunOutcome {
+    let phase = operational_checkpoint_phase(kind);
+    persist_state_impl(
+        options,
+        phase,
+        "",
+        Some(operational_review_circuit_marker(kind)),
+    );
+    RunOutcome::HardStop(format!(
+        "{}; the same review boundary remained unavailable after one bounded /continue retry, so the legacy review circuit opened. No source work was repeated. Start a new /run to retry with a fresh run",
+        review_incomplete_reason(kind, review)
+    ))
 }
 
 fn persist_state_impl(
@@ -366,6 +501,15 @@ pub async fn run_block(
     let mut phases = block_phases(start_after, &plan);
     let mut resumed_operational_review = false;
 
+    // An exhausted retry is a terminal, persisted receipt. Repeated `/continue`
+    // commands must not reopen a base session, rerun source phases, or turn a
+    // reviewer outage into an endless pause loop. An explicit fresh `/run`
+    // replaces this workflow state through `AgentRunner::start`.
+    if let Some(reason) = legacy_operational_review_terminal_reason(&options.project_root) {
+        events.emit(EngineEvent::Note(reason.clone()));
+        return RunOutcome::HardStop(reason);
+    }
+
     // A typed operational checkpoint is resumed before any colour/design consult
     // or phase directive. `/continue` therefore retries only the unavailable
     // read-only review; it cannot accidentally re-run research, rewrite source,
@@ -383,11 +527,9 @@ pub async fn run_block(
             run_review_team(session, options, events, kind, &team, 0).await
         };
         if review.status() == ReviewStatus::Unavailable {
-            let outcome = pause_at_operational_review(options, &plan, kind, &review);
-            if let RunOutcome::PausedAtOperational { reason, .. } = &outcome {
-                events.emit(EngineEvent::Note(format!(
-                    "{reason} — workflow remains paused; retry with /continue"
-                )));
+            let outcome = open_operational_review_circuit(options, kind, &review);
+            if let RunOutcome::HardStop(reason) = &outcome {
+                events.emit(EngineEvent::Note(reason.clone()));
             }
             return outcome;
         }
@@ -1415,7 +1557,12 @@ async fn run_quality_gate(
         .project_root
         .join("output")
         .join(format!("{}-quality-gate.json", options.effective_slug()));
-    let qg_body = std::fs::read_to_string(&qg_path).ok();
+    let qg_body = crate::bounded_fs::read_utf8_beneath(
+        &options.project_root,
+        &qg_path,
+        MAX_CONTINUOUS_ARTIFACT_BYTES,
+    )
+    .ok();
     let (score, passed) = match qg_body.as_deref() {
         Some(qg) => crate::phases::extract_quality_score(qg),
         // The gate phase wrote a file we can't read back → a disk/permission
@@ -1552,7 +1699,11 @@ pub(crate) fn governance_scan(options: &RunOptions) -> Vec<String> {
     let ctx = project_context_for(options);
     let mut out = Vec::new();
     for f in crate::acceptance::source_files(&options.project_root) {
-        let Ok(content) = std::fs::read_to_string(&f) else {
+        let Ok(content) = crate::bounded_fs::read_utf8_beneath(
+            &options.project_root,
+            &f,
+            MAX_CONTINUOUS_SOURCE_BYTES,
+        ) else {
             continue;
         };
         let rel = f
@@ -1626,11 +1777,14 @@ pub(crate) fn quality_floor(options: &RunOptions) -> (String, String) {
 /// `umadev_contract` exactly like the single-shot quality gate. Fail-open: an
 /// unreadable architecture doc → empty contract → no drift.
 fn frontend_contract_drift(options: &RunOptions, slug: &str) -> Vec<String> {
-    let arch_text = std::fs::read_to_string(
-        options
-            .project_root
-            .join("output")
-            .join(format!("{slug}-architecture.md")),
+    let arch_path = options
+        .project_root
+        .join("output")
+        .join(format!("{slug}-architecture.md"));
+    let arch_text = crate::bounded_fs::read_utf8_beneath(
+        &options.project_root,
+        &arch_path,
+        MAX_CONTINUOUS_ARTIFACT_BYTES,
     )
     .unwrap_or_default();
     let arch_spec = umadev_contract::parse_architecture(&arch_text, &format!("{slug} API"));
@@ -2157,6 +2311,27 @@ pub(crate) async fn run_review_team(
     team: &[Box<dyn RoleCritic>],
     round: usize,
 ) -> TeamReviewResult {
+    run_review_team_with_establish_budget(
+        session,
+        options,
+        events,
+        kind,
+        team,
+        round,
+        ReviewEstablishBudget::new(review_establish_budget(), fork_establish_timeout()),
+    )
+    .await
+}
+
+async fn run_review_team_with_establish_budget(
+    session: &mut dyn BaseSession,
+    options: &RunOptions,
+    events: &Arc<dyn EventSink>,
+    kind: ReviewKind,
+    team: &[Box<dyn RoleCritic>],
+    round: usize,
+    mut establish_budget: ReviewEstablishBudget,
+) -> TeamReviewResult {
     // Read the on-disk blackboard ONCE (every seat reviews the same snapshot).
     let bb = Blackboard::read(options, kind);
     let arts = bb.artifacts(&options.requirement);
@@ -2201,10 +2376,16 @@ pub(crate) async fn run_review_team(
     // fork degrades to an `Err`, which `review_one` records as unavailable.
     // `fork()` is independent per call, so the
     // reviews never collide and never touch the main writer (single-writer invariant).
-    let mut forks = Vec::with_capacity(team.len());
-    for _ in team {
-        forks.push(fork_with_timeout(session).await);
-    }
+    let initial_indexes = (0..team.len()).collect::<Vec<_>>();
+    let forks = establish_review_forks(
+        session,
+        team,
+        &initial_indexes,
+        &mut establish_budget,
+        events,
+        "initial",
+    )
+    .await;
     // COLD-context seats (B2#1): when the hosting layer scoped a fresh stateless
     // judge surface, the ADVERSARIAL seats (`critic.cold()` — QA + security) review
     // on it instead of the fork, so they share NO context with the doer. The fork
@@ -2217,7 +2398,47 @@ pub(crate) async fn run_review_team(
         let cold = cold.clone().filter(|_| critic.cold());
         review_one(critic.as_ref(), fork, cold, arts)
     });
-    let verdicts = crate::runner::join_all_ordered(reviews).await;
+    let mut verdicts = crate::runner::join_all_ordered(reviews).await;
+
+    // A reviewer process can disappear after the fork opens, time out, or return
+    // malformed JSON even though the base is otherwise healthy. Retry ONLY those
+    // unavailable seats once, each on a newly-established fork. Semantic pass/fail
+    // verdicts are final for this round and are never retried or rewritten.
+    let retry_indexes = verdicts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, verdict)| {
+            (verdict.status() == ReviewStatus::Unavailable).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if !retry_indexes.is_empty() {
+        events.emit(EngineEvent::Note(format!(
+            "team · {} unavailable reviewer(s) — retrying each once with a fresh session",
+            retry_indexes.len()
+        )));
+        let retry_forks = establish_review_forks(
+            session,
+            team,
+            &retry_indexes,
+            &mut establish_budget,
+            events,
+            "retry",
+        )
+        .await;
+        let retry_reviews = retry_indexes
+            .iter()
+            .copied()
+            .zip(retry_forks)
+            .map(|(index, fork)| {
+                let critic = team[index].as_ref();
+                let cold = cold.clone().filter(|_| critic.cold());
+                review_one(critic, fork, cold, arts)
+            });
+        let retry_verdicts = crate::runner::join_all_ordered(retry_reviews).await;
+        for (index, retry) in retry_indexes.into_iter().zip(retry_verdicts) {
+            verdicts[index] = retain_retry_diagnosis(&verdicts[index], retry);
+        }
+    }
 
     // Sequentially (deterministic order) record + fold blocking — the seat order
     // is the team order regardless of which fork finished first.
@@ -2265,6 +2486,150 @@ pub(crate) async fn run_review_team(
         }
     }
     result
+}
+
+struct ReviewEstablishBudget {
+    remaining: std::time::Duration,
+    per_fork_timeout: std::time::Duration,
+}
+
+impl ReviewEstablishBudget {
+    fn new(total: std::time::Duration, per_fork_timeout: std::time::Duration) -> Self {
+        Self {
+            remaining: total,
+            per_fork_timeout,
+        }
+    }
+
+    async fn establish(
+        &mut self,
+        session: &mut dyn BaseSession,
+        role: &str,
+    ) -> (Result<Box<dyn BaseSession>, SessionError>, bool) {
+        if self.remaining.is_zero() {
+            return (Err(establish_budget_unattempted(role)), true);
+        }
+
+        // Keep the existing per-fork ceiling, but never let one fork consume more
+        // than the team's remaining serial-establishment budget.
+        let per_fork = self.per_fork_timeout;
+        let allowance = self.remaining.min(per_fork);
+        let total_budget_is_tighter = self.remaining <= per_fork;
+        let started = tokio::time::Instant::now();
+        let attempt = tokio::time::timeout(allowance, session.fork()).await;
+        self.remaining = self.remaining.saturating_sub(started.elapsed());
+
+        match attempt {
+            Ok(result) => (result, false),
+            Err(_) if total_budget_is_tighter => {
+                self.remaining = std::time::Duration::ZERO;
+                (
+                    Err(SessionError::Start(format!(
+                        "team review fork establishment budget exhausted while opening `{role}`"
+                    ))),
+                    true,
+                )
+            }
+            Err(_) => (
+                Err(SessionError::Start("fork handshake timed out".to_string())),
+                false,
+            ),
+        }
+    }
+}
+
+fn establish_budget_unattempted(role: &str) -> SessionError {
+    SessionError::Start(format!(
+        "team review fork establishment budget exhausted before `{role}` could be attempted"
+    ))
+}
+
+/// Establish a deterministic seat batch while sharing ONE cumulative handshake
+/// budget across the initial team and its unavailable-only retry batch. Review
+/// turns are deliberately outside this accounting: they retain their existing
+/// concurrent execution and independent `UMADEV_REVIEW_TURN_TIMEOUT_SECS` cap.
+async fn establish_review_forks(
+    session: &mut dyn BaseSession,
+    team: &[Box<dyn RoleCritic>],
+    seat_indexes: &[usize],
+    budget: &mut ReviewEstablishBudget,
+    events: &Arc<dyn EventSink>,
+    stage: &str,
+) -> Vec<Result<Box<dyn BaseSession>, SessionError>> {
+    if seat_indexes.is_empty() {
+        return Vec::new();
+    }
+
+    events.emit(EngineEvent::Note(format!(
+        "team · establishing {} {stage} review session(s) in seat order ({}s total establishment budget remaining)",
+        seat_indexes.len(),
+        duration_secs_ceil(budget.remaining)
+    )));
+
+    let mut forks = Vec::with_capacity(seat_indexes.len());
+    let mut position = 0;
+    while position < seat_indexes.len() {
+        let index = seat_indexes[position];
+        let role = team[index].role();
+        if budget.remaining.is_zero() {
+            let unattempted = seat_indexes.len() - position;
+            events.emit(EngineEvent::Note(format!(
+                "team · review fork establishment budget exhausted — {unattempted} {stage} seat(s) were not attempted and are marked unavailable"
+            )));
+            for index in &seat_indexes[position..] {
+                forks.push(Err(establish_budget_unattempted(team[*index].role())));
+            }
+            break;
+        }
+
+        events.emit(EngineEvent::TransientStatus(Some(format!(
+            "team · establishing {stage} review session {}/{} · {} · {}s budget remaining",
+            position + 1,
+            seat_indexes.len(),
+            role,
+            duration_secs_ceil(budget.remaining)
+        ))));
+        let (fork, total_budget_expired) = budget.establish(session, role).await;
+        forks.push(fork);
+        position += 1;
+
+        if total_budget_expired {
+            let unattempted = seat_indexes.len() - position;
+            events.emit(EngineEvent::Note(format!(
+                "team · review fork establishment budget exhausted at {stage} seat {position}/{}; {unattempted} later seat(s) were not attempted and are marked unavailable",
+                seat_indexes.len()
+            )));
+            for index in &seat_indexes[position..] {
+                forks.push(Err(establish_budget_unattempted(team[*index].role())));
+            }
+            break;
+        }
+    }
+    events.emit(EngineEvent::TransientStatus(None));
+    forks
+}
+
+fn duration_secs_ceil(duration: std::time::Duration) -> u64 {
+    duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
+}
+
+/// Preserve both operational diagnoses when a fresh reviewer session also fails.
+/// A real pass/fail from the retry replaces the unavailable first attempt exactly.
+fn retain_retry_diagnosis(first: &RoleVerdict, retry: RoleVerdict) -> RoleVerdict {
+    if retry.status() != ReviewStatus::Unavailable {
+        return retry;
+    }
+    let role = retry.role.clone();
+    let first_reason = first
+        .unavailable_reason()
+        .unwrap_or("first review attempt produced no usable verdict");
+    let retry_reason = retry
+        .unavailable_reason()
+        .unwrap_or("fresh review retry produced no usable verdict");
+    RoleVerdict::unavailable(
+        &role,
+        format!("{retry_reason}; fresh retry followed: {first_reason}"),
+    )
 }
 
 /// Establish ONE read-only fork, bounded by [`fork_establish_timeout`]. A fork
@@ -2905,7 +3270,8 @@ impl Blackboard {
         let slug = options.effective_slug();
         let root = &options.project_root;
         let doc = |name: &str| {
-            std::fs::read_to_string(root.join(format!("output/{slug}-{name}.md")))
+            let path = root.join(format!("output/{slug}-{name}.md"));
+            crate::bounded_fs::read_utf8_beneath(root, &path, MAX_CONTINUOUS_ARTIFACT_BYTES)
                 .unwrap_or_default()
         };
         let (prd, architecture, uiux) = (doc("prd"), doc("architecture"), doc("uiux"));
@@ -3477,6 +3843,27 @@ fn review_turn_timeout() -> std::time::Duration {
         )
 }
 
+/// Cumulative wall-clock allowance spent opening one review team's serial
+/// read-only forks, including the one fresh retry for unavailable seats. Judge
+/// turns do not consume this budget; they remain concurrent and retain their own
+/// timeout above. Overridable via `UMADEV_REVIEW_ESTABLISH_BUDGET_SECS`.
+fn review_establish_budget() -> std::time::Duration {
+    parse_review_establish_budget(
+        std::env::var("UMADEV_REVIEW_ESTABLISH_BUDGET_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_review_establish_budget(raw: Option<&str>) -> std::time::Duration {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map_or_else(
+            || std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs,
+        )
+}
+
 /// Timeout for ESTABLISHING one fresh read-only child (Claude process startup,
 /// Codex `initialize` + `thread/start`, or OpenCode `POST /session` + SSE ready),
 /// distinct from the per-turn judge timeout above. A
@@ -3585,6 +3972,10 @@ mod tests {
         fork_script: Arc<Mutex<std::collections::VecDeque<Option<String>>>>,
         /// How many forks were opened (asserted by tests).
         forks_opened: Arc<Mutex<usize>>,
+        /// Virtual-clock delay before each successive fork resolves. Empty means
+        /// immediate. Used by paused-time tests for cumulative establishment
+        /// budgets; production sessions are unaffected.
+        fork_delays: Arc<Mutex<std::collections::VecDeque<std::time::Duration>>>,
         /// When true, `fork()` AWAITS FOREVER instead of returning — models a base
         /// whose fork handshake wedges (never returns `initialize`). The
         /// `fork_with_timeout` wrapper must bound it and report it unavailable.
@@ -3613,6 +4004,7 @@ mod tests {
                 die: false,
                 fork_script: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 forks_opened: Arc::new(Mutex::new(0)),
+                fork_delays: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fork_hangs: false,
                 next_event_hangs: false,
                 active_forever: false,
@@ -3657,6 +4049,10 @@ mod tests {
             self.fork_script = Arc::new(Mutex::new(verdicts.into_iter().collect()));
             self
         }
+        fn with_fork_delays(mut self, delays: Vec<std::time::Duration>) -> Self {
+            self.fork_delays = Arc::new(Mutex::new(delays.into_iter().collect()));
+            self
+        }
         fn sent_handle(&self) -> Arc<Mutex<Vec<String>>> {
             Arc::clone(&self.sent)
         }
@@ -3686,6 +4082,10 @@ mod tests {
             // the thing that ends the wait, not this returning.
             if self.fork_hangs {
                 std::future::pending::<()>().await;
+            }
+            let delay = self.fork_delays.lock().unwrap().pop_front();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
             // Pop the next scripted fork outcome. An empty script → a default
             // accepting verdict (so unrelated tests get a clean review). `None`
@@ -4860,9 +5260,10 @@ mod tests {
         let (events, _rec) = sink();
         let seats = team_for(ReviewKind::Quality, &options.requirement, tmp.path()).len();
         assert!(seats >= 2);
-        let mut script = vec![Some(r#"{"accepts":true}"#.to_string()); seats];
+        let mut script = vec![Some(r#"{"accepts":true}"#.to_string()); seats + 1];
         script[0] = Some(r#"{"accepts":false,"blocking":["missing regression test"]}"#.to_string());
         script[1] = None;
+        script[seats] = None;
         let mut session = FakeBaseSession::new(vec![vec![SessionEvent::TurnDone {
             status: TurnStatus::Failed("scripted rework failure".to_string()),
             usage: None,
@@ -4905,6 +5306,9 @@ mod tests {
         let mut script = vec![Some(r#"{"accepts":true}"#.to_string()); seats * 2];
         script[0] = Some(r#"{"accepts":false,"blocking":["missing regression test"]}"#.into());
         script[1] = None;
+        // The unavailable seat gets exactly one fresh-fork retry. Keep that retry
+        // unavailable so this fixture exercises a genuinely partial panel.
+        script[seats] = None;
         let mut session = FakeBaseSession::new(vec![vec![done()]]).with_fork_script(script);
         let sent = session.sent_handle();
 
@@ -5102,10 +5506,11 @@ mod tests {
             TrustMode::Guarded,
         );
         let (events, rec) = sink();
-        // EVERY fork FAILS (`None`) → the run-door archetype consult AND each docs seat are
-        // unavailable. The legacy gate must not open as if the review passed.
+        // EVERY fork FAILS (`None`) → the run-door archetype consult, each docs seat,
+        // and each seat's one fresh-fork retry are unavailable. The legacy gate must
+        // not open as if the review passed.
         let mut session = FakeBaseSession::new(vec![vec![done()], vec![done()]])
-            .with_fork_script(vec![None, None, None, None]);
+            .with_fork_script(vec![None, None, None, None, None, None, None]);
         let forks = session.forks_handle();
         let sent = session.sent_handle();
 
@@ -5118,8 +5523,8 @@ mod tests {
         ));
         assert_eq!(
             *forks.lock().unwrap(),
-            4,
-            "archetype consult + one fork per seat, all attempted"
+            7,
+            "archetype consult + initial and one bounded retry per docs seat"
         );
         assert_eq!(
             sent.lock().unwrap().len(),
@@ -5147,6 +5552,101 @@ mod tests {
             resumed_sent.lock().unwrap().is_empty(),
             "operational resume does not re-run research/docs or source work"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_operational_review_opens_a_terminal_circuit_after_one_continue() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        persist_state_impl(&options, Phase::Docs, "", Some(OPERATIONAL_REVIEW_DOCS));
+
+        // This is the ONE `/continue` retry of the already-parked review. Every
+        // docs seat gets its initial fork plus one fresh-fork retry, then the
+        // persisted circuit opens instead of returning another pause.
+        let mut resumed =
+            FakeBaseSession::new(vec![]).with_fork_script(vec![None, None, None, None, None, None]);
+        let resumed_sent = resumed.sent_handle();
+        let resumed_forks = resumed.forks_handle();
+        let outcome = run_block(&mut resumed, &options, &events, Phase::Research).await;
+        assert!(matches!(
+            outcome,
+            RunOutcome::HardStop(ref reason)
+                if reason.contains("review circuit opened")
+                    && reason.contains("No source work was repeated")
+        ));
+        assert_eq!(*resumed_forks.lock().unwrap(), 6);
+        assert!(resumed_sent.lock().unwrap().is_empty());
+        assert!(legacy_operational_review_circuit_reason(tmp.path()).is_some());
+        assert!(
+            !crate::director_loop::has_resumable_run(tmp.path()),
+            "the TUI must not advertise a circuit-open receipt as resumable"
+        );
+
+        // Even a direct stale caller cannot fall back to a fresh phase walk: the
+        // terminal receipt is checked before any fork or writer turn.
+        let mut stale_continue = FakeBaseSession::new(vec![vec![done()]])
+            .with_fork_script(vec![Some(r#"{"accepts":true}"#.into())]);
+        let stale_sent = stale_continue.sent_handle();
+        let stale_forks = stale_continue.forks_handle();
+        let stale_outcome =
+            run_block(&mut stale_continue, &options, &events, Phase::Research).await;
+        assert!(matches!(stale_outcome, RunOutcome::HardStop(_)));
+        assert!(stale_sent.lock().unwrap().is_empty());
+        assert_eq!(*stale_forks.lock().unwrap(), 0);
+
+        // An explicitly fresh `/run` calls `AgentRunner::start` before driving;
+        // that new baseline intentionally clears the terminal receipt.
+        let runner = crate::runner::AgentRunner::new(
+            umadev_runtime::OfflineRuntime::new(umadev_runtime::RuntimeKind::Anthropic),
+            options,
+        );
+        runner.start().unwrap();
+        assert!(legacy_operational_review_terminal_reason(tmp.path()).is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_legacy_operational_pause_consumes_its_resume_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_docs(tmp.path());
+        let options = opts(
+            tmp.path(),
+            "build a SaaS dashboard web app with login and charts",
+            TrustMode::Guarded,
+        );
+        let (events, _rec) = sink();
+        persist_state_impl(&options, Phase::Docs, "", Some(OPERATIONAL_REVIEW_DOCS));
+
+        assert!(crate::director_loop::cancel_operational_review_pause(
+            tmp.path(),
+            "cancelled explicitly by the user"
+        )
+        .unwrap());
+        assert!(!legacy_operational_review_pending(tmp.path()));
+        assert!(legacy_operational_review_terminal_reason(tmp.path())
+            .is_some_and(|reason| reason.contains("cancelled explicitly")));
+        assert!(!crate::director_loop::has_resumable_run(tmp.path()));
+        assert!(
+            !crate::director_loop::cancel_operational_review_pause(tmp.path(), "already cancelled")
+                .unwrap(),
+            "cancellation is idempotent once the cursor is terminal"
+        );
+
+        let mut stale_continue = FakeBaseSession::new(vec![vec![done()]])
+            .with_fork_script(vec![Some(r#"{"accepts":true}"#.into())]);
+        let sent = stale_continue.sent_handle();
+        let forks = stale_continue.forks_handle();
+        let outcome = run_block(&mut stale_continue, &options, &events, Phase::Research).await;
+        assert!(
+            matches!(outcome, RunOutcome::HardStop(ref reason) if reason.contains("cancelled explicitly"))
+        );
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(*forks.lock().unwrap(), 0);
     }
 
     #[tokio::test]
@@ -6125,6 +6625,230 @@ mod tests {
                 .iter()
                 .any(|b| b.contains("No tests exist anywhere")),
             "a critic's blocking finding must pass through un-suppressed: {blocking:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_reviewer_recovers_on_one_fresh_fork_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "pub fn app() -> bool { true }\n").unwrap();
+        let options = opts(root, "build an API", TrustMode::Auto);
+        let (events, rec) = sink();
+        let team: Vec<Box<dyn RoleCritic>> = vec![Box::new(crate::critics::QaCritic)];
+        let mut session = FakeBaseSession::new(vec![]).with_fork_script(vec![
+            Some("not a verdict".to_string()),
+            Some(r#"{"accepts":true,"blocking":[]}"#.to_string()),
+        ]);
+        let forks = session.forks_handle();
+
+        let review = run_review_team(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            &team,
+            0,
+        )
+        .await;
+
+        assert_eq!(review.status(), ReviewStatus::Pass);
+        assert_eq!(*forks.lock().unwrap(), 2, "the retry owns a new fork");
+        assert!(rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::Note(note) if note.contains("retrying each once with a fresh session")
+        )));
+        let ledger = std::fs::read_to_string(root.join(".umadev/team-ledger.jsonl")).unwrap();
+        assert_eq!(
+            ledger.lines().count(),
+            1,
+            "only the settled retry verdict is recorded as the round result"
+        );
+    }
+
+    #[test]
+    fn review_establishment_budget_defaults_and_rejects_invalid_overrides() {
+        assert_eq!(
+            parse_review_establish_budget(None),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            parse_review_establish_budget(Some(" 17 ")),
+            std::time::Duration::from_secs(17)
+        );
+        for invalid in ["", "0", "nope"] {
+            assert_eq!(
+                parse_review_establish_budget(Some(invalid)),
+                std::time::Duration::from_secs(60),
+                "invalid override `{invalid}` must retain the safe default"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn team_establishment_budget_marks_later_serial_forks_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/app.rs"),
+            "pub fn app() -> bool { true }\n",
+        )
+        .unwrap();
+        let options = opts(tmp.path(), "build an API", TrustMode::Auto);
+        let (events, rec) = sink();
+        let team: Vec<Box<dyn RoleCritic>> = vec![
+            Box::new(crate::critics::QaCritic),
+            Box::new(crate::critics::BackendCritic),
+            Box::new(crate::critics::SecurityCritic),
+        ];
+        let roles = team
+            .iter()
+            .map(|critic| critic.role().to_string())
+            .collect::<Vec<_>>();
+        let mut session = FakeBaseSession::new(vec![])
+            .with_fork_delays(vec![
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(3),
+            ])
+            .with_fork_script(vec![Some(r#"{"accepts":true,"blocking":[]}"#.to_string())]);
+        let forks = session.forks_handle();
+        let started = tokio::time::Instant::now();
+
+        let review = run_review_team_with_establish_budget(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            &team,
+            0,
+            ReviewEstablishBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await;
+
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+        assert_eq!(
+            *forks.lock().unwrap(),
+            2,
+            "the third initial seat and both retries must not open after exhaustion"
+        );
+        assert_eq!(review.status(), ReviewStatus::Unavailable);
+        assert!(review.blocking.is_empty());
+        assert_eq!(review.unavailable.len(), 2);
+        assert!(review.unavailable[0].starts_with(&format!("[{}]", roles[1])));
+        assert!(review.unavailable[1].starts_with(&format!("[{}]", roles[2])));
+        assert!(review
+            .unavailable
+            .iter()
+            .all(|item| item.contains("establishment budget exhausted")));
+        assert!(rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::Note(note)
+                if note.contains("establishment budget exhausted")
+                    && note.contains("not attempted")
+        )));
+        assert!(rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::TransientStatus(Some(note))
+                if note.contains("initial review session 2/3")
+        )));
+        assert!(matches!(
+            rec.events().last(),
+            Some(EngineEvent::Note(note)) if note.contains(&roles[2])
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_retry_shares_the_same_establishment_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/app.rs"),
+            "pub fn app() -> bool { true }\n",
+        )
+        .unwrap();
+        let options = opts(tmp.path(), "build an API", TrustMode::Auto);
+        let (events, rec) = sink();
+        let team: Vec<Box<dyn RoleCritic>> = vec![Box::new(crate::critics::QaCritic)];
+        let mut session = FakeBaseSession::new(vec![])
+            .with_fork_delays(vec![
+                std::time::Duration::from_secs(3),
+                std::time::Duration::from_secs(3),
+            ])
+            .with_fork_script(vec![Some("not a verdict".to_string())]);
+        let forks = session.forks_handle();
+        let started = tokio::time::Instant::now();
+
+        let review = run_review_team_with_establish_budget(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            &team,
+            0,
+            ReviewEstablishBudget::new(
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(30),
+            ),
+        )
+        .await;
+
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
+        assert_eq!(*forks.lock().unwrap(), 2, "one initial + one fresh retry");
+        assert_eq!(review.status(), ReviewStatus::Unavailable);
+        assert_eq!(review.unavailable.len(), 1);
+        assert!(review.unavailable[0].contains("fresh retry followed"));
+        assert!(review.unavailable[0].contains("establishment budget exhausted"));
+        assert!(rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::Note(note)
+                if note.contains("retrying each once with a fresh session")
+        )));
+        assert!(rec.events().iter().any(|event| matches!(
+            event,
+            EngineEvent::TransientStatus(Some(note))
+                if note.contains("retry review session 1/1")
+        )));
+    }
+
+    #[tokio::test]
+    async fn semantic_blocker_is_neither_retried_nor_classified_operational() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "pub fn app() -> bool { true }\n").unwrap();
+        let options = opts(root, "build an API", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let team: Vec<Box<dyn RoleCritic>> = vec![Box::new(crate::critics::QaCritic)];
+        let mut session = FakeBaseSession::new(vec![]).with_fork_script(vec![
+            Some(r#"{"accepts":false,"blocking":["missing login regression test"]}"#.to_string()),
+            Some(r#"{"accepts":true,"blocking":[]}"#.to_string()),
+        ]);
+        let forks = session.forks_handle();
+
+        let review = run_review_team(
+            &mut session,
+            &options,
+            &events,
+            ReviewKind::Quality,
+            &team,
+            0,
+        )
+        .await;
+
+        assert_eq!(review.status(), ReviewStatus::Fail);
+        assert!(review.unavailable.is_empty());
+        assert!(review
+            .blocking
+            .iter()
+            .any(|item| item.contains("login regression test")));
+        assert_eq!(
+            *forks.lock().unwrap(),
+            1,
+            "a real semantic verdict is final and consumes no retry fork"
         );
     }
 

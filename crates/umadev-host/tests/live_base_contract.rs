@@ -454,7 +454,7 @@ async fn installed_grok_uses_its_server_authoritative_prompt_queue() {
         session
             .capabilities()
             .supports(SessionCapability::PromptQueue),
-        "audited Grok 0.2.106 did not negotiate its native prompt queue"
+        "audited Grok 0.2.112 did not negotiate its native prompt queue"
     );
     let session_id = session
         .session_id()
@@ -598,7 +598,7 @@ async fn installed_grok_lists_and_stops_its_owned_background_process() {
         session
             .capabilities()
             .supports(SessionCapability::BackgroundProcessControl),
-        "audited Grok 0.2.106 did not negotiate native background control"
+        "audited Grok 0.2.112 did not negotiate native background control"
     );
     let token = format!("UMADEV_BACKGROUND_STARTED_{}", std::process::id());
     session

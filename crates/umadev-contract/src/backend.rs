@@ -36,6 +36,7 @@
 //! wildcard registration (`app.all` / `app.use` / Django / Go mux / gin
 //! `.Any`) that matches any planned verb.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -114,6 +115,13 @@ const MAX_FILES: usize = 800;
 /// Skip files larger than this (a bundled / generated file, not hand-written
 /// route source). Keeps the comment-strip + regex work bounded.
 const MAX_FILE_BYTES: u64 = 600_000;
+/// Aggregate source budget for one extraction. The old per-file-only ceiling
+/// still allowed an 800-file tree to make one status query parse ~480 MiB.
+const MAX_TOTAL_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum directory entries inspected, including non-source files and skipped
+/// directories. A file-only cap cannot bound a directory containing millions
+/// of irrelevant entries.
+const MAX_WALK_ENTRIES: usize = 6_400;
 
 /// The language family a file belongs to, used to dispatch the right set of
 /// registration regexes (and the correct comment syntax).
@@ -156,20 +164,16 @@ pub fn extract_backend_routes(project_root: &Path) -> Vec<BackendRoute> {
     let mut files: Vec<PathBuf> = Vec::new();
     collect_backend_sources(project_root, &mut files, 0);
     let mut routes: Vec<BackendRoute> = Vec::new();
+    let mut remaining_bytes = MAX_TOTAL_SOURCE_BYTES;
     for file in &files {
-        let Ok(meta) = std::fs::metadata(file) else {
-            continue;
-        };
-        if meta.len() > MAX_FILE_BYTES {
-            continue;
+        if remaining_bytes == 0 {
+            break;
         }
-        let Ok(content) = std::fs::read_to_string(file) else {
+        let Ok(content) = read_source_file(file, MAX_FILE_BYTES.min(remaining_bytes)) else {
             continue; // non-UTF-8 / unreadable → fail-open skip
         };
-        let ext = file.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let Some(lang) = Lang::from_ext(ext) else {
-            continue;
-        };
+        remaining_bytes =
+            remaining_bytes.saturating_sub(u64::try_from(content.len()).unwrap_or(u64::MAX));
         let rel = file
             .strip_prefix(project_root)
             .map(|p| p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))
@@ -177,13 +181,102 @@ pub fn extract_backend_routes(project_root: &Path) -> Vec<BackendRoute> {
                 file.to_string_lossy()
                     .replace(std::path::MAIN_SEPARATOR, "/")
             });
-        routes.extend(extract_from_file(&rel, &content, lang));
+        routes.extend(extract_backend_routes_from_content(&rel, &content));
     }
     // Dedupe across ALL files by (method, path); keep the first-seen file.
     let mut seen: std::collections::HashSet<(Option<HttpVerb>, String)> =
         std::collections::HashSet::new();
     routes.retain(|r| seen.insert((r.method, r.path.clone())));
     routes
+}
+
+/// Open one discovered workspace source without following a replacement link,
+/// reject special/reparse nodes, and enforce the byte ceiling on the handle.
+fn read_source_file(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata_is_real_file(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "backend source is not a regular non-link file",
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backend source exceeds the scan budget",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0).min(64 * 1024));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backend source grew beyond the scan budget",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn metadata_is_real_file(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn metadata_is_real_dir(metadata: &std::fs::Metadata) -> bool {
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Extract backend route registrations from one already-bounded source file.
+///
+/// Callers that own a stronger filesystem trust boundary can perform their own
+/// no-follow, aggregate-budgeted read and reuse the parser without asking this
+/// crate to reopen the workspace path.
+#[must_use]
+pub fn extract_backend_routes_from_content(file: &str, content: &str) -> Vec<BackendRoute> {
+    let ext = Path::new(file)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+    Lang::from_ext(ext)
+        .map(|lang| extract_from_file(file, content, lang))
+        .unwrap_or_default()
 }
 
 /// Extract registrations from one file's content. Public-in-crate so tests and
@@ -976,7 +1069,8 @@ pub(crate) fn strip_comments_jsts(src: &str) -> String {
 /// vendored / generated dirs; never follows symlinks, matching the frontend
 /// walker's no-follow contract).
 fn collect_backend_sources(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    collect_backend_sources_bounded(dir, out, depth, MAX_FILES);
+    let mut entries_seen = 0;
+    collect_backend_sources_bounded(dir, out, depth, MAX_FILES, &mut entries_seen);
 }
 
 fn collect_backend_sources_bounded(
@@ -984,14 +1078,17 @@ fn collect_backend_sources_bounded(
     out: &mut Vec<PathBuf>,
     depth: usize,
     max_files: usize,
+    entries_seen: &mut usize,
 ) {
-    if depth > MAX_DEPTH || out.len() >= max_files {
+    if depth > MAX_DEPTH || out.len() >= max_files || *entries_seen >= MAX_WALK_ENTRIES {
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut entries = rd.flatten().collect::<Vec<_>>();
+    let remaining = MAX_WALK_ENTRIES.saturating_sub(*entries_seen);
+    let mut entries = rd.flatten().take(remaining).collect::<Vec<_>>();
+    *entries_seen = (*entries_seen).saturating_add(entries.len());
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         if out.len() >= max_files {
@@ -1001,16 +1098,13 @@ fn collect_backend_sources_bounded(
         let Ok(meta) = std::fs::symlink_metadata(&p) else {
             continue;
         };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        if meta.is_dir() {
+        if metadata_is_real_dir(&meta) {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            collect_backend_sources_bounded(&p, out, depth + 1, max_files);
-        } else if meta.is_file() {
+            collect_backend_sources_bounded(&p, out, depth + 1, max_files, entries_seen);
+        } else if metadata_is_real_file(&meta) {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
             if BACKEND_EXTS.contains(&ext) {
                 out.push(p);
@@ -1030,12 +1124,30 @@ mod tests {
             std::fs::write(tmp.path().join(name), "fn route() {}\n").unwrap();
         }
         let mut files = Vec::new();
-        collect_backend_sources_bounded(tmp.path(), &mut files, 0, 2);
+        let mut entries_seen = 0;
+        collect_backend_sources_bounded(tmp.path(), &mut files, 0, 2, &mut entries_seen);
         let names = files
             .iter()
             .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn backend_walk_has_a_global_directory_entry_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for index in 0..8 {
+            std::fs::write(
+                tmp.path().join(format!("route-{index}.rs")),
+                "fn route() {}\n",
+            )
+            .unwrap();
+        }
+        let mut files = Vec::new();
+        let mut entries_seen = MAX_WALK_ENTRIES - 2;
+        collect_backend_sources_bounded(tmp.path(), &mut files, 0, MAX_FILES, &mut entries_seen);
+        assert_eq!(entries_seen, MAX_WALK_ENTRIES);
+        assert!(files.len() <= 2);
     }
 
     fn paths(routes: &[BackendRoute]) -> Vec<(Option<HttpVerb>, &str)> {
@@ -1584,6 +1696,39 @@ mod tests {
         std::fs::write(tmp.path().join("ok.js"), "app.get('/api/ok', h)").unwrap();
         let routes = extract_backend_routes(tmp.path());
         assert!(routes.iter().any(|r| r.path == "/api/ok"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_and_symlink_sources_are_skipped_without_blocking_or_escaping() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "app.get('/api/outside', h)").unwrap();
+        symlink(outside.path(), tmp.path().join("linked.js")).unwrap();
+        let fifo = tmp.path().join("blocked.js");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(tmp.path().join("ok.js"), "app.get('/api/ok', h)").unwrap();
+
+        let routes = extract_backend_routes(tmp.path());
+        assert!(routes.iter().any(|route| route.path == "/api/ok"));
+        assert!(!routes.iter().any(|route| route.path == "/api/outside"));
+    }
+
+    #[test]
+    fn oversized_source_is_skipped_before_parsing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let oversized = tmp.path().join("huge.js");
+        let file = std::fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_FILE_BYTES + 1).unwrap();
+        std::fs::write(tmp.path().join("ok.js"), "app.get('/api/ok', h)").unwrap();
+        let routes = extract_backend_routes(tmp.path());
+        assert_eq!(paths(&routes), vec![(Some(HttpVerb::Get), "/api/ok")]);
     }
 
     #[test]

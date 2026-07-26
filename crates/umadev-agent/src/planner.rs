@@ -870,7 +870,11 @@ pub fn derive_project_context(
 /// So last quarter's violet rebrand cannot stand the band down for today's "no purple", and a
 /// run whose door never consulted the brain simply keeps the default-reject.
 pub(crate) fn stored_color_permission(project_root: &std::path::Path, requirement: &str) -> bool {
-    let Ok(raw) = std::fs::read_to_string(project_root.join(GOVERNANCE_CONTEXT_REL)) else {
+    let Ok(raw) = crate::bounded_fs::read_utf8_beneath(
+        project_root,
+        &project_root.join(GOVERNANCE_CONTEXT_REL),
+        MAX_PLANNER_METADATA_BYTES,
+    ) else {
         return false;
     };
     serde_json::from_str::<umadev_governance::ProjectContext>(&raw)
@@ -922,9 +926,16 @@ pub fn derive_project_context_with_color(
     // Read it best-effort; absent/empty doc is fine for a light build (it often
     // has no architecture doc at all), so absence is NOT a veto here — the other
     // signals already established "frontend-only, no heavy words".
-    let arch = std::fs::read_to_string(project_root.join(format!("output/{slug}-architecture.md")))
-        .unwrap_or_default()
-        .to_lowercase();
+    let arch_path = project_root.join(format!("output/{slug}-architecture.md"));
+    let arch =
+        match crate::bounded_fs::read_utf8_beneath(project_root, &arch_path, MAX_PLANNER_DOC_BYTES)
+        {
+            Ok(content) => content.to_lowercase(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            // An existing architecture contract that cannot be read in full must
+            // not be mistaken for evidence that the project is static-only.
+            Err(_) => return strict,
+        };
     if doc_declares_server_surface(&arch) {
         return strict;
     }
@@ -949,6 +960,9 @@ fn now_secs() -> u64 {
 
 /// Workspace-relative path of the persisted governance context.
 pub const GOVERNANCE_CONTEXT_REL: &str = ".umadev/governance-context.json";
+const MAX_PLANNER_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_PLANNER_DOC_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PLANNER_SOURCE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 /// **Derive the run's governance [`ProjectContext`](umadev_governance::ProjectContext) and
 /// PERSIST it** — the single place any run path writes the rule book that the other
@@ -1063,9 +1077,15 @@ fn any_source_has_server_surface(project_root: &std::path::Path) -> bool {
     // possible from here, so we read each file and look for the same evidence the
     // kernel uses, via the public lenient/strict differential.
     let files = crate::acceptance::source_files(project_root);
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        MAX_PLANNER_SOURCE_TOTAL_BYTES,
+        MAX_PLANNER_DOC_BYTES,
+    );
     for f in files.iter().take(400) {
-        let Ok(content) = std::fs::read_to_string(f) else {
-            continue;
+        let Ok(content) = budget.read_utf8_beneath(project_root, f) else {
+            // This predicate controls whether strict server-surface governance
+            // is armed. Unavailable evidence must choose the strict direction.
+            return true;
         };
         let rel = f
             .strip_prefix(project_root)
@@ -1858,6 +1878,44 @@ mod tests {
             !ctx.static_frontend_only,
             "an architecture doc with an API surface proves a backend → strict"
         );
+    }
+
+    #[test]
+    fn context_stays_strict_when_architecture_input_exceeds_the_read_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = tmp.path().join("output");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(
+            out.join("todo-architecture.md"),
+            vec![b' '; MAX_PLANNER_DOC_BYTES + 1],
+        )
+        .unwrap();
+
+        let ctx = derive_project_context("做一个简单的待办清单单页应用,纯前端", tmp.path(), "todo");
+        assert!(
+            !ctx.static_frontend_only,
+            "unavailable architecture evidence must not disarm strict governance"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_stays_strict_for_a_symlinked_architecture_contract() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(workspace.path().join("output")).unwrap();
+        let doc = outside.path().join("architecture.md");
+        std::fs::write(&doc, "# Architecture\n").unwrap();
+        symlink(&doc, workspace.path().join("output/todo-architecture.md")).unwrap();
+
+        let ctx = derive_project_context(
+            "做一个简单的待办清单单页应用,纯前端",
+            workspace.path(),
+            "todo",
+        );
+        assert!(!ctx.static_frontend_only);
     }
 
     #[test]

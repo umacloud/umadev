@@ -614,7 +614,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | Command | What it does |
 |---|---|
 | just type | Routes to the right path; a build typed here gets the same systems as `/run` |
-| `/run [slug] <req>` | Start a full build explicitly |
+| `/run [--slug <slug>] <req>` | Start a full build explicitly; use `--slug` when overriding the project slug |
 | `/goal <objective>` | Keep working until the objective is met (same entry on all five; vendor-specific goal capability where exposed, coordinator persistence over ACP; `UMADEV_NO_GOAL_MODE=1` opts out) |
 | `/quick <task>` | Force the light path for a trivial one-off change |
 | `/plan [skip\|add\|veto\|up\|down <id>]` | View or steer the live dependency plan |

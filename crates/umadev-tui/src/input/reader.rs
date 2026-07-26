@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::Receiver;
+#[cfg(test)]
+use tokio::sync::mpsc::Sender;
 
 use super::decode::{Decoder, InputEvent};
 use super::tokenize::Tokenizer;
@@ -57,6 +59,8 @@ const DEFAULT_PASTE_FLUSH_MS: u64 = 500;
 /// Read-chunk size for the stdin reader thread. One `read()` returns whatever is
 /// available up to this; a large paste arrives in a few chunks, not byte-by-byte.
 const READ_CHUNK: usize = 4096;
+/// Backpressure envelope between the blocking stdin reader and render loop.
+const STDIN_CHANNEL_CAP: usize = 64;
 
 /// Whether to use the legacy `crossterm::EventStream` input path instead of the
 /// owned byte-tokenizer (`UMADEV_LEGACY_INPUT=1`). The de-risk escape hatch: the
@@ -103,8 +107,8 @@ fn paste_flush_interval() -> Duration {
 /// the channel close and the input source degrades gracefully (the rest of the
 /// app keeps running). On process exit a thread still blocked in `read()` is
 /// reaped by the OS — it is intentionally detached, never joined.
-fn spawn_stdin_reader() -> UnboundedReceiver<Vec<u8>> {
-    let (tx, rx): (UnboundedSender<Vec<u8>>, _) = tokio::sync::mpsc::unbounded_channel();
+fn spawn_stdin_reader() -> Receiver<Vec<u8>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(STDIN_CHANNEL_CAP);
     // If the thread can't even be spawned, `spawn` consumes + drops the closure
     // (and its captured `tx`), so the channel closes immediately and the receiver
     // degrades gracefully (fail-open: input is dead, the app still runs).
@@ -119,7 +123,7 @@ fn spawn_stdin_reader() -> UnboundedReceiver<Vec<u8>> {
                 match lock.read(&mut buf) {
                     Ok(0) => break, // EOF
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
                             break; // receiver gone
                         }
                     }
@@ -218,7 +222,7 @@ async fn sleep_until_opt(deadline: Option<Instant>) {
 /// event queue + the paste-state-aware flush deadline + the SIGWINCH listener.
 pub struct OwnedInput {
     /// Raw byte chunks from the reader thread.
-    rx: UnboundedReceiver<Vec<u8>>,
+    rx: Receiver<Vec<u8>>,
     /// Boundary tokenizer (persistent buffer across reads).
     tokenizer: Tokenizer,
     /// Token → event decoder (persistent paste state).
@@ -512,7 +516,7 @@ impl InputSource {
 #[cfg(test)]
 #[must_use]
 pub(crate) fn owned_test_source(background_reply: Option<bool>) -> InputSource {
-    let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
     InputSource::Owned(Box::new(OwnedInput {
         rx,
         tokenizer: Tokenizer::for_stdin(),
@@ -626,8 +630,8 @@ mod tests {
 
     /// A bare `OwnedInput` around a hand-made byte channel — no stdin reader
     /// thread, no SIGWINCH — so the decode/capture path is testable hermetically.
-    fn owned_for_test() -> (OwnedInput, UnboundedSender<Vec<u8>>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn owned_for_test() -> (OwnedInput, Sender<Vec<u8>>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(STDIN_CHANNEL_CAP);
         (
             OwnedInput {
                 rx,
@@ -643,6 +647,18 @@ mod tests {
             },
             tx,
         )
+    }
+
+    #[test]
+    fn raw_stdin_channel_applies_backpressure() {
+        let (_input, tx) = owned_for_test();
+        for _ in 0..STDIN_CHANNEL_CAP {
+            tx.try_send(vec![b'x'; READ_CHUNK]).unwrap();
+        }
+        assert!(matches!(
+            tx.try_send(vec![b'y'; READ_CHUNK]),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
     }
 
     #[test]
@@ -722,7 +738,7 @@ mod tests {
         // Wave 2 P1 pre-gate: when the continuation is ALREADY on the reader
         // channel, arming a flush deadline could only race it — don't arm.
         let (mut oi, tx) = owned_for_test();
-        tx.send(b"[A".to_vec()).unwrap();
+        tx.try_send(b"[A".to_vec()).unwrap();
         oi.ingest(b"\x1b");
         assert!(oi.tokenizer.has_pending_escape());
         assert!(
@@ -797,10 +813,10 @@ mod tests {
         // comfortably inside the 500 ms paste window. The result must be ONE
         // clean Paste with the marker fully stripped.
         let (mut oi, tx) = owned_for_test();
-        tx.send(b"\x1b[200~hello\x1b[20".to_vec()).unwrap();
+        tx.try_send(b"\x1b[200~hello\x1b[20".to_vec()).unwrap();
         let sender = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            tx.send(b"1~".to_vec()).unwrap();
+            tx.try_send(b"1~".to_vec()).unwrap();
             tx // keep the channel open so `next` never sees a close
         });
         let ev = oi.next().await.expect("an event").expect("no io error");
@@ -818,7 +834,7 @@ mod tests {
         // idleness (not the 50 ms Esc window) the reader force-closes it,
         // delivering the buffered body — and input stays alive afterwards.
         let (mut oi, tx) = owned_for_test();
-        tx.send(b"\x1b[200~hello".to_vec()).unwrap();
+        tx.try_send(b"\x1b[200~hello".to_vec()).unwrap();
         let t0 = tokio::time::Instant::now();
         let ev = oi.next().await.expect("an event").expect("no io error");
         assert_eq!(ev, Event::Paste("hello".into()));
@@ -832,7 +848,7 @@ mod tests {
             "but not longer than one window, waited {waited:?}"
         );
         // Input is not wedged: a later keystroke still arrives.
-        tx.send(b"x".to_vec()).unwrap();
+        tx.try_send(b"x".to_vec()).unwrap();
         let ev = oi.next().await.expect("an event").expect("no io error");
         assert!(matches!(ev, Event::Key(k) if k.code == crossterm::event::KeyCode::Char('x')));
     }
@@ -842,7 +858,7 @@ mod tests {
         // The paste-aware window must NOT slow down the lone-Esc verdict: an
         // idle fd holding a bare `\x1b` still resolves at ~50 ms, not 500 ms.
         let (mut oi, tx) = owned_for_test();
-        tx.send(b"\x1b".to_vec()).unwrap();
+        tx.try_send(b"\x1b".to_vec()).unwrap();
         let t0 = tokio::time::Instant::now();
         let ev = oi.next().await.expect("an event").expect("no io error");
         assert!(
@@ -907,7 +923,7 @@ mod tests {
         // wire, and any keystrokes riding in the same chunk stay queued for the
         // ordinary input loop — none are lost or surfaced early.
         let (mut oi, tx) = owned_for_test();
-        tx.send(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\hi".to_vec())
+        tx.try_send(b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\hi".to_vec())
             .unwrap();
         oi.prime_background_theme(Duration::from_millis(120)).await;
         assert_eq!(

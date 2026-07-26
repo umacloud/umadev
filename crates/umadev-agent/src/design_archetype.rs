@@ -259,6 +259,7 @@ fn parse_archetype(json: &str) -> Option<DesignArchetype> {
 
 /// Workspace-relative path of the persisted archetype pick.
 const DESIGN_ARCHETYPE_REL: &str = ".umadev/design-archetype.json";
+const MAX_DESIGN_ARCHETYPE_BYTES: usize = 1024 * 1024;
 
 /// UNIX seconds, or 0 when the clock is unreadable.
 fn now_secs() -> u64 {
@@ -304,7 +305,12 @@ pub(crate) fn persist_design_archetype(
 /// id no longer known, yields `None` and the renderer falls back to the deterministic
 /// recommendation.
 pub(crate) fn stored_design_archetype(project_root: &Path, requirement: &str) -> Option<String> {
-    let raw = std::fs::read_to_string(project_root.join(DESIGN_ARCHETYPE_REL)).ok()?;
+    let raw = crate::bounded_fs::read_utf8_beneath(
+        project_root,
+        &project_root.join(DESIGN_ARCHETYPE_REL),
+        MAX_DESIGN_ARCHETYPE_BYTES,
+    )
+    .ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     if v.get("requirement_hash")?.as_u64()?
         != umadev_governance::requirement_fingerprint(requirement)
@@ -515,6 +521,37 @@ mod tests {
             stored_design_archetype(tmp.path(), "做一个数据监控后台"),
             None
         );
+    }
+
+    #[test]
+    fn oversized_persisted_pick_is_ignored() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        std::fs::File::create(tmp.path().join(DESIGN_ARCHETYPE_REL))
+            .unwrap()
+            .set_len(u64::try_from(MAX_DESIGN_ARCHETYPE_BYTES + 1).unwrap())
+            .unwrap();
+        assert_eq!(stored_design_archetype(tmp.path(), "a product"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_persisted_pick_is_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        let payload = serde_json::json!({
+            "archetype": "premium-luxury",
+            "requirement_hash": umadev_governance::requirement_fingerprint("a product"),
+            "derived_at": now_secs(),
+        });
+        let outside_path = outside.path().join("pick.json");
+        std::fs::write(&outside_path, serde_json::to_vec(&payload).unwrap()).unwrap();
+        symlink(&outside_path, tmp.path().join(DESIGN_ARCHETYPE_REL)).unwrap();
+
+        assert_eq!(stored_design_archetype(tmp.path(), "a product"), None);
     }
 
     #[test]

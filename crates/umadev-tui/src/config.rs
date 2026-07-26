@@ -17,12 +17,59 @@
 //! "no preference yet — show the picker." Never panics.
 
 use std::fs;
+use std::io::Read as _;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 const FILE_NAME: &str = "config.toml";
 const DIR_NAME: &str = ".umadev";
+/// A user/base CLI config is human-authored metadata, never a document store.
+/// Keeping one shared ceiling prevents a damaged file or special filesystem
+/// node from wedging TUI startup while still leaving ample room for provider
+/// model catalogs embedded by OpenCode.
+pub(crate) const MAX_USER_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a small user-owned config through one already-open handle.
+///
+/// Dotfile managers commonly expose these files through symlinks, so unlike
+/// workspace-managed state this intentionally follows a link to a regular file.
+/// The opened handle is then type-checked and byte-bounded. `O_NONBLOCK` keeps a
+/// mistakenly-created FIFO from hanging startup before that check can reject it.
+pub(crate) fn read_user_config(path: &std::path::Path) -> std::io::Result<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config input is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_USER_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config exceeds {MAX_USER_CONFIG_BYTES} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0).min(64 * 1024));
+    file.take(MAX_USER_CONFIG_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_USER_CONFIG_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("config exceeds {MAX_USER_CONFIG_BYTES} bytes while being read"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
 
 /// The on-disk shape of the user config.
 #[derive(Debug, Clone, Eq, PartialEq, Default, Serialize, Deserialize)]
@@ -299,17 +346,16 @@ pub fn load() -> UserConfig {
 /// Read from a specific path. Same fail-soft behaviour.
 #[must_use]
 pub fn load_from(path: &std::path::Path) -> UserConfig {
-    let Ok(body) = fs::read_to_string(path) else {
+    let Ok(body) = read_user_config(path) else {
         return UserConfig::default();
     };
     toml::from_str(&body).unwrap_or_default()
 }
 
-/// Startup entry point: [`load_from`] the config, run any PENDING migrations
+/// Startup entry point: strictly load the config, run any PENDING migrations
 /// once ([`run_migrations`]), and persist the bumped version back when something
-/// changed. Fail-open: a save error is swallowed (the idempotent migrations just
-/// re-run next launch), so config drift across npm releases is repaired exactly
-/// once per upgrade without ever risking a broken startup.
+/// changed. A damaged existing file is never rewritten from a fail-soft default;
+/// a save error is swallowed so idempotent migrations can retry next launch.
 #[must_use]
 pub fn load_and_migrate(path: &std::path::Path) -> UserConfig {
     load_and_migrate_for_startup(path).0
@@ -320,7 +366,9 @@ pub fn load_and_migrate(path: &std::path::Path) -> UserConfig {
 /// so the TUI can show one clear migration notice exactly on the upgrade launch.
 #[must_use]
 pub(crate) fn load_and_migrate_for_startup(path: &std::path::Path) -> (UserConfig, Option<String>) {
-    let mut cfg = load_from(path);
+    let Ok(mut cfg) = load_strict(path) else {
+        return (UserConfig::default(), None);
+    };
     // The retired-backend step is migration index 1 (target version 2). Capture
     // the old id only while that step is pending; once v2 is persisted, a later
     // startup cannot repeat the notice.
@@ -344,10 +392,13 @@ pub(crate) fn load_and_migrate_for_startup(path: &std::path::Path) -> (UserConfi
 /// # Errors
 /// Returns the read or TOML-parse error as a string.
 pub fn load_strict(path: &std::path::Path) -> Result<UserConfig, String> {
-    if !path.is_file() {
-        return Ok(UserConfig::default());
-    }
-    let body = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let body = match read_user_config(path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UserConfig::default());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     toml::from_str(&body).map_err(|e| e.to_string())
 }
 
@@ -364,21 +415,42 @@ pub fn save_to(config: &UserConfig, path: &std::path::Path) -> std::io::Result<P
         fs::create_dir_all(parent)?;
     }
     let body = toml::to_string_pretty(config).map_err(|e| std::io::Error::other(e.to_string()))?;
-    // Atomic write (write-temp-then-rename): a crash mid-write must never corrupt
-    // config.toml — it holds the backend, model, lang AND the provider api_key,
-    // and load_from silently falls back to Default on a parse error (so a partial
-    // write would silently wipe every setting). Rename within the same dir is
-    // atomic on POSIX/Windows.
-    //
-    // PID-qualify the temp name (`config.toml.tmp-<pid>`): the GLOBAL
-    // `~/.umadev/config.toml` is shared across every umadev process, so a FIXED
-    // temp path lets two processes saving config at once write the same temp file
-    // and clobber each other's partial bytes before the rename. A per-PID temp
-    // gives each process its own staging file (matching `persist_chat`'s
-    // `{id}.json.tmp-{pid}`); the rename onto the shared target stays atomic.
-    let tmp = path.with_extension(format!("toml.tmp-{}", std::process::id()));
-    fs::write(&tmp, body)?;
-    fs::rename(&tmp, path)?;
+    // Resolve the parent first so dotfile-manager symlinked directories keep
+    // working, then use the shared crash-safe/no-follow writer on the real
+    // target. If the config file itself is a symlink, preserve it by updating
+    // its canonical regular-file target rather than replacing the link.
+    let target = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            fs::canonicalize(path)?
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = fs::canonicalize(path)?;
+            if !target.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "config symlink does not resolve to a regular file",
+                ));
+            }
+            target
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "config output is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "config has no parent")
+            })?;
+            let parent = fs::canonicalize(parent)?;
+            parent.join(path.file_name().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "config has no filename")
+            })?)
+        }
+        Err(error) => return Err(error),
+    };
+    umadev_state::fs::atomic_write(&target, body.as_bytes())?;
     Ok(path.to_path_buf())
 }
 
@@ -440,7 +512,59 @@ mod tests {
     }
 
     #[test]
-    fn save_to_uses_pid_qualified_temp_name() {
+    fn oversized_config_is_rejected_without_allocation_growth() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("oversized.toml");
+        fs::write(
+            &path,
+            vec![b'x'; usize::try_from(MAX_USER_CONFIG_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert_eq!(load_from(&path), UserConfig::default());
+        assert!(load_strict(&path).unwrap_err().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_config_is_rejected_without_blocking() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(load_from(&path), UserConfig::default());
+        assert!(load_strict(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_is_supported_and_preserved_on_save() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("dotfiles/umadev.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, "backend = \"codex\"\n").unwrap();
+        let path = tmp.path().join("config.toml");
+        symlink(&target, &path).unwrap();
+
+        assert_eq!(load_from(&path).backend.as_deref(), Some("codex"));
+        let config = UserConfig {
+            backend: Some("opencode".into()),
+            ..Default::default()
+        };
+        save_to(&config, &path).unwrap();
+        assert!(fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(load_from(&path), config);
+    }
+
+    #[test]
+    fn save_to_ignores_legacy_fixed_temp_name() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
         // Occupy the OLD fixed temp path with a directory so a write to it would
@@ -453,9 +577,9 @@ mod tests {
             backend: Some("claude-code".into()),
             ..Default::default()
         };
-        // Succeeds despite the occupied fixed temp path → the temp name is
-        // PID-qualified, not the fixed `config.toml.tmp`.
-        save_to(&cfg, &path).expect("PID-qualified temp must avoid the occupied fixed name");
+        // Succeeds despite the occupied fixed temp path → the shared atomic
+        // writer uses an unguessable create-new sibling instead.
+        save_to(&cfg, &path).expect("atomic temp must avoid the occupied fixed name");
         assert_eq!(load_from(&path), cfg);
         // The fixed-name obstacle is untouched — confirming it was never used.
         assert!(fixed_tmp.is_dir());
@@ -683,6 +807,17 @@ mod tests {
         let reloaded = load_from(&path);
         assert_eq!(reloaded.migration_version, CURRENT_MIGRATION_VERSION);
         assert_eq!(reloaded.backend.as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn load_and_migrate_never_overwrites_a_corrupt_config() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = b"backend = [broken";
+        fs::write(&path, original).unwrap();
+
+        assert_eq!(load_and_migrate(&path), UserConfig::default());
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]

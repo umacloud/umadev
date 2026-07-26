@@ -1,93 +1,12 @@
-//! The director build loop — the USB / smart-hardware model of
-//! `docs/AGENT_WIELDS_BASE_ARCHITECTURE.md` (simplified: NO marker protocol).
+//! Director build loop. UmaDev supplies policy, memory, governance, and bounded
+//! orchestration; the selected base retains its own model and tool loop.
 //!
-//! ## The model: UmaDev is firmware; the base is the brain + hands
-//!
-//! UmaDev is a smart device with its own firmware — a senior team-director
-//! identity, engineering taste, accumulated knowledge, governance, and memory —
-//! but **no compute of its own**. Plugged into one of five bases (three native
-//! plus Grok Build/Kimi Code over ACP) over the continuous session, it **borrows the base's
-//! intelligence and hands**
-//! to get work done, the way a smart peripheral borrows a host computer's CPU and
-//! storage. The firmware is injected into the base (via the directive + system
-//! prompt the caller built — `experts::director_build_directive` /
-//! `experts::director_with_team_tools`); the base then thinks, plans, and writes
-//! files with its OWN internal agentic tool loop.
-//!
-//! **The key insight that retired the old marker protocol:** the base is already a
-//! whole brain. Once UmaDev's firmware is injected, the base ITSELF plays PM /
-//! architect / frontend / QA internally and builds the goal end to end. It does
-//! **not** need to emit `<<<umadev:summon …>>>` markers for UmaDev to "summon a
-//! team" from the outside — real-machine testing showed the base writes good,
-//! multi-role code with ZERO markers, because the team lives inside the base's
-//! head, steered by the firmware. So this loop no longer asks the base to speak a
-//! scheduling protocol, and no longer parses one.
-//!
-//! ## The boundary: UmaDev grows NO "operating" machinery of its own
-//!
-//! The base is a complete Agent already — its model is the brain, its CLI tools are
-//! the body that builds code, writes files, runs commands, runs tests, and fixes
-//! bugs. UmaDev is the EXTERNAL agent that plugs into that body and shares that
-//! brain. So **UmaDev never grows its own build/write/run/test/fix capability** —
-//! all of that work is the base's body using the base's own tools. The only two
-//! tiny things UmaDev does for itself (firmware business, not "operating"):
-//!
-//! - **Governance** — the background safety net riding on the base's file writes
-//!   (the existing PreToolUse hook). Untouched here.
-//! - **A read-only honesty check** — when the base says "built it", UmaDev reads the
-//!   disk to confirm real code actually exists ([`crate::acceptance::source_files`]
-//!   via [`crate::director::verify`] / [`VerifyKind::SourcePresent`]). Tiny,
-//!   deterministic, read-only — it just stops a hallucinated "done".
-//!
-//! Everything else — building, and FIXING what QC surfaces — the base's body does
-//! with its own tools, steered by a fix directive UmaDev feeds back. UmaDev reads
-//! objective facts and judges; it does not operate.
-//!
-//! ## The loop: end-to-end build → UmaDev honesty/QC read → bounded feedback-fix
-//!
-//! 1. Drive the base end to end on the goal (one firmware-injected turn — its own
-//!    agentic tool loop runs PM→…→QA internally and writes real files).
-//! 2. When the turn settles, **UmaDev reads reality ITSELF** (it does not wait for
-//!    the base to ask, and it does not operate):
-//!    - **honesty hard floor (deterministic, read-only)** — did real source files
-//!      actually land ([`crate::acceptance::source_files`])? This is UmaDev's own
-//!      tiny check.
-//!    - **optional fork review (read-only, borrows the brain)** — for a build that
-//!      produced real code, fork the review team on isolated read-only sessions and
-//!      collect blocking findings ([`crate::director::review`]). UmaDev judges with
-//!      the borrowed brain; it writes nothing.
-//! 3. If QC found blocking problems, fold them into ONE fix directive and feed it
-//!    back to the base over the same session (the USB channel) — and the directive
-//!    tells the base's body to **run its own build/test and fix the cause with its
-//!    own tools**. Then re-read. **Bounded** by the internal QC-round limit.
-//! 4. Clean mechanical QC → done; report honestly. A quiet/tool-only reply is
-//!    never completion evidence by itself.
-//!
-//! Note on build/test: UmaDev does NOT run the build itself as its gate — the base's
-//! body runs build/test (it has the tools), and the fix directive explicitly asks it
-//! to. The optional [`VerifyKind::BuildTest`] read is retained only as a cheap
-//! reuse of an EXISTING reader to surface an objective failure fact when a manifest
-//! is present; it is positioned as "read a fact", never as "UmaDev operates".
-//!
-//! ## Floor preserved (every invariant still holds)
-//!
-//! 1. **Single-writer.** Only the MAIN base turn mutates the workspace, under the
-//!    run-lock the caller holds. UmaDev's checks are read-only: the source floor
-//!    reads disk; the QC review runs on isolated read-only forks
-//!    ([`crate::director::review`]). Nothing UmaDev does writes the workspace.
-//! 2. **Objective floor untouched.** The source-present floor remains a
-//!    deterministic, read-only check. Reviewer blockers seed bounded fixes and
-//!    must clear before a clean claim; Rust-side budgets still own termination.
-//! 3. **Governance + audit.** Every base turn (the first build and every fix pass)
-//!    drives the SAME governed/audited session; the PreToolUse hook still fires
-//!    under every write.
-//! 4. **No new endpoint.** Every QC review reads over the SAME borrowed brain + its
-//!    `fork()`; no extra model endpoint, no API key.
-//! 5. **Bounded failure.** A required review that cannot run is explicitly
-//!    unavailable, never a pass. It may leave the build incomplete, but cannot
-//!    wedge the loop; a dead session is an honest `Failed`, never a panic.
-//! 6. **Reversible.** This loop is the DEFAULT `/run` path; the legacy fixed
-//!    pipeline (`UMADEV_LEGACY_PIPELINE=1`) is untouched.
+//! Invariants:
+//! - one writable main session owns workspace mutations;
+//! - source/QC checks are read-only and evidence-based;
+//! - blocking findings can trigger only bounded fix rounds;
+//! - unavailable required review never counts as a pass;
+//! - all supported bases share the same contract without a marker protocol.
 
 use std::{sync::Arc, time::Duration};
 
@@ -98,6 +17,9 @@ use umadev_runtime::{
 
 use crate::director::{self, VerifyKind, VerifyResult};
 use crate::events::{EngineEvent, EventSink};
+
+const DIRECTOR_EVIDENCE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const DIRECTOR_SOURCE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 use crate::knowledge_feedback::{commit_sent_memories, SentReceiptGuard, TurnOutcome};
 use crate::phases::KnowledgeDigest;
 use crate::plan_state::{self, Plan, StepStatus};
@@ -110,6 +32,7 @@ mod operational_review;
 mod quality_evidence;
 mod resume;
 mod review_checkpoint;
+mod review_liveness;
 mod step_metrics;
 mod step_review;
 
@@ -123,16 +46,22 @@ pub use operational_review::{
 use quality_evidence::{has_reproduction_test, runtime_proof_blocking, QcReport};
 use resume::{
     clear_operational_review_checkpoint, load_operational_review_checkpoint,
+    next_final_review_checkpoint, next_step_review_checkpoint,
     operational_review_checkpoint_for_plan, save_operational_review_checkpoint,
     OperationalReviewCheckpoint, FINAL_REVIEW_RETRY_STEP_ID,
 };
 pub use resume::{
-    has_resumable_director_plan, has_resumable_run, is_budget_pause_reason, transient_resume_hint,
+    has_resumable_director_plan, has_resumable_run, is_budget_pause_reason,
+    terminal_review_circuit_reason, transient_resume_hint,
 };
 use resume::{load_resumable_plan, record_artifact_versions};
 use review_checkpoint::{
     ensure_final_review_retry_step, ensure_final_review_retry_step_in_plan,
     final_review_qc_receipt_matches,
+};
+use review_liveness::{
+    block_open_steps, handle_final_review_outage, handle_step_review_outage, FinalReviewOutage,
+    StepReviewOutage,
 };
 use step_metrics::{record_run_sizing, record_step_first_pass};
 use step_review::{drive_review_step, retry_review_step_once};
@@ -995,10 +924,10 @@ pub async fn drive_director_loop_routed(
 /// (the old subprocess is gone): the persisted plan + the on-disk artifacts ARE the
 /// continuity, exactly as a `/run` opens a new session.
 ///
-/// Returns `Some(outcome)` when a resume actually ran, or `None` when there was
-/// nothing resumable (absent / corrupt / fully-terminal plan) OR the first remaining
-/// step could not drive on the fresh session — in BOTH cases the caller falls back to
-/// a fresh [`drive_director_loop_routed`], so a resume never loses the build.
+/// Returns `Some(outcome)` when a resume actually ran. A persisted terminal review
+/// circuit also returns `Some(Failed)` before plan loading so a hosted caller cannot
+/// mistake the blocked plan for `None` and replay it as a fresh run. Other absent /
+/// corrupt / fully-terminal plans, or a first step that cannot drive, return `None`.
 /// Fail-open by contract: never panics, never wedges.
 pub async fn drive_director_loop_resume(
     session: &mut dyn BaseSession,
@@ -1019,6 +948,11 @@ pub async fn drive_director_loop_resume(
         return Some(DirectorLoopOutcome::Planned {
             reply: umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
         });
+    }
+
+    if let Some(reason) = terminal_review_circuit_reason(&options.project_root) {
+        events.emit(EngineEvent::Note(format!("team · {reason}")));
+        return Some(DirectorLoopOutcome::Failed(reason));
     }
 
     let mut plan = load_resumable_plan(&options.project_root)?;
@@ -1470,13 +1404,12 @@ async fn drive_director_loop_with_idle(
                 .is_some_and(|plan| plan_state::save(plan, &options.project_root).is_ok());
             let saved_checkpoint = save_operational_review_checkpoint(
                 &options.project_root,
-                &OperationalReviewCheckpoint::FinalGateReview {
-                    qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(
-                        &options.project_root,
-                    ),
-                    required_seats: route.map(|route| route.team.clone()),
-                    entry_task_run_id: None,
-                },
+                &next_final_review_checkpoint(
+                    None,
+                    crate::freshness::workspace_qc_fingerprint(&options.project_root),
+                    route.map(|route| route.team.clone()),
+                    None,
+                ),
             )
             .is_ok();
             if saved_plan && saved_checkpoint {
@@ -1493,6 +1426,10 @@ async fn drive_director_loop_with_idle(
                 };
             }
             clear_operational_review_checkpoint(&options.project_root);
+            if let Some(plan) = plan.as_mut() {
+                block_open_steps(plan, events);
+                let _ = plan_state::save(plan, &options.project_root);
+            }
             return DirectorLoopOutcome::Failed(format!(
                 "{reason}; the typed review checkpoint could not be persisted"
             ));
@@ -1969,6 +1906,7 @@ async fn drive_plan_steps(
             qc_source_fingerprint,
             required_seats,
             review_only,
+            ..
         }) = checkpoint.as_ref()
         {
             if parked_step_id == &step.id {
@@ -2074,58 +2012,18 @@ async fn drive_plan_steps(
             last_reply = reply;
         }
 
-        // A required host/reviewer outage is a resumable execution boundary, not
-        // a product verdict. Park before settling this step: it stays Active on
-        // disk (resume resets it to Pending), no dependent is marked Blocked, and
-        // no planner, repair turn, final gate, or lesson learner sees the outage.
         if unavailable {
-            let evidence = if gap_evidence.is_empty() {
-                "required host/review did not return a trustworthy result".to_string()
-            } else {
-                gap_evidence
-                    .iter()
-                    .take(4)
-                    .map(|item| item.chars().take(240).collect::<String>())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            };
-            let reason = format!("required review unavailable at step `{step_title}`: {evidence}");
-            let saved_checkpoint = save_operational_review_checkpoint(
-                &options.project_root,
-                &OperationalReviewCheckpoint::StepReview {
-                    step_id: step.id.clone(),
-                    qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(
-                        &options.project_root,
-                    ),
-                    required_seats: Some(step_review_route.team.clone()),
-                    review_only: step.kind == plan_state::StepKind::Build,
-                },
-            )
-            .is_ok();
-            if saved_checkpoint && plan_state::save(plan, &options.project_root).is_ok() {
-                match task_tracker.wait_for_user(&reason) {
-                    Ok(()) => {
-                        record_artifact_versions(&options.project_root);
-                        let (done, total) = plan.progress();
-                        events.emit(EngineEvent::Note(format!(
-                            "team · {reason} — plan paused without source rework; \
-                             type /continue to retry this step"
-                        )));
-                        return Some(DirectorLoopOutcome::PausedAtOperational {
-                            reason,
-                            done,
-                            total,
-                        });
-                    }
-                    Err(error) => events.emit(EngineEvent::Note(format!(
-                        "team · could not park the agent ledger after review outage: {error}"
-                    ))),
-                }
-            }
-            clear_operational_review_checkpoint(&options.project_root);
-            return Some(DirectorLoopOutcome::Failed(format!(
-                "{reason}; the resumable checkpoint could not be persisted"
-            )));
+            return Some(handle_step_review_outage(StepReviewOutage {
+                options,
+                events,
+                plan,
+                task_tracker: &mut task_tracker,
+                step: &step,
+                route: &step_review_route,
+                base_agents: &base_agents,
+                gaps: &gap_evidence,
+                prior: checkpoint.as_ref(),
+            }));
         }
         if matches!(
             load_operational_review_checkpoint(&options.project_root),
@@ -2514,73 +2412,19 @@ async fn drive_plan_steps(
         last_reply = final_gate.reply;
     }
 
-    // A final whole-build review outage is the same recoverable execution
-    // boundary as an unavailable step-level review. Re-open the last review
-    // step so `/continue` has a concrete unit to retry, persist before parking
-    // the ledger, and return without finalizing the run or teaching a blocker.
-    // Any required reviewer outage pauses this exact boundary. Mixed semantic
-    // evidence remains attached, but no source repair or second review starts
-    // until the unavailable reviewer can actually run.
     if !final_gate.operational_unavailable.is_empty() {
-        let evidence = final_gate
-            .operational_unavailable
-            .iter()
-            .take(4)
-            .map(|item| item.chars().take(240).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("; ");
-        let reason = format!("final quality review unavailable: {evidence}");
-        ensure_final_review_retry_step_in_plan(plan, Some(&final_review_route), events);
-        let saved_checkpoint = save_operational_review_checkpoint(
-            &options.project_root,
-            &OperationalReviewCheckpoint::FinalGateReview {
-                qc_source_fingerprint: crate::freshness::workspace_qc_fingerprint(
-                    &options.project_root,
-                ),
-                required_seats: Some(final_review_route.team.clone()),
-                entry_task_run_id: resumed_entry_task
-                    .as_ref()
-                    .map(|task| task.run_id().to_string())
-                    .or_else(|| checkpoint_entry_task_run_id.clone()),
-            },
-        )
-        .is_ok();
-        if saved_checkpoint && plan_state::save(plan, &options.project_root).is_ok() {
-            if let Some(task) = resumed_entry_task.as_mut() {
-                if let Err(error) = task.wait(&reason) {
-                    // The checkpoint still owns the exact run id. Drop will
-                    // interrupt a still-running task and `resume_exact` can
-                    // recover it on the next continuation.
-                    events.emit(EngineEvent::Note(format!(
-                        "team · resident task ledger could not append its pause ({error}); \
-                         the typed review checkpoint remains resumable"
-                    )));
-                }
-            }
-            if let Err(error) = task_tracker.wait_for_user(&reason) {
-                // The plan plus typed checkpoint are already durable. A status
-                // append failure must not erase that recovery boundary.
-                events.emit(EngineEvent::Note(format!(
-                    "team · plan task ledger could not append its pause ({error}); \
-                     the typed review checkpoint remains resumable"
-                )));
-            }
-            record_artifact_versions(&options.project_root);
-            let (done, total) = plan.progress();
-            events.emit(EngineEvent::Note(format!(
-                "team · {reason} — plan paused without source rework; \
-                 type /continue to retry the final review"
-            )));
-            return Some(DirectorLoopOutcome::PausedAtOperational {
-                reason,
-                done,
-                total,
-            });
-        }
-        clear_operational_review_checkpoint(&options.project_root);
-        return Some(DirectorLoopOutcome::Failed(format!(
-            "{reason}; the typed review checkpoint could not be persisted"
-        )));
+        return Some(handle_final_review_outage(FinalReviewOutage {
+            options,
+            events,
+            plan,
+            task_tracker: &mut task_tracker,
+            route: &final_review_route,
+            semantic_blocking: &final_gate.blocking,
+            operational_unavailable: &final_gate.operational_unavailable,
+            prior: checkpoint.as_ref(),
+            resident_task: resumed_entry_task.as_mut(),
+            checkpoint_entry_task_run_id: checkpoint_entry_task_run_id.as_deref(),
+        }));
     }
 
     // HONEST clean signal (used for the report below AND finalize): every step
@@ -4364,7 +4208,7 @@ fn file_exists_outcome(root: &std::path::Path, path: &str) -> EvidenceOutcome {
 /// `FileContains` contract → the named path exists AND its contents hold `needle`.
 fn file_contains_outcome(root: &std::path::Path, path: &str, needle: &str) -> EvidenceOutcome {
     let full = root.join(path);
-    match std::fs::read_to_string(&full) {
+    match crate::bounded_fs::read_utf8_beneath(root, &full, DIRECTOR_EVIDENCE_FILE_BYTES) {
         Ok(content)
             if content
                 .to_ascii_lowercase()
@@ -4377,8 +4221,8 @@ fn file_contains_outcome(root: &std::path::Path, path: &str, needle: &str) -> Ev
         Ok(_) => EvidenceOutcome::Gap(format!(
             "declared `{path}` contains \"{needle}\" but the file does not contain it"
         )),
-        Err(_) => EvidenceOutcome::Gap(format!(
-            "declared `{path}` contains \"{needle}\" but the file is absent/unreadable"
+        Err(error) => EvidenceOutcome::Gap(format!(
+            "declared `{path}` contains \"{needle}\" but the complete file is unavailable ({error})"
         )),
     }
 }
@@ -4757,9 +4601,15 @@ fn normalize_route(path: &str) -> String {
 /// bounded source scan ([`crate::acceptance::source_files`]); fail-open (an unreadable
 /// file is skipped). Bounded by the scan's own depth/file caps.
 fn source_mentions(root: &std::path::Path, needle: &str) -> bool {
-    crate::acceptance::source_files(root)
-        .iter()
-        .any(|f| std::fs::read_to_string(f).is_ok_and(|c| c.contains(needle)))
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        DIRECTOR_SOURCE_TOTAL_BYTES,
+        crate::acceptance::MAX_SOURCE_FILE_BYTES,
+    );
+    crate::acceptance::source_files(root).iter().any(|f| {
+        budget
+            .read_utf8_beneath(root, f)
+            .is_ok_and(|content| content.contains(needle))
+    })
 }
 
 /// Distil a turn's failed-tool summaries into the lessons KB on the DEFAULT loop —

@@ -34,6 +34,7 @@ use crate::trust::TrustMode;
 /// Where the per-project first-pass aggregate lives (under the gitignored
 /// `.umadev/` user-data dir).
 pub const STATS_FILE: &str = ".umadev/acceptance-stats.json";
+const MAX_STATS_BYTES: usize = 2 * 1024 * 1024;
 
 /// Minimum number of recorded attempts for a kind before its rate is TRUSTED.
 /// Below this the rate is statistically meaningless, so [`FirstPassStats::rate`]
@@ -134,7 +135,8 @@ impl FirstPassStats {
 #[must_use]
 pub fn load(project_root: &Path) -> FirstPassStats {
     let path = project_root.join(STATS_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = crate::bounded_fs::read_utf8_beneath(project_root, &path, MAX_STATS_BYTES)
+    else {
         return FirstPassStats::default();
     };
     serde_json::from_str::<FirstPassStats>(&text).unwrap_or_default()
@@ -345,6 +347,18 @@ mod tests {
         let kind = seat_kind("qa-engineer");
         record(tmp.path(), &kind, true);
         assert_eq!(load(tmp.path()).kinds.get(&kind).unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn oversized_stats_fail_open_without_becoming_a_signal() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        std::fs::File::create(tmp.path().join(STATS_FILE))
+            .unwrap()
+            .set_len(u64::try_from(MAX_STATS_BYTES + 1).unwrap())
+            .unwrap();
+        assert_eq!(load(tmp.path()), FirstPassStats::default());
+        assert_eq!(first_pass_rate(tmp.path(), &seat_kind("qa-engineer")), None);
     }
 
     #[test]

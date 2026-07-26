@@ -42,6 +42,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use crate::bounded_fs::{read_utf8_beneath, Utf8ReadBudget};
 use crate::plan_state::{Plan, StepKind};
 
 /// One scope finding.
@@ -167,6 +168,12 @@ const IGNORED_FILE_NAMES: &[&str] = &[".ds_store", ".coverage", ".env", ".umadev
 /// Cap on reported findings — a run that went catastrophically off-plan produces a
 /// readable directive, not a wall of text.
 const MAX_FINDINGS: usize = 20;
+/// One hand-written source/manifest is enough evidence for this check; generated
+/// bundles and oversized manifests are deliberately skipped instead of read whole.
+const MAX_SCOPE_INPUT_BYTES: usize = 600_000;
+/// Route extraction shares one aggregate allowance across the changed set so a
+/// large monorepo cannot turn the scope floor into an unbounded read pass.
+const MAX_ROUTE_INPUT_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 
 /// The set of changes this run made that belong to NO plan step.
 ///
@@ -242,7 +249,6 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
         return Vec::new();
     }
     let baseline_id = crate::checkpoint::run_baseline(root).map(|c| c.id);
-
     // The unclaimed set: everything that changed, minus everything some step claimed,
     // minus the paths that are not the team's source in the first place.
     let unclaimed: Vec<&crate::checkpoint::ChangedFile> = changed
@@ -258,7 +264,7 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
     // whether the file itself is new — reuse the contract crate's own extractor rather
     // than inventing a second, divergent notion of "a route". (Its `file` is already
     // workspace-relative and `/`-separated, matching the run diff's paths.)
-    let routes = umadev_contract::extract_backend_routes(root);
+    let routes = routes_in_unclaimed_files(root, &unclaimed);
 
     let mut out: Vec<ScopeFinding> = Vec::new();
     for c in &unclaimed {
@@ -413,7 +419,7 @@ fn added_dependencies(
     rel: &str,
     added_file: bool,
 ) -> Vec<String> {
-    let Ok(now_text) = std::fs::read_to_string(root.join(rel)) else {
+    let Ok(now_text) = read_utf8_beneath(root, Path::new(rel), MAX_SCOPE_INPUT_BYTES) else {
         return Vec::new();
     };
     let now = dependency_names(rel, &now_text);
@@ -426,7 +432,9 @@ fn added_dependencies(
         let Some(id) = baseline_id else {
             return Vec::new(); // cannot see the past → say nothing
         };
-        let Some(before_text) = crate::checkpoint::file_at(root, id, rel) else {
+        let crate::checkpoint::FileAt::Content(before_text) =
+            crate::checkpoint::file_at(root, id, rel)
+        else {
             return Vec::new();
         };
         dependency_names(rel, &before_text)
@@ -435,6 +443,34 @@ fn added_dependencies(
         .take(MAX_NEW_DEPS_REPORTED)
         .cloned()
         .collect()
+}
+
+/// Extract routes only from the already-known unclaimed changed files. Besides
+/// avoiding a second full-workspace walk, the shared budget and no-follow read
+/// boundary keep a hostile FIFO/symlink/large generated file from hanging or
+/// exhausting the governance pass.
+fn routes_in_unclaimed_files(
+    root: &Path,
+    unclaimed: &[&crate::checkpoint::ChangedFile],
+) -> Vec<umadev_contract::BackendRoute> {
+    let mut budget = Utf8ReadBudget::new(MAX_ROUTE_INPUT_TOTAL_BYTES, MAX_SCOPE_INPUT_BYTES);
+    let mut routes = Vec::new();
+    for changed in unclaimed {
+        if budget.remaining_bytes() == 0 {
+            break;
+        }
+        let path = changed.path.as_str();
+        if !is_code_file(path) {
+            continue;
+        }
+        let Ok(content) = budget.read_utf8_beneath(root, Path::new(path)) else {
+            continue;
+        };
+        routes.extend(umadev_contract::extract_backend_routes_from_content(
+            path, &content,
+        ));
+    }
+    routes
 }
 
 /// Cap on how many new dependency names one finding names.

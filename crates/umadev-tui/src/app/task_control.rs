@@ -239,7 +239,7 @@ impl App {
                 self.push(ChatRole::System, self.render_tasks());
                 Action::None
             }
-            "stop" | "cancel" if self.has_active_run() => Action::Cancel,
+            "stop" | "cancel" if self.has_interruptible_work() => Action::Cancel,
             "stop" | "cancel" => {
                 self.push(
                     ChatRole::System,

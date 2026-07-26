@@ -13,16 +13,16 @@ use serde_json::Value;
 pub const KIMI_CODE_SOURCE_REPOSITORY: &str = "https://github.com/MoonshotAI/kimi-code";
 
 /// Exact upstream commit used by source-contract drift CI.
-pub const KIMI_CODE_AUDITED_BASELINE_COMMIT: &str = "4c763f6763acb67a73d133f7450d092e71d63692";
+pub const KIMI_CODE_AUDITED_BASELINE_COMMIT: &str = "f4c3967a417a539372eadab6c809d27b8a14c005";
 
 /// Release used as the current source-audited baseline, never as a runtime pin.
-pub const KIMI_CODE_AUDITED_BASELINE_VERSION: &str = "0.28.1";
+pub const KIMI_CODE_AUDITED_BASELINE_VERSION: &str = "0.29.1";
 
 /// ACP SDK requirement declared by the audited baseline adapter.
 pub const KIMI_CODE_AUDITED_BASELINE_ACP_VERSION: &str = "0.23.0";
 
 /// ACP adapter package version in the audited baseline.
-pub const KIMI_CODE_AUDITED_BASELINE_ADAPTER_VERSION: &str = "0.3.4";
+pub const KIMI_CODE_AUDITED_BASELINE_ADAPTER_VERSION: &str = "0.3.5";
 
 const MAX_AGENT_VERSION_BYTES: usize = 128;
 

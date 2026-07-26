@@ -67,7 +67,7 @@ use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{
     isolate_process_tree, kill_isolated_process_tree_blocking, reap_isolated_process_tree,
-    END_REAP_BUDGET,
+    try_exit_isolated_process_tree, END_REAP_BUDGET,
 };
 
 /// How many events the stdout-reader task may buffer ahead of the consumer.
@@ -565,7 +565,9 @@ impl ClaudeSession {
         // exits (taskkill walks only the LIVE parent chain). `None` off Windows / if
         // the OS refuses nested job assignment — the process group is the fallback.
         #[cfg(windows)]
-        let process_job = umadev_process::KillOnCloseJob::attach(&child);
+        let process_job = Some(umadev_process::KillOnCloseJob::attach(&mut child).map_err(
+            |error| SessionError::Start(format!("failed to secure Claude process tree: {error}")),
+        )?);
 
         let stdin = child
             .stdin
@@ -989,7 +991,7 @@ impl BaseSession for ClaudeSession {
         // Non-blocking peek (the lock + try_wait both never block): a contended
         // lock or a try_wait error fails open to None; `Ok(Some(status))` = the
         // base exited, `Ok(None)` = still alive.
-        self.child.try_lock().ok()?.try_wait().ok().flatten()
+        try_exit_isolated_process_tree(&self.child)
     }
 
     fn session_id(&self) -> Option<&str> {
@@ -1497,12 +1499,12 @@ fn maybe_divert_firmware(
     lead: &[String],
     args: &[String],
 ) -> (Vec<String>, Option<FirmwareFile>) {
-    let line = crate::command_line_len(
-        std::iter::once(prog)
-            .chain(lead.iter().map(String::as_str))
+    if !crate::command_line_requires_diversion(
+        prog,
+        lead.iter()
+            .map(String::as_str)
             .chain(args.iter().map(String::as_str)),
-    );
-    if line <= crate::command_line_budget() {
+    ) {
         return (args.to_vec(), None);
     }
     divert_append_system_to_file_in(args.to_vec(), &std::env::temp_dir())

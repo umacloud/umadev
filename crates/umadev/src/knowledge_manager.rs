@@ -23,6 +23,12 @@ use std::path::{Path, PathBuf};
 /// The custom knowledge directory: `knowledge/custom/`.
 /// Files here are picked up by the existing RAG indexer automatically.
 const CUSTOM_DIR: &str = "knowledge/custom";
+const MAX_REGISTRY_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TOTAL_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_DOCUMENT_FILES: usize = 1_024;
+const MAX_WALK_DEPTH: usize = 32;
+const MAX_WALK_ENTRIES: usize = 4_096;
 
 /// Registry of custom-added documents (stored in `.umadev/knowledge.json`).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -44,35 +50,60 @@ pub struct KnowledgeEntry {
 }
 
 impl KnowledgeRegistry {
-    /// Load from `.umadev/knowledge.json`. Fail-open: empty if missing.
+    /// Load from `.umadev/knowledge.json`. Read-only callers remain fail-open;
+    /// add/remove use the strict loader below before changing any state.
     pub fn load(project_root: &Path) -> Self {
-        let path = project_root.join(".umadev").join("knowledge.json");
-        match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => Self::default(),
+        Self::load_strict(project_root).unwrap_or_default()
+    }
+
+    /// Mutation paths must distinguish "missing" from "present but unreadable
+    /// or corrupt". Treating both as an empty registry lets the next add replace
+    /// every existing entry with a new one.
+    fn load_strict(project_root: &Path) -> std::io::Result<Self> {
+        let dir = project_root.join(".umadev");
+        match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) if umadev_state::fs::metadata_is_real_dir(&metadata) => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "knowledge registry parent is not a real directory",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(error),
+        }
+        let path = dir.join("knowledge.json");
+        match umadev_state::fs::read_bounded(&path, MAX_REGISTRY_BYTES) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} is not a valid knowledge registry: {error}",
+                        path.display()
+                    ),
+                )
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error),
         }
     }
 
     /// Save to `.umadev/knowledge.json` atomically (temp file + rename, like
     /// `mcp_manager`). A bare `fs::write` could be interrupted mid-write,
-    /// leaving truncated JSON that `load`'s `unwrap_or_default()` then silently
-    /// discards — wiping the ENTIRE knowledge registry. A same-filesystem
+    /// leaving truncated JSON that a later mutation could otherwise silently
+    /// replace — wiping the ENTIRE knowledge registry. A same-filesystem
     /// rename is atomic on POSIX, so a reader sees either the old file or the
     /// complete new one, never a half-written one.
     pub fn save(&self, project_root: &Path) -> std::io::Result<()> {
         let dir = project_root.join(".umadev");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join("knowledge.json");
-        let json = serde_json::to_string_pretty(self).unwrap_or_default();
-        // Per-process temp name so concurrent writers can't share + clobber the
-        // same scratch file before the rename.
-        let tmp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        std::fs::write(&tmp, json + "\n")?;
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
         }
-        Ok(())
+        let path = dir.join("knowledge.json");
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        umadev_state::fs::atomic_write(&path, (json + "\n").as_bytes())
     }
 }
 
@@ -109,10 +140,21 @@ pub fn add_knowledge(
     source: &Path,
     name: Option<&str>,
 ) -> std::io::Result<AddResult> {
-    if !source.exists() {
+    // Validate the registry before copying anything. A corrupt registry must
+    // never be silently replaced after files have already been staged.
+    let mut registry = KnowledgeRegistry::load_strict(project_root)?;
+    let source_metadata = std::fs::symlink_metadata(source).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("source unavailable at {}: {error}", source.display()),
+        )
+    })?;
+    if !umadev_state::fs::metadata_is_real_file(&source_metadata)
+        && !umadev_state::fs::metadata_is_real_dir(&source_metadata)
+    {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("source not found: {}", source.display()),
+            std::io::ErrorKind::InvalidInput,
+            "knowledge source must be a regular file or real directory",
         ));
     }
 
@@ -128,18 +170,30 @@ pub fn add_knowledge(
     );
 
     safe_component(&entry_name)?;
-    let dest_dir = project_root.join(CUSTOM_DIR).join(&entry_name);
+    let custom_dir = ensure_custom_root(project_root)?;
+    let dest_dir = custom_dir.join(&entry_name);
     // Track whether THIS call created the dest dir: on a failure path we must only clean
     // up a dir we ourselves created, never remove_dir_all a PRE-EXISTING same-named
     // entry already-indexed files (which would delete the user prior add and leave a
     // phantom registry entry with no files on disk).
-    let dest_pre_existed = dest_dir.exists();
-    std::fs::create_dir_all(&dest_dir)?;
+    let dest_pre_existed = match std::fs::symlink_metadata(&dest_dir) {
+        Ok(metadata) if umadev_state::fs::metadata_is_real_dir(&metadata) => true,
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "knowledge destination is not a real directory",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let dest_dir = umadev_state::fs::ensure_real_child_dir(&custom_dir, &entry_name)?;
 
     let mut files_copied = 0;
     let mut skipped_non_md = 0;
     let mut skipped_symlink = 0;
-    if source.is_dir() {
+    let mut total_bytes = 0_u64;
+    if umadev_state::fs::metadata_is_real_dir(&source_metadata) {
         for entry in walk_source(source) {
             // ONLY `.md` is indexed: the runtime RAG walker is markdown-only, so
             // copying a `.txt` would print "[ok] Added" and let our own search
@@ -158,11 +212,14 @@ pub fn add_knowledge(
                 // the basename would silently overwrite same-named files from
                 // different subdirs (a/x.md and b/x.md collide).
                 let rel = entry.strip_prefix(source).unwrap_or(&entry);
-                let dest = dest_dir.join(rel);
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                copy_no_follow_symlink(&entry, &dest)?;
+                let parent = ensure_relative_parent(&dest_dir, rel.parent())?;
+                let dest = parent.join(rel.file_name().unwrap_or_default());
+                let copied = copy_no_follow_symlink(
+                    &entry,
+                    &dest,
+                    MAX_TOTAL_DOCUMENT_BYTES.saturating_sub(total_bytes),
+                )?;
+                total_bytes = total_bytes.saturating_add(copied);
                 files_copied += 1;
             } else if entry.extension().is_some() {
                 skipped_non_md += 1;
@@ -185,7 +242,7 @@ pub fn add_knowledge(
                 ),
             ));
         }
-    } else if source.is_file() {
+    } else if umadev_state::fs::metadata_is_real_file(&source_metadata) {
         if !is_markdown(source) {
             if !dest_pre_existed {
                 let _ = std::fs::remove_dir_all(&dest_dir);
@@ -200,12 +257,11 @@ pub fn add_knowledge(
             ));
         }
         let dest = dest_dir.join(source.file_name().unwrap_or_default());
-        copy_no_follow_symlink(source, &dest)?;
+        let _ = copy_no_follow_symlink(source, &dest, MAX_TOTAL_DOCUMENT_BYTES)?;
         files_copied = 1;
     }
 
     // Update registry.
-    let mut registry = KnowledgeRegistry::load(project_root);
     registry.entries.insert(
         entry_name.clone(),
         KnowledgeEntry {
@@ -226,7 +282,7 @@ pub fn add_knowledge(
 /// Remove custom knowledge by name.
 pub fn remove_knowledge(project_root: &Path, name: &str) -> std::io::Result<()> {
     safe_component(name)?;
-    let mut registry = KnowledgeRegistry::load(project_root);
+    let mut registry = KnowledgeRegistry::load_strict(project_root)?;
     if !registry.entries.contains_key(name) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -235,6 +291,12 @@ pub fn remove_knowledge(project_root: &Path, name: &str) -> std::io::Result<()> 
     }
     let dir = project_root.join(CUSTOM_DIR).join(name);
     if dir.exists() {
+        if !umadev_state::fs::real_dir(&dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to remove a linked/non-directory knowledge path",
+            ));
+        }
         std::fs::remove_dir_all(&dir)?;
     }
     registry.entries.remove(name);
@@ -252,20 +314,31 @@ pub fn list_knowledge(project_root: &Path) -> Vec<KnowledgeEntry> {
 /// Returns matching file paths and a snippet preview.
 pub fn search_knowledge(project_root: &Path, query: &str, max_results: usize) -> Vec<SearchResult> {
     let custom_dir = project_root.join(CUSTOM_DIR);
-    if !custom_dir.exists() {
+    if !umadev_state::fs::real_dir(&custom_dir) {
         return vec![];
     }
     let query_lower = query.to_ascii_lowercase();
     let query_terms: Vec<&str> = query_lower.split_whitespace().collect();
     let mut results: Vec<SearchResult> = Vec::new();
 
+    let mut remaining_bytes = MAX_TOTAL_DOCUMENT_BYTES;
     for entry in walk_source(&custom_dir) {
+        if remaining_bytes == 0 {
+            break;
+        }
         // Mirror `add`: only `.md` is indexed/searched, since only `.md` ever
         // reaches the base's RAG walker.
         if !is_markdown(&entry) {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&entry) else {
+        let Ok(bytes) =
+            umadev_state::fs::read_bounded(&entry, MAX_DOCUMENT_BYTES.min(remaining_bytes))
+        else {
+            continue;
+        };
+        remaining_bytes =
+            remaining_bytes.saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let Ok(content) = String::from_utf8(bytes) else {
             continue;
         };
         let content_lower = content.to_ascii_lowercase();
@@ -319,20 +392,51 @@ fn is_markdown(path: &Path) -> bool {
 /// `~/.ssh/id_rsa` — and `fs::copy` follows it, pulling that file into the RAG
 /// index. `symlink_metadata` does NOT follow the link, so we can detect and
 /// reject it before copying.
-fn copy_no_follow_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(src)?;
-    if meta.file_type().is_symlink() {
+fn copy_no_follow_symlink(src: &Path, dst: &Path, remaining: u64) -> std::io::Result<u64> {
+    if remaining == 0 {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "refusing to index `{}`: it is a symbolic link (could point outside the source \
-                 tree at an arbitrary host file)",
-                src.display()
-            ),
+            std::io::ErrorKind::InvalidData,
+            "knowledge import exceeds the aggregate byte limit",
         ));
     }
-    std::fs::copy(src, dst)?;
-    Ok(())
+    let bytes = umadev_state::fs::read_bounded(src, MAX_DOCUMENT_BYTES.min(remaining)).map_err(
+        |error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("refusing to index `{}`: {error}", src.display()),
+            )
+        },
+    )?;
+    umadev_state::fs::atomic_write(dst, &bytes)?;
+    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+}
+
+fn ensure_custom_root(project_root: &Path) -> std::io::Result<PathBuf> {
+    let knowledge = umadev_state::fs::ensure_real_child_dir(project_root, "knowledge")?;
+    umadev_state::fs::ensure_real_child_dir(&knowledge, "custom")
+}
+
+fn ensure_relative_parent(base: &Path, relative: Option<&Path>) -> std::io::Result<PathBuf> {
+    let mut current = base.to_path_buf();
+    let Some(relative) = relative else {
+        return Ok(current);
+    };
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "knowledge path escaped its destination",
+            ));
+        };
+        let name = name.to_str().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "knowledge path is not valid UTF-8",
+            )
+        })?;
+        current = umadev_state::fs::ensure_real_child_dir(&current, name)?;
+    }
+    Ok(current)
 }
 
 /// Recursively walk a directory, yielding file paths. Symlinked directories are
@@ -341,10 +445,35 @@ fn copy_no_follow_symlink(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// itself never follows a directory symlink out of the tree.
 fn walk_source(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
+    let mut entries_seen = 0;
+    walk_source_bounded(dir, &mut files, 0, &mut entries_seen);
+    files.sort();
+    files
+}
+
+fn walk_source_bounded(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    depth: usize,
+    entries_seen: &mut usize,
+) {
+    if depth > MAX_WALK_DEPTH
+        || files.len() >= MAX_DOCUMENT_FILES
+        || *entries_seen >= MAX_WALK_ENTRIES
+    {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return files;
+        return;
     };
-    for entry in entries.flatten() {
+    let remaining = MAX_WALK_ENTRIES.saturating_sub(*entries_seen);
+    let mut entries = entries.flatten().take(remaining).collect::<Vec<_>>();
+    *entries_seen = (*entries_seen).saturating_add(entries.len());
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        if files.len() >= MAX_DOCUMENT_FILES {
+            return;
+        }
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_symlink() {
@@ -352,12 +481,11 @@ fn walk_source(dir: &Path) -> Vec<PathBuf> {
             // step rejects it; never descend a symlinked directory.
             files.push(path);
         } else if ft.is_dir() {
-            files.extend(walk_source(&path));
+            walk_source_bounded(&path, files, depth + 1, entries_seen);
         } else if ft.is_file() {
             files.push(path);
         }
     }
-    files
 }
 
 #[cfg(test)]
@@ -385,6 +513,20 @@ mod tests {
         std::fs::write(src_dir.join("c.txt"), "text").unwrap(); // skipped: not .md
         let result = add_knowledge(tmp.path(), &src_dir, Some("my-docs")).unwrap();
         assert_eq!(result.files_copied, 2, "only the two .md files are indexed");
+    }
+
+    #[test]
+    fn add_rejects_oversized_document() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("huge.md");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
+        let error = add_knowledge(tmp.path(), &source, Some("huge")).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::InvalidData | std::io::ErrorKind::PermissionDenied
+        ));
+        assert!(!tmp.path().join(CUSTOM_DIR).join("huge/huge.md").exists());
     }
 
     #[test]
@@ -442,6 +584,23 @@ mod tests {
             !tmp.path().join(CUSTOM_DIR).join("docs").exists(),
             "stray dest dir must be cleaned up"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_rejects_symlinked_destination_tree() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let custom = tmp.path().join("knowledge/custom");
+        std::fs::create_dir_all(custom.parent().unwrap()).unwrap();
+        symlink(outside.path(), &custom).unwrap();
+        let source = tmp.path().join("guide.md");
+        std::fs::write(&source, "# private").unwrap();
+
+        assert!(add_knowledge(tmp.path(), &source, Some("guide")).is_err());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
     #[cfg(unix)]
@@ -555,5 +714,54 @@ mod tests {
             })
             .collect();
         assert!(leftover.is_empty(), "atomic save left a temp file behind");
+    }
+
+    #[test]
+    fn add_refuses_to_replace_a_corrupt_registry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&state).unwrap();
+        let registry_path = state.join("knowledge.json");
+        std::fs::write(&registry_path, b"{ damaged registry").unwrap();
+        let source = tmp.path().join("guide.md");
+        std::fs::write(&source, "# Guide").unwrap();
+
+        let error = add_knowledge(tmp.path(), &source, Some("guide")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::read(&registry_path).unwrap(),
+            b"{ damaged registry"
+        );
+        assert!(!tmp.path().join(CUSTOM_DIR).join("guide").exists());
+    }
+
+    #[test]
+    fn remove_refuses_to_mutate_when_registry_is_corrupt() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = tmp.path().join(".umadev");
+        std::fs::create_dir_all(&state).unwrap();
+        let registry_path = state.join("knowledge.json");
+        std::fs::write(&registry_path, b"not json").unwrap();
+        let existing = tmp.path().join(CUSTOM_DIR).join("kept");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("guide.md"), "# Keep").unwrap();
+
+        let error = remove_knowledge(tmp.path(), "kept").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(existing.join("guide.md").exists());
+        assert_eq!(std::fs::read(&registry_path).unwrap(), b"not json");
+    }
+
+    #[test]
+    fn knowledge_walk_has_a_global_directory_entry_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for index in 0..8 {
+            std::fs::write(tmp.path().join(format!("doc-{index}.md")), "# Doc").unwrap();
+        }
+        let mut files = Vec::new();
+        let mut entries_seen = MAX_WALK_ENTRIES - 2;
+        walk_source_bounded(tmp.path(), &mut files, 0, &mut entries_seen);
+        assert_eq!(entries_seen, MAX_WALK_ENTRIES);
+        assert!(files.len() <= 2);
     }
 }

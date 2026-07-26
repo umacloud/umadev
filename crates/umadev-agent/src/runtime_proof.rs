@@ -15,8 +15,9 @@
 //!    `dev` script / static-file server).
 //! 2. **Reclaim our own leftover**: a dev server this tool spawned on a previous
 //!    run and recorded in `.umadev/preview.pid` is killed before booting again,
-//!    so it can't keep holding the port. This is CONSERVATIVE — only a PID we
-//!    ourselves tracked is ever killed; a foreign process is never touched.
+//!    so it can't keep holding the port. This is CONSERVATIVE — a v2 record must
+//!    prove its unique sentinel token still belongs to the recorded tree; a
+//!    foreign process is never touched.
 //! 3. **Reuse-or-spawn**: if a server already answers the expected URL after the
 //!    reclaim, it is a foreign holder — reuse it (probe it directly, no duplicate
 //!    spawn). Otherwise spawn the dev command with its **stdout/stderr piped**.
@@ -31,9 +32,9 @@
 //!    `{path, status, ms}`. With no contract, at least the root path is probed.
 //! 6. **Optional e2e**: if a Playwright/Cypress config or a `test:e2e` script is
 //!    present, run it once and capture the outcome.
-//! 7. **Tear down**: the child is killed (`kill_on_drop` plus an eager kill) and
-//!    the pidfile cleared, so this preview server can never become the next
-//!    run's leftover.
+//! 7. **Tear down**: the managed process tree is killed and reaped within a
+//!    fixed budget, its readers are joined or aborted, and the pidfile is
+//!    cleared on normal return or cancellation.
 //!
 //! The structured [`RuntimeProof`] is serialized to
 //! `.umadev/audit/runtime-proof.json` and folded into the delivery proof-pack
@@ -43,6 +44,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -71,7 +73,7 @@ const E2E_TIMEOUT_SECS: u64 = 600;
 
 /// How long (seconds) to wait for the expected port to free after we kill our
 /// OWN leftover preview server, before spawning a fresh one. Short — the kernel
-/// releases a `SIGTERM`ed listener's socket promptly; if it does not free in
+/// releases a terminated listener's socket promptly; if it does not free in
 /// time, the fresh boot simply falls back to another port (still handled).
 const PORT_FREE_WAIT_SECS: u64 = 5;
 
@@ -79,16 +81,44 @@ const PORT_FREE_WAIT_SECS: u64 = 5;
 /// spawned for the runtime proof. Used to reclaim our own leftover on the next
 /// run — never a foreign process.
 const PREVIEW_PID_FILE: &str = "preview.pid";
+const PREVIEW_PID_VERSION: u8 = 2;
+const PREVIEW_PID_BYTES: u64 = 4 * 1024;
+static NEXT_PREVIEW_OWNER: AtomicU64 = AtomicU64::new(1);
+
+/// Keep a token-bearing process in the detached Unix group even if the direct
+/// dev-server wrapper exits after launching its real server. Its stdio is fully
+/// redirected, so it cannot hold UmaDev's capture pipes open.
+#[cfg(unix)]
+const PREVIEW_SENTINEL_SCRIPT: &str =
+    "sh -c 'while :; do sleep 3600; done' \"$0\" </dev/null >/dev/null 2>&1 & exec \"$@\"";
 
 /// Bounded reap after we tear down (or time out) a spawned child, so a wedged
 /// `wait()` can't hang the runtime proof.
 const TEARDOWN_REAP_SECS: u64 = 5;
+
+/// Dev-server output is framed into records no larger than this before it is
+/// scanned. Newline-free output is split at the same boundary.
+const BOOT_RECORD_BYTES: usize = 8 * 1024;
+
+/// Only parsed boot signals enter the queue; keeping even that queue bounded
+/// prevents a malicious helper from turning repeated fake readiness lines into
+/// unbounded memory while `curl` is being polled.
+const BOOT_SIGNAL_QUEUE: usize = 32;
+
+/// Hard resource envelope for short pidfile-reclaim helpers.
+const PID_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const PID_LIST_OUTPUT_BYTES: usize = 1024 * 1024;
+#[cfg(unix)]
+const MAX_PREVIEW_GROUP_MEMBERS: usize = 64;
 
 /// Cap on RAW captured e2e output held in memory while the suite runs. We retain
 /// only the last `OUTPUT_CAP` bytes (the pass/fail summary is at the end) while
 /// always draining so the child never blocks. The stored value is capped smaller
 /// still, at [`CAPTURE_CAP`].
 const OUTPUT_CAP: usize = 256 * 1024;
+const MAX_OPENAPI_INPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PACKAGE_JSON_BYTES: usize = 1024 * 1024;
 
 /// Whether the runtime check ran end-to-end or degraded (and why). This is the
 /// top-level verdict the proof-pack and the CLI surface.
@@ -269,7 +299,7 @@ async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
     //    the port and force this boot onto a fallback port — or hang. CONSERVATIVE:
     //    `reclaim_tracked_preview` only kills a PID this tool recorded in its own
     //    pidfile; it never touches a foreign process.
-    if reclaim_tracked_preview(workspace) {
+    if reclaim_tracked_preview(workspace).await {
         // Give the kernel a moment to release the socket so the fresh spawn binds
         // the expected port instead of falling back.
         wait_until_free(&base_url, PORT_FREE_WAIT_SECS).await;
@@ -303,20 +333,9 @@ async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
             return proof;
         }
     };
-    let mut cmd = Command::new(&plan.program);
-    cmd.args(&plan.args)
-        .current_dir(&plan.dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Detach the dev server into its OWN session (no controlling terminal) so a
-    // descendant that writes straight to /dev/tty — a Spring/Logback console
-    // appender, Maven/npm/Docker progress — can't paint over the TUI's
-    // alt-screen. Safe: all three stdio streams are piped/null above. Fail-open.
-    crate::spawn_util::detach_from_controlling_terminal(&mut cmd);
-    let spawn = cmd.spawn();
-    let mut child = match spawn {
+    let owner_token = next_preview_owner_token();
+    let cmd = preview_spawn_command(&plan, &owner_token);
+    let mut child = match umadev_process::ManagedChild::spawn_detached(cmd) {
         Ok(c) => c,
         Err(e) => {
             let mut proof = RuntimeProof::not_verified(format!("failed to start dev server: {e}"));
@@ -328,32 +347,22 @@ async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
     };
     // Track our own PID so a crash mid-boot can't orphan the dev server: the next
     // run's `reclaim_tracked_preview` will find and kill it.
-    if let Some(pid) = child.id() {
+    let pidfile = child.id().and_then(|pid| {
         // Record the ACTUAL spawned program (plan.program - resolve_spawn_plan already
         // stripped a `cd <dir> &&` prefix), NOT split_command(&dev.command).0 which for a
         // subdir frontend (`cd web && pnpm dev`) is literally "cd" - reclaim's cmdline match
         // would then never find "cd" in the pnpm/node process and the orphan would survive.
-        write_preview_pid(workspace, pid, &plan.program);
-    }
+        PreviewPidGuard::record(workspace, pid, &plan.program, &owner_token)
+    });
 
-    // Drain + scan the child's output on dedicated tasks. Readers stay alive until
-    // teardown so the OS pipe never fills (which would stall the server); the
-    // channel carries every line to the bounded boot wait.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    if let Some(out) = child.stdout.take() {
-        spawn_line_reader(out, tx.clone());
-    }
-    if let Some(err) = child.stderr.take() {
-        spawn_line_reader(err, tx);
-    }
+    // Drain + scan the child's output on owned tasks. Each record and the signal
+    // queue have hard bounds; non-signals are discarded immediately.
+    let (mut readers, mut rx) = BootReaders::spawn(&mut child);
 
     // 5. Bounded boot: read output for readiness / port-fallback / already-running
     //    signals AND poll the (possibly re-pointed) base URL, all within one
     //    timeout. NEVER an unbounded wait, and exactly ONE spawn.
     let outcome = wait_for_boot(&mut rx, &base_url, READY_TIMEOUT_SECS).await;
-    // Keep draining output (discard) for the rest of the proof so the child never
-    // blocks on a full pipe while we probe it.
-    tokio::spawn(async move { while rx.recv().await.is_some() {} });
 
     let proof = match outcome {
         BootOutcome::Ready {
@@ -381,24 +390,22 @@ async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
     //    survive a kill of just the wrapper and keep holding the port; a
     //    process-GROUP kill (the child was spawned detached above) reaps them.
     teardown_child(&mut child).await;
-    clear_preview_pid(workspace);
+    readers
+        .finish(Duration::from_secs(TEARDOWN_REAP_SECS))
+        .await;
+    drop(pidfile);
 
     proof
 }
 
-/// Tear down a spawned dev-server child AND its descendant tree, bounded. The
-/// child was spawned DETACHED (its own session/process-group via
-/// [`crate::spawn_util::detach_from_controlling_terminal`]), so a process-GROUP
-/// kill ([`crate::spawn_util::kill_process_group`]) reaps the `npm`/`pnpm`
-/// wrapper AND the `node`/`vite` grandchildren it forked — a plain
-/// [`tokio::process::Child::start_kill`] would drop only the wrapper and leave
-/// the real server holding the port. `start_kill` + `kill_on_drop(true)` are
-/// direct-child backstops; the reap is time-bounded so a wedged `wait()` can't
-/// hang the runtime proof.
-async fn teardown_child(child: &mut tokio::process::Child) {
-    let _ = crate::spawn_util::kill_process_group(child);
-    let _ = child.start_kill();
-    let _ = tokio::time::timeout(Duration::from_secs(TEARDOWN_REAP_SECS), child.wait()).await;
+/// Tear down a spawned dev-server child and its descendant tree. The managed
+/// child owns a detached Unix process group / Windows Job Object, so stopping
+/// it also stops npm/pnpm wrappers and node/vite descendants. The direct-child
+/// reap has a fixed wall-clock budget.
+async fn teardown_child(child: &mut umadev_process::ManagedChild) {
+    let _ = child
+        .terminate_and_reap(Duration::from_secs(TEARDOWN_REAP_SECS))
+        .await;
 }
 
 /// Whether to reuse an already-running server or spawn our own. Split out so the
@@ -581,6 +588,43 @@ struct SpawnPlan {
     args: Vec<String>,
 }
 
+/// Build the one preview command whose complete process tree we own.
+///
+/// On Unix a quiet sentinel in the same new session carries `owner_token` as
+/// one exact argv entry. That identity remains inspectable after a short-lived
+/// npm/pnpm wrapper exits, without relying on a recycled numeric PGID or an
+/// executable-name substring. Windows needs no sentinel: the process package
+/// attaches the suspended child to a kill-on-close Job Object before it runs.
+fn preview_spawn_command(plan: &SpawnPlan, owner_token: &str) -> Command {
+    #[cfg(not(unix))]
+    let _ = owner_token;
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(PREVIEW_SENTINEL_SCRIPT)
+            // `sh -c` assigns this argument to `$0`; the real program and its
+            // arguments remain `$@`, so no user-controlled text is evaluated.
+            .arg(owner_token)
+            .arg(&plan.program)
+            .args(&plan.args);
+        command
+    };
+    #[cfg(not(unix))]
+    let mut command = {
+        let mut command = Command::new(&plan.program);
+        command.args(&plan.args);
+        command
+    };
+    command
+        .current_dir(&plan.dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 /// Turn a detected dev-server command into an explicit, verified
 /// `(working_dir, program, args)` spawn plan.
 ///
@@ -703,7 +747,7 @@ enum LineVerdict {
 /// it (so a `Verified` proof always means the URL truly answered). Returns
 /// [`BootOutcome::Timeout`] when nothing answers in time — never blocks forever.
 async fn wait_for_boot(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    rx: &mut tokio::sync::mpsc::Receiver<DevSignal>,
     base_url: &str,
     budget_secs: u64,
 ) -> BootOutcome {
@@ -720,9 +764,9 @@ async fn wait_for_boot(
         tokio::select! {
             () = &mut deadline => return BootOutcome::Timeout,
             maybe = rx.recv() => {
-                if let Some(line) = maybe {
+                if let Some(signal) = maybe {
                     if let Some(verdict) =
-                        handle_boot_line(&line, base_url, &mut effective, &mut detected_port)
+                        handle_boot_signal(signal, base_url, &mut effective, &mut detected_port)
                     {
                         // Confirm with a probe before trusting a text signal: a
                         // "ready"/"already running" line can precede the socket
@@ -773,13 +817,23 @@ fn elapsed_ms(started: Instant) -> u64 {
 /// Apply one scanned output line to the boot state. Updates `effective` (the URL
 /// we will probe) when the port changes, and returns a [`LineVerdict`] when the
 /// line is decisive. Pure (no I/O) so it is unit-testable.
+#[cfg(test)]
 fn handle_boot_line(
     line: &str,
     base_url: &str,
     effective: &mut String,
     detected_port: &mut Option<u16>,
 ) -> Option<LineVerdict> {
-    match scan_dev_line(line)? {
+    handle_boot_signal(scan_dev_line(line)?, base_url, effective, detected_port)
+}
+
+fn handle_boot_signal(
+    signal: DevSignal,
+    base_url: &str,
+    effective: &mut String,
+    detected_port: &mut Option<u16>,
+) -> Option<LineVerdict> {
+    match signal {
         // The chosen port was busy; the server fell back to `port`. Re-point the
         // probe there — that is the port our spawned server actually bound.
         DevSignal::PortFallback(port) => {
@@ -940,22 +994,95 @@ fn replace_port(base_url: &str, port: u16) -> String {
     format!("{}://{host}:{port}{path}", &base_url[..scheme_end])
 }
 
-/// Spawn a detached task that reads `reader` line by line and forwards each line
-/// to `tx`, until EOF or the receiver is gone. Drains the pipe so the child never
-/// stalls on a full output buffer.
-fn spawn_line_reader<R>(reader: R, tx: tokio::sync::mpsc::UnboundedSender<String>)
+/// Owned dev-server pipe readers. Dropping this value aborts both tasks; normal
+/// teardown joins them within an explicit grace after the process tree dies.
+struct BootReaders {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl BootReaders {
+    fn spawn(
+        child: &mut umadev_process::ManagedChild,
+    ) -> (Self, tokio::sync::mpsc::Receiver<DevSignal>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(BOOT_SIGNAL_QUEUE);
+        let mut tasks = Vec::with_capacity(2);
+        if let Some(stdout) = child.take_stdout() {
+            tasks.push(spawn_boot_reader(stdout, tx.clone()));
+        }
+        if let Some(stderr) = child.take_stderr() {
+            tasks.push(spawn_boot_reader(stderr, tx.clone()));
+        }
+        drop(tx);
+        (Self { tasks }, rx)
+    }
+
+    async fn finish(&mut self, grace: Duration) {
+        for mut task in self.tasks.drain(..) {
+            if tokio::time::timeout(grace, &mut task).await.is_err() {
+                task.abort();
+                // These readers only await Tokio I/O / bounded-channel sends,
+                // so abort is cooperative. Join after abort instead of applying
+                // another timeout whose elapsed branch would detach the task.
+                let _ = task.await;
+            }
+        }
+    }
+}
+
+impl Drop for BootReaders {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn spawn_boot_reader<R>(
+    reader: R,
+    tx: tokio::sync::mpsc::Sender<DevSignal>,
+) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if tx.send(line).is_err() {
-                break;
+    tokio::spawn(read_boot_records(reader, tx))
+}
+
+async fn read_boot_records<R>(mut reader: R, tx: tokio::sync::mpsc::Sender<DevSignal>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut record = Vec::with_capacity(BOOT_RECORD_BYTES);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        for byte in &chunk[..read] {
+            if *byte == b'\n' || record.len() == BOOT_RECORD_BYTES {
+                publish_boot_record(&record, &tx);
+                record.clear();
+            }
+            if *byte != b'\n' {
+                record.push(*byte);
             }
         }
-    });
+    }
+    publish_boot_record(&record, &tx);
+}
+
+fn publish_boot_record(record: &[u8], tx: &tokio::sync::mpsc::Sender<DevSignal>) {
+    if record.is_empty() {
+        return;
+    }
+    let line = String::from_utf8_lossy(record);
+    if let Some(signal) = scan_dev_line(&line) {
+        // Never wait on a full signal queue: the pipe must remain continuously
+        // drained. Periodic curl polling is the readiness safety net.
+        let _ = tx.try_send(signal);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -967,157 +1094,273 @@ fn preview_pid_path(workspace: &Path) -> PathBuf {
     workspace.join(".umadev").join(PREVIEW_PID_FILE)
 }
 
-/// Record `pid` as our live preview server. Fail-open: a write error is ignored
-/// (the pidfile is a best-effort cleanup aid, never a correctness dependency).
-fn write_preview_pid(workspace: &Path, pid: u32, program: &str) {
-    let path = preview_pid_path(workspace);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    // Record the spawned PROGRAM name alongside the pid so reclaim can verify the live
-    // process is still OURS (not a foreign process the OS handed the recycled pid to).
-    let _ = std::fs::write(path, format!("{pid}\n{program}"));
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+struct TrackedPreview {
+    version: u8,
+    group_id: u32,
+    program: String,
+    #[serde(default)]
+    owner_token: Option<String>,
 }
 
-/// Read the tracked preview `(pid, program)`, if a valid non-zero pid is recorded. The
-/// program line may be absent in a legacy pidfile (then it is empty -> reclaim stays
-/// conservative and does not kill).
-fn read_preview_pid(workspace: &Path) -> Option<(u32, String)> {
-    let body = std::fs::read_to_string(preview_pid_path(workspace)).ok()?;
+fn ensure_preview_state_dir(workspace: &Path) -> std::io::Result<PathBuf> {
+    if !umadev_state::fs::real_dir(workspace) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "preview workspace is not a real directory",
+        ));
+    }
+    umadev_state::fs::ensure_real_child_dir(workspace, ".umadev")
+}
+
+fn existing_preview_state_dir(workspace: &Path) -> Option<PathBuf> {
+    if !umadev_state::fs::real_dir(workspace) {
+        return None;
+    }
+    let state = workspace.join(".umadev");
+    umadev_state::fs::real_dir(&state).then_some(state)
+}
+
+fn next_preview_owner_token() -> String {
+    let sequence = NEXT_PREVIEW_OWNER.fetch_add(1, Ordering::Relaxed);
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    format!("{:x}-{nanos:x}-{sequence:x}", std::process::id())
+}
+
+/// Record the isolated process-group id and its sentinel ownership token.
+/// Every filesystem component is no-follow checked and the replacement is
+/// atomic; a hostile `.umadev` or `preview.pid` link is left untouched.
+fn write_preview_pid(workspace: &Path, group_id: u32, program: &str, owner_token: &str) -> bool {
+    let Ok(_state) = ensure_preview_state_dir(workspace) else {
+        return false;
+    };
+    let record = TrackedPreview {
+        version: PREVIEW_PID_VERSION,
+        group_id,
+        program: program.to_string(),
+        owner_token: Some(owner_token.to_string()),
+    };
+    let Ok(bytes) = serde_json::to_vec(&record) else {
+        return false;
+    };
+    u64::try_from(bytes.len()).is_ok_and(|len| len <= PREVIEW_PID_BYTES)
+        && umadev_state::fs::atomic_write(&preview_pid_path(workspace), &bytes).is_ok()
+}
+
+/// Read one small no-follow pidfile. The legacy two-line format remains
+/// readable so it can be cleared, but has no token and can never authorize a
+/// kill.
+fn read_preview_pid(workspace: &Path) -> Option<TrackedPreview> {
+    existing_preview_state_dir(workspace)?;
+    let bytes =
+        umadev_state::fs::read_bounded(&preview_pid_path(workspace), PREVIEW_PID_BYTES).ok()?;
+    if let Ok(record) = serde_json::from_slice::<TrackedPreview>(&bytes) {
+        return (record.version == PREVIEW_PID_VERSION
+            && record.group_id != 0
+            && record.owner_token.as_ref().is_some_and(|token| {
+                !token.is_empty()
+                    && token.len() <= 256
+                    && token
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            }))
+        .then_some(record);
+    }
+
+    let body = String::from_utf8(bytes).ok()?;
     let mut lines = body.lines();
-    let pid = lines
+    let group_id = lines
         .next()?
         .trim()
         .parse::<u32>()
         .ok()
         .filter(|p| *p != 0)?;
     let program = lines.next().unwrap_or("").trim().to_string();
-    Some((pid, program))
+    Some(TrackedPreview {
+        version: 1,
+        group_id,
+        program,
+        owner_token: None,
+    })
 }
 
-/// Remove the pidfile (best-effort).
+/// Remove only a real regular pidfile under a still-real managed directory.
 fn clear_preview_pid(workspace: &Path) {
-    let _ = std::fs::remove_file(preview_pid_path(workspace));
+    let Some(_state) = existing_preview_state_dir(workspace) else {
+        return;
+    };
+    let _ = umadev_state::fs::remove_regular_file(&preview_pid_path(workspace));
 }
 
-/// Reclaim UmaDev's OWN previously-spawned preview server if it is still alive.
-/// Returns `true` iff it killed one. CONSERVATIVE by design: it only ever targets
-/// a PID this tool itself recorded in [`preview_pid_path`], and only when that PID
-/// is confirmed alive — a foreign process is never killed, and an unknown-liveness
-/// PID is left running. The pidfile is cleared either way.
-fn reclaim_tracked_preview(workspace: &Path) -> bool {
-    let Some((pid, program)) = read_preview_pid(workspace) else {
+/// Removes the pidfile on every exit path, including cancellation after spawn.
+struct PreviewPidGuard {
+    workspace: PathBuf,
+}
+
+impl PreviewPidGuard {
+    fn record(workspace: &Path, pid: u32, program: &str, owner_token: &str) -> Option<Self> {
+        write_preview_pid(workspace, pid, program, owner_token).then(|| Self {
+            workspace: workspace.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for PreviewPidGuard {
+    fn drop(&mut self) {
+        clear_preview_pid(&self.workspace);
+    }
+}
+
+/// Reclaim UmaDev's own previously-spawned preview tree if its identity can
+/// still be proven. A numeric group id, executable name, or legacy pidfile is
+/// never sufficient: a current group member must carry the v2 record's exact
+/// sentinel token. Unknown identity fails closed and the pidfile is cleared.
+async fn reclaim_tracked_preview(workspace: &Path) -> bool {
+    let Some(record) = read_preview_pid(workspace) else {
         return false;
     };
-    // Kill only a LIVE pid whose current command line still contains the PROGRAM we
-    // recorded. A crash can leave a stale pidfile; if the OS recycled that pid to an
-    // UNRELATED process, its cmdline won't match, so we leave it alone (leaking a stray
-    // process is far better than SIGTERM-ing the user's editor/browser on a recycled pid).
-    // An empty recorded program (legacy pidfile) or an unreadable cmdline -> do NOT kill.
-    let killed = if !program.is_empty()
-        && pid_is_alive(pid) == Some(true)
-        && pid_cmdline_contains(pid, &program)
-    {
-        kill_pid(pid);
-        true
+    // The isolated leader PID is also its process-group id. The quiet sentinel
+    // stays in that group after a short-lived wrapper exits and carries the
+    // unique token as one exact argv entry. Bounded native inspection proves
+    // that identity without trusting a possibly recycled numeric group id.
+    #[cfg(unix)]
+    let owned_tree = if let Some(token) = record.owner_token.as_deref() {
+        process_group_is_alive(record.group_id) == Some(true)
+            && process_group_has_owner_token(record.group_id, token).await
     } else {
         false
     };
+    #[cfg(not(unix))]
+    let owned_tree = false;
+
+    let killed = owned_tree && kill_preview_tree(record.group_id).await;
     clear_preview_pid(workspace);
     killed
 }
 
-/// Best-effort: does the LIVE process at `pid` have `needle` in its command line? Used to
-/// confirm a tracked pid is still the process we spawned (vs a recycled-pid foreigner).
-/// Conservative: unreadable -> `false` (do NOT kill). Unix: `ps`; other platforms: `false`.
-#[cfg(unix)]
-fn pid_cmdline_contains(pid: u32, needle: &str) -> bool {
-    let Ok(out) = std::process::Command::new("ps")
-        .arg("-o")
-        .arg("command=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-    else {
-        return false;
-    };
-    String::from_utf8_lossy(&out.stdout).contains(needle)
-}
-
-#[cfg(not(unix))]
-fn pid_cmdline_contains(_pid: u32, _needle: &str) -> bool {
-    false
-}
-
-/// `Some(true)` alive, `Some(false)` provably gone, `None` could-not-determine.
-/// Dependency-free (mirrors the run-lock helper, kept local so this module stays
-/// self-contained). Unix: `kill -0`. Windows: `tasklist`.
-#[cfg(unix)]
+/// Test-only Unix liveness probe used to assert process-tree cleanup.
+#[cfg(all(test, unix))]
+#[allow(unsafe_code)]
 fn pid_is_alive(pid: u32) -> Option<bool> {
-    let out = std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .output()
-        .ok()?;
-    if out.status.success() {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: signal 0 performs a liveness/permission probe and cannot modify
+    // the target process.
+    if unsafe { libc::kill(pid, 0) } == 0 {
         return Some(true);
     }
-    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    if stderr.contains("no such process")
-        || stderr.contains("illegal")
-        || stderr.contains("invalid")
-    {
-        Some(false)
-    } else if stderr.contains("not permitted") || stderr.contains("permission") {
-        Some(true)
-    } else {
-        None
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(false),
+        Some(libc::EPERM) => Some(true),
+        _ => None,
     }
 }
 
-#[cfg(windows)]
-fn pid_is_alive(pid: u32) -> Option<bool> {
-    let out = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+/// Does the dedicated Unix process group still contain at least one process?
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_group_is_alive(group_leader: u32) -> Option<bool> {
+    let native_id = libc::pid_t::try_from(group_leader).ok()?;
+    // SAFETY: signal 0 only probes the dedicated group id recorded at spawn.
+    if unsafe { libc::killpg(native_id, 0) } == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Some(false),
+        Some(libc::EPERM) => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+async fn process_group_has_owner_token(group_id: u32, owner_token: &str) -> bool {
+    tokio::time::timeout(PID_HELPER_TIMEOUT, async {
+        let Some(members) = process_group_members(group_id).await else {
+            return false;
+        };
+        for member in members {
+            if umadev_process::process_has_exact_argument(member, owner_token) == Some(true) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+#[cfg(unix)]
+async fn process_group_members(group_id: u32) -> Option<Vec<u32>> {
+    let mut command = Command::new("ps");
+    command.args(["-axo", "pid=,pgid="]);
+    let output = umadev_process::run_bounded_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: PID_HELPER_TIMEOUT,
+            stdout_bytes: PID_LIST_OUTPUT_BYTES,
+            stderr_bytes: 1024,
+            reader_grace: Duration::from_secs(1),
+        },
+    )
+    .await
+    .ok()?;
+    if output.timed_out
+        || output.stdout_truncated
+        || !output.status.is_some_and(|status| status.success())
+    {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout).to_lowercase();
-    if stdout.contains("no tasks") {
-        Some(false)
-    } else if stdout.contains(&format!("\"{pid}\"")) || stdout.contains(&pid.to_string()) {
-        Some(true)
-    } else {
-        Some(false)
+
+    let mut members = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(member) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(member_group) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        if member_group == group_id {
+            if members.len() == MAX_PREVIEW_GROUP_MEMBERS {
+                return None;
+            }
+            members.push(member);
+        }
     }
+    (!members.is_empty()).then_some(members)
 }
 
-#[cfg(not(any(unix, windows)))]
-fn pid_is_alive(_pid: u32) -> Option<bool> {
-    None
-}
-
-/// Terminate `pid` (best-effort). Unix: `kill` (SIGTERM — dev servers handle it
-/// and free the port). Windows: `taskkill /F /T`. Errors are ignored; the caller
-/// only kills PIDs it has confirmed it owns.
+/// Terminate the recorded process tree after ownership has been established.
 #[cfg(unix)]
-fn kill_pid(pid: u32) {
-    let _ = std::process::Command::new("kill")
-        .arg(pid.to_string())
-        .output();
+#[allow(unsafe_code)]
+async fn kill_preview_tree(group_leader: u32) -> bool {
+    let Ok(native_id) = libc::pid_t::try_from(group_leader) else {
+        return false;
+    };
+    // SAFETY: `pid` is the dedicated process-group id recorded at spawn.
+    unsafe { libc::killpg(native_id, libc::SIGKILL) == 0 }
 }
 
 #[cfg(windows)]
-fn kill_pid(pid: u32) {
-    let _ = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F", "/T"])
-        .output();
+async fn kill_preview_tree(pid: u32) -> bool {
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", &pid.to_string(), "/F", "/T"]);
+    umadev_process::run_bounded_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: PID_HELPER_TIMEOUT,
+            stdout_bytes: 1024,
+            stderr_bytes: 1024,
+            reader_grace: Duration::from_secs(1),
+        },
+    )
+    .await
+    .is_ok_and(|out| !out.timed_out && out.status.is_some_and(|status| status.success()))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn kill_pid(_pid: u32) {}
+async fn kill_preview_tree(_pid: u32) -> bool {
+    false
+}
 
 /// Probe one route: `curl` `base + path`, recording status + duration.
 async fn probe_route(base_url: &str, path: &str) -> RouteProbe {
@@ -1138,7 +1381,8 @@ async fn probe_route(base_url: &str, path: &str) -> RouteProbe {
 /// non-zero, or a `000` status — curl's "no response" sentinel).
 async fn curl_status(url: &str, max_time_secs: u64) -> Option<u16> {
     let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let out = Command::new("curl")
+    let mut command = Command::new("curl");
+    command
         .arg("-s")
         .arg("-o")
         .arg(null_sink)
@@ -1146,12 +1390,19 @@ async fn curl_status(url: &str, max_time_secs: u64) -> Option<u16> {
         .arg("%{http_code}")
         .arg("--max-time")
         .arg(max_time_secs.to_string())
-        .arg(url)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
+        .arg(url);
+    let out = umadev_process::run_bounded_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: Duration::from_secs(max_time_secs.saturating_add(1)),
+            stdout_bytes: 64,
+            stderr_bytes: 1024,
+            reader_grace: Duration::from_secs(1),
+        },
+    )
+    .await
+    .ok()?;
+    if out.timed_out || !out.status.is_some_and(|status| status.success()) {
         return None;
     }
     let code = String::from_utf8_lossy(&out.stdout);
@@ -1191,7 +1442,9 @@ fn join_url(base: &str, path: &str) -> String {
 /// always 404.
 fn contract_route_paths(workspace: &Path) -> Vec<String> {
     let openapi = workspace.join(".umadev/contracts/openapi.json");
-    let Ok(body) = std::fs::read_to_string(&openapi) else {
+    let Ok(body) =
+        crate::bounded_fs::read_utf8_beneath(workspace, &openapi, MAX_OPENAPI_INPUT_BYTES)
+    else {
         return Vec::new();
     };
     parse_openapi_paths(&body)
@@ -1249,19 +1502,19 @@ async fn run_e2e_if_present(workspace: &Path) -> Option<E2eResult> {
     let started = Instant::now();
 
     let mut ecmd = Command::new(vprog);
-    ecmd.args(&vlead)
-        .args(&args)
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Detach into its OWN session/process-group so a timeout can kill the WHOLE
-    // e2e tree — Playwright/Cypress fork browser processes that survive a kill of
-    // just the runner. Safe: stdin null, stdout/stderr piped. Fail-open.
-    crate::spawn_util::detach_from_controlling_terminal(&mut ecmd);
-    let mut child = match ecmd.spawn() {
-        Ok(c) => c,
+    ecmd.args(&vlead).args(&args).current_dir(workspace);
+    let output = match umadev_process::run_bounded_detached_command(
+        ecmd,
+        umadev_process::BoundedCommandOptions {
+            timeout: Duration::from_secs(E2E_TIMEOUT_SECS),
+            stdout_bytes: OUTPUT_CAP / 2,
+            stderr_bytes: OUTPUT_CAP / 2,
+            reader_grace: Duration::from_secs(TEARDOWN_REAP_SECS),
+        },
+    )
+    .await
+    {
+        Ok(output) => output,
         Err(e) => {
             return Some(E2eResult {
                 command: cmd,
@@ -1271,110 +1524,44 @@ async fn run_e2e_if_present(workspace: &Path) -> Option<E2eResult> {
             });
         }
     };
-
-    // Capped-tail readers: bound memory on a chatty suite while always draining
-    // so the child never blocks on a full pipe.
-    let stdout_task = child
-        .stdout
-        .take()
-        .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
-    let stderr_task = child
-        .stderr
-        .take()
-        .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
-
-    let wait_result =
-        tokio::time::timeout(Duration::from_secs(E2E_TIMEOUT_SECS), child.wait()).await;
-    if wait_result.is_err() {
-        // Timed out: kill the WHOLE group so browser descendants die too, not just
-        // the runner (dropping the `Child` alone would leave them running).
-        // Bounded reap so a wedged wait() can't hang.
-        let _ = crate::spawn_util::kill_process_group(&child);
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(TEARDOWN_REAP_SECS), child.wait()).await;
-    }
-
-    let raw_stdout = join_capped(stdout_task).await;
-    let raw_stderr = join_capped(stderr_task).await;
-    let mut combined = String::from_utf8_lossy(&raw_stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&raw_stderr));
+    let mut raw = umadev_process::BoundedTail::new(OUTPUT_CAP);
+    raw.push(&output.stdout);
+    raw.push(&output.stderr);
+    let mut combined = String::from_utf8_lossy(&raw.into_bytes()).into_owned();
     truncate(&mut combined, CAPTURE_CAP);
     let ms = elapsed_ms(started);
 
-    match wait_result {
-        Ok(Ok(status)) => Some(E2eResult {
+    if output.timed_out {
+        // Keep the killed suite's last words alongside the timeout marker.
+        let marker = format!("e2e timed out after {E2E_TIMEOUT_SECS}s");
+        let output = if combined.trim().is_empty() {
+            marker
+        } else {
+            let mut value = combined;
+            value.push_str(&format!("\n...[{marker}]"));
+            truncate(&mut value, CAPTURE_CAP);
+            value
+        };
+        return Some(E2eResult {
+            command: cmd,
+            passed: false,
+            ms,
+            output,
+        });
+    }
+    match output.status {
+        Some(status) => Some(E2eResult {
             command: cmd,
             passed: status.success(),
             ms,
             output: combined,
         }),
-        Ok(Err(e)) => Some(E2eResult {
+        None => Some(E2eResult {
             command: cmd,
             passed: false,
             ms,
-            output: format!("failed to spawn e2e runner: {e}"),
+            output: "e2e runner exited without a status".to_string(),
         }),
-        Err(_) => {
-            // Keep the killed suite's last words alongside the timeout marker.
-            let marker = format!("e2e timed out after {E2E_TIMEOUT_SECS}s");
-            let output = if combined.trim().is_empty() {
-                marker
-            } else {
-                let mut o = combined;
-                o.push_str(&format!("\n...[{marker}]"));
-                truncate(&mut o, CAPTURE_CAP);
-                o
-            };
-            Some(E2eResult {
-                command: cmd,
-                passed: false,
-                ms,
-                output,
-            })
-        }
-    }
-}
-
-/// Read `reader` to EOF, retaining only the LAST `cap` bytes (the e2e pass/fail
-/// summary lives at the end) while always draining so the child never blocks on
-/// a full pipe. Memory is bounded to `2*cap` between trims, so a huge stream
-/// costs O(total), not O(total²). Mirrors the deploy module's private helper.
-async fn read_capped_tail<R>(mut reader: R, cap: usize) -> Vec<u8>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt as _;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; 8192];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if cap > 0 && buf.len() > cap.saturating_mul(2) {
-                    let drop_to = buf.len() - cap;
-                    buf.drain(..drop_to);
-                }
-            }
-        }
-    }
-    if cap > 0 && buf.len() > cap {
-        let drop_to = buf.len() - cap;
-        buf.drain(..drop_to);
-    }
-    buf
-}
-
-/// Join a capped-tail reader task, BOUNDED so a wedged descendant that still
-/// holds a pipe open after a kill can't hang us. Fail-open: a missing task or a
-/// panic yields an empty buffer.
-async fn join_capped(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    match task {
-        Some(t) => match tokio::time::timeout(Duration::from_secs(TEARDOWN_REAP_SECS), t).await {
-            Ok(Ok(buf)) => buf,
-            Ok(Err(_)) | Err(_) => Vec::new(),
-        },
-        None => Vec::new(),
     }
 }
 
@@ -1407,7 +1594,10 @@ fn detect_e2e_command(workspace: &Path) -> Option<String> {
 /// Whether `package.json` declares a given script. Local copy (the verify
 /// module's is private) — kept tiny on purpose.
 fn package_json_has_script(workspace: &Path, script: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string(workspace.join("package.json")) else {
+    let package = workspace.join("package.json");
+    let Ok(content) =
+        crate::bounded_fs::read_utf8_beneath(workspace, &package, MAX_PACKAGE_JSON_BYTES)
+    else {
         return false;
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -2095,10 +2285,15 @@ mod tests {
     fn preview_pid_roundtrips() {
         let tmp = TempDir::new().unwrap();
         assert!(read_preview_pid(tmp.path()).is_none());
-        write_preview_pid(tmp.path(), 4242, "sleep");
+        assert!(write_preview_pid(tmp.path(), 4242, "sleep", "owner-1"));
         assert_eq!(
             read_preview_pid(tmp.path()),
-            Some((4242, "sleep".to_string()))
+            Some(TrackedPreview {
+                version: PREVIEW_PID_VERSION,
+                group_id: 4242,
+                program: "sleep".to_string(),
+                owner_token: Some("owner-1".to_string()),
+            })
         );
         clear_preview_pid(tmp.path());
         assert!(read_preview_pid(tmp.path()).is_none());
@@ -2114,33 +2309,36 @@ mod tests {
         assert!(read_preview_pid(tmp.path()).is_none());
     }
 
-    #[test]
-    fn reclaim_no_pidfile_is_noop() {
+    #[tokio::test]
+    async fn reclaim_no_pidfile_is_noop() {
         let tmp = TempDir::new().unwrap();
-        assert!(!reclaim_tracked_preview(tmp.path()));
+        assert!(!reclaim_tracked_preview(tmp.path()).await);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn reclaim_kills_our_own_tracked_alive_pid() {
+    #[tokio::test]
+    async fn reclaim_kills_our_own_tracked_alive_pid() {
         use std::os::unix::process::ExitStatusExt;
         let tmp = TempDir::new().unwrap();
+        let owner_token = "live-owner";
         // A live process we DID record in our own pidfile = ours to clean up.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", PREVIEW_SENTINEL_SCRIPT, owner_token, "sleep", "30"]);
+        umadev_process::isolate_std_command(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut tree = umadev_process::StdCommandTree::attach(&mut child).unwrap();
         let pid = child.id();
-        write_preview_pid(tmp.path(), pid, "sleep");
+        assert!(write_preview_pid(tmp.path(), pid, "sleep", owner_token));
         assert_eq!(pid_is_alive(pid), Some(true));
 
-        let killed = reclaim_tracked_preview(tmp.path());
+        let killed = reclaim_tracked_preview(tmp.path()).await;
         assert!(killed, "our own alive tracked pid should be reclaimed");
         assert!(
             read_preview_pid(tmp.path()).is_none(),
             "pidfile must be cleared after reclaim"
         );
         // It really died (by signal), and the wait() reaps it.
+        tree.retain_descendants();
         let status = child.wait().unwrap();
         assert!(
             status.signal().is_some(),
@@ -2149,8 +2347,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn reclaim_does_not_kill_foreign_process() {
+    #[tokio::test]
+    async fn reclaim_does_not_kill_foreign_process() {
         let tmp = TempDir::new().unwrap();
         // A live process we did NOT record = foreign. Reclaim must never touch it.
         let mut child = std::process::Command::new("sleep")
@@ -2159,7 +2357,7 @@ mod tests {
             .unwrap();
         let pid = child.id();
 
-        let killed = reclaim_tracked_preview(tmp.path());
+        let killed = reclaim_tracked_preview(tmp.path()).await;
         assert!(!killed);
         assert_eq!(
             pid_is_alive(pid),
@@ -2172,20 +2370,161 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn reclaim_clears_dead_pid_without_killing() {
+    #[tokio::test]
+    async fn legacy_pidfile_never_authorizes_a_kill() {
         let tmp = TempDir::new().unwrap();
-        let mut child = std::process::Command::new("sleep")
-            .arg("0")
-            .spawn()
-            .unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        umadev_process::isolate_std_command(&mut command);
+        let mut child = command.spawn().unwrap();
+        let mut tree = umadev_process::StdCommandTree::attach(&mut child).unwrap();
+        let pid = child.id();
+        fs::create_dir(tmp.path().join(".umadev")).unwrap();
+        fs::write(preview_pid_path(tmp.path()), format!("{pid}\nsleep")).unwrap();
+
+        assert!(!reclaim_tracked_preview(tmp.path()).await);
+        assert_eq!(pid_is_alive(pid), Some(true));
+        assert!(read_preview_pid(tmp.path()).is_none());
+
+        tree.terminate(&mut child);
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reclaim_clears_dead_pid_without_killing() {
+        let tmp = TempDir::new().unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("0");
+        umadev_process::isolate_std_command(&mut command);
+        let mut child = command.spawn().unwrap();
+        let _tree = umadev_process::StdCommandTree::attach(&mut child).unwrap();
         let pid = child.id();
         let _ = child.wait(); // reap → the PID is now gone
-        write_preview_pid(tmp.path(), pid, "sleep");
+        assert!(write_preview_pid(tmp.path(), pid, "sleep", "dead-owner"));
 
-        let killed = reclaim_tracked_preview(tmp.path());
+        let killed = reclaim_tracked_preview(tmp.path()).await;
         assert!(!killed, "a dead tracked pid is not a kill");
         assert!(read_preview_pid(tmp.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reclaim_kills_group_after_the_recorded_leader_exits() {
+        let tmp = TempDir::new().unwrap();
+        let leaf_file = tmp.path().join("orphaned-preview.pid");
+        let owner_token = "orphaned-owner";
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "sh -c 'while :; do sleep 3600; done' \"$0\" \
+                 </dev/null >/dev/null 2>&1 & \
+                 sleep 30 & leaf=$!; printf '%s' \"$leaf\" > '{}'; exit 0",
+                leaf_file.display()
+            ),
+            owner_token,
+        ]);
+        umadev_process::isolate_std_command(&mut command);
+        let mut leader = command.spawn().unwrap();
+        let mut tree = umadev_process::StdCommandTree::attach(&mut leader).unwrap();
+        let pgid = leader.id();
+        assert!(leader.wait().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let leaf = loop {
+            if let Ok(pid) = fs::read_to_string(&leaf_file)
+                .and_then(|body| body.parse::<u32>().map_err(std::io::Error::other))
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "orphan never published leaf pid");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(pid_is_alive(pgid), Some(false));
+        assert_eq!(process_group_is_alive(pgid), Some(true));
+        assert!(write_preview_pid(tmp.path(), pgid, "sh", owner_token));
+
+        assert!(reclaim_tracked_preview(tmp.path()).await);
+        tree.retain_descendants();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_is_alive(leaf) == Some(true) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pid_is_alive(leaf), Some(false));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_orphan_record_cannot_kill_a_reused_foreign_group() {
+        let tmp = TempDir::new().unwrap();
+        let leaf_file = tmp.path().join("foreign-group.pid");
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!(
+                "sh -c 'while :; do sleep 3600; done' \"$0\" \
+                 </dev/null >/dev/null 2>&1 & \
+                 sleep 30 & leaf=$!; printf '%s' \"$leaf\" > '{}'; exit 0",
+                leaf_file.display()
+            ),
+            "different-owner",
+        ]);
+        umadev_process::isolate_std_command(&mut command);
+        let mut leader = command.spawn().unwrap();
+        let mut tree = umadev_process::StdCommandTree::attach(&mut leader).unwrap();
+        let group_id = leader.id();
+        assert!(leader.wait().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let leaf = loop {
+            if let Ok(pid) = fs::read_to_string(&leaf_file)
+                .and_then(|body| body.parse::<u32>().map_err(std::io::Error::other))
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "foreign group never published leaf pid"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(write_preview_pid(
+            tmp.path(),
+            group_id,
+            "sh",
+            "recorded-owner"
+        ));
+
+        assert!(!reclaim_tracked_preview(tmp.path()).await);
+        assert_eq!(pid_is_alive(leaf), Some(true));
+        assert!(read_preview_pid(tmp.path()).is_none());
+
+        tree.terminate(&mut leader);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preview_pid_io_never_follows_managed_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        symlink(outside.path(), workspace.path().join(".umadev")).unwrap();
+        assert!(!write_preview_pid(workspace.path(), 42, "sleep", "owner"));
+        assert!(read_preview_pid(workspace.path()).is_none());
+        clear_preview_pid(workspace.path());
+        assert!(!outside.path().join(PREVIEW_PID_FILE).exists());
+
+        fs::remove_file(workspace.path().join(".umadev")).unwrap();
+        fs::create_dir(workspace.path().join(".umadev")).unwrap();
+        let outside_file = outside.path().join("outside.txt");
+        fs::write(&outside_file, b"preserve").unwrap();
+        let link = preview_pid_path(workspace.path());
+        symlink(&outside_file, &link).unwrap();
+        assert!(!write_preview_pid(workspace.path(), 42, "sleep", "owner"));
+        assert!(read_preview_pid(workspace.path()).is_none());
+        clear_preview_pid(workspace.path());
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read(&outside_file).unwrap(), b"preserve");
     }
 
     // -------------------------------------------------------------------
@@ -2196,7 +2535,7 @@ mod tests {
     async fn wait_for_boot_times_out_without_binding() {
         // Output channel stays open but silent and nothing binds → must return a
         // bounded Timeout, NOT hang. Independent of whether curl exists.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DevSignal>(1);
         let start = std::time::Instant::now();
         let outcome = wait_for_boot(&mut rx, "http://127.0.0.1:1", 1).await;
         // The load-bearing assertion: the 1s-budget wait returns Timeout rather
@@ -2220,7 +2559,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_boot_times_out_when_output_closes_with_no_server() {
         // Sender dropped → channel closed → final probe fails → bounded Timeout.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DevSignal>(1);
         drop(tx);
         let outcome = wait_for_boot(&mut rx, "http://127.0.0.1:1", 60).await;
         assert_eq!(outcome, BootOutcome::Timeout);
@@ -2244,13 +2583,13 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        crate::spawn_util::detach_from_controlling_terminal(&mut cmd);
-        let mut child = cmd.spawn().expect("sh should spawn");
+        let mut child =
+            umadev_process::ManagedChild::spawn_detached(cmd).expect("managed sh should spawn");
 
         // Read the backgrounded grandchild's PID from the wrapper's stdout.
         let gpid = {
             use tokio::io::{AsyncBufReadExt, BufReader};
-            let out = child.stdout.take().expect("piped stdout");
+            let out = child.take_stdout().expect("piped stdout");
             let mut lines = BufReader::new(out).lines();
             let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
                 .await
@@ -2281,20 +2620,73 @@ mod tests {
         assert!(gone, "group teardown must reap the backgrounded grandchild");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn read_capped_tail_keeps_the_last_cap_bytes() {
-        // MORE than `cap` bytes in → only the last `cap` kept (the tail, where the
-        // e2e summary lives), bounding memory.
-        let data = vec![b'z'; 10_000];
-        let cap = 1_000;
-        let got = read_capped_tail(&data[..], cap).await;
-        assert_eq!(got.len(), cap, "keeps exactly the last cap bytes");
-        assert!(got.iter().all(|&b| b == b'z'));
+    async fn aborting_preview_ownership_kills_tree_and_clears_pidfile() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let leaf_file = workspace.join("aborted-preview-leaf.pid");
+        let task_workspace = workspace.clone();
+        let task_leaf_file = leaf_file.clone();
+        let task = tokio::spawn(async move {
+            let owner_token = "aborted-owner";
+            let plan = SpawnPlan {
+                dir: task_workspace.clone(),
+                program: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    format!(
+                        "sleep 30 & leaf=$!; printf '%s' \"$leaf\" > '{}'; \
+                         while :; do printf 0123456789abcdef; done",
+                        task_leaf_file.display()
+                    ),
+                ],
+            };
+            let command = preview_spawn_command(&plan, owner_token);
+            let mut child = umadev_process::ManagedChild::spawn_detached(command).unwrap();
+            let _pidfile = PreviewPidGuard::record(
+                &task_workspace,
+                child.id().expect("managed child pid"),
+                "sh",
+                owner_token,
+            );
+            let (_readers, _signals) = BootReaders::spawn(&mut child);
+            std::future::pending::<()>().await;
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let leaf = loop {
+            if let Ok(pid) = fs::read_to_string(&leaf_file)
+                .and_then(|body| body.parse::<u32>().map_err(std::io::Error::other))
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "preview never published leaf pid"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(preview_pid_path(&workspace).is_file());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_is_alive(leaf) == Some(true) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pid_is_alive(leaf), Some(false));
+        assert!(
+            !preview_pid_path(&workspace).exists(),
+            "cancelled preview must not leave a stale pidfile"
+        );
     }
 
     #[tokio::test]
-    async fn read_capped_tail_returns_everything_when_under_cap() {
-        let got = read_capped_tail(&b"tiny"[..], 1_000).await;
-        assert_eq!(got, b"tiny");
+    async fn newline_free_boot_flood_has_a_bounded_signal_queue() {
+        let flood = "ready".repeat(BOOT_RECORD_BYTES * (BOOT_SIGNAL_QUEUE + 8));
+        let (tx, rx) = tokio::sync::mpsc::channel(BOOT_SIGNAL_QUEUE);
+        read_boot_records(flood.as_bytes(), tx).await;
+        assert_eq!(rx.len(), BOOT_SIGNAL_QUEUE);
     }
 }

@@ -2714,6 +2714,21 @@ fn slash_mode_switches_tier_and_keeps_legacy_toggle_consistent() {
         .any(|m| m.body().contains("nonsense") || m.body().contains("未知")));
 }
 
+#[test]
+fn active_codex_turn_rejects_a_mode_change_that_its_fixed_sandbox_cannot_adopt() {
+    let mut a = fresh_app(Some("codex"));
+    assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+    a.thinking = true;
+
+    assert_eq!(a.slash_mode("auto"), Action::None);
+
+    assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+    assert!(a.history.iter().any(|message| {
+        let body = message.body();
+        body.contains("cancel") || body.contains("取消")
+    }));
+}
+
 /// Serialize the `/sandbox` tests that mutate the process-wide thread-safe
 /// codex sandbox override so they can't observe each other's writes when the
 /// suite runs multi-threaded. Each test restores the override on exit. (The
@@ -2773,7 +2788,96 @@ fn slash_sandbox_no_arg_shows_current_mode_and_all_options() {
 }
 
 #[test]
-fn slash_sandbox_danger_sets_env_persists_rc_and_warns() {
+fn permission_help_and_config_report_the_effective_codex_launch_policy() {
+    let _guard = SANDBOX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = umadev_host::codex_session::codex_sandbox_override();
+    // Guarded clamps this raw high-risk preference to workspace-write. Every
+    // user-facing surface must report the actual launch sandbox, not the raw
+    // configured preference.
+    umadev_host::codex_session::set_codex_sandbox(Some("danger-full-access"));
+    let mut a = fresh_app(Some("codex"));
+    a.lang = umadev_i18n::Lang::ZhCn;
+    assert!(
+        !a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
+        "startup must not warn that danger is active when Guarded clamps it"
+    );
+    a.thinking = true;
+    a.director_run_in_flight = true;
+
+    let before = a.history.len();
+    assert_eq!(a.submit_text("怎么给你权限？".into()), Action::None);
+    let answer = a
+        .history
+        .iter()
+        .skip(before)
+        .map(|m| m.body().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(answer.contains("按回合"), "per-turn authority: {answer}");
+    assert!(
+        answer.contains("不会锁死"),
+        "first turn is not sticky: {answer}"
+    );
+    assert!(answer.contains("无需重启"), "no restart fiction: {answer}");
+    assert!(
+        answer.contains("guarded"),
+        "trust mode is explicit: {answer}"
+    );
+    assert!(
+        answer.contains("workspace-write"),
+        "reports host-resolved sandbox: {answer}"
+    );
+    assert!(
+        a.thinking && a.director_run_in_flight,
+        "permission help must not interrupt the in-flight base turn"
+    );
+    assert!(
+        a.queued_chat.is_empty() && a.queued_steer.is_empty(),
+        "permission help is answered locally without queueing another base turn"
+    );
+
+    a.open_config_overlay();
+    let config = a.overlay.take().unwrap().lines.join("\n");
+    assert!(
+        config.contains("信任模式") && config.contains("guarded"),
+        "{config}"
+    );
+    assert!(
+        config.contains("Codex 实际沙箱") && config.contains("workspace-write"),
+        "{config}"
+    );
+    sandbox_env_restore(prev);
+}
+
+#[test]
+fn permission_help_gives_sandbox_command_only_when_codex_is_actually_read_only() {
+    let _guard = SANDBOX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = umadev_host::codex_session::codex_sandbox_override();
+    umadev_host::codex_session::set_codex_sandbox(Some("read-only"));
+    let mut a = fresh_app(Some("codex"));
+    a.lang = umadev_i18n::Lang::ZhCn;
+    let before = a.history.len();
+
+    assert_eq!(a.submit_text("为什么只读？".into()), Action::None);
+    let answer = a
+        .history
+        .iter()
+        .skip(before)
+        .map(|m| m.body().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(answer.contains("read-only"), "{answer}");
+    assert!(answer.contains("/sandbox workspace-write"), "{answer}");
+    assert!(answer.contains("无需重启"), "{answer}");
+    sandbox_env_restore(prev);
+}
+
+#[test]
+fn slash_sandbox_reports_guarded_clamp_then_warns_only_when_danger_is_effective() {
     let _guard = SANDBOX_ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2800,10 +2904,36 @@ fn slash_sandbox_danger_sets_env_persists_rc_and_warns() {
         umadev_agent::config::CodexSandbox::DangerFullAccess,
         "persists to .umadevrc [codex] sandbox_mode"
     );
-    // (3) the SAME loud red startup liability warning was reused (an Error row).
+    // Guarded clamps the configured danger preference to workspace-write, so
+    // the UI must report that truth instead of claiming full access.
     assert!(
-        a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
-        "danger reuses the red liability warning"
+        !a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
+        "a clamped preference is not an active danger sandbox"
+    );
+    let guarded_body = a
+        .history
+        .iter()
+        .map(|m| m.body().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(guarded_body.contains("guarded"), "{guarded_body}");
+    assert!(guarded_body.contains("workspace-write"), "{guarded_body}");
+    assert!(guarded_body.contains("/mode auto"), "{guarded_body}");
+
+    // Once the user explicitly switches to Auto, the same configured sandbox
+    // becomes the real launch sandbox and the red liability warning is honest.
+    a.set_trust_mode(umadev_agent::TrustMode::Auto);
+    let before = a.history.len();
+    assert_eq!(
+        a.slash_sandbox("danger-full-access"),
+        Action::SandboxChanged
+    );
+    assert!(
+        a.history
+            .iter()
+            .skip(before)
+            .any(|m| matches!(m.role, ChatRole::Error)),
+        "effective danger reuses the red liability warning"
     );
     sandbox_env_restore(prev);
 }
@@ -3261,6 +3391,7 @@ fn i6_esc_on_empty_box_recalls_queued_message_before_rewind() {
     let _ = a.submit_text("first".to_string());
     let _ = a.submit_text("queued edit".to_string());
     assert_eq!(a.queued_chat.len(), 1);
+    a.interrupt_armed_at = Some(std::time::Instant::now());
     a.input.clear();
     a.input_cursor = 0;
     // Esc with a parked queued turn recalls it (popping) instead of arming the
@@ -3275,6 +3406,10 @@ fn i6_esc_on_empty_box_recalls_queued_message_before_rewind() {
     assert!(
         !a.pending_rewind,
         "queue recall takes precedence over the rewind arm"
+    );
+    assert!(
+        !a.interrupt_armed(),
+        "queue recall clears a stale interrupt arm"
     );
 }
 

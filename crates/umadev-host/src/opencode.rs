@@ -408,6 +408,7 @@ impl Runtime for OpenCodeDriver {
         req: CompletionRequest,
         on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
     ) -> Result<CompletionResponse, RuntimeError> {
+        let call_started = std::time::Instant::now();
         let prompt = merge_prompt(&req);
         let ws = self.workspace.clone().unwrap_or_else(default_workspace);
         self.ensure_program_available(&ws)
@@ -421,7 +422,7 @@ impl Runtime for OpenCodeDriver {
         // Accumulate the raw stream so a mid-stream failure can salvage whatever
         // already arrived (opencode's answer IS its plain stdout) instead of
         // cold-restarting a whole new run.
-        let stream_buf = std::sync::Mutex::new(String::new());
+        let stream_buf = crate::StreamingFallbackBuffer::new();
         let result = run_subprocess_streaming(
             SubprocessCall {
                 program: &program,
@@ -433,10 +434,7 @@ impl Runtime for OpenCodeDriver {
                 env: &[],
             },
             &|line: &str| {
-                if let Ok(mut b) = stream_buf.lock() {
-                    b.push_str(line);
-                    b.push('\n');
-                }
+                stream_buf.push_line(line);
                 if let Some(ev) = parse_opencode_stream_line(line) {
                     on_event(ev);
                 }
@@ -470,7 +468,7 @@ impl Runtime for OpenCodeDriver {
                 // Salvage what already streamed (opencode's text IS its stdout)
                 // before paying for a full `complete` re-run.
                 tracing::debug!(error = %e, "opencode streaming failed, falling back to non-streaming");
-                let partial = stream_buf.into_inner().unwrap_or_default();
+                let partial = stream_buf.into_string();
                 let salvaged = resolve_opencode_answer(&partial);
                 if !salvaged.trim().is_empty() {
                     return Ok(crate::redaction::sanitize_completion_response(
@@ -482,9 +480,17 @@ impl Runtime for OpenCodeDriver {
                         },
                     ));
                 }
+                let stream_error = crate::map_subprocess_error(&e);
+                if matches!(stream_error, RuntimeError::Timeout(_, _)) {
+                    return Err(stream_error);
+                }
+                let remaining = timeout.saturating_sub(call_started.elapsed());
+                if remaining.is_zero() {
+                    return Err(stream_error);
+                }
                 drop(args);
                 drop(prompt);
-                self.complete(req).await
+                self.clone().with_timeout(remaining).complete(req).await
             }
         }
     }
@@ -852,11 +858,9 @@ fn opencode_auth_file() -> Option<std::path::PathBuf> {
 /// subcommand). Fail-open: a parse failure on a present file yields `None`, not a
 /// guess.
 fn classify_opencode_auth_file(path: &std::path::Path) -> Option<AuthState> {
-    if !path.is_file() {
-        return None;
-    }
-    let body = std::fs::read_to_string(path).ok()?;
-    let v = serde_json::from_str::<serde_json::Value>(&body).ok()?;
+    const MAX_AUTH_BYTES: u64 = 1024 * 1024;
+    let body = crate::read_user_file_bounded(path, MAX_AUTH_BYTES).ok()?;
+    let v = serde_json::from_slice::<serde_json::Value>(&body).ok()?;
     let obj = v.as_object()?;
     Some(if obj.is_empty() {
         AuthState::NotLoggedIn
@@ -1142,6 +1146,23 @@ mod tests {
         let garbage = dir.path().join("garbage.json");
         std::fs::write(&garbage, "not json").unwrap();
         assert_eq!(classify_opencode_auth_file(&garbage), None);
+
+        let oversized = dir.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b' '; 1024 * 1024 + 1]).unwrap();
+        assert_eq!(classify_opencode_auth_file(&oversized), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_auth_fifo_is_rejected_without_blocking() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fifo = dir.path().join("auth.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(classify_opencode_auth_file(&fifo), None);
     }
 
     #[test]

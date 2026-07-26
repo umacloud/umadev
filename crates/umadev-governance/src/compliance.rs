@@ -16,6 +16,11 @@ use umadev_spec::SPEC_VERSION;
 
 use crate::audit::{ApiCallRecord, ToolCallRecord};
 
+const HASH_INPUT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const QUALITY_REPORT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const AUDIT_TRAIL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const AUDIT_TRAIL_MAX_RECORDS: usize = 100_000;
+
 /// External compliance-framework references attached to one clause.
 ///
 /// Owned strings so the type is fully Serialize+Deserialize across IPC
@@ -293,7 +298,20 @@ impl ClauseEvidence {
 #[must_use]
 pub fn file_sha256(path: &std::path::Path) -> Option<String> {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).ok()?;
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    let bytes =
+        umadev_state::fs::read_bounded_beneath(parent, Path::new(name), HASH_INPUT_MAX_BYTES)
+            .ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn file_sha256_beneath(root: &Path, relative: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes =
+        umadev_state::fs::read_bounded_beneath(root, relative, HASH_INPUT_MAX_BYTES).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Some(format!("{:x}", hasher.finalize()))
@@ -427,21 +445,21 @@ pub fn build_compliance_mapping(inputs: &ComplianceInputs<'_>) -> ComplianceMapp
     if let Some(root) = inputs.project_root {
         // Quality gate → UD-EVID-003
         let qg_path = format!("output/{}-quality-gate.json", inputs.slug);
-        if let Some(sha) = file_sha256(&root.join(&qg_path)) {
+        if let Some(sha) = file_sha256_beneath(root, Path::new(&qg_path)) {
             if let Some(entry) = evidence.get_mut("UD-EVID-003") {
                 entry.add_content_hash(&qg_path, &sha);
             }
         }
         // Architecture doc → UD-CODE-003 (API alignment source of truth)
         let arch_path = format!("output/{}-architecture.md", inputs.slug);
-        if let Some(sha) = file_sha256(&root.join(&arch_path)) {
+        if let Some(sha) = file_sha256_beneath(root, Path::new(&arch_path)) {
             if let Some(entry) = evidence.get_mut("UD-CODE-003") {
                 entry.add_content_hash(&arch_path, &sha);
             }
         }
         // Tool-call audit → UD-EVID-002
         let tc = ".umadev/audit/tool-calls.jsonl";
-        if let Some(sha) = file_sha256(&root.join(tc)) {
+        if let Some(sha) = file_sha256_beneath(root, Path::new(tc)) {
             if let Some(entry) = evidence.get_mut("UD-EVID-002") {
                 entry.add_content_hash(tc, &sha);
             }
@@ -490,25 +508,22 @@ pub fn write_compliance_mapping(
     // `output/` (path traversal). The slug derives from the workspace dir
     // name or `--slug`, which we don't fully control.
     let safe_slug = sanitize_slug(slug);
-    let quality_path = project_root
-        .join("output")
-        .join(format!("{safe_slug}-quality-gate.json"));
-    let quality_raw = fs::read_to_string(&quality_path).ok();
+    let quality_relative = PathBuf::from("output").join(format!("{safe_slug}-quality-gate.json"));
+    let quality_raw = umadev_state::fs::read_bounded_beneath(
+        project_root,
+        &quality_relative,
+        QUALITY_REPORT_MAX_BYTES,
+    )
+    .ok();
     let quality_value: Option<serde_json::Value> = quality_raw
         .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok());
+        .and_then(|bytes| serde_json::from_slice(bytes).ok());
 
-    let mut tool_calls = read_jsonl::<ToolCallRecord>(
-        &project_root
-            .join(".umadev")
-            .join("audit")
-            .join("tool-calls.jsonl"),
-    );
+    let mut tool_calls =
+        read_jsonl::<ToolCallRecord>(project_root, Path::new(".umadev/audit/tool-calls.jsonl"));
     let mut api_calls = read_jsonl::<ApiCallRecord>(
-        &project_root
-            .join(".umadev")
-            .join("audit")
-            .join("frontend-api-calls.jsonl"),
+        project_root,
+        Path::new(".umadev/audit/frontend-api-calls.jsonl"),
     );
     // Sort by ts_ms (then ts) so two calls sharing a second still order
     // deterministically by sub-second arrival. Old rows without ts_ms (0)
@@ -582,17 +597,45 @@ fn atomic_write(path: &Path, content: &str) {
     }
 }
 
-fn read_jsonl<T>(path: &Path) -> Vec<T>
+fn read_jsonl<T>(root: &Path, relative: &Path) -> Vec<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    let Ok(text) = fs::read_to_string(path) else {
+    read_jsonl_with_limits(
+        root,
+        relative,
+        AUDIT_TRAIL_MAX_BYTES,
+        AUDIT_TRAIL_MAX_RECORDS,
+    )
+}
+
+fn read_jsonl_with_limits<T>(
+    root: &Path,
+    relative: &Path,
+    max_bytes: u64,
+    max_records: usize,
+) -> Vec<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let Ok(bytes) = umadev_state::fs::read_bounded_beneath(root, relative, max_bytes) else {
         return Vec::new();
     };
-    text.lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str::<T>(line).ok())
-        .collect()
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Vec::new();
+    };
+    let mut parsed = Vec::new();
+    let mut records = 0_usize;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        records = records.saturating_add(1);
+        if records > max_records {
+            return Vec::new();
+        }
+        if let Ok(value) = serde_json::from_str::<T>(line) {
+            parsed.push(value);
+        }
+    }
+    parsed
 }
 
 #[cfg(test)]
@@ -753,6 +796,46 @@ mod tests {
     #[test]
     fn file_sha256_returns_none_for_missing() {
         assert!(file_sha256(std::path::Path::new("/nonexistent/x.json")).is_none());
+    }
+
+    #[test]
+    fn audit_reader_rejects_oversized_or_excessive_input_without_partial_evidence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        let relative = Path::new(".umadev/audit/tool-calls.jsonl");
+        fs::write(tmp.path().join(relative), vec![b'x'; 65]).unwrap();
+        assert!(read_jsonl_with_limits::<ToolCallRecord>(tmp.path(), relative, 64, 10).is_empty());
+
+        let row = serde_json::to_string(&fake_tool_call("UD-CODE-001", "block")).unwrap();
+        fs::write(tmp.path().join(relative), format!("{row}\n{row}\n")).unwrap();
+        assert!(read_jsonl_with_limits::<ToolCallRecord>(tmp.path(), relative, 4096, 1).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_and_fifo_compliance_inputs_are_rejected_without_blocking() {
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside.jsonl");
+        fs::write(&outside, "{}\n").unwrap();
+        let relative = Path::new(".umadev/audit/tool-calls.jsonl");
+        symlink(&outside, tmp.path().join(relative)).unwrap();
+        assert!(read_jsonl::<ToolCallRecord>(tmp.path(), relative).is_empty());
+        fs::remove_file(tmp.path().join(relative)).unwrap();
+
+        assert!(std::process::Command::new("mkfifo")
+            .arg(tmp.path().join(relative))
+            .status()
+            .unwrap()
+            .success());
+        let started = Instant::now();
+        assert!(read_jsonl::<ToolCallRecord>(tmp.path(), relative).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

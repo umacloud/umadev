@@ -1,5 +1,7 @@
 //! Honest summaries for low-signal read-only tool output.
 
+const MAX_TRUSTED_MATCH_COUNT: usize = 1_000_000;
+
 /// Fold a read-only tool's raw result into a single metric instead of dumping
 /// it. Grep output may contain arbitrary project data, so only a provider's
 /// explicit count phrase is safe to label as a count.
@@ -39,7 +41,13 @@ fn explicit_read_only_count(preview: &str) -> Option<usize> {
         Some(_) => (0, 1),
         None => return None,
     };
+    if words.len() != unit_at + 1 {
+        return None;
+    }
     let count = words.get(count_at)?.parse::<usize>().ok()?;
+    if count > MAX_TRUSTED_MATCH_COUNT {
+        return None;
+    }
     let unit = words.get(unit_at)?.as_str();
     matches!(
         unit,
@@ -61,4 +69,23 @@ fn explicit_read_only_count(preview: &str) -> Option<usize> {
             | "個文件"
     )
     .then_some(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explicit_read_only_count;
+
+    #[test]
+    fn accepts_only_exact_provider_summary_shapes() {
+        assert_eq!(explicit_read_only_count("Found 42 matches"), Some(42));
+        assert_eq!(explicit_read_only_count("42 matches"), Some(42));
+        assert_eq!(explicit_read_only_count("共 7 处匹配"), Some(7));
+        assert_eq!(explicit_read_only_count("3 matches in source.rs"), None);
+    }
+
+    #[test]
+    fn rejects_implausible_provider_counts() {
+        assert_eq!(explicit_read_only_count("3000000000000000 matches"), None);
+        assert_eq!(explicit_read_only_count("1000001 matches"), None);
+    }
 }

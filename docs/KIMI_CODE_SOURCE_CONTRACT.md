@@ -7,10 +7,10 @@ wrapper.
 
 ## Audited source baseline
 
-- package: `@moonshot-ai/kimi-code@0.28.1`
-- release tag: `@moonshot-ai/kimi-code@0.28.1`
-- commit: `4c763f6763acb67a73d133f7450d092e71d63692`
-- ACP adapter: `@moonshot-ai/kimi-acp-adapter@0.3.4`
+- package: `@moonshot-ai/kimi-code@0.29.1`
+- release tag: `@moonshot-ai/kimi-code@0.29.1`
+- commit: `f4c3967a417a539372eadab6c809d27b8a14c005`
+- ACP adapter: `@moonshot-ai/kimi-acp-adapter@0.3.5`
 - ACP SDK declared by upstream: `@agentclientprotocol/sdk@^0.23.0`
 - machine entrypoint: `kimi acp`
 
@@ -19,6 +19,15 @@ The fixed commit and source markers are checked by
 `kimi-source-contract` CI job. This is a drift alarm, not a runtime allowlist:
 every official Kimi Code version is accepted, and optional controls are derived
 from the live session's advertised `configOptions`.
+
+The `0.28.1` to `0.29.1` audit found the ACP implementation byte-identical:
+session creation/resume/load/list, model and mode controls, permissions,
+cancellation, streaming tool events and terminal-owned login retain the same
+wire contract. The adapter package bump is dependency-only. Kimi's internal
+external-hook registration changed from a mutable decision object to an event
+veto API; UmaDev's source fixture follows that semantic change, while the ACP
+transport and UmaDev's runtime version-independent capability negotiation are
+unchanged.
 
 The separate `kimi-published-contract` CI matrix installs that audited npm
 package on Linux, macOS, and Windows, launches its real `kimi acp` entrypoint

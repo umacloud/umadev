@@ -26,7 +26,6 @@
 //! dependency-light and emits machine-readable data plus a neutral summary line.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -47,56 +46,10 @@ const DEPLOY_TIMEOUT_SECS: u64 = 600;
 /// the end) while ALWAYS draining the pipe so the child never blocks. The final
 /// stored `log_tail` is capped smaller still, at [`CAPTURE_CAP`].
 const OUTPUT_CAP: usize = 256 * 1024;
+const MAX_DEPLOY_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 
-/// Bounded reap after a deploy TIMES OUT, so a killed CLI and its pipe readers
-/// can't turn a timeout into an unbounded hang.
+/// Bounded reap / pipe-reader grace after a deploy tree is terminated.
 const KILL_REAP_SECS: u64 = 5;
-
-/// Cancellation-safe owner for a detached deploy process tree.
-///
-/// Tokio's `Child::kill_on_drop` only kills the direct shell wrapper. A deploy
-/// future can be aborted at any `.await`, before the explicit timeout/error
-/// cleanup below runs, so this guard synchronously kills the detached process
-/// group from `Drop` as well. A normally reaped child is explicitly disarmed.
-struct DeployChildGuard {
-    child: tokio::process::Child,
-    armed: bool,
-}
-
-impl DeployChildGuard {
-    fn new(child: tokio::process::Child) -> Self {
-        Self { child, armed: true }
-    }
-
-    fn child_mut(&mut self) -> &mut tokio::process::Child {
-        &mut self.child
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    fn kill_tree_now(&mut self) {
-        let _ = crate::spawn_util::kill_process_group(&self.child);
-        let _ = self.child.start_kill();
-    }
-
-    async fn kill_tree_and_reap(&mut self) {
-        self.kill_tree_now();
-        let _ = tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), self.child.wait()).await;
-    }
-}
-
-impl Drop for DeployChildGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            // `Drop` cannot await. The group kill reaches detached descendants;
-            // `start_kill` backs it up for the direct child. Tokio performs its
-            // normal kill-on-drop/reap bookkeeping when `child` is then dropped.
-            self.kill_tree_now();
-        }
-    }
-}
 
 /// A recognised deployment platform. Detected purely from files already in the
 /// workspace; each variant maps to a single canonical CLI command.
@@ -312,20 +265,24 @@ impl DeployProof {
 #[must_use]
 pub fn detect_deploy_target(workspace: &Path) -> DeployTarget {
     // 1. Explicit platform configs (most specific).
-    if workspace.join("vercel.json").is_file() || is_next_app(workspace) {
+    if crate::bounded_fs::is_real_file_beneath(workspace, &workspace.join("vercel.json"))
+        || is_next_app(workspace)
+    {
         return DeployTarget::Vercel;
     }
-    if workspace.join("netlify.toml").is_file() {
+    if crate::bounded_fs::is_real_file_beneath(workspace, &workspace.join("netlify.toml")) {
         return DeployTarget::Netlify;
     }
-    if workspace.join("fly.toml").is_file() {
+    if crate::bounded_fs::is_real_file_beneath(workspace, &workspace.join("fly.toml")) {
         return DeployTarget::Fly;
     }
-    if workspace.join("wrangler.toml").is_file() || workspace.join("wrangler.json").is_file() {
+    if crate::bounded_fs::is_real_file_beneath(workspace, &workspace.join("wrangler.toml"))
+        || crate::bounded_fs::is_real_file_beneath(workspace, &workspace.join("wrangler.json"))
+    {
         return DeployTarget::CloudflarePages;
     }
     // 2. A Dockerfile — container build (no platform config above it).
-    if workspace.join("Dockerfile").is_file() {
+    if crate::bounded_fs::is_real_file_beneath(workspace, &workspace.join("Dockerfile")) {
         return DeployTarget::Docker;
     }
     // 3. A pre-built static bundle with no platform config — any static host.
@@ -335,7 +292,7 @@ pub fn detect_deploy_target(workspace: &Path) -> DeployTarget {
         ("build", StaticDir::Build),
         ("public", StaticDir::Public),
     ] {
-        if workspace.join(name).is_dir() {
+        if crate::bounded_fs::is_real_directory_beneath(workspace, &workspace.join(name)) {
             return DeployTarget::StaticHost(dir);
         }
     }
@@ -346,7 +303,7 @@ pub fn detect_deploy_target(workspace: &Path) -> DeployTarget {
 /// a `vercel.json`). Detected by a `next.config.*` file or a `next` dependency.
 fn is_next_app(workspace: &Path) -> bool {
     for cfg in ["next.config.js", "next.config.mjs", "next.config.ts"] {
-        if workspace.join(cfg).is_file() {
+        if crate::bounded_fs::is_real_file_beneath(workspace, &workspace.join(cfg)) {
             return true;
         }
     }
@@ -356,7 +313,11 @@ fn is_next_app(workspace: &Path) -> bool {
 /// Whether `package.json` declares a dependency on `pkg` (in `dependencies` /
 /// `devDependencies`). Best-effort; a missing / malformed manifest → `false`.
 fn package_json_depends_on(workspace: &Path, pkg: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string(workspace.join("package.json")) else {
+    let Ok(content) = crate::bounded_fs::read_utf8_beneath(
+        workspace,
+        &workspace.join("package.json"),
+        MAX_DEPLOY_MANIFEST_BYTES,
+    ) else {
         return false;
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
@@ -407,15 +368,10 @@ pub async fn run_deploy(workspace: &Path, command: Option<&str>) -> DeployProof 
 /// Spawn + drive one deploy command against `workspace`, racing its exit against
 /// `timeout_secs`. Always returns a [`DeployProof`] — fail-open, never hangs.
 ///
-/// **Kill + bound (the audit fix).** The command is spawned with
-/// `kill_on_drop(true)` AND detached into its own session/process-group. A
-/// cancellation-safe guard kills the WHOLE tree on timeout, wait failure, or
-/// when the caller aborts/drops this future (the `sh -c` wrapper forks `npx` →
-/// `node`, etc.) — tokio dropping the `Child` alone would leave those
-/// descendants running. Output is captured through a bounded, tail-retaining reader
-/// ([`read_capped_tail`]) instead of `Command::output()`, so a chatty command
-/// can't buffer unbounded stdout/stderr into memory; the reader always drains so
-/// the child never blocks on a full pipe.
+/// The shared detached-command runner continuously drains both pipes into
+/// fixed-size tails and owns the full Unix process group / Windows Job Object.
+/// It tears down descendants on success, failure, timeout, or caller
+/// cancellation, and aborts then reaps pipe readers within a fixed grace.
 async fn run_deploy_command(
     workspace: &Path,
     platform: DeployTarget,
@@ -431,19 +387,19 @@ async fn run_deploy_command(
         ("sh", "-c")
     };
     let mut dcmd = Command::new(shell);
-    dcmd.arg(shell_arg)
-        .arg(&command)
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Detach into its OWN session/process-group so a timeout can take down the
-    // whole deploy tree, not just the `sh -c` wrapper. Safe: stdin is null and
-    // stdout/stderr are piped. Fail-open (see spawn_util).
-    crate::spawn_util::detach_from_controlling_terminal(&mut dcmd);
-    let mut child = match dcmd.spawn() {
-        Ok(c) => DeployChildGuard::new(c),
+    dcmd.arg(shell_arg).arg(&command).current_dir(workspace);
+    let output = match umadev_process::run_bounded_detached_command(
+        dcmd,
+        umadev_process::BoundedCommandOptions {
+            timeout: Duration::from_secs(timeout_secs),
+            stdout_bytes: OUTPUT_CAP / 2,
+            stderr_bytes: OUTPUT_CAP / 2,
+            reader_grace: Duration::from_secs(KILL_REAP_SECS),
+        },
+    )
+    .await
+    {
+        Ok(output) => output,
         Err(e) => {
             let mut proof =
                 DeployProof::not_deployed(platform, format!("could not run deploy command: {e}"));
@@ -452,131 +408,57 @@ async fn run_deploy_command(
             return proof;
         }
     };
-
-    // Capped-tail readers: retain only the last OUTPUT_CAP bytes of each stream
-    // (bounding memory on a chatty deploy) while always draining so the child
-    // never blocks on a full pipe.
-    let stdout_task = child
-        .child_mut()
-        .stdout
-        .take()
-        .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
-    let stderr_task = child
-        .child_mut()
-        .stderr
-        .take()
-        .map(|h| tokio::spawn(read_capped_tail(h, OUTPUT_CAP)));
-
-    // Race the command's exit against the deploy budget.
-    let wait_result =
-        tokio::time::timeout(Duration::from_secs(timeout_secs), child.child_mut().wait()).await;
-    match &wait_result {
-        Ok(Ok(_)) => child.disarm(),
-        Ok(Err(_)) | Err(_) => {
-            // Timeout or a failed `wait()` leaves the child's fate uncertain.
-            // Kill the whole detached tree and bound the reap. If this future
-            // is itself cancelled during the reap, the still-armed Drop guard
-            // repeats the synchronous group kill.
-            child.kill_tree_and_reap().await;
-        }
-    }
-
-    let raw_stdout = join_capped(stdout_task).await;
-    let raw_stderr = join_capped(stderr_task).await;
-    let stdout = String::from_utf8_lossy(&raw_stdout);
-    let stderr = String::from_utf8_lossy(&raw_stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
 
-    match wait_result {
-        Ok(Ok(status)) => {
-            let exit = status.code().unwrap_or(-1);
-            // Many deploy CLIs print the live URL on stdout; some on stderr.
-            let url = extract_url(&stdout).or_else(|| extract_url(&stderr));
-            let log_tail = log_tail(&stdout, &stderr);
-            if status.success() {
-                DeployProof {
-                    timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                    platform,
-                    status: DeployStatus::Deployed,
-                    command: Some(command),
-                    exit_code: Some(exit),
-                    url,
-                    duration_ms: Some(ms),
-                    log_tail,
-                }
-            } else {
-                DeployProof {
-                    timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                    platform,
-                    status: DeployStatus::NotDeployed(format!("deploy command exited {exit}")),
-                    command: Some(command),
-                    exit_code: Some(exit),
-                    url,
-                    duration_ms: Some(ms),
-                    log_tail,
-                }
+    if output.timed_out {
+        let mut proof =
+            DeployProof::not_deployed(platform, format!("timed out after {timeout_secs}s"));
+        proof.command = Some(command);
+        proof.exit_code = Some(-1);
+        proof.duration_ms = Some(timeout_secs.saturating_mul(1000));
+        proof.log_tail = log_tail(&stdout, &stderr);
+        return proof;
+    }
+
+    if let Some(status) = output.status {
+        let exit = status.code().unwrap_or(-1);
+        // Many deploy CLIs print the live URL on stdout; some on stderr.
+        let url = extract_url(&stdout).or_else(|| extract_url(&stderr));
+        let log_tail = log_tail(&stdout, &stderr);
+        if status.success() {
+            DeployProof {
+                timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                platform,
+                status: DeployStatus::Deployed,
+                command: Some(command),
+                exit_code: Some(exit),
+                url,
+                duration_ms: Some(ms),
+                log_tail,
+            }
+        } else {
+            DeployProof {
+                timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                platform,
+                status: DeployStatus::NotDeployed(format!("deploy command exited {exit}")),
+                command: Some(command),
+                exit_code: Some(exit),
+                url,
+                duration_ms: Some(ms),
+                log_tail,
             }
         }
-        Ok(Err(e)) => {
-            let mut proof =
-                DeployProof::not_deployed(platform, format!("could not run deploy command: {e}"));
-            proof.command = Some(command);
-            proof.exit_code = Some(-1);
-            proof
-        }
-        Err(_) => {
-            let mut proof =
-                DeployProof::not_deployed(platform, format!("timed out after {timeout_secs}s"));
-            proof.command = Some(command);
-            proof.exit_code = Some(-1);
-            proof.duration_ms = Some(timeout_secs.saturating_mul(1000));
-            // Keep the killed command's last words for the auditor.
-            proof.log_tail = log_tail(&stdout, &stderr);
-            proof
-        }
-    }
-}
-
-/// Read `reader` to EOF, retaining only the LAST `cap` bytes (the deploy
-/// result / URL / error lives at the end) while always draining so the child
-/// never blocks on a full pipe. Memory is bounded to `2*cap` between trims, so a
-/// huge stream costs O(total), not O(total²).
-async fn read_capped_tail<R>(mut reader: R, cap: usize) -> Vec<u8>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt as _;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = vec![0u8; 8192];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if cap > 0 && buf.len() > cap.saturating_mul(2) {
-                    let drop_to = buf.len() - cap;
-                    buf.drain(..drop_to);
-                }
-            }
-        }
-    }
-    if cap > 0 && buf.len() > cap {
-        let drop_to = buf.len() - cap;
-        buf.drain(..drop_to);
-    }
-    buf
-}
-
-/// Join a capped-tail reader task, BOUNDED so a wedged descendant that still
-/// holds a pipe open after a kill can't hang us. Fail-open: a missing task or a
-/// panic yields an empty buffer.
-async fn join_capped(task: Option<tokio::task::JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    match task {
-        Some(t) => match tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), t).await {
-            Ok(Ok(buf)) => buf,
-            Ok(Err(_)) | Err(_) => Vec::new(),
-        },
-        None => Vec::new(),
+    } else {
+        let mut proof = DeployProof::not_deployed(
+            platform,
+            "deploy command exited without a status".to_string(),
+        );
+        proof.command = Some(command);
+        proof.exit_code = Some(-1);
+        proof.log_tail = log_tail(&stdout, &stderr);
+        proof
     }
 }
 
@@ -703,6 +585,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(detect_deploy_target(tmp.path()), DeployTarget::Vercel);
+    }
+
+    #[test]
+    fn oversized_package_json_cannot_invent_a_next_deploy_target() {
+        let tmp = TempDir::new().unwrap();
+        fs::File::create(tmp.path().join("package.json"))
+            .unwrap()
+            .set_len(u64::try_from(MAX_DEPLOY_MANIFEST_BYTES + 1).unwrap())
+            .unwrap();
+        assert_eq!(detect_deploy_target(tmp.path()), DeployTarget::None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_deploy_markers_are_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("vercel.json"), "{}").unwrap();
+        fs::create_dir(outside.path().join("dist")).unwrap();
+        symlink(
+            outside.path().join("vercel.json"),
+            tmp.path().join("vercel.json"),
+        )
+        .unwrap();
+        symlink(outside.path().join("dist"), tmp.path().join("dist")).unwrap();
+
+        assert_eq!(detect_deploy_target(tmp.path()), DeployTarget::None);
     }
 
     #[test]
@@ -926,23 +837,6 @@ mod tests {
         assert_eq!(deploy_proof_rel_path(), ".umadev/audit/deploy-proof.json");
     }
 
-    #[tokio::test]
-    async fn read_capped_tail_keeps_the_last_cap_bytes() {
-        // A reader producing MORE than `cap` bytes: only the last `cap` are kept
-        // (the tail, where a deploy prints its result / URL), bounding memory.
-        let data = vec![b'a'; 10_000];
-        let cap = 1_000;
-        let got = read_capped_tail(&data[..], cap).await;
-        assert_eq!(got.len(), cap, "keeps exactly the last cap bytes");
-        assert!(got.iter().all(|&b| b == b'a'));
-    }
-
-    #[tokio::test]
-    async fn read_capped_tail_returns_everything_when_under_cap() {
-        let got = read_capped_tail(&b"short output"[..], 1_000).await;
-        assert_eq!(got, b"short output");
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     async fn run_deploy_command_times_out_kills_and_does_not_hang() {
@@ -1070,5 +964,58 @@ mod tests {
         .await;
         assert!(proof.status.is_deployed(), "echo exits 0 → Deployed");
         assert_eq!(proof.url.as_deref(), Some("https://demo.example.app"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_deploy_wrapper_kills_a_pipe_holding_descendant() {
+        let tmp = TempDir::new().unwrap();
+        let pid_path = tmp.path().join("deploy-success-leaf.pid");
+        let proof = run_deploy_command(
+            tmp.path(),
+            DeployTarget::Netlify,
+            concat!(
+                "sleep 30 & leaf=$!; printf '%s' \"$leaf\" > deploy-success-leaf.pid; ",
+                "printf 'https://success.example.app'; exit 0"
+            )
+            .to_string(),
+            5,
+        )
+        .await;
+
+        assert!(proof.status.is_deployed());
+        assert_eq!(proof.url.as_deref(), Some("https://success.example.app"));
+        let leaf = wait_for_test_pid(&pid_path).await;
+        let stopped = tokio::time::timeout(Duration::from_secs(3), async {
+            while unix_process_is_running(leaf) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(stopped.is_ok(), "successful wrapper left descendant {leaf}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn newline_free_deploy_flood_is_drained_and_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let proof = run_deploy_command(
+            tmp.path(),
+            DeployTarget::Netlify,
+            concat!(
+                "head -c 1048576 /dev/zero | tr '\\0' x; ",
+                "printf 'https://flood.example.app'"
+            )
+            .to_string(),
+            5,
+        )
+        .await;
+
+        assert!(proof.status.is_deployed());
+        assert_eq!(proof.url.as_deref(), Some("https://flood.example.app"));
+        assert!(
+            proof.log_tail.len() <= CAPTURE_CAP + "...[truncated]\n".len(),
+            "stored deploy output exceeded its fixed envelope"
+        );
     }
 }

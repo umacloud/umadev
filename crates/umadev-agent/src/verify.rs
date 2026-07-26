@@ -22,7 +22,6 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -32,6 +31,11 @@ use tokio::process::Command;
 /// Cap stderr / stdout captured in the audit row, so a chatty build
 /// can't bloat the JSONL.
 const CAPTURE_CAP: usize = 8 * 1024;
+
+/// Project manifests and lightweight configuration inspected while building a
+/// verify plan are workspace-controlled input. Keep those probes bounded so a
+/// malformed file cannot allocate without limit or block on a special file.
+const MAX_VERIFY_CONFIG_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default per-step timeout (seconds) when neither the step's own
 /// [`VerifyStep::timeout_secs`] nor the `UMADEV_VERIFY_TIMEOUT_SECS`
@@ -44,14 +48,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// falsely time out a legitimate `cargo build --release`.
 const SLOW_STEP_TIMEOUT_SECS: u64 = 600;
 
-/// Bounded reaps after a step TIMES OUT, so a wedged descendant can never turn
-/// a step timeout into an unbounded verify hang. `KILL_REAP_SECS` bounds the
-/// wait for the killed child to be reaped; `DRAIN_REAP_SECS` bounds the join of
-/// the pipe-reader tasks — after the process-group kill they hit EOF at once, so
-/// the bound only bites in a pathological "a descendant still holds the pipe"
-/// case, where we take whatever was already buffered instead of blocking.
-const KILL_REAP_SECS: u64 = 5;
-const DRAIN_REAP_SECS: u64 = 5;
+/// Bounded reap / pipe-reader grace after a verify process tree is terminated.
+const COMMAND_REAP_SECS: u64 = 5;
 
 /// What kind of project we detected.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -167,7 +165,7 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
             // because install runs as the FIRST step at runtime — so the binary
             // may not exist yet when we build this list, and we'd wrongly pick
             // `tsc` for a Vue project whose install would have provided vue-tsc.
-            if workspace.join("tsconfig.json").is_file() {
+            if workspace_file(workspace, "tsconfig.json") {
                 let tsc = if package_json_depends_on(workspace, "vue-tsc") {
                     "vue-tsc"
                 } else {
@@ -205,8 +203,8 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
                 steps.push(slow("install", "pip", &["install", "-e", "."], true));
             }
             steps.push(s("lint", "ruff", &["check"], true));
-            if workspace.join("mypy.ini").is_file()
-                || (workspace.join("pyproject.toml").is_file()
+            if workspace_file(workspace, "mypy.ini")
+                || (workspace_file(workspace, "pyproject.toml")
                     && file_contains(workspace, "pyproject.toml", "[tool.mypy]"))
             {
                 steps.push(s("typecheck", "mypy", &["."], true));
@@ -284,10 +282,7 @@ fn is_plain_test_ident(name: &str) -> bool {
 /// filter; anything else (mocha, ava, node:test, a custom shell pipeline) is
 /// `Unavailable`.
 fn node_test_runner_takes_t_filter(workspace: &Path) -> bool {
-    let Ok(raw) = std::fs::read_to_string(workspace.join("package.json")) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Some(v) = package_json(workspace) else {
         return false;
     };
     let script = v
@@ -521,7 +516,7 @@ fn detect_dev_server_in_dir(workspace: &Path) -> Option<DevServer> {
     // 3. Static HTML — Python's http.server as a zero-dependency fallback.
     let has_html = ["index.html", "public/index.html"]
         .iter()
-        .any(|p| workspace.join(p).is_file());
+        .any(|p| workspace_file(workspace, p));
     if has_html {
         return Some(DevServer {
             label: "Static file server",
@@ -545,7 +540,7 @@ fn looks_like_root_acceptance_harness(workspace: &Path) -> bool {
         "app",
     ]
     .iter()
-    .any(|d| workspace.join(d).is_dir());
+    .any(|d| workspace_directory(workspace, d));
     if !has_real_subproject {
         return false;
     }
@@ -554,8 +549,8 @@ fn looks_like_root_acceptance_harness(workspace: &Path) -> bool {
     // its static-frontend index file. A bare `src/frontend` DIRECTORY is NOT
     // enough — a normal full-stack app keeps its own source there and must keep
     // its own root dev server rather than be mis-routed to a subproject.
-    workspace.join("src/backend/server.mjs").is_file()
-        || workspace.join("src/frontend/index.html").is_file()
+    workspace_file(workspace, "src/backend/server.mjs")
+        || workspace_file(workspace, "src/frontend/index.html")
 }
 
 fn preferred_frontend_dirs(workspace: &Path) -> Vec<std::path::PathBuf> {
@@ -573,7 +568,7 @@ fn preferred_frontend_dirs(workspace: &Path) -> Vec<std::path::PathBuf> {
     NAMES
         .iter()
         .map(|p| workspace.join(p))
-        .filter(|p| p.join("package.json").is_file())
+        .filter(|p| crate::bounded_fs::is_real_file_beneath(workspace, &p.join("package.json")))
         .collect()
 }
 
@@ -659,7 +654,26 @@ fn which(bin: &str) -> bool {
 
 /// Read a file and check whether it contains a substring (best-effort).
 fn file_contains(workspace: &Path, file: &str, needle: &str) -> bool {
-    std::fs::read_to_string(workspace.join(file)).is_ok_and(|content| content.contains(needle))
+    crate::bounded_fs::read_utf8_beneath(workspace, &workspace.join(file), MAX_VERIFY_CONFIG_BYTES)
+        .is_ok_and(|content| content.contains(needle))
+}
+
+fn workspace_file(workspace: &Path, relative: impl AsRef<Path>) -> bool {
+    crate::bounded_fs::is_real_file_beneath(workspace, &workspace.join(relative))
+}
+
+fn workspace_directory(workspace: &Path, relative: impl AsRef<Path>) -> bool {
+    crate::bounded_fs::is_real_directory_beneath(workspace, &workspace.join(relative))
+}
+
+fn package_json(workspace: &Path) -> Option<serde_json::Value> {
+    let content = crate::bounded_fs::read_utf8_beneath(
+        workspace,
+        &workspace.join("package.json"),
+        MAX_VERIFY_CONFIG_BYTES,
+    )
+    .ok()?;
+    serde_json::from_str(&content).ok()
 }
 
 /// Whether `package.json` declares a dependency (in `dependencies` or
@@ -667,10 +681,7 @@ fn file_contains(workspace: &Path, file: &str, needle: &str) -> bool {
 /// vs tsc) WITHOUT relying on `node_modules/.bin/` existing at step-build
 /// time, since install runs first at runtime.
 fn package_json_depends_on(workspace: &Path, pkg: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string(workspace.join("package.json")) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Some(json) = package_json(workspace) else {
         return false;
     };
     let in_obj = |key: &str| {
@@ -684,10 +695,7 @@ fn package_json_depends_on(workspace: &Path, pkg: &str) -> bool {
 /// Like [`package_json_depends_on`] but matches any dependency whose name
 /// starts with `prefix` (e.g. `@astrojs` -> `@astrojs/core`, `@astrojs/react`).
 fn package_json_depends_on_prefix(workspace: &Path, prefix: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string(workspace.join("package.json")) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Some(json) = package_json(workspace) else {
         return false;
     };
     let has = |key: &str| {
@@ -700,10 +708,7 @@ fn package_json_depends_on_prefix(workspace: &Path, prefix: &str) -> bool {
 
 /// Check whether `package.json` has a given script (e.g. "lint", "test").
 fn has_node_script(workspace: &Path, script: &str) -> bool {
-    let Ok(content) = std::fs::read_to_string(workspace.join("package.json")) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Some(json) = package_json(workspace) else {
         return false;
     };
     json.get("scripts").and_then(|s| s.get(script)).is_some()
@@ -712,13 +717,13 @@ fn has_node_script(workspace: &Path, script: &str) -> bool {
 /// Pick the Node package manager + install args from the workspace's
 /// lockfile. Falls back to `npm` when no lockfile is present.
 fn node_package_manager(workspace: &Path) -> (&'static str, &'static [&'static str]) {
-    if workspace.join("pnpm-lock.yaml").is_file() {
+    if workspace_file(workspace, "pnpm-lock.yaml") {
         ("pnpm", &["install", "--silent"])
-    } else if workspace.join("yarn.lock").is_file() {
+    } else if workspace_file(workspace, "yarn.lock") {
         // yarn classic (v1) AND yarn berry (v2+) both use `yarn.lock`; the
         // install command is identical, so no version branch is needed here.
         ("yarn", &["install", "--silent"])
-    } else if workspace.join("bun.lock").is_file() || workspace.join("bun.lockb").is_file() {
+    } else if workspace_file(workspace, "bun.lock") || workspace_file(workspace, "bun.lockb") {
         // Bun 1.2+ migrated from binary `bun.lockb` to text `bun.lock`; check
         // the text form first so a repo with BOTH (transition state) picks the
         // current one. Install command is the same either way.
@@ -737,21 +742,21 @@ fn node_package_manager(workspace: &Path) -> (&'static str, &'static [&'static s
 /// because a `deno.json` repository may carry either manifest for tooling.
 #[must_use]
 pub fn detect_project(workspace: &Path) -> ProjectKind {
-    if workspace.join("deno.json").is_file() || workspace.join("deno.jsonc").is_file() {
+    if workspace_file(workspace, "deno.json") || workspace_file(workspace, "deno.jsonc") {
         ProjectKind::Deno
-    } else if workspace.join("Cargo.toml").is_file() {
+    } else if workspace_file(workspace, "Cargo.toml") {
         // Rust BEFORE Node: a root Cargo.toml is a strong Rust signal (a pure-JS repo almost
         // never has one), whereas a Rust backend / Tauri / wasm-bindgen repo commonly ALSO
         // ships a root package.json for its frontend. Checking package.json first mislabeled
         // those Node and ran npm while SKIPPING cargo build/cargo test - the compiled backend
         // went unverified.
         ProjectKind::Rust
-    } else if workspace.join("package.json").is_file() {
+    } else if workspace_file(workspace, "package.json") {
         ProjectKind::Node
-    } else if workspace.join("go.mod").is_file() {
+    } else if workspace_file(workspace, "go.mod") {
         ProjectKind::Go
-    } else if workspace.join("pyproject.toml").is_file()
-        || workspace.join("requirements.txt").is_file()
+    } else if workspace_file(workspace, "pyproject.toml")
+        || workspace_file(workspace, "requirements.txt")
     {
         ProjectKind::Python
     } else {
@@ -1024,23 +1029,13 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
     outcomes
 }
 
-/// Run ONE verify step as a subprocess: spawn it (detached, stdio piped),
-/// capture up to [`CAPTURE_CAP`] of stdout/stderr, and race its exit against
-/// `timeout_secs`. Returns a structured [`VerifyOutcome`] — never hangs, never
-/// panics (fail-open).
+/// Run one verify step with bounded output and whole-tree ownership.
 ///
-/// **Timeout discipline (the anti-hang fix).** On timeout the child is KILLED
-/// *before* the pipe readers are drained. A timed-out child — or a grandchild
-/// (an `npm`/`pnpm` install/test forks `node`/`vite`) that inherited the
-/// stdout/stderr pipe — can hold the read end open indefinitely; awaiting the
-/// readers first would then hang verify forever. Because the child is spawned
-/// DETACHED (its own session/process-group via
-/// [`crate::spawn_util::detach_from_controlling_terminal`]), a process-GROUP
-/// kill ([`crate::spawn_util::kill_process_group`]) takes down the whole
-/// descendant tree, so every pipe writer dies and the readers hit EOF. The
-/// direct-child `start_kill` + `kill_on_drop(true)` are backstops, and both the
-/// child reap and the reader joins are time-bounded — so a wedged descendant can
-/// never turn a step timeout into an unbounded verify hang.
+/// The shared process runner continuously drains both pipes into fixed-size
+/// tails, so newline-free floods cannot grow memory and reaching the display cap
+/// never closes a pipe under the command. Its detached-session / Job Object
+/// guard tears down descendants after every exit mode (including a successful
+/// wrapper exit), and its Drop path does the same when this future is cancelled.
 async fn run_step_command(
     workspace: &Path,
     kind: ProjectKind,
@@ -1049,28 +1044,17 @@ async fn run_step_command(
     timeout_secs: u64,
 ) -> VerifyOutcome {
     let started = Instant::now();
-
-    // Take the pipes up-front so we can read whatever the process produced even
-    // when it times out. `wait_with_output` would own the pipes and drop partial
-    // output on timeout; instead we detach the readers, race wait() against the
-    // timer, then drain the buffers.
     let (vprog, vlead) = spawn_parts(&step.program);
     let mut vcmd = Command::new(vprog);
-    vcmd.args(&vlead)
-        .args(&step.args)
-        .current_dir(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Detach into a new session (no controlling terminal): a `--runtime` step may
-    // boot a server whose console/descendant output would otherwise write straight
-    // to /dev/tty and bleed over the TUI's alt-screen. Detaching ALSO makes the
-    // child a group leader, so a timeout can kill its whole tree. Safe: stdio is
-    // piped/null above. Fail-open (see spawn_util).
-    crate::spawn_util::detach_from_controlling_terminal(&mut vcmd);
-    let mut child = match vcmd.spawn() {
-        Ok(c) => c,
+    vcmd.args(&vlead).args(&step.args).current_dir(workspace);
+    let options = umadev_process::BoundedCommandOptions {
+        timeout: Duration::from_secs(timeout_secs),
+        stdout_bytes: CAPTURE_CAP,
+        stderr_bytes: CAPTURE_CAP,
+        reader_grace: Duration::from_secs(COMMAND_REAP_SECS),
+    };
+    let output = match umadev_process::run_bounded_detached_command(vcmd, options).await {
+        Ok(output) => output,
         Err(e) => {
             // A non-skippable install that can't even spawn is an install failure
             // too — passed=false, so `install_has_failed` picks it up and arms the
@@ -1085,76 +1069,23 @@ async fn run_step_command(
             );
         }
     };
-
-    // Detach the stdout/stderr handles into async read tasks so we can collect
-    // partial output regardless of whether the step completes or times out. Each
-    // task reads to EOF (child exit OR kill) and self-caps at CAPTURE_CAP.
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
-    let stdout_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::with_capacity(CAPTURE_CAP);
-        if let Some(mut h) = stdout_handle {
-            // Read up to CAPTURE_CAP+1 so we know to truncate.
-            let mut chunk = vec![0u8; CAPTURE_CAP + 1];
-            loop {
-                match h.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                }
-                if buf.len() > CAPTURE_CAP {
-                    buf.truncate(CAPTURE_CAP);
-                    break;
-                }
-            }
-        }
-        buf
-    });
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::with_capacity(CAPTURE_CAP);
-        if let Some(mut h) = stderr_handle {
-            let mut chunk = vec![0u8; CAPTURE_CAP + 1];
-            loop {
-                match h.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                }
-                if buf.len() > CAPTURE_CAP {
-                    buf.truncate(CAPTURE_CAP);
-                    break;
-                }
-            }
-        }
-        buf
-    });
-
-    // Race the child's exit against the timeout.
-    let wait_result = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
-
-    // On timeout, KILL BEFORE DRAINING (the anti-hang fix — see the fn doc). A
-    // process-GROUP kill reaps grandchildren that may still hold a pipe open, so
-    // the readers hit EOF instead of blocking forever. `start_kill` +
-    // `kill_on_drop` are backstops for the direct child; the reap is bounded.
-    if wait_result.is_err() {
-        let _ = crate::spawn_util::kill_process_group(&child);
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(KILL_REAP_SECS), child.wait()).await;
-    }
-
-    // Drain the pipe readers, BOUNDED. On a clean exit they already hit EOF and
-    // return their full (capped) buffer; the bound only bites if a descendant
-    // still holds a pipe open after the group kill, where we take what was
-    // buffered rather than block. Never an unbounded await → verify always returns.
-    let raw_stdout = drain_bounded(stdout_task).await;
-    let raw_stderr = drain_bounded(stderr_task).await;
-    let mut stdout = String::from_utf8_lossy(&raw_stdout).into_owned();
-    let mut stderr = String::from_utf8_lossy(&raw_stderr).into_owned();
+    let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     truncate_in_place(&mut stdout, CAPTURE_CAP);
     truncate_in_place(&mut stderr, CAPTURE_CAP);
 
-    match wait_result {
-        Ok(Ok(status)) => VerifyOutcome {
+    if output.timed_out {
+        return VerifyOutcome::from_timeout(
+            kind,
+            step.name,
+            command_str,
+            timeout_secs,
+            stdout,
+            stderr,
+        );
+    }
+    match output.status {
+        Some(status) => VerifyOutcome {
             project_kind: kind,
             step: step.name.to_string(),
             command: command_str,
@@ -1166,30 +1097,14 @@ async fn run_step_command(
             skipped: false,
             source_fingerprint: None,
         },
-        Ok(Err(e)) => VerifyOutcome::from_spawn_error(
+        None => VerifyOutcome::from_spawn_error(
             kind,
             step.name,
             command_str,
-            &e.to_string(),
+            "process exited without a status",
             started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             step.skippable,
         ),
-        // Timed out: the child (and its group) was already killed above, so the
-        // drain returned the process's last words. Record them.
-        Err(_) => {
-            VerifyOutcome::from_timeout(kind, step.name, command_str, timeout_secs, stdout, stderr)
-        }
-    }
-}
-
-/// Join a pipe-reader task, BOUNDED. A clean child close makes the reader hit
-/// EOF and return its buffer at once; the timeout only fires if a descendant
-/// still holds the pipe open after the kill, in which case we take an empty
-/// buffer rather than hang. Fail-open: a panicked reader also yields empty.
-async fn drain_bounded(task: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
-    match tokio::time::timeout(Duration::from_secs(DRAIN_REAP_SECS), task).await {
-        Ok(Ok(buf)) => buf,
-        Ok(Err(_)) | Err(_) => Vec::new(),
     }
 }
 
@@ -1239,11 +1154,91 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    async fn read_test_pid(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(pid) = fs::read_to_string(path)
+                .and_then(|body| body.trim().parse::<u32>().map_err(std::io::Error::other))
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "fixture never published its pid");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn test_process_exists(pid: u32) -> bool {
+        libc::pid_t::try_from(pid).is_ok_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
+    }
+
+    #[cfg(unix)]
+    async fn assert_test_process_reaped(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while test_process_exists(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !test_process_exists(pid),
+            "verify descendant {pid} survived whole-tree cleanup"
+        );
+    }
+
     #[test]
     fn detect_node_project() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
         assert_eq!(detect_project(tmp.path()), ProjectKind::Node);
+    }
+
+    #[test]
+    fn oversized_package_json_cannot_drive_scripts_or_framework_detection() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("package.json");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(u64::try_from(MAX_VERIFY_CONFIG_BYTES + 1).unwrap())
+            .unwrap();
+
+        // Presence still identifies a Node workspace, but unreadable manifest
+        // content cannot invent scripts, dependencies, or a dev server.
+        assert_eq!(detect_project(tmp.path()), ProjectKind::Node);
+        let steps = verify_steps(ProjectKind::Node, tmp.path()).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].name, "install");
+        assert!(detect_dev_server(tmp.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_or_special_manifests_are_not_project_signals() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(
+            outside.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"},"dependencies":{"vite":"latest"}}"#,
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("package.json"),
+            tmp.path().join("package.json"),
+        )
+        .unwrap();
+        assert_eq!(detect_project(tmp.path()), ProjectKind::None);
+        assert!(detect_dev_server(tmp.path()).is_none());
+
+        fs::remove_file(tmp.path().join("package.json")).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(tmp.path().join("package.json"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(detect_project(tmp.path()), ProjectKind::None);
+        assert!(detect_dev_server(tmp.path()).is_none());
     }
 
     // ── a "name filter" that is really a PATTERN must never fabricate a failure ──
@@ -1897,6 +1892,102 @@ mod tests {
         assert!(outcome.passed, "a `sh -c 'echo hi'` step exits 0");
         assert!(!outcome.skipped);
         assert!(outcome.stdout.contains("hi"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_wrapper_exit_kills_a_pipe_holding_descendant() {
+        let tmp = TempDir::new().unwrap();
+        let pid_file = tmp.path().join("success-leaf.pid");
+        let script = format!(
+            "sleep 30 & leaf=$!; printf '%s' \"$leaf\" > '{}'; printf success; exit 0",
+            pid_file.display()
+        );
+        let step = VerifyStep {
+            name: "test",
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), script],
+            skippable: false,
+            timeout_secs: 0,
+        };
+        let started = Instant::now();
+
+        let outcome = run_step_command(
+            tmp.path(),
+            ProjectKind::Node,
+            &step,
+            "sh -c wrapper".to_string(),
+            5,
+        )
+        .await;
+
+        assert!(outcome.passed);
+        assert!(outcome.stdout.ends_with("success"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_test_process_reaped(read_test_pid(&pid_file).await).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn newline_free_verify_flood_is_fully_drained_and_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let step = VerifyStep {
+            name: "test",
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "head -c 1048576 /dev/zero | tr '\\0' x".to_string(),
+            ],
+            skippable: false,
+            timeout_secs: 0,
+        };
+
+        let outcome = run_step_command(
+            tmp.path(),
+            ProjectKind::Node,
+            &step,
+            "sh -c flood".to_string(),
+            5,
+        )
+        .await;
+
+        assert!(outcome.passed);
+        assert!(outcome.stdout.len() <= CAPTURE_CAP);
+        assert!(outcome.stdout.bytes().all(|byte| byte == b'x'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_verify_kills_its_descendant_tree() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_path_buf();
+        let pid_file = workspace.join("aborted-leaf.pid");
+        let script = format!(
+            "sleep 30 & leaf=$!; printf '%s' \"$leaf\" > '{}'; wait",
+            pid_file.display()
+        );
+        let task = tokio::spawn(async move {
+            let step = VerifyStep {
+                name: "test",
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), script],
+                skippable: false,
+                timeout_secs: 0,
+            };
+            run_step_command(
+                &workspace,
+                ProjectKind::Node,
+                &step,
+                "sh -c abort".to_string(),
+                30,
+            )
+            .await
+        });
+
+        let leaf = read_test_pid(&pid_file).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_test_process_reaped(leaf).await;
     }
 
     // --- detect_dev_server -------------------------------------------------

@@ -10,6 +10,11 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const WORKFLOW_STATE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const SESSION_BRIEF_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const KNOWLEDGE_BUNDLE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const KNOWLEDGE_BUNDLE_MAX_ENTRIES: usize = 1024;
+
 /// Default char budget for the injected block. The effective cap is
 /// [`budget_for_phase`]-adjusted: research/docs (direction-setting) get a
 /// larger budget than delivery (where artifacts carry the context).
@@ -73,14 +78,24 @@ impl SessionContext {
 }
 
 fn read_workflow_state(root: &Path) -> Option<Value> {
-    let p = root.join(".umadev").join("workflow-state.json");
-    let text = fs::read_to_string(&p).ok()?;
-    serde_json::from_str::<Value>(&text).ok()
+    let bytes = umadev_state::fs::read_bounded_beneath(
+        root,
+        Path::new(".umadev/workflow-state.json"),
+        WORKFLOW_STATE_MAX_BYTES,
+    )
+    .ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok()
 }
 
 fn read_session_brief_head(root: &Path, line_budget: usize) -> String {
-    let p = root.join(".umadev").join("SESSION_BRIEF.md");
-    let Ok(text) = fs::read_to_string(&p) else {
+    let Ok(bytes) = umadev_state::fs::read_bounded_beneath(
+        root,
+        Path::new(".umadev/SESSION_BRIEF.md"),
+        SESSION_BRIEF_MAX_BYTES,
+    ) else {
+        return String::new();
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
         return String::new();
     };
     text.lines()
@@ -93,6 +108,9 @@ fn read_session_brief_head(root: &Path, line_budget: usize) -> String {
 
 fn read_knowledge_digest(root: &Path) -> String {
     let dir = root.join("output").join("knowledge-cache");
+    if !umadev_state::fs::real_dir(&root.join("output")) || !umadev_state::fs::real_dir(&dir) {
+        return String::new();
+    }
     let Ok(entries) = fs::read_dir(&dir) else {
         return String::new();
     };
@@ -102,6 +120,7 @@ fn read_knowledge_digest(root: &Path) -> String {
     // `aaa-...json` written LATER than `zzz-...json` was ignored — the
     // digest reflected a stale bundle.
     let mut bundles: Vec<(std::time::SystemTime, std::cmp::Reverse<String>, PathBuf)> = entries
+        .take(KNOWLEDGE_BUNDLE_MAX_ENTRIES.saturating_add(1))
         .filter_map(Result::ok)
         .filter_map(|e| {
             let p = e.path();
@@ -113,10 +132,11 @@ fn read_knowledge_digest(root: &Path) -> String {
                 return None;
             }
             // mtime; fall back to UNIX_EPOCH on error so the file still sorts.
-            let mtime = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
+            let metadata = fs::symlink_metadata(&p).ok()?;
+            if !umadev_state::fs::metadata_is_real_file(&metadata) {
+                return None;
+            }
+            let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
             let name = p
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -125,6 +145,9 @@ fn read_knowledge_digest(root: &Path) -> String {
             Some((mtime, std::cmp::Reverse(name), p))
         })
         .collect();
+    if bundles.len() > KNOWLEDGE_BUNDLE_MAX_ENTRIES {
+        return String::new();
+    }
     // Sort newest-first (mtime descending, tiebreak by name descending).
     bundles.sort_by(|a, b| b.cmp(a));
     // Walk newest→oldest and use the first bundle that reads + parses cleanly.
@@ -135,8 +158,13 @@ fn read_knowledge_digest(root: &Path) -> String {
     let (latest, val) = {
         let mut parsed: Option<(PathBuf, Value)> = None;
         for (_, _, path) in &bundles {
-            if let Ok(text) = fs::read_to_string(path) {
-                if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            if let Ok(bytes) =
+                umadev_state::fs::read_bounded_beneath(root, relative, KNOWLEDGE_BUNDLE_MAX_BYTES)
+            {
+                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                     parsed = Some((path.clone(), v));
                     break;
                 }
@@ -300,6 +328,49 @@ mod tests {
         // Should not panic; should return empty because other sources are also empty.
         let ctx = compose_session_context(tmp.path());
         assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn oversized_context_inputs_are_not_materialized() {
+        let tmp = TempDir::new().unwrap();
+        let state = tmp.path().join(".umadev");
+        fs::create_dir(&state).unwrap();
+        fs::write(
+            state.join("workflow-state.json"),
+            vec![b'x'; usize::try_from(WORKFLOW_STATE_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        fs::write(
+            state.join("SESSION_BRIEF.md"),
+            vec![b'x'; usize::try_from(SESSION_BRIEF_MAX_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(compose_session_context(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_and_fifo_context_inputs_are_rejected_without_blocking() {
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+
+        let tmp = TempDir::new().unwrap();
+        let state = tmp.path().join(".umadev");
+        fs::create_dir(&state).unwrap();
+        let outside = tmp.path().join("outside.json");
+        fs::write(&outside, r#"{"phase":"delivery"}"#).unwrap();
+        symlink(&outside, state.join("workflow-state.json")).unwrap();
+        assert!(read_workflow_state(tmp.path()).is_none());
+
+        let fifo = state.join("SESSION_BRIEF.md");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let started = Instant::now();
+        assert!(read_session_brief_head(tmp.path(), 20).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

@@ -102,7 +102,7 @@ use crate::spawn_parts;
 use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{
     isolate_process_tree, kill_isolated_process_tree_blocking, reap_isolated_process_tree,
-    END_REAP_BUDGET,
+    try_exit_isolated_process_tree, END_REAP_BUDGET,
 };
 
 const MAX_INPUT_FRAME_BYTES: usize = 32 * 1024 * 1024;
@@ -235,6 +235,15 @@ pub(crate) fn codex_sandbox_mode(permissions: BasePermissionProfile) -> &'static
         permissions.auto_approve(),
         configured.as_deref(),
     )
+}
+
+/// Return the launch sandbox that a new Codex session will actually request for
+/// `permissions`, after applying the shared project/launch override and the
+/// Plan/Guarded ceilings. TUI status surfaces use this instead of displaying the
+/// raw configured value, which may be clamped (Guarded) or ignored (Plan).
+#[must_use]
+pub fn resolved_codex_launch_sandbox(permissions: BasePermissionProfile) -> &'static str {
+    codex_sandbox_mode(permissions)
 }
 
 /// Pure policy core for [`codex_sandbox_mode`]. Plan is always read-only. On Auto
@@ -618,7 +627,9 @@ impl CodexSession {
         // `process_job` field); attached before any handshake traffic so the native
         // grandchild is captured. `None` off Windows / if the OS refuses it.
         #[cfg(windows)]
-        let process_job = umadev_process::KillOnCloseJob::attach(&child);
+        let process_job = Some(umadev_process::KillOnCloseJob::attach(&mut child).map_err(
+            |error| SessionError::Start(format!("failed to secure Codex process tree: {error}")),
+        )?);
         let stdin = take_pipe(child.stdin.take(), "stdin")?;
         let stdout = take_pipe(child.stdout.take(), "stdout")?;
         // Drain stderr on its own task so a chatty base can never fill (and then
@@ -736,7 +747,9 @@ impl CodexSession {
         // `process_job` field); attached before any handshake traffic so the native
         // grandchild is captured. `None` off Windows / if the OS refuses it.
         #[cfg(windows)]
-        let process_job = umadev_process::KillOnCloseJob::attach(&child);
+        let process_job = Some(umadev_process::KillOnCloseJob::attach(&mut child).map_err(
+            |error| SessionError::Start(format!("failed to secure Codex process tree: {error}")),
+        )?);
         let stdin = take_pipe(child.stdin.take(), "stdin")?;
         let stdout = take_pipe(child.stdout.take(), "stdout")?;
         let stderr_tail = StderrTail::new();
@@ -826,7 +839,9 @@ impl CodexSession {
         // `process_job` field); attached before any handshake traffic so the native
         // grandchild is captured. `None` off Windows / if the OS refuses it.
         #[cfg(windows)]
-        let process_job = umadev_process::KillOnCloseJob::attach(&child);
+        let process_job = Some(umadev_process::KillOnCloseJob::attach(&mut child).map_err(
+            |error| SessionError::Start(format!("failed to secure Codex process tree: {error}")),
+        )?);
         let stdin = take_pipe(child.stdin.take(), "stdin")?;
         let stdout = take_pipe(child.stdout.take(), "stdout")?;
         let stderr_tail = StderrTail::new();
@@ -1425,7 +1440,8 @@ fn take_pipe<T>(pipe: Option<T>, which: &str) -> Result<T, SessionError> {
 }
 
 /// Spawn `codex app-server` in `workspace` with piped stdio + kill-on-drop.
-/// Windows `.cmd`/`.bat` shims are routed through `cmd /c` by [`spawn_parts`].
+/// Windows `.cmd`/`.bat` shims use [`spawn_parts`] and Rust's hardened batch
+/// argument encoder.
 ///
 /// The child is placed in its OWN process group ([`isolate_process_tree`]) so
 /// teardown can signal the WHOLE tree at once. An npm install exposes `codex` as
@@ -3704,7 +3720,7 @@ impl BaseSession for CodexSession {
         // Non-blocking peek at the `codex app-server` child (lock + try_wait
         // both never block); a contended lock / try_wait error fails open to
         // None. `Ok(Some)` = the base process exited, `Ok(None)` = still alive.
-        self.child.try_lock().ok()?.try_wait().ok().flatten()
+        try_exit_isolated_process_tree(&self.child)
     }
 
     fn session_id(&self) -> Option<&str> {

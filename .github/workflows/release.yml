@@ -7,6 +7,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pin the release builders themselves. A tag retry months later must compile
+  # with the same Rust/Node toolchains instead of whatever `stable`/`20` means
+  # on that future date. Node 20 is EOL as of 2026-03-24; use the current LTS.
+  UMADEV_RELEASE_RUST: "1.97.0"
+  UMADEV_RELEASE_NODE: "24.18.0"
 
 permissions:
   contents: read
@@ -27,17 +32,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
         with:
+          toolchain: ${{ env.UMADEV_RELEASE_RUST }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: ${{ env.UMADEV_RELEASE_NODE }}
+          registry-url: "https://registry.npmjs.org"
 
       - name: Checkout audited Grok Build source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: xai-org/grok-build
-          ref: 3af4d5d39897855bdcc74f23e690024a5dc05573
+          ref: 47348d13ec4508dcfe440e34c6d511bb02998fb2
           path: _upstream/grok-build
           fetch-depth: 1
 
@@ -45,7 +52,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: MoonshotAI/kimi-code
-          ref: 4c763f6763acb67a73d133f7450d092e71d63692
+          ref: f4c3967a417a539372eadab6c809d27b8a14c005
           path: _upstream/kimi-code
           fetch-depth: 1
 
@@ -53,23 +60,23 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy (all features)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --all-features --all-targets --no-fail-fast
+        run: cargo test --workspace --all-features --all-targets --locked --no-fail-fast
 
       - name: cargo test (doctests)
-        run: cargo test --workspace --all-features --doc --no-fail-fast
+        run: cargo test --workspace --all-features --doc --locked --no-fail-fast
 
       - name: Verify audited Grok Build source baseline
         env:
           UMADEV_GROK_SOURCE_DIR: ${{ github.workspace }}/_upstream/grok-build
-        run: cargo test -p umadev-host --test grok_source_drift -- --nocapture
+        run: cargo test -p umadev-host --test grok_source_drift --locked -- --nocapture
 
       - name: Verify audited Kimi Code source baseline
         env:
           UMADEV_KIMI_SOURCE_DIR: ${{ github.workspace }}/_upstream/kimi-code
-        run: cargo test -p umadev-host --test kimi_source_drift -- --nocapture
+        run: cargo test -p umadev-host --test kimi_source_drift --locked -- --nocapture
 
       - name: Verify cross-platform npm update contracts
         run: node --test npm/scripts/terminal-contract.test.cjs
@@ -83,7 +90,7 @@ jobs:
       - name: strict rustdoc (all features)
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --workspace --all-features --no-deps --locked
 
       - name: Verify Cargo, npm, website, and tag versions
         run: node npm/scripts/verify-version-lock.mjs
@@ -94,8 +101,8 @@ jobs:
       - name: Install website dependencies from the exact lockfile
         run: npm --prefix umadev-website ci
 
-      - name: Audit website production dependencies
-        run: npm --prefix umadev-website audit --audit-level=moderate
+      - name: Audit all website dependencies
+        run: npm --prefix umadev-website audit --audit-level=moderate --registry=https://registry.npmjs.org
 
       - name: Lint website
         run: npm --prefix umadev-website run lint
@@ -115,21 +122,23 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: grok-0.2.106-linux-x86_64
-            sha256: 7180d0e03cc2a496033ff3aae2223ce239446a9827a59faa76091c7edd5e1c38
+            artifact: grok-0.2.112-linux-x86_64
+            sha256: c2867112f7d89366123fe68a55a23dfb027d3602fc5b5b9cd5c080dacb4a2503
             binary: grok
           - os: macos-latest
-            artifact: grok-0.2.106-macos-aarch64
-            sha256: 7229f5e2a69b05832c86db82bebda541e92b5c24958fbfacf5c8f463394d3027
+            artifact: grok-0.2.112-macos-aarch64
+            sha256: 5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4
             binary: grok
           - os: windows-latest
-            artifact: grok-0.2.106-windows-x86_64.exe
-            sha256: a6a25d55daadca0c2458a5aceb4c1873eb7c76964ef307647d079e344c53969a
+            artifact: grok-0.2.112-windows-x86_64.exe
+            sha256: 2469bd182af212c7fcb84f2981999e4e8a6a7a2e4172bad3ae7f787a1f11407c
             binary: grok.exe
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_RELEASE_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Download and verify the exact official Grok artifact (Unix)
         if: runner.os != 'Windows'
@@ -147,7 +156,7 @@ jobs:
           printf '%s  %s\n' '${{ matrix.sha256 }}' "$binary" | shasum -a 256 --check
           chmod +x "$binary"
           version=$("$binary" --version)
-          [[ "$version" =~ ^grok\ 0\.2\.106\ \([0-9a-f]+\)$ ]]
+          [[ "$version" =~ ^grok\ 0\.2\.112\ \([0-9a-f]+\)$ ]]
           printf 'UMADEV_GROK_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Download and verify the exact official Grok artifact (Windows)
         if: runner.os == 'Windows'
@@ -164,12 +173,12 @@ jobs:
           $actual = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
           if ($actual -ne '${{ matrix.sha256 }}') { throw "Grok artifact SHA-256 mismatch: $actual" }
           $version = (& $binary --version | Out-String).Trim()
-          if ($version -notmatch '^grok 0\.2\.106 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
+          if ($version -notmatch '^grok 0\.2\.112 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
           "UMADEV_GROK_BIN=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify real ACP identity and explicit authentication boundary
         env:
           UMADEV_GROK_PUBLISHED_CONTRACT: "1"
-        run: cargo test -p umadev-host --test grok_published_contract -- --nocapture
+        run: cargo test -p umadev-host --test grok_published_contract --locked -- --nocapture
 
   kimi-published-contract:
     name: release Kimi Code ACP (${{ matrix.os }})
@@ -182,18 +191,20 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_RELEASE_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22.19.0"
       - name: Install the exact audited npm package
-        run: npm install -g @moonshot-ai/kimi-code@0.28.1
+        run: npm install -g @moonshot-ai/kimi-code@0.29.1
       - name: Verify real ACP identity and terminal-owned authentication
         env:
           KIMI_CODE_HOME: ${{ runner.temp }}/umadev-kimi-code-home
           UMADEV_KIMI_BIN: kimi
           UMADEV_KIMI_PUBLISHED_CONTRACT: "1"
-        run: cargo test -p umadev-host --test kimi_published_contract -- --nocapture
+        run: cargo test -p umadev-host --test kimi_published_contract --locked -- --nocapture
 
   vendor-cli-published-contract:
     name: release vendor CLI contract (${{ matrix.os }})
@@ -213,15 +224,38 @@ jobs:
         run: node npm/scripts/vendor-cli-contract.mjs
 
   release-credentials:
-    name: release signing credentials
+    name: release credentials gate
     runs-on: ubuntu-latest
     steps:
-      # Only enforced when signing is turned ON (repo variable SIGN_RELEASE=true).
-      # With it unset the release ships UNSIGNED — the 1.0.53–1.0.55 behavior — and
-      # this check is a clean no-op, so a tag never blocks on secrets nobody has yet.
-      # Turning signing on later means: set SIGN_RELEASE=true AND provide the secrets;
-      # a mismatch (on, but a secret missing) then fails here, which is correct.
-      - name: Require native signing and publishing credentials for tags
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          node-version: ${{ env.UMADEV_RELEASE_NODE }}
+          registry-url: "https://registry.npmjs.org"
+      # npm is always part of a tagged release. Check its credential before any
+      # platform build can start, so a missing token can never leave a public
+      # GitHub Release behind with npm still on the previous version.
+      - name: Require npm publishing credential for tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${NPM_TOKEN:-}" ]]; then
+            echo '::error::missing required release secret: NPM_TOKEN'
+            exit 1
+          fi
+          identity=$(npm whoami --registry=https://registry.npmjs.org)
+          if [[ -z "$identity" ]]; then
+            echo '::error::npm accepted the credential but returned no registry identity'
+            exit 1
+          fi
+
+      # Native signing remains optional. Once SIGN_RELEASE=true, all platform
+      # signing/notarization credentials become a fail-closed release gate.
+      - name: Require native signing credentials for tags
         if: startsWith(github.ref, 'refs/tags/v') && vars.SIGN_RELEASE == 'true'
         shell: bash
         env:
@@ -233,7 +267,6 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           required=(
@@ -245,7 +278,6 @@ jobs:
             APPLE_APP_SPECIFIC_PASSWORD
             WINDOWS_CERTIFICATE_PFX_BASE64
             WINDOWS_CERTIFICATE_PASSWORD
-            NPM_TOKEN
           )
           missing=()
           for name in "${required[@]}"; do
@@ -299,21 +331,23 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_RELEASE_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: ${{ env.UMADEV_RELEASE_NODE }}
       - name: Verify Windows Job Object process-tree teardown
         if: runner.os == 'Windows'
         run: cargo test -p umadev-process --lib --locked -- --test-threads=1
       - name: cargo test
-        run: cargo test --workspace --all-features --all-targets --no-fail-fast
+        run: cargo test --workspace --all-features --all-targets --locked --no-fail-fast
       - name: cargo test (doctests)
-        run: cargo test --workspace --all-features --doc --no-fail-fast
+        run: cargo test --workspace --all-features --doc --locked --no-fail-fast
       - name: Verify deterministic TUI terminal contracts
-        run: cargo test -p umadev-tui --lib terminal_contract_ -- --test-threads=1
+        run: cargo test -p umadev-tui --lib terminal_contract_ --locked -- --test-threads=1
       - name: Verify native PTY / ConPTY startup, input, and teardown
-        run: cargo test -p umadev --test terminal_pty -- --test-threads=1
+        run: cargo test -p umadev --test terminal_pty --locked -- --test-threads=1
       - name: Verify cross-platform npm update contracts
         run: node --test npm/scripts/terminal-contract.test.cjs
 
@@ -382,10 +416,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
         with:
+          toolchain: ${{ env.UMADEV_RELEASE_RUST }}
           targets: ${{ matrix.target }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: ${{ env.UMADEV_RELEASE_NODE }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Every Linux target builds via `cross`: GNU uses its old glibc sysroot,
@@ -400,11 +435,11 @@ jobs:
       # CPU, so it cross-compiles to every target with the standard toolchain.
       - name: Build (cargo)
         if: matrix.cross != true
-        run: cargo build --release --bin umadev --features vector-local --target ${{ matrix.target }}
+        run: cargo build --release --bin umadev --features vector-local --locked --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.cross == true
-        run: cross build --release --bin umadev --features vector-local --target ${{ matrix.target }}
+        run: cross build --release --bin umadev --features vector-local --locked --target ${{ matrix.target }}
 
       - name: Developer ID sign and notarize (macOS)
         if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'apple-darwin') && vars.SIGN_RELEASE == 'true'
@@ -852,7 +887,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: ${{ env.UMADEV_RELEASE_NODE }}
           registry-url: "https://registry.npmjs.org"
 
       # Pull every staged platform sub-package back into npm/cli-<plat>/.
@@ -890,11 +925,80 @@ jobs:
           NPM_CONFIG_PROVENANCE: "true"
         run: ./npm/scripts/publish.sh
 
-# NOTE: the website is deployed to GitHub Pages by website-pages.yml, which fires on
-# every push to main — including the release version-bump commit (it edits
-# umadev-website/src/app/content.ts). A second deploy job here raced that push-triggered
-# run for the single github-pages environment, and the loser was marked a FAILED "Active"
-# deployment (a red X on the release even though the site was live). The release no longer
-# deploys Pages itself; the version-bump push owns the one deployment. The website BUILD is
-# still a hard publish gate in the `gate` job above ("Build website before any package can
-# be published"), so a broken site still blocks the release.
+  deploy-website:
+    name: deploy website from release tag
+    needs: [publish-npm]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/website-pages.yml
+
+  verify-publication:
+    name: verify github, npm, and website publication
+    needs: [publish-github, publish-npm, deploy-website]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: read
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.UMADEV_RELEASE_NODE }}
+      - name: Verify every public release surface
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          packages=(
+            umadev
+            @umacloud/cli-darwin-arm64
+            @umacloud/cli-darwin-x64
+            @umacloud/cli-linux-x64
+            @umacloud/cli-linux-arm64
+            @umacloud/cli-linux-musl-x64
+            @umacloud/cli-linux-musl-arm64
+            @umacloud/cli-win32-x64
+            @umacloud/knowledge
+          )
+
+          release=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,assets)
+          test "$(jq -r '.isDraft' <<<"$release")" = "false"
+          test "$(jq '.assets | length' <<<"$release")" -eq 22
+
+          for package in "${packages[@]}"; do
+            actual=$(npm view "${package}@latest" version --prefer-online)
+            test "$actual" = "$version" || {
+              echo "::error::$package latest is $actual, expected $version"
+              exit 1
+            }
+          done
+
+          deployment_id=$(gh api \
+            "repos/$GITHUB_REPOSITORY/deployments?environment=github-pages&per_page=20" \
+            --jq ".[] | select(.sha == \"$GITHUB_SHA\") | .id" | head -1)
+          test -n "$deployment_id" || {
+            echo "::error::no github-pages deployment was recorded for $GITHUB_SHA"
+            exit 1
+          }
+          deployment_state=$(gh api \
+            "repos/$GITHUB_REPOSITORY/deployments/$deployment_id/statuses" \
+            --jq '.[0].state')
+          test "$deployment_state" = "success" || {
+            echo "::error::github-pages deployment $deployment_id is $deployment_state"
+            exit 1
+          }
+
+          page=$(curl --fail --location --silent --show-error \
+            --retry 12 --retry-delay 10 --retry-all-errors \
+            https://umadev.goder.ai/)
+          grep -Fq "$version" <<<"$page" || {
+            echo "::error::the public website does not show $version"
+            exit 1
+          }

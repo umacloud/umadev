@@ -176,7 +176,9 @@ pub(super) fn should_run_critic_review(deterministic_blockers: &[String]) -> boo
 /// older artifact) has no fingerprint to contradict, so it is read as before.
 pub(super) fn runtime_proof_blocking(root: &std::path::Path) -> Option<String> {
     let path = root.join(crate::runtime_proof::runtime_proof_rel_path());
-    let body = std::fs::read_to_string(path).ok()?;
+    let body =
+        crate::bounded_fs::read_utf8_beneath(root, &path, super::DIRECTOR_EVIDENCE_FILE_BYTES)
+            .ok()?;
     let proof: crate::runtime_proof::RuntimeProof = serde_json::from_str(&body).ok()?;
     if proof.is_stale(root) {
         return None; // describes a tree that no longer exists → says nothing about this one
@@ -209,6 +211,10 @@ pub(super) fn runtime_proof_blocking(root: &std::path::Path) -> Option<String> {
 /// an empty tree → `false`. Conservative — a false "has a test" only DROPS a
 /// blocking floor (never fabricates one), so we require a reasonably strong signal.
 pub(super) fn has_reproduction_test(root: &std::path::Path) -> bool {
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        super::DIRECTOR_SOURCE_TOTAL_BYTES,
+        crate::acceptance::MAX_SOURCE_FILE_BYTES,
+    );
     for f in crate::acceptance::source_files(root) {
         let name = f
             .file_name()
@@ -231,7 +237,7 @@ pub(super) fn has_reproduction_test(root: &std::path::Path) -> bool {
         }
         // A Rust file carrying `#[test]` / `#[tokio::test]` is a real test too.
         if name.to_ascii_lowercase().ends_with(".rs") {
-            if let Ok(content) = std::fs::read_to_string(&f) {
+            if let Ok(content) = budget.read_utf8_beneath(root, &f) {
                 if content.contains("#[test]") || content.contains("#[tokio::test]") {
                     return true;
                 }

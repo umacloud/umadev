@@ -34,6 +34,8 @@ use std::path::{Path, PathBuf};
 
 use umadev_i18n::{t, Lang};
 
+const MAX_CONSTITUTION_BYTES: usize = 1024 * 1024;
+
 /// Repo-relative path of the charter file the user reads + edits.
 ///
 /// Lives under `.umadev/` next to the other per-project artifacts
@@ -195,7 +197,7 @@ fn persist(path: &Path, markdown: &str) -> std::io::Result<()> {
 pub fn ensure_constitution(root: &Path) -> ConstitutionDoc {
     let path = constitution_path(root);
     // An existing, non-empty file is the user's charter — show it verbatim.
-    if let Ok(text) = std::fs::read_to_string(&path) {
+    if let Ok(text) = crate::bounded_fs::read_utf8_beneath(root, &path, MAX_CONSTITUTION_BYTES) {
         if !text.trim().is_empty() {
             return ConstitutionDoc {
                 markdown: text,
@@ -234,7 +236,7 @@ pub fn regenerate_constitution(root: &Path) -> ConstitutionDoc {
 /// fail-open: a missing dir / unreadable file → `None`.
 #[must_use]
 pub fn read_constitution(root: &Path) -> Option<String> {
-    std::fs::read_to_string(constitution_path(root))
+    crate::bounded_fs::read_utf8_beneath(root, &constitution_path(root), MAX_CONSTITUTION_BYTES)
         .ok()
         .filter(|text| !text.trim().is_empty())
 }

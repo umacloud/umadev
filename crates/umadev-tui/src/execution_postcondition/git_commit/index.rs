@@ -1,9 +1,14 @@
 use super::captured_index::CapturedGitIndex;
 use super::{
-    git_command_failed, git_commit_blocked, git_output, git_required_text, git_std_command,
-    same_permissions, GitCommitBaseline, Path, PathBuf, ResidentExecutionBlocked,
+    bounded_git_command_output, git_command_failed, git_commit_blocked, git_output,
+    git_required_text, git_std_command, same_permissions, GitCommandLimits, GitCommitBaseline,
+    Path, PathBuf, ResidentExecutionBlocked,
 };
+use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const MAX_GIT_INDEX_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_LOGICAL_INDEX_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct GitIndexSnapshot {
@@ -27,36 +32,11 @@ impl GitIndexSnapshot {
         } else {
             root.join(path)
         };
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(git_commit_blocked(
-                    "git-index-unverifiable",
-                    &format!("无法读取 Git index 元数据 / unable to inspect Git index: {error}"),
-                ));
-            }
+        let current = read_index_file(&path)?;
+        let (bytes, permissions) = match current {
+            Some((bytes, permissions)) => (Some(bytes), Some(permissions)),
+            None => (None, None),
         };
-        if metadata
-            .as_ref()
-            .is_some_and(|item| item.is_dir() || item.file_type().is_symlink())
-        {
-            return Err(git_commit_blocked(
-                "git-index-unsafe-type",
-                "Git index 不是普通文件,拒绝执行事务 / Git index is not a regular file",
-            ));
-        }
-        let bytes = metadata
-            .as_ref()
-            .map(|_| std::fs::read(&path))
-            .transpose()
-            .map_err(|error| {
-                git_commit_blocked(
-                    "git-index-unverifiable",
-                    &format!("无法读取 Git index / unable to read Git index: {error}"),
-                )
-            })?;
-        let permissions = metadata.map(|item| item.permissions());
         let logical_entries = bytes
             .as_ref()
             .map(|_| git_index_logical_entries(root, &path))
@@ -82,30 +62,7 @@ impl GitIndexSnapshot {
     }
 
     pub(crate) fn matches_current(&self) -> Result<bool, ResidentExecutionBlocked> {
-        let current = match std::fs::symlink_metadata(&self.path) {
-            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-                let bytes = std::fs::read(&self.path).map_err(|error| {
-                    git_commit_blocked(
-                        "git-index-unverifiable",
-                        &format!("无法重读 Git index / unable to reread Git index: {error}"),
-                    )
-                })?;
-                Some((bytes, metadata.permissions()))
-            }
-            Ok(_) => {
-                return Err(git_commit_blocked(
-                    "git-index-changed",
-                    "Git index 文件类型在提交前发生变化 / Git index file type changed before commit",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(git_commit_blocked(
-                    "git-index-unverifiable",
-                    &format!("无法重读 Git index 元数据 / unable to inspect Git index: {error}"),
-                ));
-            }
-        };
+        let current = read_index_file(&self.path)?;
         Ok(match (&self.bytes, &self.permissions, current) {
             (None, None, None) => true,
             (Some(expected), Some(permissions), Some((current, current_permissions))) => {
@@ -165,6 +122,95 @@ impl GitIndexSnapshot {
             )),
         }
     }
+}
+
+fn read_index_file(
+    path: &Path,
+) -> Result<Option<(Vec<u8>, std::fs::Permissions)>, ResidentExecutionBlocked> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !umadev_state::fs::metadata_is_real_file(&metadata) => {
+            return Err(git_commit_blocked(
+                "git-index-unsafe-type",
+                "Git index 不是无重解析的普通文件,拒绝执行事务 / Git index is not a real non-reparse regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(git_commit_blocked(
+                "git-index-unverifiable",
+                &format!("无法读取 Git index 元数据 / unable to inspect Git index: {error}"),
+            ));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = match umadev_state::fs::retry_transient(|| options.open(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(git_commit_blocked(
+                "git-index-unverifiable",
+                &format!(
+                    "无法以 no-follow 模式打开 Git index / unable to open Git index without following reparse points: {error}"
+                ),
+            ));
+        }
+    };
+    let metadata = file.metadata().map_err(|error| {
+        git_commit_blocked(
+            "git-index-unverifiable",
+            &format!("无法读取 Git index 元数据 / unable to inspect Git index: {error}"),
+        )
+    })?;
+    if !umadev_state::fs::metadata_is_real_file(&metadata) {
+        return Err(git_commit_blocked(
+            "git-index-unsafe-type",
+            "Git index 不是无重解析的普通文件,拒绝执行事务 / Git index is not a real non-reparse regular file",
+        ));
+    }
+    let permissions = metadata.permissions();
+    if metadata.len() > MAX_GIT_INDEX_BYTES {
+        return Err(git_commit_blocked(
+            "git-index-unverifiable",
+            &format!(
+                "Git index 超过 {MAX_GIT_INDEX_BYTES} bytes 上限 / Git index exceeds its hard byte limit"
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(metadata.len().min(MAX_GIT_INDEX_BYTES))
+            .unwrap_or(0)
+            .min(64 * 1024),
+    );
+    file.take(MAX_GIT_INDEX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+        git_commit_blocked(
+            "git-index-unverifiable",
+            &format!(
+                "无法在 {MAX_GIT_INDEX_BYTES} bytes 上限内安全读取 Git index / unable to safely read Git index within its hard byte limit: {error}"
+            ),
+        )
+    })?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_GIT_INDEX_BYTES {
+        return Err(git_commit_blocked(
+            "git-index-unverifiable",
+            "Git index 在读取时超过安全上限 / Git index grew beyond its hard byte limit while being read",
+        ));
+    }
+    Ok(Some((bytes, permissions)))
 }
 
 pub(crate) fn expected_commit_tree(
@@ -268,16 +314,17 @@ pub(crate) fn git_index_command(
     args: &[&str],
 ) -> Result<(), ResidentExecutionBlocked> {
     let index = git_index_env_path(index)?;
-    let output = git_std_command(root)
-        .args(args)
-        .env("GIT_INDEX_FILE", &index)
-        .output()
-        .map_err(|error| {
-            git_commit_blocked(
-                "git-command-unavailable",
-                &format!("无法执行临时 Git index 命令 / unable to execute temporary-index Git command: {error}"),
-            )
-        })?;
+    let mut command = git_std_command(root);
+    command.args(args).env("GIT_INDEX_FILE", &index);
+    let output = bounded_git_command_output(
+        command,
+        GitCommandLimits {
+            stdout_bytes: 1024 * 1024,
+            ..GitCommandLimits::default()
+        },
+        "git-command-unavailable",
+        "temporary-index git",
+    )?;
     if output.status.success() {
         Ok(())
     } else {
@@ -296,16 +343,17 @@ pub(crate) fn git_index_required_text(
     code: &'static str,
 ) -> Result<String, ResidentExecutionBlocked> {
     let index = git_index_env_path(index)?;
-    let output = git_std_command(root)
-        .args(args)
-        .env("GIT_INDEX_FILE", &index)
-        .output()
-        .map_err(|error| {
-            git_commit_blocked(
-                "git-command-unavailable",
-                &format!("无法执行临时 Git index 命令 / unable to execute temporary-index Git command: {error}"),
-            )
-        })?;
+    let mut command = git_std_command(root);
+    command.args(args).env("GIT_INDEX_FILE", &index);
+    let output = bounded_git_command_output(
+        command,
+        GitCommandLimits {
+            stdout_bytes: 8 * 1024,
+            ..GitCommandLimits::default()
+        },
+        code,
+        "temporary-index git",
+    )?;
     if !output.status.success() {
         return Err(git_command_failed(code, "git", &output));
     }
@@ -332,23 +380,33 @@ pub(crate) fn git_index_logical_entries(
         ["ls-files", "--stage", "-z"].as_slice(),
         ["ls-files", "-v", "-z"].as_slice(),
     ] {
-        let output = git_std_command(root)
-            .args(args)
-            .env("GIT_INDEX_FILE", &index)
-            .output()
-            .map_err(|error| {
-                git_commit_blocked(
-                    "git-index-unverifiable",
-                    &format!(
-                        "无法读取 Git index 逻辑条目 / unable to inspect logical index entries: {error}"
-                    ),
-                )
-            })?;
+        let mut command = git_std_command(root);
+        command.args(args).env("GIT_INDEX_FILE", &index);
+        let output = bounded_git_command_output(
+            command,
+            GitCommandLimits {
+                stdout_bytes: MAX_LOGICAL_INDEX_BYTES,
+                ..GitCommandLimits::default()
+            },
+            "git-index-unverifiable",
+            "git ls-files",
+        )?;
         if !output.status.success() {
             return Err(git_command_failed(
                 "git-index-unverifiable",
                 "git ls-files",
                 &output,
+            ));
+        }
+        if canonical
+            .len()
+            .saturating_add(output.stdout.len())
+            .saturating_add(1)
+            > MAX_LOGICAL_INDEX_BYTES
+        {
+            return Err(git_commit_blocked(
+                "git-index-unverifiable",
+                "Git index 逻辑条目超过安全上限 / logical Git index entries exceed the hard byte limit",
             ));
         }
         canonical.extend_from_slice(&output.stdout);
@@ -449,6 +507,44 @@ pub(crate) fn git_stage_zero_entry(
         ));
     }
     Ok(Some((fields[0].to_string(), fields[1].to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_index_file, MAX_GIT_INDEX_BYTES};
+    use std::fs::OpenOptions;
+
+    #[test]
+    fn index_read_rejects_a_sparse_file_over_the_hard_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("index");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(MAX_GIT_INDEX_BYTES + 1).unwrap();
+        let error = read_index_file(&path).unwrap_err();
+        assert!(error.note.contains("hard byte limit") || error.note.contains("上限"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn index_read_refuses_a_symlink_even_when_the_target_is_regular() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("real-index");
+        std::fs::write(&target, b"index bytes").unwrap();
+        let link = directory.path().join("index");
+        symlink(&target, &link).unwrap();
+        let error = read_index_file(&link).unwrap_err();
+        assert!(
+            error.note.contains("git-index-unsafe-type"),
+            "{}",
+            error.note
+        );
+    }
 }
 
 #[cfg(all(test, windows))]

@@ -17,6 +17,7 @@ impl App {
     /// pause is a resumable settle, not an honest hard abort — the plan is intact on
     /// disk and `/continue` re-drives only the remaining steps.
     pub(crate) fn record_run_paused_at_budget(&mut self, done: usize, total: usize) {
+        self.stream_compacted = None;
         self.operational_pause_reason = None;
         // An away user should hear that the run parked (same as the abort/deliver
         // paths). Arm before the timers are cleared, gated on how long it had run.
@@ -83,6 +84,7 @@ impl App {
         done: usize,
         total: usize,
     ) {
+        self.stream_compacted = None;
         self.arm_completion_bell(self.run_started_at.or(self.thinking_started));
         self.thinking = false;
         self.thinking_started = None;

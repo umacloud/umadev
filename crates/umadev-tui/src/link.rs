@@ -169,7 +169,8 @@ pub fn is_safe_url(url: &str) -> bool {
     else {
         return false;
     };
-    if rest.is_empty() || rest.starts_with('/') {
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.starts_with(':') {
         return false;
     }
     url.chars().all(is_url_char)
@@ -483,6 +484,11 @@ mod tests {
         assert!(!is_safe_url("javascript:alert(1)"));
         assert!(!is_safe_url("http://"));
         assert!(!is_safe_url("https:///nohost"));
+        assert!(!is_safe_url("http://?query-without-host"));
+        assert!(!is_safe_url("http://#fragment-without-host"));
+        assert!(!is_safe_url("http://:3000"));
+        assert!(!is_safe_url("http-malware.exe"));
+        assert!(!is_safe_url("http_payload.app"));
     }
 
     #[test]

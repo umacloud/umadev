@@ -3,6 +3,29 @@ use super::{
 };
 use std::ffi::OsStr;
 use std::process::Command;
+use std::time::Duration;
+
+pub(crate) const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const GIT_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
+pub(crate) const GIT_STDERR_LIMIT: usize = 256 * 1024;
+const GIT_READER_GRACE: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GitCommandLimits {
+    pub(crate) timeout: Duration,
+    pub(crate) stdout_bytes: usize,
+    pub(crate) stderr_bytes: usize,
+}
+
+impl Default for GitCommandLimits {
+    fn default() -> Self {
+        Self {
+            timeout: GIT_COMMAND_TIMEOUT,
+            stdout_bytes: GIT_STDOUT_LIMIT,
+            stderr_bytes: GIT_STDERR_LIMIT,
+        }
+    }
+}
 
 const GIT_ENVIRONMENT_OVERRIDES: &[&str] = &[
     "GIT_DIR",
@@ -162,12 +185,15 @@ pub(crate) fn git_identity_config(
             .arg(root)
             .args(["config", "--get", key]);
         remove_git_environment_overrides(&mut command);
-        let output = command.output().map_err(|error| {
-            git_commit_blocked(
-                "git-identity-unverifiable",
-                &format!("无法读取 Git 身份配置 / unable to read Git identity: {error}"),
-            )
-        })?;
+        let output = bounded_git_command_output(
+            command,
+            GitCommandLimits {
+                stdout_bytes: 4 * 1024,
+                ..GitCommandLimits::default()
+            },
+            "git-identity-unverifiable",
+            "git config --get",
+        )?;
         if !output.status.success() {
             return Err(git_commit_blocked(
                 "git-identity-missing",
@@ -210,12 +236,15 @@ pub(crate) fn configured_git_path(
         .arg(root)
         .args(["config", "--path", "--get", key]);
     remove_git_environment_overrides(&mut command);
-    let output = command.output().map_err(|error| {
-        git_commit_blocked(
-            "git-config-unverifiable",
-            &format!("无法读取 Git 路径配置 / unable to read Git path configuration: {error}"),
-        )
-    })?;
+    let output = bounded_git_command_output(
+        command,
+        GitCommandLimits {
+            stdout_bytes: 8 * 1024,
+            ..GitCommandLimits::default()
+        },
+        "git-config-unverifiable",
+        "git config --path --get",
+    )?;
     if output.status.code() == Some(1) {
         return Ok(None);
     }
@@ -248,21 +277,78 @@ pub(crate) fn git_output(
     root: &Path,
     args: &[&str],
 ) -> Result<std::process::Output, ResidentExecutionBlocked> {
-    git_std_command(root).args(args).output().map_err(|error| {
+    let mut command = git_std_command(root);
+    command.args(args);
+    bounded_git_command_output(
+        command,
+        GitCommandLimits::default(),
+        "git-command-unavailable",
+        "git",
+    )
+}
+
+/// Run a synchronous Git probe through the shared process-tree owner.
+pub(crate) fn bounded_git_command_output(
+    command: Command,
+    limits: GitCommandLimits,
+    code: &'static str,
+    label: &str,
+) -> Result<std::process::Output, ResidentExecutionBlocked> {
+    let output = umadev_process::run_bounded_std_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: limits.timeout,
+            stdout_bytes: limits.stdout_bytes,
+            stderr_bytes: limits.stderr_bytes,
+            reader_grace: GIT_READER_GRACE,
+        },
+    )
+    .map_err(|error| {
         git_commit_blocked(
-            "git-command-unavailable",
-            &format!("无法执行 Git 验证命令 / unable to execute Git verification: {error}"),
+            code,
+            &format!("无法执行 {label} / unable to execute {label}: {error}"),
         )
+    })?;
+    if output.timed_out || output.status.is_none() {
+        return Err(git_commit_blocked(
+            code,
+            &format!(
+                "{label} 超过 {:.1} 秒并已终止完整进程树 / command timed out and its process tree was terminated",
+                limits.timeout.as_secs_f64()
+            ),
+        ));
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        return Err(git_commit_blocked(
+            code,
+            &format!(
+                "{label} 输出超过安全上限(stdout {} bytes, stderr {} bytes),拒绝使用截断结果 / command output exceeded its safety limit; truncated output was rejected",
+                limits.stdout_bytes, limits.stderr_bytes
+            ),
+        ));
+    }
+    Ok(std::process::Output {
+        status: output
+            .status
+            .expect("non-timeout bounded command always has an exit status"),
+        stdout: output.stdout,
+        stderr: output.stderr,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::{bounded_git_command_output, GitCommandLimits};
     use super::{
         git_environment_override, git_environment_variable, git_std_command, EMPTY_GIT_CONFIG,
     };
     use std::ffi::OsStr;
     use std::path::Path;
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     #[test]
     fn repository_index_and_pathspec_overrides_are_all_fail_closed() {
@@ -329,5 +415,55 @@ mod tests {
             })
             .flatten();
         assert_eq!(config.as_deref(), Some(OsStr::new(EMPTY_GIT_CONFIG)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_runner_rejects_flooded_output_instead_of_using_a_tail() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "head -c 65536 /dev/zero"]);
+        let error = bounded_git_command_output(
+            command,
+            GitCommandLimits {
+                timeout: Duration::from_secs(2),
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+            },
+            "test-output-limit",
+            "flood helper",
+        )
+        .unwrap_err();
+        assert!(error.note.contains("test-output-limit"), "{}", error.note);
+        assert!(error.note.contains("截断结果"), "{}", error.note);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_runner_times_out_and_kills_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("escaped-descendant");
+        let mut command = Command::new("sh");
+        command
+            .env("UMADEV_TEST_MARKER", &marker)
+            .args(["-c", "(sleep 1; : > \"$UMADEV_TEST_MARKER\") & sleep 30"]);
+        let started = std::time::Instant::now();
+        let error = bounded_git_command_output(
+            command,
+            GitCommandLimits {
+                timeout: Duration::from_millis(150),
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+            },
+            "test-timeout",
+            "hanging helper",
+        )
+        .unwrap_err();
+        assert!(error.note.contains("test-timeout"), "{}", error.note);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(1_100));
+        assert!(
+            !marker.exists(),
+            "descendant survived bounded tree teardown"
+        );
     }
 }

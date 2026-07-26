@@ -854,6 +854,28 @@ fn native_command_precedence_and_explicit_base_escape_are_unambiguous() {
 }
 
 #[test]
+fn plan_mode_never_forwards_untyped_native_base_commands() {
+    let mut advertised = fresh_app(Some("grok-build"));
+    advertised.base_session_commands = vec![session_command("write")];
+    advertised.set_trust_mode(umadev_agent::TrustMode::Plan);
+    assert_eq!(
+        advertised.try_slash_command("/write src/app.rs"),
+        Some(Action::None)
+    );
+    assert!(advertised.queued_chat.is_empty());
+    assert!(advertised.queued_dispatch_kinds.is_empty());
+
+    let mut escaped = fresh_app(Some("grok-build"));
+    escaped.set_trust_mode(umadev_agent::TrustMode::Plan);
+    assert_eq!(
+        escaped.try_slash_command("/base /write src/app.rs"),
+        Some(Action::None)
+    );
+    assert!(escaped.queued_chat.is_empty());
+    assert!(escaped.queued_dispatch_kinds.is_empty());
+}
+
+#[test]
 fn advertised_native_command_preserves_editor_bytes_and_palette_metadata() {
     let mut app = fresh_app(Some("grok-build"));
     let mut review = session_command("review");
@@ -1322,37 +1344,29 @@ fn ring_and_undo_do_not_fire_while_search_owns_the_keys() {
 }
 
 #[test]
-fn bang_prefix_runs_a_local_shell_and_shows_output() {
+fn bang_prefix_schedules_a_local_shell_without_blocking_the_app() {
     let mut app = fresh_app(Some("offline"));
     let before = app.history.len();
-    // `!echo <marker>` runs once in the project root and renders as a
-    // finished Bash tool row whose result holds the command's output — it is
-    // NOT routed to the base, so this works with no live session.
+    // Parsing only schedules the command. The event loop runs it asynchronously
+    // and later settles the correlated tool row.
     let action = app.try_bang_command("!echo umadev_bang_marker").unwrap();
-    assert!(matches!(action, Action::None));
     assert_eq!(
-        app.history.len(),
-        before + 1,
-        "exactly one tool row is appended"
+        action,
+        Action::RunLocalShell("echo umadev_bang_marker".to_string())
     );
-    let last = app.history.back().unwrap();
-    assert_eq!(last.role, ChatRole::Host);
-    let MessageBody::Tool(t) = &last.kind else {
-        panic!(
-            "a bang command must render as a tool row, got {:?}",
-            last.kind
-        );
-    };
-    assert_eq!(t.name, "Bash");
-    assert_eq!(t.status, ToolStatus::Ok);
-    assert!(
-        t.result
-            .as_deref()
-            .unwrap_or_default()
-            .contains("umadev_bang_marker"),
-        "the shell output must be shown in the row: {:?}",
-        t.result
-    );
+    assert_eq!(app.history.len(), before, "parsing must not run or block");
+}
+
+#[test]
+fn async_local_command_still_requires_double_esc_to_cancel() {
+    let mut app = fresh_app(Some("offline"));
+    let request = crate::local_command::LocalCommandRequest::shell(&app.project_root, "sleep 30");
+    app.begin_local_command(&request);
+
+    assert!(app.thinking, "the local command owns the busy state");
+    assert_eq!(app.apply_key(KeyCode::Esc), Action::None);
+    assert!(app.interrupt_armed(), "the first Esc arms cancellation");
+    assert_eq!(app.apply_key(KeyCode::Esc), Action::Cancel);
 }
 
 #[test]
@@ -1373,12 +1387,15 @@ fn bare_bang_is_a_consumed_no_op() {
     assert!(app.try_bang_command("/help").is_none());
 }
 
-#[test]
-fn bang_nonzero_exit_surfaces_the_code_and_stays_expanded() {
+#[tokio::test]
+async fn bang_nonzero_exit_surfaces_the_code_and_stays_expanded() {
     let mut app = fresh_app(Some("offline"));
     // A failing command marks the row Fail (kept expanded so the error is
     // never hidden) and surfaces its nonzero exit code in the result.
-    let _ = app.try_bang_command("!exit 3").unwrap();
+    let request = crate::local_command::LocalCommandRequest::shell(&app.project_root, "exit 3");
+    app.begin_local_command(&request);
+    let result = crate::local_command::run(request, umadev_i18n::Lang::En).await;
+    app.record_local_command_done(result);
     let MessageBody::Tool(t) = &app.history.back().unwrap().kind else {
         panic!("expected a tool row");
     };
@@ -1392,33 +1409,67 @@ fn bang_nonzero_exit_surfaces_the_code_and_stays_expanded() {
 }
 
 /// M3 regression — a runaway-output command (`yes` emits "y\n" forever) must
-/// NOT buffer unbounded into memory the way `Command::output()` did (read to
-/// EOF) and must NOT run on / hang. The per-stream reader caps in-memory bytes
-/// and drops the pipe at the cap; `yes` then dies on SIGPIPE — so the call
-/// returns PROMPTLY with BOUNDED output, with the kill-on-deadline path as the
-/// backstop. Unix-only (`yes` / SIGPIPE semantics).
+/// NOT buffer unbounded into memory the way `Command::output()` did and must
+/// NOT run on after the deadline. The shared bounded runner keeps draining but
+/// stores only a fixed tail, then kills the whole process group on timeout.
 #[cfg(unix)]
-#[test]
-fn bang_runaway_output_is_bounded_and_does_not_hang() {
+#[tokio::test]
+async fn bang_runaway_output_is_bounded_and_does_not_hang() {
     let root = std::env::temp_dir();
+    let mut request = crate::local_command::LocalCommandRequest::shell(&root, "yes");
+    request.timeout = std::time::Duration::from_millis(100);
     let start = std::time::Instant::now();
-    let (ok, out) = run_bang_command(&root, "yes", umadev_i18n::Lang::En);
+    let result = crate::local_command::run(request, umadev_i18n::Lang::En).await;
     let elapsed = start.elapsed();
-    // Killed by SIGPIPE (or the deadline) → not a clean success.
-    assert!(!ok, "a killed runaway command is not a success");
-    // Output is bounded (`bound_shell_output` caps at 300 lines / 16k chars),
-    // proving we never buffered the infinite stream into memory; add headroom
-    // for the appended failure note.
+    assert!(!result.ok, "a timed-out runaway command is not a success");
     assert!(
-        out.chars().count() < 17_000,
+        result.output.chars().count() < 17_000,
         "runaway output must be bounded, got {} chars",
-        out.chars().count()
+        result.output.chars().count()
     );
-    // And it returned well under the 10s kill budget (SIGPIPE death, not a
-    // hang) — the old code would never even return from this for `yes`.
     assert!(
-        elapsed < std::time::Duration::from_secs(9),
+        elapsed < std::time::Duration::from_secs(3),
         "runaway command must not hang: {elapsed:?}"
+    );
+}
+
+#[test]
+fn helper_slash_commands_are_scheduled_with_exact_noninteractive_argv() {
+    let mut app = fresh_app(Some("offline"));
+    assert_eq!(
+        app.try_slash_command("/pr create"),
+        Some(Action::RunUmaDevCommand {
+            args: vec!["pr".into(), "--create".into(), "--yes".into()],
+            presentation: LocalCommandPresentation::UmaDev,
+        })
+    );
+    assert_eq!(
+        app.try_slash_command("/pr"),
+        Some(Action::RunUmaDevCommand {
+            args: vec!["pr".into()],
+            presentation: LocalCommandPresentation::UmaDev,
+        })
+    );
+    assert_eq!(
+        app.try_slash_command("/mcp"),
+        Some(Action::RunUmaDevCommand {
+            args: vec!["mcp-manage".into(), "list".into()],
+            presentation: LocalCommandPresentation::Mcp,
+        })
+    );
+    assert_eq!(
+        app.try_slash_command("/skill"),
+        Some(Action::RunUmaDevCommand {
+            args: vec!["skill".into(), "list".into()],
+            presentation: LocalCommandPresentation::Skill,
+        })
+    );
+    assert_eq!(
+        app.try_slash_command("/adopt"),
+        Some(Action::RunUmaDevCommand {
+            args: vec!["adopt".into()],
+            presentation: LocalCommandPresentation::UmaDev,
+        })
     );
 }
 
@@ -2517,6 +2568,28 @@ fn huge_single_line_paste_also_collapses_to_a_chip() {
     );
     let expanded = a.expand_attachments(a.input.trim());
     assert_eq!(expanded, big, "expands back to the exact pasted text");
+}
+
+#[test]
+fn paste_memory_envelope_rejects_one_oversized_or_excess_stashed_payload() {
+    let mut oversized = fresh_app(Some("offline"));
+    let secret_tail = "do-not-echo";
+    let mut payload = "x".repeat(MAX_PASTE_BYTES + 1);
+    payload.push_str(secret_tail);
+    oversized.handle_paste(&payload);
+    assert!(oversized.input.is_empty());
+    assert!(oversized.text_stash.is_empty());
+    let warning = oversized.history.back().unwrap().body();
+    assert!(warning.contains("1 MiB"));
+    assert!(!warning.contains(secret_tail));
+
+    let mut total = fresh_app(Some("offline"));
+    total.handle_paste(&"a".repeat(MAX_PASTE_BYTES));
+    total.handle_paste(&"b".repeat(MAX_PASTE_BYTES));
+    assert_eq!(total.text_stash.len(), 2);
+    total.handle_paste(&"c".repeat(PASTE_CHIP_MIN_CHARS + 1));
+    assert_eq!(total.text_stash.len(), 2, "the per-turn stash cap is hard");
+    assert!(total.history.back().unwrap().body().contains("2 MiB"));
 }
 
 #[test]
@@ -4038,6 +4111,32 @@ fn preview_url_from_notes_reads_file() {
 }
 
 #[test]
+fn preview_notes_and_opener_reject_non_url_http_prefixes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let output = tmp.path().join("output");
+    std::fs::create_dir_all(&output).unwrap();
+    let notes = output.join("demo-frontend-notes.md");
+    let app = App::new(
+        "demo".to_string(),
+        UserConfig {
+            backend: Some("offline".into()),
+            ..Default::default()
+        },
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
+    );
+
+    for invalid in ["http-malware.exe", "http_payload.app", "https:///nohost"] {
+        std::fs::write(&notes, format!("## Preview URL\n\n{invalid}\n")).unwrap();
+        assert_eq!(app.preview_url_from_notes(), None, "accepted {invalid}");
+        assert_eq!(
+            crate::preview::open_url(invalid).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput,
+        );
+    }
+}
+
+#[test]
 fn slash_preview_with_no_notes_gives_hint() {
     let tmp = tempfile::TempDir::new().unwrap();
     let mut app = App::new(
@@ -4208,6 +4307,25 @@ fn build_completion_card_falls_back_to_dirs_without_git_delta() {
     assert!(
         card.contains("src"),
         "falls back to naming an output dir: {card}"
+    );
+}
+
+#[test]
+fn build_completion_card_uses_the_recorded_turn_fact_without_running_git() {
+    let (mut app, _tmp) = temp_app();
+    app.push(ChatRole::You, "update the report");
+    app.apply_engine(EngineEvent::Note(
+        "[note] 本轮实际文件变更: src/report.rs, tests/report.rs".into(),
+    ));
+
+    let card = app.build_completion_card(false);
+    assert!(
+        card.contains("src/report.rs"),
+        "card uses host fact: {card}"
+    );
+    assert!(
+        card.contains("tests/report.rs"),
+        "card uses every recorded fact path: {card}"
     );
 }
 
@@ -4555,6 +4673,109 @@ fn resumed_plan_post_restores_persisted_step_statuses() {
     assert!(card.contains("[x] s1"), "done step checked: {card}");
     assert!(card.contains("[!] s3"), "blocked step flagged: {card}");
     assert!(card.contains("[ ] s4"), "pending step blank: {card}");
+}
+
+#[test]
+fn slash_plan_is_the_lossless_view_for_every_convened_team_row() {
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::PlanPosted {
+        steps: vec![
+            "s1 · scope (product-manager)".into(),
+            "s2 · architecture (architect)".into(),
+            "s3 · visual design (uiux-designer)".into(),
+            "s4 · frontend (frontend-engineer)".into(),
+            "s5 · backend (backend-engineer)".into(),
+            "s6 · acceptance (qa-engineer)".into(),
+            "s7 · security (security-engineer)".into(),
+            "s8 · deploy (devops-engineer)".into(),
+        ],
+        statuses: vec!["active".into(); 8],
+        done: 0,
+        total: 8,
+    });
+    app.apply_engine(EngineEvent::CriticVerdict {
+        seat: "security-engineer".into(),
+        accepts: false,
+        blocking: vec!["missing authorization check".into()],
+        remediation: vec![],
+        advisory: vec![],
+    });
+
+    assert_eq!(app.try_slash_command("/plan"), Some(Action::None));
+    let card = app.history.back().expect("/plan transcript card").body();
+    assert!(
+        card.contains(umadev_i18n::t(app.lang, "team.roster.panel.title")),
+        "the full plan view includes the team section: {card}"
+    );
+    for seat in app.convened_roster() {
+        let name = seat_display_name(app.lang, &seat.role);
+        assert!(
+            card.contains(&name),
+            "missing full roster row for {name}: {card}"
+        );
+    }
+    assert!(
+        card.contains(umadev_i18n::t(app.lang, "team.status.reviewing")),
+        "reviewer live status is preserved: {card}"
+    );
+    assert!(
+        card.contains(umadev_i18n::t(app.lang, "team.status.working")),
+        "doer live status is preserved: {card}"
+    );
+}
+
+#[test]
+fn slash_plan_includes_a_base_native_plan_without_a_director_plan() {
+    let mut app = fresh_app(Some("grok-build"));
+    app.apply_engine(EngineEvent::BaseSessionState {
+        backend_id: "grok-build".to_string(),
+        update: SessionStateUpdate::PlanReplaced {
+            entries: vec![
+                umadev_runtime::SessionPlanEntry {
+                    content: "Inspect the existing API contract".to_string(),
+                    priority: umadev_runtime::SessionPlanEntryPriority::High,
+                    status: umadev_runtime::SessionPlanEntryStatus::Completed,
+                },
+                umadev_runtime::SessionPlanEntry {
+                    content: "Implement the authenticated route".to_string(),
+                    priority: umadev_runtime::SessionPlanEntryPriority::Medium,
+                    status: umadev_runtime::SessionPlanEntryStatus::InProgress,
+                },
+            ],
+        },
+    });
+
+    assert_eq!(app.try_slash_command("/plan"), Some(Action::None));
+    let card = app.history.back().expect("/plan transcript card").body();
+    assert!(
+        card.contains(umadev_i18n::t(app.lang, "base.plan.panel.title")),
+        "native plan is labeled: {card}"
+    );
+    assert!(card.contains("Inspect the existing API contract"), "{card}");
+    assert!(card.contains("Implement the authenticated route"), "{card}");
+    assert!(
+        !card.contains(umadev_i18n::t(app.lang, "plan.none")),
+        "{card}"
+    );
+}
+
+#[test]
+fn slash_plan_is_a_complete_review_snapshot() {
+    let mut app = fresh_app(Some("offline"));
+    app.lang = umadev_i18n::Lang::En;
+    app.apply_engine(EngineEvent::CriticVerdict {
+        seat: "security-engineer".into(),
+        accepts: false,
+        blocking: vec!["authorization is missing".into()],
+        remediation: vec!["enforce the role check at the route boundary".into()],
+        advisory: vec!["add an audit event for denied requests".into()],
+    });
+
+    assert_eq!(app.try_slash_command("/plan"), Some(Action::None));
+    let card = app.history.back().expect("/plan transcript card").body();
+    assert!(card.contains("authorization is missing"), "{card}");
+    assert!(card.contains("enforce the role check"), "{card}");
+    assert!(card.contains("add an audit event"), "{card}");
 }
 
 #[test]
@@ -5312,6 +5533,26 @@ fn slash_plan_lists_queued_work_without_an_active_plan() {
 }
 
 #[test]
+fn slash_plan_lists_the_base_native_prompt_queue() {
+    let mut app = fresh_app(Some("grok-build"));
+    app.prompt_queue.set_ready(true);
+    app.prompt_queue
+        .apply_snapshot(queue_snapshot(&["native queued follow-up"]));
+
+    assert_eq!(app.try_slash_command("/plan"), Some(Action::None));
+
+    let joined = app
+        .history
+        .iter()
+        .map(|message| message.body().clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("native queued follow-up"), "{joined}");
+    assert!(!joined.contains("暂无计划"), "{joined}");
+    assert_eq!(app.queued_count(), 1);
+}
+
+#[test]
 fn slash_plan_skip_folds_into_queued_steer() {
     let mut app = fresh_app(Some("offline"));
     app.apply_engine(EngineEvent::PlanPosted {
@@ -5357,6 +5598,23 @@ fn slash_plan_add_takes_free_text() {
     assert_eq!(app.queued_steer.len(), 1);
     assert!(app.queued_steer[0].contains("write integration tests"));
     assert!(app.queued_steer[0].to_ascii_uppercase().contains("ADD"));
+}
+
+#[test]
+fn plan_add_survives_the_new_run_reset_that_consumes_it() {
+    let mut app = fresh_app(Some("offline"));
+    app.requirement = "build the dashboard".into();
+    let _ = app.try_slash_command("/plan add write integration tests");
+    app.queued_steer
+        .push_back("Plan steering: SKIP step `s1`".into());
+
+    assert_eq!(
+        app.slash_redo(""),
+        Action::StartRun("build the dashboard".into())
+    );
+    assert_eq!(app.queued_steer.len(), 1);
+    assert!(app.queued_steer[0].contains("ADD"));
+    assert!(app.queued_steer[0].contains("write integration tests"));
 }
 
 #[test]
@@ -5579,15 +5837,18 @@ fn an_aborted_block_clears_the_live_plan_and_review_panels() {
 fn parse_probe_detail_unpacks_packed_auth_metadata() {
     // The packed shape spawn_probe emits.
     let s = PROBE_AUTH_SENTINEL;
-    let packed =
-        format!("{s}auth=not_logged_in|login=claude auth login|install=npm i -g x{s}claude 1.6.0");
-    let (auth, login, install, human) = parse_probe_detail(&packed);
+    let packed = format!(
+        "{s}generation=9|auth=not_logged_in|login=claude auth login|install=npm i -g x{s}claude 1.6.0"
+    );
+    let (generation, auth, login, install, human) = parse_probe_detail(&packed);
+    assert_eq!(generation, Some(9));
     assert_eq!(auth, AuthMark::NotLoggedIn);
     assert_eq!(login, "claude auth login");
     assert_eq!(install, "npm i -g x");
     assert_eq!(human, "claude 1.6.0");
     // Fail-open: a plain (untagged) detail keeps the human text, Unknown auth.
-    let (auth, login, _i, human) = parse_probe_detail("claude 1.6.0");
+    let (generation, auth, login, _i, human) = parse_probe_detail("claude 1.6.0");
+    assert_eq!(generation, None);
     assert_eq!(auth, AuthMark::Unknown);
     assert!(login.is_empty());
     assert_eq!(human, "claude 1.6.0");
@@ -5679,6 +5940,54 @@ fn reported_regression_unavailable_backend_switch_is_rejected_without_claiming_s
         .map(ChatMessage::body)
         .unwrap_or_default();
     assert!(last.contains("npm install -g @openai/codex"), "{last}");
+}
+
+#[test]
+fn backend_switch_waits_for_the_targets_startup_probe() {
+    let mut app = fresh_app(Some("claude-code"));
+    let _ = app.begin_backend_probe();
+
+    assert_eq!(app.slash_backend(Some("codex")), Action::None);
+    assert_eq!(app.backend.as_deref(), Some("claude-code"));
+    let last = app
+        .history
+        .back()
+        .map(ChatMessage::body)
+        .unwrap_or_default();
+    assert!(
+        last.contains("探测") || last.to_ascii_lowercase().contains("probe"),
+        "{last}"
+    );
+}
+
+#[test]
+fn stale_backend_probe_generation_cannot_overwrite_fresh_results() {
+    let mut app = fresh_app(Some("codex"));
+    let old = app.begin_backend_probe();
+    let current = app.begin_backend_probe();
+    let s = PROBE_AUTH_SENTINEL;
+    let detail = |generation, human: &str| {
+        format!("{s}generation={generation}|auth=logged_in|login=|install={s}{human}")
+    };
+
+    app.apply_engine(EngineEvent::BackendProbed {
+        backend_id: "codex".into(),
+        ready: true,
+        detail: detail(current, "fresh"),
+    });
+    app.apply_engine(EngineEvent::BackendProbed {
+        backend_id: "codex".into(),
+        ready: false,
+        detail: detail(old, "stale"),
+    });
+
+    let probe = app
+        .backends
+        .iter()
+        .find(|probe| probe.id == "codex")
+        .unwrap();
+    assert!(probe.ready);
+    assert_eq!(probe.detail, "fresh");
 }
 
 #[test]
@@ -5921,6 +6230,136 @@ fn slash_continue_without_gate_is_noop_with_hint() {
         .history
         .iter()
         .any(|m| m.body().contains("还没启动流水线") || m.body().contains("没有打开的 gate")));
+}
+
+#[test]
+fn slash_continue_rejects_terminal_director_review_before_consuming_a_stale_gate() {
+    let mut app = fresh_app(Some("claude-code"));
+    std::fs::create_dir_all(app.project_root.join(".umadev")).unwrap();
+    std::fs::write(
+        app.project_root
+            .join(".umadev/director-operational-review.json"),
+        br#"{
+  "kind": "final-gate-review",
+  "consecutive_outages": 2
+}"#,
+    )
+    .unwrap();
+    app.active_gate = Some(Gate::DocsConfirm);
+
+    let before = app.history.len();
+    assert_eq!(
+        app.try_slash_command("/continue"),
+        Some(Action::None),
+        "a terminal receipt is never dispatched as ResumeRun/Continue"
+    );
+    assert_eq!(
+        app.active_gate,
+        Some(Gate::DocsConfirm),
+        "terminal preflight runs before stale gate consumption"
+    );
+    let added = app
+        .history
+        .iter()
+        .skip(before)
+        .map(|message| message.body());
+    let added = added.collect::<Vec<_>>().join("\n");
+    assert!(added.contains("cannot be continued") && added.contains("new /run"));
+    assert!(!added.contains(umadev_i18n::t(app.lang, "continue.resuming")));
+}
+
+#[test]
+fn slash_continue_rejects_terminal_legacy_review_without_resuming() {
+    let mut app = fresh_app(Some("offline"));
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Quality);
+    state.note = "operational-review-circuit-open:v1:quality (continuous session)".to_string();
+    state.requirement = "old requirement".to_string();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+
+    let before = app.history.len();
+    assert_eq!(
+        app.try_slash_command("/continue"),
+        Some(Action::None),
+        "the legacy terminal receipt is never dispatched as ResumeRun"
+    );
+    let added = app
+        .history
+        .iter()
+        .skip(before)
+        .map(|message| message.body());
+    let added = added.collect::<Vec<_>>().join("\n");
+    assert!(added.contains("circuit is open") && added.contains("new /run"));
+    assert!(!added.contains(umadev_i18n::t(app.lang, "continue.resuming")));
+}
+
+#[test]
+fn terminal_review_receipt_is_aborted_not_paused_and_tasks_cannot_resume() {
+    let mut app = fresh_app(Some("claude-code"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "review".into(),
+            title: "retry required review".into(),
+            seat: umadev_agent::Seat::QaEngineer,
+            kind: umadev_agent::StepKind::Review,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Pending,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Quality);
+    state.requirement = "old requirement".to_string();
+    state.backend = "claude-code".to_string();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+    std::fs::write(
+        app.project_root
+            .join(".umadev/director-operational-review.json"),
+        br#"{
+  "kind": "final-gate-review",
+  "consecutive_outages": 2
+}"#,
+    )
+    .unwrap();
+    app.register_run_task("old requirement");
+    app.run_started = true;
+    app.record_run_paused_at_operational("review host unavailable".into(), 1, 2);
+    let reason = umadev_agent::terminal_review_circuit_reason(&app.project_root).unwrap();
+
+    app.apply_engine(EngineEvent::Note(format!(
+        "{}{reason}",
+        crate::ABORT_SENTINEL
+    )));
+
+    assert!(app.operational_pause_reason.is_none());
+    assert!(!app.budget_paused);
+    assert_eq!(app.run_state(), RunState::Aborted);
+    assert!(app.status.contains("[aborted]"));
+    assert!(!app.status.contains("[paused]"));
+    assert!(
+        umadev_agent::transient_resume_hint("429 too many requests", &app.project_root).is_none()
+    );
+    let before = app.history.len();
+    assert_eq!(app.slash_tasks("resume"), Action::None);
+    let added = app
+        .history
+        .iter()
+        .skip(before)
+        .map(|message| message.body());
+    let added = added.collect::<Vec<_>>().join("\n");
+    assert!(added.contains(umadev_i18n::t(app.lang, "tasks.nothing_to_resume")));
+    assert!(!added.contains(umadev_i18n::t(app.lang, "continue.resuming")));
+
+    let footer = app
+        .exit_footer_text()
+        .expect("the conversation has a footer");
+    assert!(
+        !footer.contains(".umadev/"),
+        "a terminal circuit is retained as evidence, not advertised as a resumable artifact"
+    );
 }
 
 #[test]
@@ -6574,6 +7013,17 @@ fn live_meta_classifier_is_bounded_and_trilingual() {
             "could you give me a current progress update?",
             LiveMetaIntent::Progress,
         ),
+        ("怎么给你权限？", LiveMetaIntent::Permissions),
+        ("为什么是只读？", LiveMetaIntent::Permissions),
+        ("你现在能修改文件吗？", LiveMetaIntent::Permissions),
+        ("请问你能写文件吗？", LiveMetaIntent::Permissions),
+        ("怎麼給你權限？", LiveMetaIntent::Permissions),
+        ("為什麼是唯讀？", LiveMetaIntent::Permissions),
+        (
+            "how can I grant you permission?",
+            LiveMetaIntent::Permissions,
+        ),
+        ("do you have write access?", LiveMetaIntent::Permissions),
     ] {
         assert_eq!(classify_live_meta(text), Some(expected), "{text}");
     }
@@ -6586,6 +7036,12 @@ fn live_meta_classifier_is_bounded_and_trilingual() {
         "show me the changes and then fix the tests",
         "what changes should we make?",
         "build a current status component",
+        "修改权限管理页面",
+        "修复只读模式切换",
+        "把权限说明写入 README",
+        "为什么只读，然后修复登录",
+        "你能写文件吗？请修改登录页面",
+        "can you write files? please update the login page",
     ] {
         assert_eq!(classify_live_meta(mutation), None, "{mutation}");
     }
@@ -6660,20 +7116,17 @@ fn live_change_answer_prefers_this_turns_diff_rows() {
 }
 
 #[test]
-fn git_status_fallback_discloses_pre_run_change_risk() {
+fn live_change_answer_does_not_scan_the_worktree_without_turn_evidence() {
     let (mut app, tmp) = temp_app();
-    let _ = std::process::Command::new("git")
-        .arg("-C")
-        .arg(tmp.path())
-        .args(["init", "-q"])
-        .status()
-        .unwrap();
     std::fs::write(tmp.path().join("already-dirty.txt"), "dirty").unwrap();
 
     assert_eq!(app.submit_text("what changed?".into()), Action::None);
     let answer = app.history.back().unwrap().body();
-    assert!(answer.contains("already-dirty.txt"));
-    assert!(answer.contains("运行开始前") || answer.contains("before the run began"));
+    assert!(!answer.contains("already-dirty.txt"));
+    assert_eq!(
+        answer.as_ref(),
+        umadev_i18n::t(app.lang, "live_meta.changes.none_yet")
+    );
 }
 
 #[test]
@@ -7204,6 +7657,47 @@ fn operational_review_pause_is_resumable_and_never_aborted() {
     assert!(app.operational_pause_reason.is_none());
     assert!(!app.budget_paused);
     assert_eq!(app.run_state(), RunState::Running);
+}
+
+#[test]
+fn operational_review_pause_can_be_cancelled_and_releases_the_prompt() {
+    let mut app = fresh_app(Some("offline"));
+    app.register_run_task("build x");
+    app.run_started = true;
+    app.record_run_paused_at_operational("qa reviewer timed out".to_string(), 2, 6);
+
+    for ch in "/cancel".chars() {
+        let _ = app.apply_key(KeyCode::Char(ch));
+    }
+    assert_eq!(
+        app.apply_key(KeyCode::Enter),
+        Action::Cancel,
+        "a parked operational review remains explicitly cancellable"
+    );
+    app.cancel_run();
+    assert!(!app.is_pipeline_active());
+    assert!(!app.has_interruptible_work());
+    assert!(!app.budget_paused);
+    assert!(app.operational_pause_reason.is_none());
+    assert!(!app.thinking && !app.agentic_in_flight && !app.director_run_in_flight);
+    assert_eq!(
+        app.tasks.last().map(|task| task.status),
+        Some(TaskStatus::Stopped)
+    );
+    assert!(app.history.back().is_some_and(|message| {
+        let body = message.body();
+        body.contains("/run") && !body.contains("/continue")
+    }));
+
+    let mut via_tasks = fresh_app(Some("offline"));
+    via_tasks.register_run_task("build y");
+    via_tasks.run_started = true;
+    via_tasks.record_run_paused_at_operational("review host unavailable".to_string(), 1, 3);
+    assert_eq!(
+        via_tasks.slash_tasks("stop"),
+        Action::Cancel,
+        "/tasks stop reaches the same cancellation path while the writer is parked"
+    );
 }
 
 #[test]
@@ -7756,6 +8250,69 @@ fn interrupt_seals_a_half_streamed_reply_as_incomplete() {
 }
 
 #[test]
+fn compacted_stream_is_replaced_by_the_complete_terminal_reply() {
+    let mut app = fresh_app(Some("offline"));
+    app.push(ChatRole::You, "请完整回答".to_string());
+    app.apply_engine(EngineEvent::WorkerStream {
+        event: umadev_runtime::StreamEvent::Text {
+            delta: "不完整前缀".to_string(),
+        },
+    });
+    app.apply_engine(EngineEvent::StreamCompacted {
+        events: 9,
+        bytes: 4_096,
+    });
+    app.record_agentic_done("这是完整的最终答复。".to_string(), false, None, None);
+
+    let host_text = app
+        .history
+        .iter()
+        .filter(|message| message.role == ChatRole::Host)
+        .filter_map(|message| match &message.kind {
+            MessageBody::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(host_text, vec!["这是完整的最终答复。"]);
+    assert!(app.history.iter().any(|message| {
+        message.body() == umadev_i18n::tf(app.lang, "stream.compacted", &["9"])
+    }));
+    assert_eq!(
+        app.full_transcript.last().map(|turn| turn.content.as_str()),
+        Some("这是完整的最终答复。")
+    );
+    assert!(app.stream_compacted.is_none());
+}
+
+#[test]
+fn cancelling_a_compacted_stream_clears_recovery_state_for_the_next_turn() {
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::StreamCompacted {
+        events: 3,
+        bytes: 200,
+    });
+    assert!(app.stream_compacted.is_some());
+    app.cancel_run();
+    assert!(app.stream_compacted.is_none());
+
+    app.push(ChatRole::You, "下一轮".to_string());
+    app.apply_engine(EngineEvent::WorkerStream {
+        event: umadev_runtime::StreamEvent::Text {
+            delta: "正常流式答复".to_string(),
+        },
+    });
+    app.record_agentic_done("正常流式答复".to_string(), false, None, None);
+    assert_eq!(
+        app.history
+            .iter()
+            .filter(|message| message.body().contains("正常流式答复"))
+            .count(),
+        1,
+        "a prior cancelled compaction must not trigger next-turn reconstruction"
+    );
+}
+
+#[test]
 fn seal_is_a_noop_when_nothing_was_streaming() {
     let mut a = fresh_app(Some("offline"));
     a.push(ChatRole::Host, "a finished reply".to_string());
@@ -7944,6 +8501,21 @@ fn structured_choice_gate_arms_picker_and_approve_drives_continue() {
     let action = a.apply_key(KeyCode::Enter);
     assert_eq!(action, Action::Continue(Gate::DocsConfirm));
     assert!(a.gate_choice.is_none() && a.active_gate.is_none());
+}
+
+#[test]
+fn plan_mode_picker_cannot_consume_or_approve_a_gate() {
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+    app.set_trust_mode(umadev_agent::TrustMode::Plan);
+
+    assert_eq!(app.apply_key(KeyCode::Enter), Action::None);
+    assert_eq!(app.active_gate, Some(Gate::DocsConfirm));
+    assert!(
+        app.gate_choice.is_some(),
+        "the recoverable picker stays open"
+    );
+    assert!(app.tasks.is_empty());
 }
 
 #[test]
@@ -9443,11 +10015,14 @@ fn no_kitty_terminal_still_submits_enter_and_newlines_on_ctrl_j() {
 // ---- palette ----
 
 #[test]
-fn slash_run_only_treats_a_separatored_ascii_first_word_as_a_slug() {
-    // `todo-app` (ASCII + a `-` separator) IS the optional run slug.
+fn slash_run_does_not_guess_natural_hyphenated_words_are_slugs() {
+    // Even a word matching the current project is requirement text unless the
+    // user explicitly marks it with `--slug`.
     let mut a = fresh_app(Some("offline"));
-    let _ = a.slash_run("todo-app 做一个待办应用");
+    a.slug = "todo-app".into();
+    let action = a.slash_run("todo-app 做一个待办应用");
     assert_eq!(a.slug, "todo-app");
+    assert_eq!(action, Action::StartRun("todo-app 做一个待办应用".into()));
     // A multi-word / Chinese requirement's first word is NOT mistaken for a
     // slug (no separator / not ASCII), so the whole thing stays the requirement
     // and no slug-invalid error fires (was: '/run with spaces' wrongly rejected).
@@ -9457,6 +10032,30 @@ fn slash_run_only_treats_a_separatored_ascii_first_word_as_a_slug() {
         b.slug, "做一个",
         "the first word must not become a phantom slug"
     );
+
+    // Natural compound adjectives are requirement text, not positional slugs.
+    let mut c = fresh_app(Some("offline"));
+    let action = c.slash_run("end-to-end test the login flow");
+    assert_ne!(c.slug, "end-to-end");
+    assert_eq!(
+        action,
+        Action::StartRun("end-to-end test the login flow".into())
+    );
+
+    let mut service = fresh_app(Some("offline"));
+    let action = service.slash_run("customer-service migration plan");
+    assert_ne!(service.slug, "customer-service");
+    assert_eq!(
+        action,
+        Action::StartRun("customer-service migration plan".into())
+    );
+
+    // Arbitrary slugs remain available through syntax that cannot be confused
+    // with prose.
+    let mut d = fresh_app(Some("offline"));
+    let action = d.slash_run("--slug foo-bar build the login flow");
+    assert_eq!(d.slug, "foo-bar");
+    assert_eq!(action, Action::StartRun("build the login flow".into()));
 }
 
 #[test]
@@ -9484,6 +10083,49 @@ fn plan_mode_slash_run_settles_before_any_run_state_or_task_is_created() {
         .history
         .iter()
         .any(|m| m.body().contains("计划模式") || m.body().contains("Plan mode")));
+}
+
+#[test]
+fn plan_mode_rejects_gate_revisions_before_task_or_run_persistence() {
+    let mut app = fresh_app(Some("claude-code"));
+    app.set_trust_mode(umadev_agent::TrustMode::Plan);
+    app.active_gate = Some(Gate::DocsConfirm);
+    app.director_gate_paused = true;
+    app.requirement = "build a todo app".into();
+    let root = app.project_root.clone();
+
+    for request in ["修改当前文档标题", "/revise 修改当前文档标题", "/continue"] {
+        assert_eq!(app.submit_text(request.to_string()), Action::None);
+        assert_eq!(app.active_gate, Some(Gate::DocsConfirm));
+        assert!(app.director_gate_paused);
+        assert!(app.tasks.is_empty());
+        assert!(!app.thinking && !app.director_run_in_flight);
+    }
+    assert!(
+        !root.join(".umadev/run.lock").exists()
+            && !root.join(".umadev/workflow-state.json").exists()
+            && !root.join(".umadev/governance-context.json").exists()
+            && !root.join(".umadev/tasks.json").exists(),
+        "Plan gate input must settle before all execution persistence"
+    );
+}
+
+#[test]
+fn plan_mode_slash_redo_settles_before_replaying_any_run() {
+    let mut app = fresh_app(Some("codex"));
+    app.requirement = "build a todo app".into();
+    app.set_trust_mode(umadev_agent::TrustMode::Plan);
+    let root = app.project_root.clone();
+
+    assert_eq!(app.slash_redo(""), Action::None);
+    assert_eq!(app.slash_redo("frontend"), Action::None);
+    assert!(!app.run_started && !app.director_run_in_flight);
+    assert!(
+        !root.join(".umadev/run.lock").exists()
+            && !root.join(".umadev/workflow-state.json").exists()
+            && !root.join(".umadev/governance-context.json").exists(),
+        "Plan /redo must settle before all execution persistence"
+    );
 }
 
 #[test]
@@ -9671,6 +10313,8 @@ fn seed_mention_files(a: &App) {
     let _ = std::fs::write(root.join("src/main.rs"), "fn main() {}\n");
     let _ = std::fs::write(root.join("src/lib.rs"), "// lib\n");
     let _ = std::fs::write(root.join("README.md"), "# readme\n");
+    *a.mention_files.borrow_mut() = Some(collect_repo_files(root));
+    a.workspace_scan_handle.borrow_mut().take();
 }
 
 #[test]
@@ -9929,6 +10573,8 @@ fn mention_fuzzy_ranks_path_match_above_incidental_hit() {
     let _ = std::fs::create_dir_all(root.join("src"));
     let _ = std::fs::write(root.join("src/main.rs"), "");
     let _ = std::fs::write(root.join("domain_libs.rs"), "");
+    *a.mention_files.borrow_mut() = Some(collect_repo_files(&root));
+    a.workspace_scan_handle.borrow_mut().take();
     for c in "@main".chars() {
         let _ = a.apply_key(KeyCode::Char(c));
     }
@@ -10297,7 +10943,7 @@ fn seed_transcript_geometry(a: &App) {
 }
 
 #[test]
-fn transcript_copy_sets_toast_without_growing_history() {
+fn transcript_selection_extracts_without_claiming_clipboard_success() {
     let mut a = fresh_app(Some("offline"));
     a.lang = umadev_i18n::Lang::En;
     seed_transcript_geometry(&a);
@@ -10311,10 +10957,7 @@ fn transcript_copy_sets_toast_without_growing_history() {
     a.selection_extend(4, 0);
     assert_eq!(a.selection_finish_copy().as_deref(), Some("row6"));
 
-    assert_eq!(
-        a.copy_toast_text(),
-        Some(umadev_i18n::tf(a.lang, "tui.copied", &["4"]).as_str())
-    );
+    assert_eq!(a.copy_toast_text(), None);
     assert_eq!(
         (
             a.history.len(),
@@ -10479,10 +11122,7 @@ fn dragging_over_input_box_selects_and_copies_the_substring() {
     let copied = a.input_selection_finish_copy();
     assert_eq!(copied.as_deref(), Some("hello"));
     assert!(!a.input_selection_dragging, "mouse-up ends the input drag");
-    assert_eq!(
-        a.copy_toast_text(),
-        Some(umadev_i18n::tf(a.lang, "tui.copied", &["5"]).as_str())
-    );
+    assert_eq!(a.copy_toast_text(), None);
     assert_eq!(
         (
             a.history.len(),
@@ -10543,8 +11183,8 @@ fn input_copy_normalizes_crlf_and_counts_wide_glyphs_as_characters() {
     );
     assert_eq!(
         a.copy_toast_text(),
-        Some(umadev_i18n::tf(a.lang, "tui.copied", &["3"]).as_str()),
-        "two wide glyphs plus one newline are three characters, not UTF-8 bytes or cells"
+        None,
+        "text extraction must not claim OS clipboard success"
     );
 }
 

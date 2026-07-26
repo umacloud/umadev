@@ -193,14 +193,13 @@ fn detect_boot_id() -> String {
         return id.split_whitespace().collect();
     }
     #[cfg(target_os = "macos")]
-    if let Ok(out) = std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "kern.boottime"])
-        .output()
     {
-        if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .collect();
+        let mut command = std::process::Command::new("/usr/sbin/sysctl");
+        command.args(["-n", "kern.boottime"]);
+        if let Some(out) = run_bounded_unix_probe(command, 4 * 1024, 4 * 1024) {
+            if let Ok(stdout) = std::str::from_utf8(&out.stdout) {
+                return stdout.split_whitespace().collect();
+            }
         }
     }
     #[cfg(windows)]
@@ -412,11 +411,13 @@ pub(crate) fn hostname() -> String {
     // command is missing or errors we just return empty.
     #[cfg(unix)]
     {
-        if let Ok(out) = std::process::Command::new("uname").arg("-n").output() {
-            if out.status.success() {
-                let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !h.is_empty() {
-                    return h;
+        let mut command = std::process::Command::new("/usr/bin/uname");
+        command.arg("-n");
+        if let Some(out) = run_bounded_unix_probe(command, 4 * 1024, 4 * 1024) {
+            if let Ok(stdout) = std::str::from_utf8(&out.stdout) {
+                let hostname = stdout.trim();
+                if !hostname.is_empty() {
+                    return hostname.to_string();
                 }
             }
         }
@@ -432,20 +433,22 @@ pub(crate) fn hostname() -> String {
 ///   we lack permission, which still proves it is alive); a "no such process"
 ///   failure proves it is gone. Implemented via `/bin/kill` semantics through
 ///   `Command`, with no `libc` dependency.
-/// - **Windows**: `tasklist /FI "PID eq <pid>"` and look for the PID in output.
+/// - **Windows**: a native `OpenProcess` + zero-duration process-handle wait,
+///   independent of the machine's UI language and console code page.
 /// - Anything else / probe error → `None`.
 #[cfg(unix)]
 pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
+    if pid == 0 {
+        return None;
+    }
     // `kill -0` sends no signal but performs the permission/existence check.
     // Exit status 0 → exists. Non-zero → distinguish "no such process" (gone)
     // from other errors (unknown). We run the standalone `kill` utility so this
     // stays free of a libc dependency.
-    let out = std::process::Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .output()
-        .ok()?;
-    if out.status.success() {
+    let mut command = std::process::Command::new("/bin/kill");
+    command.arg("-0").arg(pid.to_string());
+    let out = run_bounded_unix_probe_allow_failure(command, 1024, 4 * 1024)?;
+    if out.status.is_some_and(|status| status.success()) {
         return Some(true);
     }
     // `kill -0` failed. Classify by the failure reason:
@@ -454,7 +457,12 @@ pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
     //  - "not permitted"/"permission" → the process EXISTS but is owned by
     //    someone else (alive — never reclaim).
     //  - anything else → unknown; stay conservative (caller uses age fallback).
-    let stderr = String::from_utf8_lossy(&out.stderr).to_lowercase();
+    let stderr = std::str::from_utf8(&out.stderr).ok()?.to_lowercase();
+    classify_failed_kill_probe(&stderr)
+}
+
+#[cfg(unix)]
+fn classify_failed_kill_probe(stderr: &str) -> Option<bool> {
     if stderr.contains("no such process") {
         Some(false)
     } else if stderr.contains("illegal") || stderr.contains("invalid") {
@@ -469,47 +477,46 @@ pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
     }
 }
 
+#[cfg(unix)]
+fn run_bounded_unix_probe(
+    command: std::process::Command,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+) -> Option<umadev_process::BoundedCommandOutput> {
+    let output = run_bounded_unix_probe_allow_failure(command, stdout_bytes, stderr_bytes)?;
+    output
+        .status
+        .is_some_and(|status| status.success())
+        .then_some(output)
+}
+
+#[cfg(unix)]
+fn run_bounded_unix_probe_allow_failure(
+    mut command: std::process::Command,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+) -> Option<umadev_process::BoundedCommandOutput> {
+    command.env("CI", "1").env("LC_ALL", "C").env("LANG", "C");
+    let output = umadev_process::run_bounded_std_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: std::time::Duration::from_secs(2),
+            stdout_bytes,
+            stderr_bytes,
+            reader_grace: std::time::Duration::from_millis(500),
+        },
+    )
+    .ok()?;
+    (!output.timed_out
+        && !output.stdout_truncated
+        && !output.stderr_truncated
+        && output.status.is_some())
+    .then_some(output)
+}
+
 #[cfg(windows)]
 pub(crate) fn pid_is_alive(pid: u32) -> Option<bool> {
-    let out = std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
-        .output()
-        .ok()?;
-    // Classify by what tasklist SAID, not by how it exited. "No tasks are running
-    // which match the specified criteria" — the answer we care about most, a dead
-    // pid — is printed on stdout while the exit status is NON-ZERO on the Windows
-    // builds that matter. Bailing on the status first turned every dead pid into
-    // "unknown", so a crashed owner fell through to the age window: a stranded work
-    // tree stayed stranded for the whole rewind window, and a dead run lock held the
-    // tree for hours. The Unix arm has always classified by the message; this one
-    // now does too.
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
-    .to_lowercase();
-    if said.contains("no tasks") {
-        return Some(false);
-    }
-    // A pid tasklist itself rejects as unusable cannot name a running process.
-    if said.contains("invalid") || said.contains("illegal") {
-        return Some(false);
-    }
-    // A real match is a CSV row carrying the pid as its own quoted field. Match that
-    // exactly — a bare substring search hits the pid inside an image name, a memory
-    // figure, or a session id, and reports a dead pid as alive (which is the one
-    // mistake that must never happen: it makes a stale lock permanent).
-    if said.contains(&format!("\"{pid}\"")) {
-        return Some(true);
-    }
-    // Understood nothing. Say so — the caller falls back to the age window rather
-    // than guessing in either direction.
-    if out.status.success() {
-        Some(false)
-    } else {
-        None
-    }
+    umadev_process::process_is_alive(pid)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -522,4 +529,29 @@ pub(super) fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(all(test, unix))]
+mod probe_tests {
+    use super::{classify_failed_kill_probe, pid_is_alive};
+
+    #[test]
+    fn failed_kill_probe_is_conservative() {
+        assert_eq!(classify_failed_kill_probe("no such process"), Some(false));
+        assert_eq!(
+            classify_failed_kill_probe("invalid process id"),
+            Some(false)
+        );
+        assert_eq!(
+            classify_failed_kill_probe("operation not permitted"),
+            Some(true)
+        );
+        assert_eq!(classify_failed_kill_probe("unexpected failure"), None);
+    }
+
+    #[test]
+    fn bounded_kill_probe_recognizes_the_current_process() {
+        assert_eq!(pid_is_alive(0), None);
+        assert_eq!(pid_is_alive(std::process::id()), Some(true));
+    }
 }

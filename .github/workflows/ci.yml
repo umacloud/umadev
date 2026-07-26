@@ -10,6 +10,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
+  UMADEV_CI_RUST: "1.97.0"
+  UMADEV_CI_NODE: "24.18.0"
 
 permissions:
   contents: read
@@ -23,6 +25,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
         with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
           components: rustfmt
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -35,10 +38,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
         with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo clippy
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 
   docs:
     name: strict rustdoc
@@ -47,11 +51,13 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo doc (all features, warnings denied)
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --all-features --no-deps
+        run: cargo doc --workspace --all-features --no-deps --locked
 
   test:
     name: test (${{ matrix.os }})
@@ -64,14 +70,16 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Verify Windows Job Object process-tree teardown
         if: runner.os == 'Windows'
         run: cargo test -p umadev-process --lib --locked -- --test-threads=1
       - name: cargo test
-        run: cargo test --workspace --all-features --all-targets --no-fail-fast
+        run: cargo test --workspace --all-features --all-targets --locked --no-fail-fast
       - name: cargo test (doctests)
-        run: cargo test --workspace --all-features --doc --no-fail-fast
+        run: cargo test --workspace --all-features --doc --locked --no-fail-fast
 
   grok-source-contract:
     name: audited Grok Build source baseline
@@ -82,16 +90,18 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: xai-org/grok-build
-          ref: 3af4d5d39897855bdcc74f23e690024a5dc05573
+          ref: 47348d13ec4508dcfe440e34c6d511bb02998fb2
           path: _upstream/grok-build
           fetch-depth: 1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Verify source identity and audited wire markers
         env:
           UMADEV_GROK_SOURCE_DIR: ${{ github.workspace }}/_upstream/grok-build
-        run: cargo test -p umadev-host --test grok_source_drift -- --nocapture
+        run: cargo test -p umadev-host --test grok_source_drift --locked -- --nocapture
 
   grok-published-contract:
     name: published Grok Build ACP (${{ matrix.os }})
@@ -101,21 +111,23 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            artifact: grok-0.2.106-linux-x86_64
-            sha256: 7180d0e03cc2a496033ff3aae2223ce239446a9827a59faa76091c7edd5e1c38
+            artifact: grok-0.2.112-linux-x86_64
+            sha256: c2867112f7d89366123fe68a55a23dfb027d3602fc5b5b9cd5c080dacb4a2503
             binary: grok
           - os: macos-latest
-            artifact: grok-0.2.106-macos-aarch64
-            sha256: 7229f5e2a69b05832c86db82bebda541e92b5c24958fbfacf5c8f463394d3027
+            artifact: grok-0.2.112-macos-aarch64
+            sha256: 5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4
             binary: grok
           - os: windows-latest
-            artifact: grok-0.2.106-windows-x86_64.exe
-            sha256: a6a25d55daadca0c2458a5aceb4c1873eb7c76964ef307647d079e344c53969a
+            artifact: grok-0.2.112-windows-x86_64.exe
+            sha256: 2469bd182af212c7fcb84f2981999e4e8a6a7a2e4172bad3ae7f787a1f11407c
             binary: grok.exe
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Download and verify the exact official Grok artifact (Unix)
         if: runner.os != 'Windows'
@@ -133,7 +145,7 @@ jobs:
           printf '%s  %s\n' '${{ matrix.sha256 }}' "$binary" | shasum -a 256 --check
           chmod +x "$binary"
           version=$("$binary" --version)
-          [[ "$version" =~ ^grok\ 0\.2\.106\ \([0-9a-f]+\)$ ]]
+          [[ "$version" =~ ^grok\ 0\.2\.112\ \([0-9a-f]+\)$ ]]
           printf 'UMADEV_GROK_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Download and verify the exact official Grok artifact (Windows)
         if: runner.os == 'Windows'
@@ -150,12 +162,12 @@ jobs:
           $actual = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
           if ($actual -ne '${{ matrix.sha256 }}') { throw "Grok artifact SHA-256 mismatch: $actual" }
           $version = (& $binary --version | Out-String).Trim()
-          if ($version -notmatch '^grok 0\.2\.106 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
+          if ($version -notmatch '^grok 0\.2\.112 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
           "UMADEV_GROK_BIN=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify real ACP identity and explicit authentication boundary
         env:
           UMADEV_GROK_PUBLISHED_CONTRACT: "1"
-        run: cargo test -p umadev-host --test grok_published_contract -- --nocapture
+        run: cargo test -p umadev-host --test grok_published_contract --locked -- --nocapture
 
   kimi-source-contract:
     name: audited Kimi Code source baseline
@@ -166,16 +178,18 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: MoonshotAI/kimi-code
-          ref: 4c763f6763acb67a73d133f7450d092e71d63692
+          ref: f4c3967a417a539372eadab6c809d27b8a14c005
           path: _upstream/kimi-code
           fetch-depth: 1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Verify source identity and audited ACP markers
         env:
           UMADEV_KIMI_SOURCE_DIR: ${{ github.workspace }}/_upstream/kimi-code
-        run: cargo test -p umadev-host --test kimi_source_drift -- --nocapture
+        run: cargo test -p umadev-host --test kimi_source_drift --locked -- --nocapture
 
   kimi-published-contract:
     name: published Kimi Code ACP (${{ matrix.os }})
@@ -188,18 +202,20 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22.19.0"
       - name: Install the exact audited npm package
-        run: npm install -g @moonshot-ai/kimi-code@0.28.1
+        run: npm install -g @moonshot-ai/kimi-code@0.29.1
       - name: Verify real ACP identity and terminal-owned authentication
         env:
           KIMI_CODE_HOME: ${{ runner.temp }}/umadev-kimi-code-home
           UMADEV_KIMI_BIN: kimi
           UMADEV_KIMI_PUBLISHED_CONTRACT: "1"
-        run: cargo test -p umadev-host --test kimi_published_contract -- --nocapture
+        run: cargo test -p umadev-host --test kimi_published_contract --locked -- --nocapture
 
   vendor-cli-published-contract:
     name: published vendor CLI contract (${{ matrix.os }})
@@ -229,14 +245,16 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: ${{ env.UMADEV_CI_NODE }}
       - name: Verify native PTY / ConPTY startup, input, and teardown
-        run: cargo test -p umadev --test terminal_pty -- --test-threads=1
+        run: cargo test -p umadev --test terminal_pty --locked -- --test-threads=1
       - name: Verify deterministic TUI terminal contracts
-        run: cargo test -p umadev-tui --lib terminal_contract_ -- --test-threads=1
+        run: cargo test -p umadev-tui --lib terminal_contract_ --locked -- --test-threads=1
       - name: Verify cross-platform npm update contracts
         run: node --test npm/scripts/terminal-contract.test.cjs
 
@@ -262,10 +280,12 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: ${{ env.UMADEV_CI_NODE }}
       - name: Verify Cargo, npm, and website versions
         run: node npm/scripts/verify-version-lock.mjs
       - name: Verify npm registry visibility and retry contracts
@@ -296,9 +316,11 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo build --release
-        run: cargo build --release --bin umadev
+        run: cargo build --release --bin umadev --locked
       # A startup-panic guard: the unit suite never runs the real TUI event loop,
       # so a launch crash (e.g. an eager-evaluated `tokio::select!` branch arg)
       # shipped in 1.0.17/1.0.18 undetected. PTY-launch the built binary and fail

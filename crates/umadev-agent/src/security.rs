@@ -20,7 +20,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+#[cfg(all(test, unix))]
+use std::time::Instant;
 
 use crate::fswalk::{classify_no_follow, EntryKind};
 use chrono::Utc;
@@ -32,6 +35,17 @@ const SCAN_REL_PATH: &str = ".umadev/audit/security-scan.json";
 /// Hard wall-clock ceiling for any single scanner. A scanner that hangs must
 /// not wedge delivery — we kill it and record a `timeout` skip.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Per-stream retention budget for external scanners. Scanner JSON can be
+/// sizeable, so this is deliberately larger than UI diagnostics while still a
+/// hard bound against `yes`/newline-free floods.
+const SCAN_OUTPUT_CAP: usize = 8 * 1024 * 1024;
+
+/// Bounded post-kill grace for pipe readers and direct-child reaping.
+const SCAN_READER_GRACE: Duration = Duration::from_millis(500);
+
+const MAX_SAST_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SAST_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 /// The outcome class of one scanner invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,13 +243,16 @@ fn scan_owned_sast(project_root: &Path) -> Vec<ScanResult> {
     let mut files_scanned = 0usize;
     // Pass 1: full owned SAST over the code source tree.
     // Bound: at most 600 source files (the `source_files` collector caps it too).
-    let src_files = crate::acceptance::source_files(project_root);
+    let source_scan = crate::acceptance::source_scan(project_root);
     // M4 (extended): a walk that hit the file CAP left part of the tree UNSCANNED, so a
     // later "clean" is only clean over what we SAW. `source_files` stops descending once it
     // exceeds the cap, so a returned count past the cap means the tree was truncated.
-    let source_truncated = src_files.len() > crate::acceptance::MAX_SOURCE_FILES;
-    for f in &src_files {
-        let Ok(content) = std::fs::read_to_string(f) else {
+    let mut coverage_incomplete = source_scan.incomplete;
+    let mut read_budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_SAST_TOTAL_BYTES, MAX_SAST_FILE_BYTES);
+    for f in &source_scan.files {
+        let Ok(content) = read_budget.read_utf8_beneath(project_root, f) else {
+            coverage_incomplete = true;
             continue;
         };
         files_scanned += 1;
@@ -250,8 +267,11 @@ fn scan_owned_sast(project_root: &Path) -> Vec<ScanResult> {
     // Dockerfiles, shell, `.properties`/`.ini`), which the code-source collector
     // deliberately skips. A leaked key here was previously invisible.
     if findings.len() < 500 {
-        for f in config_secret_files(project_root) {
-            let Ok(content) = std::fs::read_to_string(&f) else {
+        let config_scan = config_secret_files(project_root);
+        coverage_incomplete |= config_scan.incomplete;
+        for f in config_scan.files {
+            let Ok(content) = read_budget.read_utf8_beneath(project_root, &f) else {
+                coverage_incomplete = true;
                 continue;
             };
             files_scanned += 1;
@@ -298,22 +318,23 @@ fn scan_owned_sast(project_root: &Path) -> Vec<ScanResult> {
         // Be HONEST about partial coverage: a tree past the file cap was only partially
         // walked, so "clean" is clean over the {files_scanned} files we saw — not a
         // whole-tree guarantee. (M4: never assert verified-clean over what wasn't scanned.)
-        let detail = if source_truncated {
-            format!(
-                "no security defects in the {files_scanned} source file(s) scanned \
-                 (UmaDev baseline SAST) — the tree exceeded the {}-file cap, so coverage is \
-                 PARTIAL, not a whole-repo guarantee",
-                crate::acceptance::MAX_SOURCE_FILES
-            )
-        } else {
-            "no security defects in source (UmaDev baseline SAST)".to_string()
-        };
+        if coverage_incomplete {
+            return vec![ScanResult::skipped(
+                TOOL,
+                CAT,
+                format!(
+                    "security scan unavailable as a whole-repo verdict: examined {files_scanned} \
+                     file(s), but at least one source/config file or traversal segment exceeded \
+                     the no-follow byte/entry budget or was unreadable"
+                ),
+            )];
+        }
         return vec![ScanResult {
             tool: TOOL.to_string(),
             category: CAT.to_string(),
             status: ScanStatus::Clean,
             findings: 0,
-            detail,
+            detail: "no security defects in source (UmaDev baseline SAST)".to_string(),
         }];
     }
 
@@ -381,6 +402,16 @@ fn scan_owned_sast(project_root: &Path) -> Vec<ScanResult> {
             ),
         });
     }
+    if coverage_incomplete {
+        rows.push(ScanResult::skipped(
+            TOOL,
+            CAT,
+            format!(
+                "additional security coverage unavailable: {files_scanned} file(s) were examined, \
+                 but at least one file or traversal segment exceeded the no-follow byte/entry budget"
+            ),
+        ));
+    }
     rows
 }
 
@@ -413,21 +444,41 @@ const CONFIG_SKIP_DIRS: &[&str] = &[
 /// [`umadev_governance::is_config_secret_path`] is the single source of truth for
 /// which non-code files are secret-scanned. Fail-open: an unreadable tree yields
 /// an empty list, never an error.
-fn config_secret_files(project_root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_config_secret(project_root, &mut out, 0);
-    out
+#[derive(Debug, Default)]
+struct ConfigSecretScan {
+    files: Vec<PathBuf>,
+    incomplete: bool,
+}
+
+fn config_secret_files(project_root: &Path) -> ConfigSecretScan {
+    let mut scan = ConfigSecretScan::default();
+    let mut entries_seen = 0usize;
+    collect_config_secret(project_root, &mut scan, 0, &mut entries_seen);
+    scan
 }
 
 /// Recursive worker for [`config_secret_files`] (bounded: depth 8, 400 files).
-fn collect_config_secret(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > 8 || out.len() >= 400 {
+fn collect_config_secret(
+    dir: &Path,
+    scan: &mut ConfigSecretScan,
+    depth: usize,
+    entries_seen: &mut usize,
+) {
+    const MAX_CONFIG_FILES: usize = 400;
+    const MAX_CONFIG_ENTRIES: usize = 20_000;
+    if depth > 8 || *entries_seen >= MAX_CONFIG_ENTRIES {
+        scan.incomplete = true;
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
+        if *entries_seen >= MAX_CONFIG_ENTRIES {
+            scan.incomplete = true;
+            break;
+        }
+        *entries_seen += 1;
         let p = e.path();
         // No-follow: a symlink (dir or file) is never traversed, so the
         // secret scan can't be steered OUT of the workspace or into a cycle.
@@ -440,16 +491,20 @@ fn collect_config_secret(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
                 if name.starts_with('.') || CONFIG_SKIP_DIRS.contains(&name) {
                     continue;
                 }
-                collect_config_secret(&p, out, depth + 1);
+                collect_config_secret(&p, scan, depth + 1, entries_seen);
             }
             EntryKind::File => {
                 if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                     if umadev_governance::is_config_secret_path(name) {
-                        out.push(p);
+                        if scan.files.len() >= MAX_CONFIG_FILES {
+                            scan.incomplete = true;
+                            break;
+                        }
+                        scan.files.push(p);
                     }
                 }
             }
-            EntryKind::Skip => {}
+            EntryKind::Skip => scan.incomplete = true,
         }
     }
 }
@@ -493,70 +548,136 @@ pub fn write_security_scan(
     Ok(path)
 }
 
-/// Whether `tool` is resolvable on `PATH`. Uses the platform's `which`/`where`
-/// so a self-test never depends on running the scanner itself. Fail-open:
-/// any spawn error → "not found".
+/// Resolve `tool` without spawning `which`/`where` (which would itself need an
+/// output cap and timeout). Windows honors `PATHEXT`, preferring executable or
+/// batch extensions over npm's same-directory extensionless Unix shim.
+fn tool_path(tool: &str) -> Option<PathBuf> {
+    let path = Path::new(tool);
+    if path.components().count() > 1 || path.is_absolute() {
+        return is_executable_file(path).then(|| path.to_path_buf());
+    }
+    let extensions: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(str::to_string)
+            .chain(std::iter::once(String::new()))
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+    let directories = std::env::var_os("PATH")
+        .as_deref()
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    tool_path_in(tool, &directories, &extensions)
+}
+
+fn tool_path_in(tool: &str, directories: &[PathBuf], extensions: &[String]) -> Option<PathBuf> {
+    for directory in directories {
+        for extension in extensions {
+            let candidate = directory.join(format!("{tool}{extension}"));
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn tool_on_path(tool: &str) -> bool {
-    let probe = if cfg!(windows) { "where" } else { "which" };
-    Command::new(probe)
-        .arg(tool)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    tool_path(tool).is_some()
 }
 
 /// Run `cmd` with `args` in `cwd`, capped at [`SCAN_TIMEOUT`]. Returns
-/// `(exit_code, combined_output)` on completion, or `None` on spawn failure /
-/// timeout. The thread-less timeout is a poll loop on `try_wait` — we avoid
-/// pulling tokio into a synchronous, fail-open scan path.
+/// separate stdout/stderr on completion, or `None` on spawn failure, timeout,
+/// or oversized stdout. Both pipes are continuously drained into bounded tails;
+/// a process group / Job Object owns descendants and reader completion is
+/// bounded even when a grandchild inherits a pipe.
 fn run_capped(cmd: &str, args: &[&str], cwd: &Path) -> Option<(i32, String, String)> {
-    use std::io::Read;
-    use std::process::Stdio;
-    let mut child = Command::new(cmd)
-        .args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    // Drain stdout + stderr on their OWN threads: a scanner that writes >64 KiB before it
-    // exits would otherwise fill the pipe buffer, BLOCK the child, and stall the try_wait
-    // loop until the timeout (the M2 deadlock). Returning stdout and stderr SEPARATELY also
-    // lets a JSON caller parse stdout without the progress text a tool writes to stderr -
-    // merging them made cargo audit --json / pip-audit parse-fail on every run (S-H3).
-    let mut stdout_pipe = child.stdout.take()?;
-    let mut stderr_pipe = child.stderr.take()?;
-    let out_h = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    });
-    let err_h = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    });
-    let start = Instant::now();
-    let code = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(-1),
-            Ok(None) => {
-                if start.elapsed() > SCAN_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = out_h.join();
-                    let _ = err_h.join();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return None,
-        }
-    };
-    let stdout = out_h.join().unwrap_or_default();
-    let stderr = err_h.join().unwrap_or_default();
-    Some((code, stdout, stderr))
+    let captured = run_capped_with_limits(
+        cmd,
+        args,
+        cwd,
+        SCAN_TIMEOUT,
+        SCAN_OUTPUT_CAP,
+        SCAN_READER_GRACE,
+    )?;
+    // Truncated JSON is not valid scanner evidence. Fail-open to an Error row,
+    // never accidentally classify a suffix as a clean scan.
+    if captured.stdout_truncated {
+        return None;
+    }
+    if captured.stderr_truncated {
+        tracing::warn!(scanner = cmd, "scanner stderr exceeded the bounded tail");
+    }
+    Some((
+        captured.code,
+        String::from_utf8_lossy(&captured.stdout).into_owned(),
+        String::from_utf8_lossy(&captured.stderr).into_owned(),
+    ))
+}
+
+struct CappedRun {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+fn run_capped_with_limits(
+    cmd: &str,
+    args: &[&str],
+    cwd: &Path,
+    timeout: Duration,
+    output_cap: usize,
+    reader_grace: Duration,
+) -> Option<CappedRun> {
+    let program = tool_path(cmd).unwrap_or_else(|| PathBuf::from(cmd));
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd).env("CI", "1");
+    let output = umadev_process::run_bounded_std_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout,
+            stdout_bytes: output_cap,
+            stderr_bytes: output_cap,
+            reader_grace,
+        },
+    )
+    .ok()?;
+    if output.timed_out {
+        return None;
+    }
+    Some(CappedRun {
+        code: output.status?.code().unwrap_or(-1),
+        stdout: output.stdout,
+        stderr: output.stderr,
+        stdout_truncated: output.stdout_truncated,
+        stderr_truncated: output.stderr_truncated,
+    })
 }
 
 // =====================================================================
@@ -896,6 +1017,110 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn write_scanner_script(directory: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = directory.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_resolution_skips_non_executable_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let shadow = first.join("scanner");
+        std::fs::write(&shadow, "not executable").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let executable = write_scanner_script(&second, "scanner", "exit 0");
+
+        assert_eq!(
+            tool_path_in("scanner", &[first, second], &[String::new()]),
+            Some(executable)
+        );
+        assert_eq!(tool_path(shadow.to_str().unwrap()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanner_capture_is_bounded_for_newline_free_output() {
+        let temp = TempDir::new().unwrap();
+        let scanner = write_scanner_script(
+            temp.path(),
+            "flood-scanner",
+            "head -c 524288 /dev/zero | tr '\\0' x; printf 'TAIL-SENTINEL'",
+        );
+        let started = Instant::now();
+        let output = run_capped_with_limits(
+            scanner.to_str().unwrap(),
+            &[],
+            temp.path(),
+            Duration::from_secs(5),
+            4096,
+            Duration::from_secs(1),
+        )
+        .expect("newline-free scanner flood must complete under a bounded tail");
+        assert_eq!(output.code, 0);
+        assert!(output.stdout_truncated);
+        assert_eq!(output.stdout.len(), 4096);
+        assert!(output.stdout.ends_with(b"TAIL-SENTINEL"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn scanner_kills_descendant_that_holds_both_pipes_open() {
+        let temp = TempDir::new().unwrap();
+        let pid_file = temp.path().join("scanner-leaf.pid");
+        let scanner = write_scanner_script(
+            temp.path(),
+            "fork-scanner",
+            &format!(
+                "sleep 30 & leaf=$!; printf '%s' \"$leaf\" > '{}'; printf done; exit 0",
+                pid_file.display()
+            ),
+        );
+        let started = Instant::now();
+        let output = run_capped_with_limits(
+            scanner.to_str().unwrap(),
+            &[],
+            temp.path(),
+            Duration::from_secs(5),
+            4096,
+            Duration::from_secs(1),
+        )
+        .expect("wrapper exit must not block on descendant-held pipes");
+        assert_eq!(output.stdout, b"done");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "bounded readers waited for the 30-second descendant"
+        );
+
+        let leaf = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(leaf, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            unsafe { libc::kill(leaf, 0) },
+            0,
+            "scanner descendant survived whole-tree teardown"
+        );
+    }
+
     #[test]
     fn empty_repo_skips_everything_fail_open() {
         // A bare temp dir has no lockfiles and (in CI) likely no gitleaks, so the
@@ -1226,13 +1451,31 @@ mod tests {
 
         // No regression: the in-tree `.env` is still collected.
         assert!(
-            found.iter().any(|p| p == &ws.path().join(".env")),
+            found.files.iter().any(|p| p == &ws.path().join(".env")),
             "in-tree config secret file must still be scanned: {found:?}"
         );
         // The scan must not be steered OUTSIDE the workspace via the symlink.
         assert!(
-            !found.iter().any(|p| p.to_string_lossy().contains("escape")),
+            !found
+                .files
+                .iter()
+                .any(|p| p.to_string_lossy().contains("escape")),
             "config-secret walk must not traverse an escaping symlink: {found:?}"
         );
+    }
+
+    #[test]
+    fn oversized_source_never_produces_a_false_clean_sast_verdict() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("src/huge.rs"),
+            vec![b'x'; MAX_SAST_FILE_BYTES + 1],
+        )
+        .unwrap();
+
+        let rows = scan_owned_sast(tmp.path());
+        assert!(rows.iter().all(|row| row.status != ScanStatus::Clean));
+        assert!(rows.iter().any(|row| row.status == ScanStatus::Skipped));
     }
 }

@@ -9,17 +9,25 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+#[cfg(all(test, unix))]
+use std::process::Stdio;
+use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::Engine as _;
 
 /// Maximum accepted clipboard image size. The complete PNG is removed when it
 /// crosses this boundary; it is never silently truncated.
 pub(crate) const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MAX_CLEANUP_ENTRIES: usize = 1_024;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+const WSLPATH_TIMEOUT: Duration = Duration::from_secs(1);
+const WSLPATH_OUTPUT_BYTES: usize = 64 * 1024;
+const HELPER_READER_GRACE: Duration = Duration::from_millis(500);
 const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 static NEXT_IMAGE: AtomicU64 = AtomicU64::new(1);
 
@@ -39,9 +47,11 @@ on error errMsg number errNum
 end try
 end run";
 
-const WINDOWS_SCRIPT: &str = "$img = [Windows.Forms.Clipboard]::GetImage(); \
+const WINDOWS_SCRIPT: &str = "$target = [Text.Encoding]::Unicode.GetString(\
+[Convert]::FromBase64String('{target_base64}')); \
+$img = [Windows.Forms.Clipboard]::GetImage(); \
 if ($null -eq $img) { exit 1 }; \
-$img.Save($args[0], [System.Drawing.Imaging.ImageFormat]::Png); \
+$img.Save($target, [System.Drawing.Imaging.ImageFormat]::Png); \
 $img.Dispose()";
 
 /// Result delivered back to the UI loop after the blocking capture finishes.
@@ -84,6 +94,25 @@ struct CommandPlan {
     missing_hint: Option<&'static str>,
 }
 
+#[derive(Debug)]
+enum HelperError {
+    Io(io::Error),
+    TimedOut,
+    OutputTooLarge(u64),
+}
+
+impl From<io::Error> for HelperError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[derive(Debug)]
+struct HelperOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
 /// Cheap, pure preflight used before spawning the blocking worker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Preflight {
@@ -102,6 +131,32 @@ pub(crate) fn preflight(remote: bool, tmux: bool, offline: bool) -> Preflight {
         Preflight::Offline
     } else {
         Preflight::Ready
+    }
+}
+
+pub(crate) fn start_capture(
+    app: &mut crate::app::App,
+    in_flight: &mut bool,
+    tx: &tokio::sync::mpsc::UnboundedSender<CaptureResult>,
+) {
+    let offline = matches!(app.brain_spec(), crate::BrainSpec::Offline);
+    match preflight(
+        crate::clipboard::clipboard_is_remote(),
+        crate::clipboard::clipboard_in_tmux(),
+        offline,
+    ) {
+        Preflight::Ready if !*in_flight => {
+            *in_flight = true;
+            let root = app.project_root.clone();
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.send(capture(&root));
+            });
+        }
+        Preflight::Ready => {}
+        Preflight::Remote => app.push_clipboard_image_notice("clipboard.image.remote", &[]),
+        Preflight::Tmux => app.push_clipboard_image_notice("clipboard.image.tmux", &[]),
+        Preflight::Offline => app.push_clipboard_image_notice("clipboard.image.offline", &[]),
     }
 }
 
@@ -131,7 +186,7 @@ pub(crate) fn capture(project_root: &Path) -> CaptureResult {
         Platform::X11 => linux_plan(false),
     };
 
-    run_plan(&plan, &target)
+    run_plan(&plan, project_root, &target)
 }
 
 /// Best-effort retention sweep. Only generated `.png` regular files older than
@@ -142,7 +197,7 @@ pub(crate) fn cleanup_old(project_root: &Path) {
         return;
     };
     let now = SystemTime::now();
-    for entry in entries.flatten() {
+    for entry in entries.flatten().take(MAX_CLEANUP_ENTRIES) {
         let path = entry.path();
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
@@ -231,6 +286,12 @@ fn macos_plan(target: &Path) -> CommandPlan {
 }
 
 fn windows_plan(target: &OsString) -> CommandPlan {
+    // Windows PowerShell does not populate `$args` from tokens placed after
+    // `-Command`; it appends those tokens to the command text instead. Embed
+    // the generated path as UTF-16LE Base64 so the script remains one final,
+    // ASCII-only argument and path characters can never become PowerShell.
+    let target_base64 = windows_path_base64(target);
+    let script = WINDOWS_SCRIPT.replace("{target_base64}", &target_base64);
     CommandPlan {
         program: "powershell.exe",
         args: vec![
@@ -241,13 +302,28 @@ fn windows_plan(target: &OsString) -> CommandPlan {
             OsString::from("-STA"),
             OsString::from("-Command"),
             OsString::from(format!(
-                "Add-Type -AssemblyName System.Windows.Forms; {WINDOWS_SCRIPT}"
+                "Add-Type -AssemblyName System.Windows.Forms; {script}"
             )),
-            target.clone(),
         ],
         output: OutputMode::Direct,
         missing_hint: None,
     }
+}
+
+fn windows_path_base64(target: &OsString) -> String {
+    #[cfg(windows)]
+    let wide = {
+        use std::os::windows::ffi::OsStrExt as _;
+        target.as_os_str().encode_wide().collect::<Vec<_>>()
+    };
+    #[cfg(not(windows))]
+    let wide = target.to_string_lossy().encode_utf16().collect::<Vec<_>>();
+
+    let bytes = wide
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn linux_plan(wayland: bool) -> CommandPlan {
@@ -271,80 +347,213 @@ fn linux_plan(wayland: bool) -> CommandPlan {
     }
 }
 
-fn run_plan(plan: &CommandPlan, target: &Path) -> CaptureResult {
+fn run_bounded_stdout_helper(
+    program: &str,
+    args: &[OsString],
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<HelperOutput, HelperError> {
+    let mut command = Command::new(program);
+    command.args(args);
+    let output = umadev_process::run_bounded_std_command_strict_stdout(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout,
+            stdout_bytes: max_bytes,
+            stderr_bytes: 0,
+            reader_grace: HELPER_READER_GRACE,
+        },
+    )?;
+    if output.stdout_truncated {
+        return Err(HelperError::OutputTooLarge(
+            u64::try_from(max_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        ));
+    }
+    if output.timed_out {
+        return Err(HelperError::TimedOut);
+    }
+    let status = output.status.ok_or_else(|| {
+        HelperError::Io(io::Error::other("clipboard helper exited without status"))
+    })?;
+    Ok(HelperOutput {
+        status,
+        stdout: output.stdout,
+    })
+}
+
+fn run_bounded_direct_helper(
+    plan: &CommandPlan,
+    target: &Path,
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<ExitStatus, HelperError> {
+    let mut command = Command::new(plan.program);
+    command.args(&plan.args);
+    let output = umadev_process::run_bounded_std_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            reader_grace: HELPER_READER_GRACE,
+        },
+    )?;
+    if let Ok(meta) = fs::symlink_metadata(target) {
+        if !umadev_state::fs::metadata_is_real_file(&meta) {
+            return Err(HelperError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "clipboard image target changed identity",
+            )));
+        }
+        if meta.len() > max_bytes {
+            return Err(HelperError::OutputTooLarge(meta.len()));
+        }
+    }
+    if output.timed_out {
+        return Err(HelperError::TimedOut);
+    }
+    output
+        .status
+        .ok_or_else(|| HelperError::Io(io::Error::other("clipboard helper exited without status")))
+}
+
+fn run_plan(plan: &CommandPlan, project_root: &Path, target: &Path) -> CaptureResult {
+    run_plan_with_limits(plan, project_root, target, CAPTURE_TIMEOUT, MAX_IMAGE_BYTES)
+}
+
+fn run_plan_with_limits(
+    plan: &CommandPlan,
+    project_root: &Path,
+    target: &Path,
+    timeout: Duration,
+    max_bytes: u64,
+) -> CaptureResult {
     // A generated name must never overwrite an existing user file.
-    if target.exists() {
+    if fs::symlink_metadata(target).is_ok()
+        || target.strip_prefix(project_root).is_err()
+        || !target_parent_is_beneath(project_root, target)
+    {
         return CaptureResult::Failed;
     }
 
-    let mut command = Command::new(plan.program);
-    command
-        .args(&plan.args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-
-    let child = match plan.output {
-        OutputMode::Direct => command.stdout(Stdio::null()).spawn(),
-        OutputMode::Stdout => {
-            let Ok(file) = OpenOptions::new().write(true).create_new(true).open(target) else {
-                return CaptureResult::Failed;
-            };
-            command.stdout(Stdio::from(file)).spawn()
-        }
-    };
-
-    let mut child = match child {
-        Ok(child) => child,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let _ = fs::remove_file(target);
-            return plan
-                .missing_hint
-                .map_or(CaptureResult::Failed, CaptureResult::MissingTool);
-        }
-        Err(_) => {
-            let _ = fs::remove_file(target);
-            return CaptureResult::Failed;
-        }
-    };
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < CAPTURE_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    let Some(status) = status else {
-        let _ = fs::remove_file(target);
+    if plan.output == OutputMode::Direct && create_target_exclusive(target).is_err() {
         return CaptureResult::Failed;
+    }
+
+    let status = match plan.output {
+        OutputMode::Direct => match run_bounded_direct_helper(plan, target, timeout, max_bytes) {
+            Ok(status) => status,
+            Err(error) => return helper_failure_result(error, plan.missing_hint, target),
+        },
+        OutputMode::Stdout => {
+            let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let output = match run_bounded_stdout_helper(plan.program, &plan.args, timeout, limit) {
+                Ok(output) => output,
+                Err(error) => return helper_failure_result(error, plan.missing_hint, target),
+            };
+            if !output.status.success() {
+                let _ = fs::remove_file(target);
+                return CaptureResult::NoImage;
+            }
+            let written =
+                create_target_exclusive(target).and_then(|mut file| file.write_all(&output.stdout));
+            if written.is_err() {
+                let _ = fs::remove_file(target);
+                return CaptureResult::Failed;
+            }
+            output.status
+        }
     };
     if !status.success() {
         let _ = fs::remove_file(target);
         return CaptureResult::NoImage;
     }
-    finish_capture(target)
+    finish_capture_with_limit(project_root, target, max_bytes)
 }
 
-fn finish_capture(target: &Path) -> CaptureResult {
-    let Ok(meta) = fs::metadata(target) else {
+fn target_parent_is_beneath(project_root: &Path, target: &Path) -> bool {
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    let (Ok(root), Ok(parent)) = (project_root.canonicalize(), parent.canonicalize()) else {
+        return false;
+    };
+    parent.starts_with(root)
+        && fs::symlink_metadata(parent)
+            .is_ok_and(|meta| umadev_state::fs::metadata_is_real_dir(&meta))
+}
+
+fn create_target_exclusive(target: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(target)?;
+    if !file
+        .metadata()
+        .is_ok_and(|meta| umadev_state::fs::metadata_is_real_file(&meta))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "clipboard image target is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn helper_failure_result(
+    error: HelperError,
+    missing_hint: Option<&'static str>,
+    target: &Path,
+) -> CaptureResult {
+    let _ = fs::remove_file(target);
+    match error {
+        HelperError::OutputTooLarge(len) => CaptureResult::TooLarge(len),
+        HelperError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
+            missing_hint.map_or(CaptureResult::Failed, CaptureResult::MissingTool)
+        }
+        HelperError::Io(_) | HelperError::TimedOut => CaptureResult::Failed,
+    }
+}
+
+#[cfg(test)]
+fn finish_capture(project_root: &Path, target: &Path) -> CaptureResult {
+    finish_capture_with_limit(project_root, target, MAX_IMAGE_BYTES)
+}
+
+fn finish_capture_with_limit(project_root: &Path, target: &Path, max_bytes: u64) -> CaptureResult {
+    let Ok(relative) = target.strip_prefix(project_root) else {
         return CaptureResult::Failed;
     };
+    let Ok(meta) = fs::symlink_metadata(target) else {
+        return CaptureResult::Failed;
+    };
+    if !umadev_state::fs::metadata_is_real_file(&meta) {
+        let _ = fs::remove_file(target);
+        return CaptureResult::Failed;
+    }
     let len = meta.len();
-    if len > MAX_IMAGE_BYTES {
+    if len > max_bytes {
         let _ = fs::remove_file(target);
         return CaptureResult::TooLarge(len);
     }
-    let mut signature = [0_u8; PNG_SIGNATURE.len()];
-    let valid = File::open(target)
-        .and_then(|mut file| file.read_exact(&mut signature))
-        .is_ok()
-        && signature == PNG_SIGNATURE;
+    let Ok(bytes) = umadev_state::fs::read_bounded_beneath(project_root, relative, max_bytes)
+    else {
+        let _ = fs::remove_file(target);
+        return CaptureResult::Failed;
+    };
+    let valid = bytes.starts_with(&PNG_SIGNATURE);
     if !valid {
         let _ = fs::remove_file(target);
         return CaptureResult::NoImage;
@@ -364,19 +573,19 @@ fn windows_target_path(target: &Path) -> Option<OsString> {
         return Some(target.as_os_str().to_owned());
     }
     // WSL's PowerShell is a Windows process and cannot open a Linux `/home/...`
-    // path. `wslpath` is part of WSL and performs the boundary conversion.
-    let output = Command::new("wslpath")
-        .args(["-w", "--"])
-        .arg(target)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    // path. `wslpath` is part of WSL and performs the boundary conversion. It is
+    // still an external PATH helper, so run it under the same whole-tree,
+    // wall-time, and output-size envelope as image capture rather than using the
+    // unbounded `Command::output()` convenience API.
+    let args = [OsString::from("-w"), OsString::from("--"), target.into()];
+    let output =
+        run_bounded_stdout_helper("wslpath", &args, WSLPATH_TIMEOUT, WSLPATH_OUTPUT_BYTES).ok()?;
     if !output.status.success() {
         return None;
     }
     let path = String::from_utf8(output.stdout).ok()?;
-    Some(OsString::from(path.trim()))
+    let path = path.trim();
+    (!path.is_empty()).then(|| OsString::from(path))
 }
 
 #[cfg(test)]
@@ -391,7 +600,7 @@ mod tests {
 
     #[test]
     fn windows_argv_locks_sta_and_never_interpolates_the_path_into_script() {
-        let path = OsString::from(r"C:\Users\我\shot path.png");
+        let path = OsString::from(r"C:\Users\我\shot '); Write-Output pwned; #.png");
         let plan = windows_plan(&path);
         let args = strings(&plan.args);
         assert_eq!(plan.program, "powershell.exe");
@@ -400,9 +609,22 @@ mod tests {
             ["-NoProfile", "-NonInteractive", "-STA", "-Command"]
         );
         assert!(args[4].contains("System.Windows.Forms"));
-        assert!(args[4].contains("$args[0]"));
-        assert!(!args[4].contains("shot path.png"));
-        assert_eq!(args[5], r"C:\Users\我\shot path.png");
+        assert!(args[4].contains("[Convert]::FromBase64String"));
+        assert!(args[4].contains("[Text.Encoding]::Unicode.GetString"));
+        assert!(!args[4].contains("Write-Output pwned"));
+        assert!(!args[4].contains(r"C:\Users"));
+        assert_eq!(args.len(), 5, "-Command must be the final argument");
+
+        let encoded = windows_path_base64(&path);
+        assert!(args[4].contains(&format!("'{encoded}'")));
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let wide = bytes
+            .chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(String::from_utf16(&wide).unwrap(), path.to_string_lossy());
     }
 
     #[test]
@@ -483,21 +705,266 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let valid = root.path().join("valid.png");
         fs::write(&valid, [PNG_SIGNATURE.as_slice(), b"body"].concat()).unwrap();
-        assert_eq!(finish_capture(&valid), CaptureResult::Image(valid.clone()));
+        assert_eq!(
+            finish_capture(root.path(), &valid),
+            CaptureResult::Image(valid.clone())
+        );
 
         let invalid = root.path().join("invalid.png");
         fs::write(&invalid, b"not a png").unwrap();
-        assert_eq!(finish_capture(&invalid), CaptureResult::NoImage);
+        assert_eq!(
+            finish_capture(root.path(), &invalid),
+            CaptureResult::NoImage
+        );
         assert!(!invalid.exists());
 
         let large = root.path().join("large.png");
         let file = File::create(&large).unwrap();
         file.set_len(MAX_IMAGE_BYTES + 1).unwrap();
         assert_eq!(
-            finish_capture(&large),
+            finish_capture(root.path(), &large),
             CaptureResult::TooLarge(MAX_IMAGE_BYTES + 1)
         );
         assert!(!large.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_symlink_never_reads_or_writes_outside_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.png");
+        let outside_bytes = [PNG_SIGNATURE.as_slice(), b"outside"].concat();
+        fs::write(&outside_file, &outside_bytes).unwrap();
+        let target = root.path().join("capture.png");
+        std::os::unix::fs::symlink(&outside_file, &target).unwrap();
+
+        assert_eq!(finish_capture(root.path(), &target), CaptureResult::Failed);
+        assert_eq!(fs::read(&outside_file).unwrap(), outside_bytes);
+
+        std::os::unix::fs::symlink(&outside_file, &target).unwrap();
+        let plan = CommandPlan {
+            program: "sh",
+            args: vec![
+                OsString::from("-c"),
+                OsString::from("printf overwritten > \"$1\""),
+                OsString::from("umadev-clipboard-image-test"),
+                target.as_os_str().to_owned(),
+            ],
+            output: OutputMode::Direct,
+            missing_hint: None,
+        };
+        assert_eq!(
+            run_plan_with_limits(
+                &plan,
+                root.path(),
+                &target,
+                Duration::from_secs(1),
+                MAX_IMAGE_BYTES,
+            ),
+            CaptureResult::Failed
+        );
+        assert_eq!(fs::read(&outside_file).unwrap(), outside_bytes);
+    }
+
+    #[cfg(unix)]
+    fn shell_plan(script: &str, args: &[&Path]) -> CommandPlan {
+        let mut command_args = vec![
+            OsString::from("-c"),
+            OsString::from(script),
+            OsString::from("umadev-clipboard-image-test"),
+        ];
+        command_args.extend(args.iter().map(|path| path.as_os_str().to_owned()));
+        CommandPlan {
+            program: "sh",
+            args: command_args,
+            output: OutputMode::Stdout,
+            missing_hint: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn read_test_pid(path: &Path) -> u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Ok(pid) = fs::read_to_string(path)
+                .and_then(|body| body.trim().parse::<u32>().map_err(io::Error::other))
+            {
+                return pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper never published its descendant pid"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    fn unix_process_exists(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn assert_process_reaped(pid: u32) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while unix_process_exists(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !unix_process_exists(pid),
+            "clipboard helper descendant {pid} survived whole-tree cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_stdout_wrapper_kills_pipe_holding_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("captured.png");
+        let fixture = root.path().join("fixture.png");
+        let pid_file = root.path().join("owner.pid");
+        fs::write(&fixture, [PNG_SIGNATURE.as_slice(), b"body"].concat()).unwrap();
+        let plan = shell_plan(
+            r#"cat "$2"; sleep 30 & printf '%s' "$!" > "$1"; exit 0"#,
+            &[&pid_file, &fixture],
+        );
+
+        assert_eq!(
+            run_plan_with_limits(
+                &plan,
+                root.path(),
+                &target,
+                Duration::from_secs(2),
+                MAX_IMAGE_BYTES,
+            ),
+            CaptureResult::Image(target.clone())
+        );
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&fixture).unwrap());
+        assert_process_reaped(read_test_pid(&pid_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_stdout_wrapper_reaps_pipe_holding_descendant_and_reader() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("failed.png");
+        let fixture = root.path().join("fixture.png");
+        let pid_file = root.path().join("failed-owner.pid");
+        fs::write(&fixture, [PNG_SIGNATURE.as_slice(), b"body"].concat()).unwrap();
+        let plan = shell_plan(
+            r#"cat "$2"; sleep 30 & printf '%s' "$!" > "$1"; exit 7"#,
+            &[&pid_file, &fixture],
+        );
+        let started = std::time::Instant::now();
+
+        assert_eq!(
+            run_plan_with_limits(
+                &plan,
+                root.path(),
+                &target,
+                Duration::from_secs(2),
+                MAX_IMAGE_BYTES,
+            ),
+            CaptureResult::NoImage
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!target.exists());
+        assert_process_reaped(read_test_pid(&pid_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_direct_wrapper_kills_background_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("direct.png");
+        let fixture = root.path().join("fixture.png");
+        let pid_file = root.path().join("direct.pid");
+        fs::write(&fixture, [PNG_SIGNATURE.as_slice(), b"body"].concat()).unwrap();
+        let plan = CommandPlan {
+            program: "sh",
+            args: vec![
+                OsString::from("-c"),
+                OsString::from(r#"cat "$3" > "$2"; sleep 30 & printf '%s' "$!" > "$1"; exit 0"#),
+                OsString::from("umadev-clipboard-image-test"),
+                pid_file.as_os_str().to_owned(),
+                target.as_os_str().to_owned(),
+                fixture.as_os_str().to_owned(),
+            ],
+            output: OutputMode::Direct,
+            missing_hint: None,
+        };
+
+        assert_eq!(
+            run_plan_with_limits(
+                &plan,
+                root.path(),
+                &target,
+                Duration::from_secs(2),
+                MAX_IMAGE_BYTES,
+            ),
+            CaptureResult::Image(target.clone())
+        );
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&fixture).unwrap());
+        assert_process_reaped(read_test_pid(&pid_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_stdout_wrapper_times_out_and_kills_descendant() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("blocked.png");
+        let pid_file = root.path().join("blocked.pid");
+        let plan = shell_plan(r#"sleep 30 & printf '%s' "$!" > "$1"; wait"#, &[&pid_file]);
+        let started = std::time::Instant::now();
+
+        assert_eq!(
+            run_plan_with_limits(
+                &plan,
+                root.path(),
+                &target,
+                Duration::from_millis(100),
+                MAX_IMAGE_BYTES,
+            ),
+            CaptureResult::Failed
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!target.exists());
+        assert_process_reaped(read_test_pid(&pid_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn flooding_stdout_wrapper_is_capped_and_kills_descendant() {
+        const TEST_LIMIT: u64 = 32 * 1024;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("flood.png");
+        let fixture = root.path().join("fixture.png");
+        let pid_file = root.path().join("flood.pid");
+        fs::write(&fixture, PNG_SIGNATURE).unwrap();
+        let plan = shell_plan(
+            r#"cat "$2"; sh -c 'while [ ! -s "$1" ]; do :; done; exec yes x' sh "$1" & child=$!; printf '%s' "$child" > "$1"; wait"#,
+            &[&pid_file, &fixture],
+        );
+        let started = std::time::Instant::now();
+
+        let result = run_plan_with_limits(
+            &plan,
+            root.path(),
+            &target,
+            Duration::from_secs(2),
+            TEST_LIMIT,
+        );
+        assert!(matches!(result, CaptureResult::TooLarge(len) if len > TEST_LIMIT));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!target.exists(), "oversize output is never materialised");
+        assert_process_reaped(read_test_pid(&pid_file));
     }
 
     #[test]

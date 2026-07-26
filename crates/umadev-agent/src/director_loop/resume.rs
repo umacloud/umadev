@@ -5,6 +5,7 @@
 //! whether such a plan is resumable and for reopening steps whose upstream
 //! artifacts changed after the plan was saved.
 
+use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,10 @@ use crate::plan_state::{self, Plan, StepStatus};
 
 const OPERATIONAL_REVIEW_CHECKPOINT_FILE: &str = "director-operational-review.json";
 const MAX_OPERATIONAL_REVIEW_CHECKPOINT_BYTES: u64 = 16 * 1024;
+const MAX_ARTIFACT_VERSION_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ARTIFACT_VERSION_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OUTPUT_ENTRIES: usize = 256;
+const MAX_CONSECUTIVE_REVIEW_OUTAGES: u8 = 2;
 
 /// The exact review boundary a recoverable host outage parked.
 ///
@@ -39,6 +44,10 @@ pub(super) enum OperationalReviewCheckpoint {
         /// matches, resume must retry that review rather than re-run the doer.
         #[serde(default)]
         review_only: bool,
+        /// Consecutive unavailable review boundaries over the same QC inputs.
+        /// One boundary already includes the per-seat fresh-fork retry.
+        #[serde(default)]
+        consecutive_outages: u8,
     },
     /// Skip already-settled plan steps and retry the final whole-build gate.
     FinalGateReview {
@@ -57,7 +66,108 @@ pub(super) enum OperationalReviewCheckpoint {
         /// checkpoints omit it and resume conservatively without ledger reuse.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         entry_task_run_id: Option<String>,
+        /// Consecutive unavailable review boundaries over the same QC inputs.
+        #[serde(default)]
+        consecutive_outages: u8,
     },
+}
+
+impl OperationalReviewCheckpoint {
+    /// Old checkpoints predate the counter but necessarily represent one outage.
+    pub(super) const fn effective_outages(&self) -> u8 {
+        let recorded = match self {
+            Self::StepReview {
+                consecutive_outages,
+                ..
+            }
+            | Self::FinalGateReview {
+                consecutive_outages,
+                ..
+            } => *consecutive_outages,
+        };
+        if recorded == 0 {
+            1
+        } else {
+            recorded
+        }
+    }
+
+    pub(super) const fn circuit_open(&self) -> bool {
+        self.effective_outages() >= MAX_CONSECUTIVE_REVIEW_OUTAGES
+    }
+}
+
+/// A durable terminal review circuit must still route `/continue` into the
+/// director. Returning `None` would make hosted callers fail open to a fresh run
+/// and replay the task that the circuit just stopped.
+pub fn terminal_review_circuit_reason(root: &Path) -> Option<String> {
+    let checkpoint = load_operational_review_checkpoint(root)?;
+    checkpoint.circuit_open().then(|| {
+        format!(
+            "required review remained unavailable after {} bounded review boundaries; this run is stopped incomplete and cannot be continued. No source repair was started. Start a new /run or send a new requirement when the reviewer service is available",
+            checkpoint.effective_outages()
+        )
+    })
+}
+
+pub(super) fn next_step_review_checkpoint(
+    prior: Option<&OperationalReviewCheckpoint>,
+    step_id: String,
+    qc_source_fingerprint: Option<String>,
+    required_seats: Option<Vec<crate::critics::Seat>>,
+    review_only: bool,
+) -> OperationalReviewCheckpoint {
+    let consecutive_outages = match prior {
+        Some(
+            checkpoint @ OperationalReviewCheckpoint::StepReview {
+                step_id: prior_step,
+                qc_source_fingerprint: prior_fingerprint,
+                required_seats: prior_seats,
+                review_only: prior_review_only,
+                ..
+            },
+        ) if prior_step == &step_id
+            && prior_fingerprint == &qc_source_fingerprint
+            && prior_seats == &required_seats
+            && *prior_review_only == review_only =>
+        {
+            checkpoint.effective_outages().saturating_add(1)
+        }
+        _ => 1,
+    };
+    OperationalReviewCheckpoint::StepReview {
+        step_id,
+        qc_source_fingerprint,
+        required_seats,
+        review_only,
+        consecutive_outages,
+    }
+}
+
+pub(super) fn next_final_review_checkpoint(
+    prior: Option<&OperationalReviewCheckpoint>,
+    qc_source_fingerprint: Option<String>,
+    required_seats: Option<Vec<crate::critics::Seat>>,
+    entry_task_run_id: Option<String>,
+) -> OperationalReviewCheckpoint {
+    let consecutive_outages = match prior {
+        Some(
+            checkpoint @ OperationalReviewCheckpoint::FinalGateReview {
+                qc_source_fingerprint: prior_fingerprint,
+                required_seats: prior_seats,
+                ..
+            },
+        ) if prior_fingerprint == &qc_source_fingerprint && prior_seats == &required_seats => {
+            checkpoint.effective_outages().saturating_add(1)
+        }
+        _ => 1,
+    };
+    OperationalReviewCheckpoint::FinalGateReview {
+        qc_source_fingerprint,
+        required_seats,
+        entry_task_run_id,
+        consecutive_outages,
+    }
 }
 
 /// In-band plan marker for a final-review retry.
@@ -96,7 +206,7 @@ pub(super) fn load_operational_review_checkpoint(
 }
 
 pub(super) fn clear_operational_review_checkpoint(root: &Path) {
-    let _ = std::fs::remove_file(operational_review_checkpoint_path(root));
+    let _ = umadev_state::fs::remove_regular_file(&operational_review_checkpoint_path(root));
 }
 
 /// Whether `plan` still has work left to drive — at least one non-terminal step.
@@ -133,6 +243,14 @@ fn reconcile_plan_with_operational_checkpoint(
     plan: &mut Plan,
     checkpoint: &OperationalReviewCheckpoint,
 ) {
+    if checkpoint.circuit_open() {
+        for step in &mut plan.steps {
+            if matches!(step.status, StepStatus::Pending | StepStatus::Active) {
+                step.status = StepStatus::Blocked;
+            }
+        }
+        return;
+    }
     match checkpoint {
         OperationalReviewCheckpoint::StepReview { step_id, .. } => {
             if let Some(step) = plan.steps.iter_mut().find(|step| step.id == *step_id) {
@@ -188,6 +306,7 @@ pub(super) fn operational_review_checkpoint_for_plan(
                 qc_source_fingerprint: None,
                 required_seats: None,
                 entry_task_run_id: None,
+                consecutive_outages: 0,
             })
     })
 }
@@ -245,27 +364,53 @@ fn artifact_kind_from_name(name: &str) -> Option<crate::critics::ArtifactKind> {
     }
 }
 
-/// Read current document-artifact content versions. Unreadable inputs are skipped.
-fn current_artifact_versions(root: &Path) -> Vec<(String, String)> {
+/// Read current document-artifact content versions. A relevant artifact that
+/// cannot be read completely makes the snapshot unavailable; it is never
+/// silently omitted and mistaken for a complete version set.
+fn current_artifact_versions(root: &Path) -> io::Result<Vec<(String, String)>> {
     let mut versions = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root.join("output")) else {
-        return versions;
-    };
-    for entry in entries.flatten() {
+    let output = root.join("output");
+    match std::fs::symlink_metadata(&output) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(versions),
+        Err(error) => return Err(error),
+    }
+    if !crate::bounded_fs::is_real_directory_beneath(root, &output) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "output directory is a link or outside the project root",
+        ));
+    }
+    let entries = std::fs::read_dir(&output)?;
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+        MAX_ARTIFACT_VERSION_TOTAL_BYTES,
+        MAX_ARTIFACT_VERSION_BYTES,
+    );
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_OUTPUT_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "output directory entry budget exhausted",
+            ));
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
         let filename = entry.file_name().to_string_lossy().into_owned();
         let Some(name) = artifact_name_from_filename(&filename) else {
             continue;
         };
-        if let Ok(content) = std::fs::read_to_string(entry.path()) {
-            versions.push((name.to_string(), crate::critics::artifact_version(&content)));
-        }
+        let content = budget.read_utf8_beneath(root, &entry.path())?;
+        versions.push((name.to_string(), crate::critics::artifact_version(&content)));
     }
-    versions
+    Ok(versions)
 }
 
 /// Record the artifact versions the persisted plan was built against.
 pub(super) fn record_artifact_versions(root: &Path) {
-    let current = current_artifact_versions(root);
+    let Ok(current) = current_artifact_versions(root) else {
+        return;
+    };
     if current.is_empty() {
         return;
     }
@@ -274,7 +419,19 @@ pub(super) fn record_artifact_versions(root: &Path) {
 
 /// Re-open steps whose upstream document artifacts changed since the last save.
 pub(super) fn invalidate_stale_steps(root: &Path, plan: &mut Plan) {
-    let current = current_artifact_versions(root);
+    let Ok(current) = current_artifact_versions(root) else {
+        use crate::critics::ArtifactKind as A;
+        plan.invalidate_stale(&[
+            A::Prd,
+            A::Architecture,
+            A::Uiux,
+            A::ApiContract,
+            A::DataModel,
+            A::DesignTokens,
+            A::Acceptance,
+        ]);
+        return;
+    };
     if current.is_empty() {
         return;
     }
@@ -305,10 +462,11 @@ pub(super) fn invalidate_stale_steps(root: &Path, plan: &mut Plan) {
     plan.invalidate_stale(&kinds);
 }
 
-/// Whether `root` contains an incomplete persisted director-loop plan.
+/// Whether `/continue` must route into the Director: either an incomplete plan
+/// or a terminal review circuit that must return `Failed` instead of replaying.
 #[must_use]
 pub fn has_resumable_director_plan(root: &Path) -> bool {
-    load_resumable_plan(root).is_some()
+    terminal_review_circuit_reason(root).is_some() || load_resumable_plan(root).is_some()
 }
 
 /// Whether `reason` is a RUN-TIME-BUDGET-exhaustion reason — the terminal string a
@@ -346,6 +504,14 @@ pub fn is_budget_pause_reason(reason: &str) -> bool {
 /// the read-only plan probe.
 #[must_use]
 pub fn transient_resume_hint(reason: &str, root: &Path) -> Option<String> {
+    // A terminal review receipt can coexist with a mechanically incomplete
+    // plan. It is nevertheless not resumable: never let a coincidental 429 or
+    // timeout string advertise `/continue` after the bounded circuit opened.
+    if terminal_review_circuit_reason(root).is_some()
+        || crate::continuous::legacy_operational_review_terminal_reason(root).is_some()
+    {
+        return None;
+    }
     // The plan must still be resumable for EITHER hint — probe once and read its
     // progress for the budget-pause variant (done/total).
     let plan = load_resumable_plan(root)?;
@@ -378,6 +544,21 @@ pub fn has_resumable_run(root: &Path) -> bool {
         if clean_delivery {
             return false;
         }
+    }
+    // The legacy fixed pipeline already consumed its one review-only retry.
+    // This is a terminal receipt, not an interrupted phase: advertising it as
+    // resumable makes the TUI dispatch `/continue` back into a fresh writer
+    // session and recreates the outage loop. A deliberate new `/run` replaces
+    // the workflow state and therefore clears this receipt.
+    if crate::continuous::legacy_operational_review_terminal_reason(root).is_some() {
+        return false;
+    }
+    if terminal_review_circuit_reason(root).is_some() {
+        // User-facing status and slash routing must not advertise a terminal
+        // circuit as resumable. `has_resumable_director_plan` intentionally stays
+        // true for programmatic callers so they route into the inner Failed guard
+        // instead of falling back to a fresh run.
+        return false;
     }
     if load_resumable_plan(root).is_some() {
         return true;
@@ -418,6 +599,35 @@ mod tests {
     }
 
     #[test]
+    fn clearing_a_missing_operational_checkpoint_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        clear_operational_review_checkpoint(temp.path());
+        clear_operational_review_checkpoint(temp.path());
+        assert!(!operational_review_checkpoint_path(temp.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clearing_an_operational_checkpoint_never_follows_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let managed = operational_review_checkpoint_path(temp.path());
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        let outside = temp.path().join("outside-review-receipt.json");
+        std::fs::write(&outside, b"keep").unwrap();
+        symlink(&outside, &managed).unwrap();
+
+        clear_operational_review_checkpoint(temp.path());
+
+        assert!(std::fs::symlink_metadata(&managed)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[test]
     fn transient_hint_fires_only_for_transient_reason_with_resumable_plan() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -431,6 +641,28 @@ mod tests {
             hint.as_deref(),
             Some(umadev_i18n::tl("run.transient_resume_hint")),
             "a rate-limit abort with a resumable plan surfaces the /continue hint"
+        );
+    }
+
+    #[test]
+    fn terminal_review_circuit_never_surfaces_a_transient_resume_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        save_plan(root, StepStatus::Active);
+        save_operational_review_checkpoint(
+            root,
+            &OperationalReviewCheckpoint::FinalGateReview {
+                qc_source_fingerprint: None,
+                required_seats: None,
+                entry_task_run_id: None,
+                consecutive_outages: 2,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            transient_resume_hint("429 too many requests", root).is_none(),
+            "a terminal review circuit cannot advertise /continue even when the latest error text is transient"
         );
     }
 
@@ -526,6 +758,7 @@ mod tests {
                 qc_source_fingerprint: Some("tree-a".to_string()),
                 required_seats: None,
                 entry_task_run_id: None,
+                consecutive_outages: 1,
             },
         )
         .unwrap();
@@ -573,6 +806,7 @@ mod tests {
                 qc_source_fingerprint: None,
                 required_seats: None,
                 entry_task_run_id: None,
+                consecutive_outages: 1,
             },
         )
         .unwrap();

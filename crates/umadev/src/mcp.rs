@@ -54,6 +54,14 @@ const TOOL_GOVERNANCE_SUMMARY: &str = "governance_summary";
 /// and the loop resynchronises to the next newline. Generous — a real
 /// JSON-RPC request is kilobytes, not megabytes.
 const MAX_LINE_BYTES: u64 = 1 << 20;
+const MAX_ARCHITECTURE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_AUDIT_TAIL_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_OUTPUT_ENTRIES: usize = 1_024;
+
+fn managed_utf8(path: &Path, max_bytes: u64) -> Option<String> {
+    let bytes = umadev_state::fs::read_bounded(path, max_bytes).ok()?;
+    String::from_utf8(bytes).ok()
+}
 
 /// Run the MCP server loop: read JSON-RPC requests from stdin, write
 /// responses to stdout. Runs until stdin closes (EOF) or `shutdown` arrives.
@@ -567,21 +575,26 @@ fn find_architecture_doc(root: &Path, explicit_slug: Option<&str>) -> Option<(St
             return None;
         }
         let path = output.join(format!("{slug}-architecture.md"));
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = managed_utf8(&path, MAX_ARCHITECTURE_BYTES)?;
         if text.trim().is_empty() {
             return None;
         }
         return Some((slug.to_string(), text));
     }
-    let rd = std::fs::read_dir(&output).ok()?;
-    for entry in rd.flatten() {
+    let mut entries = std::fs::read_dir(&output)
+        .ok()?
+        .flatten()
+        .take(MAX_OUTPUT_ENTRIES)
+        .collect::<Vec<_>>();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if let Some(slug) = name.strip_suffix("-architecture.md") {
             if slug.is_empty() {
                 continue;
             }
-            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+            if let Some(text) = managed_utf8(&entry.path(), MAX_ARCHITECTURE_BYTES) {
                 if !text.trim().is_empty() {
                     return Some((slug.to_string(), text));
                 }
@@ -888,7 +901,7 @@ const AUDIT_TAIL_LEN: usize = 10;
 /// missing/unreadable log yields an empty vec; unparseable rows are skipped.
 fn read_audit_tail(root: &Path, n: usize) -> Vec<Value> {
     let path = root.join(".umadev").join("audit").join("tool-calls.jsonl");
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = managed_utf8(&path, MAX_AUDIT_TAIL_SOURCE_BYTES) else {
         return Vec::new();
     };
     let mut tail: Vec<Value> = text

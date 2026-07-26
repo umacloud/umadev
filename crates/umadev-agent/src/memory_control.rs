@@ -1470,7 +1470,7 @@ fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
         }
         let mut hasher = Sha256::new();
         let mut measured = 0u64;
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = vec![0u8; 64 * 1024];
         loop {
             let read = file.read(&mut buffer)?;
             if read == 0 {

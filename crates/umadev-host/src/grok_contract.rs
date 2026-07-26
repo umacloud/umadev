@@ -13,10 +13,10 @@ use serde_json::Value;
 pub const GROK_BUILD_SOURCE_REPOSITORY: &str = "https://github.com/xai-org/grok-build";
 
 /// Exact upstream commit used by source-contract drift CI.
-pub const GROK_BUILD_SOURCE_COMMIT: &str = "3af4d5d39897855bdcc74f23e690024a5dc05573";
+pub const GROK_BUILD_SOURCE_COMMIT: &str = "47348d13ec4508dcfe440e34c6d511bb02998fb2";
 
 /// Release used as the current source-audited baseline, never as a runtime pin.
-pub const GROK_BUILD_SOURCE_VERSION: &str = "0.2.109";
+pub const GROK_BUILD_SOURCE_VERSION: &str = "0.2.112";
 
 /// `agent-client-protocol` version used by the audited baseline.
 pub const GROK_BUILD_SOURCE_ACP_VERSION: &str = "0.10.4";

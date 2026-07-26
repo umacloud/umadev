@@ -140,7 +140,9 @@ make_stub bun  "999.0.0"
 make_install "$UPD_TMP/node_modules"
 # The debris a previous EPERM'd upgrade leaves in an npm prefix.
 mkdir -p "$UPD_TMP/node_modules/.umadev-vv1jMlhy" \
-         "$UPD_TMP/node_modules/@umacloud/.cli-win32-x64-AbC123"
+         "$UPD_TMP/node_modules/@umacloud/.cli-win32-x64-AbC123" \
+         "$UPD_TMP/node_modules/.cli-unrelated-AbC123" \
+         "$UPD_TMP/node_modules/@umacloud/.cli-unrelated-AbC123"
 
 # If the shim launched the platform binary for `update`, the stand-in manager
 # would never be called. A `y` on stdin carries the shim past confirmation.
@@ -174,6 +176,11 @@ fi
 if [[ "$UPD_OUT" != *"upgraded and verified"* ]]; then
   echo "✗ smoke.sh: the shim did not verify the upgraded executable" >&2
   echo "$UPD_OUT" >&2
+  exit 1
+fi
+if [[ ! -d "$UPD_TMP/node_modules/.cli-unrelated-AbC123" ]] ||
+   [[ ! -d "$UPD_TMP/node_modules/@umacloud/.cli-unrelated-AbC123" ]]; then
+  echo "✗ smoke.sh: the updater swept an unrelated package-manager staging dir" >&2
   exit 1
 fi
 echo "✓ smoke.sh: update ran in the shim, executable verified, debris swept"

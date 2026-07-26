@@ -1,4 +1,4 @@
-use super::{plan_step_glyph, Action, App, ChatRole};
+use super::{plan_step_glyph, seat_display_name, Action, App, ChatRole};
 
 fn queued_text_preview(text: &str) -> String {
     let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -15,9 +15,10 @@ impl App {
     pub(super) fn show_plan_status(&mut self) {
         self.align_queued_dispatch_kinds();
         let has_plan = !self.plan_steps.is_empty();
+        let has_base_plan = !self.base_session_plan.is_empty();
         let has_review = !self.critic_verdicts.is_empty();
         let has_queue = self.queued_count() > 0;
-        if !has_plan && !has_review && !has_queue {
+        if !has_plan && !has_base_plan && !has_review && !has_queue {
             self.push(ChatRole::System, umadev_i18n::t(self.lang, "plan.none"));
             self.push(
                 ChatRole::System,
@@ -46,9 +47,66 @@ impl App {
                     step.title
                 ));
             }
+
+            // The compact live panel can clip the roster on short terminals. `/plan`
+            // is the scrollable, lossless view promised by that panel, so include
+            // every convened teammate here as well as every plan step.
+            let roster = self.convened_roster();
+            if !roster.is_empty() {
+                body.push('\n');
+                body.push_str(umadev_i18n::t(self.lang, "team.roster.panel.title"));
+                body.push('\n');
+                for seat in &roster {
+                    let status = umadev_i18n::t(self.lang, seat.status.label_key());
+                    let verdict = seat
+                        .verdict
+                        .map(|(accepts, count)| {
+                            if accepts {
+                                format!(" · {}", umadev_i18n::t(self.lang, "plan.review.accept"))
+                            } else {
+                                format!(
+                                    " · {}",
+                                    umadev_i18n::tf(
+                                        self.lang,
+                                        "plan.review.block",
+                                        &[&count.max(1).to_string()],
+                                    )
+                                )
+                            }
+                        })
+                        .unwrap_or_default();
+                    body.push_str(&format!(
+                        "  {} · {status}{verdict}\n",
+                        seat_display_name(self.lang, &seat.role)
+                    ));
+                }
+            }
+        }
+
+        if has_base_plan {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(umadev_i18n::t(self.lang, "base.plan.panel.title"));
+            body.push('\n');
+            for entry in &self.base_session_plan {
+                let status = match entry.status {
+                    umadev_runtime::SessionPlanEntryStatus::Pending => "pending",
+                    umadev_runtime::SessionPlanEntryStatus::InProgress => "active",
+                    umadev_runtime::SessionPlanEntryStatus::Completed => "done",
+                };
+                body.push_str(&format!(
+                    "  {} {}\n",
+                    plan_step_glyph(status),
+                    entry.content
+                ));
+            }
         }
 
         if has_review {
+            if !body.is_empty() {
+                body.push('\n');
+            }
             let accepts = self
                 .critic_verdicts
                 .iter()
@@ -73,10 +131,24 @@ impl App {
                 };
                 body.push_str(&format!("  [{}] {verdict}\n", critic.seat));
                 if !critic.accepts {
-                    for finding in &critic.blocking {
+                    for (index, finding) in critic.blocking.iter().enumerate() {
                         if !finding.trim().is_empty() {
                             body.push_str(&format!("    - {}\n", finding.trim()));
+                            if let Some(fix) = critic.fix_for(index) {
+                                body.push_str(&format!(
+                                    "      {}\n",
+                                    umadev_i18n::tf(self.lang, "plan.review.fix", &[fix])
+                                ));
+                            }
                         }
+                    }
+                }
+                for advisory in &critic.advisory {
+                    if !advisory.trim().is_empty() {
+                        body.push_str(&format!(
+                            "    ~ {}\n",
+                            umadev_i18n::tf(self.lang, "plan.review.advisory", &[advisory.trim()],)
+                        ));
                     }
                 }
             }
@@ -107,6 +179,15 @@ impl App {
                     self.lang,
                     "plan.queue.current_task",
                     &[&position.to_string(), &queued_text_preview(text)],
+                ));
+                body.push('\n');
+                position += 1;
+            }
+            for entry in self.prompt_queue.entries() {
+                body.push_str(&umadev_i18n::tf(
+                    self.lang,
+                    "plan.queue.native",
+                    &[&position.to_string(), &queued_text_preview(&entry.text)],
                 ));
                 body.push('\n');
                 position += 1;

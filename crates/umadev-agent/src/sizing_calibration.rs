@@ -35,6 +35,7 @@ use crate::router::{RouteClass, RoutePlan};
 /// `.umadev/` user-data dir). Distinct from [`crate::first_pass::STATS_FILE`] so the two
 /// orthogonal signals never collide on disk.
 pub const STATS_FILE: &str = ".umadev/sizing-calibration.json";
+const MAX_STATS_BYTES: usize = 2 * 1024 * 1024;
 
 /// Minimum recorded runs for a route-class before its calibration is TRUSTED. Below
 /// this the over/under-size fractions are statistically meaningless, so
@@ -226,7 +227,8 @@ impl SizingStats {
 #[must_use]
 pub fn load(project_root: &Path) -> SizingStats {
     let path = project_root.join(STATS_FILE);
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(text) = crate::bounded_fs::read_utf8_beneath(project_root, &path, MAX_STATS_BYTES)
+    else {
         return SizingStats::default();
     };
     serde_json::from_str::<SizingStats>(&text).unwrap_or_default()
@@ -528,6 +530,18 @@ mod tests {
         let r = route(RouteClass::Build, Depth::Fast);
         record_route(tmp.path(), &r, SizeRank::Heavy);
         assert_eq!(load(tmp.path()).classes.get("build").unwrap().samples, 1);
+    }
+
+    #[test]
+    fn oversized_stats_fail_open_without_becoming_a_signal() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        std::fs::File::create(tmp.path().join(STATS_FILE))
+            .unwrap()
+            .set_len(u64::try_from(MAX_STATS_BYTES + 1).unwrap())
+            .unwrap();
+        assert_eq!(load(tmp.path()), SizingStats::default());
+        assert_eq!(sizing_calibration(tmp.path(), "build"), None);
     }
 
     #[test]

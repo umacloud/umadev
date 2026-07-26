@@ -359,6 +359,7 @@ impl Runtime for CodexDriver {
         req: CompletionRequest,
         on_event: &(dyn Fn(umadev_runtime::StreamEvent) + Send + Sync),
     ) -> Result<CompletionResponse, RuntimeError> {
+        let call_started = std::time::Instant::now();
         let prompt = merge_prompt(&req);
         // Identical args to `complete` (base_args / resume_args — both carry
         // `--json` and the bypass), so streaming also resumes the session on
@@ -373,7 +374,7 @@ impl Runtime for CodexDriver {
 
         // Accumulate the raw stream so a mid-stream failure can salvage whatever
         // already arrived instead of cold-restarting a whole new run.
-        let stream_buf = std::sync::Mutex::new(String::new());
+        let stream_buf = crate::StreamingFallbackBuffer::new();
         let result = run_subprocess_streaming(
             SubprocessCall {
                 program: &program,
@@ -385,10 +386,7 @@ impl Runtime for CodexDriver {
                 env: &[],
             },
             &|line: &str| {
-                if let Ok(mut b) = stream_buf.lock() {
-                    b.push_str(line);
-                    b.push('\n');
-                }
+                stream_buf.push_line(line);
                 if let Some(ev) = parse_codex_stream_line(line) {
                     on_event(ev);
                 }
@@ -423,7 +421,7 @@ impl Runtime for CodexDriver {
                 // exit 143/142 — by its own environment), so `debug!` not a scary
                 // warning. Salvage what already streamed before a full cold restart.
                 tracing::debug!(error = %e, "codex streaming failed, falling back");
-                let partial = stream_buf.into_inner().unwrap_or_default();
+                let partial = stream_buf.into_string();
                 let salvaged = extract_codex_messages(&partial);
                 if !salvaged.trim().is_empty() {
                     let usage = extract_codex_usage(&partial);
@@ -436,9 +434,17 @@ impl Runtime for CodexDriver {
                         },
                     ));
                 }
+                let stream_error = crate::map_subprocess_error(&e);
+                if matches!(stream_error, RuntimeError::Timeout(_, _)) {
+                    return Err(stream_error);
+                }
+                let remaining = timeout.saturating_sub(call_started.elapsed());
+                if remaining.is_zero() {
+                    return Err(stream_error);
+                }
                 drop(args);
                 drop(prompt);
-                self.complete(req).await
+                self.clone().with_timeout(remaining).complete(req).await
             }
         }
     }

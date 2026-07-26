@@ -72,6 +72,12 @@ const LEN_TOL: f64 = 0.5;
 const MAX_DRIFT_FILES: usize = 300;
 /// Max drift findings reported (one directive, not a wall).
 const MAX_DRIFT_FINDINGS: usize = 6;
+/// Hard limits for project-controlled design inputs. A file is either read in
+/// full within these bounds or ignored; a truncated prefix is never parsed as
+/// a complete design contract.
+const MAX_DESIGN_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_TOKEN_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SOURCE_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 /// One design-system finding.
 #[derive(Debug, Clone)]
@@ -184,11 +190,17 @@ pub fn verify_design_system(root: &Path, requirement: &str, register: Register) 
     }
     let mut raw = String::new();
     let mut names = Vec::new();
+    let mut token_budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_TOKEN_TOTAL_BYTES, MAX_DESIGN_FILE_BYTES);
     for f in &files {
-        if let Ok(s) = std::fs::read_to_string(f) {
-            raw.push_str(&s);
-            raw.push('\n');
-        }
+        let Ok(s) = token_budget.read_utf8_beneath(root, f) else {
+            // Parsing only the readable subset would invent a token system that
+            // the project does not actually declare. Preserve this floor's
+            // fail-open contract instead.
+            return Report::default();
+        };
+        raw.push_str(&s);
+        raw.push('\n');
         names.push(rel(root, f));
     }
     // THEMES ARE PARSED SEPARATELY. A token file that declares light AND dark is the
@@ -240,8 +252,18 @@ pub fn verify_design_system(root: &Path, requirement: &str, register: Register) 
             findings.extend(banned_hue_findings_in(theme, ts));
         }
     }
-    findings.extend(drift_findings(root, &tokens));
-    findings.extend(lint_findings(root, register, purple_allowed));
+    let mut source_budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_SOURCE_TOTAL_BYTES, MAX_DESIGN_FILE_BYTES);
+    // Blocking registry rules get first claim on the shared source budget;
+    // advisory drift must never starve the gate that can actually stop a bad
+    // implementation.
+    findings.extend(lint_findings(
+        root,
+        register,
+        purple_allowed,
+        &mut source_budget,
+    ));
+    findings.extend(drift_findings(root, &tokens, &mut source_budget));
 
     Report {
         available: true,
@@ -397,7 +419,9 @@ fn uiux_path(root: &Path, slug: &str) -> PathBuf {
 /// `## `). Empty when the doc or the section is absent.
 #[must_use]
 pub fn visual_direction_section(root: &Path, slug: &str) -> String {
-    let Ok(doc) = std::fs::read_to_string(uiux_path(root, slug)) else {
+    let Ok(doc) =
+        crate::bounded_fs::read_utf8_beneath(root, &uiux_path(root, slug), MAX_DESIGN_FILE_BYTES)
+    else {
         return String::new();
     };
     section_body(&doc, "visual direction")
@@ -514,17 +538,22 @@ pub fn register_from_text(text: &str) -> Register {
 /// words → [`Register::Unknown`] → the full historical law.
 #[must_use]
 pub fn register_for_root(root: &Path, requirement: &str) -> Register {
-    if let Ok(rd) = std::fs::read_dir(root.join("output")) {
-        for e in rd.flatten().take(64) {
-            let p = e.path();
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.ends_with("-uiux.md") {
-                continue;
-            }
-            if let Ok(doc) = std::fs::read_to_string(&p) {
-                let r = register_from_text(&section_body(&doc, "visual direction"));
-                if r != Register::Unknown {
-                    return r;
+    let output = root.join("output");
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_TOKEN_TOTAL_BYTES, MAX_DESIGN_FILE_BYTES);
+    if crate::bounded_fs::is_real_directory_beneath(root, &output) {
+        if let Ok(rd) = std::fs::read_dir(&output) {
+            for e in rd.flatten().take(64) {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.ends_with("-uiux.md") {
+                    continue;
+                }
+                if let Ok(doc) = budget.read_utf8_beneath(root, &p) {
+                    let r = register_from_text(&section_body(&doc, "visual direction"));
+                    if r != Register::Unknown {
+                        return r;
+                    }
                 }
             }
         }
@@ -579,7 +608,7 @@ pub fn register_for_root(root: &Path, requirement: &str) -> Register {
 /// that is actually building UI and already has a UIUX doc.
 #[must_use]
 pub fn visual_direction_findings(root: &Path, slug: &str, needs_ui: bool) -> Vec<Finding> {
-    if !needs_ui || !uiux_path(root, slug).exists() {
+    if !needs_ui || !crate::bounded_fs::is_real_file_beneath(root, &uiux_path(root, slug)) {
         return Vec::new();
     }
     let body = visual_direction_section(root, slug);
@@ -1437,7 +1466,11 @@ fn is_token_or_vendor(p: &Path) -> bool {
         || full.split('/').any(|seg| VENDOR_DIRS.contains(&seg))
 }
 
-fn drift_findings(root: &Path, ts: &TokenSet) -> Vec<Finding> {
+fn drift_findings(
+    root: &Path,
+    ts: &TokenSet,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) -> Vec<Finding> {
     // With no colors AND no type steps declared, we have no allowed-set to
     // compare against — every literal would "drift". Stay silent (fail-open);
     // the schema floor already said the real thing.
@@ -1458,7 +1491,7 @@ fn drift_findings(root: &Path, ts: &TokenSet) -> Vec<Finding> {
         if !UI_EXTS.contains(&ext.as_str()) || is_token_or_vendor(&f) {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&f) else {
+        let Ok(content) = budget.read_utf8_beneath(root, &f) else {
             continue;
         };
         scanned += 1;
@@ -1649,7 +1682,12 @@ fn first_len(lower: &str, prop: &str, reject: impl Fn(f64) -> bool) -> Option<f6
 /// color is violet `#7c3aed`" gets an unconvergeable build: the token rule accepts the
 /// hue (the user asked for it) while this one blocks every component that uses it, and
 /// no edit satisfies both.
-fn lint_findings(root: &Path, register: Register, purple_allowed: bool) -> Vec<Finding> {
+fn lint_findings(
+    root: &Path,
+    register: Register,
+    purple_allowed: bool,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) -> Vec<Finding> {
     let intent = umadev_governance::DesignIntent { purple_allowed };
     let mut out = Vec::new();
     let mut scanned = 0usize;
@@ -1665,7 +1703,7 @@ fn lint_findings(root: &Path, register: Register, purple_allowed: bool) -> Vec<F
         if !UI_EXTS.contains(&ext.as_str()) || is_token_or_vendor(&f) {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&f) else {
+        let Ok(content) = budget.read_utf8_beneath(root, &f) else {
             continue;
         };
         scanned += 1;
@@ -1886,6 +1924,46 @@ mod tests {
         assert!(!r.available, "no token file → unavailable, not a failure");
         assert!(r.findings.is_empty());
         assert!(r.passed(), "an unavailable report conforms vacuously");
+    }
+
+    #[test]
+    fn oversized_or_aggregate_exhausted_tokens_are_not_parsed_as_partial_contracts() {
+        let oversized = tempfile::tempdir().expect("tmp");
+        std::fs::create_dir_all(oversized.path().join("src")).expect("mkdir");
+        std::fs::write(
+            oversized.path().join("src/design-tokens.css"),
+            vec![b' '; MAX_DESIGN_FILE_BYTES + 1],
+        )
+        .expect("write");
+        assert!(!verify_design_system(oversized.path(), "ui", Register::Product).available);
+
+        let aggregate = tempfile::tempdir().expect("tmp");
+        let file_len = MAX_TOKEN_TOTAL_BYTES / 5 + 1024;
+        for index in 0..5 {
+            let dir = aggregate.path().join(format!("area-{index}"));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let mut body = GOOD.to_string();
+            body.push_str(&" ".repeat(file_len - body.len()));
+            std::fs::write(dir.join("design-tokens.css"), body).expect("write");
+        }
+        assert!(file_len <= MAX_DESIGN_FILE_BYTES);
+        assert!(5 * file_len > MAX_TOKEN_TOTAL_BYTES);
+        assert!(!verify_design_system(aggregate.path(), "ui", Register::Product).available);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn visual_direction_rejects_a_symlinked_workspace_document() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(workspace.path().join("output")).expect("mkdir");
+        let secret = outside.path().join("secret.md");
+        std::fs::write(&secret, "## Visual direction\nregister: brand\n").expect("write");
+        symlink(&secret, workspace.path().join("output/demo-uiux.md")).expect("symlink");
+
+        assert!(visual_direction_section(workspace.path(), "demo").is_empty());
     }
 
     #[test]

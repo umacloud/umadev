@@ -61,15 +61,41 @@ pub(crate) const MAX_SOURCE_DEPTH: usize = 16;
 /// report partial (not "clean-verified") coverage — see `security::scan_owned_sast`.
 pub const MAX_SOURCE_FILES: usize = 600;
 
+/// Complete-file and aggregate I/O ceilings for project-controlled source.
+/// Files over the per-file ceiling are unavailable evidence, never partially
+/// parsed as if their prefix represented the whole file.
+pub(crate) const MAX_SOURCE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SOURCE_SCAN_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SOURCE_ENTRIES: usize = 40_000;
+
+#[derive(Debug, Default)]
+pub(crate) struct SourceScan {
+    pub(crate) files: Vec<PathBuf>,
+    pub(crate) incomplete: bool,
+}
+
 /// Recursively collect source files (bounded by depth + file count).
-fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    if depth > MAX_SOURCE_DEPTH || out.len() > MAX_SOURCE_FILES {
+fn collect(
+    root: &Path,
+    dir: &Path,
+    scan: &mut SourceScan,
+    depth: usize,
+    entries_seen: &mut usize,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) {
+    if depth > MAX_SOURCE_DEPTH || *entries_seen >= MAX_SOURCE_ENTRIES {
+        scan.incomplete = true;
         return;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
+        if *entries_seen >= MAX_SOURCE_ENTRIES {
+            scan.incomplete = true;
+            break;
+        }
+        *entries_seen += 1;
         let p = e.path();
         // No-follow: `symlink_metadata` classifies a symlink AS a symlink
         // (`Skip`), so a link inside the tree can never make the walk descend
@@ -81,16 +107,24 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
                 if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                     continue;
                 }
-                collect(&p, out, depth + 1);
+                collect(root, &p, scan, depth + 1, entries_seen, budget);
             }
             EntryKind::File => {
                 if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                    if SRC_EXT.contains(&ext) && is_nontrivial_source(&p, ext) {
-                        out.push(p);
+                    if SRC_EXT.contains(&ext) {
+                        if scan.files.len() >= MAX_SOURCE_FILES {
+                            scan.incomplete = true;
+                            break;
+                        }
+                        match is_nontrivial_source(root, &p, ext, budget) {
+                            Ok(true) => scan.files.push(p),
+                            Ok(false) => {}
+                            Err(_) => scan.incomplete = true,
+                        }
                     }
                 }
             }
-            EntryKind::Skip => {}
+            EntryKind::Skip => scan.incomplete = true,
         }
     }
 }
@@ -106,18 +140,19 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 /// genuinely tiny real file (`fn main(){}`). Fail-open toward the gate's intent: an
 /// unreadable / non-UTF8 file is treated as NOT real source (we cannot confirm its
 /// content), the safe answer for an honesty gate.
-fn is_nontrivial_source(p: &Path, ext: &str) -> bool {
-    match std::fs::read_to_string(p) {
-        Ok(content) => {
-            // `#` is a line comment in these languages; in CSS/SCSS a leading `#` is an
-            // id selector and in Rust `#[…]` an attribute, so `#` must NOT be treated as
-            // a comment there (else a real `#header{…}` stylesheet would mis-read as a
-            // stub).
-            let hash_comments = matches!(ext, "py" | "rb" | "ex" | "exs");
-            has_code_content(&content, hash_comments)
-        }
-        Err(_) => false,
-    }
+fn is_nontrivial_source(
+    root: &Path,
+    p: &Path,
+    ext: &str,
+    budget: &mut crate::bounded_fs::Utf8ReadBudget,
+) -> std::io::Result<bool> {
+    let content = budget.read_utf8_beneath(root, p)?;
+    // `#` is a line comment in these languages; in CSS/SCSS a leading `#` is an
+    // id selector and in Rust `#[…]` an attribute, so `#` must NOT be treated as
+    // a comment there (else a real `#header{…}` stylesheet would mis-read as a
+    // stub).
+    let hash_comments = matches!(ext, "py" | "rb" | "ex" | "exs");
+    Ok(has_code_content(&content, hash_comments))
 }
 
 /// True iff `src` has at least one substantive (non-whitespace, non-comment) line — a
@@ -177,9 +212,23 @@ fn strip_block_comments(src: &str) -> String {
 /// real-time pre-write hook).
 #[must_use]
 pub fn source_files(project_root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    collect(project_root, &mut files, 0);
-    files
+    source_scan(project_root).files
+}
+
+pub(crate) fn source_scan(project_root: &Path) -> SourceScan {
+    let mut scan = SourceScan::default();
+    let mut entries_seen = 0usize;
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_SOURCE_SCAN_BYTES, MAX_SOURCE_FILE_BYTES);
+    collect(
+        project_root,
+        project_root,
+        &mut scan,
+        0,
+        &mut entries_seen,
+        &mut budget,
+    );
+    scan
 }
 
 /// Collect candidate source paths without opening their contents.
@@ -292,12 +341,13 @@ fn find_design_tokens(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
 fn implementation_surface(root: &Path) -> String {
     let files = source_files(root);
     let mut buf = String::new();
+    let mut budget = crate::bounded_fs::Utf8ReadBudget::new(2_000_000, MAX_SOURCE_FILE_BYTES);
     for f in &files {
-        if let Ok(s) = std::fs::read_to_string(f) {
+        if let Ok(s) = budget.read_utf8_beneath(root, f) {
             buf.push_str(&s);
             buf.push('\n');
         }
-        if buf.len() > 2_000_000 {
+        if budget.remaining_bytes() == 0 {
             break;
         }
     }
@@ -310,11 +360,13 @@ fn implementation_surface(root: &Path) -> String {
 #[must_use]
 pub fn code_digest(project_root: &Path, max_bytes: usize) -> String {
     let mut buf = String::new();
+    let mut budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_SOURCE_SCAN_BYTES, MAX_SOURCE_FILE_BYTES);
     for f in source_files(project_root) {
         if buf.len() >= max_bytes {
             break;
         }
-        if let Ok(content) = std::fs::read_to_string(&f) {
+        if let Ok(content) = budget.read_utf8_beneath(project_root, &f) {
             let rel = f.strip_prefix(project_root).unwrap_or(&f);
             buf.push_str(&format!(
                 "\n// ===== {} =====\n",
@@ -369,8 +421,17 @@ fn static_prefix(path: &str) -> &str {
 /// right-aligned tail match (see `umadev_contract::route_registered`).
 #[must_use]
 pub fn task_acceptance_gaps(project_root: &Path, slug: &str) -> Vec<String> {
-    let arch = std::fs::read_to_string(project_root.join(format!("output/{slug}-architecture.md")))
-        .unwrap_or_default();
+    let arch_path = project_root.join(format!("output/{slug}-architecture.md"));
+    let arch = match crate::bounded_fs::read_utf8_beneath(project_root, &arch_path, 4 * 1024 * 1024)
+    {
+        Ok(arch) => arch,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            return vec![format!(
+                "acceptance unavailable: output/{slug}-architecture.md could not be read completely ({error})"
+            )];
+        }
+    };
     if arch.trim().is_empty() {
         return Vec::new();
     }
@@ -379,7 +440,31 @@ pub fn task_acceptance_gaps(project_root: &Path, slug: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    let backend_routes = umadev_contract::extract_backend_routes(project_root);
+    let source_scan = source_scan(project_root);
+    let mut source_budget =
+        crate::bounded_fs::Utf8ReadBudget::new(MAX_SOURCE_SCAN_BYTES, MAX_SOURCE_FILE_BYTES);
+    let mut source_unavailable = source_scan.incomplete;
+    let mut backend_routes = Vec::new();
+    for file in &source_scan.files {
+        let Ok(content) = source_budget.read_utf8_beneath(project_root, file) else {
+            source_unavailable = true;
+            continue;
+        };
+        let relative = file
+            .strip_prefix(project_root)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        backend_routes.extend(umadev_contract::extract_backend_routes_from_content(
+            &relative, &content,
+        ));
+    }
+    if source_unavailable {
+        return vec![
+            "acceptance unavailable: source route scan exceeded its no-follow file/aggregate/entry budget"
+                .to_string(),
+        ];
+    }
     if backend_routes.is_empty() {
         // Fail-open: no recognised backend registration exists anywhere. Preserve
         // the legacy surface behavior so a pure-frontend project — or a backend
@@ -762,5 +847,50 @@ mod tests {
             3,
             "the three real files count, the six stubs don't: {found:?}"
         );
+    }
+
+    #[test]
+    fn oversized_source_is_unavailable_and_marks_the_scan_incomplete() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(
+            tmp.path().join("src/huge.rs"),
+            vec![b'x'; MAX_SOURCE_FILE_BYTES + 1],
+        )
+        .unwrap();
+
+        let scan = source_scan(tmp.path());
+        assert!(scan.files.is_empty());
+        assert!(
+            scan.incomplete,
+            "oversized source must not be treated as fully scanned"
+        );
+    }
+
+    #[test]
+    fn relative_project_root_keeps_source_reads_inside_the_workspace() {
+        let tmp = tempfile::Builder::new()
+            .prefix("umadev-acceptance-relative-")
+            .tempdir_in(".")
+            .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let relative = tmp.path().strip_prefix(cwd).unwrap_or(tmp.path());
+        assert_eq!(source_files(relative).len(), 1);
+    }
+
+    #[test]
+    fn oversized_architecture_is_an_explicit_acceptance_gap() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("output")).unwrap();
+        fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            vec![b'x'; 4 * 1024 * 1024 + 1],
+        )
+        .unwrap();
+        let gaps = task_acceptance_gaps(tmp.path(), "demo");
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].contains("acceptance unavailable"));
     }
 }

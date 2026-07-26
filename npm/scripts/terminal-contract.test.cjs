@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -15,6 +16,7 @@ const {
   REPAIR_COMMANDS,
   runSelfUpdate,
   linuxLibcFromEvidence,
+  registryLatestVersion,
 } = require('../umadev/bin/cli.js');
 
 const PLATFORM_LEAVES = {
@@ -109,6 +111,36 @@ test('terminal contract: EPERM guidance names lock holders and exact repair', ()
   ]) {
     assert.match(message, new RegExp(evidence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
+});
+
+test('terminal contract: an oversized registry response cannot hang update', async (t) => {
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.write('x'.repeat(300_000));
+    // Deliberately never end the response. The client must resolve from its
+    // byte cap rather than waiting for an end/error event that may never come.
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+
+  const previous = process.env.UMADEV_REGISTRY_URL;
+  const address = server.address();
+  process.env.UMADEV_REGISTRY_URL = `http://127.0.0.1:${address.port}`;
+  t.after(() => {
+    if (previous === undefined) delete process.env.UMADEV_REGISTRY_URL;
+    else process.env.UMADEV_REGISTRY_URL = previous;
+  });
+
+  const result = await Promise.race([
+    registryLatestVersion(),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('registry response cap did not settle')), 2_000),
+    ),
+  ]);
+  assert.equal(result, null);
 });
 
 test(

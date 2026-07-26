@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -102,7 +102,10 @@ fn open_read_no_follow(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // `O_NONBLOCK` is inert for regular files and prevents a hostile FIFO
+        // from hanging this process before the post-open file-type check can
+        // reject it.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -456,7 +459,7 @@ fn open_read_source(path: &Path) -> std::io::Result<File> {
 }
 
 pub fn read_bounded(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
-    let mut file = open_read_source(path)?;
+    let file = open_read_source(path)?;
     let length = file.metadata()?.len();
     if length > max_bytes {
         return Err(std::io::Error::new(
@@ -464,8 +467,139 @@ pub fn read_bounded(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
             format!("managed file exceeds {max_bytes} bytes"),
         ));
     }
-    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
-    file.read_to_end(&mut bytes)?;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(length.min(max_bytes))
+            .unwrap_or(0)
+            .min(64 * 1024),
+    );
+    // Metadata is only a preflight: another writer can grow the already-open
+    // file between `metadata()` and EOF. Read at most one byte beyond the
+    // contract so the allocation and I/O remain bounded even in that race.
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("managed file exceeds {max_bytes} bytes while being read"),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Read a workspace-controlled regular file beneath `root` with a hard byte
+/// ceiling and without following symlink/reparse components.
+///
+/// The relative path must contain only normal components. Every ancestor is
+/// inspected before opening, the leaf is opened with the platform's no-follow
+/// flag (`O_NONBLOCK` is also used on Unix), and the opened handle's identity is
+/// checked against the path before any bytes are consumed. The final canonical
+/// path must remain beneath the canonical root. A concurrent grow is bounded by
+/// reading at most one byte beyond `max_bytes` and then rejecting the input.
+pub fn read_bounded_beneath(
+    root: &Path,
+    relative: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "managed input contains an escaping path component",
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed input path is empty",
+        ));
+    }
+
+    let canonical_root = fs::canonicalize(root)?;
+    if !symlink_metadata_path(&canonical_root).is_ok_and(|meta| metadata_is_real_dir(&meta)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed input root is not a real directory",
+        ));
+    }
+
+    let mut path = canonical_root.clone();
+    for (index, part) in parts.iter().enumerate() {
+        path.push(part);
+        let metadata = symlink_metadata_path(&path)?;
+        let is_leaf = index + 1 == parts.len();
+        let accepted = if is_leaf {
+            metadata_is_real_file(&metadata)
+        } else {
+            metadata_is_real_dir(&metadata)
+        };
+        if !accepted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                if is_leaf {
+                    "managed input is not a regular non-link file"
+                } else {
+                    "managed input ancestor is not a real directory"
+                },
+            ));
+        }
+    }
+
+    let before = same_file::Handle::from_path(&path)?;
+    let file = open_read_no_follow(&path)?;
+    let opened = same_file::Handle::from_file(file.try_clone()?)?;
+    if opened != before {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed input changed identity while opening",
+        ));
+    }
+    let canonical_path = fs::canonicalize(&path)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed input resolves outside its trusted root",
+        ));
+    }
+
+    let opened_metadata = file.metadata()?;
+    let length = opened_metadata.len();
+    if length > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("managed file exceeds {max_bytes} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(length.min(max_bytes))
+            .unwrap_or(0)
+            .min(64 * 1024),
+    );
+    (&file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("managed file exceeds {max_bytes} bytes while being read"),
+        ));
+    }
+    let after_metadata = file.metadata()?;
+    let current = same_file::Handle::from_path(&path)?;
+    let stable_metadata = opened_metadata.len() == after_metadata.len()
+        && opened_metadata.modified().ok() == after_metadata.modified().ok()
+        && after_metadata.len() == u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if opened != current || !stable_metadata {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed input changed while it was being read",
+        ));
+    }
     Ok(bytes)
 }
 
@@ -540,6 +674,45 @@ mod tests {
         assert_eq!(
             read_bounded(&path, 3).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn bounded_beneath_read_rejects_oversized_input() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("state")).unwrap();
+        fs::write(temp.path().join("state/value.json"), b"oversized").unwrap();
+        assert_eq!(
+            read_bounded_beneath(temp.path(), Path::new("state/value.json"), 3)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_beneath_read_rejects_linked_ancestors_and_fifo_without_blocking() {
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("value.json"), b"outside").unwrap();
+        symlink(outside.path(), temp.path().join("linked")).unwrap();
+        assert!(read_bounded_beneath(temp.path(), Path::new("linked/value.json"), 64).is_err());
+
+        let fifo = temp.path().join("input.fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let started = Instant::now();
+        assert!(read_bounded_beneath(temp.path(), Path::new("input.fifo"), 64).is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a FIFO must be rejected before a blocking read"
         );
     }
 

@@ -30,6 +30,7 @@ use umadev_spec::SPEC_VERSION;
 
 /// Filename relative to the workspace root.
 pub const MANIFEST_FILENAME: &str = "umadev.yaml";
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 
 /// Conformance level the workspace claims.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -169,7 +170,12 @@ impl SpecManifest {
     /// is always sensible.
     #[must_use]
     pub fn read_from(workspace: &Path) -> Option<Self> {
-        let text = fs::read_to_string(workspace.join(MANIFEST_FILENAME)).ok()?;
+        let text = crate::bounded_fs::read_utf8_beneath(
+            workspace,
+            &workspace.join(MANIFEST_FILENAME),
+            MAX_MANIFEST_BYTES,
+        )
+        .ok()?;
         Some(parse_manifest(&text))
     }
 
@@ -180,8 +186,16 @@ impl SpecManifest {
         fs::create_dir_all(workspace)?;
         let path = workspace.join(MANIFEST_FILENAME);
         let body = self.to_yaml();
-        if path.is_file() && !force {
-            if let Ok(existing) = fs::read_to_string(&path) {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !umadev_state::fs::metadata_is_real_file(&metadata) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{} is not a regular non-link file", path.display()),
+                ));
+            }
+            Ok(_) if !force => {
+                let existing =
+                    crate::bounded_fs::read_utf8_beneath(workspace, &path, MAX_MANIFEST_BYTES)?;
                 if existing == body {
                     return Ok(path); // already canonical
                 }
@@ -195,6 +209,9 @@ impl SpecManifest {
                     ),
                 ));
             }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         fs::write(&path, body)?;
         Ok(path)
@@ -437,6 +454,61 @@ spec:
     fn read_returns_none_when_missing() {
         let tmp = TempDir::new().unwrap();
         assert!(SpecManifest::read_from(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn oversized_manifest_is_unavailable_and_not_silently_overwritten() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(MANIFEST_FILENAME);
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(u64::try_from(MAX_MANIFEST_BYTES + 1).unwrap())
+            .unwrap();
+
+        assert!(SpecManifest::read_from(tmp.path()).is_none());
+        let error = SpecManifest::default()
+            .write_to(tmp.path(), false)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::metadata(path).unwrap().len(),
+            (MAX_MANIFEST_BYTES + 1) as u64
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_link_and_fifo_are_rejected_even_with_force() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_manifest = outside.path().join(MANIFEST_FILENAME);
+        fs::write(&outside_manifest, "outside sentinel").unwrap();
+        let manifest = tmp.path().join(MANIFEST_FILENAME);
+        symlink(&outside_manifest, &manifest).unwrap();
+
+        assert!(SpecManifest::read_from(tmp.path()).is_none());
+        let error = SpecManifest::default()
+            .write_to(tmp.path(), true)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            fs::read_to_string(&outside_manifest).unwrap(),
+            "outside sentinel"
+        );
+
+        fs::remove_file(&manifest).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg(&manifest)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(SpecManifest::read_from(tmp.path()).is_none());
+        let error = SpecManifest::default()
+            .write_to(tmp.path(), true)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

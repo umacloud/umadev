@@ -52,6 +52,14 @@ use crate::critics::{CriticArtifacts, CriticConsult, RoleCritic, RoleVerdict};
 /// project root. Each `*.md` file inside defines one custom review seat.
 const AGENTS_DIR: &[&str] = &[".umadev", "agents"];
 
+/// Discovery and content budgets for project-controlled custom reviewer roles.
+/// A flooded directory or giant role file must not make every automatic review
+/// allocate an attacker-chosen amount of memory.
+const MAX_CUSTOM_ROLE_DIR_ENTRIES: usize = 256;
+const MAX_CUSTOM_ROLE_FILES: usize = 64;
+const MAX_CUSTOM_ROLE_FILE_BYTES: usize = 64 * 1024;
+const MAX_CUSTOM_ROLE_TOTAL_BYTES: usize = 512 * 1024;
+
 /// A user-defined cross-review seat, loaded from a `.umadev/agents/*.md` file.
 ///
 /// Implements [`RoleCritic`] so it convenes on the SAME parallel read-only-fork
@@ -193,24 +201,49 @@ fn section(out: &mut String, label: &str, body: &str, budget: usize, sectioned: 
 /// order so the team order is stable across runs.
 #[must_use]
 pub fn load_custom_roles(project_root: &Path) -> Vec<CustomCritic> {
-    let mut dir = project_root.to_path_buf();
-    for part in AGENTS_DIR {
-        dir.push(part);
+    let managed = project_root.join(AGENTS_DIR[0]);
+    if !crate::bounded_fs::is_real_directory_beneath(project_root, &managed) {
+        return Vec::new();
+    }
+    let dir = managed.join(AGENTS_DIR[1]);
+    if !crate::bounded_fs::is_real_directory_beneath(project_root, &dir) {
+        return Vec::new();
     }
     let Ok(entries) = std::fs::read_dir(&dir) else {
         // No agents dir (the common case) -> no extra roles, team works as today.
         return Vec::new();
     };
-    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    let mut paths = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= MAX_CUSTOM_ROLE_DIR_ENTRIES {
+            // Deterministic fail-open under directory flooding: do not let an
+            // arbitrary filesystem iteration prefix decide which seats join.
+            return Vec::new();
+        }
+        let Ok(entry) = entry else {
+            return Vec::new();
+        };
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("md") {
+            paths.push(path);
+        }
+    }
     paths.sort();
     let mut roles = Vec::new();
-    for path in paths {
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+    let mut total_bytes = 0usize;
+    for path in paths.into_iter().take(MAX_CUSTOM_ROLE_FILES) {
+        let Ok(text) =
+            crate::bounded_fs::read_utf8_beneath(project_root, &path, MAX_CUSTOM_ROLE_FILE_BYTES)
+        else {
             continue;
         };
+        let Some(next_total) = total_bytes.checked_add(text.len()) else {
+            break;
+        };
+        if next_total > MAX_CUSTOM_ROLE_TOTAL_BYTES {
+            break;
+        }
+        total_bytes = next_total;
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -480,6 +513,49 @@ mod tests {
         let roles = load_custom_roles(tmp.path());
         assert_eq!(roles.len(), 1, "only the substantive role survives");
         assert_eq!(roles[0].role_id(), "i18n-reviewer");
+    }
+
+    #[test]
+    fn oversized_role_and_directory_flood_fail_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_role(
+            tmp.path(),
+            "oversized.md",
+            &"x".repeat(MAX_CUSTOM_ROLE_FILE_BYTES + 1),
+        );
+        assert!(load_custom_roles(tmp.path()).is_empty());
+
+        let agents = tmp.path().join(".umadev/agents");
+        std::fs::remove_file(agents.join("oversized.md")).unwrap();
+        for index in 0..=MAX_CUSTOM_ROLE_DIR_ENTRIES {
+            std::fs::write(agents.join(format!("noise-{index:04}.txt")), "x").unwrap();
+        }
+        assert!(
+            load_custom_roles(tmp.path()).is_empty(),
+            "a flooded directory must be bounded and must not select an arbitrary prefix"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_roles_reject_symlinked_file_and_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("escape.md"), "Review everything.").unwrap();
+
+        std::fs::create_dir_all(tmp.path().join(".umadev/agents")).unwrap();
+        symlink(
+            outside.path().join("escape.md"),
+            tmp.path().join(".umadev/agents/escape.md"),
+        )
+        .unwrap();
+        assert!(load_custom_roles(tmp.path()).is_empty());
+
+        std::fs::remove_dir_all(tmp.path().join(".umadev")).unwrap();
+        symlink(outside.path(), tmp.path().join(".umadev")).unwrap();
+        assert!(load_custom_roles(tmp.path()).is_empty());
     }
 
     #[test]

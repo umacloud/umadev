@@ -82,6 +82,8 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+const MAX_INSTALL_DISCOVERY_ENTRIES: usize = 1_024;
+
 pub use acp::{AcpDriver, AcpSession, AcpVendor};
 pub use claude::ClaudeCodeDriver;
 pub use claude_session::ClaudeSession;
@@ -92,6 +94,15 @@ pub use opencode_session::OpenCodeSession;
 
 pub mod process_logs;
 pub mod stderr_tail;
+
+/// Publish UTF-8 text to the native Windows Unicode clipboard.
+///
+/// Platform FFI stays in `umadev-process`; this host-layer seam preserves the
+/// reviewed dependency direction for UI callers.
+#[must_use]
+pub fn set_windows_clipboard_text(text: &str) -> bool {
+    umadev_process::set_windows_clipboard_text(text)
+}
 
 /// The env var UmaDev sets on a base subprocess to mark "UmaDev is driving this
 /// run/session" — its value is the project root being governed.
@@ -408,10 +419,10 @@ fn truncate_on_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..idx]
 }
 
-/// Hard cap on stderr captured from a single-shot base subprocess. A base that
-/// floods stderr can't make us buffer unboundedly — the continuous-session
-/// drivers use a bounded `StderrTail` ring for the same reason; this is the
-/// single-shot equivalent. 256 KiB matches the stdout cap in [`run_subprocess`].
+/// Hard cap on each pipe retained from a single-shot base subprocess. Readers
+/// keep draining after this threshold but retain only the newest tail, so a
+/// flooding base can neither grow memory without bound nor block on a full pipe.
+const STDOUT_CAPTURE_CAP: usize = 262_144;
 const STDERR_CAPTURE_CAP: usize = 262_144;
 
 /// Hard cap on stdout accumulated by [`run_subprocess_streaming`] — mirrors the
@@ -420,6 +431,42 @@ const STDERR_CAPTURE_CAP: usize = 262_144;
 /// line buffer without bound. Past the cap we stop accumulating and append a
 /// single truncation marker; live streaming to `on_line` is unaffected.
 const STREAM_STDOUT_CAP: usize = 262_144;
+
+/// Hard cap for one newline-delimited streaming record. The reader continues
+/// through the delimiter while retaining only this tail.
+const STREAM_LINE_CAP: usize = 262_144;
+const STREAM_LINE_QUEUE_DEPTH: usize = 32;
+
+/// Bounded salvage buffer used by legacy CLI drivers while a streaming call is
+/// in flight. It keeps only the newest bytes: a base may emit indefinitely many
+/// records before failing, but fallback recovery must never turn that stream
+/// into an unbounded `String`.
+pub(crate) struct StreamingFallbackBuffer(std::sync::Mutex<umadev_process::BoundedTail>);
+
+impl StreamingFallbackBuffer {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Mutex::new(umadev_process::BoundedTail::new(
+            STREAM_STDOUT_CAP,
+        )))
+    }
+
+    pub(crate) fn push_line(&self, line: &str) {
+        let mut tail = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tail.push(line.as_bytes());
+        tail.push(b"\n");
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        let tail = self
+            .0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&tail.into_bytes()).into_owned()
+    }
+}
 
 /// Bounded grace for draining a child's stderr AFTER it has exited (and for
 /// reaping the concurrent stdin writer). The child is already gone, so this only
@@ -431,6 +478,132 @@ const STREAM_STDOUT_CAP: usize = 262_144;
 /// authoritative) and abort the leaked reader so it can't linger.
 const STDERR_FLUSH_GRACE: Duration = Duration::from_secs(2);
 
+/// Maximum post-signal wait for the direct launcher to be reaped. The model
+/// call's operational deadline is already exhausted on these paths; cleanup is
+/// allowed one small, explicit grace and can never become an unbounded
+/// `child.wait()`.
+const SUBPROCESS_REAP_GRACE: Duration = Duration::from_secs(2);
+
+enum ReadOrExit {
+    Read(Result<std::io::Result<usize>, tokio::time::error::Elapsed>),
+    Exit(std::io::Result<std::process::ExitStatus>),
+}
+
+enum StdoutLineEvent {
+    Line(Vec<u8>),
+    End,
+    Error(std::io::Error),
+}
+
+enum LineOrExit {
+    Line(Result<Option<StdoutLineEvent>, tokio::time::error::Elapsed>),
+    Exit(std::io::Result<std::process::ExitStatus>),
+}
+
+/// Materialize a bounded byte tail, reserving space for a visible marker when
+/// older output was discarded. The result itself never exceeds `capacity`.
+fn marked_tail(tail: umadev_process::BoundedTail, capacity: usize, marker: &[u8]) -> Vec<u8> {
+    let truncated = tail.truncated();
+    let mut bytes = tail.into_bytes();
+    if !truncated || capacity == 0 {
+        return bytes;
+    }
+    let marker = &marker[..marker.len().min(capacity)];
+    let keep = capacity.saturating_sub(marker.len());
+    if bytes.len() > keep {
+        bytes.drain(..bytes.len() - keep);
+    }
+    let mut output = Vec::with_capacity(marker.len().saturating_add(bytes.len()));
+    output.extend_from_slice(marker);
+    output.extend_from_slice(&bytes);
+    output
+}
+
+/// Read through one newline (or EOF) while retaining only a fixed-size tail.
+async fn read_bounded_line<R>(reader: &mut R, capacity: usize) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+
+    let mut tail = umadev_process::BoundedTail::new(capacity);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if tail.total_seen() == 0 {
+                return Ok(None);
+            }
+            let bytes = marked_tail(
+                tail,
+                capacity,
+                b"...[umadev: stdout line truncated; showing tail] ",
+            );
+            return Ok(Some(bytes));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        tail.push(&available[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            let bytes = marked_tail(
+                tail,
+                capacity,
+                b"...[umadev: stdout line truncated; showing tail] ",
+            );
+            return Ok(Some(bytes));
+        }
+        // A permanently-ready pipe can otherwise monopolize the executor while
+        // emitting a newline-free flood. Yield so the deadline timer and cancel
+        // paths are polled even under continuous input.
+        tokio::task::yield_now().await;
+    }
+}
+
+fn spawn_stdout_line_capture(
+    stdout: tokio::process::ChildStdout,
+) -> (
+    tokio::sync::mpsc::Receiver<StdoutLineEvent>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_LINE_QUEUE_DEPTH);
+    let task = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stdout);
+        loop {
+            let (event, terminal) = match read_bounded_line(&mut reader, STREAM_LINE_CAP).await {
+                Ok(Some(line)) => (StdoutLineEvent::Line(line), false),
+                Ok(None) => (StdoutLineEvent::End, true),
+                Err(error) => (StdoutLineEvent::Error(error), true),
+            };
+            if tx.send(event).await.is_err() || terminal {
+                return;
+            }
+        }
+    });
+    (rx, task)
+}
+
+fn record_stream_line(
+    line_buf: &[u8],
+    on_line: &(dyn Fn(&str) + Send + Sync),
+    all_lines: &mut Vec<String>,
+    acc_bytes: &mut usize,
+    stdout_truncated: &mut bool,
+) {
+    let line = String::from_utf8_lossy(line_buf);
+    let line = line.trim_end_matches(['\r', '\n']).to_string();
+    on_line(&line);
+    if *stdout_truncated {
+        return;
+    }
+    if acc_bytes.saturating_add(line.len() + 1) > STREAM_STDOUT_CAP {
+        *stdout_truncated = true;
+        all_lines.push("...[umadev: stdout truncated at 256 KiB]".to_string());
+    } else {
+        *acc_bytes += line.len() + 1;
+        all_lines.push(line);
+    }
+}
+
 /// Spawn a task that drains a child's stderr into a byte buffer, bounded by
 /// [`STDERR_CAPTURE_CAP`] so a flooding base can't grow it without limit. The
 /// caller reaps it via [`reap_bounded`] under [`STDERR_FLUSH_GRACE`] (a leaked
@@ -439,27 +612,24 @@ fn spawn_stderr_capture(
     stderr: Option<tokio::process::ChildStderr>,
 ) -> tokio::task::JoinHandle<Vec<u8>> {
     tokio::spawn(async move {
-        let mut buf = Vec::new();
+        let mut tail = umadev_process::BoundedTail::new(STDERR_CAPTURE_CAP);
         if let Some(mut se) = stderr {
             let mut chunk = [0u8; 8192];
-            // Read until EOF, a read error, or the cap — whichever comes first.
-            // A bare `read_to_end` here is the bug: a grandchild holding the pipe
-            // open makes it never EOF, and there is no size bound.
-            while buf.len() < STDERR_CAPTURE_CAP {
+            // Always drain to EOF. Stopping once the retained buffer is full
+            // merely moves the deadlock into the child: its next stderr write
+            // fills the OS pipe and blocks the whole command.
+            loop {
                 match se.read(&mut chunk).await {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let remaining = STDERR_CAPTURE_CAP - buf.len();
-                        let take = n.min(remaining);
-                        buf.extend_from_slice(&chunk[..take]);
-                        if take < n {
-                            break;
-                        }
-                    }
+                    Ok(n) => tail.push(&chunk[..n]),
                 }
             }
         }
-        buf
+        marked_tail(
+            tail,
+            STDERR_CAPTURE_CAP,
+            b"...[umadev: stderr truncated at 256 KiB; showing tail]\n",
+        )
     })
 }
 
@@ -536,7 +706,12 @@ pub(crate) fn isolate_process_tree(cmd: &mut tokio::process::Command) {
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.as_std_mut().creation_flags(CREATE_NEW_PROCESS_GROUP);
+        const CREATE_SUSPENDED: u32 = 0x0000_0004;
+        // Suspend at creation so the Job Object can be assigned before the
+        // npm/Node wrapper executes or creates a grandchild. `attach` resumes
+        // the process only after assignment succeeds.
+        cmd.as_std_mut()
+            .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -561,40 +736,91 @@ fn taskkill_tree_args(pid: u32) -> [String; 4] {
 /// Best-effort immediate termination of an isolated child and its descendants.
 /// The direct child kill remains a backstop if the platform tree operation is
 /// unavailable or the process already changed groups.
-pub(crate) fn kill_isolated_process_tree(child: &mut tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        #[cfg(unix)]
-        {
-            if let Ok(pid) = i32::try_from(pid) {
-                let _ = nix::sys::signal::killpg(
-                    nix::unistd::Pid::from_raw(pid),
-                    nix::sys::signal::Signal::SIGKILL,
-                );
-            }
-        }
-        #[cfg(windows)]
-        {
-            // Job Object attachment is the primary path. If Windows rejected
-            // that attachment, synchronously finish this tree fallback before
-            // killing the parent so taskkill can still enumerate descendants.
-            let taskkill = std::env::var_os("SystemRoot")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
-                .join("System32")
-                .join("taskkill.exe");
-            let _ = std::process::Command::new(taskkill)
-                .args(taskkill_tree_args(pid))
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = pid;
+fn kill_isolated_process_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        if let Ok(pid) = i32::try_from(pid) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
         }
     }
+    #[cfg(windows)]
+    {
+        // Job Object attachment is the primary path. If Windows rejected that
+        // attachment, synchronously finish this tree fallback before killing
+        // the parent so taskkill can still enumerate descendants.
+        // Resolve taskkill from the native System32 directory rather than a
+        // mutable environment path. The helper owns a kill-on-close Job, caps
+        // output, and returns within the deadline even if the fallback wedges.
+        let args = taskkill_tree_args(pid);
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let _ = umadev_process::windows_system_command_stdout(
+            std::path::Path::new("taskkill.exe"),
+            &args,
+            Duration::from_secs(2),
+            8 * 1024,
+        );
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+}
+
+pub(crate) fn kill_isolated_process_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        kill_isolated_process_group(pid);
+    }
     let _ = child.start_kill();
+}
+
+/// Terminate the owned process tree, then reap the direct launcher under a
+/// separate bounded cleanup grace. Whole-tree termination happens before the
+/// wait, so even a pathological reap delay cannot leave a live descendant.
+async fn terminate_and_reap_subprocess(
+    child: &mut tokio::process::Child,
+    #[cfg(windows)] process_job: &umadev_process::KillOnCloseJob,
+) {
+    #[cfg(windows)]
+    {
+        process_job.terminate();
+        let _ = child.start_kill();
+    }
+    #[cfg(not(windows))]
+    kill_isolated_process_tree(child);
+
+    let _ = tokio::time::timeout(SUBPROCESS_REAP_GRACE, child.wait()).await;
+}
+
+/// Poll a resident base process without orphaning descendants when its direct
+/// launcher exits first.
+///
+/// On Unix, a plain `try_wait` would reap the process-group leader and make its
+/// numeric PGID unsafe to signal. We observe with `waitid(WNOWAIT)`, kill the
+/// still-anchored group, and only then consume the direct child's status.
+/// Windows keeps tree identity in the session-owned Job Object, so its regular
+/// non-blocking wait remains safe.
+pub(crate) fn try_exit_isolated_process_tree(
+    child: &std::sync::Mutex<tokio::process::Child>,
+) -> Option<std::process::ExitStatus> {
+    let mut child = child.try_lock().ok()?;
+    #[cfg(unix)]
+    {
+        let Some(pid) = child.id() else {
+            return child.try_wait().ok().flatten();
+        };
+        match umadev_process::unix_child_exited_unreaped(pid) {
+            Ok(false) | Err(_) => None,
+            Ok(true) => {
+                kill_isolated_process_tree(&mut child);
+                child.try_wait().ok().flatten()
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().ok().flatten()
+    }
 }
 
 /// Terminate an isolated process tree and reap its direct child within `budget`.
@@ -705,12 +931,16 @@ pub(crate) fn kill_isolated_process_tree_blocking(child: &std::sync::Mutex<tokio
 /// The idle and hard-ceiling errors both contain `timed out` (so they classify
 /// as a retriable `Timeout`, preserving the prior write-then-hang behaviour) but
 /// are textually distinguishable (`… of stdout silence`).
+#[allow(clippy::too_many_lines)] // one subprocess lifecycle state machine
 async fn drain_and_wait(
     child: &mut tokio::process::Child,
+    #[cfg(windows)] process_job: &umadev_process::KillOnCloseJob,
+    deadline: Instant,
     timeout: std::time::Duration,
     program: &str,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
-    let started = Instant::now();
+    #[cfg(unix)]
+    let tree_pid = child.id();
 
     // Drain stderr on its own task: a child can flood stderr or hold it open,
     // which would stall a single-task stdout+stderr join AND confuse the
@@ -735,18 +965,23 @@ async fn drain_and_wait(
     );
 
     // Read stdout in chunks with a per-read idle watchdog + first-byte grace.
-    let mut stdout_buf = Vec::new();
+    let mut stdout_tail = umadev_process::BoundedTail::new(STDOUT_CAPTURE_CAP);
+    let mut exited_status = None;
     if let Some(mut stdout) = child.stdout.take() {
         let mut seen_first_byte = false;
         let mut chunk = [0u8; 8192];
         loop {
-            let remaining = timeout.saturating_sub(started.elapsed());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 // Group-kill: the child is isolated in its own process group, so a
                 // direct-child kill would orphan any tool/subagent (or npm-trampoline
                 // native-base) grandchild. See `kill_isolated_process_tree`.
-                kill_isolated_process_tree(child);
-                let _ = child.wait().await;
+                terminate_and_reap_subprocess(
+                    child,
+                    #[cfg(windows)]
+                    process_job,
+                )
+                .await;
                 return Err(format!(
                     "`{program}` timed out after {}s",
                     timeout.as_secs()
@@ -761,35 +996,88 @@ async fn drain_and_wait(
             } else {
                 remaining
             };
-            match tokio::time::timeout(wait, stdout.read(&mut chunk)).await {
-                Ok(Ok(0)) => break, // EOF — stdout closed
-                Ok(Ok(n)) => {
-                    seen_first_byte = true;
-                    stdout_buf.extend_from_slice(&chunk[..n]);
+            let event = tokio::select! {
+                biased;
+                status = child.wait() => ReadOrExit::Exit(status),
+                read = tokio::time::timeout(wait, stdout.read(&mut chunk)) => {
+                    ReadOrExit::Read(read)
                 }
-                Ok(Err(e)) => {
-                    kill_isolated_process_tree(child);
-                    let _ = child.wait().await;
+            };
+            match event {
+                ReadOrExit::Exit(Ok(status)) => {
+                    exited_status = Some(status);
+                    #[cfg(unix)]
+                    if let Some(pid) = tree_pid {
+                        kill_isolated_process_group(pid);
+                    }
+                    #[cfg(windows)]
+                    process_job.terminate();
+
+                    // The direct wrapper is gone, so any remaining bytes are
+                    // already buffered or come from a descendant being torn
+                    // down above. Drain them best-effort under a short grace;
+                    // an inherited fd can never hold this call to the full idle
+                    // timeout after the authoritative child status is known.
+                    let _ = tokio::time::timeout(STDERR_FLUSH_GRACE, async {
+                        loop {
+                            match stdout.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => stdout_tail.push(&chunk[..n]),
+                            }
+                        }
+                    })
+                    .await;
+                    break;
+                }
+                ReadOrExit::Exit(Err(e)) => {
+                    #[cfg(unix)]
+                    if let Some(pid) = tree_pid {
+                        kill_isolated_process_group(pid);
+                    }
+                    #[cfg(windows)]
+                    process_job.terminate();
+                    return Err(format!("`{program}` failed: {e}"));
+                }
+                ReadOrExit::Read(Ok(Ok(0))) => break, // EOF — stdout closed
+                ReadOrExit::Read(Ok(Ok(n))) => {
+                    seen_first_byte = true;
+                    stdout_tail.push(&chunk[..n]);
+                }
+                ReadOrExit::Read(Ok(Err(e))) => {
+                    terminate_and_reap_subprocess(
+                        child,
+                        #[cfg(windows)]
+                        process_job,
+                    )
+                    .await;
                     return Err(format!("`{program}` stdout read error: {e}"));
                 }
-                Err(_) if !seen_first_byte => {
+                ReadOrExit::Read(Err(_)) if !seen_first_byte => {
                     // The wait that elapsed was the hard-ceiling remaining time
                     // (idle is not armed before the first byte) — a true silent
                     // hang, reported as the overall timeout.
-                    kill_isolated_process_tree(child);
-                    let _ = child.wait().await;
+                    terminate_and_reap_subprocess(
+                        child,
+                        #[cfg(windows)]
+                        process_job,
+                    )
+                    .await;
                     return Err(format!(
                         "`{program}` timed out after {}s",
                         timeout.as_secs()
                     ));
                 }
-                Err(_) => {
+                ReadOrExit::Read(Err(_)) => {
                     // **Idle timeout** — output started, then no further byte for
                     // `idle_timeout` (a base that hangs while holding the stdout
                     // pipe open). Kill + return a distinguishable, retriable error.
-                    kill_isolated_process_tree(child);
-                    let _ = child.wait().await;
-                    let bytes = stdout_buf.len();
+                    terminate_and_reap_subprocess(
+                        child,
+                        #[cfg(windows)]
+                        process_job,
+                    )
+                    .await;
+                    let bytes = stdout_tail.total_seen();
                     return Err(format!(
                         "`{program}` timed out after {}s of stdout silence (hang while holding the pipe open? bytes so far: {bytes}). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
                         idle_timeout.as_secs()
@@ -802,19 +1090,45 @@ async fn drain_and_wait(
     // stdout drained to EOF — the child is normally exiting now. Bound the exit
     // wait by the remaining hard ceiling so a process that closes stdout but then
     // refuses to exit can't hang us either.
-    let remaining = timeout.saturating_sub(started.elapsed());
-    let status = match tokio::time::timeout(remaining, child.wait()).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("`{program}` failed: {e}")),
-        Err(_) => {
-            kill_isolated_process_tree(child);
-            let _ = child.wait().await;
-            return Err(format!(
-                "`{program}` timed out after {}s",
-                timeout.as_secs()
-            ));
+    let status = if let Some(status) = exited_status {
+        status
+    } else {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, child.wait()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                #[cfg(unix)]
+                if let Some(pid) = tree_pid {
+                    kill_isolated_process_group(pid);
+                }
+                #[cfg(windows)]
+                process_job.terminate();
+                return Err(format!("`{program}` failed: {e}"));
+            }
+            Err(_) => {
+                terminate_and_reap_subprocess(
+                    child,
+                    #[cfg(windows)]
+                    process_job,
+                )
+                .await;
+                return Err(format!(
+                    "`{program}` timed out after {}s",
+                    timeout.as_secs()
+                ));
+            }
         }
     };
+
+    // `wait()` clears Tokio's child id. Retain the original Unix process-group
+    // id so a wrapper that exits after backgrounding a pipe-holding descendant
+    // does not leave that descendant alive for the remainder of its sleep.
+    #[cfg(unix)]
+    if let Some(pid) = tree_pid {
+        kill_isolated_process_group(pid);
+    }
+    #[cfg(windows)]
+    process_job.terminate();
 
     // H1: the child has exited, but a grandchild that inherited the stderr write
     // fd can hold the pipe open so this read never EOFs. Reap under a bounded
@@ -823,6 +1137,11 @@ async fn drain_and_wait(
     let stderr_buf = reap_bounded(stderr_task.into_inner())
         .await
         .unwrap_or_default();
+    let stdout_buf = marked_tail(
+        stdout_tail,
+        STDOUT_CAPTURE_CAP,
+        b"...[umadev: stdout truncated at 256 KiB; showing tail]\n",
+    );
     Ok((status, stdout_buf, stderr_buf))
 }
 
@@ -881,7 +1200,8 @@ pub fn resolve_program(program: &str) -> String {
     //    UMADEV_CLAUDE_BIN / UMADEV_CODEX_BIN / UMADEV_OPENCODE_BIN) pins the
     //    exact path; honored only when it points at a real file, so a stale
     //    override falls through to normal detection instead of blocking it. A
-    //    `.cmd` is fine — spawn_parts still routes it through `cmd /c`.
+    //    `.cmd` is fine — spawn_parts keeps it as a direct, safely encoded
+    //    batch target.
     let override_var = format!(
         "UMADEV_{}_BIN",
         program.to_ascii_uppercase().replace('-', "_")
@@ -1029,6 +1349,47 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     }
 }
 
+/// Read a small base-owned credential/config file without allowing a FIFO or
+/// device node to wedge a login probe. User dotfile symlinks are intentionally
+/// supported: validation is performed on the opened target handle, and the
+/// read is capped even if that regular file grows concurrently.
+pub(crate) fn read_user_file_bounded(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "input is not a regular file",
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("input exceeds {max_bytes} bytes"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0).min(64 * 1024));
+    let mut limited = std::io::Read::take(file, max_bytes.saturating_add(1));
+    std::io::Read::read_to_end(&mut limited, &mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("input exceeds {max_bytes} bytes while being read"),
+        ));
+    }
+    Ok(bytes)
+}
+
 /// The platform data directory a tool stores per-user state in, following
 /// common base-CLI storage conventions:
 ///
@@ -1061,6 +1422,7 @@ fn versioned_node_bins(parent: &std::path::Path) -> Vec<PathBuf> {
     };
     entries
         .flatten()
+        .take(MAX_INSTALL_DISCOVERY_ENTRIES)
         .map(|e| e.path().join("bin"))
         .filter(|p| p.is_dir())
         .collect()
@@ -1144,7 +1506,7 @@ fn known_install_dirs(program: &str) -> Vec<PathBuf> {
         }
         // Homebrew cellar keg-only links: `/opt/homebrew/opt/*/bin`.
         if let Ok(entries) = std::fs::read_dir("/opt/homebrew/opt") {
-            for e in entries.flatten() {
+            for e in entries.flatten().take(MAX_INSTALL_DISCOVERY_ENTRIES) {
                 dirs.push(e.path().join("bin"));
             }
         }
@@ -1159,29 +1521,24 @@ fn known_install_dirs(program: &str) -> Vec<PathBuf> {
     dirs
 }
 
-/// Windows-aware spawn target for a base/tool CLI. `.cmd`/`.bat` shims (how npm
-/// installs `claude` / `codex` / `npm` on Windows) are NOT PE executables, so
-/// `CreateProcess` refuses them with os error 193 ("not a valid Win32
-/// application"). Route those through `cmd /c`. Returns `(program, leading
-/// args)`; callers append their own args after. No-op off Windows.
+/// Resolve a base/tool CLI into a spawn target and any fixed leading arguments.
+///
+/// On Windows `.cmd`/`.bat` files are deliberately handed directly to Rust's
+/// `Command`. Rust recognizes batch files and applies its hardened batch-argument
+/// encoding (including `%VAR%` neutralization and metacharacter quoting). Our old
+/// explicit `cmd /c <shim> <args...>` wrapper bypassed that protection and let
+/// prompts containing `%`, `&`, `|`, `<`, or `>` be expanded or executed by
+/// `cmd.exe`. Modern Rust supports direct batch invocation at this safe API
+/// boundary; arguments it cannot encode safely fail with `InvalidInput` instead
+/// of being reinterpreted.
 #[must_use]
 pub fn spawn_parts(program: &str) -> (String, Vec<String>) {
-    let resolved = resolve_program(program);
-    let ext = std::path::Path::new(&resolved)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if cfg!(windows) && (ext == "cmd" || ext == "bat") {
-        ("cmd".to_string(), vec!["/c".to_string(), resolved])
-    } else {
-        (resolved, Vec::new())
-    }
+    (resolve_program(program), Vec::new())
 }
 
-/// A `std::process::Command` for a base/tool CLI, Windows-aware (`.cmd`/`.bat`
-/// routed through `cmd /c` -- see [`spawn_parts`]). Used by the binary's npm
-/// calls; the host's own async spawns use [`spawn_parts`] directly.
+/// A `std::process::Command` for a resolved base/tool CLI. Windows batch shims
+/// remain direct command targets so the standard library's hardened batch-file
+/// argument encoder is used; see [`spawn_parts`].
 #[must_use]
 pub fn std_command(program: &str) -> std::process::Command {
     let (prog, lead) = spawn_parts(program);
@@ -1194,12 +1551,10 @@ pub fn std_command(program: &str) -> std::process::Command {
 /// large prompt / system-prompt OFF the command line (to the child's stdin, or
 /// for `claude`'s firmware to a temp file passed via `--append-system-prompt-file`).
 ///
-/// Windows `cmd.exe` caps the ENTIRE command line at ~8191 chars, and npm installs
-/// the base CLIs as `.cmd` shims that [`spawn_parts`] invokes as
-/// `cmd /c <resolved path> <args…>` — so on Windows the whole line (program + every
-/// flag + the multi-KB prompt/firmware) must fit under that cap or it is silently
-/// truncated → corrupted generation. 7000 leaves >1000 chars of headroom under 8191
-/// for the `cmd /c` wrapper, the resolved program path, and quoting expansion, while
+/// Windows batch execution caps the ENTIRE command line at ~8191 chars, and npm
+/// installs the base CLIs as `.cmd` shims — so on Windows the whole line (program +
+/// every flag + the multi-KB prompt/firmware) must fit under that cap. 7000 leaves
+/// more than 1000 chars of headroom for the resolved program path and safe quoting expansion, while
 /// keeping every normal prompt on the fast argv path. Off Windows there is no such
 /// per-line cap; the only real bound is Linux's 128 KiB `MAX_ARG_STRLEN` per single
 /// arg, so the budget is a high 120_000 backstop — merged prompts are already capped
@@ -1237,16 +1592,82 @@ fn command_line_budget_from(override_val: Option<&str>) -> usize {
 /// via [`spawn_parts`]'s `lead`). Deterministic; used only to decide argv vs
 /// stdin/file delivery, so a slight over-estimate is the safe direction.
 #[must_use]
+#[cfg(test)]
 pub(crate) fn command_line_len<'a, I: IntoIterator<Item = &'a str>>(tokens: I) -> usize {
+    command_line_len_for_spawn(tokens, false).unwrap_or(usize::MAX)
+}
+
+/// Whether a resolved Windows target is a batch shim. Rust invokes `.cmd`/`.bat`
+/// through its hardened `cmd.exe` encoder; that encoder rejects CR/LF arguments
+/// and expands each `%` to an eight-code-unit escape sequence.
+fn is_windows_batch_program(program: &str) -> bool {
+    std::path::Path::new(program)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+}
+
+/// Estimate the encoded command line. `None` means a regular batch argument
+/// contains CR/LF and cannot be represented by Rust's safe batch encoder.
+fn command_line_len_for_spawn<'a, I>(tokens: I, windows_batch: bool) -> Option<usize>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     // space + up to two quote chars per token, and a wrapper allowance for
-    // `cmd /c ` plus quoting expansion the estimate cannot see per-char.
+    // `cmd /c ` plus resolved executable/path expansion.
     const PER_TOKEN_OVERHEAD: usize = 3;
     const WRAP_OVERHEAD: usize = 512;
-    WRAP_OVERHEAD
-        + tokens
-            .into_iter()
-            .map(|t| t.len() + PER_TOKEN_OVERHEAD)
-            .sum::<usize>()
+    let mut total = WRAP_OVERHEAD;
+    for token in tokens {
+        let encoded = if windows_batch {
+            if token.contains(['\r', '\n']) {
+                return None;
+            }
+            token.encode_utf16().fold(0usize, |len, unit| {
+                // std's batch encoder writes `%%cd:~,%` for every `%`. Treat
+                // every backslash as doubled too: only a subset really is, but
+                // this safely covers quote/trailing-slash expansion.
+                len.saturating_add(match unit {
+                    37 => 8,      // `%`
+                    34 | 92 => 2, // `"` or `\\`
+                    _ => 1,
+                })
+            })
+        } else {
+            token.len()
+        };
+        total = total
+            .saturating_add(encoded)
+            .saturating_add(PER_TOKEN_OVERHEAD);
+    }
+    Some(total)
+}
+
+fn command_line_requires_diversion_for_platform<'a, I>(
+    program: &'a str,
+    tokens: I,
+    budget: usize,
+    windows: bool,
+) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let batch = windows && is_windows_batch_program(program);
+    command_line_len_for_spawn(std::iter::once(program).chain(tokens), batch)
+        .is_none_or(|line| line > budget)
+}
+
+/// Whether these spawn arguments must leave argv for safe, lossless delivery.
+pub(crate) fn command_line_requires_diversion<'a, I>(program: &'a str, tokens: I) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    command_line_requires_diversion_for_platform(
+        program,
+        tokens,
+        command_line_budget(),
+        cfg!(windows),
+    )
 }
 
 /// The EFFECTIVE prompt channel for a call: an [`PromptChannel::Arg`] prompt that
@@ -1265,13 +1686,13 @@ fn effective_prompt_channel(
     if !matches!(call.channel, PromptChannel::Arg) || call.prompt.is_empty() {
         return call.channel;
     }
-    let line = command_line_len(
-        std::iter::once(program)
-            .chain(lead.iter().map(String::as_str))
+    if command_line_requires_diversion(
+        program,
+        lead.iter()
+            .map(String::as_str)
             .chain(call.args.iter().map(String::as_str))
             .chain(std::iter::once(call.prompt)),
-    );
-    if line > command_line_budget() {
+    ) {
         PromptChannel::Stdin
     } else {
         PromptChannel::Arg
@@ -1282,9 +1703,10 @@ fn effective_prompt_channel(
 /// `RuntimeError::HostProcess`.
 pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<SubprocessOutput, String> {
     let started = Instant::now();
+    let deadline = started.checked_add(call.timeout).unwrap_or(started);
     let (program, lead) = spawn_parts(call.program);
     // An oversized `Arg` prompt is delivered via stdin instead, so a Windows `.cmd`
-    // shim (`cmd /c …`, ~8191-char cap) can't truncate it (see
+    // shim's ~8191-character batch command line can't truncate it (see
     // `effective_prompt_channel`). Small prompts / mac+Linux keep the argv fast path.
     let channel = effective_prompt_channel(&call, &program, &lead);
     let mut cmd = Command::new(program);
@@ -1323,7 +1745,8 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     // path) or an explicit group-kill terminates the real base too. Held for the
     // call's lifetime; on the happy path the child has already exited (no-op).
     #[cfg(windows)]
-    let _process_job = umadev_process::KillOnCloseJob::attach(&child);
+    let process_job = umadev_process::KillOnCloseJob::attach(&mut child)
+        .map_err(|error| format!("failed to secure `{}` process tree: {error}", call.program))?;
 
     // M4: write the prompt CONCURRENTLY with draining stdout, not before it. A
     // `write_all` that fully completes before any stdout read DEADLOCKS when the
@@ -1360,7 +1783,15 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     // `drain_and_wait`): the reads themselves must be bounded, or a child that
     // emits output then hangs with its stdout pipe open blocks forever and
     // defeats the timeout.
-    let drained = drain_and_wait(&mut child, call.timeout, call.program).await;
+    let drained = drain_and_wait(
+        &mut child,
+        #[cfg(windows)]
+        &process_job,
+        deadline,
+        call.timeout,
+        call.program,
+    )
+    .await;
     // Reap the writer (the child is now dead/exited, so it returns at once) —
     // before propagating any drain error, so the task can never leak.
     if let Some(writer) = stdin_writer {
@@ -1449,12 +1880,15 @@ pub(crate) fn auth_probe_timeout() -> Duration {
 /// treats "command failed" as indeterminate); when `false`, the stdout is
 /// returned even on a non-zero exit so the caller can inspect a "Not logged in"
 /// message a base prints with a non-zero code. Cross-platform: spawns via
-/// [`spawn_parts`] so a Windows `.cmd` shim is routed through `cmd /c`.
+/// [`spawn_parts`] so a Windows `.cmd` shim uses hardened batch argv encoding.
 pub(crate) async fn run_auth_status(
     program: &str,
     args: &[String],
     success_required: bool,
 ) -> Option<String> {
+    let timeout = auth_probe_timeout();
+    let started = Instant::now();
+    let deadline = started.checked_add(timeout).unwrap_or(started);
     let (prog, lead) = spawn_parts(program);
     let mut cmd = Command::new(prog);
     cmd.args(&lead);
@@ -1472,15 +1906,21 @@ pub(crate) async fn run_auth_status(
     let mut child = spawn_retrying_etxtbsy(&mut cmd).ok()?;
     // Windows kill-on-close Job Object backstop; held for the probe's lifetime.
     #[cfg(windows)]
-    let _process_job = umadev_process::KillOnCloseJob::attach(&child);
+    let process_job = umadev_process::KillOnCloseJob::attach(&mut child).ok()?;
     // Close stdin immediately (EOF) so a status command that peeks stdin in a
     // non-interactive context returns instead of blocking to the timeout.
     drop(child.stdin.take());
 
-    let (status, stdout_buf, stderr_buf) =
-        drain_and_wait(&mut child, auth_probe_timeout(), program)
-            .await
-            .ok()?;
+    let (status, stdout_buf, stderr_buf) = drain_and_wait(
+        &mut child,
+        #[cfg(windows)]
+        &process_job,
+        deadline,
+        timeout,
+        program,
+    )
+    .await
+    .ok()?;
 
     if success_required && !status.success() {
         return None;
@@ -1522,12 +1962,11 @@ pub(crate) async fn run_subprocess_streaming(
     call: SubprocessCall<'_>,
     on_line: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<SubprocessOutput, String> {
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
     let started = Instant::now();
+    let deadline = started.checked_add(call.timeout).unwrap_or(started);
     let (program, lead) = spawn_parts(call.program);
     // An oversized `Arg` prompt is delivered via stdin instead, so a Windows `.cmd`
-    // shim (`cmd /c …`, ~8191-char cap) can't truncate it (see
+    // shim's ~8191-character batch command line can't truncate it (see
     // `effective_prompt_channel`). Small prompts / mac+Linux keep the argv fast path.
     let channel = effective_prompt_channel(&call, &program, &lead);
     let mut cmd = Command::new(program);
@@ -1557,10 +1996,13 @@ pub(crate) async fn run_subprocess_streaming(
             format!("failed to spawn `{}`: {e}", call.program)
         }
     })?;
+    #[cfg(unix)]
+    let tree_pid = child.id();
     // Windows kill-on-close Job Object: the real backstop once the trampoline exits
     // and taskkill can no longer walk to the native grandchild. Held for the call.
     #[cfg(windows)]
-    let _process_job = umadev_process::KillOnCloseJob::attach(&child);
+    let process_job = umadev_process::KillOnCloseJob::attach(&mut child)
+        .map_err(|error| format!("failed to secure `{}` process tree: {error}", call.program))?;
 
     // M4: write the prompt CONCURRENTLY with streaming stdout (see
     // `run_subprocess`) — a >64 KiB prompt that fully writes before any stdout
@@ -1623,6 +2065,7 @@ pub(crate) async fn run_subprocess_streaming(
     // stop ACCUMULATING once past the cap and append a single truncation marker.
     let mut acc_bytes: usize = 0;
     let mut stdout_truncated = false;
+    let mut exited_status = None;
     // **First-line grace.** The idle watchdog measures line-to-line *silence*,
     // which only makes sense once a line has been seen. Some bases (claude /
     // codex with `stream-json` / `--json`) emit lifecycle lines (system/init,
@@ -1639,22 +2082,22 @@ pub(crate) async fn run_subprocess_streaming(
     // wait is bounded by `idle_timeout` (still also capped by the hard ceiling),
     // restoring the mid-stream-hang protection.
     if let Some(stdout) = child.stdout.take() {
-        // Read raw bytes per line and decode LOSSY (not `.lines()`/`next_line`):
-        // `next_line` returns `Err` on a single invalid UTF-8 byte, which the old
-        // `while let Ok(Some)` treated as end-of-stream — discarding the rest of a
-        // long stream-json turn AND emitting a spurious "ended unexpectedly". A
-        // `read_until('\n')` + `from_utf8_lossy` tolerates the bad byte (mirrors
-        // `pump_sse`'s decode) and keeps streaming.
-        let mut reader = BufReader::new(stdout);
-        let mut line_buf = Vec::new();
+        // The reader task owns partial-line state across every process-exit poll;
+        // the main loop only selects on cancellation-safe channel receives.
+        let (mut line_rx, stdout_task) = spawn_stdout_line_capture(stdout);
+        let stdout_task = AbortOnDrop::new(stdout_task);
         let mut seen_first_line = false;
         loop {
-            let remaining = call.timeout.saturating_sub(started.elapsed());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 // Group-kill the isolated tree (see `isolate_process_tree` above):
                 // a direct-child kill would orphan the native base grandchild.
-                kill_isolated_process_tree(&mut child);
-                let _ = child.wait().await;
+                terminate_and_reap_subprocess(
+                    &mut child,
+                    #[cfg(windows)]
+                    &process_job,
+                )
+                .await;
                 return Err(format!(
                     "`{}` timed out after {}s",
                     call.program,
@@ -1670,50 +2113,111 @@ pub(crate) async fn run_subprocess_streaming(
             } else {
                 remaining
             };
-            line_buf.clear();
-            match tokio::time::timeout(wait, reader.read_until(b'\n', &mut line_buf)).await {
-                Ok(Ok(0)) => break, // EOF — stdout closed
-                Ok(Ok(_)) => {
-                    seen_first_line = true;
-                    let line = String::from_utf8_lossy(&line_buf);
-                    let line = line.trim_end_matches(['\r', '\n']).to_string();
-                    on_line(&line);
-                    if !stdout_truncated {
-                        // +1 accounts for the '\n' the final `join` re-inserts.
-                        if acc_bytes.saturating_add(line.len() + 1) > STREAM_STDOUT_CAP {
-                            stdout_truncated = true;
-                            all_lines.push("...[umadev: stdout truncated at 256 KiB]".to_string());
-                        } else {
-                            acc_bytes += line.len() + 1;
-                            all_lines.push(line);
-                        }
-                    }
+            let event = tokio::select! {
+                biased;
+                status = child.wait() => LineOrExit::Exit(status),
+                line = tokio::time::timeout(wait, line_rx.recv()) => {
+                    LineOrExit::Line(line)
                 }
-                Ok(Err(e)) => {
-                    kill_isolated_process_tree(&mut child);
-                    let _ = child.wait().await;
+            };
+            match event {
+                LineOrExit::Exit(Ok(status)) => {
+                    exited_status = Some(status);
+                    #[cfg(unix)]
+                    if let Some(pid) = tree_pid {
+                        kill_isolated_process_group(pid);
+                    }
+                    #[cfg(windows)]
+                    process_job.terminate();
+
+                    // Preserve complete records already buffered after exit,
+                    // bounded in case a descendant still owns the pipe.
+                    let _ = tokio::time::timeout(STDERR_FLUSH_GRACE, async {
+                        while let Some(event) = line_rx.recv().await {
+                            match event {
+                                StdoutLineEvent::Line(line_buf) => record_stream_line(
+                                    &line_buf,
+                                    on_line,
+                                    &mut all_lines,
+                                    &mut acc_bytes,
+                                    &mut stdout_truncated,
+                                ),
+                                StdoutLineEvent::End | StdoutLineEvent::Error(_) => break,
+                            }
+                        }
+                    })
+                    .await;
+                    break;
+                }
+                LineOrExit::Exit(Err(e)) => {
+                    #[cfg(unix)]
+                    if let Some(pid) = tree_pid {
+                        kill_isolated_process_group(pid);
+                    }
+                    #[cfg(windows)]
+                    process_job.terminate();
+                    return Err(format!("`{}` failed: {e}", call.program));
+                }
+                LineOrExit::Line(Ok(Some(StdoutLineEvent::End))) => break,
+                LineOrExit::Line(Ok(Some(StdoutLineEvent::Line(line_buf)))) => {
+                    seen_first_line = true;
+                    record_stream_line(
+                        &line_buf,
+                        on_line,
+                        &mut all_lines,
+                        &mut acc_bytes,
+                        &mut stdout_truncated,
+                    );
+                }
+                LineOrExit::Line(Ok(Some(StdoutLineEvent::Error(e)))) => {
+                    terminate_and_reap_subprocess(
+                        &mut child,
+                        #[cfg(windows)]
+                        &process_job,
+                    )
+                    .await;
                     return Err(format!("`{}` stdout read error: {e}", call.program));
                 }
-                Err(_) if !seen_first_line => {
+                LineOrExit::Line(Ok(None)) => {
+                    terminate_and_reap_subprocess(
+                        &mut child,
+                        #[cfg(windows)]
+                        &process_job,
+                    )
+                    .await;
+                    return Err(format!(
+                        "`{}` stdout reader ended unexpectedly",
+                        call.program
+                    ));
+                }
+                LineOrExit::Line(Err(_)) if !seen_first_line => {
                     // The wait that elapsed was the hard-ceiling remaining time
                     // (the idle sub-timeout is not armed before the first line),
                     // so a timeout here means we hit `call.timeout` with no output
                     // at all — a true hang, reported as the overall timeout.
-                    kill_isolated_process_tree(&mut child);
-                    let _ = child.wait().await;
+                    terminate_and_reap_subprocess(
+                        &mut child,
+                        #[cfg(windows)]
+                        &process_job,
+                    )
+                    .await;
                     return Err(format!(
                         "`{}` timed out after {}s",
                         call.program,
                         call.timeout.as_secs()
                     ));
                 }
-                Err(_) => {
+                LineOrExit::Line(Err(_)) => {
                     // **Idle timeout** — the stream went live, then no further
                     // line for `idle_timeout` (the stream-json hang scenario,
                     // #53584). Kill + return a distinguishable error so callers
                     // can retry.
-                    kill_isolated_process_tree(&mut child);
-                    let _ = child.wait().await;
+                    terminate_and_reap_subprocess(
+                        &mut child,
+                        #[cfg(windows)]
+                        &process_job,
+                    )
+                    .await;
                     let lines_so_far = all_lines.len();
                     return Err(format!(
                         "`{}` idle timeout: no stdout for {}s (stream-json hang? lines so far: {lines_so_far}). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
@@ -1723,29 +2227,54 @@ pub(crate) async fn run_subprocess_streaming(
                 }
             }
         }
+        drop(line_rx);
+        let _ = reap_bounded(stdout_task.into_inner()).await;
     }
 
     // H2: bound the exit wait by the remaining hard ceiling (asymmetric with the
     // single-shot `drain_and_wait`, which already does this). A base that closes
     // stdout then lingers in teardown — or a grandchild that keeps the process
     // group busy — would otherwise hang here past `call.timeout` forever.
-    let remaining = call.timeout.saturating_sub(started.elapsed());
-    let status = match tokio::time::timeout(remaining, child.wait()).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("`{}` failed: {e}", call.program)),
-        Err(_) => {
-            kill_isolated_process_tree(&mut child);
-            let _ = child.wait().await;
-            if let Some(writer) = stdin_writer {
-                let _ = reap_bounded(writer).await;
+    let status = if let Some(status) = exited_status {
+        status
+    } else {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, child.wait()).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                #[cfg(unix)]
+                if let Some(pid) = tree_pid {
+                    kill_isolated_process_group(pid);
+                }
+                #[cfg(windows)]
+                process_job.terminate();
+                return Err(format!("`{}` failed: {e}", call.program));
             }
-            return Err(format!(
-                "`{}` timed out after {}s",
-                call.program,
-                call.timeout.as_secs()
-            ));
+            Err(_) => {
+                terminate_and_reap_subprocess(
+                    &mut child,
+                    #[cfg(windows)]
+                    &process_job,
+                )
+                .await;
+                if let Some(writer) = stdin_writer {
+                    let _ = reap_bounded(writer).await;
+                }
+                return Err(format!(
+                    "`{}` timed out after {}s",
+                    call.program,
+                    call.timeout.as_secs()
+                ));
+            }
         }
     };
+
+    #[cfg(unix)]
+    if let Some(pid) = tree_pid {
+        kill_isolated_process_group(pid);
+    }
+    #[cfg(windows)]
+    process_job.terminate();
 
     // Reap the concurrent stdin writer (the child has exited, so it returns at
     // once) and the stderr capture under the bounded flush grace (H1 mirror — a
@@ -2819,6 +3348,19 @@ pub(crate) static AUTH_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mute
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_fallback_buffer_never_grows_with_the_number_of_records() {
+        let buffer = StreamingFallbackBuffer::new();
+        for _ in 0..64 {
+            buffer.push_line(&"x".repeat(32 * 1024));
+        }
+        buffer.push_line("terminal salvage record");
+
+        let retained = buffer.into_string();
+        assert!(retained.len() <= STREAM_STDOUT_CAP);
+        assert!(retained.ends_with("terminal salvage record\n"));
+    }
     use umadev_runtime::{CompletionRequest, Message};
 
     /// Serializes tests that mutate process-global env vars (`PATH`/`HOME`/…)
@@ -3486,12 +4028,20 @@ mod tests {
             .spawn()
             .unwrap();
         let task = spawn_stderr_capture(child.stderr.take());
-        let _ = child.wait().await.unwrap();
+        let status = child.wait().await.unwrap();
         let buf = reap_bounded(task).await.unwrap();
+        assert!(
+            status.success(),
+            "capture must keep draining after the retention cap instead of closing the pipe"
+        );
         assert_eq!(
             buf.len(),
             STDERR_CAPTURE_CAP,
             "stderr capture must not grow past the advertised hard cap"
+        );
+        assert!(
+            String::from_utf8_lossy(&buf).contains("stderr truncated at 256 KiB"),
+            "bounded tail should disclose discarded stderr"
         );
     }
 
@@ -3610,6 +4160,29 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn one_shot_stdout_keeps_a_bounded_tail_of_newline_free_flood() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &[
+                "-c".to_string(),
+                "head -c 524288 /dev/zero | tr '\\0' x; printf 'TAIL-SENTINEL'".to_string(),
+            ],
+            prompt: "",
+            channel: PromptChannel::Arg,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(10),
+            env: &[],
+        })
+        .await
+        .expect("newline-free one-shot output must be drained without unbounded growth");
+        assert!(out.stdout.len() <= STDOUT_CAPTURE_CAP);
+        assert!(out.stdout.contains("stdout truncated at 256 KiB"));
+        assert!(out.stdout.ends_with("TAIL-SENTINEL"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn streaming_stdout_is_capped() {
         // A chatty stream (~400 KiB of small lines) must not grow `all_lines`
         // without bound: the accumulation is capped at `STREAM_STDOUT_CAP`
@@ -3640,6 +4213,40 @@ mod tests {
             out.stdout.contains("stdout truncated at 256 KiB"),
             "the truncation marker must be present once the cap is hit"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_newline_free_record_is_bounded_before_callback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let callback_seen = seen.clone();
+        let callback = move |line: &str| {
+            *callback_seen.lock().unwrap() = line.to_string();
+        };
+        let out = run_subprocess_streaming(
+            SubprocessCall {
+                program: "sh",
+                args: &[
+                    "-c".to_string(),
+                    "head -c 524288 /dev/zero | tr '\\0' x; printf 'TAIL-SENTINEL'".to_string(),
+                ],
+                prompt: "",
+                channel: PromptChannel::Arg,
+                workspace: tmp.path(),
+                timeout: Duration::from_secs(10),
+                env: &[],
+            },
+            &callback,
+        )
+        .await
+        .expect("one malicious newline-free record must remain bounded");
+        let line = seen.lock().unwrap().clone();
+        assert!(line.len() <= STREAM_LINE_CAP);
+        assert!(line.contains("stdout line truncated"));
+        assert!(line.ends_with("TAIL-SENTINEL"));
+        assert!(out.stdout.len() <= STREAM_STDOUT_CAP + 128);
+        assert!(out.stdout.contains("stdout truncated at 256 KiB"));
     }
 
     #[cfg(unix)]
@@ -3715,6 +4322,49 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "tearing down an already-dead child must return promptly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exit_probe_kills_descendants_before_reaping_the_launcher() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("resident-leaf.pid");
+        let script = format!(
+            "sleep 30 </dev/null & printf '%s' $! > '{}'; exit 0",
+            pid_file.display()
+        );
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        isolate_process_tree(&mut command);
+        let child = std::sync::Mutex::new(command.spawn().expect("spawn resident wrapper"));
+
+        let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while try_exit_isolated_process_tree(&child).is_none() {
+            assert!(
+                tokio::time::Instant::now() < probe_deadline,
+                "the exited launcher was never observed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let leaf = std::fs::read_to_string(&pid_file)
+            .expect("launcher published descendant pid")
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while unix_process_alive(leaf) && tokio::time::Instant::now() < cleanup_deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !unix_process_alive(leaf),
+            "exit probing must not orphan a resident base descendant"
         );
     }
 
@@ -4138,6 +4788,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_batch_prompts_divert_before_safe_encoder_rejects_or_expands_them() {
+        assert!(command_line_requires_diversion_for_platform(
+            r"C:\Users\dev\AppData\Roaming\npm\claude.CMD",
+            ["first line\nsecond line"],
+            7_000,
+            true,
+        ));
+
+        // Rust's hardened batch encoder expands every `%` to `%%cd:~,%`.
+        // The raw string is far below the budget, but its encoded form is not.
+        let percent_heavy = "%".repeat(900);
+        assert!(percent_heavy.len() < 7_000);
+        assert!(command_line_requires_diversion_for_platform(
+            "opencode.cmd",
+            [percent_heavy.as_str()],
+            7_000,
+            true,
+        ));
+
+        assert!(!command_line_requires_diversion_for_platform(
+            "claude.cmd",
+            ["short safe prompt"],
+            7_000,
+            true,
+        ));
+        assert!(!command_line_requires_diversion_for_platform(
+            "claude.cmd",
+            ["first line\nsecond line"],
+            7_000,
+            false,
+        ));
+    }
+
     #[tokio::test]
     async fn oversized_arg_prompt_is_delivered_via_stdin_not_truncated() {
         // A prompt that would overflow the command line is routed through stdin (both
@@ -4229,6 +4913,37 @@ mod tests {
         let sep = std::path::MAIN_SEPARATOR;
         let p = format!("some{sep}dir{sep}codex");
         assert_eq!(resolve_program(&p), p);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_batch_spawn_does_not_expand_or_execute_argument_metacharacters() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let batch = temp.path().join("echo-arg.cmd");
+        std::fs::write(&batch, "@echo off\r\necho ARG=%1\r\n").unwrap();
+
+        let mut percent = std_command(batch.to_str().unwrap());
+        let percent_output = percent
+            .arg("%UMADEV_BATCH_SENTINEL%")
+            .env("UMADEV_BATCH_SENTINEL", "EXPANDED-BUG")
+            .output()
+            .expect("Rust's direct batch encoder accepts a percent argument");
+        assert!(percent_output.status.success());
+        let percent_stdout = String::from_utf8_lossy(&percent_output.stdout);
+        assert!(percent_stdout.contains("%UMADEV_BATCH_SENTINEL%"));
+        assert!(!percent_stdout.contains("EXPANDED-BUG"));
+
+        let mut ampersand = std_command(batch.to_str().unwrap());
+        let ampersand_output = ampersand
+            .arg("A&B")
+            .output()
+            .expect("Rust's direct batch encoder accepts a quoted ampersand argument");
+        assert!(
+            ampersand_output.status.success(),
+            "an ampersand argument must not become a second command: {}",
+            String::from_utf8_lossy(&ampersand_output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&ampersand_output.stdout).contains("A&B"));
     }
 
     #[test]
@@ -4506,7 +5221,7 @@ mod tests {
             program: "sh",
             args: &[
                 "-c".into(),
-                "echo hello; sleep 30 >/dev/null & exit 0".into(),
+                "echo hello; sleep 30 >/dev/null & echo $! > held-stderr.pid; exit 0".into(),
             ],
             prompt: "",
             channel: PromptChannel::Stdin,
@@ -4521,6 +5236,62 @@ mod tests {
             started.elapsed() < Duration::from_secs(15),
             "the post-exit stderr drain must be bounded by the flush grace, not the \
              grandchild's 30s hold"
+        );
+        let descendant = std::fs::read_to_string(tmp.path().join("held-stderr.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        for _ in 0..100 {
+            if !unix_process_alive(descendant) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !unix_process_alive(descendant),
+            "normal wrapper exit must still terminate the inherited-pipe descendant"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_subprocess_returns_when_grandchild_holds_stdout_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let started = Instant::now();
+        let out = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &[
+                "-c".into(),
+                "echo hello; sleep 30 & echo $! > held-stdout.pid; exit 0".into(),
+            ],
+            prompt: "",
+            channel: PromptChannel::Stdin,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(60),
+            env: &[],
+        })
+        .await
+        .expect("a clean wrapper exit must outrank a descendant-held stdout pipe");
+        assert!(out.stdout.contains("hello"));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the direct-child status must end stdout draining promptly"
+        );
+        let descendant = std::fs::read_to_string(tmp.path().join("held-stdout.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        for _ in 0..100 {
+            if !unix_process_alive(descendant) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !unix_process_alive(descendant),
+            "normal wrapper exit must terminate the stdout-holding descendant"
         );
     }
 
@@ -4581,6 +5352,52 @@ mod tests {
         std::fs::write(&script, body).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_returns_when_grandchild_holds_stdout_open() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let script = write_sh_fake(
+            tmp.path(),
+            "stream-wrapper-exits",
+            "#!/bin/sh\ncat >/dev/null 2>&1\nprintf 'hello\\n'\nsleep 30 &\necho $! > held-stream-stdout.pid\nexit 0\n",
+        );
+        let started = Instant::now();
+        let out = run_subprocess_streaming(
+            SubprocessCall {
+                program: script.to_str().unwrap(),
+                args: &[],
+                prompt: "",
+                channel: PromptChannel::Stdin,
+                timeout: Duration::from_secs(60),
+                workspace: tmp.path(),
+                env: &[],
+            },
+            &|_line: &str| {},
+        )
+        .await
+        .expect("streaming must return when the direct wrapper exits cleanly");
+        assert!(out.stdout.contains("hello"));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "a descendant-held stdout pipe must not wait out the hard ceiling"
+        );
+        let descendant = std::fs::read_to_string(tmp.path().join("held-stream-stdout.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        for _ in 0..100 {
+            if !unix_process_alive(descendant) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !unix_process_alive(descendant),
+            "stream completion must terminate the stdout-holding descendant"
+        );
     }
 
     // A slow FIRST token (long silence BEFORE any stdout line) must NOT trip the

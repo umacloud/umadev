@@ -33,6 +33,7 @@
 //! we allow (never block a legitimate operation on a parse error).
 
 use serde::Deserialize;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use umadev_governance::{
     check_client_secret_leak, check_dangerous_bash, check_hardcoded_secret,
@@ -51,6 +52,87 @@ use umadev_governance::{
 /// passes everything, including the bypass-immune safety floor. UmaDev is a
 /// polite agent: it governs only its own runs, never the user's other tools.
 const GOVERN_ROOT_ENV: &str = "UMADEV_GOVERN_ROOT";
+const MAX_HOOK_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_GOVERNANCE_CONTEXT_BYTES: u64 = 1024 * 1024;
+
+fn read_managed_utf8(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let bytes = umadev_state::fs::read_bounded(path, max_bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Kimi's user config is commonly managed by a dotfile symlink. Follow that
+/// link deliberately, but validate the opened handle and cap the read so a
+/// FIFO/device/oversized file cannot hang a hook install or doctor probe.
+fn read_user_utf8(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hook config is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0).min(64 * 1024));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "hook config grew beyond its byte limit",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+fn atomic_user_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let target = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            std::fs::canonicalize(path)?
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = std::fs::canonicalize(path)?;
+            if !target.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "hook config symlink does not resolve to a regular file",
+                ));
+            }
+            target
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "hook config output is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "hook config has no parent",
+                )
+            })?;
+            let parent = std::fs::canonicalize(parent)?;
+            parent.join(path.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "hook config has no filename",
+                )
+            })?)
+        }
+        Err(error) => return Err(error),
+    };
+    umadev_state::fs::atomic_write(&target, bytes)
+}
 
 /// The governance scope: `None` when UmaDev is NOT driving (hook passes
 /// everything), or `Some(root)` when it is (govern only files under `root`).
@@ -259,14 +341,17 @@ fn load_project_context(file_path: &str) -> ProjectContext {
     let Some(root) = find_project_root(file_path) else {
         return ProjectContext::unknown();
     };
-    let context_path = root.join(".umadev").join("governance-context.json");
-    let Ok(raw) = std::fs::read_to_string(&context_path) else {
+    let Ok(bytes) = umadev_state::fs::read_bounded_beneath(
+        &root,
+        Path::new(".umadev/governance-context.json"),
+        MAX_GOVERNANCE_CONTEXT_BYTES,
+    ) else {
         return ProjectContext::unknown();
     };
     // Malformed / partial JSON → strict default. `#[serde(default)]` on the
     // field also means a `{}` document deserializes to the strict default.
-    let ctx =
-        serde_json::from_str::<ProjectContext>(&raw).unwrap_or_else(|_| ProjectContext::unknown());
+    let ctx = serde_json::from_slice::<ProjectContext>(&bytes)
+        .unwrap_or_else(|_| ProjectContext::unknown());
     ctx.if_current(now_secs(), None)
 }
 
@@ -735,7 +820,7 @@ fn strip_claude_hooks(settings: &mut serde_json::Value, self_bin: Option<&str>) 
 }
 
 fn read_claude_settings(path: &Path) -> std::io::Result<serde_json::Value> {
-    match std::fs::read_to_string(path) {
+    match read_managed_utf8(path, MAX_HOOK_CONFIG_BYTES) {
         Ok(content) => serde_json::from_str(&content).map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -796,32 +881,28 @@ pub fn install_claude_hook(
     // config. Invalid JSON is reported instead of silently replacing it.
     let mut settings = read_claude_settings(&settings_path)?;
 
-    // Ensure hooks.PreToolUse exists and contains our matcher — fail-open at
-    // every level: a user whose settings.json is valid JSON but not the shape we
-    // expect (a bare array / string, or `hooks` not an object) must not crash the
-    // install; we coerce to the right shape rather than panic.
-    if !settings.is_object() {
-        settings = serde_json::json!({});
-    }
-    let Some(obj) = settings.as_object_mut() else {
-        return Ok(Some(settings_path));
-    };
+    let obj = settings.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Claude settings root is not an object; refusing to replace it",
+        )
+    })?;
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
-    if !hooks.is_object() {
-        *hooks = serde_json::json!({});
-    }
-    let Some(hooks_obj) = hooks.as_object_mut() else {
-        return Ok(Some(settings_path));
-    };
+    let hooks_obj = hooks.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Claude settings hooks value is not an object; refusing to replace it",
+        )
+    })?;
     let pre_use = hooks_obj
         .entry("PreToolUse")
         .or_insert_with(|| serde_json::json!([]));
-    if !pre_use.is_array() {
-        *pre_use = serde_json::json!([]);
-    }
-    let Some(matchers) = pre_use.as_array_mut() else {
-        return Ok(Some(settings_path));
-    };
+    let matchers = pre_use.as_array_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Claude PreToolUse value is not an array; refusing to replace it",
+        )
+    })?;
 
     // Self-healing install: first REMOVE any existing UmaDev matcher (matched by
     // its PROGRAM TOKEN — `umadev` at any install path, or this exact binary — so
@@ -867,12 +948,12 @@ pub fn install_claude_hook(
     let post_use = hooks_obj
         .entry("PostToolUse")
         .or_insert_with(|| serde_json::json!([]));
-    if !post_use.is_array() {
-        *post_use = serde_json::json!([]);
-    }
-    let Some(post_matchers) = post_use.as_array_mut() else {
-        return Ok(Some(settings_path));
-    };
+    let post_matchers = post_use.as_array_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Claude PostToolUse value is not an array; refusing to replace it",
+        )
+    })?;
     post_matchers.retain_mut(|matcher| {
         let Some(handlers) = matcher
             .get_mut("hooks")
@@ -905,11 +986,15 @@ pub fn uninstall_claude_hook(project_root: &std::path::Path) -> std::io::Result<
         .ok()
         .map(|p| p.to_string_lossy().into_owned());
     let claude_dir = project_root.join(".claude");
+    let mut failures = Vec::new();
     for name in [CLAUDE_LOCAL_SETTINGS, CLAUDE_SHARED_SETTINGS] {
         let path = claude_dir.join(name);
-        // A malformed user file cannot be safely edited. Uninstall remains
-        // fail-open for that file and continues cleaning the other location.
-        let _ = remove_claude_hooks_from_path(&path, self_bin.as_deref());
+        if let Err(error) = remove_claude_hooks_from_path(&path, self_bin.as_deref()) {
+            failures.push(format!("{}: {error}", path.display()));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(std::io::Error::other(failures.join("; ")));
     }
     Ok(())
 }
@@ -985,7 +1070,7 @@ fn kimi_hooks_mut(
 }
 
 fn install_kimi_hook_at(config_path: &Path, project_root: &Path) -> std::io::Result<()> {
-    let content = match std::fs::read_to_string(config_path) {
+    let content = match read_user_utf8(config_path, MAX_HOOK_CONFIG_BYTES) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error),
@@ -1014,7 +1099,7 @@ fn install_kimi_hook_at(config_path: &Path, project_root: &Path) -> std::io::Res
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    umadev_state::fs::atomic_write(config_path, output.as_bytes())
+    atomic_user_write(config_path, output.as_bytes())
 }
 
 /// Install project-scoped Kimi Code Pre/PostToolUse hooks without replacing
@@ -1040,7 +1125,7 @@ pub(crate) fn kimi_hook_registration(project_root: &Path) -> std::io::Result<(Pa
 }
 
 fn kimi_hook_registration_at(config_path: &Path, project_root: &Path) -> std::io::Result<bool> {
-    let content = match std::fs::read_to_string(config_path) {
+    let content = match read_user_utf8(config_path, MAX_HOOK_CONFIG_BYTES) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(false);
@@ -1067,13 +1152,12 @@ fn kimi_hook_registration_at(config_path: &Path, project_root: &Path) -> std::io
 }
 
 fn uninstall_kimi_hook_at(config_path: &Path, project_root: &Path) -> std::io::Result<()> {
-    let Ok(content) = std::fs::read_to_string(config_path) else {
-        return Ok(());
+    let content = match read_user_utf8(config_path, MAX_HOOK_CONFIG_BYTES) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
     };
-    let Ok(mut document) = parse_kimi_config(&content) else {
-        // Never damage a hand-edited or newer config shape during cleanup.
-        return Ok(());
-    };
+    let mut document = parse_kimi_config(&content)?;
     let commands = KIMI_HOOK_SPECS.map(|(_, _, check)| kimi_hook_command(check, project_root));
     let Some(hooks) = document["hooks"].as_array_of_tables_mut() else {
         return Ok(());
@@ -1091,7 +1175,7 @@ fn uninstall_kimi_hook_at(config_path: &Path, project_root: &Path) -> std::io::R
     if !output.ends_with('\n') {
         output.push('\n');
     }
-    umadev_state::fs::atomic_write(config_path, output.as_bytes())
+    atomic_user_write(config_path, output.as_bytes())
 }
 
 /// Remove only the three Kimi Code hook rows scoped to project_root.
@@ -1185,6 +1269,24 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn kimi_uninstall_reports_invalid_config_without_clobbering() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let config = temp.path().join("config.toml");
+        let original = "[[broken";
+        std::fs::write(&config, original).unwrap();
+
+        assert_eq!(
+            uninstall_kimi_hook_at(&config, &project)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::read_to_string(config).unwrap(), original);
     }
 
     #[test]
@@ -1519,15 +1621,41 @@ mod tests {
     }
 
     #[test]
-    fn install_does_not_panic_on_malformed_settings() {
+    fn install_refuses_unknown_settings_shapes_without_clobbering() {
         let tmp = tempfile::TempDir::new().unwrap();
         let claude = tmp.path().join(".claude");
         std::fs::create_dir_all(&claude).unwrap();
-        // Valid JSON but NOT an object — install must coerce, not panic.
-        std::fs::write(claude.join("settings.local.json"), "[1, 2, 3]").unwrap();
-        install_claude_hook(tmp.path()).unwrap();
-        let s = std::fs::read_to_string(claude.join("settings.local.json")).unwrap();
-        assert!(s.contains("\"pre-write\""));
+        for original in [
+            "[1, 2, 3]",
+            r#"{"hooks":"future-shape"}"#,
+            r#"{"hooks":{"PreToolUse":"future-shape"}}"#,
+            r#"{"hooks":{"PostToolUse":"future-shape"}}"#,
+        ] {
+            let path = claude.join("settings.local.json");
+            std::fs::write(&path, original).unwrap();
+            assert_eq!(
+                install_claude_hook(tmp.path()).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn uninstall_reports_a_damaged_settings_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("settings.local.json"), "{broken").unwrap();
+
+        assert_eq!(
+            uninstall_claude_hook(tmp.path()).unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude.join("settings.local.json")).unwrap(),
+            "{broken"
+        );
     }
 
     #[test]

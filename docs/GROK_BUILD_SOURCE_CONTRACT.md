@@ -13,12 +13,12 @@
 | Item | Audited value |
 |---|---|
 | Official repository | <https://github.com/xai-org/grok-build> |
-| Audited commit | `3af4d5d39897855bdcc74f23e690024a5dc05573` |
-| Grok Build version | `0.2.109` |
+| Audited commit | `47348d13ec4508dcfe440e34c6d511bb02998fb2` |
+| Grok Build version | `0.2.112` |
 | `agent-client-protocol` | `0.10.4`, with upstream's `unstable` feature |
 | `agent-client-protocol-schema` resolved by upstream | `0.11.4` |
 | ACP wire protocol negotiated by this build | V1 |
-| Audit date | 2026-07-22 |
+| Audit date | 2026-07-26 |
 
 The version is declared by the upstream `xai-grok-pager`,
 `xai-grok-pager-bin`, `xai-grok-shell`, and related crates. The ACP dependency
@@ -30,20 +30,20 @@ not a runtime version gate. Every official peer reporting `grokShell: true` may
 run; standard features come from ACP advertisement/session state, and private
 messages pass only typed, bounded parsers with method-level fallback.
 
-The previously audited `0.2.106` release artifacts are also retained by content
+The audited `0.2.112` release artifacts are retained by content
 as cross-platform regression fixtures, rather than trusting a mutable installer:
 
 | Official artifact | SHA-256 |
 |---|---|
-| `grok-0.2.106-linux-x86_64` | `7180d0e03cc2a496033ff3aae2223ce239446a9827a59faa76091c7edd5e1c38` |
-| `grok-0.2.106-linux-aarch64` | `d12be1698d56d4543f1f1095c2c26cd3d17a64e88772629673740991c188e4ff` |
-| `grok-0.2.106-macos-aarch64` | `7229f5e2a69b05832c86db82bebda541e92b5c24958fbfacf5c8f463394d3027` |
-| `grok-0.2.106-macos-x86_64` | `445d0a211e42e0c7efe888c8c928f1a2f38ea05d4ae8a7069035181f0c371faa` |
-| `grok-0.2.106-windows-x86_64.exe` | `a6a25d55daadca0c2458a5aceb4c1873eb7c76964ef307647d079e344c53969a` |
+| `grok-0.2.112-linux-x86_64` | `c2867112f7d89366123fe68a55a23dfb027d3602fc5b5b9cd5c080dacb4a2503` |
+| `grok-0.2.112-linux-aarch64` | `d21f1aaaba7f2930db0ef7d5a9dc3f814a94c54af208e091f72a239cac02ba39` |
+| `grok-0.2.112-macos-aarch64` | `5cf05fe670b1818561daf7566b580a5de6b81149166499d61072e49640b541a4` |
+| `grok-0.2.112-macos-x86_64` | `9d00be3e3e28d1ce3c36f26d65c40aac2623917aabc6a20b3bda21a269d8ea24` |
+| `grok-0.2.112-windows-x86_64.exe` | `2469bd182af212c7fcb84f2981999e4e8a6a7a2e4172bad3ae7f787a1f11407c` |
 
 Ordinary and tag CI download the exact Linux x64, macOS arm64 and Windows x64
 artifacts directly from `https://x.ai/cli/`, verify these digests and the exact
-`grok 0.2.106 (<revision>)` version line, then run an isolated real-process ACP
+`grok 0.2.112 (<revision>)` version line, then run an isolated real-process ACP
 handshake. The test requires the typed authentication offer and proves that no
 browser-capable authentication RPC or project write occurs before explicit
 confirmation. The other two hashes lock the official artifact bytes for the
@@ -60,6 +60,16 @@ source-shaped DTO markers, exact artifacts, and isolated real ACP handshake
 were rerun for this pin. New optional client-driven methods such as
 `x.ai/mcp/setup` and `x.ai/session/import` are not advertised as UmaDev features
 merely because the vendor pager uses them.
+
+The latest source re-audit additionally compared `0.2.109` through `0.2.112`.
+The public ACP version and schema remain unchanged. Interjection, lifecycle
+notifications, turn completion, permission choices and authentication ordering
+remain wire-compatible. Subagent execution moved behind a coordinator actor and
+the task snapshot gained an optional description, but the external
+`x.ai/subagent/*`, `x.ai/task/*` and `_x.ai/session/update` contracts retained
+their typed fields and cancellation/reconnect semantics. The drift tests pin the
+new coordinator route so a later internal refactor cannot silently weaken
+resynchronization.
 
 ## 2. Contract vocabulary and gates
 

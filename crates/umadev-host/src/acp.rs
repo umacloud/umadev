@@ -80,8 +80,8 @@ use crate::stderr_tail::{StderrDrain, StderrTail};
 use crate::{
     default_workspace, govern_root_env, home_dir, isolate_process_tree,
     kill_isolated_process_tree_blocking, merge_prompt, reap_isolated_process_tree, resolve_program,
-    run_subprocess, spawn_parts, spawn_retrying_etxtbsy, AuthState, HostDriver, ProbeResult,
-    PromptChannel, SubprocessCall, TerminalTextSanitizer, END_REAP_BUDGET,
+    run_subprocess, spawn_parts, spawn_retrying_etxtbsy, try_exit_isolated_process_tree, AuthState,
+    HostDriver, ProbeResult, PromptChannel, SubprocessCall, TerminalTextSanitizer, END_REAP_BUDGET,
 };
 
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -851,10 +851,11 @@ fn kimi_cached_login_present() -> bool {
 /// file, an empty `{}`, a non-object, or any read/parse failure returns `false`,
 /// so the auth probe never claims a login it cannot actually see.
 fn credential_file_has_entries(path: &std::path::Path) -> bool {
-    let Ok(body) = std::fs::read_to_string(path) else {
+    const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
+    let Ok(body) = crate::read_user_file_bounded(path, MAX_CREDENTIAL_BYTES) else {
         return false;
     };
-    serde_json::from_str::<serde_json::Value>(&body)
+    serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| value.as_object().map(|object| !object.is_empty()))
         .unwrap_or(false)
@@ -1647,8 +1648,8 @@ impl AcpSession {
         }
         // Validate the final PATH-resolved target, not the caller's spelling.
         // On Windows a bare `grok` can resolve to the npm `grok.cmd` shim; if
-        // validation happened first, ACP arguments would later re-enter
-        // `cmd.exe` parsing through `spawn_parts`.
+        // validation happened first, ACP arguments would later target a batch
+        // shim through `spawn_parts` rather than the intended native binary.
         let program = resolve_and_validate_vendor_program(vendor, program)?;
         let (spawn_program, lead) = spawn_parts(&program);
         let mut cmd = Command::new(spawn_program);
@@ -1674,7 +1675,14 @@ impl AcpSession {
             ))
         })?;
         #[cfg(windows)]
-        let process_job = umadev_process::KillOnCloseJob::attach(&child);
+        let process_job = Some(umadev_process::KillOnCloseJob::attach(&mut child).map_err(
+            |error| {
+                SessionError::Start(format!(
+                    "failed to secure {} ACP process tree: {error}",
+                    vendor.display_name()
+                ))
+            },
+        )?);
         let stdin = child
             .stdin
             .take()
@@ -3800,7 +3808,7 @@ impl BaseSession for AcpSession {
     }
 
     fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
-        self.child.try_lock().ok()?.try_wait().ok().flatten()
+        try_exit_isolated_process_tree(&self.child)
     }
 
     fn session_id(&self) -> Option<&str> {
@@ -3931,10 +3939,7 @@ async fn wait_for_child_exit(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if matches!(
-            child.try_lock().map(|mut child| child.try_wait()),
-            Ok(Ok(Some(_)))
-        ) {
+        if try_exit_isolated_process_tree(child).is_some() {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {

@@ -3190,6 +3190,12 @@ fn code_nesting_ignores_test_files_and_trailing_rust_test_modules() {
     assert!(!check_deep_nesting("src/app.rs", &source).block);
 }
 
+#[test]
+fn code_nesting_trims_long_unicode_openers_at_utf8_boundaries() {
+    let code = format!("fn shipping() {{\n{} if ready {{}}\n}}", "变量".repeat(120));
+    assert!(!check_deep_nesting("src/app.rs", &code).block);
+}
+
 // --- UD-ARCH-023: PHP shell exec -----------------------------------
 
 #[test]

@@ -60,6 +60,15 @@ const RESEARCH_MAX_REVIEW_ROUNDS: usize = 1;
 /// cap and the quality-gate review→fix budget is untouched.
 const DOCS_MAX_REVIEW_ROUNDS: usize = 1;
 
+/// Workspace-controlled artifact/source read ceilings used by the legacy
+/// runner. Multi-document operations share the group budget so three individually
+/// valid files cannot produce unbounded aggregate I/O.
+const RUN_ARTIFACT_FILE_BYTES: usize = 4 * 1024 * 1024;
+const RUN_ARTIFACT_GROUP_BYTES: usize = 12 * 1024 * 1024;
+const RUN_SOURCE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const RUN_KNOWLEDGE_FILE_BYTES: usize = 512 * 1024;
+const RUN_KNOWLEDGE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+
 /// Default wall-clock budget for ONE `consult` call (critic / judge / surfacer),
 /// in seconds. These bounded reads must NOT inherit the 600s generation-grade
 /// ceiling the *worker* calls use. Without this, a single review can hang for
@@ -299,14 +308,55 @@ fn run_budget() -> std::time::Duration {
 /// clean run to degraded on a false signal, or otherwise break the pipeline.
 /// This is the same safety property the TUI's git snapshot relies on; do not
 /// turn it into an error path.
-fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new("git")
+async fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
+    use std::process::Stdio;
+
+    const STDOUT_CAP: usize = 512 * 1024;
+    #[cfg(windows)]
+    const EMPTY_GIT_CONFIG: &str = "NUL";
+    #[cfg(not(windows))]
+    const EMPTY_GIT_CONFIG: &str = "/dev/null";
+
+    let mut command = tokio::process::Command::new("git");
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            command.env_remove(key);
+        }
+    }
+    command
+        .arg("--no-pager")
+        .arg("--literal-pathspecs")
+        .args(["-c", "core.fsmonitor=false"])
         .arg("-C")
         .arg(root)
         .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never");
+    let out = umadev_process::run_bounded_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: std::time::Duration::from_secs(5),
+            stdout_bytes: STDOUT_CAP,
+            stderr_bytes: 32 * 1024,
+            reader_grace: std::time::Duration::from_millis(500),
+        },
+    )
+    .await
+    .ok()?;
+    if out.timed_out
+        || out.stdout_truncated
+        || out.stderr_truncated
+        || !out.status.is_some_and(|status| status.success())
+    {
         return None; // not a git repo (or git refused) → fail-open, skip check
     }
     Some(String::from_utf8_lossy(&out.stdout).to_string())
@@ -767,7 +817,11 @@ fn recorded_quality_passed(options: &RunOptions) -> bool {
         .project_root
         .join("output")
         .join(format!("{}-quality-gate.json", options.effective_slug()));
-    match std::fs::read_to_string(&path) {
+    match crate::bounded_fs::read_utf8_beneath(
+        &options.project_root,
+        &path,
+        RUN_ARTIFACT_FILE_BYTES,
+    ) {
         Ok(body) => crate::phases::extract_quality_score(&body).1,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => false,
@@ -938,6 +992,54 @@ impl<R: Runtime> AgentRunner<R> {
     /// Emit `event` to the attached sink (no-op for the null sink).
     fn emit(&self, event: EngineEvent) {
         self.events.emit(event);
+    }
+
+    fn note_unavailable_workspace_input(&self, label: &str, error: &std::io::Error) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            self.emit(EngineEvent::Note(format!(
+                "[warn] {label} unavailable: complete no-follow read failed ({error})"
+            )));
+        }
+    }
+
+    fn read_workspace_artifact(&self, path: &Path, label: &str) -> String {
+        match crate::bounded_fs::read_utf8_beneath(
+            &self.options.project_root,
+            path,
+            RUN_ARTIFACT_FILE_BYTES,
+        ) {
+            Ok(content) => content,
+            Err(error) => {
+                self.note_unavailable_workspace_input(label, &error);
+                String::new()
+            }
+        }
+    }
+
+    fn read_output_bundle(&self, slug: &str, names: &[&str]) -> Vec<String> {
+        let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+            RUN_ARTIFACT_GROUP_BYTES,
+            RUN_ARTIFACT_FILE_BYTES,
+        );
+        names
+            .iter()
+            .map(|name| {
+                let path = self
+                    .options
+                    .project_root
+                    .join(format!("output/{slug}-{name}.md"));
+                match budget.read_utf8_beneath(&self.options.project_root, &path) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        self.note_unavailable_workspace_input(
+                            &format!("output/{slug}-{name}.md"),
+                            &error,
+                        );
+                        String::new()
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Drive a long-blocking future while keeping the UI **alive**: emit ONE
@@ -3161,8 +3263,17 @@ impl<R: Runtime> AgentRunner<R> {
             "[wait] 正在加载专家工程知识(分层/分包/服务层规范)…".to_string(),
         ));
         let mut out = String::new();
+        let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+            RUN_KNOWLEDGE_TOTAL_BYTES,
+            RUN_KNOWLEDGE_FILE_BYTES,
+        );
         for file in files {
-            let Ok(content) = std::fs::read_to_string(file.path()) else {
+            let read = if file.scope() == umadev_knowledge::CorpusScope::Project {
+                budget.read_utf8_beneath(&self.options.project_root, file.path())
+            } else {
+                budget.read_utf8(file.path())
+            };
+            let Ok(content) = read else {
                 continue;
             };
             let trimmed: String = content.chars().take(1500).collect();
@@ -3354,11 +3465,13 @@ impl<R: Runtime> AgentRunner<R> {
             phase,
             Phase::Spec | Phase::Frontend | Phase::Backend | Phase::Delivery
         ) {
-            let contract = std::fs::read_to_string(self.options.project_root.join(format!(
-                "output/{}-contract.md",
-                self.options.effective_slug()
-            )))
-            .unwrap_or_default();
+            let slug = self.options.effective_slug();
+            let contract_path = self
+                .options
+                .project_root
+                .join(format!("output/{slug}-contract.md"));
+            let contract =
+                self.read_workspace_artifact(&contract_path, &format!("output/{slug}-contract.md"));
             if !contract.trim().is_empty() {
                 append(
                     &mut prompt.system,
@@ -3511,17 +3624,12 @@ impl<R: Runtime> AgentRunner<R> {
         if self.runtime.is_offline() {
             return;
         }
-        let read = |name: &str| {
-            std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-{name}.md")),
-            )
-            .unwrap_or_default()
-        };
-        let prd = read("prd");
-        let arch = read("architecture");
-        let uiux = read("uiux");
+        let mut docs = self
+            .read_output_bundle(slug, &["prd", "architecture", "uiux"])
+            .into_iter();
+        let prd = docs.next().unwrap_or_default();
+        let arch = docs.next().unwrap_or_default();
+        let uiux = docs.next().unwrap_or_default();
         if prd.trim().is_empty() && arch.trim().is_empty() && uiux.trim().is_empty() {
             return;
         }
@@ -3584,7 +3692,9 @@ impl<R: Runtime> AgentRunner<R> {
         let (what, refs) = if phase == Phase::Frontend {
             (
                 "前端实现",
-                format!("output/{slug}-uiux.md、output/{slug}-architecture.md、output/{slug}-execution-plan.md"),
+                format!(
+                    "output/{slug}-uiux.md、output/{slug}-architecture.md、output/{slug}-execution-plan.md"
+                ),
             )
         } else {
             (
@@ -3742,12 +3852,11 @@ impl<R: Runtime> AgentRunner<R> {
     /// delivery looks commercial-grade. `None` (fail-open) when there's no brain
     /// or no PRD — the caller then relies on the deterministic endpoint check.
     async fn judge_acceptance(&self, slug: &str) -> Option<AcceptanceVerdict> {
-        let prd = std::fs::read_to_string(
-            self.options
-                .project_root
-                .join(format!("output/{slug}-prd.md")),
-        )
-        .ok()?;
+        let path = self
+            .options
+            .project_root
+            .join(format!("output/{slug}-prd.md"));
+        let prd = self.read_workspace_artifact(&path, &format!("output/{slug}-prd.md"));
         if prd.trim().is_empty() {
             return None;
         }
@@ -3829,15 +3938,12 @@ impl<R: Runtime> AgentRunner<R> {
     /// and surface its judgment (biggest risk, what's missing, ready-to-build).
     /// Informational: the user still decides (`c` / `/revise`). Fail-open.
     async fn surface_docs_assessment(&self, slug: &str) {
-        let read = |name: &str| {
-            std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-{name}.md")),
-            )
-            .unwrap_or_default()
-        };
-        let (prd, arch, uiux) = (read("prd"), read("architecture"), read("uiux"));
+        let mut docs = self
+            .read_output_bundle(slug, &["prd", "architecture", "uiux"])
+            .into_iter();
+        let prd = docs.next().unwrap_or_default();
+        let arch = docs.next().unwrap_or_default();
+        let uiux = docs.next().unwrap_or_default();
         if prd.trim().is_empty() && arch.trim().is_empty() {
             return;
         }
@@ -3978,15 +4084,12 @@ impl<R: Runtime> AgentRunner<R> {
         if team.is_empty() {
             return Vec::new();
         }
-        let read = |name: &str| {
-            std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-{name}.md")),
-            )
-            .unwrap_or_default()
-        };
-        let (prd, arch, uiux) = (read("prd"), read("architecture"), read("uiux"));
+        let mut docs = self
+            .read_output_bundle(slug, &["prd", "architecture", "uiux"])
+            .into_iter();
+        let prd = docs.next().unwrap_or_default();
+        let arch = docs.next().unwrap_or_default();
+        let uiux = docs.next().unwrap_or_default();
         // Two-layer artifact materialization (item A): derive the typed contracts
         // (data model / design tokens / acceptance) out of the prose docs and emit
         // them to `.umadev/contracts/` next to the API contract — the typed "what"
@@ -4081,20 +4184,17 @@ impl<R: Runtime> AgentRunner<R> {
         if code.trim().is_empty() {
             return Vec::new();
         }
-        let read = |name: &str| {
-            std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-{name}.md")),
-            )
-            .unwrap_or_default()
-        };
+        let mut docs = self
+            .read_output_bundle(slug, &["uiux", "architecture", "prd"])
+            .into_iter();
         // Include the PRD: the preview team's seats (uiux-designer, frontend-engineer)
         // declare `Prd` in their SeatCard.reads, so leaving it empty made the per-hop
         // hand-off check emit a FALSE "missing Prd input" advisory + provenance on every
         // preview review (and the uiux critic lost real PRD context). The docs bundle
         // already includes it; the preview bundle simply forgot to.
-        let (uiux, arch, prd) = (read("uiux"), read("architecture"), read("prd"));
+        let uiux = docs.next().unwrap_or_default();
+        let arch = docs.next().unwrap_or_default();
+        let prd = docs.next().unwrap_or_default();
         let requirement = self.options.requirement.clone();
         let arts = crate::critics::CriticArtifacts {
             requirement: &requirement,
@@ -4259,9 +4359,20 @@ impl<R: Runtime> AgentRunner<R> {
         let mut out = Vec::new();
         let policy = umadev_governance::Policy::load(&self.options.project_root);
         let ctx = self.project_context();
+        let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+            RUN_SOURCE_TOTAL_BYTES,
+            crate::acceptance::MAX_SOURCE_FILE_BYTES,
+        );
         for f in crate::acceptance::source_files(&self.options.project_root) {
-            let Ok(content) = std::fs::read_to_string(&f) else {
-                continue;
+            let content = match budget.read_utf8_beneath(&self.options.project_root, &f) {
+                Ok(content) => content,
+                Err(error) => {
+                    out.push(format!(
+                        "security scan unavailable for {}: {error}",
+                        f.display()
+                    ));
+                    break;
+                }
             };
             let rel = f
                 .strip_prefix(&self.options.project_root)
@@ -4288,15 +4399,25 @@ impl<R: Runtime> AgentRunner<R> {
             )),
             self.options.project_root.join(".umadev/security-scan.json"),
         ] {
-            if let Ok(raw) = std::fs::read_to_string(&cand) {
-                let trimmed = raw.trim();
-                if !trimmed.is_empty() {
-                    out.push(format!(
-                        "external security-scan.json: {}",
-                        excerpt(trimmed, 600)
-                    ));
+            match budget.read_utf8_beneath(&self.options.project_root, &cand) {
+                Ok(raw) => {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty() {
+                        out.push(format!(
+                            "external security-scan.json: {}",
+                            excerpt(trimmed, 600)
+                        ));
+                    }
+                    break;
                 }
-                break;
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    out.push(format!(
+                        "external security scan unavailable for {}: {error}",
+                        cand.display()
+                    ));
+                    break;
+                }
             }
         }
         out
@@ -4427,12 +4548,12 @@ impl<R: Runtime> AgentRunner<R> {
     /// its judgment (biggest risk, what's weak, ready-to-proceed) so the user
     /// approves with a real opinion. Informational; fail-open.
     async fn surface_preview_assessment(&self, slug: &str) {
-        let notes = std::fs::read_to_string(
-            self.options
-                .project_root
-                .join(format!("output/{slug}-frontend-notes.md")),
-        )
-        .unwrap_or_default();
+        let notes_path = self
+            .options
+            .project_root
+            .join(format!("output/{slug}-frontend-notes.md"));
+        let notes =
+            self.read_workspace_artifact(&notes_path, &format!("output/{slug}-frontend-notes.md"));
         let code = crate::acceptance::code_digest(&self.options.project_root, 18_000);
         if code.trim().is_empty() {
             return;
@@ -4551,12 +4672,11 @@ impl<R: Runtime> AgentRunner<R> {
     /// deterministic detector is the floor (hard rules); this is the taste
     /// judgment a detector can't make. Fail-open → `None`.
     async fn judge_design(&self, slug: &str) -> Option<DesignVerdict> {
-        let uiux = std::fs::read_to_string(
-            self.options
-                .project_root
-                .join(format!("output/{slug}-uiux.md")),
-        )
-        .unwrap_or_default();
+        let uiux_path = self
+            .options
+            .project_root
+            .join(format!("output/{slug}-uiux.md"));
+        let uiux = self.read_workspace_artifact(&uiux_path, &format!("output/{slug}-uiux.md"));
         let code = crate::acceptance::code_digest(&self.options.project_root, 22_000);
         if code.trim().is_empty() {
             return None;
@@ -4655,9 +4775,20 @@ impl<R: Runtime> AgentRunner<R> {
         let ctx = self.project_context();
         let scan = |files: Vec<std::path::PathBuf>| -> Vec<String> {
             let mut out = Vec::new();
+            let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
+                RUN_SOURCE_TOTAL_BYTES,
+                crate::acceptance::MAX_SOURCE_FILE_BYTES,
+            );
             for f in &files {
-                let Ok(content) = std::fs::read_to_string(f) else {
-                    continue;
+                let content = match budget.read_utf8_beneath(&self.options.project_root, f) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        out.push(format!(
+                            "{}: governance scan unavailable ({error})",
+                            f.display()
+                        ));
+                        break;
+                    }
                 };
                 let rel = f
                     .strip_prefix(&self.options.project_root)
@@ -4830,12 +4961,11 @@ impl<R: Runtime> AgentRunner<R> {
     /// `(content, missing)` where `missing` is `true` iff the doc was empty.
     /// Fail-open: an IO error is just an empty doc → flagged, never an error.
     fn read_expected_doc(&self, slug: &str, name: &str) -> (String, bool) {
-        let content = std::fs::read_to_string(
-            self.options
-                .project_root
-                .join(format!("output/{slug}-{name}.md")),
-        )
-        .unwrap_or_default();
+        let path = self
+            .options
+            .project_root
+            .join(format!("output/{slug}-{name}.md"));
+        let content = self.read_workspace_artifact(&path, &format!("output/{slug}-{name}.md"));
         let missing = content.trim().is_empty();
         if missing {
             self.emit(EngineEvent::Note(format!(
@@ -5003,18 +5133,11 @@ impl<R: Runtime> AgentRunner<R> {
                     .with_phase_budget(Phase::Spec, async {
                         let slug = self.options.effective_slug();
                         // Read approved docs for context
-                        let prd = std::fs::read_to_string(
-                            self.options
-                                .project_root
-                                .join(format!("output/{slug}-prd.md")),
-                        )
-                        .unwrap_or_default();
-                        let arch = std::fs::read_to_string(
-                            self.options
-                                .project_root
-                                .join(format!("output/{slug}-architecture.md")),
-                        )
-                        .unwrap_or_default();
+                        let mut docs = self
+                            .read_output_bundle(&slug, &["prd", "architecture"])
+                            .into_iter();
+                        let prd = docs.next().unwrap_or_default();
+                        let arch = docs.next().unwrap_or_default();
                         let context = format!(
                             "PRD excerpt:\n{}\n\nArchitecture excerpt:\n{}",
                             excerpt_sections(&prd, 2000),
@@ -5131,7 +5254,7 @@ impl<R: Runtime> AgentRunner<R> {
                 // The `after` snapshot is taken right after the budgeted body and
                 // BEFORE `run_frontend` writes its notes artifact, so the diff
                 // reflects only what the worker itself wrote.
-                let fe_before = git_worktree_snapshot(&self.options.project_root);
+                let fe_before = git_worktree_snapshot(&self.options.project_root).await;
                 // Git-INDEPENDENT real-source baseline: count actual source files
                 // before the worker body so we can prove the phase wrote code even
                 // when the workspace is NOT a git repo (where the porcelain snapshot
@@ -5182,7 +5305,7 @@ impl<R: Runtime> AgentRunner<R> {
                 // #1: base reported a non-empty implementation but the working tree
                 // is provably unchanged → degrade + warn (fail-open if no git).
                 if !fe_degraded {
-                    let fe_after = git_worktree_snapshot(&self.options.project_root);
+                    let fe_after = git_worktree_snapshot(&self.options.project_root).await;
                     if self.implementation_left_no_files(
                         Phase::Frontend,
                         base_reported,
@@ -5326,7 +5449,7 @@ impl<R: Runtime> AgentRunner<R> {
                 // changed-files reality check the frontend phase does. `run_backend`
                 // writes its notes artifact only after this block, so the `after`
                 // snapshot reflects exactly what the worker wrote.
-                let be_before = git_worktree_snapshot(&self.options.project_root);
+                let be_before = git_worktree_snapshot(&self.options.project_root).await;
                 // Git-INDEPENDENT real-source baseline (mirrors the frontend phase).
                 let be_src_before = source_file_count(&self.options.project_root);
                 // #4: read the approved docs as context here; an expected doc that
@@ -5369,7 +5492,7 @@ impl<R: Runtime> AgentRunner<R> {
                 // #1: base reported a non-empty implementation but the working tree
                 // is provably unchanged → degrade + warn (fail-open if no git).
                 if !be_degraded {
-                    let be_after = git_worktree_snapshot(&self.options.project_root);
+                    let be_after = git_worktree_snapshot(&self.options.project_root).await;
                     if self.implementation_left_no_files(
                         Phase::Backend,
                         base_reported,
@@ -5511,8 +5634,8 @@ impl<R: Runtime> AgentRunner<R> {
                         .collect::<Vec<_>>()
                         .join("\n");
                     self.emit(EngineEvent::Note(format!(
-                    "[team] 质量阶段团队建议(advisory,不沉质量门 — 确定性门仍为硬信号):\n{list}"
-                )));
+                        "[team] 质量阶段团队建议(advisory,不沉质量门 — 确定性门仍为硬信号):\n{list}"
+                    )));
                 }
             }
 
@@ -5523,7 +5646,17 @@ impl<R: Runtime> AgentRunner<R> {
             // Keep the gate JSON around: we need it both for the score line AND, when
             // the gate blocks, to inline the top findings instead of telling the user
             // to open the file themselves.
-            let qg_body = std::fs::read_to_string(&qg_path).ok();
+            let qg_body = match crate::bounded_fs::read_utf8_beneath(
+                &self.options.project_root,
+                &qg_path,
+                RUN_ARTIFACT_FILE_BYTES,
+            ) {
+                Ok(body) => Some(body),
+                Err(error) => {
+                    self.note_unavailable_workspace_input("quality-gate.json", &error);
+                    None
+                }
+            };
             let mut qg_score = "?".to_string();
             let quality_passed = if let Some(qg) = qg_body.as_deref() {
                 let (score_str, passed) = crate::phases::extract_quality_score(qg);
@@ -5607,12 +5740,14 @@ impl<R: Runtime> AgentRunner<R> {
                         .to_string(),
                 ));
                     let slug = self.options.effective_slug();
-                    let arch = std::fs::read_to_string(
-                        self.options
-                            .project_root
-                            .join(format!("output/{slug}-architecture.md")),
-                    )
-                    .unwrap_or_default();
+                    let arch_path = self
+                        .options
+                        .project_root
+                        .join(format!("output/{slug}-architecture.md"));
+                    let arch = self.read_workspace_artifact(
+                        &arch_path,
+                        &format!("output/{slug}-architecture.md"),
+                    );
                     self.emit(EngineEvent::SubTaskStarted {
                         phase: Phase::Delivery,
                         task_id: "delivery.recipe".into(),
@@ -5827,9 +5962,18 @@ impl<R: Runtime> AgentRunner<R> {
                     "{}-quality-gate.json",
                     self.options.effective_slug()
                 ));
-                std::fs::read_to_string(&qg_path)
-                    .ok()
-                    .is_none_or(|qg| crate::phases::extract_quality_score(&qg).1)
+                match crate::bounded_fs::read_utf8_beneath(
+                    &self.options.project_root,
+                    &qg_path,
+                    RUN_ARTIFACT_FILE_BYTES,
+                ) {
+                    Ok(qg) => crate::phases::extract_quality_score(&qg).1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => {
+                        self.note_unavailable_workspace_input("quality-gate.json", &error);
+                        false
+                    }
+                }
             };
 
             // Mark the lean run complete — phase stays at quality (Light has no
@@ -5972,14 +6116,6 @@ impl<R: Runtime> AgentRunner<R> {
         use_runtime: bool,
     ) -> std::io::Result<(PhaseOutput, bool)> {
         let slug = self.options.effective_slug();
-        let read = |name: &str| -> String {
-            std::fs::read_to_string(
-                self.options
-                    .project_root
-                    .join(format!("output/{slug}-{name}.md")),
-            )
-            .unwrap_or_default()
-        };
         match phase {
             Phase::Research => {
                 let text = if use_runtime {
@@ -5998,7 +6134,12 @@ impl<R: Runtime> AgentRunner<R> {
             Phase::Docs => {
                 // Reuse the full docs generation path so PRD/architecture/UIUX
                 // are all regenerated against the same research input.
-                let research = read("research");
+                let research_path = self
+                    .options
+                    .project_root
+                    .join(format!("output/{slug}-research.md"));
+                let research = self
+                    .read_workspace_artifact(&research_path, &format!("output/{slug}-research.md"));
                 let content = if use_runtime {
                     self.generate_docs_content(Some(&research)).await
                 } else {
@@ -6013,8 +6154,11 @@ impl<R: Runtime> AgentRunner<R> {
             Phase::Spec => {
                 let mut degraded = false;
                 if use_runtime {
-                    let prd = read("prd");
-                    let arch = read("architecture");
+                    let mut docs = self
+                        .read_output_bundle(&slug, &["prd", "architecture"])
+                        .into_iter();
+                    let prd = docs.next().unwrap_or_default();
+                    let arch = docs.next().unwrap_or_default();
                     let context = format!(
                         "PRD excerpt:\n{}\n\nArchitecture excerpt:\n{}",
                         excerpt_sections(&prd, 2000),
@@ -6060,7 +6204,7 @@ impl<R: Runtime> AgentRunner<R> {
                     let (prd, prd_missing) = self.read_expected_doc(&slug, "prd");
                     let ctx_missing = uiux_missing || arch_missing || prd_missing;
                     // #1: snapshot before/after for the changed-files reality check.
-                    let before = git_worktree_snapshot(&self.options.project_root);
+                    let before = git_worktree_snapshot(&self.options.project_root).await;
                     let fe_p = self.with_expert_knowledge(
                         frontend_prompt(
                             &slug,
@@ -6074,7 +6218,7 @@ impl<R: Runtime> AgentRunner<R> {
                     let base_reported = self.try_generate(phase, fe_p).await.is_some();
                     degraded = !base_reported || ctx_missing;
                     if !degraded {
-                        let after = git_worktree_snapshot(&self.options.project_root);
+                        let after = git_worktree_snapshot(&self.options.project_root).await;
                         if self.implementation_left_no_files(
                             Phase::Frontend,
                             base_reported,
@@ -6098,7 +6242,7 @@ impl<R: Runtime> AgentRunner<R> {
                     let (prd, prd_missing) = self.read_expected_doc(&slug, "prd");
                     let ctx_missing = arch_missing || prd_missing;
                     // #1: snapshot before/after for the changed-files reality check.
-                    let before = git_worktree_snapshot(&self.options.project_root);
+                    let before = git_worktree_snapshot(&self.options.project_root).await;
                     let be_p = self.with_expert_knowledge(
                         backend_prompt(
                             &slug,
@@ -6111,7 +6255,7 @@ impl<R: Runtime> AgentRunner<R> {
                     let base_reported = self.try_generate(phase, be_p).await.is_some();
                     degraded = !base_reported || ctx_missing;
                     if !degraded {
-                        let after = git_worktree_snapshot(&self.options.project_root);
+                        let after = git_worktree_snapshot(&self.options.project_root).await;
                         if self.implementation_left_no_files(
                             Phase::Backend,
                             base_reported,
@@ -6135,7 +6279,14 @@ impl<R: Runtime> AgentRunner<R> {
             Phase::Delivery => {
                 let mut degraded = false;
                 if use_runtime {
-                    let arch = read("architecture");
+                    let arch_path = self
+                        .options
+                        .project_root
+                        .join(format!("output/{slug}-architecture.md"));
+                    let arch = self.read_workspace_artifact(
+                        &arch_path,
+                        &format!("output/{slug}-architecture.md"),
+                    );
                     let del_p = self.with_expert_knowledge(
                         delivery_prompt(
                             &slug,
@@ -6208,9 +6359,8 @@ impl<R: Runtime> AgentRunner<R> {
             .project_root
             .join("output")
             .join(format!("{slug}-clarify-answers.md"));
-        let Ok(answers) = std::fs::read_to_string(&answers_path) else {
-            return self.options.requirement.clone();
-        };
+        let answers = self
+            .read_workspace_artifact(&answers_path, &format!("output/{slug}-clarify-answers.md"));
         let answers = answers.trim();
         if answers.is_empty() {
             return self.options.requirement.clone();
@@ -7000,6 +7150,26 @@ mod tests {
             mode: crate::trust::TrustMode::Guarded,
             strict_coverage: false,
         }
+    }
+
+    #[test]
+    fn output_bundle_rejects_an_oversized_artifact_without_truncating_it() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-prd.md"),
+            vec![b'x'; RUN_ARTIFACT_FILE_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("output/demo-architecture.md"),
+            "complete architecture",
+        )
+        .unwrap();
+        let runner = AgentRunner::new(FakeRuntime, opts(tmp.path()));
+        let docs = runner.read_output_bundle("demo", &["prd", "architecture"]);
+        assert!(docs[0].is_empty());
+        assert_eq!(docs[1], "complete architecture");
     }
 
     #[test]
@@ -9863,11 +10033,11 @@ error TS2304: Cannot find name 'Foo'
         );
     }
 
-    #[test]
-    fn git_worktree_snapshot_fails_open_on_non_git_dir() {
+    #[tokio::test]
+    async fn git_worktree_snapshot_fails_open_on_non_git_dir() {
         let tmp = TempDir::new().unwrap();
         // No `git init` → not a repo → None (fail-open, the caller skips the check).
-        assert!(git_worktree_snapshot(tmp.path()).is_none());
+        assert!(git_worktree_snapshot(tmp.path()).await.is_none());
     }
 
     #[test]

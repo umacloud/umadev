@@ -962,15 +962,39 @@ mod tests {
         for request in [
             "不要只分析，直接修复",
             "删除页面里的‘不要修改文件’提示",
+            "删除页面里的‘不要修改任何文件’提示",
+            "把 “read-only analysis” 改成 “editable analysis”",
             "不是让你不要修改，直接改",
             "只改 app.rs，不要修改其他文件",
+            "Only modify app.rs; do not modify any file except app.rs",
+            "不要修改任何文件，除了 src/app.rs",
+            "除 src/app.rs 以外，不要修改任何文件",
         ] {
             assert!(
                 !explicit_read_only_request(request),
                 "scoped/quoted/negated wording is not a whole-turn ceiling: {request}"
             );
+            assert!(
+                !requirement_demands_read_only(request),
+                "execution-layer ceiling must also ignore scoped/quoted wording: {request}"
+            );
         }
         assert!(explicit_read_only_request("只分析原因，不要修改任何文件"));
+        for request in [
+            "除了告诉我原因，不要修改任何文件",
+            "除非你需要解释原因以外，不要修改任何文件",
+            "do not modify any file except tell me why",
+            "不要修改任何文件，除了告诉我 app 为什么崩溃",
+            "do not modify any file except explain app behavior",
+            "do not modify any file except explain src/app.rs behavior",
+            "不要修改任何文件，除了告诉我 src/app.rs 为什么崩溃",
+        ] {
+            assert!(
+                explicit_read_only_request(request),
+                "a prose exception must not erase the read-only ceiling: {request}"
+            );
+            assert!(requirement_demands_read_only(request));
+        }
     }
 
     #[test]

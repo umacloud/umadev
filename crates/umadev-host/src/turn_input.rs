@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -225,7 +225,7 @@ fn read_attachment(
 ) -> Result<PreparedAttachment, SessionError> {
     let before = fs::symlink_metadata(path)
         .map_err(|_| invalid(index, kind, "attachment is unavailable"))?;
-    if !before.file_type().is_file() || before.file_type().is_symlink() {
+    if !metadata_is_regular_no_reparse(&before) {
         return Err(invalid(index, kind, "attachment must be a regular file"));
     }
     if before.len() > MAX_ATTACHMENT_BYTES {
@@ -237,12 +237,26 @@ fn read_attachment(
     }
     let canonical = fs::canonicalize(path)
         .map_err(|_| invalid(index, kind, "attachment path could not be resolved"))?;
-    let mut file = File::open(&canonical)
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options
+        .open(path)
         .map_err(|_| invalid(index, kind, "attachment could not be opened"))?;
     let opened = file
         .metadata()
         .map_err(|_| invalid(index, kind, "attachment metadata is unavailable"))?;
-    if !opened.is_file() || !same_file_identity(&before, &opened) {
+    if !metadata_is_regular_no_reparse(&opened) || !same_file_identity(&before, &opened) {
         return Err(invalid(index, kind, "attachment changed during validation"));
     }
     let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
@@ -262,7 +276,7 @@ fn read_attachment(
     let after = fs::symlink_metadata(path)
         .map_err(|_| invalid(index, kind, "attachment changed during validation"))?;
     if after_path != canonical
-        || !after.file_type().is_file()
+        || !metadata_is_regular_no_reparse(&after)
         || !same_file_identity(&opened, &after)
     {
         return Err(invalid(index, kind, "attachment changed during validation"));
@@ -274,6 +288,21 @@ fn read_attachment(
         bytes,
         media_type,
     })
+}
+
+fn metadata_is_regular_no_reparse(metadata: &fs::Metadata) -> bool {
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(unix)]
@@ -425,6 +454,7 @@ pub(crate) fn invalid(index: usize, kind: TurnInputBlockKind, reason: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -491,6 +521,29 @@ mod tests {
             mode: FileInputMode::MaterializeText,
         }]))
         .await
+        .unwrap_err();
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_attachment_is_rejected_without_blocking() {
+        let dir = tempdir().unwrap();
+        let fifo = dir.path().join("attachment.txt");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            prepare(TurnInput::new(vec![TurnInputBlock::File {
+                path: fifo,
+                mode: FileInputMode::MaterializeText,
+            }])),
+        )
+        .await
+        .expect("a FIFO must be rejected without waiting for a writer")
         .unwrap_err();
         assert!(error.to_string().contains("regular file"));
     }

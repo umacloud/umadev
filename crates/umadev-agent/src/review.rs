@@ -19,10 +19,17 @@
 //! one live probe; a missing/!git repo simply downgrades to "could not diff".
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
 use crate::phases::QualityReport;
 use crate::security::SecurityScan;
+
+/// Review artifacts are project-controlled and consulted automatically. Two
+/// MiB is generous for the structured reports while keeping every read hard
+/// bounded before parsing.
+const MAX_REVIEW_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
+const REVIEW_GIT_TIMEOUT: Duration = Duration::from_secs(10);
+const REVIEW_DIFF_BYTES: usize = 16 * 1024 * 1024;
 
 /// One assertion in the review report: a claim, the verdict, and the concrete
 /// evidence backing it. Kept as data (not just rendered text) so the renderer is
@@ -177,7 +184,8 @@ fn ci_integrity_claim(project_root: &Path) -> ReviewClaim {
 /// quality gate does: parse the architecture API table, extract the real
 /// frontend calls, cross-validate.
 fn contract_claim(project_root: &Path, slug: &str) -> ReviewClaim {
-    let arch = read(project_root.join(format!("output/{slug}-architecture.md")));
+    let arch_path = project_root.join(format!("output/{slug}-architecture.md"));
+    let arch = read(project_root, &arch_path);
     if arch.trim().is_empty() {
         return ReviewClaim {
             title: "API contract".to_string(),
@@ -323,7 +331,7 @@ fn quality_claim(project_root: &Path, slug: &str) -> ReviewClaim {
 /// Security scan — reuse the persisted `.umadev/audit/security-scan.json`.
 fn security_claim(project_root: &Path) -> ReviewClaim {
     let path = project_root.join(crate::security::security_scan_rel_path());
-    let raw = read(path);
+    let raw = read(project_root, &path);
     if raw.trim().is_empty() {
         // No file → the scan simply hasn't run yet.
         return ReviewClaim {
@@ -390,8 +398,8 @@ fn security_claim(project_root: &Path) -> ReviewClaim {
 /// Runtime evidence — reuse the persisted `.umadev/audit/runtime-proof.json`.
 fn runtime_claim(project_root: &Path) -> ReviewClaim {
     let path = project_root.join(crate::runtime_proof::runtime_proof_rel_path());
-    let Some(proof) =
-        read(path).pipe_opt(|s| serde_json::from_str::<crate::runtime_proof::RuntimeProof>(s).ok())
+    let Some(proof) = read(project_root, &path)
+        .pipe_opt(|s| serde_json::from_str::<crate::runtime_proof::RuntimeProof>(s).ok())
     else {
         return ReviewClaim {
             title: "Runtime evidence".to_string(),
@@ -481,8 +489,9 @@ pub fn render_review_md(report: &ReviewReport) -> String {
 // helpers
 // =====================================================================
 
-fn read(path: PathBuf) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
+fn read(project_root: &Path, path: &Path) -> String {
+    crate::bounded_fs::read_utf8_beneath(project_root, path, MAX_REVIEW_ARTIFACT_BYTES)
+        .unwrap_or_default()
 }
 
 /// Tiny `Option`-combinator so the claim builders read top-down. Returns `None`
@@ -501,7 +510,8 @@ impl PipeOpt for String {
 }
 
 fn read_quality(project_root: &Path, slug: &str) -> Option<QualityReport> {
-    let body = read(project_root.join(format!("output/{slug}-quality-gate.json")));
+    let path = project_root.join(format!("output/{slug}-quality-gate.json"));
+    let body = read(project_root, &path);
     if body.trim().is_empty() {
         return None;
     }
@@ -527,15 +537,16 @@ fn git_diff(project_root: &Path) -> Option<String> {
 /// `git diff --find-renames <against>` in `project_root`; `None` on spawn failure or a
 /// non-zero git exit.
 fn run_git_diff(project_root: &Path, against: &str) -> Option<String> {
-    let out = Command::new("git")
-        .args(["diff", "--find-renames", against])
-        .current_dir(project_root)
-        .output()
-        .ok()?;
+    let out = crate::external_command::bounded_git_output(
+        project_root,
+        &["diff", "--no-ext-diff", "--find-renames", against],
+        REVIEW_GIT_TIMEOUT,
+        REVIEW_DIFF_BYTES,
+    )?;
     if !out.status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    String::from_utf8(out.stdout).ok()
 }
 
 /// Resolve the merge-base of HEAD with the repo default branch (tries the common
@@ -543,14 +554,15 @@ fn run_git_diff(project_root: &Path, against: &str) -> Option<String> {
 /// no default branch), so `git_diff` falls back to the working-tree diff.
 fn merge_base_with_default(project_root: &Path) -> Option<String> {
     for base in ["origin/main", "origin/master", "main", "master"] {
-        let out = Command::new("git")
-            .args(["merge-base", "HEAD", base])
-            .current_dir(project_root)
-            .output()
-            .ok()?;
+        let out = crate::external_command::bounded_git_output(
+            project_root,
+            &["merge-base", "HEAD", base],
+            REVIEW_GIT_TIMEOUT,
+            8 * 1024,
+        )?;
         if out.status.success() {
-            let sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !sha.is_empty() {
+            let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+            if matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Some(sha);
             }
         }
@@ -741,6 +753,27 @@ mod tests {
                 "{hostile:?} -> absolute {rel:?}"
             );
         }
+    }
+
+    #[test]
+    fn review_artifact_read_is_hard_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("artifact.json");
+        fs::write(&path, vec![b'x'; MAX_REVIEW_ARTIFACT_BYTES + 1]).unwrap();
+        assert!(read(tmp.path(), &path).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_artifact_read_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "not review evidence").unwrap();
+        let link = tmp.path().join("artifact.json");
+        symlink(outside.path(), &link).unwrap();
+        assert!(read(tmp.path(), &link).is_empty());
     }
 
     #[test]

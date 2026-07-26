@@ -48,6 +48,8 @@ enum PolicyLoadError {
     /// The file could not be read (absent or unreadable) — a silent default is
     /// the correct, expected behavior.
     Missing,
+    /// The file exists but cannot be consumed within the safe input contract.
+    Read(String),
     /// The file was read but is not valid TOML; the string is the parser error.
     Parse(String),
 }
@@ -102,6 +104,9 @@ fn canonical_rule_id(rule_id: &str) -> String {
 }
 
 impl Policy {
+    /// A governance policy is configuration, not an unbounded data store.
+    const MAX_POLICY_BYTES: u64 = 1024 * 1024;
+
     /// Load the policy from `<project_root>/.umadev/rules.toml`.
     /// Fail-open: a missing or unparseable file returns the default policy
     /// (everything enabled) so the host is never blocked by a config error. A
@@ -111,7 +116,10 @@ impl Policy {
     #[must_use]
     pub fn load(project_root: &Path) -> Self {
         let path = project_root.join(".umadev").join("rules.toml");
-        Self::load_from(&path)
+        Self::finish_load(
+            &path,
+            Self::try_load_beneath(project_root, Path::new(".umadev/rules.toml")),
+        )
     }
 
     /// Load from an explicit path. Fail-open on any error, but **honest** about
@@ -125,9 +133,21 @@ impl Policy {
     /// visible so they can fix it; governance never blocks the host on this.
     #[must_use]
     pub fn load_from(path: &Path) -> Self {
-        match Self::try_load_from(path) {
+        Self::finish_load(path, Self::try_load_from(path))
+    }
+
+    fn finish_load(path: &Path, result: Result<Self, PolicyLoadError>) -> Self {
+        match result {
             Ok(policy) => policy,
             Err(PolicyLoadError::Missing) => Self::default(),
+            Err(PolicyLoadError::Read(msg)) => {
+                eprintln!(
+                    "UmaDev governance: could not safely read {} ({msg}); IGNORING your \
+                     rules.toml overrides and enforcing ALL default rules.",
+                    path.display()
+                );
+                Self::default()
+            }
             Err(PolicyLoadError::Parse(msg)) => {
                 eprintln!(
                     "UmaDev governance: could not parse {} ({msg}); IGNORING your \
@@ -152,7 +172,30 @@ impl Policy {
     /// unreadable); [`PolicyLoadError::Parse`] when it reads but is not valid
     /// TOML (message carries the parser error).
     fn try_load_from(path: &Path) -> Result<Self, PolicyLoadError> {
-        let text = std::fs::read_to_string(path).map_err(|_| PolicyLoadError::Missing)?;
+        let Some(parent) = path.parent() else {
+            return Err(PolicyLoadError::Read(
+                "policy path has no parent directory".to_owned(),
+            ));
+        };
+        let Some(name) = path.file_name() else {
+            return Err(PolicyLoadError::Read(
+                "policy path has no filename".to_owned(),
+            ));
+        };
+        Self::try_load_beneath(parent, Path::new(name))
+    }
+
+    fn try_load_beneath(root: &Path, relative: &Path) -> Result<Self, PolicyLoadError> {
+        let bytes =
+            match umadev_state::fs::read_bounded_beneath(root, relative, Self::MAX_POLICY_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(PolicyLoadError::Missing)
+                }
+                Err(error) => return Err(PolicyLoadError::Read(error.to_string())),
+            };
+        let text = String::from_utf8(bytes)
+            .map_err(|_| PolicyLoadError::Read("policy is not valid UTF-8".to_owned()))?;
         toml::from_str(&text).map_err(|e| PolicyLoadError::Parse(e.to_string()))
     }
 
@@ -353,6 +396,46 @@ mod tests {
         std::fs::write(&path, "this is not {{{ valid toml").unwrap();
         let p = Policy::load_from(&path);
         assert!(!p.is_disabled("UD-ARCH-002"));
+    }
+
+    #[test]
+    fn oversized_policy_is_ignored_in_the_strict_direction() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("rules.toml"),
+            vec![b'x'; usize::try_from(Policy::MAX_POLICY_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        let policy = Policy::load(tmp.path());
+        assert!(!policy.is_disabled("UD-CODE-001"));
+        assert!(!policy.is_excluded("src/app.ts"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_or_fifo_policy_never_relaxes_rules_or_blocks() {
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&dir).unwrap();
+        let outside = tmp.path().join("outside.toml");
+        std::fs::write(&outside, "[disabled]\nclauses=['UD-CODE-001']\n").unwrap();
+        symlink(&outside, dir.join("rules.toml")).unwrap();
+        assert!(!Policy::load(tmp.path()).is_disabled("UD-CODE-001"));
+        std::fs::remove_file(dir.join("rules.toml")).unwrap();
+
+        assert!(std::process::Command::new("mkfifo")
+            .arg(dir.join("rules.toml"))
+            .status()
+            .unwrap()
+            .success());
+        let started = Instant::now();
+        assert!(!Policy::load(tmp.path()).is_disabled("UD-CODE-001"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

@@ -120,12 +120,17 @@ const GROWN_FILE_MAX_LINES: usize = 800;
 /// Hard repo-size skip: more source files than this → the god-file and clone
 /// scans silently no-op (fail-open; the pass must stay fast on any repo).
 const MAX_SCAN_FILES: usize = 5_000;
-/// Max bytes read per file (a 512 KiB cap still counts far beyond any line
-/// ceiling, so god-file detection is unaffected).
+/// Hard cap across all directory entries, including irrelevant extensions.
+const MAX_SCAN_ENTRIES: usize = 50_000;
+/// Max bytes read per file. A larger file disables the whole comparative scan;
+/// its prefix is never treated as complete architecture evidence.
 const MAX_FILE_BYTES: usize = 512 * 1024;
 /// Total read budget across one scan — blown → the whole scan is discarded
 /// (partial data could misclassify a pre-existing file as "new").
 const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+/// Architecture declaration input is small prose; reject pathological files
+/// instead of parsing an arbitrary prefix as the complete layering contract.
+const MAX_LAYER_DOC_BYTES: usize = 2 * 1024 * 1024;
 /// Max directory recursion depth (mirrors the acceptance source walk).
 const MAX_SCAN_DEPTH: usize = 16;
 
@@ -320,28 +325,21 @@ fn touched_rels(now: &ArchScan, before: &ArchBaseline) -> Vec<String> {
 /// the whole scan rather than returning a half-truth).
 fn scan(root: &Path) -> Option<ArchScan> {
     let mut paths: Vec<(String, PathBuf)> = Vec::new();
-    collect(root, root, &mut paths, 0);
-    if paths.len() > MAX_SCAN_FILES {
+    let mut entries_seen = 0usize;
+    if !collect(root, root, &mut paths, &mut entries_seen, 0) || paths.len() > MAX_SCAN_FILES {
         return None;
     }
     let mut files = BTreeMap::new();
     let mut clone_ok = true;
-    let mut total_bytes = 0usize;
     let mut total_windows = 0usize;
+    let mut read_budget = crate::bounded_fs::Utf8ReadBudget::new(MAX_TOTAL_BYTES, MAX_FILE_BYTES);
     for (rel, abs) in paths {
-        let Ok(bytes) = std::fs::read(&abs) else {
-            continue; // unreadable file → skip (fail-open)
+        let Ok(bytes) = read_budget.read_bytes_beneath(root, &abs) else {
+            // A partial tree can misclassify an existing file as newly added.
+            // Discard the whole scan rather than silently trusting a prefix.
+            return None;
         };
-        total_bytes = total_bytes.saturating_add(bytes.len().min(MAX_FILE_BYTES));
-        if total_bytes > MAX_TOTAL_BYTES {
-            return None; // blown budget → discard (never a half-truth)
-        }
-        let capped = if bytes.len() > MAX_FILE_BYTES {
-            &bytes[..MAX_FILE_BYTES]
-        } else {
-            &bytes[..]
-        };
-        let content = String::from_utf8_lossy(capped);
+        let content = String::from_utf8_lossy(&bytes);
         let windows = if clone_ok {
             let w = windows_of(&content);
             total_windows += w.len();
@@ -352,14 +350,10 @@ fn scan(root: &Path) -> Option<ArchScan> {
         } else {
             HashMap::new()
         };
-        let comments = if bytes.len() > MAX_FILE_BYTES {
-            CommentStats::default()
-        } else {
-            std::str::from_utf8(&bytes)
-                .ok()
-                .map(|text| comment_stats(text, &rel))
-                .unwrap_or_default()
-        };
+        let comments = std::str::from_utf8(&bytes)
+            .ok()
+            .map(|text| comment_stats(text, &rel))
+            .unwrap_or_default();
         files.insert(
             rel,
             FileScan {
@@ -377,16 +371,29 @@ fn scan(root: &Path) -> Option<ArchScan> {
 /// code extensions only, skipping vendored/build dirs, dot-dirs, symlinks
 /// (no-follow), and exempt (test / generated / lock) files. Collects at most
 /// [`MAX_SCAN_FILES`] + 1 entries so the caller can detect the overflow.
-fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, depth: usize) {
+fn collect(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+    entries_seen: &mut usize,
+    depth: usize,
+) -> bool {
     if depth > MAX_SCAN_DEPTH || out.len() > MAX_SCAN_FILES {
-        return;
+        return false;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return; // unreadable dir → skip (fail-open)
+        return false;
     };
-    for e in rd.flatten() {
+    for entry in rd {
+        *entries_seen = entries_seen.saturating_add(1);
+        if *entries_seen > MAX_SCAN_ENTRIES {
+            return false;
+        }
+        let Ok(e) = entry else {
+            return false;
+        };
         if out.len() > MAX_SCAN_FILES {
-            return;
+            return false;
         }
         let p = e.path();
         match classify_no_follow(&p) {
@@ -396,7 +403,9 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, depth: usi
                 if name.starts_with('.') || SKIP_DIRS.contains(&lower_name.as_str()) {
                     continue;
                 }
-                collect(root, &p, out, depth + 1);
+                if !collect(root, &p, out, entries_seen, depth + 1) {
+                    return false;
+                }
             }
             EntryKind::File => {
                 let ext = p
@@ -416,6 +425,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>, depth: usi
             EntryKind::Skip => {}
         }
     }
+    true
 }
 
 /// Workspace-relative, `/`-separated form of `p`.
@@ -609,7 +619,9 @@ impl LayerSpec {
 /// mtime cache keeps repeat calls cheap).
 fn layer_findings(root: &Path, slug: &str) -> Vec<Finding> {
     let doc_rel = format!("output/{slug}-architecture.md");
-    let Ok(doc) = std::fs::read_to_string(root.join(&doc_rel)) else {
+    let Ok(doc) =
+        crate::bounded_fs::read_utf8_beneath(root, &root.join(&doc_rel), MAX_LAYER_DOC_BYTES)
+    else {
         return Vec::new();
     };
     let spec = parse_layer_spec(&doc);
@@ -2386,6 +2398,46 @@ mod tests {
             arch_fitness_findings_since(tmp.path(), "demo", &disabled).is_empty(),
             "a disabled (huge-repo) baseline is a silent no-op"
         );
+    }
+
+    #[test]
+    fn oversized_source_or_exhausted_aggregate_disables_the_whole_scan() {
+        let oversized = TempDir::new().unwrap();
+        fs::create_dir_all(oversized.path().join("src")).unwrap();
+        let file = fs::File::create(oversized.path().join("src/huge.rs")).unwrap();
+        file.set_len((MAX_FILE_BYTES + 1) as u64).unwrap();
+        drop(file);
+        assert!(baseline(oversized.path()).disabled);
+
+        let exhausted = TempDir::new().unwrap();
+        let src = exhausted.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let file_count = MAX_TOTAL_BYTES / MAX_FILE_BYTES + 1;
+        for index in 0..file_count {
+            let file = fs::File::create(src.join(format!("part-{index}.rs"))).unwrap();
+            file.set_len(MAX_FILE_BYTES as u64).unwrap();
+        }
+        assert!(
+            baseline(exhausted.path()).disabled,
+            "aggregate exhaustion must discard the scan rather than trust a partial tree"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_source_file_is_not_added_to_the_architecture_baseline() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let external = outside.path().join("secret.rs");
+        fs::write(&external, "pub const SECRET: &str = \"outside\";\n").unwrap();
+        symlink(&external, workspace.path().join("src/secret.rs")).unwrap();
+
+        let before = baseline(workspace.path());
+        assert!(!before.disabled);
+        assert!(before.files.is_empty());
     }
 
     #[test]

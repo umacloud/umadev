@@ -25,8 +25,16 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use crate::bounded_fs::{read_utf8_beneath, Utf8ReadBudget};
+
 /// On-disk ledger location, relative to project root.
 pub const DEBT_LEDGER: &str = ".umadev/tech-debt.jsonl";
+
+const MAX_DEBT_SCAN_FILES: usize = 256;
+const MAX_DEBT_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DEBT_SCAN_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DEBT_ITEMS: usize = 10_000;
+const MAX_DEBT_LEDGER_BYTES: usize = 8 * 1024 * 1024;
 
 /// The kind of placeholder marker found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -107,10 +115,18 @@ fn default_status() -> DebtStatus {
 pub fn scan_debt(output_dir: &Path) -> Vec<DebtItem> {
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut items = Vec::new();
+    let project_root = output_dir.parent().unwrap_or(output_dir);
+    if !crate::bounded_fs::is_real_directory_beneath(project_root, output_dir) {
+        return items;
+    }
     let Ok(rd) = fs::read_dir(output_dir) else {
         return items;
     };
-    for entry in rd.flatten() {
+    let mut budget = Utf8ReadBudget::new(MAX_DEBT_SCAN_TOTAL_BYTES, MAX_DEBT_FILE_BYTES);
+    for entry in rd.flatten().take(MAX_DEBT_SCAN_FILES) {
+        if items.len() >= MAX_DEBT_ITEMS || budget.remaining_bytes() == 0 {
+            break;
+        }
         let p = entry.path();
         if p.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
@@ -120,10 +136,13 @@ pub fn scan_debt(output_dir: &Path) -> Vec<DebtItem> {
             .unwrap_or(&p)
             .to_string_lossy()
             .replace(std::path::MAIN_SEPARATOR, "/");
-        let Ok(content) = fs::read_to_string(&p) else {
+        let Ok(content) = budget.read_utf8_beneath(project_root, &p) else {
             continue;
         };
         for (i, line) in content.lines().enumerate() {
+            if items.len() >= MAX_DEBT_ITEMS {
+                break;
+            }
             let lineno = u32::try_from(i + 1).unwrap_or(0);
             let lower = line.to_ascii_lowercase();
             // Classify the strongest marker on this line (one item per line).
@@ -193,7 +212,7 @@ pub fn write_ledger(project_root: &Path, items: &[DebtItem]) -> PathBuf {
 #[must_use]
 pub fn read_ledger(project_root: &Path) -> Vec<DebtItem> {
     let path = project_root.join(DEBT_LEDGER);
-    let Ok(text) = fs::read_to_string(&path) else {
+    let Ok(text) = read_utf8_beneath(project_root, &path, MAX_DEBT_LEDGER_BYTES) else {
         return Vec::new();
     };
     text.lines()
