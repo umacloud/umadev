@@ -75,7 +75,13 @@ pub fn check_insecure_file_perms(file_path: &str, content: &str) -> Decision {
     } else {
         content
     };
-    let lower = content.to_ascii_lowercase();
+    let context_lower = content.to_ascii_lowercase();
+    // Permission modes must be executable syntax. Detector examples in comments
+    // and shell snippets held in strings do not grant filesystem permissions.
+    let tokenized = crate::tokenizer::Tokenized::new(content);
+    let lower = tokenized
+        .code_only_preserving_lines(content)
+        .to_ascii_lowercase();
     let insecure_modes = [
         concat!("0o", "666"),
         concat!("0o", "777"),
@@ -92,15 +98,22 @@ pub fn check_insecure_file_perms(file_path: &str, content: &str) -> Decision {
         concat!("S_IRWXU | S_IRWXG | ", "S_IRWXO"),
         concat!("S_IRWXU|S_IRWXG|", "S_IRWXO"),
     ];
-    let sensitive_context = lower.contains("secret")
-        || lower.contains("key")
-        || lower.contains("password")
-        || lower.contains("token")
-        || lower.contains("config")
-        || lower.contains("credential")
-        || lower.contains("private");
+    let sensitive_context = context_lower.contains("secret")
+        || context_lower.contains("key")
+        || context_lower.contains("password")
+        || context_lower.contains("token")
+        || context_lower.contains("config")
+        || context_lower.contains("credential")
+        || context_lower.contains("private");
     for mode in insecure_modes {
-        if lower.contains(mode) && sensitive_context {
+        let uses_insecure_mode = lower.lines().any(|line| {
+            line.contains(mode)
+                // Reading Unix permission bits uses 0777 as a mask; it neither
+                // creates a file nor grants those permissions.
+                && !line.contains(".mode() &")
+                && !line.contains(".mode()&")
+        });
+        if uses_insecure_mode && sensitive_context {
             return Decision::block(
                 "UD-SEC-025",
                 format!(

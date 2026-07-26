@@ -2621,6 +2621,12 @@ fn arch_logging_allows_cli_user_output() {
     assert!(!check_structured_logging("scripts/release.py", "print('uploaded')").block);
 }
 
+#[test]
+fn arch_logging_ignores_server_test_fixture_console_capture() {
+    let fixture = "const server = http.createServer(() => {});\nconsole.error = capture;";
+    assert!(!check_structured_logging("scripts/terminal-contract.test.cjs", fixture).block);
+}
+
 // --- UD-SEC-010: insecure CORS --------------------------------------
 
 #[test]
@@ -4611,6 +4617,21 @@ fn sec_perms_ignores_rust_test_fixtures() {
     assert!(!check_insecure_file_perms("src/hook.rs", source).block);
 }
 
+#[test]
+fn sec_perms_allows_unix_permission_bitmask_reads() {
+    let source = "let private_mode = metadata.permissions().mode() & 0o777;";
+    assert!(!check_insecure_file_perms("src/checkpoint.rs", source).block);
+}
+
+#[test]
+fn sec_perms_ignores_permission_examples_in_comments_and_strings() {
+    let source = r#"
+        // Never use chmod 777 for a private config.
+        const WARNING: &str = "chmod 777 leaks a secret token";
+    "#;
+    assert!(!check_insecure_file_perms("src/security_help.rs", source).block);
+}
+
 // --- UD-ARCH-052: unsynchronized mutation ---------------------------------
 
 #[test]
@@ -4641,6 +4662,24 @@ fn arch_unsync_allows_no_concurrency() {
 fn arch_unsync_ignores_non_target() {
     let d = check_unsynchronized_mutation("src/App.tsx", "let x = 0; async fn()");
     assert!(!d.block);
+}
+
+#[test]
+fn arch_unsync_ignores_rust_locals_after_literal_braces() {
+    let code = r#"
+        const EXAMPLE: &str = "}";
+        fn collect() {
+            let mut entries_seen = 0;
+        }
+        async fn run() {}
+    "#;
+    assert!(!check_unsynchronized_mutation("src/backend.rs", code).block);
+}
+
+#[test]
+fn arch_unsync_still_bans_rust_static_mut() {
+    let code = "static mut COUNT: usize = 0;\nasync fn increment() {}";
+    assert!(check_unsynchronized_mutation("src/counter.rs", code).block);
 }
 
 // --- UD-ARCH-053: hard delete --------------------------------------

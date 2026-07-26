@@ -150,6 +150,27 @@ fn audited_grok_baseline_matches_the_wire_contract() {
     assert!(pager_effects.contains("for i in 0..60"));
     assert!(pager_effects.contains("Duration::from_millis(50)"));
 
+    // The audited Linux read-only launch protects Grok's direct hook sources
+    // with a mount namespace before ACP starts.  That happens before
+    // `initialize`, so the published-binary job must provide a usable bwrap;
+    // otherwise an auth contract probe observes only an unexplained EOF.
+    let sandbox_startup = read(&root, "crates/codegen/xai-grok-shell/src/config/mod.rs");
+    assert_markers(
+        &sandbox_startup,
+        "Linux pre-ACP sandbox prerequisite",
+        &[
+            "let requires_hook_write_deny =",
+            "bwrap_reexec_for_profile(&sandbox_profile, &workspace)",
+            "Install bubblewrap with",
+            "std::process::exit(1)",
+        ],
+    );
+    let hook_write_deny = read(
+        &root,
+        "crates/codegen/xai-grok-sandbox/src/hook_write_deny.rs",
+    );
+    assert!(hook_write_deny.contains("!matches!(profile, ProfileName::Devbox | ProfileName::Off)"));
+
     let folder_trust = read(
         &root,
         "crates/codegen/xai-grok-shell/src/agent/mvp_agent/folder_trust_prompt.rs",

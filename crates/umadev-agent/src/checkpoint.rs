@@ -1249,6 +1249,14 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
         let relative = validated_tree_path(&entry.path)?;
         ensure_restore_parent(project_root, &relative)?;
         let absolute = project_root.join(&relative);
+        #[cfg(unix)]
+        let previous_mode = std::fs::symlink_metadata(&absolute)
+            .ok()
+            .filter(umadev_state::fs::metadata_is_real_file)
+            .map(|metadata| {
+                use std::os::unix::fs::PermissionsExt as _;
+                metadata.permissions().mode() & 0o777
+            });
         if std::fs::symlink_metadata(&absolute)
             .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_dir(&metadata))
         {
@@ -1258,14 +1266,16 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(
-                &absolute,
-                std::fs::Permissions::from_mode(if entry.mode == 0o100_755 {
-                    0o755
-                } else {
-                    0o644
-                }),
-            )?;
+            // Replacing an existing file must never widen its visibility. Git trees
+            // retain only the executable bit, so a deleted file has no trustworthy
+            // group/other permissions to restore; recreate it owner-only instead.
+            let mut mode = previous_mode.unwrap_or(0o600);
+            if entry.mode == 0o100_755 {
+                mode |= 0o100;
+            } else {
+                mode &= !0o111;
+            }
+            std::fs::set_permissions(&absolute, std::fs::Permissions::from_mode(mode))?;
         }
     }
     Ok(())
@@ -2806,6 +2816,48 @@ mod tests {
         assert!(
             after.iter().any(|c| c.label.contains("回滚到")),
             "pre-rewind snapshot is reachable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_deleted_files_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = temp.path();
+        let private = root.join(".env");
+        let executable = root.join("deploy.sh");
+        std::fs::write(&private, "TOKEN=test-only\n").expect("private fixture");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600))
+            .expect("private mode");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("script fixture");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("script mode");
+        let checkpoint = create_checkpoint(root, "private baseline").expect("checkpoint");
+
+        std::fs::remove_file(&private).expect("remove private fixture");
+        std::fs::remove_file(&executable).expect("remove script fixture");
+        restore_checkpoint(root, &checkpoint).expect("restore");
+
+        assert_eq!(
+            std::fs::metadata(&private)
+                .expect("restored private fixture")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&executable)
+                .expect("restored script fixture")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
         );
     }
 

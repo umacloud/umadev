@@ -132,14 +132,16 @@ impl App {
                 body.push_str(&format!("  [{}] {verdict}\n", critic.seat));
                 if !critic.accepts {
                     for (index, finding) in critic.blocking.iter().enumerate() {
-                        if !finding.trim().is_empty() {
-                            body.push_str(&format!("    - {}\n", finding.trim()));
-                            if let Some(fix) = critic.fix_for(index) {
-                                body.push_str(&format!(
-                                    "      {}\n",
-                                    umadev_i18n::tf(self.lang, "plan.review.fix", &[fix])
-                                ));
-                            }
+                        let finding = finding.trim();
+                        if finding.is_empty() {
+                            continue;
+                        }
+                        body.push_str(&format!("    - {finding}\n"));
+                        if let Some(fix) = critic.fix_for(index) {
+                            body.push_str(&format!(
+                                "      {}\n",
+                                umadev_i18n::tf(self.lang, "plan.review.fix", &[fix])
+                            ));
                         }
                     }
                 }

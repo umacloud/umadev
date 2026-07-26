@@ -371,6 +371,7 @@ fn fresh_app(backend: Option<&str>) -> App {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id();
     let cfg = UserConfig {
         backend: backend.map(str::to_string),
         // Pin zh-CN so language-sensitive UI assertions (gate cards etc.)
@@ -378,12 +379,12 @@ fn fresh_app(backend: Option<&str>) -> App {
         lang: Some("zh-CN".to_string()),
         ..Default::default()
     };
-    // Each test gets a unique workspace dir to avoid file races between
-    // parallel tests. The .umadevrc disables auto_approve_gates so
+    // PID + counter keeps the workspace unique across parallel test processes.
+    // The .umadevrc disables auto_approve_gates so
     // gate-card tests see the manual-approval path. Remove any leftover dir
     // from a PRIOR run first so a persisted `.umadev/chat/` (Wave 5) can't
     // bleed into a test that expects a clean conversation buffer.
-    let workspace = std::env::temp_dir().join(format!("sd-test-ws-{id}"));
+    let workspace = std::env::temp_dir().join(format!("sd-test-ws-{pid}-{id}"));
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = std::fs::create_dir_all(&workspace);
     let _ = std::fs::write(
@@ -393,7 +394,7 @@ fn fresh_app(backend: Option<&str>) -> App {
     let mut app = App::new(
         "demo",
         cfg,
-        std::env::temp_dir().join(format!("sd-test-cfg-{id}.toml")),
+        std::env::temp_dir().join(format!("sd-test-cfg-{pid}-{id}.toml")),
         workspace,
     );
     // P5d: force animations ON in tests so spinner-cadence assertions are
@@ -6416,6 +6417,52 @@ fn slash_continue_with_a_resumable_plan_resumes_instead_of_hinting() {
             .any(|m| m.body().contains("还没启动流水线")),
         "the restart hint is NOT shown"
     );
+}
+
+#[test]
+fn fresh_session_continues_the_first_operational_review_boundary() {
+    let mut app = fresh_app(Some("claude-code"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "build".into(),
+            title: "implement the product".into(),
+            seat: umadev_agent::Seat::FrontendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Done,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Quality);
+    state.slug = "demo".into();
+    state.requirement = "完成现有产品的安全评审".into();
+    state.backend = "claude-code".into();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+    std::fs::write(
+        app.project_root
+            .join(".umadev/director-operational-review.json"),
+        br#"{
+  "kind": "final-gate-review",
+  "consecutive_outages": 1
+}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        app.try_slash_command("/continue"),
+        Some(Action::ResumeRun("完成现有产品的安全评审".to_string())),
+        "a reopened TUI must retry the parked review boundary instead of starting over"
+    );
+    assert!(app.history.back().is_some_and(|message| {
+        message
+            .body()
+            .contains(umadev_i18n::t(app.lang, "continue.resuming"))
+    }));
 }
 
 #[test]

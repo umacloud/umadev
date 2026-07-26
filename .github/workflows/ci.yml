@@ -129,6 +129,16 @@ jobs:
         with:
           toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install and verify Grok's Linux Plan sandbox prerequisite
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          # Grok's read-only profile fail-closes before ACP initialize unless
+          # this exact mount-namespace primitive can re-exec the agent.
+          bwrap --cap-drop ALL --bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
       - name: Download and verify the exact official Grok artifact (Unix)
         if: runner.os != 'Windows'
         shell: bash

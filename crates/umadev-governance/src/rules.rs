@@ -11,6 +11,8 @@ mod deep_nesting;
 pub use deep_nesting::check_deep_nesting;
 mod debug_residue;
 pub use debug_residue::check_debug_residue;
+mod concurrency;
+pub use concurrency::check_unsynchronized_mutation;
 mod file_safety;
 pub use file_safety::{check_hard_delete, check_insecure_file_perms, check_toctou_race};
 mod security_rules;
@@ -3780,6 +3782,9 @@ pub fn check_rate_limiting(file_path: &str, content: &str) -> Decision {
 #[must_use]
 pub fn check_structured_logging(file_path: &str, content: &str) -> Decision {
     let ext = extension_of(file_path);
+    if looks_like_secret_test_path(file_path) {
+        return Decision::pass();
+    }
     let lower_path = file_path.to_ascii_lowercase().replace('\\', "/");
     let name = std::path::Path::new(file_path)
         .file_name()
@@ -6926,92 +6931,6 @@ pub fn check_websocket_auth(file_path: &str, content: &str) -> Decision {
         );
     }
     Decision::pass()
-}
-
-/// **UD-ARCH-052**: ban shared mutable state without synchronization (race conditions).
-///
-/// A global/static mutable variable (`let count = 0` at module scope, `static
-/// mut` in Rust, module-level `var` in Go) accessed from async/multi-threaded
-/// code without a mutex/lock is a data race. Flags module-scope mutable
-/// variables in async-capable files. Conservative: only flags when the file
-/// also has `async`/`await`/`Promise`/`goroutine`/`spawn`.
-#[must_use]
-pub fn check_unsynchronized_mutation(file_path: &str, content: &str) -> Decision {
-    let ext = extension_of(file_path);
-    if !matches!(ext.as_str(), "ts" | "js" | "go" | "rs" | "py") {
-        return Decision::pass();
-    }
-    let lower = content.to_ascii_lowercase();
-    // Must have concurrency primitives (async/goroutine/spawn/thread).
-    let has_concurrency = lower.contains("async")
-        || lower.contains("await")
-        || lower.contains("promise")
-        || lower.contains("go func")
-        || lower.contains("goroutine")
-        || lower.contains("spawn")
-        || lower.contains("thread::")
-        || lower.contains("tokio::")
-        || lower.contains("asyncio");
-    if !has_concurrency {
-        return Decision::pass();
-    }
-    // Module-scope mutable variable (not inside a function).
-    let lines = content.lines().collect::<Vec<_>>();
-    let mut in_function = 0i32;
-    let mut hits = 0usize;
-    for line in &lines {
-        // Track function depth.
-        for ch in line.chars() {
-            match ch {
-                '{' => in_function += 1,
-                '}' => in_function -= 1,
-                _ => {}
-            }
-        }
-        if in_function > 0 {
-            continue; // Inside a function — local var, not module scope.
-        }
-        let trimmed = line.trim_start();
-        // Module-scope mutable assignments.
-        if (trimmed.starts_with("let ")
-            || trimmed.starts_with("var ")
-            || trimmed.starts_with("static mut "))
-            && (trimmed.contains("= 0")
-                || trimmed.contains("= 1")
-                || trimmed.contains("= []")
-                || trimmed.contains("= {}")
-                || trimmed.contains("= new ")
-                || trimmed.contains("= \"")
-                || trimmed.contains("= Some")
-                || trimmed.contains("= Mutex")
-                || trimmed.contains("= Atomic"))
-        {
-            // Safe: has a Mutex/Atomic/RwLock.
-            if lower.contains("mutex")
-                || lower.contains("atomic")
-                || lower.contains("rwlock")
-                || lower.contains("sync.")
-                || lower.contains("lock()")
-            {
-                continue;
-            }
-            hits += 1;
-        }
-    }
-    if hits > 0 {
-        Decision::block(
-            "UD-ARCH-052",
-            format!(
-                "UmaDev: shared mutable state without synchronization (UD-ARCH-052). \
-                 `{file_path}` has module-scope mutable variable(s) ({hits}) in \
-                 concurrent code (async/goroutine/thread) — this is a data race. \
-                 Use a `Mutex`/`AtomicUsize`/`Arc<Mutex<T>>` (Rust), `sync.Mutex` \
-                 (Go), or move the state into a class/actor.",
-            ),
-        )
-    } else {
-        Decision::pass()
-    }
 }
 
 /// **UD-SEC-026**: ban server-side env secrets leaked into client bundles.

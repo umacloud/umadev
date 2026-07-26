@@ -192,6 +192,101 @@ fn terminal_contract_resize_reflows_cjk_emoji_combining_and_neutralizes_ansi() {
 }
 
 #[test]
+fn terminal_contract_plan_snapshot_is_lossless_and_scrollable_at_44x12() {
+    let mut fixture = Fixture::new();
+    fixture.app.backend = Some("grok-build".to_string());
+
+    let seats = [
+        "product-manager",
+        "architect",
+        "uiux-designer",
+        "frontend-engineer",
+        "backend-engineer",
+        "qa-engineer",
+        "security-engineer",
+        "devops-engineer",
+    ];
+    fixture
+        .app
+        .apply_engine(umadev_agent::EngineEvent::PlanPosted {
+            statuses: vec!["active".into(); 20],
+            steps: (0..20)
+                .map(|index| {
+                    format!(
+                        "s{index} · preserve complete 窄终端计划 step {index} ({})",
+                        seats[index % seats.len()]
+                    )
+                })
+                .collect(),
+            done: 0,
+            total: 20,
+        });
+    fixture
+        .app
+        .apply_engine(umadev_agent::EngineEvent::BaseSessionState {
+            backend_id: "grok-build".to_string(),
+            update: umadev_runtime::SessionStateUpdate::PlanReplaced {
+                entries: vec![umadev_runtime::SessionPlanEntry {
+                    content: "native base plan remains reachable".to_string(),
+                    priority: umadev_runtime::SessionPlanEntryPriority::High,
+                    status: umadev_runtime::SessionPlanEntryStatus::InProgress,
+                }],
+            },
+        });
+    fixture
+        .app
+        .apply_engine(umadev_agent::EngineEvent::CriticVerdict {
+            seat: "security-engineer".to_string(),
+            accepts: false,
+            blocking: vec!["review blocker remains reachable".to_string()],
+            remediation: vec!["review fix remains reachable".to_string()],
+            advisory: vec!["review advisory remains reachable".to_string()],
+        });
+
+    assert_eq!(submit(&mut fixture.app, "/plan"), Action::None);
+    let _ = render_to_rows(&fixture.app, 44, 12);
+
+    let transcript_rows = fixture.app.transcript_rows.borrow().clone();
+    let transcript = transcript_rows.join("\n");
+    let compact_transcript = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+    for expected in [
+        "s19",
+        "Base plan",
+        "native base plan remains reachable",
+        "Team",
+        "Security",
+        "review blocker remains reachable",
+        "review fix remains reachable",
+        "review advisory remains reachable",
+    ] {
+        assert!(
+            compact_transcript.contains(expected),
+            "missing {expected}: {transcript}"
+        );
+    }
+
+    let transcript_width = usize::from(fixture.app.transcript_area.get().2);
+    assert!(transcript_width > 0);
+    assert!(transcript_rows
+        .iter()
+        .all(|row| UnicodeWidthStr::width(row.as_str()) <= transcript_width));
+    assert!(
+        fixture.app.transcript_max_scroll.get() > 0,
+        "the narrow fixture must overflow"
+    );
+
+    fixture.app.transcript_scroll_to_top();
+    let _ = render_to_rows(&fixture.app, 44, 12);
+    assert_eq!(
+        fixture.app.transcript_scroll(),
+        fixture.app.transcript_max_scroll.get()
+    );
+    fixture.app.transcript_scroll_to_bottom();
+    let _ = render_to_rows(&fixture.app, 44, 12);
+    assert_eq!(fixture.app.transcript_scroll(), 0);
+}
+
+#[test]
 fn terminal_contract_conpty_interrupt_preserves_chat_and_restore_is_symmetric() {
     let mut fixture = Fixture::new();
     fixture.app.thinking = true;

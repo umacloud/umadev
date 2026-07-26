@@ -8165,7 +8165,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let workspace = std::env::temp_dir().join(format!("sd-ui-test-workspace-{id}"));
+        let pid = std::process::id();
+        let workspace = std::env::temp_dir().join(format!("sd-ui-test-workspace-{pid}-{id}"));
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::create_dir_all(&workspace);
         let mut app = App::new(
@@ -8174,7 +8175,7 @@ mod tests {
                 backend: backend.map(str::to_string),
                 ..Default::default()
             },
-            std::env::temp_dir().join(format!("sd-ui-test-config-{id}.toml")),
+            std::env::temp_dir().join(format!("sd-ui-test-config-{pid}-{id}.toml")),
             workspace,
         );
         // P5d: deterministic spinner cadence in render tests (see fresh_app).

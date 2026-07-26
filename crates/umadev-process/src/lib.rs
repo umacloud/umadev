@@ -2338,7 +2338,21 @@ mod tests {
         let mut tree = super::StdCommandTree::attach(&mut child).expect("attach child tree");
         let pid = child.id();
 
-        assert_eq!(super::process_has_exact_argument(pid, VALUE), Some(true));
+        // `spawn` returns after fork/clone, so Linux may expose the child before
+        // it has exec'd `sh` and published its final argv in `/proc`. Treat the
+        // documented transient `None` as unavailable and wait for the real
+        // argument surface instead of making the test depend on scheduler luck.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let exact = loop {
+            match super::process_has_exact_argument(pid, VALUE) {
+                Some(found) => break Some(found),
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                None => break None,
+            }
+        };
+        assert_eq!(exact, Some(true));
         assert_eq!(
             super::process_has_exact_argument(pid, "umadev-owner-value"),
             Some(false),
@@ -2458,12 +2472,17 @@ mod tests {
         let fixture_dir = FixtureDir::new();
         let leaf_pid_path = fixture_dir.0.join("system-command-leaf-pid");
         let escaped_pid_path = leaf_pid_path.to_string_lossy().replace('\'', "''");
+        // Keep the leader alive explicitly. `Start-Process` returns immediately
+        // on some Windows/PowerShell versions, and a successful leader exit is
+        // intentionally reported as success after its Job descendants are
+        // terminated; that path is not a timeout and cannot test this contract.
         let script = format!(
             "Start-Sleep -Milliseconds 100; \
              $p=Start-Process -PassThru -NoNewWindow \
              -FilePath \"$env:SystemRoot\\System32\\ping.exe\" \
              -ArgumentList @('-n','30','127.0.0.1'); \
-             [IO.File]::WriteAllText('{escaped_pid_path}', [string]$p.Id)"
+             [IO.File]::WriteAllText('{escaped_pid_path}', [string]$p.Id); \
+             Start-Sleep -Seconds 30"
         );
 
         let started = Instant::now();

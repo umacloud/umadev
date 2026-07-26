@@ -72,7 +72,7 @@ jobs:
 
           printf '%s\n' 'export const label = "Save";' > "$clean/app.ts"
           target/release/umadev ci --project-root "$clean" > clean-scan.log
-          grep -Eq 'UmaDev: 1 file\(s\) selected, 1 scanned, 0 unreadable/binary skipped; 0 file\(s\) with a governance hit, 0 first-hit finding\(s\)' clean-scan.log
+          grep -Eq 'UmaDev: 1 file\(s\) selected, 1 scanned, 0 unscanned, 0 scan failure\(s\); 0 file\(s\) with a governance hit, 0 first-hit finding\(s\)\. The enforcing gate stops after the first hit per file; run --report-only for the complete count\.' clean-scan.log
 
           printf '%s\n' 'export const icon = "🚀";' > "$blocked/app.tsx"
           if target/release/umadev ci --project-root "$blocked" > blocked-scan.log 2>&1; then
@@ -80,7 +80,7 @@ jobs:
             exit 1
           fi
           grep -q 'BLOCK  UD-CODE-001' blocked-scan.log
-          grep -Eq 'UmaDev: 1 file\(s\) selected, 1 scanned, 0 unreadable/binary skipped; 1 file\(s\) with a governance hit, 1 first-hit finding\(s\)' blocked-scan.log
+          grep -Eq 'UmaDev: 1 file\(s\) selected, 1 scanned, 0 unscanned, 0 scan failure\(s\); 1 file\(s\) with a governance hit, 1 first-hit finding\(s\)\. The enforcing gate stops after the first hit per file; run --report-only for the complete count\.' blocked-scan.log
 
       - name: Upload governance self-audit
         if: always()

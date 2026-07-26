@@ -2737,15 +2737,16 @@ impl AcpSession {
             .await
         {
             Ok(value) => Ok(value),
+            Err(SessionError::Send(error)) if is_acp_startup_transport_send(&error) => {
+                Err(self.process_closed_open_error(label, Some(&error)).await)
+            }
             Err(SessionError::Send(error)) if error.starts_with("ACP ") => {
                 Err(SessionError::Start(error))
             }
             Err(SessionError::Send(error)) => {
                 Err(SessionError::Start(format!("ACP {label}: {error}")))
             }
-            Err(SessionError::Closed) => Err(SessionError::Start(format!(
-                "ACP {label}: process closed before responding"
-            ))),
+            Err(SessionError::Closed) => Err(self.process_closed_open_error(label, None).await),
             Err(error) => Err(SessionError::Start(format!("ACP {label}: {error}"))),
         }
     }
@@ -2756,20 +2757,28 @@ impl AcpSession {
         params: Value,
         label: &str,
     ) -> Result<Value, (SessionError, Option<i64>)> {
-        let (id, receiver, _) = self
-            .begin_request(method, params)
-            .await
-            .map_err(|error| (error, None))?;
+        let (id, receiver, _) = match self.begin_request(method, params).await {
+            Ok(request) => request,
+            Err(SessionError::Send(error)) if is_acp_startup_transport_send(&error) => {
+                return Err((
+                    self.process_closed_open_error(label, Some(&error)).await,
+                    None,
+                ));
+            }
+            Err(error) => return Err((error, None)),
+        };
         match tokio::time::timeout(handshake_timeout(), receiver).await {
             Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) if error.message == "ACP process closed" => Err((
+                self.process_closed_open_error(label, Some(&error.message))
+                    .await,
+                error.code,
+            )),
             Ok(Ok(Err(error))) => Err((
                 SessionError::Start(format!("ACP {label}: {}", error.message)),
                 error.code,
             )),
-            Ok(Err(_)) => Err((
-                SessionError::Start(format!("ACP {label}: process closed before responding")),
-                None,
-            )),
+            Ok(Err(_)) => Err((self.process_closed_open_error(label, None).await, None)),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 Err((
@@ -2782,6 +2791,34 @@ impl AcpSession {
 
     fn handshake_timeout_message(&self, label: &str) -> String {
         acp_handshake_timeout_message(self.vendor, label)
+    }
+
+    async fn process_closed_open_error(
+        &self,
+        label: &str,
+        transport_error: Option<&str>,
+    ) -> SessionError {
+        // stdout and stderr close independently. Give the already-running,
+        // bounded stderr drain a tiny deterministic window to consume the
+        // final diagnostic before turning EOF into the user's startup error.
+        // The tail itself is capped at 4 KiB/20 lines and redacted on ingest.
+        for _ in 0..20 {
+            if let Some(stderr) = self.stderr.snapshot() {
+                return SessionError::Start(acp_process_closed_message(
+                    self.vendor,
+                    label,
+                    transport_error,
+                    Some(&stderr),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        SessionError::Start(acp_process_closed_message(
+            self.vendor,
+            label,
+            transport_error,
+            None,
+        ))
     }
 
     async fn begin_request(
@@ -3126,6 +3163,45 @@ fn acp_handshake_timeout_message(vendor: AcpVendor, label: &str) -> String {
         );
     }
     format!("ACP {label} timed out; check login and CLI version")
+}
+
+fn is_acp_startup_transport_send(error: &str) -> bool {
+    error == "ACP process closed"
+        || error == "ACP stdin is closed"
+        || error.starts_with("write ACP frame:")
+        || error.starts_with("flush ACP frame:")
+}
+
+fn acp_process_closed_message(
+    vendor: AcpVendor,
+    label: &str,
+    transport_error: Option<&str>,
+    bounded_redacted_stderr: Option<&str>,
+) -> String {
+    let stderr = bounded_redacted_stderr.filter(|value| !value.trim().is_empty());
+    let sandbox_prerequisite_failed = matches!(vendor, AcpVendor::Grok)
+        && stderr.is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            value.contains("bubblewrap")
+                || value.contains("bwrap")
+                || value.contains("mount-namespace deny")
+        });
+    let mut message = if sandbox_prerequisite_failed {
+        format!(
+            "ACP {label}: Grok Build could not start its Linux sandbox. Install and enable bubblewrap with your OS package manager (Ubuntu/Debian: `sudo apt-get install bubblewrap`), verify unprivileged `bwrap` can run, then retry; after the sandbox starts, UmaDev will present Grok's typed login choices"
+        )
+    } else {
+        format!("ACP {label}: process closed before responding")
+    };
+    if let Some(error) = transport_error.filter(|value| !value.trim().is_empty()) {
+        message.push_str("; transport error (redacted): ");
+        message.push_str(&clip_text(&redact_text(error), MAX_DIAGNOSTIC_CHARS));
+    }
+    if let Some(stderr) = stderr {
+        message.push_str("; base stderr (redacted, bounded): ");
+        message.push_str(stderr);
+    }
+    message
 }
 
 fn acp_content_blocks(
@@ -9319,6 +9395,45 @@ mod tests {
     }
 
     #[test]
+    fn startup_pre_write_pipe_failures_keep_cause_and_classify_bounded_stderr() {
+        for error in [
+            "ACP process closed",
+            "ACP stdin is closed",
+            "write ACP frame: Broken pipe (os error 32)",
+            "flush ACP frame: The pipe is being closed. (os error 232)",
+        ] {
+            assert!(
+                is_acp_startup_transport_send(error),
+                "startup transport closure was not classified: {error}"
+            );
+        }
+        assert!(!is_acp_startup_transport_send(
+            "encode ACP request frame: unsupported value"
+        ));
+
+        let error = "write ACP frame: Broken pipe (os error 32)";
+        let message = acp_process_closed_message(
+            AcpVendor::Grok,
+            "initialize",
+            Some(error),
+            Some(
+                "error: mount-namespace deny unavailable because bubblewrap is missing\nAuthorization: Bearer [REDACTED]",
+            ),
+        );
+        assert!(
+            message.contains("Install and enable bubblewrap"),
+            "{message}"
+        );
+        assert!(message.contains(error), "{message}");
+        assert!(message.contains("transport error (redacted)"), "{message}");
+        assert!(
+            message.contains("base stderr (redacted, bounded)"),
+            "{message}"
+        );
+        assert!(!message.contains("grok-contract-secret"), "{message}");
+    }
+
+    #[test]
     fn kimi_missing_mode_fails_closed_only_where_correctness_requires() {
         // SECURITY INVARIANT: Kimi's ONLY permission boundary is the ACP session mode.
         // Plan MUST fail closed because read-only cannot be proven without mode.
@@ -11052,6 +11167,54 @@ mod tests {
                 stdout.flush().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn fake_grok_pre_initialize_bwrap_failure_child() {
+        let invoked = std::env::args().any(|arg| arg == "--exact")
+            && std::env::args()
+                .any(|arg| arg.ends_with("fake_grok_pre_initialize_bwrap_failure_child"));
+        if !invoked {
+            return;
+        }
+        eprintln!(
+            "error: this sandbox could not enforce its mount-namespace deny set on Linux; bubblewrap missing/unusable"
+        );
+        eprintln!("Authorization: Bearer grok-contract-secret");
+    }
+
+    #[tokio::test]
+    async fn pre_initialize_grok_bwrap_exit_surfaces_bounded_actionable_stderr() {
+        let executable = std::env::current_exe().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let args = vec![
+            "--exact".to_string(),
+            "acp::tests::fake_grok_pre_initialize_bwrap_failure_child".to_string(),
+            "--nocapture".to_string(),
+            "--test-threads=1".to_string(),
+        ];
+        let result = AcpSession::start_with_program_args_and_policy(
+            AcpVendor::Grok,
+            executable.to_str().unwrap(),
+            args,
+            workspace.path(),
+            "",
+            BasePermissionProfile::Plan,
+            SessionOpenPolicy::NonInteractive,
+        )
+        .await;
+        let Err(SessionOpenError::Session(SessionError::Start(message))) = result else {
+            panic!("expected a typed startup error");
+        };
+        assert!(
+            message.contains("Install and enable bubblewrap")
+                && message.contains("typed login choices")
+                && message.contains("base stderr (redacted, bounded)")
+                && message.contains("mount-namespace deny set")
+                && message.contains("[redacted]")
+                && !message.contains("grok-contract-secret"),
+            "unexpected startup error: {message}"
+        );
     }
 
     #[tokio::test]

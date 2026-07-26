@@ -62,7 +62,8 @@ fn freeze_project_root(project_root: &Path) -> std::result::Result<PathBuf, Stri
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(unix)]
+#[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
     use std::process::Command;

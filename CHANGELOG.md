@@ -22,7 +22,7 @@
 
 ### 发布
 
-- 官网不再在版本提交到 `main` 时提前宣传新版本，而是由正式 tag 的 Release 流水线在 GitHub 资产和 npm 九包完成后，从同一提交部署；最终门同时核验 22 个 GitHub 资产、九个 npm `latest`、Pages deployment SHA 与官网版本。
+- 官网不再在版本提交到 `main` 时提前宣传新版本，而是由正式 tag 的 Release 流水线在 GitHub 资产和 npm 九包完成后，从同一提交部署；公开任何资产前先验证 Pages 环境允许该版本 tag，最终门同时核验 22 个 GitHub 资产、九个 npm `latest`、Pages deployment SHA 与官网版本。
 - CI 与 Release 统一固定 Rust 1.97、Node 24.18 和 `--locked` 输入；三系统测试、七个原生二进制、GNU/musl、PTY/ConPTY、底座公开契约、版本锁、RustSec、npm 更新与官网生产构建继续作为发版硬门。
 
 ## [1.0.65] - 2026-07-24
