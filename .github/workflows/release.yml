@@ -147,6 +147,13 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap
+          # Ubuntu 24.04 denies the uid map that bwrap needs unless the binary
+          # has a dedicated AppArmor userns profile (first shipped by Ubuntu
+          # after Noble). This is an ephemeral, isolated contract runner; lift
+          # that host restriction only for this job, then prove bwrap works.
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns >/dev/null
+          fi
           # Grok's read-only profile fail-closes before ACP initialize unless
           # this exact mount-namespace primitive can re-exec the agent.
           bwrap --cap-drop ALL --bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
