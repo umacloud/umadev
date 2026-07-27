@@ -252,6 +252,48 @@ pub(crate) fn read_bytes_beneath(
     read_open_file(file, max_bytes)
 }
 
+/// Read at most `max_bytes` from a regular file beneath `root`, returning the
+/// opened file's observed length as scope metadata. Unlike [`read_bytes_beneath`]
+/// this deliberately permits a larger file because callers need an explicitly
+/// labelled prefix, while retaining the same containment and identity checks.
+pub(crate) fn read_prefix_beneath(
+    root: &Path,
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<(Vec<u8>, u64)> {
+    let (canonical_root, resolved) = resolve_beneath(root, path, false)?;
+    let file = open_regular_no_follow(&resolved)?;
+    let opened = same_file::Handle::from_file(file.try_clone()?)?;
+    let current = same_file::Handle::from_path(&resolved)?;
+    let canonical_after = std::fs::canonicalize(&resolved)?;
+    if opened != current || !canonical_after.starts_with(canonical_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "workspace input changed identity while opening",
+        ));
+    }
+    let before = file.metadata()?;
+    let observed_len = before.len();
+    let modified_before = before.modified().ok();
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(observed_len)
+            .unwrap_or(0)
+            .min(max_bytes)
+            .min(64 * 1024),
+    );
+    (&file)
+        .take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if after.len() != observed_len || after.modified().ok() != modified_before {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "workspace input changed while its bounded prefix was read",
+        ));
+    }
+    Ok((bytes, observed_len))
+}
+
 /// A hard aggregate byte budget shared by a multi-file read operation.
 ///
 /// The budget never returns a prefix of an oversized file. Once the remaining
@@ -398,6 +440,7 @@ mod tests {
         std::fs::write(&target, "outside").unwrap();
         symlink(&target, &link).unwrap();
         assert!(read_utf8(&link, 64).is_err());
+        assert!(read_prefix_beneath(tmp.path(), &link, 64).is_err());
 
         let socket = tmp.path().join("socket");
         let _listener = UnixListener::bind(&socket).unwrap();
@@ -422,10 +465,29 @@ mod tests {
         std::fs::write(outside.path().join("rules.md"), "escape").unwrap();
         symlink(outside.path(), root.path().join("linked")).unwrap();
         assert!(read_utf8_beneath(root.path(), &root.path().join("linked/rules.md"), 64,).is_err());
+        assert!(
+            read_prefix_beneath(root.path(), &root.path().join("linked/rules.md"), 64).is_err()
+        );
         assert!(!is_real_directory_beneath(
             root.path(),
             &root.path().join("linked")
         ));
+    }
+
+    #[test]
+    fn bounded_prefix_reports_observed_length_without_reading_past_the_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("large.txt");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let (prefix, observed_len) = read_prefix_beneath(tmp.path(), &path, 4).unwrap();
+        assert_eq!(prefix, b"0123");
+        assert_eq!(observed_len, 10);
+
+        let exact = tmp.path().join("exact.txt");
+        std::fs::write(&exact, b"1234").unwrap();
+        let (whole, observed_len) = read_prefix_beneath(tmp.path(), &exact, 4).unwrap();
+        assert_eq!(whole, b"1234");
+        assert_eq!(observed_len, 4);
     }
 
     #[test]

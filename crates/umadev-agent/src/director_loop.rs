@@ -34,6 +34,7 @@ mod resume;
 mod review_checkpoint;
 mod review_liveness;
 mod step_metrics;
+mod step_outcome;
 mod step_review;
 
 #[cfg(test)]
@@ -48,7 +49,7 @@ use resume::{
     clear_operational_review_checkpoint, load_operational_review_checkpoint,
     next_final_review_checkpoint, next_step_review_checkpoint,
     operational_review_checkpoint_for_plan, save_operational_review_checkpoint,
-    OperationalReviewCheckpoint, FINAL_REVIEW_RETRY_STEP_ID,
+    OperationalReviewCheckpoint, OperationalReviewEvidence, FINAL_REVIEW_RETRY_STEP_ID,
 };
 pub use resume::{
     has_resumable_director_plan, has_resumable_run, is_budget_pause_reason,
@@ -64,6 +65,7 @@ use review_liveness::{
     StepReviewOutage,
 };
 use step_metrics::{record_run_sizing, record_step_first_pass};
+use step_outcome::StepOutcome;
 use step_review::{drive_review_step, retry_review_step_once};
 
 /// The hard ceiling on auto-QC feedback-fix rounds in one `/run`. One round is: the
@@ -1399,21 +1401,37 @@ async fn drive_director_loop_with_idle(
                 }
             }
             ensure_final_review_retry_step(&mut plan, route, events);
+            let mut checkpoint = next_final_review_checkpoint(
+                None,
+                crate::freshness::workspace_qc_fingerprint(&options.project_root),
+                route.map(|route| route.team.clone()),
+                None,
+                OperationalReviewEvidence::new(&qc.blocking, &qc.operational),
+            );
+            if options.mode == crate::trust::TrustMode::Auto {
+                checkpoint.settle_terminally();
+                if let Some(plan) = plan.as_mut() {
+                    block_open_steps(plan, events);
+                }
+            }
             let saved_plan = plan
                 .as_ref()
                 .is_some_and(|plan| plan_state::save(plan, &options.project_root).is_ok());
-            let saved_checkpoint = save_operational_review_checkpoint(
-                &options.project_root,
-                &next_final_review_checkpoint(
-                    None,
-                    crate::freshness::workspace_qc_fingerprint(&options.project_root),
-                    route.map(|route| route.team.clone()),
-                    None,
-                ),
-            )
-            .is_ok();
+            let saved_checkpoint =
+                save_operational_review_checkpoint(&options.project_root, &checkpoint).is_ok();
             if saved_plan && saved_checkpoint {
                 record_artifact_versions(&options.project_root);
+                if checkpoint.circuit_open() {
+                    let reason = format!(
+                        "{reason}; automatic mode exhausted its bounded reviewer retry and \
+                         stopped this run incomplete. Start a new /run when the reviewer \
+                         service is available"
+                    );
+                    events.emit(EngineEvent::Note(format!(
+                        "team · {reason} — no source repair was started"
+                    )));
+                    return DirectorLoopOutcome::Failed(reason);
+                }
                 let (done, total) = plan.as_ref().map_or((0, 0), Plan::progress);
                 events.emit(EngineEvent::Note(format!(
                     "team · {reason} — plan paused without source rework; \
@@ -2007,6 +2025,7 @@ async fn drive_plan_steps(
             unavailable,
             base_agents,
             gap_evidence,
+            operational_unavailable,
         } = outcome;
         if !reply.is_empty() {
             last_reply = reply;
@@ -2021,7 +2040,8 @@ async fn drive_plan_steps(
                 step: &step,
                 route: &step_review_route,
                 base_agents: &base_agents,
-                gaps: &gap_evidence,
+                semantic_blocking: &gap_evidence,
+                operational_unavailable: &operational_unavailable,
                 prior: checkpoint.as_ref(),
             }));
         }
@@ -2759,43 +2779,6 @@ fn run_actual_size_from_plan(plan: &Plan) -> crate::sizing_calibration::SizeRank
     }
 }
 
-/// The observable result of driving one plan step — what the scheduler reads to set
-/// the step's terminal status. `made_progress` is the MEDIUM #3 honesty signal: an
-/// "accepted" step that did NO real verifiable work (a dead Build turn that only
-/// cleared a neutral skip, or an empty-team ReviewClean) is accepted-but-not-progress,
-/// so the scheduler marks it Blocked rather than falsely ticking it Done.
-// The three flags are INDEPENDENT honest observations of one step's outcome (accepted /
-// drove-a-turn / made-real-progress), not a state machine — collapsing
-// them into an enum would lose the orthogonal signals the scheduler reads separately.
-#[allow(clippy::struct_excessive_bools)]
-struct StepOutcome {
-    /// Whether the step's acceptance is satisfied (passed or fail-open neutral skip).
-    accepted: bool,
-    /// The step's last assistant reply text (empty when nothing ran).
-    reply: String,
-    /// Whether at least one real work turn actually ran (a live doer turn settled /
-    /// a review team convened). `false` = a dead/hung session or an empty team.
-    drove: bool,
-    /// Whether the step made REAL, verifiable progress — `accepted` resting on either
-    /// a turn that actually ran OR positive deterministic evidence (real source / a
-    /// green build / a seat that actually reviewed). `false` = a neutral skip that
-    /// must not count toward `Done`.
-    made_progress: bool,
-    /// The required host/reviewer was unavailable, rather than returning a
-    /// semantic verification failure.
-    unavailable: bool,
-    /// Base-native child agents observed while producing this step. The plan
-    /// ledger hashes vendor ids and settles these children with the same
-    /// deterministic result as their parent step.
-    base_agents: crate::bg_agents::BaseAgentObservation,
-    /// The TYPED gap evidence from the step's LAST failing acceptance check (the
-    /// diagnosed "declared X but Y" lines the deterministic floor produced) — carried
-    /// out so a BOUNDED RE-PLAN of a blocked subtree can feed the brain WHY the step
-    /// blocked, not just that it did. Empty on an accepted step or a neutral skip that
-    /// produced no verifiable failure.
-    gap_evidence: Vec<String>,
-}
-
 /// The overall-goal preamble prepended to every plan-step directive — the directive
 /// half of full-context cross-session resume. It restates the ORIGINAL requirement
 /// so the base knows the product it is building, not just an isolated step title.
@@ -3305,6 +3288,7 @@ async fn drive_build_step(
                      sent, so no turn ever ran for this step"
                         .to_string(),
                 ],
+                operational_unavailable: Vec::new(),
             };
         }
         // The exact knowledge receipt exists only when the doer directive really
@@ -3342,7 +3326,8 @@ async fn drive_build_step(
                 made_progress: false,
                 unavailable: true,
                 base_agents,
-                gap_evidence: verdict.operational_unavailable,
+                gap_evidence: verdict.evidence,
+                operational_unavailable: verdict.operational_unavailable,
             };
         }
         // TEST-INTEGRITY FLOOR (UD-QA-001). Compare the test surface to the
@@ -3460,6 +3445,7 @@ async fn drive_build_step(
                 unavailable: false,
                 base_agents,
                 gap_evidence: Vec::new(), // accepted → no gap to re-plan around
+                operational_unavailable: Vec::new(),
             };
         }
         // SELF-EVOLUTION (a SIDE EFFECT of this FAILING verdict — never a driver of
@@ -3588,6 +3574,7 @@ async fn drive_build_step(
         // The last failing round's typed evidence — WHY this step could not pass its
         // acceptance — so a bounded re-plan can route around the diagnosed blocker.
         gap_evidence: last_fail_errors,
+        operational_unavailable: Vec::new(),
     }
 }
 

@@ -9075,6 +9075,76 @@ async fn resident_fallback_build_review_outage_pauses_without_repair_or_repeat()
 }
 
 #[tokio::test]
+async fn resident_auto_review_outage_fails_terminally_without_dead_continue() {
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let requirement =
+        "做一个完整的大型企业级 SaaS 登录系统，包含前后端、安全校验和自动化测试".to_string();
+    let route_reply = vec![
+        umadev_runtime::SessionEvent::TextDelta("intent unavailable".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ];
+    let (intent, _intent_sent, _intent_ended) = FakeChatSession::new(vec![route_reply]);
+    let (writer, writer_sent, writer_ended) =
+        FakeChatSession::new(vec![write_tool_turn("src/lib.rs")]);
+    let target = tmp.path().join("src/lib.rs");
+    let writer = writer
+        .with_fork(Box::new(intent))
+        .with_send_effect(move || {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, "pub fn login() -> bool { true }\n").unwrap();
+        });
+    let chat_holder = ChatSessionHolder::from_mutex_with_permissions(
+        tokio::sync::Mutex::new(Some(ResidentChat::Primed(Box::new(writer)))),
+        umadev_runtime::BasePermissionProfile::Auto,
+    );
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let turn = auto_chat_turn(
+        &requirement,
+        chat_holder.clone(),
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    );
+    let director_holder = turn.director_session_holder.clone();
+
+    drive_chat_session_turn(turn).await;
+
+    let routes = std::iter::from_fn(|| route_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(
+        routes.iter().any(|route| matches!(
+            route,
+            RouteDecision::Failed(reason) if reason.contains("automatic mode exhausted")
+        )),
+        "{routes:?}"
+    );
+    assert!(!routes
+        .iter()
+        .any(|route| matches!(route, RouteDecision::RunPausedAtOperational { .. })));
+    assert_eq!(writer_sent.lock().unwrap().len(), 1);
+    assert!(
+        writer_ended.load(std::sync::atomic::Ordering::SeqCst),
+        "terminal Auto settlement closes the resident base"
+    );
+    assert!(chat_holder.lock().await.is_none());
+    assert!(director_holder.lock().await.is_none());
+    assert!(!umadev_agent::has_resumable_run(tmp.path()));
+    let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event, EngineEvent::Note(note) if note.contains("type /continue"))));
+    let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 8);
+    assert!(runs.iter().any(|run| run
+        .tasks
+        .iter()
+        .any(|task| { task.state == umadev_agent::task_lifecycle::AgentTaskState::Failed })));
+}
+
+#[tokio::test]
 async fn resident_brain_quick_edit_never_launches_team_qc_after_writing() {
     let _qc = ReactiveQcOverride::force(true);
     let tmp = tempfile::TempDir::new().unwrap();

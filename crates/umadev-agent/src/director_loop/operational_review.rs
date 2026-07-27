@@ -318,6 +318,9 @@ pub struct PostBuildOperationalPause {
     pub done: usize,
     /// Total steps in the minimal persisted resume plan.
     pub total: usize,
+    /// Auto mode has no human gate. Its bounded reviewer retry is exhausted and
+    /// the persisted cursor is a terminal circuit rather than a resumable pause.
+    pub terminal: bool,
 }
 
 /// Cancel and close a persisted operational-review boundary before a fresh run
@@ -437,16 +440,21 @@ pub fn checkpoint_post_build_review_pause(
         open_questions: Vec::new(),
     });
     ensure_final_review_retry_step(&mut plan, Some(route), events);
-    let plan = plan.expect("the helper always creates a final-review cursor");
-    let plan_path = plan_state::save(&plan, &options.project_root)
-        .map_err(|error| format!("could not persist post-build review plan: {error}"))?;
-
-    let checkpoint = super::next_final_review_checkpoint(
+    let mut plan = plan.expect("the helper always creates a final-review cursor");
+    let mut checkpoint = super::next_final_review_checkpoint(
         None,
         crate::freshness::workspace_qc_fingerprint(&options.project_root),
         Some(route.team.clone()),
         entry_task_run_id.map(str::to_string),
+        super::OperationalReviewEvidence::new(&qc.blocking, &qc.operational_unavailable),
     );
+    if options.mode == crate::trust::TrustMode::Auto {
+        checkpoint.settle_terminally();
+        super::block_open_steps(&mut plan, events);
+    }
+    let plan_path = plan_state::save(&plan, &options.project_root)
+        .map_err(|error| format!("could not persist post-build review plan: {error}"))?;
+
     if let Err(error) = save_operational_review_checkpoint(&options.project_root, &checkpoint) {
         if let Some(prior) = prior_plan.as_ref() {
             let _ = plan_state::save(prior, &options.project_root);
@@ -466,7 +474,11 @@ pub fn checkpoint_post_build_review_pause(
     state.slug = options.effective_slug();
     state.requirement.clone_from(&options.requirement);
     state.last_transition_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    state.note = "Paused at final quality review (operational outage)".to_string();
+    state.note = if checkpoint.circuit_open() {
+        "Operational review circuit open after bounded automatic retry".to_string()
+    } else {
+        "Paused at final quality review (operational outage)".to_string()
+    };
     state.backend.clone_from(&options.backend);
     state.base_session_id = base_session_id.map(str::to_string);
     state.base_resume_identity = base_resume_identity.cloned();
@@ -492,6 +504,7 @@ pub fn checkpoint_post_build_review_pause(
         reason,
         done,
         total,
+        terminal: checkpoint.circuit_open(),
     })
 }
 

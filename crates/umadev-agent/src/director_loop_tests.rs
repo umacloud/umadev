@@ -39,6 +39,10 @@ impl Drop for EnvRestore {
 }
 
 fn opts(root: &std::path::Path) -> RunOptions {
+    // The real runner records a pre-run snapshot before it enters this loop.
+    // These tests call the loop directly, so establish the same run-diff
+    // contract rather than exercising the no-baseline failure path by accident.
+    let _ = crate::checkpoint::ensure_run_baseline(root, "director-loop-test");
     RunOptions {
         project_root: root.to_path_buf(),
         requirement: "做一个登录系统".to_string(),
@@ -1201,7 +1205,7 @@ async fn qc_review_blocking_is_fed_back_as_a_fix_directive() {
 }
 
 #[tokio::test]
-async fn unavailable_review_stops_incomplete_without_a_source_fix_turn() {
+async fn auto_unavailable_review_stops_terminally_without_a_source_fix_turn() {
     let tmp = tempfile::TempDir::new().unwrap();
     seed_source(tmp.path());
     let (events, rec) = sink();
@@ -1214,16 +1218,11 @@ async fn unavailable_review_stops_incomplete_without_a_source_fix_turn() {
 
     let outcome =
         drive_director_loop(&mut sess, &opts(tmp.path()), &events, "GO".to_string()).await;
-    let DirectorLoopOutcome::PausedAtOperational {
-        reason,
-        done,
-        total,
-    } = outcome
-    else {
-        panic!("unavailable required review must park for retry: {outcome:?}");
+    let DirectorLoopOutcome::Failed(reason) = outcome else {
+        panic!("auto mode must terminally settle an unavailable required review: {outcome:?}");
     };
     assert!(reason.contains("review unavailable"), "{reason}");
-    assert_eq!((done, total), (0, 1));
+    assert!(reason.contains("automatic mode exhausted"), "{reason}");
     assert_eq!(
         sent.lock().unwrap().len(),
         1,
@@ -1232,12 +1231,13 @@ async fn unavailable_review_stops_incomplete_without_a_source_fix_turn() {
     assert!(rec.events().iter().any(|event| matches!(
         event,
         EngineEvent::Note(note)
-            if note.contains("paused without source rework")
+            if note.contains("no source repair was started")
     )));
     let saved = plan_state::load(tmp.path()).expect("typed retry plan persisted");
     assert_eq!(saved.steps.len(), 1);
     assert_eq!(saved.steps[0].kind, plan_state::StepKind::Review);
-    assert_eq!(saved.steps[0].status, plan_state::StepStatus::Pending);
+    assert_eq!(saved.steps[0].status, plan_state::StepStatus::Blocked);
+    assert!(!has_resumable_run(tmp.path()));
 }
 
 #[tokio::test]
@@ -6793,7 +6793,9 @@ async fn scheduler_parks_operational_review_without_blocking_the_plan() {
         .with_fork_replies([
             "not a verdict",
             "still not a verdict",
-            r#"{"accepts":true,"blocking":[]}"#,
+            "retry is not a verdict",
+            "retry repair is still not a verdict",
+            "unused sentinel",
         ]);
     let remaining_forks = Arc::clone(sess.fork_replies.as_ref().unwrap());
     let sent = sess.sent_handle();
@@ -6826,9 +6828,11 @@ async fn scheduler_parks_operational_review_without_blocking_the_plan() {
         open_questions: Vec::new(),
     };
 
+    let mut options = opts(tmp.path());
+    options.mode = TrustMode::Guarded;
     let outcome = drive_plan_steps(
         &mut sess,
-        &opts(tmp.path()),
+        &options,
         &events,
         &build_route(),
         &mut plan,
@@ -6861,6 +6865,72 @@ async fn scheduler_parks_operational_review_without_blocking_the_plan() {
 }
 
 #[tokio::test]
+async fn auto_review_outage_terminally_settles_and_keeps_semantic_evidence_separate() {
+    use crate::critics::Seat;
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let options = opts(tmp.path());
+    let mut route = build_route();
+    route.team = vec![Seat::BackendEngineer, Seat::QaEngineer];
+    let mut plan = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles::default(),
+            id: "security-review".into(),
+            title: "Security review".into(),
+            seat: Seat::SecurityEngineer,
+            kind: StepKind::Review,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    let mut session = FakeSession::new(vec![text_turn("writer must never run")], true, "")
+        .with_fork_replies([
+            r#"{"accepts":false,"blocking":["missing auth regression test"]}"#,
+            "not a verdict",
+            "still not a verdict",
+        ]);
+    let sent = session.sent_handle();
+
+    let outcome = drive_plan_steps(
+        &mut session,
+        &options,
+        &events,
+        &route,
+        &mut plan,
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
+        std::time::Instant::now() + Duration::from_secs(3_600),
+    )
+    .await;
+
+    assert!(matches!(
+        outcome,
+        Some(DirectorLoopOutcome::Failed(ref reason))
+            if reason.contains("stopped incomplete") && reason.contains("new /run")
+    ));
+    assert!(sent.lock().unwrap().is_empty(), "no source repair may run");
+    let checkpoint =
+        load_operational_review_checkpoint(tmp.path()).expect("terminal review checkpoint");
+    assert!(checkpoint.circuit_open());
+    assert_eq!(
+        checkpoint.evidence().semantic_blocking,
+        vec!["[backend-engineer] missing auth regression test"]
+    );
+    assert_eq!(checkpoint.evidence().operational_unavailable.len(), 1);
+    assert!(!has_resumable_run(tmp.path()));
+    assert!(plan
+        .steps
+        .iter()
+        .all(|step| step.status == StepStatus::Blocked));
+}
+
+#[tokio::test]
 async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases_run() {
     use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
     let tmp = tempfile::TempDir::new().unwrap();
@@ -6868,6 +6938,7 @@ async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases
     let (events, rec) = sink();
     let mut options = opts(tmp.path());
     options.backend = "codex".to_string();
+    options.mode = TrustMode::Guarded;
     let route = build_route();
     let mut plan = Plan {
         steps: vec![
@@ -7023,7 +7094,8 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
     let tmp = tempfile::TempDir::new().unwrap();
     seed_source(tmp.path());
     let (events, rec) = sink();
-    let options = opts(tmp.path());
+    let mut options = opts(tmp.path());
+    options.mode = TrustMode::Guarded;
     let mut route = build_route();
     route.team = vec![Seat::FrontendEngineer, Seat::BackendEngineer];
     let mut plan = step_checkpoint_review_clean_build_plan();
@@ -7151,7 +7223,8 @@ async fn step_review_only_resume_semantic_blocker_never_repairs_or_rereviews() {
     let source_path = tmp.path().join("app.ts");
     let source_before = std::fs::read(&source_path).unwrap();
     let (events, _rec) = sink();
-    let options = opts(tmp.path());
+    let mut options = opts(tmp.path());
+    options.mode = TrustMode::Guarded;
     let mut route = build_route();
     route.team = vec![Seat::FrontendEngineer];
     let mut plan = step_checkpoint_review_clean_build_plan();
@@ -7240,7 +7313,8 @@ async fn assert_step_review_receipt_expires_after(mutation: StepReviewReceiptMut
     let tmp = tempfile::TempDir::new().unwrap();
     seed_source(tmp.path());
     let (events, rec) = sink();
-    let options = opts(tmp.path());
+    let mut options = opts(tmp.path());
+    options.mode = TrustMode::Guarded;
     let route = build_route();
     let mut plan = step_checkpoint_review_clean_build_plan();
     let mut first = FakeSession::new(vec![text_turn("implementation complete")], true, "")
@@ -7342,7 +7416,8 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
     seed_source(tmp.path());
     let (events, rec) = sink();
     let route = build_route();
-    let options = opts(tmp.path());
+    let mut options = opts(tmp.path());
+    options.mode = TrustMode::Guarded;
     let mut plan = Plan {
         steps: vec![PlanStep {
             files: plan_state::StepFiles::default(),
@@ -7362,6 +7437,8 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
     let mut first = FakeSession::new(vec![], true, "").with_fork_replies([
         "not a verdict",
         "still not a verdict",
+        "retry is not a verdict",
+        "retry repair is still not a verdict",
         "unused sentinel",
     ]);
     let first_forks = Arc::clone(first.fork_replies.as_ref().unwrap());
@@ -7417,6 +7494,8 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
         qc_source_fingerprint,
         required_seats,
         consecutive_outages,
+        evidence,
+        terminally_settled,
         ..
     } = checkpoint
     else {
@@ -7429,6 +7508,8 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
             required_seats,
             entry_task_run_id: Some(resident_run_id.clone()),
             consecutive_outages,
+            evidence,
+            terminally_settled,
         },
     )
     .unwrap();
@@ -7495,7 +7576,8 @@ fn cancelling_an_operational_pause_settles_the_exact_entry_and_closes_the_plan_c
     let tmp = tempfile::TempDir::new().unwrap();
     seed_source(tmp.path());
     let (events, _rec) = sink();
-    let options = opts(tmp.path());
+    let mut options = opts(tmp.path());
+    options.mode = TrustMode::Guarded;
     let route = build_route();
     let mut entry = crate::task_lifecycle::EntryTaskTracker::begin(
         tmp.path(),
@@ -7543,7 +7625,8 @@ async fn resident_final_review_semantic_blocker_fails_same_run_and_closes_resume
     seed_source(tmp.path());
     let (events, rec) = sink();
     let route = build_route();
-    let options = opts(tmp.path());
+    let mut options = opts(tmp.path());
+    options.mode = TrustMode::Guarded;
     let mut plan = Plan {
         steps: vec![PlanStep {
             files: plan_state::StepFiles::default(),
@@ -7607,6 +7690,8 @@ async fn resident_final_review_semantic_blocker_fails_same_run_and_closes_resume
         qc_source_fingerprint,
         required_seats,
         consecutive_outages,
+        evidence,
+        terminally_settled,
         ..
     } = checkpoint
     else {
@@ -7619,6 +7704,8 @@ async fn resident_final_review_semantic_blocker_fails_same_run_and_closes_resume
             required_seats,
             entry_task_run_id: Some(resident_run_id.clone()),
             consecutive_outages,
+            evidence,
+            terminally_settled,
         },
     )
     .unwrap();
@@ -7732,6 +7819,8 @@ async fn mixed_review_pauses_without_repairing_or_rechecking() {
             r#"{"accepts":false,"blocking":["missing regression test"]}"#,
             "not a verdict",
             "still not a verdict",
+            "retry is not a verdict",
+            "retry repair is still not a verdict",
             "unused sentinel",
         ]);
     let sent = sess.sent_handle();
@@ -7766,11 +7855,11 @@ async fn mixed_review_pauses_without_repairing_or_rechecking() {
     );
     assert!(
         outcome
-            .gap_evidence
+            .operational_unavailable
             .iter()
             .any(|item| item.contains("unavailable") || item.contains("timed out")),
         "{:?}",
-        outcome.gap_evidence
+        outcome.operational_unavailable
     );
     let sent = sent.lock().unwrap();
     assert!(
@@ -7791,8 +7880,10 @@ async fn unavailable_mixed_review_retains_evidence_without_starting_a_recheck() 
         .with_fork_replies([
             r#"{"accepts":false,"blocking":["missing regression test"]}"#,
             "not a verdict",
-            "not a verdict",
-            r#"{"accepts":true,"blocking":[]}"#,
+            "repair is not a verdict",
+            "retry is not a verdict",
+            "retry repair is not a verdict",
+            "unused sentinel",
         ]);
     let sent = sess.sent_handle();
     let step = PlanStep {
@@ -7817,9 +7908,9 @@ async fn unavailable_mixed_review_retains_evidence_without_starting_a_recheck() 
     .await;
     assert!(outcome.unavailable && !outcome.made_progress);
     assert!(outcome
-        .gap_evidence
+        .operational_unavailable
         .iter()
-        .any(|gap| gap.contains("not valid verdict JSON")));
+        .any(|gap| gap.contains("schema repair") || gap.contains("usable verdict")));
     assert!(
         outcome
             .gap_evidence
@@ -8201,6 +8292,8 @@ async fn post_build_qc_mixed_review_retains_semantic_evidence_without_repair_or_
         r#"{"accepts":false,"blocking":["missing regression test"]}"#,
         "not a verdict",
         "still not a verdict",
+        "retry is not a verdict",
+        "retry repair is still not a verdict",
         "unused sentinel",
     ]);
     let remaining = Arc::clone(session.fork_replies.as_ref().unwrap());

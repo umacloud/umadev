@@ -231,55 +231,6 @@ pub(crate) fn source_scan(project_root: &Path) -> SourceScan {
     scan
 }
 
-/// Collect candidate source paths without opening their contents.
-///
-/// Code-review bundling uses this metadata-only walk so it can reject a huge
-/// file by size before any content I/O. The source-present honesty gate continues
-/// to use [`source_files`], whose substantive-content check intentionally reads
-/// candidates.
-pub(crate) fn source_file_candidates(project_root: &Path) -> Vec<PathBuf> {
-    fn collect_paths(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-        if depth > 8 || out.len() >= 600 {
-            return;
-        }
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in rd.flatten() {
-            if out.len() >= 600 {
-                break;
-            }
-            let path = entry.path();
-            match classify_no_follow(&path) {
-                EntryKind::Dir => {
-                    let name = path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("");
-                    if name.starts_with('.') || SKIP_DIRS.contains(&name) {
-                        continue;
-                    }
-                    collect_paths(&path, out, depth + 1);
-                }
-                EntryKind::File => {
-                    if path
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .is_some_and(|extension| SRC_EXT.contains(&extension))
-                    {
-                        out.push(path);
-                    }
-                }
-                EntryKind::Skip => {}
-            }
-        }
-    }
-
-    let mut files = Vec::new();
-    collect_paths(project_root, &mut files, 0);
-    files
-}
-
 /// Locate the designer's **design-tokens** deliverable on the blackboard — the
 /// `design-tokens.json` (the token source of truth: a type scale, color palette,
 /// spacing, the component list) and/or `design-tokens.css` (the same tokens as CSS

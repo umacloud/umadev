@@ -22,8 +22,6 @@ pub(super) async fn retry_review_step_once(
         events.emit(EngineEvent::Note(quality_evidence::operational_stop_note(
             &review.operational,
         )));
-        let mut gaps = review.blocking;
-        gaps.extend(review.operational);
         return StepOutcome {
             accepted: false,
             reply: String::new(),
@@ -31,7 +29,8 @@ pub(super) async fn retry_review_step_once(
             made_progress: false,
             unavailable: true,
             base_agents: crate::bg_agents::BaseAgentObservation::default(),
-            gap_evidence: gaps,
+            gap_evidence: review.blocking,
+            operational_unavailable: review.operational,
         };
     }
     if review.blocking.is_empty() {
@@ -44,6 +43,7 @@ pub(super) async fn retry_review_step_once(
             unavailable: false,
             base_agents: crate::bg_agents::BaseAgentObservation::default(),
             gap_evidence: Vec::new(),
+            operational_unavailable: Vec::new(),
         };
     }
     events.emit(EngineEvent::Note(format!(
@@ -59,6 +59,7 @@ pub(super) async fn retry_review_step_once(
         unavailable: false,
         base_agents: crate::bg_agents::BaseAgentObservation::default(),
         gap_evidence: review.blocking,
+        operational_unavailable: Vec::new(),
     }
 }
 
@@ -96,8 +97,6 @@ pub(super) async fn drive_review_step(
         events.emit(EngineEvent::Note(quality_evidence::operational_stop_note(
             &review.operational,
         )));
-        let mut gaps = review.blocking;
-        gaps.extend(review.operational);
         return StepOutcome {
             accepted: true,
             reply: String::new(),
@@ -105,7 +104,8 @@ pub(super) async fn drive_review_step(
             made_progress: false,
             unavailable: true,
             base_agents: crate::bg_agents::BaseAgentObservation::default(),
-            gap_evidence: gaps,
+            gap_evidence: review.blocking,
+            operational_unavailable: review.operational,
         };
     }
     if review.blocking.is_empty() {
@@ -120,6 +120,7 @@ pub(super) async fn drive_review_step(
             unavailable: false,
             base_agents: crate::bg_agents::BaseAgentObservation::default(),
             gap_evidence: Vec::new(), // review accepted → no gap
+            operational_unavailable: Vec::new(),
         };
     }
     // The team found blockers after the fix budget ended. Preserve those blockers
@@ -139,6 +140,7 @@ pub(super) async fn drive_review_step(
             unavailable: false,
             base_agents: crate::bg_agents::BaseAgentObservation::default(),
             gap_evidence: review.blocking,
+            operational_unavailable: Vec::new(),
         };
     }
     // The team found blocking issues — fold them into ONE bounded fix turn on the
@@ -171,8 +173,6 @@ pub(super) async fn drive_review_step(
         events.emit(EngineEvent::Note(
             quality_evidence::operational_recheck_note(&recheck.operational),
         ));
-        let mut gaps = recheck.blocking;
-        gaps.extend(recheck.operational);
         return StepOutcome {
             accepted: true,
             reply: String::new(),
@@ -180,7 +180,8 @@ pub(super) async fn drive_review_step(
             made_progress: false,
             unavailable: true,
             base_agents,
-            gap_evidence: gaps,
+            gap_evidence: recheck.blocking,
+            operational_unavailable: recheck.operational,
         };
     }
     if !recheck.blocking.is_empty() {
@@ -196,6 +197,7 @@ pub(super) async fn drive_review_step(
             unavailable: false,
             base_agents,
             gap_evidence: recheck.blocking,
+            operational_unavailable: Vec::new(),
         };
     }
     // A team convened, raised findings, and a repair turn ran — real review progress
@@ -208,5 +210,6 @@ pub(super) async fn drive_review_step(
         unavailable: false,
         base_agents,
         gap_evidence: Vec::new(),
+        operational_unavailable: Vec::new(),
     }
 }

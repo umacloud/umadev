@@ -302,7 +302,7 @@ pub fn legacy_operational_review_circuit_reason(project_root: &Path) -> Option<S
     let state = crate::state::read_workflow_state(project_root)?;
     let kind = review_kind_from_circuit_marker(state.note.as_str())?;
     Some(format!(
-        "required {} review infrastructure remained unavailable after one bounded /continue retry; the legacy review circuit is open. No source work was repeated. Start a new /run to retry with a fresh run",
+        "required {} review infrastructure remained unavailable after bounded schema/transport retries; the legacy review circuit is open. No source work was repeated. Start a new /run to retry with a fresh run",
         kind_phase_label(kind)
     ))
 }
@@ -355,6 +355,9 @@ fn pause_at_operational_review(
     kind: ReviewKind,
     review: &TeamReviewResult,
 ) -> RunOutcome {
+    if options.mode == crate::trust::TrustMode::Auto {
+        return open_operational_review_circuit(options, kind, review);
+    }
     let phase = operational_checkpoint_phase(kind);
     persist_state_impl(options, phase, "", Some(operational_review_marker(kind)));
     let reason = review_incomplete_reason(kind, review);
@@ -383,7 +386,7 @@ fn open_operational_review_circuit(
         Some(operational_review_circuit_marker(kind)),
     );
     RunOutcome::HardStop(format!(
-        "{}; the same review boundary remained unavailable after one bounded /continue retry, so the legacy review circuit opened. No source work was repeated. Start a new /run to retry with a fresh run",
+        "{}; the review boundary remained unavailable after bounded schema/transport retries, so the legacy review circuit opened. No source work was repeated. Start a new /run to retry with a fresh run",
         review_incomplete_reason(kind, review)
     ))
 }
@@ -664,9 +667,14 @@ pub async fn run_block(
                 let kind = gate_review_kind(phase);
                 let outcome = pause_at_operational_review(options, &plan, kind, &review);
                 let reason = review_incomplete_reason(kind, &review);
-                events.emit(EngineEvent::Note(format!(
-                    "{reason} — workflow paused before the gate; retry the review with /continue"
-                )));
+                let note = if matches!(outcome, RunOutcome::PausedAtOperational { .. }) {
+                    format!(
+                        "{reason} — workflow paused before the gate; retry the review with /continue"
+                    )
+                } else {
+                    format!("{reason} — automatic review retries exhausted; start a new /run")
+                };
+                events.emit(EngineEvent::Note(note));
                 return outcome;
             }
             // P0-A: persist the OPEN-GATE state (phase = the gate phase, active_gate
@@ -794,10 +802,13 @@ pub async fn run_block(
             if review.status() == ReviewStatus::Unavailable {
                 let outcome =
                     pause_at_operational_review(options, &plan, ReviewKind::Quality, &review);
-                events.emit(EngineEvent::Note(format!(
-                    "{} — workflow paused; retry the review with /continue",
-                    review_incomplete_reason(ReviewKind::Quality, &review)
-                )));
+                let reason = review_incomplete_reason(ReviewKind::Quality, &review);
+                let note = if matches!(outcome, RunOutcome::PausedAtOperational { .. }) {
+                    format!("{reason} — workflow paused; retry the review with /continue")
+                } else {
+                    format!("{reason} — automatic review retries exhausted; start a new /run")
+                };
+                events.emit(EngineEvent::Note(note));
                 return outcome;
             }
             if let Some(reason) = required_review_failure(ReviewKind::Quality, &review) {
@@ -3276,21 +3287,28 @@ impl Blackboard {
         };
         let (prd, architecture, uiux) = (doc("prd"), doc("architecture"), doc("uiux"));
         let code_review = matches!(kind, ReviewKind::Preview | ReviewKind::Quality);
-        let (code, substantive_source_chars) = if code_review {
+        let digest = if code_review {
             // One host-built file-boundary bundle is shared by every code critic.
             // It is below the smallest downstream critic limit, so no role applies
             // a hidden second mid-file truncation. Its manifest carries both
             // included and normally sampled-out paths.
-            source_digest(options)
+            source_digest(options, kind)
         } else {
-            (String::new(), 0)
+            SourceDigest::default()
         };
         let mut coverage = if code_review {
-            ReviewPayloadCoverage::source_bundle(&code, substantive_source_chars)
+            ReviewPayloadCoverage::source_bundle(&digest.bundle, digest.substantive_source_chars)
+                .with_file_scope(
+                    digest.discovered_files,
+                    digest.represented_files,
+                    digest.required_focus_files,
+                    digest.represented_focus_files,
+                )
         } else {
-            ReviewPayloadCoverage::intact(&code)
+            ReviewPayloadCoverage::intact(&digest.bundle)
         };
         coverage.malformed = coverage.supplied_chars > REVIEW_BUNDLE_MAX_CHARS;
+        coverage.discovery_incomplete = digest.discovery_incomplete;
         // The deterministic floors are surfaced as CONTEXT to the QA / security
         // seats (so their semantic pass focuses on what a static check can't see).
         // At the QUALITY node these are the REAL deterministic findings — coverage
@@ -3306,7 +3324,7 @@ impl Blackboard {
             prd,
             architecture,
             uiux,
-            code,
+            code: digest.bundle,
             qa_floor,
             security_floor,
             coverage,
@@ -3330,50 +3348,113 @@ impl Blackboard {
 
 /// A bounded file-boundary bundle of real source for code-review seats.
 ///
-/// Files are included whole when they fit. A large file contributes a bounded
-/// prefix cut on a Unicode scalar boundary, rather than leaving a required code
-/// review with a manifest but zero code. The builder owns both a character budget
-/// and a global byte-read ceiling, so a huge file/tree cannot cause unbounded I/O
-/// or allocation before the review starts.
+/// Every represented file contributes a bounded prefix cut on a Unicode scalar
+/// boundary; a small file is included whole when it fits that cap. The builder
+/// owns both a character budget and a global byte-read ceiling, so a huge
+/// file/tree cannot cause unbounded I/O or allocation before the review starts.
 const REVIEW_BUNDLE_MAX_CHARS: usize = 11_000;
 const REVIEW_BUNDLE_MAX_READ_BYTES: usize = REVIEW_BUNDLE_MAX_CHARS * 4 + 16 * 1024;
+const REVIEW_BUNDLE_FILE_CHARS: usize = 900;
+const REVIEW_BUNDLE_FOCUS_FILES: usize = 8;
 
-fn source_digest(options: &RunOptions) -> (String, usize) {
-    let (bundle, _bytes_read, substantive_source_chars) = source_digest_with_stats(options);
-    (bundle, substantive_source_chars)
+#[derive(Default)]
+struct SourceDigest {
+    bundle: String,
+    #[cfg(test)]
+    bytes_read: usize,
+    substantive_source_chars: usize,
+    discovered_files: usize,
+    represented_files: usize,
+    required_focus_files: usize,
+    represented_focus_files: usize,
+    discovery_incomplete: bool,
 }
 
-/// Build the review bundle and return the exact number of source bytes read.
-///
-/// The statistic makes the I/O ceiling mechanically testable; production callers
-/// use [`source_digest`] and discard it.
-fn source_digest_with_stats(options: &RunOptions) -> (String, usize, usize) {
-    use std::io::Read;
+#[allow(clippy::struct_excessive_bools)]
+struct RankedSource {
+    path: std::path::PathBuf,
+    rel: String,
+    requirement_hits: usize,
+    frontend: bool,
+    backend: bool,
+    tests: bool,
+    security: bool,
+    plan_focus: bool,
+    plan_related: bool,
+}
 
+#[derive(Default)]
+struct ReviewSourceScan {
+    paths: Vec<std::path::PathBuf>,
+    incomplete: bool,
+    sensitive_omitted: usize,
+}
+
+#[derive(Default)]
+struct ReviewPlanScope {
+    exact: Vec<String>,
+    prefixes: Vec<String>,
+    deleted_changed: Vec<String>,
+    change_scope_unavailable: Option<String>,
+}
+
+fn source_digest(options: &RunOptions, kind: ReviewKind) -> SourceDigest {
+    source_digest_with_stats(options, kind)
+}
+
+/// Build the bounded review bundle. Tests also observe the exact source bytes read
+/// so the I/O ceiling remains mechanically enforceable.
+fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDigest {
     const BUNDLE_CHARS: usize = 10_500;
     const MANIFEST_CHARS: usize = 1_500;
     const CONTENT_CHARS: usize = BUNDLE_CHARS - MANIFEST_CHARS;
 
-    let mut files = crate::acceptance::source_file_candidates(&options.project_root);
+    let terms = review_path_terms(&options.requirement);
+    let plan_scope = review_plan_scope(&options.project_root);
+    let scan = review_source_candidates(&options.project_root);
+    let mut files = scan
+        .paths
+        .into_iter()
+        .map(|path| rank_source_path(&options.project_root, path, &terms, &plan_scope))
+        .collect::<Vec<_>>();
     files.sort_by(|left, right| {
-        left.strip_prefix(&options.project_root)
-            .unwrap_or(left)
-            .cmp(right.strip_prefix(&options.project_root).unwrap_or(right))
+        source_priority(right, kind)
+            .cmp(&source_priority(left, kind))
+            .then_with(|| left.rel.cmp(&right.rel))
     });
+    let sampling_focus = select_review_focus(&files, kind);
+    let mandatory = files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| file.plan_focus.then_some(index))
+        .collect::<Vec<_>>();
+    let missing_required = plan_scope
+        .exact
+        .iter()
+        .filter(|required| !files.iter().any(|file| &file.rel == *required))
+        .cloned()
+        .collect::<Vec<_>>();
+    // Only files that actually exist can require byte-for-byte representation.
+    // A missing plan path or an intentional deletion is a semantic fact, not an
+    // operational reviewer outage: carry both as explicit tombstones below so
+    // the reviewer can judge them without routing the run into the outage
+    // circuit (which deliberately never starts a source-repair turn).
+    let required_focus_files = mandatory.len();
+    let mut order = sampling_focus.clone();
+    order.extend((0..files.len()).filter(|index| !sampling_focus.contains(index)));
     let mut included: Vec<(String, Option<(usize, u64)>)> = Vec::new();
     let mut omitted = Vec::new();
     let mut sections = String::new();
     let mut used = 0usize;
     let mut bytes_read = 0usize;
     let mut substantive_source_chars = 0usize;
+    let mut represented_focus_files = 0usize;
     const SAMPLE_MARKER: &str = "\n// … bounded prefix; remainder omitted …\n";
 
-    for file in &files {
-        let rel = file
-            .strip_prefix(&options.project_root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
+    for index in order {
+        let file = &files[index];
+        let rel = file.rel.clone();
+        let is_mandatory = mandatory.contains(&index);
         let header = format!("\n// ===== {rel} =====\n");
         let framing_chars = header.chars().count() + 1;
         let remaining_chars = CONTENT_CHARS.saturating_sub(used);
@@ -3381,40 +3462,31 @@ fn source_digest_with_stats(options: &RunOptions) -> (String, usize, usize) {
             omitted.push((rel, "sampled out; bundle budget exhausted"));
             continue;
         }
-        let content_char_budget = remaining_chars - framing_chars;
+        let focus_file_chars = if is_mandatory {
+            ((CONTENT_CHARS * 3 / 4) / mandatory.len().max(1)).max(96)
+        } else {
+            REVIEW_BUNDLE_FILE_CHARS
+        };
+        let content_char_budget = (remaining_chars - framing_chars).min(focus_file_chars);
         // UTF-8 uses at most four bytes per scalar. Read only enough bytes to
         // supply this section's character budget, even when the file is huge.
         // A later `chars().take(...)` establishes the exact scalar boundary.
         let candidate_byte_budget = content_char_budget.saturating_mul(4);
         let remaining_read_budget = REVIEW_BUNDLE_MAX_READ_BYTES.saturating_sub(bytes_read);
-        let Ok(metadata) = std::fs::metadata(file) else {
-            omitted.push((rel, "unreadable"));
-            continue;
-        };
-        let file_bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-        let read_limit = file_bytes
-            .min(candidate_byte_budget)
-            .min(remaining_read_budget);
+        let read_limit = candidate_byte_budget.min(remaining_read_budget);
         if read_limit == 0 {
             omitted.push((rel, "sampled out; read budget exhausted"));
             continue;
         }
 
-        let Ok(file_handle) = std::fs::File::open(file) else {
+        let Ok((bytes, observed_len)) =
+            crate::bounded_fs::read_prefix_beneath(&options.project_root, &file.path, read_limit)
+        else {
             omitted.push((rel, "unreadable"));
             continue;
         };
-        // `take` protects against a file growing between metadata and open. The
-        // global read budget is therefore a hard ceiling even under a racing
-        // workspace writer.
-        let mut bytes = Vec::with_capacity(read_limit);
-        let mut bounded = file_handle.take(read_limit as u64);
-        if bounded.read_to_end(&mut bytes).is_err() {
-            omitted.push((rel, "unreadable"));
-            continue;
-        }
         bytes_read = bytes_read.saturating_add(bytes.len());
-        let file_was_byte_sampled = bytes.len() < file_bytes;
+        let file_was_byte_sampled = u64::try_from(bytes.len()).unwrap_or(u64::MAX) < observed_len;
         let (content, boundary_was_sampled) = match std::str::from_utf8(&bytes) {
             Ok(content) => (content, false),
             Err(error)
@@ -3459,13 +3531,32 @@ fn source_digest_with_stats(options: &RunOptions) -> (String, usize, usize) {
             sections.push_str(SAMPLE_MARKER);
         }
         sections.push('\n');
-        included.push((rel, sampled.then_some((selected_chars, metadata.len()))));
+        // A required source counts as represented only when its complete
+        // contents fit. A prefix proves the file exists, but cannot prove the
+        // changed hunk in its unseen tail was reviewed.
+        if is_mandatory && !sampled {
+            represented_focus_files += 1;
+        }
+        included.push((rel, sampled.then_some((selected_chars, observed_len))));
     }
 
     let mut manifest = format!(
-        "# Review bundle manifest\nsampling: bounded-character-boundary\nincluded: {}\nomitted: {}\n",
+        "# Review bundle manifest\nsampling: requirement-and-review-priority; bounded-prefixes\n\
+         scope: bounded sample, not full-workspace coverage\ndiscovery-complete: {}\nchange-scope: {}\ndiscovered: {}\nrepresented: {}\n\
+         required-focus: {}\nrepresented-focus: {}\nomitted: {}\nsensitive-omitted: {}\ndeleted-changes: {}\n",
+        if scan.incomplete || plan_scope.change_scope_unavailable.is_some() {
+            "no"
+        } else {
+            "yes"
+        },
+        plan_scope.change_scope_unavailable.as_deref().unwrap_or("available"),
+        files.len(),
         included.len(),
-        omitted.len()
+        required_focus_files,
+        represented_focus_files,
+        omitted.len(),
+        scan.sensitive_omitted,
+        plan_scope.deleted_changed.len()
     );
     for (path, sample) in &included {
         let line = match sample {
@@ -3493,22 +3584,560 @@ fn source_digest_with_stats(options: &RunOptions) -> (String, usize, usize) {
         }
         manifest.push_str(&line);
     }
+    for path in &missing_required {
+        let line = format!("! {path} (required source was not discovered as a regular file)\n");
+        if manifest.chars().count() + line.chars().count() > MANIFEST_CHARS {
+            break;
+        }
+        manifest.push_str(&line);
+    }
+    for path in &plan_scope.deleted_changed {
+        let line = format!("! {path} (deleted in this run)\n");
+        if manifest.chars().count() + line.chars().count() > MANIFEST_CHARS {
+            break;
+        }
+        manifest.push_str(&line);
+    }
     manifest.push_str(
-        "Omission is normal bounded sampling, not a product defect. Prefixes end on character \
-         boundaries. Judge only supplied source; deterministic floors cover the full workspace.\n",
+        "Omitted files were not reviewed by the model. Judge only represented source; \
+         deterministic floors separately inspect their own bounded workspace surfaces.\n",
     );
-    (
-        format!("{manifest}{sections}"),
+    SourceDigest {
+        bundle: format!("{manifest}{sections}"),
+        #[cfg(test)]
         bytes_read,
         substantive_source_chars,
-    )
+        discovered_files: files.len(),
+        represented_files: included.len(),
+        required_focus_files,
+        represented_focus_files,
+        discovery_incomplete: scan.incomplete || plan_scope.change_scope_unavailable.is_some(),
+    }
 }
+
+fn review_source_candidates(root: &std::path::Path) -> ReviewSourceScan {
+    fn collect(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        depth: usize,
+        entries: &mut usize,
+        scan: &mut ReviewSourceScan,
+    ) {
+        const MAX_DEPTH: usize = 24;
+        const MAX_ENTRIES: usize = 50_000;
+        const MAX_FILES: usize = 2_000;
+        if depth > MAX_DEPTH || *entries >= MAX_ENTRIES || scan.paths.len() >= MAX_FILES {
+            scan.incomplete = true;
+            return;
+        }
+        if !crate::bounded_fs::is_real_directory_beneath(root, dir) {
+            scan.incomplete = true;
+            return;
+        }
+        let Ok(before) = same_file::Handle::from_path(dir) else {
+            scan.incomplete = true;
+            return;
+        };
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            scan.incomplete = true;
+            return;
+        };
+        let mut children = Vec::new();
+        for entry in read_dir {
+            match entry {
+                Ok(entry) => children.push(entry),
+                Err(_) => scan.incomplete = true,
+            }
+        }
+        let after = same_file::Handle::from_path(dir);
+        if after.as_ref().is_err() || after.as_ref().is_ok_and(|handle| handle != &before) {
+            scan.incomplete = true;
+            return;
+        }
+        children.sort_by_key(std::fs::DirEntry::file_name);
+        for child in children {
+            *entries = entries.saturating_add(1);
+            if *entries > MAX_ENTRIES || scan.paths.len() >= MAX_FILES {
+                scan.incomplete = true;
+                break;
+            }
+            let path = child.path();
+            match crate::fswalk::classify_no_follow(&path) {
+                crate::fswalk::EntryKind::Dir => {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("");
+                    if (name.starts_with('.') && name != ".github")
+                        || crate::acceptance::SKIP_DIRS.contains(&name)
+                    {
+                        continue;
+                    }
+                    collect(root, &path, depth + 1, entries, scan);
+                }
+                crate::fswalk::EntryKind::File => {
+                    if is_review_source_path(&path) {
+                        let rel = path
+                            .strip_prefix(root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace(std::path::MAIN_SEPARATOR, "/");
+                        if is_review_secret_path(&rel) {
+                            scan.sensitive_omitted = scan.sensitive_omitted.saturating_add(1);
+                        } else {
+                            scan.paths.push(path);
+                        }
+                    }
+                }
+                crate::fswalk::EntryKind::Skip => {}
+            }
+        }
+    }
+
+    let mut scan = ReviewSourceScan::default();
+    let mut entries = 0usize;
+    collect(root, root, 0, &mut entries, &mut scan);
+    scan
+}
+
+fn is_review_source_path(path: &std::path::Path) -> bool {
+    const EXTRA_EXTENSIONS: &[&str] = &[
+        "conf",
+        "gql",
+        "gradle",
+        "graphql",
+        "hcl",
+        "ini",
+        "json",
+        "kts",
+        "prisma",
+        "properties",
+        "proto",
+        "ps1",
+        "sh",
+        "sql",
+        "tf",
+        "toml",
+        "xml",
+        "yaml",
+        "yml",
+    ];
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if matches!(name, "Dockerfile" | "Makefile" | "Procfile") {
+        return true;
+    }
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            let extension = extension.to_ascii_lowercase();
+            crate::acceptance::SRC_EXT.contains(&extension.as_str())
+                || EXTRA_EXTENSIONS.contains(&extension.as_str())
+        })
+}
+
+/// Reject path classes that are likely to contain credentials before their
+/// names or contents can enter a reviewer prompt. This is intentionally a
+/// path-only denylist: normal manifests, Dockerfiles and CI YAML remain useful
+/// review surfaces, while known credential stores and private-key containers do
+/// not. The governance floor still scans those files independently for leaks.
+fn is_review_secret_path(path: &str) -> bool {
+    let normalized = path.trim_start_matches("./").replace('\\', "/");
+    if umadev_governance::check_sensitive_path(&normalized, "").block {
+        return true;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    let basename = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    let extension = std::path::Path::new(basename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+    let stem = basename
+        .strip_suffix(&format!(".{extension}"))
+        .unwrap_or(basename);
+    let secret_named_config = matches!(
+        extension,
+        "conf" | "ini" | "json" | "properties" | "toml" | "yaml" | "yml"
+    ) && (matches!(
+        stem,
+        "credential" | "credentials" | "secret" | "secrets" | "token" | "tokens"
+    ) || stem.contains("service-account")
+        || stem.contains("service_account")
+        || stem.ends_with("-credentials")
+        || stem.ends_with("_credentials"));
+    let sensitive_extension = matches!(
+        extension,
+        "pem" | "key" | "p12" | "pfx" | "ppk" | "jks" | "keystore" | "kdb" | "kdbx"
+    );
+    let env_secret = basename == ".env"
+        || (basename.starts_with(".env.")
+            && !matches!(basename, ".env.example" | ".env.sample" | ".env.template"));
+    let sensitive_segment = lower.split('/').any(|segment| {
+        matches!(
+            segment,
+            "secrets" | "credentials" | "service-accounts" | "service_accounts"
+        )
+    });
+    env_secret
+        || sensitive_segment
+        || sensitive_extension
+        || secret_named_config
+        || matches!(
+            basename,
+            ".envrc"
+                | ".git-credentials"
+                | "application_default_credentials.json"
+                | "service_account.json"
+                | "secrets.json"
+                | "secrets.yaml"
+                | "secrets.yml"
+                | "secrets.toml"
+                | ".dockerconfigjson"
+        )
+        || basename.starts_with("private-key.")
+        || basename.starts_with("private_key.")
+        || (basename.starts_with("id_")
+            && !std::path::Path::new(basename)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pub")))
+        || path_is_or_ends_with(&lower, ".docker/config.json")
+        || path_is_or_ends_with(&lower, ".kube/config")
+        || path_is_or_ends_with(
+            &lower,
+            ".config/gcloud/application_default_credentials.json",
+        )
+        || path_is_or_ends_with(&lower, ".azure/accesstokens.json")
+        || path_is_or_ends_with(&lower, ".config/gh/hosts.yml")
+        || path_is_or_ends_with(&lower, ".config/glab-cli/config.yml")
+}
+
+fn path_is_or_ends_with(path: &str, suffix: &str) -> bool {
+    path == suffix || path.ends_with(&format!("/{suffix}"))
+}
+
+fn review_plan_scope(root: &std::path::Path) -> ReviewPlanScope {
+    let mut scope = ReviewPlanScope::default();
+    if let Some(plan) = crate::plan_state::load(root) {
+        for step in plan.steps {
+            for raw in step.files.all() {
+                add_review_scope_path(root, raw, &mut scope);
+            }
+            for evidence in step.evidence {
+                match evidence {
+                    crate::plan_state::EvidenceContract::FileExists { path }
+                    | crate::plan_state::EvidenceContract::FileContains { path, .. } => {
+                        add_review_scope_path(root, &path, &mut scope);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // The run checkpoint is the authoritative source for what this run really
+    // touched. `Unavailable` and `TooLarge` are not an empty changed set: either
+    // makes the typed payload unavailable so plan/heuristic sampling cannot
+    // masquerade as coverage of changes the host could not enumerate.
+    match crate::checkpoint::run_diff_since_baseline(root) {
+        crate::checkpoint::RunDiff::Changed(changed) => {
+            for changed_file in changed {
+                let Some(path) = normalize_review_scope_path(&changed_file.path) else {
+                    continue;
+                };
+                if is_review_secret_path(&path)
+                    || !is_review_source_path(std::path::Path::new(&path))
+                {
+                    continue;
+                }
+                let full = root.join(&path);
+                match std::fs::symlink_metadata(&full) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // A plan exact already represents this missing path in the
+                        // required-but-unrepresented count. Otherwise add one
+                        // deletion tombstone: without a bounded baseline diff there
+                        // is no artifact the semantic reviewer can honestly approve.
+                        if !scope.deleted_changed.contains(&path) {
+                            scope.deleted_changed.push(path);
+                        }
+                    }
+                    Ok(_) if crate::bounded_fs::is_real_file_beneath(root, &full) => {
+                        add_exact_review_scope(path, &mut scope);
+                    }
+                    // A changed source that still exists but is no longer a safe
+                    // regular in-root file is required-but-unrepresented, forcing
+                    // coverage unavailable without following it.
+                    Ok(_) | Err(_) => add_exact_review_scope(path, &mut scope),
+                }
+            }
+        }
+        crate::checkpoint::RunDiff::Unavailable => {
+            scope.change_scope_unavailable = Some("unavailable".into());
+        }
+        crate::checkpoint::RunDiff::TooLarge(count) => {
+            scope.change_scope_unavailable = Some(format!("too-large ({count} files)"));
+        }
+    }
+    scope
+}
+
+fn add_review_scope_path(root: &std::path::Path, raw: &str, scope: &mut ReviewPlanScope) {
+    let Some(normalized) = normalize_review_scope_path(raw) else {
+        return;
+    };
+    if is_review_secret_path(&normalized) {
+        return;
+    }
+    let directory = normalized.ends_with('/')
+        || crate::bounded_fs::is_real_directory_beneath(root, &root.join(&normalized));
+    let target = if directory {
+        format!("{}/", normalized.trim_end_matches('/'))
+    } else {
+        normalized
+    };
+    if directory {
+        if !scope.prefixes.contains(&target) {
+            scope.prefixes.push(target);
+        }
+    } else if is_review_source_path(std::path::Path::new(&target)) {
+        add_exact_review_scope(target, scope);
+    }
+}
+
+fn normalize_review_scope_path(raw: &str) -> Option<String> {
+    let normalized = raw.trim().trim_start_matches("./").replace('\\', "/");
+    let path = std::path::Path::new(&normalized);
+    (!normalized.is_empty()
+        && !normalized.contains('\0')
+        && !path.is_absolute()
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }))
+    .then_some(normalized)
+}
+
+fn add_exact_review_scope(path: String, scope: &mut ReviewPlanScope) {
+    if !scope.exact.contains(&path) {
+        scope.exact.push(path);
+    }
+}
+
+fn rank_source_path(
+    root: &std::path::Path,
+    path: std::path::PathBuf,
+    terms: &[String],
+    plan_scope: &ReviewPlanScope,
+) -> RankedSource {
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    let lower = rel.to_ascii_lowercase();
+    let plan_focus = plan_scope.exact.iter().any(|focus| focus == &rel);
+    let plan_related = plan_focus
+        || plan_scope
+            .prefixes
+            .iter()
+            .any(|prefix| rel.starts_with(prefix));
+    RankedSource {
+        path,
+        rel,
+        requirement_hits: terms
+            .iter()
+            .filter(|term| lower.contains(term.as_str()))
+            .count(),
+        frontend: path_has_any(
+            &lower,
+            &[
+                "frontend",
+                "/ui/",
+                "/views/",
+                "/pages/",
+                "/components/",
+                ".tsx",
+                ".jsx",
+                ".vue",
+                ".svelte",
+                ".css",
+                ".html",
+            ],
+        ),
+        backend: path_has_any(
+            &lower,
+            &[
+                "backend",
+                "/api/",
+                "/server/",
+                "/routes/",
+                "/controller",
+                "/service",
+                "/repository",
+                "/handler",
+            ],
+        ),
+        tests: path_has_any(
+            &lower,
+            &["/test/", "/tests/", "_test.", ".test.", ".spec.", "/spec/"],
+        ),
+        security: path_has_any(
+            &lower,
+            &[
+                "auth",
+                "login",
+                "signin",
+                "session",
+                "token",
+                "permission",
+                "security",
+                "middleware",
+            ],
+        ),
+        plan_focus,
+        plan_related,
+    }
+}
+
+fn source_priority(file: &RankedSource, kind: ReviewKind) -> usize {
+    let lane = match kind {
+        ReviewKind::Preview => {
+            usize::from(file.frontend) * 80
+                + usize::from(file.tests) * 30
+                + usize::from(file.backend) * 15
+        }
+        ReviewKind::Quality => {
+            usize::from(file.tests) * 70
+                + usize::from(file.backend) * 60
+                + usize::from(file.security) * 50
+                + usize::from(file.frontend) * 40
+        }
+        ReviewKind::Docs => 0,
+    };
+    usize::from(file.plan_focus) * 1_000_000
+        + usize::from(file.plan_related) * 100_000
+        + file.requirement_hits.saturating_mul(1_000)
+        + lane
+}
+
+fn select_review_focus(files: &[RankedSource], kind: ReviewKind) -> Vec<usize> {
+    let mut selected = Vec::new();
+    for (index, file) in files.iter().enumerate() {
+        if file.plan_focus {
+            selected.push(index);
+        }
+    }
+    {
+        let mut add_first = |predicate: &dyn Fn(&RankedSource) -> bool| {
+            if let Some(index) = files.iter().enumerate().find_map(|(index, file)| {
+                (predicate(file) && !selected.contains(&index)).then_some(index)
+            }) {
+                selected.push(index);
+            }
+        };
+
+        add_first(&|file| file.requirement_hits > 0);
+        add_first(&|file| file.frontend);
+        add_first(&|file| file.backend);
+        add_first(&|file| file.tests);
+        if matches!(kind, ReviewKind::Quality) {
+            add_first(&|file| file.security);
+        }
+    }
+    for (index, file) in files.iter().enumerate() {
+        if selected.len() >= REVIEW_BUNDLE_FOCUS_FILES {
+            break;
+        }
+        if file.requirement_hits > 0 && !selected.contains(&index) {
+            selected.push(index);
+        }
+    }
+    selected
+}
+
+fn path_has_any(path: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| path.contains(needle))
+}
+
+fn review_path_terms(requirement: &str) -> Vec<String> {
+    let lower = requirement.to_lowercase();
+    let mut terms = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 3 && !REVIEW_PATH_STOP_WORDS.contains(term))
+        .take(24)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let mut add = |term: &str| {
+        if !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_string());
+        }
+    };
+    if path_has_any(
+        &lower,
+        &[
+            "登录",
+            "登陆",
+            "login",
+            "log in",
+            "sign in",
+            "authentication",
+        ],
+    ) {
+        for term in ["login", "signin", "auth", "session"] {
+            add(term);
+        }
+    }
+    if path_has_any(&lower, &["工单", "work order", "work-order", "ticket"]) {
+        for term in ["workorder", "work-order", "ticket", "order"] {
+            add(term);
+        }
+    }
+    if path_has_any(&lower, &["报表", "报告", "report"]) {
+        add("report");
+    }
+    if path_has_any(&lower, &["通知", "notification", "notice"]) {
+        for term in ["notification", "notice"] {
+            add(term);
+        }
+    }
+    if path_has_any(&lower, &["权限", "角色", "permission", "role"]) {
+        for term in ["permission", "role"] {
+            add(term);
+        }
+    }
+    terms
+}
+
+const REVIEW_PATH_STOP_WORDS: &[&str] = &[
+    "add",
+    "and",
+    "app",
+    "build",
+    "change",
+    "create",
+    "develop",
+    "feature",
+    "fix",
+    "for",
+    "from",
+    "implement",
+    "project",
+    "the",
+    "this",
+    "update",
+    "with",
+];
 
 /// An owner for the fresh READ-ONLY child returned by `BaseSession::fork()`.
 /// Critic callers run a strict-JSON judge turn on it; the intent router runs its
 /// typed pre-action decision and may recover the same child for a read-only user
-/// turn. A child that failed to open (or an offline brain) makes each caller take
-/// its own safe fallback; an absent critic can NEVER block (invariant 1).
+/// turn. A child that failed to open becomes a typed unavailable result; callers
+/// then apply their own bounded fallback or review-liveness policy.
 pub(crate) struct ForkConsult {
     /// The read-only fork, or the error that prevented opening one. `Mutex` so
     /// the `&self` `judge` can drive the `&mut` session.
@@ -3619,9 +4248,12 @@ const INDEPENDENT_REVIEW_FIREWALL: &str = "You are opening an INDEPENDENT, clean
      the artifact, the acceptance criteria, and the requirement provided below, on their own \
      terms, digging independently from your role's seat. Judge what the artifact ACTUALLY is \
      and does — not what its author intended, narrated, or claimed. The supplied payload is the \
-     COMPLETE review boundary: do NOT call tools, inspect the workspace, read extra files, or \
-     search conversation logs. If the payload is insufficient, report the review as unavailable \
+     ONLY review boundary; its manifest explicitly reports any sampled or omitted files. Do NOT \
+     call tools, inspect the workspace, read extra files, or search conversation logs. If the \
+     payload is insufficient, report the review as unavailable \
      or advisory in the requested JSON instead of expanding scope.";
+
+const REVIEW_REPLY_MAX_CHARS: usize = 16_000;
 
 /// Compose the full judge directive sent to a critic's read-only fork: the
 /// maker-checker [`INDEPENDENT_REVIEW_FIREWALL`] FIRST (so the reviewer rejects
@@ -3661,8 +4293,16 @@ impl CriticConsult for ForkConsult {
         }
         // Bound the judge turn so one wedged fork can't hang the whole gate.
         match tokio::time::timeout(review_turn_timeout(), drain_review_text(fork)).await {
-            // A clean TurnDone with the collected text → parse the verdict.
-            Ok(Some(text)) => parse_verdict(role, &text),
+            // Only a clean completed turn is eligible for one bounded schema
+            // normalization. Transport/tool/stream failures return `None` above
+            // and are never salvaged from buffered text.
+            Ok(Some(text)) if text.trim().is_empty() => {
+                RoleVerdict::unavailable(role, "review session completed without a verdict")
+            }
+            Ok(Some(text)) => match try_parse_verdict(role, &text) {
+                Some(verdict) => verdict,
+                None => repair_verdict_once(fork, role, &text).await,
+            },
             Ok(None) => RoleVerdict::unavailable(role, "review session ended before a verdict"),
             Err(_) => RoleVerdict::unavailable(role, "review turn timed out"),
         }
@@ -3740,13 +4380,23 @@ impl CriticConsult for ColdConsult {
 }
 
 /// Drain a read-only fork's events until its `TurnDone`, returning the collected
-/// assistant text (`Some`) — or `None` if the session ended first. Tool noise on
-/// a read-only fork is ignored. Split out of `judge` to keep nesting shallow.
+/// assistant text (`Some`) — or `None` if the session ended first, failed, exceeded
+/// the reply budget, or attempted a tool call outside the supplied review boundary.
 async fn drain_review_text(fork: &mut Box<dyn BaseSession>) -> Option<String> {
     let mut text = String::new();
+    let mut chars = 0usize;
     while let Some(ev) = fork.next_event().await {
         match ev {
-            SessionEvent::TextDelta(t) => text.push_str(&t),
+            SessionEvent::TextDelta(t) => {
+                chars = chars.saturating_add(t.chars().count());
+                if chars > REVIEW_REPLY_MAX_CHARS {
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), fork.interrupt())
+                            .await;
+                    return None;
+                }
+                text.push_str(&t);
+            }
             SessionEvent::TurnDone {
                 status: TurnStatus::Completed,
                 ..
@@ -3768,8 +4418,40 @@ async fn drain_review_text(fork: &mut Box<dyn BaseSession>) -> Option<String> {
     None
 }
 
+async fn repair_verdict_once(
+    fork: &mut Box<dyn BaseSession>,
+    role: &str,
+    completed_reply: &str,
+) -> RoleVerdict {
+    let original = serde_json::to_string(completed_reply).unwrap_or_else(|_| "\"\"".to_string());
+    let directive = format!(
+        "Normalize ONE already-completed `{role}` review into the schema below. This is format \
+         repair only: preserve the original meaning, do not re-review, call tools, inspect files, \
+         or invent findings. If the original clearly accepts, set accepts=true. If it states \
+         must-fix findings, set accepts=false and copy them into blocking. If its meaning is \
+         genuinely indeterminate, return accepts=false, blocking=[], and explain that in advisory. \
+         Return exactly one JSON object: \
+         {{\"accepts\":<bool>,\"blocking\":[<string>],\"remediation\":[<string>],\
+         \"advisory\":[<string>],\"evidence\":[<string>]}}.\n\nOriginal reviewer response as JSON string:\n{original}"
+    );
+    if let Err(error) = fork.send_turn(directive).await {
+        return RoleVerdict::unavailable(
+            role,
+            format!("review schema repair failed to start: {error}"),
+        );
+    }
+    match tokio::time::timeout(review_turn_timeout(), drain_review_text(fork)).await {
+        Ok(Some(text)) => try_parse_verdict(role, &text).unwrap_or_else(|| {
+            RoleVerdict::unavailable(role, "review schema repair returned invalid verdict JSON")
+        }),
+        Ok(None) => RoleVerdict::unavailable(role, "review schema repair ended before a verdict"),
+        Err(_) => RoleVerdict::unavailable(role, "review schema repair timed out"),
+    }
+}
+
 /// Parse a fork's judge reply into a [`RoleVerdict`]. Malformed output is an
 /// explicit unavailable review, never a clean pass.
+#[cfg(test)]
 fn parse_verdict(role: &str, text: &str) -> RoleVerdict {
     try_parse_verdict(role, text).unwrap_or_else(|| {
         RoleVerdict::unavailable(role, "review reply was not valid verdict JSON")
@@ -3781,6 +4463,13 @@ fn parse_verdict(role: &str, text: &str) -> RoleVerdict {
 /// "empty accept" (the cold consult falls back to the FORK) can take it instead.
 fn try_parse_verdict(role: &str, text: &str) -> Option<RoleVerdict> {
     let json = extract_json_object(text)?;
+    let shape = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    if !shape
+        .get("accepts")
+        .is_some_and(serde_json::Value::is_boolean)
+    {
+        return None;
+    }
     serde_json::from_str::<RoleVerdict>(&json)
         .ok()
         .map(|v| v.normalized(role))
@@ -4170,6 +4859,14 @@ mod tests {
     }
 
     fn opts(root: &Path, requirement: &str, mode: TrustMode) -> RunOptions {
+        // Production establishes this before any writer turn. Keep unit fixtures
+        // honest too: an absent diff view now correctly makes code-review
+        // coverage unavailable rather than pretending the changed set is empty.
+        let _ = crate::checkpoint::ensure_run_baseline(root, "demo");
+        raw_opts(root, requirement, mode)
+    }
+
+    fn raw_opts(root: &Path, requirement: &str, mode: TrustMode) -> RunOptions {
         RunOptions {
             project_root: root.to_path_buf(),
             requirement: requirement.to_string(),
@@ -4976,7 +5673,9 @@ mod tests {
     #[tokio::test]
     async fn plan_mode_is_a_hard_nonexecution_before_session_or_disk_effects() {
         let tmp = tempfile::tempdir().unwrap();
-        let options = opts(tmp.path(), "build a dashboard app", TrustMode::Plan);
+        // Plan mode must remain side-effect free even at fixture construction,
+        // so deliberately do not create the execution baseline used by `opts`.
+        let options = raw_opts(tmp.path(), "build a dashboard app", TrustMode::Plan);
         let (events, _rec) = sink();
         let mut session = FakeBaseSession::new(vec![vec![done()]]);
         let sent = session.sent_handle();
@@ -5194,6 +5893,155 @@ mod tests {
         assert_eq!(no_context.blocking.len(), 1);
     }
 
+    #[tokio::test]
+    async fn clean_completed_natural_language_verdict_gets_one_schema_repair() {
+        let fake = FakeBaseSession::new(vec![
+            vec![
+                SessionEvent::TextDelta(
+                    "I cannot approve: the login error path has no regression test.".into(),
+                ),
+                done(),
+            ],
+            vec![
+                SessionEvent::TextDelta(
+                    r#"{"accepts":false,"blocking":["login error path has no regression test"]}"#
+                        .into(),
+                ),
+                done(),
+            ],
+        ]);
+        let sent = fake.sent_handle();
+        let consult = ForkConsult::new(Ok(Box::new(fake)));
+
+        let verdict = consult
+            .judge("qa-engineer", "strict QA schema", "artifact".into())
+            .await;
+
+        assert_eq!(verdict.status(), ReviewStatus::Fail);
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        assert!(sent.lock().unwrap()[1].contains("format repair only"));
+    }
+
+    #[tokio::test]
+    async fn empty_completed_review_is_unavailable_without_schema_repair() {
+        let fake = FakeBaseSession::new(vec![
+            vec![SessionEvent::TextDelta("  \n".into()), done()],
+            vec![
+                SessionEvent::TextDelta(r#"{"accepts":true}"#.into()),
+                done(),
+            ],
+        ]);
+        let sent = fake.sent_handle();
+        let consult = ForkConsult::new(Ok(Box::new(fake)));
+
+        let verdict = consult
+            .judge("architect", "strict schema", "artifact".into())
+            .await;
+
+        assert_eq!(verdict.status(), ReviewStatus::Unavailable);
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "an empty completed turn is not meaningful output to normalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_schema_repair_is_attempted_exactly_once() {
+        let fake = FakeBaseSession::new(vec![
+            vec![SessionEvent::TextDelta("not valid JSON".into()), done()],
+            vec![
+                SessionEvent::TextDelta(r#"{"status":"maybe"}"#.into()),
+                done(),
+            ],
+            vec![
+                SessionEvent::TextDelta(r#"{"accepts":true}"#.into()),
+                done(),
+            ],
+        ]);
+        let sent = fake.sent_handle();
+        let consult = ForkConsult::new(Ok(Box::new(fake)));
+
+        let verdict = consult
+            .judge("architect", "strict schema", "artifact".into())
+            .await;
+
+        assert_eq!(verdict.status(), ReviewStatus::Unavailable);
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            2,
+            "a malformed repair response must not start a third reviewer turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_wrong_schema_is_repaired_once_but_failed_turn_is_never_salvaged() {
+        let repairable = FakeBaseSession::new(vec![
+            vec![
+                SessionEvent::TextDelta(r#"{"status":"pass","findings":[]}"#.into()),
+                done(),
+            ],
+            vec![
+                SessionEvent::TextDelta(r#"{"accepts":true,"blocking":[]}"#.into()),
+                done(),
+            ],
+        ]);
+        let repair_sent = repairable.sent_handle();
+        let repair = ForkConsult::new(Ok(Box::new(repairable)));
+        assert_eq!(
+            repair
+                .judge("architect", "strict schema", "artifact".into())
+                .await
+                .status(),
+            ReviewStatus::Pass
+        );
+        assert_eq!(repair_sent.lock().unwrap().len(), 2);
+
+        let failed = FakeBaseSession::new(vec![
+            vec![
+                SessionEvent::TextDelta("PASS; no blockers".into()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Failed("transport closed".into()),
+                    usage: None,
+                },
+            ],
+            vec![
+                SessionEvent::TextDelta(r#"{"accepts":true}"#.into()),
+                done(),
+            ],
+        ]);
+        let failed_sent = failed.sent_handle();
+        let failed_consult = ForkConsult::new(Ok(Box::new(failed)));
+        let verdict = failed_consult
+            .judge("architect", "strict schema", "artifact".into())
+            .await;
+        assert_eq!(verdict.status(), ReviewStatus::Unavailable);
+        assert_eq!(
+            failed_sent.lock().unwrap().len(),
+            1,
+            "a non-completed turn never starts schema repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_review_never_starts_schema_repair() {
+        let fake = FakeBaseSession::new(vec![vec![
+            SessionEvent::ToolCall {
+                name: "Read".into(),
+                input: serde_json::json!({"path":"src/login.rs"}),
+            },
+            SessionEvent::TextDelta("PASS".into()),
+            done(),
+        ]]);
+        let sent = fake.sent_handle();
+        let consult = ForkConsult::new(Ok(Box::new(fake)));
+        let verdict = consult
+            .judge("security-engineer", "strict schema", "artifact".into())
+            .await;
+        assert_eq!(verdict.status(), ReviewStatus::Unavailable);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn missing_reviewable_artifact_verdict_remains_semantic() {
         let verdict = parse_verdict(
@@ -5245,6 +6093,38 @@ mod tests {
         assert!(
             drain_review_text(&mut fork).await.is_none(),
             "only TurnStatus::Completed may make buffered reviewer text authoritative"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_review_turn_cannot_repair_or_promote_buffered_text() {
+        let fake = FakeBaseSession::new(vec![
+            vec![
+                SessionEvent::TextDelta(
+                    "I approve the sampled artifact; there are no blocking findings.".into(),
+                ),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Truncated,
+                    usage: None,
+                },
+            ],
+            vec![
+                SessionEvent::TextDelta(r#"{"accepts":true,"blocking":[]}"#.into()),
+                done(),
+            ],
+        ]);
+        let sent = fake.sent_handle();
+        let consult = ForkConsult::new(Ok(Box::new(fake)));
+
+        let verdict = consult
+            .judge("qa-engineer", "strict schema", "artifact".into())
+            .await;
+
+        assert_eq!(verdict.status(), ReviewStatus::Unavailable);
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            1,
+            "a truncated turn is transport-incomplete and cannot start schema repair"
         );
     }
 
@@ -5554,6 +6434,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_first_review_outage_pauses_guarded_but_settles_auto_terminally() {
+        let review = TeamReviewResult {
+            blocking: Vec::new(),
+            unavailable: vec!["[qa-engineer] review turn timed out".into()],
+        };
+        let requirement = "build a SaaS dashboard web app with login and charts";
+        let plan = crate::planner::plan(requirement);
+
+        let guarded_root = tempfile::tempdir().unwrap();
+        let guarded = opts(guarded_root.path(), requirement, TrustMode::Guarded);
+        assert!(matches!(
+            pause_at_operational_review(&guarded, &plan, ReviewKind::Quality, &review),
+            RunOutcome::PausedAtOperational { .. }
+        ));
+        assert!(legacy_operational_review_pending(guarded_root.path()));
+
+        let auto_root = tempfile::tempdir().unwrap();
+        let auto = opts(auto_root.path(), requirement, TrustMode::Auto);
+        assert!(matches!(
+            pause_at_operational_review(&auto, &plan, ReviewKind::Quality, &review),
+            RunOutcome::HardStop(ref reason)
+                if reason.contains("review circuit opened")
+                    && reason.contains("No source work was repeated")
+        ));
+        assert!(legacy_operational_review_circuit_reason(auto_root.path()).is_some());
+        assert!(!legacy_operational_review_pending(auto_root.path()));
+    }
+
     #[tokio::test]
     async fn legacy_operational_review_opens_a_terminal_circuit_after_one_continue() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5777,8 +6686,11 @@ mod tests {
             "unexpected prior deliberation is explicitly rejected"
         );
         assert!(
-            lower.contains("do not call tools") && lower.contains("complete review boundary"),
-            "the critic is confined to the bounded artifact payload"
+            lower.contains("do not call tools")
+                && lower.contains("only review boundary")
+                && lower.contains("sampled")
+                && lower.contains("omitted"),
+            "the critic is confined to the bounded payload without claiming full-workspace coverage"
         );
         assert!(
             d.find(INDEPENDENT_REVIEW_FIREWALL).unwrap() < d.find(system).unwrap(),
@@ -5839,8 +6751,13 @@ mod tests {
                 declared_chars: 200,
                 supplied_chars: 20,
                 malformed: false,
+                discovery_incomplete: false,
                 requires_source: true,
                 substantive_source_chars: 20,
+                discovered_source_files: 1,
+                represented_source_files: 1,
+                required_focus_files: 1,
+                represented_focus_files: 1,
             },
             ..CriticArtifacts::default()
         };
@@ -6494,7 +7411,9 @@ mod tests {
 
         assert!(
             arts.code.contains("# Review bundle manifest")
-                && arts.code.contains("sampling: bounded-character-boundary"),
+                && arts
+                    .code
+                    .contains("sampling: requirement-and-review-priority"),
             "quality critics receive the bounded bundle contract: {}",
             arts.code
         );
@@ -6505,8 +7424,317 @@ mod tests {
             "the bundle is below the smallest critic limit"
         );
         assert!(
-            arts.coverage.is_complete(),
-            "normal file-boundary sampling is a complete host contract"
+            arts.coverage.is_reviewable(),
+            "normal file-boundary sampling is an explicit, reviewable host scope"
+        );
+    }
+
+    #[test]
+    fn plan_and_requirement_focus_survive_twenty_six_lexical_fillers() {
+        use crate::critics::Seat;
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/filler")).unwrap();
+        for index in 0..26 {
+            std::fs::write(
+                root.join(format!("src/filler/a{index:02}.ts")),
+                format!("export const filler{index} = '{}';\n", "x".repeat(1_600)),
+            )
+            .unwrap();
+        }
+        let critical = [
+            "frontend/src/pages/WorkOrderList.tsx",
+            "backend/src/api/LoginController.java",
+            "backend/src/api/NotificationController.java",
+            "tests/login-work-order.test.ts",
+            "package.json",
+        ];
+        for path in critical {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(
+                full,
+                format!("// {path}\nexport const implemented = true;\n"),
+            )
+            .unwrap();
+        }
+        crate::plan_state::save(
+            &Plan {
+                steps: vec![PlanStep {
+                    id: "commercial-flow".into(),
+                    title: "登录、工单、通知与测试".into(),
+                    seat: Seat::FrontendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: Vec::new(),
+                    acceptance: AcceptanceSpec::BuildTest,
+                    evidence: Vec::new(),
+                    files: StepFiles {
+                        create: critical.iter().map(|path| (*path).to_string()).collect(),
+                        modify: Vec::new(),
+                    },
+                    status: StepStatus::Done,
+                }],
+                risks: Vec::new(),
+                open_questions: Vec::new(),
+            },
+            root,
+        )
+        .unwrap();
+        let options = opts(
+            root,
+            "实现登录、工单列表详情新建、通知、API 和完整测试",
+            TrustMode::Auto,
+        );
+
+        let bb = Blackboard::read(&options, ReviewKind::Quality);
+        let arts = bb.artifacts(&options.requirement);
+        for path in critical {
+            assert!(
+                arts.code.contains(path),
+                "plan-declared critical path was displaced by lexical filler: {path}\n{}",
+                arts.code
+            );
+        }
+        assert_eq!(arts.coverage.required_focus_files, critical.len());
+        assert_eq!(
+            arts.coverage.represented_focus_files,
+            arts.coverage.required_focus_files
+        );
+        assert!(arts.coverage.represented_source_files < arts.coverage.discovered_source_files);
+        assert!(arts
+            .code
+            .contains("scope: bounded sample, not full-workspace coverage"));
+        assert!(arts.coverage.is_reviewable());
+    }
+
+    #[test]
+    fn changed_deep_source_after_six_hundred_fillers_is_mandatory_and_honestly_sampled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/filler")).unwrap();
+        for index in 0..650 {
+            std::fs::write(
+                root.join(format!("src/filler/a{index:03}.rs")),
+                format!("pub const FILLER_{index}: usize = {index};\n"),
+            )
+            .unwrap();
+        }
+        let critical_rel =
+            "src/deep/one/two/three/four/five/six/seven/eight/nine/ten/zzz_critical.rs";
+        let critical = root.join(critical_rel);
+        std::fs::create_dir_all(critical.parent().unwrap()).unwrap();
+        std::fs::write(
+            &critical,
+            format!(
+                "{}\npub const RESULT: &str = \"before\";\n",
+                "// prefix\n".repeat(900)
+            ),
+        )
+        .unwrap();
+        if crate::checkpoint::create_run_baseline(root, "review-focus").is_none() {
+            return;
+        }
+        std::fs::write(
+            &critical,
+            format!(
+                "{}\npub const RESULT: &str = \"changed-after-900-chars\";\n",
+                "// prefix\n".repeat(900)
+            ),
+        )
+        .unwrap();
+
+        let options = opts(root, "review the implementation", TrustMode::Auto);
+        let blackboard = Blackboard::read(&options, ReviewKind::Quality);
+        let bundle = &blackboard.code;
+
+        assert!(bundle.contains(critical_rel), "{bundle}");
+        assert_eq!(blackboard.coverage.required_focus_files, 1);
+        assert_eq!(blackboard.coverage.represented_focus_files, 0);
+        assert!(
+            bundle.contains(&format!("~ {critical_rel} (prefix"))
+                && bundle.contains("bounded prefix; remainder omitted"),
+            "a large changed file must be represented without claiming its unseen tail was reviewed: {bundle}"
+        );
+        assert!(
+            !bundle.contains("changed-after-900-chars"),
+            "the test must actually exercise a change beyond the represented prefix"
+        );
+        assert!(
+            !blackboard.coverage.is_reviewable(),
+            "a mandatory changed source whose unseen tail contains the change must fail closed"
+        );
+    }
+
+    #[test]
+    fn sensitive_files_never_enter_review_but_manifests_ci_and_dockerfiles_do() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(root.join("config/secrets")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"scripts":{"test":"vitest"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".github/workflows/ci.yml"),
+            "name: ci\nsteps:\n  - run: npm test\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(
+            root.join("service-account.json"),
+            r#"{"private_key":"SECRET_SENTINEL_ONE"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config/secrets/production.yaml"),
+            "token: SECRET_SENTINEL_TWO\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("team-service-account-prod.json"),
+            r#"{"private_key":"SECRET_SENTINEL_FOUR"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("token.toml"),
+            "value = \"SECRET_SENTINEL_FIVE\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join(".npmrc"), "//registry/:_authToken=SECRET_THREE\n").unwrap();
+
+        let options = opts(
+            root,
+            "review deployment and CI configuration",
+            TrustMode::Auto,
+        );
+        let digest = source_digest_with_stats(&options, ReviewKind::Quality);
+
+        for safe in ["package.json", ".github/workflows/ci.yml", "Dockerfile"] {
+            assert!(
+                digest.bundle.contains(safe),
+                "safe review surface was omitted: {safe}\n{}",
+                digest.bundle
+            );
+        }
+        for secret in [
+            "service-account.json",
+            "config/secrets/production.yaml",
+            "team-service-account-prod.json",
+            "token.toml",
+            ".npmrc",
+            "SECRET_SENTINEL_ONE",
+            "SECRET_SENTINEL_TWO",
+            "SECRET_THREE",
+            "SECRET_SENTINEL_FOUR",
+            "SECRET_SENTINEL_FIVE",
+        ] {
+            assert!(
+                !digest.bundle.contains(secret),
+                "secret path/content leaked into review payload: {secret}\n{}",
+                digest.bundle
+            );
+        }
+        assert!(digest.bundle.contains("sensitive-omitted: 4"));
+    }
+
+    #[test]
+    fn missing_plan_declared_source_is_an_explicit_semantic_tombstone() {
+        use crate::critics::Seat;
+        use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/existing.ts"),
+            "export const existing = true;\n",
+        )
+        .unwrap();
+        crate::plan_state::save(
+            &Plan {
+                steps: vec![PlanStep {
+                    id: "missing-source".into(),
+                    title: "build missing source".into(),
+                    seat: Seat::BackendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: Vec::new(),
+                    acceptance: AcceptanceSpec::BuildTest,
+                    evidence: Vec::new(),
+                    files: StepFiles {
+                        create: vec!["src/missing.ts".into()],
+                        modify: Vec::new(),
+                    },
+                    status: StepStatus::Done,
+                }],
+                risks: Vec::new(),
+                open_questions: Vec::new(),
+            },
+            root,
+        )
+        .unwrap();
+        let options = opts(root, "build the API", TrustMode::Auto);
+        let blackboard = Blackboard::read(&options, ReviewKind::Quality);
+
+        assert_eq!(blackboard.coverage.required_focus_files, 0);
+        assert_eq!(blackboard.coverage.represented_focus_files, 0);
+        assert!(blackboard.coverage.is_reviewable());
+        assert!(blackboard.code.contains("! src/missing.ts"));
+    }
+
+    #[test]
+    fn changed_source_deletion_is_a_reviewable_semantic_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/kept.rs"), "pub fn kept() {}\n").unwrap();
+        std::fs::write(
+            root.join("src/removed_auth.rs"),
+            "pub fn authorize() -> bool { true }\n",
+        )
+        .unwrap();
+        if crate::checkpoint::create_run_baseline(root, "review-deletion").is_none() {
+            return;
+        }
+        std::fs::remove_file(root.join("src/removed_auth.rs")).unwrap();
+        let options = opts(root, "review authorization", TrustMode::Auto);
+        let blackboard = Blackboard::read(&options, ReviewKind::Quality);
+
+        assert_eq!(blackboard.coverage.required_focus_files, 0);
+        assert_eq!(blackboard.coverage.represented_focus_files, 0);
+        assert!(blackboard.coverage.is_reviewable());
+        assert!(blackboard.code.contains("deleted-changes: 1"));
+        assert!(blackboard
+            .code
+            .contains("! src/removed_auth.rs (deleted in this run)"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collected_review_path_replaced_by_ancestor_symlink_is_never_read() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/app.ts"), "safe workspace source").unwrap();
+        std::fs::write(outside.path().join("app.ts"), "OUTSIDE_SECRET").unwrap();
+
+        let scan = review_source_candidates(root.path());
+        let captured = scan
+            .paths
+            .into_iter()
+            .find(|path| path.ends_with("src/app.ts"))
+            .expect("candidate collected before replacement");
+        std::fs::rename(root.path().join("src"), root.path().join("src-old")).unwrap();
+        symlink(outside.path(), root.path().join("src")).unwrap();
+
+        assert!(
+            crate::bounded_fs::read_prefix_beneath(root.path(), &captured, 128).is_err(),
+            "the secure open revalidates containment after candidate collection"
         );
     }
 
@@ -6529,20 +7757,21 @@ mod tests {
         drop(huge);
 
         let options = opts(root, "review a large project", TrustMode::Auto);
-        let (bundle, bytes_read, substantive_source_chars) = source_digest_with_stats(&options);
+        let digest = source_digest_with_stats(&options, ReviewKind::Quality);
 
         assert!(
-            bytes_read > 0 && bytes_read <= REVIEW_BUNDLE_MAX_READ_BYTES,
-            "a huge file contributes only one globally-bounded prefix: {bytes_read}"
+            digest.bytes_read > 0 && digest.bytes_read <= REVIEW_BUNDLE_MAX_READ_BYTES,
+            "a huge file contributes only one globally-bounded prefix: {}",
+            digest.bytes_read
         );
-        assert!(bundle.contains("src/huge.rs"), "{bundle}");
-        assert!(bundle.contains("prefix"), "{bundle}");
+        assert!(digest.bundle.contains("src/huge.rs"), "{}", digest.bundle);
+        assert!(digest.bundle.contains("prefix"), "{}", digest.bundle);
         assert!(
-            bundle.contains("SHOULD_NEVER_ENTER_REVIEW_BUNDLE"),
+            digest.bundle.contains("SHOULD_NEVER_ENTER_REVIEW_BUNDLE"),
             "the bounded prefix gives the reviewer substantive implementation evidence"
         );
-        assert!(substantive_source_chars > 0);
-        assert!(bundle.chars().count() <= REVIEW_BUNDLE_MAX_CHARS);
+        assert!(digest.substantive_source_chars > 0);
+        assert!(digest.bundle.chars().count() <= REVIEW_BUNDLE_MAX_CHARS);
     }
 
     #[test]
@@ -6551,7 +7780,7 @@ mod tests {
             "# Review bundle manifest\nincluded: 0\nomitted: 1\n",
             0,
         );
-        assert!(!coverage.is_complete());
+        assert!(!coverage.is_reviewable());
         assert!(coverage
             .unavailable_reason()
             .is_some_and(|reason| reason.contains("no substantive source")));
@@ -6569,16 +7798,18 @@ mod tests {
         .unwrap();
         let options = opts(root, "review a large project", TrustMode::Auto);
 
-        let (bundle, bytes_read, substantive_source_chars) = source_digest_with_stats(&options);
+        let digest = source_digest_with_stats(&options, ReviewKind::Quality);
 
-        assert!(bundle.contains("fn 标题()"));
-        assert!(bundle.contains("bounded prefix"));
-        assert!(!bundle.contains('\u{fffd}'));
-        assert!(bytes_read <= REVIEW_BUNDLE_MAX_READ_BYTES);
-        assert!(substantive_source_chars > 0);
-        assert!(
-            ReviewPayloadCoverage::source_bundle(&bundle, substantive_source_chars).is_complete()
-        );
+        assert!(digest.bundle.contains("fn 标题()"));
+        assert!(digest.bundle.contains("bounded prefix"));
+        assert!(!digest.bundle.contains('\u{fffd}'));
+        assert!(digest.bytes_read <= REVIEW_BUNDLE_MAX_READ_BYTES);
+        assert!(digest.substantive_source_chars > 0);
+        assert!(ReviewPayloadCoverage::source_bundle(
+            &digest.bundle,
+            digest.substantive_source_chars
+        )
+        .is_reviewable());
     }
 
     #[tokio::test]

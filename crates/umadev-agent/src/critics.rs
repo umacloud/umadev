@@ -660,6 +660,8 @@ pub struct ReviewPayloadCoverage {
     pub supplied_chars: usize,
     /// The bundle failed a host-side structural/file-boundary check.
     pub malformed: bool,
+    /// The bounded host walk hit a depth/file/entry or directory-stability limit.
+    pub discovery_incomplete: bool,
     /// Whether this review surface is required to carry implementation source.
     ///
     /// Document-review payloads legitimately leave `code` empty. Quality/preview
@@ -671,6 +673,17 @@ pub struct ReviewPayloadCoverage {
     /// Manifest/header text is deliberately excluded. This prevents a
     /// manifest-only bundle from satisfying the coverage contract.
     pub substantive_source_chars: usize,
+    /// Source files discovered by the bounded host walk. This is scope metadata,
+    /// not a claim that every file was placed in the model context.
+    pub discovered_source_files: usize,
+    /// Discovered files represented by at least one non-empty bounded sample.
+    pub represented_source_files: usize,
+    /// Host-mandated plan/evidence and run-changed source files that must be
+    /// represented completely before the review may run. Heuristic lane samples
+    /// do not inflate this gate.
+    pub required_focus_files: usize,
+    /// Required focus files actually represented in the bounded payload.
+    pub represented_focus_files: usize,
 }
 
 impl ReviewPayloadCoverage {
@@ -682,8 +695,13 @@ impl ReviewPayloadCoverage {
             declared_chars: chars,
             supplied_chars: chars,
             malformed: false,
+            discovery_incomplete: false,
             requires_source: false,
             substantive_source_chars: 0,
+            discovered_source_files: 0,
+            represented_source_files: 0,
+            required_focus_files: 0,
+            represented_focus_files: 0,
         }
     }
 
@@ -696,23 +714,51 @@ impl ReviewPayloadCoverage {
         coverage
     }
 
-    /// Whether the host supplied an internally-complete payload and, when this is
-    /// a code review, at least one substantive source character.
+    /// Attach the host's explicit bounded-sampling scope. Omitted background
+    /// files remain visible in the manifest; only the small, deterministic focus
+    /// set is required to be represented.
     #[must_use]
-    pub const fn is_complete(self) -> bool {
+    pub const fn with_file_scope(
+        mut self,
+        discovered: usize,
+        represented: usize,
+        required_focus: usize,
+        represented_focus: usize,
+    ) -> Self {
+        self.discovered_source_files = discovered;
+        self.represented_source_files = represented;
+        self.required_focus_files = required_focus;
+        self.represented_focus_files = represented_focus;
+        self
+    }
+
+    /// Whether the bounded payload is safe to review. This does not mean the
+    /// entire workspace was supplied; the explicit file counts describe scope.
+    #[must_use]
+    pub const fn is_reviewable(self) -> bool {
         !self.malformed
+            && !self.discovery_incomplete
             && self.declared_chars == self.supplied_chars
             && (!self.requires_source || self.substantive_source_chars > 0)
+            && self.required_focus_files == self.represented_focus_files
     }
 
     /// Stable host-owned diagnosis for an incomplete review surface.
     #[must_use]
     pub fn unavailable_reason(self) -> Option<String> {
-        if self.is_complete() {
+        if self.is_reviewable() {
             return None;
         }
         let cause = if self.malformed {
             "host bundle failed its structural/file-boundary check".to_string()
+        } else if self.discovery_incomplete {
+            "host source discovery or run-change scope was unavailable, bounded, or unstable"
+                .to_string()
+        } else if self.required_focus_files != self.represented_focus_files {
+            format!(
+                "host bundle represented {} of {} mandatory changed/plan source files",
+                self.represented_focus_files, self.required_focus_files
+            )
         } else if self.requires_source && self.substantive_source_chars == 0 {
             "host bundle contained no substantive source content".to_string()
         } else {

@@ -66,7 +66,10 @@ pub use base_config::{
 };
 #[cfg(test)]
 use director_run::resolve_workflow_resume_identity;
-use director_run::{run_director_loop, settle_director_session};
+use director_run::{
+    cancel_entry_task, fail_entry_task, run_director_loop, settle_director_session,
+    settle_terminal_post_build_review,
+};
 pub use host_git::execute_host_git_commit;
 
 use std::fmt::Write as _;
@@ -3581,25 +3584,6 @@ enum ResidentTurnKind {
     NativeCommand,
 }
 
-fn fail_entry_task(
-    task: &mut Option<umadev_agent::task_lifecycle::EntryTaskTracker>,
-    summary: &str,
-    blocker: impl Into<String>,
-) {
-    if let Some(task) = task.as_mut() {
-        let _ = task.fail(summary, vec![blocker.into()]);
-    }
-}
-
-fn cancel_entry_task(
-    task: &mut Option<umadev_agent::task_lifecycle::EntryTaskTracker>,
-    detail: &str,
-) {
-    if let Some(task) = task.as_mut() {
-        let _ = task.cancel(detail);
-    }
-}
-
 /// The path token of a tool call's raw input — the human-readable target shown in
 /// the tool row (file path / command / url / pattern / plan). A self-contained
 /// mirror of the agent crate's internal `tool_call_target` (kept local so this TUI
@@ -6679,6 +6663,20 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     let _ = route_tx.send(RouteDecision::Failed(note));
                     return;
                 }
+            };
+            session = match settle_terminal_post_build_review(
+                &pause,
+                &mut entry_task,
+                &*sink,
+                session,
+                &director_session_holder,
+                requested_session_identity.clone(),
+                &route_tx,
+            )
+            .await
+            {
+                Ok(session) => session,
+                Err(()) => return,
             };
             if let Some(task) = entry_task.as_mut() {
                 if let Err(error) = task.wait(&pause.reason) {

@@ -2,7 +2,8 @@ use super::{
     clear_operational_review_checkpoint, ensure_final_review_retry_step_in_plan,
     next_final_review_checkpoint, next_step_review_checkpoint, plan_state,
     record_artifact_versions, save_operational_review_checkpoint, Arc, DirectorLoopOutcome,
-    EngineEvent, EventSink, OperationalReviewCheckpoint, Plan, RoutePlan, RunOptions, StepStatus,
+    EngineEvent, EventSink, OperationalReviewCheckpoint, OperationalReviewEvidence, Plan,
+    RoutePlan, RunOptions, StepStatus,
 };
 
 fn evidence_summary(items: &[String]) -> String {
@@ -39,9 +40,10 @@ pub(super) fn block_open_steps(plan: &mut Plan, events: &Arc<dyn EventSink>) {
 
 /// Persist or terminally settle one unavailable step-review boundary.
 ///
-/// The first outage parks one final `/continue` opportunity. The second outage
-/// over the same QC fingerprint opens the durable circuit and closes all live
-/// plan tasks, so another `/continue` cannot recreate the same wait forever.
+/// Guarded mode parks one final `/continue` opportunity. Auto mode has no human
+/// gate: one boundary already includes the per-seat fresh-session retry, so it
+/// settles terminally when that retry is unavailable. A guarded retry that fails
+/// over the same QC fingerprint also opens the durable circuit.
 pub(super) struct StepReviewOutage<'a> {
     pub options: &'a RunOptions,
     pub events: &'a Arc<dyn EventSink>,
@@ -50,7 +52,8 @@ pub(super) struct StepReviewOutage<'a> {
     pub step: &'a crate::plan_state::PlanStep,
     pub route: &'a RoutePlan,
     pub base_agents: &'a crate::bg_agents::BaseAgentObservation,
-    pub gaps: &'a [String],
+    pub semantic_blocking: &'a [String],
+    pub operational_unavailable: &'a [String],
     pub prior: Option<&'a OperationalReviewCheckpoint>,
 }
 
@@ -63,27 +66,29 @@ pub(super) fn handle_step_review_outage(context: StepReviewOutage<'_>) -> Direct
         step,
         route,
         base_agents,
-        gaps,
+        semantic_blocking,
+        operational_unavailable,
         prior,
     } = context;
-    let evidence = evidence_summary(gaps);
-    let checkpoint = next_step_review_checkpoint(
+    let typed_evidence = OperationalReviewEvidence::new(semantic_blocking, operational_unavailable);
+    let mut checkpoint = next_step_review_checkpoint(
         prior,
         step.id.clone(),
         crate::freshness::workspace_qc_fingerprint(&options.project_root),
         Some(route.team.clone()),
         step.kind == plan_state::StepKind::Build,
+        typed_evidence,
     );
+    if options.mode == crate::trust::TrustMode::Auto {
+        checkpoint.settle_terminally();
+    }
+    let evidence = evidence_summary(&checkpoint.evidence().operational_unavailable);
     let boundary = format!("required review at step `{}`", step.title);
     if checkpoint.circuit_open() {
         let reason = stop_reason(&boundary, &checkpoint, &evidence);
         let _ = save_operational_review_checkpoint(&options.project_root, &checkpoint);
         block_open_steps(plan, events);
-        let blockers = if gaps.is_empty() {
-            vec![evidence]
-        } else {
-            gaps.to_vec()
-        };
+        let blockers = checkpoint.evidence().ledger_blockers();
         let _ = task_tracker.settle_base_agents(
             step,
             base_agents,
@@ -101,7 +106,15 @@ pub(super) fn handle_step_review_outage(context: StepReviewOutage<'_>) -> Direct
         return DirectorLoopOutcome::Failed(reason);
     }
 
-    let reason = format!("{boundary} unavailable: {evidence}");
+    let semantic = if checkpoint.evidence().semantic_blocking.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} semantic finding(s) retained separately",
+            checkpoint.evidence().semantic_blocking.len()
+        )
+    };
+    let reason = format!("{boundary} unavailable: {evidence}{semantic}");
     let saved = save_operational_review_checkpoint(&options.project_root, &checkpoint).is_ok()
         && plan_state::save(plan, &options.project_root).is_ok();
     if saved && task_tracker.wait_for_user(&reason).is_ok() {
@@ -152,27 +165,28 @@ pub(super) fn handle_final_review_outage(context: FinalReviewOutage<'_>) -> Dire
         mut resident_task,
         checkpoint_entry_task_run_id,
     } = context;
-    let evidence = evidence_summary(operational_unavailable);
+    let typed_evidence = OperationalReviewEvidence::new(semantic_blocking, operational_unavailable);
     ensure_final_review_retry_step_in_plan(plan, Some(route), events);
     let entry_task_run_id = resident_task
         .as_ref()
         .map(|task| task.run_id().to_string())
         .or_else(|| checkpoint_entry_task_run_id.map(str::to_string));
-    let checkpoint = next_final_review_checkpoint(
+    let mut checkpoint = next_final_review_checkpoint(
         prior,
         crate::freshness::workspace_qc_fingerprint(&options.project_root),
         Some(route.team.clone()),
         entry_task_run_id,
+        typed_evidence,
     );
+    if options.mode == crate::trust::TrustMode::Auto {
+        checkpoint.settle_terminally();
+    }
+    let evidence = evidence_summary(&checkpoint.evidence().operational_unavailable);
     if checkpoint.circuit_open() {
         let reason = stop_reason("final quality review", &checkpoint, &evidence);
         let _ = save_operational_review_checkpoint(&options.project_root, &checkpoint);
         block_open_steps(plan, events);
-        let mut blockers = semantic_blocking.to_vec();
-        blockers.extend_from_slice(operational_unavailable);
-        if blockers.is_empty() {
-            blockers.push(evidence);
-        }
+        let blockers = checkpoint.evidence().ledger_blockers();
         if let Some(task) = resident_task.as_mut() {
             let _ = task.fail(&reason, blockers.clone());
         }

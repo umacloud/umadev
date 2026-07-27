@@ -1187,6 +1187,11 @@ mod tests {
 
     /// Minimal RunOptions for a tempdir project.
     fn opts(root: &std::path::Path) -> RunOptions {
+        // Production creates this before a writable run enters the director.
+        // Direct unit tests bypass that runner boundary, so reproduce the same
+        // precondition instead of turning every review into a synthetic
+        // "change scope unavailable" outage.
+        let _ = crate::checkpoint::ensure_run_baseline(root, "director-test");
         RunOptions {
             project_root: root.to_path_buf(),
             requirement: "做一个登录系统".to_string(),

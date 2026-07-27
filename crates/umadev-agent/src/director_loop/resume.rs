@@ -20,6 +20,81 @@ const MAX_ARTIFACT_VERSION_TOTAL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_ENTRIES: usize = 256;
 const MAX_CONSECUTIVE_REVIEW_OUTAGES: u8 = 2;
 
+/// Typed evidence retained at an operationally unavailable review boundary.
+///
+/// Product findings and reviewer-infrastructure failures have different owners:
+/// only the former may inform a later repair run, while only the latter may open
+/// the review liveness circuit. Keeping them in separate persisted fields prevents
+/// a mixed panel from turning a host outage into a source defect after `/continue`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct OperationalReviewEvidence {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) semantic_blocking: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) operational_unavailable: Vec<String>,
+}
+
+impl OperationalReviewEvidence {
+    const MAX_ITEMS_PER_CHANNEL: usize = 8;
+    const MAX_ITEM_CHARS: usize = 240;
+
+    pub(super) fn new(semantic_blocking: &[String], operational_unavailable: &[String]) -> Self {
+        Self {
+            semantic_blocking: Self::bounded(semantic_blocking),
+            operational_unavailable: Self::bounded(operational_unavailable),
+        }
+    }
+
+    fn bounded(items: &[String]) -> Vec<String> {
+        items
+            .iter()
+            .take(Self::MAX_ITEMS_PER_CHANNEL)
+            .map(|item| item.chars().take(Self::MAX_ITEM_CHARS).collect())
+            .collect()
+    }
+
+    fn merged(prior: Option<&Self>, current: Self) -> Self {
+        fn merge_channel(prior: &[String], current: Vec<String>) -> Vec<String> {
+            let mut merged = prior.to_vec();
+            for item in current {
+                if !merged.contains(&item) {
+                    merged.push(item);
+                }
+            }
+            merged.truncate(OperationalReviewEvidence::MAX_ITEMS_PER_CHANNEL);
+            merged
+        }
+
+        match prior {
+            Some(prior) => Self {
+                semantic_blocking: merge_channel(
+                    &prior.semantic_blocking,
+                    current.semantic_blocking,
+                ),
+                operational_unavailable: merge_channel(
+                    &prior.operational_unavailable,
+                    current.operational_unavailable,
+                ),
+            },
+            None => current,
+        }
+    }
+
+    pub(super) fn ledger_blockers(&self) -> Vec<String> {
+        let mut blockers = self
+            .semantic_blocking
+            .iter()
+            .map(|item| format!("semantic blocker: {item}"))
+            .collect::<Vec<_>>();
+        blockers.extend(
+            self.operational_unavailable
+                .iter()
+                .map(|item| format!("operational review unavailable: {item}")),
+        );
+        blockers
+    }
+}
+
 /// The exact review boundary a recoverable host outage parked.
 ///
 /// A step review and the final whole-build review are deliberately distinct:
@@ -48,6 +123,14 @@ pub(super) enum OperationalReviewCheckpoint {
         /// One boundary already includes the per-seat fresh-fork retry.
         #[serde(default)]
         consecutive_outages: u8,
+        /// Product findings returned by available seats and host-owned outage
+        /// evidence returned by unavailable seats, kept as separate channels.
+        #[serde(default)]
+        evidence: OperationalReviewEvidence,
+        /// `auto` has no human retry gate: one boundary (which already includes
+        /// the seat's fresh-session retry) settles terminally.
+        #[serde(default)]
+        terminally_settled: bool,
     },
     /// Skip already-settled plan steps and retry the final whole-build gate.
     FinalGateReview {
@@ -69,6 +152,14 @@ pub(super) enum OperationalReviewCheckpoint {
         /// Consecutive unavailable review boundaries over the same QC inputs.
         #[serde(default)]
         consecutive_outages: u8,
+        /// Product findings returned by available seats and host-owned outage
+        /// evidence returned by unavailable seats, kept as separate channels.
+        #[serde(default)]
+        evidence: OperationalReviewEvidence,
+        /// `auto` has no human retry gate: one boundary (which already includes
+        /// the seat's fresh-session retry) settles terminally.
+        #[serde(default)]
+        terminally_settled: bool,
     },
 }
 
@@ -93,7 +184,32 @@ impl OperationalReviewCheckpoint {
     }
 
     pub(super) const fn circuit_open(&self) -> bool {
-        self.effective_outages() >= MAX_CONSECUTIVE_REVIEW_OUTAGES
+        let terminally_settled = match self {
+            Self::StepReview {
+                terminally_settled, ..
+            }
+            | Self::FinalGateReview {
+                terminally_settled, ..
+            } => *terminally_settled,
+        };
+        terminally_settled || self.effective_outages() >= MAX_CONSECUTIVE_REVIEW_OUTAGES
+    }
+
+    pub(super) const fn evidence(&self) -> &OperationalReviewEvidence {
+        match self {
+            Self::StepReview { evidence, .. } | Self::FinalGateReview { evidence, .. } => evidence,
+        }
+    }
+
+    pub(super) fn settle_terminally(&mut self) {
+        match self {
+            Self::StepReview {
+                terminally_settled, ..
+            }
+            | Self::FinalGateReview {
+                terminally_settled, ..
+            } => *terminally_settled = true,
+        }
     }
 }
 
@@ -116,6 +232,7 @@ pub(super) fn next_step_review_checkpoint(
     qc_source_fingerprint: Option<String>,
     required_seats: Option<Vec<crate::critics::Seat>>,
     review_only: bool,
+    evidence: OperationalReviewEvidence,
 ) -> OperationalReviewCheckpoint {
     let consecutive_outages = match prior {
         Some(
@@ -135,12 +252,18 @@ pub(super) fn next_step_review_checkpoint(
         }
         _ => 1,
     };
+    let evidence = OperationalReviewEvidence::merged(
+        prior.map(OperationalReviewCheckpoint::evidence),
+        evidence,
+    );
     OperationalReviewCheckpoint::StepReview {
         step_id,
         qc_source_fingerprint,
         required_seats,
         review_only,
         consecutive_outages,
+        evidence,
+        terminally_settled: false,
     }
 }
 
@@ -149,6 +272,7 @@ pub(super) fn next_final_review_checkpoint(
     qc_source_fingerprint: Option<String>,
     required_seats: Option<Vec<crate::critics::Seat>>,
     entry_task_run_id: Option<String>,
+    evidence: OperationalReviewEvidence,
 ) -> OperationalReviewCheckpoint {
     let consecutive_outages = match prior {
         Some(
@@ -162,11 +286,17 @@ pub(super) fn next_final_review_checkpoint(
         }
         _ => 1,
     };
+    let evidence = OperationalReviewEvidence::merged(
+        prior.map(OperationalReviewCheckpoint::evidence),
+        evidence,
+    );
     OperationalReviewCheckpoint::FinalGateReview {
         qc_source_fingerprint,
         required_seats,
         entry_task_run_id,
         consecutive_outages,
+        evidence,
+        terminally_settled: false,
     }
 }
 
@@ -307,6 +437,8 @@ pub(super) fn operational_review_checkpoint_for_plan(
                 required_seats: None,
                 entry_task_run_id: None,
                 consecutive_outages: 0,
+                evidence: OperationalReviewEvidence::default(),
+                terminally_settled: false,
             })
     })
 }
@@ -656,6 +788,8 @@ mod tests {
                 required_seats: None,
                 entry_task_run_id: None,
                 consecutive_outages: 2,
+                evidence: OperationalReviewEvidence::default(),
+                terminally_settled: false,
             },
         )
         .unwrap();
@@ -759,6 +893,8 @@ mod tests {
                 required_seats: None,
                 entry_task_run_id: None,
                 consecutive_outages: 1,
+                evidence: OperationalReviewEvidence::default(),
+                terminally_settled: false,
             },
         )
         .unwrap();
@@ -807,6 +943,8 @@ mod tests {
                 required_seats: None,
                 entry_task_run_id: None,
                 consecutive_outages: 1,
+                evidence: OperationalReviewEvidence::default(),
+                terminally_settled: false,
             },
         )
         .unwrap();
