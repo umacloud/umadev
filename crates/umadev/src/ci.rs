@@ -1345,27 +1345,110 @@ fn null_device() -> &'static str {
     }
 }
 
-fn trusted_git_command(repo: &TrustedGitRepository) -> std::process::Command {
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
+fn git_cli_path(path: &Path) -> std::io::Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
+/// Convert Rust's canonical Windows path representation into one understood by
+/// Git for Windows. `std::fs::canonicalize` deliberately returns verbatim
+/// (`\\?\`) paths on Windows; Git's command-line parser does not consistently
+/// accept that namespace for `--git-dir`, `--work-tree`, or `GIT_INDEX_FILE`.
+/// Keep the verbatim paths in [`TrustedGitRepository`] for containment checks
+/// and undecorate only at the child-process boundary. The plain path must
+/// canonicalize back to the exact trusted path: Win32 otherwise aliases names
+/// with trailing dots/spaces and DOS device components.
+#[cfg(windows)]
+fn git_cli_path(path: &Path) -> std::io::Result<PathBuf> {
+    let Some(plain) = windows_git_plain_candidate(path)? else {
+        return Ok(path.to_path_buf());
+    };
+    let round_trip = std::fs::canonicalize(&plain).map_err(|error| {
+        selection_resource_error(format!(
+            "cannot verify Git-compatible Windows path {}: {error}",
+            plain.display()
+        ))
+    })?;
+    if !windows_git_round_trip_matches(path, &round_trip) {
+        return Err(selection_resource_error(format!(
+            "Git-compatible Windows path does not resolve to the trusted repository path: {}",
+            plain.display()
+        )));
+    }
+    Ok(plain)
+}
+
+#[cfg(windows)]
+fn windows_git_plain_candidate(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::ffi::OsString;
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Ok(None);
+    };
+    let mut plain = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", drive as char)),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut root = OsString::from(r"\\");
+            root.push(server);
+            root.push("\\");
+            root.push(share);
+            PathBuf::from(root)
+        }
+        Prefix::Verbatim(_) | Prefix::DeviceNS(_) => {
+            return Err(selection_resource_error(format!(
+                "Git cannot use this Windows device path: {}",
+                path.display()
+            )))
+        }
+        _ => return Ok(None),
+    };
+    for component in components {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => plain.push(name),
+            _ => {
+                return Err(selection_resource_error(format!(
+                    "trusted Windows Git path contains a non-normal component: {}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Ok(Some(plain))
+}
+
+#[cfg(windows)]
+fn windows_git_round_trip_matches(trusted: &Path, round_trip: &Path) -> bool {
+    trusted == round_trip
+}
+
+fn trusted_git_command(repo: &TrustedGitRepository) -> std::io::Result<std::process::Command> {
+    let worktree = git_cli_path(&repo.worktree)?;
+    let git_dir = git_cli_path(&repo.git_dir)?;
+    let index_file = repo.index_file.as_deref().map(git_cli_path).transpose()?;
     let mut command = umadev_host::std_command("git");
     sanitize_git_environment(&mut command);
-    if let Some(index_file) = &repo.index_file {
+    if let Some(index_file) = &index_file {
         command.env("GIT_INDEX_FILE", index_file);
     }
     command
         .arg("--no-pager")
         .arg("--literal-pathspecs")
         .arg("--git-dir")
-        .arg(&repo.git_dir)
+        .arg(git_dir)
         .arg("--work-tree")
-        .arg(&repo.worktree)
+        .arg(&worktree)
         .args(["-c", "core.fsmonitor=false"])
         .args(["-c", "core.untrackedCache=false"])
         .args(["-c", "core.preloadIndex=false"])
         .args(["-c", "core.quotePath=false"])
         .args(["-c", "core.excludesFile="])
         .args(["-c", "core.attributesFile="])
-        .current_dir(&repo.worktree);
-    command
+        .current_dir(worktree);
+    Ok(command)
 }
 
 /// In a Git worktree, scan tracked files plus untracked files not excluded by
@@ -1376,7 +1459,7 @@ fn git_worktree_files(root: &Path, limits: ScanLimits) -> std::io::Result<Option
     let Some(repo) = discover_git_repository(root, false)? else {
         return Ok(None);
     };
-    let mut probe = trusted_git_command(&repo);
+    let mut probe = trusted_git_command(&repo)?;
     probe.args(["rev-parse", "--is-inside-work-tree"]);
     let probe = capture_git_path_output(probe, limits, "git rev-parse")?;
     if !probe.status.is_some_and(|status| status.success()) {
@@ -1388,7 +1471,7 @@ fn git_worktree_files(root: &Path, limits: ScanLimits) -> std::io::Result<Option
         ));
     }
 
-    let mut command = trusted_git_command(&repo);
+    let mut command = trusted_git_command(&repo)?;
     command
         .args([
             "ls-files",
@@ -1603,7 +1686,7 @@ fn git_changed_files_with_limits(root: &Path, limits: ScanLimits) -> std::io::Re
     let repo = discover_git_repository(root, true)?.ok_or_else(|| {
         selection_resource_error("--changed-only requires a .git entry at the project root")
     })?;
-    let mut command = trusted_git_command(&repo);
+    let mut command = trusted_git_command(&repo)?;
     command
         .args([
             "diff",
@@ -1628,7 +1711,7 @@ fn staged_blob_size(root: &Path, rel: &str) -> Result<u64, String> {
     let repo = discover_git_repository(root, true)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "cannot find the Git repository for staged content".to_owned())?;
-    let mut command = trusted_git_command(&repo);
+    let mut command = trusted_git_command(&repo).map_err(|error| error.to_string())?;
     command
         .args(["cat-file", "-s", &format!(":{rel}")])
         .current_dir(root);
@@ -1661,7 +1744,7 @@ fn read_staged_blob(root: &Path, rel: &str, max_bytes: usize) -> Result<String, 
     let repo = discover_git_repository(root, true)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "cannot find the Git repository for staged content".to_owned())?;
-    let mut command = trusted_git_command(&repo);
+    let mut command = trusted_git_command(&repo).map_err(|error| error.to_string())?;
     command.args(["show", &format!(":{rel}")]).current_dir(root);
     let output = run_capturing_with_timeout(command, GIT_BLOB_TIMEOUT, capture_bytes)
         .map_err(|error| format!("cannot read staged blob: {error}"))?;
@@ -2743,6 +2826,50 @@ mod tests {
             env.get(std::ffi::OsStr::new("GIT_CONFIG_GLOBAL")),
             Some(&Some(std::ffi::OsStr::new(null_device())))
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_git_plain_candidates_preserve_ordinary_disk_and_unc_paths() {
+        assert_eq!(
+            windows_git_plain_candidate(Path::new(r"\\?\C:\Users\runner\repo\.git")).unwrap(),
+            Some(PathBuf::from(r"C:\Users\runner\repo\.git"))
+        );
+        assert_eq!(
+            windows_git_plain_candidate(Path::new(r"\\?\UNC\server\share\repo\.git")).unwrap(),
+            Some(PathBuf::from(r"\\server\share\repo\.git"))
+        );
+        assert!(windows_git_plain_candidate(Path::new(
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\repo\.git"
+        ))
+        .is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_git_round_trip_requires_exact_canonical_identity() {
+        assert!(windows_git_round_trip_matches(
+            Path::new(r"\\?\C:\repo\ordinary"),
+            Path::new(r"\\?\C:\repo\ordinary")
+        ));
+        assert!(!windows_git_round_trip_matches(
+            Path::new(r"\\?\C:\repo\trailing."),
+            Path::new(r"\\?\C:\repo\trailing")
+        ));
+        assert!(!windows_git_round_trip_matches(
+            Path::new(r"\\?\C:\repo\CON"),
+            Path::new(r"\\?\CON")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_cli_path_round_trips_an_existing_windows_directory() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+        let plain = git_cli_path(&canonical).unwrap();
+        assert!(!plain.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(std::fs::canonicalize(&plain).unwrap(), canonical);
     }
 
     fn tiny_scan_limits(max_file_bytes: usize, max_total_bytes: u64) -> ScanLimits {

@@ -81,10 +81,22 @@ fn normal_relative_components(path: &Path) -> io::Result<Vec<OsString>> {
 
 fn relative_beneath(root: &Path, canonical_root: &Path, path: &Path) -> io::Result<PathBuf> {
     let parts = if path.is_absolute() {
+        // Keep an absolute *lexical* form alongside the canonical root. On
+        // Windows `canonicalize` uses a `\\?\` prefix while callers can supply
+        // the same path as a normal `C:\...` absolute path. Comparing against
+        // both forms accepts that representation difference without resolving
+        // the input path and hiding a reparse-point component from the walk.
+        let lexical_root = std::path::absolute(root).ok();
         let relative = path
             .strip_prefix(root)
-            .or_else(|_| path.strip_prefix(canonical_root))
-            .map_err(|_| {
+            .ok()
+            .or_else(|| {
+                lexical_root
+                    .as_deref()
+                    .and_then(|root| path.strip_prefix(root).ok())
+            })
+            .or_else(|| path.strip_prefix(canonical_root).ok())
+            .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "workspace input is outside its trusted project root",
@@ -424,12 +436,17 @@ mod tests {
             .unwrap();
         let file = tmp.path().join("rules.md");
         std::fs::write(&file, "relative root works").unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let lexical_absolute_file = if file.is_absolute() {
+            file.clone()
+        } else {
+            cwd.join(&file)
+        };
         assert_eq!(
-            read_utf8_beneath(Path::new("."), &file, 64).unwrap(),
+            read_utf8_beneath(Path::new("."), &lexical_absolute_file, 64).unwrap(),
             "relative root works"
         );
 
-        let cwd = std::env::current_dir().unwrap();
         let relative_root = tmp.path().strip_prefix(&cwd).unwrap_or(tmp.path());
         let relative_file = relative_root.join("rules.md");
         assert_eq!(
