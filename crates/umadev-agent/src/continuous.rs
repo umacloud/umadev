@@ -1664,7 +1664,7 @@ async fn governance_catchup(
     events: &Arc<dyn EventSink>,
     deadline: std::time::Instant,
 ) {
-    if backend_has_realtime_governance(&options.backend) {
+    if session.capabilities().realtime_governance {
         return;
     }
     let violations = governance_scan(options);
@@ -1690,15 +1690,6 @@ async fn governance_catchup(
             &[&remaining.len().to_string()],
         )));
     }
-}
-
-/// Whether a backend id drives a base that governs writes in REAL TIME (a
-/// PreToolUse hook fires before each write). Only `claude-code` does; every other
-/// base writes ungoverned in real time and needs the post-hoc
-/// [`governance_catchup`]. Deterministic + host-free (matches the
-/// `realtime_governance` capability the host crate reports for these bases).
-pub(crate) fn backend_has_realtime_governance(backend: &str) -> bool {
-    backend.eq_ignore_ascii_case("claude-code")
 }
 
 /// Scan every real source file with the governance kernel, returning a bounded
@@ -4681,6 +4672,7 @@ mod tests {
         /// Count of `interrupt()` calls — a test asserts the idle watchdog issued
         /// its best-effort interrupt before settling.
         interrupts: Arc<Mutex<usize>>,
+        realtime_governance: bool,
     }
 
     impl FakeBaseSession {
@@ -4698,7 +4690,12 @@ mod tests {
                 next_event_hangs: false,
                 active_forever: false,
                 interrupts: Arc::new(Mutex::new(0)),
+                realtime_governance: false,
             }
+        }
+        fn with_realtime_governance(mut self) -> Self {
+            self.realtime_governance = true;
+            self
         }
         /// A session that accepts `send_turn` then stays ACTIVE forever — every
         /// `next_event` yields a fresh `TextDelta`, never a `TurnDone`. The idle
@@ -4765,6 +4762,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl BaseSession for FakeBaseSession {
+        fn capabilities(&self) -> umadev_runtime::SessionCapabilities {
+            umadev_runtime::SessionCapabilities {
+                realtime_governance: self.realtime_governance,
+                ..umadev_runtime::SessionCapabilities::default()
+            }
+        }
+
         async fn fork(&mut self) -> Result<Box<dyn BaseSession>, SessionError> {
             *self.forks_opened.lock().unwrap() += 1;
             // A wedged fork handshake: await forever so `fork_with_timeout` must be
@@ -7302,14 +7306,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn governance_catchup_is_skipped_for_claude_base() {
+    async fn governance_catchup_is_skipped_when_the_session_declares_a_native_hook() {
         let tmp = tempfile::tempdir().unwrap();
         seed_ungoverned_source(tmp.path());
-        // claude-code governs at WRITE time (PreToolUse hook), so the post-write
-        // catch-up is a no-op — no rework turn, even with a real violation on disk.
-        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto); // backend = claude-code
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
         let (events, _rec) = sink();
-        let mut session = FakeBaseSession::new(vec![vec![done()]]);
+        let mut session = FakeBaseSession::new(vec![vec![done()]]).with_realtime_governance();
         let sent = session.sent_handle();
 
         governance_catchup(
@@ -7321,16 +7323,8 @@ mod tests {
         .await;
         assert!(
             sent.lock().unwrap().is_empty(),
-            "claude-code already governs at write time — no catch-up rework"
+            "a session with native write governance needs no catch-up rework"
         );
-    }
-
-    #[test]
-    fn backend_realtime_governance_only_for_claude() {
-        assert!(backend_has_realtime_governance("claude-code"));
-        assert!(backend_has_realtime_governance("CLAUDE-CODE"));
-        assert!(!backend_has_realtime_governance("codex"));
-        assert!(!backend_has_realtime_governance("opencode"));
     }
 
     #[test]

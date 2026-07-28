@@ -934,7 +934,7 @@ pub fn run_frontend_with_kind(
         "# Frontend notes — {slug}\n\n\
          > Instruction checklist for the interactive worker session.\n\
          > Open one of UmaDev's five bases in this workspace and follow each item:\n\
-         > native: Claude Code / Codex / OpenCode; ACP: Grok Build.\n\n\
+         > vendor protocols: Claude Code / Codex / OpenCode; ACP: Grok Build / Kimi Code.\n\n\
          ## Sources of truth\n\n\
          - `output/{slug}-prd.md` (acceptance criteria)\n\
          - `output/{slug}-architecture.md` (API surface)\n\
@@ -987,7 +987,7 @@ pub fn run_backend(opts: &RunOptions) -> io::Result<PhaseOutput> {
         "# Backend notes — {slug}\n\n\
          > Instruction checklist for the interactive worker session.\n\
          > Open one of UmaDev's five bases in this workspace and follow each item:\n\
-         > native: Claude Code / Codex / OpenCode; ACP: Grok Build.\n\n\
+         > vendor protocols: Claude Code / Codex / OpenCode; ACP: Grok Build / Kimi Code.\n\n\
          ## Sources of truth\n\n\
          - `output/{slug}-architecture.md` (API surface + data model)\n\
          - `.umadev/audit/frontend-api-calls.jsonl` (every URL the frontend wrote)\n\n\

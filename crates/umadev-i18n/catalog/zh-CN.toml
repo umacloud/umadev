@@ -23,7 +23,7 @@
 "backend.grok" = "Grok Build CLI"
 "backend.kimi" = "Kimi Code CLI"
 "backend.offline" = "离线模板（无 AI，演示 / CI）"
-"backend.migration.retired" = "此前选择的底座 {} 已不再属于 UmaDev 正式支持的底座。请在下方重新选择 Claude Code、Codex、OpenCode 或 Grok Build；UmaDev 没有替你切换到其他底座或离线模式。"
+"backend.migration.retired" = "此前选择的底座 {} 已不再属于 UmaDev 正式支持的底座。请在下方重新选择 Claude Code、Codex、OpenCode、Grok Build 或 Kimi Code；UmaDev 没有替你切换到其他底座或离线模式。"
 
 # 通用
 "common.confirm" = "确认"
@@ -455,8 +455,8 @@
 "report.write_failed" = "[warn] 无法写入报告: {}"
 
 # 欢迎语（冷启动第一屏）
-"greeting.main" = "UmaDev — 把一句话需求,变成可上线的商业产品。\n你不用写一行代码:我驱动你登录的 AI 底座,按 研究 -> 设计 -> 开发 -> 预览 -> 上线 帮你交付,并自动套用商业级设计系统、留下质量与审计证据。\n当前底座:{}"
-"greeting.examples" = "直接输入你想做什么,例如(也可以照抄一条):\n\n  · 做一个带邮箱登录的 SaaS 数据分析仪表盘\n  · 做一个待办清单应用,支持分组和提醒\n  · 做一个博客系统,支持 Markdown 写作\n  · 做一个产品落地页,要能上架的那种\n\n接下来:回答几个澄清问题 -> 审核三份设计文档(c 通过)-> /preview 看效果 -> /deploy 上线。\n更多:/help 全部命令 · /design 换设计风格（默认已自动选）· /config 当前配置"
+"greeting.main" = "UmaDev — 把一句话需求变成可上线的商业产品。\n当前底座:{}"
+"greeting.examples" = "直接输入你想做什么，例如：\n  · 做一个带邮箱登录的 SaaS 数据分析仪表盘\n  · 修复登录接口并补齐测试\n我会按需调研、设计、开发和验证；/help 查看命令，/config 查看配置。"
 
 # Provider preset labels (vendor menu in the external-API wizard)
 

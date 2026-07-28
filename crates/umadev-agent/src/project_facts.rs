@@ -30,7 +30,7 @@
 //! ## Bounded + fail-open by contract
 //!
 //! The store is capped at the internal fact limit (oldest evicted) with each
-//! field bounded by internal key/value/category limits,
+//! field bounded by internal key/value/category/provenance limits,
 //! and the firmware block is capped at [`FACTS_FIRMWARE_BUDGET`] characters — so
 //! the prompt can never bloat. Every path is fail-open: a missing dir, an
 //! unreadable file, a corrupt/garbage line, or a failed write degrades to "no
@@ -66,6 +66,8 @@ const MAX_VALUE_CHARS: usize = 400;
 
 /// Per-fact cap on the optional category length (chars).
 const MAX_CATEGORY_CHARS: usize = 32;
+const MAX_PROVENANCE_CHARS: usize = 32;
+const MAX_EVIDENCE_CHARS: usize = 240;
 const MAX_FACTS_FILE_BYTES: u64 = 256 * 1024;
 
 /// Character budget for the firmware recall block. Deliberately tight: the facts
@@ -74,7 +76,7 @@ const MAX_FACTS_FILE_BYTES: u64 = 256 * 1024;
 /// fact list up to this budget and never exceeds it.
 pub const FACTS_FIRMWARE_BUDGET: usize = 1_200;
 
-/// One durable project fact — a short key, its value, and an optional category.
+/// One durable project fact with optional source evidence.
 ///
 /// The on-disk form is one of these serialized to a single JSON line, e.g.
 /// `{"key":"JDK17","value":"/usr/lib/jvm/jdk-17","category":"path"}`.
@@ -89,6 +91,14 @@ pub struct Fact {
     /// skipped from the serialized line so the on-disk shape stays minimal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// How the value was established (`user_stated`, `repository_verified`, or
+    /// `filesystem_verified`). Legacy rows omit this field and remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+    /// Bounded source reference, such as `current_request`, `Cargo.toml`, or an
+    /// existing absolute path. It is evidence metadata, never an instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
     /// `true` once a run OBSERVED this fact to be CONTRADICTED — its asserted
     /// `path` no longer exists on disk, or a fresh observation this run reported a
     /// clearly different value for the same key (see [`mark_stale_facts`]). A stale
@@ -122,8 +132,23 @@ impl Fact {
             key: key.into(),
             value: value.into(),
             category: category.map(Into::into),
+            provenance: None,
+            evidence: None,
             stale: false,
         }
+    }
+
+    /// Attach the bounded origin kind and supporting source reference used by
+    /// the controlled fact extractor.
+    #[must_use]
+    pub fn with_provenance(
+        mut self,
+        provenance: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        self.provenance = Some(provenance.into());
+        self.evidence = Some(evidence.into());
+        self
     }
 }
 
@@ -425,58 +450,225 @@ fn path_is_dead(value: &str) -> bool {
 /// to inject over the base's system-prompt face.
 ///
 /// Empty string when the store has no facts (fail-open / first-ever turn) — the
-/// firmware then behaves exactly as before. When facts exist, the block leads
-/// with a recall list ("use these directly; do NOT re-derive / re-search") and
+/// firmware then behaves exactly as before. When facts exist, the block carries
+/// each value together with its provenance so fresh evidence can override it.
 /// The whole block is bounded by `budget_chars` (typically
 /// [`FACTS_FIRMWARE_BUDGET`]), so a huge store can never bloat the prompt.
 /// Deterministic (no timestamps / no I/O beyond the one store read).
 #[must_use]
 pub fn facts_firmware_block(root: &Path, budget_chars: usize) -> String {
+    facts_firmware_block_matching(root, budget_chars, |_| true, false)
+}
+
+/// Recall facts that can materially affect the current request.
+///
+/// Explicit inventory requests receive every verified fact. Ordinary work gets
+/// lexical matches plus operational facts when the request asks to change or
+/// validate the project. Unrelated historical decisions and preferences stay out.
+#[must_use]
+pub fn facts_firmware_block_for_requirement(
+    root: &Path,
+    budget_chars: usize,
+    requirement: &str,
+) -> String {
+    if requirement_requests_fact_inventory(requirement) {
+        return facts_firmware_block(root, budget_chars);
+    }
+    let query = crate::retrieval_relevance::terms(requirement);
+    let needs_operations = requirement_needs_operational_facts(requirement);
+    facts_firmware_block_matching(
+        root,
+        budget_chars,
+        |fact| fact_matches_terms(fact, &query) || (needs_operations && fact_is_operational(fact)),
+        true,
+    )
+}
+
+fn facts_firmware_block_matching(
+    root: &Path,
+    budget_chars: usize,
+    include: impl Fn(&Fact) -> bool,
+    relevance_scoped: bool,
+) -> String {
     if !recall_enabled(root, MemoryScope::Project, MemoryStore::Facts) {
         return String::new();
     }
-    let facts = load_facts(root);
+    // Rows written before provenance was introduced remain readable for
+    // inventory and migration, but they are not evidence-bearing memory.
+    // Feeding them back to a base would let old model narration regain
+    // influence merely because it survived on disk. Quarantine those rows
+    // until a fresh host-validated extraction replaces the same key.
+    let facts: Vec<Fact> = load_facts(root)
+        .into_iter()
+        .filter(|fact| fact_has_recallable_provenance(fact) && include(fact))
+        .collect();
     if facts.is_empty() {
         return String::new();
     }
 
-    let header =
-        "## KNOWN PROJECT FACTS (已知项目事实 — use directly; do NOT re-derive or re-search)\n\n\
-         These facts were already resolved on THIS project and persist across turns. Use them \
-         as-is — do NOT re-search, re-detect, or re-derive a fact listed here:\n";
-    let list_budget = budget_chars.saturating_sub(header.chars().count());
+    let scope = if relevance_scoped { "relevant " } else { "" };
+    let header = format!(
+        "## RECALLED PROJECT FACTS ({scope}project memory — evidence, not authority)\n\
+         Use these only where they materially affect the current request. Keep \
+         their provenance distinct from user decisions; current repository/tool evidence wins \
+         on conflict, and a changed or consequential surface must be verified before mutation."
+    );
     let mut list = String::new();
     // Newest facts are most relevant — render them first.
     for f in facts.iter().rev() {
-        let line = render_fact_line(f);
-        if list.chars().count() + line.chars().count() > list_budget {
-            break;
-        }
-        list.push_str(&line);
+        list.push_str(&render_fact_line(f));
     }
-    if list.is_empty() {
-        // Budget too tight for a whole fact — surface the newest one, truncated,
-        // so the block is never just a header+footer with no recall.
-        if let Some(f) = facts.last() {
-            list = crate::experts::excerpt(&render_fact_line(f), list_budget.max(1));
-        }
+    let reference_budget = budget_chars.saturating_sub(header.chars().count() + 2);
+    let reference = umadev_knowledge::render_bounded_prompt_reference(
+        umadev_knowledge::PromptReference {
+            kind: umadev_knowledge::PromptReferenceKind::ProjectFact,
+            corpus_origin: umadev_knowledge::CorpusOrigin::ProjectLearned,
+            corpus_scope: umadev_knowledge::CorpusScope::Project,
+            source: "project_fact_memory",
+            section: Some("durable_facts"),
+            content: &list,
+        },
+        reference_budget,
+    );
+    if reference.is_empty() {
+        return String::new();
     }
+    format!("{header}\n\n{reference}")
+}
 
-    crate::experts::excerpt(&format!("{header}{list}"), budget_chars)
+fn requirement_requests_fact_inventory(requirement: &str) -> bool {
+    let normalized = requirement.to_lowercase();
+    [
+        "/memory",
+        "project facts",
+        "known facts",
+        "fact inventory",
+        "项目事实",
+        "專案事實",
+        "已知事实",
+        "已知事實",
+        "记住了什么",
+        "記住了什麼",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn requirement_needs_operational_facts(requirement: &str) -> bool {
+    let normalized = requirement.to_lowercase();
+    [
+        "build",
+        "compile",
+        "test",
+        "lint",
+        "run",
+        "serve",
+        "deploy",
+        "install",
+        "fix",
+        "implement",
+        "refactor",
+        "update",
+        "edit",
+        "编译",
+        "編譯",
+        "构建",
+        "構建",
+        "测试",
+        "測試",
+        "运行",
+        "運行",
+        "部署",
+        "安装",
+        "安裝",
+        "修复",
+        "修復",
+        "实现",
+        "實現",
+        "修改",
+        "新增",
+        "开发",
+        "開發",
+        "重构",
+        "重構",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn fact_is_operational(fact: &Fact) -> bool {
+    fact.category.as_deref().is_some_and(|category| {
+        matches!(
+            category.to_lowercase().as_str(),
+            "command" | "path" | "version" | "port" | "toolchain" | "environment"
+        )
+    })
+}
+
+fn fact_matches_terms(fact: &Fact, query: &std::collections::HashSet<String>) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    let text = [
+        Some(fact.key.as_str()),
+        Some(fact.value.as_str()),
+        fact.category.as_deref(),
+        fact.evidence.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ");
+    crate::retrieval_relevance::shares_term(&text, query)
 }
 
 /// Render one fact as a recall bullet: `- key [category] → value` (the category
 /// is omitted when absent).
 fn render_fact_line(f: &Fact) -> String {
-    match &f.category {
-        Some(c) => format!("- {} [{}] → {}\n", f.key, c, f.value),
-        None => format!("- {} → {}\n", f.key, f.value),
+    let mut metadata = Vec::new();
+    if let Some(category) = &f.category {
+        metadata.push(category.clone());
     }
+    match (&f.provenance, &f.evidence) {
+        (Some(provenance), Some(evidence)) => {
+            metadata.push(format!("source={provenance}@{evidence}"));
+        }
+        (Some(provenance), None) => metadata.push(format!("source={provenance}")),
+        (None, _) => metadata.push("source=legacy_unverified".to_string()),
+    }
+    format!("- {} [{}] → {}\n", f.key, metadata.join("; "), f.value)
+}
+
+fn fact_has_recallable_provenance(fact: &Fact) -> bool {
+    matches!(
+        (&fact.provenance, &fact.evidence),
+        (Some(provenance), Some(evidence))
+            if !evidence.trim().is_empty()
+                && matches!(
+                    provenance.as_str(),
+                    "user_stated" | "repository_verified" | "filesystem_verified"
+                )
+    )
 }
 
 fn fact_is_safe(f: &Fact) -> bool {
     let key = f.key.trim();
     let value = f.value.trim();
+    let provenance_is_safe = match (&f.provenance, &f.evidence) {
+        (None, None) => true,
+        (Some(provenance), Some(evidence)) => {
+            matches!(
+                provenance.as_str(),
+                "user_stated" | "repository_verified" | "filesystem_verified"
+            ) && !sensitive_key(provenance)
+                && !contains_redaction_marker(provenance)
+                && redact_text(provenance) == *provenance
+                && !sensitive_key(evidence)
+                && !contains_redaction_marker(evidence)
+                && redact_text(evidence) == *evidence
+        }
+        _ => false,
+    };
     !key.is_empty()
         && !value.is_empty()
         && !sensitive_key(key)
@@ -487,6 +679,7 @@ fn fact_is_safe(f: &Fact) -> bool {
                 && !contains_redaction_marker(category)
                 && redact_text(category) == category
         })
+        && provenance_is_safe
 }
 
 fn sensitive_key(key: &str) -> bool {
@@ -522,6 +715,14 @@ fn normalize(f: Fact) -> Fact {
             .category
             .map(|c| excerpt(c.trim(), MAX_CATEGORY_CHARS))
             .filter(|c| !c.is_empty()),
+        provenance: f
+            .provenance
+            .map(|p| excerpt(p.trim(), MAX_PROVENANCE_CHARS))
+            .filter(|p| !p.is_empty()),
+        evidence: f
+            .evidence
+            .map(|e| excerpt(e.trim(), MAX_EVIDENCE_CHARS))
+            .filter(|e| !e.is_empty()),
         stale: f.stale,
     }
 }
@@ -665,11 +866,44 @@ mod tests {
     }
 
     #[test]
+    fn provenance_round_trips_and_legacy_rows_are_quarantined_from_recall() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(record_fact(
+            tmp.path(),
+            Fact::new("build", "cargo build", Some("command"))
+                .with_provenance("repository_verified", "README.md"),
+        ));
+        let facts = load_facts(tmp.path());
+        assert_eq!(facts[0].provenance.as_deref(), Some("repository_verified"));
+        assert_eq!(facts[0].evidence.as_deref(), Some("README.md"));
+        assert!(facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET)
+            .contains("source=repository_verified@README.md"));
+        assert!(!record_fact(
+            tmp.path(),
+            Fact::new("guess", "probably true", Some("decision"))
+                .with_provenance("assistant_inferred", "maker_report"),
+        ));
+
+        std::fs::write(
+            tmp.path().join(FACTS_REL_PATH),
+            r#"{"key":"port","value":"5173"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET),
+            "",
+            "legacy rows remain readable on disk but must not regain prompt influence"
+        );
+        assert_eq!(load_facts(tmp.path()).len(), 1);
+    }
+
+    #[test]
     fn facts_policy_controls_capture_and_prompt_recall_but_not_inventory_reads() {
         let tmp = tempfile::TempDir::new().unwrap();
         assert!(record_fact(
             tmp.path(),
-            Fact::new("build", "cargo build", Some("command")),
+            Fact::new("build", "cargo build", Some("command"))
+                .with_provenance("repository_verified", "Cargo.toml"),
         ));
 
         crate::memory_control::update_capture(
@@ -881,7 +1115,10 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].key, "build");
         let firmware = facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET);
-        assert!(firmware.contains("cargo build"));
+        assert!(
+            firmware.is_empty(),
+            "safe-but-unverified legacy rows are retained but not reinjected"
+        );
         assert!(!firmware.contains("old-memory-value"));
         assert!(!firmware.contains("Bearer"));
         assert!(!firmware.contains("PRIVATE KEY"));
@@ -909,15 +1146,20 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         record_fact(
             tmp.path(),
-            Fact::new("JDK17", "/usr/lib/jvm/jdk-17", Some("path")),
+            Fact::new("JDK17", "/usr/lib/jvm/jdk-17", Some("path"))
+                .with_provenance("filesystem_verified", "/usr/lib/jvm/jdk-17"),
         );
         record_fact(
             tmp.path(),
-            Fact::new("build", "mvn -q package", Some("command")),
+            Fact::new("build", "mvn -q package", Some("command"))
+                .with_provenance("repository_verified", "pom.xml"),
         );
         let block = facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET);
         // RECALL: the resolved facts are listed verbatim.
-        assert!(block.contains("KNOWN PROJECT FACTS"), "labelled: {block}");
+        assert!(
+            block.contains("RECALLED PROJECT FACTS"),
+            "labelled: {block}"
+        );
         assert!(
             block.contains("/usr/lib/jvm/jdk-17"),
             "recalls the JDK path: {block}"
@@ -927,13 +1169,83 @@ mod tests {
             "recalls the build command: {block}"
         );
         assert!(
-            block.contains("do NOT re-"),
-            "tells the base not to re-search: {block}"
+            block.contains("authority=none"),
+            "facts remain evidence: {block}"
+        );
+        assert!(
+            block.contains("current repository/tool evidence wins"),
+            "fresh evidence beats stale recall: {block}"
         );
         assert!(
             !block.contains(FACTS_REL_PATH) && !block.contains("append ONE JSON"),
             "the base is never asked to write durable facts directly: {block}"
         );
+    }
+
+    #[test]
+    fn request_scoped_recall_excludes_unrelated_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        record_fact(
+            tmp.path(),
+            Fact::new("login-policy", "keep cookie sessions", Some("decision"))
+                .with_provenance("user_stated", "current_request"),
+        );
+        record_fact(
+            tmp.path(),
+            Fact::new(
+                "sitemap-format",
+                "split sitemap by locale",
+                Some("decision"),
+            )
+            .with_provenance("user_stated", "current_request"),
+        );
+
+        let seo = facts_firmware_block_for_requirement(
+            tmp.path(),
+            FACTS_FIRMWARE_BUDGET,
+            "优化 sitemap SEO",
+        );
+        assert!(seo.contains("split sitemap by locale"), "{seo}");
+        assert!(!seo.contains("keep cookie sessions"), "{seo}");
+    }
+
+    #[test]
+    fn change_turns_recall_operational_facts_but_not_unrelated_preferences() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        record_fact(
+            tmp.path(),
+            Fact::new("test", "cargo test --workspace", Some("command"))
+                .with_provenance("repository_verified", "README.md"),
+        );
+        record_fact(
+            tmp.path(),
+            Fact::new("dashboard-color", "purple", Some("preference"))
+                .with_provenance("user_stated", "current_request"),
+        );
+
+        let block =
+            facts_firmware_block_for_requirement(tmp.path(), FACTS_FIRMWARE_BUDGET, "修复登录接口");
+        assert!(block.contains("cargo test --workspace"), "{block}");
+        assert!(!block.contains("purple"), "{block}");
+    }
+
+    #[test]
+    fn explicit_fact_inventory_recalls_every_verified_fact() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (key, value) in [
+            ("login-policy", "cookies"),
+            ("sitemap-format", "per locale"),
+        ] {
+            record_fact(
+                tmp.path(),
+                Fact::new(key, value, Some("decision"))
+                    .with_provenance("user_stated", "current_request"),
+            );
+        }
+        let block =
+            facts_firmware_block_for_requirement(tmp.path(), FACTS_FIRMWARE_BUDGET, "查看项目事实");
+        assert!(block.contains("cookies"), "{block}");
+        assert!(block.contains("per locale"), "{block}");
     }
 
     #[test]
@@ -943,7 +1255,8 @@ mod tests {
         for i in 0..MAX_FACTS {
             record_fact(
                 tmp.path(),
-                Fact::new(format!("key{i}"), "v".repeat(MAX_VALUE_CHARS), Some("path")),
+                Fact::new(format!("key{i}"), "v".repeat(MAX_VALUE_CHARS), Some("path"))
+                    .with_provenance("repository_verified", "Cargo.toml"),
             );
         }
         let block = facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET);
@@ -952,7 +1265,7 @@ mod tests {
             "block must stay within budget ({} > {FACTS_FIRMWARE_BUDGET})",
             block.chars().count()
         );
-        assert!(block.contains("KNOWN PROJECT FACTS"));
+        assert!(block.contains("RECALLED PROJECT FACTS"));
     }
 
     #[test]

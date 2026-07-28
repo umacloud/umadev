@@ -1084,7 +1084,7 @@ pub fn offline_chat_reply(req: &CompletionRequest) -> String {
     if echo.is_empty() {
         // No ask to echo — still never silent: the base-less guidance line.
         "[offline] No base CLI is connected, so I can't think this through yet. \
-         Pick a base with /claude, /codex or /opencode (or run `umadev` again to \
+         Pick a base with /claude, /codex, /opencode, /grok or /kimi (or run `umadev` again to \
          re-open the picker), and I'll pick up the conversation with full context. \
          離線:尚未连接底座 CLI / 離線:尚未連接底座 CLI。"
             .to_string()
@@ -1094,8 +1094,8 @@ pub fn offline_chat_reply(req: &CompletionRequest) -> String {
         // runtime-crate floor, which has no i18n dep on purpose).
         format!(
             "[offline] I heard: \u{201c}{echo}\u{201d} — but no base CLI is connected, \
-             so I can't actually work on it yet. Connect a base with /claude, /codex \
-             or /opencode and ask again; I'll keep this conversation's context. \
+             so I can't actually work on it yet. Connect a base with /claude, /codex, \
+             /opencode, /grok or /kimi and ask again; I'll keep this conversation's context. \
              離線:已收到你的需求,但尚未连接底座 / 已收到你的需求,但尚未連接底座。"
         )
     }
@@ -3017,6 +3017,8 @@ pub struct SessionCapabilities {
     pub set_mode: bool,
     /// The session implements [`BaseSession::set_thinking`].
     pub set_thinking: bool,
+    /// Writes are checked by a host-native pre-write governance hook.
+    pub realtime_governance: bool,
     /// Text delivery mode.
     pub text_input: InputDelivery,
     /// Image delivery mode.
@@ -3042,6 +3044,7 @@ impl Default for SessionCapabilities {
             set_model: false,
             set_mode: false,
             set_thinking: false,
+            realtime_governance: false,
             text_input: InputDelivery::Native,
             image_input: InputDelivery::Unsupported,
             file_input: InputDelivery::Unsupported,
@@ -3715,6 +3718,12 @@ mod tests {
             r.contains("/claude"),
             "should point at connecting a base: {r}"
         );
+        for alias in ["/codex", "/opencode", "/grok", "/kimi"] {
+            assert!(
+                r.contains(alias),
+                "offline guidance must advertise every first-class base alias ({alias}): {r}"
+            );
+        }
     }
 
     #[test]
@@ -3723,7 +3732,12 @@ mod tests {
         // never an empty string.
         let r = offline_chat_reply(&req(vec![("user", "   ")]));
         assert!(!r.trim().is_empty());
-        assert!(r.contains("/codex") || r.contains("base CLI"));
+        for alias in ["/claude", "/codex", "/opencode", "/grok", "/kimi"] {
+            assert!(
+                r.contains(alias),
+                "empty offline guidance must advertise every first-class base alias ({alias}): {r}"
+            );
+        }
     }
 
     #[test]

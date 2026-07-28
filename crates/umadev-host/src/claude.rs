@@ -404,14 +404,15 @@ impl Runtime for ClaudeCodeDriver {
     }
 
     fn capabilities(&self) -> umadev_runtime::BrainCapabilities {
-        // Claude Code is the most capable base: persistent `/goal` mode,
-        // stream-json streaming, real usage on the result line, and the
-        // PreToolUse real-time governance hook.
+        // The project hook is an explicit, optional installation.  The driver
+        // cannot truthfully promise that it is present for this workspace, so
+        // retain the post-turn governance pass.  An installed hook still gives
+        // earlier feedback; the redundant scan is deliberately fail-safe.
         umadev_runtime::BrainCapabilities {
             persistent_goal: true,
             streaming: true,
             reports_usage: true,
-            realtime_governance: true,
+            realtime_governance: false,
         }
     }
 

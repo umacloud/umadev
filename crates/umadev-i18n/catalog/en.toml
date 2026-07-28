@@ -23,7 +23,7 @@
 "backend.grok" = "Grok Build CLI"
 "backend.kimi" = "Kimi Code CLI"
 "backend.offline" = "Offline templates (no AI, demo / CI)"
-"backend.migration.retired" = "Your previous base, {}, is no longer a supported UmaDev base. Choose Claude Code, Codex, OpenCode, or Grok Build below. No replacement or offline mode was selected for you."
+"backend.migration.retired" = "Your previous base, {}, is no longer a supported UmaDev base. Choose Claude Code, Codex, OpenCode, Grok Build, or Kimi Code below. No replacement or offline mode was selected for you."
 
 # Common
 "common.confirm" = "Confirm"
@@ -461,8 +461,8 @@
 "report.write_failed" = "[warn] could not write report: {}"
 
 # Greeting (cold-start first screen)
-"greeting.main" = "UmaDev — turn a one-line idea into a shippable, commercial product.\nYou write zero code: I drive your logged-in AI worker through research -> design -> build -> preview -> ship, auto-applying a commercial design system and leaving quality + audit evidence.\nCurrent worker: {}"
-"greeting.examples" = "Just type what you want to build, for example (feel free to copy one):\n\n  · A SaaS analytics dashboard with email login\n  · A to-do app with groups and reminders\n  · A blog system with Markdown authoring\n  · A product landing page ready to ship\n\nNext: answer a few clarifying questions -> review the three design docs (c to approve) -> /preview to see it -> /deploy to ship.\nMore: /help all commands · /design change design style (auto-picked by default) · /config current settings"
+"greeting.main" = "UmaDev — turn a one-line request into a shippable product.\nCurrent base: {}"
+"greeting.examples" = "Just type what you want, for example:\n  · Build a SaaS analytics dashboard with email login\n  · Fix the login API and add regression tests\nI will research, design, build, and verify only as needed. /help lists commands; /config shows settings."
 
 # Provider preset labels (vendor menu in the external-API wizard)
 

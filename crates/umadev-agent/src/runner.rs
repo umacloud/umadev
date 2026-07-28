@@ -4760,16 +4760,14 @@ impl<R: Runtime> AgentRunner<R> {
         let _ = self.try_generate(Phase::Frontend, fix_p).await;
     }
 
-    /// Post-phase real-file governance catch-up for brains WITHOUT a real-time
-    /// pre-write hook. Only Claude Code fires `PreToolUse`; codex / opencode /
-    /// HTTP brains write files ungoverned in real time, so a hardcoded color or
-    /// emoji is only caught at the final quality gate. This scans the real
-    /// source files right after a code phase, re-delegates fixes (one round),
-    /// and re-scans — giving every brain a governance feedback loop, not just
-    /// claude. No-op for a brain that already governs at write time.
+    /// Post-phase real-file governance catch-up for any runtime that does not
+    /// declare verified, workspace-local pre-write governance. This scans the
+    /// real source files right after a code phase, re-delegates fixes (one
+    /// round), and re-scans. No-op only when the active runtime declares that
+    /// this workspace is already governed at write time.
     async fn run_governance_catchup(&self, phase: Phase) {
         if self.runtime.capabilities().realtime_governance {
-            return; // claude already blocked these at write time
+            return;
         }
         let policy = umadev_governance::Policy::load(&self.options.project_root);
         let ctx = self.project_context();

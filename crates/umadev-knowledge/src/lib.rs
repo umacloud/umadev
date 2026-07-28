@@ -96,7 +96,8 @@ pub use index::{
     load_or_build_index_corpus, load_or_build_index_multi, Bm25Index, Posting,
 };
 pub use prompt_reference::{
-    render_prompt_reference, truncate_prompt_reference_block, PromptReference, PromptReferenceKind,
+    render_bounded_prompt_reference, render_prompt_reference, truncate_prompt_reference_block,
+    PromptReference, PromptReferenceKind,
 };
 pub use query_expansion::expand_bilingual_query;
 pub use repomap::{

@@ -790,6 +790,10 @@ impl BaseSession for ClaudeSession {
             set_model: false,
             set_mode: false,
             set_thinking: false,
+            // Project hooks are optional and installed only by an explicit
+            // user command.  A session therefore must not claim that real-time
+            // governance is active merely because this backend supports it.
+            realtime_governance: false,
             text_input: InputDelivery::Native,
             image_input: InputDelivery::Native,
             file_input: InputDelivery::MaterializedText,

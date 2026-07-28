@@ -3833,16 +3833,12 @@ async fn light_path_firmware_is_route_tiered_via_compose_firmware() {
     // HIGH #3 / MEDIUM #6: the LIGHT path now injects firmware through
     // `compose_firmware`, sized by the turn's route — NOT a keyword table.
     //
-    // (1) A pure CHAT turn now carries the ALWAYS-ON standards core (identity +
-    //     craft + anti-slop), decoupled from intent class (A0) — a greeting leads
-    //     with the team's craft, while the slow JIT retrieval still stays off.
+    // (1) A pure CHAT turn carries identity and authority boundaries only.
     let chat = captured_system_for_route(&chat_route(), "你好").await;
     let chat_lower = chat.to_lowercase();
     assert!(chat_lower.contains("umadev"), "identity is always-on");
-    assert!(
-        chat.contains("emoji"),
-        "a chat turn now carries the engineering craft block (always-on standards)"
-    );
+    assert!(!chat.contains("emoji"), "chat skips implementation craft");
+    assert!(!chat.contains("YOUR CODEBASE"), "chat skips repo context");
     // The reality scaffold is still appended on every light turn, but a Chat
     // route is mechanically Plan and must never advertise writer authority.
     assert!(chat.contains("READ-ONLY"));
@@ -3865,10 +3861,7 @@ async fn light_path_firmware_is_route_tiered_via_compose_firmware() {
 }
 
 #[tokio::test]
-async fn light_path_quick_edit_and_chat_both_carry_craft() {
-    // A0: the craft law is ALWAYS-ON, so BOTH a QuickEdit and pure chat now lead with
-    // it (the standards are decoupled from intent class). The remaining tier
-    // difference is the slower JIT retrieval + build overlay, not the craft itself.
+async fn light_path_carries_craft_only_for_work() {
     let edit =
         captured_system_for_route(&test_route(umadev_agent::RouteClass::QuickEdit), "改个文案")
             .await;
@@ -3878,8 +3871,8 @@ async fn light_path_quick_edit_and_chat_both_carry_craft() {
     );
     let chat = captured_system_for_route(&chat_route(), "谢谢").await;
     assert!(
-        chat.contains("emoji"),
-        "pure chat now carries the craft law too (always-on standards)"
+        !chat.contains("emoji"),
+        "pure chat must not carry implementation craft"
     );
 }
 
@@ -4542,7 +4535,9 @@ async fn dropping_preview_handle_kills_a_descendant_tree() {
     );
 
     start_preview_server(&preview, &sink, &url, &command, tmp.path(), false);
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    // This checks eventual process-tree ownership, not scheduler latency; full
+    // workspace CI can delay the detached shell on a saturated host.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let leaf = loop {
         if let Ok(pid) = std::fs::read_to_string(&leaf_path)
             .and_then(|body| body.parse::<libc::pid_t>().map_err(std::io::Error::other))
@@ -4558,7 +4553,7 @@ async fn dropping_preview_handle_kills_a_descendant_tree() {
     assert!(process_is_running(leaf));
 
     drop(preview.lock().unwrap().take());
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while process_is_running(leaf) && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

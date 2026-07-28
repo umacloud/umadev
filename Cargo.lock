@@ -4029,7 +4029,7 @@ dependencies = [
 
 [[package]]
 name = "umadev"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4063,7 +4063,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-agent"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-contract"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "libc",
  "pretty_assertions",
@@ -4107,7 +4107,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-governance"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "chrono",
  "pretty_assertions",
@@ -4126,7 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-host"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "agent-client-protocol-schema",
  "async-trait",
@@ -4149,7 +4149,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-i18n"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "pretty_assertions",
  "serde",
@@ -4159,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-knowledge"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -4182,7 +4182,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-process"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "libc",
  "tempfile",
@@ -4192,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-runtime"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "async-trait",
  "mockito",
@@ -4206,7 +4206,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-spec"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "serde",
  "serde_json",
@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-state"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "libc",
  "same-file",
@@ -4226,7 +4226,7 @@ dependencies = [
 
 [[package]]
 name = "umadev-tui"
-version = "1.0.66"
+version = "1.0.67"
 dependencies = [
  "anyhow",
  "async-trait",

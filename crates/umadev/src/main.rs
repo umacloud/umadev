@@ -1555,26 +1555,6 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn activate_realtime_governance_hook(backend_id: &str, project_root: &Path) {
-    let result = match backend_id {
-        "claude-code" => hook::install_claude_hook(project_root),
-        "kimi-code" => hook::install_kimi_hook(project_root),
-        _ => return,
-    };
-    match result {
-        Ok(Some(path)) => eprintln!(
-            "  [governance] real-time Pre/PostToolUse hooks active ({})",
-            path.display()
-        ),
-        Ok(None) => eprintln!(
-            "  [governance] native hooks skipped: the selected project root is the user home"
-        ),
-        Err(error) => eprintln!(
-            "  [governance] native hook install failed open ({error}); protocol audit and final quality gates remain active"
-        ),
-    }
-}
-
 fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>) -> Result<()> {
     let root = project_root_or_cwd(project_root);
     // Hook-only mode: `umadev uninstall --base <x>` — unchanged behaviour.
@@ -2495,22 +2475,6 @@ fn cmd_adopt(path: Option<PathBuf>, project_root: Option<PathBuf>) -> Result<()>
 /// recommended entry — same as running `umadev` bare.
 async fn cmd_tui() -> Result<()> {
     let project_root = resolve_root(None)?;
-    // Pre-register the real-time governance PreToolUse hook so that whenever
-    // the session drives Claude Code (the default/most-common base, and even
-    // after an in-session `/claude` switch) its file writes are governed live.
-    // Idempotent + merges; inert for codex/opencode/offline (they don't read
-    // `.claude/settings.local.json`), so it's safe to install unconditionally.
-    if let Err(error) = hook::install_claude_hook(&project_root) {
-        eprintln!("[warn] Claude Code governance hook was not installed: {error}");
-    }
-    // Kimi's registry is user-level rather than project-local, so only touch it
-    // when Kimi is the user's selected base. Each installed command still
-    // carries an exact project scope and immediately fails open elsewhere.
-    if umadev_tui::config::load().backend.as_deref() == Some("kimi-code") {
-        if let Err(error) = hook::install_kimi_hook(&project_root) {
-            eprintln!("[warn] Kimi Code governance hook was not installed: {error}");
-        }
-    }
     let opts = umadev_tui::LaunchOptions {
         project_root,
         slug: String::new(),
@@ -3447,11 +3411,6 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
-                // Claude and the source-audited Kimi release expose native
-                // pre/post tool hooks. Both installers merge idempotently and
-                // fail open; Kimi's user-level registry command is constrained
-                // to this exact project root.
-                activate_realtime_governance_hook(backend.id(), &project_root);
             }
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
@@ -3754,7 +3713,6 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
-                activate_realtime_governance_hook(backend.id(), &project_root);
             }
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
@@ -3945,7 +3903,6 @@ async fn cmd_redo(
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
-                activate_realtime_governance_hook(backend.id(), &project_root);
             }
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
@@ -4272,7 +4229,6 @@ async fn drive_gate_block(
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
-                activate_realtime_governance_hook(backend.id(), project_root);
             }
             umadev_host::ProbeResult::NotInstalled { program } => {
                 anyhow::bail!(
@@ -4584,7 +4540,6 @@ async fn drive_director_continue(
     match probe.probe().await {
         umadev_host::ProbeResult::Ready { version, .. } => {
             println!("Backend {} ready ({version}).", probe.display_name());
-            activate_realtime_governance_hook(backend.id(), project_root);
         }
         umadev_host::ProbeResult::NotInstalled { program } => anyhow::bail!(
             "backend `{}` is not available: `{program}` is not on PATH; the Director plan was left unchanged",

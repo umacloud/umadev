@@ -1343,20 +1343,18 @@ async fn drive_director_loop_with_idle(
                     crate::sizing_calibration::SizeRank::Heavy
                 },
             );
-            // ACTIVE FACT-RECORDING BACKSTOP (single-turn path): this turn passed the
-            // objective build QC, so it is a real completed work turn regardless of
-            // whether its final prose happened to use a change verb — extract its
-            // durable facts ourselves and persist
-            // them to `.umadev/memory/facts.jsonl` so the store reliably populates
-            // without depending on the base writing it. Once per clean single-turn
-            // build (count 1 → the throttle always fires the first work turn); a
-            // pure-chat/explain route is skipped inside; fully fail-open.
+            // A clean build may establish durable facts. Extraction is throttled,
+            // evidence-checked, and fail-open inside `maybe_extract_facts`.
             crate::fact_extract::maybe_extract_facts(
                 session,
                 &options.project_root,
                 route,
                 1,
-                events,
+                &crate::fact_extract::FactExtractionEvidence {
+                    current_request: &options.requirement,
+                    work_scope: None,
+                    maker_report: &last_reply,
+                },
             )
             .await;
             // Change 2: on a REWORKED build, supersede the (now-stale) report A with ONE
@@ -2263,15 +2261,8 @@ async fn drive_plan_steps(
             .await;
         }
 
-        // ACTIVE FACT-RECORDING BACKSTOP — after a Build step that did REAL work,
-        // extract this turn's durable facts ourselves (a read-only fork asking the
-        // brain for `key: value` lines) and persist them to `.umadev/memory/facts.jsonl`,
-        // so the store reliably populates instead of relying on the base voluntarily
-        // writing it (the user-reported gap). A step's completion is the natural hook
-        // point; the call is THROTTLED (only a bounded subset of build steps) and
-        // fully fail-open — a failed fork / `none` reply / unwritable store records
-        // nothing and never affects the schedule. Only a step that actually ticked
-        // Done counts as a work turn (a Blocked/empty step never extracts).
+        // Extract durable facts only after completed build steps; the extractor
+        // owns throttling, evidence validation, and fail-open behavior.
         if step.kind == plan_state::StepKind::Build && status == StepStatus::Done {
             work_turns += 1;
             crate::fact_extract::maybe_extract_facts(
@@ -2279,7 +2270,11 @@ async fn drive_plan_steps(
                 &options.project_root,
                 Some(route),
                 work_turns,
-                events,
+                &crate::fact_extract::FactExtractionEvidence {
+                    current_request: &options.requirement,
+                    work_scope: Some(&step_title),
+                    maker_report: &last_reply,
+                },
             )
             .await;
         }

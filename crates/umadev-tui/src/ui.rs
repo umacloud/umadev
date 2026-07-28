@@ -7328,8 +7328,11 @@ fn status_text_and_color(app: &App) -> Option<(String, Color)> {
 // ---------- Help overlay (both modes) -------------------------------------
 
 fn render_help_overlay(frame: &mut Frame, app: &App) {
-    let area = centered_rect(frame.area(), 72, 80);
+    // Help is a reading surface, so use almost the full terminal. The previous
+    // 72%-wide dialog clipped ordinary command signatures at 80 columns.
+    let area = centered_rect(frame.area(), 94, 90);
     frame.render_widget(Clear, area);
+    let content_width = area.width.saturating_sub(2) as usize;
 
     let header = match app.mode {
         AppMode::Picker => umadev_i18n::t(app.lang, "tui.help.header_picker"),
@@ -7357,6 +7360,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("F1", umadev_i18n::t(lang, "tui.help.nav.toggle")),
                     ("Esc", umadev_i18n::t(lang, "tui.help.nav.quit")),
                 ],
+                content_width,
             );
         }
         AppMode::Chat => {
@@ -7387,6 +7391,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     &mut items,
                     umadev_i18n::t(lang, group.title_key()),
                     &row_refs,
+                    content_width,
                 );
             }
             // Keyboard shortcuts are KEYS, not slash commands, so they stay
@@ -7421,6 +7426,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("F1", umadev_i18n::t(lang, "tui.help.edit.toggle")),
                     ("Esc", umadev_i18n::t(lang, "tui.help.edit.esc")),
                 ],
+                content_width,
             );
         }
     }
@@ -7458,26 +7464,72 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
     frame.render_widget(list, area);
 }
 
-fn push_help_group(items: &mut Vec<ListItem<'_>>, title: &str, rows: &[(&str, &str)]) {
+fn push_help_group(
+    items: &mut Vec<ListItem<'_>>,
+    title: &str,
+    rows: &[(&str, &str)],
+    content_width: usize,
+) {
     items.push(ListItem::new(Line::from(Span::styled(
         format!(" {title}"),
         Style::default()
             .fg(theme::INFO())
             .add_modifier(Modifier::BOLD),
     ))));
+    let longest_key = rows
+        .iter()
+        .map(|(key, _)| disp_width(key))
+        .max()
+        .unwrap_or(0);
+    let key_column = (longest_key + 2).clamp(14, 30);
     for (key, desc) in rows {
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(
-                format!("  {key:<22} "),
-                Style::default()
-                    .fg(theme::WARNING())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                (*desc).to_string(),
-                Style::default().fg(theme::TEXT_MUTED()),
-            ),
-        ])));
+        let key_width = disp_width(key) + 2;
+        let inline_desc_width = content_width.saturating_sub(key_column + 1);
+        if key_width <= key_column && inline_desc_width >= 18 {
+            let key_text = pad_to_width(&format!("  {key}"), key_column);
+            let desc_rows =
+                wrap_input_rows(desc, u16::try_from(inline_desc_width).unwrap_or(u16::MAX));
+            for (index, row) in desc_rows.into_iter().enumerate() {
+                if index == 0 {
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::styled(
+                            key_text.clone(),
+                            Style::default()
+                                .fg(theme::WARNING())
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(row, Style::default().fg(theme::TEXT_MUTED())),
+                    ])));
+                } else {
+                    items.push(ListItem::new(Line::from(vec![
+                        Span::raw(" ".repeat(key_column + 1)),
+                        Span::styled(row, Style::default().fg(theme::TEXT_MUTED())),
+                    ])));
+                }
+            }
+            continue;
+        }
+
+        let key_wrap_width = content_width.saturating_sub(2).max(1);
+        for row in wrap_input_rows(key, u16::try_from(key_wrap_width).unwrap_or(u16::MAX)) {
+            items.push(ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    row,
+                    Style::default()
+                        .fg(theme::WARNING())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])));
+        }
+        let desc_wrap_width = content_width.saturating_sub(4).max(1);
+        for row in wrap_input_rows(desc, u16::try_from(desc_wrap_width).unwrap_or(u16::MAX)) {
+            items.push(ListItem::new(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(row, Style::default().fg(theme::TEXT_MUTED())),
+            ])));
+        }
     }
     items.push(ListItem::new(Line::from("")));
 }
@@ -8248,9 +8300,10 @@ mod tests {
     fn chat_shows_greeting() {
         let app = app_with(Some("offline"));
         let out = render_to_string(&app);
-        // Title row + greeting render.
+        // Title row + compact, outcome-first greeting render. The greeting names
+        // the selected base instead of relying on a generic "AI" slogan.
         assert!(out.contains("UmaDev"));
-        assert!(out.contains("AI"));
+        assert!(out.contains("offline"));
         // The prompt's placeholder + meta row render.
         assert!(out.contains("输入需求") || out.contains("help"));
     }
@@ -9360,6 +9413,44 @@ mod tests {
         assert!(out.contains(umadev_i18n::t(app.lang, "tui.help.header_chat").trim()));
         assert!(out.contains("/claude"));
         assert!(out.contains("/quit"));
+    }
+
+    #[test]
+    fn help_overlay_keeps_long_command_signatures_visible_at_eighty_columns() {
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        let _ = app.apply_key(KeyCode::F(1));
+        let out = render_chat_at(&app, 80, 180);
+        assert!(
+            out.contains("/sandbox [read-only|workspace-write|danger-full-access]"),
+            "the complete sandbox signature must not be clipped: {out}"
+        );
+    }
+
+    #[test]
+    fn compact_startup_fits_a_common_eighty_by_twenty_four_terminal() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!("umadev-compact-start-{id}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let app = App::new(
+            "demo",
+            UserConfig {
+                backend: Some("offline".into()),
+                lang: Some("zh-CN".into()),
+                ..Default::default()
+            },
+            root.join("config.toml"),
+            root.clone(),
+        );
+        let out = render_chat_at(&app, 80, 24);
+        assert_eq!(
+            app.transcript_max_scroll.get(),
+            0,
+            "a fresh session should not start with hidden instructions: {out}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -3406,6 +3406,7 @@ impl BaseSession for AcpSession {
             set_model: self.negotiated.set_model,
             set_mode: self.negotiated.set_mode,
             set_thinking: self.negotiated.set_thinking,
+            realtime_governance: false,
             text_input: InputDelivery::Native,
             image_input: if self.negotiated.image {
                 InputDelivery::Native

@@ -3506,6 +3506,7 @@ impl BaseSession for CodexSession {
             set_model: false,
             set_mode: false,
             set_thinking: false,
+            realtime_governance: false,
             text_input: InputDelivery::Native,
             image_input: InputDelivery::Native,
             file_input: InputDelivery::MaterializedText,

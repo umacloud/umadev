@@ -155,7 +155,7 @@ const MAX_CLONE_FINDINGS: usize = 12;
 /// Comment-hygiene thresholds. These are deliberately high enough to catch
 /// narration blocks without imposing a comment quota on ordinary code.
 const LONG_COMMENT_RUN: usize = 8;
-const COMMENT_RATIO_MIN: usize = 10;
+const COMMENT_RATIO_MIN: usize = 12;
 const MAX_COMMENT_FINDINGS: usize = 12;
 /// Max layer-violation findings reported per pass.
 const MAX_LAYER_FINDINGS: usize = 10;

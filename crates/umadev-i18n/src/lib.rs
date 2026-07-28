@@ -315,6 +315,26 @@ mod tests {
     }
 
     #[test]
+    fn retired_backend_migration_offers_all_five_first_class_bases() {
+        for lang in Lang::ALL {
+            let message = t(lang, "backend.migration.retired");
+            for base in [
+                "Claude Code",
+                "Codex",
+                "OpenCode",
+                "Grok Build",
+                "Kimi Code",
+            ] {
+                assert!(
+                    message.contains(base),
+                    "{} migration text omits {base}: {message}",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)] // a flat registry of guarded keys; length is data, not logic.
     fn migrated_tui_keys_present_in_all_langs() {
         // Guard the keys migrated out of hard-coded TUI strings (overlay / help

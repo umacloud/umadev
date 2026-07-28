@@ -88,6 +88,7 @@ pub mod pr;
 pub mod project_facts;
 pub mod project_init;
 pub mod recipes;
+pub(crate) mod retrieval_relevance;
 pub mod review;
 pub mod router;
 pub mod run_lock;
