@@ -2974,8 +2974,8 @@ fn director_outcome_is_failure(outcome: &DirectorOutcome) -> bool {
 
 /// Honest terminal line for a CLI Director outcome.
 ///
-/// Kept as a pure mapping so a defensive gate pause can never fall through to
-/// the completed-build wording merely because headless runs normally auto-drive.
+/// Kept as a pure mapping so a gate pause can never fall through to completed
+/// wording. Guarded headless runs report a resumable pause; Auto drives through.
 fn director_outcome_report(outcome: &DirectorOutcome) -> String {
     match outcome {
         DirectorOutcome::Planned => umadev_i18n::tl("continuous.plan_mode_skip").to_string(),
@@ -3152,9 +3152,21 @@ async fn drive_director_run(
     // context — same wiring as the TUI drive. Fail-open: a surface that can't
     // serve (offline / unknown backend) leaves those seats on their read-only
     // fork, exactly today's path.
-    let reply = match Box::pin(umadev_agent::critics::with_cold_surface(
-        umadev_tui::cold_judge_surface(&options.backend, &options.model, &options.project_root),
-        umadev_agent::drive_director_loop_routed(session, options, events, directive, Some(&route)),
+    let reply = match Box::pin(umadev_agent::hosted_interaction(
+        umadev_agent::RunInteraction {
+            confirm_gates: true,
+            ..Default::default()
+        },
+        umadev_agent::critics::with_cold_surface(
+            umadev_tui::cold_judge_surface(&options.backend, &options.model, &options.project_root),
+            umadev_agent::drive_director_loop_routed(
+                session,
+                options,
+                events,
+                directive,
+                Some(&route),
+            ),
+        ),
     ))
     .await
     {
@@ -3163,10 +3175,8 @@ async fn drive_director_run(
         // A session that died / a turn that failed is an honest hard stop (never
         // disguised as a build).
         DirectorLoopOutcome::Failed(reason) => return Ok(DirectorOutcome::HardStop(reason)),
-        // Defensive: a gate pause is only produced on a HOSTED run (the TUI scopes
-        // `umadev_agent::RunInteraction` with `confirm_gates`), never on this
-        // headless CLI drive. If it ever surfaces, report it honestly as a paused
-        // (not failed) run and point at the resume surface.
+        // Headless guarded runs persist the same resumable confirmation doors as
+        // the TUI. The next `continue` resumes from the exact checkpoint.
         DirectorLoopOutcome::PausedAtGate { gate } => {
             return Ok(DirectorOutcome::Paused { gate });
         }
@@ -4630,9 +4640,15 @@ async fn drive_director_continue(
             print_engine_event(&event);
         }
     });
-    let outcome = Box::pin(umadev_agent::critics::with_cold_surface(
-        umadev_tui::cold_judge_surface(backend.id(), &opts.model, project_root),
-        umadev_agent::drive_director_loop_resume(session.as_mut(), &opts, &sink, &route),
+    let outcome = Box::pin(umadev_agent::hosted_interaction(
+        umadev_agent::RunInteraction {
+            confirm_gates: true,
+            ..Default::default()
+        },
+        umadev_agent::critics::with_cold_surface(
+            umadev_tui::cold_judge_surface(backend.id(), &opts.model, project_root),
+            umadev_agent::drive_director_loop_resume(session.as_mut(), &opts, &sink, &route),
+        ),
     ))
     .await;
     let settled_id = session.session_id().map(str::to_string);

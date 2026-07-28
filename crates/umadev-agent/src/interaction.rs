@@ -1,18 +1,16 @@
 //! TUI-hosted interaction bridge for the director loop — the task-scoped channel
 //! that lets the DEFAULT `/run` engine reach a live user when one exists.
 //!
-//! The director loop (`crate::director_loop`) is deliberately headless-safe: every
+//! The director loop (`crate::director_loop`) is deliberately host-safe: every
 //! decision point (a base `NeedApproval`, a spec-MUST confirmation gate) has a
-//! deterministic fail-open floor so a CLI / CI run is never wedged waiting on a
-//! human. But when the loop runs INSIDE the TUI there IS a human — and the old
-//! behaviour silently auto-denied approvals and drove straight through the two
-//! spec-MUST gates (`UD-FLOW-002` / `UD-FLOW-003`) the product promises.
+//! deterministic fail-open floor when no host declares that it can resume the
+//! interaction. The TUI and the guarded headless CLI both host resumable gates;
+//! an unscoped library/CI drive does not block waiting on a human.
 //!
 //! This module carries the hosting UI's live hooks to the loop WITHOUT threading a
 //! parameter through every pump signature: the host scopes a [`RunInteraction`]
 //! around the whole drive via [`hosted`] (a tokio task-local), and the loop's
-//! decision points consult it fail-open — an unscoped (headless) run reads `None`
-//! everywhere and keeps today's behaviour byte-for-byte.
+//! decision points consult it fail-open — an unscoped drive reads `None`.
 //!
 //! Three hooks ride the scope:
 //! - **`approval`** — an async callback the loop awaits when the trust floor says
@@ -25,8 +23,7 @@
 //!   instead of evaporating.
 //! - **`confirm_gates`** — whether the host can actually render + resume a
 //!   confirmation gate. Only a hosted, non-auto run pauses at `docs_confirm` /
-//!   `preview_confirm`; headless runs (which could never resume) drive through
-//!   exactly as before.
+//!   `preview_confirm`; unhosted library/CI runs drive through instead of wedging.
 //!
 //! Everything here is fail-open by contract (a poisoned lock / missing scope
 //! degrades to "no interaction"), and no new dependency is introduced (tokio's
@@ -527,20 +524,20 @@ impl std::fmt::Debug for RunInteraction {
 
 tokio::task_local! {
     /// The hosting UI's interaction hooks for the CURRENT director-loop task.
-    /// Unset (headless CLI / CI / tests that don't opt in) → every consult below
-    /// fails open to "no interaction" and behaviour is byte-for-byte today's.
+    /// Unset (embedded/CI callers and tests that do not opt in) → every consult
+    /// below fails open to "no interaction".
     static RUN_INTERACTION: RunInteraction;
 }
 
 /// Run `fut` with `interaction` scoped as the current task's interaction hooks.
-/// The host (TUI) wraps its whole director-loop drive in this; everything the
-/// loop awaits inside inherits the scope (task-locals span the whole task).
+/// The TUI and guarded headless CLI wrap their director-loop drive in this;
+/// everything the loop awaits inside inherits the scope.
 pub async fn hosted<F: Future>(interaction: RunInteraction, fut: F) -> F::Output {
     RUN_INTERACTION.scope(interaction, fut).await
 }
 
-/// Whether the current task is hosted by a UI that renders + resumes
-/// confirmation gates. `false` when unscoped (headless) — fail-open.
+/// Whether the current task is hosted by a surface that renders or reports, then
+/// resumes, confirmation gates. `false` when unscoped — fail-open.
 #[must_use]
 pub(crate) fn gates_hosted() -> bool {
     RUN_INTERACTION

@@ -2389,7 +2389,7 @@ async fn auto_qc_clean_when_source_present_and_no_review_team() {
     route.kind = crate::planner::TaskKind::Light;
     route.depth = crate::router::Depth::Fast;
     route.team.clear();
-    let qc = run_auto_qc(&mut sess, &o, &events, Some(&route), None, false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, Some(&route), None, false, false).await;
     assert!(qc.is_clean(), "source present + nothing to fail → clean QC");
 }
 
@@ -2419,7 +2419,7 @@ async fn auto_qc_governs_codex_writes_and_blocks_on_emoji_icon() {
     let (events, _rec) = sink();
     let mut sess = FakeSession::new(vec![], false, "");
     let o = codex_opts(tmp.path());
-    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false, false).await;
     assert!(
         !qc.is_clean(),
         "an emoji-as-icon write by codex must be governed: {:?}",
@@ -2429,6 +2429,46 @@ async fn auto_qc_governs_codex_writes_and_blocks_on_emoji_icon() {
         qc.blocking.iter().any(|b| b.starts_with("[governance]")),
         "the finding is tagged [governance]: {:?}",
         qc.blocking
+    );
+}
+
+#[tokio::test]
+async fn director_qc_attributes_only_new_or_changed_governance_findings() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let source = tmp.path().join("button.tsx");
+    std::fs::write(
+        &source,
+        "export const Btn = () => <button>\u{1F680} Launch</button>;",
+    )
+    .unwrap();
+    let (events, rec) = sink();
+    let mut sess = FakeSession::new(vec![], false, "");
+    let mut o = codex_opts(tmp.path());
+    o.requirement = "只更新项目文档".to_string();
+    crate::governance_baseline::begin(&o);
+    let mut route = fast_build_route();
+    route.kind = crate::planner::TaskKind::DocsOnly;
+
+    let unchanged = run_auto_qc(&mut sess, &o, &events, Some(&route), None, false, true).await;
+    assert!(
+        unchanged.is_clean(),
+        "unchanged brownfield debt is not attributed"
+    );
+    assert!(note_seen(&rec, "ignored 1 unchanged pre-existing"));
+
+    std::fs::write(
+        source,
+        "export const Btn = () => <button>\u{1F680} Launch now</button>;",
+    )
+    .unwrap();
+    let changed = run_auto_qc(&mut sess, &o, &events, Some(&route), None, false, true).await;
+    assert!(
+        changed
+            .blocking
+            .iter()
+            .any(|finding| finding.starts_with("[governance]")),
+        "a changed file remains governed: {:?}",
+        changed.blocking
     );
 }
 
@@ -2450,7 +2490,7 @@ async fn auto_qc_governs_craft_for_claude_too() {
     let mut sess = FakeSession::new(vec![], false, "");
     let mut o = opts(tmp.path());
     o.backend = "claude-code".to_string();
-    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false, false).await;
     assert!(
         !qc.is_clean(),
         "an emoji-as-icon write must be governed by QC even on claude: {:?}",
@@ -2478,7 +2518,7 @@ async fn auto_qc_governance_does_not_falsely_flag_a_clean_static_page() {
     let mut sess = FakeSession::new(vec![], false, "");
     let mut o = codex_opts(tmp.path());
     o.requirement = "做一个简单的静态介绍页,纯前端".to_string();
-    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false, false).await;
     assert!(
         qc.is_clean(),
         "a clean static page must not be falsely flagged: {:?}",
@@ -2494,7 +2534,7 @@ async fn auto_qc_blocks_when_no_source_present() {
     let (events, _rec) = sink();
     let mut sess = FakeSession::new(vec![], false, "");
     let o = opts(tmp.path());
-    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false, false).await;
     assert!(!qc.is_clean(), "no source → blocking");
     assert!(
         qc.blocking.iter().any(|b| b.contains("source-present")),
@@ -2524,7 +2564,7 @@ async fn lean_goal_qc_stops_at_source_floor_and_skips_review() {
     let reply = r#"{"accepts": false, "blocking": ["a review nit that must NOT surface"]}"#;
     let mut sess = FakeSession::new(vec![], true, reply);
     let o = lean_opts(tmp.path());
-    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false, false).await;
     assert!(
         qc.is_clean(),
         "a lean goal with source present is clean — the fork review is skipped: {:?}",
@@ -2541,7 +2581,7 @@ async fn lean_goal_qc_still_enforces_the_source_present_hard_floor() {
     let (events, _rec) = sink();
     let mut sess = FakeSession::new(vec![], false, "");
     let o = lean_opts(tmp.path());
-    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, None, None, false, false).await;
     assert!(!qc.is_clean(), "a lean goal with no source still blocks");
     assert!(
         qc.blocking.iter().any(|b| b.contains("source-present")),
@@ -2704,7 +2744,7 @@ async fn incremental_verify_skips_the_duplicate_build_when_base_ran_it_green() {
     let o = opts(tmp.path()); // "做一个登录系统" — non-lean, so it reaches the build read
     let reply = "Implemented the login system end to end. Ran `npm test` and `npm run build` — all tests pass and the build succeeded (exit code 0).";
     // ran_build_tool = true: a real runner WAS observed on the tool-call stream.
-    let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply), true).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply), true, false).await;
     assert!(
         qc.is_clean(),
         "clean source + corroborated build → clean: {:?}",
@@ -2736,7 +2776,7 @@ async fn incremental_verify_does_not_skip_a_green_claim_with_no_observed_run() {
     let o = opts(tmp.path());
     let reply = "Implemented the login system end to end. Ran `npm test` and `npm run build` — all tests pass and the build succeeded (exit code 0).";
     // ran_build_tool = false: the base narrated a run it never actually performed.
-    let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply), false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, None, Some(reply), false, false).await;
     assert!(
         qc.is_clean(),
         "no manifest → neutral re-verify, still clean (no false FAIL): {:?}",
@@ -2770,6 +2810,7 @@ async fn incremental_verify_runs_our_own_read_when_reply_is_ambiguous() {
         &events,
         None,
         Some("Done — implemented it."),
+        false,
         false,
     )
     .await;
@@ -2952,7 +2993,16 @@ async fn deliberate_qc_enforces_the_acceptance_floor_lean_skips_it() {
     let mut deliberate = opts(tmp.path());
     deliberate.requirement = "做一个完整的任务管理产品".to_string();
     let route = build_route();
-    let qc = run_auto_qc(&mut sess, &deliberate, &events, Some(&route), None, false).await;
+    let qc = run_auto_qc(
+        &mut sess,
+        &deliberate,
+        &events,
+        Some(&route),
+        None,
+        false,
+        false,
+    )
+    .await;
     assert!(
         qc.blocking.iter().any(|b| b.contains("coverage gap")),
         "deliberate QC enforces the acceptance floor: {:?}",
@@ -2962,7 +3012,7 @@ async fn deliberate_qc_enforces_the_acceptance_floor_lean_skips_it() {
     // Lean requirement → QC returns at the lean short-circuit, BEFORE the floor.
     let mut lean = opts(tmp.path());
     lean.requirement = "做一个简单的待办清单单页应用,纯前端".to_string();
-    let qc2 = run_auto_qc(&mut sess, &lean, &events, None, None, false).await;
+    let qc2 = run_auto_qc(&mut sess, &lean, &events, None, None, false, false).await;
     assert!(
         !qc2.blocking.iter().any(|b| b.contains("coverage gap")),
         "a lean goal does NOT pay the acceptance floor (speed): {:?}",
@@ -2990,7 +3040,7 @@ async fn deliberate_route_with_lean_reading_requirement_still_runs_full_gate() {
     );
     // …but the ROUTE is deliberate (Standard depth) → the full gate must run.
     let route = build_route();
-    let qc = run_auto_qc(&mut sess, &o, &events, Some(&route), None, false).await;
+    let qc = run_auto_qc(&mut sess, &o, &events, Some(&route), None, false, false).await;
     assert!(
         qc.blocking.iter().any(|b| b.contains("coverage gap")),
         "a deliberate route runs the full gate even when the requirement reads lean: {:?}",
@@ -3315,6 +3365,8 @@ fn seat_driven_decision_is_router_driven_with_an_escape_hatch() {
     // stays the single end-to-end turn so token cost stays proportional.
     let deliberate = build_route(); // Greenfield / Standard (deliberate)
     let lean = fast_build_route(); // Light / Fast (not deliberate)
+    let mut docs = lean.clone();
+    docs.kind = crate::planner::TaskKind::DocsOnly;
     assert!(
         seat_driven_build_warranted(&deliberate, false),
         "a deliberate full build warrants seat-by-seat building"
@@ -3322,6 +3374,10 @@ fn seat_driven_decision_is_router_driven_with_an_escape_hatch() {
     assert!(
         !seat_driven_build_warranted(&lean, false),
         "a lean/Fast build stays single-turn (no per-step scheduling)"
+    );
+    assert!(
+        seat_driven_build_warranted(&docs, false),
+        "a docs-only /run drives its owned steps so docs_confirm can pause"
     );
     // The escape hatch can only DISABLE seat-driving (force the cheaper single
     // turn); it can NEVER force seat-driving on, and it leaves the lean default
@@ -3334,6 +3390,7 @@ fn seat_driven_decision_is_router_driven_with_an_escape_hatch() {
         !seat_driven_build_warranted(&lean, true),
         "the escape hatch never turns a lean build into a seat-driven one"
     );
+    assert!(!seat_driven_build_warranted(&docs, true));
 }
 
 #[tokio::test]
@@ -8934,6 +8991,24 @@ fn load_resumable_plan_resets_an_interrupted_active_step_to_pending() {
     );
     let ready: Vec<String> = loaded.ready_steps().iter().map(|s| s.id.clone()).collect();
     assert_eq!(ready, vec!["b"], "the reset step is ready again");
+}
+
+#[test]
+fn load_resumable_plan_keeps_a_fully_done_plan_parked_at_a_gate() {
+    use crate::plan_state::{Plan, StepStatus};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let plan = Plan {
+        steps: vec![resume_step("docs", "docs", &[], StepStatus::Done)],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    plan_state::save(&plan, tmp.path()).unwrap();
+    let mut state = crate::state::WorkflowState::new(Phase::Docs);
+    state.active_gate = "docs_confirm".to_string();
+    crate::state::write_workflow_state(tmp.path(), &state).unwrap();
+
+    let loaded = load_resumable_plan(tmp.path()).expect("open gate remains resumable");
+    assert_eq!(loaded.progress(), (1, 1));
 }
 
 #[test]

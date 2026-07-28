@@ -187,6 +187,7 @@ async fn post_build_qc_next_clean_qc_passes_the_sent_memory() {
         &context,
         false,
         false,
+        false,
     )
     .await;
     assert!(outcome.clean);

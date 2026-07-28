@@ -64,6 +64,8 @@ pub(super) async fn run_final_gate(
     // tests, manifests/locks, tool configuration, Docker and CI inputs). In that
     // one case round 0 retries only the unavailable reviewer.
     review_only_first_round: bool,
+    // Explicit `/run` owns a pre-run baseline. Chat-originated builds do not.
+    attribute_to_director_run: bool,
 ) -> PostBuildQcOutcome {
     let mut last_reply = String::new();
     let mut last_blocking = Vec::new();
@@ -98,6 +100,7 @@ pub(super) async fn run_final_gate(
                 Some(route),
                 Some(verify_signal.as_str()),
                 verify_ran_build_tool,
+                attribute_to_director_run,
             )
             .await
         };
@@ -303,7 +306,7 @@ pub async fn run_post_build_qc(
     // the seed's prose "it's green" — narration alone must not skip. The caller consumes
     // the complete typed result, including dirty and operational states.
     run_final_gate(
-        session, options, events, route, seed_reply, deadline, &context, false, false,
+        session, options, events, route, seed_reply, deadline, &context, false, false, false,
     )
     .await
 }

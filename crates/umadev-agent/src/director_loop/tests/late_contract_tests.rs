@@ -250,7 +250,7 @@ async fn replan_does_not_trigger_for_a_blocked_leaf_with_no_dependents() {
 // ── Spec-MUST confirmation gates on the DEFAULT path (A1-GAP1 / UD-FLOW-002 /
 //    UD-FLOW-003): a HOSTED, guarded run pauses at docs_confirm once the core-doc
 //    steps settle Done, and at preview_confirm once the frontend family settles;
-//    auto / headless runs drive through exactly as today; a resume never
+//    auto / unhosted library runs drive through; a resume never
 //    re-fires the gate it paused at. ──
 
 /// A doc-first 4-step plan (PM → architect → frontend/backend) whose steps all
@@ -466,8 +466,8 @@ async fn resume_after_docs_gate_pauses_at_preview_then_completes() {
 }
 
 #[tokio::test]
-async fn auto_mode_and_headless_runs_never_pause_at_a_gate() {
-    // Hosted Auto and headless Guarded both drive through without gates and finish every step.
+async fn auto_mode_and_unhosted_runs_never_pause_at_a_gate() {
+    // Hosted Auto and unhosted Guarded both drive through without gates and finish every step.
     for (mode, hosted) in [(TrustMode::Auto, true), (TrustMode::Guarded, false)] {
         let tmp = tempfile::TempDir::new().unwrap();
         seed_source(tmp.path());
@@ -510,10 +510,10 @@ async fn auto_mode_and_headless_runs_never_pause_at_a_gate() {
 }
 
 #[tokio::test]
-async fn gate_never_fires_with_no_remaining_work() {
-    // A docs-only plan (PM + architect, nothing after) must NOT pause: a pause
-    // with nothing left to drive would strand the run (not resumable). The
-    // schedule finishes normally instead.
+async fn terminal_docs_only_plan_opens_a_resumable_confirmation_gate() {
+    // A docs-only plan still owes the user the documented confirmation door.
+    // The fully-Done plan is retained as the resume cursor, so `/continue` can
+    // close the door and run final document-aware QC without replaying the docs.
     use crate::critics::Seat;
     use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
     let tmp = tempfile::TempDir::new().unwrap();
@@ -557,15 +557,24 @@ async fn gate_never_fires_with_no_remaining_work() {
         .await
     })
     .await;
-    assert!(
-        matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
-        "a docs-only plan finishes instead of pausing un-resumably: {outcome:?}"
+    assert_eq!(
+        outcome,
+        Some(DirectorLoopOutcome::PausedAtGate {
+            gate: crate::gates::Gate::DocsConfirm,
+        })
     );
     assert_eq!(
         rec.count(|e| matches!(e, EngineEvent::GateOpened { .. })),
-        0,
-        "no gate fires when nothing remains to resume into"
+        1,
+        "the docs confirmation is visible even when docs are the final deliverable"
     );
+    let loaded = load_resumable_plan(tmp.path()).expect("the terminal docs gate is resumable");
+    assert!(loaded
+        .steps
+        .iter()
+        .all(|step| step.status == StepStatus::Done));
+    let state = crate::state::read_workflow_state(tmp.path()).expect("workflow state");
+    assert_eq!(state.active_gate, "docs_confirm");
 }
 
 #[tokio::test]

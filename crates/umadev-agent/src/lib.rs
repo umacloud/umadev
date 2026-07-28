@@ -71,6 +71,7 @@ pub mod first_pass;
 pub mod freshness;
 pub(crate) mod fswalk;
 pub mod gates;
+pub(crate) mod governance_baseline;
 pub mod init_assets;
 pub mod interaction;
 pub mod knowledge_feedback;

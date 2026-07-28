@@ -816,6 +816,11 @@ pub async fn drive_director_loop_routed(
         return DirectorLoopOutcome::Failed(reason);
     }
 
+    // Attribute governance findings to this run. The snapshot survives a
+    // cross-process `/continue`, so unchanged brownfield findings are not
+    // misreported as defects introduced by a docs-only or targeted run.
+    crate::governance_baseline::begin(options);
+
     // 0. ONE RULE BOOK. Persist the derived governance context BEFORE anything is written.
     //    See `persist_run_governance_context` — the default `/run` path drives the base
     //    from HERE, and it used to be the one path that never wrote the context: the run
@@ -1143,18 +1148,12 @@ fn seat_build_force_disabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Whether to drive THIS build SEAT-BY-SEAT (the team builds its own steps via
-/// [`drive_plan_steps`]) versus the single end-to-end turn — the Wave A build-path
-/// decision. It is AUTOMATIC from the existing [`RoutePlan`]: a deliberate build
-/// ([`crate::router::Depth::is_deliberate`] — the router already sized the turn
-/// `Standard` / `Deep`, i.e. a Greenfield product, a high-complexity feature, the full
-/// team convened) warrants seat-by-seat building, while a lean / `Fast` / quick-edit /
-/// docs route stays the cheap single turn so token cost stays proportional to the task.
-/// It REUSES the router's own `depth` signal — no new classifier, no user flag. The
-/// `force_single_turn` escape hatch (see [`seat_build_force_disabled`]) can only
-/// DISABLE seat-driving, never force it on.
+/// Deliberate builds drive their plan seat-by-seat. Docs-only `/run` also drives
+/// its owned steps so `docs_confirm` is real; other Fast routes stay single-turn.
+/// The escape hatch can only disable step driving.
 fn seat_driven_build_warranted(route: &RoutePlan, force_single_turn: bool) -> bool {
-    !force_single_turn && route.depth.is_deliberate()
+    !force_single_turn
+        && (route.depth.is_deliberate() || matches!(route.kind, crate::planner::TaskKind::DocsOnly))
 }
 
 /// [`drive_director_loop`] with an explicit idle window — the env read is hoisted
@@ -1313,6 +1312,7 @@ async fn drive_director_loop_with_idle(
             route,
             Some(turn.text.as_str()),
             turn.ran_build_tool,
+            true,
         )
         .await;
 
@@ -2420,6 +2420,7 @@ async fn drive_plan_steps(
             &no_fix_context,
             false,
             review_only_resume,
+            true,
         )
         .await
     };
@@ -2612,34 +2613,11 @@ async fn drive_plan_steps(
     })
 }
 
-/// The confirmation gate to OPEN after a plan step settled, or `None` (the
-/// overwhelmingly common case) — the DEFAULT path's revival of the two spec-MUST
-/// human gates (`UD-FLOW-002` docs_confirm / `UD-FLOW-003` preview_confirm;
-/// A1-GAP1: `drive_plan_steps` never emitted `GateOpened` and never paused, so
-/// the gates only existed on the legacy engine).
-///
-/// **Transition-triggered by design** (no persisted "gate passed" state needed):
-/// a gate fires exactly when the JUST-SETTLED step is a `Done` BUILD step of the
-/// gate's producing seat family AND that family is now fully `Done`. A resumed
-/// run never re-drives a `Done` step, so a resume can never re-fire the gate it
-/// paused at; a doc step re-opened by artifact staleness (the user revised the
-/// doc) that re-settles `Done` legitimately re-confirms.
-///
-/// Fires ONLY when every condition holds:
-/// - the run is HOSTED by a UI that renders + resumes gates
-///   ([`crate::interaction::gates_hosted`]) — a headless CLI / CI run could never
-///   resume a pause, so it keeps today's drive-through behaviour (fail-open);
-/// - the trust tier is NOT `auto` ([`crate::trust::TrustMode::gates_auto_approve`]
-///   — auto runs end-to-end, exactly as today);
-/// - real work remains (≥1 `Pending`/`Active` step) — a pause with nothing left
-///   would strand the run (a fully-terminal plan is not resumable).
-///
-/// The designer's **design-tokens deliverable step**
-/// ([`plan_state::is_design_tokens_step`]) is UIUX-seated but is CODE-PHASE PREP,
-/// not doc authoring: it is excluded from the docs family AND from the trigger, so
-/// (1) the docs gate fires as soon as the actual PM/architect/UIUX *docs* are Done
-/// (the tokens step runs after the gate resumes), and (2) the tokens step settling
-/// Done post-resume can never RE-fire `docs_confirm` (gate-opens-once).
+/// Open a hosted, non-auto confirmation gate when its producing BUILD family
+/// settles. Done steps are not replayed on resume, so gates open once unless a
+/// user edit legitimately reopens the producing step. Docs may be the terminal
+/// deliverable; preview still requires remaining work. Design-prep/token steps
+/// are excluded from the docs family.
 fn confirm_gate_after_step(
     step: &plan_state::PlanStep,
     status: StepStatus,
@@ -2655,15 +2633,10 @@ fn confirm_gate_after_step(
     if options.mode.gates_auto_approve() || !crate::interaction::gates_hosted() {
         return None;
     }
-    // Never pause a run that has nothing left to drive — the pause would not be
-    // resumable and the final gate / finalize below own the ending instead.
-    if !plan
+    let has_remaining_work = plan
         .steps
         .iter()
-        .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active))
-    {
-        return None;
-    }
+        .any(|s| matches!(s.status, StepStatus::Pending | StepStatus::Active));
     // "The whole family is Done" — true only when the family is non-empty AND
     // every member reached Done (a Blocked member keeps the gate closed: the
     // docs/preview are incomplete, so there is nothing coherent to confirm).
@@ -2694,7 +2667,8 @@ fn confirm_gate_after_step(
     if doc_member(step) && family_done(&doc_member) {
         return Some(crate::gates::Gate::DocsConfirm);
     }
-    if step.seat == Seat::FrontendEngineer
+    if has_remaining_work
+        && step.seat == Seat::FrontendEngineer
         && family_done(&|s: &plan_state::PlanStep| {
             s.kind == plan_state::StepKind::Build && s.seat == Seat::FrontendEngineer
         })
@@ -6604,6 +6578,7 @@ async fn run_auto_qc(
     // CLAIM in `last_turn_text` — before the duplicate build/test read is skipped. `false`
     // (the conservative default when no observation is available) → UmaDev runs its own read.
     ran_build_tool: bool,
+    attribute_to_director_run: bool,
 ) -> QcReport {
     events.emit(EngineEvent::Note("team · honesty + QC read".to_string()));
     let mut blocking: Vec<String> = Vec::new();
@@ -6649,7 +6624,17 @@ async fn run_auto_qc(
     // path keeps this moat — only the duplicate build + fork review are skipped
     // for a lean goal, never the craft floor. Fail-open: a clean / empty scan
     // contributes nothing, an unreadable file is skipped.
-    let violations = crate::continuous::governance_scan(options);
+    let (violations, ignored_preexisting) = if attribute_to_director_run {
+        let scan = crate::governance_baseline::scan(options);
+        (scan.violations, scan.ignored_preexisting)
+    } else {
+        (crate::continuous::governance_scan(options), 0)
+    };
+    if ignored_preexisting > 0 {
+        events.emit(EngineEvent::Note(format!(
+            "team · ignored {ignored_preexisting} unchanged pre-existing governance finding(s)"
+        )));
+    }
     if !violations.is_empty() {
         events.emit(EngineEvent::Note(format!(
             "team · content governance flagged {} issue(s) in what the base wrote",

@@ -443,7 +443,7 @@ pub(super) fn operational_review_checkpoint_for_plan(
     })
 }
 
-/// Load a persisted plan only when it still contains resumable work.
+/// Load a persisted plan when it contains work or owns an open confirmation gate.
 ///
 /// The plan and operational-review checkpoint are reconciled as one logical
 /// transaction. Either file may be the one whose atomic rename landed before a
@@ -465,7 +465,10 @@ pub(super) fn load_resumable_plan(root: &Path) -> Option<Plan> {
     if let Some(checkpoint) = checkpoint.as_ref() {
         reconcile_plan_with_operational_checkpoint(&mut plan, checkpoint);
     }
-    if !plan_has_incomplete_step(&plan) {
+    let parked_at_gate = crate::state::read_workflow_state(root)
+        .and_then(|state| crate::gates::Gate::from_id(&state.active_gate))
+        .is_some();
+    if !plan_has_incomplete_step(&plan) && !parked_at_gate {
         return None;
     }
     reset_active_to_pending(&mut plan);
