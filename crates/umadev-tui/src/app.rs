@@ -12645,6 +12645,10 @@ impl App {
         self.cancelling = true;
         self.thinking = true;
         self.thinking_started = Some(std::time::Instant::now());
+        // The cached status string must reflect the stopping state NOW — every
+        // sibling state change refreshes it; skipping it here left the previous
+        // turn's terminal chip painted in the top bar for the whole drain window.
+        self.refresh_status();
         self.push(
             ChatRole::System,
             umadev_i18n::t(self.lang, "status.stopping"),
