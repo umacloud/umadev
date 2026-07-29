@@ -128,6 +128,7 @@
 "approval.bar.label" = "待批准"
 "approval.bar.hint" = "y/批准=允许 · n/拒绝=拒绝 · Esc=拒绝"
 "host.input.bar.label" = "待答复"
+"host.request.withdrawn" = "[note] 底座撤回了刚才的请求({}),对应的问题已自动收起。"
 "host.input.bar.hint" = "Enter=提交 · Shift+Enter=换行 · Esc=取消"
 "host.input.secret_suffix" = "（敏感输入已遮蔽）"
 "host.input.marker" = "[?]"

@@ -443,11 +443,11 @@ pub(super) async fn run_director_loop(
             let input_holder = host_input.clone();
             let input_sink = sink.clone();
             let host_request_cb: umadev_agent::HostRequestFn = Arc::new(
-                move |_req_id: String, request: umadev_runtime::HostRequest| {
+                move |req_id: String, request: umadev_runtime::HostRequest| {
                     let input_holder = input_holder.clone();
                     let input_sink = input_sink.clone();
                     Box::pin(async move {
-                        Some(await_host_input(&input_holder, &input_sink, &request).await)
+                        Some(await_host_input(&input_holder, &input_sink, &request, &req_id).await)
                     }) as umadev_agent::HostRequestFuture
                 },
             );

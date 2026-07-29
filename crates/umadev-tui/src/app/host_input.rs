@@ -88,6 +88,7 @@ mod tests {
         *holder.lock().unwrap() = Some(PendingHostInput {
             token,
             reply_tx: tx,
+            req_id: String::new(),
             request,
         });
         app.set_pending_host_input(pending_host_input_item(&holder));

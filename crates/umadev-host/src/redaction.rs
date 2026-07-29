@@ -429,6 +429,10 @@ pub(crate) fn sanitize_session_event(event: SessionEvent) -> SessionEvent {
             req_id: redact_text(&req_id),
             request: sanitize_host_request(request),
         },
+        SessionEvent::HostRequestSettled { req_id, reason } => SessionEvent::HostRequestSettled {
+            req_id: redact_text(&req_id),
+            reason: redact_text(&reason),
+        },
         SessionEvent::BackgroundTask(signal) => {
             SessionEvent::BackgroundTask(sanitize_background_task(signal))
         }

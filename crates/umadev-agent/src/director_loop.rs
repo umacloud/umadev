@@ -6207,6 +6207,12 @@ async fn drive_one_turn_with_backoff_and_memories(
                     return Err(format!("session host response: {error}"));
                 }
             }
+            SessionEvent::HostRequestSettled { .. } => {
+                // The director resolves each host request INLINE above, so a
+                // withdrawal has no lingering picker to retract on this headless
+                // path — the retraction consumer lives on the resident-chat
+                // surface. Informational only here.
+            }
             SessionEvent::BackgroundTask(_) => {
                 // Already folded into the tracker above; carries no render row.
             }

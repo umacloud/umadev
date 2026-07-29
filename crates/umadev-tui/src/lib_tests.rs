@@ -457,6 +457,7 @@ fn auto_switch_keeps_a_true_disaster_pending_but_explicit_approve_resolves() {
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     *holder.lock().unwrap() = Some(PendingApproval {
         reply_tx: tx,
+        req_id: String::new(),
         action: "Bash".to_string(),
         target: "rm -rf node_modules".to_string(),
         auto_releasable: true,
@@ -485,6 +486,7 @@ fn auto_switch_keeps_a_true_disaster_pending_but_explicit_approve_resolves() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     *holder.lock().unwrap() = Some(PendingApproval {
         reply_tx: tx,
+        req_id: String::new(),
         action: "Bash".to_string(),
         target: "rm -rf node_modules".to_string(),
         auto_releasable: true,
@@ -499,6 +501,7 @@ fn auto_switch_never_releases_an_upstream_permission_boundary() {
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     *holder.lock().unwrap() = Some(PendingApproval {
         reply_tx: tx,
+        req_id: String::new(),
         action: "Bash".to_string(),
         target: "npm install".to_string(),
         auto_releasable: false,
@@ -541,6 +544,7 @@ async fn auto_tier_auto_approves_the_grok_plan_review_and_guarded_still_asks() {
 
     let auto = resolve_resident_host_request(
         &request,
+        "test-req-id",
         root.path(),
         umadev_agent::TrustMode::Auto,
         true,
@@ -566,6 +570,7 @@ async fn auto_tier_auto_approves_the_grok_plan_review_and_guarded_still_asks() {
     // Guarded: the picker parks and waits for the human — unchanged.
     let guarded = resolve_resident_host_request(
         &request,
+        "test-req-id",
         root.path(),
         umadev_agent::TrustMode::Guarded,
         true,
@@ -633,6 +638,7 @@ async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
 
     let headless = resolve_resident_host_request(
         &request,
+        "test-req-id",
         root.path(),
         umadev_agent::TrustMode::Auto,
         false,
@@ -652,6 +658,7 @@ async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
 
     let interactive = resolve_resident_host_request(
         &request,
+        "test-req-id",
         root.path(),
         umadev_agent::TrustMode::Auto,
         true,
@@ -807,6 +814,7 @@ fn binary_host_approval_never_escalates_to_persistent_options() {
 fn test_pending_approval(tx: tokio::sync::oneshot::Sender<ApprovalReply>) -> PendingApproval {
     PendingApproval {
         reply_tx: tx,
+        req_id: String::new(),
         action: "Bash".to_string(),
         target: "npm install".to_string(),
         auto_releasable: true,
@@ -1015,6 +1023,7 @@ fn secret_host_reply_is_masked_and_never_persisted_in_chat() {
     *holder.lock().unwrap() = Some(PendingHostInput {
         token: 1,
         reply_tx: tx,
+        req_id: String::new(),
         request: request.clone(),
     });
     app.set_pending_host_input(pending_host_input_item(&holder));
@@ -1051,6 +1060,52 @@ fn secret_host_reply_is_masked_and_never_persisted_in_chat() {
 }
 
 #[tokio::test]
+async fn a_withdrawn_request_retracts_only_the_matching_picker() {
+    use crate::interaction_bridge::{retract_pending_approval_for, retract_pending_host_input_for};
+    // The base WITHDRAWS a request it raised (HostRequestSettled). The picker
+    // answering exactly that req_id must be retracted with a protocol-shaped
+    // cancel; a picker for a DIFFERENT req_id (e.g. a newer one that superseded
+    // it) must be left live.
+    let holder: HostInputHolder = Arc::new(std::sync::Mutex::new(None));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *holder.lock().unwrap() = Some(PendingHostInput {
+        token: 1,
+        req_id: "ask-42".to_string(),
+        reply_tx: tx,
+        request: secret_host_request(),
+    });
+
+    // A mismatched withdrawal leaves the picker untouched.
+    assert!(!retract_pending_host_input_for(&holder, "ask-OTHER"));
+    assert!(
+        holder.lock().unwrap().is_some(),
+        "a foreign withdrawal is a no-op"
+    );
+
+    // The matching withdrawal retracts it and wakes the waiter with a cancel.
+    assert!(retract_pending_host_input_for(&holder, "ask-42"));
+    assert!(
+        holder.lock().unwrap().is_none(),
+        "the matching picker is cleared"
+    );
+    assert!(
+        matches!(rx.await, Ok(umadev_runtime::HostResponse::Cancelled { .. })),
+        "the parked RPC settles protocol-shaped, never a fabricated answer"
+    );
+
+    // Approval twin: an empty req_id (a Guarded local pause with no base RPC)
+    // never matches a real withdrawn id.
+    let approval: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let (atx, _arx) = tokio::sync::oneshot::channel();
+    *approval.lock().unwrap() = Some(test_pending_approval(atx));
+    assert!(
+        !retract_pending_approval_for(&approval, "ask-42"),
+        "a local (req_id-less) approval is never retracted by a base withdrawal"
+    );
+    assert!(approval.lock().unwrap().is_some());
+}
+
+#[tokio::test]
 async fn a_newer_host_request_supersedes_the_stale_unanswered_one() {
     // The reported production loop: a plan-review / question picker the base had
     // ALREADY abandoned kept occupying the single interactive slot, so every later
@@ -1064,6 +1119,7 @@ async fn a_newer_host_request_supersedes_the_stale_unanswered_one() {
     let (old_tx, old_rx) = tokio::sync::oneshot::channel();
     *holder.lock().unwrap() = Some(PendingHostInput {
         token: 1,
+        req_id: String::new(),
         reply_tx: old_tx,
         request: secret_host_request(),
     });
@@ -1073,8 +1129,13 @@ async fn a_newer_host_request_supersedes_the_stale_unanswered_one() {
         let holder = holder.clone();
         let sink = sink.clone();
         async move {
-            crate::interaction_bridge::await_host_input(&holder, &sink, &secret_host_request())
-                .await
+            crate::interaction_bridge::await_host_input(
+                &holder,
+                &sink,
+                &secret_host_request(),
+                "new-req",
+            )
+            .await
         }
     });
 
@@ -1127,6 +1188,7 @@ fn cancelling_secret_host_reply_scrubs_editor_recovery_immediately() {
     *holder.lock().unwrap() = Some(PendingHostInput {
         token: 1,
         reply_tx: tx,
+        req_id: String::new(),
         request: secret_host_request(),
     });
     app.set_pending_host_input(pending_host_input_item(&holder));
@@ -1208,6 +1270,7 @@ fn invalid_typed_host_choice_keeps_draft_and_request_pending() {
     *holder.lock().unwrap() = Some(PendingHostInput {
         token: 1,
         reply_tx: tx,
+        req_id: String::new(),
         request,
     });
     app.input = "99".to_string();
@@ -1267,6 +1330,7 @@ fn an_older_host_waiter_cannot_clear_a_newer_request() {
     *holder.lock().unwrap() = Some(PendingHostInput {
         token: 2,
         reply_tx: tx,
+        req_id: String::new(),
         request: umadev_runtime::HostRequest::UserInput {
             questions: Vec::new(),
             metadata: serde_json::Value::Null,

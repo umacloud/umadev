@@ -2019,6 +2019,21 @@ pub enum SessionEvent {
         /// Typed request payload.
         request: HostRequest,
     },
+    /// A previously surfaced [`SessionEvent::HostRequest`] was WITHDRAWN by the
+    /// base before the host answered — the base cancelled its own request, the
+    /// sub-agent that raised it finished, its bounded timeout elapsed, or the
+    /// session/turn tore down. The surface must retract the now-stale picker for
+    /// this `req_id` (a late answer to a withdrawn request is a benign no-op the
+    /// driver's `respond_host` already tolerates). State-only: like
+    /// [`SessionEvent::StateUpdate`], it creates no transcript row by itself and
+    /// never counts as turn content.
+    HostRequestSettled {
+        /// The `req_id` of the withdrawn [`SessionEvent::HostRequest`].
+        req_id: String,
+        /// Short, non-secret reason for display (e.g. "base cancelled",
+        /// "sub-agent finished", "timed out").
+        reason: String,
+    },
     /// A lifecycle signal for one of the base's OWN background **sub-agents**.
     /// Claude emits these as stream-json `system` frames: `task_started` (edge),
     /// `task_notification` (terminal edge: completed / failed / stopped) and

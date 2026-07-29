@@ -120,8 +120,8 @@ use crate::interaction_bridge::{
     deny_pending_approval, interactive_user_present, pending_approval_item,
     pending_host_input_item, publish_live_trust, release_pending_approval_on_auto_switch,
     resolve_pending_approval, resolve_pending_host_input_key, resolve_resident_host_request,
-    should_pause_for_user, trust_for_resident_turn, ApprovalHolder, ApprovalReply, HostInputHolder,
-    PendingAskHolder,
+    retract_pending_approval_for, retract_pending_host_input_for, should_pause_for_user,
+    trust_for_resident_turn, ApprovalHolder, ApprovalReply, HostInputHolder, PendingAskHolder,
 };
 #[cfg(test)]
 use crate::interaction_bridge::{
@@ -5570,6 +5570,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     } => {
                         let response = resolve_resident_host_request(
                             &request,
+                            &req_id,
                             &project_root,
                             mode,
                             true,
@@ -6236,9 +6237,26 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                         return;
                     }
                 }
+                umadev_runtime::SessionEvent::HostRequestSettled { req_id, reason } => {
+                    // The base WITHDREW a request it had raised (cancelled it, the
+                    // sub-agent finished, its timeout elapsed). Retract the stale
+                    // picker/approval that was answering exactly this `req_id`, so
+                    // the user is not left answering a dead prompt. Token-scoped:
+                    // only the matching occupant is cleared — a newer request that
+                    // already superseded this one is left untouched.
+                    let retracted = retract_pending_host_input_for(&host_input_holder, &req_id)
+                        | retract_pending_approval_for(&approval_holder, &req_id);
+                    if retracted {
+                        sink.emit(EngineEvent::Note(umadev_i18n::tlf(
+                            "host.request.withdrawn",
+                            &[&reason],
+                        )));
+                    }
+                }
                 umadev_runtime::SessionEvent::HostRequest { req_id, request } => {
                     let response = resolve_resident_host_request(
                         &request,
+                        &req_id,
                         &project_root,
                         mode,
                         interactive,

@@ -129,6 +129,7 @@
 "approval.bar.label" = "APPROVAL"
 "approval.bar.hint" = "y/approve=allow · n/deny=refuse · Esc=deny"
 "host.input.bar.label" = "RESPONSE"
+"host.request.withdrawn" = "[note] The base withdrew its request ({}); the matching prompt was retracted."
 "host.input.bar.hint" = "Enter=submit · Shift+Enter=newline · Esc=cancel"
 "host.input.secret_suffix" = " (sensitive input masked)"
 "host.input.marker" = "[?]"

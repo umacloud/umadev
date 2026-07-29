@@ -1100,6 +1100,12 @@ async fn drive_phase(
                     return PhaseResult::Failed(format!("respond host request: {error}"));
                 }
             }
+            SessionEvent::HostRequestSettled { .. } => {
+                // The /run pipeline resolves each host request INLINE above, so
+                // there is no lingering interactive picker to retract here — a
+                // withdrawal is informational only. (The retraction consumer
+                // lives on the resident-chat surface, which owns the pickers.)
+            }
             SessionEvent::BackgroundTask(_) => {
                 // Already folded into the tracker above; carries no render row.
             }
@@ -3120,6 +3126,9 @@ async fn drive_rework_turn_with_idle_and_memories(
                         skill_receipt,
                     };
                 }
+            }
+            SessionEvent::HostRequestSettled { .. } => {
+                // Inline-resolved on this rework path; no picker to retract.
             }
             SessionEvent::BackgroundTask(_) => {
                 // Already folded into the tracker above; carries no render row.

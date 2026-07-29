@@ -62,6 +62,11 @@ pub(super) struct PendingApproval {
     /// upstream policy/sandbox boundary, not an ordinary Guarded prompt, and
     /// only an explicit user verdict may resolve it.
     pub(super) auto_releasable: bool,
+    /// The base protocol `req_id` this approval answers, when it came from a
+    /// `HostRequest::Approval` (empty for a Guarded local-pause that has no base
+    /// RPC). Retained so a [`umadev_runtime::SessionEvent::HostRequestSettled`]
+    /// can retract exactly this approval when the base withdraws its request.
+    pub(super) req_id: String,
 }
 
 /// Shared slot for the single in-flight [`PendingApproval`]. A plain `std::sync::Mutex`
@@ -76,6 +81,10 @@ pub(super) type ApprovalHolder = Arc<std::sync::Mutex<Option<PendingApproval>>>;
 /// instead of allowing an unknown prompt to inherit authority.
 pub(super) struct PendingHostInput {
     pub(super) token: u64,
+    /// The base protocol `req_id` this picker is answering. Retained so a
+    /// [`umadev_runtime::SessionEvent::HostRequestSettled`] (the base withdrew
+    /// the request) can be correlated to THIS picker and retract it.
+    pub(super) req_id: String,
     pub(super) reply_tx: tokio::sync::oneshot::Sender<umadev_runtime::HostResponse>,
     pub(super) request: umadev_runtime::HostRequest,
 }
@@ -232,6 +241,59 @@ pub(super) fn clear_pending_host_input_if(holder: &HostInputHolder, token: u64) 
             guard.take();
         }
     }
+}
+
+/// Retract a pending picker IFF it is answering `req_id` — the base WITHDREW that
+/// request (cancel / sub-agent finished / timeout). Settles the parked RPC with a
+/// protocol-shaped cancel so its waiter (if any) wakes cleanly, and clears the
+/// slot so the per-frame UI sync drops the picker. Req-id-scoped: a newer request
+/// that already superseded this one keeps its live picker. Returns whether a
+/// matching picker was retracted.
+pub(super) fn retract_pending_host_input_for(holder: &HostInputHolder, req_id: &str) -> bool {
+    let Ok(mut guard) = holder.lock() else {
+        return false;
+    };
+    if guard
+        .as_ref()
+        .is_some_and(|pending| pending.req_id == req_id)
+    {
+        if let Some(pending) = guard.take() {
+            // A withdrawal settles as a uniform protocol Cancelled (universally
+            // handled by every driver's write-back), never a fabricated answer —
+            // the base isn't listening anyway, but this keeps the waiter's return
+            // path honest.
+            let _ = pending
+                .reply_tx
+                .send(umadev_runtime::HostResponse::Cancelled {
+                    reason: Some("the base withdrew this request".to_string()),
+                });
+        }
+        return true;
+    }
+    false
+}
+
+/// The approval twin of [`retract_pending_host_input_for`]: retract a pending
+/// approval that was answering `req_id`. An empty `req_id` (a Guarded local pause
+/// / host-git / `/run` approval with no base RPC) never matches a real withdrawn
+/// id. Returns whether a matching approval was retracted.
+pub(super) fn retract_pending_approval_for(holder: &ApprovalHolder, req_id: &str) -> bool {
+    if req_id.is_empty() {
+        return false;
+    }
+    let Ok(mut guard) = holder.lock() else {
+        return false;
+    };
+    if guard
+        .as_ref()
+        .is_some_and(|pending| pending.req_id == req_id)
+    {
+        if let Some(pending) = guard.take() {
+            let _ = pending.reply_tx.send(ApprovalReply::Deny);
+        }
+        return true;
+    }
+    false
 }
 
 pub(super) fn is_host_cancel_text(text: &str) -> bool {
@@ -446,6 +508,7 @@ pub(super) async fn await_host_input(
     holder: &HostInputHolder,
     sink: &Arc<ChannelSink>,
     request: &umadev_runtime::HostRequest,
+    req_id: &str,
 ) -> umadev_runtime::HostResponse {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let token = NEXT_HOST_INPUT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -477,6 +540,7 @@ pub(super) async fn await_host_input(
             }
             *guard = Some(PendingHostInput {
                 token,
+                req_id: req_id.to_string(),
                 reply_tx: tx,
                 request: request.clone(),
             });
@@ -877,8 +941,17 @@ pub(super) async fn await_user_approval(
     action: &str,
     target: &str,
 ) -> ApprovalReply {
-    await_user_approval_with_auto_release(holder, sink, action, target, true).await
+    // Callers with no base RPC (host-git, a Guarded local pause, the /run
+    // callback) carry no `req_id` — a HostRequestSettled can never correlate to
+    // these, so an empty id is correct.
+    await_user_approval_with_auto_release(holder, sink, action, target, true, "").await
 }
+
+// NOTE: threading the base `req_id` into a `HostRequest::Approval` pause (so a
+// HostRequestSettled can retract the APPROVAL bar, not just the picker) is a
+// follow-up — it needs `req_id` down through `resident_approval_decision`. Today
+// approvals register with an empty `req_id`, so `retract_pending_approval_for` is
+// wired but inert; picker retraction (the common zombie case) is live.
 
 /// Register the same visible approval pause with an explicit mode-switch
 /// policy. Upstream-forced permission requests pass `false`, ensuring a local
@@ -889,6 +962,7 @@ async fn await_user_approval_with_auto_release(
     action: &str,
     target: &str,
     auto_releasable: bool,
+    req_id: &str,
 ) -> ApprovalReply {
     let (tx, rx) = tokio::sync::oneshot::channel();
     // Register the pause so the event loop routes the user's keypress here — carrying
@@ -915,6 +989,7 @@ async fn await_user_approval_with_auto_release(
                 action: action.to_string(),
                 target: target.to_string(),
                 auto_releasable,
+                req_id: req_id.to_string(),
             });
         }
         Err(_) => return ApprovalReply::Deny,
@@ -966,7 +1041,8 @@ async fn resolve_upstream_permission_boundary(
         return umadev_runtime::ApprovalDecision::Deny;
     }
 
-    match await_user_approval_with_auto_release(approval_holder, sink, action, target, false).await
+    match await_user_approval_with_auto_release(approval_holder, sink, action, target, false, "")
+        .await
     {
         ApprovalReply::Allow => {
             sink.emit(EngineEvent::Note(umadev_i18n::tlf(
@@ -1064,8 +1140,10 @@ pub(super) async fn resident_approval_decision(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // a protocol resolver: each arg is a distinct, irreducible input
 pub(super) async fn resolve_resident_host_request(
     request: &umadev_runtime::HostRequest,
+    req_id: &str,
     project_root: &std::path::Path,
     mode: umadev_agent::TrustMode,
     interactive: bool,
@@ -1176,7 +1254,7 @@ pub(super) async fn resolve_resident_host_request(
                     outcome: umadev_runtime::HostPlanOutcome::Approved,
                 }
             } else {
-                await_host_input(host_input_holder, sink, request).await
+                await_host_input(host_input_holder, sink, request, req_id).await
             }
         }
         umadev_runtime::HostRequest::PlanConfirmation { metadata, .. }
@@ -1223,7 +1301,7 @@ pub(super) async fn resolve_resident_host_request(
         | umadev_runtime::HostRequest::FolderTrust { .. }
             if interactive =>
         {
-            await_host_input(host_input_holder, sink, request).await
+            await_host_input(host_input_holder, sink, request, req_id).await
         }
         umadev_runtime::HostRequest::FolderTrust { .. } => {
             request.safe_rejection("interactive folder-trust confirmation is unavailable")
