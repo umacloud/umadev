@@ -1238,9 +1238,19 @@ impl BaseSession for OpenCodeSession {
         response: HostResponse,
     ) -> Result<(), SessionError> {
         let Some(interaction) = self.pending_interactions.remove(req_id) else {
-            return Err(SessionError::Send(format!(
-                "opencode host response has no pending request `{req_id}`"
-            )));
+            // An unknown req_id means the request was already withdrawn or
+            // answered — e.g. the user pressed ESC (→ the turn aborted, the
+            // picker was dropped), then a late click on the stale card landed a
+            // second later. Answering it is a benign no-op (opencode would 404
+            // the dropped id anyway). Return Ok so a LATE answer never kills the
+            // live session: the callers escalate a respond_host Err to
+            // session-end + a failed turn, so the old Err meant "you answered a
+            // prompt we showed you, so we killed your session."
+            tracing::debug!(
+                target: "opencode_session",
+                "late/duplicate host response for withdrawn request `{req_id}` — ignored"
+            );
+            return Ok(());
         };
         let retry = interaction.clone();
         let result = respond_to_interaction(&self.http, req_id, interaction, response).await;
@@ -1253,6 +1263,11 @@ impl BaseSession for OpenCodeSession {
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         self.turn_active = false;
         self.turn_sse_gate.disarm();
+        // An interrupt abandons every in-flight interactive request — the turn
+        // that raised them is gone. Clearing here (like `end` does) means a late
+        // answer to a now-stale picker finds nothing and is a benign no-op,
+        // instead of the request lingering to be answered against a dead turn.
+        self.pending_interactions.clear();
         self.http
             .abort(&self.session_id)
             .await
