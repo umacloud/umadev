@@ -16082,6 +16082,27 @@ impl App {
         Action::RunDeploy { command: cmd }
     }
 
+    /// Plan approval IS authorization to implement. When the user approves the
+    /// base's plan review ("批准并开始实施") while the session runs under the
+    /// read-only Plan tier, promote to Guarded — the least-privilege WRITABLE
+    /// tier (every write still asks) — and say so. Without this the approval was
+    /// a dead letter: the base tried to implement inside a read-only sandbox,
+    /// every write failed, the next prompt re-pinned plan mode, and the run
+    /// looped planning forever (the reported approved-plan-can-never-execute
+    /// strand). The switch takes effect from the NEXT turn (the running process
+    /// keeps its launch sandbox — a live boundary is never widened mid-turn).
+    /// A no-op outside the Plan tier.
+    pub(crate) fn promote_plan_approval_to_execution(&mut self) {
+        if self.effective_trust_mode() != umadev_agent::TrustMode::Plan {
+            return;
+        }
+        self.set_trust_mode(umadev_agent::TrustMode::Guarded);
+        self.push(
+            ChatRole::UmaDev,
+            umadev_i18n::t(self.lang, "plan.approved_promoted").to_string(),
+        );
+    }
+
     /// Cycle the trust tier with Shift+Tab. It toggles ONLY the two WRITABLE,
     /// gate-related tiers — Guarded (per-gate approval, "手动审核") ↔ Auto
     /// (auto-pass, "自动过门") — exactly matching the footer chips. It deliberately

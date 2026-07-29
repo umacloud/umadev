@@ -363,6 +363,7 @@
 "plan.queue.native" = "  {}. [底座原生佇列] {}"
 "plan.review.title" = "團隊評審"
 "plan.review.accept" = "通過"
+"plan.approved_promoted" = "[plan] 計劃已批准。原會話為唯讀(計劃檔),已切換到「手動審核」檔 — 下一條訊息起即可受控寫入實施;每步寫入仍會請求你批准。"
 "plan.review.auto_approved" = "[plan] 「計劃審閱」已自動批准並開始實施(自動過門)。按 shift+Tab 或 /manual 可轉人工逐項審閱。"
 "plan.review.block" = "{} 個必改"
 "plan.review.collapsed" = "團隊評審:{} 通過 · {} 攔截 — /plan 展開"

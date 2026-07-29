@@ -6396,10 +6396,22 @@ pub(crate) fn record_turn_usage(
     // number still wins the instant the base reports one). The ledger row below still
     // records the estimate fallback so `/usage` stays honest.
     events.emit(EngineEvent::TurnUsage { usage, est_tokens });
-    record_estimated_usage(
-        &options.backend,
-        real_or_estimated_tokens(usage, est_tokens),
-    );
+    // Honest ledger quality: a base-REPORTED usage row is recorded through the
+    // quality-preserving V2 path (exact counts, input/output/cache split, native
+    // cost when the base reports one — grok's exact cost ticks included), so
+    // `/usage` stops labeling exact data "estimated" and stops discarding the
+    // split. Only a turn with NO usable base report falls back to the labeled
+    // `chars/4` estimate — under-claiming stays impossible in both directions.
+    match usage {
+        Some(u) if !(u.usage_incomplete && u.has_empty_lower_bound()) => {
+            crate::usage_ledger::record_runtime_usage(
+                &options.backend,
+                umadev_spec::Phase::Frontend,
+                u,
+            );
+        }
+        _ => record_estimated_usage(&options.backend, est_tokens),
+    }
 }
 
 /// Record one base tool call to the audit trail (UD-EVID-002) on the default loop.

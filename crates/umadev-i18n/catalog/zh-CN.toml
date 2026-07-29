@@ -363,6 +363,7 @@
 "plan.queue.native" = "  {}. [底座原生队列] {}"
 "plan.review.title" = "团队评审"
 "plan.review.accept" = "通过"
+"plan.approved_promoted" = "[plan] 计划已批准。原会话为只读(计划档),已切换到「手动审核」档 — 下一条消息起即可受控写入实施;每步写入仍会请求你批准。"
 "plan.review.auto_approved" = "[plan] 「计划审阅」已自动批准并开始实施(自动过门)。按 shift+Tab 或 /manual 可转人工逐项审阅。"
 "plan.review.block" = "{} 个必改"
 "plan.review.collapsed" = "团队评审:{} 通过 · {} 拦截 — /plan 展开"

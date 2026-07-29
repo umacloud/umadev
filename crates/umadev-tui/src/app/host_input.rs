@@ -212,6 +212,55 @@ mod tests {
     }
 
     #[test]
+    fn approving_the_plan_under_the_read_only_tier_promotes_to_guarded_execution() {
+        // "批准并开始实施" must actually lead to implementation: under the
+        // read-only Plan tier the approval used to be a dead letter (writes
+        // failed in the read-only sandbox, the next prompt re-pinned plan mode,
+        // the run looped planning forever). Approving now promotes to Guarded —
+        // the least-privilege WRITABLE tier — with a visible note; approving
+        // while already writable changes nothing.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = App::new(
+            "plan-promote",
+            crate::config::UserConfig::default(),
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        app.trust_mode_override = Some(umadev_agent::TrustMode::Plan);
+        let (holder, rx) = install_host_request(&mut app, 61, grok_plan_request("步骤一"));
+        assert!(host_key(&holder, &mut app, KeyCode::Char('a')));
+        assert!(matches!(
+            rx.blocking_recv().unwrap(),
+            umadev_runtime::HostResponse::PlanOutcome {
+                outcome: umadev_runtime::HostPlanOutcome::Approved
+            }
+        ));
+        assert_eq!(
+            app.effective_trust_mode(),
+            umadev_agent::TrustMode::Guarded,
+            "plan approval under Plan promotes to the writable Guarded tier"
+        );
+
+        // Already-writable approval: no tier change.
+        let tmp2 = tempfile::TempDir::new().unwrap();
+        let mut auto_app = App::new(
+            "plan-promote-auto",
+            crate::config::UserConfig::default(),
+            tmp2.path().join("config.toml"),
+            tmp2.path().to_path_buf(),
+        );
+        auto_app.trust_mode_override = Some(umadev_agent::TrustMode::Auto);
+        let (holder2, rx2) = install_host_request(&mut auto_app, 62, grok_plan_request("步骤一"));
+        assert!(host_key(&holder2, &mut auto_app, KeyCode::Char('a')));
+        let _ = rx2.blocking_recv().unwrap();
+        assert_eq!(
+            auto_app.effective_trust_mode(),
+            umadev_agent::TrustMode::Auto,
+            "an already-writable tier is never changed by a plan approval"
+        );
+    }
+
+    #[test]
     fn grok_exit_plan_picker_has_three_explicit_states_and_feedback_escape_is_local() {
         for (token, key, expected) in [
             (31, KeyCode::Char('a'), "approved"),
@@ -1093,6 +1142,24 @@ impl App {
                 }
             }
             KeyCode::Enter if modifiers.is_empty() => {
+                // FOCUS IS SELECTION for a single-choice question: the cursor
+                // already points at an option (`> [ ] A. …`), so Enter confirms
+                // that option directly. Demanding a separate Space first
+                // rejected the user's most natural reply — Enter on the focused
+                // row — with "requires a selection or note", four times in the
+                // reported session, while the base itself had told them to just
+                // reply with the option. Multi-choice keeps the explicit Space
+                // toggles (Enter alone stays ambiguous there).
+                {
+                    let question = &state.questions[state.current];
+                    let progress = &mut state.progress[state.current];
+                    if matches!(question.kind, HostQuestionKind::SingleChoice)
+                        && progress.selected.is_empty()
+                        && question.options.get(progress.cursor).is_some()
+                    {
+                        progress.selected = vec![progress.cursor];
+                    }
+                }
                 let progress = &state.progress[state.current];
                 if !question_is_answered(&state.questions[state.current], progress) {
                     return HostInputKeyOutcome::Invalid(format!(

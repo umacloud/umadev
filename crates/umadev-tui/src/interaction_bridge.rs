@@ -474,7 +474,14 @@ pub(super) async fn await_host_input(
             sink.emit(EngineEvent::Note(
                 "[warn] host response timed out and was safely rejected".to_string(),
             ));
-            request.safe_rejection("host response timed out")
+            // The reason text reaches the BASE, and a bare "host response timed
+            // out" was echoed back as if it were the user's words ("The user
+            // said: host response timed out") and treated as revision feedback.
+            // Say explicitly that no user input arrived and it carries no intent.
+            request.safe_rejection(
+                "no user answer arrived within the wait window; this is not user feedback — \
+                 re-ask when needed or proceed with your best judgment",
+            )
         }
     };
     // The UI takes the slot before sending a response. If a later request was
@@ -522,8 +529,20 @@ pub(super) fn resolve_pending_host_input_key(
                 let Some(pending) = taken else {
                     return true;
                 };
+                let plan_approved = matches!(
+                    &response,
+                    umadev_runtime::HostResponse::PlanOutcome {
+                        outcome: umadev_runtime::HostPlanOutcome::Approved
+                    }
+                );
                 let _ = pending.reply_tx.send(response);
                 app.set_pending_host_input(None);
+                // Approving the plan review under the read-only Plan tier is the
+                // user's authorization to IMPLEMENT — promote to the writable
+                // Guarded tier (see `promote_plan_approval_to_execution`).
+                if plan_approved {
+                    app.promote_plan_approval_to_execution();
+                }
                 return true;
             }
         }
