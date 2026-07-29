@@ -8749,6 +8749,9 @@ fn handle_mouse_event(app: &mut App, terminal: &mut Term, event: MouseEvent) {
 fn handle_paste_event(app: &mut App, pasted: &str) {
     if let Some(auth) = app.auth_ui.as_mut() {
         auth.handle_paste(pasted);
+    } else if app.paste_into_active_picker(pasted) {
+        // Consumed by the specialized picker (routed into its notes/feedback
+        // buffer) — never leak into the chat composer behind the picker.
     } else {
         app.handle_paste(pasted);
     }

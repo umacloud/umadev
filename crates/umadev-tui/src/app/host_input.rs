@@ -212,6 +212,46 @@ mod tests {
     }
 
     #[test]
+    fn pasting_into_a_focused_question_becomes_its_note_not_dead_composer_text() {
+        // Reported: pasting while the picker is up dropped the text into the
+        // hidden chat composer, which the picker never reads — Enter then said
+        // "requires a selection or note" with the answer sitting right there.
+        // A paste is the user answering in text: it must land in the NOTES
+        // buffer (which IS read) and the picker must switch to Notes focus.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = App::new(
+            "paste-picker",
+            crate::config::UserConfig::default(),
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        let (_holder, _rx) = install_host_request(&mut app, 51, grok_question_request("plan"));
+        assert!(
+            app.paste_into_active_picker("use the sqlite id, keep it reversible"),
+            "the paste is consumed by the focused picker"
+        );
+        let view = app.pending_host_input.as_ref().unwrap();
+        let HostInputKind::GrokQuestion(state) = &view.kind else {
+            panic!("expected a question picker");
+        };
+        assert_eq!(
+            state.focus,
+            QuestionFocus::Notes,
+            "paste switches to Notes focus"
+        );
+        assert_eq!(
+            state.progress[state.current].notes, "use the sqlite id, keep it reversible",
+            "the pasted text became the current question's note"
+        );
+        // Already in Notes focus → the composer IS the buffer, so the picker
+        // declines to special-route (normal composer paste takes over).
+        assert!(
+            !app.paste_into_active_picker("more"),
+            "a second paste while editing the note is left to the composer"
+        );
+    }
+
+    #[test]
     fn approving_the_plan_under_the_read_only_tier_promotes_to_guarded_execution() {
         // "批准并开始实施" must actually lead to implementation: under the
         // read-only Plan tier the approval used to be a dead letter (writes
@@ -636,7 +676,8 @@ impl PendingHostInputView {
 
     pub(crate) fn panel_height(&self) -> u16 {
         match self.kind {
-            HostInputKind::Generic => 1,
+            // label+summary row and the answer-key hint row (see `panel_lines`).
+            HostInputKind::Generic => 2,
             HostInputKind::GrokQuestion(_) => 6,
             HostInputKind::GrokPlan(_) | HostInputKind::FolderTrust(_) => 7,
         }
@@ -647,7 +688,24 @@ impl PendingHostInputView {
     /// lines here so an option cannot crowd the transcript off-screen.
     pub(crate) fn panel_lines(&self, lang: umadev_i18n::Lang) -> Vec<String> {
         match &self.kind {
-            HostInputKind::Generic => vec![self.summary.clone()],
+            // A refactor once collapsed this bar to the bare summary — no label,
+            // no answer keys, and a Secret question masked the composer to `•`
+            // with nothing explaining why. Restore the label chip, the key hint,
+            // and the masking notice (the three catalog keys had gone dead).
+            HostInputKind::Generic => {
+                let mut title = format!(
+                    "{} · {}",
+                    umadev_i18n::t(lang, "host.input.bar.label"),
+                    self.summary
+                );
+                if self.is_secret() {
+                    title.push_str(umadev_i18n::t(lang, "host.input.secret_suffix"));
+                }
+                vec![
+                    title,
+                    umadev_i18n::t(lang, "host.input.bar.hint").to_string(),
+                ]
+            }
             HostInputKind::GrokPlan(state) => {
                 let actions = [
                     umadev_i18n::t(lang, "host.grok.plan.approve"),
@@ -841,6 +899,56 @@ fn set_composer_text(app: &mut App, text: String) {
 fn save_question_notes(app: &mut App, state: &mut GrokQuestionState) {
     if state.focus == QuestionFocus::Notes {
         state.progress[state.current].notes = app.input.clone();
+    }
+}
+
+impl App {
+    /// Route a bracketed paste to the active specialized picker instead of the
+    /// dead composer. With a picker up, pasted text used to land in `app.input`,
+    /// which the picker never reads — the answer sat visible but ignored, Enter
+    /// said "requires a selection or note", and `c`/`s` became dead keys (guarded
+    /// on `input.is_empty()`). Now a paste into a focused question moves it to the
+    /// NOTES buffer (which IS read as the answer); a paste into the plan picker
+    /// opens its feedback editor. Returns `true` when the paste was consumed.
+    pub(crate) fn paste_into_active_picker(&mut self, pasted: &str) -> bool {
+        let Some(mut view) = self.pending_host_input.take() else {
+            return false;
+        };
+        if !view.specialized() {
+            self.pending_host_input = Some(view);
+            return false;
+        }
+        let consumed = match &mut view.kind {
+            HostInputKind::GrokQuestion(state) => {
+                // Already editing a note → the composer IS the buffer; let normal
+                // composer paste handle it. Otherwise adopt the paste AS the note.
+                if state.focus == QuestionFocus::Notes {
+                    false
+                } else {
+                    state.focus = QuestionFocus::Notes;
+                    let mut buffer = state.progress[state.current].notes.clone();
+                    buffer.push_str(pasted);
+                    set_composer_text(self, buffer.clone());
+                    state.progress[state.current].notes = buffer;
+                    true
+                }
+            }
+            HostInputKind::GrokPlan(state) => {
+                if state.editing_feedback {
+                    false
+                } else {
+                    state.editing_feedback = true;
+                    state.cursor = Some(1);
+                    set_composer_text(self, pasted.to_string());
+                    true
+                }
+            }
+            // FolderTrust takes no free text; drop the paste with a visible note
+            // rather than stashing it in a composer the picker ignores.
+            HostInputKind::FolderTrust(_) | HostInputKind::Generic => false,
+        };
+        self.pending_host_input = Some(view);
+        consumed
     }
 }
 

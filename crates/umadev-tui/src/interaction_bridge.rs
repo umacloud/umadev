@@ -133,7 +133,20 @@ pub(super) fn host_request_summary(request: &umadev_runtime::HostRequest) -> Str
 /// printed because vendor fields may contain sensitive material.
 pub(super) fn host_request_note(request: &umadev_runtime::HostRequest) -> String {
     match request {
-        umadev_runtime::HostRequest::UserInput { questions, .. } => {
+        umadev_runtime::HostRequest::UserInput {
+            questions,
+            metadata,
+        } => {
+            // A contract-driven ask is answered through the SPECIALIZED PICKER,
+            // which owns every bare key — typed free-form text is never read.
+            // Teaching the free-form protocol for those asks sent users typing
+            // "A" + Enter into a picker that cannot see it (the reported
+            // invalid-response loop); the tail instruction must match the real
+            // input surface.
+            let contract_picker = metadata
+                .get("responseContract")
+                .and_then(serde_json::Value::as_str)
+                .is_some();
             let mut out = String::from("[input] ");
             if questions.len() > 1 {
                 out.push_str("The base is waiting for structured answers:\n");
@@ -158,7 +171,11 @@ pub(super) fn host_request_note(request: &umadev_runtime::HostRequest) -> String
                     }
                 }
             }
-            if questions.len() > 1 {
+            if contract_picker {
+                out.push_str(
+                    "\nAnswer in the picker above the input box (↑↓ move · Space select · Enter confirm · Tab note) — typed free-form text is not read there.",
+                );
+            } else if questions.len() > 1 {
                 out.push_str(
                     "\nReply with one line per question, or a JSON object keyed by question id.",
                 );
@@ -880,6 +897,19 @@ async fn await_user_approval_with_auto_release(
     // unroutable wait).
     match holder.lock() {
         Ok(mut g) => {
+            // Supersede, never silently drop: overwriting a still-parked older
+            // approval used to close its channel, so that waiter resolved to a
+            // SILENT fail-open DENY — the base saw "User rejected" for an ask
+            // the user never even saw (the approval twin of the host-input
+            // supersede). The newest ask from a serially-asking base is the
+            // live one; say the old one was superseded so a rejection the base
+            // reports is never a mystery.
+            if g.take().is_some() {
+                sink.emit(EngineEvent::Note(
+                    "[note] a newer approval request superseded the earlier unanswered one (it was declined safely)"
+                        .to_string(),
+                ));
+            }
             *g = Some(PendingApproval {
                 reply_tx: tx,
                 action: action.to_string(),
