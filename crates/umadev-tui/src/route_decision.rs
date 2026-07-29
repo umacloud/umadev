@@ -66,6 +66,20 @@ pub(super) enum RouteDecision {
         base_session_id: Option<String>,
         base_resume_identity: Option<BaseResumeIdentity>,
     },
+    /// A resident turn ended WITHOUT completing its work — the user/base
+    /// interrupted it, or the base parked awaiting the user's typed answer.
+    /// Settles bookkeeping exactly like [`RouteDecision::AgenticDone`] (thinking
+    /// clears, session ids re-pin, the queue drains) but the transcript line is
+    /// honest — these turns previously emitted an empty `AgenticDone`, which the
+    /// settle path rendered as "[agentic] 完成。" while the ledger said cancelled
+    /// (the reported 完成 ≠ delivered confusion).
+    AgenticStopped {
+        /// i18n key for the honest stop line
+        /// (`agentic.interrupted` / `agentic.awaiting_answer`).
+        message_key: &'static str,
+        base_session_id: Option<String>,
+        base_resume_identity: Option<BaseResumeIdentity>,
+    },
     /// A host-owned Git transaction settled without touching resident state.
     HostGitDone {
         result: std::result::Result<String, String>,

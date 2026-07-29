@@ -4433,15 +4433,13 @@ async fn director_build_stream_fires_hardgate_on_phantom_build() {
         saw_sentinel,
         "a director-build that claimed code but wrote zero source must abort honestly"
     );
-    // The turn still terminates cleanly (the gate is an honest note, not a
-    // panic), and carries `director_build: true` back so the event loop drives
-    // the Wave-5 session hand-back.
+    // The hard-gate is an OBJECTIVE terminal rejection: the route settles as
+    // Failed (mirroring the /run path), never an AgenticDone that would print
+    // "[agentic] 完成。" right under the loud "判为未完成" abort note — the
+    // reported contradiction. The reason carries the gate text sans sentinel.
     assert!(matches!(
         route_rx.try_recv(),
-        Ok(RouteDecision::AgenticDone {
-            director_build: true,
-            ..
-        })
+        Ok(RouteDecision::Failed(reason)) if !reason.starts_with(ABORT_SENTINEL)
     ));
 }
 
@@ -10937,8 +10935,14 @@ async fn interactive_askuserquestion_parks_and_waits_same_session() {
         "the base is driven exactly once — no re-emit of the question"
     );
     assert!(
-        matches!(route_rx.try_recv(), Ok(RouteDecision::AgenticDone { .. })),
-        "the parked turn settles (thinking clears), awaiting the user's reply"
+        matches!(
+            route_rx.try_recv(),
+            Ok(RouteDecision::AgenticStopped {
+                message_key: "agentic.awaiting_answer",
+                ..
+            })
+        ),
+        "the parked turn settles honestly as awaiting the user's reply — never a false 完成"
     );
 }
 

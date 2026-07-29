@@ -6846,8 +6846,15 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         Some(umadev_i18n::t(app.lang, "tui.hint.budget_paused").into())
     } else if app.aborted {
         // Aborted round — the hint must match the `[aborted]` status, not the
-        // "wait for the next gate" line a live run shows.
-        Some(umadev_i18n::t(app.lang, "tui.hint.aborted").into())
+        // "wait for the next gate" line a live run shows. When the settle left a
+        // resumable plan (the frozen checklist says "/continue 继续"), advising
+        // "re-enter your requirement" here contradicted the panel on the SAME
+        // screen — split on the frozen-plan truth.
+        if app.plan_frozen {
+            Some(umadev_i18n::t(app.lang, "tui.hint.aborted_resumable").into())
+        } else {
+            Some(umadev_i18n::t(app.lang, "tui.hint.aborted").into())
+        }
     } else if app.run_started {
         Some(umadev_i18n::t(app.lang, "tui.hint.running").into())
     } else {
@@ -6985,7 +6992,13 @@ fn input_placeholder(app: &App) -> std::borrow::Cow<'static, str> {
         // The round bailed — tell the user to re-enter a requirement, NOT that a
         // run is still in flight (which the bare `run_started` branch below would
         // wrongly imply, since `run_started` stays set on an aborted block).
-        umadev_i18n::t(app.lang, "input.aborted").into()
+        // Resumable split: with a frozen plan on screen, /continue is the honest
+        // primary affordance (the repair-resume re-drives the blocked steps).
+        if app.plan_frozen {
+            umadev_i18n::t(app.lang, "input.aborted_resumable").into()
+        } else {
+            umadev_i18n::t(app.lang, "input.aborted").into()
+        }
     } else if app.degraded {
         // The block ended TERMINALLY short of delivery on placeholder templates /
         // a failed hard gate — point at `/redo`, NOT the bare `run_started`

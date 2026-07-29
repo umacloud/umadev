@@ -7400,6 +7400,12 @@ impl App {
             CmdGroup::Pipeline,
             "tui.cmd.plan",
         ),
+        // `/queue` opens the base's native prompt-queue pane. The Ctrl+; / Ctrl+'
+        // chords remain, but most legacy terminals (Terminal.app, ConPTY, VS Code
+        // default) cannot ENCODE Ctrl+punctuation at all — without this command
+        // the whole pane (select / reorder / delete / edit / interject) was
+        // unreachable there, and the chord was documented nowhere.
+        Self::cmd("queue", &[], None, CmdGroup::Pipeline, "tui.cmd.queue"),
         Self::cmd(
             "continue",
             &[],
@@ -11218,6 +11224,13 @@ impl App {
         self.thinking = false;
         self.thinking_started = None;
         self.agentic_in_flight = false;
+        // A turn that failed MID-TOOL must also clear the tool-in-flight markers —
+        // every sibling terminal recorder does. Leaving `tool_in_progress` set kept
+        // the meta hint on "[wait] 流水线运行中 — 等待下一个闸门" (and the input
+        // placeholder on "运行中 — 消息会排队") right next to "[aborted] 本轮已中止"
+        // — the reported contradictory status row — for a turn that was already dead.
+        self.tool_in_progress = false;
+        self.stream_tool_batch = None;
         // P5c: close any open reasoning block on a failed/aborted route.
         self.collapse_thinking_block();
         // P5a: a failed/aborted route ends any in-flight stream — drop its cache.
@@ -11332,14 +11345,15 @@ impl App {
     /// turn INSIDE the spawned task — after the slow brain-router consult — so the
     /// event loop no longer knows the class before dispatch. The build-ness rides
     /// the terminal decision instead, and drives the Wave-5 session hand-back here.
-    pub(crate) fn record_agentic_done(
+    /// The field-clearing + session-id-pinning shared by every agentic settle
+    /// (clean [`Self::record_agentic_done`] and honest-stop
+    /// [`Self::record_agentic_stopped`]), so a stopped turn can never leave a
+    /// stale spinner/tool marker or lose the resumable base id.
+    fn settle_agentic_bookkeeping(
         &mut self,
-        reply: String,
-        director_build: bool,
         base_session_id: Option<String>,
         base_resume_identity: Option<BaseResumeIdentity>,
     ) {
-        let compacted = self.stream_compacted.take();
         // Feature A — a long agentic turn just settled; alert the (possibly away)
         // user. Arm BEFORE clearing `thinking_started`, gated on its elapsed.
         self.arm_completion_bell(self.thinking_started);
@@ -11370,15 +11384,49 @@ impl App {
         self.reset_stream_md_cache();
         // Wave 5 deliverable 2 — unify chat ↔ director memory. The exact native
         // session id arrived in `base_session_id` above and is now pinned on App;
-        // this one-shot flag tells the next turn not to mint a competing id. Only a
-        // real director build sets it (plain chat / explain / quick-edit carry
-        // `director_build = false`). Bases without resume support fall back to the
-        // bounded UmaDev transcript. The in-flight marker is always cleared.
+        // this one-shot flag tells the next turn not to mint a competing id.
+        // Bases without resume support fall back to the bounded UmaDev
+        // transcript. The in-flight marker is always cleared.
         self.director_run_in_flight = false;
         // A settled run is no longer parked at any gate (safety: a stale pause
         // marker must never survive into the next run's routing).
         self.director_gate_paused = false;
         self.pending_director_gate = None;
+    }
+
+    /// An interrupted / parked resident turn: settle every in-flight marker and
+    /// re-pin the resumable session exactly like a clean finish, but say what
+    /// actually happened. These turns previously flowed through the empty-reply
+    /// `record_agentic_done` branch and printed "[agentic] 完成。" while the task
+    /// ledger recorded cancelled — the reported 完成 ≠ delivered confusion.
+    pub(crate) fn record_agentic_stopped(
+        &mut self,
+        message_key: &'static str,
+        base_session_id: Option<String>,
+        base_resume_identity: Option<BaseResumeIdentity>,
+    ) {
+        self.stream_compacted = None;
+        self.settle_agentic_bookkeeping(base_session_id, base_resume_identity);
+        // The turn stopped; its task row (when any) settles as Stopped — never Done.
+        self.mark_active_task(TaskStatus::Stopped);
+        self.refresh_status();
+        let marker = umadev_i18n::t(self.lang, message_key).to_string();
+        self.push(ChatRole::System, marker.clone());
+        // Durability parity with the tool-only completion branch: record + persist
+        // so a relaunch restores the honest stop line, not a dangling user turn.
+        self.record_turn("assistant", marker);
+        self.persist_chat();
+    }
+
+    pub(crate) fn record_agentic_done(
+        &mut self,
+        reply: String,
+        director_build: bool,
+        base_session_id: Option<String>,
+        base_resume_identity: Option<BaseResumeIdentity>,
+    ) {
+        let compacted = self.stream_compacted.take();
+        self.settle_agentic_bookkeeping(base_session_id, base_resume_identity);
         if director_build {
             self.run_session_handed_to_chat = true;
             // The director build settled cleanly → mark its task Done.
@@ -13215,6 +13263,22 @@ impl App {
             "goal" => self.slash_goal(rest),
             "quick" => self.slash_quick(rest),
             "plan" => self.slash_plan(rest),
+            "queue" => {
+                // Slash entry for the native prompt-queue pane: the Ctrl+;/Ctrl+'
+                // chords cannot be ENCODED on most legacy terminals, which left
+                // the whole pane unreachable there. toggle() refuses (false) when
+                // the session exposes no native queue — say so instead of a dead
+                // keypress.
+                if self.prompt_queue.toggle() {
+                    self.request_full_repaint();
+                } else {
+                    self.push(
+                        ChatRole::System,
+                        umadev_i18n::t(self.lang, "queue.unavailable").to_string(),
+                    );
+                }
+                Action::None
+            }
             "status" => {
                 self.open_status_overlay();
                 Action::None

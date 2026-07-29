@@ -3008,7 +3008,20 @@ async fn drive_agentic_stream(
                 if let Some(note) =
                     director_source_hardgate(project_root, &reply, source_obligation)
                 {
-                    sink.emit(EngineEvent::Note(note));
+                    // Objective terminal rejection, not an advisory (the same
+                    // hazard the /run path documents and fixed): emitting
+                    // AgenticDone after this abort note let the event loop mark
+                    // the task Failed and then print "[agentic] 完成。" right
+                    // under the loud "判为未完成" — the reported contradiction.
+                    // Keep the sentinel note for the aborted UI state, then
+                    // settle the route honestly as Failed and STOP.
+                    sink.emit(EngineEvent::Note(note.clone()));
+                    let reason = note
+                        .strip_prefix(ABORT_SENTINEL)
+                        .unwrap_or(note.as_str())
+                        .to_string();
+                    let _ = route_tx.send(RouteDecision::Failed(reason));
+                    return;
                 }
             }
             // Wave 5 / G11: offline chat must never read as silence. When the brain
@@ -4195,7 +4208,15 @@ fn first_chat_directive(
     let scoped = scoped_chat_directive(directive_text, route);
     let with_history = director_directive_with_history(conversation, current_text, scoped);
     match firmware {
-        Some(fw) if backend != "claude-code" => format!("{fw}\n\n---\n\n{with_history}"),
+        // claude gets the firmware natively via --append-system-prompt, and
+        // grok-build receives the IDENTICAL bytes as session/new `_meta.rules`
+        // (folded into its <human_rules> system section) — prefixing it again
+        // here sent the whole firmware twice in one prompt on every first grok
+        // turn. The CLI's firmware_requires_directive_prefix already excludes
+        // both; keep the surfaces consistent.
+        Some(fw) if backend != "claude-code" && backend != "grok-build" => {
+            format!("{fw}\n\n---\n\n{with_history}")
+        }
         _ => with_history,
     }
 }
@@ -5991,13 +6012,15 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                             // returned to the input loop. Its answer is dispatched
                             // as a new resident entry, so settle this writer as
                             // stopped instead of leaving an orphaned Waiting task.
+                            // Honest settle: the base is WAITING for the user's
+                            // typed answer — printing "完成" here was the reported
+                            // "why did it stop?" confusion.
                             cancel_entry_task(
                                 &mut entry_task,
                                 "base requested user input; continuation is a new resident turn",
                             );
-                            let _ = route_tx.send(RouteDecision::AgenticDone {
-                                reply: String::new(),
-                                director_build: false,
+                            let _ = route_tx.send(RouteDecision::AgenticStopped {
+                                message_key: "agentic.awaiting_answer",
                                 base_session_id,
                                 base_resume_identity,
                             });
@@ -6390,9 +6413,12 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                                     &mut entry_task,
                                     "user or base interrupted the resident turn",
                                 );
-                                let _ = route_tx.send(RouteDecision::AgenticDone {
-                                    reply: String::new(),
-                                    director_build: false,
+                                // Honest settle: the ledger just recorded a CANCEL —
+                                // the transcript must not say "完成". AgenticStopped
+                                // clears thinking + re-pins the session exactly like
+                                // a clean finish, with a truthful stop line.
+                                let _ = route_tx.send(RouteDecision::AgenticStopped {
+                                    message_key: "agentic.interrupted",
                                     base_session_id,
                                     base_resume_identity,
                                 });
@@ -10969,6 +10995,44 @@ async fn event_loop(
                 // Director failures clear the stale chat dedup key and preserve
                 // the whole FIFO. This keeps accidental chat double-Enter from
                 // auto-replaying without sacrificing post-Director messages.
+                Some(RouteDecision::AgenticStopped {
+                    message_key,
+                    base_session_id,
+                    base_resume_identity,
+                }) => {
+                    let was_run = app.director_run_in_flight;
+                    // Same stale-ask cleanup as every terminal settle.
+                    clear_pending_host_input(&host_input_holder);
+                    clear_pending_approval(&approval_holder);
+                    app.record_agentic_stopped(message_key, base_session_id, base_resume_identity);
+                    if was_run {
+                        surface_unsent_steer(app, &steer_holder);
+                        refresh_resident_chat_after_run(
+                            app,
+                            &chat_session_holder,
+                            &pending_ask_holder,
+                        )
+                        .await;
+                    }
+                    // The queue still drains: a stopped turn releases the writer,
+                    // and parked follow-ups keep their existing fire-on-settle
+                    // semantics (an ESC that should also drop the queue already
+                    // goes through the cancel path, which clears it).
+                    run_task = drain_next_queued_chat(
+                        app,
+                        &chat_session_holder,
+                        &session_holder,
+                        &pending_ask_holder,
+                        &approval_holder,
+                        &host_input_holder,
+                        &steer_holder,
+                        &live_input_hub,
+                        &sink,
+                        &route_tx,
+                    );
+                    needs_redraw = true;
+                    draw_now = true;
+                }
                 Some(RouteDecision::Failed(note)) => {
                     let was_run = app.director_run_in_flight;
                     // Same stale-ask cleanup as the AgenticDone settle: a failed

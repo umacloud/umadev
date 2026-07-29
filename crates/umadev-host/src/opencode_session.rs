@@ -129,7 +129,6 @@ const MAX_TRACKED_MESSAGE_ROLES: usize = 512;
 /// that never ran.
 struct TurnSse {
     gate: AtomicU8,
-    content_seen: std::sync::atomic::AtomicBool,
 }
 
 type TurnSseGate = Arc<TurnSse>;
@@ -141,7 +140,6 @@ impl TurnSse {
     fn unarmed() -> TurnSseGate {
         Arc::new(Self {
             gate: AtomicU8::new(SSE_TURN_UNARMED),
-            content_seen: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -150,14 +148,11 @@ impl TurnSse {
     fn active_for_tests() -> TurnSseGate {
         Arc::new(Self {
             gate: AtomicU8::new(SSE_TURN_ACTIVE),
-            content_seen: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// A prompt was just sent: arm the gate and reset the per-turn content flag.
+    /// A prompt was just sent: arm the gate.
     fn arm(&self) {
-        self.content_seen
-            .store(false, std::sync::atomic::Ordering::Release);
         self.gate.store(SSE_TURN_ARMED, Ordering::Release);
     }
 
@@ -189,26 +184,28 @@ impl TurnSse {
         self.gate.swap(SSE_TURN_UNARMED, Ordering::AcqRel) != SSE_TURN_UNARMED
     }
 
-    /// Record content-bearing activity for the armed/active turn. A stale replay
-    /// while UNARMED never counts.
-    fn note_content(&self, events: &[SessionEvent]) {
-        if self.gate.load(Ordering::Acquire) == SSE_TURN_UNARMED {
-            return;
+    /// Content-bearing activity is the SAME evidence a busy edge carries: the
+    /// armed turn is running. Promote ARMED → ACTIVE on the first such event —
+    /// behaviorally identical to the earlier corroborated-idle acceptance, but it
+    /// ALSO restores real usage capture for a turn whose busy edge was
+    /// coalesced/dropped (`capture_usage` keys off ACTIVE; the first rescue
+    /// shipped the turn with `usage: None` and the gauge fell to the estimate).
+    /// Returns `true` when THIS call performed the promotion, so the pump can
+    /// begin the usage-attribution turn exactly once. A stale replay while
+    /// UNARMED never promotes (the compare-exchange refuses).
+    fn note_content(&self, events: &[SessionEvent]) -> bool {
+        if !events.iter().any(is_content_bearing_event) {
+            return false;
         }
-        if events.iter().any(is_content_bearing_event) {
-            self.content_seen
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
+        self.activate_on_busy()
     }
 
-    /// May a `Completed` (idle) settle the turn? The normal path is the observed
-    /// busy edge (ACTIVE → UNARMED). The corroborated path accepts a first idle
-    /// that arrived while still ARMED — the busy edge was coalesced/dropped —
-    /// but ONLY once real content was seen for this arming, so an initial or
-    /// delayed idle with no activity behind it still leaves the gate armed.
+    /// May a `Completed` (idle) settle the turn? Only an ACTIVE turn — reached
+    /// via the official busy/retry edge OR the first content-bearing event
+    /// (`note_content`) — accepts an idle. An initial or delayed idle with no
+    /// activity behind it still leaves the gate armed for the real sequence.
     fn complete_on_idle(&self) -> bool {
-        if self
-            .gate
+        self.gate
             .compare_exchange(
                 SSE_TURN_ACTIVE,
                 SSE_TURN_UNARMED,
@@ -216,19 +213,6 @@ impl TurnSse {
                 Ordering::Acquire,
             )
             .is_ok()
-        {
-            return true;
-        }
-        self.content_seen.load(std::sync::atomic::Ordering::Acquire)
-            && self
-                .gate
-                .compare_exchange(
-                    SSE_TURN_ARMED,
-                    SSE_TURN_UNARMED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
     }
 }
 
@@ -2386,9 +2370,13 @@ async fn pump_sse_with_ready(
                 &mut tracker,
                 capture_usage,
             );
-            // Record content-bearing activity for the armed/active turn — the
-            // corroboration that lets a coalesced-busy idle complete it.
-            turn_sse_gate.note_content(&events);
+            // Content-bearing activity promotes ARMED → ACTIVE (the same evidence
+            // a busy edge carries) so a coalesced-busy turn both completes on its
+            // idle AND captures its real usage. A promotion is the turn boundary
+            // for usage attribution, exactly like the busy edge above.
+            if turn_sse_gate.note_content(&events) {
+                tracker.begin_turn();
+            }
             if !forward_open_code_events(
                 &http,
                 &session_id,
@@ -4311,18 +4299,25 @@ mod tests {
             usage: None,
         };
         gate.arm();
-        gate.note_content(&[SessionEvent::TextDelta("answer text".to_string())]);
+        assert!(
+            gate.note_content(&[SessionEvent::TextDelta("answer text".to_string())]),
+            "the first content-bearing event promotes the armed turn (usage capture on)"
+        );
+        assert!(
+            gate.is_active(),
+            "content promotion reaches ACTIVE so real usage frames are captured"
+        );
         assert!(
             terminal_event_belongs_to_armed_turn(&done, &gate),
-            "content-corroborated idle completes the armed turn without a busy edge"
+            "content-corroborated idle completes the turn without a busy edge"
         );
         assert!(
             !terminal_event_belongs_to_armed_turn(&done, &gate),
             "the corroborated completion is consumed exactly once"
         );
 
-        // Re-arming resets the content flag: the NEXT turn's premature idle is
-        // still dropped until that turn shows its own content or busy edge.
+        // Re-arming starts fresh: the NEXT turn's premature idle is still dropped
+        // until that turn shows its own content or busy edge.
         gate.arm();
         assert!(
             !terminal_event_belongs_to_armed_turn(&done, &gate),
@@ -4330,7 +4325,10 @@ mod tests {
         );
 
         // Non-content events (state updates / model reports) are not corroboration.
-        gate.note_content(&[SessionEvent::SessionModel("m".to_string())]);
+        assert!(
+            !gate.note_content(&[SessionEvent::SessionModel("m".to_string())]),
+            "a state-only frame never promotes"
+        );
         assert!(
             !terminal_event_belongs_to_armed_turn(&done, &gate),
             "a state-only frame is not proof the turn ran"
@@ -4338,7 +4336,10 @@ mod tests {
 
         // Content replayed while UNARMED never counts toward a future turn.
         gate.disarm();
-        gate.note_content(&[SessionEvent::TextDelta("stale replay".to_string())]);
+        assert!(
+            !gate.note_content(&[SessionEvent::TextDelta("stale replay".to_string())]),
+            "replayed content before arming never promotes"
+        );
         gate.arm();
         assert!(
             !terminal_event_belongs_to_armed_turn(&done, &gate),

@@ -61,6 +61,7 @@
 "model.reasoning" = "思考強度 {}(底座設定,umadev 不覆寫)"
 "input.idle" = "問我任何事…"
 "input.aborted" = "本輪已中止 —— 重新輸入需求再試"
+"input.aborted_resumable" = "本輪已停止 —— /continue 續跑,或輸入新需求"
 "input.budget_paused" = "[paused] /continue 續跑剩餘步驟,或輸入新需求"
 "input.degraded" = "本輪降級/未完成 —— 修好底座後用 /redo 重跑拿真實產物"
 # 閒置輸入框的輪換佔位:範例需求（呼應歡迎語範例）+ 指令提示,每次送出後輪換一條;
@@ -1059,6 +1060,7 @@
 "tui.hint.finished" = "[ok] 已完成 —— 輸入新需求可重新開始"
 "tui.hint.running" = "[wait] 流水線執行中 —— 等待下一個閘門"
 "tui.hint.aborted" = "[aborted] 本輪已停止 —— 重新輸入需求再啟動"
+"tui.hint.aborted_resumable" = "[aborted] 本輪已停止 —— /continue 續跑,或輸入新需求"
 "tui.hint.budget_paused" = "[paused] 已到時間上限 —— 輸入 /continue 續跑剩餘步驟"
 # 斜線命令面板浮層標題
 "tui.palette.title" = "斜線命令"
@@ -1197,6 +1199,8 @@
 "tui.cmd.thinking" = "查看或切換 Kimi 目前模型的原生思考狀態"
 "tui.cmd.goal" = "設定目標 — 讓底座持續工作直到達成"
 "tui.cmd.plan" = "檢視 / 調度即時計畫"
+"tui.cmd.queue" = "打開底座原生訊息佇列面板(也可 Ctrl+; 或 Ctrl+')"
+"queue.unavailable" = "[note] 當前底座會話沒有原生訊息佇列(僅 Grok Build 提供);本地排隊訊息見輸入框上方的常駐預覽。"
 "tui.cmd.checkpoint" = "快照工作區檔案"
 "tui.cmd.cancel" = "停止正在執行的流水線 / 智慧體回合"
 "tui.cmd.adopt" = "接管既有專案(辨識技術棧、索引原始碼、反推契約)"
@@ -1229,6 +1233,8 @@
 "agentic.inspecting" = "[agentic] 正在檢視儲存庫…"
 "agentic.working_on" = "[agentic] 正在處理:{}"
 "agentic.done" = "[agentic] 完成。"
+"agentic.interrupted" = "[stopped] 本輪已中斷 — 輸入 /continue 續跑,或直接輸入新指令。"
+"agentic.awaiting_answer" = "[wait] 底座在等你的回答 — 直接輸入即可,回車送出。"
 "stream.compacted" = "[提示] 為限制記憶體占用，已合併 {} 則中間即時進度；上方已恢復完整最終回覆。"
 # 斜線命令內聯輸出(app.rs)
 "slash.history_cleared" = "對話歷史已清空。"

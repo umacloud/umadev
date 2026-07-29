@@ -1445,10 +1445,16 @@ async fn chat_session_interrupt_parks_session_for_reuse() {
         "interrupt does NOT close the resident session"
     );
     match route_rx.try_recv() {
-        Ok(RouteDecision::AgenticDone { director_build, .. }) => {
-            assert!(!director_build, "an interrupted turn settles as a chat");
+        // Honest settle: an interrupted turn is STOPPED, never "done" — the old
+        // empty AgenticDone printed "[agentic] 完成。" while the ledger recorded
+        // a cancel (the reported 完成 ≠ delivered confusion).
+        Ok(RouteDecision::AgenticStopped { message_key, .. }) => {
+            assert_eq!(
+                message_key, "agentic.interrupted",
+                "the stop line says interrupted, not done"
+            );
         }
-        other => panic!("expected AgenticDone, got {other:?}"),
+        other => panic!("expected AgenticStopped, got {other:?}"),
     }
 }
 

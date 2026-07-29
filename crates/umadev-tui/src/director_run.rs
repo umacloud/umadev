@@ -370,7 +370,14 @@ pub(super) async fn run_director_loop(
         // the directive is unchanged. See `director_directive_with_history`.
         let goal = director_directive_with_history(&conversation, &options.requirement, goal);
         let directive = match firmware.as_deref() {
-            Some(fw) if backend != "claude-code" || reused_resident => {
+            // grok-build receives the identical firmware natively via session/new
+            // `_meta.rules` — prefixing it again doubled the bytes in every
+            // director build's first directive (claude likewise gets it via
+            // --append-system-prompt, except when REUSING a resident session
+            // whose spawn args this run does not control).
+            Some(fw)
+                if (backend != "claude-code" && backend != "grok-build") || reused_resident =>
+            {
                 format!("{fw}\n\n---\n\n{goal}")
             }
             _ => goal,
