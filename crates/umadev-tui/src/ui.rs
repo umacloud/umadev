@@ -2884,7 +2884,11 @@ fn render_chat(frame: &mut Frame, app: &App) {
     let prompt_h = prompt_block_height(&rendered_input, inner.width, mode_prefix_width(app))
         .min(inner.height.saturating_sub(3 + approval_h))
         .max(2);
-    let queue_h = app.prompt_queue.panel_height().min(
+    // One queue slot, two sections: the base's NATIVE prompt queue (when the
+    // base exposes one) plus the LOCAL parked messages (steer + deferred chat) —
+    // pinned above the prompt so a queued message stays visible the whole time
+    // it waits instead of scrolling away as a one-off note.
+    let queue_h = (app.prompt_queue.panel_height() + local_queue_panel_height(app)).min(
         inner
             .height
             .saturating_sub(1 + 3 + 1 + prompt_h + approval_h),
@@ -2978,17 +2982,61 @@ fn render_chat(frame: &mut Frame, app: &App) {
 
 /// Render at most three rows from the base's complete prompt-queue snapshot.
 /// Pending mutations keep the old rows visible until a replacement arrives.
+/// Rows the LOCAL queued-message preview needs: a title plus up to three parked
+/// messages. Zero when nothing is locally parked (the native base queue sizes
+/// its own section via `prompt_queue.panel_height`).
+fn local_queue_panel_height(app: &App) -> u16 {
+    let (rows, _total) = app.queued_preview();
+    if rows.is_empty() {
+        0
+    } else {
+        1 + u16::try_from(rows.len()).unwrap_or(3)
+    }
+}
+
 fn render_prompt_queue(frame: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Section 1 — the base's NATIVE prompt queue (absent when the base has none).
+    if app.prompt_queue.panel_height() > 0 {
+        render_native_prompt_queue_lines(app, area, &mut lines);
+    }
+    // Section 2 — the LOCAL parked messages (steer + deferred chat): visible the
+    // whole time they wait, instead of a one-off note that scrolls away.
+    let (rows, total) = app.queued_preview();
+    if !rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            umadev_i18n::tf(app.lang, "queue.local.title", &[&total.to_string()]),
+            Style::default()
+                .fg(theme::WARNING())
+                .add_modifier(Modifier::BOLD),
+        )));
+        for row in rows {
+            lines.push(Line::from(Span::styled(
+                truncate_to_width_cjk(&format!("  · {row}"), usize::from(area.width)),
+                Style::default().fg(theme::TEXT_MUTED()),
+            )));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme::BG_ELEMENT())),
+        area,
+    );
+}
+
+/// The native prompt-queue section lines (title + visible entries + hint) —
+/// the pre-existing panel body, factored out so the unified queue slot can
+/// stack it above the local parked-message section.
+fn render_native_prompt_queue_lines(app: &App, area: Rect, lines: &mut Vec<Line<'static>>) {
     let count = app.prompt_queue.entries().len().to_string();
     let pending = if app.prompt_queue.awaiting_snapshot() {
         format!(" · {}", umadev_i18n::t(app.lang, "prompt_queue.pending"))
     } else {
         String::new()
     };
-    let mut lines = vec![Line::from(vec![
+    lines.push(Line::from(vec![
         Span::styled(
             umadev_i18n::tf(app.lang, "prompt_queue.title", &[&count]),
             Style::default()
@@ -2996,7 +3044,7 @@ fn render_prompt_queue(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(pending, Style::default().fg(theme::WARNING())),
-    ])];
+    ]));
     for entry in app.prompt_queue.visible_entries() {
         let selected = app.prompt_queue.selected_id() == Some(entry.id.as_str());
         let marker = if selected { "› " } else { "  " };
@@ -3027,10 +3075,6 @@ fn render_prompt_queue(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Style::default().fg(theme::TEXT_MUTED()),
     )));
-    frame.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(theme::BG_ELEMENT())),
-        area,
-    );
 }
 
 /// A2#5 — render the STICKY approval bar: one warning-colored row pinned
@@ -9937,6 +9981,48 @@ mod tests {
         assert!(
             !render_to_string(&app).contains("queued"),
             "the chip must disappear once the queue empties"
+        );
+    }
+
+    #[test]
+    fn queued_messages_render_a_persistent_preview_above_the_prompt() {
+        // The reported gap: a parked message was announced by a one-off note that
+        // scrolled away, leaving only a bare count — the user could not SEE what
+        // was queued. The preview panel pins the parked texts above the prompt
+        // for the whole time they wait: steer first (fires at the next step
+        // boundary), then deferred chat, with the title carrying the total.
+        let mut app = app_with(Some("offline"));
+        app.queued_steer.push_back("按钮改成蓝色".into());
+        app.queued_chat.push_back("再做一个登录页".into());
+        // The cell grid renders each wide CJK glyph with a continuation-cell
+        // space, so compare whitespace-stripped text.
+        let flat: String = render_to_string(&app)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            flat.contains("已排队2条"),
+            "the preview title shows the total queued count: {flat}"
+        );
+        assert!(
+            flat.contains("[steer]按钮改成蓝色"),
+            "the parked steer text stays visible while it waits: {flat}"
+        );
+        assert!(
+            flat.contains("再做一个登录页"),
+            "the parked chat text stays visible while it waits: {flat}"
+        );
+
+        // Draining the queue removes the panel entirely (no residue).
+        app.queued_steer.clear();
+        let _ = app.take_next_queued_chat();
+        let drained: String = render_to_string(&app)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !drained.contains("已排队"),
+            "the preview disappears once nothing is parked"
         );
     }
 

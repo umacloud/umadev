@@ -293,6 +293,7 @@
 "input.steer.director_deferred" = "附件不能進入 Director 的純文字步驟邊界 steer 通道；已完整延後為下一輪模型輸入。"
 "input.steer.gate_deferred" = "附件不是閘門核准或修訂文字；已完整延後到閘門結束後。"
 "prompt_queue.title" = "Grok 原生佇列 · {} 則"
+"queue.local.title" = "已排隊 {} 則 — 本輪結束後按序自動送出(輸入框空時按 ↑ 取回編輯)"
 "prompt_queue.pending" = "等待底座快照"
 "prompt_queue.hint" = "j/k 選擇 · x 刪除 · e/Enter 編輯 · J/K 排序 · Ctrl+Enter 立即傳送"
 "prompt_queue.awaiting_snapshot" = "佇列請求已傳送；等待底座完整快照確認…"

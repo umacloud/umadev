@@ -293,6 +293,7 @@
 "input.steer.director_deferred" = "附件不能进入 Director 的纯文本步骤边界 steer 通道；已完整延后为下一轮模型输入。"
 "input.steer.gate_deferred" = "附件不是门禁批准或修订文本；已完整延后到门禁结束后。"
 "prompt_queue.title" = "Grok 原生队列 · {} 条"
+"queue.local.title" = "已排队 {} 条 — 本轮结束后按序自动发送(输入框空时按 ↑ 取回编辑)"
 "prompt_queue.pending" = "等待底座快照"
 "prompt_queue.hint" = "j/k 选择 · x 删除 · e/Enter 编辑 · J/K 排序 · Ctrl+Enter 立即发送"
 "prompt_queue.awaiting_snapshot" = "队列请求已发送；等待底座完整快照确认…"

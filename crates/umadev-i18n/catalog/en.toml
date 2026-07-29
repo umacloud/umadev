@@ -299,6 +299,7 @@
 "input.steer.director_deferred" = "Attachments cannot enter the Director's text-only step-boundary steer lane; deferred intact as the next model turn."
 "input.steer.gate_deferred" = "Attachments are not gate approval or revision text; deferred intact until the gate settles."
 "prompt_queue.title" = "Grok native queue · {} item(s)"
+"queue.local.title" = "{} queued — sent in order once this turn settles (press ↑ on an empty input to recall)"
 "prompt_queue.pending" = "awaiting base snapshot"
 "prompt_queue.hint" = "j/k select · x delete · e/Enter edit · J/K reorder · Ctrl+Enter send now"
 "prompt_queue.awaiting_snapshot" = "Queue request sent; waiting for the base's complete snapshot…"

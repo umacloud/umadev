@@ -11942,6 +11942,28 @@ impl App {
         self.queued_chat.len() + self.queued_steer.len() + self.prompt_queue.entries().len()
     }
 
+    /// The LOCALLY parked messages (steer first — they fire at the next step
+    /// boundary of the live run — then ordinary deferred chat, FIFO), flattened
+    /// to single lines for the persistent queue preview pinned above the prompt.
+    /// Returns at most three rows plus the total count; the count lets the title
+    /// say "5 queued" while only the first three render. Native base-side queue
+    /// entries (`prompt_queue`) render in their own section and are not repeated
+    /// here. A one-off "[排队]" note scrolls away with the transcript — this
+    /// preview is what keeps the parked text VISIBLE the whole time it waits.
+    #[must_use]
+    pub fn queued_preview(&self) -> (Vec<String>, usize) {
+        let mut rows: Vec<String> = Vec::new();
+        for steer in &self.queued_steer {
+            rows.push(format!("[steer] {}", steer.replace(['\n', '\r'], " ")));
+        }
+        for chat in &self.queued_chat {
+            rows.push(chat.replace(['\n', '\r'], " "));
+        }
+        let total = rows.len();
+        rows.truncate(3);
+        (rows, total)
+    }
+
     /// A clone of the conversation memory to hand to a routed turn (Wave 5 / G11).
     /// The receiver (`drive_agentic_stream`) bounds it to a token budget before
     /// threading it into the request, so this is a plain clone of the live buffer.
