@@ -3178,13 +3178,33 @@ fn parse_result_usage(v: &Value) -> Option<Usage> {
 fn parse_control_request(v: &Value) -> Vec<SessionEvent> {
     let req = v.get("request");
     if req.and_then(|r| r.get("subtype")).and_then(Value::as_str) != Some("can_use_tool") {
-        return vec![]; // interrupt acks etc. — not an approval prompt
+        // interrupt acks etc. — not an approval prompt. Log an UNKNOWN subtype so
+        // a future control subtype we don't yet answer (hook_callback /
+        // mcp_message) is diagnosable from the transcript instead of silently
+        // blocking the base forever (the silent-drop class the opencode Unknown
+        // fallback already logs).
+        if let Some(sub) = req.and_then(|r| r.get("subtype")).and_then(Value::as_str) {
+            tracing::debug!(target: "claude_session", "unhandled control subtype `{sub}` dropped");
+        }
+        return vec![];
     }
     let req_id = v
         .get("request_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    if req_id.is_empty() {
+        // The reply path (`pending_control_from_frame`) refuses an empty id, so a
+        // can_use_tool with no request_id would surface an approval that can
+        // never be correlated or answered — a phantom picker over a base that
+        // then blocks on a control_response it will never receive. Drop it
+        // loudly rather than show an un-answerable prompt.
+        tracing::warn!(
+            target: "claude_session",
+            "can_use_tool control frame has no request_id — dropped"
+        );
+        return vec![];
+    }
     let action = req
         .and_then(|r| r.get("tool_name"))
         .and_then(Value::as_str)
@@ -4494,6 +4514,23 @@ mod tests {
                 target: "rm -rf /".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn can_use_tool_without_a_request_id_is_dropped_not_surfaced_uncorrelatable() {
+        // A can_use_tool with no request_id would surface an approval the reply
+        // path (which refuses an empty id) can never answer — a phantom picker
+        // over a base that then hangs. It must be dropped, not surfaced.
+        let line = r#"{"type":"control_request","request":{
+            "subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"}}}"#;
+        assert!(
+            parse_stdout_line(line).is_empty(),
+            "a request_id-less can_use_tool frame surfaces nothing"
+        );
+        // A non-can_use_tool control subtype is likewise not an approval prompt.
+        let ack =
+            r#"{"type":"control_request","request_id":"x","request":{"subtype":"interrupt"}}"#;
+        assert!(parse_stdout_line(ack).is_empty());
     }
 
     #[test]
