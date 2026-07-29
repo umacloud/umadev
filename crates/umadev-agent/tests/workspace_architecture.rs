@@ -7,7 +7,7 @@ use toml::Value;
 const HOTSPOT_LINES: &[(&str, usize)] = &[
     ("crates/umadev-tui/src/app.rs", 18_441),
     ("crates/umadev-tui/src/lib.rs", 11_830),
-    ("crates/umadev-agent/src/director_loop.rs", 7_044),
+    ("crates/umadev-agent/src/director_loop.rs", 7_106),
     ("crates/umadev-governance/src/rules.rs", 8_832),
 ];
 

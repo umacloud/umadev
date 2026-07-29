@@ -841,6 +841,7 @@
 "base.fail.exited" = "Base process exited (code {})"
 "base.fail.turn_failed" = "Base turn failed (no further detail) — retry, or switch base"
 "base.fail.idle" = "Base produced no output for {}s with no tool running — it looks hung, or the run budget was reached. While a tool is running UmaDev keeps waiting as long as the base stays alive; for the no-tool idle window raise UMADEV_IDLE_TIMEOUT_SECS, or retry or switch base"
+"workspace.out_of_scope_access" = "[note] The base accessed a file outside the workspace: {} (visibility only, not a block; if you meant to work only inside this project, consider narrowing scope)"
 # Visible retry: a transient base hiccup (429 / overloaded / network) is backed off and
 # retried with a COUNTDOWN (never a silent wait); a non-tool silent hang on a live base
 # is re-driven ONCE before failing. The "{}/{}" attempt/max is a stable marker.

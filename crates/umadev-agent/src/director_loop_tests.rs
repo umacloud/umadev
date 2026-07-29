@@ -9109,3 +9109,29 @@ fn file_contains_supports_a_relative_project_root() {
         EvidenceOutcome::Pass
     ));
 }
+
+#[test]
+fn absolute_paths_outside_the_workspace_are_flagged_others_ignored() {
+    let root = std::path::Path::new("/home/u/proj/2.0");
+    // The reported case: an absolute read into a sibling project escapes.
+    assert_eq!(
+        absolute_path_escapes_workspace(root, "/home/u/proj/1.5/src/main.rs").as_deref(),
+        Some("/home/u/proj/1.5/src/main.rs"),
+        "a sibling-project absolute path is flagged"
+    );
+    // `..` normalization catches an in-root prefix that climbs out.
+    assert_eq!(
+        absolute_path_escapes_workspace(root, "/home/u/proj/2.0/../1.5/x").as_deref(),
+        Some("/home/u/proj/1.5/x")
+    );
+    // A path inside the workspace is never flagged.
+    assert!(absolute_path_escapes_workspace(root, "/home/u/proj/2.0/src/a.rs").is_none());
+    // A relative path inside the workspace is never flagged.
+    assert!(absolute_path_escapes_workspace(root, "src/a.rs").is_none());
+    // A relative path that climbs OUT (base cwd == workspace) IS flagged.
+    assert_eq!(
+        absolute_path_escapes_workspace(root, "../1.5/x").as_deref(),
+        Some("/home/u/proj/1.5/x"),
+        "a relative parent-escape is caught too"
+    );
+}

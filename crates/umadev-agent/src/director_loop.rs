@@ -5806,6 +5806,15 @@ async fn drive_one_turn_with_backoff_and_memories(
     // requires before a green CLAIM is trusted to skip UmaDev's own build/test read. Reset
     // alongside `text` on a transient re-drive so it reflects only the FINAL attempt.
     let mut ran_build_tool = false;
+    // Cross-workspace ACCESS visibility (the reported "empty 2.0 dir but the base
+    // read ../1.5" surprise). Bases run with unscoped reads (claude Read is
+    // global; Auto bypasses everything), which is sometimes legitimate — but it
+    // must never be INVISIBLE. We observe each tool call's target path and emit a
+    // ONE-TIME note per distinct out-of-workspace path. Purely observational:
+    // nothing is blocked here (governance still owns the write verdict), so this
+    // is zero-risk and fail-open.
+    let mut out_of_workspace_seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     // Outstanding-background-agents guard (the premature-final-report fix): counts
     // the base's OWN background sub-agents still running (observed via the driver's
     // BackgroundTask frames + the "Async agent launched" tool_result fallback). A
@@ -6060,6 +6069,7 @@ async fn drive_one_turn_with_backoff_and_memories(
                     events.emit(EngineEvent::Note(surface.note));
                 }
                 record_tool_call_audit(options, &name, &detail, &input);
+                note_out_of_workspace_access(options, &input, &mut out_of_workspace_seen, events);
                 // P1: forward the structured before/after for a Write/Edit so the
                 // TUI can draw a live diff card on the DEFAULT loop (the user hit
                 // "no real-time feedback when writing code"). Fail-open: a
@@ -6509,6 +6519,58 @@ fn tool_call_target(input: &serde_json::Value) -> String {
         }
     }
     String::new()
+}
+
+/// Whether a tool-call path points outside `root`. The base's cwd IS the
+/// workspace, so a RELATIVE path is joined onto `root` first — then both cases
+/// normalize `..`/`.` lexically and check containment, so `/root/../other` and
+/// a relative `../other` are both caught. This is a lexical check (no filesystem
+/// touch, no symlink resolution) — a VISIBILITY signal, not a security boundary,
+/// so it must never block or error. A path that stays inside `root` returns None.
+fn absolute_path_escapes_workspace(root: &std::path::Path, raw: &str) -> Option<String> {
+    let raw_path = std::path::Path::new(raw);
+    let joined = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        root.join(raw_path)
+    };
+    let mut normalized = std::path::PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    (!normalized.starts_with(root)).then(|| normalized.display().to_string())
+}
+
+/// Emit a ONE-TIME visible note the first time a turn's tool call reads/writes a
+/// path outside the workspace. Observational only (governance still owns the
+/// write verdict); deduped per distinct escaping path via `seen`. Fail-open: a
+/// call with no path key, or a workspace-relative path, is silently ignored.
+fn note_out_of_workspace_access(
+    options: &RunOptions,
+    input: &serde_json::Value,
+    seen: &mut std::collections::HashSet<String>,
+    events: &Arc<dyn EventSink>,
+) {
+    let Some(raw) = ["file_path", "path"]
+        .iter()
+        .find_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
+    else {
+        return;
+    };
+    if let Some(escaped) = absolute_path_escapes_workspace(&options.project_root, raw) {
+        if seen.insert(escaped.clone()) {
+            events.emit(EngineEvent::Note(umadev_i18n::tlf(
+                "workspace.out_of_scope_access",
+                &[&escaped],
+            )));
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
