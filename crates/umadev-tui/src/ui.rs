@@ -7501,6 +7501,12 @@ fn status_text_and_color(app: &App) -> Option<(String, Color)> {
             None if app.interrupt_armed() => format!("{} · {esc_hint}", app.status),
             None => app.status.clone(),
         }
+    } else if app.pending_approval.is_some() || app.pending_host_input.is_some() {
+        // The base is BLOCKED waiting on the user (an approval or a question).
+        // Without this branch — when `thinking` had already cleared — the status
+        // fell through to "就绪/ready" while the whole input channel was actually
+        // parked on a pending decision (a direct status lie).
+        umadev_i18n::t(app.lang, "status.awaiting_you").to_string()
     } else {
         umadev_i18n::t(app.lang, "status.ready").to_string()
     };

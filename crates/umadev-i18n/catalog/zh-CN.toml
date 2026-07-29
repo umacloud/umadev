@@ -84,6 +84,7 @@
 
 # 状态
 "status.ready" = "就绪"
+"status.awaiting_you" = "等待你的回应"
 "status.aborted" = "本轮已中止"
 "status.budget_paused" = "已到时间上限暂停"
 "status.operational_paused" = "评审服务不可用，已暂停"

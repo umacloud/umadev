@@ -84,6 +84,7 @@
 
 # 狀態
 "status.ready" = "就緒"
+"status.awaiting_you" = "等待你的回應"
 "status.aborted" = "本輪已中止"
 "status.budget_paused" = "已到時間上限暫停"
 "status.operational_paused" = "評審服務不可用，已暫停"

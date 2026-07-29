@@ -85,6 +85,7 @@
 
 # Status
 "status.ready" = "Ready"
+"status.awaiting_you" = "awaiting your response"
 "status.aborted" = "this round was aborted"
 "status.budget_paused" = "paused at the time budget"
 "status.operational_paused" = "paused: review service unavailable"
