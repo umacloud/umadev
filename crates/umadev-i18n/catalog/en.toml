@@ -306,7 +306,7 @@
 "prompt_queue.title" = "Grok native queue · {} item(s)"
 "queue.local.title" = "{} queued — sent in order once this turn settles (press ↑ on an empty input to recall)"
 "prompt_queue.pending" = "awaiting base snapshot"
-"prompt_queue.hint" = "j/k select · x delete · e/Enter edit · J/K reorder · Ctrl+Enter send now"
+"prompt_queue.hint" = "j/k select · x delete · e/Enter edit · J/K reorder · s send now"
 "prompt_queue.awaiting_snapshot" = "Queue request sent; waiting for the base's complete snapshot…"
 "prompt_queue.transport_written" = "Input was written to Grok's queue transport; the next base snapshot is authoritative."
 "prompt_queue.not_active" = "The resident session has ended; the queue request was not sent."

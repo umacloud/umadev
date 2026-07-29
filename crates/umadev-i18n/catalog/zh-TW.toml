@@ -300,7 +300,7 @@
 "prompt_queue.title" = "Grok 原生佇列 · {} 則"
 "queue.local.title" = "已排隊 {} 則 — 本輪結束後按序自動送出(輸入框空時按 ↑ 取回編輯)"
 "prompt_queue.pending" = "等待底座快照"
-"prompt_queue.hint" = "j/k 選擇 · x 刪除 · e/Enter 編輯 · J/K 排序 · Ctrl+Enter 立即傳送"
+"prompt_queue.hint" = "j/k 選擇 · x 刪除 · e/Enter 編輯 · J/K 排序 · s 立即傳送"
 "prompt_queue.awaiting_snapshot" = "佇列請求已傳送；等待底座完整快照確認…"
 "prompt_queue.transport_written" = "輸入已寫入 Grok 佇列傳輸；以底座後續快照為準。"
 "prompt_queue.not_active" = "目前常駐工作階段已結束；佇列請求未傳送。"

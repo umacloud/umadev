@@ -9831,6 +9831,13 @@ impl App {
                 }
                 KeyCode::Char('J') => self.prompt_queue.reorder_selected(false),
                 KeyCode::Char('K') => self.prompt_queue.reorder_selected(true),
+                // Send-now. Ctrl+Enter / Ctrl+I are the documented chords, but
+                // NEITHER survives a legacy terminal (Ctrl+Enter arrives as a bare
+                // Enter → the edit arm below; Ctrl+I decodes to Tab), so the
+                // advertised "立即发送" silently began an EDIT instead. A bare `s`
+                // is encodable everywhere and unused in this pane — it is the
+                // legacy-safe alias, the way Ctrl+J aliases Shift+Enter elsewhere.
+                KeyCode::Char('s') => self.prompt_queue.interject_selected(),
                 KeyCode::Enter | KeyCode::Char('i') if ctrl => {
                     self.prompt_queue.interject_selected()
                 }
