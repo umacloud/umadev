@@ -712,8 +712,26 @@ impl PendingHostInputView {
                     umadev_i18n::t(lang, "host.grok.plan.revise"),
                     umadev_i18n::t(lang, "host.grok.plan.abandon"),
                 ];
+                // Title carries a row position so the user can tell how much plan
+                // remains (the picker shows a 2-row window into a longer plan and
+                // used to give no "where am I" signal at all).
+                let total_rows = state.plan_rows.len();
+                let position = if total_rows > 2 {
+                    let first = state.plan_scroll + 1;
+                    let last = (state.plan_scroll + 2).min(total_rows);
+                    format!(
+                        " · {}",
+                        umadev_i18n::tf(
+                            lang,
+                            "host.grok.plan.row_position",
+                            &[&first.to_string(), &last.to_string(), &total_rows.to_string()],
+                        )
+                    )
+                } else {
+                    String::new()
+                };
                 let mut lines = vec![format!(
-                    "{} · {}",
+                    "{} · {}{position}",
                     umadev_i18n::t(lang, "host.grok.plan.title"),
                     self.summary
                 )];
@@ -732,9 +750,13 @@ impl PendingHostInputView {
                         })
                         .collect::<Vec<_>>()
                 };
-                // The first plan row plus all three decisions fit in the
-                // 40x10 minimum layout. Extra plan context and hints use the
-                // remaining rows on ordinary terminals.
+                // The first plan row plus all three decisions fit in the 40x10
+                // minimum layout; the second plan row + hint are "extra context"
+                // that a bottom-clip may drop FIRST — so the decisions must stay
+                // ABOVE plan_rows[1] to survive the minimum layout (locked by
+                // `grok_plan_picker_keeps_plan_and_all_decisions_visible_at_40x10`).
+                // The row-position counter in the title is what addresses "how
+                // much plan remains" without reordering.
                 lines.push(plan_rows[0].clone());
                 lines.extend(actions.into_iter().enumerate().map(|(index, action)| {
                     format!(

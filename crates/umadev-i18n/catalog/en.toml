@@ -140,6 +140,7 @@
 "host.grok.question.plan_hint" = "c chat about this · s skip interview · Esc cancel"
 "host.grok.question.cancel_hint" = "Esc cancel"
 "host.grok.plan.title" = "PLAN REVIEW"
+"host.grok.plan.row_position" = "rows {}-{}/{}"
 "host.grok.plan.empty" = "No plan content was supplied"
 "host.grok.plan.approve" = "Approve and implement"
 "host.grok.plan.revise" = "Request plan changes"

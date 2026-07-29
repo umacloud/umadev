@@ -139,6 +139,7 @@
 "host.grok.question.plan_hint" = "c 繼續討論 · s 跳過問卷 · Esc 取消"
 "host.grok.question.cancel_hint" = "Esc 取消"
 "host.grok.plan.title" = "計畫審閱"
+"host.grok.plan.row_position" = "第 {}-{}/{} 行"
 "host.grok.plan.empty" = "底座未提供計畫內容"
 "host.grok.plan.approve" = "批准並開始實作"
 "host.grok.plan.revise" = "要求修改計畫"
