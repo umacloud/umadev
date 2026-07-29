@@ -111,12 +111,146 @@ const MAX_TRACKED_MESSAGE_ROLES: usize = 512;
 
 /// Correlate OpenCode's session-scoped SSE status edges with the locally sent
 /// turn. The protocol does not carry a turn id on `session.status`, so an idle
-/// edge is accepted only after this client armed a prompt *and* observed the
-/// official `busy`/`retry` edge for that prompt.
-type TurnSseGate = Arc<AtomicU8>;
+/// edge is accepted only after this client armed a prompt *and* observed either
+/// the official `busy`/`retry` edge for that prompt or real turn content.
+///
+/// `gate` is the three-state edge tracker: `UNARMED` (no locally outstanding
+/// prompt), `ARMED` (prompt sent, no busy/retry edge yet), `ACTIVE` (busy edge
+/// seen — an idle may complete the turn).
+///
+/// `content_seen` records whether any content-bearing event (assistant text /
+/// thinking / tool activity) arrived since the LAST arming. It is the
+/// corroboration that lets a first `idle` complete a turn whose busy edge was
+/// coalesced or dropped (a very fast turn, a loaded server, a future status
+/// schema) instead of hanging the turn until the run budget settles it — the
+/// historical opencode "silent blocking" mode. An initial or delayed
+/// session-scoped idle right after arming still finds `content_seen == false`
+/// and is dropped, preserving the original protection against completing a turn
+/// that never ran.
+struct TurnSse {
+    gate: AtomicU8,
+    content_seen: std::sync::atomic::AtomicBool,
+}
+
+type TurnSseGate = Arc<TurnSse>;
 const SSE_TURN_UNARMED: u8 = 0;
 const SSE_TURN_ARMED: u8 = 1;
 const SSE_TURN_ACTIVE: u8 = 2;
+
+impl TurnSse {
+    fn unarmed() -> TurnSseGate {
+        Arc::new(Self {
+            gate: AtomicU8::new(SSE_TURN_UNARMED),
+            content_seen: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Test-only pump helper state: pre-ACTIVE so fixtures need no arming dance.
+    #[cfg(test)]
+    fn active_for_tests() -> TurnSseGate {
+        Arc::new(Self {
+            gate: AtomicU8::new(SSE_TURN_ACTIVE),
+            content_seen: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// A prompt was just sent: arm the gate and reset the per-turn content flag.
+    fn arm(&self) {
+        self.content_seen
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.gate.store(SSE_TURN_ARMED, Ordering::Release);
+    }
+
+    /// The locally outstanding prompt is gone (send failed / abort / teardown).
+    fn disarm(&self) {
+        self.gate.store(SSE_TURN_UNARMED, Ordering::Release);
+    }
+
+    /// The official busy/retry edge for the armed prompt: ARMED → ACTIVE.
+    /// `true` exactly once per arming (duplicate busy frames do not re-fire).
+    fn activate_on_busy(&self) -> bool {
+        self.gate
+            .compare_exchange(
+                SSE_TURN_ARMED,
+                SSE_TURN_ACTIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn is_active(&self) -> bool {
+        self.gate.load(Ordering::Acquire) == SSE_TURN_ACTIVE
+    }
+
+    /// Terminal settle for failure paths: take the gate whatever armed state it
+    /// is in. `true` when a prompt was locally outstanding.
+    fn take_any_armed(&self) -> bool {
+        self.gate.swap(SSE_TURN_UNARMED, Ordering::AcqRel) != SSE_TURN_UNARMED
+    }
+
+    /// Record content-bearing activity for the armed/active turn. A stale replay
+    /// while UNARMED never counts.
+    fn note_content(&self, events: &[SessionEvent]) {
+        if self.gate.load(Ordering::Acquire) == SSE_TURN_UNARMED {
+            return;
+        }
+        if events.iter().any(is_content_bearing_event) {
+            self.content_seen
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// May a `Completed` (idle) settle the turn? The normal path is the observed
+    /// busy edge (ACTIVE → UNARMED). The corroborated path accepts a first idle
+    /// that arrived while still ARMED — the busy edge was coalesced/dropped —
+    /// but ONLY once real content was seen for this arming, so an initial or
+    /// delayed idle with no activity behind it still leaves the gate armed.
+    fn complete_on_idle(&self) -> bool {
+        if self
+            .gate
+            .compare_exchange(
+                SSE_TURN_ACTIVE,
+                SSE_TURN_UNARMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return true;
+        }
+        self.content_seen.load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .gate
+                .compare_exchange(
+                    SSE_TURN_ARMED,
+                    SSE_TURN_UNARMED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+    }
+}
+
+/// The event kinds that prove the armed turn actually RAN (assistant text /
+/// thinking / tool activity). State updates, model reports, and background-task
+/// signals deliberately do not count — they can replay outside a turn.
+fn is_content_bearing_event(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::TextDelta(_)
+            | SessionEvent::ThinkingDelta(_)
+            | SessionEvent::ToolCall { .. }
+            | SessionEvent::ToolCallCorrelated { .. }
+            | SessionEvent::ToolProgressCorrelated { .. }
+            | SessionEvent::ToolOutputDelta(_)
+            | SessionEvent::ToolOutputDeltaCorrelated { .. }
+            | SessionEvent::ToolOutputSnapshot(_)
+            | SessionEvent::ToolOutputSnapshotCorrelated { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::ToolResultCorrelated { .. }
+    )
+}
 
 /// How long to wait for `opencode serve` to print its `listening on ...` line
 /// before giving up (fail-open: a slow/stuck server start surfaces as a
@@ -1016,7 +1150,7 @@ impl BaseSession for OpenCodeSession {
                 "opencode event stream is not running".to_string(),
             ));
         }
-        self.turn_sse_gate.store(SSE_TURN_ARMED, Ordering::Release);
+        self.turn_sse_gate.arm();
         self.turn_active = true;
         let res = self
             .http
@@ -1028,8 +1162,7 @@ impl BaseSession for OpenCodeSession {
             // clear the flag so the state machine stays honest and a later
             // `is_turn_active` / re-drive isn't blocked by a phantom turn.
             self.turn_active = false;
-            self.turn_sse_gate
-                .store(SSE_TURN_UNARMED, Ordering::Release);
+            self.turn_sse_gate.disarm();
         }
         res.map_err(crate::redaction::sanitize_session_error)
     }
@@ -1047,7 +1180,7 @@ impl BaseSession for OpenCodeSession {
                 "opencode event stream is not running".to_string(),
             ));
         }
-        self.turn_sse_gate.store(SSE_TURN_ARMED, Ordering::Release);
+        self.turn_sse_gate.arm();
         self.turn_active = true;
         let result = self
             .http
@@ -1056,8 +1189,7 @@ impl BaseSession for OpenCodeSession {
             .map_err(SessionError::Send);
         if result.is_err() {
             self.turn_active = false;
-            self.turn_sse_gate
-                .store(SSE_TURN_UNARMED, Ordering::Release);
+            self.turn_sse_gate.disarm();
         }
         let encoded_bytes = result.map_err(crate::redaction::sanitize_session_error)?;
         Ok(acknowledged_delivery_report(
@@ -1136,8 +1268,7 @@ impl BaseSession for OpenCodeSession {
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         self.turn_active = false;
-        self.turn_sse_gate
-            .store(SSE_TURN_UNARMED, Ordering::Release);
+        self.turn_sse_gate.disarm();
         self.http
             .abort(&self.session_id)
             .await
@@ -1253,7 +1384,7 @@ impl BaseSession for OpenCodeForkSession {
                 "opencode fork event stream is not running".to_string(),
             ));
         }
-        self.turn_sse_gate.store(SSE_TURN_ARMED, Ordering::Release);
+        self.turn_sse_gate.arm();
         self.turn_active = true;
         let res = self
             .http
@@ -1263,8 +1394,7 @@ impl BaseSession for OpenCodeForkSession {
         if res.is_err() {
             // Reset on a failed send so the fork's state machine stays honest.
             self.turn_active = false;
-            self.turn_sse_gate
-                .store(SSE_TURN_UNARMED, Ordering::Release);
+            self.turn_sse_gate.disarm();
         }
         res.map_err(crate::redaction::sanitize_session_error)
     }
@@ -1282,7 +1412,7 @@ impl BaseSession for OpenCodeForkSession {
                 "opencode fork event stream is not running".to_string(),
             ));
         }
-        self.turn_sse_gate.store(SSE_TURN_ARMED, Ordering::Release);
+        self.turn_sse_gate.arm();
         self.turn_active = true;
         let result = self
             .http
@@ -1291,8 +1421,7 @@ impl BaseSession for OpenCodeForkSession {
             .map_err(SessionError::Send);
         if result.is_err() {
             self.turn_active = false;
-            self.turn_sse_gate
-                .store(SSE_TURN_UNARMED, Ordering::Release);
+            self.turn_sse_gate.disarm();
         }
         let encoded_bytes = result.map_err(crate::redaction::sanitize_session_error)?;
         Ok(acknowledged_delivery_report(
@@ -1373,8 +1502,7 @@ impl BaseSession for OpenCodeForkSession {
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
         self.turn_active = false;
-        self.turn_sse_gate
-            .store(SSE_TURN_UNARMED, Ordering::Release);
+        self.turn_sse_gate.disarm();
         self.http
             .abort(&self.session_id)
             .await
@@ -1599,7 +1727,7 @@ impl HttpCtx {
     > {
         let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let turn_sse_gate: TurnSseGate = Arc::new(AtomicU8::new(SSE_TURN_UNARMED));
+        let turn_sse_gate: TurnSseGate = TurnSse::unarmed();
         let task = tokio::spawn(pump_sse_with_ready(
             self.clone(),
             session_id.to_string(),
@@ -1986,27 +2114,21 @@ async fn forward_open_code_events(
 
 fn terminal_event_belongs_to_armed_turn(event: &SessionEvent, gate: &TurnSseGate) -> bool {
     match event {
-        // An idle status is session-scoped rather than turn-scoped. Requiring
-        // the preceding busy/retry edge prevents an initial or delayed idle
-        // from completing a newly armed turn. A premature idle leaves the gate
-        // armed so the real busy -> idle sequence can still complete it.
+        // An idle status is session-scoped rather than turn-scoped. The normal
+        // acceptance is the observed busy/retry edge (ACTIVE); the corroborated
+        // acceptance is a first idle while still ARMED once real turn content
+        // was seen — the busy edge was coalesced/dropped, and without this the
+        // turn hung until the run budget (the historical opencode silent-block).
+        // An initial or delayed idle with NO content behind it still leaves the
+        // gate armed so the real busy -> idle sequence can complete it.
         SessionEvent::TurnDone {
             status: TurnStatus::Completed,
             ..
-        } => gate
-            .compare_exchange(
-                SSE_TURN_ACTIVE,
-                SSE_TURN_UNARMED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok(),
+        } => gate.complete_on_idle(),
         // A session.error is already an explicit failure for this session. It
         // may precede the busy edge, so accept it for either armed state while
         // still rejecting errors arriving with no locally outstanding prompt.
-        SessionEvent::TurnDone { .. } => {
-            gate.swap(SSE_TURN_UNARMED, Ordering::AcqRel) != SSE_TURN_UNARMED
-        }
+        SessionEvent::TurnDone { .. } => gate.take_any_armed(),
         _ => true,
     }
 }
@@ -2164,14 +2286,7 @@ impl BoundedSseDecoder {
 /// `TurnDone{Failed}` rather than a silent hang. Fail-open throughout.
 #[cfg(test)]
 async fn pump_sse(http: HttpCtx, session_id: String, tx: mpsc::Sender<SessionEvent>) {
-    pump_sse_with_ready(
-        http,
-        session_id,
-        tx,
-        None,
-        Arc::new(AtomicU8::new(SSE_TURN_ACTIVE)),
-    )
-    .await;
+    pump_sse_with_ready(http, session_id, tx, None, TurnSse::active_for_tests()).await;
 }
 
 /// SSE pump core with an optional one-shot subscription barrier. The ready
@@ -2240,7 +2355,7 @@ async fn pump_sse_with_ready(
         let payloads = match decoder.push(&bytes) {
             Ok(payloads) => payloads,
             Err(error) => {
-                if turn_sse_gate.swap(SSE_TURN_UNARMED, Ordering::AcqRel) != SSE_TURN_UNARMED {
+                if turn_sse_gate.take_any_armed() {
                     let _ = send_event(&tx, failed_turn(error)).await;
                 }
                 return;
@@ -2248,15 +2363,7 @@ async fn pump_sse_with_ready(
         };
         for payload in payloads {
             if parent_turn_is_active(&payload, &session_id) {
-                if turn_sse_gate
-                    .compare_exchange(
-                        SSE_TURN_ARMED,
-                        SSE_TURN_ACTIVE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
+                if turn_sse_gate.activate_on_busy() {
                     // A fresh official busy/retry edge is the exact boundary at
                     // which usage from the previous prompt must become
                     // unreachable. Duplicate retry/busy frames do not reset an
@@ -2272,13 +2379,16 @@ async fn pump_sse_with_ready(
             if !send_events(&tx, child_events).await {
                 return;
             }
-            let capture_usage = turn_sse_gate.load(Ordering::Acquire) == SSE_TURN_ACTIVE;
+            let capture_usage = turn_sse_gate.is_active();
             let events = translate_frame_tracked_for_turn(
                 &payload,
                 &session_id,
                 &mut tracker,
                 capture_usage,
             );
+            // Record content-bearing activity for the armed/active turn — the
+            // corroboration that lets a coalesced-busy idle complete it.
+            turn_sse_gate.note_content(&events);
             if !forward_open_code_events(
                 &http,
                 &session_id,
@@ -2298,7 +2408,7 @@ async fn pump_sse_with_ready(
     }
     // Stream ended / errored -> terminal failure so the runner never hangs.
     settle_state.store(2, Ordering::SeqCst);
-    if turn_sse_gate.swap(SSE_TURN_UNARMED, Ordering::AcqRel) != SSE_TURN_UNARMED {
+    if turn_sse_gate.take_any_armed() {
         let _ = send_event(&tx, failed_turn("event stream ended")).await;
     }
 }
@@ -3268,6 +3378,13 @@ fn session_ruleset_for_profile(permissions: BasePermissionProfile) -> Value {
         return json!([
             { "permission": "*", "pattern": "*", "action": "allow" },
             { "permission": "question", "pattern": "*", "action": "allow" },
+            // opencode resolves a SPECIFIC permission over the wildcard floor, and it
+            // ships its own specific `external_directory` default — so without this
+            // explicit allow, an Auto session still ASKED for any file outside the
+            // workspace (e.g. the user's own ~/.config/opencode/skills), and a reply
+            // that never came back rejected the read and killed the turn. Auto means
+            // auto: match the wildcard's intent explicitly.
+            { "permission": "external_directory", "pattern": "*", "action": "allow" },
             { "permission": "plan_enter", "pattern": "*", "action": "deny" },
             { "permission": "plan_exit", "pattern": "*", "action": "deny" },
         ]);
@@ -3300,6 +3417,11 @@ fn session_ruleset_for_profile(permissions: BasePermissionProfile) -> Value {
         { "permission": "patch", "pattern": "*", "action": "ask" },
         { "permission": "bash", "pattern": "*", "action": "ask" },
         { "permission": "task", "pattern": "*", "action": "ask" },
+        // Outside-the-workspace access stays a REAL human boundary under Guarded —
+        // explicit (not just the wildcard floor) so a future broad allow cannot
+        // silently erase it. The ask genuinely reaches the user now that a stale
+        // unanswered request supersedes instead of auto-rejecting newcomers.
+        { "permission": "external_directory", "pattern": "*", "action": "ask" },
     ])
 }
 
@@ -4149,19 +4271,22 @@ mod tests {
 
     #[test]
     fn idle_terminal_requires_busy_after_arm_and_is_consumed_once() {
-        let gate: TurnSseGate = Arc::new(AtomicU8::new(SSE_TURN_UNARMED));
+        let gate: TurnSseGate = TurnSse::unarmed();
         let done = SessionEvent::TurnDone {
             status: TurnStatus::Completed,
             usage: None,
         };
         assert!(!terminal_event_belongs_to_armed_turn(&done, &gate));
-        gate.store(SSE_TURN_ARMED, Ordering::Release);
+        gate.arm();
         assert!(
             !terminal_event_belongs_to_armed_turn(&done, &gate),
-            "idle before the official busy edge is not turn completion"
+            "idle before the busy edge with NO content is not turn completion"
         );
-        assert_eq!(gate.load(Ordering::Acquire), SSE_TURN_ARMED);
-        gate.store(SSE_TURN_ACTIVE, Ordering::Release);
+        assert!(
+            !gate.is_active(),
+            "a premature idle leaves the gate armed for the real edge"
+        );
+        assert!(gate.activate_on_busy());
         assert!(terminal_event_belongs_to_armed_turn(&done, &gate));
         assert!(
             !terminal_event_belongs_to_armed_turn(&done, &gate),
@@ -4171,6 +4296,54 @@ mod tests {
             &SessionEvent::TextDelta("progress".to_string()),
             &gate
         ));
+    }
+
+    #[test]
+    fn idle_with_observed_content_completes_a_turn_whose_busy_edge_was_dropped() {
+        // The historical opencode silent-block: a very fast turn (or a loaded
+        // server) coalesces/drops the busy edge, so the first idle used to be
+        // discarded and the turn hung until the run budget settled it. Real turn
+        // content is the corroboration that the turn ran: a first idle while
+        // still ARMED now completes it.
+        let gate: TurnSseGate = TurnSse::unarmed();
+        let done = SessionEvent::TurnDone {
+            status: TurnStatus::Completed,
+            usage: None,
+        };
+        gate.arm();
+        gate.note_content(&[SessionEvent::TextDelta("answer text".to_string())]);
+        assert!(
+            terminal_event_belongs_to_armed_turn(&done, &gate),
+            "content-corroborated idle completes the armed turn without a busy edge"
+        );
+        assert!(
+            !terminal_event_belongs_to_armed_turn(&done, &gate),
+            "the corroborated completion is consumed exactly once"
+        );
+
+        // Re-arming resets the content flag: the NEXT turn's premature idle is
+        // still dropped until that turn shows its own content or busy edge.
+        gate.arm();
+        assert!(
+            !terminal_event_belongs_to_armed_turn(&done, &gate),
+            "content from a previous turn never corroborates the next one"
+        );
+
+        // Non-content events (state updates / model reports) are not corroboration.
+        gate.note_content(&[SessionEvent::SessionModel("m".to_string())]);
+        assert!(
+            !terminal_event_belongs_to_armed_turn(&done, &gate),
+            "a state-only frame is not proof the turn ran"
+        );
+
+        // Content replayed while UNARMED never counts toward a future turn.
+        gate.disarm();
+        gate.note_content(&[SessionEvent::TextDelta("stale replay".to_string())]);
+        gate.arm();
+        assert!(
+            !terminal_event_belongs_to_armed_turn(&done, &gate),
+            "replayed content before arming is not corroboration"
+        );
     }
 
     #[test]
@@ -4321,7 +4494,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(EVENT_CHANNEL_CAP);
         let lifecycle = Arc::new(Mutex::new(ChildLifecycle::default()));
         let settle_state = Arc::new(AtomicU8::new(0));
-        let turn_sse_gate: TurnSseGate = Arc::new(AtomicU8::new(SSE_TURN_ACTIVE));
+        let turn_sse_gate: TurnSseGate = TurnSse::active_for_tests();
         let created = json!({
             "type": "session.created",
             "properties": { "info": { "id": "child-a", "parentID": "parent" } }
@@ -5122,7 +5295,7 @@ mod tests {
             sse_task: None,
             lifecycle: SessionLifecycle::Ephemeral,
             pending_interactions: HashMap::new(),
-            turn_sse_gate: Arc::new(AtomicU8::new(SSE_TURN_UNARMED)),
+            turn_sse_gate: TurnSse::unarmed(),
             turn_active: false,
         };
         let res = fork.send_turn("hello".to_string()).await;
@@ -5166,7 +5339,7 @@ mod tests {
             sse_task: Some(sse_task),
             lifecycle: SessionLifecycle::Ephemeral,
             pending_interactions: HashMap::new(),
-            turn_sse_gate: Arc::new(AtomicU8::new(SSE_TURN_UNARMED)),
+            turn_sse_gate: TurnSse::unarmed(),
             turn_active: false,
         };
         drop(fork);
@@ -5208,7 +5381,7 @@ mod tests {
             sse_task: None,
             lifecycle: SessionLifecycle::Ephemeral,
             pending_interactions: HashMap::new(),
-            turn_sse_gate: Arc::new(AtomicU8::new(SSE_TURN_UNARMED)),
+            turn_sse_gate: TurnSse::unarmed(),
             turn_active: false,
         };
         fork.respond("per_write", ApprovalDecision::Allow)
@@ -5452,7 +5625,7 @@ mod tests {
             sse_task: None,
             lifecycle: SessionLifecycle::Persistent,
             pending_interactions: HashMap::new(),
-            turn_sse_gate: Arc::new(AtomicU8::new(SSE_TURN_UNARMED)),
+            turn_sse_gate: TurnSse::unarmed(),
             turn_active: false,
         };
 
