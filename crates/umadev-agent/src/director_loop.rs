@@ -5585,8 +5585,22 @@ pub(crate) async fn resolve_host_request(
                 .and_then(serde_json::Value::as_str)
                 == Some("grok_exit_plan_mode_v1")
             {
+                // ROUTE to the live host surface first. The /run lane installs a
+                // `host_request` callback (director_run.rs → `await_host_input`)
+                // that raises the grok plan picker — but this arm used to hard-
+                // reject unconditionally, so under `/run` grok's plan gate was
+                // ALWAYS auto-cancelled, grok stayed in sticky session-level PLAN
+                // MODE, and every later execution came back "User rejected the
+                // execution" while the footer promised autonomy. Only when NO
+                // surface is available do we fall back to the protocol-shaped
+                // safe rejection (which IS PlanOutcome::Cancelled here).
+                if let Some(response) =
+                    crate::interaction::request_host_response(req_id, request).await
+                {
+                    return response;
+                }
                 events.emit(EngineEvent::Note(
-                    "[plan] the base's plan review needs the interactive host — declined protocol-shaped (kept planning)"
+                    "[plan] the base's plan review found no live host surface — declined protocol-shaped (kept planning)"
                         .to_string(),
                 ));
                 return request.safe_rejection("plan review requires an interactive host");
@@ -5614,8 +5628,20 @@ pub(crate) async fn resolve_host_request(
             workspace,
             config_kinds,
         } => {
+            // Route to the live host surface first (the /run lane installs the
+            // callback that raises the folder-trust picker). Previously this arm
+            // hard-rejected → KeepGated for the WHOLE build, so a `/run` + grok
+            // build never loaded project configuration and the user was never
+            // shown the trust prompt — the base just behaved inexplicably
+            // degraded. The picker itself still requires a double-confirm, so
+            // routing here cannot auto-grant trust. Fall back to KeepGated only
+            // when no surface is available.
+            if let Some(response) = crate::interaction::request_host_response(req_id, request).await
+            {
+                return response;
+            }
             events.emit(EngineEvent::Note(format!(
-                "[folder-trust] kept gated: cwd={} workspace={} config={}",
+                "[folder-trust] kept gated (no live surface): cwd={} workspace={} config={}",
                 cwd.display(),
                 workspace.display(),
                 config_kinds.join(", ")

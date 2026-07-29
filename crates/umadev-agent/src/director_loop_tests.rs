@@ -9146,3 +9146,47 @@ fn absolute_paths_outside_the_workspace_are_flagged_others_ignored() {
         "a relative parent-escape is caught too"
     );
 }
+
+#[tokio::test]
+async fn run_lane_host_requests_fall_back_to_protocol_shaped_rejection_with_no_surface() {
+    use umadev_runtime::{HostFolderTrustDecision, HostPlanOutcome, HostRequest, HostResponse};
+    // Outside a hosted_interaction scope there is no host_request callback, so
+    // request_host_response returns None and the /run resolver must fall back to
+    // the PROTOCOL-SHAPED rejection — never a generic reject the grok driver
+    // would bounce as a JSON-RPC error (which left grok stuck in plan mode).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let options = opts(tmp.path());
+    let (events, _rec) = sink();
+
+    let plan = HostRequest::PlanConfirmation {
+        plan: "# 计划\n1. 实现登录".to_string(),
+        message: None,
+        metadata: serde_json::json!({ "responseContract": "grok_exit_plan_mode_v1" }),
+    };
+    let resolved = resolve_host_request(&options, &events, "p1", &plan).await;
+    assert!(
+        matches!(
+            resolved,
+            HostResponse::PlanOutcome {
+                outcome: HostPlanOutcome::Cancelled { .. }
+            }
+        ),
+        "grok plan review with no surface settles as PlanOutcome::Cancelled: {resolved:?}"
+    );
+
+    let trust = HostRequest::FolderTrust {
+        cwd: tmp.path().to_path_buf(),
+        workspace: tmp.path().to_path_buf(),
+        config_kinds: vec!["settings".to_string()],
+    };
+    let resolved = resolve_host_request(&options, &events, "f1", &trust).await;
+    assert!(
+        matches!(
+            resolved,
+            HostResponse::FolderTrust {
+                decision: HostFolderTrustDecision::KeepGated
+            }
+        ),
+        "folder trust with no surface stays KeepGated: {resolved:?}"
+    );
+}
