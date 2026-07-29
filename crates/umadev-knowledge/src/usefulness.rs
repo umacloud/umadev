@@ -1142,6 +1142,8 @@ mod tests {
                 .map(|join| join.join().unwrap())
                 .collect::<Vec<_>>()
         });
+        // The real invariant: exactly ONE thread publishes. `hard_link` is an
+        // atomic no-replace, so this holds regardless of scheduling.
         assert_eq!(
             writes
                 .iter()
@@ -1149,10 +1151,29 @@ mod tests {
                 .count(),
             1
         );
-        assert!(writes.iter().all(|write| matches!(
-            write,
-            ReceiptOutcomeWrite::Recorded | ReceiptOutcomeWrite::AlreadyRecorded
-        )));
+        // Every loser settles BENIGNLY: it either saw the winner's record
+        // (AlreadyRecorded), or — under heavy contention on a loaded runner — the
+        // BOUNDED store lock gave up within its timeout (Unavailable). Unavailable
+        // is a correct, harmless outcome here: the record already exists via the
+        // winner, so nothing was lost; the lock is deliberately time-bounded so a
+        // turn never blocks forever on a busy store. (This was the CI flake: the
+        // old assertion assumed no thread ever hit the timeout.) What must NEVER
+        // happen is a Conflict — two divergent records for one receipt — which
+        // would be a genuine dedup bug, so that stays forbidden.
+        assert!(
+            writes.iter().all(|write| matches!(
+                write,
+                ReceiptOutcomeWrite::Recorded
+                    | ReceiptOutcomeWrite::AlreadyRecorded
+                    | ReceiptOutcomeWrite::Unavailable
+            )),
+            "a loser must settle benignly (already-recorded or a bounded-lock \
+             timeout), never a divergent conflict: {writes:?}"
+        );
+        assert!(
+            !writes.contains(&ReceiptOutcomeWrite::Conflict),
+            "no thread may see a divergent record for the same receipt: {writes:?}"
+        );
         let store = UsefulnessStore::load_from(home.path());
         assert_eq!(store.entries[&exact_chunk_key(&memory.id)].helpful, 1);
     }

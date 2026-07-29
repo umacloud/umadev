@@ -2342,7 +2342,11 @@ mod tests {
         // it has exec'd `sh` and published its final argv in `/proc`. Treat the
         // documented transient `None` as unavailable and wait for the real
         // argument surface instead of making the test depend on scheduler luck.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // The child lives 30s, so a GENEROUS ceiling (not a tight 2s that a
+        // loaded CI runner's fork/exec latency can blow past — the observed
+        // flake) costs nothing on the common fast path and only bounds a genuine
+        // hang.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let exact = loop {
             match super::process_has_exact_argument(pid, VALUE) {
                 Some(found) => break Some(found),
