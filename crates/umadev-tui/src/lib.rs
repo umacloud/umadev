@@ -8613,11 +8613,16 @@ fn prepare_cancel_request(
     if app.cancelling || cancel_drain_active {
         return false;
     }
+    // Clear BOTH interactive holders symmetrically before the host-git early
+    // return — the approval holder was cleared here but the host-input picker
+    // was not, so a cancel during a host-git op could strand a live picker on
+    // screen while its RPC was already being torn down. The heavier cleanup
+    // below (auth UI, steer queue, session) stays gated on a non-host-git cancel.
     clear_pending_approval(approval_holder);
+    clear_pending_host_input(host_input_holder);
     if app.host_git_in_flight {
         return true;
     }
-    clear_pending_host_input(host_input_holder);
     app.auth_ui = None;
     if let Ok(mut queued) = steer_holder.lock() {
         queued.clear();
