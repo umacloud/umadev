@@ -76,6 +76,20 @@ npm i umadev && npx umadev # or as a project-local dependency
 
 Already hit the sudo trap? `umadev doctor` detects a root-owned install or npm cache and prints the exact repair (`sudo chown -R $(whoami) ~/.npm`, then reinstall under a user-owned prefix).
 
+**Or skip npm entirely** — the native installer needs no Node, no npm, and never sudo. It downloads the official release binary for your platform, verifies its published SHA-256, and installs to a directory you own (`~/.local/bin`, or `%LOCALAPPDATA%\Programs\umadev` on Windows):
+
+```bash
+# macOS / Linux
+curl -fsSL https://umadev.goder.ai/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://umadev.goder.ai/install.ps1 | iex
+```
+
+(Pin a version with `UMADEV_VERSION=1.0.68` / `$env:UMADEV_VERSION='1.0.68'`; override the target directory with `UMADEV_INSTALL_DIR`. The npm package stays the batteries-included path — it bundles the curated knowledge corpus and fetches the optional embedding model; the native binary degrades gracefully without them and `umadev doctor` reports anything missing.)
+
 The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64, glibc ≥ 2.31 or musl/Alpine), and Windows (x86_64).
 
 The Rust binary and curated corpus need no cloud knowledge service. Real coding still requires an installed, authenticated base CLI. The optional local embedding model (`multilingual-e5-small`, f16, ~224 MB) is **not** inside the npm tarball: the npm launcher fetches the version-matched, checksummed release asset on the first command that needs retrieval and stores it in `~/.umadev/embed-model`. Later local inference needs no API key or network. If the fetch is unavailable, retrieval continues as BM25-only and a later eligible launch retries; a corrupt cache is rejected and re-fetched.
