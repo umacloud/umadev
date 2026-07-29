@@ -2992,8 +2992,23 @@ fn translate_error(
 
 /// Preserve OpenCode's permission request as a typed approval, including its
 /// three exact reply choices. Unknown/future permissions remain approval-gated.
+/// A permission/question frame's `sessionID` must MATCH when present, but an
+/// ABSENT field is ACCEPTED — mirrors `translate_error`'s tolerance. The strict
+/// `!= Some` form dropped every frame that omits the field; under Guarded
+/// (`*: ask`) every write raises `permission.asked`, so a frame shape without
+/// `sessionID` would make 100% of approval prompts vanish (the base goes quiet
+/// mid-write, the turn hangs to budget with no error). Reply routes are by GLOBAL
+/// id (`/permission/{id}/reply`, `/question/{id}/reply`), so accepting an absent
+/// or foreign-session frame can never misroute the answer.
+fn session_scope_allows(props: &Value, session_id: &str) -> bool {
+    props
+        .get("sessionID")
+        .and_then(Value::as_str)
+        .is_none_or(|sid| sid == session_id)
+}
+
 fn translate_permission(props: &Value, session_id: &str) -> Vec<SessionEvent> {
-    if props.get("sessionID").and_then(Value::as_str) != Some(session_id) {
+    if !session_scope_allows(props, session_id) {
         return Vec::new();
     }
     let Some(req_id) = props.get("id").and_then(Value::as_str) else {
@@ -3055,7 +3070,9 @@ fn translate_permission(props: &Value, session_id: &str) -> Vec<SessionEvent> {
 /// Question IDs are deterministic derivatives of the request id because the
 /// protocol identifies the request and question position, not each question.
 fn translate_question(props: &Value, session_id: &str) -> Vec<SessionEvent> {
-    if props.get("sessionID").and_then(Value::as_str) != Some(session_id) {
+    // Same absent-tolerant sessionID rule (see `session_scope_allows`) — a
+    // dropped `question.asked` would hang the turn just as silently.
+    if !session_scope_allows(props, session_id) {
         return Vec::new();
     }
     let Some(req_id) = props.get("id").and_then(Value::as_str) else {
@@ -4712,6 +4729,47 @@ mod tests {
             }
             other => panic!("expected typed approval, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn permission_asked_without_a_session_id_is_accepted_not_silently_dropped() {
+        // Guarded is `*: ask`, so every write raises permission.asked. The strict
+        // `!= Some(session_id)` guard dropped a frame that OMITS sessionID — which
+        // would make 100% of prompts vanish and hang the turn. An absent field is
+        // now accepted (present-and-mismatched still drops); reply is by global id.
+        let frame = serde_json::json!({
+            "type": "permission.asked",
+            "properties": {
+                "id": "per_nosid",
+                "permission": "edit", "patterns": ["src/app.tsx"],
+                "metadata": {}, "always": []
+            }
+        })
+        .to_string();
+        let events = translate_frame(&frame, "ses_abc");
+        assert!(
+            matches!(
+                events.first(),
+                Some(SessionEvent::HostRequest {
+                    request: HostRequest::Approval { .. },
+                    ..
+                })
+            ),
+            "a sessionID-less permission frame surfaces as an approval, not dropped: {events:?}"
+        );
+        // A PRESENT but mismatched sessionID is still dropped (belongs elsewhere).
+        let foreign = serde_json::json!({
+            "type": "permission.asked",
+            "properties": {
+                "id": "per_foreign", "sessionID": "ses_other",
+                "permission": "edit", "patterns": ["x"], "metadata": {}, "always": []
+            }
+        })
+        .to_string();
+        assert!(
+            translate_frame(&foreign, "ses_abc").is_empty(),
+            "a present-but-mismatched sessionID is still dropped"
+        );
     }
 
     #[test]

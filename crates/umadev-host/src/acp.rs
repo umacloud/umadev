@@ -5134,7 +5134,17 @@ async fn handle_kimi_permission_question(frame: &Value, params: &Value, context:
             req_id,
             request: HostRequest::UserInput {
                 questions: vec![question],
-                metadata: json!({"transport":"kimi_permission_question_v1"}),
+                // Carry the `responseContract` (not just `transport`) so
+                // `safe_rejection` can dispatch. Without it, every refusal path
+                // (300s timeout, Esc, headless, one-shot) fell through to
+                // `HostResponse::Rejected`, which `write_host_response` has no arm
+                // for → `-32602` written to a `session/request_permission` kimi is
+                // blocking on. The kimi PLAN review already stamps both (below);
+                // this mirrors it so the question path settles as a clean cancel.
+                metadata: json!({
+                    "transport":"kimi_permission_question_v1",
+                    "responseContract":"kimi_permission_question_v1"
+                }),
             },
         },
     )

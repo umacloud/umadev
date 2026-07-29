@@ -1520,11 +1520,17 @@ impl HostRequest {
                 }
             }
             Self::UserInput { metadata, .. }
-                if metadata
-                    .get("responseContract")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("kimi_plan_review_permission_v1") =>
+                if matches!(
+                    metadata
+                        .get("responseContract")
+                        .and_then(serde_json::Value::as_str),
+                    Some("kimi_plan_review_permission_v1" | "kimi_permission_question_v1")
+                ) =>
             {
+                // Both kimi ACP interactive contracts settle a refusal as a
+                // protocol Cancelled (→ `write_host_response`'s Cancelled arm →
+                // `cancelled_host_response_frame`), never the generic Rejected
+                // that the kimi driver has no write-back arm for (→ -32602).
                 HostResponse::Cancelled {
                     reason: Some(reason),
                 }
@@ -4283,6 +4289,23 @@ mod tests {
         };
         assert_eq!(
             kimi_plan_review.safe_rejection("closed"),
+            HostResponse::Cancelled {
+                reason: Some("closed".into())
+            }
+        );
+
+        // The kimi permission QUESTION contract must refuse as a protocol
+        // Cancelled too — before it carried no responseContract and fell to the
+        // generic Rejected, which the kimi driver has no write-back arm for
+        // (every refusal path then wrote a -32602 error to a blocking request).
+        let kimi_question = HostRequest::UserInput {
+            questions: Vec::new(),
+            metadata: serde_json::json!({
+                "responseContract":"kimi_permission_question_v1"
+            }),
+        };
+        assert_eq!(
+            kimi_question.safe_rejection("closed"),
             HostResponse::Cancelled {
                 reason: Some("closed".into())
             }
