@@ -4818,10 +4818,19 @@ async fn rework_drives_ready_peers_in_plan_order() {
         !order.contains(&"api".to_string()) && !order.contains(&"ui".to_string()),
         "stranded dependents were never driven (rework obviated): {order:?}"
     );
+    // Blocked/stranded steps never mint SUCCESS memory ("Verified … completed"),
+    // but the settle now records failure-shaped REPAIR memory ("BLOCKED …") so a
+    // later /continue re-drives the reopened steps INFORMED by what blocked them
+    // instead of re-deriving the same mistake blind.
+    let notes =
+        crate::context::run_notes_tail_block(tmp.path(), crate::context::RUN_NOTES_TAIL_LINES);
     assert!(
-        crate::context::run_notes_tail_block(tmp.path(), crate::context::RUN_NOTES_TAIL_LINES,)
-            .is_empty(),
-        "failed or stranded steps must not become successful run memory"
+        !notes.contains("Verified"),
+        "failed or stranded steps must not become successful run memory: {notes}"
+    );
+    assert!(
+        notes.contains("BLOCKED"),
+        "the blocked settle records repair memory for the informed /continue: {notes}"
     );
 }
 

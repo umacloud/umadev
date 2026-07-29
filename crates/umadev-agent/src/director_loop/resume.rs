@@ -313,6 +313,38 @@ fn operational_review_checkpoint_path(root: &Path) -> std::path::PathBuf {
         .join(OPERATIONAL_REVIEW_CHECKPOINT_FILE)
 }
 
+/// Marker: the repair channel for the CURRENT persisted plan is explicitly
+/// CLOSED. Written when the user cancels an operational pause (an explicit "do
+/// not come back to this"), it keeps that plan's `Blocked` steps terminal on a
+/// later `/continue` — [`reopen_blocked_for_repair`] must never resurrect a run
+/// the user deliberately closed. Cleared whenever a NEW plan is synthesized, so
+/// a stale marker can never suppress repair-resume for a later, unrelated run.
+const PLAN_REPAIR_CLOSED_FILE: &str = "plan-repair-closed.json";
+
+fn plan_repair_closed_path(root: &Path) -> std::path::PathBuf {
+    root.join(".umadev").join(PLAN_REPAIR_CLOSED_FILE)
+}
+
+/// Close the repair channel for the current plan (best-effort, bounded reason).
+pub(super) fn mark_plan_repair_closed(root: &Path, reason: &str) {
+    let path = plan_repair_closed_path(root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body =
+        serde_json::json!({ "reason": reason.chars().take(240).collect::<String>() }).to_string();
+    let _ = std::fs::write(&path, body);
+}
+
+/// Reopen the repair channel — called when a fresh plan replaces the closed one.
+pub(super) fn clear_plan_repair_closed(root: &Path) {
+    let _ = umadev_state::fs::remove_regular_file(&plan_repair_closed_path(root));
+}
+
+fn plan_repair_closed(root: &Path) -> bool {
+    std::fs::symlink_metadata(plan_repair_closed_path(root)).is_ok()
+}
+
 pub(super) fn save_operational_review_checkpoint(
     root: &Path,
     checkpoint: &OperationalReviewCheckpoint,
@@ -344,6 +376,31 @@ fn plan_has_incomplete_step(plan: &Plan) -> bool {
     plan.steps
         .iter()
         .any(|step| matches!(step.status, StepStatus::Pending | StepStatus::Active))
+}
+
+/// REPAIR-RESUME: reopen every `Blocked` step so a Blocked-settled run is
+/// resumable *as a repair* instead of being neither resumable nor terminal.
+///
+/// Before this, a run that settled with blocked steps had no `Pending`/`Active`
+/// work, so [`load_resumable_plan`] returned `None` — while every user-facing
+/// affordance still advertised `/continue`. `/continue` then silently degraded
+/// into a brand-new full run (fresh plan synthesis, completed work redone) that
+/// hit the same wall — the reported "一直这样子" loop. Reopening the blocked
+/// steps (their stranded dependents were blocked by the same sweep, so the whole
+/// chain reopens together) makes `/continue` re-drive exactly the failed work,
+/// and the settle path has already written each step's WHY into the bounded
+/// run-notes, so the repair attempt is INFORMED — the next directives carry the
+/// blockers instead of re-deriving the same mistake blind.
+///
+/// The caller gates this on the operational-review circuit being CLOSED: an open
+/// circuit blocked the steps precisely so the run is NOT resumable, and undoing
+/// that here would resurrect a terminally-refused run.
+fn reopen_blocked_for_repair(plan: &mut Plan) {
+    for step in &mut plan.steps {
+        if step.status == StepStatus::Blocked {
+            step.status = StepStatus::Pending;
+        }
+    }
 }
 
 /// Reset interrupted work so a fresh session can schedule it again.
@@ -462,8 +519,17 @@ pub(super) fn load_resumable_plan(root: &Path) -> Option<Plan> {
     };
     invalidate_stale_steps(root, &mut plan);
     checkpoint = operational_review_checkpoint_for_plan(root, &plan);
+    let circuit_open = checkpoint
+        .as_ref()
+        .is_some_and(OperationalReviewCheckpoint::circuit_open);
     if let Some(checkpoint) = checkpoint.as_ref() {
         reconcile_plan_with_operational_checkpoint(&mut plan, checkpoint);
+    }
+    // REPAIR-RESUME: with the circuit closed AND the repair channel not explicitly
+    // closed (a user-cancelled pause), blocked steps are re-drivable work (see
+    // `reopen_blocked_for_repair`); otherwise they stay terminal.
+    if !circuit_open && !plan_repair_closed(root) {
+        reopen_blocked_for_repair(&mut plan);
     }
     let parked_at_gate = crate::state::read_workflow_state(root)
         .and_then(|state| crate::gates::Gate::from_id(&state.active_gate))
@@ -699,7 +765,16 @@ pub fn has_resumable_run(root: &Path) -> bool {
         return true;
     }
     if let Some(state) = crate::state::read_workflow_state(root) {
-        if !state.active_gate.trim().is_empty() || state.phase != Phase::Delivery.id() {
+        // A parked gate is always resumable. The phase-based fallback is scoped to
+        // runs with NO director plan on disk (the legacy continuous engine, which
+        // persists only workflow-state): when a plan EXISTS, `load_resumable_plan`
+        // above is authoritative — advertising `/continue` off the phase alone for
+        // a settled director plan was the "resume silently restarts from scratch"
+        // trap (the plan had nothing to resume, so the resume path fell open to a
+        // brand-new run).
+        if !state.active_gate.trim().is_empty()
+            || (state.phase != Phase::Delivery.id() && plan_state::load(root).is_none())
+        {
             return true;
         }
     }
@@ -776,6 +851,101 @@ mod tests {
             hint.as_deref(),
             Some(umadev_i18n::tl("run.transient_resume_hint")),
             "a rate-limit abort with a resumable plan surfaces the /continue hint"
+        );
+    }
+
+    #[test]
+    fn blocked_settled_plan_reopens_as_a_repair_resume() {
+        // The reported "一直这样子" loop: a Blocked settle left no Pending/Active
+        // work, so the plan was "not resumable" — while every affordance still
+        // advertised /continue, which then silently fell open to a brand-new run.
+        // A Blocked step (circuit CLOSED) now reopens as Pending, so /continue
+        // re-drives exactly the failed work instead of restarting from scratch.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        save_plan(root, StepStatus::Blocked);
+        let plan =
+            load_resumable_plan(root).expect("a blocked-settled plan is resumable as repair");
+        assert_eq!(
+            plan.steps[0].status,
+            StepStatus::Pending,
+            "the blocked step reopens for the repair attempt"
+        );
+        assert!(
+            has_resumable_director_plan(root),
+            "the resumability probe agrees with the loader"
+        );
+    }
+
+    #[test]
+    fn a_closed_repair_channel_keeps_blocked_steps_terminal_until_a_fresh_plan() {
+        // The user explicitly cancelled the paused run — that closed the repair
+        // channel, so its Blocked steps must not resurrect on /continue…
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        save_plan(root, StepStatus::Blocked);
+        mark_plan_repair_closed(root, "cancelled by user");
+        assert!(
+            load_resumable_plan(root).is_none(),
+            "a deliberately cancelled run stays terminal"
+        );
+        // …while a fresh plan synthesis reopens the channel for the NEW run.
+        clear_plan_repair_closed(root);
+        assert!(
+            load_resumable_plan(root).is_some(),
+            "clearing the marker restores repair-resume for a new plan"
+        );
+    }
+
+    #[test]
+    fn open_review_circuit_keeps_a_blocked_plan_terminal() {
+        // The deliberate exception: an OPEN operational-review circuit blocked the
+        // steps precisely so the run is NOT resumable — repair-reopening would
+        // resurrect a terminally-refused run.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        save_plan(root, StepStatus::Blocked);
+        save_operational_review_checkpoint(
+            root,
+            &OperationalReviewCheckpoint::FinalGateReview {
+                qc_source_fingerprint: None,
+                required_seats: None,
+                entry_task_run_id: None,
+                consecutive_outages: 2,
+                evidence: OperationalReviewEvidence::default(),
+                terminally_settled: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            load_resumable_plan(root).is_none(),
+            "an open circuit never reopens blocked steps"
+        );
+    }
+
+    #[test]
+    fn phase_fallback_never_advertises_resume_over_a_settled_director_plan() {
+        // has_resumable_run's phase fallback exists for the legacy continuous
+        // engine (workflow-state only, NO plan.json). When a director plan exists,
+        // the loader is authoritative: an all-Done plan with a mid phase must NOT
+        // advertise /continue (that was the silent-restart trap)...
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        save_plan(root, StepStatus::Done);
+        let state = crate::state::WorkflowState::new(Phase::Backend);
+        crate::state::write_workflow_state(root, &state).unwrap();
+        assert!(
+            !has_resumable_run(root),
+            "a settled director plan is not resumable off the phase alone"
+        );
+        // ...while the SAME workflow state with no plan on disk (legacy continuous)
+        // keeps its resume offer.
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root2 = tmp2.path();
+        crate::state::write_workflow_state(root2, &state).unwrap();
+        assert!(
+            has_resumable_run(root2),
+            "the legacy continuous engine (no plan.json) keeps the phase fallback"
         );
     }
 

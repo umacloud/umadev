@@ -8784,13 +8784,28 @@ fn route_replay_key(
         *draw_now = true;
         return None;
     }
-    if resolve_pending_host_input_key(host_input_holder, app, sink, key.code, key.modifiers)
-        || resolve_pending_approval(
-            approval_holder,
-            key.code,
-            key.modifiers,
-            app.input.is_empty(),
-        )
+    // A modal mode that OWNS the keyboard (scrollback search, history search, the
+    // help overlay, the log overlay, the queue pane) must keep receiving its keys.
+    // The approval interceptor used `input.is_empty()` as its "the user isn't
+    // typing" test — but those modes type into their OWN buffers, so the composer
+    // read as empty the whole time: a `y` typed into the Ctrl+F search bar was
+    // consumed as ApprovalReply::Allow, silently approving (and trust-remembering)
+    // the paused action; Esc denied the RPC instead of closing the bar. While such
+    // a mode is open, keys flow to it untouched — the sticky approval/picker bars
+    // stay visible and become answerable the moment the mode closes.
+    let modal_owns_keys = app.show_help
+        || app.overlay.is_some()
+        || app.search.is_some()
+        || app.history_search.is_some()
+        || app.prompt_queue.is_open();
+    if !modal_owns_keys
+        && (resolve_pending_host_input_key(host_input_holder, app, sink, key.code, key.modifiers)
+            || resolve_pending_approval(
+                approval_holder,
+                key.code,
+                key.modifiers,
+                app.input.is_empty(),
+            ))
     {
         *needs_redraw = true;
         return None;

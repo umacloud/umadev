@@ -45,8 +45,13 @@ impl App {
     /// left it (empty), never a fabricated panel; never panics.
     pub(super) fn rehydrate_frozen_plan_if_resumable(&mut self, reason: &str) {
         let failure = umadev_agent::base_error::classify(None, None, Some(reason.trim()));
+        // Resumable = a transient hiccup, a budget pause, OR a plan the repair-resume
+        // path can actually re-drive (a Blocked settle reopens its blocked steps on
+        // /continue, so the frozen checklist is meaningful again — previously it
+        // vanished exactly when the user most needed to see WHICH steps blocked).
         let resumable = umadev_agent::base_error::is_transient(&failure)
-            || umadev_agent::is_budget_pause_reason(reason);
+            || umadev_agent::is_budget_pause_reason(reason)
+            || umadev_agent::has_resumable_director_plan(&self.project_root);
         if !resumable {
             return;
         }

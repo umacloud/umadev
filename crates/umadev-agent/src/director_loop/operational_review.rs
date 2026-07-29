@@ -395,6 +395,11 @@ pub fn cancel_operational_review_pause(
         plan_state::save(&plan, project_root)
             .map_err(|error| format!("could not close paused plan cursor: {error}"))?;
     }
+    // An explicit cancellation closes the REPAIR channel too: the blocked steps
+    // this cursor-close just wrote must stay terminal on a later /continue —
+    // repair-resume reopens acceptance-blocked work, never a run the user
+    // deliberately cancelled. A fresh plan synthesis clears the marker.
+    super::resume::mark_plan_repair_closed(project_root, detail);
     crate::continuous::cancel_legacy_operational_review_pause(project_root)?;
     clear_operational_review_checkpoint(project_root);
     Ok(true)

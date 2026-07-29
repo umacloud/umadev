@@ -3008,7 +3008,12 @@ fn render_prompt_queue(frame: &mut Frame, area: Rect, app: &App) {
     let (rows, total) = app.queued_preview();
     if !rows.is_empty() {
         lines.push(Line::from(Span::styled(
-            umadev_i18n::tf(app.lang, "queue.local.title", &[&total.to_string()]),
+            // Budgeted at worst-case CJK width like every pinned row — an
+            // over-wide title on a CJK-locale console would shift and wrap.
+            truncate_to_width_cjk(
+                &umadev_i18n::tf(app.lang, "queue.local.title", &[&total.to_string()]),
+                usize::from(area.width),
+            ),
             Style::default()
                 .fg(theme::WARNING())
                 .add_modifier(Modifier::BOLD),
@@ -3038,7 +3043,10 @@ fn render_native_prompt_queue_lines(app: &App, area: Rect, lines: &mut Vec<Line<
     };
     lines.push(Line::from(vec![
         Span::styled(
-            umadev_i18n::tf(app.lang, "prompt_queue.title", &[&count]),
+            truncate_to_width_cjk(
+                &umadev_i18n::tf(app.lang, "prompt_queue.title", &[&count]),
+                usize::from(area.width),
+            ),
             Style::default()
                 .fg(theme::PRIMARY())
                 .add_modifier(Modifier::BOLD),
@@ -8707,9 +8715,12 @@ mod tests {
             panel.contains("signed session token"),
             "resolution suggestion surfaced: {panel}"
         );
-        // …AND a WHAT-TO-DO-NEXT hint (run to fix / revise) guides the user out.
+        // …AND a WHAT-TO-DO-NEXT hint guides the user out via affordances that
+        // actually work in this state (type the fix — it folds into the next
+        // step; /continue after the settle resumes as an informed repair). The
+        // old hint named /run (usage error mid-run) and /revise (no open gate).
         assert!(
-            panel.contains("/run") && panel.contains("/revise"),
+            panel.contains("type the fix"),
             "next-step hint shown: {panel}"
         );
     }
@@ -8750,7 +8761,7 @@ mod tests {
         );
         // The next-step hint still shows so the user isn't stranded at the blocker.
         assert!(
-            panel.contains("/run"),
+            panel.contains("type the fix"),
             "next-step hint still shown: {panel}"
         );
     }
@@ -9992,6 +10003,10 @@ mod tests {
         // for the whole time they wait: steer first (fires at the next step
         // boundary), then deferred chat, with the title carrying the total.
         let mut app = app_with(Some("offline"));
+        // Pin the locale: App derives its language from the host environment, so
+        // an English-locale CI runner would otherwise render the English title
+        // and fail the zh assertions below.
+        app.lang = umadev_i18n::Lang::ZhCn;
         app.queued_steer.push_back("按钮改成蓝色".into());
         app.queued_chat.push_back("再做一个登录页".into());
         // The cell grid renders each wide CJK glyph with a continuation-cell

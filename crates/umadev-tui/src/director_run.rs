@@ -472,18 +472,29 @@ pub(super) async fn run_director_loop(
                 } else {
                     None
                 };
-                match resumed {
-                    Some(o) => o,
-                    None => {
-                        umadev_agent::drive_director_loop_routed(
-                            session.as_mut(),
-                            &options,
-                            &sink_dyn,
-                            directive,
-                            Some(&route),
-                        )
-                        .await
+                if let Some(o) = resumed {
+                    o
+                } else {
+                    // An explicitly requested resume found nothing resumable
+                    // (plan gone, or already terminal). Falling open to a
+                    // fresh run is the safe behaviour — but it must SAY so:
+                    // the user just read a "resuming your last task" banner,
+                    // and silently restarting from scratch under it was the
+                    // reported trap. Blocked-settled plans no longer land
+                    // here (they reopen as a repair); this is the residue.
+                    if resume {
+                        sink_dyn.emit(umadev_agent::EngineEvent::Note(
+                            umadev_i18n::tl("continue.fresh_fallback").to_string(),
+                        ));
                     }
+                    umadev_agent::drive_director_loop_routed(
+                        session.as_mut(),
+                        &options,
+                        &sink_dyn,
+                        directive,
+                        Some(&route),
+                    )
+                    .await
                 }
             })),
         )

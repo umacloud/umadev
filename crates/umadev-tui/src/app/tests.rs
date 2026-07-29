@@ -11429,8 +11429,14 @@ fn a_fresh_plan_post_clears_the_frozen_panel_and_shows_the_new_plan() {
 }
 
 #[test]
-fn a_hard_or_planless_abort_does_not_repopulate_the_panel() {
-    // Hard failure (auth) even WITH a resumable plan on disk → no false panel.
+fn auth_abort_keeps_the_resumable_checklist_but_a_planless_abort_stays_cleared() {
+    // Hard failure (auth) WITH a resumable plan on disk → the frozen checklist
+    // rehydrates. This was previously suppressed as a "false panel", but the
+    // lifecycle audit flagged that as the gap: an auth death mid-build leaves
+    // genuinely resumable Pending steps — the user re-logs-in and /continue
+    // works perfectly — so hiding the frozen checklist hid the one affordance
+    // that works. The panel renders STATICALLY (frozen header, no spinner), so
+    // it is honest, not a fabricated live run.
     let (mut app, tmp) = temp_app();
     save_three_step_plan(tmp.path());
     app.apply_engine(EngineEvent::Note(format!(
@@ -11438,8 +11444,8 @@ fn a_hard_or_planless_abort_does_not_repopulate_the_panel() {
         crate::ABORT_SENTINEL
     )));
     assert!(
-        app.plan_steps.is_empty() && !app.plan_frozen,
-        "a hard auth abort leaves the panel cleared, never a frozen false panel"
+        app.plan_frozen && !app.plan_steps.is_empty(),
+        "an auth abort with a resumable plan keeps the frozen checklist visible"
     );
 
     // Transient reason but NO plan on disk → nothing to rehydrate.

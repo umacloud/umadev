@@ -1098,6 +1098,10 @@ async fn synthesize_and_post_plan(
     // reaches this synthesis), so its notes survive — exactly the memory it wants
     // back. Best-effort + fail-open (see `context::rotate_run_notes`).
     crate::context::rotate_run_notes(&options.project_root);
+    // A fresh plan REOPENS the repair channel: a `plan-repair-closed` marker left
+    // by a cancelled previous run must never suppress repair-resume for this new,
+    // unrelated plan. Best-effort + fail-open.
+    resume::clear_plan_repair_closed(&options.project_root);
     // Persist best-effort; a failed write is ignored (fail-open — never blocks).
     let _ = plan_state::save(&plan, &options.project_root);
     // Sync the 9-phase workflow state off its initial `research` value the moment a
@@ -2546,6 +2550,35 @@ async fn drive_plan_steps(
         }
         reason
     });
+    // REPAIR-RESUME memory (the half that crosses the settle boundary): persist WHY
+    // this run blocked into the bounded, validated run-notes, which compose_firmware
+    // threads into EVERY later run's directives. Without this, the blocker evidence
+    // was run-local — a `/continue` (which now reopens the blocked steps as a repair,
+    // see `resume::reopen_blocked_for_repair`) re-drove the same work blind and
+    // re-made the same mistake. Best-effort + bounded: `record_run_note` validates,
+    // one-lines, excerpts, and caps the file; a refused note never affects the settle.
+    if !clean {
+        for step in plan
+            .steps
+            .iter()
+            .filter(|step| step.status == StepStatus::Blocked)
+        {
+            let why = incomplete_evidence
+                .iter()
+                .find(|(id, _)| *id == step.id)
+                .map_or("no recorded evidence", |(_, why)| why.as_str());
+            let _ = crate::context::record_run_note(
+                &options.project_root,
+                &format!("BLOCKED {}: {why}", step.title.trim()),
+            );
+        }
+        for finding in final_gate.blocking.iter().take(5) {
+            let _ = crate::context::record_run_note(
+                &options.project_root,
+                &format!("BLOCKING final-review finding: {finding}"),
+            );
+        }
+    }
 
     // Persist the plan's terminal state for resume.
     persist_plan_ref(plan, options);
