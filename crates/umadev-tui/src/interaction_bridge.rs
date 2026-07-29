@@ -1103,7 +1103,24 @@ pub(super) async fn resolve_resident_host_request(
                 == Some("grok_exit_plan_mode_v1")
                 && interactive =>
         {
-            await_host_input(host_input_holder, sink, request).await
+            // 自动过门 keeps its word here too: under the Auto tier the base's own
+            // plan-review gate is auto-APPROVED with a visible note, exactly like
+            // every other gate. Leaving it interactive under Auto caused the
+            // reported strand: the picker went unanswered (or was answered
+            // invalidly), grok stayed in its sticky session-level PLAN MODE, and
+            // every later execution came back "User rejected the execution" while
+            // the footer promised full autonomy. Guarded/Plan keep the human
+            // picker — reviewing the plan is exactly what those tiers are for.
+            if trust_for_resident_turn(mode) == umadev_agent::TrustMode::Auto {
+                sink.emit(EngineEvent::Note(
+                    umadev_i18n::tl("plan.review.auto_approved").to_string(),
+                ));
+                umadev_runtime::HostResponse::PlanOutcome {
+                    outcome: umadev_runtime::HostPlanOutcome::Approved,
+                }
+            } else {
+                await_host_input(host_input_holder, sink, request).await
+            }
         }
         umadev_runtime::HostRequest::PlanConfirmation { metadata, .. }
             if metadata

@@ -519,6 +519,86 @@ fn auto_switch_never_releases_an_upstream_permission_boundary() {
 }
 
 #[tokio::test]
+async fn auto_tier_auto_approves_the_grok_plan_review_and_guarded_still_asks() {
+    use umadev_runtime::{HostPlanOutcome, HostRequest, HostResponse};
+
+    // The reported strand: under 自动过门 (Auto) the grok plan-review picker was
+    // still interactive; unanswered (or answered invalidly) it left grok in its
+    // sticky session-level PLAN MODE, so every later execution came back "User
+    // rejected the execution" while the footer promised full autonomy. Auto now
+    // auto-APPROVES the base's own plan gate — like every other gate — with a
+    // visible note; Guarded keeps the human picker.
+    let root = tempfile::tempdir().unwrap();
+    let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let host_input_holder: HostInputHolder = Arc::new(std::sync::Mutex::new(None));
+    let (sink, _events) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let request = HostRequest::PlanConfirmation {
+        plan: "# 实现计划\n1. manage-auth.ts".to_string(),
+        message: Some("Review the proposed plan".to_string()),
+        metadata: serde_json::json!({ "responseContract": "grok_exit_plan_mode_v1" }),
+    };
+
+    let auto = resolve_resident_host_request(
+        &request,
+        root.path(),
+        umadev_agent::TrustMode::Auto,
+        true,
+        &approval_holder,
+        &host_input_holder,
+        &sink,
+    )
+    .await;
+    assert!(
+        matches!(
+            auto,
+            HostResponse::PlanOutcome {
+                outcome: HostPlanOutcome::Approved
+            }
+        ),
+        "Auto approves the plan review immediately: {auto:?}"
+    );
+    assert!(
+        host_input_holder.lock().unwrap().is_none(),
+        "no picker is parked under Auto — nothing left to go stale"
+    );
+
+    // Guarded: the picker parks and waits for the human — unchanged.
+    let guarded = resolve_resident_host_request(
+        &request,
+        root.path(),
+        umadev_agent::TrustMode::Guarded,
+        true,
+        &approval_holder,
+        &host_input_holder,
+        &sink,
+    );
+    tokio::pin!(guarded);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut guarded)
+            .await
+            .is_err(),
+        "Guarded keeps the interactive plan review pending for the user"
+    );
+    assert!(
+        host_input_holder.lock().unwrap().is_some(),
+        "the Guarded picker is parked in the host-input slot"
+    );
+    // Settle the parked ask so the pinned future resolves cleanly.
+    clear_pending_host_input(&host_input_holder);
+    let settled = tokio::time::timeout(TURN_HANG_GUARD, guarded)
+        .await
+        .expect("clearing the slot settles the pending ask");
+    assert!(
+        matches!(
+            settled,
+            HostResponse::PlanOutcome { .. } | HostResponse::Cancelled { .. }
+        ),
+        "the cleared ask settles protocol-shaped: {settled:?}"
+    );
+}
+
+#[tokio::test]
 async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
     use umadev_runtime::{
         ApprovalDecision, HostApprovalOption, HostApprovalOptionKind, HostRequest, HostResponse,

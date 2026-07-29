@@ -362,6 +362,7 @@
 "plan.queue.native" = "  {}. [底座原生佇列] {}"
 "plan.review.title" = "團隊評審"
 "plan.review.accept" = "通過"
+"plan.review.auto_approved" = "[plan] 「計劃審閱」已自動批准並開始實施(自動過門)。按 shift+Tab 或 /manual 可轉人工逐項審閱。"
 "plan.review.block" = "{} 個必改"
 "plan.review.collapsed" = "團隊評審:{} 通過 · {} 攔截 — /plan 展開"
 "plan.review.note.accept" = "團隊評審 · [{}] 通過"

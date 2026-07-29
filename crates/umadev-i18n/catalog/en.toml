@@ -368,6 +368,7 @@
 "plan.queue.native" = "  {}. [base-native queue] {}"
 "plan.review.title" = "Team review"
 "plan.review.accept" = "accepts"
+"plan.review.auto_approved" = "[plan] Plan review auto-approved and implementation started (auto-pass tier). Press shift+Tab or /manual for per-item human review."
 "plan.review.block" = "{} must-fix"
 "plan.review.collapsed" = "Team review: {} accept · {} blocking — /plan to expand"
 "plan.review.note.accept" = "Team review · [{}] accepts"

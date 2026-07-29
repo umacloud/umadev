@@ -362,6 +362,7 @@
 "plan.queue.native" = "  {}. [底座原生队列] {}"
 "plan.review.title" = "团队评审"
 "plan.review.accept" = "通过"
+"plan.review.auto_approved" = "[plan] 「计划审阅」已自动批准并开始实施(自动过门)。按 shift+Tab 或 /manual 可转人工逐项审阅。"
 "plan.review.block" = "{} 个必改"
 "plan.review.collapsed" = "团队评审:{} 通过 · {} 拦截 — /plan 展开"
 "plan.review.note.accept" = "团队评审 · [{}] 通过"
