@@ -3421,15 +3421,15 @@ fn render_gate_choice_panel(
     // Reserve the question and the hint; the rest is the option window.
     let option_budget = inner_rows.saturating_sub(2).max(1);
     let clipped = total > option_budget;
-    let (start, end) = if !clipped {
-        (0, total)
-    } else {
+    let (start, end) = if clipped {
         // Center the window on the selection, clamped to the ends.
         let half = option_budget / 2;
         let start = sel
             .saturating_sub(half)
             .min(total.saturating_sub(option_budget));
         (start, start + option_budget)
+    } else {
+        (0, total)
     };
 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_rows);
