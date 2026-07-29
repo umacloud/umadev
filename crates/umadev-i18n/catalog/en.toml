@@ -211,6 +211,7 @@
 "gate.choice.add_more" = "Add more"
 "gate.choice.cancel" = "Cancel this run"
 "gate.choice.hint" = "↑↓ to choose · number keys to pick · Enter to confirm · or just type your feedback"
+"gate.choice.hint_windowed" = "item {}/{} · ↑↓ to scroll options · number keys to pick · Enter to confirm · or just type"
 "gate.choice.revise.prompt" = "Okay — describe what you'd like changed."
 "gate.choice.add_more.prompt" = "Okay — tell me what to add."
 

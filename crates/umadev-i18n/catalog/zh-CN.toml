@@ -209,6 +209,7 @@
 "gate.choice.add_more" = "补充内容"
 "gate.choice.cancel" = "取消本次运行"
 "gate.choice.hint" = "↑↓ 选择 · 数字键直选 · Enter 确认 · 或直接输入你的反馈"
+"gate.choice.hint_windowed" = "第 {}/{} 项 · ↑↓ 滚动选项 · 数字键直选 · Enter 确认 · 或直接输入反馈"
 "gate.choice.revise.prompt" = "好的,请描述要修改的地方。"
 "gate.choice.add_more.prompt" = "好的,请补充你想增加的内容。"
 

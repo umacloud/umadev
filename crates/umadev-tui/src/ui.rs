@@ -2931,7 +2931,20 @@ fn render_chat(frame: &mut Frame, app: &App) {
     render_title_row(frame, chunks[0], app);
     render_transcript(frame, chunks[1], app);
     if panel_h > 0 {
-        render_plan_panel(frame, chunks[2], &panel_lines, app.lang);
+        // A live gate-choice picker uses a windowed renderer so a SHORT terminal
+        // never hides an option the digit keys can still pick (the reported
+        // "only an ellipsis row, but 4/5 still select"). Otherwise the generic
+        // top-clip plan panel.
+        let gate_choice = app
+            .input
+            .is_empty()
+            .then(|| app.gate_choice.as_ref().filter(|c| c.is_renderable()))
+            .flatten();
+        if let Some(choice) = gate_choice {
+            render_gate_choice_panel(frame, chunks[2], app, choice);
+        } else {
+            render_plan_panel(frame, chunks[2], &panel_lines, app.lang);
+        }
     }
     if queue_h > 0 {
         render_prompt_queue(frame, chunks[3], app);
@@ -3354,6 +3367,100 @@ const PLAN_PANEL_MAX_ROWS: u16 = 12;
 /// and a one-line hint. Labels are localized via `t()` (an i18n key is resolved,
 /// a literal is shown verbatim). All colors come from the theme — no naked hex,
 /// no emoji. Free-text stays available; the hint says so.
+/// Render a live gate-choice picker with height-aware WINDOWING: the question
+/// row and the key-hint row are always reserved, and the option rows window
+/// around the current selection so a short terminal can never hide an option
+/// while its digit hotkey stays live (the reported "ellipsis-only, but 4/5 still
+/// pick"). When options are clipped, the hint carries a "第 n/m 项" position so
+/// the user knows more exist and that free-text is still available.
+fn render_gate_choice_panel(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    choice: &umadev_agent::GateChoice,
+) {
+    let lang = app.lang;
+    let width = usize::from(area.width);
+    let inner_rows = (area.height as usize).saturating_sub(1); // TOP border eats one row
+    if inner_rows == 0 {
+        return;
+    }
+    let total = choice.options.len();
+    let sel = app.gate_choice_sel.min(total.saturating_sub(1));
+
+    let question = Line::from(Span::styled(
+        format!(" {}", umadev_i18n::t(lang, &choice.question)),
+        Style::default()
+            .fg(theme::WARNING())
+            .add_modifier(Modifier::BOLD),
+    ));
+    let option_line = |i: usize| -> Line<'static> {
+        let n = i + 1;
+        let label = umadev_i18n::t(lang, &choice.options[i].label);
+        let selected = i == sel;
+        let marker = if selected { "▸" } else { " " };
+        let (marker_color, label_style) = if selected {
+            (
+                theme::PRIMARY(),
+                Style::default()
+                    .fg(theme::PRIMARY())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (theme::TEXT_MUTED(), Style::default().fg(theme::TEXT()))
+        };
+        Line::from(vec![
+            Span::styled(
+                format!("  {marker} {n}. "),
+                Style::default().fg(marker_color),
+            ),
+            Span::styled(compact_display(label), label_style),
+        ])
+    };
+
+    // Reserve the question and the hint; the rest is the option window.
+    let option_budget = inner_rows.saturating_sub(2).max(1);
+    let clipped = total > option_budget;
+    let (start, end) = if !clipped {
+        (0, total)
+    } else {
+        // Center the window on the selection, clamped to the ends.
+        let half = option_budget / 2;
+        let start = sel
+            .saturating_sub(half)
+            .min(total.saturating_sub(option_budget));
+        (start, start + option_budget)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_rows);
+    lines.push(question);
+    for i in start..end {
+        lines.push(option_line(i));
+    }
+    let hint = if clipped {
+        // Position-aware hint so the user knows the list is windowed.
+        umadev_i18n::tlf(
+            "gate.choice.hint_windowed",
+            &[&(sel + 1).to_string(), &total.to_string()],
+        )
+    } else {
+        umadev_i18n::t(lang, "gate.choice.hint").to_string()
+    };
+    lines.push(Line::from(Span::styled(
+        format!("  {hint}"),
+        Style::default().fg(theme::TEXT_MUTED()),
+    )));
+
+    frame.render_widget(
+        Paragraph::new(clip_panel_lines(lines, width)).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(theme::BORDER())),
+        ),
+        area,
+    );
+}
+
 fn gate_choice_lines(app: &App, choice: &umadev_agent::GateChoice) -> Vec<Line<'static>> {
     let lang = app.lang;
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -8298,6 +8405,57 @@ mod tests {
         // P5d: deterministic spinner cadence in render tests (see fresh_app).
         app.animations = true;
         app
+    }
+
+    // --- Gate choice picker windowing ---
+
+    #[test]
+    fn a_short_terminal_still_shows_the_selected_gate_option() {
+        use umadev_agent::gates::{GateChoice, GateChoiceOption, GateDecision};
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        // Four options; select the LAST — the generic top-clip would drop it,
+        // letting digit key 4 pick an option the user cannot see. The windowed
+        // renderer must keep the selected row on screen.
+        app.gate_choice = Some(GateChoice {
+            question: "Pick a direction".to_string(),
+            options: vec![
+                GateChoiceOption {
+                    label: "OPTION_ALPHA".to_string(),
+                    decision: GateDecision::Approve,
+                },
+                GateChoiceOption {
+                    label: "OPTION_BRAVO".to_string(),
+                    decision: GateDecision::Revise,
+                },
+                GateChoiceOption {
+                    label: "OPTION_CHARLIE".to_string(),
+                    decision: GateDecision::AddMore,
+                },
+                GateChoiceOption {
+                    label: "OPTION_DELTA".to_string(),
+                    decision: GateDecision::Approve,
+                },
+            ],
+        });
+        app.gate_choice_sel = 3;
+        app.input.clear();
+
+        // A deliberately short terminal so the option list must window.
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let out: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            out.contains("DELTA"),
+            "the selected (4th) option must stay visible when the panel windows: {out}"
+        );
     }
 
     // --- Picker ---
