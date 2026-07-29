@@ -6947,6 +6947,11 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         Some(umadev_i18n::t(app.lang, "tui.hint.running").into())
     } else if app.finished {
         Some(umadev_i18n::t(app.lang, "tui.hint.finished").into())
+    } else if app.operational_pause_reason.is_some() {
+        // Review infrastructure is unavailable and the run PAUSED — the hint must
+        // say so, not fall through to the bare "running" line the right-side
+        // status contradicts with "评审服务不可用" (the reported split status row).
+        Some(umadev_i18n::t(app.lang, "tui.hint.operational_paused").into())
     } else if app.budget_paused {
         // Resumable budget pause — the hint points at `/continue`, NOT the
         // "type a new requirement" abort line (the run's plan is saved).
@@ -6962,6 +6967,12 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Some(umadev_i18n::t(app.lang, "tui.hint.aborted").into())
         }
+    } else if app.degraded {
+        // Terminally degraded (placeholder templates / failed hard gate) keeps
+        // `run_started` set — without this branch the hint read "流水线运行中"
+        // while the right-side status said "[degraded] 降级/未完成" on the SAME
+        // row. Point at `/redo`, matching the status.
+        Some(umadev_i18n::t(app.lang, "tui.hint.degraded").into())
     } else if app.run_started {
         Some(umadev_i18n::t(app.lang, "tui.hint.running").into())
     } else {
@@ -7091,6 +7102,11 @@ fn input_placeholder(app: &App) -> std::borrow::Cow<'static, str> {
         umadev_i18n::t(app.lang, "input.running").into()
     } else if app.finished {
         umadev_i18n::t(app.lang, "input.finished").into()
+    } else if app.operational_pause_reason.is_some() {
+        // Review infrastructure unavailable + paused — say so, don't fall through
+        // to the "running"/budget line (which named a wrong, contradictory stop
+        // reason next to the right-side "评审服务不可用" status).
+        umadev_i18n::t(app.lang, "input.operational_paused").into()
     } else if app.budget_paused {
         // Parked at the wall-clock budget — point at `/continue` (the plan is saved),
         // NOT the "re-enter a requirement" abort line nor the bare "running" hint.
