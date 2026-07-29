@@ -2189,6 +2189,25 @@ async fn drain_plan_turn_traced(
                     };
                 }
             }
+            // claude/codex route AskUserQuestion / ExitPlanMode / elicitation as a
+            // HostRequest, NEVER a NeedApproval — so without this arm the request
+            // fell into the `Ok(Some(_))` ignore below, the base's callback never
+            // got a control_response, the base blocked until the 180s idle timer,
+            // and the `Err(_)` arm returned WITHOUT interrupting, handing the
+            // fallback build a shared session that still carried an unanswered RPC
+            // (exactly the wedge the NeedApproval arm above exists to prevent).
+            // A JSON-only plan turn forbids tools: safe-reject it and, if the
+            // reply cannot be written, interrupt to un-wedge the session.
+            Ok(Some(SessionEvent::HostRequest { req_id, request })) => {
+                let rejection = request.safe_rejection("plan-only turn does not run tools");
+                if session.respond_host(&req_id, rejection).await.is_err() {
+                    let _ = session.interrupt().await;
+                    return TracedPlanTurn {
+                        text: None,
+                        recipe_receipt,
+                    };
+                }
+            }
             // A JSON-only plan turn should emit no other tools; ignore anything else
             // and let the next-event timeout bound a misbehaving turn.
             Ok(Some(_)) => {}
@@ -2963,6 +2982,52 @@ mod tests {
             "the approval was answered, not left dangling"
         );
         assert_eq!(replies[0], ("req-1".to_string(), ApprovalDecision::Deny));
+    }
+
+    #[tokio::test]
+    async fn drain_plan_turn_safe_rejects_a_host_request_and_finishes_without_wedging() {
+        use umadev_runtime::{ApprovalDecision, HostRequest, SessionEvent, TurnStatus};
+        // claude/codex route AskUserQuestion / ExitPlanMode as a HostRequest,
+        // never a NeedApproval. Without the HostRequest arm the base blocked to
+        // the idle timeout and the shared session was handed on carrying an
+        // unanswered RPC. drain must safe-reject it (recorded as a Deny through
+        // the default respond_host) and still drain to the JSON reply.
+        let mut s = ScriptedSession::new(
+            vec![
+                SessionEvent::HostRequest {
+                    req_id: "hr-1".into(),
+                    request: HostRequest::UserInput {
+                        questions: Vec::new(),
+                        metadata: serde_json::Value::Null,
+                    },
+                },
+                SessionEvent::TextDelta("{\"steps\":[]}".into()),
+                SessionEvent::TurnDone {
+                    status: TurnStatus::Completed,
+                    usage: None,
+                },
+            ],
+            false,
+        );
+        let responded = std::sync::Arc::clone(&s.responded);
+        let out = drain_plan_turn(
+            &mut s,
+            "plan please".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+        .await;
+        assert_eq!(
+            out.as_deref(),
+            Some("{\"steps\":[]}"),
+            "drained the JSON reply"
+        );
+        let replies = responded.lock().unwrap();
+        assert_eq!(
+            replies.len(),
+            1,
+            "the host request was answered, not left dangling"
+        );
+        assert_eq!(replies[0], ("hr-1".to_string(), ApprovalDecision::Deny));
     }
 
     #[tokio::test]

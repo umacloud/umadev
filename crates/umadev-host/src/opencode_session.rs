@@ -2630,8 +2630,31 @@ fn translate_frame_tracked_raw(
         "session.created" | "session.updated" => {
             translate_session_model(&props, session_id, tracker)
         }
-        // Connection / liveness frames carry no turn semantics.
-        _ => Vec::new(),
+        // Unmatched frame. Most are connection/liveness noise, but this is the
+        // ONLY driver that dropped everything unknown with no trace — so one
+        // opencode release renaming `question.asked`/`permission.asked` would
+        // wedge a turn forever with nothing in the log to diagnose it. Log every
+        // unmatched frame at debug; escalate to WARN for an interactive-looking
+        // namespace (`permission.*` / `question.*` / `elicitation.*`), the frames
+        // whose loss would silently hang a turn. (Emitting a HostRequest for a
+        // renamed request is deferred: an unknown `permission.replied`/
+        // `question.answered` is lifecycle, not a new ask, so surfacing a picker
+        // needs a real wire sample to tell request from settlement.)
+        other => {
+            if other.starts_with("permission.")
+                || other.starts_with("question.")
+                || other.starts_with("elicitation.")
+            {
+                tracing::warn!(
+                    target: "opencode_session",
+                    "unhandled interactive frame `{other}` dropped — a turn may hang; \
+                     this is likely an opencode protocol change"
+                );
+            } else {
+                tracing::debug!(target: "opencode_session", "unmatched frame `{other}`");
+            }
+            Vec::new()
+        }
     }
 }
 

@@ -4403,6 +4403,23 @@ async fn drain_review_text(fork: &mut Box<dyn BaseSession>) -> Option<String> {
                     tokio::time::timeout(std::time::Duration::from_secs(2), fork.interrupt()).await;
                 return None;
             }
+            // A critic fork must not stall on an interactive request. The three
+            // native forks are pinned read-only, but an ACP fork has no such
+            // hard guarantee — an unanswered HostRequest would burn the whole
+            // review round to the caller's timeout with no diagnosable cause.
+            // Safe-reject it and enforce the review boundary, mirroring the
+            // ToolCall arm above.
+            SessionEvent::HostRequest { req_id, request } => {
+                let rejection = request.safe_rejection("review fork does not run tools");
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    fork.respond_host(&req_id, rejection),
+                )
+                .await;
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), fork.interrupt()).await;
+                return None;
+            }
             _ => {}
         }
     }
