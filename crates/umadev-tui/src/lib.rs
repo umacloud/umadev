@@ -10830,6 +10830,15 @@ async fn event_loop(
                     // writer, so the ordinary resident chat holder must be warm
                     // again before the next queued conversation turn.
                     let was_run = app.director_run_in_flight;
+                    // A question / approval cannot outlive the turn that asked it: the
+                    // turn just SETTLED, so any still-parked interactive request is
+                    // stale (its asker moved past it). Left in place, it kept the dead
+                    // picker + "[?] waiting for your answer" bar on screen across
+                    // turns AND auto-rejected every later interactive ask behind it.
+                    // Dropping the holder settles the stale RPC via the waiter's
+                    // safe-rejection path; the per-frame UI sync dismisses the picker.
+                    clear_pending_host_input(&host_input_holder);
+                    clear_pending_approval(&approval_holder);
                     app.record_agentic_done(
                         reply,
                         director_build,
@@ -10947,6 +10956,10 @@ async fn event_loop(
                 // auto-replaying without sacrificing post-Director messages.
                 Some(RouteDecision::Failed(note)) => {
                     let was_run = app.director_run_in_flight;
+                    // Same stale-ask cleanup as the AgenticDone settle: a failed
+                    // terminal outcome equally orphans any parked question/approval.
+                    clear_pending_host_input(&host_input_holder);
+                    clear_pending_approval(&approval_holder);
                     let origin = if was_run {
                         FailedRouteOrigin::Director
                     } else {

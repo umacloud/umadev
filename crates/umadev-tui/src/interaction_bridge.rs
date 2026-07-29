@@ -433,14 +433,37 @@ pub(super) async fn await_host_input(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let token = NEXT_HOST_INPUT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match holder.lock() {
-        Ok(mut guard) if guard.is_none() => {
+        Ok(mut guard) => {
+            // An older request still parked here means the serially-asking base has
+            // ABANDONED it: it stopped waiting (its own timeout / it answered itself)
+            // and moved on — this NEW ask is the live one. The old behaviour rejected
+            // the NEWCOMER ("another host response is already pending"), which bricked
+            // every later interactive ask behind one stale occupant: each terminal /
+            // permission question came back to the base as an instant rejection
+            // (rendered as "User rejected the execution"), commands stopped running,
+            // and the whole pipeline fail-closed — while the dead picker stayed on
+            // screen. Supersede instead: settle the stale RPC with a protocol-shaped
+            // cancel (harmless if the server already dropped it) and register the
+            // live request; the per-frame UI sync then swaps the picker.
+            if let Some(stale) = guard.take() {
+                let _ = stale
+                    .reply_tx
+                    .send(umadev_runtime::HostResponse::Cancelled {
+                        reason: Some(
+                            "superseded by a newer interactive request from the base".to_string(),
+                        ),
+                    });
+                sink.emit(EngineEvent::Note(
+                    "[note] the base moved on to a new question; the earlier unanswered one was cancelled"
+                        .to_string(),
+                ));
+            }
             *guard = Some(PendingHostInput {
                 token,
                 reply_tx: tx,
                 request: request.clone(),
             });
         }
-        Ok(_) => return request.safe_rejection("another host response is already pending"),
         Err(_) => return request.safe_rejection("host response bridge unavailable"),
     }
     sink.emit(EngineEvent::Note(host_request_note(request)));

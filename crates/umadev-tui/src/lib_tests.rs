@@ -970,6 +970,69 @@ fn secret_host_reply_is_masked_and_never_persisted_in_chat() {
     );
 }
 
+#[tokio::test]
+async fn a_newer_host_request_supersedes_the_stale_unanswered_one() {
+    // The reported production loop: a plan-review / question picker the base had
+    // ALREADY abandoned kept occupying the single interactive slot, so every later
+    // ask (each terminal-permission question) was instantly auto-rejected — the base
+    // rendered "User rejected the execution", commands stopped running, and the
+    // pipeline fail-closed, while the dead picker stayed on screen. The newest ask
+    // from a serially-asking base is the live one: it must SUPERSEDE the stale
+    // occupant (settling that RPC with a protocol-shaped cancel), never be rejected
+    // behind it.
+    let holder: HostInputHolder = Arc::new(std::sync::Mutex::new(None));
+    let (old_tx, old_rx) = tokio::sync::oneshot::channel();
+    *holder.lock().unwrap() = Some(PendingHostInput {
+        token: 1,
+        reply_tx: old_tx,
+        request: secret_host_request(),
+    });
+    let (sink, _events) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let waiter = tokio::spawn({
+        let holder = holder.clone();
+        let sink = sink.clone();
+        async move {
+            crate::interaction_bridge::await_host_input(&holder, &sink, &secret_host_request())
+                .await
+        }
+    });
+
+    // The stale occupant settles promptly with a cancel — not a 5-minute hang, and
+    // never by rejecting the newcomer.
+    let stale_response = old_rx.await.expect("the stale request must be settled");
+    assert!(
+        matches!(
+            &stale_response,
+            umadev_runtime::HostResponse::Cancelled { reason: Some(reason) }
+                if reason.contains("superseded")
+        ),
+        "the abandoned ask is cancelled as superseded: {stale_response:?}"
+    );
+
+    // The NEW request owns the slot; answering it resolves the live waiter.
+    let pending = loop {
+        if let Some(pending) = holder.lock().unwrap().take() {
+            break pending;
+        }
+        tokio::task::yield_now().await;
+    };
+    let _ = pending
+        .reply_tx
+        .send(umadev_runtime::HostResponse::Cancelled {
+            reason: Some("answered-new".to_string()),
+        });
+    let got = waiter.await.expect("waiter task completes");
+    assert!(
+        matches!(
+            &got,
+            umadev_runtime::HostResponse::Cancelled { reason: Some(reason) }
+                if reason == "answered-new"
+        ),
+        "the live (newest) request is the one the user answers: {got:?}"
+    );
+}
+
 #[test]
 fn cancelling_secret_host_reply_scrubs_editor_recovery_immediately() {
     let tmp = tempfile::TempDir::new().unwrap();
