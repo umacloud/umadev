@@ -3208,6 +3208,15 @@ fn error_message_at(value: Option<&Value>) -> Option<String> {
 
 /// Stable string key for a JSON-RPC id (number or string), used to correlate a
 /// host-visible `req_id` back to the raw id for the reply.
+///
+/// NOTE (deferred): a numeric id `7` and a string id `"7"` collapse to the same
+/// key, so twin-typed distinct requests would collide (audit LOW). Type-prefixing
+/// fixes the collision on the request-insert side, but the `serverRequest/
+/// resolved` CLEANUP path keys the same way — and if codex ever echoes a
+/// request's id with a DIFFERENT JSON type in the resolved notification than in
+/// the original request, a prefixed key would break the cleanup correlation and
+/// LEAK the request. Whether codex echoes ids type-consistently is unverified
+/// here, so this stays as-is until a real codex frame confirms the echo type.
 fn json_id_key(id: &Value) -> String {
     match id {
         Value::String(s) => s.clone(),
