@@ -73,11 +73,20 @@ jobs:
         with:
           toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Verify Windows Job Object process-tree teardown
-        if: runner.os == 'Windows'
+      # The process-group / Job-Object teardown tests spawn real child processes
+      # and assert on signal delivery, PID-reuse safety, and reap ordering. They
+      # are correct and pass reliably when run SERIALLY (as designed), but the
+      # default-parallel workspace run below starves them of scheduling under a
+      # loaded CI runner and they flake — NOT a logic bug (they pass locally and
+      # here at --test-threads=1). Run them serially on EVERY platform (this step
+      # used to be Windows-only, which left macos/ubuntu to flake in the parallel
+      # run) and EXCLUDE the crate from the parallel run so it is covered exactly
+      # once, reliably. umadev-process has no integration/doc tests, so --lib here
+      # is its full surface.
+      - name: Process-tree teardown (serial, all platforms)
         run: cargo test -p umadev-process --lib --locked -- --test-threads=1
       - name: cargo test
-        run: cargo test --workspace --all-features --all-targets --locked --no-fail-fast
+        run: cargo test --workspace --exclude umadev-process --all-features --all-targets --locked --no-fail-fast
       - name: cargo test (doctests)
         run: cargo test --workspace --all-features --doc --locked --no-fail-fast
 

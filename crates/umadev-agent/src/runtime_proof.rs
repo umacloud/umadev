@@ -2331,6 +2331,22 @@ mod tests {
         assert!(write_preview_pid(tmp.path(), pid, "sleep", owner_token));
         assert_eq!(pid_is_alive(pid), Some(true));
 
+        // `spawn` returns after fork; the child must still exec `sh` and publish
+        // its argv (carrying `owner_token`) in `/proc` before the token-identity
+        // check inside `reclaim_tracked_preview` can see it. On a loaded CI runner
+        // that lag can exceed the helper's own bounded probe, so the token isn't
+        // found → reclaim reports not-ours → `killed` is false (the observed
+        // flake). `reclaim` clears the pidfile even on failure, so a retry can't
+        // recover — WAIT for the argv to publish here, before the single reclaim.
+        let token_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !process_group_has_owner_token(pid, owner_token).await {
+            assert!(
+                std::time::Instant::now() < token_deadline,
+                "the tracked child never published its owner token in /proc"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
         let killed = reclaim_tracked_preview(tmp.path()).await;
         assert!(killed, "our own alive tracked pid should be reclaimed");
         assert!(
