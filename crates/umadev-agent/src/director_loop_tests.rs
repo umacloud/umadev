@@ -9112,26 +9112,37 @@ fn file_contains_supports_a_relative_project_root() {
 
 #[test]
 fn absolute_paths_outside_the_workspace_are_flagged_others_ignored() {
-    let root = std::path::Path::new("/home/u/proj/2.0");
+    // Build paths from a REAL absolute anchor so `is_absolute()` holds on every
+    // platform (a Unix-style "/home/..." literal is NOT absolute on Windows,
+    // where a path needs a drive prefix — that made the earlier literal-based
+    // test fail on the Windows runner).
+    let proj = std::env::temp_dir().join("umadev-scope-proj");
+    let root = proj.join("2.0");
+    let sibling = proj.join("1.5");
+
     // The reported case: an absolute read into a sibling project escapes.
+    let sibling_file = sibling.join("src").join("main.rs");
     assert_eq!(
-        absolute_path_escapes_workspace(root, "/home/u/proj/1.5/src/main.rs").as_deref(),
-        Some("/home/u/proj/1.5/src/main.rs"),
+        absolute_path_escapes_workspace(&root, &sibling_file.to_string_lossy()).as_deref(),
+        Some(sibling_file.to_string_lossy().as_ref()),
         "a sibling-project absolute path is flagged"
     );
     // `..` normalization catches an in-root prefix that climbs out.
+    let climb = root.join("..").join("1.5").join("x");
+    let expect = sibling.join("x");
     assert_eq!(
-        absolute_path_escapes_workspace(root, "/home/u/proj/2.0/../1.5/x").as_deref(),
-        Some("/home/u/proj/1.5/x")
+        absolute_path_escapes_workspace(&root, &climb.to_string_lossy()).as_deref(),
+        Some(expect.to_string_lossy().as_ref())
     );
     // A path inside the workspace is never flagged.
-    assert!(absolute_path_escapes_workspace(root, "/home/u/proj/2.0/src/a.rs").is_none());
+    let inside = root.join("src").join("a.rs");
+    assert!(absolute_path_escapes_workspace(&root, &inside.to_string_lossy()).is_none());
     // A relative path inside the workspace is never flagged.
-    assert!(absolute_path_escapes_workspace(root, "src/a.rs").is_none());
+    assert!(absolute_path_escapes_workspace(&root, "src/a.rs").is_none());
     // A relative path that climbs OUT (base cwd == workspace) IS flagged.
     assert_eq!(
-        absolute_path_escapes_workspace(root, "../1.5/x").as_deref(),
-        Some("/home/u/proj/1.5/x"),
+        absolute_path_escapes_workspace(&root, "../1.5/x").as_deref(),
+        Some(expect.to_string_lossy().as_ref()),
         "a relative parent-escape is caught too"
     );
 }

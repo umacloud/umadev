@@ -724,7 +724,11 @@ impl PendingHostInputView {
                         umadev_i18n::tf(
                             lang,
                             "host.grok.plan.row_position",
-                            &[&first.to_string(), &last.to_string(), &total_rows.to_string()],
+                            &[
+                                &first.to_string(),
+                                &last.to_string(),
+                                &total_rows.to_string()
+                            ],
                         )
                     )
                 } else {
