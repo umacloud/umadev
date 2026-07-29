@@ -947,11 +947,17 @@ pub(super) async fn await_user_approval(
     await_user_approval_with_auto_release(holder, sink, action, target, true, "").await
 }
 
-// NOTE: threading the base `req_id` into a `HostRequest::Approval` pause (so a
-// HostRequestSettled can retract the APPROVAL bar, not just the picker) is a
-// follow-up — it needs `req_id` down through `resident_approval_decision`. Today
-// approvals register with an empty `req_id`, so `retract_pending_approval_for` is
-// wired but inert; picker retraction (the common zombie case) is live.
+/// The `HostRequest::Approval` variant: carries the base `req_id` so a later
+/// `HostRequestSettled` can retract exactly this approval bar.
+pub(super) async fn await_user_approval_for_request(
+    holder: &ApprovalHolder,
+    sink: &Arc<ChannelSink>,
+    action: &str,
+    target: &str,
+    req_id: &str,
+) -> ApprovalReply {
+    await_user_approval_with_auto_release(holder, sink, action, target, true, req_id).await
+}
 
 /// Register the same visible approval pause with an explicit mode-switch
 /// policy. Upstream-forced permission requests pass `false`, ensuring a local
@@ -1083,9 +1089,11 @@ pub(super) fn host_approval_option_id(
 /// Resolve one approval-shaped request through the live trust tier and ledger.
 /// This is shared by legacy `NeedApproval` and typed host requests semantically;
 /// the latter additionally preserves the selected protocol option id.
+#[allow(clippy::too_many_arguments)] // a protocol resolver: each arg is a distinct, irreducible input
 pub(super) async fn resident_approval_decision(
     action: &str,
     target: &str,
+    req_id: &str,
     project_root: &std::path::Path,
     mode_snapshot: umadev_agent::TrustMode,
     interactive: bool,
@@ -1104,7 +1112,10 @@ pub(super) async fn resident_approval_decision(
         &ledger,
     );
     if should_pause_for_user(mode, interactive, cap, already, needs_confirm) {
-        match await_user_approval(approval_holder, sink, action, target).await {
+        // Carry the base `req_id` (when this approval came from a
+        // `HostRequest::Approval`) so a HostRequestSettled can retract the
+        // approval bar too — not just the picker.
+        match await_user_approval_for_request(approval_holder, sink, action, target, req_id).await {
             ApprovalReply::Allow => {
                 umadev_agent::remember_project_approval(project_root, action, target);
                 sink.emit(EngineEvent::Note(umadev_i18n::tlf(
@@ -1172,6 +1183,7 @@ pub(super) async fn resolve_resident_host_request(
                 resident_approval_decision(
                     action,
                     target,
+                    req_id,
                     project_root,
                     mode,
                     interactive,
@@ -1216,6 +1228,7 @@ pub(super) async fn resolve_resident_host_request(
             let decision = resident_approval_decision(
                 "permission-expansion",
                 &target,
+                req_id,
                 project_root,
                 mode,
                 interactive,
@@ -1280,6 +1293,7 @@ pub(super) async fn resolve_resident_host_request(
             let decision = resident_approval_decision(
                 "plan-confirmation",
                 target,
+                req_id,
                 project_root,
                 mode,
                 interactive,

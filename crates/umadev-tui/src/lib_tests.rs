@@ -1093,8 +1093,8 @@ async fn a_withdrawn_request_retracts_only_the_matching_picker() {
         "the parked RPC settles protocol-shaped, never a fabricated answer"
     );
 
-    // Approval twin: an empty req_id (a Guarded local pause with no base RPC)
-    // never matches a real withdrawn id.
+    // Approval twin. An empty req_id (a Guarded LOCAL pause with no base RPC) is
+    // never retracted by a base withdrawal…
     let approval: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
     let (atx, _arx) = tokio::sync::oneshot::channel();
     *approval.lock().unwrap() = Some(test_pending_approval(atx));
@@ -1103,6 +1103,30 @@ async fn a_withdrawn_request_retracts_only_the_matching_picker() {
         "a local (req_id-less) approval is never retracted by a base withdrawal"
     );
     assert!(approval.lock().unwrap().is_some());
+
+    // …but an approval that came from a `HostRequest::Approval` (carrying its
+    // req_id) IS retracted by the matching withdrawal, and left alone by a
+    // foreign one.
+    let (btx, brx) = tokio::sync::oneshot::channel();
+    *approval.lock().unwrap() = Some(PendingApproval {
+        req_id: "perm-9".to_string(),
+        ..test_pending_approval(btx)
+    });
+    assert!(!retract_pending_approval_for(&approval, "perm-OTHER"));
+    assert!(
+        approval.lock().unwrap().is_some(),
+        "a foreign id is a no-op"
+    );
+    assert!(retract_pending_approval_for(&approval, "perm-9"));
+    assert!(
+        approval.lock().unwrap().is_none(),
+        "the matching approval is retracted"
+    );
+    assert_eq!(
+        brx.await,
+        Ok(ApprovalReply::Deny),
+        "a retracted approval settles as Deny"
+    );
 }
 
 #[tokio::test]
