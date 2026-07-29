@@ -11948,7 +11948,7 @@ impl App {
     /// Returns at most three rows plus the total count; the count lets the title
     /// say "5 queued" while only the first three render. Native base-side queue
     /// entries (`prompt_queue`) render in their own section and are not repeated
-    /// here. A one-off "[排队]" note scrolls away with the transcript — this
+    /// here. A one-off `[排队]` note scrolls away with the transcript — this
     /// preview is what keeps the parked text VISIBLE the whole time it waits.
     #[must_use]
     pub fn queued_preview(&self) -> (Vec<String>, usize) {
