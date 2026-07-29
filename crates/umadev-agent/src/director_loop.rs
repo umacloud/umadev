@@ -5567,7 +5567,30 @@ pub(crate) async fn resolve_host_request(
                 message: reason.clone(),
             }
         }
-        HostRequest::PlanConfirmation { plan, message, .. } => {
+        HostRequest::PlanConfirmation {
+            plan,
+            message,
+            metadata,
+        } => {
+            // The grok exit-plan-mode contract accepts ONLY a PlanOutcome reply
+            // — a generic PlanConfirmation here was rejected by the host driver
+            // as a mismatched response, so grok's plan tool got a JSON-RPC error
+            // and the step died without ever presenting the plan. This resolver
+            // has no interactive picker (the hosted TUI path owns that), so the
+            // protocol-shaped safe rejection — which IS PlanOutcome::Cancelled
+            // for this contract — is the correct, graceful answer: grok keeps
+            // planning/settles instead of erroring.
+            if metadata
+                .get("responseContract")
+                .and_then(serde_json::Value::as_str)
+                == Some("grok_exit_plan_mode_v1")
+            {
+                events.emit(EngineEvent::Note(
+                    "[plan] the base's plan review needs the interactive host — declined protocol-shaped (kept planning)"
+                        .to_string(),
+                ));
+                return request.safe_rejection("plan review requires an interactive host");
+            }
             events.emit(EngineEvent::Note(format!(
                 "[plan] {}\n{}",
                 message
