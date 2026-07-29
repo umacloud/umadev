@@ -6926,6 +6926,28 @@ fn render_prompt(frame: &mut Frame, area: Rect, app: &App) {
             gate_parts.push(("·".into(), theme::BORDER()));
             gate_parts.push((model, theme::TEXT_MUTED()));
         }
+        // A gate opening is EXACTLY when the user queues follow-up input, yet the
+        // old gate row dropped the [queued N] chip (and the run chip) that the
+        // normal row shows — so parked messages went invisible at the one moment
+        // they matter most. Append the same unreconstructable state chips.
+        if let Some(task) = app.active_task() {
+            gate_parts.push(("·".into(), theme::BORDER()));
+            let chip = if task.total > 0 {
+                umadev_i18n::tf(
+                    app.lang,
+                    "tui.chip.run",
+                    &[&task.done.to_string(), &task.total.to_string()],
+                )
+            } else {
+                umadev_i18n::t(app.lang, "tui.chip.run_indeterminate").into()
+            };
+            gate_parts.push((chip, theme::INFO()));
+        }
+        let queued = app.queued_count();
+        if queued > 0 {
+            gate_parts.push(("·".into(), theme::BORDER()));
+            gate_parts.push((format!("[queued {queued}]"), theme::WARNING()));
+        }
         return meta_row(
             frame,
             prompt_chunks[1],
@@ -8427,6 +8449,22 @@ mod tests {
         // P5d: deterministic spinner cadence in render tests (see fresh_app).
         app.animations = true;
         app
+    }
+
+    #[test]
+    fn the_queued_chip_survives_an_open_gate() {
+        // A gate opening is exactly when the user queues follow-ups — the gate
+        // meta row must not drop the unreconstructable [queued N] chip.
+        let mut app = app_with(Some("offline"));
+        app.lang = umadev_i18n::Lang::En;
+        app.active_gate = Some(umadev_agent::gates::Gate::DocsConfirm);
+        app.queued_chat.push_back("do the login page next".into());
+        app.queued_chat.push_back("and dark mode".into());
+        let out = render_to_string(&app);
+        assert!(
+            out.contains("[queued 2]"),
+            "the queued chip must render on the gate meta row: {out}"
+        );
     }
 
     // --- Gate choice picker windowing ---
