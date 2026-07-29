@@ -5229,6 +5229,12 @@ async fn handle_permission_request(
     };
     match context.permissions {
         BasePermissionProfile::Plan => {
+            // Plan is read-only: an ACP permission request (a write/command the
+            // base wants to run) is declined here. NOTE: this is still SILENT —
+            // the driver has no informational-note channel (SessionEvent carries
+            // no Note variant), so surfacing "[plan] 只读模式已拒绝…此非你的决定"
+            // needs that infrastructure first. Tracked in the interaction backlog
+            // as the "Plan-tier silent deny has no human-visible cause" HIGH.
             let option = record.option_for_decision(ApprovalDecision::Deny);
             let _ =
                 write_permission_response(&context.writer, &raw_id, option.as_deref(), None).await;

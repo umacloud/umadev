@@ -1034,6 +1034,24 @@ fn remembered_class(command: &str, target_path: &str) -> Option<&'static str> {
 /// the ledger key consistent with the root-aware gate, so a remembered IN-tree
 /// approval can never silently auto-allow an OUT-of-tree write. `None` root → the
 /// legacy heuristic (back-compat for the `command`/`target`-only ledger methods).
+/// Semantic REQUEST actions that are not shell commands but which
+/// [`capability_class`] cannot classify (no command to inspect) and so funnels
+/// into [`Capability::Shell`]. Left rememberable, ONE approval of any of these —
+/// or of an ordinary `bash` — collapses into the single `"shell"` ledger key and
+/// then silently auto-grants EVERY later one of them for the whole project (the
+/// reported permission blank-check: approve `npm run build` once → every later
+/// sandbox-expansion and generic plan-confirmation is auto-granted; approve one
+/// out-of-workspace read → every shell command is auto-approved). They are made
+/// structurally UNREMEMBERABLE: never written to the ledger, and — because the
+/// same function is the ledger CHECK — never matched against an existing shell
+/// rule, so each one always re-asks. The first-time pause is unchanged
+/// (`capability_class` still returns `Shell`, so Guarded still surfaces it).
+const UNREMEMBERABLE_REQUEST_ACTIONS: &[&str] = &[
+    "permission-expansion",
+    "plan-confirmation",
+    "external_directory",
+];
+
 #[must_use]
 fn remembered_class_rooted(
     command: &str,
@@ -1042,6 +1060,10 @@ fn remembered_class_rooted(
 ) -> Option<&'static str> {
     // Irreversible-floor actions are NEVER remembered — they always re-confirm.
     if reversibility_class(command, target_path).always_escalates() {
+        return None;
+    }
+    // Semantic request actions never share the coarse `"shell"` key (see above).
+    if UNREMEMBERABLE_REQUEST_ACTIONS.contains(&command.trim()) {
         return None;
     }
     match capability_class(command, target_path) {
@@ -3231,5 +3253,44 @@ mod tests {
         assert!(!ledger.remembers_rooted("", out_of_tree_abs(), root));
         // An irreversible-floor action is never remembered (its class is None).
         assert!(!ledger.remembers_rooted("git push origin main", "", root));
+    }
+
+    #[test]
+    fn semantic_request_actions_never_share_the_shell_blank_check() {
+        // The reported permission blank-check: `permission-expansion`,
+        // `plan-confirmation`, and `external_directory` are not shell commands,
+        // but `capability_class` funnels them into `Capability::Shell`. If they
+        // shared the single `"shell"` ledger key, ONE remembered `bash` approval
+        // would auto-grant every later sandbox expansion / plan confirmation, and
+        // one remembered out-of-workspace read would auto-approve every shell
+        // command. They must be structurally unrememberable.
+        let root = real_root();
+        let mut ledger = TrustLedger::default();
+        // A real shell approval is remembered under "shell"…
+        assert_eq!(
+            remembered_class_rooted("npm run build", "", Some(root)),
+            Some("shell")
+        );
+        ledger.allow_rules.insert("shell".to_string());
+        // …but that shell rule must NOT auto-grant any semantic request action.
+        for action in [
+            "permission-expansion",
+            "plan-confirmation",
+            "external_directory",
+        ] {
+            assert!(
+                remembered_class_rooted(action, "/etc/hosts", Some(root)).is_none(),
+                "{action} must be unrememberable (no ledger key)"
+            );
+            assert!(
+                !ledger.remembers_rooted(action, "/etc/hosts", root),
+                "an existing `shell` rule must never auto-grant {action}"
+            );
+        }
+        // And approving one of them must never itself write a shell blank-check.
+        assert!(
+            !remember_project_approval(root, "external_directory", "/etc/hosts"),
+            "approving an external read must not record a rememberable rule"
+        );
     }
 }

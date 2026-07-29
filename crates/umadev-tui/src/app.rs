@@ -16126,7 +16126,7 @@ impl App {
             TrustMode::Plan | TrustMode::Auto => TrustMode::Guarded,
             TrustMode::Guarded => TrustMode::Auto,
         };
-        if self.codex_mode_change_requires_idle(next) {
+        if self.mode_change_blocked_while_busy(next) {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
@@ -16200,6 +16200,19 @@ impl App {
             && (self.has_interruptible_work() || self.thinking)
     }
 
+    /// Whether a tier change to `next` must be refused because a turn is live.
+    /// The ONE guard shared by `/mode`, `/manual`/`/auto`, AND Shift+Tab: a
+    /// mid-turn DOWNGRADE (e.g. Auto→Guarded) would flip the chip to a tighter
+    /// tier while the running base process keeps its wider launch authority —
+    /// the chip would say 手动审核 while writes still flow unasked (the reported
+    /// chip/authority mismatch window). Shift+Tab used to check only the codex
+    /// idle rule and so bypassed this; routing all three through here closes it.
+    fn mode_change_blocked_while_busy(&self, next: umadev_agent::TrustMode) -> bool {
+        (self.effective_trust_mode().is_downgrade_to(next)
+            && (self.has_interruptible_work() || self.thinking))
+            || self.codex_mode_change_requires_idle(next)
+    }
+
     /// Drop the cached config-derived trust tier so the next
     /// [`effective_trust_mode`] re-reads `.umadevrc`. Call after anything that
     /// could change the on-disk `auto_approve_gates` (a `/mode` switch is held
@@ -16222,10 +16235,7 @@ impl App {
         } else {
             umadev_agent::TrustMode::Guarded
         };
-        if (self.effective_trust_mode().is_downgrade_to(mode)
-            && (self.has_interruptible_work() || self.thinking))
-            || self.codex_mode_change_requires_idle(mode)
-        {
+        if self.mode_change_blocked_while_busy(mode) {
             self.push(
                 ChatRole::System,
                 umadev_i18n::t(self.lang, "chat.busy_cancel_first"),
@@ -16262,10 +16272,7 @@ impl App {
         }
         match umadev_agent::TrustMode::parse(arg) {
             Some(mode) => {
-                if (self.effective_trust_mode().is_downgrade_to(mode)
-                    && (self.has_interruptible_work() || self.thinking))
-                    || self.codex_mode_change_requires_idle(mode)
-                {
+                if self.mode_change_blocked_while_busy(mode) {
                     self.push(
                         ChatRole::System,
                         umadev_i18n::t(self.lang, "chat.busy_cancel_first"),

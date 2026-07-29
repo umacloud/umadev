@@ -11603,3 +11603,28 @@ fn preedit_cleanup_requests_invalidate_not_contamination() {
     assert_eq!(crate::heal_mode(true, false), crate::HealMode::Invalidate);
     assert_eq!(crate::heal_mode(false, true), crate::HealMode::Erase);
 }
+
+#[test]
+fn shift_tab_cannot_downgrade_the_tier_mid_turn() {
+    // Shift+Tab used to check only the codex idle rule, so a mid-turn
+    // Auto→Guarded downgrade slipped through: the chip flipped to 手动审核 while
+    // the running base kept its Auto launch authority (writes still flowed
+    // unasked). It must be refused exactly like /mode and /manual are.
+    let (mut app, _tmp) = temp_app();
+    app.trust_mode_override = Some(umadev_agent::TrustMode::Auto);
+    app.thinking = true; // a live turn
+    app.cycle_approval_mode();
+    assert_eq!(
+        app.effective_trust_mode(),
+        umadev_agent::TrustMode::Auto,
+        "a mid-turn downgrade via Shift+Tab is refused"
+    );
+    // Idle: the same Shift+Tab now downgrades cleanly.
+    app.thinking = false;
+    app.cycle_approval_mode();
+    assert_eq!(
+        app.effective_trust_mode(),
+        umadev_agent::TrustMode::Guarded,
+        "when idle, Shift+Tab switches tiers normally"
+    );
+}

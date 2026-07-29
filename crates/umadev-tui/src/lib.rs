@@ -5018,13 +5018,34 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             }
         }
 
+        let user_asked_read_only = umadev_agent::requirement_demands_read_only(&text);
         execution_read_only = routed_turn_executes_read_only(
             native_command,
             &route,
             route_source,
-            umadev_agent::requirement_demands_read_only(&text),
+            user_asked_read_only,
             permissions,
         );
+        // VISIBILITY (permission audit CRITICAL): when the user's live tier is
+        // WRITABLE (Guarded/Auto) but this turn was routed read-only purely
+        // because the brain classified it non-mutating (chat/explain), the base
+        // is reopened under the read-only Plan profile — and used to say so with
+        // zero UI signal, so an "actually, fix it" turn that got misrouted came
+        // back "I'm in read-only mode, I can't edit" while the footer still
+        // showed 自动过门. Emit a one-time note that names the downgrade AND how
+        // to get a writable turn, so a misclassification is legible and
+        // recoverable (re-send making the change intent explicit). Skipped when
+        // the user themselves asked for read-only, when the tier IS Plan, and for
+        // a native slash/shell command (never downgraded).
+        if execution_read_only
+            && permissions != umadev_runtime::BasePermissionProfile::Plan
+            && !user_asked_read_only
+            && !native_command
+        {
+            sink.emit(EngineEvent::Note(
+                umadev_i18n::tl("live_meta.permissions.readonly_route").to_string(),
+            ));
+        }
         let codex_sandbox = (backend == "codex")
             .then(|| umadev_host::codex_session::resolved_codex_launch_sandbox(permissions));
         if codex_read_only_sandbox_blocks_route(
