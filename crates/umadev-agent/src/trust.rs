@@ -1051,7 +1051,7 @@ fn absolute_is_under(path: &Path, root: &Path) -> bool {
 /// key distinguishes the riskier reversible actions a mode would confirm:
 /// an in-tree vs. out-of-tree write, or a local shell command.
 #[must_use]
-fn remembered_class(command: &str, target_path: &str) -> Option<&'static str> {
+fn remembered_class(command: &str, target_path: &str) -> Option<String> {
     remembered_class_rooted(command, target_path, None)
 }
 
@@ -1084,12 +1084,12 @@ fn remembered_class_rooted(
     command: &str,
     target_path: &str,
     workspace_root: Option<&Path>,
-) -> Option<&'static str> {
+) -> Option<String> {
     // Irreversible-floor actions are NEVER remembered — they always re-confirm.
     if reversibility_class(command, target_path).always_escalates() {
         return None;
     }
-    // Semantic request actions never share the coarse `"shell"` key (see above).
+    // Semantic request actions never share the coarse shell key (see above).
     if UNREMEMBERABLE_REQUEST_ACTIONS.contains(&command.trim()) {
         return None;
     }
@@ -1098,12 +1098,36 @@ fn remembered_class_rooted(
         // Network is always a floor action → handled above, never reaches here.
         Capability::Read | Capability::Network => None,
         Capability::Write => Some(if target_escapes_workspace(target_path, workspace_root) {
-            "write_out_of_tree"
+            // Scope an out-of-tree write approval to its PARENT DIRECTORY, so approving a
+            // write under `~/.config/app` cannot silently auto-grant a later write to
+            // `~/.ssh/authorized_keys`, `~/.zshrc`, or a LaunchAgent plist. A single
+            // `write_out_of_tree` key covered the entire filesystem outside the workspace.
+            format!("write_out_of_tree:{}", out_of_tree_write_scope(target_path))
         } else {
-            "write_in_tree"
+            "write_in_tree".to_string()
         }),
-        Capability::Shell => Some("shell"),
+        // Key each shell / MCP / dynamic-tool action by its OWN effective command, NOT one
+        // coarse `"shell"` constant. `capability_class` funnels every non-read, non-write,
+        // non-network action into `Capability::Shell` — a local shell command, but ALSO
+        // every `mcp__server__tool`, sub-agent spawn, and the `Read` tool name. Sharing one
+        // key meant ONE approved `npm run build` auto-granted every later `mcp__*` delete,
+        // sub-agent, and arbitrary shell command for the life of the project (a blank check
+        // via the ordinary tool lane). Each distinct effective command / tool id now has its
+        // own key, so a remembered approval covers only the identical action.
+        Capability::Shell => Some(format!("shell:{}", effective_command(command, target_path))),
     }
+}
+
+/// The remember-scope for an OUT-of-tree write: its PARENT directory, so an approval is
+/// bounded to that directory rather than the whole filesystem outside the workspace. Falls
+/// back to the trimmed target when it has no parent component (e.g. a bare `~`).
+fn out_of_tree_write_scope(target_path: &str) -> String {
+    let trimmed = target_path.trim();
+    Path::new(trimmed)
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .filter(|scope| !scope.is_empty())
+        .unwrap_or_else(|| trimmed.to_string())
 }
 
 /// The decision, consulting the per-project **trust ledger** of remembered
@@ -1136,7 +1160,7 @@ pub fn requires_confirmation_with_ledger(
     // rule can't relax an out-of-tree write.
     if requires_confirmation_rooted(mode, command, target_path, Some(workspace_root)) {
         let key = remembered_class_rooted(command, target_path, Some(workspace_root));
-        return !key.is_some_and(|k| ledger.allow_rules.contains(k));
+        return !key.is_some_and(|k| ledger.allow_rules.contains(k.as_str()));
     }
     false
 }
@@ -1158,7 +1182,7 @@ pub fn remember_project_approval(project_root: &Path, command: &str, target_path
     let Some(key) = remembered_class_rooted(command, target_path, Some(project_root)) else {
         return false;
     };
-    if ledger.allow_rules.insert(key.to_string()) {
+    if ledger.allow_rules.insert(key) {
         ledger.save(project_root);
         true
     } else {
@@ -1764,7 +1788,7 @@ impl TrustLedger {
     /// read (auto-allowed anyway) also records nothing.
     pub fn remember_approval(&mut self, command: &str, target_path: &str) -> bool {
         match remembered_class(command, target_path) {
-            Some(key) => self.allow_rules.insert(key.to_string()),
+            Some(key) => self.allow_rules.insert(key),
             None => false,
         }
     }
@@ -1774,7 +1798,8 @@ impl TrustLedger {
     /// class is `None`), so the floor can never be skipped via a remembered rule.
     #[must_use]
     pub fn remembers(&self, command: &str, target_path: &str) -> bool {
-        remembered_class(command, target_path).is_some_and(|k| self.allow_rules.contains(k))
+        remembered_class(command, target_path)
+            .is_some_and(|k| self.allow_rules.contains(k.as_str()))
     }
 
     /// Root-aware [`Self::remembers`]: classifies a write as in/out-of-tree using the
@@ -1787,7 +1812,7 @@ impl TrustLedger {
     #[must_use]
     pub fn remembers_rooted(&self, command: &str, target_path: &str, project_root: &Path) -> bool {
         remembered_class_rooted(command, target_path, Some(project_root))
-            .is_some_and(|k| self.allow_rules.contains(k))
+            .is_some_and(|k| self.allow_rules.contains(k.as_str()))
     }
 
     /// Record that `gate_id` was approved (auto or manual) without a revision.
@@ -2686,7 +2711,15 @@ mod tests {
             led.remember_approval(cmd, tgt),
             "reversible class is recorded"
         );
-        assert!(led.allow_rules.contains("write_out_of_tree"));
+        // The out-of-tree write key is now scoped to the target's PARENT directory
+        // (`/etc/hosts` → `write_out_of_tree:/etc`), not one filesystem-wide key.
+        assert!(
+            led.allow_rules
+                .iter()
+                .any(|k| k.starts_with("write_out_of_tree:")),
+            "out-of-tree write recorded under a directory-scoped key: {:?}",
+            led.allow_rules
+        );
         // After learning: not re-asked.
         assert!(
             !requires_confirmation_with_ledger(TrustMode::Guarded, cmd, tgt, root, &led),
@@ -2712,7 +2745,10 @@ mod tests {
         assert!(remember_project_approval(tmp.path(), "", out));
         // Persisted + reloaded: the rule survives and short-circuits the prompt.
         let back = TrustLedger::load(tmp.path());
-        assert!(back.allow_rules.contains("write_out_of_tree"));
+        assert!(back
+            .allow_rules
+            .iter()
+            .any(|k| k.starts_with("write_out_of_tree:")));
         assert!(!requires_confirmation_with_ledger(
             TrustMode::Guarded,
             "",
@@ -3403,12 +3439,13 @@ mod tests {
         // command. They must be structurally unrememberable.
         let root = real_root();
         let mut ledger = TrustLedger::default();
-        // A real shell approval is remembered under "shell"…
+        // A real shell approval is remembered under a COMMAND-SCOPED key, not a coarse
+        // `"shell"` constant.
         assert_eq!(
-            remembered_class_rooted("npm run build", "", Some(root)),
-            Some("shell")
+            remembered_class_rooted("npm run build", "", Some(root)).as_deref(),
+            Some("shell:npm run build")
         );
-        ledger.allow_rules.insert("shell".to_string());
+        ledger.allow_rules.insert("shell:npm run build".to_string());
         // …but that shell rule must NOT auto-grant any semantic request action.
         for action in [
             "permission-expansion",
@@ -3421,7 +3458,7 @@ mod tests {
             );
             assert!(
                 !ledger.remembers_rooted(action, "/etc/hosts", root),
-                "an existing `shell` rule must never auto-grant {action}"
+                "an existing shell rule must never auto-grant {action}"
             );
         }
         // And approving one of them must never itself write a shell blank-check.
@@ -3429,5 +3466,51 @@ mod tests {
             !remember_project_approval(root, "external_directory", "/etc/hosts"),
             "approving an external read must not record a rememberable rule"
         );
+    }
+
+    #[test]
+    fn one_shell_approval_does_not_blank_check_other_tools() {
+        // The ordinary-tool-lane blank-check: `capability_class` funnels a local shell
+        // command, every `mcp__server__tool`, a sub-agent spawn, and the `Read` tool name
+        // all into `Capability::Shell`. Under the old single `"shell"` key, approving ONE
+        // routine `npm run build` auto-granted every later `mcp__*` delete / arbitrary shell
+        // command for the life of the project. Command-scoped keys close that.
+        let root = real_root();
+        let mut ledger = TrustLedger::default();
+        assert!(remember_project_approval_into(
+            &mut ledger,
+            root,
+            "npm run build",
+            ""
+        ));
+        // The IDENTICAL command is remembered (no re-nag) …
+        assert!(ledger.remembers_rooted("npm run build", "", root));
+        // … but a DIFFERENT shell command, an MCP tool, a sub-agent, and a tool-shaped
+        // dangerous exec are each their OWN key → still confirmed.
+        for (cmd, tgt) in [
+            ("cargo test", ""),
+            ("mcp__cloud__delete_bucket", ""),
+            ("Task", ""),
+            ("docker", "run --rm -v /:/host alpine sh"),
+        ] {
+            assert!(
+                !ledger.remembers_rooted(cmd, tgt, root),
+                "an approved `npm run build` must NOT auto-grant {cmd:?}/{tgt:?}"
+            );
+        }
+    }
+
+    /// Record an approval into an in-memory ledger (test helper mirroring
+    /// [`remember_project_approval`] without touching disk).
+    fn remember_project_approval_into(
+        ledger: &mut TrustLedger,
+        root: &Path,
+        command: &str,
+        target: &str,
+    ) -> bool {
+        match remembered_class_rooted(command, target, Some(root)) {
+            Some(key) => ledger.allow_rules.insert(key),
+            None => false,
+        }
     }
 }

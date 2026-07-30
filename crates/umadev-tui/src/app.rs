@@ -16073,15 +16073,15 @@ impl App {
             );
             return Action::None;
         }
-        // The user explicitly approved running this command — remember the
-        // approval for this project's trust ledger so the same reversible action
-        // class isn't re-asked. Fail-open + floor-safe: an irreversible (network)
-        // class records nothing, and the deploy preflight floor above uses an
-        // always-escalating `git push` probe regardless, so a deploy itself is
-        // never skipped by this ledger entry.
-        if confirmed {
-            self.record_action_approval(&cmd, "");
-        }
+        // NOTE: `/deploy confirm` deliberately records NOTHING in the trust ledger.
+        // The deploy gate above is mode-independent — it always consults an
+        // always-escalating `git push (deploy)` probe — so a remembered rule could
+        // never skip a future deploy anyway. But stock recipes (`npx vercel --prod`,
+        // `flyctl deploy`, `docker build …`) carry no network token, so they classify
+        // as a reversible Shell command: recording one here would mint a
+        // `shell:<recipe>` rule that silently auto-allows the identical raw shell
+        // invocation as an ordinary later tool call. A one-off outward deploy must not
+        // grant standing shell authority, so we do not remember it.
         self.push(
             ChatRole::UmaDev,
             umadev_i18n::tf(self.lang, "deploy.starting", &[&cmd]),
@@ -16566,35 +16566,6 @@ impl App {
     fn record_trust_revision(&mut self, gate_id: &str) {
         self.trust_ledger.record_revision(gate_id);
         self.trust_ledger.save(&self.project_root);
-    }
-
-    /// Record that the user **approved** a guarded confirmation for `command` /
-    /// `target`'s reversible action class, scoped to THIS project, so the same
-    /// class isn't re-asked. Persists to the per-project trust ledger
-    /// (`.umadev/trust.json`) via the ready
-    /// [`umadev_agent::trust::remember_project_approval`] API and mirrors the new
-    /// rule into the in-memory ledger so [`TrustLedger::remembers`] is true for
-    /// the rest of this session too (without a disk re-read).
-    ///
-    /// Fully **fail-open** and floor-safe: an irreversible-floor action (`.git`
-    /// internals / network / destructive verb) records nothing and returns
-    /// `false`, so the safety floor always re-confirms; any IO error is swallowed
-    /// so trust learning never blocks a run. Returns `true` when a NEW rule was
-    /// recorded, and surfaces a one-time localized note so the user knows the
-    /// approval was remembered.
-    fn record_action_approval(&mut self, command: &str, target: &str) -> bool {
-        let recorded =
-            umadev_agent::trust::remember_project_approval(&self.project_root, command, target);
-        // Keep the in-memory ledger in lockstep with disk (the disk helper does a
-        // fresh load+save; this avoids re-reading just to stay consistent).
-        self.trust_ledger.remember_approval(command, target);
-        if recorded {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "trust.approval_remembered").to_string(),
-            );
-        }
-        recorded
     }
 
     /// Toggle mouse capture. ON (default) lets the wheel page the history AND

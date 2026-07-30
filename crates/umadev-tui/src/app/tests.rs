@@ -5427,31 +5427,12 @@ fn task_registry_load_is_fail_open_on_a_corrupt_file() {
 }
 
 // ---- Trust record-on-approval --------------------------------------------
-
-#[test]
-fn approving_a_reversible_action_records_to_the_trust_ledger() {
-    let (mut app, _tmp) = temp_app();
-    // A plain shell command is a reversible class → remembered.
-    let recorded = app.record_action_approval("npm run build", "");
-    assert!(recorded, "a reversible action class is remembered");
-    // Consultable in-memory for the rest of this session…
-    assert!(app.trust_ledger.remembers("npm run build", ""));
-    // …and persisted to disk so a later session / consult sees it too.
-    let on_disk = umadev_agent::TrustLedger::load(&app.project_root);
-    assert!(on_disk.remembers("npm run build", ""));
-}
-
-#[test]
-fn approving_an_irreversible_action_is_floor_safe_and_records_nothing() {
-    let (mut app, _tmp) = temp_app();
-    // A network push is the irreversible floor — never remembered (always re-asked).
-    let recorded = app.record_action_approval("git push origin main", "");
-    assert!(!recorded);
-    assert!(!app.trust_ledger.remembers("git push origin main", ""));
-    assert!(
-        !umadev_agent::TrustLedger::load(&app.project_root).remembers("git push origin main", "")
-    );
-}
+// The App-level `record_action_approval` helper was removed: its only production
+// caller was `/deploy confirm`, which must NOT mint a standing shell rule for a
+// one-off outward deploy. Interactive approvals record directly through
+// `umadev_agent::remember_project_approval` (the rooted disk API), which the agent
+// crate covers (`ledger_remembers_reversible_class_and_is_not_reasked`, the floor
+// tests, `one_shell_approval_does_not_blank_check_other_tools`).
 
 #[test]
 fn critic_verdict_records_and_replaces_per_seat() {
