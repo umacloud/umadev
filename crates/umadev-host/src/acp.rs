@@ -1967,9 +1967,7 @@ impl AcpSession {
             {
                 Ok(result) => result,
                 Err((error, Some(-32_000))) => {
-                    self.fresh_session_bind_in_progress
-                        .store(false, Ordering::Release);
-                    self.keep_gated_deferred_folder_trust_requests().await;
+                    self.abort_fresh_session_bind().await;
                     if let Some(offer) = grok_auth_offer.clone() {
                         return Err(SessionOpenError::AuthRequired(offer));
                     }
@@ -1983,31 +1981,47 @@ impl AcpSession {
                     return Err(error.into());
                 }
                 Err((error, _)) => {
-                    self.fresh_session_bind_in_progress
-                        .store(false, Ordering::Release);
-                    self.keep_gated_deferred_folder_trust_requests().await;
+                    self.abort_fresh_session_bind().await;
                     return Err(error.into());
                 }
             };
-            self.session_id = result
+            // Every early exit BELOW is a failure AFTER a successful session/new — the
+            // deferred folder-trust requests are already parked and the bind latch is still
+            // `true`, so each must route through `abort_fresh_session_bind` exactly like the
+            // RPC-error arms above (previously these three `?` returns skipped both, leaving
+            // the base blocked on an unanswered folder-trust request and the latch stuck).
+            let Some(session_id) = result
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| {
-                    SessionError::Start("ACP session/new returned no sessionId".to_string())
-                })?
-                .to_string();
+                .map(str::to_string)
+            else {
+                self.abort_fresh_session_bind().await;
+                return Err(SessionError::Start(
+                    "ACP session/new returned no sessionId".to_string(),
+                )
+                .into());
+            };
+            self.session_id = session_id;
             if let Ok(mut active) = self.active_session_id.write() {
                 *active = Some(self.session_id.clone());
             }
-            self.session_routes
+            if self
+                .session_routes
                 .lock()
                 .await
                 .activate_root(&self.session_id)
-                .map_err(|_| {
-                    SessionError::Start("invalid ACP session/new sessionId".to_string())
-                })?;
-            self.bind_folder_trust_scope(&self.session_id)?;
+                .is_err()
+            {
+                self.abort_fresh_session_bind().await;
+                return Err(
+                    SessionError::Start("invalid ACP session/new sessionId".to_string()).into(),
+                );
+            }
+            if let Err(error) = self.bind_folder_trust_scope(&self.session_id) {
+                self.abort_fresh_session_bind().await;
+                return Err(error.into());
+            }
             self.fresh_session_bind_in_progress
                 .store(false, Ordering::Release);
             self.flush_deferred_folder_trust_requests().await;
@@ -2246,6 +2260,19 @@ impl AcpSession {
             let response = folder_trust_response_frame(&raw_id, FolderTrustUserDecision::KeepGated);
             let _ = write_json_line(&self.writer, &response).await;
         }
+    }
+
+    /// Roll back an aborted fresh-session bind: clear the `fresh_session_bind_in_progress`
+    /// latch and settle every folder-trust request parked during the handshake (KeepGated),
+    /// so a `session/new` that fails at ANY step — the RPC itself, a missing sessionId,
+    /// `activate_root`, or `bind_folder_trust_scope` — never leaves the latch stuck `true`
+    /// or strands the base on a folder-trust decision it will never receive. Shared by every
+    /// early exit in the bind branch so the success-then-fail paths cannot drift from the
+    /// RPC-error paths.
+    async fn abort_fresh_session_bind(&self) {
+        self.fresh_session_bind_in_progress
+            .store(false, Ordering::Release);
+        self.keep_gated_deferred_folder_trust_requests().await;
     }
 
     async fn apply_grok_auth_policy(
@@ -5131,13 +5158,11 @@ fn kimi_plan_review_permission(params: &Value) -> Option<(HostQuestion, PendingQ
 async fn handle_kimi_permission_question(frame: &Value, params: &Value, context: &ReaderContext) {
     let raw_id = frame.get("id").cloned().unwrap_or(Value::Null);
     let Some((question, pending_question)) = kimi_permission_question(params) else {
-        reply_rpc_error(
-            &context.writer,
-            raw_id,
-            -32_602,
-            "Kimi question payload was not understood",
-        )
-        .await;
+        // A payload we couldn't parse still gets a graceful DECLINE, not a JSON-RPC error:
+        // kimi BLOCKS on session/request_permission, and a clean `cancelled` outcome lets it
+        // treat the tool as declined and continue, rather than wedging the turn on a -32602.
+        // Mirrors handle_kimi_plan_review's refusal handling.
+        let _ = write_permission_response(&context.writer, &raw_id, None, None).await;
         return;
     };
     let req_id = rpc_id_string(&raw_id);
@@ -5154,13 +5179,9 @@ async fn handle_kimi_permission_question(frame: &Value, params: &Value, context:
     )
     .await
     {
-        reply_rpc_error(
-            &context.writer,
-            raw_id,
-            -32_000,
-            "too many pending host requests",
-        )
-        .await;
+        // Queue full → clean cancel (as handle_kimi_plan_review's queue-full path), not a
+        // -32000 kimi would treat as a hard protocol failure on a blocking permission request.
+        let _ = write_permission_response(&context.writer, &raw_id, None, None).await;
         return;
     }
     emit_event(
@@ -5234,13 +5255,10 @@ async fn handle_kimi_plan_review(
 async fn handle_kimi_plan_review_request(frame: &Value, params: &Value, context: &ReaderContext) {
     let raw_id = frame.get("id").cloned().unwrap_or(Value::Null);
     let Some((question, pending_question)) = kimi_plan_review_permission(params) else {
-        reply_rpc_error(
-            &context.writer,
-            raw_id,
-            -32_602,
-            "Kimi plan-review payload was not understood",
-        )
-        .await;
+        // Unparseable plan-review payload → graceful cancel on the blocking
+        // session/request_permission, consistent with the queue-full / Plan-tier refusals
+        // handle_kimi_plan_review already settles with `cancelled`.
+        let _ = write_permission_response(&context.writer, &raw_id, None, None).await;
         return;
     };
     handle_kimi_plan_review(frame, params, context, question, pending_question).await;
@@ -5255,13 +5273,12 @@ async fn handle_permission_request(
     let raw_id = frame.get("id").cloned().unwrap_or(Value::Null);
     let options = if context.vendor == AcpVendor::Kimi {
         let Some(options) = kimi_ordinary_permission_options(params) else {
-            reply_rpc_error(
-                &context.writer,
-                raw_id,
-                -32_602,
-                "Kimi ordinary permission options did not match the audited contract",
-            )
-            .await;
+            // Kimi's option set drifted from the audited contract, so we can't present a
+            // faithful approval. Decline gracefully (cancelled) rather than answering every
+            // tool approval in the session with a -32602 that wedges kimi's turn: a clean
+            // cancel lets the base continue with the tool declined. Same writer the normal
+            // Plan / deny paths below use.
+            let _ = write_permission_response(&context.writer, &raw_id, None, None).await;
             return;
         };
         options
@@ -7976,18 +7993,25 @@ async fn write_grok_user_input_outcome(
     questions: &[PendingQuestion],
     outcome: &HostUserInputOutcome,
 ) -> Result<(), SessionError> {
-    let result = match grok_user_input_outcome_result(questions, outcome) {
-        Ok(result) => result,
-        Err(message) => {
-            reply_rpc_error(writer, raw_id, -32_602, message).await;
-            return Ok(());
-        }
-    };
+    let result = grok_user_input_result_or_cancelled(questions, outcome);
     write_json_line(
         writer,
         &json!({"jsonrpc":"2.0", "id":raw_id, "result":result}),
     )
     .await
+}
+
+/// The grok user-input result body, degrading a bound / shape violation to a clean
+/// `cancelled` outcome instead of a JSON-RPC error. grok BLOCKS on session/request_input,
+/// so a -32602 (e.g. from a >16 KiB paste into a free-text field) surfaces as a FAILED
+/// ask_user_question tool and wedges the turn — even though the user DID answer. A cancel
+/// lets grok re-ask instead. Mirrors grok_partial_result's `unwrap_or_else(|_| cancelled)`.
+fn grok_user_input_result_or_cancelled(
+    questions: &[PendingQuestion],
+    outcome: &HostUserInputOutcome,
+) -> Value {
+    grok_user_input_outcome_result(questions, outcome)
+        .unwrap_or_else(|_| json!({"outcome":"cancelled"}))
 }
 
 async fn write_kimi_permission_question_response(
@@ -13189,6 +13213,40 @@ mod tests {
         assert_grok_accepted_outcome(&questions);
         assert_grok_partial_and_plan_outcomes(&questions);
         assert_grok_legacy_user_input(&questions);
+    }
+
+    #[test]
+    fn grok_over_long_free_text_degrades_to_cancelled_not_error() {
+        let questions = blocking_test_questions();
+        // A >16 KiB free-text answer overruns MAX_GROK_NOTES_CHARS, which
+        // grok_user_input_outcome_result rejects with Err (previously a -32602 written to a
+        // blocking session/request_input, wedging the ask_user_question tool even though the
+        // user answered). It now degrades to a clean cancel so grok re-asks.
+        let huge = "x".repeat(MAX_GROK_NOTES_CHARS + 1);
+        let over_long = HostUserInputOutcome::Accepted {
+            answers: vec![HostAnswer {
+                question_id: "q2".to_string(),
+                values: vec![huge],
+            }],
+            annotations: Vec::new(),
+        };
+        assert!(grok_user_input_outcome_result(&questions, &over_long).is_err());
+        assert_eq!(
+            grok_user_input_result_or_cancelled(&questions, &over_long),
+            json!({"outcome": "cancelled"})
+        );
+        // A normal answer is NOT falsely cancelled — it still produces a real accepted outcome.
+        let ok = HostUserInputOutcome::Accepted {
+            answers: vec![HostAnswer {
+                question_id: "q1".to_string(),
+                values: vec!["pg".to_string()],
+            }],
+            annotations: Vec::new(),
+        };
+        assert_eq!(
+            grok_user_input_result_or_cancelled(&questions, &ok)["outcome"],
+            json!("accepted")
+        );
     }
 
     #[test]
