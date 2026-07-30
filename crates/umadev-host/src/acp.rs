@@ -4971,13 +4971,19 @@ fn kimi_permission_question(params: &Value) -> Option<(HostQuestion, PendingQues
         {
             return None;
         }
+        let shown_label = clip_text(&redact_text(label), 240);
         options.push(HostQuestionOption {
             value: id.to_string(),
-            label: clip_text(&redact_text(label), 240),
+            label: shown_label.clone(),
             description: None,
             preview: None,
         });
+        // Key by the option id AND its displayed label (like the grok/generic
+        // paths), so a label-valued answer correlates instead of degrading to
+        // cancelled. Strictly additive: the id key still matches every id-valued
+        // answer; this only adds label matching.
         option_labels.insert(id.to_string(), label.to_string());
+        option_labels.insert(shown_label, label.to_string());
     }
     let prompt = clip_text(&redact_text(prompt), 4_000);
     Some((
@@ -5054,13 +5060,19 @@ fn kimi_plan_review_permission(params: &Value) -> Option<(HostQuestion, PendingQ
         {
             return None;
         }
+        let shown_label = clip_text(&redact_text(label), 240);
         options.push(HostQuestionOption {
             value: id.to_string(),
-            label: clip_text(&redact_text(label), 240),
+            label: shown_label.clone(),
             description: None,
             preview: None,
         });
+        // Key by the option id AND its displayed label (like the grok/generic
+        // paths), so a label-valued answer correlates instead of degrading to
+        // cancelled. Strictly additive: the id key still matches every id-valued
+        // answer; this only adds label matching.
         option_labels.insert(id.to_string(), label.to_string());
+        option_labels.insert(shown_label, label.to_string());
     }
 
     let prompt = tool
@@ -13063,6 +13075,34 @@ mod tests {
         assert_eq!(
             decision_from_plan_outcome(HostPlanOutcome::Abandoned),
             (ApprovalDecision::Deny, None)
+        );
+    }
+
+    #[test]
+    fn kimi_question_option_labels_key_by_both_id_and_label() {
+        // A label-valued answer must correlate, not degrade to cancelled — the
+        // kimi map keyed by id only (grok/generic keyed by both). Now dual-keyed.
+        let params = json!({
+            "toolCall": {
+                "title": "AskUserQuestion",
+                "content": [{ "content": { "text": "Which database?" } }]
+            },
+            "options": [
+                { "optionId": "q0_opt_0", "kind": "allow_once", "name": "Postgres" },
+                { "optionId": "q0_skip", "kind": "reject_once", "name": "Skip" }
+            ]
+        });
+        let (_question, pending) =
+            kimi_permission_question(&params).expect("a well-formed kimi question parses");
+        assert_eq!(
+            pending.option_labels.get("q0_opt_0").map(String::as_str),
+            Some("Postgres"),
+            "the id key still resolves"
+        );
+        assert_eq!(
+            pending.option_labels.get("Postgres").map(String::as_str),
+            Some("Postgres"),
+            "the label key now resolves too (was missing → label answers cancelled)"
         );
     }
 
