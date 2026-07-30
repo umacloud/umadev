@@ -3093,12 +3093,17 @@ fn translate_question(props: &Value, session_id: &str) -> Vec<SessionEvent> {
     let Some(req_id) = props.get("id").and_then(Value::as_str) else {
         return Vec::new();
     };
-    let Some(raw_questions) = props.get("questions").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    if raw_questions.is_empty() {
-        return Vec::new();
-    }
+    // A question.asked whose `questions` array is ABSENT or EMPTY is malformed — the exact
+    // opencode field drift the frame-shape comment warns about. Dropping it silently left the
+    // base HUNG: nothing was recorded, respond_host no-op'd, and /question/{id}/reject never
+    // fired. Fall through with an empty question set instead: the interactive layer rejects a
+    // zero-question request straight back (await_host_input's guard), so the base is unblocked
+    // through its normal reject reply rather than waiting forever.
+    let raw_questions = props
+        .get("questions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     let questions = raw_questions
         .iter()
@@ -4837,6 +4842,33 @@ mod tests {
             other => panic!("expected typed user input, got {other:?}"),
         }
         assert!(translate_frame(&frame, "other").is_empty());
+    }
+
+    #[test]
+    fn malformed_question_asked_emits_an_empty_user_input_not_a_silent_drop() {
+        // A `question.asked` whose `questions` array is ABSENT or EMPTY previously dropped the
+        // frame with no reply, hanging the base on a question it would never get an answer to.
+        // It now emits a zero-question UserInput carrying the req_id, which the interactive
+        // layer rejects straight back — so the base is UNBLOCKED via its reject reply.
+        for props in [
+            json!({"id": "ask_9", "sessionID": "ses_abc"}), // questions field absent
+            json!({"id": "ask_9", "sessionID": "ses_abc", "questions": []}), // empty
+        ] {
+            let frame = json!({"type": "question.asked", "properties": props}).to_string();
+            match &translate_frame(&frame, "ses_abc")[..] {
+                [SessionEvent::HostRequest {
+                    req_id,
+                    request: HostRequest::UserInput { questions, .. },
+                }] => {
+                    assert_eq!(req_id, "ask_9");
+                    assert!(
+                        questions.is_empty(),
+                        "malformed question carries no questions"
+                    );
+                }
+                other => panic!("expected an empty user input, got {other:?}"),
+            }
+        }
     }
 
     #[test]

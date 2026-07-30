@@ -510,6 +510,17 @@ pub(super) async fn await_host_input(
     request: &umadev_runtime::HostRequest,
     req_id: &str,
 ) -> umadev_runtime::HostResponse {
+    // A UserInput with NO questions carries nothing to present — surfacing an empty picker
+    // would be a confusing dead prompt (the user could only Esc it). This happens when a base
+    // sends a malformed / field-drifted question frame (e.g. opencode's `question.asked` with
+    // an absent or empty `questions` array). Reject it straight back so the base is UNBLOCKED
+    // via its normal reject reply, without registering a picker. Covers every caller (resident
+    // chat + /run director), so no interactive surface can ever show a zero-question prompt.
+    if let umadev_runtime::HostRequest::UserInput { questions, .. } = request {
+        if questions.is_empty() {
+            return request.safe_rejection("the base supplied a question with no content");
+        }
+    }
     let (tx, rx) = tokio::sync::oneshot::channel();
     let token = NEXT_HOST_INPUT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match holder.lock() {
