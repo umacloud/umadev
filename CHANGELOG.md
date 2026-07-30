@@ -2,6 +2,39 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.0.70] - 2026-07-30
+
+交互通道四维深审 · 权限绕过根治 · 送达契约对称 · 结算诚实 · 生命周期竞态
+
+### 修复(权限)
+
+- 越界 shell 写守卫不再是死代码:工具形态底座请求(`action="Bash"`、命令在 `target`)下,守卫原本只扫裸动作名 “Bash”(不含 `>`/`tee`/`cp`/`of=`),使 `Bash: echo … >> ~/.ssh/authorized_keys` 在 Guarded(默认)与 Auto 档静默放行;现按其它分类器同样的方式重定向到真实命令。
+- ledger key 不再按能力坍缩:单个 `"shell"` key 原本覆盖本地 shell + 所有 MCP 工具 + 子代理 + Read 工具——批准一次 `npm run build` 便永久免问全项目所有 MCP 删除;单个 `"write_out_of_tree"` 覆盖工作区外整个文件系统。现按具体有效命令与目录细分(`shell:<命令>` / `write_out_of_tree:<父目录>`),相同命令仍不重复询问。`/deploy confirm` 不再顺带写入 shell 空白支票。
+- 空命令 exec 与符号链接洗白的越界写改为 fail-closed:无可检命令的 exec 判为 Uncertain(每档升级);工作区内符号链接指向工作区外的写入,新增 canonicalize 兜底(仅 unix)识别。
+
+### 修复(送达契约)
+
+- kimi 四条拒绝路径(问答/计划审阅解析失败、队列满、选项契约漂移)与 grok 超长自由文本不再向阻塞中的 `session/request_permission` / `session/request_input` 写协议错误,改回优雅 `cancelled`,底座当作“已拒绝”继续而非卡死。
+- claude AskUserQuestion 不再用会被脱敏的问题文本做关联 id:问题含密钥样式文本时,用户回答对不上原文而被误回 DENY;改用合成 id `claude-question-N`,可见提示与答复映射仍按原文。
+- opencode 畸形 `question.asked`(questions 缺失/为空)不再静默丢弃挂死底座,改直接拒绝(交互层对零问题请求直接安全拒绝,不弹空 picker);`session/new` 各失败路径统一清理挂起的 folder-trust 请求。
+
+### 修复(生命周期)
+
+- 底座问题与用户缓冲的回车同一 tick 到达时,用户正在输入的无关聊天不再被当作对该问题的回答并污染记录;解析前先同步镜像、暂存草稿。
+- 取消回合会清理挂起的 `pending_ask`,不再把用户下一条无关指令当作对一个已废弃会话所问问题的回答;upstream 权限边界审批穿正确 `req_id`,底座撤回时可按 id 撤回。
+
+### 修复(结算诚实)
+
+- 大脑澄清问题现在会显示给用户(原本 settle 成完成却从未渲染,用户只见 spinner 停下、问题只进了给底座读的记录)。
+- `AgenticStopped` 补进 `is_terminal`:停驻回合的写锁 task 现在会先 join,下一条排队消息不再撞析构器被误拒“写锁被占”。
+- 被截断的构建(达 max turns/tokens/budget)不再显示 ✅完成卡 + 任务完成(与账本记 failed 矛盾),改标注任务已停并抑制完成卡。
+- resident 聊天面(默认面)精确用量按精确入账,`/usage` 不再把底座上报的精确用量标为“估算”、不再丢弃输入/输出/缓存拆分。
+
+### 验证
+
+- 四条独立审查线逐个亲验落地;Agent、TUI、Host 全套测试通过,严格 Clippy `-D warnings`、格式、严格 rustdoc、i18n 三语一致性、工作区架构门与行数/嵌套 ratchet 全绿。
+- 诚实记录:一处子代理审查误报(opencode 子会话权限,实际 `observe_sse` 已处理,穿线会双发 picker)经编译核实后回退;Windows `canonicalize` 8.3 短名跨平台不确定与一处 PowerShell 冷启动超时 flake 根治。
+
 ## [1.0.69] - 2026-07-29
 
 底座↔UmaDev↔用户交互通道系统性加固 · 权限失控根因根治 · 结算诚实化 · CI flaky 簇根治
