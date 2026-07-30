@@ -565,8 +565,17 @@ pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
     // git push, base64|sh) - scanning only "bash" auto-allowed every dangerous shell action in
     // Guarded/Auto. The recursion terminates (the target first token is a real verb, never a
     // bare shell-exec action name).
-    if SHELL_EXEC_ACTIONS.contains(&cmd.as_str()) && !target_path.trim().is_empty() {
-        return reversibility_class(target_path, "");
+    if SHELL_EXEC_ACTIONS.contains(&cmd.as_str()) {
+        if !target_path.trim().is_empty() {
+            return reversibility_class(target_path, "");
+        }
+        // A shell-exec action with NO visible command (empty target) carries no payload
+        // to vet — the same fail-closed boundary (UD-FLOW-008) applies as for an obfuscated
+        // command. Falling through to the allow-by-default `Reversible` arm let a degenerate
+        // `permission.asked{action:"bash", patterns:[]}` frame (target built with
+        // `unwrap_or_default`) auto-run an entirely unvetted shell command under headless
+        // Guarded. An exec with no inspectable command is Uncertain → escalates everywhere.
+        return Reversibility::Uncertain;
     }
     if DESTRUCTIVE_TOKENS.iter().any(|t| cmd.contains(t)) {
         return Reversibility::Destructive;
@@ -2205,6 +2214,37 @@ mod tests {
         assert!(
             !requires_confirmation_with_ledger(TrustMode::Guarded, "Bash", inside, root, &ledger),
             "an in-tree tool-shaped redirect must stay automatic"
+        );
+    }
+
+    #[test]
+    fn shell_exec_action_with_empty_command_is_uncertain_not_reversible() {
+        // A bare shell-exec ACTION name with no command to inspect (e.g. an opencode
+        // `permission.asked{action:"bash", patterns:[]}` whose target defaulted to "")
+        // carries no payload to vet — it must fail closed (Uncertain → escalate in every
+        // mode), never fall through to the allow-by-default Reversible arm.
+        for action in ["bash", "sh", "cmd", "powershell", "exec"] {
+            assert_eq!(
+                reversibility_class(action, ""),
+                Reversibility::Uncertain,
+                "{action}: empty-command exec must be Uncertain"
+            );
+            for mode in [TrustMode::Guarded, TrustMode::Auto, TrustMode::Plan] {
+                assert!(
+                    requires_confirmation(mode, action, ""),
+                    "{action} under {mode:?}: empty-command exec must confirm"
+                );
+            }
+        }
+        // Regression: a shell-exec action WITH a real command still redirects and keeps its
+        // precise class (a plain read stays reversible; a destructive one escalates).
+        assert_eq!(
+            reversibility_class("bash", "ls -la"),
+            Reversibility::Reversible
+        );
+        assert_eq!(
+            reversibility_class("bash", "rm -rf /"),
+            Reversibility::Destructive
         );
     }
 
