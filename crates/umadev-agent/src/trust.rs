@@ -2230,40 +2230,30 @@ mod tests {
 
     #[test]
     fn tool_shaped_shell_redirect_escapes_real_root_via_ledger_entry() {
-        // The production per-tool gate (`requires_confirmation_with_ledger`) threads the
-        // REAL workspace root, so a tool-shaped shell write to an absolute path the legacy
-        // denylist misses (`/Library/LaunchAgents/`, another user's home) is now correctly
-        // escalated — and an empty ledger cannot relax it.
-        let root = real_root();
+        // The production per-tool gate (`requires_confirmation_with_ledger`) threads the REAL
+        // workspace root. Use real directories so the containment check (including the
+        // canonicalize backstop) resolves deterministically on every platform: a tool-shaped
+        // shell write ESCAPING the workspace escalates under Guarded AND Auto, and an in-tree
+        // redirect stays automatic. An empty ledger cannot relax the escape.
+        let root_tmp = TempDir::new().unwrap();
+        let outside_tmp = TempDir::new().unwrap();
+        let root = root_tmp.path();
         let ledger = TrustLedger::default();
-        let escaping: &[&str] = if cfg!(windows) {
-            &[
-                "cp payload C:\\Windows\\System32\\drivers\\etc\\hosts",
-                "echo x >> C:\\Users\\other\\.ssh\\authorized_keys",
-            ]
-        } else {
-            &[
-                "cp payload /Library/LaunchAgents/x.plist",
-                "echo x >> /Users/other/.ssh/authorized_keys",
-            ]
-        };
-        for &cmd in escaping {
-            for mode in [TrustMode::Guarded, TrustMode::Auto] {
-                assert!(
-                    requires_confirmation_with_ledger(mode, "Bash", cmd, root, &ledger),
-                    "{mode:?}: tool-shaped escaping write must confirm under real root: {cmd}"
-                );
-            }
+
+        let outside = outside_tmp.path().join("authorized_keys");
+        let escaping = format!("echo x >> {}", outside.display());
+        for mode in [TrustMode::Guarded, TrustMode::Auto] {
+            assert!(
+                requires_confirmation_with_ledger(mode, "Bash", &escaping, root, &ledger),
+                "{mode:?}: tool-shaped escaping redirect must confirm: {escaping}"
+            );
         }
+
         // A tool-shaped in-tree redirect (absolute, UNDER the real root) stays automatic.
-        let inside = if cfg!(windows) {
-            "echo hi > C:\\Users\\me\\project\\build.log"
-        } else {
-            "echo hi > /Users/me/project/build.log"
-        };
+        let inside = format!("echo hi > {}", root.join("build.log").display());
         assert!(
-            !requires_confirmation_with_ledger(TrustMode::Guarded, "Bash", inside, root, &ledger),
-            "an in-tree tool-shaped redirect must stay automatic"
+            !requires_confirmation_with_ledger(TrustMode::Guarded, "Bash", &inside, root, &ledger),
+            "an in-tree tool-shaped redirect must stay automatic: {inside}"
         );
     }
 
