@@ -1969,7 +1969,7 @@ impl AcpSession {
                 Err((error, Some(-32_000))) => {
                     self.fresh_session_bind_in_progress
                         .store(false, Ordering::Release);
-                    self.deferred_folder_trust_requests.lock().await.clear();
+                    self.keep_gated_deferred_folder_trust_requests().await;
                     if let Some(offer) = grok_auth_offer.clone() {
                         return Err(SessionOpenError::AuthRequired(offer));
                     }
@@ -1985,7 +1985,7 @@ impl AcpSession {
                 Err((error, _)) => {
                     self.fresh_session_bind_in_progress
                         .store(false, Ordering::Release);
-                    self.deferred_folder_trust_requests.lock().await.clear();
+                    self.keep_gated_deferred_folder_trust_requests().await;
                     return Err(error.into());
                 }
             };
@@ -2229,6 +2229,22 @@ impl AcpSession {
                     folder_trust_response_frame(&raw_id, FolderTrustUserDecision::KeepGated);
                 let _ = write_json_line(&self.writer, &response).await;
             }
+        }
+    }
+
+    /// Drain deferred folder-trust requests replying `KeepGated` to each, for the
+    /// abort paths (a failed `session/new`). The old code `.clear()`ed them and
+    /// left the base blocked on a folder-trust reply it would never receive;
+    /// KeepGated is the same safe default `flush` uses when no scope is known.
+    async fn keep_gated_deferred_folder_trust_requests(&self) {
+        let deferred = {
+            let mut deferred = self.deferred_folder_trust_requests.lock().await;
+            std::mem::take(&mut *deferred)
+        };
+        for (frame, _params) in deferred {
+            let raw_id = frame.get("id").cloned().unwrap_or(Value::Null);
+            let response = folder_trust_response_frame(&raw_id, FolderTrustUserDecision::KeepGated);
+            let _ = write_json_line(&self.writer, &response).await;
         }
     }
 
