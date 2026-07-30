@@ -1040,7 +1040,7 @@ fn absolute_is_under(path: &Path, root: &Path) -> bool {
     if rp.is_empty() || pp.len() < rp.len() || pp[..rp.len()] != rp[..] {
         return false;
     }
-    // SYMLINK-LAUNDERING BACKSTOP (runtime-only): a path can be lexically in-tree yet
+    // SYMLINK-LAUNDERING BACKSTOP (unix, runtime-only): a path can be lexically in-tree yet
     // RESOLVE outside the root through an in-tree symlink — a malicious dependency's
     // postinstall (or any earlier auto-allowed in-tree shell command) drops
     // `node_modules/.cache/link -> ~/.ssh`, then the base writes
@@ -1049,12 +1049,24 @@ fn absolute_is_under(path: &Path, root: &Path) -> bool {
     // Canonicalize the deepest EXISTING ancestor of the target (the target itself may not
     // exist yet) and the root, and require the ancestor to stay under the canonical root.
     // Fail-SAFE: if either canonicalize fails (nonexistent / synthetic paths — e.g. the
-    // pure unit-test fixtures), keep the lexical result, so this can only ever ADD an
-    // escape detection, never remove one. Root and ancestor are resolved the SAME way, so a
-    // legitimately symlinked workspace still resolves consistently under itself.
-    match (root.canonicalize(), canonical_existing_ancestor(path)) {
-        (Ok(canon_root), Some(canon_ancestor)) => canon_ancestor.starts_with(&canon_root),
-        _ => true,
+    // pure unit-test fixtures), keep the lexical result, so this can only ever ADD an escape
+    // detection, never remove one.
+    //
+    // UNIX ONLY: on Windows `canonicalize` normalizes 8.3 short names / casing / the `\\?\`
+    // verbatim prefix, so canonicalizing the root and an ancestor of the SAME real directory
+    // can yield non-comparable spellings — a false escape on a genuinely in-tree write. The
+    // laundering vector is a POSIX symlink inside a dependency tree; Windows keeps the prior
+    // lexical-only behavior (no regression — this backstop is additive over it).
+    #[cfg(unix)]
+    {
+        match (root.canonicalize(), canonical_existing_ancestor(path)) {
+            (Ok(canon_root), Some(canon_ancestor)) => canon_ancestor.starts_with(&canon_root),
+            _ => true,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
@@ -1062,6 +1074,7 @@ fn absolute_is_under(path: &Path, root: &Path) -> bool {
 /// when it exists). `None` when no ancestor resolves — so a fully synthetic path yields
 /// `None` and [`absolute_is_under`]'s backstop keeps the lexical decision. `ancestors()`
 /// walks target → parent → … so the FIRST that canonicalizes is the deepest that exists.
+#[cfg(unix)]
 fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find_map(|ancestor| ancestor.canonicalize().ok())
