@@ -2242,7 +2242,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn tool_shaped_shell_redirect_escapes_real_root_via_ledger_entry() {
+        // Unix only: this exercises the canonicalize backstop (which is unix-only — see
+        // `absolute_is_under`) with real TempDir paths. Windows real-root containment is
+        // covered by `out_of_tree_absolute_write_escalates_in_guarded_with_real_root`, and the
+        // tool-shaped shell-write fix itself is verified cross-platform (incl. Windows) by the
+        // root=None escaping cases in `tool_shaped_shell_redirect_out_of_tree_write_confirms`.
         // The production per-tool gate (`requires_confirmation_with_ledger`) threads the REAL
         // workspace root. Use real directories so the containment check (including the
         // canonicalize backstop) resolves deterministically on every platform: a tool-shaped
