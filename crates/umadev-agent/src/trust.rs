@@ -902,9 +902,27 @@ fn requires_confirmation_rooted(
     //    legacy caller can enter a deny loop); Plan's execution-entry guard and
     //    read-only host profile remain the authority that prevents the write.
     let cap = capability_class(command, target_path);
+    // A shell-exec TOOL call carries the REAL command in `target_path` (`action="Bash"`,
+    // `target`=the command string) — the shape every base emits (claude/codex/opencode).
+    // `shell_write_escapes_workspace` must see that real command, NOT the bare `"Bash"`
+    // action name: `"Bash"` contains no redirect / `tee` / `cp` / `of=`, so scanning it
+    // always returned false and left the out-of-tree shell-write guard DEAD for the tool
+    // form — `Bash: echo x >> ~/.ssh/authorized_keys` auto-ran under Guarded AND Auto (the
+    // raw-string form was the only one the guard ever saw, so its test stayed green).
+    // Redirect the SAME way `reversibility_class` / `capability_class` do, but WITHOUT
+    // lowercasing: the destination path is case-sensitive and `shell_write_escapes_workspace`
+    // (like the already-correct raw-command path) relies on original case for exact
+    // containment against the workspace root.
+    let shell_cmd = if SHELL_EXEC_ACTIONS.contains(&command.to_ascii_lowercase().as_str())
+        && !target_path.trim().is_empty()
+    {
+        target_path
+    } else {
+        command
+    };
     let out_of_tree_write = (matches!(cap, Capability::Write)
         && target_escapes_workspace(target_path, workspace_root))
-        || shell_write_escapes_workspace(command, workspace_root);
+        || shell_write_escapes_workspace(shell_cmd, workspace_root);
     match mode {
         // Fully autonomous: a write that ESCAPES the workspace (not
         // checkpoint-rewindable) still confirms — it is on the always-confirm
@@ -2109,6 +2127,85 @@ mod tests {
             "npm test 2>/dev/null",
             ""
         ));
+    }
+
+    #[test]
+    fn tool_shaped_shell_redirect_out_of_tree_write_confirms() {
+        // The previous test only exercised the RAW-command form (`command` = the whole
+        // string, empty target). Every real base instead emits the TOOL shape: the action
+        // name in `command` (`"Bash"` / `"bash"`) and the actual command in `target_path`.
+        // The out-of-tree shell-write guard used to scan the bare `"Bash"`, so this shape
+        // auto-ran an escaping write under BOTH the ask-before-write and autonomous tiers —
+        // a silent SSH-backdoor / dotfile / LaunchAgent write outside the workspace.
+        //
+        // `~`-relative and `/etc/…` destinations escape under the legacy (root=None) entry;
+        // the `/Library/LaunchAgents/…` class the legacy denylist misses is checked below
+        // against the REAL-root production entry (`requires_confirmation_with_ledger`).
+        for mode in [TrustMode::Guarded, TrustMode::Auto] {
+            assert!(
+                requires_confirmation(mode, "Bash", "echo pwn >> ~/.ssh/authorized_keys"),
+                "{mode:?}: tool-shaped escaping redirect must confirm"
+            );
+            assert!(
+                requires_confirmation(mode, "bash", "tee ~/.bashrc"),
+                "{mode:?}: tool-shaped escaping tee must confirm"
+            );
+            assert!(
+                requires_confirmation(mode, "Bash", "cp payload /etc/cron.d/x"),
+                "{mode:?}: tool-shaped escaping cp must confirm"
+            );
+        }
+        // An IN-TREE redirect through the tool shape stays automatic — no false escalation.
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "Bash",
+            "echo hi > output/log.txt"
+        ));
+        // A benign char device through the tool shape stays automatic.
+        assert!(!requires_confirmation(
+            TrustMode::Guarded,
+            "Bash",
+            "echo hi > /dev/null"
+        ));
+    }
+
+    #[test]
+    fn tool_shaped_shell_redirect_escapes_real_root_via_ledger_entry() {
+        // The production per-tool gate (`requires_confirmation_with_ledger`) threads the
+        // REAL workspace root, so a tool-shaped shell write to an absolute path the legacy
+        // denylist misses (`/Library/LaunchAgents/`, another user's home) is now correctly
+        // escalated — and an empty ledger cannot relax it.
+        let root = real_root();
+        let ledger = TrustLedger::default();
+        let escaping: &[&str] = if cfg!(windows) {
+            &[
+                "cp payload C:\\Windows\\System32\\drivers\\etc\\hosts",
+                "echo x >> C:\\Users\\other\\.ssh\\authorized_keys",
+            ]
+        } else {
+            &[
+                "cp payload /Library/LaunchAgents/x.plist",
+                "echo x >> /Users/other/.ssh/authorized_keys",
+            ]
+        };
+        for &cmd in escaping {
+            for mode in [TrustMode::Guarded, TrustMode::Auto] {
+                assert!(
+                    requires_confirmation_with_ledger(mode, "Bash", cmd, root, &ledger),
+                    "{mode:?}: tool-shaped escaping write must confirm under real root: {cmd}"
+                );
+            }
+        }
+        // A tool-shaped in-tree redirect (absolute, UNDER the real root) stays automatic.
+        let inside = if cfg!(windows) {
+            "echo hi > C:\\Users\\me\\project\\build.log"
+        } else {
+            "echo hi > /Users/me/project/build.log"
+        };
+        assert!(
+            !requires_confirmation_with_ledger(TrustMode::Guarded, "Bash", inside, root, &ledger),
+            "an in-tree tool-shaped redirect must stay automatic"
+        );
     }
 
     #[test]
