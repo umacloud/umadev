@@ -4808,6 +4808,13 @@ async fn cancel_interactions_for_session(context: &ReaderContext, session_id: &s
         ids
     };
     for request_id in request_ids {
+        // NOTE: emitting SessionEvent::HostRequestSettled here (so the TUI
+        // retracts the picker) belongs WITH Phase 2 (decoupling the serial-inline
+        // drain): while a picker blocks the drain, the event is not processed
+        // until the picker resolves, so the emit is inert for live retraction
+        // today. It also needs wiring at all four grok settle sites (this one,
+        // interrupt/session-cancel, folder-trust timeout, teardown). Tracked in
+        // the backlog as Phase 3 to be done together with Phase 2.
         let pending = context.approvals.lock().await.remove(&request_id);
         if let Some(pending) = pending {
             let _ = write_cancelled_host_response(&context.writer, pending, None).await;
