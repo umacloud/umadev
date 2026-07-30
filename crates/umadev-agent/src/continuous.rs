@@ -1101,10 +1101,13 @@ async fn drive_phase(
                 }
             }
             SessionEvent::HostRequestSettled { .. } => {
-                // The /run pipeline resolves each host request INLINE above, so
-                // there is no lingering interactive picker to retract here — a
-                // withdrawal is informational only. (The retraction consumer
-                // lives on the resident-chat surface, which owns the pickers.)
+                // Retraction is not wired on this path yet (informational only). NOTE for
+                // Phase 3: NOT a "no picker here" lane. Under a TUI `/run` the host_request
+                // callback installed by `director_run` registers a real interactive picker /
+                // approval bar (`await_host_input` / `await_user_approval`), so a genuine base
+                // withdrawal WILL leave a live picker to retract here. Phase 3 must wire the
+                // driver emit AND a retract against that callback's holder — do not skip this
+                // lane assuming inline resolution.
             }
             SessionEvent::BackgroundTask(_) => {
                 // Already folded into the tracker above; carries no render row.
@@ -3128,7 +3131,10 @@ async fn drive_rework_turn_with_idle_and_memories(
                 }
             }
             SessionEvent::HostRequestSettled { .. } => {
-                // Inline-resolved on this rework path; no picker to retract.
+                // Retraction not wired yet (informational only). NOTE for Phase 3: under a TUI
+                // `/run` the host_request callback (`director_run`) registers a real picker /
+                // approval bar, so a base withdrawal on this rework path WILL leave a live
+                // picker to retract — do not skip this lane assuming inline resolution.
             }
             SessionEvent::BackgroundTask(_) => {
                 // Already folded into the tracker above; carries no render row.

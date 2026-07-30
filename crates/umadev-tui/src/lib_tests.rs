@@ -1297,6 +1297,11 @@ fn invalid_typed_host_choice_keeps_draft_and_request_pending() {
         req_id: String::new(),
         request,
     });
+    // The question is already on screen (mirror synced, clean answer box) — the real state
+    // when a user types an answer. resolve_pending_host_input_key now syncs the mirror before
+    // interpreting a key, so an UNSYNCED "99" would be stashed as an unrelated draft; here the
+    // user genuinely typed "99" as an (invalid) choice into the shown picker.
+    app.set_pending_host_input(pending_host_input_item(&holder));
     app.input = "99".to_string();
     app.input_cursor = 2;
     let (sink, mut events) = ChannelSink::new();
@@ -1345,6 +1350,60 @@ fn arriving_host_question_parks_and_restores_unrelated_chat_draft() {
     assert!(app.set_pending_host_input(None));
     assert_eq!(app.input, "下一条普通消息");
     assert_eq!(app.input_cursor, app.input.chars().count());
+}
+
+#[test]
+fn a_buffered_enter_before_the_mirror_syncs_does_not_answer_with_an_unrelated_draft() {
+    // Lifecycle race: the base registers a question and the user's buffered Enter (meant to
+    // SEND their in-progress chat line) is processed in the SAME tick, before the per-frame
+    // mirror sync ran — holder=Some, app.pending_host_input still None. The Enter must NOT
+    // answer the base's question with that unrelated chat line. resolve now syncs the mirror
+    // first, which stashes the draft and starts a clean box, so the question stays pending and
+    // no answer is sent.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = App::new(
+        "race-test",
+        crate::config::UserConfig::default(),
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
+    );
+    let request = umadev_runtime::HostRequest::UserInput {
+        questions: vec![host_choice_question(
+            "database",
+            umadev_runtime::HostQuestionKind::SingleChoice,
+            true,
+        )],
+        metadata: serde_json::Value::Null,
+    };
+    let holder: HostInputHolder = Arc::new(std::sync::Mutex::new(None));
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    *holder.lock().unwrap() = Some(PendingHostInput {
+        token: 1,
+        reply_tx: tx,
+        req_id: String::new(),
+        request,
+    });
+    // The user was typing an unrelated chat line; the mirror is intentionally NOT synced.
+    app.input = "an unrelated chat line".to_string();
+    app.input_cursor = app.input.chars().count();
+    let (sink, _events) = ChannelSink::new();
+    resolve_pending_host_input_key(
+        &holder,
+        &mut app,
+        &Arc::new(sink),
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    );
+    // The unrelated line was NOT sent as the answer: the request is still pending and the
+    // reply channel is empty. (The draft is stashed and restored when the question settles.)
+    assert!(
+        holder.lock().unwrap().is_some(),
+        "the base question must stay pending"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no answer may be sent from an unrelated chat draft"
+    );
 }
 
 #[test]
@@ -1907,18 +1966,27 @@ fn cancel_preflight_clears_shared_steer_and_invalidates_the_resident_session() {
         ));
     let chat_session_holder = ChatSessionHolder::new(None);
     let generation = chat_session_holder.generation();
+    let pending_ask_holder: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(
+        umadev_runtime::AskUserQuestion::parse_value(&serde_json::json!({
+            "questions": [{"header": "H", "question": "Q?", "options": [{"label": "A"}]}]
+        })),
+    ));
 
     assert!(prepare_cancel_request(
         &mut app,
         false,
         &approval_holder,
         &host_input_holder,
+        &pending_ask_holder,
         &steer_holder,
         &chat_session_holder,
     ));
     assert!(steer_holder.lock().unwrap().is_empty());
     assert!(!app.director_gate_paused);
     assert_ne!(chat_session_holder.generation(), generation);
+    // The parked base question is dropped on cancel too — otherwise it survives the
+    // session invalidation and gets relayed onto the user's NEXT, unrelated instruction.
+    assert!(pending_ask_holder.try_lock().unwrap().is_none());
 }
 
 #[test]
@@ -1938,12 +2006,18 @@ fn cancel_preflight_rejects_reentry_until_the_existing_abort_drain_finishes() {
     ]));
     let chat_session_holder = ChatSessionHolder::new(None);
     let generation = chat_session_holder.generation();
+    let pending_ask_holder: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(
+        umadev_runtime::AskUserQuestion::parse_value(&serde_json::json!({
+            "questions": [{"header": "H", "question": "Q?", "options": [{"label": "A"}]}]
+        })),
+    ));
 
     assert!(!prepare_cancel_request(
         &mut app,
         true,
         &approval_holder,
         &host_input_holder,
+        &pending_ask_holder,
         &steer_holder,
         &chat_session_holder,
     ));
@@ -1952,6 +2026,8 @@ fn cancel_preflight_rejects_reentry_until_the_existing_abort_drain_finishes() {
         ["must stay owned by the old drain"]
     );
     assert_eq!(chat_session_holder.generation(), generation);
+    // The reentry guard bailed before any cleanup, so the parked question is untouched.
+    assert!(pending_ask_holder.try_lock().unwrap().is_some());
     assert!(app.cancelling);
 }
 

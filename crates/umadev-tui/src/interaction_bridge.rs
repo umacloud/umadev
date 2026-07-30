@@ -600,6 +600,16 @@ pub(super) fn resolve_pending_host_input_key(
     if !pending {
         return false;
     }
+    // Sync the app mirror from the holder BEFORE interpreting the key. The per-frame sync
+    // (see the resident loop) may not have run yet when a buffered key lands in the SAME tick
+    // the base registered this request — the holder is Some but `app.pending_host_input` is
+    // still empty. Left unsynced, the specialized picker path below is skipped (its take()
+    // sees None) and the key falls through to the generic free-form handler, which answers
+    // the base's question with the user's UNRELATED in-progress chat line and pushes that
+    // line into the transcript. set_pending_host_input is idempotent (an unchanged token is a
+    // no-op) and, on the None->Some edge, stashes the chat draft before the key is
+    // interpreted — so the answer is composed against the picker, not the stray sentence.
+    app.set_pending_host_input(pending_host_input_item(holder));
     if let Some(outcome) = app.resolve_specialized_host_input_key(code, modifiers) {
         match outcome {
             HostInputKeyOutcome::Passthrough => return false,
@@ -1046,6 +1056,7 @@ fn is_upstream_permission_boundary(metadata: &serde_json::Value) -> bool {
 async fn resolve_upstream_permission_boundary(
     action: &str,
     target: &str,
+    req_id: &str,
     interactive: bool,
     approval_holder: &ApprovalHolder,
     sink: &Arc<ChannelSink>,
@@ -1058,8 +1069,20 @@ async fn resolve_upstream_permission_boundary(
         return umadev_runtime::ApprovalDecision::Deny;
     }
 
-    match await_user_approval_with_auto_release(approval_holder, sink, action, target, false, "")
-        .await
+    // Thread the real req_id (this arm previously hardcoded ""), so a base that WITHDRAWS
+    // this upstream-boundary approval can retract the sticky bar by id — an empty id makes
+    // retract_pending_approval_for a no-op, leaving the user to answer a dead prompt (and its
+    // Allow side effects to run for an action the base already abandoned). Every other
+    // approval class already threads its id; this one silently did not.
+    match await_user_approval_with_auto_release(
+        approval_holder,
+        sink,
+        action,
+        target,
+        false,
+        req_id,
+    )
+    .await
     {
         ApprovalReply::Allow => {
             sink.emit(EngineEvent::Note(umadev_i18n::tlf(
@@ -1185,6 +1208,7 @@ pub(super) async fn resolve_resident_host_request(
                 resolve_upstream_permission_boundary(
                     action,
                     target,
+                    req_id,
                     interactive,
                     approval_holder,
                     sink,

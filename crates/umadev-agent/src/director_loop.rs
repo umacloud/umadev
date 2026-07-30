@@ -6208,10 +6208,14 @@ async fn drive_one_turn_with_backoff_and_memories(
                 }
             }
             SessionEvent::HostRequestSettled { .. } => {
-                // The director resolves each host request INLINE above, so a
-                // withdrawal has no lingering picker to retract on this headless
-                // path — the retraction consumer lives on the resident-chat
-                // surface. Informational only here.
+                // Retraction is not wired on this path yet (informational only). NOTE for
+                // Phase 3: this is NOT a "no picker here" lane. Under a HEADLESS director the
+                // host_request callback resolves inline with no UI, but under a TUI `/run` the
+                // callback installed by `director_run` registers a real interactive picker /
+                // approval bar (`await_host_input` / `await_user_approval`), so a genuine
+                // base withdrawal WILL leave a live picker to retract on this exact path.
+                // Phase 3 must wire the driver emit AND a retract against that callback's
+                // holder here — do not skip this lane assuming inline resolution.
             }
             SessionEvent::BackgroundTask(_) => {
                 // Already folded into the tracker above; carries no render row.

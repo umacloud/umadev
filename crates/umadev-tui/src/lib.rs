@@ -8625,6 +8625,7 @@ fn prepare_cancel_request(
     cancel_drain_active: bool,
     approval_holder: &ApprovalHolder,
     host_input_holder: &HostInputHolder,
+    pending_ask_holder: &PendingAskHolder,
     steer_holder: &umadev_agent::SteerIntake,
     chat_session_holder: &ChatSessionHolder,
 ) -> bool {
@@ -8638,6 +8639,16 @@ fn prepare_cancel_request(
     // below (auth UI, steer queue, session) stays gated on a non-host-git cancel.
     clear_pending_approval(approval_holder);
     clear_pending_host_input(host_input_holder);
+    // Drop a parked base question (AskUserQuestion / ExitPlanMode) too. Cancel
+    // invalidates the session that asked it, but `pending_ask` was otherwise cleared
+    // only by a session RESTART — so a stale ask survived the cancel and
+    // `select_resident_turn_payload` relayed the user's NEXT, unrelated instruction as
+    // an answer to a question a discarded session raised. try_lock + fail-open: the
+    // async holder is only ever held briefly across a set/take, and skipping the clear
+    // on the rare contended tick is harmless (the restart path still clears it).
+    if let Ok(mut ask) = pending_ask_holder.try_lock() {
+        *ask = None;
+    }
     if app.host_git_in_flight {
         return true;
     }
@@ -8916,6 +8927,7 @@ fn handle_tick_flush_key(
             cancel_drain.is_some(),
             approval_holder,
             host_input_holder,
+            pending_ask_holder,
             steer_holder,
             chat_session_holder,
         )
@@ -10384,6 +10396,7 @@ async fn event_loop(
                         cancel_drain.is_some(),
                         &approval_holder,
                         &host_input_holder,
+                        &pending_ask_holder,
                         &steer_holder,
                         &chat_session_holder,
                     ) =>
