@@ -63,6 +63,11 @@ pub(super) enum RouteDecision {
     AgenticDone {
         reply: String,
         director_build: bool,
+        /// The base hit a hard limit (max turns / tokens / budget) mid-work. The reply is a
+        /// PARTIAL result: the durable ledger records it as failed, so the visible settle must
+        /// NOT show the ✅ completion card or mark the task Done — it settles as Stopped with
+        /// the truncation caveat, matching the ledger instead of contradicting it.
+        truncated: bool,
         base_session_id: Option<String>,
         base_resume_identity: Option<BaseResumeIdentity>,
     },
@@ -117,6 +122,14 @@ impl RouteDecision {
             Self::InputRejected { .. }
                 | Self::AuthCancelled { .. }
                 | Self::AgenticDone { .. }
+                // A parked (awaiting-answer / base-interrupted) turn is ALSO terminal for the
+                // publishing task: it `return`s right after sending AgenticStopped, dropping
+                // the task that owns the workspace writer lock. Without joining it here, the
+                // very next queued follow-up races that destructor — its RunLock::acquire hits
+                // the still-held same-process guard and the queued message is spuriously
+                // rejected with a writer-lock error. Joining also settles the handle so the
+                // interrupted task is not detached un-awaited (Ctrl-C can still abort it).
+                | Self::AgenticStopped { .. }
                 | Self::HostGitDone { .. }
                 | Self::LocalCommandDone(_)
                 | Self::RunNotExecuted
@@ -134,6 +147,33 @@ impl RouteDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_parked_turn_is_terminal_so_its_writer_lock_is_joined() {
+        // AgenticStopped publishes a parked turn whose task already `return`ed, dropping the
+        // workspace-writer-lock guard. It MUST be terminal so the event loop joins that task
+        // before firing the next queued turn — otherwise the follow-up races the destructor
+        // and is spuriously rejected with a writer-lock error.
+        assert!(RouteDecision::AgenticStopped {
+            message_key: "agentic.awaiting_answer",
+            base_session_id: None,
+            base_resume_identity: None,
+        }
+        .is_terminal());
+        // A clean finish is (still) terminal; a mid-flight director start is NOT.
+        assert!(RouteDecision::AgenticDone {
+            reply: String::new(),
+            director_build: false,
+            truncated: false,
+            base_session_id: None,
+            base_resume_identity: None,
+        }
+        .is_terminal());
+        assert!(!RouteDecision::DirectorStarted {
+            requirement: String::new()
+        }
+        .is_terminal());
+    }
 
     #[test]
     fn read_only_brain_build_never_transfers_to_director() {

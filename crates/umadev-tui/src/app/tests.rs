@@ -839,7 +839,7 @@ fn native_command_precedence_and_explicit_base_escape_are_unambiguous() {
     product.base_session_commands = vec![session_command("compact")];
     for index in 0..12 {
         product.record_user_turn(&format!("user message {index}"));
-        product.record_agentic_done(format!("assistant reply {index}"), false, None, None);
+        product.record_agentic_done(format!("assistant reply {index}"), false, false, None, None);
     }
     assert!(matches!(
         product.try_slash_command("/compact"),
@@ -1903,6 +1903,7 @@ fn record_agentic_done_with_session(app: &mut App, reply: &str, session_id: &str
     .expect("test workspace has a canonical launch identity");
     app.record_agentic_done(
         reply.to_string(),
+        false,
         false,
         Some(session_id.to_string()),
         Some(identity),
@@ -3565,7 +3566,7 @@ fn display_transcript_round_trips_rich_rows_and_ends_with_divider() {
     // A recorded exchange makes the chat persistable; `record_agentic_done`
     // persists (transcript + the display snapshot above).
     app.record_user_turn("做一个看板");
-    app.record_agentic_done("好的，开始搭建。".to_string(), false, None, None);
+    app.record_agentic_done("好的，开始搭建。".to_string(), false, false, None, None);
     let saved_id = app.chat_id.clone();
 
     // Simulate a restart: a brand-new App over the SAME project root.
@@ -3731,7 +3732,7 @@ fn slash_compact_runs_the_structured_summary_path() {
     let (mut app, _tmp) = temp_app();
     for i in 0..12 {
         app.record_user_turn(&format!("user message {i}"));
-        app.record_agentic_done(format!("assistant reply {i}"), false, None, None);
+        app.record_agentic_done(format!("assistant reply {i}"), false, false, None, None);
     }
     // The slash handler signals intent (and pushes the "compacting…" note).
     let action = app.try_slash_command("/compact").expect("a slash command");
@@ -3781,7 +3782,13 @@ fn slash_compact_runs_the_structured_summary_path() {
 fn fill_over_budget(app: &mut App, exchanges: usize) {
     for i in 0..exchanges {
         app.record_user_turn(&format!("u{i} {}", "alpha ".repeat(80)));
-        app.record_agentic_done(format!("a{i} {}", "beta ".repeat(80)), false, None, None);
+        app.record_agentic_done(
+            format!("a{i} {}", "beta ".repeat(80)),
+            false,
+            false,
+            None,
+            None,
+        );
     }
 }
 
@@ -4009,7 +4016,7 @@ fn director_run_finish_hands_session_back_to_chat() {
     // `director_run_in_flight` flag — the chat surface classifies in the task.
     let (mut app, _tmp) = temp_app();
     app.director_run_in_flight = true;
-    app.record_agentic_done("built the app".to_string(), true, None, None);
+    app.record_agentic_done("built the app".to_string(), true, false, None, None);
     assert!(
         app.run_session_handed_to_chat,
         "a finished director build hands its session back to chat"
@@ -4027,7 +4034,7 @@ fn director_run_finish_hands_session_back_to_chat() {
     // even if the in-flight marker was left set.
     app.run_session_handed_to_chat = false;
     app.director_run_in_flight = true;
-    app.record_agentic_done("just chatting".to_string(), false, None, None);
+    app.record_agentic_done("just chatting".to_string(), false, false, None, None);
     assert!(
         !app.run_session_handed_to_chat,
         "a non-build turn never hands a session back"
@@ -5330,8 +5337,16 @@ fn terminal_transitions_settle_the_task_status() {
     // Done on a clean director build hand-back.
     let mut app = fresh_app(Some("offline"));
     app.register_run_task("build y");
-    app.record_agentic_done("done".into(), true, None, None);
+    app.record_agentic_done("done".into(), true, false, None, None);
     assert_eq!(app.tasks.last().unwrap().status, TaskStatus::Done);
+
+    // A TRUNCATED director build (base hit max turns/tokens/budget) is a partial result the
+    // durable ledger records as failed — its task settles Stopped, never Done, so the visible
+    // row does not contradict the ledger (and the caller suppresses the ✅ completion card).
+    let mut app = fresh_app(Some("offline"));
+    app.register_run_task("build z");
+    app.record_agentic_done("partial".into(), true, true, None, None);
+    assert_eq!(app.tasks.last().unwrap().status, TaskStatus::Stopped);
 }
 
 #[test]
@@ -8290,7 +8305,7 @@ fn compacted_stream_is_replaced_by_the_complete_terminal_reply() {
         events: 9,
         bytes: 4_096,
     });
-    app.record_agentic_done("这是完整的最终答复。".to_string(), false, None, None);
+    app.record_agentic_done("这是完整的最终答复。".to_string(), false, false, None, None);
 
     let host_text = app
         .history
@@ -8329,7 +8344,7 @@ fn cancelling_a_compacted_stream_clears_recovery_state_for_the_next_turn() {
             delta: "正常流式答复".to_string(),
         },
     });
-    app.record_agentic_done("正常流式答复".to_string(), false, None, None);
+    app.record_agentic_done("正常流式答复".to_string(), false, false, None, None);
     assert_eq!(
         app.history
             .iter()

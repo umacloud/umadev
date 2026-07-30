@@ -3050,6 +3050,7 @@ async fn drive_agentic_stream(
             let _ = route_tx.send(RouteDecision::AgenticDone {
                 reply,
                 director_build: full_build,
+                truncated: false,
                 // The non-resident light path (offline brain) owns no resumable base
                 // session id — the resident host chat path carries one (see
                 // `drive_chat_session_turn`); fail-open `None` here.
@@ -4592,10 +4593,29 @@ fn emit_chat_turn_usage(
     let est_tokens = umadev_agent::director_loop::approx_tokens(prompt)
         .saturating_add(umadev_agent::director_loop::approx_tokens(reply));
     sink.emit(EngineEvent::TurnUsage { usage, est_tokens });
-    umadev_agent::director_loop::record_estimated_usage(
-        backend,
-        umadev_agent::director_loop::real_or_estimated_tokens(usage, est_tokens),
-    );
+    // Honest ledger quality (mirrors director_loop::record_turn_usage): a base-REPORTED usage
+    // row goes through the quality-preserving V2 path — exact counts, input/output/cache
+    // split, native cost when the base reports one (grok's exact cost ticks included) — so
+    // `/usage` stops labeling exact data "estimated" and stops discarding the split. The
+    // resident-chat surface is UmaDev's DEFAULT and previously ALWAYS took the estimated path,
+    // so `/usage` directly contradicted the live gauge (which reads the same real Usage). Only
+    // a turn with NO usable base report falls back to the labeled chars/4 lower bound.
+    let reported = usage.filter(|u| !(u.usage_incomplete && u.has_empty_lower_bound()));
+    if let Some(u) = reported {
+        umadev_agent::usage_ledger::record_runtime_usage(backend, umadev_spec::Phase::Frontend, u);
+    } else {
+        umadev_agent::director_loop::record_estimated_usage(
+            backend,
+            umadev_agent::director_loop::real_or_estimated_tokens(usage, est_tokens),
+        );
+    }
+}
+
+/// The bilingual "this turn may be incomplete" caveat shown when a base turn hit a hard limit
+/// (max turns / tokens / budget). Kept as a standalone accessor so the long CJK string lives
+/// outside the deeply-nested resident-turn body.
+fn truncation_caveat_text() -> &'static str {
+    "[warn] 本轮可能未完成或未全部落盘(底座中途告警/截断),请核对实际文件状态 / turn may be incomplete or not fully written — verify the working tree"
 }
 
 fn chat_turn_should_auto_redrive(
@@ -5008,9 +5028,18 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     )
                     .await;
                 cancel_entry_task(&mut entry_task, "intent routing requested clarification");
+                // The clarification question was NEVER streamed, and record_agentic_done does
+                // not render a non-streamed AgenticDone.reply (its contract is "the body
+                // already streamed live"). Without emitting it here the spinner just stops and
+                // the user sees nothing — the question lived only in the transcript the base
+                // reads next turn, never on screen. Emit it so the user actually sees what they
+                // are being asked; the AgenticDone.reply still records it to the transcript for
+                // the base's context (visible once, recorded once — no double).
+                sink.emit(EngineEvent::Note(reply.clone()));
                 let _ = route_tx.send(RouteDecision::AgenticDone {
                     reply,
                     director_build: false,
+                    truncated: false,
                     base_session_id,
                     base_resume_identity,
                 });
@@ -6587,10 +6616,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         if !reply.is_empty() {
             reply.push('\n');
         }
-        reply.push_str(
-            "[warn] 本轮可能未完成或未全部落盘(底座中途告警/截断),请核对实际文件状态 \
-             / turn may be incomplete or not fully written — verify the working tree",
-        );
+        reply.push_str(truncation_caveat_text());
     }
 
     // `Write`/`Edit` is an early lock/isolation signal, not filesystem truth.
@@ -6929,6 +6955,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         reply,
         // Completion depth follows intent, not the mere existence of a write.
         director_build: full_build,
+        truncated,
         base_session_id,
         base_resume_identity,
     });
@@ -10922,6 +10949,7 @@ async fn event_loop(
                 Some(RouteDecision::AgenticDone {
                     reply,
                     director_build,
+                    truncated,
                     base_session_id,
                     base_resume_identity,
                 }) => {
@@ -10943,6 +10971,7 @@ async fn event_loop(
                     app.record_agentic_done(
                         reply,
                         director_build,
+                        truncated,
                         base_session_id,
                         base_resume_identity,
                     );
@@ -10963,7 +10992,11 @@ async fn event_loop(
                     // URL. A plain chat / explain / quick-edit turn carries
                     // `director_build = false` and gets NO card (it just streamed
                     // its answer). Fail-open + non-blocking by contract.
-                    if director_build {
+                    // A TRUNCATED build is not a clean delivery — the durable ledger already
+                    // recorded it as failed, so suppress the ✅ "done + changed + demo" card
+                    // (record_agentic_done also settles the task Stopped, not Done). The
+                    // truncation caveat was surfaced as a note on the turn.
+                    if director_build && !truncated {
                         finalize_build_completion(app, &sink);
                     }
                     // A director just released its writer; refresh/pre-load the

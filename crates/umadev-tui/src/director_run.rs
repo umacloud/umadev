@@ -564,6 +564,9 @@ pub(super) async fn run_director_loop(
                 let _ = route_tx.send(RouteDecision::AgenticDone {
                     reply,
                     director_build: true,
+                    // The /run director settles through its own loop outcome; truncation on
+                    // this path is handled there, not via this flag.
+                    truncated: false,
                     // Pin the hand-back to the director's exact native session.
                     // `record_agentic_done` stores it on App, and the resident
                     // pre-loader resumes that id before the next chat turn.

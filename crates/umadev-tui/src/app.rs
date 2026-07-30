@@ -11429,6 +11429,7 @@ impl App {
         &mut self,
         reply: String,
         director_build: bool,
+        truncated: bool,
         base_session_id: Option<String>,
         base_resume_identity: Option<BaseResumeIdentity>,
     ) {
@@ -11436,8 +11437,16 @@ impl App {
         self.settle_agentic_bookkeeping(base_session_id, base_resume_identity);
         if director_build {
             self.run_session_handed_to_chat = true;
-            // The director build settled cleanly → mark its task Done.
-            self.mark_active_task(TaskStatus::Done);
+            // A CLEAN director build settles Done; a TRUNCATED one (base hit max
+            // turns/tokens/budget) is a partial result the durable ledger already recorded as
+            // failed — settle its task Stopped, never Done, so the visible row matches the
+            // ledger instead of contradicting it. The completion card is suppressed by the
+            // caller on the same condition.
+            self.mark_active_task(if truncated {
+                TaskStatus::Stopped
+            } else {
+                TaskStatus::Done
+            });
         }
         self.refresh_status();
         let reply = reply.trim().to_string();

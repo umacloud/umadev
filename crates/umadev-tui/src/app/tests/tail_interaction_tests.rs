@@ -3349,7 +3349,7 @@ fn terminal_recorders_clear_the_run_marker_so_the_post_run_refresh_must_snapshot
 
     let mut done = fresh_app(Some("offline"));
     done.director_run_in_flight = true;
-    done.record_agentic_done("built it".into(), true, None, None);
+    done.record_agentic_done("built it".into(), true, false, None, None);
     assert!(
         !done.director_run_in_flight,
         "a completed run clears the in-flight marker"
@@ -4029,7 +4029,7 @@ fn a_long_agentic_turn_rings_a_short_chat_reply_does_not() {
     app.bell_enabled = true;
     app.thinking = true;
     app.thinking_started = secs_ago(6);
-    app.record_agentic_done("done".into(), false, None, None);
+    app.record_agentic_done("done".into(), false, false, None, None);
     assert!(app.bell_pending, "a long agentic turn arms the bell");
     assert_eq!(app.bell_count, 1);
 
@@ -4038,7 +4038,7 @@ fn a_long_agentic_turn_rings_a_short_chat_reply_does_not() {
     quick.bell_enabled = true;
     quick.thinking = true;
     quick.thinking_started = Some(std::time::Instant::now());
-    quick.record_agentic_done("hi".into(), false, None, None);
+    quick.record_agentic_done("hi".into(), false, false, None, None);
     assert!(!quick.bell_pending, "a quick reply does not beep");
     assert_eq!(quick.bell_count, 0);
 }
