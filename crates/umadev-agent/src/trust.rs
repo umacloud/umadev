@@ -1011,12 +1011,13 @@ fn target_escapes_workspace(target_path: &str, workspace_root: Option<&Path>) ->
     false
 }
 
-/// Whether absolute `path` lies under absolute `root`, decided LEXICALLY (no IO — the
-/// write target may not exist yet, so `canonicalize` is unavailable). Normalizes away
-/// `.` segments and compares path components; `root`'s components must be a prefix of
-/// `path`'s. Fail-open toward the safe answer: a non-absolute root, or any case we
-/// can't positively confirm as contained, returns `false` (treated as an escape →
-/// confirm). Used only by [`target_escapes_workspace`].
+/// Whether absolute `path` lies under absolute `root`. A LEXICAL component-prefix check
+/// (normalizing away `.` segments) decides the common case — the write target may not
+/// exist yet, so a purely lexical answer is always available. When the target's ancestors
+/// DO exist, a runtime symlink backstop additionally requires the resolved location to
+/// stay under the resolved root (see below). Fail-open toward the safe answer: a
+/// non-absolute root, or any case we can't positively confirm as contained, returns
+/// `false` (treated as an escape → confirm). Used only by [`target_escapes_workspace`].
 #[must_use]
 fn absolute_is_under(path: &Path, root: &Path) -> bool {
     use std::path::Component;
@@ -1036,10 +1037,34 @@ fn absolute_is_under(path: &Path, root: &Path) -> bool {
     }
     let rp = norm(root);
     let pp = norm(path);
-    if rp.is_empty() || pp.len() < rp.len() {
+    if rp.is_empty() || pp.len() < rp.len() || pp[..rp.len()] != rp[..] {
         return false;
     }
-    pp[..rp.len()] == rp[..]
+    // SYMLINK-LAUNDERING BACKSTOP (runtime-only): a path can be lexically in-tree yet
+    // RESOLVE outside the root through an in-tree symlink — a malicious dependency's
+    // postinstall (or any earlier auto-allowed in-tree shell command) drops
+    // `node_modules/.cache/link -> ~/.ssh`, then the base writes
+    // `node_modules/.cache/link/authorized_keys`: lexically relative and `..`-free, so the
+    // pure check calls it in-tree and Guarded/Auto auto-writes outside the workspace.
+    // Canonicalize the deepest EXISTING ancestor of the target (the target itself may not
+    // exist yet) and the root, and require the ancestor to stay under the canonical root.
+    // Fail-SAFE: if either canonicalize fails (nonexistent / synthetic paths — e.g. the
+    // pure unit-test fixtures), keep the lexical result, so this can only ever ADD an
+    // escape detection, never remove one. Root and ancestor are resolved the SAME way, so a
+    // legitimately symlinked workspace still resolves consistently under itself.
+    match (root.canonicalize(), canonical_existing_ancestor(path)) {
+        (Ok(canon_root), Some(canon_ancestor)) => canon_ancestor.starts_with(&canon_root),
+        _ => true,
+    }
+}
+
+/// The canonical path of the deepest EXISTING ancestor of `path` (the path itself counts
+/// when it exists). `None` when no ancestor resolves — so a fully synthetic path yields
+/// `None` and [`absolute_is_under`]'s backstop keeps the lexical decision. `ancestors()`
+/// walks target → parent → … so the FIRST that canonicalizes is the deepest that exists.
+fn canonical_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find_map(|ancestor| ancestor.canonicalize().ok())
 }
 
 /// The stable class key under which an APPROVED reversible action is remembered
@@ -2856,6 +2881,49 @@ mod tests {
                 "plan allows a pure read: {read:?}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn in_tree_symlink_cannot_launder_an_out_of_tree_write() {
+        use std::os::unix::fs::symlink;
+        // A write that is LEXICALLY in-tree (relative, `..`-free) but RESOLVES outside the
+        // workspace through an in-tree symlink must still escalate — otherwise a malicious
+        // dependency's postinstall (`node_modules/.cache/link -> <outside>`) launders an
+        // out-of-tree write past Guarded AND Auto with no prompt.
+        let root_tmp = TempDir::new().unwrap();
+        let outside_tmp = TempDir::new().unwrap();
+        let root = root_tmp.path();
+        let cache = root.join("node_modules/.cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let link = cache.join("link");
+        symlink(outside_tmp.path(), &link).unwrap();
+
+        let laundered = link.join("authorized_keys");
+        let laundered = laundered.to_str().unwrap();
+        let ledger = TrustLedger::default();
+        for mode in [TrustMode::Guarded, TrustMode::Auto] {
+            assert!(
+                requires_confirmation_with_ledger(mode, "", laundered, root, &ledger),
+                "{mode:?}: a write laundered through an in-tree symlink must escalate"
+            );
+        }
+
+        // Control: a genuine in-tree write (no symlink) stays automatic — the backstop must
+        // not over-escalate. `src` exists; the file within it does not yet.
+        let real_dir = root.join("src");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let inside = real_dir.join("app.rs");
+        assert!(
+            !requires_confirmation_with_ledger(
+                TrustMode::Guarded,
+                "",
+                inside.to_str().unwrap(),
+                root,
+                &ledger
+            ),
+            "a real in-tree write must stay automatic"
+        );
     }
 
     #[test]
