@@ -2395,6 +2395,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn trusted_windows_system_command_is_bounded_and_confined() {
+        // This spawns a REAL PowerShell. Its cold start (JIT + module load) can take several
+        // seconds on a loaded CI runner, so the deadline here is only generous flake headroom —
+        // NOT a behavioural assertion. The tight-deadline kill + output cap are proven
+        // separately by `trusted_windows_system_command_enforces_zero_timeout_and_output_cap`.
+        // The command itself does no sleeping so the happy path returns as soon as PowerShell
+        // is warm; a too-tight 3s budget was the source of an intermittent CI kill.
         let output = super::windows_system_command_stdout(
             Path::new("WindowsPowerShell/v1.0/powershell.exe"),
             &[
@@ -2402,9 +2408,9 @@ mod tests {
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "Start-Sleep -Milliseconds 100; Write-Output umadev-system-command",
+                "Write-Output umadev-system-command",
             ],
-            Duration::from_secs(3),
+            Duration::from_secs(60),
             1024,
         )
         .expect("run PowerShell from the OS-reported system directory");
