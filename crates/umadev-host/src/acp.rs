@@ -7647,6 +7647,10 @@ fn folder_trust_response_frame(raw_id: &Value, decision: FolderTrustUserDecision
     })
 }
 
+// A protocol dispatcher: one arm per (pending-kind × response-variant) pair,
+// including the cross-variant acceptances. Splitting it would only scatter the
+// exhaustive match that makes the mismatch fall-through auditable.
+#[allow(clippy::too_many_lines)]
 async fn write_host_response(
     writer: &SharedWriter,
     pending: PendingHostRequest,
@@ -7680,6 +7684,57 @@ async fn write_host_response(
             },
             HostResponse::UserInputOutcome { outcome },
         ) => write_grok_user_input_outcome(writer, raw_id, &questions, &outcome).await,
+        // Cross-variant acceptance (defensive, same rationale as the plan arms):
+        // a grok question also accepts a plain answers reply (wrapped as
+        // Accepted), and a generic/kimi question also accepts the richer
+        // UserInputOutcome (its answers extracted), instead of a -32602 mismatch.
+        (
+            PendingHostRequest::UserInput {
+                raw_id,
+                questions,
+                flavor: UserInputFlavor::GrokAskUserQuestion,
+            },
+            HostResponse::UserInput { answers },
+        ) => {
+            let outcome = HostUserInputOutcome::Accepted {
+                answers,
+                annotations: Vec::new(),
+            };
+            write_grok_user_input_outcome(writer, raw_id, &questions, &outcome).await
+        }
+        (
+            PendingHostRequest::UserInput {
+                raw_id,
+                questions,
+                flavor: UserInputFlavor::Generic,
+            },
+            HostResponse::UserInputOutcome { outcome },
+        ) => {
+            let answers = answers_from_outcome(outcome);
+            write_generic_user_input_response(writer, raw_id, &questions, &answers).await
+        }
+        (
+            PendingHostRequest::UserInput {
+                raw_id,
+                questions,
+                flavor: UserInputFlavor::KimiPermissionQuestion,
+            },
+            HostResponse::UserInputOutcome { outcome },
+        ) => {
+            let answers = answers_from_outcome(outcome);
+            write_kimi_permission_question_response(writer, raw_id, &questions, &answers).await
+        }
+        (
+            PendingHostRequest::UserInput {
+                raw_id,
+                questions,
+                flavor: UserInputFlavor::KimiPlanReview,
+            },
+            HostResponse::UserInputOutcome { outcome },
+        ) => {
+            let answers = answers_from_outcome(outcome);
+            write_kimi_plan_review_response(writer, raw_id, &questions, &answers).await
+        }
         (
             PendingHostRequest::UserInput {
                 raw_id,
@@ -7737,6 +7792,35 @@ async fn write_host_response(
             },
             HostResponse::PlanOutcome { outcome },
         ) => write_grok_plan_outcome(writer, raw_id, &outcome).await,
+        // Cross-variant acceptance (defensive): each plan flavor also accepts the
+        // OTHER natural reply shape, converting deterministically, instead of
+        // bouncing it as a -32602 mismatch. Today the TUI keys the variant on the
+        // responseContract so these do not fire, but any new surface using the
+        // natural variant is now handled instead of erroring the base.
+        (
+            PendingHostRequest::PlanConfirmation {
+                raw_id,
+                flavor: PlanConfirmationFlavor::GrokExitPlanMode,
+            },
+            HostResponse::PlanConfirmation { decision, feedback },
+        ) => {
+            let outcome = plan_outcome_from_decision(decision, feedback);
+            write_grok_plan_outcome(writer, raw_id, &outcome).await
+        }
+        (
+            PendingHostRequest::PlanConfirmation {
+                raw_id,
+                flavor: PlanConfirmationFlavor::Generic,
+            },
+            HostResponse::PlanOutcome { outcome },
+        ) => {
+            let (decision, feedback) = decision_from_plan_outcome(outcome);
+            write_json_line(
+                writer,
+                &plan_confirmation_response_frame(&raw_id, decision, feedback),
+            )
+            .await
+        }
         (
             PendingHostRequest::FolderTrust { raw_id, .. },
             HostResponse::FolderTrust { decision },
@@ -7785,6 +7869,42 @@ async fn write_permission_expansion_host_response(
         &permission_expansion_response_frame(&raw_id, decision, granted, message),
     )
     .await
+}
+
+/// Grok exit-plan-mode outcome for a generic plan decision (cross-variant
+/// acceptance): Allow → approved, Deny → keep planning with the feedback.
+fn plan_outcome_from_decision(
+    decision: ApprovalDecision,
+    feedback: Option<String>,
+) -> HostPlanOutcome {
+    match decision {
+        ApprovalDecision::Allow => HostPlanOutcome::Approved,
+        ApprovalDecision::Deny => HostPlanOutcome::Cancelled { feedback },
+    }
+}
+
+/// The inverse: a generic plan decision for a grok plan outcome. Approved →
+/// allow; both keep-planning and abandon map to deny (abandon carries no
+/// feedback), so a generic caller never mistakes either for approval.
+fn decision_from_plan_outcome(outcome: HostPlanOutcome) -> (ApprovalDecision, Option<String>) {
+    match outcome {
+        HostPlanOutcome::Approved => (ApprovalDecision::Allow, None),
+        HostPlanOutcome::Cancelled { feedback } => (ApprovalDecision::Deny, feedback),
+        HostPlanOutcome::Abandoned => (ApprovalDecision::Deny, None),
+    }
+}
+
+/// Flatten a rich [`HostUserInputOutcome`] to a plain answer list for a flavor
+/// whose write-back is answer-based (generic / kimi). The grok-specific framings
+/// degrade benignly: a partial (chat/skip) yields its partial answers and a
+/// dismissal yields none — better than bouncing the reply as a mismatch.
+fn answers_from_outcome(outcome: HostUserInputOutcome) -> Vec<HostAnswer> {
+    match outcome {
+        HostUserInputOutcome::Accepted { answers, .. } => answers,
+        HostUserInputOutcome::ChatAboutThis { partial_answers }
+        | HostUserInputOutcome::SkipInterview { partial_answers } => partial_answers,
+        HostUserInputOutcome::Cancelled => Vec::new(),
+    }
 }
 
 async fn write_generic_user_input_response(
@@ -12904,6 +13024,67 @@ mod tests {
         ] {
             assert_eq!(grok_plan_outcome_result(&outcome).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn cross_variant_plan_conversions_round_trip_the_decision() {
+        // Grok flavor accepting a generic PlanConfirmation: allow → approved,
+        // deny (with feedback) → keep planning carrying that feedback.
+        assert_eq!(
+            plan_outcome_from_decision(ApprovalDecision::Allow, None),
+            HostPlanOutcome::Approved
+        );
+        assert_eq!(
+            plan_outcome_from_decision(ApprovalDecision::Deny, Some("revise".into())),
+            HostPlanOutcome::Cancelled {
+                feedback: Some("revise".into())
+            }
+        );
+        // Generic flavor accepting a grok PlanOutcome: approved → allow; BOTH
+        // keep-planning and abandon → deny, so a generic caller never mistakes
+        // either for approval.
+        assert_eq!(
+            decision_from_plan_outcome(HostPlanOutcome::Approved),
+            (ApprovalDecision::Allow, None)
+        );
+        assert_eq!(
+            decision_from_plan_outcome(HostPlanOutcome::Cancelled {
+                feedback: Some("revise".into())
+            }),
+            (ApprovalDecision::Deny, Some("revise".into()))
+        );
+        assert_eq!(
+            decision_from_plan_outcome(HostPlanOutcome::Abandoned),
+            (ApprovalDecision::Deny, None)
+        );
+    }
+
+    #[test]
+    fn answers_from_outcome_flattens_every_grok_framing() {
+        let a = vec![HostAnswer {
+            question_id: "q".into(),
+            values: vec!["v".into()],
+        }];
+        assert_eq!(
+            answers_from_outcome(HostUserInputOutcome::Accepted {
+                answers: a.clone(),
+                annotations: Vec::new()
+            }),
+            a
+        );
+        assert_eq!(
+            answers_from_outcome(HostUserInputOutcome::ChatAboutThis {
+                partial_answers: a.clone()
+            }),
+            a
+        );
+        assert_eq!(
+            answers_from_outcome(HostUserInputOutcome::SkipInterview {
+                partial_answers: a.clone()
+            }),
+            a
+        );
+        assert!(answers_from_outcome(HostUserInputOutcome::Cancelled).is_empty());
     }
 
     fn assert_grok_legacy_user_input(questions: &[PendingQuestion]) {
