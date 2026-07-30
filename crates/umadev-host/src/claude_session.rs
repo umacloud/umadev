@@ -1185,12 +1185,20 @@ fn merge_claude_answers(input: &Value, answers: &[HostAnswer]) -> Result<Value, 
     Ok(Value::Object(updated))
 }
 
-fn claude_question_id(question: &AskQuestion, index: usize) -> String {
-    if question.question.trim().is_empty() {
-        format!("claude-question-{}", index + 1)
-    } else {
-        question.question.clone()
-    }
+fn claude_question_id(_question: &AskQuestion, index: usize) -> String {
+    // The stable CORRELATION id for a Claude question — ALWAYS a synthetic index key, never
+    // the question TEXT. The outbound question is redacted before it reaches the user
+    // (`sanitize_question` redacts `HostQuestion::id`), so a text-derived id does not survive
+    // the round trip when the text carries a secret pattern (`api_key=…`, `sk-…`): the user's
+    // answer echoes the REDACTED id, which no longer matches the unredacted `expected` key in
+    // `merge_claude_answers`, and a real answer is rejected as "does not match a pending
+    // Claude question" — a DENY returned to Claude for a tool the user actually answered. A
+    // synthetic id carries no secret, so redaction leaves it untouched and correlation always
+    // holds. The visible prompt still carries the question text (see `typed_claude_interaction`)
+    // and Claude's answer map is still keyed by the text (see `merge_claude_answers`); only the
+    // correlation handle is synthetic. Two questions with identical text also no longer
+    // false-collide on a shared id.
+    format!("claude-question-{}", index + 1)
 }
 
 /// Record or cancel pending controls before their public events are sent. This
@@ -4554,7 +4562,10 @@ mod tests {
             panic!("expected user input, got {request:?}");
         };
         assert_eq!(questions.len(), 2);
-        assert_eq!(questions[0].id, "Which areas?");
+        // The correlation id is a synthetic index key (never the question text, which is
+        // redacted on the way out); the visible prompt still carries the text.
+        assert_eq!(questions[0].id, "claude-question-1");
+        assert_eq!(questions[0].prompt, "Which areas?");
         assert_eq!(questions[0].kind, HostQuestionKind::MultiChoice);
         assert_eq!(questions[0].options[1].value, "UI");
         assert_eq!(questions[1].kind, HostQuestionKind::SingleChoice);
@@ -4596,12 +4607,13 @@ mod tests {
         let payload = typed_host_response_payload(
             HostResponse::UserInput {
                 answers: vec![
+                    // The user echoes back the synthetic correlation id we sent, not the text.
                     HostAnswer {
-                        question_id: "Which areas?".to_string(),
+                        question_id: "claude-question-1".to_string(),
                         values: vec!["API".to_string(), "UI".to_string()],
                     },
                     HostAnswer {
-                        question_id: "Any extra constraints?".to_string(),
+                        question_id: "claude-question-2".to_string(),
                         values: vec!["Keep the public API stable".to_string()],
                     },
                 ],
@@ -4618,6 +4630,54 @@ mod tests {
         assert_eq!(
             payload["updatedInput"]["answers"]["Any extra constraints?"],
             "Keep the public API stable"
+        );
+    }
+
+    #[test]
+    fn ask_user_question_with_secret_in_text_still_correlates_the_answer() {
+        // A question whose TEXT carries a secret pattern is redacted before it reaches the
+        // user (sanitize_question redacts HostQuestion::id + prompt). Because the correlation
+        // id is now a synthetic index key (not the text), the user's answer — which echoes
+        // that synthetic id — still matches, so a real answer is delivered to Claude as
+        // "allow", not rejected as "does not match a pending Claude question". The answer map
+        // stays keyed by the full (unredacted) question text Claude's schema expects.
+        let question_text = "Found api_key=SECRET_TOKEN_1234567890, which database?";
+        let input = serde_json::json!({
+            "questions": [{
+                "header": "Database",
+                "question": question_text,
+                "multiSelect": false,
+                "options": [
+                    {"label": "Postgres", "description": "Relational"},
+                    {"label": "SQLite", "description": "Embedded"}
+                ]
+            }]
+        });
+        // The id we send (and the user echoes back) is the synthetic key, which redaction
+        // leaves untouched.
+        let request = typed_claude_interaction("AskUserQuestion", &input).unwrap();
+        let HostRequest::UserInput { questions, .. } = &request else {
+            panic!("expected user input, got {request:?}");
+        };
+        assert_eq!(questions[0].id, "claude-question-1");
+
+        let pending = PendingClaudeControl {
+            tool_name: "AskUserQuestion".to_string(),
+            input: input.clone(),
+        };
+        let payload = typed_host_response_payload(
+            HostResponse::UserInput {
+                answers: vec![HostAnswer {
+                    question_id: "claude-question-1".to_string(),
+                    values: vec!["Postgres".to_string()],
+                }],
+            },
+            Some(&pending),
+        );
+        assert_eq!(payload["behavior"], "allow");
+        assert_eq!(
+            payload["updatedInput"]["answers"][question_text],
+            "Postgres"
         );
     }
 
@@ -5793,7 +5853,9 @@ cat >/dev/null
                 "ask-live",
                 HostResponse::UserInput {
                     answers: vec![HostAnswer {
-                        question_id: "Which database?".to_string(),
+                        // The correlation id is the synthetic index key the question carried,
+                        // not the (redactable) question text.
+                        question_id: "claude-question-1".to_string(),
                         values: vec!["Postgres".to_string()],
                     }],
                 },
