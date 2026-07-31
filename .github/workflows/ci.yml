@@ -55,6 +55,10 @@ jobs:
           toolchain: ${{ env.UMADEV_CI_RUST }}
           components: clippy
           targets: x86_64-pc-windows-gnu
+      - name: Install Windows GNU C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: windows-gnu-cross

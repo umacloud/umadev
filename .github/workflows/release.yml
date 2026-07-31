@@ -41,6 +41,10 @@ jobs:
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
           registry-url: "https://registry.npmjs.org"
+      - name: Install Windows GNU C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64
 
       - name: Checkout audited Grok Build source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
