@@ -270,6 +270,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn persist_fixture(root: &Path, stats: &FirstPassStats) {
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        let body = serde_json::to_vec_pretty(stats).unwrap();
+        std::fs::write(root.join(STATS_FILE), body).unwrap();
+    }
+
     #[test]
     fn first_pass_step_increments_first_pass_and_attempts() {
         let tmp = TempDir::new().unwrap();
@@ -296,10 +302,12 @@ mod tests {
     fn rate_is_none_below_min_samples_and_correct_above() {
         let tmp = TempDir::new().unwrap();
         let kind = class_kind("build");
+        let mut stats = FirstPassStats::default();
         // 4 attempts (< MIN_SAMPLES = 5): not enough → None.
         for _ in 0..4 {
-            record(tmp.path(), &kind, true);
+            stats.observe(&kind, true);
         }
+        persist_fixture(tmp.path(), &stats);
         assert_eq!(
             first_pass_rate(tmp.path(), &kind),
             None,
@@ -307,9 +315,11 @@ mod tests {
         );
         // 6 attempts, 3 first-pass → 0.5 once over the threshold of samples.
         let tmp2 = TempDir::new().unwrap();
+        let mut stats = FirstPassStats::default();
         for i in 0..6 {
-            record(tmp2.path(), &kind, i < 3);
+            stats.observe(&kind, i < 3);
         }
+        persist_fixture(tmp2.path(), &stats);
         let r = first_pass_rate(tmp2.path(), &kind).expect("trusted over min samples");
         assert!((r - 0.5).abs() < 1e-9, "3/6 == 0.5, got {r}");
     }
@@ -404,10 +414,12 @@ mod tests {
     fn low_confidence_nudge_fires_only_on_a_trustworthy_low_rate() {
         let tmp = TempDir::new().unwrap();
         let kind = class_kind("build");
+        let mut stats = FirstPassStats::default();
         // 6 attempts, 1 first-pass = 16% ≤ 50% over the min sample → nudge fires.
         for i in 0..6 {
-            record(tmp.path(), &kind, i == 0);
+            stats.observe(&kind, i == 0);
         }
+        persist_fixture(tmp.path(), &stats);
         assert!(
             low_confidence_nudge(tmp.path(), &kind).is_some(),
             "a low rate over the min sample nudges"
@@ -415,9 +427,11 @@ mod tests {
 
         // A healthy rate (5/5 = 100%) → no nudge.
         let tmp2 = TempDir::new().unwrap();
+        let mut stats = FirstPassStats::default();
         for _ in 0..5 {
-            record(tmp2.path(), &kind, true);
+            stats.observe(&kind, true);
         }
+        persist_fixture(tmp2.path(), &stats);
         assert!(
             low_confidence_nudge(tmp2.path(), &kind).is_none(),
             "a healthy rate never nudges"
@@ -425,9 +439,11 @@ mod tests {
 
         // Low rate but too few samples (3 attempts) → no nudge yet.
         let tmp3 = TempDir::new().unwrap();
+        let mut stats = FirstPassStats::default();
         for _ in 0..3 {
-            record(tmp3.path(), &kind, false);
+            stats.observe(&kind, false);
         }
+        persist_fixture(tmp3.path(), &stats);
         assert!(
             low_confidence_nudge(tmp3.path(), &kind).is_none(),
             "below the min sample, even a 0% rate stays silent"
@@ -438,10 +454,12 @@ mod tests {
     fn autonomy_default_only_lowers_never_raises() {
         let tmp = TempDir::new().unwrap();
         let kind = class_kind("build");
+        let mut stats = FirstPassStats::default();
         // Drive a trustworthy-low rate.
         for _ in 0..6 {
-            record(tmp.path(), &kind, false);
+            stats.observe(&kind, false);
         }
+        persist_fixture(tmp.path(), &stats);
         // Auto is damped to Guarded on a low-confidence kind …
         assert_eq!(
             autonomy_default(tmp.path(), &kind, TrustMode::Auto),
@@ -490,10 +508,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let trusted = seat_kind("frontend-engineer");
         let untrusted = seat_kind("backend-engineer");
+        let mut stats = FirstPassStats::default();
         for _ in 0..5 {
-            record(tmp.path(), &trusted, true);
+            stats.observe(&trusted, true);
         }
-        record(tmp.path(), &untrusted, true); // 1 attempt < MIN_SAMPLES
+        stats.observe(&untrusted, true); // 1 attempt < MIN_SAMPLES
+        persist_fixture(tmp.path(), &stats);
         let lines = summary(tmp.path());
         assert_eq!(
             lines.len(),
