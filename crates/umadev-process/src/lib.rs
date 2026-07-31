@@ -357,9 +357,7 @@ fn isolate_detached_command(command: &mut tokio::process::Command) {
     let _ = command;
 }
 
-/// Prepare a synchronous helper for whole-tree ownership. Call
-/// [`StdCommandTree::attach`] immediately after spawning it.
-pub fn isolate_std_command(command: &mut std::process::Command) {
+fn isolate_std_command(command: &mut std::process::Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -376,24 +374,24 @@ pub fn isolate_std_command(command: &mut std::process::Command) {
     let _ = command;
 }
 
-/// Whole-tree lifetime guard for short synchronous helpers.
-pub struct StdCommandTree {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdCommandTreeState {
+    Anchored,
+    Terminated,
+    #[cfg(unix)]
+    Retained,
+}
+
+struct StdCommandTree {
     #[cfg(unix)]
     pid: u32,
-    /// A numeric Unix PGID may be signaled only while its leader is still our
-    /// live child or an unreaped zombie. `waitid(WNOWAIT)` revalidates that
-    /// identity immediately before every group signal.
-    #[cfg(unix)]
-    group_signal_safe: bool,
-    terminated: bool,
+    state: StdCommandTreeState,
     #[cfg(windows)]
     job: KillOnCloseJob,
 }
 
 impl StdCommandTree {
-    /// Attach the just-spawned child. Windows assignment resumes a child that
-    /// [`isolate_std_command`] created suspended, closing the wrapper-fork race.
-    pub fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
+    fn attach(child: &mut std::process::Child) -> std::io::Result<Self> {
         #[cfg(unix)]
         let pid = child.id();
         #[cfg(windows)]
@@ -401,70 +399,172 @@ impl StdCommandTree {
         Ok(Self {
             #[cfg(unix)]
             pid,
-            #[cfg(unix)]
-            group_signal_safe: true,
-            terminated: false,
+            state: StdCommandTreeState::Anchored,
             #[cfg(windows)]
             job,
         })
     }
 
-    /// Terminate the helper and every descendant. Idempotent.
-    pub fn terminate(&mut self, child: &mut std::process::Child) {
-        if self.terminated {
+    fn terminate(&mut self) {
+        if self.state == StdCommandTreeState::Terminated {
             return;
         }
-        self.terminated = true;
+        // Disarm before signaling so every error/early return is fail-closed
+        // and can never signal the same numeric Unix group twice.
+        self.state = StdCommandTreeState::Terminated;
         #[cfg(unix)]
         {
-            // Revalidate at the point of use. Callers historically exposed the
-            // raw `Child` and could reap it before this guard was dropped; in
-            // that state the cached number may already name an unrelated group.
-            if self.group_signal_safe && unix_child_exited_unreaped(self.pid).is_err() {
-                self.group_signal_safe = false;
-            }
-            if let (true, Ok(pid)) = (self.group_signal_safe, libc::pid_t::try_from(self.pid)) {
-                // SAFETY: successful `waitid(P_PID, ..., WNOWAIT)` immediately
-                // above proves this PID is still our child, live or unreaped.
-                // Consequently its numeric PID/PGID cannot have been recycled.
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
+            if unix_child_observation(self.pid).is_ok() {
+                if let Ok(pid) = libc::pid_t::try_from(self.pid) {
+                    // SAFETY: the only safe API owns the matching Child and
+                    // never exposes raw wait/reap operations. A successful
+                    // waitid therefore proves this leader is still live or an
+                    // unreaped zombie, anchoring the process-group identity.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        libc::killpg(pid, libc::SIGKILL);
+                    }
                 }
             }
-            self.group_signal_safe = false;
         }
         #[cfg(windows)]
         self.job.terminate();
-        let _ = child.kill();
     }
 
-    /// Poll the direct child without losing the process-tree identity anchor.
-    ///
-    /// A plain [`std::process::Child::try_wait`] reaps an exited Unix leader.
-    /// Once reaped, its numeric PID/PGID can be reused and it is no longer safe
-    /// to signal the original process group. This method observes exit with
-    /// `waitid(WNOWAIT)`, terminates descendants while the leader is still an
-    /// unreaped identity anchor, and only then consumes the exit status.
-    pub fn try_wait(
+    #[cfg(unix)]
+    fn abandon_group_identity(&mut self) {
+        if self.state == StdCommandTreeState::Anchored {
+            self.state = StdCommandTreeState::Terminated;
+        }
+    }
+
+    #[cfg(unix)]
+    fn retain_descendants(&mut self) {
+        if self.state == StdCommandTreeState::Anchored {
+            self.state = StdCommandTreeState::Retained;
+        }
+    }
+}
+
+/// A synchronous child owned together with its dedicated process tree.
+///
+/// The raw [`std::process::Child`] is intentionally never exposed: consuming
+/// its wait status outside this guard would release the Unix PID/PGID identity
+/// anchor and make a later whole-tree signal unsafe. Dropping the guard either
+/// terminates the complete tree or, after an explicit Unix retention decision,
+/// leaves descendants alive and transfers only direct-child reaping to the
+/// process-wide reaper.
+pub struct ManagedStdChild {
+    child: Option<std::process::Child>,
+    exit_status: Option<std::process::ExitStatus>,
+    tree: StdCommandTree,
+}
+
+impl std::fmt::Debug for ManagedStdChild {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ManagedStdChild")
+            .field("id", &self.id())
+            .field("exit_status", &self.exit_status)
+            .field("tree_state", &self.tree.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ManagedStdChild {
+    /// Spawn a synchronous child in a dedicated Unix process group or Windows
+    /// kill-on-close Job Object.
+    pub fn spawn(mut command: std::process::Command) -> std::io::Result<Self> {
+        isolate_std_command(&mut command);
+        child_reaper()?;
+        let mut child = spawn_managed_std_child(&mut command)?;
+        let tree = match StdCommandTree::attach(&mut child) {
+            Ok(tree) => tree,
+            Err(error) => {
+                let _ = child.kill();
+                enqueue_child_reap(ReapChild::Std(child));
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            child: Some(child),
+            exit_status: None,
+            tree,
+        })
+    }
+
+    fn child_mut(&mut self) -> std::io::Result<&mut std::process::Child> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("managed child has already been reaped"))
+    }
+
+    fn finish_reaped(
         &mut self,
-        child: &mut std::process::Child,
-    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        status: std::process::ExitStatus,
+    ) -> Option<std::process::ExitStatus> {
+        let _ = self.child.take();
+        self.exit_status = Some(status);
+        Some(status)
+    }
+
+    #[cfg(unix)]
+    fn wait_direct(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child_mut()?.wait()?;
+        let _ = self.child.take();
+        self.exit_status = Some(status);
+        Ok(status)
+    }
+
+    fn try_wait_direct(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.child.is_none() {
+            return Ok(self.exit_status);
+        }
+        let status = self.child_mut()?.try_wait()?;
+        Ok(status.and_then(|status| self.finish_reaped(status)))
+    }
+
+    /// Take the configured stdin pipe without exposing wait/reap operations.
+    pub fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.as_mut()?.stdin.take()
+    }
+
+    /// Take the configured stdout pipe without exposing wait/reap operations.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.as_mut()?.stdout.take()
+    }
+
+    /// Take the configured stderr pipe without exposing wait/reap operations.
+    pub fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.as_mut()?.stderr.take()
+    }
+
+    /// The direct child's process id while it remains owned by this guard.
+    #[must_use]
+    pub fn id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+
+    /// Poll the direct child, terminating its complete tree before reaping an
+    /// exited leader.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.child.is_none() {
+            return Ok(self.exit_status);
+        }
         #[cfg(unix)]
         {
-            match self.leader_exited_unreaped() {
-                Ok(false) => Ok(None),
-                Ok(true) => {
-                    self.terminate(child);
-                    child.wait().map(Some)
+            if self.tree.state != StdCommandTreeState::Anchored {
+                return self.try_wait_direct();
+            }
+            match unix_child_observation(self.tree.pid) {
+                Ok(UnixChildObservation::Running) => Ok(None),
+                Ok(UnixChildObservation::Exited { .. }) => {
+                    self.terminate();
+                    self.wait_direct().map(Some)
                 }
                 Err(error) => {
-                    // Identity can no longer be proven, so group signaling is
-                    // permanently disabled. Polling the owned direct handle is
-                    // still safe and gives the caller an actionable OS error
-                    // only when that operation itself fails.
-                    self.group_signal_safe = false;
-                    child.try_wait().map_err(|poll_error| {
+                    self.tree.abandon_group_identity();
+                    self.try_wait_direct().map_err(|poll_error| {
                         std::io::Error::new(
                             poll_error.kind(),
                             format!(
@@ -477,73 +577,184 @@ impl StdCommandTree {
         }
         #[cfg(windows)]
         {
-            match child.try_wait()? {
+            match self.child_mut()?.try_wait()? {
                 Some(status) => {
-                    // The Job Object remains an identity-bearing tree handle
-                    // even after the direct process exits.
-                    self.terminate(child);
-                    Ok(Some(status))
+                    self.tree.terminate();
+                    Ok(self.finish_reaped(status))
                 }
                 None => Ok(None),
             }
         }
         #[cfg(not(any(unix, windows)))]
         {
-            child.try_wait()
+            self.try_wait_direct()
         }
     }
 
-    /// Stop the Unix drop backstop without terminating the group.
-    ///
-    /// This is only for desktop selection owners such as `wl-copy`/`xclip`:
-    /// their descendants must remain alive after the launcher accepts stdin so
-    /// another application can request the clipboard contents later.
-    #[cfg(unix)]
-    pub fn retain_descendants(&mut self) {
-        self.terminated = true;
-        self.group_signal_safe = false;
+    /// Wait for the direct child, preserving tree identity until descendants
+    /// have been terminated.
+    pub fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(STD_COMMAND_POLL_INTERVAL);
+        }
     }
 
-    /// Observe whether the Unix leader has exited without consuming its wait
-    /// status. Keeping the zombie unreaped preserves the PID/PGID identity until
-    /// the caller has terminated every descendant.
+    /// Observe a Unix launcher's exit without consuming its status or changing
+    /// the process-tree cleanup decision.
+    ///
+    /// This lets a caller finish a bounded handoff (for example, writing
+    /// clipboard data) while an exited launcher remains the PID/PGID identity
+    /// anchor. The caller must subsequently choose either whole-tree
+    /// termination or one of the retention methods below.
     #[cfg(unix)]
-    fn leader_exited_unreaped(&mut self) -> std::io::Result<bool> {
-        if !self.group_signal_safe {
+    pub fn observe_exit_unreaped(&mut self) -> std::io::Result<Option<bool>> {
+        if self.child.is_none() {
+            return Ok(self.exit_status.map(|status| status.success()));
+        }
+        if self.tree.state != StdCommandTreeState::Anchored {
             return Err(std::io::Error::other(
-                "Unix process-group identity is no longer available",
+                "process-tree cleanup decision is already final",
             ));
         }
-        match unix_child_exited_unreaped(self.pid) {
-            Ok(exited) => Ok(exited),
+        match unix_child_observation(self.tree.pid) {
+            Ok(UnixChildObservation::Running) => Ok(None),
+            Ok(UnixChildObservation::Exited { success }) => Ok(Some(success)),
             Err(error) => {
-                self.group_signal_safe = false;
+                self.tree.abandon_group_identity();
                 Err(error)
+            }
+        }
+    }
+
+    /// Poll a Unix launcher whose descendants intentionally outlive a
+    /// successful launcher exit. Failed launchers still have their full group
+    /// terminated before the direct child is reaped.
+    #[cfg(unix)]
+    pub fn try_wait_retaining_descendants_on_success(
+        &mut self,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.child.is_none() {
+            return Ok(self.exit_status);
+        }
+        if self.tree.state != StdCommandTreeState::Anchored {
+            return self.try_wait_direct();
+        }
+        match unix_child_observation(self.tree.pid) {
+            Ok(UnixChildObservation::Running) => Ok(None),
+            Ok(UnixChildObservation::Exited { success: true }) => {
+                let status = self.wait_direct()?;
+                self.tree.retain_descendants();
+                Ok(Some(status))
+            }
+            Ok(UnixChildObservation::Exited { success: false }) => {
+                self.terminate();
+                self.wait_direct().map(Some)
+            }
+            Err(error) => {
+                self.tree.abandon_group_identity();
+                self.try_wait_direct().map_err(|poll_error| {
+                    std::io::Error::new(
+                        poll_error.kind(),
+                        format!(
+                            "lost Unix process-group identity ({error}); direct-child poll failed: {poll_error}"
+                        ),
+                    )
+                })
+            }
+        }
+    }
+
+    /// Wait for a Unix launcher, retaining descendants only after a successful
+    /// launcher exit.
+    #[cfg(unix)]
+    pub fn wait_retaining_descendants_on_success(
+        &mut self,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        loop {
+            if let Some(status) = self.try_wait_retaining_descendants_on_success()? {
+                return Ok(status);
+            }
+            std::thread::sleep(STD_COMMAND_POLL_INTERVAL);
+        }
+    }
+
+    /// Intentionally preserve a Unix selection owner and any descendants when
+    /// this guard is dropped. The direct child is still reaped asynchronously.
+    /// An explicit [`Self::terminate`] can override this decision while the
+    /// direct child remains owned.
+    #[cfg(unix)]
+    pub fn retain_descendants(&mut self) {
+        self.tree.retain_descendants();
+    }
+
+    /// Terminate the direct child and every descendant. Idempotent.
+    pub fn terminate(&mut self) {
+        if self.child.is_none() {
+            return;
+        }
+        self.tree.terminate();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+    }
+
+    /// Terminate the complete tree and spend at most `budget` reaping the
+    /// direct child. `Ok(None)` transfers final reaping to Drop's process-wide
+    /// reaper without blocking the caller.
+    pub fn terminate_and_reap(
+        &mut self,
+        budget: std::time::Duration,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        if self.child.is_none() {
+            return Ok(self.exit_status);
+        }
+        self.terminate();
+        let started = std::time::Instant::now();
+        loop {
+            match self.try_wait_direct()? {
+                Some(status) => return Ok(Some(status)),
+                None if started.elapsed() < budget => {
+                    std::thread::sleep(STD_COMMAND_POLL_INTERVAL);
+                }
+                None => return Ok(None),
             }
         }
     }
 }
 
-impl Drop for StdCommandTree {
+impl Drop for ManagedStdChild {
     fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
         #[cfg(unix)]
-        if !self.terminated && self.group_signal_safe {
-            // A raw `Child::wait`/`try_wait` may already have consumed the
-            // leader. Never signal the cached number unless WNOWAIT proves it is
-            // still our child at this exact point.
-            if unix_child_exited_unreaped(self.pid).is_ok() {
-                if let Ok(pid) = libc::pid_t::try_from(self.pid) {
-                    // SAFETY: the immediately preceding waitid check anchors the
-                    // process-group identity against numeric PGID reuse.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        libc::killpg(pid, libc::SIGKILL);
-                    }
-                }
-            }
+        let retain = self.tree.state == StdCommandTreeState::Retained;
+        #[cfg(not(unix))]
+        let retain = false;
+        if !retain {
+            self.tree.terminate();
+            let _ = child.kill();
         }
-        // On Windows, KillOnCloseJob::drop is the corresponding backstop.
+        enqueue_child_reap(ReapChild::Std(child));
     }
+}
+
+fn spawn_managed_std_child(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    for _ in 0..30 {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+    command.spawn()
 }
 
 const STD_COMMAND_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
@@ -793,25 +1004,6 @@ where
     })
 }
 
-fn reap_std_child_bounded(
-    mut child: std::process::Child,
-    budget: std::time::Duration,
-) -> std::io::Result<()> {
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_) => return Ok(()),
-            None if started.elapsed() < budget => {
-                std::thread::sleep(STD_COMMAND_POLL_INTERVAL);
-            }
-            None => {
-                enqueue_child_reap(ReapChild::Std(child));
-                return Ok(());
-            }
-        }
-    }
-}
-
 enum StdCommandInput {
     Null,
     File(std::fs::File),
@@ -873,23 +1065,12 @@ fn run_bounded_std_command_with_input(
         }
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    isolate_std_command(&mut command);
-    child_reaper()?;
-    let mut child = command.spawn()?;
-    let mut tree = match StdCommandTree::attach(&mut child) {
-        Ok(tree) => tree,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = reap_std_child_bounded(child, options.reader_grace);
-            return Err(error);
-        }
-    };
+    let mut child = ManagedStdChild::spawn(command)?;
 
-    let stdout_pipe = match child.stdout.take() {
+    let stdout_pipe = match child.take_stdout() {
         Some(pipe) => pipe,
         None => {
-            tree.terminate(&mut child);
-            let _ = reap_std_child_bounded(child, options.reader_grace);
+            let _ = child.terminate_and_reap(options.reader_grace);
             return Err(std::io::Error::other("bounded child stdout was not piped"));
         }
     };
@@ -900,16 +1081,14 @@ fn run_bounded_std_command_with_input(
     ) {
         Ok(reader) => reader,
         Err(error) => {
-            tree.terminate(&mut child);
-            let _ = reap_std_child_bounded(child, options.reader_grace);
+            let _ = child.terminate_and_reap(options.reader_grace);
             return Err(error);
         }
     };
-    let stderr_pipe = match child.stderr.take() {
+    let stderr_pipe = match child.take_stderr() {
         Some(pipe) => pipe,
         None => {
-            tree.terminate(&mut child);
-            let _ = reap_std_child_bounded(child, options.reader_grace);
+            let _ = child.terminate_and_reap(options.reader_grace);
             let _ = stdout.finish();
             return Err(std::io::Error::other("bounded child stderr was not piped"));
         }
@@ -921,8 +1100,7 @@ fn run_bounded_std_command_with_input(
     ) {
         Ok(reader) => reader,
         Err(error) => {
-            tree.terminate(&mut child);
-            let _ = reap_std_child_bounded(child, options.reader_grace);
+            let _ = child.terminate_and_reap(options.reader_grace);
             let _ = stdout.finish();
             return Err(error);
         }
@@ -933,41 +1111,15 @@ fn run_bounded_std_command_with_input(
     let mut failure = None;
     let (status, timed_out) = loop {
         if stop_on_stdout_truncation && stdout.is_truncated() {
-            tree.terminate(&mut child);
+            child.terminate();
             break (None, false);
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            tree.terminate(&mut child);
+            child.terminate();
             break (None, true);
         }
 
-        #[cfg(unix)]
-        let observed = match tree.leader_exited_unreaped() {
-            Ok(true) => {
-                tree.terminate(&mut child);
-                match child.wait() {
-                    Ok(status) => Some(status),
-                    Err(error) => {
-                        failure = Some(error);
-                        None
-                    }
-                }
-            }
-            Ok(false) => None,
-            Err(error) => {
-                // Identity cannot be proven, so group signaling is permanently
-                // disabled. The direct handle remains safe to poll/kill.
-                match child.try_wait() {
-                    Ok(status) => status,
-                    Err(_) => {
-                        failure = Some(error);
-                        None
-                    }
-                }
-            }
-        };
-        #[cfg(not(unix))]
         let observed = match child.try_wait() {
             Ok(status) => status,
             Err(error) => {
@@ -977,11 +1129,10 @@ fn run_bounded_std_command_with_input(
         };
 
         if let Some(status) = observed {
-            tree.terminate(&mut child);
             break (Some(status), false);
         }
         if failure.is_some() {
-            tree.terminate(&mut child);
+            child.terminate();
             break (None, false);
         }
         std::thread::sleep(
@@ -996,7 +1147,7 @@ fn run_bounded_std_command_with_input(
     let stdout_result = stdout.finish();
     let stderr_result = stderr.finish();
     if status.is_none() {
-        let _ = reap_std_child_bounded(child, options.reader_grace);
+        let _ = child.terminate_and_reap(options.reader_grace);
     }
     if let Some(error) = failure {
         let _ = stdout_result;
@@ -1172,39 +1323,61 @@ fn spawn_managed_child(
     command.spawn()
 }
 
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixChildObservation {
+    Running,
+    Exited { success: bool },
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn unix_child_observation(pid: u32) -> std::io::Result<UnixChildObservation> {
+    let native_pid = libc::id_t::try_from(pid)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid child pid"))?;
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `info` points to writable siginfo storage. WNOWAIT observes
+        // the owned child without consuming its status, which keeps the
+        // PID/PGID from being recycled until the guarded wait.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                native_pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        // SAFETY: successful waitid initialized `info`; si_pid==0 is the
+        // specified WNOHANG result when the child has not exited yet. For an
+        // exited child, waitid guarantees SIGCHLD status fields are initialized.
+        let info = unsafe { info.assume_init() };
+        if unsafe { info.si_pid() } == 0 {
+            return Ok(UnixChildObservation::Running);
+        }
+        return Ok(UnixChildObservation::Exited {
+            success: info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0,
+        });
+    }
+}
+
 /// Observe an owned Unix child exit without consuming its wait status.
 ///
 /// Keeping the exited leader unreaped preserves its PID/PGID identity so a
 /// caller can terminate the complete process group before finally waiting on
-/// the direct child. `pid` must identify a child owned by this process;
-/// otherwise the OS returns an error and no signal is sent by this function.
+/// the direct child. `pid` must identify the same live or unreaped child whose
+/// identity the caller preserved; this probe cannot authenticate a historical
+/// PID after a raw wait allowed that number to be reused.
 #[cfg(unix)]
-#[allow(unsafe_code)]
 pub fn unix_child_exited_unreaped(pid: u32) -> std::io::Result<bool> {
-    let native_pid = libc::id_t::try_from(pid)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid child pid"))?;
-    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    // SAFETY: `info` points to writable siginfo storage. WNOWAIT observes the
-    // owned child without consuming its status, which keeps the PID/PGID from
-    // being recycled until `Child::wait` runs after group termination.
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            native_pid,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.kind() == std::io::ErrorKind::Interrupted {
-            return Ok(false);
-        }
-        return Err(error);
-    }
-    // SAFETY: successful waitid initialized `info`; si_pid==0 is the specified
-    // WNOHANG result when the child has not exited yet.
-    Ok(unsafe { info.assume_init().si_pid() } != 0)
+    unix_child_observation(pid).map(|observation| observation != UnixChildObservation::Running)
 }
 
 impl Drop for ManagedChild {
@@ -2145,29 +2318,96 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn reaped_std_leader_never_signals_a_reused_numeric_group() {
-        let mut foreign_command = std::process::Command::new("sleep");
-        foreign_command.arg("30");
-        super::isolate_std_command(&mut foreign_command);
-        let mut foreign = foreign_command.spawn().unwrap();
-        let mut foreign_tree = super::StdCommandTree::attach(&mut foreign).unwrap();
+    fn managed_std_drop_kills_and_reaps_its_owned_child() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let child = super::ManagedStdChild::spawn(command).unwrap();
+        let pid = libc::pid_t::try_from(child.id().unwrap()).unwrap();
+        drop(child);
+        assert_pid_reaped(pid);
+    }
 
-        let mut owned_command = std::process::Command::new("sleep");
-        owned_command.arg("30");
-        super::isolate_std_command(&mut owned_command);
-        let mut owned = owned_command.spawn().unwrap();
-        let mut owned_tree = super::StdCommandTree::attach(&mut owned).unwrap();
-        owned.kill().unwrap();
-        owned.wait().unwrap();
+    #[cfg(unix)]
+    #[test]
+    fn successful_launcher_can_retain_descendants_without_exposing_raw_wait() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut child = super::ManagedStdChild::spawn(command).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait_retaining_descendants_on_success().unwrap() {
+                Some(status) => {
+                    assert!(status.success());
+                    break;
+                }
+                None => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        assert_eq!(child.tree.state, super::StdCommandTreeState::Retained);
+        assert!(child.id().is_none());
+    }
 
-        // Model PID/PGID reuse after the leader was consumed. The cached number
-        // now names a foreign group, but waitid must reject it as not our child.
-        owned_tree.pid = foreign.id();
-        owned_tree.terminate(&mut owned);
-        assert!(foreign.try_wait().unwrap().is_none());
+    #[cfg(unix)]
+    #[test]
+    fn observing_exit_keeps_the_tree_anchored_until_cleanup_is_chosen() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exit 0"]);
+        let mut child = super::ManagedStdChild::spawn(command).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.observe_exit_unreaped().unwrap() {
+                Some(success) => {
+                    assert!(success);
+                    break;
+                }
+                None => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        assert!(child.id().is_some(), "observation must not reap the leader");
+        assert_eq!(child.tree.state, super::StdCommandTreeState::Anchored);
+        assert!(child
+            .terminate_and_reap(Duration::from_secs(1))
+            .unwrap()
+            .is_some());
+        assert!(child.id().is_none());
+    }
 
-        foreign_tree.terminate(&mut foreign);
-        let _ = foreign.wait();
+    #[cfg(unix)]
+    #[test]
+    fn explicit_termination_overrides_a_prior_retention_decision() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let leaf_file = temp.path().join("retained-leaf.pid");
+        let script = format!(
+            "sleep 30 & leaf=$!; printf '%s' \"$leaf\" > '{}'; wait",
+            leaf_file.display()
+        );
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]);
+        let mut child = super::ManagedStdChild::spawn(command).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let leaf = loop {
+            if let Some(pid) = std::fs::read_to_string(&leaf_file)
+                .ok()
+                .and_then(|text| text.parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher did not publish its descendant pid"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        child.retain_descendants();
+        child.terminate_and_reap(Duration::from_secs(1)).unwrap();
+        assert_pid_reaped(leaf);
     }
 
     #[cfg(unix)]
@@ -2300,10 +2540,8 @@ mod tests {
     async fn lost_group_identity_never_signals_a_reused_numeric_group() {
         let mut foreign_command = std::process::Command::new("sleep");
         foreign_command.arg("30");
-        super::isolate_std_command(&mut foreign_command);
-        let mut foreign = foreign_command.spawn().unwrap();
-        let mut foreign_tree = super::StdCommandTree::attach(&mut foreign).unwrap();
-        let foreign_group = foreign.id();
+        let mut foreign = super::ManagedStdChild::spawn(foreign_command).unwrap();
+        let foreign_group = foreign.id().unwrap();
 
         let mut owned_command = tokio::process::Command::new("sleep");
         owned_command.arg("30");
@@ -2316,8 +2554,7 @@ mod tests {
         owned.terminate();
         assert!(foreign.try_wait().unwrap().is_none());
 
-        foreign_tree.terminate(&mut foreign);
-        let _ = foreign.wait();
+        let _ = foreign.terminate_and_reap(Duration::from_secs(1));
     }
 
     #[cfg(unix)]
@@ -2348,10 +2585,8 @@ mod tests {
 
         let mut command = std::process::Command::new("sh");
         command.args(["-c", "while :; do sleep 30; done", VALUE]);
-        super::isolate_std_command(&mut command);
-        let mut child = command.spawn().expect("spawn argument probe child");
-        let mut tree = super::StdCommandTree::attach(&mut child).expect("attach child tree");
-        let pid = child.id();
+        let mut child = super::ManagedStdChild::spawn(command).expect("spawn argument probe child");
+        let pid = child.id().unwrap();
 
         // `spawn` returns after fork/clone, so Linux may expose the child before
         // it has exec'd `sh` and published its final argv in `/proc`. Treat the
@@ -2378,8 +2613,7 @@ mod tests {
             "an argument prefix must not match"
         );
 
-        tree.terminate(&mut child);
-        let _ = child.wait();
+        let _ = child.terminate_and_reap(Duration::from_secs(1));
     }
 
     #[cfg(windows)]

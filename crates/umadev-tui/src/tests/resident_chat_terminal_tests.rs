@@ -1594,6 +1594,8 @@ fn scope_contract_is_route_sized_and_history_is_not_authority() {
     chat_route.class = umadev_agent::RouteClass::Chat;
     let read = scoped_chat_directive("what is Rust?", &chat_route);
     assert!(read.contains("without tools, commands, file writes, reviews, or QC"));
+    assert!(read.contains("does NOT mean the UmaDev session or its base is read-only"));
+    assert!(!read.contains("This is a read-only answer"));
     assert!(read.contains("context only"));
 
     // The fix at the directive boundary: a bare question now floors to Explain (read/
@@ -1608,6 +1610,7 @@ fn scope_contract_is_route_sized_and_history_is_not_authority() {
     let explain = scoped_chat_directive("解释现有代码", &explain_route);
     assert!(explain.contains("necessary read/search tools"));
     assert!(explain.contains("do not run mutating commands, write files"));
+    assert!(!explain.contains("This is read-only"));
 
     let edit = scoped_chat_directive(
         "改个文案，把标题改成 Welcome",

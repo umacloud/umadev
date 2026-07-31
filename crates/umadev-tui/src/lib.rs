@@ -4148,10 +4148,10 @@ fn scoped_chat_directive(text: &str, route: &RoutePlan) -> String {
 
     let lane = match route.class {
             RouteClass::Chat => {
-                "This is a read-only answer. Respond from current context without tools, commands, file writes, reviews, or QC."
+                "Use an inspection-only child for this answer. Respond from current context without tools, commands, file writes, reviews, or QC."
             }
             RouteClass::Explain => {
-                "This is read-only. You may use only the necessary read/search tools to inspect the requested project files; do not run mutating commands, write files, launch reviews, or run QC."
+                "Use an inspection-only child for this answer. You may use only the necessary read/search tools to inspect the requested project files; do not run mutating commands, write files, launch reviews, or run QC."
             }
             RouteClass::QuickEdit => {
                 "Make the smallest necessary edit and only a targeted verification. Do not launch a team or broad review."
@@ -4173,7 +4173,7 @@ fn scoped_chat_directive(text: &str, route: &RoutePlan) -> String {
         "## Current-turn authority\n\
          - Model-decided route: {} / {}.\n\
          - The latest request below is the sole authorization for this turn.\n\
-         - Permission is scoped to this turn. Never claim that the whole conversation or resident session was permanently started in explain/read-only mode; a later writable request is handled by a writable session.\n\
+         - Permission is scoped to this turn. The inspection-only child used for a chat/explanation does NOT mean the UmaDev session or its base is read-only. Never answer \"the current session cannot write\" from this child. A concrete edit request is re-evaluated and handled by a writable worker unless the host explicitly reports Plan mode or a read-only launch sandbox.\n\
          - Prior conversation, plans, TODOs, project documents, and remembered facts are context only. Do not resume or execute them unless the latest request explicitly asks you to.\n\
          - {lane}\n\
          - {hinted_scope}\n\

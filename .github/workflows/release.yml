@@ -35,6 +35,7 @@ jobs:
         with:
           toolchain: ${{ env.UMADEV_RELEASE_RUST }}
           components: rustfmt, clippy
+          targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -63,6 +64,9 @@ jobs:
       - name: cargo clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+      - name: Windows GNU cross-check
+        run: cargo clippy --workspace --all-targets --all-features --locked --target x86_64-pc-windows-gnu -- -D warnings
+
       # Keep the release gate identical to the ordinary CI contract. These
       # real process-tree tests are timing-sensitive under a loaded parallel
       # runner, so CI covers the crate serially and excludes it from the
@@ -88,6 +92,9 @@ jobs:
 
       - name: Verify cross-platform npm update contracts
         run: node --test npm/scripts/terminal-contract.test.cjs
+
+      - name: Verify launcher command classification
+        run: node --test npm/scripts/cli-classification.test.cjs
 
       - name: Verify npm registry visibility and retry contracts
         run: node --test npm/scripts/publish-registry.test.cjs

@@ -44,6 +44,23 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 
+  windows-gnu-cross:
+    name: Windows GNU cross-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install Rust toolchain and Windows GNU target
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable 2026-07-14
+        with:
+          toolchain: ${{ env.UMADEV_CI_RUST }}
+          components: clippy
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: windows-gnu-cross
+      - name: Clippy-check the full Windows GNU surface
+        run: cargo clippy --workspace --all-features --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+
   docs:
     name: strict rustdoc
     runs-on: ubuntu-latest
@@ -288,6 +305,8 @@ jobs:
           node-version: ${{ env.UMADEV_CI_NODE }}
       - name: Verify Cargo, npm, and website versions
         run: node npm/scripts/verify-version-lock.mjs
+      - name: Verify launcher command classification
+        run: node --test npm/scripts/cli-classification.test.cjs
       - name: Verify npm registry visibility and retry contracts
         run: node --test npm/scripts/publish-registry.test.cjs
       - name: Verify platform binary header contracts
@@ -306,7 +325,7 @@ jobs:
   build-release:
     name: build release (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: [fmt, clippy, docs, test, grok-source-contract, grok-published-contract, kimi-source-contract, kimi-published-contract, vendor-cli-published-contract, terminal-contract, msrv, npm-shim]
+    needs: [fmt, clippy, windows-gnu-cross, docs, test, grok-source-contract, grok-published-contract, kimi-source-contract, kimi-published-contract, vendor-cli-published-contract, terminal-contract, msrv, npm-shim]
     strategy:
       fail-fast: false
       matrix:

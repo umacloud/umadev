@@ -5,6 +5,7 @@
 //! successor's lock after stale recovery. Acquisition has a hard deadline: a
 //! memory write may fail open, but it may not wedge the host indefinitely.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,6 +46,7 @@ pub struct StoreLock {
     lock: PathBuf,
     nonce: String,
     lease: Option<std::fs::File>,
+    namespace_guard: std::fs::File,
 }
 
 impl Drop for StoreLock {
@@ -62,6 +64,7 @@ impl Drop for StoreLock {
         drop(self.lease.take());
         let _ = self.root.remove_regular_file(&self.lock.join(LEASE_FILE));
         let _ = self.root.remove_empty_dir(&self.lock);
+        let _ = fs2::FileExt::unlock(&self.namespace_guard);
     }
 }
 
@@ -129,7 +132,34 @@ fn lock_age_ms(root: &crate::fs::RootedDir, lock: &Path, now: u64) -> Option<u64
     Some(now.saturating_sub(created_at))
 }
 
-fn reclaim_stale_lock(root: &crate::fs::RootedDir, lock: &Path, stale_after: Duration) -> bool {
+fn namespace_guard_path(lock: &Path) -> std::io::Result<PathBuf> {
+    let name = lock.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "store lock has no name")
+    })?;
+    let mut guard = OsString::from(".");
+    guard.push(name);
+    guard.push(".guard");
+    Ok(lock.with_file_name(guard))
+}
+
+fn try_acquire_namespace_guard(
+    root: &crate::fs::RootedDir,
+    lock: &Path,
+) -> std::io::Result<Option<std::fs::File>> {
+    let file = root.open_private_lock(&namespace_guard_path(lock)?, false)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if crate::fs::lock_error_is_contention(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn reclaim_stale_lock(
+    root: &crate::fs::RootedDir,
+    lock: &Path,
+    _namespace_guard: &std::fs::File,
+    stale_after: Duration,
+) -> bool {
     if !root.is_real_dir(lock).unwrap_or(false) {
         return false;
     }
@@ -141,7 +171,7 @@ fn reclaim_stale_lock(root: &crate::fs::RootedDir, lock: &Path, stale_after: Dur
     let lease = match root.open_private_existing_lock(&lease_path) {
         Ok(file) => match file.try_lock_exclusive() {
             Ok(()) => Some(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(error) if crate::fs::lock_error_is_contention(&error) => return false,
             Err(_) => return false,
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -155,10 +185,13 @@ fn reclaim_stale_lock(root: &crate::fs::RootedDir, lock: &Path, stale_after: Dur
         .and_then(|name| name.to_str())
         .unwrap_or("store.lock");
     let isolated = parent.join(format!(".{name}.stale.{}", unique_nonce("reclaim")));
+    // The sibling guard excludes creators and other reclaimers after the
+    // internal liveness probe, so Windows can release the lease handle before
+    // renaming its parent directory without opening an ownership race.
+    drop(lease);
     if root.rename(lock, &isolated).is_err() {
         return false;
     }
-    drop(lease);
     let _ = root.remove_regular_file(&isolated.join(OWNER_FILE));
     let _ = root.remove_regular_file(&isolated.join(LEASE_FILE));
     // Never recursively delete an unexpected entry. The stale lock is already
@@ -190,6 +223,19 @@ fn acquire_from_root_with_timing(
     let lock = lock_root.join(format!("{}.lock", store.id()));
     let started = Instant::now();
     loop {
+        let Some(namespace_guard) = try_acquire_namespace_guard(&root, &lock)? else {
+            if started.elapsed() >= timeout {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "memory store `{}` is busy in another UmaDev process",
+                        store.id()
+                    ),
+                ));
+            }
+            std::thread::sleep(poll);
+            continue;
+        };
         match root.create_dir(&lock, false) {
             Ok(()) => {
                 let owner = LockOwner {
@@ -240,6 +286,7 @@ fn acquire_from_root_with_timing(
                         lock,
                         nonce: owner.nonce,
                         lease: Some(lease),
+                        namespace_guard,
                     });
                 }
                 return Err(std::io::Error::new(
@@ -248,7 +295,8 @@ fn acquire_from_root_with_timing(
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = reclaim_stale_lock(&root, &lock, stale_after);
+                let _ = reclaim_stale_lock(&root, &lock, &namespace_guard, stale_after);
+                drop(namespace_guard);
                 if started.elapsed() >= timeout {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
@@ -350,6 +398,7 @@ mod tests {
         assert!(!reclaim_stale_lock(
             &first.root,
             &first.lock,
+            &first.namespace_guard,
             Duration::ZERO
         ));
         let lock_path = temp.path().join(&first.lock);
@@ -370,7 +419,16 @@ mod tests {
         let lock = lock_root.join(format!("{}.lock", MemoryStore::Beliefs.id()));
         rooted.create_dir(&lock, false).unwrap();
         std::thread::sleep(Duration::from_millis(2));
-        assert!(reclaim_stale_lock(&rooted, &lock, Duration::ZERO));
+        let namespace_guard = try_acquire_namespace_guard(&rooted, &lock)
+            .unwrap()
+            .unwrap();
+        assert!(reclaim_stale_lock(
+            &rooted,
+            &lock,
+            &namespace_guard,
+            Duration::ZERO
+        ));
+        drop(namespace_guard);
         let guard = acquire(temp.path(), MemoryStore::Beliefs).unwrap();
         drop(guard);
         assert!(!temp.path().join(lock).exists());
@@ -473,11 +531,8 @@ mod tests {
         assert!(outside.read_dir().unwrap().next().is_none());
         drop(guard);
         assert!(outside.read_dir().unwrap().next().is_none());
-        assert!(moved
-            .join(".umadev/memory/store-locks")
-            .read_dir()
-            .unwrap()
-            .next()
-            .is_none());
+        assert!(!moved
+            .join(".umadev/memory/store-locks/pitfalls.lock")
+            .exists());
     }
 }

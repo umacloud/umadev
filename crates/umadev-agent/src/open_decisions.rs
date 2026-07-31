@@ -473,7 +473,7 @@ pub fn append_decision(root: &Path, entry: &NewDecision) -> bool {
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if umadev_state::fs::lock_error_is_contention(&error) => {
                 if started.elapsed() >= REGISTER_LOCK_TIMEOUT {
                     return false;
                 }

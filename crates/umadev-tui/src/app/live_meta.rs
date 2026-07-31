@@ -431,13 +431,25 @@ mod tests {
             ("为什么是只读？", LiveMetaIntent::Permissions),
             ("你现在能修改文件吗？", LiveMetaIntent::Permissions),
             ("请问你能写文件吗？", LiveMetaIntent::Permissions),
+            ("怎么切换为可写会话？", LiveMetaIntent::Permissions),
+            ("我授权你操作文件", LiveMetaIntent::Permissions),
+            ("现在是可写会话", LiveMetaIntent::Permissions),
+            (
+                "Codex 是可写的，为什么 UmaDev 说只读？",
+                LiveMetaIntent::Permissions,
+            ),
             ("怎麼給你權限？", LiveMetaIntent::Permissions),
             ("為什麼是唯讀？", LiveMetaIntent::Permissions),
+            ("怎麼切換為可寫會話？", LiveMetaIntent::Permissions),
             (
                 "how can I grant you permission?",
                 LiveMetaIntent::Permissions,
             ),
             ("do you have write access?", LiveMetaIntent::Permissions),
+            (
+                "how do I switch to a writable session?",
+                LiveMetaIntent::Permissions,
+            ),
         ] {
             assert_eq!(classify_live_meta(text), Some(expected), "{text}");
         }
@@ -455,7 +467,28 @@ mod tests {
             "把权限说明写入 README",
             "为什么只读，然后修复登录",
             "你能写文件吗？请修改登录页面",
+            "修复只读模式切换",
+            "可写会话下修改登录页面",
+            "现在是可写会话，继续做",
+            "现在是可写会话，开始修改",
+            "现在可写了，继续",
+            "当前权限已给，执行吧",
+            "现在有权限了，动手吧",
+            "现在是可写会话，执行修改",
+            "设置沙箱为 danger-full-access",
+            "設定沙箱為 danger-full-access",
+            "权限管理页面有什么问题，修一下",
+            "沙箱配置为什么报错，解决一下",
+            "为什么只读，帮我解决",
             "can you write files? please update the login page",
+            "fix read-only mode switching",
+            "this session is writable, continue the work",
+            "this session is writable, go ahead",
+            "this session is writable, resume",
+            "set sandbox to danger-full-access",
+            "switch sandbox to workspace-write",
+            "why is Codex read-only? resolve it",
+            "why is this read-only? make it writable",
         ] {
             assert_eq!(classify_live_meta(mutation), None, "{mutation}");
         }

@@ -398,12 +398,12 @@ impl SkillRegistry {
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
                 Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
+                    if umadev_state::fs::lock_error_is_contention(&error)
                         && Instant::now() < deadline =>
                 {
                     std::thread::sleep(SKILL_LOCK_POLL);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if umadev_state::fs::lock_error_is_contention(&error) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
                         "another skill update is still running",

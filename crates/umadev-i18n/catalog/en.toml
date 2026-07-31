@@ -55,7 +55,7 @@
 "live_meta.permissions.ready" = "State the file or feature to change and the intended result; UmaDev will automatically open a writable session for that turn."
 "live_meta.permissions.plan" = "Plan mode intentionally blocks writes. Enter `/mode guarded` or `/mode auto`, then submit the concrete edit request again. No restart is needed."
 "live_meta.permissions.codex_read_only" = "Codex's effective launch sandbox is `read-only`. Enter `/sandbox workspace-write` to rebuild the resident session immediately, then submit the concrete edit request again. UmaDev does not need a restart."
-"live_meta.permissions.readonly_route" = "[note] This turn ran read-only (routed as chat/explain, no edits). If you actually want code changed, restate it with the edit intent (e.g. 'fix X for me') and resend — it will run writable."
+"live_meta.permissions.readonly_route" = "[note] Only this chat/explanation reply uses an isolated read-only child; UmaDev and the base are not locked read-only. State the concrete change you want and that turn will automatically use a writable worker."
 "live_meta.permissions.other_base" = "Guarded/Auto requests a writable session for concrete edit requests; the base, platform, or enterprise policy may still constrain actual capabilities."
 "model.synced" = "synced driving model {} (from {}) — the agent runs on the base's own model"
 "model.synced_default" = "{} pins no model in config — the agent runs on its login/default model (the real model shows after a run)"
@@ -499,7 +499,7 @@
 
 # Codex high-risk sandbox liability warning (only shown for danger-full-access on codex)
 "codex.sandbox.danger_warning" = "WARNING: UmaDev will launch this project's Codex base sessions with danger-full-access — you assume all risk to your system environment. A separately opened Codex window has its own permission setting and may show a different mode.\n  To revert: enter `/sandbox workspace-write` to rebuild the session immediately; UmaDev does not need a restart."
-"codex.sandbox.windows_hint" = "Note (Windows + Codex): the current sandbox BLOCKS the network, local dev ports and git, so a full-stack build (npm install / a dev server / git) cannot complete; and codex\u2019s Windows sandbox helper fails with \u201cmodule not found\u201d on some machines. For full-stack work use `/mode auto`, then `/sandbox danger-full-access` if it is not already configured (UmaDev still audits everything)."
+"codex.sandbox.windows_hint" = "Note (Windows + Codex): the current sandbox BLOCKS the network, local dev ports and git, so a full-stack build (npm install / a dev server / git) cannot complete; and codex\u2019s Windows sandbox helper fails with \u201cmodule not found\u201d on some machines. For full-stack work use `/sandbox danger-full-access`; Guarded keeps approvals and Auto pre-authorizes ordinary approvals (UmaDev still audits everything)."
 
 # /sandbox — view / change the Codex base launch sandbox in-app (no .umadevrc hand-edit)
 "sandbox.current" = "Codex sandbox is currently: {}\n  (applies to the codex base only — it controls what the codex worker may touch when it runs)"
@@ -510,7 +510,7 @@
 "sandbox.codex_only" = "Note: the active base isn't codex, so this only takes effect once you switch to the codex base (/codex)."
 "sandbox.set" = "Codex sandbox set to {} — active this session and saved to .umadevrc."
 "sandbox.danger_set" = "Codex sandbox set to danger-full-access — active this session and saved to .umadevrc. Local ports / network / git are now unblocked; you accept all risk to your system environment."
-"sandbox.clamped" = "Saved the requested Codex sandbox `{}`, but trust mode `{}` currently clamps the actual launch sandbox to `{}`. UmaDev has not claimed wider access. Use `/mode auto` for danger-full-access, or `/mode guarded`/`/mode auto` for workspace-write; the resident session rebuilds immediately without restarting UmaDev."
+"sandbox.clamped" = "Saved the requested Codex sandbox `{}`, but trust mode `{}` currently clamps the actual launch sandbox to `{}`. UmaDev has not claimed wider access. Plan is always read-only; switch to `/mode guarded` or `/mode auto` to use the saved writable sandbox. The resident session rebuilds immediately without restarting UmaDev."
 "sandbox.persist_failed" = "[warn] Applied for this session, but could not save to .umadevrc (it will revert on next launch): {}"
 "sandbox.busy_no_change" = "A Codex turn is still running. Cancel it first, then change /sandbox; UmaDev will rebuild the resident Codex session with the new permissions."
 

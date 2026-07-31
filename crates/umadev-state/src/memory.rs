@@ -10,6 +10,7 @@ const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const POLICY_LOCK_DIR: &str = ".policy.lock";
 const POLICY_LOCK_OWNER: &str = "owner";
 const POLICY_LOCK_LEASE: &str = "lease";
+const POLICY_LOCK_GUARD: &str = ".policy.lock.guard";
 const POLICY_LOCK_ATTEMPTS: usize = 500;
 const POLICY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 const POLICY_LOCK_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
@@ -464,6 +465,7 @@ struct PolicyLock {
     lock: PathBuf,
     nonce: String,
     lease: Option<std::fs::File>,
+    namespace_guard: std::fs::File,
 }
 
 impl Drop for PolicyLock {
@@ -481,6 +483,7 @@ impl Drop for PolicyLock {
             .root
             .remove_regular_file(&self.lock.join(POLICY_LOCK_LEASE));
         let _ = self.root.remove_empty_dir(&self.lock);
+        let _ = fs2::FileExt::unlock(&self.namespace_guard);
     }
 }
 
@@ -503,7 +506,24 @@ fn policy_lock_age_ms(root: &crate::fs::RootedDir, lock: &Path, now: u64) -> Opt
     Some(now.saturating_sub(created_at))
 }
 
-fn reclaim_stale_policy_lock(root: &crate::fs::RootedDir, lock: &Path, stale_after_ms: u64) {
+fn try_acquire_policy_namespace_guard(
+    root: &crate::fs::RootedDir,
+    memory: &Path,
+) -> std::io::Result<Option<std::fs::File>> {
+    let file = root.open_private_lock(&memory.join(POLICY_LOCK_GUARD), false)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if crate::fs::lock_error_is_contention(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn reclaim_stale_policy_lock(
+    root: &crate::fs::RootedDir,
+    lock: &Path,
+    _namespace_guard: &std::fs::File,
+    stale_after_ms: u64,
+) {
     if !root.is_real_dir(lock).unwrap_or(false) {
         return;
     }
@@ -514,7 +534,7 @@ fn reclaim_stale_policy_lock(root: &crate::fs::RootedDir, lock: &Path, stale_aft
     let lease = match root.open_private_existing_lock(&lease_path) {
         Ok(file) => match file.try_lock_exclusive() {
             Ok(()) => Some(file),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(error) if crate::fs::lock_error_is_contention(&error) => return,
             Err(_) => return,
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -524,8 +544,8 @@ fn reclaim_stale_policy_lock(root: &crate::fs::RootedDir, lock: &Path, stale_aft
         return;
     };
     let tomb = parent.join(format!(".policy.lock.stale.{}", lock_nonce()));
+    drop(lease);
     if root.rename(lock, &tomb).is_ok() {
-        drop(lease);
         let _ = root.remove_regular_file(&tomb.join(POLICY_LOCK_OWNER));
         let _ = root.remove_regular_file(&tomb.join(POLICY_LOCK_LEASE));
         let _ = root.remove_empty_dir(&tomb);
@@ -539,6 +559,10 @@ fn acquire_policy_lock(
     let memory = ensure_memory_dir(&root, state_directory)?;
     let lock = memory.join(POLICY_LOCK_DIR);
     for _ in 0..POLICY_LOCK_ATTEMPTS {
+        let Some(namespace_guard) = try_acquire_policy_namespace_guard(&root, &memory)? else {
+            std::thread::sleep(POLICY_LOCK_WAIT);
+            continue;
+        };
         match root.create_dir(&lock, false) {
             Ok(()) => {
                 let nonce = lock_nonce();
@@ -577,10 +601,17 @@ fn acquire_policy_lock(
                     lock,
                     nonce,
                     lease: Some(lease),
+                    namespace_guard,
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                reclaim_stale_policy_lock(&root, &lock, POLICY_LOCK_STALE_AFTER_MS);
+                reclaim_stale_policy_lock(
+                    &root,
+                    &lock,
+                    &namespace_guard,
+                    POLICY_LOCK_STALE_AFTER_MS,
+                );
+                drop(namespace_guard);
                 std::thread::sleep(POLICY_LOCK_WAIT);
             }
             Err(error) => return Err(error),
@@ -826,9 +857,39 @@ mod tests {
         root.create_dir(&lock, false).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
 
-        reclaim_stale_policy_lock(&root, &lock, 0);
+        let namespace_guard = try_acquire_policy_namespace_guard(&root, &memory)
+            .unwrap()
+            .unwrap();
+        reclaim_stale_policy_lock(&root, &lock, &namespace_guard, 0);
+        drop(namespace_guard);
         assert!(!temp.path().join(lock).exists());
         save_policy(temp.path(), &MemoryPolicy::default()).unwrap();
+    }
+
+    #[test]
+    fn released_stale_policy_lease_is_reclaimed_with_parent_arbitration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::fs::RootedDir::open(temp.path()).unwrap();
+        let memory = ensure_memory_dir(&root, false).unwrap();
+        let lock = memory.join(POLICY_LOCK_DIR);
+        root.create_dir(&lock, false).unwrap();
+        root.atomic_write(
+            &lock.join(POLICY_LOCK_OWNER),
+            format!("0\n{}", lock_nonce()).as_bytes(),
+            false,
+        )
+        .unwrap();
+        let lease = root
+            .open_private_lock(&lock.join(POLICY_LOCK_LEASE), false)
+            .unwrap();
+        lease.try_lock_exclusive().unwrap();
+        drop(lease);
+
+        let namespace_guard = try_acquire_policy_namespace_guard(&root, &memory)
+            .unwrap()
+            .unwrap();
+        reclaim_stale_policy_lock(&root, &lock, &namespace_guard, 0);
+        assert!(!temp.path().join(lock).exists());
     }
 
     #[test]
@@ -842,7 +903,7 @@ mod tests {
             .atomic_write(&guard.lock.join(POLICY_LOCK_OWNER), owner.as_bytes(), false)
             .unwrap();
 
-        reclaim_stale_policy_lock(&guard.root, &guard.lock, 0);
+        reclaim_stale_policy_lock(&guard.root, &guard.lock, &guard.namespace_guard, 0);
         assert!(guard.root.is_real_dir(&guard.lock).unwrap());
         drop(guard);
         assert!(!temp.path().join(".umadev/memory/.policy.lock").exists());

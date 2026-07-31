@@ -55,7 +55,7 @@
 "live_meta.permissions.ready" = "直接說明要修改哪個檔案或功能及目標即可；UmaDev 會自動為該回合開啟可寫會話。"
 "live_meta.permissions.plan" = "目前 Plan 模式主動禁止寫入；輸入 `/mode guarded` 或 `/mode auto`，再提交具體修改要求即可，無需重新啟動。"
 "live_meta.permissions.codex_read_only" = "目前 Codex 啟動沙箱確為 `read-only`；輸入 `/sandbox workspace-write` 即時重建常駐會話，再提交具體修改要求，無需重新啟動 UmaDev。"
-"live_meta.permissions.readonly_route" = "[note] 本回合按唯讀執行(判為諮詢/解釋,未改程式碼)。若你其實要修改程式碼,請把修改意圖說清楚再發一次(例如「幫我改 X」),就會以可寫模式執行。"
+"live_meta.permissions.readonly_route" = "[note] 目前僅這則諮詢/解釋回覆使用隔離的唯讀子會話；UmaDev 和底座並未被鎖成唯讀。直接說明具體修改，下一回合會自動使用可寫執行會話。"
 "live_meta.permissions.other_base" = "Guarded/Auto 會為具體修改要求申請可寫會話；底座、平台或企業政策仍可能限制實際能力。"
 "model.synced" = "已同步驅動模型 {}(來自 {})—— Agent 就用底座這個模型工作"
 "model.synced_default" = "{} 未在設定裡固定模型 —— Agent 用它的登入/預設模型驅動(執行後可見真實模型)"
@@ -493,7 +493,7 @@
 
 # Codex 高危沙箱責任警告(僅在 codex 且 danger-full-access 時顯示)
 "codex.sandbox.danger_warning" = "警告:UmaDev 將以 danger-full-access 啟動本專案中的 Codex 底座工作階段 —— 請自行承擔系統環境風險。單獨開啟的 Codex 視窗有自己的權限設定，顯示可能不同。\n  關閉:輸入 `/sandbox workspace-write` 即時重建工作階段，無需重新啟動 UmaDev。"
-"codex.sandbox.windows_hint" = "提示(Windows + Codex):目前沙箱會封鎖網路、本地 dev 埠與 git,全端建置(npm install / dev server / git)無法完成;且 codex 的 Windows 沙箱輔助程序在部分機器上會因缺少執行階段而報「找不到指定的模組」。做全端開發請先用 `/mode auto`，尚未設定時再輸入 `/sandbox danger-full-access`（UmaDev 仍全程稽核）。"
+"codex.sandbox.windows_hint" = "提示(Windows + Codex):目前沙箱會封鎖網路、本地 dev 埠與 git,全端建置(npm install / dev server / git)無法完成;且 codex 的 Windows 沙箱輔助程序在部分機器上會因缺少執行階段而報「找不到指定的模組」。做全端開發請用 `/sandbox danger-full-access`；Guarded 保留審批，Auto 自動核准一般動作（UmaDev 仍全程稽核）。"
 
 # /sandbox —— 在應用內查看 / 修改 Codex 底座啟動沙箱(無需手改 .umadevrc)
 "sandbox.current" = "Codex 沙箱目前為:{}\n  (僅對 codex 底座生效 —— 它決定 codex 執行時能動到哪些東西)"
@@ -504,7 +504,7 @@
 "sandbox.codex_only" = "提示:目前底座不是 codex,這項設定要切到 codex 底座(/codex)後才生效。"
 "sandbox.set" = "Codex 沙箱已設為 {} —— 本次工作階段生效,並已寫入 .umadevrc。"
 "sandbox.danger_set" = "Codex 沙箱已設為 danger-full-access —— 本次工作階段生效,並已寫入 .umadevrc。本機連接埠 / 網路 / git 已解除限制,系統環境風險由你承擔。"
-"sandbox.clamped" = "已儲存所要求的 Codex 沙箱 `{}`，但目前信任模式 `{}` 會把實際啟動沙箱限制為 `{}`；UmaDev 不會聲稱已取得更高權限。danger-full-access 請用 `/mode auto`，workspace-write 請用 `/mode guarded` 或 `/mode auto`；常駐工作階段會立即重建，無需重新啟動 UmaDev。"
+"sandbox.clamped" = "已儲存所要求的 Codex 沙箱 `{}`，但目前信任模式 `{}` 會把實際啟動沙箱限制為 `{}`；UmaDev 不會聲稱已取得更高權限。Plan 始終唯讀；切換到 `/mode guarded` 或 `/mode auto` 後會使用已儲存的可寫沙箱。常駐工作階段會立即重建，無需重新啟動 UmaDev。"
 "sandbox.persist_failed" = "[warn] 本次工作階段已生效,但無法寫入 .umadevrc(下次啟動會恢復):{}"
 "sandbox.busy_no_change" = "Codex 目前仍在執行。請先取消本輪,再修改 /sandbox;UmaDev 會依新權限重建常駐 Codex 工作階段。"
 

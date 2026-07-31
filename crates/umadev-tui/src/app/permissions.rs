@@ -35,6 +35,21 @@ const ZH_QUESTIONS: &[&str] = &[
     "你有写权限吗",
     "当前能写吗",
     "能否写入",
+    "怎么切换为可写会话",
+    "如何切换为可写会话",
+    "怎么开启可写会话",
+    "如何开启可写会话",
+    "我授权你操作文件",
+    "授权你操作文件",
+    "我授权你修改文件",
+    "允许你写文件",
+    "现在是可写会话",
+    "现在是可写会话吗",
+    "当前是可写会话",
+    "当前是可写会话吗",
+    "codex是可写的为什么umadev说只读",
+    "codex是可写的，为什么umadev说只读",
+    "codex可写为什么umadev说只读",
     "你能寫檔案嗎",
     "能寫檔案嗎",
     "能不能寫檔案",
@@ -45,6 +60,21 @@ const ZH_QUESTIONS: &[&str] = &[
     "你有寫入權限嗎",
     "當前能寫嗎",
     "能否寫入",
+    "怎麼切換為可寫會話",
+    "如何切換為可寫會話",
+    "怎麼開啟可寫會話",
+    "如何開啟可寫會話",
+    "我授權你操作檔案",
+    "授權你操作檔案",
+    "我授權你修改檔案",
+    "允許你寫檔案",
+    "現在是可寫會話",
+    "現在是可寫會話嗎",
+    "當前是可寫會話",
+    "當前是可寫會話嗎",
+    "codex是可寫的為什麼umadev說唯讀",
+    "codex是可寫的，為什麼umadev說唯讀",
+    "codex可寫為什麼umadev說唯讀",
 ];
 
 const EN_QUESTIONS: &[&str] = &[
@@ -58,6 +88,17 @@ const EN_QUESTIONS: &[&str] = &[
     "can you edit files",
     "do you have write access",
     "are you able to write files",
+    "how do i switch to a writable session",
+    "how can i switch to a writable session",
+    "how do i enable a writable session",
+    "i grant you permission to edit files",
+    "you have permission to edit files",
+    "is this session writable",
+    "is the current session writable",
+    "codex is writable why does umadev say read-only",
+    "codex is writable, why does umadev say read-only",
+    "codex is writable why does umadev say read only",
+    "codex is writable, why does umadev say read only",
 ];
 
 /// Match only a standalone permission question. Polite wrappers are accepted,
@@ -120,7 +161,10 @@ pub(super) fn is_pure_question(normalized: &str, compact: &str) -> bool {
             break;
         }
     }
-    EN_QUESTIONS.contains(&en)
+    if EN_QUESTIONS.contains(&en) {
+        return true;
+    }
+    false
 }
 
 pub(super) fn slash_mutates_workspace(command: &str, rest: &str) -> bool {

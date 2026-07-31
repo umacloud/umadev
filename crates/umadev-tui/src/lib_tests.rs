@@ -8054,9 +8054,10 @@ async fn resident_model_read_only_intent_uses_child_and_never_reaches_writer() {
             2,
             "one intent consult plus one answer turn"
         );
-        assert!(directives[1].contains("This is read-only"));
+        assert!(directives[1].contains("Use an inspection-only child for this answer"));
         assert!(directives[1].contains("Permission is scoped to this turn"));
-        assert!(directives[1].contains("later writable request is handled by a writable session"));
+        assert!(directives[1].contains("does NOT mean the UmaDev session or its base is read-only"));
+        assert!(directives[1].contains("A concrete edit request is re-evaluated"));
     }
     assert!(matches!(
         *holder.lock().await,

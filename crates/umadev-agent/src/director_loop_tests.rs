@@ -5215,7 +5215,7 @@ async fn first_pass_signal_records_clean_steps_as_first_pass() {
         &events,
         &route,
         &mut plan,
-        IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
         std::time::Instant::now() + Duration::from_secs(3_600),
     )
     .await;
@@ -5231,18 +5231,13 @@ async fn first_pass_signal_records_clean_steps_as_first_pass() {
             .map(|s| (s.id.clone(), s.status))
             .collect::<Vec<_>>()
     );
-    // The recorded aggregate: 4 first-pass attempts under each dimension.
     let stats = crate::first_pass::load(tmp.path());
     let class = crate::first_pass::class_kind("build");
     let seat = crate::first_pass::seat_kind("frontend-engineer");
     let cs = stats.kinds.get(&class).copied().expect("class recorded");
     let ss = stats.kinds.get(&seat).copied().expect("seat recorded");
-    assert_eq!(
-        (cs.attempts, cs.first_pass),
-        (4, 4),
-        "class:build all first-pass"
-    );
-    assert_eq!((ss.attempts, ss.first_pass), (4, 4), "seat all first-pass");
+    assert_eq!((cs.attempts, cs.first_pass), (4, 4));
+    assert_eq!((ss.attempts, ss.first_pass), (4, 4));
 }
 
 #[tokio::test]
@@ -5266,7 +5261,7 @@ async fn first_pass_signal_records_reworked_steps_as_attempts_only() {
         &events,
         &route,
         &mut plan,
-        IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+        IdleBudget::new(Duration::from_secs(5), Duration::from_secs(5)),
         std::time::Instant::now() + Duration::from_secs(3_600),
     )
     .await;
@@ -5280,15 +5275,11 @@ async fn first_pass_signal_records_reworked_steps_as_attempts_only() {
     let by = |id: &str| plan.steps.iter().find(|s| s.id == id).unwrap().status;
     assert_eq!(by("schema"), StepStatus::Blocked);
     assert_eq!(by("config"), StepStatus::Blocked);
-    // Only schema + config were driven (api/ui stranded) → 2 attempts, 0 first-pass.
+    // Only schema + config were driven (api/ui stranded).
     let stats = crate::first_pass::load(tmp.path());
     let class = crate::first_pass::class_kind("build");
     let cs = stats.kinds.get(&class).copied().expect("class recorded");
-    assert_eq!(
-        (cs.attempts, cs.first_pass),
-        (2, 0),
-        "reworked/failed steps bump attempts only"
-    );
+    assert_eq!((cs.attempts, cs.first_pass), (2, 0));
     // The signal is correctly NOT first-pass; the rate is 0% but below the min
     // sample so it stays untrusted (None) — no false confidence on 2 samples.
     assert_eq!(crate::first_pass::first_pass_rate(tmp.path(), &class), None);

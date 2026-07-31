@@ -2920,21 +2920,29 @@ fn permission_help_and_config_report_the_effective_codex_launch_policy() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let prev = umadev_host::codex_session::codex_sandbox_override();
-    // Guarded clamps this raw high-risk preference to workspace-write. Every
-    // user-facing surface must report the actual launch sandbox, not the raw
-    // configured preference.
+    // Guarded keeps approvals but uses the configured full development
+    // environment. Every user-facing surface must report that actual launch
+    // sandbox.
     umadev_host::codex_session::set_codex_sandbox(Some("danger-full-access"));
     let mut a = fresh_app(Some("codex"));
     a.lang = umadev_i18n::Lang::ZhCn;
     assert!(
-        !a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
-        "startup must not warn that danger is active when Guarded clamps it"
+        a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
+        "startup must warn when the Guarded writer really has full access"
     );
     a.thinking = true;
     a.director_run_in_flight = true;
 
     let before = a.history.len();
-    assert_eq!(a.submit_text("怎么给你权限？".into()), Action::None);
+    for request in [
+        "怎么给你权限？",
+        "我授权你操作文件",
+        "怎么切换为可写会话？",
+        "现在是可写会话",
+        "Codex 是可写的，为什么 UmaDev 说只读？",
+    ] {
+        assert_eq!(a.submit_text(request.into()), Action::None);
+    }
     let answer = a
         .history
         .iter()
@@ -2953,7 +2961,7 @@ fn permission_help_and_config_report_the_effective_codex_launch_policy() {
         "trust mode is explicit: {answer}"
     );
     assert!(
-        answer.contains("workspace-write"),
+        answer.contains("danger-full-access"),
         "reports host-resolved sandbox: {answer}"
     );
     assert!(
@@ -2972,7 +2980,7 @@ fn permission_help_and_config_report_the_effective_codex_launch_policy() {
         "{config}"
     );
     assert!(
-        config.contains("Codex 实际沙箱") && config.contains("workspace-write"),
+        config.contains("Codex 实际沙箱") && config.contains("danger-full-access"),
         "{config}"
     );
     sandbox_env_restore(prev);
@@ -3004,7 +3012,38 @@ fn permission_help_gives_sandbox_command_only_when_codex_is_actually_read_only()
 }
 
 #[test]
-fn slash_sandbox_reports_guarded_clamp_then_warns_only_when_danger_is_effective() {
+fn codex_auto_permission_statement_reports_the_writable_launch_session() {
+    let _guard = SANDBOX_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = umadev_host::codex_session::codex_sandbox_override();
+    umadev_host::codex_session::set_codex_sandbox(Some("danger-full-access"));
+    let mut app = fresh_app(Some("codex"));
+    app.lang = umadev_i18n::Lang::ZhCn;
+    app.set_trust_mode(umadev_agent::TrustMode::Auto);
+    let before = app.history.len();
+
+    assert_eq!(app.submit_text("现在是可写会话".into()), Action::None);
+    let answer = app
+        .history
+        .iter()
+        .skip(before)
+        .map(|message| message.body().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(answer.contains("auto"), "{answer}");
+    assert!(answer.contains("danger-full-access"), "{answer}");
+    assert!(answer.contains("自动为该回合打开可写会话"), "{answer}");
+    assert!(
+        !answer.contains("当前 Codex 启动沙箱确为 `read-only`"),
+        "{answer}"
+    );
+    assert!(app.queued_chat.is_empty() && app.queued_steer.is_empty());
+    sandbox_env_restore(prev);
+}
+
+#[test]
+fn slash_sandbox_warns_when_danger_is_effective_in_guarded_and_auto() {
     let _guard = SANDBOX_ENV_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3031,11 +3070,11 @@ fn slash_sandbox_reports_guarded_clamp_then_warns_only_when_danger_is_effective(
         umadev_agent::config::CodexSandbox::DangerFullAccess,
         "persists to .umadevrc [codex] sandbox_mode"
     );
-    // Guarded clamps the configured danger preference to workspace-write, so
-    // the UI must report that truth instead of claiming full access.
+    // Guarded retains approvals but does not restrict the main worker's
+    // development environment, so the warning is already required.
     assert!(
-        !a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
-        "a clamped preference is not an active danger sandbox"
+        a.history.iter().any(|m| matches!(m.role, ChatRole::Error)),
+        "effective danger in Guarded must reuse the liability warning"
     );
     let guarded_body = a
         .history
@@ -3043,12 +3082,18 @@ fn slash_sandbox_reports_guarded_clamp_then_warns_only_when_danger_is_effective(
         .map(|m| m.body().into_owned())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(guarded_body.contains("guarded"), "{guarded_body}");
-    assert!(guarded_body.contains("workspace-write"), "{guarded_body}");
-    assert!(guarded_body.contains("/mode auto"), "{guarded_body}");
+    assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+    assert_eq!(
+        a.effective_codex_launch_sandbox(),
+        umadev_agent::config::CodexSandbox::DangerFullAccess
+    );
+    assert!(
+        guarded_body.contains("danger-full-access"),
+        "{guarded_body}"
+    );
 
-    // Once the user explicitly switches to Auto, the same configured sandbox
-    // becomes the real launch sandbox and the red liability warning is honest.
+    // Auto keeps the same launch access and changes only ordinary approval
+    // automation; the red liability warning remains honest.
     a.set_trust_mode(umadev_agent::TrustMode::Auto);
     let before = a.history.len();
     assert_eq!(

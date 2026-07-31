@@ -7,6 +7,27 @@ use std::time::SystemTime;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Return whether an advisory file-lock failure means another holder currently
+/// owns the lock.
+///
+/// `fs2` reports contention as [`std::io::ErrorKind::WouldBlock`] on Unix. On
+/// Windows, `LockFileEx` can instead surface `ERROR_SHARING_VIOLATION` (32) or
+/// `ERROR_LOCK_VIOLATION` (33) as an uncategorized I/O error.
+#[must_use]
+pub fn lock_error_is_contention(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(32 | 33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[must_use]
 pub fn metadata_is_real_dir(meta: &fs::Metadata) -> bool {
     if !meta.file_type().is_dir() {
@@ -155,6 +176,7 @@ impl ManagedParent {
             } else if create {
                 flags |= OFlags::CREATE;
             }
+            #[allow(clippy::useless_conversion)]
             let mode = unix_mode.try_into().map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid Unix file mode")
             })?;
@@ -1259,9 +1281,15 @@ impl RootedDir {
         validate_empty_tree(&directory, 0, &mut visited, max_depth, max_nodes)
     }
 
-    /// Remove a tree only when every descendant is an empty real directory.
-    /// Files, links, reparse points, and concurrently replaced entries are
-    /// never removed.
+    /// Remove a tree only when every descendant observed by the bounded walk is
+    /// an empty real directory. The operation never recurses through files,
+    /// links, or reparse points and its final removals are non-recursive.
+    ///
+    /// Portable filesystems have no remove-directory-if-file-id primitive, and
+    /// Windows requires releasing target handles before `remove_dir`. Callers
+    /// that must distinguish concurrent same-parent empty-directory replacement
+    /// must serialize that namespace; the rooted capability still prevents any
+    /// replacement from redirecting deletion outside this parent.
     pub fn remove_empty_directory_tree(
         &self,
         relative: &Path,
@@ -1280,16 +1308,24 @@ impl RootedDir {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
-        let opened_file = directory.try_clone()?.into_std_file();
+        let opened_identity = same_file::Handle::from_file(directory.try_clone()?.into_std_file())?;
         let mut visited = 0usize;
         remove_empty_tree_contents(&directory, 0, &mut visited, max_depth, max_nodes)?;
-        let current = parent.capability.open_dir_nofollow(&name)?.into_std_file();
-        if same_file::Handle::from_file(opened_file)? != same_file::Handle::from_file(current)? {
+        let current_identity = same_file::Handle::from_file(
+            parent.capability.open_dir_nofollow(&name)?.into_std_file(),
+        )?;
+        if opened_identity != current_identity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "rooted directory changed before removal",
             ));
         }
+        drop(current_identity);
+        drop(opened_identity);
+        // cap-std's Windows directory handles do not opt into SHARE_DELETE.
+        // Retain the no-follow parent capability, but release the target before
+        // asking that parent to remove its now-verified child.
+        drop(directory);
         parent.remove_dir(&name)?;
         Ok(true)
     }
@@ -1624,15 +1660,19 @@ fn remove_empty_tree_contents(
             ));
         }
         let child = directory.open_dir_nofollow(&name)?;
-        let opened = child.try_clone()?.into_std_file();
+        let opened_identity = same_file::Handle::from_file(child.try_clone()?.into_std_file())?;
         remove_empty_tree_contents(&child, depth + 1, visited, max_depth, max_nodes)?;
-        let current = directory.open_dir_nofollow(&name)?.into_std_file();
-        if same_file::Handle::from_file(opened)? != same_file::Handle::from_file(current)? {
+        let current_identity =
+            same_file::Handle::from_file(directory.open_dir_nofollow(&name)?.into_std_file())?;
+        if opened_identity != current_identity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "rooted child directory changed before removal",
             ));
         }
+        drop(current_identity);
+        drop(opened_identity);
+        drop(child);
         retry_transient(|| directory.remove_dir(&name))?;
     }
     Ok(())
@@ -2517,6 +2557,62 @@ pub fn replace_regular_file(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn advisory_lock_contention_is_classified_cross_platform() {
+        assert!(lock_error_is_contention(&std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "busy"
+        )));
+        assert!(
+            lock_error_is_contention(&fs2::lock_contended_error()),
+            "the platform-native fs2 error must be recognized"
+        );
+        assert!(!lock_error_is_contention(&std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "denied"
+        )));
+
+        let temp = tempfile::tempdir().unwrap();
+        let lock_path = temp.path().join("contention.lock");
+        let first = open_private_lock(&lock_path).unwrap();
+        let second = open_private_lock(&lock_path).unwrap();
+        fs2::FileExt::try_lock_exclusive(&first).unwrap();
+        let actual = fs2::FileExt::try_lock_exclusive(&second).unwrap_err();
+        assert!(
+            lock_error_is_contention(&actual),
+            "a real competing advisory lock must be recognized: {actual}"
+        );
+        fs2::FileExt::unlock(&first).unwrap();
+
+        #[cfg(windows)]
+        for raw in [32, 33] {
+            assert!(
+                lock_error_is_contention(&std::io::Error::from_raw_os_error(raw)),
+                "Windows lock error {raw} must be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn rooted_empty_directory_tree_cleanup_can_be_repeated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = RootedDir::open_no_follow(temp.path()).unwrap();
+        let tree = Path::new("staged");
+
+        for _ in 0..4 {
+            fs::create_dir_all(temp.path().join("staged/branch/leaf")).unwrap();
+            assert!(
+                root.remove_empty_directory_tree(tree, 8, 32).unwrap(),
+                "a freshly created empty tree must be removed"
+            );
+            assert!(!temp.path().join(tree).exists());
+            assert!(
+                !root.remove_empty_directory_tree(tree, 8, 32).unwrap(),
+                "repeated cleanup of an absent tree is idempotent"
+            );
+        }
+    }
 
     #[test]
     fn repeated_atomic_writes_replace_the_same_file() {

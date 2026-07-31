@@ -16,7 +16,7 @@ pub(super) struct WorkspaceFileIndex {
     recent_source: Option<String>,
 }
 
-fn is_link_like(_entry: &std::fs::DirEntry, kind: std::fs::FileType) -> bool {
+fn is_link_like(entry: &std::fs::DirEntry, kind: std::fs::FileType) -> bool {
     if kind.is_symlink() {
         return true;
     }
@@ -24,12 +24,15 @@ fn is_link_like(_entry: &std::fs::DirEntry, kind: std::fs::FileType) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        return std::fs::symlink_metadata(_entry.path()).map_or(true, |metadata| {
+        std::fs::symlink_metadata(entry.path()).map_or(true, |metadata| {
             metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        });
+        })
     }
     #[cfg(not(windows))]
-    false
+    {
+        let _ = entry;
+        false
+    }
 }
 
 fn visit_repo_files(

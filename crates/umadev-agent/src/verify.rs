@@ -1144,7 +1144,7 @@ pub fn record_verify_outcome(
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if umadev_state::fs::lock_error_is_contention(&error) => {
                 if started.elapsed() >= VERIFY_AUDIT_LOCK_TIMEOUT {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,

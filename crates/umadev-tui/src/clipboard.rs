@@ -35,8 +35,7 @@ const MAX_SELECTION_OWNERS: usize = 8;
 
 #[cfg(unix)]
 struct SelectionOwner {
-    child: std::process::Child,
-    tree: umadev_process::StdCommandTree,
+    process: umadev_process::ManagedStdChild,
 }
 
 fn clipboard_feedback_slot() -> &'static Mutex<Option<ClipboardFeedback>> {
@@ -67,9 +66,23 @@ fn selection_owners() -> &'static Mutex<Vec<SelectionOwner>> {
 }
 
 #[cfg(unix)]
+fn selection_owner_is_running(owner: &mut SelectionOwner) -> bool {
+    match owner.process.try_wait_retaining_descendants_on_success() {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(_) => {
+            let _ = owner
+                .process
+                .terminate_and_reap(std::time::Duration::from_secs(1));
+            false
+        }
+    }
+}
+
+#[cfg(unix)]
 fn reap_finished_selection_owners() {
     if let Ok(mut owners) = selection_owners().lock() {
-        owners.retain_mut(|owner| !matches!(owner.child.try_wait(), Ok(Some(_)) | Err(_)));
+        owners.retain_mut(selection_owner_is_running);
     }
 }
 
@@ -395,16 +408,11 @@ fn try_native_clipboard(
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    umadev_process::isolate_std_command(&mut command);
-    let Ok(mut child) = command.spawn() else {
+    let Ok(mut process) = umadev_process::ManagedStdChild::spawn(command) else {
         return false;
     };
-    let Ok(mut tree) = umadev_process::StdCommandTree::attach(&mut child) else {
-        terminate_clipboard_helper(child, None);
-        return false;
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        terminate_clipboard_helper(child, Some(tree));
+    let Some(mut stdin) = process.take_stdin() else {
+        terminate_clipboard_helper(process);
         return false;
     };
     let (write_tx, write_rx) = std::sync::mpsc::sync_channel(1);
@@ -416,7 +424,7 @@ fn try_native_clipboard(
             let _ = write_tx.send(wrote);
         });
     let Ok(writer) = writer else {
-        terminate_clipboard_helper(child, Some(tree));
+        terminate_clipboard_helper(process);
         return false;
     };
     let mut writer = Some(writer);
@@ -438,7 +446,7 @@ fn try_native_clipboard(
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
         }
         if wrote == Some(false) {
-            terminate_clipboard_helper(child, Some(tree));
+            terminate_clipboard_helper(process);
             join_clipboard_writer(&mut writer);
             return false;
         }
@@ -446,22 +454,37 @@ fn try_native_clipboard(
             // Exit-style helpers must not be allowed to daemonize. Preserve the
             // Unix leader as an unreaped identity anchor until its whole tree
             // has been terminated.
-            NativeClipboardLifetime::Exit => tree.try_wait(&mut child),
+            NativeClipboardLifetime::Exit => process.try_wait(),
             // X11 clipboard owners are intentionally allowed to daemonize so
             // they can continue serving the selection after the launcher exits.
-            NativeClipboardLifetime::SelectionOwner => child.try_wait(),
+            NativeClipboardLifetime::SelectionOwner => {
+                #[cfg(unix)]
+                {
+                    if wrote == Some(true) {
+                        process.try_wait_retaining_descendants_on_success()
+                    } else {
+                        match process.observe_exit_unreaped() {
+                            Ok(Some(false)) => process.try_wait(),
+                            Ok(Some(true) | None) => Ok(None),
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    process.try_wait()
+                }
+            }
         };
         match polled {
             Ok(Some(status)) => {
                 if !status.success() {
-                    tree.terminate(&mut child);
-                    let _ = child.wait();
                     join_clipboard_writer(&mut writer);
                     return false;
                 }
                 if wrote == Some(true) {
                     join_clipboard_writer(&mut writer);
-                    finish_clipboard_success(child, tree, lifetime);
+                    finish_clipboard_success(process, lifetime);
                     return true;
                 }
             }
@@ -469,19 +492,19 @@ fn try_native_clipboard(
                 if lifetime == NativeClipboardLifetime::SelectionOwner
                     && wrote_at.is_some_and(|at| at.elapsed() >= SELECTION_OWNER_SETTLE)
                 {
-                    finish_clipboard_success(child, tree, lifetime);
+                    finish_clipboard_success(process, lifetime);
                     return true;
                 }
             }
             Err(_) => {
-                terminate_clipboard_helper(child, Some(tree));
+                terminate_clipboard_helper(process);
                 join_clipboard_writer(&mut writer);
                 return false;
             }
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            terminate_clipboard_helper(child, Some(tree));
+            terminate_clipboard_helper(process);
             join_clipboard_writer(&mut writer);
             return false;
         }
@@ -500,49 +523,44 @@ fn join_clipboard_writer(writer: &mut Option<std::thread::JoinHandle<()>>) {
 }
 
 fn finish_clipboard_success(
-    mut child: std::process::Child,
-    mut tree: umadev_process::StdCommandTree,
+    mut process: umadev_process::ManagedStdChild,
     lifetime: NativeClipboardLifetime,
 ) {
     if lifetime == NativeClipboardLifetime::Exit {
-        tree.terminate(&mut child);
-        let _ = child.wait();
+        let _ = process.terminate_and_reap(std::time::Duration::from_secs(1));
         return;
     }
     #[cfg(unix)]
-    register_selection_owner(child, tree);
+    register_selection_owner(process);
     #[cfg(not(unix))]
     {
-        tree.terminate(&mut child);
-        let _ = child.wait();
+        let _ = process.terminate_and_reap(std::time::Duration::from_secs(1));
     }
 }
 
 #[cfg(unix)]
-fn register_selection_owner(child: std::process::Child, tree: umadev_process::StdCommandTree) {
+fn register_selection_owner(process: umadev_process::ManagedStdChild) {
+    // A successful launcher may already have exited after handing ownership to
+    // its retained daemon. The guard has reaped that launcher and intentionally
+    // disarmed group cleanup, so there is nothing left for this registry to own.
+    if process.id().is_none() {
+        return;
+    }
     let Ok(mut owners) = selection_owners().lock() else {
         return;
     };
-    owners.retain_mut(|owner| !matches!(owner.child.try_wait(), Ok(Some(_)) | Err(_)));
+    owners.retain_mut(selection_owner_is_running);
     if owners.len() >= MAX_SELECTION_OWNERS {
         let mut stale = owners.remove(0);
-        stale.tree.terminate(&mut stale.child);
-        let _ = stale.child.wait();
+        let _ = stale
+            .process
+            .terminate_and_reap(std::time::Duration::from_secs(1));
     }
-    owners.push(SelectionOwner { child, tree });
+    owners.push(SelectionOwner { process });
 }
 
-fn terminate_clipboard_helper(
-    mut child: std::process::Child,
-    mut tree: Option<umadev_process::StdCommandTree>,
-) {
-    if let Some(tree) = tree.as_mut() {
-        tree.terminate(&mut child);
-    } else {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-    drop(tree);
+fn terminate_clipboard_helper(mut process: umadev_process::ManagedStdChild) {
+    let _ = process.terminate_and_reap(std::time::Duration::from_secs(1));
 }
 
 pub(crate) fn shutdown_clipboard_workers() {
@@ -554,7 +572,7 @@ pub(crate) fn shutdown_clipboard_workers() {
     #[cfg(unix)]
     if let Ok(mut owners) = selection_owners().lock() {
         for mut owner in owners.drain(..) {
-            owner.tree.retain_descendants();
+            owner.process.retain_descendants();
         }
     }
 }
@@ -883,6 +901,79 @@ mod tests {
         let _ = std::process::Command::new("kill")
             .args(["-KILL", &owner.to_string()])
             .status();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_selection_launcher_does_not_leave_its_descendant_alive() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("failed-clipboard-owner.pid");
+        let script = format!(
+            "cat >/dev/null; sleep 30 </dev/null & printf '%s' $! > '{}'; exit 7",
+            pid_file.display()
+        );
+        assert!(!try_native_clipboard(
+            "sh",
+            &["-c", &script],
+            Arc::from(b"clipboard payload".as_slice()),
+            Instant::now() + Duration::from_secs(2),
+            NativeClipboardLifetime::SelectionOwner,
+        ));
+
+        let owner = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let reaped_by = Instant::now() + Duration::from_secs(2);
+        while unix_process_exists(owner) && Instant::now() < reaped_by {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !unix_process_exists(owner),
+            "failed selection launcher left a descendant alive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selection_launcher_cannot_disarm_cleanup_before_stdin_is_delivered() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("blocked-clipboard-owner.pid");
+        let script = format!(
+            "sleep 30 <&0 & printf '%s' $! > '{}'; exit 0",
+            pid_file.display()
+        );
+        let started = Instant::now();
+        assert!(!try_native_clipboard(
+            "sh",
+            &["-c", &script],
+            Arc::from(vec![b'x'; 2 * 1024 * 1024]),
+            Instant::now() + Duration::from_millis(250),
+            NativeClipboardLifetime::SelectionOwner,
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an exited launcher with a blocked inherited stdin escaped the deadline"
+        );
+
+        let owner = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        let reaped_by = Instant::now() + Duration::from_secs(2);
+        while unix_process_exists(owner) && Instant::now() < reaped_by {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !unix_process_exists(owner),
+            "timed-out selection handoff left its stdin-holding daemon alive"
+        );
     }
 
     #[cfg(unix)]

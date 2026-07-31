@@ -338,6 +338,15 @@ fn run_pre_write_scoped(
 /// is honouring. The age fallback is the right bound for this surface, and the stakes are
 /// low: the hook blocks nothing but the irreversible floor anyway (see [`run_pre_write`]).
 fn load_project_context(file_path: &str) -> ProjectContext {
+    let key = umadev_state::privacy::installation_key();
+    load_project_context_at(
+        file_path,
+        now_secs(),
+        key.as_ref().map(<[u8; 32]>::as_slice),
+    )
+}
+
+fn load_project_context_at(file_path: &str, now: u64, key: Option<&[u8]>) -> ProjectContext {
     let Some(root) = find_project_root(file_path) else {
         return ProjectContext::unknown();
     };
@@ -352,8 +361,7 @@ fn load_project_context(file_path: &str) -> ProjectContext {
     // field also means a `{}` document deserializes to the strict default.
     let ctx = serde_json::from_slice::<ProjectContext>(&bytes)
         .unwrap_or_else(|_| ProjectContext::unknown());
-    let key = umadev_state::privacy::installation_key();
-    ctx.if_current(now_secs(), None, key.as_ref().map(<[u8; 32]>::as_slice))
+    ctx.if_current(now, None, key)
 }
 
 /// UNIX seconds, or 0 when the clock is unreadable (which ages every unstamped context out
@@ -1987,10 +1995,13 @@ mod tests {
         // longer describes this workspace.
         let (_tmp, root) = project_with_context(true);
         let ctx_path = root.join(".umadev").join("governance-context.json");
+        let key = [0x5a_u8; 32];
+        let now = 1_800_000_000_u64;
 
         std::fs::write(&ctx_path, r#"{"static_frontend_only":true}"#).unwrap();
         assert!(
-            !load_project_context(&root.join("index.html").to_string_lossy()).static_frontend_only,
+            !load_project_context_at(&root.join("index.html").to_string_lossy(), now, Some(&key))
+                .static_frontend_only,
             "an unstamped context has no provenance — it cannot stand a rule down"
         );
 
@@ -1999,10 +2010,11 @@ mod tests {
             "purple_allowed": true,
             "requirement_fingerprint": vec![7_u8; 32],
             "provenance_auth": vec![9_u8; 32],
-            "derived_at": now_secs()
+            "derived_at": now
         });
         std::fs::write(&ctx_path, serde_json::to_vec(&forged).unwrap()).unwrap();
-        let loaded = load_project_context(&root.join("index.html").to_string_lossy());
+        let loaded =
+            load_project_context_at(&root.join("index.html").to_string_lossy(), now, Some(&key));
         assert_eq!(
             loaded,
             ProjectContext::unknown(),
@@ -2011,25 +2023,24 @@ mod tests {
 
         let ancient = ProjectContext::static_frontend().derived_from(
             "a static frontend page",
-            &umadev_state::privacy::installation_key().expect("provenance key"),
-            now_secs() - ProjectContext::MAX_UNMATCHED_AGE_SECS - 1,
+            &key,
+            now - ProjectContext::MAX_UNMATCHED_AGE_SECS - 1,
         );
         std::fs::write(&ctx_path, serde_json::to_string(&ancient).unwrap()).unwrap();
         assert!(
-            !load_project_context(&root.join("index.html").to_string_lossy()).static_frontend_only,
+            !load_project_context_at(&root.join("index.html").to_string_lossy(), now, Some(&key))
+                .static_frontend_only,
             "a context too old to attribute to this workspace is not evidence"
         );
 
         // …while the freshly-stamped one from the fixture IS honoured (or the guard above
         // would be vacuous).
-        let fresh = ProjectContext::static_frontend().derived_from(
-            "a static frontend page",
-            &umadev_state::privacy::installation_key().expect("provenance key"),
-            now_secs(),
-        );
+        let fresh =
+            ProjectContext::static_frontend().derived_from("a static frontend page", &key, now);
         std::fs::write(&ctx_path, serde_json::to_string(&fresh).unwrap()).unwrap();
         assert!(
-            load_project_context(&root.join("index.html").to_string_lossy()).static_frontend_only,
+            load_project_context_at(&root.join("index.html").to_string_lossy(), now, Some(&key))
+                .static_frontend_only,
             "a current context still stands the surface rules down"
         );
     }

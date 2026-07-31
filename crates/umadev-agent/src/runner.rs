@@ -101,7 +101,7 @@ pub(crate) fn append_private_run_jsonl(
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if umadev_state::fs::lock_error_is_contention(&error) => {
                 if started.elapsed() >= RUN_HISTORY_LOCK_TIMEOUT {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,

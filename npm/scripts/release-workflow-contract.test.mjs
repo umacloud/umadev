@@ -171,6 +171,31 @@ test("CI and release use the same bounded Grok artifact contract", () => {
   }
 });
 
+test("CI and release both gate launcher classification and Windows GNU", () => {
+  for (const [name, source] of [["CI", ciWorkflow], ["release", workflow]]) {
+    assert.match(
+      source,
+      /node --test npm\/scripts\/cli-classification\.test\.cjs/,
+      `${name} omits the launcher command-classification regression`,
+    );
+    assert.match(
+      source,
+      /targets: x86_64-pc-windows-gnu/,
+      `${name} does not install the Windows GNU target`,
+    );
+    assert.match(
+      source,
+      /cargo clippy --workspace --all-(?:features --all-targets|targets --all-features) --locked --target x86_64-pc-windows-gnu -- -D warnings/,
+      `${name} does not run the full Windows GNU strict-Clippy gate`,
+    );
+  }
+  assert.match(
+    ciWorkflow,
+    /needs: \[[^\]]*windows-gnu-cross[^\]]*\]/,
+    "release artifact builds can bypass the Windows GNU gate",
+  );
+});
+
 test("public release verification bounds every external read", () => {
   const block = jobBlock("verify-publication");
   assert.match(block, /^    timeout-minutes: 60$/m);

@@ -16213,8 +16213,8 @@ impl App {
         let persisted = umadev_agent::config::persist_codex_sandbox(&self.project_root, mode);
 
         // Report the launch sandbox the host will ACTUALLY use under the current
-        // trust ceiling. A Guarded/Plan clamp must never be described as if the
-        // requested wider tier already took effect.
+        // trust ceiling. Plan's read-only ceiling must never be described as if
+        // the requested wider tier already took effect.
         let effective = self.effective_codex_launch_sandbox();
         if effective.is_high_risk() {
             self.push(

@@ -2366,10 +2366,8 @@ mod tests {
         // A live process we DID record in our own pidfile = ours to clean up.
         let mut command = std::process::Command::new("sh");
         command.args(["-c", PREVIEW_SENTINEL_SCRIPT, owner_token, "sleep", "30"]);
-        umadev_process::isolate_std_command(&mut command);
-        let mut child = command.spawn().unwrap();
-        let mut tree = umadev_process::StdCommandTree::attach(&mut child).unwrap();
-        let pid = child.id();
+        let mut child = umadev_process::ManagedStdChild::spawn(command).unwrap();
+        let pid = child.id().unwrap();
         assert!(write_preview_pid(tmp.path(), pid, "sleep", owner_token));
         assert_eq!(pid_is_alive(pid), Some(true));
 
@@ -2396,7 +2394,6 @@ mod tests {
             "pidfile must be cleared after reclaim"
         );
         // It really died (by signal), and the wait() reaps it.
-        tree.retain_descendants();
         let status = child.wait().unwrap();
         assert!(
             status.signal().is_some(),
@@ -2433,10 +2430,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut command = std::process::Command::new("sleep");
         command.arg("30");
-        umadev_process::isolate_std_command(&mut command);
-        let mut child = command.spawn().unwrap();
-        let mut tree = umadev_process::StdCommandTree::attach(&mut child).unwrap();
-        let pid = child.id();
+        let mut child = umadev_process::ManagedStdChild::spawn(command).unwrap();
+        let pid = child.id().unwrap();
         fs::create_dir(tmp.path().join(".umadev")).unwrap();
         fs::write(preview_pid_path(tmp.path()), format!("{pid}\nsleep")).unwrap();
 
@@ -2444,8 +2439,7 @@ mod tests {
         assert_eq!(pid_is_alive(pid), Some(true));
         assert!(read_preview_pid(tmp.path()).is_none());
 
-        tree.terminate(&mut child);
-        let _ = child.wait();
+        let _ = child.terminate_and_reap(Duration::from_secs(1));
     }
 
     #[cfg(unix)]
@@ -2454,10 +2448,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut command = std::process::Command::new("sleep");
         command.arg("0");
-        umadev_process::isolate_std_command(&mut command);
-        let mut child = command.spawn().unwrap();
-        let _tree = umadev_process::StdCommandTree::attach(&mut child).unwrap();
-        let pid = child.id();
+        let mut child = umadev_process::ManagedStdChild::spawn(command).unwrap();
+        let pid = child.id().unwrap();
         let _ = child.wait(); // reap → the PID is now gone
         assert!(write_preview_pid(tmp.path(), pid, "sleep", "dead-owner"));
 
@@ -2483,11 +2475,12 @@ mod tests {
             ),
             owner_token,
         ]);
-        umadev_process::isolate_std_command(&mut command);
-        let mut leader = command.spawn().unwrap();
-        let mut tree = umadev_process::StdCommandTree::attach(&mut leader).unwrap();
-        let pgid = leader.id();
-        assert!(leader.wait().unwrap().success());
+        let mut leader = umadev_process::ManagedStdChild::spawn(command).unwrap();
+        let pgid = leader.id().unwrap();
+        assert!(leader
+            .wait_retaining_descendants_on_success()
+            .unwrap()
+            .success());
         let deadline = Instant::now() + Duration::from_secs(2);
         let leaf = loop {
             if let Ok(pid) = fs::read_to_string(&leaf_file)
@@ -2503,7 +2496,6 @@ mod tests {
         assert!(write_preview_pid(tmp.path(), pgid, "sh", owner_token));
 
         assert!(reclaim_tracked_preview(tmp.path()).await);
-        tree.retain_descendants();
         let deadline = Instant::now() + Duration::from_secs(2);
         while pid_is_alive(leaf) == Some(true) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2527,11 +2519,12 @@ mod tests {
             ),
             "different-owner",
         ]);
-        umadev_process::isolate_std_command(&mut command);
-        let mut leader = command.spawn().unwrap();
-        let mut tree = umadev_process::StdCommandTree::attach(&mut leader).unwrap();
-        let group_id = leader.id();
-        assert!(leader.wait().unwrap().success());
+        let mut leader = umadev_process::ManagedStdChild::spawn(command).unwrap();
+        let group_id = leader.id().unwrap();
+        assert!(leader
+            .wait_retaining_descendants_on_success()
+            .unwrap()
+            .success());
         let deadline = Instant::now() + Duration::from_secs(2);
         let leaf = loop {
             if let Ok(pid) = fs::read_to_string(&leaf_file)
@@ -2558,7 +2551,6 @@ mod tests {
 
         assert!(process_group_has_owner_token(group_id, "different-owner").await);
         assert!(kill_preview_tree(group_id).await);
-        tree.retain_descendants();
         let deadline = Instant::now() + Duration::from_secs(2);
         while pid_is_alive(leaf) == Some(true) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;

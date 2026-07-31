@@ -62,6 +62,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use umadev_state::fs::lock_error_is_contention;
 
 mod fence;
 mod namespace;
@@ -74,8 +75,7 @@ pub(crate) use owner::{
 
 use fence::ensure_v2_fence;
 use namespace::{
-    ensure_local_git_excludes, external_guard_path, lock_error_is_contention, open_guard_file,
-    same_file_identity,
+    ensure_local_git_excludes, external_guard_path, open_guard_file, same_file_identity,
 };
 use owner::{holder_is_self, holder_nonce_matches, unique_nonce, write_owner};
 

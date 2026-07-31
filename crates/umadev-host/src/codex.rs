@@ -189,9 +189,10 @@ impl CodexDriver {
     /// - `--skip-git-repo-check`: UmaDev workspaces are frequently
     ///   `output/` + `.umadev/` scratch dirs that aren't git repos;
     ///   codex otherwise refuses to run.
-    /// - `--sandbox`: Plan is hard-pinned to `read-only`; Guarded uses
-    ///   `workspace-write` unless `.umadevrc` restricts it. Emitted for every
-    ///   profile EXCEPT Auto+full-access (which uses the bypass flag below instead).
+    /// - `--sandbox`: Plan is hard-pinned to `read-only`; Guarded uses the
+    ///   resolved writable sandbox (`danger-full-access` by default, or an
+    ///   explicit narrower project setting). Emitted for every profile EXCEPT
+    ///   Auto+full-access (which uses the bypass flag below instead).
     /// - `--dangerously-bypass-approvals-and-sandbox`: Auto only, and only when
     ///   the resolved sandbox is already `danger-full-access`. Emitted ALONE (it
     ///   disables the sandbox entirely, so a paired `--sandbox` is redundant and

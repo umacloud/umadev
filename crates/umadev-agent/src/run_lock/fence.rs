@@ -9,13 +9,12 @@ use std::io;
 use std::path::Path;
 
 use fs2::FileExt;
+use umadev_state::fs::lock_error_is_contention;
 
 #[cfg(unix)]
 use std::fs::File;
 
-use super::namespace::{
-    external_guard_path, lock_error_is_contention, open_guard_file, same_file_identity,
-};
+use super::namespace::{external_guard_path, open_guard_file, same_file_identity};
 use super::owner::{
     boot_id, classify_claim_owner, hostname, older_than_stale, pid_is_alive, ClaimOwner, Owner,
     OwnerLiveness,

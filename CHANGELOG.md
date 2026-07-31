@@ -2,13 +2,13 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [1.0.71] - 2026-07-31
+## [1.0.72] - 2026-07-31
 
 全项目无边界深审 · 状态与知识持久化加固 · 常驻会话止损 · 五底座能力化适配 · 发布供应链闭环
 
 ### 修复(意图、流程与评审)
 
-- 状态、进度、本次改动等查询直接读取宿主事实并立即回答，不再排队、复活旧计划、召集团队评审或触发自动修复；明确写入、修复、创建与普通 Git 提交仍按当前请求进入可写通道，模型的陈旧 `read-only` 判断不能覆盖用户本轮授权。
+- 状态、进度、本次改动与权限等查询直接读取宿主事实并立即回答，不再排队、复活旧计划、召集团队评审或触发自动修复；Codex 的只读咨询子线程不再被误报成整个 UmaDev/底座会话只读。明确写入、修复、创建与普通 Git 提交仍按当前请求进入可写通道，模型的陈旧 `read-only` 判断不能覆盖用户本轮授权。Codex 的 Guarded / Auto 主执行会话默认都获得完整文件系统、进程、网络、本地端口与 Git 开发环境，Guarded 保留审批而 Auto 自动批准普通动作；Plan、意图判断和独立评审仍机械只读，用户显式选择的较窄沙箱仍会被尊重。
 - 常驻回合新增绝对时间、token、事件和工具调用四重上限；长时间有心跳但没有收敛的工具洪泛也会有界停止。截断、取消和评审基础设施不可用均诚实结算，不再自动重发相同需求、重跑 QC 或把运行故障交给源码修复。
 - 评审不可用与代码不通过彻底分离，并加入熔断与可恢复边界；同一源码指纹下不会循环“评审 → 自动修复 → 再评审”。纯后端请求的团队范围会压住模型误加的 UIUX / 前端席位，只有用户明确要求跨端工作时才加入。
 - `/plan`、底部队列和团队面板继续读取同一份宿主状态；完整计划、团队与排队任务都能从 transcript 到达，不再出现底部有 `[queued N]`、`/plan` 却说无任务的分叉。
@@ -31,14 +31,18 @@
 
 - Release 在公开资产前绑定 tag、commit、七个二进制、哈希、provenance、SBOM 和完整 manifest；npm 九包与官网只能从同一已验证提交推进，查询、下载、重定向和 manifest 解析均有上限与超时。
 - Grok 版本探针的进程树回收测试先安装信号处理再启动顽固子进程，并给冷启动留出明确预算；CI / Release 将多组进程型 Node 契约串行隔离，避免受限 runner 因调度饥饿随机误报而阻断发布。
+- Unix 文件模式继续在 `u32` 与平台 `mode_t` 之间做可失败转换；针对 Linux 上二者同型的 Rust 1.97 Clippy 差异只收窄豁免到该跨平台转换，不牺牲 macOS 等较窄 `mode_t` 的溢出检查。
+- 同步 helper 改由单一 guard 同时持有 `Child` 与进程树，安全 API 不再暴露可提前消费 leader 的原始 wait/reap 入口；Unix 在 `waitid(WNOWAIT)` 仍锚定 PID/PGID 时才终止整组，Windows 始终由 Job Object 持有树身份。剪贴板只在 launcher 成功时保留选择服务后代，失败、超时和淘汰都会回收整棵树。
+- Windows `LockFileEx` 返回的 raw OS 32/33 现与 Unix `WouldBlock` 统一识别为有界锁竞争；状态锁用父目录中的 sibling guard 串行创建、过期回收与释放，并在隔离过期锁目录前释放其内部 lease 句柄。删除空知识/MCP/Skill/缓存目录前也会释放 cap-std 目标目录句柄，同时保留 no-follow 父能力，消除 Windows `SHARING_VIOLATION` 且不放宽路径边界。
+- 一次过验收测试恢复 `4/4`、`2/0` 精确聚合断言；治理上下文的时间/认证测试使用显式固定时钟和测试密钥，不再被并行测试临时切换 HOME/状态目录影响。
 - “外来进程组不可误杀”回归在断言后会用测试专属 owner token 重新证明归属并回收夹具，不再把休眠 shell / sleep 子进程遗留给系统；本次审查也清理了历史测试残留。
 - 大型控制器继续拆分：live-meta 分类与常驻回合限制移出 TUI 主文件，计划与治理辅助逻辑移出 Director；架构行数与嵌套 ratchet 只下调不放宽。
 - 删除两份仍导入已退役 `super_dev.review_state`、没有对应源码或 fixture、无法被 pytest 收集的遗留测试；当前发布测试面只保留可执行、可复现的 UmaDev 契约。
 
 ### 验证
 
-- 全工作区 `--all-features --all-targets` 测试、doctest、严格 Clippy `-D warnings`、严格 rustdoc、格式、差异、三语目录契约和架构门全绿；Agent 2,111 项、TUI 1,430 项及 CLI / 集成 / PTY / Git 事故回归均通过。
-- Rust 1.88 MSRV 与 Windows GNU 交叉检查通过；Linux glibc/musl x64/arm64 四个 release 二进制实际构建并核验 ELF 架构；Node 发布/安装/终端契约 60 项、npm smoke、官网 audit/lint/生产构建和所有 shell 语法通过。
+- 全工作区 `--all-features --all-targets` 测试、doctest、严格 Clippy `-D warnings`、严格 rustdoc、格式、差异、三语目录契约和架构门全绿；Agent 2,111 项、TUI 1,434 项（1,433 通过，1 项手动性能基准按设计忽略）及 CLI / 集成 / PTY / Git 事故回归均通过。
+- Rust 1.88 MSRV 与 Windows GNU 交叉检查通过；Linux glibc/musl x64/arm64 四个 release 二进制实际构建并核验 ELF 架构；Node 发布/安装/终端契约 61 项（当前平台 60 通过、1 项 Windows 实机契约按设计跳过）、npm smoke、官网 audit/lint/生产构建和所有 shell 语法通过。
 - RustSec 未发现已知漏洞；仅保留 Candle / tokenizers 传递依赖 `paste 1.0.15` 的“停止维护”告警，当前没有安全通告或可直接替换的小版本修复。
 
 ## [1.0.70] - 2026-07-30

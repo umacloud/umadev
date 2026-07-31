@@ -29,4 +29,6 @@ for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
 NODE
 ( cd "$ROOT" && cargo check -p umadev-spec >/dev/null )
 echo "version -> $NEW  (Cargo.toml + npm/*/package.json + Cargo.lock)"
-echo "then: git commit -am \"release: $NEW\" && git tag \"v$NEW\" && git push origin HEAD:main && git push origin \"v$NEW\""
+echo "next: commit release $NEW, push main, and wait for that exact SHA's CI"
+echo "then: run the Release workflow_dispatch validation on main and wait for green"
+echo "last: create the immutable v$NEW tag on that verified SHA and push only that tag"

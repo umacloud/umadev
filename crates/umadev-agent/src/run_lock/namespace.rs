@@ -8,16 +8,7 @@
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-pub(super) fn lock_error_is_contention(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        return true;
-    }
-    // On Windows fs2's LockFileEx path returns ERROR_LOCK_VIOLATION (33),
-    // which Rust may classify as Uncategorized rather than WouldBlock. Compare
-    // the crate's platform-native sentinel instead of guessing ErrorKind.
-    let expected = fs2::lock_contended_error().raw_os_error();
-    expected.is_some() && error.raw_os_error() == expected
-}
+
 pub(super) fn open_guard_file(path: &Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);

@@ -49,11 +49,12 @@ fn with_mutation_lock<T>(
         match lock.try_lock_exclusive() {
             Ok(()) => break,
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                if umadev_state::fs::lock_error_is_contention(&error)
+                    && Instant::now() < deadline =>
             {
                 std::thread::sleep(KNOWLEDGE_LOCK_POLL);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if umadev_state::fs::lock_error_is_contention(&error) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
                     "another knowledge update is still running",
