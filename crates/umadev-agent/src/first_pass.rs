@@ -172,6 +172,14 @@ pub fn record(project_root: &Path, kind: &str, first_pass: bool) {
 /// dir, unreadable file, busy lock past the bound, or write error is swallowed —
 /// recording is telemetry and never changes the build outcome.
 pub fn record_many(project_root: &Path, observations: &[(&str, bool)]) {
+    record_many_with_lock_budget(project_root, observations, LOCK_RETRY_BUDGET);
+}
+
+fn record_many_with_lock_budget(
+    project_root: &Path,
+    observations: &[(&str, bool)],
+    lock_retry_budget: Duration,
+) {
     if observations.is_empty() {
         return;
     }
@@ -195,7 +203,7 @@ pub fn record_many(project_root: &Path, observations: &[(&str, bool)]) {
     let Ok(lock) = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)) else {
         return;
     };
-    if !umadev_state::fs::try_lock_exclusive_bounded(&lock, LOCK_RETRY_BUDGET)
+    if !umadev_state::fs::try_lock_exclusive_bounded(&lock, lock_retry_budget)
         .is_ok_and(|acquired| acquired)
     {
         return;
@@ -495,13 +503,17 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let held = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)).unwrap();
         fs2::FileExt::lock_exclusive(&held).unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(5));
-            drop(held);
+        let root = tmp.path().to_path_buf();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let recorder = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            record_many_with_lock_budget(&root, &[("class:build", true)], Duration::from_secs(5));
         });
 
-        record(tmp.path(), "class:build", true);
-        release.join().unwrap();
+        ready_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        drop(held);
+        recorder.join().unwrap();
 
         let value = load(tmp.path())
             .kinds
