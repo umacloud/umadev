@@ -26,8 +26,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::trust::TrustMode;
@@ -38,6 +38,10 @@ pub const STATS_FILE: &str = ".umadev/acceptance-stats.json";
 const MAX_STATS_BYTES: usize = 2 * 1024 * 1024;
 const STATS_FILENAME: &str = "acceptance-stats.json";
 const LOCK_FILENAME: &str = "acceptance-stats.lock";
+/// Keep telemetry off the user's critical path while tolerating the short lock
+/// hand-off window between two healthy UmaDev processes. A permanently busy
+/// writer is still skipped after this small, hard bound.
+const LOCK_RETRY_BUDGET: Duration = Duration::from_millis(25);
 
 /// Minimum number of recorded attempts for a kind before its rate is TRUSTED.
 /// Below this the rate is statistically meaningless, so [`FirstPassStats::rate`]
@@ -145,14 +149,32 @@ pub fn load(project_root: &Path) -> FirstPassStats {
     serde_json::from_str::<FirstPassStats>(&text).unwrap_or_default()
 }
 
-/// Record one verified cheap-path proposal for `kind`, merging into the
-/// persisted aggregate (read-modify-write) and atomically rewriting the file.
+/// Record one verified cheap-path proposal for `kind`.
 ///
-/// Serialised by a process-wide lock so two concurrent recorders (e.g. parallel
-/// steps) can't clobber each other's read-modify-write. FAIL-OPEN throughout: a
-/// missing dir, an unreadable file, or a write error is swallowed — recording is
-/// pure telemetry and must NEVER block or fail the build.
+/// This is the single-observation convenience wrapper around [`record_many`].
 pub fn record(project_root: &Path, kind: &str, first_pass: bool) {
+    record_many(project_root, &[(kind, first_pass)]);
+}
+
+/// Record one verified proposal under every supplied dimension in ONE durable
+/// read-modify-write transaction.
+///
+/// A step contributes both a seat dimension and a route-class dimension. Those
+/// counters must advance together: writing them through separate transactions
+/// allowed a transient lock/file-system hand-off to persist one dimension and
+/// silently lose the other. This batch boundary makes the observation atomic.
+///
+/// Serialised by a process-wide lock so concurrent recorders can't clobber each
+/// other's read-modify-write. The advisory OS lock also coordinates independent
+/// UmaDev processes. Its acquisition retries only for a tiny, hard-bounded
+/// window so a normal lock hand-off does not drop telemetry while a wedged
+/// process can never delay the run materially. FAIL-OPEN throughout: a missing
+/// dir, unreadable file, busy lock past the bound, or write error is swallowed —
+/// recording is telemetry and never changes the build outcome.
+pub fn record_many(project_root: &Path, observations: &[(&str, bool)]) {
+    if observations.is_empty() {
+        return;
+    }
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK
         .lock()
@@ -167,18 +189,22 @@ pub fn record(project_root: &Path, kind: &str, first_pass: bool) {
     let Ok(dir) = umadev_state::fs::ensure_real_child_dir(&root, ".umadev") else {
         return;
     };
-    // The in-process mutex above covers parallel steps, while this advisory OS lock also
-    // serializes independent UmaDev processes. Telemetry is strictly best-effort: if another
-    // process owns the lock, skip this sample instead of ever delaying the user's run.
+    // The in-process mutex above covers parallel steps, while this advisory OS
+    // lock serializes independent UmaDev processes. Tolerate only a normal,
+    // millisecond-scale hand-off; never wait unboundedly on an unhealthy peer.
     let Ok(lock) = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)) else {
         return;
     };
-    if lock.try_lock_exclusive().is_err() {
+    if !umadev_state::fs::try_lock_exclusive_bounded(&lock, LOCK_RETRY_BUDGET)
+        .is_ok_and(|acquired| acquired)
+    {
         return;
     }
 
     let mut stats = load(&root);
-    stats.observe(kind, first_pass);
+    for (kind, first_pass) in observations {
+        stats.observe(kind, *first_pass);
+    }
 
     let Ok(body) = serde_json::to_string_pretty(&stats) else {
         return;
@@ -340,6 +366,58 @@ mod tests {
     }
 
     #[test]
+    fn one_step_persists_its_seat_and_class_dimensions_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let seat = seat_kind("frontend-engineer");
+        let class = class_kind("build");
+        record_many(
+            tmp.path(),
+            &[(seat.as_str(), false), (class.as_str(), false)],
+        );
+
+        let stats = load(tmp.path());
+        assert_eq!(
+            stats.kinds.get(&seat).copied(),
+            Some(KindStat {
+                attempts: 1,
+                first_pass: 0,
+            })
+        );
+        assert_eq!(
+            stats.kinds.get(&class).copied(),
+            Some(KindStat {
+                attempts: 1,
+                first_pass: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn concurrent_step_observations_never_lose_or_split_dimensions() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::sync::Arc::new(tmp.path().to_path_buf());
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let root = std::sync::Arc::clone(&root);
+            workers.push(std::thread::spawn(move || {
+                record_many(
+                    &root,
+                    &[("seat:frontend-engineer", true), ("class:build", true)],
+                );
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let stats = load(&root);
+        for kind in ["seat:frontend-engineer", "class:build"] {
+            let value = stats.kinds.get(kind).copied().expect("dimension recorded");
+            assert_eq!((value.attempts, value.first_pass), (8, 8), "{kind}");
+        }
+    }
+
+    #[test]
     fn fail_open_on_a_corrupt_file() {
         let tmp = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
@@ -399,7 +477,7 @@ mod tests {
         let dir = tmp.path().join(".umadev");
         std::fs::create_dir(&dir).unwrap();
         let held = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)).unwrap();
-        held.lock_exclusive().unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
 
         let started = std::time::Instant::now();
         record(tmp.path(), "class:build", true);
@@ -408,6 +486,29 @@ mod tests {
             "best-effort telemetry must skip a contended sample"
         );
         assert_eq!(load(tmp.path()), FirstPassStats::default());
+    }
+
+    #[test]
+    fn a_transient_cross_process_lock_handoff_does_not_drop_the_sample() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&dir).unwrap();
+        let held = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            drop(held);
+        });
+
+        record(tmp.path(), "class:build", true);
+        release.join().unwrap();
+
+        let value = load(tmp.path())
+            .kinds
+            .get("class:build")
+            .copied()
+            .expect("the hand-off should complete inside the bounded retry window");
+        assert_eq!((value.attempts, value.first_pass), (1, 1));
     }
 
     #[test]

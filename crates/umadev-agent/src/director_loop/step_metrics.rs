@@ -17,11 +17,18 @@ pub(super) fn record_step_first_pass(
     step: &plan_state::PlanStep,
     first_pass: bool,
 ) {
-    for kind in [
+    let kinds = [
         crate::first_pass::seat_kind(step.seat.role_id()),
         crate::first_pass::class_kind(route.class.as_str()),
-    ] {
-        crate::first_pass::record(&options.project_root, &kind, first_pass);
+    ];
+    crate::first_pass::record_many(
+        &options.project_root,
+        &[
+            (kinds[0].as_str(), first_pass),
+            (kinds[1].as_str(), first_pass),
+        ],
+    );
+    for kind in kinds {
         // Surface the running rate so the signal is visible (only once a kind has
         // crossed the trusted min-sample threshold). Pure observation.
         if let Some(rate) = crate::first_pass::first_pass_rate(&options.project_root, &kind) {

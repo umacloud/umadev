@@ -26,8 +26,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
-use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::router::{RouteClass, RoutePlan};
@@ -39,6 +39,7 @@ pub const STATS_FILE: &str = ".umadev/sizing-calibration.json";
 const MAX_STATS_BYTES: usize = 2 * 1024 * 1024;
 const STATS_FILENAME: &str = "sizing-calibration.json";
 const LOCK_FILENAME: &str = "sizing-calibration.lock";
+const LOCK_RETRY_BUDGET: Duration = Duration::from_millis(25);
 
 /// Minimum recorded runs for a route-class before its calibration is TRUSTED. Below
 /// this the over/under-size fractions are statistically meaningless, so
@@ -241,9 +242,10 @@ pub fn load(project_root: &Path) -> SizingStats {
 /// (read-modify-write) and atomically rewriting the file.
 ///
 /// Serialised by a process-wide lock so two concurrent recorders can't clobber each
-/// other's read-modify-write. FAIL-OPEN throughout: a missing dir, an unreadable file,
-/// or a write error is swallowed — recording is pure telemetry and must NEVER block or
-/// fail a run.
+/// other's read-modify-write. The cross-process lock tolerates a normal,
+/// millisecond-scale hand-off but has a hard wait bound. FAIL-OPEN throughout: a
+/// missing dir, unreadable file, busy lock past the bound, or write error is swallowed
+/// — recording is telemetry and never changes the run outcome.
 pub fn record(project_root: &Path, class: &str, predicted: SizeRank, actual: SizeRank) {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK
@@ -262,9 +264,9 @@ pub fn record(project_root: &Path, class: &str, predicted: SizeRank, actual: Siz
     let Ok(lock) = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)) else {
         return;
     };
-    // Calibration is advisory telemetry. A concurrent UmaDev process must never delay the
-    // actual task: a busy store simply drops this sample and a later run will add another.
-    if lock.try_lock_exclusive().is_err() {
+    if !umadev_state::fs::try_lock_exclusive_bounded(&lock, LOCK_RETRY_BUDGET)
+        .is_ok_and(|acquired| acquired)
+    {
         return;
     }
 
@@ -375,6 +377,12 @@ mod tests {
     use crate::router::{Budget, Depth};
     use tempfile::TempDir;
 
+    fn persist_fixture(root: &Path, stats: &SizingStats) {
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        let body = serde_json::to_vec_pretty(stats).unwrap();
+        std::fs::write(root.join(STATS_FILE), body).unwrap();
+    }
+
     /// A minimal [`RoutePlan`] for a (class, depth) — only the fields the calibration
     /// reads matter; the rest are filler.
     fn route(class: RouteClass, depth: Depth) -> RoutePlan {
@@ -422,10 +430,11 @@ mod tests {
         // recorded MIN_SAMPLES times → the class systematically under-sizes → nudge
         // heavier. The default size for that class is bumped one step up.
         let tmp = TempDir::new().unwrap();
-        let r = route(RouteClass::Build, Depth::Fast); // predicted Light
+        let mut stats = SizingStats::default();
         for _ in 0..MIN_SAMPLES {
-            record_route(tmp.path(), &r, SizeRank::Heavy); // actual heavy → under
+            stats.observe("build", SizeRank::Light, SizeRank::Heavy);
         }
+        persist_fixture(tmp.path(), &stats);
         assert_eq!(
             sizing_calibration(tmp.path(), "build"),
             Some(SizingAdjustment::Heavier),
@@ -445,10 +454,11 @@ mod tests {
         // recorded MIN_SAMPLES times → the class systematically over-sizes → nudge
         // lighter, and the default size drops one step.
         let tmp = TempDir::new().unwrap();
-        let r = route(RouteClass::Build, Depth::Deep); // predicted Heavy
+        let mut stats = SizingStats::default();
         for _ in 0..MIN_SAMPLES {
-            record_route(tmp.path(), &r, SizeRank::Trivial); // actual trivial → over
+            stats.observe("build", SizeRank::Heavy, SizeRank::Trivial);
         }
+        persist_fixture(tmp.path(), &stats);
         assert_eq!(
             sizing_calibration(tmp.path(), "build"),
             Some(SizingAdjustment::Lighter),
@@ -464,10 +474,11 @@ mod tests {
     fn calibration_is_none_below_min_samples() {
         // Under-sizing every time, but fewer than MIN_SAMPLES runs → no trusted signal.
         let tmp = TempDir::new().unwrap();
-        let r = route(RouteClass::QuickEdit, Depth::Fast); // predicted Light
+        let mut stats = SizingStats::default();
         for _ in 0..(MIN_SAMPLES - 1) {
-            record_route(tmp.path(), &r, SizeRank::Heavy);
+            stats.observe("quick_edit", SizeRank::Light, SizeRank::Heavy);
         }
+        persist_fixture(tmp.path(), &stats);
         assert_eq!(
             sizing_calibration(tmp.path(), "quick_edit"),
             None,
@@ -486,12 +497,13 @@ mod tests {
         // 2 under + 2 over + 1 match over 5 runs: neither direction dominates / clears
         // the threshold → no nudge (the misses are noise, not a systematic bias).
         let tmp = TempDir::new().unwrap();
-        let r = route(RouteClass::Build, Depth::Fast); // predicted Light
-        record_route(tmp.path(), &r, SizeRank::Heavy); // under
-        record_route(tmp.path(), &r, SizeRank::Heavy); // under
-        record_route(tmp.path(), &r, SizeRank::Trivial); // over
-        record_route(tmp.path(), &r, SizeRank::Trivial); // over
-        record_route(tmp.path(), &r, SizeRank::Light); // match
+        let mut stats = SizingStats::default();
+        stats.observe("build", SizeRank::Light, SizeRank::Heavy); // under
+        stats.observe("build", SizeRank::Light, SizeRank::Heavy); // under
+        stats.observe("build", SizeRank::Light, SizeRank::Trivial); // over
+        stats.observe("build", SizeRank::Light, SizeRank::Trivial); // over
+        stats.observe("build", SizeRank::Light, SizeRank::Light); // match
+        persist_fixture(tmp.path(), &stats);
         assert_eq!(sizing_calibration(tmp.path(), "build"), None);
     }
 
@@ -573,7 +585,7 @@ mod tests {
         let dir = tmp.path().join(".umadev");
         std::fs::create_dir(&dir).unwrap();
         let held = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)).unwrap();
-        held.lock_exclusive().unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
 
         let started = std::time::Instant::now();
         record(tmp.path(), "build", SizeRank::Light, SizeRank::Heavy);
@@ -585,6 +597,29 @@ mod tests {
     }
 
     #[test]
+    fn a_transient_cross_process_lock_handoff_does_not_drop_the_sample() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&dir).unwrap();
+        let held = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            drop(held);
+        });
+
+        record(tmp.path(), "build", SizeRank::Light, SizeRank::Heavy);
+        release.join().unwrap();
+
+        let value = load(tmp.path())
+            .classes
+            .get("build")
+            .copied()
+            .expect("the hand-off should complete inside the bounded retry window");
+        assert_eq!((value.samples, value.under, value.over), (1, 1, 0));
+    }
+
+    #[test]
     fn advisory_does_not_change_a_specific_runs_route_or_floor() {
         // The deterministic floor must NOT consult the calibration: even with a strong
         // OVER-size signal for the `build` class on disk, the router's `for_run` floor
@@ -593,10 +628,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let req = "做一个完整的电商网站,带账号、商品、购物车、支付和后台管理";
         let baseline = crate::router::for_run(req);
-        let r = route(RouteClass::Build, Depth::Deep);
+        let mut stats = SizingStats::default();
         for _ in 0..(MIN_SAMPLES * 2) {
-            record_route(tmp.path(), &r, SizeRank::Trivial); // hammer an over-size signal
+            stats.observe("build", SizeRank::Heavy, SizeRank::Trivial);
         }
+        persist_fixture(tmp.path(), &stats);
         assert_eq!(
             sizing_calibration(tmp.path(), "build"),
             Some(SizingAdjustment::Lighter),
@@ -640,16 +676,13 @@ mod tests {
     #[test]
     fn summary_lists_only_trusted_classes() {
         let tmp = TempDir::new().unwrap();
-        let heavy_under = route(RouteClass::Build, Depth::Fast); // predicted Light
+        let mut stats = SizingStats::default();
         for _ in 0..MIN_SAMPLES {
-            record_route(tmp.path(), &heavy_under, SizeRank::Heavy); // under → trusted
+            stats.observe("build", SizeRank::Light, SizeRank::Heavy);
         }
         // A different class with too few samples stays untrusted.
-        record_route(
-            tmp.path(),
-            &route(RouteClass::Debug, Depth::Fast),
-            SizeRank::Heavy,
-        );
+        stats.observe("debug", SizeRank::Light, SizeRank::Heavy);
+        persist_fixture(tmp.path(), &stats);
         let lines = summary(tmp.path());
         assert_eq!(
             lines.len(),

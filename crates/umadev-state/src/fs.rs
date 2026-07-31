@@ -28,6 +28,32 @@ pub fn lock_error_is_contention(error: &std::io::Error) -> bool {
     }
 }
 
+/// Try to acquire an exclusive advisory file lock for at most `timeout`.
+///
+/// This is the shared cross-platform primitive for tiny best-effort stores:
+/// ordinary lock hand-offs are retried instead of losing an update, while a
+/// stuck peer can delay the caller only by the explicit hard bound. `Ok(false)`
+/// means the whole bound was spent on genuine contention; any other lock error
+/// remains distinguishable as `Err`.
+pub fn try_lock_exclusive_bounded(
+    file: &File,
+    timeout: std::time::Duration,
+) -> std::io::Result<bool> {
+    let started = std::time::Instant::now();
+    loop {
+        match fs2::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return Ok(true),
+            Err(error) if lock_error_is_contention(&error) => {
+                if started.elapsed() >= timeout {
+                    return Ok(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[must_use]
 pub fn metadata_is_real_dir(meta: &fs::Metadata) -> bool {
     if !meta.file_type().is_dir() {
