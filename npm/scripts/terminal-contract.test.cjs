@@ -4,8 +4,11 @@ const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const http = require('node:http');
+const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
+const { EventEmitter } = require('node:events');
+const { PassThrough } = require('node:stream');
 const test = require('node:test');
 
 const {
@@ -17,6 +20,16 @@ const {
   runSelfUpdate,
   linuxLibcFromEvidence,
   registryLatestVersion,
+  sweepAbandonedStagingDirs,
+  ABANDONED_STAGING_MIN_AGE_MS,
+  ensureModelCacheDirectory,
+  downloadTo,
+  MAX_MODEL_REDIRECTS,
+  versionAtLeast,
+  acquireModelDownloadLock,
+  releaseModelDownloadLock,
+  modelDownloadTempPath,
+  MODEL_DOWNLOAD_LOCK_NAME,
 } = require('../umadev/bin/cli.js');
 
 const PLATFORM_LEAVES = {
@@ -113,6 +126,19 @@ test('terminal contract: EPERM guidance names lock holders and exact repair', ()
   }
 });
 
+test('terminal contract: updater follows strict SemVer precedence', () => {
+  assert.equal(versionAtLeast('1.0.71-beta.1', '1.0.71'), false);
+  assert.equal(versionAtLeast('1.0.71', '1.0.71-beta.99'), true);
+  assert.equal(versionAtLeast('1.0.71-beta.2', '1.0.71-beta.11'), false);
+  assert.equal(versionAtLeast('1.0.71-beta.11', '1.0.71-beta.2'), true);
+  assert.equal(versionAtLeast('1.0.71-1', '1.0.71-alpha'), false);
+  assert.equal(versionAtLeast('1.0.71-alpha', '1.0.71-alpha.1'), false);
+  assert.equal(versionAtLeast('1.0.71+local.2', '1.0.71+build.9'), true);
+  assert.equal(versionAtLeast('1.0.72-rc.1', '1.0.71'), true);
+  assert.equal(versionAtLeast('1.0.071', '1.0.71'), false);
+  assert.equal(versionAtLeast('1.0.071', '1.0.071'), true);
+});
+
 test('terminal contract: an oversized registry response cannot hang update', async (t) => {
   const server = http.createServer((_request, response) => {
     response.writeHead(200, { 'content-type': 'application/json' });
@@ -141,6 +167,263 @@ test('terminal contract: an oversized registry response cannot hang update', asy
     ),
   ]);
   assert.equal(result, null);
+});
+
+test('terminal contract: updater cleanup preserves fresh package-manager staging', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev-staging-cleanup-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const nodeModules = path.join(root, 'node_modules');
+  const packageRoot = path.join(nodeModules, 'umadev');
+  const fresh = path.join(nodeModules, '.umadev-FreshTxn');
+  const stale = path.join(nodeModules, '.umadev-StaleTxn');
+  const unrelated = path.join(nodeModules, '.another-package-StaleTxn');
+  for (const directory of [packageRoot, fresh, stale, unrelated]) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+  const now = Date.now();
+  const old = new Date(now - ABANDONED_STAGING_MIN_AGE_MS - 60_000);
+  fs.utimesSync(stale, old, old);
+  fs.utimesSync(unrelated, old, old);
+
+  assert.equal(sweepAbandonedStagingDirs(packageRoot, now), 1);
+  assert.equal(fs.existsSync(fresh), true, 'a fresh/possibly active transaction was deleted');
+  assert.equal(fs.existsSync(stale), false, 'a conservatively stale UmaDev staging dir remains');
+  assert.equal(fs.existsSync(unrelated), true, 'cleanup crossed into another package');
+});
+
+test('terminal contract: concurrent model download lock is bounded and recoverable', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev-model-lock-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const first = await acquireModelDownloadLock(dir, { waitMs: 100, pollMs: 10 });
+  t.after(() => releaseModelDownloadLock(first));
+  const ownerPath = path.join(dir, MODEL_DOWNLOAD_LOCK_NAME, 'owner.json');
+  const ownerBefore = fs.readFileSync(ownerPath, 'utf8');
+
+  await assert.rejects(
+    acquireModelDownloadLock(dir, { waitMs: 100, pollMs: 10 }),
+    /another UmaDev process is downloading/,
+  );
+  assert.equal(fs.readFileSync(ownerPath, 'utf8'), ownerBefore, 'an active lock was replaced');
+  releaseModelDownloadLock(first);
+
+  const afterRelease = await acquireModelDownloadLock(dir, { waitMs: 100, pollMs: 10 });
+  releaseModelDownloadLock(afterRelease);
+
+  const exited = spawn(process.execPath, ['-e', 'process.exit(0)'], { stdio: 'ignore' });
+  const deadPid = exited.pid;
+  await new Promise((resolve, reject) => {
+    exited.once('exit', resolve);
+    exited.once('error', reject);
+  });
+  const stalePath = path.join(dir, MODEL_DOWNLOAD_LOCK_NAME);
+  fs.mkdirSync(stalePath);
+  fs.writeFileSync(
+    path.join(stalePath, 'owner.json'),
+    `${JSON.stringify({ pid: deadPid, token: 'stale', startedAt: new Date().toISOString() })}\n`,
+  );
+  const recovered = await acquireModelDownloadLock(dir, { waitMs: 500, pollMs: 10 });
+  assert.notEqual(recovered.token, 'stale');
+  releaseModelDownloadLock(recovered);
+});
+
+test('terminal contract: model cache directories must not be symlinks or junctions', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev-model-cache-root-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const ordinary = path.join(root, 'ordinary', '.umadev', 'embed-model');
+  fs.mkdirSync(path.dirname(path.dirname(ordinary)), { recursive: true });
+  assert.equal(ensureModelCacheDirectory(ordinary), ordinary);
+
+  const externalRoot = path.join(root, 'external-root');
+  const linkedRootParent = path.join(root, 'linked-root-parent');
+  const linkedRoot = path.join(linkedRootParent, '.umadev');
+  fs.mkdirSync(externalRoot);
+  fs.mkdirSync(linkedRootParent);
+  try {
+    fs.symlinkSync(externalRoot, linkedRoot, process.platform === 'win32' ? 'junction' : 'dir');
+  } catch (error) {
+    if (process.platform === 'win32' && error && error.code === 'EPERM') {
+      t.skip('Windows runner did not grant directory junction creation');
+      return;
+    }
+    throw error;
+  }
+  assert.throws(
+    () => ensureModelCacheDirectory(path.join(linkedRoot, 'embed-model')),
+    /refusing linked or non-directory model cache path/,
+  );
+
+  const linkedLeafRoot = path.join(root, 'linked-leaf-parent', '.umadev');
+  const externalLeaf = path.join(root, 'external-leaf');
+  fs.mkdirSync(linkedLeafRoot, { recursive: true });
+  fs.mkdirSync(externalLeaf);
+  fs.symlinkSync(
+    externalLeaf,
+    path.join(linkedLeafRoot, 'embed-model'),
+    process.platform === 'win32' ? 'junction' : 'dir',
+  );
+  assert.throws(
+    () => ensureModelCacheDirectory(path.join(linkedLeafRoot, 'embed-model')),
+    /refusing linked or non-directory model cache path/,
+  );
+});
+
+test('terminal contract: concurrent model transfers never share a part path', () => {
+  const destination = path.join(os.tmpdir(), 'umadev-model-cache', 'model.safetensors');
+  const first = modelDownloadTempPath(destination);
+  const second = modelDownloadTempPath(destination);
+  assert.notEqual(first, second);
+  assert.ok(first.startsWith(`${destination}.part.${process.pid}.`));
+  assert.ok(second.startsWith(`${destination}.part.${process.pid}.`));
+});
+
+function fakeHttpsRequest(responseFactory, callback) {
+  const request = new EventEmitter();
+  request.setTimeout = () => request;
+  request.destroy = (error) => {
+    if (error) queueMicrotask(() => request.emit('error', error));
+  };
+  queueMicrotask(() => callback(responseFactory()));
+  return request;
+}
+
+test('terminal contract: model download rejects a declared oversized body', async (t) => {
+  const original = https.get;
+  https.get = (_url, _options, callback) =>
+    fakeHttpsRequest(() => {
+      const response = new PassThrough();
+      response.statusCode = 200;
+      response.headers = { 'content-length': '9' };
+      return response;
+    }, callback);
+  t.after(() => { https.get = original; });
+
+  await assert.rejects(
+    downloadTo(
+      'https://github.com/umacloud/umadev/releases/download/v1/config.json',
+      path.join(os.tmpdir(), `umadev-oversized-${process.pid}`),
+      false,
+      '',
+      null,
+      8,
+    ),
+    /exceeds 8 bytes/,
+  );
+});
+
+test('terminal contract: model download bounds a chunked body without Content-Length', async (t) => {
+  const original = https.get;
+  const destination = path.join(os.tmpdir(), `umadev-chunked-${process.pid}-${Date.now()}`);
+  https.get = (_url, _options, callback) =>
+    fakeHttpsRequest(() => {
+      const response = new PassThrough();
+      response.statusCode = 200;
+      response.headers = {};
+      queueMicrotask(() => response.end(Buffer.alloc(9)));
+      return response;
+    }, callback);
+  t.after(() => {
+    https.get = original;
+    fs.rmSync(destination, { force: true });
+    fs.rmSync(`${destination}.part`, { force: true });
+  });
+
+  await assert.rejects(
+    downloadTo(
+      'https://github.com/umacloud/umadev/releases/download/v1/config.json',
+      destination,
+      false,
+      '',
+      null,
+      8,
+    ),
+    /exceeds 8 bytes/,
+  );
+});
+
+test('terminal contract: model download refuses symlink temp and destination paths', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev-model-symlink-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const protectedFile = path.join(root, 'protected.txt');
+  const destination = path.join(root, 'config.json');
+  const forcedTemp = path.join(root, 'forced.part');
+  fs.writeFileSync(protectedFile, 'do-not-touch');
+  try {
+    fs.symlinkSync(protectedFile, forcedTemp, 'file');
+  } catch (error) {
+    if (process.platform === 'win32' && error && error.code === 'EPERM') {
+      t.skip('Windows runner did not grant symlink creation');
+      return;
+    }
+    throw error;
+  }
+
+  const original = https.get;
+  https.get = (_url, _options, callback) =>
+    fakeHttpsRequest(() => {
+      const response = new PassThrough();
+      response.statusCode = 200;
+      response.headers = { 'content-length': '2' };
+      queueMicrotask(() => response.end('{}'));
+      return response;
+    }, callback);
+  t.after(() => { https.get = original; });
+
+  await assert.rejects(
+    downloadTo(
+      'https://github.com/umacloud/umadev/releases/download/v1/config.json',
+      destination,
+      false,
+      '',
+      null,
+      8,
+      0,
+      Date.now() + 1000,
+      forcedTemp,
+    ),
+    /EEXIST/,
+  );
+  assert.equal(fs.readFileSync(protectedFile, 'utf8'), 'do-not-touch');
+
+  fs.rmSync(forcedTemp, { force: true });
+  fs.symlinkSync(protectedFile, destination, 'file');
+  await assert.rejects(
+    downloadTo(
+      'https://github.com/umacloud/umadev/releases/download/v1/config.json',
+      destination,
+      false,
+      '',
+      null,
+      8,
+    ),
+    /refusing to replace non-regular model cache entry/,
+  );
+  assert.equal(fs.readFileSync(protectedFile, 'utf8'), 'do-not-touch');
+});
+
+test('terminal contract: model download redirect chain is bounded', async (t) => {
+  const original = https.get;
+  let requests = 0;
+  https.get = (url, _options, callback) =>
+    fakeHttpsRequest(() => {
+      requests += 1;
+      const response = new PassThrough();
+      response.statusCode = 302;
+      response.headers = { location: url };
+      return response;
+    }, callback);
+  t.after(() => { https.get = original; });
+
+  await assert.rejects(
+    downloadTo(
+      'https://github.com/umacloud/umadev/releases/download/v1/model.safetensors',
+      path.join(os.tmpdir(), `umadev-redirect-${process.pid}`),
+      false,
+      '',
+    ),
+    /too many model download redirects/,
+  );
+  assert.equal(requests, MAX_MODEL_REDIRECTS + 1);
 });
 
 test(

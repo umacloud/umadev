@@ -13,9 +13,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 same-file = "1"
+fs2 = { workspace = true }
+getrandom = { workspace = true }
+cap-std = "4.0.2"
+cap-fs-ext = "4.0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"

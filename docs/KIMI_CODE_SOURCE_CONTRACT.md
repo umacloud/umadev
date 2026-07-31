@@ -7,27 +7,27 @@ wrapper.
 
 ## Audited source baseline
 
-- package: `@moonshot-ai/kimi-code@0.29.1`
-- release tag: `@moonshot-ai/kimi-code@0.29.1`
-- commit: `f4c3967a417a539372eadab6c809d27b8a14c005`
-- ACP adapter: `@moonshot-ai/kimi-acp-adapter@0.3.5`
+- source version: `@moonshot-ai/kimi-code@0.31.0`
+- source-audited commit: `17dfd49768f753a4f0fe97d8e7d3317dab560575`
+- real npm artifact tested on Linux/macOS/Windows: `@moonshot-ai/kimi-code@0.31.0`
+- release tag for that artifact: `@moonshot-ai/kimi-code@0.31.0`
+- ACP adapter: `@moonshot-ai/kimi-acp-adapter@0.3.6`
 - ACP SDK declared by upstream: `@agentclientprotocol/sdk@^0.23.0`
 - machine entrypoint: `kimi acp`
 
-The fixed commit and source markers are checked by
+The fixed source commit and markers are checked by
 `crates/umadev-host/tests/kimi_source_drift.rs` locally and by the
 `kimi-source-contract` CI job. This is a drift alarm, not a runtime allowlist:
 every official Kimi Code version is accepted, and optional controls are derived
 from the live session's advertised `configOptions`.
 
-The `0.28.1` to `0.29.1` audit found the ACP implementation byte-identical:
-session creation/resume/load/list, model and mode controls, permissions,
-cancellation, streaming tool events and terminal-owned login retain the same
-wire contract. The adapter package bump is dependency-only. Kimi's internal
-external-hook registration changed from a mutable decision object to an event
-veto API; UmaDev's source fixture follows that semantic change, while the ACP
-transport and UmaDev's runtime version-independent capability negotiation are
-unchanged.
+The audit through `0.31.0` covers session creation/resume/load/list, model,
+thinking and mode controls, permissions, cancellation, streaming tool events,
+native skills and terminal-owned login. Kimi's internal external-hook
+registration changed from a mutable decision object to an event veto API;
+UmaDev's source fixture follows that semantic change, while the ACP transport
+and UmaDev's runtime version-independent capability negotiation remain
+version-independent.
 
 The separate `kimi-published-contract` CI matrix installs that audited npm
 package on Linux, macOS, and Windows, launches its real `kimi acp` entrypoint

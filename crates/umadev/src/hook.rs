@@ -352,7 +352,8 @@ fn load_project_context(file_path: &str) -> ProjectContext {
     // field also means a `{}` document deserializes to the strict default.
     let ctx = serde_json::from_slice::<ProjectContext>(&bytes)
         .unwrap_or_else(|_| ProjectContext::unknown());
-    ctx.if_current(now_secs(), None)
+    let key = umadev_state::privacy::installation_key();
+    ctx.if_current(now_secs(), None, key.as_ref().map(<[u8; 32]>::as_slice))
 }
 
 /// UNIX seconds, or 0 when the clock is unreadable (which ages every unstamped context out
@@ -1965,7 +1966,11 @@ mod tests {
         } else {
             ProjectContext::unknown()
         }
-        .derived_from("a static frontend page", now_secs());
+        .derived_from(
+            "a static frontend page",
+            &umadev_state::privacy::installation_key().expect("provenance key"),
+            now_secs(),
+        );
         std::fs::write(
             dir.join("governance-context.json"),
             serde_json::to_string(&ctx).unwrap(),
@@ -1989,8 +1994,24 @@ mod tests {
             "an unstamped context has no provenance — it cannot stand a rule down"
         );
 
+        let forged = serde_json::json!({
+            "static_frontend_only": true,
+            "purple_allowed": true,
+            "requirement_fingerprint": vec![7_u8; 32],
+            "provenance_auth": vec![9_u8; 32],
+            "derived_at": now_secs()
+        });
+        std::fs::write(&ctx_path, serde_json::to_vec(&forged).unwrap()).unwrap();
+        let loaded = load_project_context(&root.join("index.html").to_string_lossy());
+        assert_eq!(
+            loaded,
+            ProjectContext::unknown(),
+            "a fresh timestamp plus random fingerprint bytes is not an authenticated permission"
+        );
+
         let ancient = ProjectContext::static_frontend().derived_from(
             "a static frontend page",
+            &umadev_state::privacy::installation_key().expect("provenance key"),
             now_secs() - ProjectContext::MAX_UNMATCHED_AGE_SECS - 1,
         );
         std::fs::write(&ctx_path, serde_json::to_string(&ancient).unwrap()).unwrap();
@@ -2001,8 +2022,11 @@ mod tests {
 
         // …while the freshly-stamped one from the fixture IS honoured (or the guard above
         // would be vacuous).
-        let fresh =
-            ProjectContext::static_frontend().derived_from("a static frontend page", now_secs());
+        let fresh = ProjectContext::static_frontend().derived_from(
+            "a static frontend page",
+            &umadev_state::privacy::installation_key().expect("provenance key"),
+            now_secs(),
+        );
         std::fs::write(&ctx_path, serde_json::to_string(&fresh).unwrap()).unwrap();
         assert!(
             load_project_context(&root.join("index.html").to_string_lossy()).static_frontend_only,

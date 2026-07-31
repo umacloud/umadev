@@ -17,6 +17,7 @@ const MANAGED_END: &str = "<!-- umadev:project:end -->";
 const PROJECT_DISCOVERY_DEPTH: usize = 2;
 const MAX_DISCOVERED_FILES: usize = 4_000;
 const MAX_SOURCE_FILES: usize = 10_000;
+const MAX_INIT_MANAGED_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
 /// Whether initialization found a pre-existing project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,7 +281,7 @@ fn ensure_manifest(
         warnings.push("umadev.yaml is a symlink; it was not followed or replaced".to_string());
         return Ok((SpecManifest::read_from(root).unwrap_or(requested), path));
     }
-    match fs::read_to_string(&path) {
+    match crate::bounded_fs::read_utf8_beneath(root, &path, MAX_INIT_MANAGED_TEXT_BYTES) {
         Ok(existing) => {
             if options.force_manifest {
                 if existing == requested_yaml {
@@ -349,28 +350,29 @@ fn ensure_guidance(
         ));
         return;
     }
-    let existing = match fs::read_to_string(&path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let body = format!("{}\n{}\n", header.trim_end(), block.trim_end());
-            match umadev_state::fs::write_new_private(&path, body.as_bytes()) {
-                Ok(()) => created.push(name.to_string()),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    preserved.push(name.to_string());
-                    warnings.push(format!(
-                        "{name} appeared during init; preserved without replacing it"
-                    ));
+    let existing =
+        match crate::bounded_fs::read_utf8_beneath(root, &path, MAX_INIT_MANAGED_TEXT_BYTES) {
+            Ok(body) => body,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let body = format!("{}\n{}\n", header.trim_end(), block.trim_end());
+                match umadev_state::fs::write_new_private(&path, body.as_bytes()) {
+                    Ok(()) => created.push(name.to_string()),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        preserved.push(name.to_string());
+                        warnings.push(format!(
+                            "{name} appeared during init; preserved without replacing it"
+                        ));
+                    }
+                    Err(error) => warnings.push(format!("could not create {name}: {error}")),
                 }
-                Err(error) => warnings.push(format!("could not create {name}: {error}")),
+                return;
             }
-            return;
-        }
-        Err(error) => {
-            preserved.push(name.to_string());
-            warnings.push(format!("could not read {name}; preserved: {error}"));
-            return;
-        }
-    };
+            Err(error) => {
+                preserved.push(name.to_string());
+                warnings.push(format!("could not read {name}; preserved: {error}"));
+                return;
+            }
+        };
     let merged = match upsert_managed_block(&existing, block) {
         Ok(body) => body,
         Err(reason) => {
@@ -459,15 +461,16 @@ fn ensure_gitignore(
         warnings.push(".gitignore is a symlink; preserved without following it".to_string());
         return;
     }
-    let (existing, existed) = match fs::read_to_string(&path) {
-        Ok(body) => (body, true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (String::new(), false),
-        Err(error) => {
-            preserved.push(".gitignore".to_string());
-            warnings.push(format!("could not read .gitignore; preserved: {error}"));
-            return;
-        }
-    };
+    let (existing, existed) =
+        match crate::bounded_fs::read_utf8_beneath(root, &path, MAX_INIT_MANAGED_TEXT_BYTES) {
+            Ok(body) => (body, true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (String::new(), false),
+            Err(error) => {
+                preserved.push(".gitignore".to_string());
+                warnings.push(format!("could not read .gitignore; preserved: {error}"));
+                return;
+            }
+        };
     let missing = ENTRIES
         .iter()
         .filter(|entry| !gitignore_covers(&existing, entry))
@@ -633,13 +636,7 @@ fn detect_stacks(files: &[PathBuf]) -> Vec<String> {
 }
 
 fn detect_package_stacks(path: &Path, stacks: &mut BTreeSet<String>) {
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
-    };
-    if metadata.len() > 1_048_576 {
-        return;
-    }
-    let Ok(body) = fs::read_to_string(path) else {
+    let Ok(body) = crate::bounded_fs::read_utf8(path, 1024 * 1024) else {
         return;
     };
     let lower = body.to_ascii_lowercase();
@@ -1124,5 +1121,30 @@ mod tests {
         let report = initialize_project(temp.path(), &forced).unwrap();
         assert_eq!(report.effective_slug(), "generated");
         assert!(report.updated.contains(&"umadev.yaml".to_string()));
+    }
+
+    #[test]
+    fn oversized_user_owned_init_files_are_preserved_without_being_loaded() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in ["AGENTS.md", ".gitignore", "umadev.yaml"] {
+            std::fs::File::create(temp.path().join(name))
+                .unwrap()
+                .set_len((MAX_INIT_MANAGED_TEXT_BYTES + 1) as u64)
+                .unwrap();
+        }
+
+        let report = initialize_project(temp.path(), &ProjectInitOptions::new("demo")).unwrap();
+
+        for name in ["AGENTS.md", ".gitignore", "umadev.yaml"] {
+            assert_eq!(
+                std::fs::metadata(temp.path().join(name)).unwrap().len(),
+                (MAX_INIT_MANAGED_TEXT_BYTES + 1) as u64,
+                "init must preserve oversized user-owned {name}"
+            );
+            assert!(
+                report.warnings.iter().any(|warning| warning.contains(name)),
+                "init should explain why {name} was preserved"
+            );
+        }
     }
 }

@@ -1,7 +1,6 @@
 //! Durable lifecycle for UmaDev-owned agent tasks.
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,9 +19,13 @@ const MAX_ARTIFACTS: usize = 64;
 const MAX_BLOCKERS: usize = 32;
 const SCOPE_SCHEMA_VERSION: u8 = 1;
 const ENTRY_TASK_ID: &str = "entry";
+const MAX_EVENT_BYTES: u64 = 1024 * 1024;
+const MAX_POINTER_BYTES: u64 = 8 * 1024;
+const MAX_JOURNAL_EVENTS: u64 = 16_384;
+const MAX_JOURNAL_DIRECTORY_ENTRIES: usize = 20_000;
+const MAX_POINTER_DIRECTORY_ENTRIES: usize = 4_096;
 
 static RUN_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a task may mutate the workspace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,7 +266,8 @@ struct TaskEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ScopedRunPointer {
     version: u8,
-    scope_sha256: String,
+    #[serde(alias = "scope_sha256")]
+    scope_fingerprint: String,
     run_id: String,
     created_at: String,
 }
@@ -287,10 +291,103 @@ enum TaskEventBody {
 /// Append-only, replayable ledger for one run's agent tasks.
 #[derive(Debug)]
 pub struct AgentTaskLedger {
+    project_root: PathBuf,
     root: PathBuf,
     run_id: String,
     sequence: u64,
     tasks: BTreeMap<String, AgentTaskRecord>,
+}
+
+fn canonical_project_root(project_root: &Path) -> std::io::Result<PathBuf> {
+    let root = std::fs::canonicalize(project_root)?;
+    if !umadev_state::fs::real_dir(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "project root is not a real directory",
+        ));
+    }
+    Ok(root)
+}
+
+fn existing_real_dir(path: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if umadev_state::fs::metadata_is_real_dir(&metadata) => Ok(path.to_path_buf()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed task path is not a real directory",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn managed_task_parent(project_root: &Path, create: bool) -> std::io::Result<PathBuf> {
+    let root = canonical_project_root(project_root)?;
+    let state = if create {
+        umadev_state::fs::ensure_real_child_dir(&root, ".umadev")?
+    } else {
+        existing_real_dir(&root.join(".umadev"))?
+    };
+    if create {
+        umadev_state::fs::ensure_real_child_dir(&state, "agent-tasks")
+    } else {
+        existing_real_dir(&state.join("agent-tasks"))
+    }
+}
+
+fn managed_run_dir(project_root: &Path, run_id: &str, create: bool) -> std::io::Result<PathBuf> {
+    let parent = managed_task_parent(project_root, create)?;
+    if create {
+        umadev_state::fs::ensure_real_child_dir(&parent, run_id)
+    } else {
+        existing_real_dir(&parent.join(run_id))
+    }
+}
+
+fn bounded_directory_paths(dir: &Path, max_entries: usize) -> std::io::Result<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(dir)?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        if paths.len() >= max_entries {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "managed task directory exceeds its entry limit",
+            ));
+        }
+        if let Ok(entry) = entry {
+            paths.push(entry.path());
+        }
+    }
+    Ok(paths)
+}
+
+fn scoped_pointer_filename(pointer: &ScopedRunPointer) -> String {
+    format!(
+        "scope-{}-{}.json",
+        &pointer.scope_fingerprint[..pointer.scope_fingerprint.len().min(20)],
+        pointer.run_id
+    )
+}
+
+fn scoped_pointer_is_valid(path: &Path, pointer: &ScopedRunPointer) -> bool {
+    pointer.version == SCOPE_SCHEMA_VERSION
+        && pointer.scope_fingerprint.len() == 64
+        && pointer
+            .scope_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && validate_id("run id", &pointer.run_id).is_ok()
+        && chrono::DateTime::parse_from_rfc3339(&pointer.created_at).is_ok()
+        && path.file_name().and_then(|name| name.to_str())
+            == Some(scoped_pointer_filename(pointer).as_str())
+}
+
+fn read_scoped_pointer(path: &Path) -> Option<ScopedRunPointer> {
+    if !umadev_state::fs::real_file(path) {
+        return None;
+    }
+    let bytes = umadev_state::fs::read_bounded(path, MAX_POINTER_BYTES).ok()?;
+    let pointer: ScopedRunPointer = serde_json::from_slice(&bytes).ok()?;
+    scoped_pointer_is_valid(path, &pointer).then_some(pointer)
 }
 
 impl AgentTaskLedger {
@@ -302,34 +399,29 @@ impl AgentTaskLedger {
         project_root: &Path,
         scope_key: &str,
     ) -> Result<Option<Self>, TaskLifecycleError> {
-        let scope_sha256 = hex_digest(scope_key.as_bytes());
-        let parent = project_root.join(".umadev").join("agent-tasks");
-        let prefix = format!("scope-{}-", &scope_sha256[..20]);
-        let mut pointers = match std::fs::read_dir(&parent) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| name.starts_with(&prefix))
-                        && path
-                            .extension()
-                            .is_some_and(|extension| extension == "json")
-                })
-                .filter_map(|path| {
-                    let pointer =
-                        serde_json::from_slice::<ScopedRunPointer>(&std::fs::read(&path).ok()?)
-                            .ok()?;
-                    (pointer.version == SCOPE_SCHEMA_VERSION
-                        && pointer.scope_sha256 == scope_sha256
-                        && validate_id("run id", &pointer.run_id).is_ok())
-                    .then_some(pointer)
-                })
-                .collect::<Vec<_>>(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        let Some(scope_fingerprint) = private_scope_fingerprint(scope_key) else {
+            return Ok(None);
+        };
+        let parent = match managed_task_parent(project_root, false) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        let prefix = format!("scope-{}-", &scope_fingerprint[..20]);
+        let paths = bounded_directory_paths(&parent, MAX_POINTER_DIRECTORY_ENTRIES)?;
+        let mut pointers = paths
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+            })
+            .filter_map(|path| read_scoped_pointer(&path))
+            .filter(|pointer| pointer.scope_fingerprint == scope_fingerprint)
+            .collect::<Vec<_>>();
         pointers.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         for pointer in pointers {
             let ledger = Self::open(project_root, pointer.run_id)?;
@@ -352,23 +444,26 @@ impl AgentTaskLedger {
 
     /// Open the newest resumable ledger for a logical plan, or mint a new run.
     ///
-    /// Only a SHA-256 digest of `scope_key` is persisted. This keeps requirements
-    /// and credentials out of pointer metadata while making a gate/crash resume
-    /// deterministic across processes.
+    /// Only an installation-keyed HMAC of `scope_key` is persisted. This keeps requirements
+    /// and credentials out of pointer metadata without making short scopes dictionary-testable,
+    /// while preserving deterministic crash resume across processes on this installation.
     pub fn open_scoped(project_root: &Path, scope_key: &str) -> Result<Self, TaskLifecycleError> {
-        let scope_sha256 = hex_digest(scope_key.as_bytes());
         if let Some(ledger) = Self::open_scoped_existing(project_root, scope_key)? {
             return Ok(ledger);
         }
-        let parent = project_root.join(".umadev").join("agent-tasks");
-        let run_id = mint_agent_run_id(&scope_sha256);
+        let Some(scope_fingerprint) = private_scope_fingerprint(scope_key) else {
+            // No persistent privacy key means no safe cross-run lookup. The current run still
+            // gets a normal durable ledger; it simply publishes no enumerable scope pointer.
+            return Self::open(project_root, mint_agent_run_id("private-unscoped"));
+        };
+        let run_id = mint_agent_run_id(&scope_fingerprint);
         let pointer = ScopedRunPointer {
             version: SCOPE_SCHEMA_VERSION,
-            scope_sha256,
+            scope_fingerprint,
             run_id: run_id.clone(),
             created_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         };
-        publish_scoped_pointer(&parent, &pointer)?;
+        publish_scoped_pointer(project_root, &pointer)?;
         Self::open(project_root, run_id)
     }
 
@@ -379,11 +474,13 @@ impl AgentTaskLedger {
     ) -> Result<Self, TaskLifecycleError> {
         let run_id = run_id.into();
         validate_id("run id", &run_id)?;
+        let project_root = canonical_project_root(project_root)?;
         let root = project_root
             .join(".umadev")
             .join("agent-tasks")
             .join(&run_id);
         let mut ledger = Self {
+            project_root,
             root,
             run_id,
             sequence: 0,
@@ -797,58 +894,84 @@ impl AgentTaskLedger {
     }
 
     fn append(&self, event: &TaskEvent) -> Result<(), TaskLifecycleError> {
-        std::fs::create_dir_all(&self.root)?;
+        if event.sequence == 0 || event.sequence > MAX_JOURNAL_EVENTS {
+            return Err(TaskLifecycleError::CorruptJournal(
+                "task event limit exceeded".to_string(),
+            ));
+        }
+        let root = managed_run_dir(&self.project_root, &self.run_id, true)?;
+        if root != self.root {
+            return Err(TaskLifecycleError::CorruptJournal(
+                "managed run directory changed identity".to_string(),
+            ));
+        }
         let body = serde_json::to_vec(event)?;
-        let name = format!("{:020}.json", event.sequence);
-        let final_path = self.root.join(&name);
-        if final_path.exists() {
-            return Err(TaskLifecycleError::CorruptJournal(format!(
-                "duplicate event sequence {}",
-                event.sequence
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_EVENT_BYTES {
+            return Err(TaskLifecycleError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "task event exceeds its byte limit",
             )));
         }
-        let temp_sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp_path = self.root.join(format!(
-            ".{name}.{}.{}.tmp",
-            std::process::id(),
-            temp_sequence
-        ));
-        let mut temp = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)?;
-        temp.write_all(&body)?;
-        temp.sync_all()?;
-        drop(temp);
-        let publish = std::fs::hard_link(&temp_path, &final_path);
-        let _ = std::fs::remove_file(&temp_path);
-        publish?;
+        let name = format!("{:020}.json", event.sequence);
+        let final_path = root.join(&name);
+        match std::fs::symlink_metadata(&final_path) {
+            Ok(_) => {
+                return Err(TaskLifecycleError::CorruptJournal(format!(
+                    "duplicate event sequence {}",
+                    event.sequence
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let relative = Path::new(".umadev")
+            .join("agent-tasks")
+            .join(&self.run_id)
+            .join(&name);
+        umadev_state::fs::publish_new_private_beneath(&self.project_root, &relative, &body, false)?;
         Ok(())
     }
 
     fn load(&mut self) -> Result<(), TaskLifecycleError> {
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
+        let root = match managed_run_dir(&self.project_root, &self.run_id, false) {
+            Ok(root) => root,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
-        let mut paths = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
+        if root != self.root {
+            return Err(TaskLifecycleError::CorruptJournal(
+                "managed run directory changed identity".to_string(),
+            ));
+        }
+        let mut paths = bounded_directory_paths(&root, MAX_JOURNAL_DIRECTORY_ENTRIES)?
+            .into_iter()
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
             .collect::<Vec<_>>();
+        if u64::try_from(paths.len()).unwrap_or(u64::MAX) > MAX_JOURNAL_EVENTS {
+            return Err(TaskLifecycleError::CorruptJournal(
+                "task journal exceeds its event limit".to_string(),
+            ));
+        }
         paths.sort();
         for path in paths {
-            let event: TaskEvent =
-                serde_json::from_slice(&std::fs::read(&path)?).map_err(|error| {
-                    TaskLifecycleError::CorruptJournal(format!("{}: {error}", path.display()))
-                })?;
+            let bytes = umadev_state::fs::read_bounded(&path, MAX_EVENT_BYTES)?;
+            let event: TaskEvent = serde_json::from_slice(&bytes).map_err(|error| {
+                TaskLifecycleError::CorruptJournal(format!("{}: {error}", path.display()))
+            })?;
             self.apply_loaded(event, &path)?;
         }
         Ok(())
     }
 
     fn apply_loaded(&mut self, event: TaskEvent, path: &Path) -> Result<(), TaskLifecycleError> {
+        let expected_name = format!("{:020}.json", event.sequence);
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            return Err(TaskLifecycleError::CorruptJournal(format!(
+                "{} does not match event sequence {}",
+                path.display(),
+                event.sequence
+            )));
+        }
         if event.version != SCHEMA_VERSION || event.run_id != self.run_id {
             return Err(TaskLifecycleError::CorruptJournal(format!(
                 "{} has an incompatible schema or run id",
@@ -1193,13 +1316,14 @@ pub fn recent_agent_runs(project_root: &Path, limit: usize) -> Vec<AgentRunSnaps
     if limit == 0 {
         return Vec::new();
     }
-    let parent = project_root.join(".umadev").join("agent-tasks");
-    let Ok(entries) = std::fs::read_dir(parent) else {
+    let Ok(parent) = managed_task_parent(project_root, false) else {
         return Vec::new();
     };
-    let mut pointers = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
+    let Ok(paths) = bounded_directory_paths(&parent, MAX_POINTER_DIRECTORY_ENTRIES) else {
+        return Vec::new();
+    };
+    let mut pointers = paths
+        .into_iter()
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -1208,14 +1332,7 @@ pub fn recent_agent_runs(project_root: &Path, limit: usize) -> Vec<AgentRunSnaps
                     .extension()
                     .is_some_and(|extension| extension == "json")
         })
-        .filter_map(|path| {
-            serde_json::from_slice::<ScopedRunPointer>(&std::fs::read(path).ok()?).ok()
-        })
-        .filter(|pointer| {
-            pointer.version == SCOPE_SCHEMA_VERSION
-                && pointer.scope_sha256.len() == 64
-                && validate_id("run id", &pointer.run_id).is_ok()
-        })
+        .filter_map(|path| read_scoped_pointer(&path))
         .collect::<Vec<_>>();
     pointers.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     let mut seen = std::collections::BTreeSet::new();
@@ -1348,34 +1465,36 @@ fn state_id(state: AgentTaskState) -> &'static str {
 }
 
 fn publish_scoped_pointer(
-    parent: &Path,
+    project_root: &Path,
     pointer: &ScopedRunPointer,
 ) -> Result<(), TaskLifecycleError> {
-    std::fs::create_dir_all(parent)?;
-    let final_path = parent.join(format!(
-        "scope-{}-{}.json",
-        &pointer.scope_sha256[..20],
-        pointer.run_id
-    ));
-    let temp_sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp_path = parent.join(format!(
-        ".scope-{}.{}.tmp",
-        std::process::id(),
-        temp_sequence
-    ));
-    let mut temp = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp_path)?;
-    temp.write_all(&serde_json::to_vec(pointer)?)?;
-    temp.sync_all()?;
-    drop(temp);
-    let publish = std::fs::hard_link(&temp_path, &final_path);
-    let _ = std::fs::remove_file(&temp_path);
-    publish?;
+    let parent = managed_task_parent(project_root, true)?;
+    let final_path = parent.join(scoped_pointer_filename(pointer));
+    match std::fs::symlink_metadata(&final_path) {
+        Ok(_) => {
+            return Err(TaskLifecycleError::CorruptJournal(format!(
+                "duplicate scoped run pointer {}",
+                final_path.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let body = serde_json::to_vec(pointer)?;
+    if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_POINTER_BYTES {
+        return Err(TaskLifecycleError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "scoped run pointer exceeds its byte limit",
+        )));
+    }
+    let relative = Path::new(".umadev")
+        .join("agent-tasks")
+        .join(scoped_pointer_filename(pointer));
+    umadev_state::fs::publish_new_private_beneath(project_root, &relative, &body, false)?;
     Ok(())
 }
 
+#[cfg(test)]
 fn hex_digest(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
@@ -1384,6 +1503,32 @@ fn hex_digest(bytes: &[u8]) -> String {
         let _ = write!(encoded, "{byte:02x}");
     }
     encoded
+}
+
+fn private_scope_fingerprint(scope_key: &str) -> Option<String> {
+    let key = task_scope_privacy_key()?;
+    Some(hex_bytes(&umadev_governance::privacy_fingerprint(
+        &key,
+        b"umadev.agent-task-scope.v1",
+        scope_key.as_bytes(),
+    )))
+}
+
+#[cfg(not(test))]
+fn task_scope_privacy_key() -> Option<[u8; 32]> {
+    umadev_state::privacy::installation_key()
+}
+
+// Unit tests must never create or read the developer's real `~/.umadev/provenance.key`.
+// A process-local injected key exercises deterministic resume without ambient filesystem state.
+#[cfg(test)]
+fn task_scope_privacy_key() -> Option<[u8; 32]> {
+    static TEST_KEY: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    *TEST_KEY.get_or_init(umadev_state::privacy::ephemeral_key)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn clip(value: &str, max_chars: usize) -> String {
@@ -1700,6 +1845,69 @@ mod tests {
     }
 
     #[test]
+    fn noncanonical_or_oversized_journal_events_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ledger = ledger(temp.path());
+        ledger
+            .queue("work", None, "worker", "build", AgentTaskMode::Writer)
+            .unwrap();
+        let root = temp.path().join(".umadev/agent-tasks/run-1");
+        let canonical = root.join("00000000000000000001.json");
+        std::fs::rename(&canonical, root.join("1.json")).unwrap();
+        assert!(matches!(
+            AgentTaskLedger::open(temp.path(), "run-1"),
+            Err(TaskLifecycleError::CorruptJournal(_))
+        ));
+
+        std::fs::remove_file(root.join("1.json")).unwrap();
+        std::fs::File::create(&canonical)
+            .unwrap()
+            .set_len(MAX_EVENT_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            AgentTaskLedger::open(temp.path(), "run-1"),
+            Err(TaskLifecycleError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_journal_never_follows_managed_directory_or_event_links() {
+        use std::os::unix::fs::symlink;
+
+        let linked_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(linked_root.path().join(".umadev")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(
+            outside.path(),
+            linked_root.path().join(".umadev/agent-tasks"),
+        )
+        .unwrap();
+        assert!(AgentTaskLedger::open(linked_root.path(), "run-1").is_err());
+        assert!(AgentTaskLedger::open_scoped(linked_root.path(), "scope").is_err());
+        assert!(recent_agent_runs(linked_root.path(), 10).is_empty());
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut ledger = ledger(temp.path());
+        ledger
+            .queue("work", None, "worker", "build", AgentTaskMode::Writer)
+            .unwrap();
+        let event = temp
+            .path()
+            .join(".umadev/agent-tasks/run-1/00000000000000000001.json");
+        let external_event = outside.path().join("external-event.json");
+        let original = std::fs::read(&event).unwrap();
+        std::fs::write(&external_event, &original).unwrap();
+        std::fs::remove_file(&event).unwrap();
+        symlink(&external_event, &event).unwrap();
+
+        assert!(AgentTaskLedger::open(temp.path(), "run-1").is_err());
+        assert_eq!(std::fs::read(external_event).unwrap(), original);
+    }
+
+    #[test]
     fn ids_and_artifact_paths_are_confined() {
         let temp = tempfile::tempdir().unwrap();
         assert!(AgentTaskLedger::open(temp.path(), "../escape").is_err());
@@ -1795,6 +2003,11 @@ mod tests {
             .collect::<String>();
         assert!(!pointer_text.contains(concat!("sk-", "scope-secret-value")));
         assert!(!pointer_text.contains("feature checkout"));
+        assert!(pointer_text.contains("scope_fingerprint"));
+        assert!(
+            !pointer_text.contains(&hex_digest(scope.as_bytes())),
+            "the old unkeyed SHA-256 was dictionary-testable and must not be persisted"
+        );
     }
 
     #[test]

@@ -185,8 +185,16 @@ impl SpecManifest {
     pub fn write_to(&self, workspace: &Path, force: bool) -> io::Result<PathBuf> {
         fs::create_dir_all(workspace)?;
         let path = workspace.join(MANIFEST_FILENAME);
+        let canonical_workspace = fs::canonicalize(workspace)?;
+        if !umadev_state::fs::real_dir(&canonical_workspace) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "workspace is not a real directory",
+            ));
+        }
+        let managed_path = canonical_workspace.join(MANIFEST_FILENAME);
         let body = self.to_yaml();
-        match fs::symlink_metadata(&path) {
+        match fs::symlink_metadata(&managed_path) {
             Ok(metadata) if !umadev_state::fs::metadata_is_real_file(&metadata) => {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -213,7 +221,7 @@ impl SpecManifest {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        fs::write(&path, body)?;
+        umadev_state::fs::atomic_write(&managed_path, body.as_bytes())?;
         Ok(path)
     }
 }

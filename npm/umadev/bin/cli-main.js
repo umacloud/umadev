@@ -221,6 +221,24 @@ function homeDir() {
 function modelTargetDir() {
   return path.join(homeDir(), '.umadev', 'embed-model');
 }
+function assertOrdinaryDirectory(directory) {
+  const stat = fs.lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`refusing linked or non-directory model cache path: ${directory}`);
+  }
+}
+function ensureModelCacheDirectory(dir) {
+  const cacheRoot = path.dirname(dir);
+  for (const directory of [cacheRoot, dir]) {
+    try {
+      fs.mkdirSync(directory, { mode: 0o700 });
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') throw error;
+    }
+    assertOrdinaryDirectory(directory);
+  }
+  return dir;
+}
 const MODEL_FILES = ['config.json', 'tokenizer.json', 'model.safetensors'];
 // A real multilingual-e5-small safetensors is tens of MB (fp16 ~224MB, f32
 // ~448MB); anything under 1 MiB is a truncated/garbage download, never a real
@@ -298,6 +316,12 @@ function safetensorsLooksValid(filePath) {
 // the P3 self-heal fix (a non-empty corrupt cache previously healed never).
 function modelFileValid(dir, name) {
   const filePath = path.join(dir, name);
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return false;
+  } catch (_) {
+    return false;
+  }
   if (name.endsWith('.safetensors')) return safetensorsLooksValid(filePath);
   if (name.endsWith('.json')) return jsonModelFileLooksValid(filePath);
   try {
@@ -309,14 +333,156 @@ function modelFileValid(dir, name) {
 function modelPresent(dir) {
   return MODEL_FILES.every((f) => modelFileValid(dir, f));
 }
+const MODEL_DOWNLOAD_LOCK_NAME = '.umadev-model-download.lock';
+const MODEL_DOWNLOAD_LOCK_WAIT_MS = 30000;
+const MODEL_DOWNLOAD_LOCK_POLL_MS = 250;
+const MODEL_DOWNLOAD_LOCK_OWNER_GRACE_MS = 30000;
+
+function readModelLockState(lockPath) {
+  try {
+    const stat = fs.lstatSync(lockPath);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      return { stat, owner: null, unsafe: true };
+    }
+    let owner = null;
+    try {
+      owner = JSON.parse(fs.readFileSync(path.join(lockPath, 'owner.json'), 'utf8'));
+    } catch (_) {
+      /* a creator may still be writing owner.json */
+    }
+    return { stat, owner };
+  } catch (_) {
+    return null;
+  }
+}
+
+function modelLockOwnerAlive(owner) {
+  if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) return null;
+  try {
+    process.kill(owner.pid, 0);
+    return true;
+  } catch (error) {
+    if (error && error.code === 'ESRCH') return false;
+    // EPERM means the process exists but is not signalable. Unknown platform
+    // errors are also treated as alive so cleanup can never target an active lock.
+    return true;
+  }
+}
+
+function modelLockIsOrphaned(state, now = Date.now()) {
+  if (!state || state.unsafe) return false;
+  const alive = modelLockOwnerAlive(state.owner);
+  if (alive !== null) return !alive;
+  return now - state.stat.mtimeMs >= MODEL_DOWNLOAD_LOCK_OWNER_GRACE_MS;
+}
+
+function createModelLock(lockPath) {
+  fs.mkdirSync(lockPath);
+  const owner = {
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    token: crypto.randomBytes(16).toString('hex'),
+  };
+  try {
+    fs.writeFileSync(
+      path.join(lockPath, 'owner.json'),
+      `${JSON.stringify(owner)}\n`,
+      { flag: 'wx', mode: 0o600 },
+    );
+  } catch (error) {
+    fs.rmSync(lockPath, { recursive: true, force: true });
+    throw error;
+  }
+  return { lockPath, token: owner.token };
+}
+
+function retireModelLock(lockPath, suffix) {
+  const retired = `${lockPath}.${suffix}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
+  try {
+    fs.renameSync(lockPath, retired);
+  } catch (_) {
+    return false;
+  }
+  try {
+    fs.rmSync(retired, { recursive: true, force: true });
+  } catch (_) {
+    /* the retired unique path cannot block the live lock */
+  }
+  return true;
+}
+
+function tryReclaimModelLock(lockPath) {
+  if (!modelLockIsOrphaned(readModelLockState(lockPath))) return false;
+  const guardPath = `${lockPath}.reclaim`;
+  try {
+    createModelLock(guardPath);
+  } catch (error) {
+    if (!error || error.code !== 'EEXIST') return false;
+    if (modelLockIsOrphaned(readModelLockState(guardPath))) {
+      retireModelLock(guardPath, 'orphan');
+    }
+    return false;
+  }
+  try {
+    // Re-read only after owning the reclaim guard. If another process replaced
+    // the stale lock in the meantime, its live pid prevents us touching it.
+    if (!modelLockIsOrphaned(readModelLockState(lockPath))) return false;
+    return retireModelLock(lockPath, 'orphan');
+  } finally {
+    retireModelLock(guardPath, 'done');
+  }
+}
+
+async function acquireModelDownloadLock(
+  dir,
+  { waitMs = MODEL_DOWNLOAD_LOCK_WAIT_MS, pollMs = MODEL_DOWNLOAD_LOCK_POLL_MS } = {},
+) {
+  ensureModelCacheDirectory(dir);
+  const lockPath = path.join(dir, MODEL_DOWNLOAD_LOCK_NAME);
+  const deadline = Date.now() + Math.max(0, waitMs);
+  for (;;) {
+    try {
+      return createModelLock(lockPath);
+    } catch (error) {
+      if (!error || error.code !== 'EEXIST') throw error;
+    }
+    if (modelPresent(dir)) return null;
+    if (tryReclaimModelLock(lockPath)) continue;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error('another UmaDev process is downloading the vector model');
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, remaining)));
+  }
+}
+
+function releaseModelDownloadLock(lock) {
+  if (!lock) return;
+  const state = readModelLockState(lock.lockPath);
+  if (!state || !state.owner || state.owner.token !== lock.token) return;
+  retireModelLock(lock.lockPath, 'released');
+}
+
+function modelDownloadTempPath(dest) {
+  return `${dest}.part.${process.pid}.${crypto.randomBytes(8).toString('hex')}`;
+}
 // Remove any existing model files (and leftover `.part` temporaries) so a
 // re-download starts from a clean slate — called before re-fetching a cache that
-// failed `modelPresent`. Fail-open: unlink errors are ignored (a fresh download's
-// atomic rename overwrites anyway); never throws.
+// failed `modelPresent`. Final cache entries must be ordinary files: refusing a
+// symlink/device here prevents a cache path from redirecting trusted bytes.
 function clearModelFiles(dir) {
   for (const f of MODEL_FILES) {
+    const destination = path.join(dir, f);
+    try {
+      const stat = fs.lstatSync(destination);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error(`refusing to replace non-regular model cache entry: ${destination}`);
+      }
+      fs.unlinkSync(destination);
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+    }
     for (const p of [
-      path.join(dir, f),
       path.join(dir, f + '.part'),
       path.join(dir, f + '.sha256.download'),
       path.join(dir, f + '.sha256.download.part'),
@@ -324,9 +490,21 @@ function clearModelFiles(dir) {
       try {
         fs.unlinkSync(p);
       } catch (_) {
-        /* missing or locked — the re-download's rename overwrites it */
+        /* missing or locked temporary — unique downloads do not reuse it */
       }
     }
+  }
+  try {
+    const prefixes = MODEL_FILES.flatMap((f) => [
+      `${f}.part.`,
+      `${f}.sha256.download.part.`,
+    ]);
+    for (const entry of fs.readdirSync(dir)) {
+      if (!prefixes.some((prefix) => entry.startsWith(prefix))) continue;
+      try { fs.unlinkSync(path.join(dir, entry)); } catch (_) { /* best effort */ }
+    }
+  } catch (_) {
+    /* directory may not exist yet */
   }
 }
 // Render one frame of the download progress bar (in place, via \r). Block-glyph
@@ -356,6 +534,12 @@ function drawBar(label, got, total, startTime) {
 // bar keeps ticking while bytes flow. The old 120s made a single dead source
 // block for two minutes, times several bases and files.
 const DOWNLOAD_IDLE_TIMEOUT_MS = 20000;
+const DOWNLOAD_TOTAL_TIMEOUT_MS = 15 * 60 * 1000;
+const MAX_MODEL_REDIRECTS = 10;
+const MAX_CHECKSUM_DOWNLOAD_BYTES = 4 * 1024;
+const MAX_CONFIG_DOWNLOAD_BYTES = 1024 * 1024;
+const MAX_TOKENIZER_DOWNLOAD_BYTES = 64 * 1024 * 1024;
+const MAX_SAFETENSORS_DOWNLOAD_BYTES = 512 * 1024 * 1024;
 const OFFICIAL_GITHUB_ASSET_HOSTS = new Set([
   'release-assets.githubusercontent.com',
   'objects.githubusercontent.com',
@@ -386,8 +570,22 @@ function isAllowedCustomModelUrl(raw, origin) {
 
 // Download one URL to `dest`, following redirects (GitHub → CDN), drawing a
 // progress bar when `withBar`. Resolves on success, rejects on any error.
-function downloadTo(url, dest, withBar, label, customOrigin = null) {
+function downloadTo(
+  url,
+  dest,
+  withBar,
+  label,
+  customOrigin = null,
+  maxBytes = MAX_SAFETENSORS_DOWNLOAD_BYTES,
+  redirectCount = 0,
+  deadlineAt = Date.now() + DOWNLOAD_TOTAL_TIMEOUT_MS,
+  tempPath = modelDownloadTempPath(dest),
+) {
   return new Promise((resolve, reject) => {
+    if (redirectCount > MAX_MODEL_REDIRECTS) {
+      reject(new Error(`too many model download redirects (>${MAX_MODEL_REDIRECTS})`));
+      return;
+    }
     const allowed = customOrigin
       ? isAllowedCustomModelUrl(url, customOrigin)
       : isOfficialModelUrl(url);
@@ -395,6 +593,23 @@ function downloadTo(url, dest, withBar, label, customOrigin = null) {
       reject(new Error('refusing model download outside the trusted HTTPS source'));
       return;
     }
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) {
+      reject(new Error('model download total timeout'));
+      return;
+    }
+    let settled = false;
+    let totalTimer = null;
+    const settle = (error) => {
+      if (settled) return;
+      settled = true;
+      if (totalTimer) clearTimeout(totalTimer);
+      if (error) {
+        try { fs.unlinkSync(tempPath); } catch (_) { /* stream may still be closing */ }
+        reject(error);
+      }
+      else resolve();
+    };
     const req = https.get(
       url,
       { headers: { 'User-Agent': 'umadev-cli', Accept: 'application/octet-stream' } },
@@ -402,26 +617,55 @@ function downloadTo(url, dest, withBar, label, customOrigin = null) {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
           const next = new URL(res.headers.location, url).href;
-          downloadTo(next, dest, withBar, label, customOrigin).then(resolve, reject);
+          if (totalTimer) clearTimeout(totalTimer);
+          downloadTo(
+            next,
+            dest,
+            withBar,
+            label,
+            customOrigin,
+            maxBytes,
+            redirectCount + 1,
+            deadlineAt,
+            tempPath,
+          ).then(() => settle(), settle);
           return;
         }
         if (res.statusCode !== 200) {
           res.resume();
-          reject(new Error('HTTP ' + res.statusCode));
+          settle(new Error('HTTP ' + res.statusCode));
           return;
         }
-        const total = parseInt(res.headers['content-length'] || '0', 10);
+        const declared = res.headers['content-length'];
+        const total = declared === undefined ? 0 : Number(declared);
+        if (!Number.isSafeInteger(total) || total < 0) {
+          res.resume();
+          settle(new Error('invalid model download Content-Length'));
+          return;
+        }
+        if (total > maxBytes) {
+          res.resume();
+          settle(new Error(`model download exceeds ${maxBytes} bytes`));
+          return;
+        }
         let got = 0;
         let lastPct = -1;
         let lastDraw = 0;
         const startTime = Date.now();
-        const tmp = dest + '.part';
-        const out = fs.createWriteStream(tmp);
+        const tmp = tempPath;
+        const out = fs.createWriteStream(tmp, { flags: 'wx', mode: 0o600 });
         // Draw the bar at 0% the instant the response starts — on a slow link the
         // first 1% can take a while, and a silent gap reads as "stuck / failed".
         if (withBar && total > 0) drawBar(label, 0, total, startTime);
         res.on('data', (chunk) => {
           got += chunk.length;
+          if (got > maxBytes) {
+            const error = new Error(`model download exceeds ${maxBytes} bytes`);
+            res.destroy(error);
+            out.destroy(error);
+            settle(error);
+            return;
+          }
           if (withBar && total > 0) {
             const now = Date.now();
             const pct = Math.floor((got / total) * 100);
@@ -437,25 +681,40 @@ function downloadTo(url, dest, withBar, label, customOrigin = null) {
         res.pipe(out);
         out.on('finish', () =>
           out.close((e) => {
-            if (e) return reject(e);
+            if (e) return settle(e);
             try {
+              try {
+                const destination = fs.lstatSync(dest);
+                if (!destination.isFile() || destination.isSymbolicLink()) {
+                  throw new Error(`refusing to replace non-regular model cache entry: ${dest}`);
+                }
+              } catch (destinationError) {
+                if (!destinationError || destinationError.code !== 'ENOENT') {
+                  throw destinationError;
+                }
+              }
               fs.renameSync(tmp, dest);
             } catch (er) {
-              return reject(er);
+              return settle(er);
             }
             if (withBar && total > 0) {
               drawBar(label, total, total, startTime);
               process.stderr.write('\n');
             }
-            resolve();
+            settle();
           }),
         );
-        out.on('error', reject);
+        res.on('error', settle);
+        out.on('error', settle);
       },
     );
-    req.on('error', reject);
+    req.on('error', settle);
     req.setTimeout(DOWNLOAD_IDLE_TIMEOUT_MS, () =>
       req.destroy(new Error('idle timeout')),
+    );
+    totalTimer = setTimeout(
+      () => req.destroy(new Error('model download total timeout')),
+      remainingMs,
     );
   });
 }
@@ -514,9 +773,15 @@ async function downloadFile(bases, name, dest, withBar, label) {
         false,
         '',
         customOrigin,
+        MAX_CHECKSUM_DOWNLOAD_BYTES,
       );
       const expected = parseSha256Sidecar(fs.readFileSync(checksumPath, 'utf8'), name);
-      await downloadTo(base + '/' + name, dest, withBar, label, customOrigin);
+      const maxBytes = name === 'config.json'
+        ? MAX_CONFIG_DOWNLOAD_BYTES
+        : name === 'tokenizer.json'
+          ? MAX_TOKENIZER_DOWNLOAD_BYTES
+          : MAX_SAFETENSORS_DOWNLOAD_BYTES;
+      await downloadTo(base + '/' + name, dest, withBar, label, customOrigin, maxBytes);
       const actual = sha256File(dest);
       if (actual !== expected) {
         throw new Error(`SHA-256 mismatch for ${name} (expected ${expected}, got ${actual})`);
@@ -539,6 +804,12 @@ async function downloadFile(bases, name, dest, withBar, label) {
 }
 async function ensureModel() {
   const dir = modelTargetDir();
+  try {
+    ensureModelCacheDirectory(dir);
+  } catch (e) {
+    process.stderr.write(`\n  [提示] 向量模型缓存目录不安全 (${e.message});本次用 BM25 检索。\n\n`);
+    return null;
+  }
   if (modelPresent(dir)) return dir; // already installed & intact — fast path, no network
   let version = '0.0.0';
   try {
@@ -547,8 +818,11 @@ async function ensureModel() {
     /* keep default */
   }
   const bases = releaseBases(version);
+  let downloadLock = null;
   try {
-    fs.mkdirSync(dir, { recursive: true });
+    downloadLock = await acquireModelDownloadLock(dir);
+    if (!downloadLock) return dir;
+    if (modelPresent(dir)) return dir;
     // modelPresent() was false — either absent (first run) or a corrupt/partial
     // cache. Drop any bad or leftover `.part` files first so this fetch self-heals
     // a corrupt download instead of being shadowed by it (P3).
@@ -568,6 +842,7 @@ async function ensureModel() {
       true,
       '下载向量模型',
     );
+    if (!modelPresent(dir)) throw new Error('downloaded model cache did not pass validation');
     process.stderr.write('  本地向量模型就绪 ✓\n\n');
     return dir;
   } catch (e) {
@@ -577,6 +852,8 @@ async function ensureModel() {
         ');本次用 BM25 检索,下次启动重试。\n\n',
     );
     return null;
+  } finally {
+    releaseModelDownloadLock(downloadLock);
   }
 }
 
@@ -789,12 +1066,12 @@ function managerRunnable(mgr) {
   }
 }
 
-// npm stages a replacement by renaming the old package dir to `.<name>-<rand>`
-// and deleting it afterwards. A delete that hit EPERM (see above) leaves that
-// directory behind forever. Sweep the ones belonging to us — they are npm's own
-// abandoned temp dirs, and by the time we run, nothing in them is in use.
-// Fail-open: any error is ignored; a failed sweep must never block an upgrade.
-function sweepAbandonedStagingDirs(pkgRoot) {
+// npm stages a replacement by renaming the old package dir to `.<name>-<rand>`.
+// Another package-manager process can be using a freshly-created directory with
+// exactly that name, so name matching alone is never deletion authority. Only a
+// same-user directory whose mtime is at least one day old is considered abandoned.
+const ABANDONED_STAGING_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+function sweepAbandonedStagingDirs(pkgRoot, now = Date.now()) {
   const roots = [
     {
       root: path.dirname(pkgRoot), // …/node_modules
@@ -815,8 +1092,20 @@ function sweepAbandonedStagingDirs(pkgRoot) {
     }
     for (const e of entries) {
       if (!e.isDirectory() || !staging.test(e.name)) continue;
+      const candidate = path.join(root, e.name);
       try {
-        fs.rmSync(path.join(root, e.name), { recursive: true, force: true });
+        const stat = fs.lstatSync(candidate);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+        if (now - stat.mtimeMs < ABANDONED_STAGING_MIN_AGE_MS) continue;
+        if (
+          process.platform !== 'win32' &&
+          typeof process.getuid === 'function' &&
+          typeof stat.uid === 'number' &&
+          stat.uid !== process.getuid()
+        ) {
+          continue;
+        }
+        fs.rmSync(candidate, { recursive: true, force: true });
         swept += 1;
       } catch (_) {
         /* still locked by another process — leave it, try again next time */
@@ -973,14 +1262,43 @@ async function latestPublishedVersion() {
 // version is never treated as "up to date" unless it is literally identical.
 function versionAtLeast(current, latest) {
   const parse = (v) => {
-    const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(v || '').trim());
-    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+    const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.exec(
+      String(v || '').trim(),
+    );
+    if (!m) return null;
+    const core = m.slice(1, 4);
+    if (core.some((part) => part.length > 1 && part.startsWith('0'))) return null;
+    const prerelease = m[4] ? m[4].split('.') : [];
+    if (
+      prerelease.some(
+        (identifier) => /^\d+$/.test(identifier) && identifier.length > 1 && identifier.startsWith('0'),
+      )
+    ) {
+      return null;
+    }
+    return { core: core.map((part) => BigInt(part)), prerelease };
   };
   const a = parse(current);
   const b = parse(latest);
   if (!a || !b) return String(current) === String(latest);
   for (let i = 0; i < 3; i += 1) {
-    if (a[i] !== b[i]) return a[i] > b[i];
+    if (a.core[i] !== b.core[i]) return a.core[i] > b.core[i];
+  }
+  if (a.prerelease.length === 0 || b.prerelease.length === 0) {
+    return a.prerelease.length === 0;
+  }
+  const count = Math.max(a.prerelease.length, b.prerelease.length);
+  for (let i = 0; i < count; i += 1) {
+    if (a.prerelease[i] === undefined) return false;
+    if (b.prerelease[i] === undefined) return true;
+    const left = a.prerelease[i];
+    const right = b.prerelease[i];
+    if (left === right) continue;
+    const leftNumeric = /^\d+$/.test(left);
+    const rightNumeric = /^\d+$/.test(right);
+    if (leftNumeric && rightNumeric) return BigInt(left) > BigInt(right);
+    if (leftNumeric !== rightNumeric) return !leftNumeric;
+    return left > right;
   }
   return true;
 }
@@ -1265,6 +1583,20 @@ module.exports = {
   platformKey,
   linuxLibcFromEvidence,
   registryLatestVersion,
+  sweepAbandonedStagingDirs,
+  ABANDONED_STAGING_MIN_AGE_MS,
+  ensureModelCacheDirectory,
+  acquireModelDownloadLock,
+  releaseModelDownloadLock,
+  modelDownloadTempPath,
+  MODEL_DOWNLOAD_LOCK_NAME,
+  MODEL_DOWNLOAD_LOCK_WAIT_MS,
+  downloadTo,
+  MAX_MODEL_REDIRECTS,
+  MAX_CHECKSUM_DOWNLOAD_BYTES,
+  MAX_CONFIG_DOWNLOAD_BYTES,
+  MAX_TOKENIZER_DOWNLOAD_BYTES,
+  MAX_SAFETENSORS_DOWNLOAD_BYTES,
   NEEDS_MODEL,
   UPGRADE_COMMANDS,
   REPAIR_COMMANDS,

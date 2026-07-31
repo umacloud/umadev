@@ -302,6 +302,41 @@ pub enum RouteSource {
     DeterministicFallback,
 }
 
+/// Bounded, non-sensitive reason why intent routing used its deterministic fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteFallbackReason {
+    /// No forkable resident model session was available.
+    NoSession,
+    /// The base refused or failed to create the read-only routing child.
+    ForkUnavailable,
+    /// Creating the read-only routing child exceeded the interactive deadline.
+    ForkTimedOut,
+    /// The routing child did not finish its small judgement before the deadline.
+    TurnTimedOut,
+    /// The child finished without a usable response body.
+    EmptyReply,
+    /// The response was not valid typed routing JSON.
+    InvalidReply,
+    /// The response JSON used an unsupported route class.
+    InvalidClass,
+}
+
+impl RouteFallbackReason {
+    /// Stable diagnostic id suitable for UI and audit output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoSession => "no-session",
+            Self::ForkUnavailable => "fork-unavailable",
+            Self::ForkTimedOut => "fork-timeout",
+            Self::TurnTimedOut => "turn-timeout",
+            Self::EmptyReply => "empty-reply",
+            Self::InvalidReply => "invalid-reply",
+            Self::InvalidClass => "invalid-class",
+        }
+    }
+}
+
 /// A typed route together with its decision provenance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RoutedIntent {
@@ -309,6 +344,8 @@ pub struct RoutedIntent {
     pub plan: RoutePlan,
     /// Whether the model or the fail-open fallback decided it.
     pub source: RouteSource,
+    /// Exact bounded fallback cause; absent for a model-authored decision.
+    pub fallback_reason: Option<RouteFallbackReason>,
 }
 
 /// Route ONE turn — produce the typed [`RoutePlan`] the caller drives off.
@@ -421,12 +458,13 @@ pub async fn route_with_context_and_readonly_session(
             RoutedIntent {
                 plan: fallback,
                 source: RouteSource::DeterministicFallback,
+                fallback_reason: Some(RouteFallbackReason::NoSession),
             },
             None,
         );
     };
 
-    let (brain, readonly_session) =
+    let (brain, readonly_session, fallback_reason) =
         consult_route(session, options, requirement, conversation_context).await;
     let Some(brain) = brain else {
         close_readonly_session(readonly_session).await;
@@ -434,6 +472,7 @@ pub async fn route_with_context_and_readonly_session(
             RoutedIntent {
                 plan: fallback,
                 source: RouteSource::DeterministicFallback,
+                fallback_reason: Some(fallback_reason.unwrap_or(RouteFallbackReason::EmptyReply)),
             },
             None,
         );
@@ -444,6 +483,7 @@ pub async fn route_with_context_and_readonly_session(
             RoutedIntent {
                 plan: fallback,
                 source: RouteSource::DeterministicFallback,
+                fallback_reason: Some(RouteFallbackReason::InvalidClass),
             },
             None,
         );
@@ -458,6 +498,7 @@ pub async fn route_with_context_and_readonly_session(
         RoutedIntent {
             plan,
             source: RouteSource::Brain,
+            fallback_reason: None,
         },
         readonly_session,
     )
@@ -680,6 +721,124 @@ fn build_ships_ui(kind: TaskKind, requirement: &str) -> bool {
     }
 }
 
+fn brain_need_matches_scope(kind: TaskKind, seat: Seat, requirement: &str) -> bool {
+    if kind != TaskKind::BackendOnly || !matches!(seat, Seat::UiuxDesigner | Seat::FrontendEngineer)
+    {
+        return true;
+    }
+    let q = requirement.to_lowercase();
+    let frontend_actions = [
+        "修改前端",
+        "改前端",
+        "改动前端",
+        "改動前端",
+        "动前端",
+        "動前端",
+        "调整前端",
+        "調整前端",
+        "更新前端",
+        "实现前端",
+        "實現前端",
+        "开发前端",
+        "開發前端",
+        "修复前端",
+        "修復前端",
+        "重构前端",
+        "重構前端",
+        "新增前端",
+        "补齐前端",
+        "補齊前端",
+        "前端联调",
+        "前端聯調",
+    ];
+    // A nested negation restores write intent: “不是不需要修改前端” and
+    // “不要不修改前端” both require frontend work. Check it before the
+    // exclusion scan so the inner “不需要/不修改前端” is not mistaken for
+    // the user's final intent.
+    let reasserts_frontend = ["不是", "不要", "別", "别"].iter().any(|outer| {
+        ["不需要", "无需", "無需", "无须", "無須", "不必", "不"]
+            .iter()
+            .any(|inner| {
+                frontend_actions
+                    .iter()
+                    .any(|action| q.contains(&format!("{outer}{inner}{action}")))
+            })
+    });
+    let excludes_frontend = !reasserts_frontend
+        && ([
+            "前端保持不变",
+            "前端保持不變",
+            "前端不用改",
+            "前端无需改",
+            "前端無需改",
+            "no frontend changes",
+            "without frontend changes",
+            "frontend unchanged",
+            "leave frontend unchanged",
+        ]
+        .iter()
+        .any(|marker| q.contains(marker))
+            || [
+                "不要",
+                "无需",
+                "無需",
+                "无须",
+                "無須",
+                "不需要",
+                "不必",
+                "不",
+            ]
+            .iter()
+            .any(|negative| {
+                frontend_actions
+                    .iter()
+                    .any(|action| q.contains(&format!("{negative}{action}")))
+            })
+            || ["do not ", "don't ", "no need to "].iter().any(|negative| {
+                [
+                    "modify frontend",
+                    "change frontend",
+                    "update frontend",
+                    "implement frontend",
+                    "build frontend",
+                    "fix frontend",
+                    "refactor frontend",
+                ]
+                .iter()
+                .any(|action| q.contains(&format!("{negative}{action}")))
+            }));
+    if excludes_frontend {
+        return false;
+    }
+    [
+        "前后端",
+        "全栈",
+        "修改前端",
+        "调整前端",
+        "更新前端",
+        "实现前端",
+        "开发前端",
+        "修复前端",
+        "重构前端",
+        "新增前端",
+        "补齐前端",
+        "前端联调",
+        "full-stack",
+        "full stack",
+        "frontend and backend",
+        "backend and frontend",
+        "modify frontend",
+        "update frontend",
+        "change frontend",
+        "implement frontend",
+        "build frontend",
+        "fix frontend",
+        "refactor frontend",
+    ]
+    .iter()
+    .any(|marker| q.contains(marker))
+}
+
 /// A deterministic confidence for the Tier-0 verdict: high at the clear poles
 /// (obvious greeting, obvious greenfield), lower in the ambiguous middle so the
 /// caller can tell the brain consult is worth more there. `0.0..=1.0`.
@@ -893,11 +1052,15 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize;
-    Ok(match serde_json::Value::deserialize(d)? {
+    let value = match serde_json::Value::deserialize(d)? {
         serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0) as f32,
         serde_json::Value::String(s) => s.trim().parse::<f32>().unwrap_or(0.0),
         _ => 0.0,
-    })
+    };
+    // Quoted `"NaN"`/`"inf"` parse successfully as Rust floats. They must not
+    // escape into a public RoutePlan: comparisons and clamp both preserve NaN,
+    // violating the documented 0..=1 confidence invariant.
+    Ok(if value.is_finite() { value } else { 0.0 })
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -1046,7 +1209,11 @@ async fn consult_route(
     _options: &RunOptions,
     requirement: &str,
     conversation_context: &str,
-) -> (Option<BrainRoute>, Option<Box<dyn BaseSession>>) {
+) -> (
+    Option<BrainRoute>,
+    Option<Box<dyn BaseSession>>,
+    Option<RouteFallbackReason>,
+) {
     let context = conversation_context.trim();
     let user = render_router_input(requirement, context);
 
@@ -1054,22 +1221,42 @@ async fn consult_route(
     // deadlines than an advisory critic. Both are separately overridable for a
     // slow local model; timeout remains fail-open to the deterministic fallback.
     let fork = match tokio::time::timeout(route_fork_timeout(), session.fork()).await {
-        Ok(result) => result,
-        Err(_) => Err(SessionError::Start(
-            "intent fork handshake timed out — using deterministic fallback".to_string(),
-        )),
+        Ok(Ok(fork)) => fork,
+        Ok(Err(_)) => return (None, None, Some(RouteFallbackReason::ForkUnavailable)),
+        Err(_) => return (None, None, Some(RouteFallbackReason::ForkTimedOut)),
     };
-    let consult = crate::continuous::ForkConsult::new(fork);
-    let json_text = tokio::time::timeout(
+    let consult = crate::continuous::ForkConsult::new(Ok::<_, SessionError>(fork));
+    let judged = tokio::time::timeout(
         route_turn_timeout(),
         consult.judge_json("router", ROUTER_TRIAGE_SYSTEM, user),
     )
-    .await
-    .ok()
-    .flatten();
+    .await;
     let readonly_session = consult.into_session();
-    let brain = json_text.and_then(|text| serde_json::from_str::<BrainRoute>(&text).ok());
-    (brain, readonly_session)
+    let json_text = match judged {
+        Err(_) => {
+            return (
+                None,
+                readonly_session,
+                Some(RouteFallbackReason::TurnTimedOut),
+            )
+        }
+        Ok(None) => {
+            return (
+                None,
+                readonly_session,
+                Some(RouteFallbackReason::EmptyReply),
+            )
+        }
+        Ok(Some(text)) => text,
+    };
+    match serde_json::from_str::<BrainRoute>(&json_text) {
+        Ok(brain) => (Some(brain), readonly_session, None),
+        Err(_) => (
+            None,
+            readonly_session,
+            Some(RouteFallbackReason::InvalidReply),
+        ),
+    }
 }
 
 /// Route a turn by asking the **borrowed brain** to classify the intent — a single
@@ -1320,7 +1507,7 @@ fn brain_to_route_in_mode(
         let mut seen: HashSet<Seat> = team.iter().copied().collect();
         for n in &brain.needs {
             if let Some(s) = Seat::from_alias(n) {
-                if seen.insert(s) {
+                if brain_need_matches_scope(kind, s, requirement) && seen.insert(s) {
                     team.push(s);
                 }
             }
@@ -1336,7 +1523,11 @@ fn brain_to_route_in_mode(
         scope,
         needs_clarify,
         est_budget: Budget::for_route(class, depth),
-        confidence: brain.confidence.clamp(0.0, 1.0),
+        confidence: if brain.confidence.is_finite() {
+            brain.confidence.clamp(0.0, 1.0)
+        } else {
+            0.0
+        },
     }
 }
 
@@ -1927,6 +2118,10 @@ fn explicit_observation_only_request(requirement: &str) -> bool {
         "report progress",
         "report current progress",
         "report current status",
+        "is everything done",
+        "are all issues fixed",
+        "what remains",
+        "what tasks remain",
         "current progress",
         "current status",
         "what is the current progress",
@@ -1968,6 +2163,14 @@ fn explicit_observation_only_request(requirement: &str) -> bool {
             "匯報當前進度",
             "汇报当前状态",
             "匯報當前狀態",
+            "全部完成了吗",
+            "全部完成了嗎",
+            "所有问题都解决了吗",
+            "所有問題都解決了嗎",
+            "还剩什么任务",
+            "還剩什麼任務",
+            "还有哪些任务",
+            "還有哪些任務",
         ]
         .contains(&compact.as_str())
         || asks_about_mutation;

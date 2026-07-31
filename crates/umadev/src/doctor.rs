@@ -34,6 +34,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use umadev_state::fs::RootedDir;
 
 const MAX_DOCTOR_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_DOCTOR_NOTES_BYTES: u64 = 8 * 1024 * 1024;
@@ -199,14 +200,14 @@ const EMBED_MODEL_CHECK: &str = "local embedding model";
 /// Doctor row name for the Node.js runtime version check.
 const NODE_CHECK: &str = "node.js runtime";
 
-/// The three files a usable local embedding-model directory must hold, matching
-/// `umadev-knowledge`'s local backend.
-const EMBED_MODEL_FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
-
 /// Smallest plausible `model.safetensors`. A real `multilingual-e5-small` is tens
 /// of MB (fp16 ~224MB); anything under 1 MiB is a truncated/garbage download, not
 /// a usable model. Mirrors `umadev-knowledge`'s `MIN_SAFETENSORS_BYTES`.
 const EMBED_MODEL_MIN_SAFETENSORS_BYTES: u64 = 1_048_576;
+const EMBED_MODEL_MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+const EMBED_MODEL_MAX_TOKENIZER_BYTES: u64 = 64 * 1024 * 1024;
+const EMBED_MODEL_MAX_WEIGHTS_BYTES: u64 = 512 * 1024 * 1024;
+const SAFETENSORS_PREFIX_BYTES: u64 = 8;
 
 /// Minimum Node.js major version the npm launcher (`bin/cli.js`) and its `engines`
 /// floor require. Below this the launch shim prints an upgrade notice; the doctor
@@ -224,7 +225,7 @@ fn embed_model_dir() -> Option<PathBuf> {
         .filter(|s| !s.is_empty())
     {
         let p = PathBuf::from(d);
-        if p.is_dir() {
+        if RootedDir::open_no_follow(&p).is_ok() {
             return Some(p);
         }
     }
@@ -233,27 +234,57 @@ fn embed_model_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var("USERPROFILE").ok())
         .filter(|s| !s.is_empty())?;
     let p = PathBuf::from(home).join(".umadev").join("embed-model");
-    p.is_dir().then_some(p)
+    RootedDir::open_no_follow(&p).ok().map(|_| p)
 }
 
-/// Are all three model files present in `dir`, with the weights clearing the size
-/// floor? A cheap filesystem check only — it deliberately does NOT depend on the
-/// candle backend (which is compiled in only under the `vector-local` feature), so
-/// the doctor reports the same answer in every build. Fail-open: any unreadable
-/// path counts as absent.
+/// Mirror the runtime's cheap structural gate without loading the model.
 fn embed_model_present(dir: Option<&Path>) -> bool {
     let Some(dir) = dir else {
         return false;
     };
-    EMBED_MODEL_FILES.iter().all(|name| {
-        let path = dir.join(name);
-        match fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => {
-                !name.ends_with(".safetensors") || meta.len() >= EMBED_MODEL_MIN_SAFETENSORS_BYTES
-            }
-            _ => false,
-        }
-    })
+    let Ok(root) = RootedDir::open_no_follow(dir) else {
+        return false;
+    };
+    json_model_sidecar_present(
+        &root,
+        Path::new("config.json"),
+        EMBED_MODEL_MAX_CONFIG_BYTES,
+    ) && json_model_sidecar_present(
+        &root,
+        Path::new("tokenizer.json"),
+        EMBED_MODEL_MAX_TOKENIZER_BYTES,
+    ) && safetensors_model_present(&root)
+}
+
+fn json_model_sidecar_present(root: &RootedDir, path: &Path, max_bytes: u64) -> bool {
+    let Ok(Some(size)) = root.regular_file_len(path) else {
+        return false;
+    };
+    if size == 0 || size > max_bytes {
+        return false;
+    }
+    root.read_prefix(path, 16)
+        .ok()
+        .and_then(|prefix| prefix.into_iter().find(|byte| !byte.is_ascii_whitespace()))
+        == Some(b'{')
+}
+
+fn safetensors_model_present(root: &RootedDir) -> bool {
+    let path = Path::new("model.safetensors");
+    let Ok(Some(size)) = root.regular_file_len(path) else {
+        return false;
+    };
+    if !(EMBED_MODEL_MIN_SAFETENSORS_BYTES..=EMBED_MODEL_MAX_WEIGHTS_BYTES).contains(&size) {
+        return false;
+    }
+    let Ok(prefix) = root.read_prefix(path, SAFETENSORS_PREFIX_BYTES) else {
+        return false;
+    };
+    let Ok(prefix) = <[u8; 8]>::try_from(prefix) else {
+        return false;
+    };
+    let header_len = u64::from_le_bytes(prefix);
+    header_len > 0 && SAFETENSORS_PREFIX_BYTES.saturating_add(header_len) <= size
 }
 
 /// Turn "is the local model present?" into a doctor row. Present → PASS (full
@@ -274,9 +305,11 @@ fn embed_model_row(present: bool) -> CheckResult {
             status: Status::Warning,
             detail:
                 "not found — knowledge retrieval falls back to keyword-only (BM25). npm installs \
-                 fetch it automatically; for a cargo/manual install, run `umadev update` or place \
+                 fetch it on the next `umadev run`, `umadev quick`, `umadev continue`, `umadev \
+                 redo`, or `umadev revise`; for a cargo/native/manual install, place compatible \
                  config.json + tokenizer.json + model.safetensors under ~/.umadev/embed-model (or \
-                 set UMADEV_EMBED_MODEL_DIR)."
+                 set UMADEV_EMBED_MODEL_DIR). `umadev update` updates UmaDev itself and does not \
+                 install this model."
                     .to_string(),
         }
     }
@@ -1819,12 +1852,15 @@ mod tests {
         let absent = embed_model_row(false);
         assert_eq!(absent.status, Status::Warning);
         assert!(absent.detail.contains("BM25"));
+        assert!(absent.detail.contains("umadev run"));
+        assert!(!absent.detail.contains("run `umadev update`"));
+        assert!(absent.detail.contains("does not install this model"));
         assert!(absent.detail.contains("~/.umadev/embed-model"));
         assert!(absent.detail.contains("UMADEV_EMBED_MODEL_DIR"));
     }
 
     #[test]
-    fn embed_model_present_requires_all_three_and_a_sized_safetensors() {
+    fn embed_model_present_matches_the_runtime_structural_gate() {
         assert!(!embed_model_present(None), "no dir → absent");
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
@@ -1839,13 +1875,57 @@ mod tests {
             "safetensors under the size floor → absent"
         );
 
-        // Clear the floor → present.
+        // Size alone is not enough: an empty safetensors header is corrupt.
+        let weights = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(dir.join("model.safetensors"))
+            .unwrap();
+        weights
+            .set_len(EMBED_MODEL_MIN_SAFETENSORS_BYTES + 16)
+            .unwrap();
+        assert!(!embed_model_present(Some(dir)), "zero header → absent");
+
         fs::write(
             dir.join("model.safetensors"),
-            vec![0u8; usize::try_from(EMBED_MODEL_MIN_SAFETENSORS_BYTES).unwrap() + 16],
+            [
+                2_u64.to_le_bytes().as_slice(),
+                b"{}",
+                &vec![0_u8; usize::try_from(EMBED_MODEL_MIN_SAFETENSORS_BYTES).unwrap()],
+            ]
+            .concat(),
         )
         .unwrap();
-        assert!(embed_model_present(Some(dir)), "all three present + sized");
+        assert!(embed_model_present(Some(dir)), "structurally valid model");
+
+        fs::write(dir.join("config.json"), "not json").unwrap();
+        assert!(!embed_model_present(Some(dir)), "invalid config → absent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embed_model_present_rejects_linked_model_files() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(tmp.path().join("config.json"), "{}").unwrap();
+        fs::write(tmp.path().join("tokenizer.json"), "{}").unwrap();
+        let outside_weights = outside.path().join("model.safetensors");
+        let file = fs::File::create(&outside_weights).unwrap();
+        file.set_len(EMBED_MODEL_MIN_SAFETENSORS_BYTES + 16)
+            .unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&outside_weights)
+            .unwrap();
+        file.write_all(&2_u64.to_le_bytes()).unwrap();
+        symlink(&outside_weights, tmp.path().join("model.safetensors")).unwrap();
+
+        assert!(
+            !embed_model_present(Some(tmp.path())),
+            "the doctor must not pass a model the runtime refuses"
+        );
     }
 
     #[test]

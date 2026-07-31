@@ -380,6 +380,41 @@ pub(crate) fn is_real_file_beneath(root: &Path, path: &Path) -> bool {
     resolve_beneath(root, path, false).is_ok()
 }
 
+/// Create (or validate) a managed directory path below a trusted project root
+/// one component at a time, refusing links/reparse points and `..` escapes.
+///
+/// `create_dir_all` follows an already-present linked ancestor, which lets a
+/// workspace redirect internal state or generated artifacts outside the
+/// project. This helper keeps the project-root alias itself usable, then walks
+/// only real child directories beneath its canonical target.
+pub(crate) fn ensure_real_dir_beneath(root: &Path, relative: &Path) -> io::Result<PathBuf> {
+    let canonical_root = std::fs::canonicalize(root)?;
+    if !umadev_state::fs::real_dir(&canonical_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "project root is not a real directory",
+        ));
+    }
+    let parts = normal_relative_components(relative)?;
+    if parts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed directory path is empty",
+        ));
+    }
+    let mut directory = canonical_root;
+    for part in parts {
+        let name = part.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed directory component is not valid UTF-8",
+            )
+        })?;
+        directory = umadev_state::fs::ensure_real_child_dir(&directory, name)?;
+    }
+    Ok(directory)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +507,17 @@ mod tests {
             root.path(),
             &root.path().join("linked")
         ));
+        assert!(ensure_real_dir_beneath(root.path(), Path::new("linked/child")).is_err());
+        assert!(!outside.path().join("child").exists());
+    }
+
+    #[test]
+    fn managed_directory_creation_is_component_bounded() {
+        let root = tempfile::TempDir::new().unwrap();
+        let created = ensure_real_dir_beneath(root.path(), Path::new(".umadev/audit")).unwrap();
+        assert!(umadev_state::fs::real_dir(&created));
+        assert!(created.starts_with(std::fs::canonicalize(root.path()).unwrap()));
+        assert!(ensure_real_dir_beneath(root.path(), Path::new("../escape")).is_err());
     }
 
     #[test]

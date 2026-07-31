@@ -15,11 +15,10 @@
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE};
-use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokenizers::Tokenizer;
+use umadev_state::fs::RootedDir;
 
 /// Env var pointing at the model directory (must hold `config.json`,
 /// `model.safetensors`, `tokenizer.json`). Set by the npm `bin/cli.js` wrapper
@@ -34,6 +33,25 @@ const SAFETENSORS_PREFIX_BYTES: u64 = 8;
 /// `multilingual-e5-small` `model.safetensors` is tens of MB (fp16 ~224MB, f32
 /// ~448MB); anything smaller is a truncated/garbage download, not a usable model.
 const MIN_SAFETENSORS_BYTES: u64 = 1024 * 1024; // 1 MiB
+const MAX_MODEL_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_MODEL_TOKENIZER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MODEL_WEIGHTS_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_LOCAL_EMBED_BATCH: usize = 128;
+const MAX_LOCAL_EMBED_TEXT_BYTES: usize = 256 * 1024;
+const MAX_LOCAL_EMBED_BATCH_BYTES: usize = 8 * 1024 * 1024;
+
+struct ModelSource {
+    display_path: PathBuf,
+    root: RootedDir,
+}
+
+fn read_model_config(source: &ModelSource) -> std::io::Result<String> {
+    let bytes = source
+        .root
+        .read_bounded(Path::new("config.json"), MAX_MODEL_CONFIG_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
 
 /// Whether a usable local model directory is configured, present on disk, AND
 /// structurally intact. Beyond mere existence, each file is cheaply
@@ -46,7 +64,7 @@ const MIN_SAFETENSORS_BYTES: u64 = 1024 * 1024; // 1 MiB
 /// corrupt cache healed never). Fail-open: never panics.
 #[must_use]
 pub fn is_available() -> bool {
-    let usable = model_dir().is_some_and(|d| model_files_usable(&d));
+    let usable = model_source().is_some_and(|source| model_files_usable(&source));
     if !usable {
         // Honest degrade notice (#2b): a `cargo install` / self-updated user never
         // had the model fetched (only the npm `bin/cli.js` shim downloads it), so
@@ -81,18 +99,31 @@ fn note_keyword_only_once() {
 /// corruption — so only when all three are present but one fails validation is a
 /// one-time "corrupt cache" warning emitted. Fail-open: any problem returns
 /// `false` so the caller drops to BM25.
-fn model_files_usable(dir: &Path) -> bool {
-    let config = dir.join("config.json");
-    let tokenizer = dir.join("tokenizer.json");
-    let weights = dir.join("model.safetensors");
-    if !config.is_file() || !tokenizer.is_file() || !weights.is_file() {
+fn model_files_usable(source: &ModelSource) -> bool {
+    let files = [
+        ("config.json", MAX_MODEL_CONFIG_BYTES),
+        ("tokenizer.json", MAX_MODEL_TOKENIZER_BYTES),
+        ("model.safetensors", MAX_MODEL_WEIGHTS_BYTES),
+    ];
+    if files.iter().any(|(path, max)| {
+        !source
+            .root
+            .regular_file_len(Path::new(path))
+            .ok()
+            .flatten()
+            .is_some_and(|len| len > 0 && len <= *max)
+    }) {
         return false; // absent — normal first-run state, not corruption
     }
-    let intact = json_sidecar_looks_valid(&config)
-        && json_sidecar_looks_valid(&tokenizer)
-        && safetensors_looks_valid(&weights);
+    let intact = json_sidecar_looks_valid(source, Path::new("config.json"), MAX_MODEL_CONFIG_BYTES)
+        && json_sidecar_looks_valid(
+            source,
+            Path::new("tokenizer.json"),
+            MAX_MODEL_TOKENIZER_BYTES,
+        )
+        && safetensors_looks_valid(source, Path::new("model.safetensors"));
     if !intact {
-        warn_corrupt_cache_once(dir);
+        warn_corrupt_cache_once(&source.display_path);
     }
     intact
 }
@@ -104,21 +135,17 @@ fn model_files_usable(dir: &Path) -> bool {
 /// full downstream by [`local_dim`] / [`load_model`], both fail-open on a parse
 /// error. A truncated or binary-garbage file fails the non-empty / leading-brace
 /// check. Fail-open: any read error returns `false`.
-fn json_sidecar_looks_valid(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
+fn json_sidecar_looks_valid(source: &ModelSource, path: &Path, max_bytes: u64) -> bool {
+    let Ok(Some(size)) = source.root.regular_file_len(path) else {
         return false;
     };
-    if meta.len() == 0 {
+    if size == 0 || size > max_bytes {
         return false;
     }
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok(buf) = source.root.read_prefix(path, 16) else {
         return false;
     };
-    let mut buf = [0u8; 16];
-    let Ok(n) = f.read(&mut buf) else {
-        return false;
-    };
-    buf[..n].iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{')
+    buf.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{')
 }
 
 /// Cheap structural validity check for a safetensors file WITHOUT loading it. The
@@ -128,21 +155,19 @@ fn json_sidecar_looks_valid(path: &Path) -> bool {
 /// a ~224–448MB model is never slurped into memory on this hot path. Fail-open:
 /// any read error returns `false` (a file we cannot validate is treated as
 /// unusable, so the caller drops to BM25).
-fn safetensors_looks_valid(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
+fn safetensors_looks_valid(source: &ModelSource, path: &Path) -> bool {
+    let Ok(Some(size)) = source.root.regular_file_len(path) else {
         return false;
     };
-    let size = meta.len();
-    if size < MIN_SAFETENSORS_BYTES {
+    if !(MIN_SAFETENSORS_BYTES..=MAX_MODEL_WEIGHTS_BYTES).contains(&size) {
         return false;
     }
-    let Ok(mut f) = std::fs::File::open(path) else {
+    let Ok(prefix) = source.root.read_prefix(path, SAFETENSORS_PREFIX_BYTES) else {
         return false;
     };
-    let mut prefix = [0u8; 8];
-    if f.read_exact(&mut prefix).is_err() {
+    let Ok(prefix) = <[u8; 8]>::try_from(prefix) else {
         return false;
-    }
+    };
     let header_len = u64::from_le_bytes(prefix);
     // A non-empty header that fits inside the file after its 8-byte length prefix.
     header_len > 0 && SAFETENSORS_PREFIX_BYTES.saturating_add(header_len) <= size
@@ -163,13 +188,16 @@ fn warn_corrupt_cache_once(dir: &Path) {
     }
 }
 
-fn model_dir() -> Option<PathBuf> {
+fn model_source() -> Option<ModelSource> {
     // 1. Explicit override — set by the npm `bin/cli.js` wrapper to the bundled
     //    `@umacloud/model-e5-small` package path under `node_modules`.
     if let Some(d) = std::env::var(ENV_MODEL_DIR).ok().filter(|s| !s.is_empty()) {
         let p = PathBuf::from(d);
-        if p.is_dir() {
-            return Some(p);
+        if let Ok(root) = RootedDir::open_no_follow(&p) {
+            return Some(ModelSource {
+                display_path: p,
+                root,
+            });
         }
     }
     // 2. Conventional local location, auto-discovered with ZERO config: drop the
@@ -180,7 +208,11 @@ fn model_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var("USERPROFILE").ok())
         .filter(|s| !s.is_empty())?;
     let p = PathBuf::from(home).join(".umadev").join("embed-model");
-    p.is_dir().then_some(p)
+    let root = RootedDir::open_no_follow(&p).ok()?;
+    Some(ModelSource {
+        display_path: p,
+        root,
+    })
 }
 
 /// The embedding width the bundled local model emits, read from its
@@ -197,11 +229,11 @@ pub fn local_dim() -> Option<usize> {
     struct HiddenSize {
         hidden_size: usize,
     }
-    if !is_available() {
+    let source = model_source()?;
+    if !model_files_usable(&source) {
         return None;
     }
-    let dir = model_dir()?;
-    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let text = read_model_config(&source).ok()?;
     let cfg: HiddenSize = serde_json::from_str(&text).ok()?;
     (cfg.hidden_size > 0).then_some(cfg.hidden_size)
 }
@@ -221,57 +253,111 @@ struct LoadedModel {
     max_seq_len: usize,
 }
 
-/// Process-wide model cache keyed by the resolved model directory. Loading is
-/// multi-second work (read ~220MB safetensors, build the BERT graph, parse the
-/// tokenizer); doing it per `embed_query` stalled every retrieval on the
-/// default path. The cache loads once per dir (once, in production where the
-/// dir is fixed by the npm wrapper). Fail-open: a load error is NOT cached, so
-/// a later call can retry; a poisoned lock just falls back to a fresh load.
-fn model_cache() -> &'static Mutex<HashMap<PathBuf, Arc<LoadedModel>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<LoadedModel>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+struct CacheEntry<T> {
+    root: RootedDir,
+    value: Arc<T>,
+}
+
+struct SingleFlightCache<T> {
+    entries: Mutex<Vec<CacheEntry<T>>>,
+}
+
+impl<T> SingleFlightCache<T> {
+    const fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn get_or_try_insert_with<E>(
+        &self,
+        root: &RootedDir,
+        load: impl FnOnce() -> Result<T, E>,
+        clone_root: impl FnOnce() -> Result<RootedDir, E>,
+    ) -> Result<Arc<T>, E> {
+        // Hold one mutex across the first expensive load. This deliberately
+        // serializes concurrent cache misses so two queries cannot each
+        // materialize a several-hundred-megabyte weights buffer.
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.root.same_directory(root).unwrap_or(false))
+        {
+            return Ok(Arc::clone(&entry.value));
+        }
+        let cached_root = clone_root()?;
+        let value = Arc::new(load()?);
+        // The launcher selects one model directory. Evicting an older
+        // generation keeps repeated path replacement from retaining an
+        // unbounded number of model graphs.
+        entries.clear();
+        entries.push(CacheEntry {
+            root: cached_root,
+            value: Arc::clone(&value),
+        });
+        Ok(value)
+    }
+}
+
+/// Process-wide cache. Its single-flight insertion prevents duplicate
+/// multi-hundred-megabyte first loads, and directory identity (not an ambient
+/// path string) prevents reuse across root replacement.
+fn model_cache() -> &'static SingleFlightCache<LoadedModel> {
+    static CACHE: OnceLock<SingleFlightCache<LoadedModel>> = OnceLock::new();
+    CACHE.get_or_init(SingleFlightCache::new)
 }
 
 /// Fetch the cached model for `dir`, loading + caching it on first use. Returns
 /// `None` (fail-open) on any load error, WITHOUT caching the failure so a
 /// transient problem can be retried.
-fn cached_model(dir: &Path) -> candle_core::Result<Arc<LoadedModel>> {
-    // Fast path: already cached. The lock is held only for the map lookup, NOT
-    // across the heavy load, so concurrent queries don't serialise behind it.
-    if let Ok(map) = model_cache().lock() {
-        if let Some(m) = map.get(dir) {
-            return Ok(Arc::clone(m));
-        }
-    }
-    // Slow path: load outside the lock. Two racing first-calls may both load;
-    // last writer wins (both produce an equivalent model), which is rare and
-    // far cheaper than holding the lock across a multi-second load.
-    let loaded = Arc::new(load_model(dir)?);
-    if let Ok(mut map) = model_cache().lock() {
-        map.insert(dir.to_path_buf(), Arc::clone(&loaded));
-    }
-    Ok(loaded)
+fn cached_model(source: &ModelSource) -> candle_core::Result<Arc<LoadedModel>> {
+    model_cache().get_or_try_insert_with(
+        &source.root,
+        || load_model(source),
+        || {
+            source
+                .root
+                .try_clone()
+                .map_err(|error| candle_core::Error::Msg(error.to_string()))
+        },
+    )
 }
 
 /// Read + build the model and tokenizer from `dir`. The expensive part that the
 /// [`model_cache`] memoises.
-fn load_model(dir: &Path) -> candle_core::Result<LoadedModel> {
+fn load_model(source: &ModelSource) -> candle_core::Result<LoadedModel> {
     let device = Device::Cpu;
     let to_msg =
         |e: Box<dyn std::error::Error + Send + Sync>| candle_core::Error::Msg(e.to_string());
 
-    let config_text = std::fs::read_to_string(dir.join("config.json"))
-        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    if !model_files_usable(source) {
+        return Err(candle_core::Error::Msg(
+            "local model files are missing, linked, corrupt, or oversized".to_string(),
+        ));
+    }
+    let config_text =
+        read_model_config(source).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
     let config: Config =
         serde_json::from_str(&config_text).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 
-    let weights = dir.join("model.safetensors");
     // Safe (non-mmap) load — the crate forbids `unsafe`: read the whole
     // safetensors file into tensors, then build the model.
-    let tensors = candle_core::safetensors::load(&weights, &device)?;
+    let weights = source
+        .root
+        .read_bounded(Path::new("model.safetensors"), MAX_MODEL_WEIGHTS_BYTES)
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+    let tensors = candle_core::safetensors::load_buffer(&weights, &device)?;
+    drop(weights);
     let vb = VarBuilder::from_tensors(tensors, DTYPE, &device);
     let model = BertModel::load(vb, &config)?;
-    let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(to_msg)?;
+    let tokenizer_bytes = source
+        .root
+        .read_bounded(Path::new("tokenizer.json"), MAX_MODEL_TOKENIZER_BYTES)
+        .map_err(|error| candle_core::Error::Msg(error.to_string()))?;
+    let tokenizer = Tokenizer::from_bytes(tokenizer_bytes).map_err(to_msg)?;
     let max_seq_len = read_max_seq_len(&config_text);
     Ok(LoadedModel {
         model,
@@ -303,8 +389,9 @@ fn read_max_seq_len(config_text: &str) -> usize {
 /// can fall back to HTTP / BM25.
 #[must_use]
 pub fn embed_texts(texts: &[String], is_query: bool) -> Option<Vec<Vec<f32>>> {
-    let dir = model_dir()?;
-    match embed_inner(&dir, texts, is_query) {
+    let bounded = bounded_embed_inputs(texts)?;
+    let source = model_source()?;
+    match embed_inner(&source, &bounded, is_query) {
         Ok(v) => Some(v),
         Err(e) => {
             tracing::debug!("local embed failed, falling back: {e}");
@@ -313,11 +400,15 @@ pub fn embed_texts(texts: &[String], is_query: bool) -> Option<Vec<Vec<f32>>> {
     }
 }
 
-fn embed_inner(dir: &Path, texts: &[String], is_query: bool) -> candle_core::Result<Vec<Vec<f32>>> {
+fn embed_inner(
+    source: &ModelSource,
+    texts: &[&str],
+    is_query: bool,
+) -> candle_core::Result<Vec<Vec<f32>>> {
     let device = Device::Cpu;
     // Reuse the cached (model, tokenizer) — loaded ONCE per process, not per
     // query. The heavy safetensors load + graph build happens on first use only.
-    let loaded = cached_model(dir)?;
+    let loaded = cached_model(source)?;
     let prefix = if is_query { "query: " } else { "passage: " };
     // Embed each text INDEPENDENTLY so one bad text (a tokeniser quirk, an
     // unexpected per-row inference error) can't null the whole batch — a failed
@@ -340,6 +431,34 @@ fn embed_inner(dir: &Path, texts: &[String], is_query: bool) -> candle_core::Res
     assemble_batch(rows).ok_or_else(|| {
         candle_core::Error::Msg("local embed produced no usable vectors (every text failed)".into())
     })
+}
+
+fn bounded_embed_inputs(texts: &[String]) -> Option<Vec<&str>> {
+    if texts.len() > MAX_LOCAL_EMBED_BATCH {
+        return None;
+    }
+    let mut total = 0usize;
+    let mut bounded = Vec::with_capacity(texts.len());
+    for text in texts {
+        let text = bounded_text_prefix(text, MAX_LOCAL_EMBED_TEXT_BYTES);
+        total = total.checked_add(text.len())?;
+        if total > MAX_LOCAL_EMBED_BATCH_BYTES {
+            return None;
+        }
+        bounded.push(text);
+    }
+    Some(bounded)
+}
+
+fn bounded_text_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Embed ONE text. The token ids are capped to the model's `max_seq_len`
@@ -410,6 +529,19 @@ fn l2_normalize(v: &Tensor) -> candle_core::Result<Tensor> {
 mod tests {
     use super::*;
 
+    fn source(dir: &Path) -> ModelSource {
+        ModelSource {
+            display_path: dir.to_path_buf(),
+            root: RootedDir::open_no_follow(dir).unwrap(),
+        }
+    }
+
+    fn write_structurally_valid_model(dir: &Path) {
+        std::fs::write(dir.join("config.json"), r#"{"hidden_size":384}"#).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), r#"{"model":{}}"#).unwrap();
+        write_valid_safetensors(&dir.join("model.safetensors"));
+    }
+
     /// Write a size-plausible, structurally-valid `model.safetensors`: an 8-byte
     /// little-endian header-length prefix, that many header bytes, then zero
     /// padding past the 1 MiB size floor. Enough to pass [`safetensors_looks_valid`]
@@ -469,6 +601,25 @@ mod tests {
         assert_eq!(capped_len(512, 512), 512, "exactly-at-limit is kept");
         // Defensive: a degenerate (zero) limit must never produce an empty slice.
         assert_eq!(capped_len(5, 0), 1);
+    }
+
+    #[test]
+    fn raw_embed_inputs_are_bounded_before_tokenization() {
+        let multibyte = format!("{}界", "a".repeat(MAX_LOCAL_EMBED_TEXT_BYTES - 1));
+        let inputs = vec![multibyte];
+        let bounded = bounded_embed_inputs(&inputs).unwrap();
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].len(), MAX_LOCAL_EMBED_TEXT_BYTES - 1);
+        assert!(bounded[0].is_char_boundary(bounded[0].len()));
+
+        let too_many = vec![String::new(); MAX_LOCAL_EMBED_BATCH + 1];
+        assert!(bounded_embed_inputs(&too_many).is_none());
+
+        let over_aggregate = vec![
+            "x".repeat(MAX_LOCAL_EMBED_TEXT_BYTES);
+            MAX_LOCAL_EMBED_BATCH_BYTES / MAX_LOCAL_EMBED_TEXT_BYTES + 1
+        ];
+        assert!(bounded_embed_inputs(&over_aggregate).is_none());
     }
 
     #[test]
@@ -590,23 +741,27 @@ mod tests {
     #[test]
     fn safetensors_looks_valid_rejects_corrupt_accepts_sane() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let source = source(tmp.path());
         let good = tmp.path().join("good.safetensors");
         write_valid_safetensors(&good);
         assert!(
-            safetensors_looks_valid(&good),
+            safetensors_looks_valid(&source, Path::new("good.safetensors")),
             "size + fitting header -> valid"
         );
 
         // Empty: below the 8-byte prefix and the size floor.
         let empty = tmp.path().join("empty.safetensors");
         std::fs::write(&empty, b"").unwrap();
-        assert!(!safetensors_looks_valid(&empty), "empty -> invalid");
+        assert!(
+            !safetensors_looks_valid(&source, Path::new("empty.safetensors")),
+            "empty -> invalid"
+        );
 
         // Non-empty but under the 1 MiB size floor (a truncated download).
         let tiny = tmp.path().join("tiny.safetensors");
         std::fs::write(&tiny, vec![0u8; 1024]).unwrap();
         assert!(
-            !safetensors_looks_valid(&tiny),
+            !safetensors_looks_valid(&source, Path::new("tiny.safetensors")),
             "under size floor -> invalid"
         );
 
@@ -616,41 +771,157 @@ mod tests {
         bad.resize(usize::try_from(MIN_SAFETENSORS_BYTES).unwrap() + 16, 0);
         std::fs::write(&trunc, &bad).unwrap();
         assert!(
-            !safetensors_looks_valid(&trunc),
+            !safetensors_looks_valid(&source, Path::new("trunc.safetensors")),
             "header past EOF -> invalid"
         );
 
         // Missing file.
         assert!(!safetensors_looks_valid(
-            &tmp.path().join("nope.safetensors")
+            &source,
+            Path::new("nope.safetensors")
         ));
     }
 
     #[test]
     fn json_sidecar_looks_valid_checks_open_and_nonempty() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let source = source(tmp.path());
         let ok = tmp.path().join("config.json");
         std::fs::write(&ok, r#"{"hidden_size":384}"#).unwrap();
-        assert!(json_sidecar_looks_valid(&ok));
+        assert!(json_sidecar_looks_valid(
+            &source,
+            Path::new("config.json"),
+            MAX_MODEL_CONFIG_BYTES
+        ));
 
         let ws = tmp.path().join("ws.json");
         std::fs::write(&ws, "  \n\t {\"a\":1}").unwrap();
         assert!(
-            json_sidecar_looks_valid(&ws),
+            json_sidecar_looks_valid(&source, Path::new("ws.json"), MAX_MODEL_CONFIG_BYTES),
             "leading whitespace tolerated"
         );
 
         let empty = tmp.path().join("empty.json");
         std::fs::write(&empty, b"").unwrap();
-        assert!(!json_sidecar_looks_valid(&empty), "empty -> invalid");
+        assert!(
+            !json_sidecar_looks_valid(&source, Path::new("empty.json"), MAX_MODEL_CONFIG_BYTES),
+            "empty -> invalid"
+        );
 
         let garbage = tmp.path().join("garbage.json");
         std::fs::write(&garbage, b"\x00\x01\x02not json").unwrap();
         assert!(
-            !json_sidecar_looks_valid(&garbage),
+            !json_sidecar_looks_valid(&source, Path::new("garbage.json"), MAX_MODEL_CONFIG_BYTES),
             "binary garbage -> invalid"
         );
 
-        assert!(!json_sidecar_looks_valid(&tmp.path().join("missing.json")));
+        assert!(!json_sidecar_looks_valid(
+            &source,
+            Path::new("missing.json"),
+            MAX_MODEL_CONFIG_BYTES
+        ));
+    }
+
+    #[test]
+    fn oversized_model_files_are_rejected_before_materialization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_structurally_valid_model(tmp.path());
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join("config.json"))
+            .unwrap()
+            .set_len(MAX_MODEL_CONFIG_BYTES + 1)
+            .unwrap();
+        assert!(!model_files_usable(&source(tmp.path())));
+
+        write_structurally_valid_model(tmp.path());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join("tokenizer.json"))
+            .unwrap()
+            .set_len(MAX_MODEL_TOKENIZER_BYTES + 1)
+            .unwrap();
+        assert!(!model_files_usable(&source(tmp.path())));
+
+        write_structurally_valid_model(tmp.path());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join("model.safetensors"))
+            .unwrap()
+            .set_len(MAX_MODEL_WEIGHTS_BYTES + 1)
+            .unwrap();
+        assert!(!model_files_usable(&source(tmp.path())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_roots_and_files_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::TempDir::new().unwrap();
+        let model = parent.path().join("model");
+        std::fs::create_dir(&model).unwrap();
+        write_structurally_valid_model(&model);
+
+        let linked_root = parent.path().join("linked-model");
+        symlink(&model, &linked_root).unwrap();
+        assert!(RootedDir::open_no_follow(&linked_root).is_err());
+
+        let outside = parent.path().join("outside-tokenizer.json");
+        std::fs::write(&outside, r#"{"model":{}}"#).unwrap();
+        std::fs::remove_file(model.join("tokenizer.json")).unwrap();
+        symlink(&outside, model.join("tokenizer.json")).unwrap();
+        assert!(!model_files_usable(&source(&model)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_model_source_stays_on_one_directory_generation() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let model = parent.path().join("model");
+        std::fs::create_dir(&model).unwrap();
+        write_structurally_valid_model(&model);
+        let source = source(&model);
+
+        let moved = parent.path().join("model-moved");
+        std::fs::rename(&model, &moved).unwrap();
+        std::fs::create_dir(&model).unwrap();
+        std::fs::write(model.join("config.json"), r#"{"hidden_size":999}"#).unwrap();
+
+        assert!(model_files_usable(&source));
+        assert!(read_model_config(&source).unwrap().contains("384"));
+    }
+
+    #[test]
+    fn model_cache_single_flights_concurrent_first_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = Arc::new(SingleFlightCache::<usize>::new());
+        let loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut threads = Vec::new();
+
+        for _ in 0..12 {
+            let cache = Arc::clone(&cache);
+            let loads = Arc::clone(&loads);
+            let root = RootedDir::open_no_follow(tmp.path()).unwrap();
+            threads.push(std::thread::spawn(move || {
+                cache
+                    .get_or_try_insert_with(
+                        &root,
+                        || -> std::io::Result<usize> {
+                            loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            Ok(384)
+                        },
+                        || root.try_clone(),
+                    )
+                    .unwrap()
+            }));
+        }
+
+        for thread in threads {
+            assert_eq!(*thread.join().unwrap(), 384);
+        }
+        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -11,26 +11,40 @@
 //! break the host.
 
 use chrono::Utc;
+use fs2::FileExt as _;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::collections::BTreeSet;
+#[cfg(test)]
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 const FRONTEND_EXTS: &[&str] = &["tsx", "ts", "jsx", "js", "vue", "svelte", "astro"];
 
 /// Maximum size an audit JSONL may reach before it is rotated. Default
 /// 5 MiB — large enough to hold a full delivery's worth of tool/API calls
 /// (typically a few hundred KB), small enough that a long-running session
-/// can't bloat `.umadev/audit/` without bound. Override with the
-/// `UMADEV_AUDIT_MAX_BYTES` env var (0 = never rotate).
+/// can't bloat `.umadev/audit/` without bound. `UMADEV_AUDIT_MAX_BYTES` may
+/// lower this ceiling, but cannot disable rotation or raise the hard cap.
 const DEFAULT_MAX_JSONL_BYTES: u64 = 5 * 1024 * 1024;
+const MIN_JSONL_BYTES: u64 = 4 * 1024;
 
 /// How many rotated archives to keep per audit file. Older archives
 /// (`*.jsonl.<n>` beyond this count) are deleted on rotation so the
 /// directory stays bounded.
 const MAX_ARCHIVES: usize = 3;
+const AUDIT_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+const AUDIT_LOCK_POLL: Duration = Duration::from_millis(1);
+const MAX_AUDIT_TOOL_CHARS: usize = 256;
+const MAX_AUDIT_FILE_CHARS: usize = 8 * 1024;
+const MAX_AUDIT_REASON_CHARS: usize = 16 * 1024;
+const MAX_AUDIT_SESSION_CHARS: usize = 2 * 1024;
+const MAX_AUDIT_CLAUSE_CHARS: usize = 128;
+const MAX_AUDIT_URL_CHARS: usize = 2 * 1024;
+const MAX_AUDIT_URLS: usize = 1024;
+const MAX_AUDIT_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Resolve the rotation threshold from the env override, falling back to
 /// the default. `0` disables rotation entirely.
@@ -38,6 +52,7 @@ fn max_jsonl_bytes() -> u64 {
     std::env::var("UMADEV_AUDIT_MAX_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
+        .filter(|value| (MIN_JSONL_BYTES..=DEFAULT_MAX_JSONL_BYTES).contains(value))
         .unwrap_or(DEFAULT_MAX_JSONL_BYTES)
 }
 
@@ -45,114 +60,90 @@ fn max_jsonl_bytes() -> u64 {
 /// `tool-calls.jsonl` → `tool-calls.jsonl.1` (shifting older `.n` up),
 /// keeping at most `MAX_ARCHIVES` copies. Best-effort — rotation errors
 /// are swallowed (audit must never block the host).
-fn rotate_if_needed(path: &Path) {
+fn rotate_if_needed_locked(root: &umadev_state::fs::RootedDir, path: &Path) {
     let cap = max_jsonl_bytes();
-    if cap == 0 {
-        return;
-    }
-    let Ok(meta) = fs::metadata(path) else {
+    let Ok(Some(len)) = root.regular_file_len(path) else {
         return;
     };
-    if meta.len() < cap {
+    if len < cap {
         return;
-    }
-    // A bare stat-then-rename is a cross-PROCESS TOCTOU: every hook is its own
-    // process, so two can both observe the over-cap file and both rotate,
-    // double-shifting archives and pruning real records early (lost evidence).
-    // Serialize rotation with a best-effort exclusive lock file and re-check the
-    // size after acquiring it (rename-if-still-needed) so exactly ONE rotation
-    // happens. Fail-open throughout: if we can't take the lock we just skip
-    // rotating (a peer will, or the next append will); a stale lock left by a
-    // crashed process is stolen so rotation can never wedge the host.
-    let Some(_lock) = acquire_rotate_lock(path) else {
-        return;
-    };
-    // Re-check under the lock: a peer may have already rotated this file out.
-    match fs::metadata(path) {
-        Ok(m) if m.len() >= cap => {}
-        // Gone or now under cap → already rotated; do nothing (idempotent).
-        _ => return,
     }
     // Shift archives: .{MAX-1} is dropped, .{n} → .{n+1}, then current → .1.
     // Walk from the oldest kept slot downward so we don't overwrite an
     // archive we still need to shift.
     for n in (1..MAX_ARCHIVES).rev() {
         let src = archive_path(path, n);
-        if src.exists() {
+        if root.regular_file_exists(&src).unwrap_or(false) {
             let dst = archive_path(path, n + 1);
-            let _ = fs::rename(&src, &dst);
+            if rooted_regular_file_or_absent(root, &dst) {
+                let _ = root.replace_regular_file(&src, &dst);
+            }
         }
     }
     // Current file becomes .1.
     let archive1 = archive_path(path, 1);
-    let _ = fs::rename(path, &archive1);
+    if rooted_regular_file_or_absent(root, &archive1) {
+        let _ = root.replace_regular_file(path, &archive1);
+    }
     // Drop any archive beyond the keep count.
     if MAX_ARCHIVES > 0 {
         let drop_n = MAX_ARCHIVES + 1;
         let beyond = archive_path(path, drop_n);
-        let _ = fs::remove_file(&beyond);
+        let _ = root.remove_regular_file(&beyond);
     }
 }
 
-/// Seconds after which a rotation lock left by a crashed process is treated as
-/// stale and stolen — rotation must never wedge the host (fail-open).
-const ROTATE_LOCK_STALE_SECS: u64 = 30;
-
-/// RAII guard removing the rotation lock file on drop.
-struct RotateLock {
-    path: PathBuf,
+fn rooted_regular_file_or_absent(root: &umadev_state::fs::RootedDir, path: &Path) -> bool {
+    root.regular_file_exists(path).is_ok()
 }
 
-impl Drop for RotateLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+struct AuditLock {
+    _file: std::fs::File,
 }
 
-/// `<dir>/.<audit-file>.lock` — a hidden sibling of the audit file (the leading
-/// dot keeps it from being mistaken for a `.jsonl.N` archive).
+/// Persistent hidden sibling used for an OS-released advisory lock. The file is
+/// intentionally not unlinked on drop: unlinking a lock file while a waiter has
+/// it open can split future lockers across two inodes.
 fn rotate_lock_path(path: &Path) -> PathBuf {
     let base = path
         .file_name()
         .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-    path.with_file_name(format!(".{base}.lock"))
+    path.with_file_name(format!(".{base}.audit-lock"))
 }
 
-/// Best-effort cross-process rotation lock via atomic exclusive file creation
-/// (`O_CREAT|O_EXCL`, atomic on POSIX and Windows). Returns `Some(guard)` when
-/// we now hold the lock, `None` when a peer holds a FRESH one (caller skips
-/// rotating). A lock older than [`ROTATE_LOCK_STALE_SECS`] is stolen so a
-/// crashed holder can't wedge rotation forever. Any unexpected error → `None`
-/// (fail-open: don't rotate rather than risk blocking).
-fn acquire_rotate_lock(path: &Path) -> Option<RotateLock> {
+fn acquire_audit_lock(
+    root: &umadev_state::fs::RootedDir,
+    path: &Path,
+) -> std::io::Result<AuditLock> {
     let lock_path = rotate_lock_path(path);
-    match OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(_) => Some(RotateLock { path: lock_path }),
-        Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let stale = fs::metadata(&lock_path)
-                .and_then(|m| m.modified())
-                .map_or(true, |t| {
-                    t.elapsed()
-                        .map_or(true, |d| d.as_secs() >= ROTATE_LOCK_STALE_SECS)
-                });
-            if !stale {
-                return None;
+    let file = root.open_private_lock(&lock_path, false)?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(AuditLock { _file: file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= AUDIT_LOCK_TIMEOUT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "audit trail is busy in another UmaDev process",
+                    ));
+                }
+                std::thread::sleep(AUDIT_LOCK_POLL);
             }
-            // Steal the stale lock, then re-create it exclusively for us.
-            let _ = fs::remove_file(&lock_path);
-            OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&lock_path)
-                .ok()
-                .map(|_| RotateLock { path: lock_path })
+            Err(error) => return Err(error),
         }
-        Err(_) => None,
     }
+}
+
+#[cfg(test)]
+fn rotate_if_needed(path: &Path) {
+    let Some((root, relative)) = test_rooted_file(path) else {
+        return;
+    };
+    let Ok(_lock) = acquire_audit_lock(&root, &relative) else {
+        return;
+    };
+    rotate_if_needed_locked(&root, &relative);
 }
 
 /// `tool-calls.jsonl` + `.{n}` → `tool-calls.jsonl.{n}`.
@@ -259,28 +250,34 @@ pub fn extract_api_urls(file_path: &str, content: &str) -> Vec<String> {
     if !FRONTEND_EXTS.contains(&ext.as_str()) {
         return Vec::new();
     }
-    let mut urls: Vec<String> = Vec::new();
-    for cap in api_url_regex().captures_iter(content) {
+    let mut end = content.len().min(MAX_AUDIT_SOURCE_BYTES);
+    while !content.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut urls = BTreeSet::new();
+    for cap in api_url_regex().captures_iter(&content[..end]) {
         if let Some(url) = cap.name("url") {
-            let s = url.as_str().to_string();
-            if !urls.contains(&s) {
-                urls.push(s);
+            urls.insert(url.as_str().to_string());
+            if urls.len() >= MAX_AUDIT_URLS {
+                break;
             }
         }
     }
-    urls.sort();
-    urls
+    urls.into_iter().collect()
 }
 
-fn audit_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".umadev").join("audit")
+fn audit_dir(project_root: &Path) -> std::io::Result<umadev_state::fs::RootedDir> {
+    let root = umadev_state::fs::RootedDir::open_no_follow(project_root)?;
+    root.ensure_dir(Path::new(".umadev"), false)?;
+    root.ensure_dir(Path::new(".umadev/audit"), false)?;
+    root.open_dir(Path::new(".umadev/audit"))
 }
 
 /// Normalize a tool-call decision to the documented vocabulary
 /// (`allow` | `block` | `warn` | `audit`). Unknown / empty → `allow`
 /// (fail-open: an unrecognized decision must never block the host).
 /// Matching is case-insensitive so `BLOCK` / `Block` collapse correctly.
-fn normalize_decision(decision: &str) -> String {
+pub(crate) fn normalize_decision(decision: &str) -> String {
     let lower = decision.trim().to_ascii_lowercase();
     match lower.as_str() {
         "block" | "warn" | "audit" => lower,
@@ -288,24 +285,55 @@ fn normalize_decision(decision: &str) -> String {
     }
 }
 
-fn append_jsonl(path: &Path, line: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn audit_timestamp(now: Option<i64>) -> (i64, i64) {
+    now.map_or_else(
+        || {
+            let current = Utc::now();
+            (current.timestamp(), current.timestamp_millis())
+        },
+        |seconds| (seconds, seconds.saturating_mul(1_000)),
+    )
+}
+
+fn sanitize_audit_text(text: &str, max_chars: usize) -> String {
+    let redacted = crate::redaction::redact_text(text);
+    if redacted.chars().count() <= max_chars {
+        return redacted;
     }
-    // Rotate before appending so the file stays under the size cap across
-    // long sessions. Best-effort: a rotation failure must not block the
-    // append (audit is fail-open).
-    rotate_if_needed(path);
-    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
-    // SINGLE write of `line + \n`. Each hook invocation is a SEPARATE process
-    // appending to the SAME JSONL concurrently; with `O_APPEND` one `write(2)`
-    // is atomic (the kernel seeks-to-end + writes under one lock), so a record
-    // and its terminating newline land together. Two `write_all` calls (line,
-    // then "\n") were two syscalls — a concurrent appender could interleave
-    // between them and split a record across the newline, producing a torn,
-    // unparseable JSONL row and a corrupt evidence chain.
-    f.write_all(format!("{line}\n").as_bytes())?;
-    Ok(())
+    let mut clipped: String = redacted.chars().take(max_chars.saturating_sub(3)).collect();
+    clipped.push_str("...");
+    clipped
+}
+
+fn append_jsonl(
+    root: &umadev_state::fs::RootedDir,
+    path: &Path,
+    line: &str,
+) -> std::io::Result<()> {
+    let _lock = acquire_audit_lock(root, path).map_err(|error| {
+        std::io::Error::new(error.kind(), format!("acquire audit lock: {error}"))
+    })?;
+    // Hold the same OS lock across rotation and append. Otherwise a peer can
+    // rename the live file after this process opens it, sending the new record
+    // into an archive while another peer appends to a new live inode.
+    rotate_if_needed_locked(root, path);
+    let record = format!("{line}\n");
+    root.append_private(path, record.as_bytes(), false)
+        .map_err(|error| std::io::Error::new(error.kind(), format!("append audit row: {error}")))
+}
+
+#[cfg(test)]
+fn test_rooted_file(path: &Path) -> Option<(umadev_state::fs::RootedDir, PathBuf)> {
+    let root = umadev_state::fs::RootedDir::open_no_follow(path.parent()?).ok()?;
+    Some((root, PathBuf::from(path.file_name()?)))
+}
+
+#[cfg(test)]
+fn append_jsonl_at(path: &Path, line: &str) -> std::io::Result<()> {
+    let (root, relative) = test_rooted_file(path).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "audit path has no parent")
+    })?;
+    append_jsonl(&root, &relative, line)
 }
 
 /// Append an API-audit record. Implements `UD-EVID-001`.
@@ -322,21 +350,26 @@ pub fn record_api_calls(
     session_id: &str,
     now: Option<i64>,
 ) -> Option<ApiCallRecord> {
-    let urls = extract_api_urls(file_path, content);
+    let mut urls: Vec<String> = extract_api_urls(file_path, content)
+        .into_iter()
+        .map(|url| sanitize_audit_text(&url, MAX_AUDIT_URL_CHARS))
+        .collect();
+    urls.sort();
+    urls.dedup();
     if urls.is_empty() {
         return None;
     }
+    let (ts, ts_ms) = audit_timestamp(now);
     let record = ApiCallRecord {
-        ts: now.unwrap_or_else(|| Utc::now().timestamp()),
-        ts_ms: Utc::now().timestamp_millis(),
-        file: file_path.to_string(),
-        tool: tool_name.to_string(),
+        ts,
+        ts_ms,
+        file: sanitize_audit_text(file_path, MAX_AUDIT_FILE_CHARS),
+        tool: sanitize_audit_text(tool_name, MAX_AUDIT_TOOL_CHARS),
         urls,
-        session_id: session_id.to_string(),
+        session_id: sanitize_audit_text(session_id, MAX_AUDIT_SESSION_CHARS),
     };
-    let log_path = audit_dir(project_root).join("frontend-api-calls.jsonl");
-    if let Ok(line) = serde_json::to_string(&record) {
-        let _ = append_jsonl(&log_path, &line);
+    if let (Ok(dir), Ok(line)) = (audit_dir(project_root), serde_json::to_string(&record)) {
+        let _ = append_jsonl(&dir, Path::new("frontend-api-calls.jsonl"), &line);
     }
     Some(record)
 }
@@ -364,19 +397,19 @@ pub fn record_tool_call(
     // verbatim, which then polluted the decisions BTreeMap in the
     // compliance mapping with arbitrary keys.
     let decision_norm = normalize_decision(decision);
+    let (ts, ts_ms) = audit_timestamp(now);
     let record = ToolCallRecord {
-        ts: now.unwrap_or_else(|| Utc::now().timestamp()),
-        ts_ms: Utc::now().timestamp_millis(),
-        tool: tool_name.to_string(),
-        file: file_path.to_string(),
+        ts,
+        ts_ms,
+        tool: sanitize_audit_text(tool_name, MAX_AUDIT_TOOL_CHARS),
+        file: sanitize_audit_text(file_path, MAX_AUDIT_FILE_CHARS),
         decision: decision_norm,
-        clause: clause.to_string(),
-        reason: reason.to_string(),
-        session_id: session_id.to_string(),
+        clause: sanitize_audit_text(clause, MAX_AUDIT_CLAUSE_CHARS),
+        reason: sanitize_audit_text(reason, MAX_AUDIT_REASON_CHARS),
+        session_id: sanitize_audit_text(session_id, MAX_AUDIT_SESSION_CHARS),
     };
-    let log_path = audit_dir(project_root).join("tool-calls.jsonl");
-    if let Ok(line) = serde_json::to_string(&record) {
-        let _ = append_jsonl(&log_path, &line);
+    if let (Ok(dir), Ok(line)) = (audit_dir(project_root), serde_json::to_string(&record)) {
+        let _ = append_jsonl(&dir, Path::new("tool-calls.jsonl"), &line);
     }
     Some(record)
 }
@@ -445,6 +478,29 @@ mod tests {
     #[test]
     fn extract_handles_empty_content() {
         assert!(extract_api_urls("src/x.tsx", "").is_empty());
+    }
+
+    #[test]
+    fn extract_caps_unique_urls_during_collection() {
+        use std::fmt::Write as _;
+
+        let mut content = String::new();
+        for index in 0..(MAX_AUDIT_URLS + 200) {
+            let _ = write!(content, "fetch('/api/item-{index}');");
+        }
+
+        let urls = extract_api_urls("src/X.tsx", &content);
+        assert_eq!(urls.len(), MAX_AUDIT_URLS);
+        assert!(urls.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn extract_does_not_scan_past_the_source_byte_budget() {
+        let mut content = "fetch('/api/inside');".to_string();
+        content.push_str(&"x".repeat(MAX_AUDIT_SOURCE_BYTES));
+        content.push_str("fetch('/api/outside');");
+
+        assert_eq!(extract_api_urls("src/X.tsx", &content), vec!["/api/inside"]);
     }
 
     #[test]
@@ -564,14 +620,15 @@ mod tests {
     fn concurrent_appends_never_tear_a_line() {
         // P1-1: every hook invocation is a SEPARATE process appending to the
         // SAME JSONL. Model that with many threads each appending its own
-        // record at once. The single `write_all(line + "\n")` under O_APPEND
-        // must keep every line whole — no record split across a newline. We
-        // assert each line round-trips as a valid record AND every record we
-        // wrote is present exactly once.
+        // record at once. The OS lock must cover each complete append, so no
+        // partial `write_all` can interleave with another record or a rotation.
+        // Assert each line round-trips and every record is present exactly once.
         let _guard = ROTATE_TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", "0"); // never rotate mid-test
+        // Invalid zero falls back to the 5 MiB hard cap; this test stays far
+        // below it and therefore never rotates mid-test.
+        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", "0");
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".umadev/audit");
         fs::create_dir_all(&dir).unwrap();
@@ -597,7 +654,7 @@ mod tests {
                         session_id: String::new(),
                     };
                     let serialized = serde_json::to_string(&rec).unwrap();
-                    append_jsonl(&live, &serialized).unwrap();
+                    append_jsonl_at(&live, &serialized).unwrap();
                 }
             }));
         }
@@ -632,6 +689,58 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_process_append_child() {
+        let Some(root) = std::env::var_os("UMADEV_AUDIT_PROCESS_TEST_ROOT") else {
+            return;
+        };
+        let writer = std::env::var("UMADEV_AUDIT_PROCESS_TEST_WRITER").unwrap();
+        let live = Path::new(&root).join("tool-calls.jsonl");
+        for line in 0..50 {
+            append_jsonl_at(&live, &format!(r#"{{"writer":"{writer}","line":{line}}}"#)).unwrap();
+        }
+    }
+
+    #[test]
+    fn concurrent_process_appends_are_complete_and_unique() {
+        let tmp = TempDir::new().unwrap();
+        let writers = 6;
+        let mut children = Vec::new();
+        for writer in 0..writers {
+            children.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "audit::tests::concurrent_process_append_child",
+                        "--nocapture",
+                    ])
+                    .env("UMADEV_AUDIT_PROCESS_TEST_ROOT", tmp.path())
+                    .env("UMADEV_AUDIT_PROCESS_TEST_WRITER", writer.to_string())
+                    .env("UMADEV_AUDIT_MAX_BYTES", "0")
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        for mut child in children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let body = fs::read_to_string(tmp.path().join("tool-calls.jsonl")).unwrap();
+        let mut rows: Vec<(usize, usize)> = body
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                (
+                    value["writer"].as_str().unwrap().parse().unwrap(),
+                    usize::try_from(value["line"].as_u64().unwrap()).unwrap(),
+                )
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        assert_eq!(rows.len(), writers * 50);
+    }
+
+    #[test]
     fn concurrent_rotation_rotates_exactly_once() {
         // Two concurrent hook PROCESSES could both observe an over-cap file and
         // both rotate (stat-then-rename TOCTOU), double-shifting archives and
@@ -641,13 +750,16 @@ mod tests {
         let _guard = ROTATE_TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", "16");
+        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", MIN_JSONL_BYTES.to_string());
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".umadev/audit");
         fs::create_dir_all(&dir).unwrap();
         let live = dir.join("tool-calls.jsonl");
-        let original = "ORIGINAL-AUDIT-RECORDS-PAYLOAD"; // > 16 bytes
-        fs::write(&live, original).unwrap();
+        let original = format!(
+            "ORIGINAL-AUDIT-RECORDS-PAYLOAD{}",
+            "x".repeat(usize::try_from(MIN_JSONL_BYTES).unwrap())
+        );
+        fs::write(&live, &original).unwrap();
 
         let live = std::sync::Arc::new(live);
         let racers = 16;
@@ -669,7 +781,7 @@ mod tests {
         let mut copies = 0;
         for n in 1..=MAX_ARCHIVES {
             if let Ok(body) = fs::read_to_string(archive_path(&live, n)) {
-                if body.contains(original) {
+                if body.contains(&original) {
                     copies += 1;
                 }
             }
@@ -683,8 +795,8 @@ mod tests {
             "must not premature-shift into .2 under concurrency"
         );
         assert!(
-            !rotate_lock_path(&live).exists(),
-            "rotation lock must be released after rotation"
+            umadev_state::fs::real_file(&rotate_lock_path(&live)),
+            "persistent OS lock file must remain a safe regular file"
         );
     }
 
@@ -697,20 +809,24 @@ mod tests {
     static ROTATE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn rotate_serial_under_cap_and_disabled() {
+    fn rotate_serial_under_cap_and_invalid_overrides() {
         use super::*;
         let _guard = ROTATE_TEST_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // --- (1) rotate when over cap ---
-        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", "8");
+        let _env = EnvRestore::set("UMADEV_AUDIT_MAX_BYTES", MIN_JSONL_BYTES.to_string());
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".umadev/audit");
         fs::create_dir_all(&dir).unwrap();
         let live = dir.join("tool-calls.jsonl");
-        fs::write(&live, "already-big-content-here").unwrap();
-        append_jsonl(&live, r#"{"ts":1}"#).unwrap();
+        let old = format!(
+            "already-big-content-here{}",
+            "x".repeat(usize::try_from(MIN_JSONL_BYTES).unwrap())
+        );
+        fs::write(&live, &old).unwrap();
+        append_jsonl_at(&live, r#"{"ts":1}"#).unwrap();
         let body = fs::read_to_string(&live).unwrap();
         assert!(
             body.contains(r#"{"ts":1}"#),
@@ -726,9 +842,16 @@ mod tests {
             .contains("already-big-content"));
 
         // --- (2) keeps at most MAX_ARCHIVES ---
-        std::env::set_var("UMADEV_AUDIT_MAX_BYTES", "4");
+        std::env::set_var("UMADEV_AUDIT_MAX_BYTES", MIN_JSONL_BYTES.to_string());
         for i in 0..(MAX_ARCHIVES + 3) {
-            append_jsonl(&live, &format!("line-{i}-content")).unwrap();
+            append_jsonl_at(
+                &live,
+                &format!(
+                    "line-{i}-content{}",
+                    "y".repeat(usize::try_from(MIN_JSONL_BYTES).unwrap())
+                ),
+            )
+            .unwrap();
         }
         let archived_files: Vec<_> = fs::read_dir(&dir)
             .unwrap()
@@ -745,18 +868,120 @@ mod tests {
             archived_files.len()
         );
 
-        // --- (3) disabled when cap=0 ---
+        // --- (3) zero cannot disable rotation or lower the cap to zero ---
         std::env::set_var("UMADEV_AUDIT_MAX_BYTES", "0");
         let tmp2 = TempDir::new().unwrap();
         let live2 = tmp2.path().join("tool-calls.jsonl");
-        fs::write(&live2, "big-content-that-would-normally-rotate").unwrap();
-        append_jsonl(&live2, "new").unwrap();
+        let over_default = "z".repeat(usize::try_from(DEFAULT_MAX_JSONL_BYTES + 1).unwrap());
+        fs::write(&live2, &over_default).unwrap();
+        append_jsonl_at(&live2, "new").unwrap();
         let body2 = fs::read_to_string(&live2).unwrap();
-        assert!(body2.contains("big-content"), "cap=0 must not rotate");
-        assert!(body2.contains("new"));
+        assert_eq!(body2, "new\n");
+        assert_eq!(
+            fs::metadata(archive_path(&live2, 1)).unwrap().len(),
+            DEFAULT_MAX_JSONL_BYTES + 1
+        );
+
+        // --- (4) an oversized override cannot raise the hard cap ---
+        std::env::set_var(
+            "UMADEV_AUDIT_MAX_BYTES",
+            (DEFAULT_MAX_JSONL_BYTES + 1).to_string(),
+        );
+        assert_eq!(max_jsonl_bytes(), DEFAULT_MAX_JSONL_BYTES);
 
         // Restore the sentinel so other tests see the real default.
         // Rotation tests mutate UMADEV_AUDIT_MAX_BYTES; run governance
         // tests with --test-threads=1 to avoid env-var races.
+    }
+
+    #[test]
+    fn audit_records_redact_and_bound_untrusted_fields() {
+        let tmp = TempDir::new().unwrap();
+        let secret = "sk-live-1234567890abcdef";
+        let reason = format!("api_key={secret}\n{}", "x".repeat(20_000));
+        let record = record_tool_call(
+            tmp.path(),
+            "Bash",
+            &format!("curl -H 'Authorization: Bearer abcdefghijklmnop' /{secret}"),
+            "block",
+            "UD-SEC-003",
+            &reason,
+            "session-token=abcdefghijklmnop",
+            Some(42),
+        )
+        .unwrap();
+
+        assert_eq!((record.ts, record.ts_ms), (42, 42_000));
+        let serialized = serde_json::to_string(&record).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("abcdefghijklmnop"));
+        assert!(record.reason.chars().count() <= MAX_AUDIT_REASON_CHARS);
+        assert!(record.reason.ends_with("..."));
+        let disk = fs::read_to_string(tmp.path().join(".umadev/audit/tool-calls.jsonl")).unwrap();
+        assert!(!disk.contains(secret));
+        assert!(!disk.contains("abcdefghijklmnop"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_writer_rejects_linked_directories_and_log_files() {
+        use std::os::unix::fs::symlink;
+
+        let linked_root = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        symlink(outside_dir.path(), linked_root.path().join(".umadev")).unwrap();
+        assert!(record_tool_call(
+            linked_root.path(),
+            "Write",
+            "src/x.rs",
+            "audit",
+            "",
+            "safe",
+            "",
+            Some(1),
+        )
+        .is_some());
+        assert!(outside_dir.path().read_dir().unwrap().next().is_none());
+
+        let linked_file_root = TempDir::new().unwrap();
+        let audit = linked_file_root.path().join(".umadev/audit");
+        fs::create_dir_all(&audit).unwrap();
+        let outside_file = linked_file_root.path().join("outside.jsonl");
+        fs::write(&outside_file, "keep\n").unwrap();
+        symlink(&outside_file, audit.join("tool-calls.jsonl")).unwrap();
+        let _ = record_tool_call(
+            linked_file_root.path(),
+            "Write",
+            "src/x.rs",
+            "audit",
+            "",
+            "safe",
+            "",
+            Some(1),
+        );
+        assert_eq!(fs::read_to_string(outside_file).unwrap(), "keep\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_audit_directory_never_writes_to_a_replacement_project() {
+        let parent = TempDir::new().unwrap();
+        let project = parent.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let audit = audit_dir(&project).unwrap();
+
+        let moved = parent.path().join("project-moved");
+        fs::rename(&project, &moved).unwrap();
+        fs::create_dir(&project).unwrap();
+        fs::create_dir_all(project.join(".umadev/audit")).unwrap();
+
+        append_jsonl(&audit, Path::new("tool-calls.jsonl"), r#"{"safe":true}"#).unwrap();
+
+        assert!(
+            fs::read_to_string(moved.join(".umadev/audit/tool-calls.jsonl"))
+                .unwrap()
+                .contains(r#""safe":true"#)
+        );
+        assert!(!project.join(".umadev/audit/tool-calls.jsonl").exists());
     }
 }

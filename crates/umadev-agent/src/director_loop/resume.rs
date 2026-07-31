@@ -5,6 +5,7 @@
 //! whether such a plan is resumable and for reopening steps whose upstream
 //! artifacts changed after the plan was saved.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 
@@ -17,7 +18,7 @@ const OPERATIONAL_REVIEW_CHECKPOINT_FILE: &str = "director-operational-review.js
 const MAX_OPERATIONAL_REVIEW_CHECKPOINT_BYTES: u64 = 16 * 1024;
 const MAX_ARTIFACT_VERSION_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ARTIFACT_VERSION_TOTAL_BYTES: usize = 8 * 1024 * 1024;
-const MAX_OUTPUT_ENTRIES: usize = 256;
+const MAX_ACTIVE_ARTIFACTS: usize = 256;
 const MAX_CONSECUTIVE_REVIEW_OUTAGES: u8 = 2;
 
 /// Typed evidence retained at an operationally unavailable review boundary.
@@ -308,6 +309,7 @@ pub(super) fn next_final_review_checkpoint(
 /// and then immediately reviewing again in the final gate.
 pub(super) const FINAL_REVIEW_RETRY_STEP_ID: &str = "umadev-final-review-retry";
 
+#[cfg(test)]
 fn operational_review_checkpoint_path(root: &Path) -> std::path::PathBuf {
     root.join(".umadev")
         .join(OPERATIONAL_REVIEW_CHECKPOINT_FILE)
@@ -320,47 +322,69 @@ fn operational_review_checkpoint_path(root: &Path) -> std::path::PathBuf {
 /// the user deliberately closed. Cleared whenever a NEW plan is synthesized, so
 /// a stale marker can never suppress repair-resume for a later, unrelated run.
 const PLAN_REPAIR_CLOSED_FILE: &str = "plan-repair-closed.json";
-
-fn plan_repair_closed_path(root: &Path) -> std::path::PathBuf {
-    root.join(".umadev").join(PLAN_REPAIR_CLOSED_FILE)
-}
+const MAX_PLAN_REPAIR_CLOSED_BYTES: u64 = 4 * 1024;
 
 /// Close the repair channel for the current plan (best-effort, bounded reason).
 pub(super) fn mark_plan_repair_closed(root: &Path, reason: &str) {
-    let path = plan_repair_closed_path(root);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let Ok(dir) = crate::bounded_fs::ensure_real_dir_beneath(root, Path::new(".umadev")) else {
+        return;
+    };
+    let reason = umadev_governance::redaction::redact_text(reason);
     let body =
         serde_json::json!({ "reason": reason.chars().take(240).collect::<String>() }).to_string();
-    let _ = std::fs::write(&path, body);
+    let _ = umadev_state::fs::atomic_write(&dir.join(PLAN_REPAIR_CLOSED_FILE), body.as_bytes());
 }
 
 /// Reopen the repair channel — called when a fresh plan replaces the closed one.
 pub(super) fn clear_plan_repair_closed(root: &Path) {
-    let _ = umadev_state::fs::remove_regular_file(&plan_repair_closed_path(root));
+    if let Some(dir) = existing_umadev_dir(root) {
+        let _ = umadev_state::fs::remove_regular_file(&dir.join(PLAN_REPAIR_CLOSED_FILE));
+    }
 }
 
 fn plan_repair_closed(root: &Path) -> bool {
-    std::fs::symlink_metadata(plan_repair_closed_path(root)).is_ok()
+    umadev_state::fs::read_bounded_beneath(
+        root,
+        Path::new(".umadev/plan-repair-closed.json"),
+        MAX_PLAN_REPAIR_CLOSED_BYTES,
+    )
+    .is_ok()
+}
+
+fn existing_umadev_dir(root: &Path) -> Option<std::path::PathBuf> {
+    let canonical_root = std::fs::canonicalize(root).ok()?;
+    if !umadev_state::fs::real_dir(&canonical_root) {
+        return None;
+    }
+    let dir = canonical_root.join(".umadev");
+    umadev_state::fs::real_dir(&dir).then_some(dir)
 }
 
 pub(super) fn save_operational_review_checkpoint(
     root: &Path,
     checkpoint: &OperationalReviewCheckpoint,
 ) -> std::io::Result<()> {
-    let dir = root.join(".umadev");
-    std::fs::create_dir_all(&dir)?;
+    let dir = crate::bounded_fs::ensure_real_dir_beneath(root, Path::new(".umadev"))?;
     let body = serde_json::to_vec_pretty(checkpoint)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    umadev_state::fs::atomic_write(&operational_review_checkpoint_path(root), body.as_slice())
+    if body.len() > usize::try_from(MAX_OPERATIONAL_REVIEW_CHECKPOINT_BYTES).unwrap_or(usize::MAX) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "operational review checkpoint exceeds the managed file limit",
+        ));
+    }
+    umadev_state::fs::atomic_write(
+        &dir.join(OPERATIONAL_REVIEW_CHECKPOINT_FILE),
+        body.as_slice(),
+    )
 }
 
 pub(super) fn load_operational_review_checkpoint(
     root: &Path,
 ) -> Option<OperationalReviewCheckpoint> {
-    let body = umadev_state::fs::read_bounded(
-        &operational_review_checkpoint_path(root),
+    let body = umadev_state::fs::read_bounded_beneath(
+        root,
+        Path::new(".umadev/director-operational-review.json"),
         MAX_OPERATIONAL_REVIEW_CHECKPOINT_BYTES,
     )
     .ok()?;
@@ -368,7 +392,10 @@ pub(super) fn load_operational_review_checkpoint(
 }
 
 pub(super) fn clear_operational_review_checkpoint(root: &Path) {
-    let _ = umadev_state::fs::remove_regular_file(&operational_review_checkpoint_path(root));
+    if let Some(dir) = existing_umadev_dir(root) {
+        let _ =
+            umadev_state::fs::remove_regular_file(&dir.join(OPERATIONAL_REVIEW_CHECKPOINT_FILE));
+    }
 }
 
 /// Whether `plan` still has work left to drive — at least one non-terminal step.
@@ -565,51 +592,107 @@ fn artifact_kind_from_name(name: &str) -> Option<crate::critics::ArtifactKind> {
     }
 }
 
-/// Read current document-artifact content versions. A relevant artifact that
-/// cannot be read completely makes the snapshot unavailable; it is never
-/// silently omitted and mistaken for a complete version set.
-fn current_artifact_versions(root: &Path) -> io::Result<Vec<(String, String)>> {
-    let mut versions = Vec::new();
-    let output = root.join("output");
-    match std::fs::symlink_metadata(&output) {
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(versions),
-        Err(error) => return Err(error),
+/// The concrete document files the current plan declares as part of its active
+/// blackboard. Historical `output/*-{prd,architecture,uiux}.md` files that no
+/// current step names are deliberately absent. Both typed evidence and the step's
+/// file surface participate; a path repeated across them is read once.
+fn active_artifact_paths(plan: &Plan) -> BTreeMap<String, BTreeSet<String>> {
+    let mut active = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut insert = |raw: &str| {
+        // Plan paths are specified with `/`, but tolerate a persisted Windows
+        // separator so the same plan remains portable across hosts.
+        let path = raw.trim().replace('\\', "/");
+        let Some(filename) = path.rsplit('/').next().filter(|name| !name.is_empty()) else {
+            return;
+        };
+        let Some(kind) = artifact_name_from_filename(filename) else {
+            return;
+        };
+        active.entry(kind.to_string()).or_default().insert(path);
+    };
+
+    for step in &plan.steps {
+        for path in step.files.all() {
+            insert(path);
+        }
+        for evidence in &step.evidence {
+            match evidence {
+                crate::plan_state::EvidenceContract::FileExists { path }
+                | crate::plan_state::EvidenceContract::FileContains { path, .. } => insert(path),
+                _ => {}
+            }
+        }
     }
-    if !crate::bounded_fs::is_real_directory_beneath(root, &output) {
+    active
+}
+
+/// Read the active plan's current document-artifact versions. Multiple explicitly
+/// active files of one semantic kind are folded in lexical path order, producing a
+/// deterministic aggregate independent of directory enumeration or step order.
+/// A relevant artifact that cannot be read completely makes the snapshot
+/// unavailable; it is never silently omitted and mistaken for a complete version
+/// set. A legacy plan with no concrete document references returns an empty set,
+/// so unrelated historical output can never make it false-stale.
+pub(super) fn current_artifact_versions(
+    root: &Path,
+    plan: &Plan,
+) -> io::Result<Vec<(String, String)>> {
+    let active = active_artifact_paths(plan);
+    let active_count = active.values().map(BTreeSet::len).sum::<usize>();
+    if active_count > MAX_ACTIVE_ARTIFACTS {
         return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "output directory is a link or outside the project root",
+            io::ErrorKind::InvalidData,
+            "active artifact path budget exhausted",
         ));
     }
-    let entries = std::fs::read_dir(&output)?;
+
+    let mut versions = Vec::with_capacity(active.len());
     let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
         MAX_ARTIFACT_VERSION_TOTAL_BYTES,
         MAX_ARTIFACT_VERSION_BYTES,
     );
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_OUTPUT_ENTRIES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "output directory entry budget exhausted",
-            ));
+    for (kind, paths) in active {
+        let mut members = Vec::with_capacity(paths.len());
+        for path in paths {
+            let member_version = match budget.read_utf8_beneath(root, Path::new(&path)) {
+                Ok(content) => crate::critics::artifact_version(&content),
+                // Absence is a deterministic state, not an incomplete snapshot.
+                // Recording it lets a later deletion or first materialization
+                // compare honestly without scanning unrelated output files.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    crate::critics::artifact_version(&format!("missing active artifact: {path}"))
+                }
+                Err(error) => return Err(error),
+            };
+            members.push((path, member_version));
         }
-        let Ok(entry) = entry else {
-            continue;
+        let version = if members.len() == 1 {
+            members.pop().expect("one active artifact member").1
+        } else {
+            // Length-prefix each component so unusual, but valid, file names cannot
+            // produce an ambiguous aggregate. `members` is already path-sorted.
+            let mut aggregate = String::new();
+            for (path, member_version) in members {
+                aggregate.push_str(&path.len().to_string());
+                aggregate.push(':');
+                aggregate.push_str(&path);
+                aggregate.push_str(&member_version.len().to_string());
+                aggregate.push(':');
+                aggregate.push_str(&member_version);
+            }
+            crate::critics::artifact_version(&aggregate)
         };
-        let filename = entry.file_name().to_string_lossy().into_owned();
-        let Some(name) = artifact_name_from_filename(&filename) else {
-            continue;
-        };
-        let content = budget.read_utf8_beneath(root, &entry.path())?;
-        versions.push((name.to_string(), crate::critics::artifact_version(&content)));
+        versions.push((kind, version));
     }
     Ok(versions)
 }
 
 /// Record the artifact versions the persisted plan was built against.
 pub(super) fn record_artifact_versions(root: &Path) {
-    let Ok(current) = current_artifact_versions(root) else {
+    let Some(plan) = plan_state::load(root) else {
+        return;
+    };
+    let Ok(current) = current_artifact_versions(root, &plan) else {
         return;
     };
     if current.is_empty() {
@@ -620,7 +703,7 @@ pub(super) fn record_artifact_versions(root: &Path) {
 
 /// Re-open steps whose upstream document artifacts changed since the last save.
 pub(super) fn invalidate_stale_steps(root: &Path, plan: &mut Plan) {
-    let Ok(current) = current_artifact_versions(root) else {
+    let Ok(current) = current_artifact_versions(root, plan) else {
         use crate::critics::ArtifactKind as A;
         plan.invalidate_stale(&[
             A::Prd,
@@ -835,6 +918,46 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_state_never_follows_a_linked_managed_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let checkpoint = OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint: None,
+            required_seats: None,
+            entry_task_run_id: None,
+            consecutive_outages: 2,
+            evidence: OperationalReviewEvidence::default(),
+            terminally_settled: false,
+        };
+        let outside_checkpoint = outside.path().join(OPERATIONAL_REVIEW_CHECKPOINT_FILE);
+        std::fs::write(
+            &outside_checkpoint,
+            serde_json::to_vec_pretty(&checkpoint).unwrap(),
+        )
+        .unwrap();
+        let outside_closed = outside.path().join(PLAN_REPAIR_CLOSED_FILE);
+        std::fs::write(&outside_closed, b"outside").unwrap();
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+
+        assert!(load_operational_review_checkpoint(root.path()).is_none());
+        assert!(save_operational_review_checkpoint(root.path(), &checkpoint).is_err());
+        mark_plan_repair_closed(root.path(), "cancelled");
+        clear_plan_repair_closed(root.path());
+        clear_operational_review_checkpoint(root.path());
+        assert_eq!(std::fs::read(&outside_closed).unwrap(), b"outside");
+        assert_eq!(
+            serde_json::from_slice::<OperationalReviewCheckpoint>(
+                &std::fs::read(&outside_checkpoint).unwrap()
+            )
+            .unwrap(),
+            checkpoint
+        );
     }
 
     #[test]

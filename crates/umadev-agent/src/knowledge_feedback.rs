@@ -839,6 +839,25 @@ mod tests {
     }
 
     #[test]
+    fn oversized_receipt_publication_fails_open_without_leaving_a_partial_file() {
+        let project = tempfile::TempDir::new().unwrap();
+        let dir = ensure_receipts_dir(project.path()).unwrap();
+        let path = dir.join("oversized.receipt.json");
+        let body = vec![b'x'; (storage::MAX_RECEIPT_FILE_BYTES + 1) as usize];
+
+        assert_eq!(publish_create_new(&path, &body), PublishResult::Unavailable);
+        assert!(!path.exists());
+        assert!(
+            std::fs::read_dir(&dir).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")),
+            "a rejected receipt must not leave a publish temp behind"
+        );
+    }
+
+    #[test]
     fn snapshot_round_trips_and_is_bounded() {
         let tmp = tempfile::TempDir::new().unwrap();
         let keys: Vec<(String, String)> = (0..(MAX_TRACKED_CHUNKS + 5))

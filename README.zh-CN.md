@@ -139,6 +139,20 @@ npm i umadev && npx umadev # 或作为项目本地依赖
 
 已经踩了 sudo 的坑？`umadev doctor` 会检出 root 属主的安装目录或 npm 缓存，并打印确切的修复命令（`sudo chown -R $(whoami) ~/.npm`，然后在自有前缀下重装）。
 
+也可以完全跳过 npm。原生安装器不需要 Node、不使用 sudo，会下载对应平台的 GitHub Release 二进制并校验公开的 SHA-256：
+
+```bash
+# macOS / Linux
+curl -fsSL https://umadev.goder.ai/install.sh | bash
+```
+
+```powershell
+# Windows PowerShell
+irm https://umadev.goder.ai/install.ps1 | iex
+```
+
+设置 `UMADEV_VERSION` / `$env:UMADEV_VERSION` 可固定到所需版本，设置 `UMADEV_INSTALL_DIR` / `$env:UMADEV_INSTALL_DIR` 可覆盖安装目录。所有 Release 二进制都内置并自动释放知识语料；原生安装可立即使用 BM25，若需要本地向量检索，可把兼容模型放到 `~/.umadev/embed-model` 或用 `UMADEV_EMBED_MODEL_DIR` 指定。
+
 npm 只是分发壳。真正运行的是 Rust 编译出的 `umadev` 二进制。
 
 npm tarball 不内含向量模型。第一次执行需要检索的命令时，npm 启动器会从同版本 GitHub Release 下载并校验 `multilingual-e5-small`（f16，约 224MB），缓存到 `~/.umadev/embed-model`；以后本地推理无需 API key 或运行时网络。下载受限时 UmaDev 仍以 BM25 检索，后续符合条件的启动会重试；损坏缓存不会被信任，而会重新下载。真实编码仍需要已安装、已认证的底座 CLI。
@@ -149,7 +163,7 @@ npm tarball 不内含向量模型。第一次执行需要检索的命令时，np
 - macOS Intel
 - Linux x86_64（glibc ≥ 2.31 或 musl/Alpine）
 - Linux ARM64（glibc ≥ 2.31 或 musl/Alpine）
-- Windows x86_64
+- Windows x86_64（Windows on ARM 通过系统 x64 兼容层运行同一二进制）
 
 也可以从源码构建：
 
@@ -387,7 +401,7 @@ umadev 的可信来自把"模型说了什么"和"硬信号是什么"严格分开
 | `claude-code` | 厂商专属 stream-json | Claude permission mode | 精确 `--resume` |
 | `codex` | 厂商专属 `codex app-server` JSON-RPC | Codex sandbox + approval policy | 精确 `thread/resume` |
 | `opencode` | 厂商专属 `opencode serve` HTTP/SSE | OpenCode permission rules | 精确持久 session id |
-| `grok-build` | ACP v1 stdio | Plan 增加只读 sandbox、禁用子 Agent、限制为只读工具集 | 协商到 `session/resume` 时优先使用，否则使用已声明的 `session/load` |
+| `grok-build` | ACP v1 stdio | Plan 增加只读 sandbox、禁用子 Agent、限制为只读工具集 | 当前使用有界新会话交接；只有同时证明有效沙箱与原生恢复预检后才启用持久恢复 |
 | `kimi-code` | 官方 `kimi acp` v1 stdio | Plan=`plan`；Guarded/Auto 保持 `default`，由 UmaDev 审批策略和不可逆红线掌权 | 标准 `session/resume`，并按声明回退 `session/load`；工作区与权限身份必须一致 |
 
 特点：
@@ -755,7 +769,7 @@ umadev 有两套入口，一一对应：
 | `umadev lessons` | 查看由复发事故或机械验证结果形成的可复用规则及其 pending / validated / needs-revision 状态；具体事故看 TUI `/pitfalls` |
 | `umadev history` | 列出回滚快照 |
 | `umadev rollback latest` | 回滚到某快照 |
-| `umadev update` | 升级 umadev 到最新版（经 npm） |
+| `umadev update` | 通过实际所属包管理器（npm / pnpm / yarn / bun）升级；原生 / 独立安装则从 GitHub Release 校验并原子更新 |
 | `umadev uninstall` | 完整卸载：确认后删 `~/.umadev` + 本项目治理钩子 + 二进制（加 `--base <claude-code\|pre-commit>` 则仅卸钩子） |
 
 **脚本 / CI 运行（外层命令非交互）**

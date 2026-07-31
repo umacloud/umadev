@@ -132,6 +132,17 @@
 "host.input.bar.hint" = "Enter=提交 · Shift+Enter=换行 · Esc=取消"
 "host.input.secret_suffix" = "（敏感输入已遮蔽）"
 "host.input.marker" = "[?]"
+"host.input.summary.user" = "底座请求用户输入"
+"host.input.summary.response" = "底座正在等待答复"
+"host.input.summary.plan" = "审阅底座提出的计划"
+"host.input.summary.folder_trust" = "Grok Build 文件夹信任：{}"
+"host.input.note.marker" = "[输入]"
+"host.input.note.structured_answers" = "底座正在等待结构化答复："
+"host.input.note.picker_only" = "请在输入框上方的选择器中回答（↑↓ 移动 · Space 选择 · Enter 确认 · Tab 备注）；此处不会读取自由输入的文字。"
+"host.input.note.multi_reply" = "请每个问题回复一行，或按问题 id 提交 JSON 对象。"
+"host.input.note.mcp_expected" = "{}：{}\n预期答复类型：{}"
+"host.input.note.folder_trust" = "[文件夹信任] Grok Build 正在等待确认，尚未加载项目配置。\n工作区：{}\n当前会话目录：{}\n准备加载的配置：{}\n信任必须由用户单独明确确认；Auto 模式绝不会自动回答此请求。"
+"host.input.note.approval_superseded" = "[note] 新的批准请求取代了先前尚未回答的请求；先前请求已安全拒绝。"
 "host.grok.question.empty" = "问卷没有问题 · Esc 取消"
 "host.grok.question.title" = "问题 {}/{} · {}"
 "host.grok.question.preview" = "  预览：{}"
@@ -861,6 +872,8 @@
 "deploy.detected" = "[deploy] 已识别部署目标:{}(若底座未记录部署命令,将自动选用对应命令)。"
 "deploy.proof_written" = "[ok] 已写入部署证据:{}(并入下一个 proof-pack)。"
 "deploy.no_target" = "未识别到部署目标(没有 vercel.json / netlify.toml / Dockerfile / fly.toml / 构建产物)。请补一个平台配置,或手动部署。"
+"deploy.irreversible_prompt" = "即将执行不可逆的网络部署:\n  {}\n确认继续?"
+"deploy.cancelled" = "已取消部署。"
 
 # --- usage / lessons read-only views (umadev usage · umadev lessons · /usage · /lessons) ---
 "usage.empty" = "还没有使用记录。跑一次需求(run)后会自动按阶段统计 token 用量。\n(UmaDev 驱动的是你自己的底座订阅,不会向你计费。)"
@@ -1003,6 +1016,11 @@
 "pr.create_failed" = "`gh pr create` 失败(fail-open):{}"
 "pr.git_failed" = "git `{}` 失败(fail-open):{}"
 "pr.fallback" = "无法自动完成 — 回退到下方手动步骤。仓库保持原样(不 force-push、不改写已有提交)。"
+"pr.diff_unavailable" = "无法确认本轮源码差异(运行基线缺失或不可读),已拒绝发布不完整 PR。"
+"pr.diff_too_large" = "本轮改动达到 {}+ 个文件,超过 {} 个文件的可验证差异上限;请拆分本轮后再发布。"
+"pr.no_changes" = "本轮没有改动源码或证据路径,没有可供 PR 提交的内容。"
+"pr.irreversible_prompt" = "即将仅暂存并提交这些本轮所有的路径:{}\n然后推送 `{}` 并创建 PR(不可逆网络动作)。确认继续?"
+"pr.cancelled" = "已取消创建 PR。"
 
 # auto 模式 — 自动跳过澄清 + 每条路径一致的自动通过播报
 "auto.clarify_skipped" = "[auto] 已自动通过澄清(用原始需求,不再追问)。想逐条回答就切到 /mode guarded。"

@@ -1,15 +1,19 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 const POLICY_VERSION: u32 = 1;
 const MAX_POLICY_BYTES: u64 = 64 * 1024;
 const POLICY_LOCK_DIR: &str = ".policy.lock";
 const POLICY_LOCK_OWNER: &str = "owner";
+const POLICY_LOCK_LEASE: &str = "lease";
 const POLICY_LOCK_ATTEMPTS: usize = 500;
 const POLICY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 const POLICY_LOCK_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
+const POLICY_LOCK_FUTURE_SKEW_MS: u64 = 60 * 1_000;
 static POLICY_LOCK_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -370,11 +374,11 @@ impl MemoryPolicy {
         if let Some(unknown) = self
             .stores
             .keys()
-            .find(|name| MemoryStore::parse(name).is_none())
+            .find(|name| MemoryStore::parse(name).is_none_or(|store| store.id() != name.as_str()))
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("unknown memory store `{unknown}`"),
+                format!("unknown or non-canonical memory store `{unknown}`"),
             ));
         }
         Ok(())
@@ -392,20 +396,40 @@ pub fn policy_path(boundary: &Path) -> std::io::Result<PathBuf> {
     Ok(root.join(".umadev").join("memory").join("policy.toml"))
 }
 
-fn ensure_policy_path(boundary: &Path) -> std::io::Result<PathBuf> {
-    Ok(ensure_memory_dir(boundary)?.join("policy.toml"))
-}
-
-fn ensure_memory_dir(boundary: &Path) -> std::io::Result<PathBuf> {
-    let root = std::fs::canonicalize(boundary)?;
-    if !crate::fs::real_dir(&root) {
+/// Resolve the memory policy below an explicit `UmaDev` state directory.
+///
+/// Most callers pass a user/project boundary and use [`policy_path`], which
+/// appends `.umadev`. `UMADEV_HOME`, however, already names that state
+/// directory, so global stores must not append a second `.umadev` component.
+pub fn policy_path_in_state(state: &Path) -> std::io::Result<PathBuf> {
+    let state = std::fs::canonicalize(state)?;
+    if !crate::fs::real_dir(&state) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "memory policy boundary is not a real directory",
+            "memory policy state root is not a real directory",
         ));
     }
-    let umadev = crate::fs::ensure_real_child_dir(&root, ".umadev")?;
-    crate::fs::ensure_real_child_dir(&umadev, "memory")
+    Ok(state.join("memory").join("policy.toml"))
+}
+
+fn memory_relative(state_directory: bool) -> PathBuf {
+    if state_directory {
+        PathBuf::from("memory")
+    } else {
+        PathBuf::from(".umadev/memory")
+    }
+}
+
+fn ensure_memory_dir(
+    root: &crate::fs::RootedDir,
+    state_directory: bool,
+) -> std::io::Result<PathBuf> {
+    if !state_directory {
+        root.ensure_dir(Path::new(".umadev"), false)?;
+    }
+    let memory = memory_relative(state_directory);
+    root.ensure_dir(&memory, true)?;
+    Ok(memory)
 }
 
 fn now_ms() -> u64 {
@@ -428,67 +452,135 @@ fn parse_lock_owner(bytes: &[u8]) -> Option<(u64, &str)> {
     (!nonce.is_empty() && !nonce.contains('\n')).then_some((stamp, nonce))
 }
 
+fn policy_owner_matches(root: &crate::fs::RootedDir, path: &Path, nonce: &str) -> bool {
+    root.read_bounded(path, 4_096)
+        .ok()
+        .and_then(|bytes| parse_lock_owner(&bytes).map(|(_, seen)| seen == nonce))
+        .unwrap_or(false)
+}
+
 struct PolicyLock {
-    path: PathBuf,
+    root: Arc<crate::fs::RootedDir>,
+    lock: PathBuf,
     nonce: String,
+    lease: Option<std::fs::File>,
 }
 
 impl Drop for PolicyLock {
     fn drop(&mut self) {
-        let owner = self.path.join(POLICY_LOCK_OWNER);
-        let Ok(bytes) = crate::fs::read_bounded(&owner, 4_096) else {
+        let owner = self.lock.join(POLICY_LOCK_OWNER);
+        let Ok(bytes) = self.root.read_bounded(&owner, 4_096) else {
             return;
         };
         if parse_lock_owner(&bytes).is_none_or(|(_, nonce)| nonce != self.nonce) {
             return;
         }
-        let _ = crate::fs::remove_regular_file(&owner);
-        let _ = crate::fs::remove_empty_dir(&self.path);
+        let _ = self.root.remove_regular_file(&owner);
+        drop(self.lease.take());
+        let _ = self
+            .root
+            .remove_regular_file(&self.lock.join(POLICY_LOCK_LEASE));
+        let _ = self.root.remove_empty_dir(&self.lock);
     }
 }
 
-fn reclaim_stale_policy_lock(lock: &Path) {
-    if !crate::fs::real_dir(lock) {
+fn policy_lock_modified_at_ms(root: &crate::fs::RootedDir, lock: &Path) -> Option<u64> {
+    root.directory_modified(lock)
+        .ok()
+        .flatten()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn policy_lock_age_ms(root: &crate::fs::RootedDir, lock: &Path, now: u64) -> Option<u64> {
+    let future_limit = now.saturating_add(POLICY_LOCK_FUTURE_SKEW_MS);
+    let created_at = root
+        .read_bounded(&lock.join(POLICY_LOCK_OWNER), 4_096)
+        .ok()
+        .and_then(|bytes| parse_lock_owner(&bytes).map(|(stamp, _)| stamp))
+        .filter(|stamp| *stamp <= future_limit)
+        .or_else(|| policy_lock_modified_at_ms(root, lock))?;
+    Some(now.saturating_sub(created_at))
+}
+
+fn reclaim_stale_policy_lock(root: &crate::fs::RootedDir, lock: &Path, stale_after_ms: u64) {
+    if !root.is_real_dir(lock).unwrap_or(false) {
         return;
     }
-    let owner = lock.join(POLICY_LOCK_OWNER);
-    let Ok(bytes) = crate::fs::read_bounded(&owner, 4_096) else {
-        return;
-    };
-    let Some((created_at, _)) = parse_lock_owner(&bytes) else {
-        return;
-    };
-    if now_ms().saturating_sub(created_at) <= POLICY_LOCK_STALE_AFTER_MS {
+    if policy_lock_age_ms(root, lock, now_ms()).is_none_or(|age| age <= stale_after_ms) {
         return;
     }
+    let lease_path = lock.join(POLICY_LOCK_LEASE);
+    let lease = match root.open_private_existing_lock(&lease_path) {
+        Ok(file) => match file.try_lock_exclusive() {
+            Ok(()) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(_) => return,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return,
+    };
     let Some(parent) = lock.parent() else {
         return;
     };
     let tomb = parent.join(format!(".policy.lock.stale.{}", lock_nonce()));
-    if crate::fs::rename(lock, &tomb).is_ok() {
-        let _ = crate::fs::remove_regular_file(&tomb.join(POLICY_LOCK_OWNER));
-        let _ = crate::fs::remove_empty_dir(&tomb);
+    if root.rename(lock, &tomb).is_ok() {
+        drop(lease);
+        let _ = root.remove_regular_file(&tomb.join(POLICY_LOCK_OWNER));
+        let _ = root.remove_regular_file(&tomb.join(POLICY_LOCK_LEASE));
+        let _ = root.remove_empty_dir(&tomb);
     }
 }
 
-fn acquire_policy_lock(boundary: &Path) -> std::io::Result<PolicyLock> {
-    let memory = ensure_memory_dir(boundary)?;
+fn acquire_policy_lock(
+    root: Arc<crate::fs::RootedDir>,
+    state_directory: bool,
+) -> std::io::Result<PolicyLock> {
+    let memory = ensure_memory_dir(&root, state_directory)?;
     let lock = memory.join(POLICY_LOCK_DIR);
     for _ in 0..POLICY_LOCK_ATTEMPTS {
-        match crate::fs::create_dir(&lock) {
+        match root.create_dir(&lock, false) {
             Ok(()) => {
                 let nonce = lock_nonce();
                 let owner = format!("{}\n{nonce}", now_ms());
                 if let Err(error) =
-                    crate::fs::atomic_write(&lock.join(POLICY_LOCK_OWNER), owner.as_bytes())
+                    root.atomic_write(&lock.join(POLICY_LOCK_OWNER), owner.as_bytes(), false)
                 {
-                    let _ = crate::fs::remove_empty_dir(&lock);
+                    let _ = root.remove_empty_dir(&lock);
                     return Err(error);
                 }
-                return Ok(PolicyLock { path: lock, nonce });
+                let lease = match root
+                    .open_private_lock(&lock.join(POLICY_LOCK_LEASE), false)
+                    .and_then(|file| {
+                        file.try_lock_exclusive()?;
+                        Ok(file)
+                    }) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        if policy_owner_matches(&root, &lock.join(POLICY_LOCK_OWNER), &nonce) {
+                            let _ = root.remove_regular_file(&lock.join(POLICY_LOCK_OWNER));
+                            let _ = root.remove_regular_file(&lock.join(POLICY_LOCK_LEASE));
+                            let _ = root.remove_empty_dir(&lock);
+                        }
+                        return Err(error);
+                    }
+                };
+                if !policy_owner_matches(&root, &lock.join(POLICY_LOCK_OWNER), &nonce) {
+                    drop(lease);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "memory policy lock namespace changed during lease acquisition",
+                    ));
+                }
+                return Ok(PolicyLock {
+                    root,
+                    lock,
+                    nonce,
+                    lease: Some(lease),
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                reclaim_stale_policy_lock(&lock);
+                reclaim_stale_policy_lock(&root, &lock, POLICY_LOCK_STALE_AFTER_MS);
                 std::thread::sleep(POLICY_LOCK_WAIT);
             }
             Err(error) => return Err(error),
@@ -500,45 +592,70 @@ fn acquire_policy_lock(boundary: &Path) -> std::io::Result<PolicyLock> {
     ))
 }
 
-pub fn load_policy(boundary: &Path) -> std::io::Result<MemoryPolicy> {
-    let path = policy_path(boundary)?;
-    match crate::fs::read_bounded(&path, MAX_POLICY_BYTES) {
-        Ok(bytes) => {
-            let text = std::str::from_utf8(&bytes).map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-            })?;
-            let policy: MemoryPolicy = toml::from_str(text).map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-            })?;
-            policy.validate()?;
-            Ok(policy)
-        }
+fn parse_policy(bytes: &[u8]) -> std::io::Result<MemoryPolicy> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let policy: MemoryPolicy = toml::from_str(text)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    policy.validate()?;
+    Ok(policy)
+}
+
+/// Load the boundary-scoped policy through an already captured root
+/// capability. This is used by multi-step lifecycle operations so an ambient
+/// boundary rename cannot redirect the policy read between preflight and
+/// mutation.
+pub fn load_policy_rooted(
+    root: &crate::fs::RootedDir,
+    state_directory: bool,
+) -> std::io::Result<MemoryPolicy> {
+    let path = memory_relative(state_directory).join("policy.toml");
+    match root.read_bounded(&path, MAX_POLICY_BYTES) {
+        Ok(bytes) => parse_policy(&bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MemoryPolicy::default()),
         Err(error) => Err(error),
     }
 }
 
-fn save_policy_unlocked(boundary: &Path, policy: &MemoryPolicy) -> std::io::Result<()> {
+pub fn load_policy(boundary: &Path) -> std::io::Result<MemoryPolicy> {
+    let root = crate::fs::RootedDir::open(boundary)?;
+    load_policy_rooted(&root, false)
+}
+
+/// Load policy when the supplied path is the `UmaDev` state directory itself.
+pub fn load_policy_in_state(state: &Path) -> std::io::Result<MemoryPolicy> {
+    let root = crate::fs::RootedDir::open(state)?;
+    load_policy_rooted(&root, true)
+}
+
+fn save_policy_unlocked(
+    root: &crate::fs::RootedDir,
+    state_directory: bool,
+    policy: &MemoryPolicy,
+) -> std::io::Result<()> {
     policy.validate()?;
-    let path = ensure_policy_path(boundary)?;
+    let memory = ensure_memory_dir(root, state_directory)?;
+    let path = memory.join("policy.toml");
     let text = toml::to_string_pretty(policy)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
-    crate::fs::atomic_write(&path, text.as_bytes())
+    root.atomic_write(&path, text.as_bytes(), false)
 }
 
 pub fn save_policy(boundary: &Path, policy: &MemoryPolicy) -> std::io::Result<()> {
-    let _lock = acquire_policy_lock(boundary)?;
-    save_policy_unlocked(boundary, policy)
+    let root = Arc::new(crate::fs::RootedDir::open(boundary)?);
+    let _lock = acquire_policy_lock(Arc::clone(&root), false)?;
+    save_policy_unlocked(&root, false, policy)
 }
 
 pub fn update_policy(
     boundary: &Path,
     update: impl FnOnce(&mut MemoryPolicy) -> std::io::Result<()>,
 ) -> std::io::Result<MemoryPolicy> {
-    let _lock = acquire_policy_lock(boundary)?;
-    let mut policy = load_policy(boundary)?;
+    let root = Arc::new(crate::fs::RootedDir::open(boundary)?);
+    let _lock = acquire_policy_lock(Arc::clone(&root), false)?;
+    let mut policy = load_policy_rooted(&root, false)?;
     update(&mut policy)?;
-    save_policy_unlocked(boundary, &policy)?;
+    save_policy_unlocked(&root, false, &policy)?;
     Ok(policy)
 }
 
@@ -554,6 +671,20 @@ pub fn recall_enabled(boundary: &Path, store: MemoryStore) -> bool {
         && load_policy(boundary).is_ok_and(|policy| policy.recall_enabled(store))
 }
 
+/// State-directory variant of [`capture_enabled`], used for `UMADEV_HOME`.
+#[must_use]
+pub fn capture_enabled_in_state(state: &Path, store: MemoryStore) -> bool {
+    store.capture_controllable()
+        && load_policy_in_state(state).is_ok_and(|policy| policy.capture_enabled(store))
+}
+
+/// State-directory variant of [`recall_enabled`], used for `UMADEV_HOME`.
+#[must_use]
+pub fn recall_enabled_in_state(state: &Path, store: MemoryStore) -> bool {
+    store.recall_controllable()
+        && load_policy_in_state(state).is_ok_and(|policy| policy.recall_enabled(store))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +694,25 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert!(capture_enabled(temp.path(), MemoryStore::Facts));
         assert!(recall_enabled(temp.path(), MemoryStore::Facts));
+    }
+
+    #[test]
+    fn explicit_state_policy_does_not_append_a_second_umadev_directory() {
+        let state = tempfile::tempdir().unwrap();
+        let memory = crate::fs::ensure_real_child_dir(state.path(), "memory").unwrap();
+        crate::fs::atomic_write(
+            &memory.join("policy.toml"),
+            b"version = 1\ncapture = true\nrecall = true\n",
+        )
+        .unwrap();
+        assert!(capture_enabled_in_state(state.path(), MemoryStore::Facts));
+        assert!(recall_enabled_in_state(state.path(), MemoryStore::Facts));
+        let canonical_state = std::fs::canonicalize(state.path()).unwrap();
+        assert_eq!(
+            policy_path_in_state(state.path()).unwrap(),
+            canonical_state.join("memory/policy.toml")
+        );
+        assert!(!state.path().join(".umadev").exists());
     }
 
     #[test]
@@ -584,8 +734,9 @@ mod tests {
     #[test]
     fn malformed_policy_disables_use_instead_of_ignoring_privacy_intent() {
         let temp = tempfile::tempdir().unwrap();
-        let path = ensure_policy_path(temp.path()).unwrap();
-        std::fs::write(path, "capture = maybe").unwrap();
+        let root = crate::fs::RootedDir::open(temp.path()).unwrap();
+        let path = ensure_memory_dir(&root, false).unwrap().join("policy.toml");
+        root.atomic_write(&path, b"capture = maybe", false).unwrap();
         assert!(!capture_enabled(temp.path(), MemoryStore::Facts));
         assert!(!recall_enabled(temp.path(), MemoryStore::Facts));
     }
@@ -649,11 +800,13 @@ mod tests {
     #[test]
     fn stale_policy_lock_is_reclaimed_without_recursive_deletion() {
         let temp = tempfile::tempdir().unwrap();
-        let memory = ensure_memory_dir(temp.path()).unwrap();
+        let root = crate::fs::RootedDir::open(temp.path()).unwrap();
+        let memory = ensure_memory_dir(&root, false).unwrap();
         let lock = memory.join(POLICY_LOCK_DIR);
-        std::fs::create_dir(&lock).unwrap();
+        root.create_dir(&lock, false).unwrap();
         let owner = format!("{}\nstale-test", now_ms() - POLICY_LOCK_STALE_AFTER_MS - 1);
-        crate::fs::atomic_write(&lock.join(POLICY_LOCK_OWNER), owner.as_bytes()).unwrap();
+        root.atomic_write(&lock.join(POLICY_LOCK_OWNER), owner.as_bytes(), false)
+            .unwrap();
 
         update_policy(temp.path(), |policy| {
             policy.set_capture(Some(MemoryStore::Facts), false);
@@ -661,6 +814,83 @@ mod tests {
         })
         .unwrap();
         assert!(!capture_enabled(temp.path(), MemoryStore::Facts));
-        assert!(!lock.exists());
+        assert!(!temp.path().join(lock).exists());
+    }
+
+    #[test]
+    fn ownerless_crash_policy_lock_is_reclaimable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::fs::RootedDir::open(temp.path()).unwrap();
+        let memory = ensure_memory_dir(&root, false).unwrap();
+        let lock = memory.join(POLICY_LOCK_DIR);
+        root.create_dir(&lock, false).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        reclaim_stale_policy_lock(&root, &lock, 0);
+        assert!(!temp.path().join(lock).exists());
+        save_policy(temp.path(), &MemoryPolicy::default()).unwrap();
+    }
+
+    #[test]
+    fn active_policy_lease_cannot_be_reclaimed_by_age() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Arc::new(crate::fs::RootedDir::open(temp.path()).unwrap());
+        let guard = acquire_policy_lock(root, false).unwrap();
+        let owner = format!("0\n{}", guard.nonce);
+        guard
+            .root
+            .atomic_write(&guard.lock.join(POLICY_LOCK_OWNER), owner.as_bytes(), false)
+            .unwrap();
+
+        reclaim_stale_policy_lock(&guard.root, &guard.lock, 0);
+        assert!(guard.root.is_real_dir(&guard.lock).unwrap());
+        drop(guard);
+        assert!(!temp.path().join(".umadev/memory/.policy.lock").exists());
+    }
+
+    #[test]
+    fn non_canonical_store_keys_fail_closed_instead_of_being_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::fs::RootedDir::open(temp.path()).unwrap();
+        let path = ensure_memory_dir(&root, false).unwrap().join("policy.toml");
+        root.atomic_write(
+            &path,
+            b"version = 1\ncapture = true\nrecall = true\n\n[stores.FACTS]\ncapture = false\n",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_policy(temp.path()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(!capture_enabled(temp.path(), MemoryStore::Facts));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_transaction_never_writes_to_a_replacement_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let container = tempfile::tempdir().unwrap();
+        let boundary = container.path().join("boundary");
+        let moved = container.path().join("moved");
+        let outside = container.path().join("outside");
+        std::fs::create_dir(&boundary).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+
+        update_policy(&boundary, |policy| {
+            std::fs::rename(&boundary, &moved)?;
+            symlink(&outside, &boundary)?;
+            policy.set_capture(Some(MemoryStore::Facts), false);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(outside.read_dir().unwrap().next().is_none());
+        assert!(!load_policy(&moved)
+            .unwrap()
+            .capture_enabled(MemoryStore::Facts));
+        assert!(!moved.join(".umadev/memory/.policy.lock").exists());
     }
 }

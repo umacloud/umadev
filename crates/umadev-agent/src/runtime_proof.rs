@@ -55,6 +55,7 @@ use crate::verify::{detect_dev_server, DevServer};
 
 /// Cap captured e2e / probe-body output so a chatty run can't bloat the JSON.
 const CAPTURE_CAP: usize = 8 * 1024;
+const MAX_RUNTIME_PROOF_BYTES: usize = 1024 * 1024;
 
 /// How long (seconds) we wait for the dev server to answer its base URL before
 /// giving up. A cold `npm run dev` (install already done) usually answers in a
@@ -542,12 +543,19 @@ fn downgrade_reason(
 /// success; fail-open (`Err`) is swallowed by callers — a write failure must
 /// not block delivery.
 pub fn write_runtime_proof(workspace: &Path, proof: &RuntimeProof) -> std::io::Result<PathBuf> {
-    let audit_dir = workspace.join(".umadev/audit");
-    std::fs::create_dir_all(&audit_dir)?;
-    let path = audit_dir.join("runtime-proof.json");
-    let body = serde_json::to_string_pretty(proof).unwrap_or_else(|_| "{}".into());
-    std::fs::write(&path, body)?;
-    Ok(path)
+    let audit_dir =
+        crate::bounded_fs::ensure_real_dir_beneath(workspace, Path::new(".umadev/audit"))?;
+    let value = serde_json::to_value(proof).map_err(std::io::Error::other)?;
+    let value = umadev_governance::redaction::redact_json(value);
+    let body = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
+    if body.len() > MAX_RUNTIME_PROOF_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "runtime proof exceeds the managed file limit",
+        ));
+    }
+    umadev_state::fs::atomic_write(&audit_dir.join("runtime-proof.json"), &body)?;
+    Ok(workspace.join(runtime_proof_rel_path()))
 }
 
 /// The canonical location of the runtime-proof artifact relative to the
@@ -2007,6 +2015,40 @@ mod tests {
         assert_eq!(written, expected);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_proof_is_redacted_and_never_follows_managed_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_proof = outside.path().join("runtime-proof.json");
+        fs::write(&outside_proof, "outside").unwrap();
+        let mut proof = RuntimeProof::not_verified("api_key=sk-live-super-secret-value");
+        proof.e2e = Some(E2eResult {
+            command: "test".to_string(),
+            passed: false,
+            ms: 1,
+            output: "Authorization: Bearer live-secret-value".to_string(),
+        });
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        assert!(write_runtime_proof(root.path(), &proof).is_err());
+        assert_eq!(fs::read_to_string(&outside_proof).unwrap(), "outside");
+
+        fs::remove_file(root.path().join(".umadev")).unwrap();
+        let path = write_runtime_proof(root.path(), &proof).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(!body.contains("sk-live-super-secret-value"));
+        assert!(!body.contains("live-secret-value"));
+        assert!(body.contains("[redacted]"));
+
+        fs::remove_file(root.path().join(runtime_proof_rel_path())).unwrap();
+        symlink(&outside_proof, root.path().join(runtime_proof_rel_path())).unwrap();
+        assert!(write_runtime_proof(root.path(), &proof).is_err());
+        assert_eq!(fs::read_to_string(&outside_proof).unwrap(), "outside");
+    }
+
     #[tokio::test]
     async fn run_runtime_proof_no_dev_server_is_not_verified() {
         // An empty workspace has no dev server → fail-open "not verified",
@@ -2514,7 +2556,14 @@ mod tests {
         assert_eq!(pid_is_alive(leaf), Some(true));
         assert!(read_preview_pid(tmp.path()).is_none());
 
-        tree.terminate(&mut leader);
+        assert!(process_group_has_owner_token(group_id, "different-owner").await);
+        assert!(kill_preview_tree(group_id).await);
+        tree.retain_descendants();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while pid_is_alive(leaf) == Some(true) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(pid_is_alive(leaf), Some(false));
     }
 
     #[cfg(unix)]

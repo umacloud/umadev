@@ -84,12 +84,12 @@ pub(crate) const PRINT_BG_WAIT_CEILING_DEFAULT_MS: &str = "1800000";
 /// governance-root marker ([`govern_root_env`]) plus the raised background
 /// wind-down ceiling ([`PRINT_BG_WAIT_CEILING_ENV`]) when the user has not set
 /// their own value (the user's explicit value always wins — it is inherited).
-fn claude_call_env(ws: &std::path::Path) -> Vec<(String, String)> {
+fn claude_call_env(ws: &std::path::Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     let mut env = govern_root_env(ws);
     if std::env::var_os(PRINT_BG_WAIT_CEILING_ENV).is_none() {
         env.push((
-            PRINT_BG_WAIT_CEILING_ENV.to_string(),
-            PRINT_BG_WAIT_CEILING_DEFAULT_MS.to_string(),
+            PRINT_BG_WAIT_CEILING_ENV.into(),
+            PRINT_BG_WAIT_CEILING_DEFAULT_MS.into(),
         ));
     }
     env

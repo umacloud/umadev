@@ -76,6 +76,32 @@ mod tests {
         assert!(p.team.is_empty());
     }
 
+    #[test]
+    fn non_finite_brain_confidence_degrades_to_zero() {
+        for encoded in ["NaN", "inf", "-inf"] {
+            let json = format!(r#"{{"class":"chat","kind":"light","confidence":"{encoded}"}}"#);
+            let brain: BrainRoute = serde_json::from_str(&json).unwrap();
+            assert!(
+                brain.confidence.abs() < f32::EPSILON,
+                "{encoded} must not survive parsing"
+            );
+        }
+
+        // Keep the public invariant defensive even if a future internal caller
+        // constructs BrainRoute without going through serde.
+        let route = brain_to_route(
+            &BrainRoute {
+                class: "chat".into(),
+                kind: "light".into(),
+                confidence: f32::NAN,
+                ..Default::default()
+            },
+            "hello",
+        );
+        assert!(route.confidence.abs() < f32::EPSILON);
+        assert!(route.confidence.is_finite());
+    }
+
     #[tokio::test]
     async fn brain_classifies_a_real_build_as_build_with_team() {
         let brain = TriageBrain(
@@ -116,7 +142,7 @@ mod tests {
         // the deterministic domain floor scopes the team to BackendOnly so it convenes no UI
         // reviewers (the reported "backend task pulls in a uiux-designer + frontend-engineer").
         let brain = TriageBrain(
-            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"greenfield\",\"complexity\":\"medium\"}",
+            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"greenfield\",\"complexity\":\"medium\",\"needs\":[\"uiux-designer\",\"frontend-engineer\"]}",
         );
         let p = route_via_brain(&brain, "优化后端代码,提升接口性能").await;
         assert_eq!(p.class, RouteClass::Build);
@@ -130,6 +156,65 @@ mod tests {
             "a pure-backend build convenes NO UI reviewers: {:?}",
             p.team
         );
+    }
+
+    #[tokio::test]
+    async fn backend_route_accepts_ui_needs_only_for_explicit_cross_surface_work() {
+        let brain = TriageBrain(
+            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"backend_only\",\"complexity\":\"medium\",\"needs\":[\"uiux-designer\",\"frontend-engineer\"]}",
+        );
+        let p = route_via_brain(&brain, "优化后端接口并同步修改前端登录页面").await;
+        assert_eq!(p.kind, TaskKind::BackendOnly);
+        assert!(p.team.contains(&Seat::UiuxDesigner), "{:?}", p.team);
+        assert!(p.team.contains(&Seat::FrontendEngineer), "{:?}", p.team);
+    }
+
+    #[tokio::test]
+    async fn backend_route_honours_explicit_frontend_exclusions_before_positive_words() {
+        let brain = TriageBrain(
+            "{\"class\":\"build\",\"authorization\":\"mutating\",\"kind\":\"backend_only\",\"complexity\":\"medium\",\"needs\":[\"uiux-designer\",\"frontend-engineer\"]}",
+        );
+        for request in [
+            "只优化后端，不要修改前端",
+            "无需修改前端，只改后端接口",
+            "修复后端接口，不要调整前端页面",
+            "optimize the backend only; do not change frontend",
+            "fix the backend; do not update frontend",
+        ] {
+            let p = route_via_brain(&brain, request).await;
+            assert_eq!(p.kind, TaskKind::BackendOnly, "{request}");
+            assert!(
+                !p.team.contains(&Seat::UiuxDesigner),
+                "{request}: {:?}",
+                p.team
+            );
+            assert!(
+                !p.team.contains(&Seat::FrontendEngineer),
+                "{request}: {:?}",
+                p.team
+            );
+        }
+
+        let cross_surface = route_via_brain(&brain, "不要只改后端，还要修改前端登录页面").await;
+        assert!(cross_surface.team.contains(&Seat::UiuxDesigner));
+        assert!(cross_surface.team.contains(&Seat::FrontendEngineer));
+
+        for request in [
+            "不是不需要修改前端，后端接口和前端登录页都要完成",
+            "不要不修改前端，登录页也必须同步更新",
+        ] {
+            let p = route_via_brain(&brain, request).await;
+            assert!(
+                p.team.contains(&Seat::UiuxDesigner),
+                "{request}: {:?}",
+                p.team
+            );
+            assert!(
+                p.team.contains(&Seat::FrontendEngineer),
+                "{request}: {:?}",
+                p.team
+            );
+        }
     }
 
     #[tokio::test]
@@ -404,6 +489,10 @@ mod tests {
         assert_eq!(p.depth, Depth::Fast);
         assert!(p.team.is_empty());
         assert!(p.needs_clarify.is_none());
+
+        let routed = route_with_source(None, &opts(), "你好,在吗?").await;
+        assert_eq!(routed.source, RouteSource::DeterministicFallback);
+        assert_eq!(routed.fallback_reason, Some(RouteFallbackReason::NoSession));
     }
 
     #[tokio::test]
@@ -767,8 +856,13 @@ mod tests {
             "帮我总结刚才做了什么",
             "目前进度如何？",
             "目前什么进展了？",
+            "全部完成了吗？",
+            "所有问题都解决了吗？",
+            "还剩什么任务？",
             "what changed in this turn?",
             "summarize the changes",
+            "is everything done?",
+            "what remains?",
         ] {
             let route = apply_route_ceilings(
                 brain_to_route(&wrong, request),
@@ -917,8 +1011,13 @@ mod tests {
             "本次改动做了什么？",
             "当前状态如何？",
             "汇报当前进度",
+            "全部完成了吗？",
+            "所有问题都解决了吗？",
+            "还剩什么任务？",
             "what changed in this turn?",
             "report current status",
+            "is everything done?",
+            "what remains?",
             "当前进度条是否需要修复？",
             "本次改动，修复了哪些问题？",
             "修复当前进度条了吗？",

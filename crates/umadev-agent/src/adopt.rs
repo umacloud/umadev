@@ -54,6 +54,11 @@ pub const PROJECT_SOURCE_INDEX_DIR: &str = ".umadev/project-source-index";
 /// File name of the brownfield baseline marker, under `.umadev/`.
 pub const ADOPT_MARKER_FILE: &str = "adopt.json";
 
+/// Durable adopt artifacts are workspace-controlled inputs on later runs.
+/// Bound them before allocation and reject link/special-file indirection.
+const MAX_ADOPT_MARKER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_PROJECT_SOURCE_INDEX_BYTES: usize = 256 * 1024 * 1024;
+
 /// Max directory depth the source walker descends. Mirrors the depth guards
 /// used elsewhere (contract extractor: 8, knowledge walker: 6); 8 is generous
 /// enough for `src/a/b/c/d/...` layouts without risking a pathological walk.
@@ -207,7 +212,8 @@ pub fn run_adopt(project_root: &Path) -> AdoptReport {
 #[must_use]
 pub fn read_adopt_marker(project_root: &Path) -> Option<AdoptReport> {
     let path = project_root.join(".umadev").join(ADOPT_MARKER_FILE);
-    let body = std::fs::read_to_string(path).ok()?;
+    let body =
+        crate::bounded_fs::read_utf8_beneath(project_root, &path, MAX_ADOPT_MARKER_BYTES).ok()?;
     serde_json::from_str(&body).ok()
 }
 
@@ -215,10 +221,7 @@ pub fn read_adopt_marker(project_root: &Path) -> Option<AdoptReport> {
 /// A cheap predicate the runner can call to choose incremental-vs-rewrite.
 #[must_use]
 pub fn is_adopted(project_root: &Path) -> bool {
-    project_root
-        .join(".umadev")
-        .join(ADOPT_MARKER_FILE)
-        .is_file()
+    read_adopt_marker(project_root).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -272,14 +275,12 @@ fn index_project_source(project_root: &Path) -> Result<(u32, u32, String), Strin
     // committed lockfile (`package-lock.json` / `pnpm-lock.yaml` - both at root with indexable
     // extensions), a big `.sql` dump, or a minified bundle would otherwise blow memory and
     // flood the source index with noise.
-    const MAX_SOURCE_BYTES: u64 = 512 * 1024;
+    const MAX_SOURCE_BYTES: usize = 512 * 1024;
     let mut chunks = Vec::new();
     let mut file_count: u32 = 0;
     for abs in &files {
-        if std::fs::metadata(abs).map(|m| m.len()).unwrap_or(0) > MAX_SOURCE_BYTES {
-            continue;
-        }
-        let Ok(body) = std::fs::read_to_string(abs) else {
+        let Ok(body) = crate::bounded_fs::read_utf8_beneath(project_root, abs, MAX_SOURCE_BYTES)
+        else {
             continue; // unreadable / binary → skip (fail-open)
         };
         if body.trim().is_empty() {
@@ -306,11 +307,19 @@ fn index_project_source(project_root: &Path) -> Result<(u32, u32, String), Strin
     let chunk_count = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
     let index = Bm25Index::from_chunks(chunks);
 
-    let dir = project_root.join(PROJECT_SOURCE_INDEX_DIR);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create index dir: {e}"))?;
+    let root = std::fs::canonicalize(project_root).map_err(|e| format!("resolve project: {e}"))?;
+    let state_dir = umadev_state::fs::ensure_real_child_dir(&root, ".umadev")
+        .map_err(|e| format!("create state dir: {e}"))?;
+    let dir = umadev_state::fs::ensure_real_child_dir(&state_dir, "project-source-index")
+        .map_err(|e| format!("create index dir: {e}"))?;
     let index_path = dir.join("source.bin");
     let bytes = serde_json::to_vec(&index).map_err(|e| format!("serialise index: {e}"))?;
-    std::fs::write(&index_path, bytes).map_err(|e| format!("write index: {e}"))?;
+    if bytes.len() > MAX_PROJECT_SOURCE_INDEX_BYTES {
+        return Err(format!(
+            "serialised source index exceeds {MAX_PROJECT_SOURCE_INDEX_BYTES} bytes"
+        ));
+    }
+    umadev_state::fs::atomic_write(&index_path, &bytes).map_err(|e| format!("write index: {e}"))?;
 
     let rel = format!("{PROJECT_SOURCE_INDEX_DIR}/source.bin");
     Ok((file_count, chunk_count, rel))
@@ -324,8 +333,11 @@ pub fn load_project_source_index(project_root: &Path) -> Option<Bm25Index> {
     let path = project_root
         .join(PROJECT_SOURCE_INDEX_DIR)
         .join("source.bin");
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let bytes =
+        crate::bounded_fs::read_bytes_beneath(project_root, &path, MAX_PROJECT_SOURCE_INDEX_BYTES)
+            .ok()?;
+    let index: Bm25Index = serde_json::from_slice(&bytes).ok()?;
+    index.is_consistent().then_some(index)
 }
 
 /// Source-file extensions worth indexing. Broad enough to cover the common
@@ -599,8 +611,12 @@ fn write_boundary_doc(project_root: &Path, report: &AdoptReport) -> Result<Strin
     );
 
     // Never clobber a user's hand-authored AGENTS.md; write our own filename.
-    let path = project_root.join("UMADEV.md");
-    std::fs::write(&path, md).map_err(|e| format!("write UMADEV.md: {e}"))?;
+    // The project may itself be opened through a link, so resolve that trusted
+    // root first, then refuse a linked/special UMADEV.md leaf.
+    let root = std::fs::canonicalize(project_root).map_err(|e| format!("resolve project: {e}"))?;
+    let path = root.join("UMADEV.md");
+    umadev_state::fs::atomic_write(&path, md.as_bytes())
+        .map_err(|e| format!("write UMADEV.md: {e}"))?;
     Ok("UMADEV.md".to_string())
 }
 
@@ -612,12 +628,19 @@ fn write_boundary_doc(project_root: &Path, report: &AdoptReport) -> Result<Strin
 /// signal the planner / runner read (via [`read_adopt_marker`] / [`is_adopted`])
 /// to choose incremental change over a rewrite.
 fn write_adopt_marker(project_root: &Path, report: &AdoptReport) -> Result<String, String> {
-    let dir = project_root.join(".umadev");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create .umadev: {e}"))?;
+    let root = std::fs::canonicalize(project_root).map_err(|e| format!("resolve project: {e}"))?;
+    let dir = umadev_state::fs::ensure_real_child_dir(&root, ".umadev")
+        .map_err(|e| format!("create .umadev: {e}"))?;
     let path = dir.join(ADOPT_MARKER_FILE);
     let body =
         serde_json::to_string_pretty(report).map_err(|e| format!("serialise marker: {e}"))?;
-    std::fs::write(&path, body).map_err(|e| format!("write marker: {e}"))?;
+    if body.len() > MAX_ADOPT_MARKER_BYTES {
+        return Err(format!(
+            "serialised adopt marker exceeds {MAX_ADOPT_MARKER_BYTES} bytes"
+        ));
+    }
+    umadev_state::fs::atomic_write(&path, body.as_bytes())
+        .map_err(|e| format!("write marker: {e}"))?;
     Ok(format!(".umadev/{ADOPT_MARKER_FILE}"))
 }
 
@@ -752,6 +775,81 @@ mod tests {
         // And it loads back as a usable BM25 index.
         let loaded = load_project_source_index(tmp.path()).expect("index loads");
         assert!(loaded.doc_count >= 1);
+    }
+
+    #[test]
+    fn project_source_loader_rejects_shape_valid_inconsistent_index() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(PROJECT_SOURCE_INDEX_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let mut index = Bm25Index::from_chunks(chunk_text("src/app.rs", "alpha beta"));
+        assert!(index.is_consistent());
+        index.doc_count = index.doc_count.saturating_add(1);
+        fs::write(dir.join("source.bin"), serde_json::to_vec(&index).unwrap()).unwrap();
+
+        assert!(
+            load_project_source_index(tmp.path()).is_none(),
+            "redundant index fields must be validated before query code sees them"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopt_state_does_not_follow_linked_marker_or_index_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "src/app.rs", "pub fn app() -> bool { true }");
+        fs::create_dir(tmp.path().join(".umadev")).unwrap();
+
+        let outside = TempDir::new().unwrap();
+        let outside_index = outside.path().join("index");
+        fs::create_dir(&outside_index).unwrap();
+        symlink(
+            &outside_index,
+            tmp.path().join(".umadev/project-source-index"),
+        )
+        .unwrap();
+        assert!(index_project_source(tmp.path()).is_err());
+        assert!(
+            fs::read_dir(&outside_index).unwrap().next().is_none(),
+            "the index writer must not escape through a linked managed directory"
+        );
+
+        let report = AdoptReport {
+            mode: "brownfield".into(),
+            adopted_at: "2026-01-01T00:00:00Z".into(),
+            stack: "rust".into(),
+            dev_server: String::new(),
+            commands: Vec::new(),
+            api_endpoints: 0,
+            indexed_files: 1,
+            indexed_chunks: 1,
+            artifacts: Vec::new(),
+            notes: Vec::new(),
+        };
+        let boundary_target = outside.path().join("outside-UMADEV.md");
+        fs::write(&boundary_target, "outside boundary").unwrap();
+        symlink(&boundary_target, tmp.path().join("UMADEV.md")).unwrap();
+        assert!(write_boundary_doc(tmp.path(), &report).is_err());
+        assert_eq!(
+            fs::read_to_string(&boundary_target).unwrap(),
+            "outside boundary"
+        );
+
+        let marker_target = outside.path().join("outside-adopt.json");
+        let original = serde_json::to_vec(&report).unwrap();
+        fs::write(&marker_target, &original).unwrap();
+        symlink(
+            &marker_target,
+            tmp.path().join(".umadev").join(ADOPT_MARKER_FILE),
+        )
+        .unwrap();
+
+        assert!(read_adopt_marker(tmp.path()).is_none());
+        assert!(!is_adopted(tmp.path()));
+        assert!(write_adopt_marker(tmp.path(), &report).is_err());
+        assert_eq!(fs::read(marker_target).unwrap(), original);
     }
 
     #[test]

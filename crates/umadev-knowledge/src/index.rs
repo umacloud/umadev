@@ -546,7 +546,9 @@ pub(crate) fn write_atomic_in_real_dir(path: &Path, bytes: &[u8]) -> std::io::Re
 /// a current vector store; an actual version upgrade removes both lexical
 /// chunks and old vector metadata (which may contain legacy private paths).
 fn prepare_cache_schema(project_root: &Path) {
-    prepare_cache_schema_with_remove(project_root, |path| std::fs::remove_file(path));
+    prepare_cache_schema_with_remove(project_root, |path| {
+        umadev_state::fs::remove_regular_file(path).map(|_| ())
+    });
 }
 
 fn prepare_cache_schema_with_remove(
@@ -594,7 +596,7 @@ fn prepare_cache_schema_with_remove(
 /// extra organic rebuild later, never correctness).
 pub fn invalidate_cache(project_root: &Path) {
     if let Some(cache_dir) = existing_managed_cache_dir(project_root) {
-        let _ = std::fs::remove_file(cache_dir.join("bm25.sig"));
+        let _ = umadev_state::fs::remove_regular_file(&cache_dir.join("bm25.sig"));
     }
 }
 
@@ -602,7 +604,7 @@ pub fn invalidate_cache(project_root: &Path) {
 /// Learned sources carry their reviewed text immediately; curated files stay
 /// lazy until a cache miss requires a rebuild.
 struct CorpusSource {
-    path: PathBuf,
+    file: CorpusFile,
     relative_path: String,
     text: Option<String>,
     is_learned: bool,
@@ -611,8 +613,8 @@ struct CorpusSource {
     scope: CorpusScope,
 }
 
-fn read_knowledge_text(path: &Path) -> std::io::Result<String> {
-    let bytes = umadev_state::fs::read_bounded(path, MAX_KNOWLEDGE_FILE_BYTES)?;
+fn read_knowledge_text(file: &CorpusFile) -> std::io::Result<String> {
+    let bytes = file.read_bounded(MAX_KNOWLEDGE_FILE_BYTES)?;
     String::from_utf8(bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
@@ -622,19 +624,12 @@ fn bounded_corpus_files(files: Vec<CorpusFile>) -> Vec<CorpusFile> {
     let mut bounded = Vec::with_capacity(files.len());
     let mut skipped = 0usize;
     for file in files {
-        let Ok(metadata) = std::fs::symlink_metadata(file.path()) else {
-            skipped = skipped.saturating_add(1);
-            continue;
-        };
-        let size = metadata.len();
+        let size = file.len();
         let Some(next_total) = total_bytes.checked_add(size) else {
             skipped = skipped.saturating_add(1);
             continue;
         };
-        if !umadev_state::fs::metadata_is_real_file(&metadata)
-            || size > MAX_KNOWLEDGE_FILE_BYTES
-            || next_total > MAX_KNOWLEDGE_CORPUS_BYTES
-        {
+        if size > MAX_KNOWLEDGE_FILE_BYTES || next_total > MAX_KNOWLEDGE_CORPUS_BYTES {
             skipped = skipped.saturating_add(1);
             continue;
         }
@@ -658,13 +653,13 @@ fn collect_corpus_sources(files: &[CorpusFile]) -> Vec<CorpusSource> {
 
 fn collect_corpus_sources_with_reader(
     files: &[CorpusFile],
-    mut read_to_string: impl FnMut(&Path) -> std::io::Result<String>,
+    mut read_to_string: impl FnMut(&CorpusFile) -> std::io::Result<String>,
 ) -> Vec<CorpusSource> {
     let mut sources = Vec::with_capacity(files.len());
     for file in files {
         let is_learned = file.origin().is_learned();
         let text = if is_learned {
-            let Ok(text) = read_to_string(file.path()) else {
+            let Ok(text) = read_to_string(file) else {
                 continue;
             };
             if file.origin() == CorpusOrigin::GlobalSafeLearned
@@ -680,7 +675,7 @@ fn collect_corpus_sources_with_reader(
             .as_deref()
             .is_some_and(source_has_current_pitfall_safety_marker);
         sources.push(CorpusSource {
-            path: file.path().to_path_buf(),
+            file: file.clone(),
             relative_path: file.relative_path().to_string(),
             text,
             is_learned,
@@ -698,13 +693,13 @@ fn materialize_corpus_sources(sources: Vec<CorpusSource>) -> Vec<CorpusSource> {
 
 fn materialize_corpus_sources_with_reader(
     sources: Vec<CorpusSource>,
-    mut read_to_string: impl FnMut(&Path) -> std::io::Result<String>,
+    mut read_to_string: impl FnMut(&CorpusFile) -> std::io::Result<String>,
 ) -> Vec<CorpusSource> {
     sources
         .into_iter()
         .filter_map(|mut source| {
             if source.text.is_none() {
-                source.text = read_to_string(&source.path).ok();
+                source.text = read_to_string(&source.file).ok();
             }
             source.text.as_ref()?;
             Some(source)
@@ -903,13 +898,42 @@ fn compute_corpus_source_signature(
         .iter()
         .filter_map(|source| {
             let hash = source.text.as_ref().map_or_else(
-                || file_content_hash(&source.path, memo, &mut content_reads),
+                || corpus_file_content_hash(&source.file, memo, &mut content_reads),
                 |text| Some(content_hash(text.as_bytes())),
             )?;
             Some((source_identity(source), hash))
         })
         .collect();
     format_corpus_signature(entries)
+}
+
+fn corpus_file_content_hash(
+    file: &CorpusFile,
+    memo: &mut HashMap<PathBuf, CachedFileHash>,
+    content_reads: &mut usize,
+) -> Option<String> {
+    let stat = file.modified().map(|modified| (modified, file.len()));
+    if let Some((mtime, size)) = stat {
+        if let Some(cached) = memo.get(file.path()) {
+            if cached.mtime == mtime && cached.size == size {
+                return Some(cached.hash.clone());
+            }
+        }
+    }
+    let bytes = file.read_bounded(MAX_KNOWLEDGE_FILE_BYTES).ok()?;
+    *content_reads += 1;
+    let hash = content_hash(&bytes);
+    if let Some((mtime, size)) = stat {
+        memo.insert(
+            file.path().to_path_buf(),
+            CachedFileHash {
+                mtime,
+                size,
+                hash: hash.clone(),
+            },
+        );
+    }
+    Some(hash)
 }
 
 fn exact_corpus_source_signature(sources: &[CorpusSource]) -> String {
@@ -947,7 +971,7 @@ fn source_identity(source: &CorpusSource) -> String {
 /// implementation `std::fs::read` + SHA-256'd the WHOLE corpus on each of those
 /// calls, so retrieval latency scaled O(total corpus bytes) PER QUERY even on a
 /// cache hit. The content hash is now memoized per file in an in-process cache
-/// keyed on the cheap `(mtime, size)` `stat` ([`file_content_hash`]): on a warm
+/// keyed on the inventory `(mtime, size)` metadata ([`corpus_file_content_hash`]): on a warm
 /// memo with unchanged metadata the stored hash is reused WITHOUT reading the
 /// file, so a repeat call over an unchanged corpus does only one cheap `stat`
 /// per file (O(file count), zero byte reads) and returns the byte-identical
@@ -1002,6 +1026,7 @@ fn signature_memo() -> &'static Mutex<HashMap<PathBuf, CachedFileHash>> {
 /// One cheap `stat` of a file's `(mtime, size)` — no read, no hash. Fail-open to
 /// `None` on any error (a missing file, or a platform without `modified()`),
 /// which callers treat as "changed" and re-read.
+#[cfg(test)]
 fn file_stat(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let md = std::fs::metadata(path).ok()?;
     Some((md.modified().ok()?, md.len()))
@@ -1015,6 +1040,7 @@ fn file_stat(path: &Path) -> Option<(std::time::SystemTime, u64)> {
 /// that proves an unchanged corpus is signed without re-reading every file.
 /// Fail-open: a read failure returns `None` (the file is skipped from the
 /// signature, matching the prior behaviour).
+#[cfg(test)]
 fn file_content_hash(
     path: &Path,
     memo: &mut HashMap<PathBuf, CachedFileHash>,
@@ -1086,77 +1112,127 @@ fn compute_signature(
 /// pathological corpus (e.g. a vendored docs dump) ballooning index build
 /// time + memory. When hit, the extra files are silently skipped — but a
 /// warning is emitted (see [`walk_md`]) so the user knows coverage is
-/// partial. Override via `UMADEV_KNOWLEDGE_MAX_FILES` (0 = unlimited).
+/// partial. The environment override may lower, but never remove or raise, the
+/// product ceiling.
 const DEFAULT_MAX_MD_FILES: usize = 2000;
+const MAX_MD_NODES: usize = 16_000;
 
-/// Effective file cap, honouring the `UMADEV_KNOWLEDGE_MAX_FILES` env
-/// override (`0` = unlimited). Read once and cached for the process.
 fn max_md_files() -> usize {
-    std::env::var("UMADEV_KNOWLEDGE_MAX_FILES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    clamp_md_file_cap(
+        std::env::var("UMADEV_KNOWLEDGE_MAX_FILES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok()),
+    )
+}
+
+fn clamp_md_file_cap(requested: Option<usize>) -> usize {
+    requested
+        .filter(|value| *value > 0)
+        .map(|value| value.min(DEFAULT_MAX_MD_FILES))
         .unwrap_or(DEFAULT_MAX_MD_FILES)
 }
 
-/// Recursively collect `.md` file paths under `dir`, up to `depth` 6.
-/// Matches the legacy `walk_md` behaviour (phases.rs:1851) so the corpus
-/// coverage is identical.
-///
-/// No-follow: entries are classified with `symlink_metadata` (lstat), so a
-/// symlinked directory INSIDE the knowledge tree is never descended and a
-/// symlinked `.md` is never collected — a link can't pull markdown from OUTSIDE
-/// the corpus into the RAG index, and a symlink cycle can't recurse. Fail-open:
-/// an entry whose metadata can't be read is skipped, never aborting the walk.
-/// (umadev-knowledge deliberately does not depend on umadev-agent, so this
-/// mirrors that crate's `fswalk` policy inline rather than sharing the helper.)
-pub(crate) fn walk_md(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    let cap = max_md_files();
-    walk_md_bounded(dir, out, depth, cap);
+pub(crate) struct MarkdownFile {
+    pub relative: PathBuf,
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
 }
 
+pub(crate) fn walk_md_rooted(root: &umadev_state::fs::RootedDir) -> Option<Vec<MarkdownFile>> {
+    walk_md_rooted_with_limits(root, max_md_files(), MAX_MD_NODES)
+}
+
+fn walk_md_rooted_with_limits(
+    root: &umadev_state::fs::RootedDir,
+    cap: usize,
+    max_nodes: usize,
+) -> Option<Vec<MarkdownFile>> {
+    let mut files = Vec::new();
+    let mut visited = 0usize;
+    collect_md_rooted(
+        root,
+        Path::new(""),
+        0,
+        &mut files,
+        &mut visited,
+        cap.max(1),
+        max_nodes,
+    )
+    .ok()?;
+    Some(files)
+}
+
+fn collect_md_rooted(
+    root: &umadev_state::fs::RootedDir,
+    relative_dir: &Path,
+    depth: usize,
+    out: &mut Vec<MarkdownFile>,
+    visited: &mut usize,
+    cap: usize,
+    max_nodes: usize,
+) -> std::io::Result<()> {
+    if depth > 6 || out.len() >= cap {
+        return Ok(());
+    }
+    let remaining = max_nodes.saturating_sub(*visited);
+    if remaining == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "knowledge corpus exceeds its directory-entry bound",
+        ));
+    }
+    let entries = root.list_entries(relative_dir, remaining)?;
+    *visited = visited.checked_add(entries.len()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "knowledge corpus entry count overflow",
+        )
+    })?;
+    for entry in entries {
+        if out.len() >= cap {
+            warn_md_cap_once(cap);
+            return Ok(());
+        }
+        let relative = relative_dir.join(&entry.name);
+        match entry.kind {
+            umadev_state::fs::RootedEntryKind::Directory => {
+                collect_md_rooted(root, &relative, depth + 1, out, visited, cap, max_nodes)?;
+            }
+            umadev_state::fs::RootedEntryKind::RegularFile
+                if relative.extension().and_then(|value| value.to_str()) == Some("md") =>
+            {
+                out.push(MarkdownFile {
+                    relative,
+                    len: entry.len,
+                    modified: entry.modified,
+                });
+            }
+            umadev_state::fs::RootedEntryKind::RegularFile
+            | umadev_state::fs::RootedEntryKind::Unsafe => {}
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn walk_md(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    walk_md_bounded(dir, out, depth, max_md_files());
+}
+
+#[cfg(test)]
 fn walk_md_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize, cap: usize) {
-    if depth > 6 {
+    if depth > 6 || cap == 0 {
         return;
     }
-    // Callers can pass a corpus root directly. Classifying only its children
-    // still follows a symlinked root through `read_dir`, which lets a managed
-    // `.umadev/learned` link escape into an arbitrary external markdown tree.
-    // Apply the same lstat/no-follow rule to every recursion root as to entries.
-    if !real_dir_no_follow(dir) {
-        return;
-    }
-    // 0 = unlimited; otherwise this is a hard ceiling enforced PER-PUSH below
-    // (so a single large directory can't overshoot it).
-    if cap != 0 && out.len() >= cap {
-        return;
-    }
-    let Ok(rd) = std::fs::read_dir(dir) else {
+    let Ok(rooted) = umadev_state::fs::RootedDir::open_no_follow(dir) else {
         return;
     };
-    // File-system enumeration order is unspecified. Apply the cap only after a
-    // stable per-directory ordering so identical corpora select identical files
-    // on APFS, ext4 and NTFS.
-    let mut entries = rd.flatten().collect::<Vec<_>>();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let p = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&p) else {
-            continue;
-        };
-        let ft = meta.file_type();
-        if ft.is_symlink() {
-            continue;
-        }
-        if ft.is_dir() {
-            walk_md_bounded(&p, out, depth + 1, cap);
-        } else if ft.is_file() && p.extension().and_then(|s| s.to_str()) == Some("md") {
-            if cap != 0 && out.len() >= cap {
-                warn_md_cap_once(cap);
-                return;
-            }
-            out.push(p);
-        }
-    }
+    let Some(files) =
+        walk_md_rooted_with_limits(&rooted, cap.min(DEFAULT_MAX_MD_FILES), MAX_MD_NODES)
+    else {
+        return;
+    };
+    out.extend(files.into_iter().map(|file| dir.join(file.relative)));
 }
 
 /// Emit the "knowledge index hit its file cap" warning at most once per process
@@ -2054,6 +2130,27 @@ B: {sb}"
         assert_eq!(names, vec!["a.md", "b.md"]);
     }
 
+    #[test]
+    fn markdown_file_cap_cannot_be_disabled_or_raised() {
+        assert_eq!(clamp_md_file_cap(None), DEFAULT_MAX_MD_FILES);
+        assert_eq!(clamp_md_file_cap(Some(0)), DEFAULT_MAX_MD_FILES);
+        assert_eq!(
+            clamp_md_file_cap(Some(DEFAULT_MAX_MD_FILES + 1)),
+            DEFAULT_MAX_MD_FILES
+        );
+        assert_eq!(clamp_md_file_cap(Some(7)), 7);
+    }
+
+    #[test]
+    fn markdown_directory_entry_cap_fails_before_unbounded_collection() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.md"), "# A").unwrap();
+        std::fs::write(tmp.path().join("b.md"), "# B").unwrap();
+        std::fs::write(tmp.path().join("c.md"), "# C").unwrap();
+        let rooted = umadev_state::fs::RootedDir::open_no_follow(tmp.path()).unwrap();
+        assert!(walk_md_rooted_with_limits(&rooted, DEFAULT_MAX_MD_FILES, 2).is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn walk_md_no_follow_symlinks_out_and_cycle_terminates() {
@@ -2085,6 +2182,23 @@ B: {sb}"
             !out.iter().any(|p| p.to_string_lossy().contains("escape")),
             "walk must not traverse an escaping symlink: {out:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn markdown_fifo_is_rejected_without_blocking() {
+        let corpus = tempfile::TempDir::new().unwrap();
+        std::fs::write(corpus.path().join("inside.md"), "# inside").unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(corpus.path().join("blocked.md"))
+            .status()
+            .unwrap()
+            .success());
+        let started = std::time::Instant::now();
+        let mut paths = Vec::new();
+        walk_md(corpus.path(), &mut paths, 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(paths, vec![corpus.path().join("inside.md")]);
     }
 
     #[cfg(unix)]

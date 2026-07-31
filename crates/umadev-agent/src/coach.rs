@@ -19,7 +19,6 @@
 //! 5. The input context (requirement, knowledge digest, prior artifacts).
 //! 6. The next step (`umadev continue`).
 
-use std::fs;
 use std::io;
 use std::path::PathBuf;
 
@@ -33,6 +32,7 @@ pub const COACH_DIR: &str = ".umadev/coach";
 const MAX_COACH_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_COACH_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_COACH_INPUT_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_COACH_PROMPT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Write the coach prompt for `phase` to `.umadev/coach/<NN>-<phase>.md`.
 ///
@@ -66,11 +66,20 @@ pub fn write_coach_prompt_with_retrieval(
     query_vec: Option<&[f32]>,
     expansion: Option<&str>,
 ) -> io::Result<PathBuf> {
-    let dir = opts.project_root.join(COACH_DIR);
-    fs::create_dir_all(&dir)?;
+    let dir = crate::bounded_fs::ensure_real_dir_beneath(
+        &opts.project_root,
+        std::path::Path::new(COACH_DIR),
+    )?;
     let body = render_coach_prompt_with_retrieval(opts, phase, query_vec, expansion);
-    let path = dir.join(coach_filename(phase));
-    fs::write(&path, &body)?;
+    if body.len() > MAX_COACH_PROMPT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rendered coach prompt exceeds the managed file limit",
+        ));
+    }
+    let filename = coach_filename(phase);
+    let managed_path = dir.join(&filename);
+    umadev_state::fs::atomic_write(&managed_path, body.as_bytes())?;
     // Mirror to CURRENT.md so the host's CLAUDE.md can point at one
     // stable path without needing to know the phase number.
     let current = dir.join("CURRENT.md");
@@ -81,8 +90,8 @@ pub fn write_coach_prompt_with_retrieval(
     );
     let mut current_body = header;
     current_body.push_str(&body);
-    fs::write(&current, current_body)?;
-    Ok(path)
+    umadev_state::fs::atomic_write(&current, current_body.as_bytes())?;
+    Ok(opts.project_root.join(COACH_DIR).join(filename))
 }
 
 fn coach_filename(phase: Phase) -> String {
@@ -1563,6 +1572,7 @@ fn render_delivery(slug: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -1829,6 +1839,28 @@ mod tests {
             phase_body, current_body,
             "CURRENT.md must reuse the exact rendered body"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coach_writes_never_follow_managed_directory_or_file_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let sentinel = outside.path().join("CURRENT.md");
+        fs::write(&sentinel, "outside").unwrap();
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        assert!(write_coach_prompt(&opts(root.path()), Phase::Backend).is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "outside");
+
+        fs::remove_file(root.path().join(".umadev")).unwrap();
+        fs::create_dir(root.path().join(".umadev")).unwrap();
+        fs::create_dir(root.path().join(COACH_DIR)).unwrap();
+        symlink(&sentinel, root.path().join(COACH_DIR).join("CURRENT.md")).unwrap();
+        assert!(write_coach_prompt(&opts(root.path()), Phase::Backend).is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "outside");
     }
 
     #[test]

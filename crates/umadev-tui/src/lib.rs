@@ -50,6 +50,7 @@ mod local_command;
 mod preview;
 mod prompt_queue_ui;
 mod resident_host_git;
+mod resident_turn;
 mod resident_turn_support;
 mod route_decision;
 mod run_options;
@@ -121,7 +122,8 @@ use crate::interaction_bridge::{
     pending_host_input_item, publish_live_trust, release_pending_approval_on_auto_switch,
     resolve_pending_approval, resolve_pending_host_input_key, resolve_resident_host_request,
     retract_pending_approval_for, retract_pending_host_input_for, should_pause_for_user,
-    trust_for_resident_turn, ApprovalHolder, ApprovalReply, HostInputHolder, PendingAskHolder,
+    sync_live_input_readiness, trust_for_resident_turn, ApprovalHolder, ApprovalReply,
+    HostInputHolder, PendingAskHolder,
 };
 #[cfg(test)]
 use crate::interaction_bridge::{
@@ -132,9 +134,16 @@ use crate::local_command::LocalCommandRequest;
 use crate::preview::start_preview_server;
 #[cfg(test)]
 use crate::preview::{parse_run_command, port_is_free, url_host_port, wait_for_port};
+use crate::resident_turn::{chat_idle_budget, next_chat_event_idle, ResidentTurnLimiter};
+#[cfg(test)]
+use crate::resident_turn::{
+    chat_tool_silence_ceiling, ResidentTurnLimit, DEFAULT_RESIDENT_TURN_MAX_EVENTS,
+    DEFAULT_RESIDENT_TURN_MAX_TOKENS, HARD_RESIDENT_TURN_MAX_SECS, HARD_RESIDENT_TURN_MAX_TOKENS,
+    HARD_RESIDENT_TURN_MAX_TOOL_CALLS,
+};
 use crate::resident_turn_support::{
     capture_resident_tool_pitfall, delivery_report_status, directive_turn_input,
-    input_failure_decision, input_failure_note, route_clarification_reply,
+    input_failure_decision, input_failure_note, route_clarification_reply, route_fallback_note,
     routed_turn_executes_read_only, select_resident_turn_payload,
 };
 use crate::route_decision::RouteDecision;
@@ -255,7 +264,7 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     set_terminal_title(app.backend.as_deref().unwrap_or("offline"));
     let result = event_loop(&mut terminal, &mut app, opts, win_console_guard.as_ref()).await;
     clipboard::shutdown_clipboard_workers();
-    clipboard_image::cleanup_old(&app.project_root);
+    clipboard_image::cleanup_old_if_available(app.project_filesystem.as_deref());
     // Graceful cleanup spends a fixed budget reaping the direct child after the
     // managed handle terminates its whole group/job. The scope guard remains the
     // cancellation/panic backstop when this async tail is not reached.
@@ -3613,107 +3622,6 @@ fn session_tool_target(input: &serde_json::Value) -> String {
     String::new()
 }
 
-/// Pull the next [`SessionEvent`] under the LIVENESS-based idle watchdog — the local
-/// analogue of the agent crate's [`umadev_agent::director_loop::next_event_idle`], so
-/// the chat path behaves identically to the /run pumps. A base that HANGS (stops
-/// emitting but never exits) can't block the drain forever; ANY event resets the clock
-/// (a long compile/test turn survives as long as it emits SOMETHING).
-///
-/// The window is picked from `budget` by `in_tool_call`:
-/// - **A tool is in flight**: the `tool` window is a liveness POLL, not a kill
-///   deadline. Each time it elapses with no event the base is re-checked — a DEAD base
-///   (`try_exit_status` is `Some`) settles as `Ok(None)` (session ended); a LIVE base
-///   means the tool is genuinely running (build / compile / install / long test / dev
-///   server), so it keeps waiting — bounded only by the optional run-budget `deadline`
-///   (`None` on the interactive chat path: the user controls via Esc, a dead base still
-///   settles). A tool of ANY duration with a live base survives.
-/// - **No tool in flight**: the `base` window IS the hang deadline — pure silence past
-///   it settles as `Err(())`, which the caller turns into the idle reason (it issues
-///   the interrupt + ends the session).
-///
-/// `Ok(None)` = session ended (incl. a base that died mid-tool), `Err(())` =
-/// idle-timed-out / budget-bound (caller settles), `Ok(Some(ev))` = a real event.
-#[allow(clippy::result_unit_err)]
-async fn next_chat_event_idle(
-    session: &mut dyn umadev_runtime::BaseSession,
-    budget: umadev_agent::director_loop::IdleBudget,
-    in_tool_call: bool,
-    deadline: Option<std::time::Instant>,
-) -> Result<Option<umadev_runtime::SessionEvent>, ()> {
-    let window = budget.window(in_tool_call);
-    // Absolute ceiling on CONTINUOUS in-tool silence (zero events at all). A live base
-    // mid-tool normally streams SOMETHING (a ToolResult, text) — that returns above and
-    // resets this per call — so only a base that has produced NOTHING for this long is a
-    // genuine wedge, not a long build. This is the safety net for the interactive chat
-    // surface where `deadline` is `None`: without it a base parked forever on an
-    // unanswerable question / a never-returning tool while its resident server stays
-    // alive (opencode arms `in_tool_call` on the tool's `running` frame) hung the whole
-    // session with no bound — the reported "调用工具… 8684s". Generous + env-overridable
-    // (`UMADEV_CHAT_TOOL_MAX_SILENCE_SECS`, default 30 min) so a legitimately quiet-but-
-    // alive tool isn't killed; on exceed we settle (`Err`) and the caller interrupts +
-    // parks the session, so control ALWAYS returns to the user in bounded time.
-    let silence_ceiling = chat_tool_silence_ceiling();
-    let waited_since = std::time::Instant::now();
-
-    loop {
-        // A real event (or `Ok(None)` session-end) landed inside the window → return it.
-        if let Ok(ev) = tokio::time::timeout(window, session.next_event()).await {
-            return Ok(ev);
-        }
-        // The window elapsed with no event.
-        if in_tool_call {
-            // Liveness poll: a live base mid-tool keeps waiting (only a dead
-            // base or the run deadline settles it).
-            if session.try_exit_status().is_some() {
-                // The base died under the tool → treat as session ended so the
-                // caller surfaces its stderr/exit (the "ended mid-turn" path).
-                return Ok(None);
-            }
-            if let Some(dl) = deadline {
-                if std::time::Instant::now() >= dl {
-                    return Err(());
-                }
-            }
-            // Universal wedge backstop (applies even when `deadline` is `None`): a base
-            // that has emitted nothing for the whole ceiling is stuck, not working.
-            if waited_since.elapsed() >= silence_ceiling {
-                return Err(());
-            }
-            continue;
-        }
-        // NOT in a tool → genuinely hung: settle (the caller interrupts + ends).
-        return Err(());
-    }
-}
-
-/// Absolute ceiling on CONTINUOUS in-tool silence for one chat turn — the backstop that
-/// makes a wedged base recoverable on the interactive surface (where there is no
-/// run-budget `deadline`). Default 30 min; env `UMADEV_CHAT_TOOL_MAX_SILENCE_SECS` (a
-/// value of `0` is ignored). Generous on purpose: ANY base output resets it (a real long
-/// build streams progress), so only a truly silent wedge — a base parked awaiting a human
-/// answer, or a never-returning tool — ever trips it.
-fn chat_tool_silence_ceiling() -> std::time::Duration {
-    let secs = std::env::var("UMADEV_CHAT_TOOL_MAX_SILENCE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(1800);
-    std::time::Duration::from_secs(secs)
-}
-
-/// Idle budget for one persistent-session chat turn — the SAME source the director
-/// loop uses ([`umadev_agent::director_loop::IdleBudget::from_env`], env
-/// `UMADEV_IDLE_TIMEOUT_SECS` / `UMADEV_TOOL_IDLE_TIMEOUT_SECS`), so the chat path and
-/// the build path behave identically: a long agentic turn (deep web research, a big
-/// build) is never killed while it is still streaming, a base mid-tool (a `docker
-/// build` / compile / install / a long test / a dev server that goes silent for
-/// minutes or hours) keeps waiting as long as the base stays alive (the liveness poll —
-/// see [`next_chat_event_idle`]), and only a TRULY silent non-tool hang settles. Read
-/// once per chat turn.
-fn chat_idle_budget() -> umadev_agent::director_loop::IdleBudget {
-    umadev_agent::director_loop::IdleBudget::from_env()
-}
-
 /// Enrich a base-failure reason with a classified, per-base, actionable diagnosis
 /// PLUS the base's OWN stderr tail + exit status, so "base session idle" /
 /// "ended mid-turn" tells the user WHAT failed and HOW to fix it. A broken base
@@ -4975,7 +4883,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         // the workspace or inherit unfinished native-thread authority. The healthy
         // child is reused for Chat/Explain; a mutating verdict keeps the parent.
         let mut readonly_route_session = None;
-        if !native_command && route_source != Some(umadev_agent::RouteSource::Brain) {
+        if !native_command && route_source.is_none() {
             let opts = route_floor_options(&project_root, &text, mode);
             let _route_permit = umadev_agent::base_gate::base_permit().await;
             let (decided, readonly_session) =
@@ -4989,6 +4897,9 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             readonly_route_session = readonly_session;
             route = decided.plan;
             route_source = Some(decided.source);
+            if let Some(reason) = decided.fallback_reason {
+                sink.emit(EngineEvent::Note(route_fallback_note(&route, reason)));
+            }
         }
 
         // A genuine ambiguity pauses before any writer, lock, branch, or tool call.
@@ -5645,14 +5556,20 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             }
         }
 
+        let mut turn_limiter = ResidentTurnLimiter::new(&route);
         // Drain THIS attempt's turn. ANY event resets the idle clock; while a tool runs
         // the path keeps waiting as long as the base stays alive (the liveness poll), so
-        // a long silent build is never killed; only a non-tool hang settles. A `None` /
-        // a `Failed` status is an honest terminal. The terminal `break` carries whether
-        // the finish was truncated (mid-stream cut-off) AND the live session. `deadline`
-        // is `None`: chat is interactive (the user controls via Esc) and a dead base
-        // still settles via the `Ok(None)` session-ended path.
+        // a long healthy tool survives ordinary idle windows. The independent resident
+        // limiter is the absolute runaway backstop: continuous tiny output, tool-call
+        // floods, or huge usage can no longer evade the idle detector forever. A `None`
+        // / a `Failed` status is an honest terminal. The terminal `break` carries
+        // whether the finish was truncated (mid-stream cut-off) AND the live session.
         loop {
+            if let Some(limit) = turn_limiter.wall_limit() {
+                sink.emit(EngineEvent::Note(limit.note()));
+                let _ = session.interrupt().await;
+                break 'attempt (true, session, postcondition);
+            }
             let next_event = if let Some(event) = pre_turn_events.pop_front() {
                 Ok(Some(event))
             } else {
@@ -5722,7 +5639,12 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                         }
                         continue;
                     }
-                    event = next_chat_event_idle(session.as_mut(), idle, in_tool_call, None) => event,
+                    event = next_chat_event_idle(
+                        session.as_mut(),
+                        idle,
+                        in_tool_call,
+                        Some(turn_limiter.deadline()),
+                    ) => event,
                 }
             };
             let ev = match next_event {
@@ -5748,9 +5670,14 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     return;
                 }
                 Err(()) => {
-                    // Non-tool idle hang (deadline is None for chat, so an in-tool live base
-                    // never lands here — it keeps waiting until the user hits Esc or it
-                    // exits). Capture the base's OWN stderr + exit status FIRST, then
+                    if let Some(limit) = turn_limiter.wall_limit() {
+                        sink.emit(EngineEvent::Note(limit.note()));
+                        let _ = session.interrupt().await;
+                        break 'attempt (true, session, postcondition);
+                    }
+                    // Non-tool idle hang (the resident hard deadline was handled
+                    // immediately above; an in-tool live base otherwise keeps waiting
+                    // through ordinary idle polls). Capture the base's OWN stderr + exit status FIRST, then
                     // interrupt + drop the session and settle honestly. The base message is
                     // the trilingual long-task diagnosis (NOT a misleading "check your
                     // login/model config") — `enrich_base_failure` still PREPENDS the
@@ -5818,6 +5745,16 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     return;
                 }
             };
+            if let Some(limit) = turn_limiter.observe(&ev) {
+                // Preserve the base's exact terminal usage in the meter/ledger even
+                // when that report itself proves the turn exceeded the hard ceiling.
+                if let umadev_runtime::SessionEvent::TurnDone { usage, .. } = &ev {
+                    emit_chat_turn_usage(&sink, &backend, *usage, &text, &text_acc);
+                }
+                sink.emit(EngineEvent::Note(limit.note()));
+                let _ = session.interrupt().await;
+                break 'attempt (true, session, postcondition);
+            }
             // Grok's queue keeps the resident event pump alive across several
             // correlated prompt RPCs. A TurnDone is only the boundary of one
             // draining prompt; settle the UmaDev turn after BOTH a terminal and
@@ -6639,7 +6576,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         && reactive_qc_enabled();
     let sink_dyn: Arc<dyn EventSink> = sink.clone();
     let mut post_build_qc_outcome = None;
-    if routed_build || reactive_qc {
+    if !truncated && (routed_build || reactive_qc) {
         let qc_opts = RunOptions {
             project_root: project_root.clone(),
             requirement: text.clone(),
@@ -8790,6 +8727,9 @@ fn handle_prepared_cancel(
 }
 
 fn handle_mouse_event(app: &mut App, terminal: &mut Term, event: MouseEvent) {
+    if handle_transcript_scrollbar_mouse(app, event) {
+        return;
+    }
     let selection_enabled =
         app.mouse_scroll && app.overlay.is_none() && matches!(app.mode, crate::app::AppMode::Chat);
     let (column, row) = (event.column, event.row);
@@ -8825,6 +8765,17 @@ fn handle_mouse_event(app: &mut App, terminal: &mut Term, event: MouseEvent) {
         }
         MouseEventKind::Up(MouseButton::Left) => finish_mouse_selection_copy(app, terminal),
         _ => {}
+    }
+}
+
+fn handle_transcript_scrollbar_mouse(app: &mut App, event: MouseEvent) -> bool {
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.transcript_scrollbar_begin(event.column, event.row)
+        }
+        MouseEventKind::Drag(MouseButton::Left) => app.transcript_scrollbar_drag(event.row),
+        MouseEventKind::Up(MouseButton::Left) => app.transcript_scrollbar_end(event.row),
+        _ => false,
     }
 }
 
@@ -11260,9 +11211,7 @@ async fn event_loop(
                 last_key_instant = Some(Instant::now());
                 app.key_arrived_in_burst =
                     key_gap.is_some_and(|g| g <= crate::app::PASTE_BURST_GAP);
-                app.live_input_ready = live_input_hub.is_ready();
-                app.prompt_queue
-                    .set_ready(live_input_hub.prompt_queue_ready());
+                let _ = sync_live_input_readiness(app, &live_input_hub);
                 let trust_before_key = app.effective_trust_mode();
                 let action = app.apply_key_with_mods(replay_key.code, replay_key.modifiers);
                 publish_trust_after_key(app, &approval_holder, trust_before_key);
@@ -11275,6 +11224,7 @@ async fn event_loop(
     loop {
         apply_background_theme_reply(app, &mut input, &mut draw_now);
         transfer_queued_director_steer(app, &steer_holder);
+        needs_redraw |= sync_live_input_readiness(app, &live_input_hub);
 
         // A2#5 — mirror the shared in-flight approval pause into the app model so
         // the renderer pins a VISIBLE sticky approval bar above the input box (the

@@ -578,6 +578,28 @@ pub fn is_design_prep_step(s: &PlanStep) -> bool {
     is_design_tokens_step(s) || is_design_direction_step(s)
 }
 
+/// A documentation-family build step that can open the docs confirmation gate.
+pub(crate) fn is_core_doc_build_step(step: &PlanStep) -> bool {
+    step.kind == StepKind::Build
+        && matches!(
+            step.seat,
+            Seat::ProductManager | Seat::Architect | Seat::UiuxDesigner
+        )
+        && !is_design_prep_step(step)
+}
+
+/// Whether implementation is now running after every core documentation step.
+pub(crate) fn is_post_docs_implementation_step(step: &PlanStep, plan: &Plan) -> bool {
+    step.kind == StepKind::Build
+        && !is_core_doc_build_step(step)
+        && plan.steps.iter().any(is_core_doc_build_step)
+        && plan
+            .steps
+            .iter()
+            .filter(|candidate| is_core_doc_build_step(candidate))
+            .all(|candidate| candidate.status == StepStatus::Done)
+}
+
 /// Whether an existing QA BUILD step can safely run **before any code exists** —
 /// the adoption bar for treating a brain-authored QA step as THE test-authoring
 /// (test-first) step that frontend/backend code is wired BEHIND. Its acceptance /
@@ -1970,23 +1992,29 @@ const MAX_PERSISTED_PLAN_BYTES: u64 = 8 * 1024 * 1024;
 /// rename). Best-effort + fail-open: any IO error is returned for the caller to
 /// ignore — a failed persist never blocks the build. Returns `Ok(path)` on success.
 pub fn save(plan: &Plan, root: &Path) -> std::io::Result<PathBuf> {
-    let dir = root.join(".umadev");
-    std::fs::create_dir_all(&dir)?;
+    let dir = crate::bounded_fs::ensure_real_dir_beneath(root, Path::new(".umadev"))?;
     let final_path = dir.join("plan.json");
     let json = serde_json::to_string_pretty(plan)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if json.len() > usize::try_from(MAX_PERSISTED_PLAN_BYTES).unwrap_or(usize::MAX) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "persisted plan exceeds the managed file limit",
+        ));
+    }
     umadev_state::fs::atomic_write(&final_path, json.as_bytes())?;
-    Ok(final_path)
+    Ok(root.join(plan_rel_path()))
 }
 
 /// Load the persisted plan from `.umadev/plan.json`, or `None` when absent /
 /// unreadable / unparseable (fail-open — a corrupt plan is treated as "no plan").
 #[must_use]
 pub fn load(root: &Path) -> Option<Plan> {
-    let path = root.join(".umadev").join("plan.json");
-    let text =
-        String::from_utf8(umadev_state::fs::read_bounded(&path, MAX_PERSISTED_PLAN_BYTES).ok()?)
-            .ok()?;
+    let text = String::from_utf8(
+        umadev_state::fs::read_bounded_beneath(root, &plan_rel_path(), MAX_PERSISTED_PLAN_BYTES)
+            .ok()?,
+    )
+    .ok()?;
     let mut plan = serde_json::from_str::<Plan>(&text).ok()?;
     // Backward-compatible migration for plans written before file surfaces became
     // a hard execution contract. Exact FileExists/FileContains evidence can be
@@ -2836,6 +2864,18 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(victim).unwrap(),
             "outside must survive"
+        );
+
+        let linked_root = tempfile::TempDir::new().unwrap();
+        let linked_outside = tempfile::TempDir::new().unwrap();
+        let outside_plan = linked_outside.path().join("plan.json");
+        std::fs::write(&outside_plan, "outside ancestor must survive").unwrap();
+        symlink(linked_outside.path(), linked_root.path().join(".umadev")).unwrap();
+        assert!(save(&p, linked_root.path()).is_err());
+        assert!(load(linked_root.path()).is_none());
+        assert_eq!(
+            std::fs::read_to_string(outside_plan).unwrap(),
+            "outside ancestor must survive"
         );
     }
 

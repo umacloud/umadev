@@ -3362,6 +3362,9 @@ const REVIEW_BUNDLE_MAX_CHARS: usize = 11_000;
 const REVIEW_BUNDLE_MAX_READ_BYTES: usize = REVIEW_BUNDLE_MAX_CHARS * 4 + 16 * 1024;
 const REVIEW_BUNDLE_FILE_CHARS: usize = 900;
 const REVIEW_BUNDLE_FOCUS_FILES: usize = 8;
+const REVIEW_SOURCE_MAX_DEPTH: usize = 24;
+const REVIEW_SOURCE_MAX_ENTRIES: usize = 50_000;
+const REVIEW_SOURCE_MAX_FILES: usize = 2_000;
 
 #[derive(Default)]
 struct SourceDigest {
@@ -3622,17 +3625,27 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
 }
 
 fn review_source_candidates(root: &std::path::Path) -> ReviewSourceScan {
+    review_source_candidates_with_limits(root, REVIEW_SOURCE_MAX_ENTRIES, REVIEW_SOURCE_MAX_FILES)
+}
+
+fn review_source_candidates_with_limits(
+    root: &std::path::Path,
+    max_entries: usize,
+    max_files: usize,
+) -> ReviewSourceScan {
     fn collect(
         root: &std::path::Path,
         dir: &std::path::Path,
         depth: usize,
         entries: &mut usize,
         scan: &mut ReviewSourceScan,
+        max_entries: usize,
+        max_files: usize,
     ) {
-        const MAX_DEPTH: usize = 24;
-        const MAX_ENTRIES: usize = 50_000;
-        const MAX_FILES: usize = 2_000;
-        if depth > MAX_DEPTH || *entries >= MAX_ENTRIES || scan.paths.len() >= MAX_FILES {
+        if depth > REVIEW_SOURCE_MAX_DEPTH
+            || *entries >= max_entries
+            || scan.paths.len() >= max_files
+        {
             scan.incomplete = true;
             return;
         }
@@ -3650,6 +3663,11 @@ fn review_source_candidates(root: &std::path::Path) -> ReviewSourceScan {
         };
         let mut children = Vec::new();
         for entry in read_dir {
+            if *entries >= max_entries {
+                scan.incomplete = true;
+                break;
+            }
+            *entries = entries.saturating_add(1);
             match entry {
                 Ok(entry) => children.push(entry),
                 Err(_) => scan.incomplete = true,
@@ -3662,8 +3680,7 @@ fn review_source_candidates(root: &std::path::Path) -> ReviewSourceScan {
         }
         children.sort_by_key(std::fs::DirEntry::file_name);
         for child in children {
-            *entries = entries.saturating_add(1);
-            if *entries > MAX_ENTRIES || scan.paths.len() >= MAX_FILES {
+            if scan.paths.len() >= max_files {
                 scan.incomplete = true;
                 break;
             }
@@ -3679,7 +3696,15 @@ fn review_source_candidates(root: &std::path::Path) -> ReviewSourceScan {
                     {
                         continue;
                     }
-                    collect(root, &path, depth + 1, entries, scan);
+                    collect(
+                        root,
+                        &path,
+                        depth + 1,
+                        entries,
+                        scan,
+                        max_entries,
+                        max_files,
+                    );
                 }
                 crate::fswalk::EntryKind::File => {
                     if is_review_source_path(&path) {
@@ -3702,7 +3727,15 @@ fn review_source_candidates(root: &std::path::Path) -> ReviewSourceScan {
 
     let mut scan = ReviewSourceScan::default();
     let mut entries = 0usize;
-    collect(root, root, 0, &mut entries, &mut scan);
+    collect(
+        root,
+        root,
+        0,
+        &mut entries,
+        &mut scan,
+        max_entries,
+        max_files,
+    );
     scan
 }
 
@@ -7736,6 +7769,26 @@ mod tests {
         assert!(blackboard
             .code
             .contains("! src/removed_auth.rs (deleted in this run)"));
+    }
+
+    #[test]
+    fn review_source_discovery_stops_at_the_directory_entry_budget() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..6 {
+            std::fs::write(
+                root.path().join(format!("source-{index}.rs")),
+                format!("pub const VALUE_{index}: usize = {index};\n"),
+            )
+            .unwrap();
+        }
+
+        let scan = review_source_candidates_with_limits(root.path(), 3, 20);
+        assert!(scan.incomplete);
+        assert!(
+            scan.paths.len() <= 3,
+            "enumeration must stop before buffering an unbounded directory: {}",
+            scan.paths.len()
+        );
     }
 
     #[cfg(unix)]

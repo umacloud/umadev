@@ -8,17 +8,21 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::memory::MemoryStore;
 
 const LOCK_DIR: &str = ".lifecycle.lock";
 const LOCK_OWNER: &str = "owner";
+const LOCK_LEASE: &str = "lease";
 const LOCK_ATTEMPTS: usize = 500;
 const LOCK_WAIT: Duration = Duration::from_millis(2);
 const LOCK_STALE_AFTER_MS: u64 = 5 * 60 * 1_000;
+const LOCK_FUTURE_SKEW_MS: u64 = 60 * 1_000;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_ACTION_NODES: usize = 40_000;
 const MAX_ACTION_DEPTH: usize = 16;
@@ -171,16 +175,11 @@ fn operation_id() -> String {
     format!("mlc-{nanos:x}-{:x}-{sequence:x}", std::process::id())
 }
 
-fn ensure_memory_dir(boundary: &Path) -> std::io::Result<PathBuf> {
-    let root = std::fs::canonicalize(boundary)?;
-    if !crate::fs::real_dir(&root) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "memory lifecycle boundary is not a real directory",
-        ));
-    }
-    let umadev = crate::fs::ensure_real_child_dir(&root, ".umadev")?;
-    crate::fs::ensure_real_child_dir(&umadev, "memory")
+fn ensure_memory_dir(root: &crate::fs::RootedDir) -> std::io::Result<PathBuf> {
+    root.ensure_dir(Path::new(".umadev"), false)?;
+    let memory = PathBuf::from(".umadev/memory");
+    root.ensure_dir(&memory, true)?;
+    Ok(memory)
 }
 
 fn parse_lock_owner(bytes: &[u8]) -> Option<(u64, &str)> {
@@ -190,68 +189,131 @@ fn parse_lock_owner(bytes: &[u8]) -> Option<(u64, &str)> {
     (!nonce.is_empty() && !nonce.contains('\n')).then_some((stamp, nonce))
 }
 
+fn lock_owner_matches(root: &crate::fs::RootedDir, path: &Path, nonce: &str) -> bool {
+    root.read_bounded(path, 4_096)
+        .ok()
+        .and_then(|bytes| parse_lock_owner(&bytes).map(|(_, seen)| seen == nonce))
+        .unwrap_or(false)
+}
+
 #[derive(Debug)]
 struct LifecycleLock {
-    path: PathBuf,
+    root: Arc<crate::fs::RootedDir>,
+    lock: PathBuf,
     nonce: String,
+    lease: Option<std::fs::File>,
 }
 
 impl Drop for LifecycleLock {
     fn drop(&mut self) {
-        let owner = self.path.join(LOCK_OWNER);
-        let Ok(bytes) = crate::fs::read_bounded(&owner, 4_096) else {
+        let owner = self.lock.join(LOCK_OWNER);
+        let Ok(bytes) = self.root.read_bounded(&owner, 4_096) else {
             return;
         };
         if parse_lock_owner(&bytes).is_none_or(|(_, nonce)| nonce != self.nonce) {
             return;
         }
-        let _ = crate::fs::remove_regular_file(&owner);
-        let _ = crate::fs::remove_empty_dir(&self.path);
+        let _ = self.root.remove_regular_file(&owner);
+        drop(self.lease.take());
+        let _ = self.root.remove_regular_file(&self.lock.join(LOCK_LEASE));
+        let _ = self.root.remove_empty_dir(&self.lock);
     }
 }
 
-fn reclaim_stale_lock(lock: &Path) {
-    if !crate::fs::real_dir(lock) {
+fn lock_modified_at_ms(root: &crate::fs::RootedDir, lock: &Path) -> Option<u64> {
+    root.directory_modified(lock)
+        .ok()
+        .flatten()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+}
+
+fn lock_age_ms(root: &crate::fs::RootedDir, lock: &Path, now: u64) -> Option<u64> {
+    let future_limit = now.saturating_add(LOCK_FUTURE_SKEW_MS);
+    let created_at = root
+        .read_bounded(&lock.join(LOCK_OWNER), 4_096)
+        .ok()
+        .and_then(|bytes| parse_lock_owner(&bytes).map(|(stamp, _)| stamp))
+        .filter(|stamp| *stamp <= future_limit)
+        .or_else(|| lock_modified_at_ms(root, lock))?;
+    Some(now.saturating_sub(created_at))
+}
+
+fn reclaim_stale_lock(root: &crate::fs::RootedDir, lock: &Path, stale_after_ms: u64) {
+    if !root.is_real_dir(lock).unwrap_or(false) {
         return;
     }
-    let owner = lock.join(LOCK_OWNER);
-    let Ok(bytes) = crate::fs::read_bounded(&owner, 4_096) else {
-        return;
-    };
-    let Some((created_at, _)) = parse_lock_owner(&bytes) else {
-        return;
-    };
-    if now_ms().saturating_sub(created_at) <= LOCK_STALE_AFTER_MS {
+    if lock_age_ms(root, lock, now_ms()).is_none_or(|age| age <= stale_after_ms) {
         return;
     }
+    let lease_path = lock.join(LOCK_LEASE);
+    let lease = match root.open_private_existing_lock(&lease_path) {
+        Ok(file) => match file.try_lock_exclusive() {
+            Ok(()) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+            Err(_) => return,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return,
+    };
     let Some(parent) = lock.parent() else {
         return;
     };
     let stale = parent.join(format!(".lifecycle.lock.stale.{}", operation_id()));
-    if crate::fs::rename(lock, &stale).is_ok() {
-        let _ = crate::fs::remove_regular_file(&stale.join(LOCK_OWNER));
-        let _ = crate::fs::remove_empty_dir(&stale);
+    if root.rename(lock, &stale).is_ok() {
+        drop(lease);
+        let _ = root.remove_regular_file(&stale.join(LOCK_OWNER));
+        let _ = root.remove_regular_file(&stale.join(LOCK_LEASE));
+        let _ = root.remove_empty_dir(&stale);
     }
 }
 
-fn acquire_lock(boundary: &Path) -> std::io::Result<LifecycleLock> {
-    let memory = ensure_memory_dir(boundary)?;
+fn acquire_lock(root: Arc<crate::fs::RootedDir>) -> std::io::Result<LifecycleLock> {
+    let memory = ensure_memory_dir(&root)?;
     let lock = memory.join(LOCK_DIR);
     for _ in 0..LOCK_ATTEMPTS {
-        match crate::fs::create_dir(&lock) {
+        match root.create_dir(&lock, false) {
             Ok(()) => {
                 let nonce = operation_id();
                 let owner = format!("{}\n{nonce}", now_ms());
                 if let Err(error) =
-                    crate::fs::atomic_write(&lock.join(LOCK_OWNER), owner.as_bytes())
+                    root.atomic_write(&lock.join(LOCK_OWNER), owner.as_bytes(), false)
                 {
-                    let _ = crate::fs::remove_empty_dir(&lock);
+                    let _ = root.remove_empty_dir(&lock);
                     return Err(error);
                 }
-                return Ok(LifecycleLock { path: lock, nonce });
+                let lease = match root
+                    .open_private_lock(&lock.join(LOCK_LEASE), false)
+                    .and_then(|file| {
+                        file.try_lock_exclusive()?;
+                        Ok(file)
+                    }) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        if lock_owner_matches(&root, &lock.join(LOCK_OWNER), &nonce) {
+                            let _ = root.remove_regular_file(&lock.join(LOCK_OWNER));
+                            let _ = root.remove_regular_file(&lock.join(LOCK_LEASE));
+                            let _ = root.remove_empty_dir(&lock);
+                        }
+                        return Err(error);
+                    }
+                };
+                if !lock_owner_matches(&root, &lock.join(LOCK_OWNER), &nonce) {
+                    drop(lease);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "memory lifecycle lock namespace changed during lease acquisition",
+                    ));
+                }
+                return Ok(LifecycleLock {
+                    root,
+                    lock,
+                    nonce,
+                    lease: Some(lease),
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                reclaim_stale_lock(&lock);
+                reclaim_stale_lock(&root, &lock, LOCK_STALE_AFTER_MS);
                 std::thread::sleep(LOCK_WAIT);
             }
             Err(error) => return Err(error),
@@ -282,15 +344,17 @@ fn validate_stores(stores: &[MemoryStore]) -> std::io::Result<Vec<String>> {
 #[derive(Debug)]
 pub struct LifecycleTransaction {
     _lock: LifecycleLock,
+    root: Arc<crate::fs::RootedDir>,
     id: String,
     scope: LifecycleScope,
     stores: Vec<String>,
     operation: LifecycleOperation,
     created_at_ms: u64,
-    pending_dir: PathBuf,
-    final_dir: PathBuf,
+    pending_relative: PathBuf,
+    final_relative: PathBuf,
+    payload_relative: PathBuf,
+    audit_relative: PathBuf,
     payload_dir: PathBuf,
-    audit_path: PathBuf,
     committed: bool,
 }
 
@@ -303,12 +367,16 @@ pub struct LifecycleTransaction {
 #[derive(Debug)]
 pub struct TombstoneActionTransaction {
     _lock: LifecycleLock,
+    root: Arc<crate::fs::RootedDir>,
     tombstone: TombstoneRecord,
     action: TombstoneAction,
     action_id: String,
     created_at_ms: u64,
+    payload_relative: PathBuf,
+    disposition_relative: PathBuf,
+    audit_relative: PathBuf,
     payload_dir: PathBuf,
-    disposition_path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     audit_path: PathBuf,
     prepared: bool,
     committed: bool,
@@ -325,6 +393,20 @@ impl LifecycleTransaction {
     #[must_use]
     pub fn payload_dir(&self) -> &Path {
         &self.payload_dir
+    }
+
+    /// Duplicate the boundary capability captured when this transaction
+    /// started. Agent-layer payload transfers must use this handle together
+    /// with [`Self::payload_relative`] instead of resolving [`Self::payload_dir`]
+    /// through the ambient filesystem namespace.
+    pub fn rooted_dir(&self) -> std::io::Result<crate::fs::RootedDir> {
+        self.root.try_clone()
+    }
+
+    /// Capability-relative payload directory owned by this transaction.
+    #[must_use]
+    pub fn payload_relative(&self) -> &Path {
+        &self.payload_relative
     }
 
     /// Atomically publishes the tombstone after the caller staged all payload.
@@ -369,14 +451,20 @@ impl LifecycleTransaction {
         let audit_bytes = serde_json::to_vec_pretty(&audit).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
         })?;
-        crate::fs::atomic_write(&self.pending_dir.join("tombstone.json"), &tombstone_bytes)?;
-        crate::fs::atomic_write(&self.audit_path, &audit_bytes)?;
-        crate::fs::rename(&self.pending_dir, &self.final_dir)?;
+        self.root.atomic_write(
+            &self.pending_relative.join("tombstone.json"),
+            &tombstone_bytes,
+            false,
+        )?;
+        self.root
+            .atomic_write(&self.audit_relative, &audit_bytes, false)?;
+        self.root
+            .rename(&self.pending_relative, &self.final_relative)?;
         self.committed = true;
 
         audit.state = AuditState::Committed;
         if let Ok(bytes) = serde_json::to_vec_pretty(&audit) {
-            let _ = crate::fs::atomic_write(&self.audit_path, &bytes);
+            let _ = self.root.atomic_write(&self.audit_relative, &bytes, false);
         }
         Ok(tombstone)
     }
@@ -391,14 +479,17 @@ impl LifecycleTransaction {
                 "a committed lifecycle transaction cannot be aborted",
             ));
         }
-        let _ = crate::fs::remove_regular_file(&self.pending_dir.join("tombstone.json"))?;
-        let _ = crate::fs::remove_regular_file(&self.audit_path)?;
-        remove_empty_dirs(&self.payload_dir)?;
-        match std::fs::remove_dir(&self.pending_dir) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        let _ = self
+            .root
+            .remove_regular_file(&self.pending_relative.join("tombstone.json"))?;
+        let _ = self.root.remove_regular_file(&self.audit_relative)?;
+        let _ = self.root.remove_empty_directory_tree(
+            &self.payload_relative,
+            MAX_ACTION_DEPTH,
+            MAX_ACTION_NODES,
+        )?;
+        let _ = self.root.remove_empty_dir(&self.pending_relative)?;
+        Ok(())
     }
 }
 
@@ -414,6 +505,17 @@ impl TombstoneActionTransaction {
     #[must_use]
     pub fn payload_dir(&self) -> &Path {
         &self.payload_dir
+    }
+
+    /// Duplicate the boundary capability retained for the complete action.
+    pub fn rooted_dir(&self) -> std::io::Result<crate::fs::RootedDir> {
+        self.root.try_clone()
+    }
+
+    /// Capability-relative location of this tombstone's payload tree.
+    #[must_use]
+    pub fn payload_relative(&self) -> &Path {
+        &self.payload_relative
     }
 
     fn record(&self, state: AuditState, files: usize, bytes: u64) -> TombstoneActionRecord {
@@ -456,7 +558,8 @@ impl TombstoneActionTransaction {
         let bytes = serde_json::to_vec_pretty(&record).map_err(|error| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
         })?;
-        crate::fs::write_new_private(&self.audit_path, &bytes)?;
+        self.root
+            .publish_new_private(&self.audit_relative, &bytes, false)?;
         self.prepared = true;
         Ok(())
     }
@@ -471,8 +574,11 @@ impl TombstoneActionTransaction {
                 "tombstone action must be prepared exactly once before commit",
             ));
         }
-        let mut visited = 0usize;
-        validate_payload_unlinked(&self.payload_dir, 0, &mut visited)?;
+        self.root.validate_empty_directory_tree(
+            &self.payload_relative,
+            MAX_ACTION_DEPTH,
+            MAX_ACTION_NODES,
+        )?;
         let record = self.record(
             AuditState::Committed,
             self.tombstone.files,
@@ -483,80 +589,14 @@ impl TombstoneActionTransaction {
         })?;
         // Creation, rather than replacement, makes a concurrently published
         // disposition a hard conflict even outside the lifecycle lock.
-        crate::fs::write_new_private(&self.disposition_path, &bytes)?;
+        self.root
+            .publish_new_private(&self.disposition_relative, &bytes, false)?;
         self.committed = true;
         // The committed disposition is authoritative. Preserve a conservative
         // prepared audit if this best-effort state upgrade cannot be written.
-        let _ = crate::fs::atomic_write(&self.audit_path, &bytes);
+        let _ = self.root.atomic_write(&self.audit_relative, &bytes, false);
         Ok(record)
     }
-}
-
-fn validate_payload_unlinked(
-    path: &Path,
-    depth: usize,
-    visited: &mut usize,
-) -> std::io::Result<()> {
-    if depth > MAX_ACTION_DEPTH || *visited >= MAX_ACTION_NODES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "tombstone payload exceeds the action validation bound",
-        ));
-    }
-    *visited += 1;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !crate::fs::metadata_is_real_dir(&metadata) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "tombstone payload contains a linked or special directory",
-        ));
-    }
-    let mut entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let child = entry.path();
-        let metadata = std::fs::symlink_metadata(&child)?;
-        if crate::fs::metadata_is_real_dir(&metadata) {
-            validate_payload_unlinked(&child, depth + 1, visited)?;
-        } else if crate::fs::metadata_is_real_file(&metadata) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::DirectoryNotEmpty,
-                "tombstone payload remains recoverable and cannot be committed",
-            ));
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "tombstone payload contains a linked or special entry",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn remove_empty_dirs(path: &Path) -> std::io::Result<()> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if !crate::fs::metadata_is_real_dir(&metadata) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to clean a linked lifecycle directory",
-        ));
-    }
-    for entry in std::fs::read_dir(path)? {
-        let child = entry?.path();
-        let child_metadata = std::fs::symlink_metadata(&child)?;
-        if !crate::fs::metadata_is_real_dir(&child_metadata) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::DirectoryNotEmpty,
-                "lifecycle payload still contains recoverable data",
-            ));
-        }
-        remove_empty_dirs(&child)?;
-    }
-    std::fs::remove_dir(path)
 }
 
 /// Starts a cross-process serialized soft-deletion transaction.
@@ -566,34 +606,71 @@ pub fn begin_transaction(
     stores: &[MemoryStore],
     operation: LifecycleOperation,
 ) -> std::io::Result<LifecycleTransaction> {
-    let stores = validate_stores(stores)?;
-    let lock = acquire_lock(boundary)?;
-    let memory = ensure_memory_dir(boundary)?;
-    let tombstones = crate::fs::ensure_real_child_dir(&memory, "tombstones")?;
-    let audit = crate::fs::ensure_real_child_dir(&memory, "audit")?;
-    let deletions = crate::fs::ensure_real_child_dir(&audit, "deletions")?;
-    let id = operation_id();
-    let pending_name = format!(".pending-{id}");
-    let pending_dir = tombstones.join(&pending_name);
-    std::fs::create_dir(&pending_dir)?;
-    if !crate::fs::real_dir(&pending_dir) {
+    let boundary_path = std::fs::canonicalize(boundary)?;
+    let root = crate::fs::RootedDir::open(&boundary_path)?;
+    if !root.matches_path(&boundary_path)? {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "lifecycle staging directory is not a real directory",
+            std::io::ErrorKind::WouldBlock,
+            "memory lifecycle boundary changed while the transaction started",
         ));
     }
-    let payload_dir = crate::fs::ensure_real_child_dir(&pending_dir, "payload")?;
+    begin_transaction_rooted_inner(root, Some(boundary_path), scope, stores, operation)
+}
+
+/// Starts a lifecycle transaction from a directory capability the caller
+/// opened before inventory/preflight. This closes the ambient-root replacement
+/// window between discovery and the first lifecycle mutation.
+pub fn begin_transaction_rooted(
+    root: crate::fs::RootedDir,
+    scope: LifecycleScope,
+    stores: &[MemoryStore],
+    operation: LifecycleOperation,
+) -> std::io::Result<LifecycleTransaction> {
+    begin_transaction_rooted_inner(root, None, scope, stores, operation)
+}
+
+fn begin_transaction_rooted_inner(
+    root: crate::fs::RootedDir,
+    display_root: Option<PathBuf>,
+    scope: LifecycleScope,
+    stores: &[MemoryStore],
+    operation: LifecycleOperation,
+) -> std::io::Result<LifecycleTransaction> {
+    let stores = validate_stores(stores)?;
+    let root = Arc::new(root);
+    let lock = acquire_lock(Arc::clone(&root))?;
+    let memory = ensure_memory_dir(&root)?;
+    let tombstones = memory.join("tombstones");
+    root.ensure_dir(&tombstones, false)?;
+    let audit = memory.join("audit");
+    root.ensure_dir(&audit, false)?;
+    let deletions = audit.join("deletions");
+    root.ensure_dir(&deletions, false)?;
+    let id = operation_id();
+    let pending_name = format!(".pending-{id}");
+    let pending_relative = tombstones.join(&pending_name);
+    root.create_dir(&pending_relative, false)?;
+    let payload_relative = pending_relative.join("payload");
+    root.ensure_dir(&payload_relative, false)?;
+    // Kept only for backwards-compatible diagnostics/tests. Capability-aware
+    // callers use `rooted_dir()` plus `payload_relative()`.
+    let payload_dir = display_root.map_or_else(
+        || PathBuf::from(&payload_relative),
+        |boundary| boundary.join(&payload_relative),
+    );
     Ok(LifecycleTransaction {
         _lock: lock,
+        root,
         id: id.clone(),
         scope,
         stores,
         operation,
         created_at_ms: now_ms(),
-        pending_dir,
-        final_dir: tombstones.join(&id),
+        pending_relative,
+        final_relative: tombstones.join(&id),
+        payload_relative,
+        audit_relative: deletions.join(format!("{id}.json")),
         payload_dir,
-        audit_path: deletions.join(format!("{id}.json")),
         committed: false,
     })
 }
@@ -614,6 +691,32 @@ fn validate_operation_id(id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn validate_store_ids(stores: &[String]) -> std::io::Result<()> {
+    let mut previous: Option<&str> = None;
+    for id in stores {
+        let Some(store) = MemoryStore::parse(id) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "lifecycle record contains an unknown logical store",
+            ));
+        };
+        if store.id() != id || previous.is_some_and(|seen| seen >= id.as_str()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "lifecycle store set is non-canonical, duplicated, or unsorted",
+            ));
+        }
+        previous = Some(id);
+    }
+    if stores.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "lifecycle record contains an empty logical store set",
+        ));
+    }
+    Ok(())
+}
+
 /// Starts a serialized restore or logical-purge transaction for a committed
 /// tombstone.
 ///
@@ -626,60 +729,101 @@ pub fn begin_tombstone_action(
     tombstone_id: &str,
     action: TombstoneAction,
 ) -> std::io::Result<TombstoneActionTransaction> {
+    let boundary_path = std::fs::canonicalize(boundary)?;
+    let root = crate::fs::RootedDir::open(&boundary_path)?;
+    if !root.matches_path(&boundary_path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "memory lifecycle boundary changed while the action started",
+        ));
+    }
+    begin_tombstone_action_rooted_inner(root, Some(boundary_path), scope, tombstone_id, action)
+}
+
+/// Starts a tombstone action using a boundary capability captured by the
+/// caller before any action-specific preflight.
+pub fn begin_tombstone_action_rooted(
+    root: crate::fs::RootedDir,
+    scope: LifecycleScope,
+    tombstone_id: &str,
+    action: TombstoneAction,
+) -> std::io::Result<TombstoneActionTransaction> {
+    begin_tombstone_action_rooted_inner(root, None, scope, tombstone_id, action)
+}
+
+fn begin_tombstone_action_rooted_inner(
+    root: crate::fs::RootedDir,
+    display_root: Option<PathBuf>,
+    scope: LifecycleScope,
+    tombstone_id: &str,
+    action: TombstoneAction,
+) -> std::io::Result<TombstoneActionTransaction> {
     validate_operation_id(tombstone_id)?;
-    let lock = acquire_lock(boundary)?;
-    let memory = ensure_memory_dir(boundary)?;
-    let tombstones = crate::fs::ensure_real_child_dir(&memory, "tombstones")?;
+    let root = Arc::new(root);
+    let lock = acquire_lock(Arc::clone(&root))?;
+    let memory = ensure_memory_dir(&root)?;
+    let tombstones = memory.join("tombstones");
+    root.ensure_dir(&tombstones, false)?;
     let tombstone_dir = tombstones.join(tombstone_id);
-    if !crate::fs::real_dir(&tombstone_dir) {
+    if !root.is_real_dir(&tombstone_dir)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "committed memory tombstone is unavailable or unsafe",
         ));
     }
-    let tombstone = read_tombstone(&tombstone_dir.join("tombstone.json"))?;
+    let tombstone = read_tombstone_bytes(
+        &root.read_bounded(&tombstone_dir.join("tombstone.json"), MAX_RECORD_BYTES)?,
+    )?;
     if tombstone.id != tombstone_id || tombstone.scope != scope {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "tombstone identity or scope does not match the requested boundary",
         ));
     }
-    let payload_dir = tombstone_dir.join("payload");
-    if !crate::fs::real_dir(&payload_dir) {
+    let payload_relative = tombstone_dir.join("payload");
+    if !root.is_real_dir(&payload_relative)? {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "tombstone payload is missing, linked, or special",
         ));
     }
-    let disposition_path = tombstone_dir.join("disposition.json");
-    match std::fs::symlink_metadata(&disposition_path) {
-        Ok(metadata) if crate::fs::metadata_is_real_file(&metadata) => {
+    let disposition_relative = tombstone_dir.join("disposition.json");
+    match root.regular_file_exists(&disposition_relative) {
+        Ok(true) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "tombstone already has a terminal disposition",
             ));
         }
-        Ok(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "unsafe tombstone disposition path",
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(false) => {}
         Err(error) => return Err(error),
     }
-    let audit = crate::fs::ensure_real_child_dir(&memory, "audit")?;
-    let actions = crate::fs::ensure_real_child_dir(&audit, "lifecycle-actions")?;
+    let audit = memory.join("audit");
+    root.ensure_dir(&audit, false)?;
+    let actions = audit.join("lifecycle-actions");
+    root.ensure_dir(&actions, false)?;
     let action_id = operation_id();
+    let audit_relative = actions.join(format!("{action_id}.json"));
+    let audit_path = display_root.as_ref().map_or_else(
+        || PathBuf::from(&audit_relative),
+        |boundary| boundary.join(&audit_relative),
+    );
+    let payload_dir = display_root.map_or_else(
+        || PathBuf::from(&payload_relative),
+        |boundary| boundary.join(&payload_relative),
+    );
     Ok(TombstoneActionTransaction {
         _lock: lock,
+        root,
         tombstone,
         action,
-        audit_path: actions.join(format!("{action_id}.json")),
+        audit_path,
+        audit_relative,
         action_id,
         created_at_ms: now_ms(),
         payload_dir,
-        disposition_path,
+        payload_relative,
+        disposition_relative,
         prepared: false,
         committed: false,
     })
@@ -689,7 +833,11 @@ pub fn begin_tombstone_action(
 /// lifecycle metadata.
 pub fn read_tombstone(path: &Path) -> std::io::Result<TombstoneRecord> {
     let bytes = crate::fs::read_bounded(path, MAX_RECORD_BYTES)?;
-    let record: TombstoneRecord = serde_json::from_slice(&bytes)
+    read_tombstone_bytes(&bytes)
+}
+
+fn read_tombstone_bytes(bytes: &[u8]) -> std::io::Result<TombstoneRecord> {
+    let record: TombstoneRecord = serde_json::from_slice(bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
     if record.version != RECORD_VERSION || record.physically_deleted {
         return Err(std::io::Error::new(
@@ -698,17 +846,7 @@ pub fn read_tombstone(path: &Path) -> std::io::Result<TombstoneRecord> {
         ));
     }
     validate_operation_id(&record.id)?;
-    if record.stores.is_empty()
-        || record
-            .stores
-            .iter()
-            .any(|store| MemoryStore::parse(store).is_none())
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "tombstone contains an invalid logical store set",
-        ));
-    }
+    validate_store_ids(&record.stores)?;
     Ok(record)
 }
 
@@ -717,12 +855,17 @@ pub fn read_deletion_audit(path: &Path) -> std::io::Result<DeletionAuditRecord> 
     let bytes = crate::fs::read_bounded(path, MAX_RECORD_BYTES)?;
     let record: DeletionAuditRecord = serde_json::from_slice(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
-    if record.version != RECORD_VERSION || record.physically_deleted {
+    if record.version != RECORD_VERSION
+        || record.physically_deleted
+        || record.id != record.tombstone_id
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "unsupported or unsafe memory deletion audit record",
         ));
     }
+    validate_operation_id(&record.id)?;
+    validate_store_ids(&record.stores)?;
     Ok(record)
 }
 
@@ -744,6 +887,7 @@ pub fn read_tombstone_action(path: &Path) -> std::io::Result<TombstoneActionReco
     }
     validate_operation_id(&record.id)?;
     validate_operation_id(&record.tombstone_id)?;
+    validate_store_ids(&record.stores)?;
     Ok(record)
 }
 
@@ -932,9 +1076,10 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
-        let memory = ensure_memory_dir(temp.path()).unwrap();
+        let root = crate::fs::RootedDir::open(temp.path()).unwrap();
+        let memory = ensure_memory_dir(&root).unwrap();
         let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), memory.join("audit")).unwrap();
+        symlink(outside.path(), temp.path().join(memory).join("audit")).unwrap();
         let error = begin_transaction(
             temp.path(),
             LifecycleScope::Project,
@@ -944,5 +1089,112 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(outside.path().read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn ownerless_crash_lifecycle_lock_is_reclaimable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::fs::RootedDir::open(temp.path()).unwrap();
+        let memory = ensure_memory_dir(&root).unwrap();
+        let lock = memory.join(LOCK_DIR);
+        root.create_dir(&lock, false).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+
+        reclaim_stale_lock(&root, &lock, 0);
+        assert!(!temp.path().join(lock).exists());
+        let transaction = begin_transaction(
+            temp.path(),
+            LifecycleScope::Project,
+            &[MemoryStore::Facts],
+            LifecycleOperation::Forget,
+        )
+        .unwrap();
+        drop(transaction);
+    }
+
+    #[test]
+    fn active_lifecycle_lease_cannot_be_reclaimed_by_age() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = Arc::new(crate::fs::RootedDir::open(temp.path()).unwrap());
+        let guard = acquire_lock(root).unwrap();
+        let owner = format!("0\n{}", guard.nonce);
+        guard
+            .root
+            .atomic_write(&guard.lock.join(LOCK_OWNER), owner.as_bytes(), false)
+            .unwrap();
+
+        reclaim_stale_lock(&guard.root, &guard.lock, 0);
+        assert!(guard.root.is_real_dir(&guard.lock).unwrap());
+        drop(guard);
+        assert!(!temp.path().join(".umadev/memory/.lifecycle.lock").exists());
+    }
+
+    #[test]
+    fn tampered_lifecycle_audit_identity_and_store_sets_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = DeletionAuditRecord {
+            version: RECORD_VERSION,
+            id: "mlc-audit01".to_string(),
+            tombstone_id: "mlc-audit01".to_string(),
+            scope: LifecycleScope::Project,
+            stores: vec![MemoryStore::Facts.id().to_string()],
+            operation: LifecycleOperation::Forget,
+            state: AuditState::Committed,
+            created_at_ms: 1,
+            files: 1,
+            bytes: 1,
+            physically_deleted: false,
+        };
+        let path = temp.path().join("audit.json");
+
+        let mut mismatched = valid.clone();
+        mismatched.tombstone_id = "mlc-other01".to_string();
+        crate::fs::atomic_write(&path, &serde_json::to_vec(&mismatched).unwrap()).unwrap();
+        assert_eq!(
+            read_deletion_audit(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut aliased = valid;
+        aliased.stores = vec!["FACTS".to_string()];
+        crate::fs::atomic_write(&path, &serde_json::to_vec(&aliased).unwrap()).unwrap();
+        assert_eq!(
+            read_deletion_audit(&path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_commit_never_writes_to_a_replacement_boundary() {
+        use std::os::unix::fs::symlink;
+
+        let container = tempfile::tempdir().unwrap();
+        let boundary = container.path().join("boundary");
+        let moved = container.path().join("moved");
+        let outside = container.path().join("outside");
+        std::fs::create_dir(&boundary).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let mut transaction = begin_transaction(
+            &boundary,
+            LifecycleScope::Project,
+            &[MemoryStore::Facts],
+            LifecycleOperation::Forget,
+        )
+        .unwrap();
+        let id = transaction.id().to_string();
+
+        std::fs::rename(&boundary, &moved).unwrap();
+        symlink(&outside, &boundary).unwrap();
+        transaction.commit(0, 0).unwrap();
+        drop(transaction);
+
+        assert!(outside.read_dir().unwrap().next().is_none());
+        assert!(moved
+            .join(".umadev/memory/tombstones")
+            .join(&id)
+            .join("tombstone.json")
+            .is_file());
+        assert!(!moved.join(".umadev/memory/.lifecycle.lock").exists());
     }
 }

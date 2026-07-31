@@ -48,6 +48,18 @@ pub(super) fn route_clarification_reply(question: &umadev_agent::ClarifyQuestion
     out
 }
 
+pub(super) fn route_fallback_note(
+    route: &RoutePlan,
+    reason: umadev_agent::RouteFallbackReason,
+) -> String {
+    format!(
+        "[route] 意图模型未完成判断（{}），已采用确定性安全路径：{} / {}。",
+        reason.as_str(),
+        route.class.as_str(),
+        route.depth.as_str()
+    )
+}
+
 pub(super) fn capture_resident_tool_pitfall(
     project_root: &Path,
     slug: &str,
@@ -223,5 +235,19 @@ pub(super) fn input_failure_decision(
         RouteDecision::InputRejected { turn, note }
     } else {
         RouteDecision::Failed(note)
+    }
+}
+
+#[cfg(test)]
+mod route_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_note_names_the_real_cause_and_final_route() {
+        let route = umadev_agent::deterministic_route("where is the repo");
+        let note = route_fallback_note(&route, umadev_agent::RouteFallbackReason::TurnTimedOut);
+        assert!(note.contains("turn-timeout"));
+        assert!(note.contains(route.class.as_str()));
+        assert!(note.contains(route.depth.as_str()));
     }
 }

@@ -467,7 +467,7 @@ pub fn checkpoint_post_build_review_pause(
         if let Some(prior) = prior_plan.as_ref() {
             let _ = plan_state::save(prior, &options.project_root);
         } else {
-            let _ = std::fs::remove_file(&plan_path);
+            let _ = umadev_state::fs::remove_regular_file(&plan_path);
         }
         return Err(format!(
             "could not persist post-build review checkpoint: {error}"
@@ -496,7 +496,7 @@ pub fn checkpoint_post_build_review_pause(
         if let Some(prior) = prior_plan.as_ref() {
             let _ = plan_state::save(prior, &options.project_root);
         } else {
-            let _ = std::fs::remove_file(&plan_path);
+            let _ = umadev_state::fs::remove_regular_file(&plan_path);
         }
         if let Some(prior) = prior_state.as_ref() {
             let _ = crate::state::write_workflow_state(&options.project_root, prior);

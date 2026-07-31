@@ -1134,6 +1134,220 @@ fn collect_store_files(
     Ok(files)
 }
 
+fn auto_sediment_rooted(
+    root: &umadev_state::fs::RootedDir,
+    relative: &Path,
+) -> std::io::Result<bool> {
+    if !is_markdown(relative) {
+        return Ok(false);
+    }
+    let bytes = root.read_bounded(relative, MAX_EXPORT_FILE_BYTES)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| invalid_data(format!("memory markdown is not UTF-8: {error}")))?;
+    Ok(umadev_knowledge::front_matter_field(text, "maintainer")
+        == umadev_knowledge::FrontMatterField::Value("auto-sediment"))
+}
+
+fn valid_skill_migration_marker_rooted(
+    root: &umadev_state::fs::RootedDir,
+    relative: &Path,
+) -> std::io::Result<bool> {
+    let bytes = match root.read_bounded(relative, 16 * 1024) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|error| invalid_data(format!("invalid skill migration marker: {error}")))?;
+    Ok(
+        value.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+            && value
+                .get("store_sha256")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|hash| {
+                    hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }),
+    )
+}
+
+fn collect_exact_rooted(
+    root: &umadev_state::fs::RootedDir,
+    boundary: &Path,
+    relative: &Path,
+    files: &mut Vec<ManagedFile>,
+    total_bytes: &mut u64,
+    accept: &dyn Fn(&Path) -> std::io::Result<bool>,
+) -> std::io::Result<()> {
+    root.validate_path(relative)?;
+    if files.len() >= MAX_INVENTORY_FILES {
+        return Err(invalid_data(
+            "memory operation exceeds the managed file limit",
+        ));
+    }
+    let discovered = root.list_regular_tree(
+        relative,
+        MAX_INVENTORY_DEPTH,
+        MAX_LIFECYCLE_NODES,
+        MAX_LIFECYCLE_NODES,
+        u64::MAX,
+    )?;
+    for file in discovered {
+        if !accept(&file.relative)? {
+            continue;
+        }
+        if files.len() >= MAX_INVENTORY_FILES {
+            return Err(invalid_data(
+                "memory operation exceeds the managed file limit",
+            ));
+        }
+        *total_bytes = total_bytes
+            .checked_add(file.len)
+            .ok_or_else(|| invalid_data("memory operation byte count overflow"))?;
+        if *total_bytes > MAX_LIFECYCLE_BYTES {
+            return Err(invalid_data(
+                "memory operation exceeds the managed byte limit",
+            ));
+        }
+        files.push(ManagedFile {
+            path: boundary.join(&file.relative),
+            relative: file.relative,
+            bytes: file.len,
+            modified: file.modified,
+        });
+    }
+    Ok(())
+}
+
+/// Lifecycle-only collector. Unlike inventory/export discovery, every tree
+/// walk and classification read is made through the root capability captured
+/// before preflight, so a renamed workspace cannot redirect even read-side
+/// lifecycle decisions.
+fn collect_store_files_rooted(
+    root: &umadev_state::fs::RootedDir,
+    boundary: &Path,
+    scope: MemoryScope,
+    store: MemoryStore,
+) -> std::io::Result<Vec<ManagedFile>> {
+    if !store_supports_scope(store, scope) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "store is unavailable in the selected scope",
+        ));
+    }
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+    let accept_all = |_: &Path| Ok(true);
+
+    match (scope, store) {
+        (MemoryScope::Project, MemoryStore::LessonSediment) => {
+            let raw = Path::new(".umadev/learned/_raw");
+            let skills = Path::new(".umadev/learned/skills");
+            collect_exact_rooted(
+                root,
+                boundary,
+                Path::new(".umadev/learned"),
+                &mut files,
+                &mut total_bytes,
+                &|relative| {
+                    Ok(!relative.starts_with(raw)
+                        && !relative.starts_with(skills)
+                        && relative
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with("lesson-"))
+                        && auto_sediment_rooted(root, relative)?)
+                },
+            )?;
+        }
+        (MemoryScope::Global, MemoryStore::GlobalLessonProjection) => {
+            collect_exact_rooted(
+                root,
+                boundary,
+                Path::new(".umadev/learned"),
+                &mut files,
+                &mut total_bytes,
+                &|relative| auto_sediment_rooted(root, relative),
+            )?;
+        }
+        (MemoryScope::Global, MemoryStore::GlobalLessonsManual) => {
+            collect_exact_rooted(
+                root,
+                boundary,
+                Path::new(".umadev/learned"),
+                &mut files,
+                &mut total_bytes,
+                &|relative| Ok(is_markdown(relative) && !auto_sediment_rooted(root, relative)?),
+            )?;
+        }
+        (MemoryScope::Project, MemoryStore::SkillPackages) => {
+            let receipts = Path::new(".umadev/skills/receipts");
+            let learned_store = Path::new(".umadev/skills/skills.jsonl");
+            collect_exact_rooted(
+                root,
+                boundary,
+                Path::new(".umadev/skills"),
+                &mut files,
+                &mut total_bytes,
+                &|relative| Ok(relative != learned_store && !relative.starts_with(receipts)),
+            )?;
+            collect_exact_rooted(
+                root,
+                boundary,
+                Path::new("knowledge/skills"),
+                &mut files,
+                &mut total_bytes,
+                &accept_all,
+            )?;
+        }
+        (MemoryScope::Project, MemoryStore::LearnedSkills) => {
+            let current = PathBuf::from(".umadev/memory/learned-skills");
+            let legacy = PathBuf::from(".umadev/skills");
+            let legacy_store = legacy.join("skills.jsonl");
+            let selected =
+                if valid_skill_migration_marker_rooted(root, &current.join("migration-v1.json"))?
+                    || !root.regular_file_exists(&legacy_store)?
+                {
+                    current
+                } else {
+                    legacy
+                };
+            collect_exact_rooted(
+                root,
+                boundary,
+                &selected.join("skills.jsonl"),
+                &mut files,
+                &mut total_bytes,
+                &accept_all,
+            )?;
+            collect_exact_rooted(
+                root,
+                boundary,
+                &selected.join("receipts"),
+                &mut files,
+                &mut total_bytes,
+                &accept_all,
+            )?;
+        }
+        _ => {
+            for location in logical_locations(store, scope) {
+                if !location.contains('*') && !location.contains('<') {
+                    collect_exact_rooted(
+                        root,
+                        boundary,
+                        Path::new(location),
+                        &mut files,
+                        &mut total_bytes,
+                        &accept_all,
+                    )?;
+                }
+            }
+        }
+    }
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    files.dedup_by(|left, right| left.relative == right.relative);
+    Ok(files)
+}
+
 fn normalize_stores(
     scope: MemoryScope,
     stores: &[MemoryStore],
@@ -1175,44 +1389,6 @@ fn lifecycle_scope(scope: MemoryScope) -> umadev_state::lifecycle::LifecycleScop
     }
 }
 
-fn ensure_relative_parent(root: &Path, relative: &Path) -> std::io::Result<PathBuf> {
-    validate_relative_path(relative)?;
-    let parent = relative.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "memory file has no parent",
-        )
-    })?;
-    let mut current = root.to_path_buf();
-    for component in parent.components() {
-        let Component::Normal(name) = component else {
-            return Err(permission_denied(
-                "memory payload path escapes its boundary",
-            ));
-        };
-        let next = current.join(name);
-        match std::fs::symlink_metadata(&next) {
-            Ok(metadata) if umadev_state::fs::metadata_is_real_dir(&metadata) => {}
-            Ok(_) => {
-                return Err(permission_denied(
-                    "memory payload parent is linked or special",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&next)?;
-                if !umadev_state::fs::real_dir(&next) {
-                    return Err(permission_denied(
-                        "memory payload parent changed during creation",
-                    ));
-                }
-            }
-            Err(error) => return Err(error),
-        }
-        current = next;
-    }
-    Ok(root.join(relative))
-}
-
 fn file_still_matches(file: &ManagedFile) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(&file.path)?;
     if !umadev_state::fs::metadata_is_real_file(&metadata)
@@ -1227,10 +1403,120 @@ fn file_still_matches(file: &ManagedFile) -> std::io::Result<()> {
     Ok(())
 }
 
-fn rollback_moves(moved: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+fn open_scope_root(
+    project_root: &Path,
+    scope: MemoryScope,
+) -> std::io::Result<(PathBuf, umadev_state::fs::RootedDir)> {
+    let boundary = scope_boundary(project_root, scope)?;
+    let root = umadev_state::fs::RootedDir::open(&boundary)?;
+    if !root.matches_path(&boundary)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "memory scope changed while its capability was opened",
+        ));
+    }
+    Ok((boundary, root))
+}
+
+#[derive(Debug, Clone)]
+struct RootedTransfer {
+    source: PathBuf,
+    destination: PathBuf,
+    bytes: u64,
+    sha256: [u8; 32],
+}
+
+/// Copy one complete file into a no-replace rooted destination, verify both
+/// identities and contents, and only then unlink the source name. The two
+/// roots may be separate capabilities; no ambient path is resolved.
+fn transfer_rooted_file(
+    source_root: &umadev_state::fs::RootedDir,
+    source: &Path,
+    destination_root: &umadev_state::fs::RootedDir,
+    destination: &Path,
+    expected_bytes: u64,
+    expected_sha256: Option<[u8; 32]>,
+) -> std::io::Result<[u8; 32]> {
+    validate_relative_path(source)?;
+    validate_relative_path(destination)?;
+    let source_read = source_root.read_bounded_verified(source, expected_bytes)?;
+    if source_read.len() != expected_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "memory file length changed after lifecycle preflight",
+        ));
+    }
+    let sha256: [u8; 32] = Sha256::digest(source_read.bytes()).into();
+    if expected_sha256.is_some_and(|expected| expected != sha256) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "memory contents changed before lifecycle rollback",
+        ));
+    }
+    destination_root.publish_new_private(destination, source_read.bytes(), true)?;
+    let destination_read = match destination_root.read_bounded_verified(destination, expected_bytes)
+    {
+        Ok(read) if read.bytes() == source_read.bytes() => read,
+        Ok(read) => {
+            let _ = destination_root.remove_regular_file_if_unchanged(destination, &read);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "memory payload changed during no-replace publication",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    match source_root.remove_regular_file_if_unchanged(source, &source_read) {
+        Ok(true) => match source_root.regular_file_exists(source) {
+            Ok(false) => Ok(sha256),
+            Ok(true) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "a concurrent memory source appeared after rooted unlink",
+            )),
+            Err(error) => Err(error),
+        },
+        Ok(false) => {
+            let _ =
+                destination_root.remove_regular_file_if_unchanged(destination, &destination_read);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "memory source disappeared before rooted unlink",
+            ))
+        }
+        Err(error) => {
+            let cleanup =
+                destination_root.remove_regular_file_if_unchanged(destination, &destination_read);
+            match cleanup {
+                Ok(true) => Err(error),
+                Ok(false) => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("{error}; published recovery copy disappeared during rollback"),
+                )),
+                Err(cleanup_error) => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!(
+                        "{error}; published recovery copy could not be safely rolled back ({cleanup_error})"
+                    ),
+                )),
+            }
+        }
+    }
+}
+
+fn rollback_rooted_transfers(
+    root: &umadev_state::fs::RootedDir,
+    transfers: &[RootedTransfer],
+) -> std::io::Result<()> {
     let mut first_error = None;
-    for (source, payload) in moved.iter().rev() {
-        if let Err(error) = std::fs::rename(payload, source) {
+    for transfer in transfers.iter().rev() {
+        if let Err(error) = transfer_rooted_file(
+            root,
+            &transfer.destination,
+            root,
+            &transfer.source,
+            transfer.bytes,
+            Some(transfer.sha256),
+        ) {
             first_error.get_or_insert(error);
         }
     }
@@ -1238,37 +1524,60 @@ fn rollback_moves(moved: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
 }
 
 fn soft_delete_files(
-    boundary: &Path,
+    root: umadev_state::fs::RootedDir,
     scope: MemoryScope,
     stores: &[MemoryStore],
     operation: umadev_state::lifecycle::LifecycleOperation,
     files: &[ManagedFile],
 ) -> std::io::Result<Option<String>> {
+    soft_delete_files_with_hook(root, scope, stores, operation, files, || {})
+}
+
+fn soft_delete_files_with_hook(
+    root: umadev_state::fs::RootedDir,
+    scope: MemoryScope,
+    stores: &[MemoryStore],
+    operation: umadev_state::lifecycle::LifecycleOperation,
+    files: &[ManagedFile],
+    after_begin: impl FnOnce(),
+) -> std::io::Result<Option<String>> {
     if files.is_empty() {
         return Ok(None);
     }
-    let mut transaction = umadev_state::lifecycle::begin_transaction(
-        boundary,
+    let mut transaction = umadev_state::lifecycle::begin_transaction_rooted(
+        root,
         lifecycle_scope(scope),
         stores,
         operation,
     )?;
+    after_begin();
+    let rooted = transaction.rooted_dir()?;
+    let payload = transaction.payload_relative().to_path_buf();
     let mut destinations = Vec::with_capacity(files.len());
     for file in files {
-        if let Err(error) = file_still_matches(file) {
-            let _ = transaction.abort();
-            return Err(error);
-        }
-        let destination = match ensure_relative_parent(transaction.payload_dir(), &file.relative) {
-            Ok(destination) => destination,
+        let source_read = match rooted.read_bounded_verified(&file.relative, file.bytes) {
+            Ok(read) if read.len() == file.bytes => read,
+            Ok(_) => {
+                let _ = transaction.abort();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "memory changed after lifecycle preflight",
+                ));
+            }
             Err(error) => {
                 let _ = transaction.abort();
                 return Err(error);
             }
         };
-        match std::fs::symlink_metadata(&destination) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
+        drop(source_read);
+        let destination = payload.join(&file.relative);
+        if let Err(error) = rooted.validate_path(&destination) {
+            let _ = transaction.abort();
+            return Err(error);
+        }
+        match rooted.regular_file_exists(&destination) {
+            Ok(false) => {}
+            Ok(true) => {
                 let _ = transaction.abort();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
@@ -1283,23 +1592,38 @@ fn soft_delete_files(
         destinations.push(destination);
     }
 
-    let mut moved = Vec::with_capacity(files.len());
+    let mut moved: Vec<RootedTransfer> = Vec::with_capacity(files.len());
     for (file, destination) in files.iter().zip(&destinations) {
-        if let Err(error) = std::fs::rename(&file.path, destination) {
-            let rollback = rollback_moves(&moved);
-            let _ = transaction.abort();
-            return match rollback {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{error}; rollback failed ({rollback_error}); recover payload {} manually",
-                        transaction.id()
-                    ),
-                )),
-            };
-        }
-        moved.push((file.path.clone(), destination.clone()));
+        let sha256 = match transfer_rooted_file(
+            &rooted,
+            &file.relative,
+            &rooted,
+            destination,
+            file.bytes,
+            None,
+        ) {
+            Ok(sha256) => sha256,
+            Err(error) => {
+                let rollback = rollback_rooted_transfers(&rooted, &moved);
+                let _ = transaction.abort();
+                return match rollback {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{error}; rollback failed ({rollback_error}); recover payload {} manually",
+                            transaction.id()
+                        ),
+                    )),
+                };
+            }
+        };
+        moved.push(RootedTransfer {
+            source: file.relative.clone(),
+            destination: destination.clone(),
+            bytes: file.bytes,
+            sha256,
+        });
     }
     let bytes = files
         .iter()
@@ -1307,7 +1631,7 @@ fn soft_delete_files(
     match transaction.commit(files.len(), bytes) {
         Ok(record) => Ok(Some(record.id)),
         Err(error) => {
-            let rollback = rollback_moves(&moved);
+            let rollback = rollback_rooted_transfers(&rooted, &moved);
             let _ = transaction.abort();
             match rollback {
                 Ok(()) => Err(error),
@@ -1340,10 +1664,10 @@ pub fn forget(
         ));
     }
     let stores = normalize_stores(scope, stores, false)?;
-    let boundary = scope_boundary(project_root, scope)?;
+    let (boundary, root) = open_scope_root(project_root, scope)?;
     let mut unique = BTreeMap::new();
     for store in &stores {
-        for file in collect_store_files(&boundary, scope, *store)? {
+        for file in collect_store_files_rooted(&root, &boundary, scope, *store)? {
             unique.entry(file.relative.clone()).or_insert(file);
         }
         if unique.len() > MAX_INVENTORY_FILES {
@@ -1362,7 +1686,7 @@ pub fn forget(
         ));
     }
     let tombstone_id = soft_delete_files(
-        &boundary,
+        root,
         scope,
         &stores,
         umadev_state::lifecycle::LifecycleOperation::Forget,
@@ -1376,34 +1700,42 @@ pub fn forget(
     })
 }
 
-fn collect_tombstone_payload(payload: &Path) -> std::io::Result<Vec<ManagedFile>> {
-    if !umadev_state::fs::real_dir(payload) {
+#[derive(Debug, Clone)]
+struct LifecycleFile {
+    relative: PathBuf,
+    bytes: u64,
+}
+
+fn collect_tombstone_payload(
+    root: &umadev_state::fs::RootedDir,
+    payload: &Path,
+) -> std::io::Result<Vec<LifecycleFile>> {
+    if !root.is_real_dir(payload)? {
         return Err(permission_denied(
             "tombstone payload root is missing, linked, or special",
         ));
     }
-    let mut files = Vec::new();
-    let mut total_bytes = 0u64;
-    let mut visited_nodes = 0usize;
-    let mut entries = std::fs::read_dir(payload)?.collect::<Result<Vec<_>, _>>()?;
-    if entries.len() > MAX_LIFECYCLE_NODES {
-        return Err(invalid_data(
-            "tombstone payload exceeds the managed node limit",
-        ));
-    }
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        collect_exact_path(
-            payload,
-            &entry.path(),
-            &mut files,
-            &mut total_bytes,
-            &mut visited_nodes,
-        )?;
-    }
-    files.sort_by(|left, right| left.relative.cmp(&right.relative));
-    files.dedup_by(|left, right| left.relative == right.relative);
-    Ok(files)
+    root.list_regular_tree(
+        payload,
+        MAX_INVENTORY_DEPTH,
+        MAX_LIFECYCLE_NODES,
+        MAX_INVENTORY_FILES,
+        MAX_LIFECYCLE_BYTES,
+    )?
+    .into_iter()
+    .map(|file| {
+        let relative = file
+            .relative
+            .strip_prefix(payload)
+            .map_err(|_| permission_denied("tombstone payload escaped its rooted boundary"))?
+            .to_path_buf();
+        validate_relative_path(&relative)?;
+        Ok(LifecycleFile {
+            relative,
+            bytes: file.len,
+        })
+    })
+    .collect()
 }
 
 fn tombstone_stores(
@@ -1421,174 +1753,12 @@ fn tombstone_stores(
     normalize_stores(scope, &stores, false)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    volume: u64,
-    file: u64,
-    bytes: u64,
-    digest: Option<[u8; 32]>,
-}
-
-fn file_identity(path: &Path) -> std::io::Result<FileIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::symlink_metadata(path)?;
-        if !umadev_state::fs::metadata_is_real_file(&metadata) {
-            return Err(permission_denied(
-                "restore identity source is linked or special",
-            ));
-        }
-        Ok(FileIdentity {
-            volume: metadata.dev(),
-            file: metadata.ino(),
-            bytes: metadata.len(),
-            digest: None,
-        })
-    }
-    #[cfg(windows)]
-    {
-        use std::io::Read as _;
-        use std::os::windows::fs::MetadataExt as _;
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        let mut file = options.open(path)?;
-        let metadata = file.metadata()?;
-        if !umadev_state::fs::metadata_is_real_file(&metadata) {
-            return Err(permission_denied(
-                "restore identity source is linked or special",
-            ));
-        }
-        if metadata.file_size() > MAX_LIFECYCLE_BYTES {
-            return Err(invalid_data(
-                "restore identity source exceeds the managed byte limit",
-            ));
-        }
-        let mut hasher = Sha256::new();
-        let mut measured = 0u64;
-        let mut buffer = vec![0u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            measured = measured
-                .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
-                .ok_or_else(|| invalid_data("restore identity byte count overflow"))?;
-            if measured > MAX_LIFECYCLE_BYTES {
-                return Err(invalid_data(
-                    "restore identity source exceeds the managed byte limit",
-                ));
-            }
-            hasher.update(&buffer[..read]);
-        }
-        if measured != metadata.file_size() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "restore identity source changed while it was inspected",
-            ));
-        }
-        Ok(FileIdentity {
-            // Stable Rust does not expose Windows file IDs. Creation/write
-            // times plus a bounded SHA-256 form a conservative fallback; any
-            // mismatch is treated as a conflict and never unlinked.
-            volume: metadata.creation_time(),
-            file: metadata.last_write_time(),
-            bytes: measured,
-            digest: Some(hasher.finalize().into()),
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "safe restore requires stable filesystem file identities",
-        ))
-    }
-}
-
-#[derive(Debug)]
-struct RestoreLink {
-    payload: PathBuf,
-    active: PathBuf,
-    identity: FileIdentity,
-}
-
-fn has_file_identity(path: &Path, identity: FileIdentity) -> bool {
-    file_identity(path).is_ok_and(|found| found == identity)
-}
-
-fn rollback_restore_links(links: &[RestoreLink]) -> std::io::Result<()> {
-    let mut first_error = None;
-    // Recreate every payload name that was already unlinked. hard_link is an
-    // atomic no-replace operation, so a concurrent payload name is preserved.
-    for link in links {
-        match std::fs::symlink_metadata(&link.payload) {
-            Ok(_) => {
-                let payload_matches = has_file_identity(&link.payload, link.identity);
-                let active_matches = has_file_identity(&link.active, link.identity);
-                if !payload_matches || !active_matches {
-                    first_error.get_or_insert_with(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "restore rollback found a payload identity conflict",
-                        )
-                    });
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if !has_file_identity(&link.active, link.identity) {
-                    first_error.get_or_insert_with(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "restore rollback refused a replaced active identity",
-                        )
-                    });
-                } else if let Err(error) = std::fs::hard_link(&link.active, &link.payload) {
-                    first_error.get_or_insert(error);
-                }
-            }
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-    // Never unlink a name that cannot still be proven to reference the exact
-    // payload inode created by this transaction.
-    for link in links.iter().rev() {
-        match std::fs::symlink_metadata(&link.active) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
-                let payload_matches = has_file_identity(&link.payload, link.identity);
-                let active_matches = has_file_identity(&link.active, link.identity);
-                if payload_matches && active_matches {
-                    if let Err(error) = umadev_state::fs::remove_regular_file(&link.active) {
-                        first_error.get_or_insert(error);
-                    }
-                } else {
-                    first_error.get_or_insert_with(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::WouldBlock,
-                            "restore rollback refused to unlink a concurrent active file",
-                        )
-                    });
-                }
-            }
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-    first_error.map_or(Ok(()), Err)
-}
-
-fn restore_failure(error: std::io::Error, links: &[RestoreLink]) -> std::io::Result<RestoreReport> {
-    match rollback_restore_links(links) {
+fn restore_failure(
+    error: std::io::Error,
+    root: &umadev_state::fs::RootedDir,
+    transfers: &[RootedTransfer],
+) -> std::io::Result<RestoreReport> {
+    match rollback_rooted_transfers(root, transfers) {
         Ok(()) => Err(error),
         Err(rollback) => Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
@@ -1601,9 +1771,10 @@ fn restore_failure(error: std::io::Error, links: &[RestoreLink]) -> std::io::Res
 
 /// Restores a committed tombstone without replacing any active path.
 ///
-/// Every destination is preflighted before mutation. Each file is then linked
-/// with the filesystem's atomic no-replace primitive and the payload link is
-/// removed only after all destinations exist. Conflicts are never overwritten.
+/// Every source and destination is preflighted before mutation. Each file is
+/// copied through fixed directory capabilities, published no-replace, checked
+/// byte-for-byte, and only then unlinked from the payload. Conflicts are never
+/// overwritten.
 pub fn restore(
     project_root: &Path,
     scope: MemoryScope,
@@ -1615,28 +1786,36 @@ pub fn restore(
             "restore requires explicit confirmation and never replaces active memory",
         ));
     }
-    let boundary = scope_boundary(project_root, scope)?;
-    let mut action = umadev_state::lifecycle::begin_tombstone_action(
-        &boundary,
+    let (_boundary, root) = open_scope_root(project_root, scope)?;
+    let mut action = umadev_state::lifecycle::begin_tombstone_action_rooted(
+        root,
         lifecycle_scope(scope),
         tombstone_id,
         umadev_state::lifecycle::TombstoneAction::Restore,
     )?;
     let stores = tombstone_stores(action.tombstone(), scope)?;
-    let payload = action.payload_dir().to_path_buf();
-    let files = collect_tombstone_payload(&payload)?;
+    let rooted = action.rooted_dir()?;
+    let payload = action.payload_relative().to_path_buf();
+    let files = collect_tombstone_payload(&rooted, &payload)?;
     let bytes = files
         .iter()
         .try_fold(0u64, |sum, file| sum.checked_add(file.bytes))
         .ok_or_else(|| invalid_data("tombstone payload byte count overflow"))?;
 
-    // Complete preflight happens before parent creation or active links.
+    // Complete preflight happens before parent creation or active publication.
     for file in &files {
-        let target = boundary.join(&file.relative);
-        validate_managed_ancestors(&boundary, &target)?;
-        match std::fs::symlink_metadata(&target) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
+        let source = payload.join(&file.relative);
+        let source_read = rooted.read_bounded_verified(&source, file.bytes)?;
+        if source_read.len() != file.bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "tombstone payload changed during restore preflight",
+            ));
+        }
+        rooted.validate_path(&file.relative)?;
+        match rooted.regular_file_exists(&file.relative) {
+            Ok(false) => {}
+            Ok(true) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AlreadyExists,
                     "restore refuses to replace an existing active memory path",
@@ -1645,68 +1824,26 @@ pub fn restore(
             Err(error) => return Err(error),
         }
     }
-    let mut targets = Vec::with_capacity(files.len());
-    for file in &files {
-        let target = ensure_relative_parent(&boundary, &file.relative)?;
-        match std::fs::symlink_metadata(&target) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "restore target appeared during preflight",
-                ));
-            }
-            Err(error) => return Err(error),
-        }
-        targets.push(target);
-    }
     action.prepare(files.len(), bytes)?;
 
-    let mut links = Vec::with_capacity(files.len());
-    for (file, target) in files.iter().zip(&targets) {
-        if let Err(error) = file_still_matches(file) {
-            return restore_failure(error, &links);
-        }
-        let identity = match file_identity(&file.path) {
-            Ok(identity) => identity,
-            Err(error) => return restore_failure(error, &links),
-        };
-        if let Err(error) = std::fs::hard_link(&file.path, target) {
-            return restore_failure(error, &links);
-        }
-        links.push(RestoreLink {
-            payload: file.path.clone(),
-            active: target.clone(),
-            identity,
+    let mut transfers = Vec::with_capacity(files.len());
+    for file in &files {
+        let source = payload.join(&file.relative);
+        let sha256 =
+            match transfer_rooted_file(&rooted, &source, &rooted, &file.relative, file.bytes, None)
+            {
+                Ok(sha256) => sha256,
+                Err(error) => return restore_failure(error, &rooted, &transfers),
+            };
+        transfers.push(RootedTransfer {
+            source,
+            destination: file.relative.clone(),
+            bytes: file.bytes,
+            sha256,
         });
-        if !has_file_identity(target, identity) {
-            return restore_failure(
-                std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "restore target identity changed during no-clobber link",
-                ),
-                &links,
-            );
-        }
-    }
-    for link in &links {
-        if !has_file_identity(&link.payload, link.identity)
-            || !has_file_identity(&link.active, link.identity)
-        {
-            return restore_failure(
-                std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "restore file identity changed before payload unlink",
-                ),
-                &links,
-            );
-        }
-        if let Err(error) = umadev_state::fs::remove_regular_file(&link.payload) {
-            return restore_failure(error, &links);
-        }
     }
     if let Err(error) = action.commit() {
-        return restore_failure(error, &links);
+        return restore_failure(error, &rooted, &transfers);
     }
     Ok(RestoreReport {
         tombstone_id: tombstone_id.to_string(),
@@ -1733,15 +1870,17 @@ pub fn purge(
             "logical purge requires explicit confirmation and is not physical erasure",
         ));
     }
-    let boundary = scope_boundary(project_root, scope)?;
-    let mut action = umadev_state::lifecycle::begin_tombstone_action(
-        &boundary,
+    let (_boundary, root) = open_scope_root(project_root, scope)?;
+    let mut action = umadev_state::lifecycle::begin_tombstone_action_rooted(
+        root,
         lifecycle_scope(scope),
         tombstone_id,
         umadev_state::lifecycle::TombstoneAction::LogicalPurge,
     )?;
     let stores = tombstone_stores(action.tombstone(), scope)?;
-    let files = collect_tombstone_payload(action.payload_dir())?;
+    let rooted = action.rooted_dir()?;
+    let payload = action.payload_relative().to_path_buf();
+    let files = collect_tombstone_payload(&rooted, &payload)?;
     let bytes = files
         .iter()
         .try_fold(0u64, |sum, file| sum.checked_add(file.bytes))
@@ -1750,8 +1889,14 @@ pub fn purge(
     // is published and before the first irreversible unlink.
     action.prepare(files.len(), bytes)?;
     for file in &files {
-        file_still_matches(file)?;
-        umadev_state::fs::remove_regular_file(&file.path)?;
+        let source = payload.join(&file.relative);
+        let proof = rooted.read_bounded_verified(&source, file.bytes)?;
+        if proof.len() != file.bytes || !rooted.remove_regular_file_if_unchanged(&source, &proof)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "tombstone payload changed before logical purge",
+            ));
+        }
     }
     let disposition = action.commit()?;
     Ok(PurgeReport {
@@ -1778,8 +1923,8 @@ fn enforce_retention_at(
             "store does not have an executable age-retention adapter in this scope",
         ));
     }
-    let boundary = scope_boundary(project_root, scope)?;
-    let policy = umadev_state::memory::load_policy(&boundary)?;
+    let (boundary, root) = open_scope_root(project_root, scope)?;
+    let policy = umadev_state::memory::load_policy_rooted(&root, false)?;
     let Some(days) = policy.retention_days(store) else {
         return Ok(RetentionReport {
             store,
@@ -1793,7 +1938,7 @@ fn enforce_retention_at(
     };
     let max_age = Duration::from_secs(u64::from(days).saturating_mul(24 * 60 * 60));
     let cutoff = now.checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
-    let scanned = collect_store_files(&boundary, scope, store)?;
+    let scanned = collect_store_files_rooted(&root, &boundary, scope, store)?;
     let stale: Vec<ManagedFile> = scanned
         .iter()
         .filter(|file| file.modified.is_some_and(|modified| modified <= cutoff))
@@ -1803,7 +1948,7 @@ fn enforce_retention_at(
         .iter()
         .fold(0u64, |sum, file| sum.saturating_add(file.bytes));
     let tombstone_id = soft_delete_files(
-        &boundary,
+        root,
         scope,
         &[store],
         umadev_state::lifecycle::LifecycleOperation::Retention,
@@ -2012,67 +2157,6 @@ pub fn export(
     })
 }
 
-fn clear_real_tree(path: &Path, depth: usize) -> std::io::Result<(usize, u64)> {
-    if depth > MAX_INVENTORY_DEPTH {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache tree exceeds the managed depth limit",
-        ));
-    }
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-        Err(error) => return Err(error),
-    };
-    if umadev_state::fs::metadata_is_real_file(&metadata) {
-        let bytes = metadata.len();
-        umadev_state::fs::remove_regular_file(path)?;
-        return Ok((1, bytes));
-    }
-    if !umadev_state::fs::metadata_is_real_dir(&metadata) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to clear a linked or special cache path",
-        ));
-    }
-    let mut removed = 0usize;
-    let mut bytes = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        let (entry_count, entry_bytes) = clear_real_tree(&entry?.path(), depth + 1)?;
-        removed = removed.saturating_add(entry_count);
-        bytes = bytes.saturating_add(entry_bytes);
-    }
-    std::fs::remove_dir(path)?;
-    Ok((removed, bytes))
-}
-
-fn validate_real_tree(path: &Path, depth: usize) -> std::io::Result<()> {
-    if depth > MAX_INVENTORY_DEPTH {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cache tree exceeds the managed depth limit",
-        ));
-    }
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if umadev_state::fs::metadata_is_real_file(&metadata) {
-        return Ok(());
-    }
-    if !umadev_state::fs::metadata_is_real_dir(&metadata) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "refusing to clear a linked or special cache path",
-        ));
-    }
-    for entry in std::fs::read_dir(path)? {
-        validate_real_tree(&entry?.path(), depth + 1)?;
-    }
-    Ok(())
-}
-
 /// Deletes only a rebuildable project cache and returns removed files and bytes.
 pub fn clear_derived_cache(
     project_root: &Path,
@@ -2088,10 +2172,45 @@ pub fn clear_derived_cache(
             ));
         }
     };
-    let root = scope_boundary(project_root, MemoryScope::Project)?;
-    let path = root.join(location);
-    validate_real_tree(&path, 0)?;
-    clear_real_tree(&path, 0)
+    let (_boundary, root) = open_scope_root(project_root, MemoryScope::Project)?;
+    clear_derived_cache_rooted(&root, Path::new(location))
+}
+
+fn clear_derived_cache_rooted(
+    root: &umadev_state::fs::RootedDir,
+    relative: &Path,
+) -> std::io::Result<(usize, u64)> {
+    root.validate_path(relative)?;
+    if !root.is_real_dir(relative)? {
+        return Ok((0, 0));
+    }
+    // The complete bounded walk happens before the first unlink so a static
+    // link/reparse/special entry never causes a partial cache clear.
+    let files = root.list_regular_tree(
+        relative,
+        MAX_INVENTORY_DEPTH,
+        MAX_LIFECYCLE_NODES,
+        MAX_INVENTORY_FILES,
+        MAX_LIFECYCLE_BYTES,
+    )?;
+    let bytes = files.iter().try_fold(0u64, |total, file| {
+        total
+            .checked_add(file.len)
+            .ok_or_else(|| invalid_data("cache byte count overflow"))
+    })?;
+    for file in &files {
+        let proof = root.read_bounded_verified(&file.relative, file.len)?;
+        if proof.len() != file.len
+            || !root.remove_regular_file_if_unchanged(&file.relative, &proof)?
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "cache file changed during rooted removal",
+            ));
+        }
+    }
+    root.remove_empty_directory_tree(relative, MAX_INVENTORY_DEPTH, MAX_LIFECYCLE_NODES)?;
+    Ok((files.len(), bytes))
 }
 
 #[cfg(test)]
@@ -2421,46 +2540,54 @@ mod tests {
     #[test]
     fn rollback_never_unlinks_a_concurrently_replaced_target() {
         let temp = tempfile::tempdir().unwrap();
-        let payload = temp.path().join("payload");
-        let active = temp.path().join("active");
-        std::fs::write(&payload, "recoverable").unwrap();
-        let identity = file_identity(&payload).unwrap();
-        std::fs::hard_link(&payload, &active).unwrap();
-        std::fs::remove_file(&active).unwrap();
-        std::fs::write(&active, "concurrent").unwrap();
-
-        let error = rollback_restore_links(&[RestoreLink {
-            payload: payload.clone(),
-            active: active.clone(),
-            identity,
-        }])
+        std::fs::write(temp.path().join("payload"), "recoverable").unwrap();
+        std::fs::write(temp.path().join("active"), "concurrent!").unwrap();
+        let root = umadev_state::fs::RootedDir::open(temp.path()).unwrap();
+        let error = rollback_rooted_transfers(
+            &root,
+            &[RootedTransfer {
+                source: PathBuf::from("payload"),
+                destination: PathBuf::from("active"),
+                bytes: 11,
+                sha256: Sha256::digest(b"recoverable").into(),
+            }],
+        )
         .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        assert_eq!(std::fs::read_to_string(payload).unwrap(), "recoverable");
-        assert_eq!(std::fs::read_to_string(active).unwrap(), "concurrent");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("payload")).unwrap(),
+            "recoverable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("active")).unwrap(),
+            "concurrent!"
+        );
     }
 
     #[test]
     fn rollback_never_recreates_payload_from_a_replaced_active_file() {
         let temp = tempfile::tempdir().unwrap();
-        let payload = temp.path().join("payload");
-        let active = temp.path().join("active");
-        std::fs::write(&payload, "recoverable").unwrap();
-        let identity = file_identity(&payload).unwrap();
-        std::fs::hard_link(&payload, &active).unwrap();
-        std::fs::remove_file(&payload).unwrap();
-        std::fs::remove_file(&active).unwrap();
-        std::fs::write(&active, "concurrent").unwrap();
-
-        let error = rollback_restore_links(&[RestoreLink {
-            payload: payload.clone(),
-            active: active.clone(),
-            identity,
-        }])
+        std::fs::write(temp.path().join("active"), "concurrent!").unwrap();
+        let root = umadev_state::fs::RootedDir::open(temp.path()).unwrap();
+        let error = rollback_rooted_transfers(
+            &root,
+            &[RootedTransfer {
+                source: PathBuf::from("payload"),
+                destination: PathBuf::from("active"),
+                bytes: 11,
+                sha256: Sha256::digest(b"recoverable").into(),
+            }],
+        )
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-        assert!(!payload.exists());
-        assert_eq!(std::fs::read_to_string(active).unwrap(), "concurrent");
+        assert!(!temp.path().join("payload").exists());
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("active")).unwrap(),
+            "concurrent!"
+        );
     }
 
     #[test]
@@ -2690,5 +2817,140 @@ mod tests {
             "outside-private-fact"
         );
         assert!(!outside_memory.join("tombstones").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn soft_delete_stays_on_captured_root_after_workspace_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let moved_workspace = parent.path().join("workspace-captured");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir_all(workspace.join(".umadev/memory")).unwrap();
+        std::fs::create_dir_all(outside.join(".umadev/memory")).unwrap();
+        std::fs::write(
+            workspace.join(".umadev/memory/facts.jsonl"),
+            "captured-private-fact",
+        )
+        .unwrap();
+        let outside_fact = outside.join(".umadev/memory/facts.jsonl");
+        std::fs::write(&outside_fact, "outside-must-survive").unwrap();
+
+        let boundary = scope_boundary(&workspace, MemoryScope::Project).unwrap();
+        let root = umadev_state::fs::RootedDir::open(&boundary).unwrap();
+        let files =
+            collect_store_files(&boundary, MemoryScope::Project, MemoryStore::Facts).unwrap();
+        let report = soft_delete_files_with_hook(
+            root,
+            MemoryScope::Project,
+            &[MemoryStore::Facts],
+            umadev_state::lifecycle::LifecycleOperation::Forget,
+            &files,
+            || {
+                std::fs::rename(&workspace, &moved_workspace).unwrap();
+                symlink(&outside, &workspace).unwrap();
+            },
+        )
+        .unwrap();
+
+        let id = report.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&outside_fact).unwrap(),
+            "outside-must-survive"
+        );
+        assert!(!outside.join(".umadev/memory/tombstones").exists());
+        assert!(!moved_workspace.join(".umadev/memory/facts.jsonl").exists());
+        assert_eq!(
+            std::fs::read_to_string(
+                moved_workspace
+                    .join(".umadev/memory/tombstones")
+                    .join(id)
+                    .join("payload/.umadev/memory/facts.jsonl")
+            )
+            .unwrap(),
+            "captured-private-fact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaced_active_and_payload_ancestor_fails_without_touching_outside() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let original_umadev = workspace.join(".umadev-captured");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir_all(workspace.join(".umadev/memory")).unwrap();
+        std::fs::create_dir_all(outside.join("memory")).unwrap();
+        std::fs::write(
+            workspace.join(".umadev/memory/facts.jsonl"),
+            "captured-private-fact",
+        )
+        .unwrap();
+        let outside_fact = outside.join("memory/facts.jsonl");
+        std::fs::write(&outside_fact, "outside-must-survive").unwrap();
+
+        let boundary = scope_boundary(&workspace, MemoryScope::Project).unwrap();
+        let root = umadev_state::fs::RootedDir::open(&boundary).unwrap();
+        let files =
+            collect_store_files(&boundary, MemoryScope::Project, MemoryStore::Facts).unwrap();
+        let _error = soft_delete_files_with_hook(
+            root,
+            MemoryScope::Project,
+            &[MemoryStore::Facts],
+            umadev_state::lifecycle::LifecycleOperation::Forget,
+            &files,
+            || {
+                std::fs::rename(workspace.join(".umadev"), &original_umadev).unwrap();
+                symlink(&outside, workspace.join(".umadev")).unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(&outside_fact).unwrap(),
+            "outside-must-survive"
+        );
+        assert!(!outside.join("memory/tombstones").exists());
+        assert_eq!(
+            std::fs::read_to_string(original_umadev.join("memory/facts.jsonl")).unwrap(),
+            "captured-private-fact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_clear_uses_captured_root_after_workspace_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let workspace = parent.path().join("workspace");
+        let moved_workspace = parent.path().join("workspace-captured");
+        let outside = parent.path().join("outside");
+        std::fs::create_dir_all(workspace.join(".umadev/kb-index/nested")).unwrap();
+        std::fs::create_dir_all(outside.join(".umadev/kb-index")).unwrap();
+        std::fs::write(
+            workspace.join(".umadev/kb-index/nested/cache.bin"),
+            "captured-cache",
+        )
+        .unwrap();
+        let outside_cache = outside.join(".umadev/kb-index/cache.bin");
+        std::fs::write(&outside_cache, "outside-cache").unwrap();
+        let root = umadev_state::fs::RootedDir::open(&workspace).unwrap();
+        std::fs::rename(&workspace, &moved_workspace).unwrap();
+        symlink(&outside, &workspace).unwrap();
+
+        assert_eq!(
+            clear_derived_cache_rooted(&root, Path::new(".umadev/kb-index")).unwrap(),
+            (1, 14)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_cache).unwrap(),
+            "outside-cache"
+        );
+        assert!(!moved_workspace.join(".umadev/kb-index").exists());
     }
 }

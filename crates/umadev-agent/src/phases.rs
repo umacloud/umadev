@@ -23,6 +23,7 @@ const MAX_PHASE_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PHASE_SCAN_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PHASE_SCAN_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PHASE_LOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PHASE_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OPS_SCAN_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_OPS_SCAN_ENTRIES: usize = 8_192;
 const MAX_SOURCE_SCAN_ENTRIES: usize = 40_000;
@@ -710,9 +711,12 @@ fn read_excerpt(file: &Path, limit: usize) -> String {
 pub fn run_research(opts: &RunOptions, generated_body: Option<&str>) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
-    fs::create_dir_all(&output_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
     let cache_dir = output_dir.join("knowledge-cache");
-    fs::create_dir_all(&cache_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(
+        &opts.project_root,
+        Path::new("output/knowledge-cache"),
+    )?;
 
     let knowledge_digest = summarise_knowledge_corpus(&knowledge_corpus(&opts.project_root));
 
@@ -738,7 +742,7 @@ pub fn run_research(opts: &RunOptions, generated_body: Option<&str>) -> io::Resu
             }
         }
     };
-    fs::write(&research_path, &research_body)?;
+    atomic_write(&research_path, &research_body)?;
 
     let bundle_path = cache_dir.join(format!("{slug}-knowledge-bundle.json"));
     let bundle = serde_json::json!({
@@ -791,7 +795,7 @@ pub struct DocsContent {
 pub fn run_docs(opts: &RunOptions, content: &DocsContent) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
-    fs::create_dir_all(&output_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
 
     let prd = output_dir.join(format!("{slug}-prd.md"));
     let arch = output_dir.join(format!("{slug}-architecture.md"));
@@ -838,10 +842,13 @@ pub fn run_docs(opts: &RunOptions, content: &DocsContent) -> io::Result<PhaseOut
 pub fn run_spec(opts: &RunOptions) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
-    fs::create_dir_all(&output_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
     let change_id = format!("{}-{}", slug, Utc::now().format("%Y%m%d%H%M%S"));
     let changes_dir = opts.project_root.join(".umadev/changes").join(&change_id);
-    fs::create_dir_all(&changes_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(
+        &opts.project_root,
+        &PathBuf::from(".umadev/changes").join(&change_id),
+    )?;
 
     let plan = output_dir.join(format!("{slug}-execution-plan.md"));
     let tasks = changes_dir.join("tasks.md");
@@ -863,7 +870,7 @@ pub fn run_spec(opts: &RunOptions) -> io::Result<PhaseOutput> {
     let keep_base = current.trim().len() > 200 && !is_skeleton_stub;
     let body = if keep_base { current } else { skeleton };
     atomic_write(&plan, &body)?;
-    fs::write(&tasks, render_tasks(&slug))?;
+    atomic_write(&tasks, &render_tasks(&slug))?;
 
     audit(
         opts,
@@ -928,7 +935,7 @@ pub fn run_frontend_with_kind(
 ) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
-    fs::create_dir_all(&output_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
     let note = output_dir.join(format!("{slug}-frontend-notes.md"));
     let body = format!(
         "# Frontend notes — {slug}\n\n\
@@ -950,7 +957,7 @@ pub fn run_frontend_with_kind(
          ## Run command\n\n\
          _(e.g. `cd web && npm run dev`)_"
     );
-    fs::write(&note, body)?;
+    atomic_write(&note, &body)?;
     audit(
         opts,
         "umadev/agent.frontend",
@@ -981,7 +988,7 @@ pub fn run_frontend_with_kind(
 pub fn run_backend(opts: &RunOptions) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
-    fs::create_dir_all(&output_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
     let note = output_dir.join(format!("{slug}-backend-notes.md"));
     let body = format!(
         "# Backend notes — {slug}\n\n\
@@ -996,7 +1003,7 @@ pub fn run_backend(opts: &RunOptions) -> io::Result<PhaseOutput> {
          - [ ] tests cover the acceptance criteria from the PRD\n\
          - [ ] secrets / env variables documented in `output/{slug}-architecture.md`\n",
     );
-    fs::write(&note, body)?;
+    atomic_write(&note, &body)?;
     audit(
         opts,
         "umadev/agent.backend",
@@ -1087,7 +1094,7 @@ pub fn run_quality_with_kind(
 ) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
-    fs::create_dir_all(&output_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
     let project_config = crate::config::load_project_config(&opts.project_root);
     let pass_threshold = i32::try_from(project_config.quality.threshold).unwrap_or(90);
 
@@ -1943,11 +1950,11 @@ pub fn run_quality_with_kind(
 
     let json_path = output_dir.join(format!("{slug}-quality-gate.json"));
     let md_path = output_dir.join(format!("{slug}-quality-gate.md"));
-    fs::write(
+    atomic_write(
         &json_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
+        &serde_json::to_string_pretty(&report).unwrap_or_default(),
     )?;
-    fs::write(&md_path, render_quality_md(&report))?;
+    atomic_write(&md_path, &render_quality_md(&report))?;
 
     audit(
         opts,
@@ -2467,6 +2474,7 @@ fn render_quality_md(r: &QualityReport) -> String {
 /// and a proof-pack zip in `release/`.
 pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
+    crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
 
     // Read the REAL quality-gate result first — it gates both the skill
     // graduation below AND the wording of the captured-pattern lesson (we must
@@ -2571,7 +2579,7 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
              ## Run command\n\n\
              _(how to run the production build locally)_"
         );
-        let _ = fs::write(&delivery_notes, placeholder);
+        let _ = umadev_state::fs::write_new_private(&delivery_notes, placeholder.as_bytes());
     }
     if crate::bounded_fs::is_real_file_beneath(&opts.project_root, &delivery_notes) {
         artifacts.push(delivery_notes);
@@ -2609,13 +2617,13 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
 
     // 6. Proof pack zip
     let release_dir = opts.project_root.join("release");
-    fs::create_dir_all(&release_dir)?;
+    crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("release"))?;
     let run_id = Utc::now().format("%Y%m%d%H%M%S").to_string();
     let zip_path = release_dir.join(format!("proof-pack-{slug}-{run_id}.zip"));
     let manifest = build_and_zip_proof_pack(&opts.project_root, &zip_path, &slug)?;
 
     let manifest_path = release_dir.join(format!("proof-pack-{slug}-{run_id}.manifest.txt"));
-    fs::write(&manifest_path, manifest.join("\n"))?;
+    atomic_write(&manifest_path, &manifest.join("\n"))?;
 
     audit(
         opts,
@@ -2783,7 +2791,7 @@ tr:last-child td{{border-bottom:none}}.num{{font-variant-numeric:tabular-nums;fo
     );
 
     let path = release_dir.join(format!("scorecard-{slug}-{run_id}.html"));
-    fs::write(&path, html)?;
+    atomic_write(&path, &html)?;
     Ok(path)
 }
 
@@ -3379,10 +3387,7 @@ fn build_and_zip_proof_pack_with_limits(
     let mut temp_name = file_name.to_os_string();
     temp_name.push(format!(".{}.{}.part", std::process::id(), sequence));
     let temp_path = zip_path.with_file_name(temp_name);
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)?;
+    let file = umadev_state::fs::create_new_private(&temp_path)?;
 
     let result = (|| -> io::Result<Vec<String>> {
         let mut zw = zip::ZipWriter::new(file);
@@ -3449,11 +3454,11 @@ fn build_and_zip_proof_pack_with_limits(
         let completed = zw.finish()?;
         completed.sync_all()?;
         drop(completed);
-        fs::rename(&temp_path, zip_path)?;
+        umadev_state::fs::replace_regular_file(&temp_path, zip_path)?;
         Ok(manifest)
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
+        let _ = umadev_state::fs::remove_regular_file(&temp_path);
     }
     result
 }
@@ -3831,7 +3836,7 @@ fn write_preferring_richer(
     let existing = read_phase_artifact(project_root, path);
     let candidate = pick(stdout_text, fallback);
     let body = prefer_richer(&candidate, &existing);
-    fs::write(path, body)
+    atomic_write(path, &body)
 }
 
 fn pick(override_text: &Option<String>, fallback: impl FnOnce() -> String) -> String {
@@ -4306,26 +4311,16 @@ fn prefer_richer(stdout_text: &str, disk_text: &str) -> String {
     }
 }
 
-/// Atomically write `content` to `path`: write to `<path>.tmp-<pid>` in
-/// the same directory, then rename over `path`. Same-filesystem rename is
-/// atomic on POSIX, so a concurrent reader never observes a half-written
-/// file (the reader either sees the old complete file or the new complete
-/// one). Falls back to a direct `fs::write` if the temp path can't be
-/// constructed.
+/// Atomically write a bounded generated artifact without following a linked
+/// leaf. Callers must first validate/create its managed parent directory.
 pub(crate) fn atomic_write(path: &Path, content: &str) -> io::Result<()> {
-    // Per-process temp name so two concurrent writers can't share + clobber the
-    // same scratch file before the rename (the run-lock already serialises
-    // pipeline writes; this is belt-and-suspenders for any other caller).
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&tmp, content)?;
-    if fs::rename(&tmp, path).is_ok() {
-        Ok(())
-    } else {
-        // Rename failed (cross-filesystem?). Clean up the temp and fall
-        // back to a direct write — correctness > atomicity here.
-        let _ = fs::remove_file(&tmp);
-        fs::write(path, content)
+    if content.len() > MAX_PHASE_OUTPUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "generated phase artifact exceeds the managed file limit",
+        ));
     }
+    umadev_state::fs::atomic_write(path, content.as_bytes())
 }
 
 fn audit(opts: &RunOptions, tool_name: &str, target: &Path, clause: &str, reason: &str) {
@@ -5264,6 +5259,35 @@ mod tests {
             mode: crate::trust::TrustMode::Guarded,
             strict_coverage: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phase_outputs_never_follow_managed_directory_or_artifact_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_note = outside.path().join("demo-backend-notes.md");
+        fs::write(&outside_note, "outside").unwrap();
+
+        symlink(outside.path(), root.path().join("output")).unwrap();
+        assert!(run_research(&opts(root.path()), None).is_err());
+        assert_eq!(fs::read_to_string(&outside_note).unwrap(), "outside");
+
+        fs::remove_file(root.path().join("output")).unwrap();
+        fs::create_dir(root.path().join("output")).unwrap();
+        symlink(
+            &outside_note,
+            root.path().join("output/demo-backend-notes.md"),
+        )
+        .unwrap();
+        assert!(run_backend(&opts(root.path())).is_err());
+        assert_eq!(fs::read_to_string(&outside_note).unwrap(), "outside");
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        assert!(run_spec(&opts(root.path())).is_err());
+        assert!(!outside.path().join("changes").exists());
     }
 
     #[test]

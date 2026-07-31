@@ -211,6 +211,7 @@ fn artifact_versions_path(project_root: &std::path::Path) -> std::path::PathBuf 
 
 const MAX_ARTIFACT_VERSION_BYTES: usize = 1024 * 1024;
 const MAX_SCRATCH_NOTE_BYTES: usize = 1024 * 1024;
+const MAX_SCRATCH_FILES: usize = 1_024;
 
 /// Read the persisted `artifact-name -> last-seen version` map. Fail-open: a
 /// missing or corrupt store yields an empty map (versioning is an optimisation,
@@ -235,12 +236,16 @@ pub fn write_artifact_versions(
     project_root: &std::path::Path,
     versions: &std::collections::BTreeMap<String, String>,
 ) {
-    let path = artifact_versions_path(project_root);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let Ok(json) = serde_json::to_vec_pretty(versions) else {
+        return;
+    };
+    if json.len() > MAX_ARTIFACT_VERSION_BYTES {
+        return;
     }
-    if let Ok(json) = serde_json::to_string_pretty(versions) {
-        let _ = std::fs::write(path, json);
+    if let Ok(dir) =
+        crate::bounded_fs::ensure_real_dir_beneath(project_root, std::path::Path::new(".umadev"))
+    {
+        let _ = umadev_state::fs::atomic_write(&dir.join("artifact-versions.json"), &json);
     }
 }
 
@@ -290,11 +295,19 @@ fn scratch_path(project_root: &std::path::Path, key: &str) -> std::path::PathBuf
 
 /// Write a private scratch note for `key`. Best-effort + fail-open.
 pub fn write_scratch(project_root: &std::path::Path, key: &str, content: &str) {
-    let path = scratch_path(project_root, key);
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    if content.len() > MAX_SCRATCH_NOTE_BYTES {
+        return;
     }
-    let _ = std::fs::write(path, content);
+    let logical_path = scratch_path(project_root, key);
+    let Some(filename) = logical_path.file_name() else {
+        return;
+    };
+    if let Ok(dir) = crate::bounded_fs::ensure_real_dir_beneath(
+        project_root,
+        std::path::Path::new(".umadev/scratch"),
+    ) {
+        let _ = umadev_state::fs::atomic_write(&dir.join(filename), content.as_bytes());
+    }
 }
 
 /// Read a private scratch note for `key`. `None` if absent/unreadable.
@@ -310,7 +323,42 @@ pub fn read_scratch(project_root: &std::path::Path, key: &str) -> Option<String>
 
 /// GC the whole private scratch lane (call at run end). Best-effort.
 pub fn clear_scratch(project_root: &std::path::Path) {
-    let _ = std::fs::remove_dir_all(project_root.join(".umadev").join("scratch"));
+    let Ok(root) = std::fs::canonicalize(project_root) else {
+        return;
+    };
+    if !umadev_state::fs::real_dir(&root) {
+        return;
+    }
+    let umadev = root.join(".umadev");
+    let scratch = umadev.join("scratch");
+    if !umadev_state::fs::real_dir(&umadev) || !umadev_state::fs::real_dir(&scratch) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&scratch) else {
+        return;
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return;
+        };
+        if files.len() >= MAX_SCRATCH_FILES {
+            return;
+        }
+        let path = entry.path();
+        if !std::fs::symlink_metadata(&path)
+            .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_file(&metadata))
+        {
+            return;
+        }
+        files.push(path);
+    }
+    for path in files {
+        if umadev_state::fs::remove_regular_file(&path).is_err() {
+            return;
+        }
+    }
+    let _ = umadev_state::fs::remove_empty_dir(&scratch);
 }
 
 /// A seat's self-describing capability card - the internal analogue of an A2A
@@ -1563,10 +1611,6 @@ pub fn append_team_ledger(
     round: usize,
     verdict: &RoleVerdict,
 ) {
-    let dir = project_root.join(".umadev");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
     let entry = serde_json::json!({
         "timestamp": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
         "phase": phase,
@@ -1582,15 +1626,7 @@ pub fn append_team_ledger(
         // divergence between cold and forked verdicts is auditable per seat.
         "cold": verdict.cold,
     });
-    let path = dir.join("team-ledger.jsonl");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{entry}");
-    }
+    let _ = crate::runner::append_private_run_jsonl(project_root, "team-ledger.jsonl", entry);
 }
 
 #[cfg(test)]
@@ -1779,6 +1815,58 @@ mod tests {
             .starts_with(tmp.path().join(".umadev").join("scratch")));
         clear_scratch(tmp.path());
         assert!(read_scratch(tmp.path(), "architect-vs-frontend").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_writes_and_gc_never_follow_managed_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_note = outside.path().join("note.md");
+        std::fs::write(&outside_note, "outside").unwrap();
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+
+        let mut versions = std::collections::BTreeMap::new();
+        versions.insert("prd".to_string(), "v1".to_string());
+        write_artifact_versions(root.path(), &versions);
+        write_scratch(root.path(), "note", "inside");
+        append_team_ledger(
+            root.path(),
+            "quality",
+            1,
+            &RoleVerdict::empty("qa-engineer"),
+        );
+        clear_scratch(root.path());
+        assert_eq!(std::fs::read_to_string(&outside_note).unwrap(), "outside");
+        assert!(!outside.path().join("artifact-versions.json").exists());
+        assert!(!outside.path().join("team-ledger.jsonl").exists());
+
+        std::fs::remove_file(root.path().join(".umadev")).unwrap();
+        std::fs::create_dir(root.path().join(".umadev")).unwrap();
+        std::fs::create_dir(root.path().join(".umadev/scratch")).unwrap();
+        symlink(&outside_note, root.path().join(".umadev/scratch/note.md")).unwrap();
+        let outside_ledger = outside.path().join("team-ledger.jsonl");
+        std::fs::write(&outside_ledger, "outside-ledger\n").unwrap();
+        symlink(
+            &outside_ledger,
+            root.path().join(".umadev/team-ledger.jsonl"),
+        )
+        .unwrap();
+        write_scratch(root.path(), "note", "inside");
+        append_team_ledger(
+            root.path(),
+            "quality",
+            1,
+            &RoleVerdict::empty("qa-engineer"),
+        );
+        clear_scratch(root.path());
+        assert_eq!(std::fs::read_to_string(&outside_note).unwrap(), "outside");
+        assert_eq!(
+            std::fs::read_to_string(&outside_ledger).unwrap(),
+            "outside-ledger\n"
+        );
     }
 
     #[test]

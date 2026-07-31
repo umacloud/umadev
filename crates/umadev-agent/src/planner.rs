@@ -877,8 +877,16 @@ pub(crate) fn stored_color_permission(project_root: &std::path::Path, requiremen
     ) else {
         return false;
     };
+    let key = umadev_state::privacy::installation_key();
     serde_json::from_str::<umadev_governance::ProjectContext>(&raw)
-        .map(|ctx| ctx.if_current(now_secs(), Some(requirement)).purple_allowed)
+        .map(|ctx| {
+            ctx.if_current(
+                now_secs(),
+                Some(requirement),
+                key.as_ref().map(<[u8; 32]>::as_slice),
+            )
+            .purple_allowed
+        })
         .unwrap_or(false)
 }
 
@@ -908,7 +916,12 @@ pub fn derive_project_context_with_color(
     // from an old violet rebrand would stand the banned-hue band down for every later
     // requirement, including one whose first line is "no purple". See
     // `ProjectContext::if_current`, which is what the readers apply.
-    let stamp = |ctx: umadev_governance::ProjectContext| ctx.derived_from(requirement, now_secs());
+    let provenance_key = umadev_state::privacy::installation_key();
+    let stamp = |ctx: umadev_governance::ProjectContext| {
+        provenance_key
+            .as_ref()
+            .map_or(ctx, |key| ctx.derived_from(requirement, key, now_secs()))
+    };
     let strict = stamp(umadev_governance::ProjectContext::unknown().with_purple_allowed(purple));
 
     // Signal 1: task kind must be a frontend-only / light build.
@@ -1026,10 +1039,14 @@ pub fn persist_project_context_with_color(
 /// Best-effort write of the context to [`GOVERNANCE_CONTEXT_REL`]. Fail-open: an unwritable
 /// `.umadev/` is swallowed, and the readers then default to full strictness.
 fn write_project_context(project_root: &std::path::Path, ctx: &umadev_governance::ProjectContext) {
-    let dir = project_root.join(".umadev");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        if let Ok(json) = serde_json::to_string_pretty(ctx) {
-            let _ = std::fs::write(dir.join("governance-context.json"), json);
+    let Ok(dir) =
+        crate::bounded_fs::ensure_real_dir_beneath(project_root, std::path::Path::new(".umadev"))
+    else {
+        return;
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(ctx) {
+        if json.len() <= MAX_PLANNER_METADATA_BYTES {
+            let _ = umadev_state::fs::atomic_write(&dir.join("governance-context.json"), &json);
         }
     }
 }
@@ -1981,5 +1998,32 @@ mod tests {
         let p = plan("做一个简单的小工具");
         assert_eq!(p.kind, TaskKind::Light);
         assert!(p.includes(Phase::Frontend) && p.includes(Phase::Backend));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn governance_context_write_never_follows_managed_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_context = outside.path().join("governance-context.json");
+        std::fs::write(&outside_context, "outside").unwrap();
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        let _ = persist_project_context("build a dashboard", root.path(), "demo");
+        assert_eq!(
+            std::fs::read_to_string(&outside_context).unwrap(),
+            "outside"
+        );
+
+        std::fs::remove_file(root.path().join(".umadev")).unwrap();
+        std::fs::create_dir(root.path().join(".umadev")).unwrap();
+        symlink(&outside_context, root.path().join(GOVERNANCE_CONTEXT_REL)).unwrap();
+        let _ = persist_project_context("build a dashboard", root.path(), "demo");
+        assert_eq!(
+            std::fs::read_to_string(&outside_context).unwrap(),
+            "outside"
+        );
     }
 }

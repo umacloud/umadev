@@ -22,12 +22,14 @@ use crate::local_command::{LocalCommandRequest, LocalCommandResult};
 use crate::prompt_queue_ui::PromptQueueUi;
 
 mod backend;
+mod bounded_text;
 mod dir_scan;
 mod file_index;
 mod frozen_plan;
 mod host_git;
 pub(crate) mod host_input;
 mod lessons_view;
+mod live_meta;
 mod memory_view;
 pub(crate) mod permissions;
 mod plan_view;
@@ -39,11 +41,13 @@ mod usage_meter;
 
 pub(crate) use backend::{parse_probe_detail, PROBE_AUTH_SENTINEL};
 use backend::{refresh_picker_with_probes, step_items};
+use bounded_text::{prefix_with_char_limit, read_utf8 as read_bounded_utf8, trim_tail};
 #[cfg(test)]
 use file_index::collect_repo_files;
 use host_git::QueuedResidentKind;
 pub(crate) use host_git::ResidentDispatch;
 use lessons_view::{format_lessons_report, format_pitfalls_report};
+use live_meta::{classify_live_meta, LiveMetaIntent};
 use memory_view::{compact_audit_id, MemoryParseError, MemoryTuiCommand, MemoryViewScope};
 use read_only_metric::read_only_metric;
 use submission::{append_text_block, submitted_content_end};
@@ -99,15 +103,6 @@ const MAX_TOTAL_PASTE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TURN_ATTACHMENTS: usize = 16;
 const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
-
-fn read_bounded_utf8(path: &std::path::Path, max_bytes: u64) -> std::io::Result<String> {
-    String::from_utf8(umadev_state::fs::read_bounded(path, max_bytes)?).map_err(|error| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("managed text is not UTF-8: {error}"),
-        )
-    })
-}
 
 #[derive(Debug, Default)]
 struct MemoryOptions {
@@ -820,370 +815,6 @@ pub enum Action {
 #[must_use]
 pub(crate) fn classify_approval_reply(text: &str) -> Option<bool> {
     umadev_agent::classify_approval_reply(text)
-}
-
-/// Read-only questions the TUI can answer from state it already owns.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum LiveMetaIntent {
-    Progress,
-    Changes,
-    Permissions,
-}
-
-/// Bounded, trilingual live-meta classifier. It accepts polite/natural variants,
-/// but rejects multiline, future-work, and chained-action requests so a status
-/// lookup cannot swallow real work.
-fn classify_live_meta(text: &str) -> Option<LiveMetaIntent> {
-    const CHANGES: &[&str] = &[
-        "这次改了什么",
-        "这次改了啥",
-        "这次都改了什么",
-        "这次都改了啥",
-        "这次改动都做了什么",
-        "这次改动都做了啥",
-        "本次改了什么",
-        "本次改了啥",
-        "本次改动",
-        "本轮改动",
-        "这轮改动",
-        "改了哪些文件",
-        "这次改了哪些文件",
-        "這次改了什麼",
-        "這次都改了什麼",
-        "這次改動都做了什麼",
-        "本次改動",
-        "本輪改動",
-        "這輪改動",
-        "改了哪些檔案",
-        "這次改了哪些檔案",
-        "what changed",
-        "what did you change",
-        "what have you changed",
-        "what changes did you make",
-        "what files changed",
-        "show me the changes",
-        "what did this turn change",
-    ];
-    const PROGRESS: &[&str] = &[
-        "当前进度",
-        "目前进度",
-        "现在进度",
-        "进度怎么样",
-        "进度怎么样了",
-        "现在做到哪了",
-        "做到哪了",
-        "进行到哪了",
-        "现在在做什么",
-        "当前在做什么",
-        "任务进度",
-        "當前進度",
-        "目前進度",
-        "現在進度",
-        "進度怎麼樣",
-        "進度怎麼樣了",
-        "現在做到哪了",
-        "進行到哪了",
-        "現在在做什麼",
-        "當前在做什麼",
-        "任務進度",
-        "current progress",
-        "progress update",
-        "what's the progress",
-        "what is the progress",
-        "where are we",
-        "where are you at",
-        "what are you doing",
-        "what are you working on",
-        "current status",
-        "status update",
-    ];
-    let lowered = text.trim().to_lowercase();
-    let normalized = lowered
-        .trim_matches(|c: char| {
-            c.is_ascii_punctuation()
-                || matches!(c, '，' | '。' | '？' | '！' | '：' | '；' | '、' | '～')
-        })
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if CHANGES.contains(&normalized.as_str()) {
-        return Some(LiveMetaIntent::Changes);
-    }
-    if PROGRESS.contains(&normalized.as_str()) {
-        return Some(LiveMetaIntent::Progress);
-    }
-
-    // Natural variants stay deliberately bounded. A longer instruction or a
-    // second requested action belongs to the normal intent router.
-    if text.contains(['\n', '\r']) || normalized.chars().count() > 120 {
-        return None;
-    }
-    let compact = normalized.split_whitespace().collect::<String>();
-    let contains_any =
-        |haystack: &str, needles: &[&str]| needles.iter().any(|n| haystack.contains(n));
-    let chained_work = contains_any(
-        &compact,
-        &[
-            "然后修",
-            "然后改",
-            "然后写",
-            "然后跑",
-            "然后测试",
-            "然後修",
-            "然後改",
-            "然後寫",
-            "然後測試",
-            "并修",
-            "并改",
-            "并写",
-            "并补",
-            "并测试",
-            "並修",
-            "並改",
-            "並寫",
-            "並補",
-            "並測試",
-            "顺便修",
-            "顺便改",
-            "順便修",
-            "順便改",
-            "接着修",
-            "接着改",
-            "接著修",
-            "接著改",
-        ],
-    ) || contains_any(
-        &normalized,
-        &[
-            " and then ",
-            " then fix",
-            " then update",
-            " then edit",
-            " then run",
-            " and fix",
-            " and update",
-            " and edit",
-            " and run",
-            " also fix",
-            " also update",
-        ],
-    );
-    if chained_work {
-        return None;
-    }
-    if permissions::is_pure_question(&normalized, &compact) {
-        return Some(LiveMetaIntent::Permissions);
-    }
-
-    let zh_scope = contains_any(
-        &compact,
-        &[
-            "这次", "本次", "此次", "这轮", "本轮", "刚才", "刚刚", "這次", "此次", "這輪", "本輪",
-            "剛才", "剛剛",
-        ],
-    );
-    let zh_completed_change = contains_any(
-        &compact,
-        &[
-            "改了",
-            "修改了",
-            "更新了",
-            "变更了",
-            "變更了",
-            "改动",
-            "改動",
-            "变更",
-            "變更",
-            "的修改",
-            "的更新",
-        ],
-    );
-    let zh_change_question = contains_any(
-        &compact,
-        &[
-            "什么",
-            "什麼",
-            "啥",
-            "哪些",
-            "哪几",
-            "哪幾",
-            "改了些什",
-            "做了些什",
-        ],
-    );
-    let zh_present = contains_any(
-        &compact,
-        &[
-            "说下",
-            "說下",
-            "说说",
-            "說說",
-            "讲下",
-            "講下",
-            "告诉我",
-            "告訴我",
-            "总结",
-            "總結",
-            "列出",
-            "展示",
-            "说明",
-            "說明",
-            "介绍",
-            "介紹",
-        ],
-    );
-    let zh_future_change = contains_any(
-        &compact,
-        &[
-            "要改", "需改", "需要", "应该", "應該", "计划", "計劃", "打算", "要求", "目标", "目標",
-            "任务", "任務",
-        ],
-    );
-    if !zh_future_change
-        && zh_completed_change
-        && (zh_change_question || zh_present)
-        && (zh_scope || compact.contains("你改了") || compact.contains("您改了"))
-    {
-        return Some(LiveMetaIntent::Changes);
-    }
-
-    let english_future_change = contains_any(
-        &normalized,
-        &[
-            "should change",
-            "should update",
-            "need to change",
-            "need to update",
-            "plan to change",
-            "changes to make",
-            "change requirements",
-        ],
-    );
-    let english_change_question = contains_any(
-        &normalized,
-        &[
-            "what changed",
-            "what did you change",
-            "what have you changed",
-            "what you changed",
-            "what files did you change",
-            "which files did you change",
-            "what did you update",
-            "changes you made",
-            "changes did you make",
-            "summarize the changes",
-            "summarise the changes",
-            "summary of the changes",
-            "show me the changes",
-            "list the changes",
-            "what was changed",
-            "what got changed",
-        ],
-    );
-    if english_change_question && !english_future_change {
-        return Some(LiveMetaIntent::Changes);
-    }
-
-    let zh_progress = contains_any(&compact, &["进度", "進度", "进展", "進展"]);
-    let zh_progress_question = contains_any(
-        &compact,
-        &[
-            "怎么样",
-            "怎麼樣",
-            "如何",
-            "到哪",
-            "哪一步",
-            "多少",
-            "什么进展",
-            "什麼進展",
-            "啥进展",
-            "啥進展",
-            "有什么进展",
-            "有什麼進展",
-            "什么情况",
-            "什麼情況",
-            "啥情况",
-            "嗎",
-            "吗",
-        ],
-    );
-    let zh_progress_where = contains_any(
-        &compact,
-        &[
-            "做到哪",
-            "进行到哪",
-            "進行到哪",
-            "处理到哪",
-            "處理到哪",
-            "弄到哪",
-        ],
-    );
-    let zh_work_object = contains_any(
-        &compact,
-        &[
-            "组件", "組件", "页面", "頁面", "代码", "代碼", "函数", "函數", "接口", "文件", "檔案",
-            "配置", "测试", "測試",
-        ],
-    );
-    if !zh_work_object
-        && ((zh_progress && (zh_progress_question || zh_present)) || zh_progress_where)
-    {
-        return Some(LiveMetaIntent::Progress);
-    }
-
-    let english_progress = contains_any(
-        &normalized,
-        &[
-            "how is it going",
-            "how far along",
-            "what's the progress",
-            "what is the progress",
-            "current progress",
-            "progress update",
-            "where are we",
-            "where are you at",
-            "what are you doing",
-            "what are you working on",
-            "current status",
-            "status update",
-            "what stage are we",
-            "what stage are you",
-            "what step are we on",
-            "what step are you on",
-            "tell me the current progress",
-            "give me a progress update",
-            "show me the current progress",
-        ],
-    );
-    let english_progress_prompt = contains_any(
-        &normalized,
-        &[
-            "what",
-            "where",
-            "how",
-            "tell me",
-            "show me",
-            "give me",
-            "can you",
-            "could you",
-            "please",
-        ],
-    );
-    let english_work_object = contains_any(
-        &normalized,
-        &[
-            " component",
-            " page",
-            " function",
-            " endpoint",
-            " widget",
-            " source file",
-            " code",
-            " api",
-        ],
-    );
-    (english_progress && english_progress_prompt && !english_work_object)
-        .then_some(LiveMetaIntent::Progress)
 }
 
 /// One derived truth for the run's lifecycle, so the status label, the elapsed
@@ -3004,6 +2635,13 @@ pub struct App {
     /// compute the content row. `(0,0,0,0)` until the first render.
     pub transcript_area: std::cell::Cell<(u16, u16, u16, u16)>,
 
+    /// Right-edge transcript scrollbar track from the last frame.
+    pub(crate) transcript_scrollbar_area: std::cell::Cell<(u16, u16, u16, u16)>,
+    /// Thumb position within the published track: `(top_offset, height)`.
+    pub(crate) transcript_scrollbar_thumb: std::cell::Cell<(u16, u16)>,
+    /// Row offset grabbed inside the thumb while a mouse drag is active.
+    pub(crate) transcript_scrollbar_drag_offset: Option<u16>,
+
     /// Index into [`Self::transcript_rows`] of the row currently painted at the
     /// top of the transcript area (`hidden_above - user_offset`, the renderer's
     /// effective top scroll offset). Combined with [`Self::transcript_area`] this
@@ -3444,6 +3082,10 @@ pub struct App {
     pub preview_server: std::sync::Arc<std::sync::Mutex<Option<umadev_process::ManagedChild>>>,
     /// Workspace root — surfaced in the status bar as a breadcrumb.
     pub project_root: std::path::PathBuf,
+    /// Capability-pinned view of the workspace opened at launch. Automatic TUI
+    /// persistence uses this handle so replacing the path spelling later cannot
+    /// redirect history/chat/task writes outside the original workspace.
+    pub(crate) project_filesystem: Option<std::sync::Arc<umadev_state::fs::RootedDir>>,
     /// When a pipeline is running and the user presses `q` / Esc, we
     /// stash a "press again to confirm" flag instead of quitting
     /// immediately. Cleared on any other keypress.
@@ -3886,6 +3528,34 @@ fn memory_store_summary(
     summary
 }
 
+pub(crate) fn transcript_scrollbar_thumb(
+    track_height: u16,
+    total_rows: usize,
+    viewport_rows: usize,
+    first_visible: usize,
+) -> Option<(u16, u16)> {
+    if track_height == 0 || viewport_rows == 0 || total_rows <= viewport_rows {
+        return None;
+    }
+    let track = usize::from(track_height);
+    let thumb_height = viewport_rows
+        .saturating_mul(track)
+        .saturating_add(total_rows / 2)
+        / total_rows;
+    let thumb_height = thumb_height.clamp(1, track);
+    let travel = track.saturating_sub(thumb_height);
+    let max_first = total_rows - viewport_rows;
+    let thumb_top = first_visible
+        .min(max_first)
+        .saturating_mul(travel)
+        .saturating_add(max_first / 2)
+        / max_first;
+    Some((
+        u16::try_from(thumb_top).unwrap_or(track_height),
+        u16::try_from(thumb_height).unwrap_or(track_height),
+    ))
+}
+
 impl App {
     /// Build a fresh app. Reads existing config from disk; if no
     /// backend is set, opens on the picker.
@@ -3923,6 +3593,9 @@ impl App {
             .as_deref()
             .and_then(|b| crate::detect_base_context_window(b, &project_root));
         let lang = config.resolved_lang();
+        let project_filesystem = umadev_state::fs::RootedDir::open(&project_root)
+            .ok()
+            .map(std::sync::Arc::new);
         umadev_i18n::set_lang(lang);
         // Publish the saved process-log preference (`/logs`) into the base drivers'
         // thread-safe shared flag, so a build's long-running command output is
@@ -3995,6 +3668,9 @@ impl App {
             transcript_gutters: std::cell::RefCell::new(Vec::new()),
             transcript_row_wraps: std::cell::RefCell::new(Vec::new()),
             transcript_area: std::cell::Cell::new((0, 0, 0, 0)),
+            transcript_scrollbar_area: std::cell::Cell::new((0, 0, 0, 0)),
+            transcript_scrollbar_thumb: std::cell::Cell::new((0, 0)),
+            transcript_scrollbar_drag_offset: None,
             transcript_first_visible: std::cell::Cell::new(0),
             input_selection: None,
             input_selection_dragging: false,
@@ -4082,6 +3758,7 @@ impl App {
             history_search: None,
             preview_server: std::sync::Arc::new(std::sync::Mutex::new(None)),
             project_root,
+            project_filesystem,
             pending_quit_confirm: false,
             pending_rewind: false,
             interrupt_armed_at: None,
@@ -4205,23 +3882,6 @@ impl App {
         )
     }
 
-    fn existing_project_umadev_dir(&self) -> Option<std::path::PathBuf> {
-        let root = std::fs::canonicalize(&self.project_root).ok()?;
-        if !umadev_state::fs::real_dir(&root) {
-            return None;
-        }
-        let umadev = root.join(".umadev");
-        umadev_state::fs::real_dir(&umadev).then_some(umadev)
-    }
-
-    fn ensure_project_umadev_dir(&self) -> Option<std::path::PathBuf> {
-        let root = std::fs::canonicalize(&self.project_root).ok()?;
-        if !umadev_state::fs::real_dir(&root) {
-            return None;
-        }
-        umadev_state::fs::ensure_real_child_dir(&root, ".umadev").ok()
-    }
-
     fn history_path(&self) -> std::path::PathBuf {
         self.project_root.join(".umadev").join("input-history.txt")
     }
@@ -4230,11 +3890,13 @@ impl App {
         if !self.memory_recall_enabled(umadev_agent::memory_control::MemoryStore::InputHistory) {
             return;
         }
-        let Some(umadev) = self.existing_project_umadev_dir() else {
+        let Some(root) = self.project_filesystem.as_deref() else {
             return;
         };
-        let path = umadev.join("input-history.txt");
-        let Ok(bytes) = umadev_state::fs::read_bounded(&path, MAX_INPUT_HISTORY_BYTES) else {
+        let Ok(bytes) = root.read_bounded(
+            std::path::Path::new(".umadev/input-history.txt"),
+            MAX_INPUT_HISTORY_BYTES,
+        ) else {
             return;
         };
         let Ok(body) = String::from_utf8(bytes) else {
@@ -4258,10 +3920,9 @@ impl App {
         if !self.memory_capture_enabled(umadev_agent::memory_control::MemoryStore::InputHistory) {
             return;
         }
-        let Some(parent) = self.ensure_project_umadev_dir() else {
+        let Some(root) = self.project_filesystem.as_deref() else {
             return;
         };
-        let path = parent.join("input-history.txt");
         // Serialize the ring as a JSON array so a multi-line entry round-trips as
         // a single entry (the newline-join would otherwise re-split it on load).
         // Fail-open: a serialize error skips the write rather than corrupting the
@@ -4269,7 +3930,11 @@ impl App {
         let entries: Vec<&String> = self.input_history.iter().collect();
         if let Ok(json) = serde_json::to_string(&entries) {
             if json.len() <= usize::try_from(MAX_INPUT_HISTORY_BYTES).unwrap_or(usize::MAX) {
-                let _ = umadev_state::fs::atomic_write(&path, json.as_bytes());
+                let _ = root.atomic_write(
+                    std::path::Path::new(".umadev/input-history.txt"),
+                    json.as_bytes(),
+                    true,
+                );
             }
         }
     }
@@ -4280,17 +3945,6 @@ impl App {
     #[cfg(test)]
     fn chat_dir(&self) -> std::path::PathBuf {
         self.project_root.join(".umadev").join("chat")
-    }
-
-    fn ensure_chat_dir(&self) -> Option<std::path::PathBuf> {
-        let umadev = self.ensure_project_umadev_dir()?;
-        umadev_state::fs::ensure_real_child_dir(&umadev, "chat").ok()
-    }
-
-    fn existing_chat_dir(&self) -> Option<std::path::PathBuf> {
-        let umadev = self.existing_project_umadev_dir()?;
-        let chat = umadev.join("chat");
-        umadev_state::fs::real_dir(&chat).then_some(chat)
     }
 
     fn valid_chat_id(id: &str) -> bool {
@@ -4347,11 +4001,11 @@ impl App {
         if body.len() > usize::try_from(MAX_CHAT_FILE_BYTES).unwrap_or(usize::MAX) {
             return;
         }
-        let Some(dir) = self.ensure_chat_dir() else {
+        let Some(root) = self.project_filesystem.as_deref() else {
             return;
         };
-        let final_path = dir.join(format!("{}.json", self.chat_id));
-        let _ = umadev_state::fs::atomic_write(&final_path, body.as_bytes());
+        let relative = std::path::Path::new(".umadev/chat").join(format!("{}.json", self.chat_id));
+        let _ = root.atomic_write(&relative, body.as_bytes(), true);
     }
 
     /// Remove this chat's persisted file (best-effort, **fail-open**). Used when a
@@ -4362,9 +4016,10 @@ impl App {
     /// conversation the rewind dropped. A missing file / IO error is swallowed.
     fn discard_persisted_chat(&self) {
         if Self::valid_chat_id(&self.chat_id) {
-            if let Some(dir) = self.existing_chat_dir() {
-                let path = dir.join(format!("{}.json", self.chat_id));
-                let _ = umadev_state::fs::remove_regular_file(&path);
+            if let Some(root) = self.project_filesystem.as_deref() {
+                let relative =
+                    std::path::Path::new(".umadev/chat").join(format!("{}.json", self.chat_id));
+                let _ = root.remove_regular_file(&relative);
             }
         }
     }
@@ -4374,27 +4029,26 @@ impl App {
     /// dir / unreadable / corrupt file yields an empty list (never an error).
     pub(crate) fn list_chats(&self) -> Vec<(String, String, usize, String)> {
         let mut out: Vec<(String, String, usize, String)> = Vec::new();
-        let Some(chat_dir) = self.existing_chat_dir() else {
+        let Some(root) = self.project_filesystem.as_deref() else {
             return out;
         };
-        for entry in dir_scan::scan_dir(&chat_dir).entries {
-            if !entry.is_file() {
+        let chat_dir = std::path::Path::new(".umadev/chat");
+        let Ok(entries) = root.list_regular_files(chat_dir, dir_scan::ENTRY_CAP) else {
+            return out;
+        };
+        for entry in entries {
+            let name = std::path::Path::new(&entry.name);
+            if name.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(file_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            let Some(file_id) = name.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            if !Self::valid_chat_id(file_id)
-                || !std::fs::symlink_metadata(path)
-                    .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_file(&metadata))
-            {
+            if !Self::valid_chat_id(file_id) {
                 continue;
             }
-            let Ok(bytes) = umadev_state::fs::read_bounded(path, MAX_CHAT_FILE_BYTES) else {
+            let relative = chat_dir.join(name);
+            let Ok(bytes) = root.read_bounded(&relative, MAX_CHAT_FILE_BYTES) else {
                 continue;
             };
             let Ok(session) = serde_json::from_slice::<ChatSession>(&bytes) else {
@@ -4441,11 +4095,11 @@ impl App {
         if !Self::valid_chat_id(id) {
             return false;
         }
-        let Some(chat_dir) = self.existing_chat_dir() else {
+        let Some(root) = self.project_filesystem.as_deref() else {
             return false;
         };
-        let path = chat_dir.join(format!("{id}.json"));
-        let Ok(bytes) = umadev_state::fs::read_bounded(&path, MAX_CHAT_FILE_BYTES) else {
+        let relative = std::path::Path::new(".umadev/chat").join(format!("{id}.json"));
+        let Ok(bytes) = root.read_bounded(&relative, MAX_CHAT_FILE_BYTES) else {
             return false;
         };
         let Ok(session) = serde_json::from_slice::<ChatSession>(&bytes) else {
@@ -4926,7 +4580,7 @@ impl App {
                     } else {
                         200
                     };
-                    let preview: String = summary.chars().take(cap).collect();
+                    let preview = prefix_with_char_limit(summary, cap);
                     if t.merged {
                         // The headline stays the running count; only fold the
                         // metric in (e.g. `(3 matches)`), never the raw dump.
@@ -5011,7 +4665,7 @@ impl App {
     }
 
     fn attach_tool_output_delta_for(&mut self, call_id: Option<&str>, delta: &str) {
-        if delta.trim().is_empty() {
+        if delta.is_empty() {
             return;
         }
         let target = self.history.iter().rposition(|message| {
@@ -5023,6 +4677,13 @@ impl App {
                             && call_id.is_none_or(|id| tool.call_id.as_deref() == Some(id))
                 )
         });
+        // Whitespace-only chunks are meaningful once a running tool exists:
+        // protocols may split `\n` or indentation into their own deltas. Do not
+        // synthesize an otherwise-empty Bash row when its start frame is missing,
+        // but never concatenate established output by dropping those chunks.
+        if target.is_none() && delta.trim().is_empty() {
+            return;
+        }
         let target = target.unwrap_or_else(|| {
             if let Some(call_id) = call_id {
                 self.push_tool_use_correlated(call_id, "Bash", "");
@@ -5039,13 +4700,7 @@ impl App {
         };
         let output = tool.result.get_or_insert_with(String::new);
         output.push_str(delta);
-        let chars = output.chars().count();
-        if chars > PROCESS_LOG_PREVIEW_CHARS {
-            let drop_chars = chars - PROCESS_LOG_PREVIEW_CHARS;
-            if let Some((byte, _)) = output.char_indices().nth(drop_chars) {
-                output.drain(..byte);
-            }
-        }
+        trim_tail(output, PROCESS_LOG_PREVIEW_CHARS);
         tool.collapsed = false;
     }
 
@@ -5088,13 +4743,7 @@ impl App {
             return;
         };
         let mut output = snapshot.to_string();
-        let chars = output.chars().count();
-        if chars > PROCESS_LOG_PREVIEW_CHARS {
-            let drop_chars = chars - PROCESS_LOG_PREVIEW_CHARS;
-            if let Some((byte, _)) = output.char_indices().nth(drop_chars) {
-                output.drain(..byte);
-            }
-        }
+        trim_tail(&mut output, PROCESS_LOG_PREVIEW_CHARS);
         tool.result = (!output.is_empty()).then_some(output);
         tool.collapsed = false;
     }
@@ -5519,6 +5168,84 @@ impl App {
     /// Jump back to the bottom (newest content) and re-enable auto-stick.
     pub fn transcript_scroll_to_bottom(&mut self) {
         self.transcript_scroll.set(0);
+    }
+
+    /// Start dragging the visible transcript scrollbar, if the point hits its track.
+    pub(crate) fn transcript_scrollbar_begin(&mut self, col: u16, row: u16) -> bool {
+        let (left, top, width, height) = self.transcript_scrollbar_area.get();
+        if !self.mouse_scroll
+            || self.overlay.is_some()
+            || !matches!(self.mode, AppMode::Chat)
+            || self.transcript_max_scroll.get() == 0
+            || width == 0
+            || height == 0
+            || col < left
+            || col >= left.saturating_add(width)
+            || row < top
+            || row >= top.saturating_add(height)
+        {
+            return false;
+        }
+
+        let local_row = row.saturating_sub(top);
+        let (thumb_top, thumb_height) = self.transcript_scrollbar_thumb.get();
+        let thumb_end = thumb_top.saturating_add(thumb_height);
+        let grab = if local_row >= thumb_top && local_row < thumb_end {
+            local_row - thumb_top
+        } else {
+            thumb_height / 2
+        };
+        self.transcript_scrollbar_drag_offset = Some(grab);
+        self.selection_dragging = false;
+        self.last_drag_mouse = None;
+        self.input_selection_dragging = false;
+        self.link_click_pending = false;
+        self.update_transcript_scrollbar_drag(row);
+        true
+    }
+
+    /// Move an active transcript scrollbar drag, even outside the track column.
+    pub(crate) fn transcript_scrollbar_drag(&mut self, row: u16) -> bool {
+        if self.transcript_scrollbar_drag_offset.is_none() {
+            return false;
+        }
+        self.update_transcript_scrollbar_drag(row);
+        true
+    }
+
+    /// Finish an active transcript scrollbar drag.
+    pub(crate) fn transcript_scrollbar_end(&mut self, row: u16) -> bool {
+        if self.transcript_scrollbar_drag_offset.is_none() {
+            return false;
+        }
+        self.update_transcript_scrollbar_drag(row);
+        self.transcript_scrollbar_drag_offset = None;
+        true
+    }
+
+    fn update_transcript_scrollbar_drag(&mut self, row: u16) {
+        let (_, track_top, _, track_height) = self.transcript_scrollbar_area.get();
+        let (_, thumb_height) = self.transcript_scrollbar_thumb.get();
+        let Some(grab) = self.transcript_scrollbar_drag_offset else {
+            return;
+        };
+        let travel = track_height.saturating_sub(thumb_height);
+        let max_scroll = self.transcript_max_scroll.get();
+        if travel == 0 || max_scroll == 0 {
+            return;
+        }
+
+        let local = i32::from(row) - i32::from(track_top) - i32::from(grab);
+        let thumb_top = usize::try_from(local.clamp(0, i32::from(travel))).unwrap_or_default();
+        let first_visible = thumb_top
+            .saturating_mul(max_scroll)
+            .saturating_add(usize::from(travel) / 2)
+            / usize::from(travel);
+        self.transcript_scroll
+            .set(max_scroll.saturating_sub(first_visible));
+        self.transcript_first_visible.set(first_visible);
+        self.transcript_scrollbar_thumb
+            .set((u16::try_from(thumb_top).unwrap_or(travel), thumb_height));
     }
 
     /// Scroll the help overlay DOWN by `rows`, clamped to the renderer-published
@@ -6161,18 +5888,23 @@ impl App {
         let room = INPUT_CAP.saturating_sub(self.input_len());
         let mut buf = String::with_capacity(text.len().min(room * 4));
         let mut added = 0usize;
-        for c in text.chars() {
-            if added >= room {
+        for grapheme in text.graphemes(true) {
+            let grapheme_chars = grapheme
+                .chars()
+                .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+                .count();
+            if added.saturating_add(grapheme_chars) > room {
                 break;
             }
             // Keep newlines AND tabs; drop every other control char. Dropping
             // `\t` silently stripped the indentation out of pasted tab-indented
             // code (a real "my paste lost all its tabs" bug).
-            if c != '\n' && c != '\t' && c.is_control() {
-                continue;
-            }
-            buf.push(c);
-            added += 1;
+            buf.extend(
+                grapheme
+                    .chars()
+                    .filter(|c| *c == '\n' || *c == '\t' || !c.is_control()),
+            );
+            added += grapheme_chars;
         }
         if !buf.is_empty() {
             // Chip-aware (see `insert_at_cursor`): a paste landing STRICTLY interior
@@ -6437,7 +6169,7 @@ impl App {
         // (Alt+Y) could otherwise push the box past the limit. Room = the cap
         // minus everything OUTSIDE the span being replaced.
         let room = INPUT_CAP.saturating_sub(self.input_len().saturating_sub(len));
-        let replacement: String = replacement.chars().take(room).collect();
+        let replacement = prefix_with_char_limit(&replacement, room);
         self.snapshot_for_undo();
         let bstart = self.byte_index(start);
         let bend = self.byte_index(start + len);
@@ -13852,6 +13584,10 @@ impl App {
             return action;
         }
         if self.reject_active_backend_unavailable() {
+            // Enter clears the editor before slash-command dispatch.  Match the
+            // ordinary-turn failure path and put the exact `/run` request back so
+            // repairing PATH or switching bases never costs the user's requirement.
+            self.restore_submitted_turn(SubmittedTurn::text(format!("/run {arg}")));
             return Action::None;
         }
         if self.run_started {
@@ -16714,20 +16450,18 @@ impl App {
     }
 
     fn slash_toggle_animations(&mut self) -> Action {
-        let path = std::env::var("HOME")
-            .map(|h| {
-                std::path::PathBuf::from(h)
-                    .join(".umadev")
-                    .join("settings.json")
-            })
-            .unwrap_or_default();
-        let current = read_bounded_utf8(&path, MAX_UI_STATE_BYTES)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v.get("animations_enabled")
-                    .and_then(serde_json::Value::as_bool)
-            })
+        let settings = animation_settings_root(true);
+        // Read once through the same pinned state capability that will receive
+        // the write, so a replaced ambient state path cannot split this
+        // read/modify/write across two directory generations.
+        let mut root = settings
+            .as_ref()
+            .and_then(read_animation_settings)
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let current = root
+            .get("animations_enabled")
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         let new_val = !current;
         // P5d: flip the LIVE field so the spinner switches static/animated this
@@ -16736,20 +16470,13 @@ impl App {
         // Read-merge-write so toggling animations never clobbers sibling keys in
         // settings.json, and write atomically (temp+rename) so a crash mid-write
         // can't corrupt it.
-        let mut root = read_bounded_utf8(&path, MAX_UI_STATE_BYTES)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .filter(serde_json::Value::is_object)
-            .unwrap_or_else(|| serde_json::json!({}));
         root["animations_enabled"] = serde_json::json!(new_val);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(body) = serde_json::to_string_pretty(&root) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, body).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+        if let (Some(settings), Ok(body)) = (settings, serde_json::to_string_pretty(&root)) {
+            let _ = settings.atomic_write(
+                std::path::Path::new("settings.json"),
+                body.as_bytes(),
+                false,
+            );
         }
         let state = if new_val {
             umadev_i18n::t(self.lang, "anim.on")
@@ -17835,21 +17562,25 @@ fn animations_enabled_default() -> bool {
         return false;
     }
     // Honor a persisted `/animations off`. Absent / unreadable → animated.
-    let path = std::env::var("HOME")
-        .map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".umadev")
-                .join("settings.json")
-        })
-        .unwrap_or_default();
-    read_bounded_utf8(&path, MAX_UI_STATE_BYTES)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    animation_settings_root(false)
+        .as_ref()
+        .and_then(read_animation_settings)
         .and_then(|v| {
             v.get("animations_enabled")
                 .and_then(serde_json::Value::as_bool)
         })
         .unwrap_or(true)
+}
+
+fn animation_settings_root(create_state: bool) -> Option<umadev_state::fs::RootedDir> {
+    umadev_state::privacy::state_root(create_state)
+}
+
+fn read_animation_settings(settings: &umadev_state::fs::RootedDir) -> Option<serde_json::Value> {
+    let bytes = settings
+        .read_bounded(std::path::Path::new("settings.json"), MAX_UI_STATE_BYTES)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 pub(crate) fn has_open_code_fence(body: &str) -> bool {

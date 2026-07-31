@@ -87,6 +87,51 @@ fn safe_point_capabilities() -> SessionCapabilities {
 }
 
 #[test]
+fn live_queue_ui_clears_when_its_worker_registration_ends_without_a_keypress() {
+    let hub = LiveInputHub::default();
+    let capabilities = SessionCapabilities {
+        prompt_queue: umadev_runtime::PromptQueueCapability::ServerAuthoritativeVersioned,
+        ..SessionCapabilities::default()
+    };
+    let (_receiver, registration) = hub.register("grok-build", capabilities);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = App::new(
+        "queue-registration",
+        crate::config::UserConfig::default(),
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
+    );
+
+    assert!(sync_live_input_readiness(&mut app, &hub));
+    app.prompt_queue
+        .apply_snapshot(umadev_runtime::PromptQueueSnapshot {
+            session_id: "s1".to_string(),
+            entries: vec![umadev_runtime::PromptQueueEntry {
+                id: "p1".to_string(),
+                version: 1,
+                owner: Some("umadev".to_string()),
+                last_editor: None,
+                kind: "prompt".to_string(),
+                text: "must not look queued after disconnect".to_string(),
+                position: 0,
+            }],
+            running_prompt_id: Some("running".to_string()),
+        });
+    assert!(app.prompt_queue.toggle());
+    assert_eq!(app.queued_count(), 1);
+
+    drop(registration);
+    assert!(
+        sync_live_input_readiness(&mut app, &hub),
+        "the loop observes worker teardown without waiting for user input"
+    );
+    assert!(!app.prompt_queue.ready());
+    assert!(!app.prompt_queue.is_open());
+    assert!(app.prompt_queue.entries().is_empty());
+    assert_eq!(app.queued_count(), 0);
+}
+
+#[test]
 fn live_input_distinguishes_codex_same_turn_from_grok_safe_point() {
     let hub = LiveInputHub::default();
     let turn = SubmittedTurn::text("调整当前实现".to_string());
@@ -1887,6 +1932,44 @@ fn wheel_and_drag_coalesce_keys_and_clicks_stay_immediate() {
     assert!(!input_event_coalesces(&Event::Paste("hello".into())));
     assert!(!input_event_coalesces(&Event::Resize(80, 24)));
     assert!(!input_event_coalesces(&Event::FocusGained));
+}
+
+#[test]
+fn scrollbar_mouse_gesture_is_consumed_before_text_selection() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = App::new(
+        "scrollbar",
+        crate::config::UserConfig::default(),
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
+    );
+    app.mode = crate::app::AppMode::Chat;
+    app.transcript_scrollbar_area.set((59, 10, 1, 10));
+    app.transcript_scrollbar_thumb.set((8, 2));
+    app.transcript_max_scroll.set(80);
+    let selection = crate::selection::Selection {
+        anchor: (1, 0),
+        cursor: (3, 2),
+    };
+    app.selection = Some(selection);
+
+    let event = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 59,
+        row: 10,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(handle_transcript_scrollbar_mouse(&mut app, event));
+    assert_eq!(app.selection, Some(selection));
+    assert_eq!(app.transcript_scroll(), 80);
+
+    let event = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        row: 19,
+        ..event
+    };
+    assert!(handle_transcript_scrollbar_mouse(&mut app, event));
+    assert_eq!(app.transcript_scroll(), 0);
 }
 
 #[test]
@@ -10007,6 +10090,223 @@ fn chat_idle_budget_uses_a_finite_poll_window_mid_tool() {
         budget.window(true) > Duration::ZERO && budget.window(false) > Duration::ZERO,
         "both the poll window and the base window are finite, positive durations"
     );
+}
+
+#[tokio::test]
+async fn resident_turn_limits_are_configurable_but_globally_clamped_and_fail_safe() {
+    let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+    let _wall = EnvRestore::set("UMADEV_CHAT_TURN_MAX_SECS", "999999999");
+    let _tokens = EnvRestore::set("UMADEV_CHAT_TURN_MAX_TOKENS", "NaN");
+    let _events = EnvRestore::set("UMADEV_CHAT_TURN_MAX_EVENTS", "0");
+    let _tools = EnvRestore::set("UMADEV_CHAT_TURN_MAX_TOOL_CALLS", "999999999");
+
+    let limiter = ResidentTurnLimiter::new(&light_default_route());
+    assert_eq!(limiter.wall_seconds, HARD_RESIDENT_TURN_MAX_SECS);
+    assert_eq!(
+        limiter.token_ceiling, DEFAULT_RESIDENT_TURN_MAX_TOKENS,
+        "non-numeric usage limits fail closed to the product default"
+    );
+    assert_eq!(
+        limiter.event_ceiling, DEFAULT_RESIDENT_TURN_MAX_EVENTS,
+        "zero cannot disable the event ceiling"
+    );
+    assert_eq!(
+        limiter.tool_call_ceiling, HARD_RESIDENT_TURN_MAX_TOOL_CALLS,
+        "large overrides are clamped to the global hard maximum"
+    );
+}
+
+#[tokio::test]
+async fn resident_turn_usage_limit_handles_missing_and_saturating_reports() {
+    let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+    let _tokens = EnvRestore::set("UMADEV_CHAT_TURN_MAX_TOKENS", "100");
+    let mut limiter = ResidentTurnLimiter::new(&light_default_route());
+
+    assert_eq!(
+        limiter.observe(&umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        }),
+        None,
+        "missing usage remains unknown instead of fabricating an overflow"
+    );
+    let overflow = umadev_runtime::Usage::exact(u64::MAX, u64::MAX);
+    assert_eq!(overflow.total_tokens, u64::MAX);
+    assert!(matches!(
+        limiter.observe(&umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: Some(overflow),
+        }),
+        Some(ResidentTurnLimit::ReportedTokens {
+            used: u64::MAX,
+            ceiling: 100
+        })
+    ));
+
+    let mut streamed = ResidentTurnLimiter::new(&light_default_route());
+    assert!(matches!(
+        streamed.observe(&umadev_runtime::SessionEvent::ThinkingDelta(
+            "x".repeat(1_000)
+        )),
+        Some(ResidentTurnLimit::StreamTokens {
+            used: 250,
+            ceiling: 100
+        })
+    ));
+}
+
+#[tokio::test]
+async fn resident_turn_wall_clock_is_absolute_even_when_events_keep_arriving() {
+    let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+    let mut limiter = ResidentTurnLimiter::new(&light_default_route());
+    limiter.started = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(limiter.wall_seconds.saturating_add(1)))
+        .expect("the resident turn test duration must fit in Instant");
+    assert_eq!(
+        limiter.observe(&umadev_runtime::SessionEvent::ThinkingDelta(
+            "still producing tiny chunks".into()
+        )),
+        Some(ResidentTurnLimit::WallClock {
+            seconds: limiter.wall_seconds
+        }),
+        "productive-looking output cannot reset the absolute turn deadline"
+    );
+}
+
+#[tokio::test]
+async fn resident_continuous_small_output_cannot_evade_the_event_ceiling() {
+    let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+    let _events = EnvRestore::set("UMADEV_CHAT_TURN_MAX_EVENTS", "4");
+    let _tokens = EnvRestore::set(
+        "UMADEV_CHAT_TURN_MAX_TOKENS",
+        HARD_RESIDENT_TURN_MAX_TOKENS.to_string(),
+    );
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut answer = (0..8)
+        .map(|_| umadev_runtime::SessionEvent::ThinkingDelta(".".into()))
+        .collect::<Vec<_>>();
+    answer.push(umadev_runtime::SessionEvent::TurnDone {
+        status: umadev_runtime::TurnStatus::Completed,
+        usage: None,
+    });
+
+    let (events, routes) =
+        drive_resident_readonly_turn(tmp.path(), "explain this project", answer).await;
+
+    assert!(events.iter().any(
+        |event| matches!(event, EngineEvent::Note(note) if note.contains("stream events 5/4"))
+    ));
+    assert!(routes.iter().any(|route| matches!(
+        route,
+        RouteDecision::AgenticDone {
+            truncated: true,
+            ..
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::CriticVerdict { .. })),
+        "a runaway resident answer never launches review"
+    );
+}
+
+#[tokio::test]
+async fn resident_tool_call_flood_truncates_without_replay_or_review() {
+    let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+    let _tools = EnvRestore::set("UMADEV_CHAT_TURN_MAX_TOOL_CALLS", "2");
+    let tmp = tempfile::TempDir::new().unwrap();
+    let answer = (0..4)
+        .map(|index| umadev_runtime::SessionEvent::ToolCall {
+            name: "Read".into(),
+            input: serde_json::json!({"file_path": format!("src/{index}.rs")}),
+        })
+        .chain(std::iter::once(umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        }))
+        .collect();
+
+    let (events, routes) =
+        drive_resident_readonly_turn(tmp.path(), "inspect the implementation", answer).await;
+
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, EngineEvent::Note(note) if note.contains("tool calls 3/2"))));
+    assert!(routes.iter().any(|route| matches!(
+        route,
+        RouteDecision::AgenticDone {
+            truncated: true,
+            ..
+        }
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::CriticVerdict { .. })),
+        "tool flood truncation is terminal for this turn"
+    );
+}
+
+#[tokio::test]
+async fn one_long_tool_with_normal_heartbeats_stays_below_the_runaway_limits() {
+    let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+    let _events = EnvRestore::set("UMADEV_CHAT_TURN_MAX_EVENTS", "1000");
+    let _tools = EnvRestore::set("UMADEV_CHAT_TURN_MAX_TOOL_CALLS", "4");
+    let mut limiter = ResidentTurnLimiter::new(&light_default_route());
+
+    assert_eq!(
+        limiter.observe(&umadev_runtime::SessionEvent::ToolCallCorrelated {
+            call_id: "build-1".into(),
+            name: "Bash".into(),
+            input: serde_json::json!({"command": "cargo test --workspace"}),
+        }),
+        None
+    );
+    for tick in 0..200 {
+        assert_eq!(
+            limiter.observe(&umadev_runtime::SessionEvent::ToolProgressCorrelated {
+                call_id: "build-1".into(),
+                title: format!("test heartbeat {tick}"),
+            }),
+            None,
+            "healthy progress is not mistaken for a tool-call flood"
+        );
+    }
+    assert_eq!(
+        limiter.observe(&umadev_runtime::SessionEvent::ToolResultCorrelated {
+            call_id: "build-1".into(),
+            ok: true,
+            summary: "tests passed".into(),
+        }),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_resident_write_never_enters_post_build_qc() {
+    let _qc = ReactiveQcOverride::force(true);
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut batch = write_tool_turn("src/App.tsx");
+    let Some(umadev_runtime::SessionEvent::TurnDone { status, .. }) = batch.last_mut() else {
+        panic!("scripted write ends in TurnDone");
+    };
+    *status = umadev_runtime::TurnStatus::Truncated;
+
+    let (events, routes) =
+        drive_resident_turn(tmp.path(), "做一个登录页", batch, Some("src/App.tsx")).await;
+
+    assert!(
+        !ran_governance_qc(&events),
+        "a hard-limited partial turn must not spend more work on QC/review: {events:?}"
+    );
+    assert!(routes.iter().any(|route| matches!(
+        route,
+        RouteDecision::AgenticDone {
+            truncated: true,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]

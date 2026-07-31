@@ -2682,6 +2682,32 @@ fn paste_preserves_tab_indentation() {
 }
 
 #[test]
+fn bulk_insert_at_input_cap_never_keeps_half_an_extended_grapheme() {
+    let mut app = fresh_app(Some("offline"));
+    app.input = "x".repeat(INPUT_CAP - 1);
+    app.input_cursor = app.input_len();
+
+    app.insert_str_at_cursor("e\u{301}");
+    assert_eq!(
+        app.input_len(),
+        INPUT_CAP - 1,
+        "one remaining scalar slot cannot split base + combining mark"
+    );
+    assert!(!app.input.ends_with('e'));
+
+    app.insert_str_at_cursor("a");
+    assert_eq!(app.input_len(), INPUT_CAP);
+    assert!(app.input.ends_with('a'));
+
+    let mut exact = fresh_app(Some("offline"));
+    exact.input = "x".repeat(INPUT_CAP - 2);
+    exact.input_cursor = exact.input_len();
+    exact.insert_str_at_cursor("e\u{301}z");
+    assert!(exact.input.ends_with("e\u{301}"));
+    assert_eq!(exact.input_len(), INPUT_CAP);
+}
+
+#[test]
 fn two_large_pastes_each_stash_and_expand_independently() {
     let mut a = fresh_app(Some("offline"));
     let a_text = numbered_lines("alpha", 15);
@@ -5158,6 +5184,95 @@ fn legacy_task_registry_secrets_are_redacted_on_load_and_rewrite() {
     assert!(body.contains("[redacted]"));
 }
 
+#[cfg(unix)]
+#[test]
+fn automatic_tui_persistence_stays_with_the_workspace_opened_at_launch() {
+    use std::os::unix::fs::symlink;
+
+    let parent = tempfile::TempDir::new().unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let workspace = parent.path().join("workspace");
+    let moved = parent.path().join("workspace-moved");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut app = App::new(
+        "demo",
+        cfg_offline(),
+        workspace.join("config.toml"),
+        workspace.clone(),
+    );
+    app.register_run_task("state captured before the workspace moves");
+    app.input_history.push_back("original history".to_string());
+    app.persist_history();
+    app.record_user_turn("original persisted chat");
+    let original_chat_id = app.chat_id.clone();
+
+    std::fs::rename(&workspace, &moved).unwrap();
+    symlink(outside.path(), &workspace).unwrap();
+
+    // A replacement tree contains plausible but hostile state. Reads after
+    // launch must stay on the same directory capability as writes.
+    std::fs::create_dir_all(outside.path().join(".umadev/chat")).unwrap();
+    std::fs::write(outside.path().join(".umadev/tasks.json"), "not json").unwrap();
+    std::fs::write(
+        outside.path().join(".umadev/input-history.txt"),
+        "outside history",
+    )
+    .unwrap();
+    std::fs::write(
+        outside
+            .path()
+            .join(".umadev/chat")
+            .join(format!("{original_chat_id}.json")),
+        "{}",
+    )
+    .unwrap();
+
+    app.tasks.clear();
+    app.input_history.clear();
+    app.full_transcript.clear();
+    app.conversation.clear();
+    app.load_tasks();
+    app.load_history();
+    assert!(app
+        .tasks
+        .iter()
+        .any(|task| task.requirement.contains("state captured")));
+    assert!(app
+        .input_history
+        .iter()
+        .any(|row| row == "original history"));
+    assert!(app.load_chat(&original_chat_id));
+    assert!(app
+        .conversation
+        .iter()
+        .any(|message| message.content.contains("original persisted chat")));
+
+    app.register_run_task("persist only inside the launch workspace");
+    app.input_history.push_back("safe history".to_string());
+    app.persist_history();
+
+    assert!(moved.join(".umadev/tasks.json").is_file());
+    assert!(moved.join(".umadev/input-history.txt").is_file());
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join(".umadev/tasks.json")).unwrap(),
+        "not json"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join(".umadev/input-history.txt")).unwrap(),
+        "outside history"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            outside
+                .path()
+                .join(".umadev/chat")
+                .join(format!("{original_chat_id}.json"))
+        )
+        .unwrap(),
+        "{}"
+    );
+}
+
 #[test]
 fn tasks_command_lists_durable_agent_team_children() {
     let mut app = fresh_app(Some("offline"));
@@ -6003,6 +6118,10 @@ fn reported_regression_run_stops_before_planning_when_active_backend_is_missing(
     assert!(!app.run_started && !app.director_run_in_flight);
     assert!(app.tasks.is_empty());
     assert!(app.requirement.is_empty());
+    assert_eq!(
+        app.input, "/run build the dashboard",
+        "the unavailable-backend preflight must preserve the complete request for retry"
+    );
     let last = app
         .history
         .back()
@@ -7027,66 +7146,6 @@ fn non_steering_gate_input_is_deferred_not_reinterpreted_as_revision() {
                 .all(|message| !message.body().contains("收到修订")),
             "a gate question must not trigger Action::Revise: {text}"
         );
-    }
-}
-
-#[test]
-fn live_meta_classifier_is_bounded_and_trilingual() {
-    for (text, expected) in [
-        ("这次改动都做了啥？", LiveMetaIntent::Changes),
-        ("能说下这次都改了哪些内容吗？", LiveMetaIntent::Changes),
-        ("你这次都改了些什么？", LiveMetaIntent::Changes),
-        ("本輪改動", LiveMetaIntent::Changes),
-        ("what did you change?", LiveMetaIntent::Changes),
-        (
-            "could you tell me what changed this time?",
-            LiveMetaIntent::Changes,
-        ),
-        ("what files did you change?", LiveMetaIntent::Changes),
-        ("当前进度", LiveMetaIntent::Progress),
-        ("现在进展到哪一步啦？", LiveMetaIntent::Progress),
-        ("目前什么进展了", LiveMetaIntent::Progress),
-        ("现在啥进展了？", LiveMetaIntent::Progress),
-        ("当前有什么进展", LiveMetaIntent::Progress),
-        ("目前有什麼進展了？", LiveMetaIntent::Progress),
-        ("目前進度？", LiveMetaIntent::Progress),
-        ("what are you working on?", LiveMetaIntent::Progress),
-        ("how far along are you?", LiveMetaIntent::Progress),
-        (
-            "could you give me a current progress update?",
-            LiveMetaIntent::Progress,
-        ),
-        ("怎么给你权限？", LiveMetaIntent::Permissions),
-        ("为什么是只读？", LiveMetaIntent::Permissions),
-        ("你现在能修改文件吗？", LiveMetaIntent::Permissions),
-        ("请问你能写文件吗？", LiveMetaIntent::Permissions),
-        ("怎麼給你權限？", LiveMetaIntent::Permissions),
-        ("為什麼是唯讀？", LiveMetaIntent::Permissions),
-        (
-            "how can I grant you permission?",
-            LiveMetaIntent::Permissions,
-        ),
-        ("do you have write access?", LiveMetaIntent::Permissions),
-    ] {
-        assert_eq!(classify_live_meta(text), Some(expected), "{text}");
-    }
-    for mutation in [
-        "修改当前进度组件",
-        "当前进度组件如何修改",
-        "把本次改动写进 CHANGELOG",
-        "这次修改有哪些要求",
-        "总结本次改动并补测试",
-        "show me the changes and then fix the tests",
-        "what changes should we make?",
-        "build a current status component",
-        "修改权限管理页面",
-        "修复只读模式切换",
-        "把权限说明写入 README",
-        "为什么只读，然后修复登录",
-        "你能写文件吗？请修改登录页面",
-        "can you write files? please update the login page",
-    ] {
-        assert_eq!(classify_live_meta(mutation), None, "{mutation}");
     }
 }
 

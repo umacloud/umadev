@@ -88,9 +88,9 @@ curl -fsSL https://umadev.goder.ai/install.sh | bash
 irm https://umadev.goder.ai/install.ps1 | iex
 ```
 
-(Pin a version with `UMADEV_VERSION=1.0.68` / `$env:UMADEV_VERSION='1.0.68'`; override the target directory with `UMADEV_INSTALL_DIR`. The npm package stays the batteries-included path — it bundles the curated knowledge corpus and fetches the optional embedding model; the native binary degrades gracefully without them and `umadev doctor` reports anything missing.)
+(Pin a version by setting `UMADEV_VERSION` / `$env:UMADEV_VERSION` to the release you need; override the target directory with `UMADEV_INSTALL_DIR`. Every release binary embeds and stages the curated knowledge corpus. The npm launcher additionally fetches the optional embedding model on demand; a native install starts with BM25 retrieval and can use a manually provisioned local model through `UMADEV_EMBED_MODEL_DIR`. `umadev doctor` reports the active retrieval path and anything missing.)
 
-The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64, glibc ≥ 2.31 or musl/Alpine), and Windows (x86_64).
+The npm package is a distribution shim. The actual program is a Rust binary. Prebuilt binaries ship for macOS (Apple Silicon and Intel), Linux (x86_64 and ARM64, glibc ≥ 2.31 or musl/Alpine), and Windows x86_64; Windows on ARM uses that x64 build through the OS compatibility layer.
 
 The Rust binary and curated corpus need no cloud knowledge service. Real coding still requires an installed, authenticated base CLI. The optional local embedding model (`multilingual-e5-small`, f16, ~224 MB) is **not** inside the npm tarball: the npm launcher fetches the version-matched, checksummed release asset on the first command that needs retrieval and stores it in `~/.umadev/embed-model`. Later local inference needs no API key or network. If the fetch is unavailable, retrieval continues as BM25-only and a later eligible launch retries; a corrupt cache is rejected and re-fetched.
 
@@ -716,7 +716,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `umadev lessons` | Curated reusable rules distilled from incidents and verified outcomes (the concrete incident ledger remains in TUI `/pitfalls`) |
 | `umadev history` | List rollback snapshots |
 | `umadev rollback latest` | Roll back to a snapshot |
-| `umadev update` | Upgrade umadev via npm |
+| `umadev update` | Upgrade through the owning package manager (npm / pnpm / yarn / bun), or through GitHub Releases for a standalone/native install |
 | `umadev uninstall` | Full uninstall: removes `~/.umadev`, governance hooks, and the binary (`--base <id>` for hook-only) |
 
 **Script / CI run (non-interactive outer command)**

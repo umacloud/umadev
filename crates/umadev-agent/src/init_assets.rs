@@ -326,18 +326,37 @@ pub fn scaffold_init_knowledge(workspace: &Path) -> KnowledgeScaffoldReport {
     let mut preserved = 0;
     let mut failed = 0;
     for (rel, content) in files {
-        let target = workspace.join(rel);
-        if target.exists() {
-            preserved += 1;
+        let relative = Path::new(rel);
+        let Some(parent) = relative.parent() else {
+            failed += 1;
             continue;
-        }
-        if let Some(parent) = target.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
+        };
+        let Some(filename) = relative.file_name() else {
+            failed += 1;
+            continue;
+        };
+        let Ok(managed_parent) = crate::bounded_fs::ensure_real_dir_beneath(workspace, parent)
+        else {
+            failed += 1;
+            continue;
+        };
+        let target = managed_parent.join(filename);
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) if umadev_state::fs::metadata_is_real_file(&metadata) => {
+                preserved += 1;
+                continue;
+            }
+            Ok(_) => {
+                failed += 1;
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
                 failed += 1;
                 continue;
             }
         }
-        if std::fs::write(&target, content).is_ok() {
+        if umadev_state::fs::write_new_private(&target, content.as_bytes()).is_ok() {
             created += 1;
         } else {
             failed += 1;
@@ -348,5 +367,43 @@ pub fn scaffold_init_knowledge(workspace: &Path) -> KnowledgeScaffoldReport {
         preserved,
         failed,
         total: files.len(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn scaffold_never_follows_linked_knowledge_directories_or_files() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        std::fs::write(&sentinel, "outside").unwrap();
+        symlink(outside.path(), workspace.path().join("knowledge")).unwrap();
+        let report = scaffold_init_knowledge(workspace.path());
+        assert_eq!(report.failed, report.total);
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "outside");
+        assert!(!outside
+            .path()
+            .join("design-systems/modern-minimal.md")
+            .exists());
+
+        std::fs::remove_file(workspace.path().join("knowledge")).unwrap();
+        let target = workspace
+            .path()
+            .join("knowledge/design-systems/modern-minimal.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        symlink(&sentinel, &target).unwrap();
+        let _ = scaffold_init_knowledge(workspace.path());
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "outside");
+        assert!(std::fs::symlink_metadata(target)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

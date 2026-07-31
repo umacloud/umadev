@@ -137,6 +137,67 @@ fn drag_past_bottom_edge_auto_scrolls_and_extends() {
 }
 
 #[test]
+fn transcript_scrollbar_thumb_reaches_top_middle_and_bottom() {
+    assert_eq!(transcript_scrollbar_thumb(10, 100, 20, 0), Some((0, 2)));
+    assert_eq!(transcript_scrollbar_thumb(10, 100, 20, 40), Some((4, 2)));
+    assert_eq!(transcript_scrollbar_thumb(10, 100, 20, 80), Some((8, 2)));
+    assert_eq!(transcript_scrollbar_thumb(10, 10, 10, 0), None);
+}
+
+#[test]
+fn transcript_scrollbar_drag_maps_track_to_full_history() {
+    let mut a = fresh_app(Some("offline"));
+    a.transcript_scrollbar_area.set((59, 10, 1, 10));
+    a.transcript_scrollbar_thumb.set((8, 2));
+    a.transcript_max_scroll.set(80);
+    a.set_transcript_scroll(0);
+
+    assert!(a.transcript_scrollbar_begin(59, 10));
+    assert_eq!(a.transcript_scroll(), 80, "track top reaches oldest rows");
+    assert!(a.transcript_scrollbar_drag(15));
+    assert_eq!(
+        a.transcript_scroll(),
+        40,
+        "track middle reaches history midpoint"
+    );
+    assert!(a.transcript_scrollbar_drag(19));
+    assert_eq!(
+        a.transcript_scroll(),
+        0,
+        "track bottom re-pins to newest rows"
+    );
+    assert!(a.transcript_scrollbar_end(19));
+    assert!(a.transcript_scrollbar_drag_offset.is_none());
+}
+
+#[test]
+fn transcript_scrollbar_gesture_preserves_text_selection() {
+    let mut a = fresh_app(Some("offline"));
+    a.transcript_scrollbar_area.set((59, 10, 1, 10));
+    a.transcript_scrollbar_thumb.set((8, 2));
+    a.transcript_max_scroll.set(80);
+    let selection = crate::selection::Selection {
+        anchor: (2, 1),
+        cursor: (4, 3),
+    };
+    a.selection = Some(selection);
+    a.selection_dragging = true;
+    a.last_drag_mouse = Some((4, 12));
+
+    assert!(a.transcript_scrollbar_begin(59, 18));
+    assert_eq!(a.selection, Some(selection));
+    assert!(!a.selection_dragging);
+    assert!(a.last_drag_mouse.is_none());
+    assert!(a.transcript_scrollbar_end(18));
+
+    a.transcript_area.set((0, 10, 58, 10));
+    *a.transcript_rows.borrow_mut() = vec!["text".to_string(); 100];
+    a.transcript_gutters.borrow_mut().resize(100, 0);
+    a.selection_begin(4, 12);
+    assert!(a.selection_dragging, "ordinary transcript drag still works");
+}
+
+#[test]
 fn slash_history_opens_overlay_with_messages() {
     let mut a = fresh_app(Some("offline"));
     for c in "/history".chars() {
@@ -1711,6 +1772,72 @@ fn tool_output_delta_stays_running_until_terminal_result() {
     assert_eq!(tool.status, ToolStatus::Fail);
     assert_eq!(tool.result.as_deref(), Some("test failed"));
     assert!(!a.tool_in_progress);
+}
+
+#[test]
+fn tool_output_delta_preserves_separately_chunked_newlines_and_indentation() {
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::WorkerStream {
+        event: umadev_runtime::StreamEvent::ToolUse {
+            name: "Bash".into(),
+            detail: "printf a; printf '\\n  b'".into(),
+            edit: None,
+        },
+    });
+    for delta in ["first", "\n", "  ", "indented"] {
+        app.apply_engine(EngineEvent::WorkerStream {
+            event: umadev_runtime::StreamEvent::ToolOutputDelta {
+                delta: delta.into(),
+            },
+        });
+    }
+
+    let MessageBody::Tool(tool) = &app.history.back().unwrap().kind else {
+        panic!("expected a tool row");
+    };
+    assert_eq!(tool.status, ToolStatus::Running);
+    assert_eq!(tool.result.as_deref(), Some("first\n  indented"));
+    assert!(
+        app.tool_in_progress,
+        "output chunks must not settle the tool"
+    );
+}
+
+#[test]
+fn bounded_tool_output_never_starts_inside_an_extended_grapheme() {
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::WorkerStream {
+        event: umadev_runtime::StreamEvent::ToolUse {
+            name: "Bash".into(),
+            detail: "long unicode output".into(),
+            edit: None,
+        },
+    });
+    // Four Unicode scalars form one two-cell glyph. The old scalar tail cut
+    // dropped only its first two scalars and retained an orphan ZWJ + laptop.
+    let tail = "x".repeat(PROCESS_LOG_PREVIEW_CHARS - 2);
+    let oversized = format!("🧑🏽‍💻{tail}");
+    app.apply_engine(EngineEvent::WorkerStream {
+        event: umadev_runtime::StreamEvent::ToolOutputDelta {
+            delta: oversized.clone(),
+        },
+    });
+    let MessageBody::Tool(tool) = &app.history.back().unwrap().kind else {
+        panic!("expected a tool row");
+    };
+    assert_eq!(tool.result.as_deref(), Some(tail.as_str()));
+
+    app.apply_engine(EngineEvent::WorkerStream {
+        event: umadev_runtime::StreamEvent::ToolOutputSnapshot { output: oversized },
+    });
+    let MessageBody::Tool(tool) = &app.history.back().unwrap().kind else {
+        panic!("expected the same tool row");
+    };
+    assert_eq!(tool.result.as_deref(), Some(tail.as_str()));
+    assert!(tool
+        .result
+        .as_deref()
+        .is_none_or(|output| output.chars().count() <= PROCESS_LOG_PREVIEW_CHARS));
 }
 
 #[test]

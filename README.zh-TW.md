@@ -81,6 +81,20 @@ npm i umadev && npx umadev # 或作為專案本地相依
 
 已經踩到 sudo 的坑？`umadev doctor` 會檢出 root 屬主的安裝目錄或 npm 快取，並印出確切的修復指令（`sudo chown -R $(whoami) ~/.npm`，然後在自有前綴下重裝）。
 
+也可以完全跳過 npm。原生安裝器不需要 Node、不使用 sudo，會下載對應平台的 GitHub Release 二進位並驗證公開的 SHA-256：
+
+```bash
+# macOS / Linux
+curl -fsSL https://umadev.goder.ai/install.sh | bash
+```
+
+```powershell
+# Windows PowerShell
+irm https://umadev.goder.ai/install.ps1 | iex
+```
+
+設定 `UMADEV_VERSION` / `$env:UMADEV_VERSION` 可固定到所需版本，設定 `UMADEV_INSTALL_DIR` / `$env:UMADEV_INSTALL_DIR` 可覆寫安裝目錄。所有 Release 二進位都內建並自動釋出知識語料；原生安裝可立即使用 BM25，若需要本地向量檢索，可把相容模型放到 `~/.umadev/embed-model` 或用 `UMADEV_EMBED_MODEL_DIR` 指定。
+
 npm 只是分發外殼。真正執行的是 Rust 編譯出的 `umadev` 二進位。
 
 npm tarball 不內含向量模型。第一次執行需要檢索的指令時，npm 啟動器會從同版本 GitHub Release 下載並驗證 `multilingual-e5-small`（f16，約 224MB），快取到 `~/.umadev/embed-model`；之後本地推理不需要 API key 或執行時網路。下載受限時 UmaDev 仍以 BM25 檢索，後續符合條件的啟動會重試；損壞快取不會被信任，而會重新下載。真實編碼仍需要已安裝、已認證的底座 CLI。
@@ -89,9 +103,9 @@ npm tarball 不內含向量模型。第一次執行需要檢索的指令時，np
 
 - macOS Apple Silicon
 - macOS Intel
-- Linux x86_64
-- Linux ARM64
-- Windows x86_64
+- Linux x86_64（glibc ≥ 2.31 或 musl/Alpine）
+- Linux ARM64（glibc ≥ 2.31 或 musl/Alpine）
+- Windows x86_64（Windows on ARM 透過系統 x64 相容層執行同一二進位）
 
 也可以從原始碼建置：
 
@@ -384,7 +398,7 @@ flowchart TB
 | `claude-code` | 廠商專屬 stream-json | Claude permission mode | 精確 `--resume` |
 | `codex` | 廠商專屬 `codex app-server` JSON-RPC | Codex sandbox + approval policy | 精確 `thread/resume` |
 | `opencode` | 廠商專屬 `opencode serve` HTTP/SSE | OpenCode permission rules | 精確持久 session id |
-| `grok-build` | ACP v1 stdio | Plan 增加唯讀 sandbox、停用子 Agent、限制為唯讀工具集 | 協商到 `session/resume` 時優先使用，否則使用已宣告的 `session/load` |
+| `grok-build` | ACP v1 stdio | Plan 增加唯讀 sandbox、停用子 Agent、限制為唯讀工具集 | 目前使用有界新工作階段交接；只有同時證明有效沙箱與原生恢復預檢後才啟用持久恢復 |
 | `kimi-code` | 官方 `kimi acp` v1 stdio | Plan=`plan`；Guarded/Auto 維持 `default`，由 UmaDev 審批策略與不可逆紅線掌權 | 標準 `session/resume`，並按宣告回退 `session/load`；工作區與權限身分必須一致 |
 
 上表五個底座全部是一等適配，任何一個都不使用 CLI 版本白名單；版本號只用於診斷，能力由即時協定、型別化回應與執行期安全規則決定。ACP 是 Grok Build 與 Kimi Code 正式提供的機器協定路徑，不是降級模式；兩者接受所有官方版本，並持續用各自開源倉庫做原始碼漂移審計。Grok Build 在有效沙箱證明與原生恢復預檢尚不完整時使用新工作階段交接。Kimi Code 透過 ACP 只複驗既有登入，不自動執行登入命令或開啟瀏覽器；模型、模式、思考、恢復等能力以目前工作階段即時宣告為準。評審永遠新開 Plan 子工作階段，不載入可寫主線。
@@ -733,7 +747,7 @@ umadev 有兩套入口，一一對應：
 | `umadev report` | 合規對應（SOC 2 / ISO 27001 / EU AI Act）；加 `--review` 產出 PR 前的評審報告與安全掃描 |
 | `umadev history` | 列出回滾快照 |
 | `umadev rollback latest` | 回滾到某快照 |
-| `umadev update` | 升級 umadev 到最新版（經 npm） |
+| `umadev update` | 透過實際所屬套件管理器（npm / pnpm / yarn / bun）升級；原生 / 獨立安裝則從 GitHub Release 驗證並原子更新 |
 | `umadev uninstall` | 完整解除安裝：確認後刪 `~/.umadev` + 本專案治理掛鉤 + 二進位（加 `--base <claude-code\|pre-commit>` 則僅卸掛鉤） |
 | `umadev adopt` | 棕地專案：偵測技術棧、索引現有原始碼、反推 API 契約 |
 | `umadev lessons` | 檢視由復發事故或機械驗證結果形成的可重用規則及 pending / validated / needs-revision 狀態；具體事故看 TUI `/pitfalls` |
@@ -865,7 +879,7 @@ flowchart TB
 
     subgraph host["umadev-host（底座驅動）"]
         vendor["廠商專屬協定驅動 × 3<br/>Claude · Codex · OpenCode"]
-        acp["官方 ACP v1 協定驅動 × 1<br/>Grok Build"]
+        acp["官方 ACP v1 協定驅動 × 2<br/>Grok Build · Kimi Code"]
     end
 
     subgraph knowledge["umadev-knowledge（知識）"]

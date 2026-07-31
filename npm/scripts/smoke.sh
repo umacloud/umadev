@@ -138,11 +138,18 @@ make_stub bun  "999.0.0"
 
 # ── 1. An npm-owned install upgrades via npm, in the shim, sweeping npm's debris.
 make_install "$UPD_TMP/node_modules"
-# The debris a previous EPERM'd upgrade leaves in an npm prefix.
+# The stale debris a previous EPERM'd upgrade leaves in an npm prefix. Fresh
+# matching directories may belong to an npm transaction that is still active.
 mkdir -p "$UPD_TMP/node_modules/.umadev-vv1jMlhy" \
          "$UPD_TMP/node_modules/@umacloud/.cli-win32-x64-AbC123" \
          "$UPD_TMP/node_modules/.cli-unrelated-AbC123" \
          "$UPD_TMP/node_modules/@umacloud/.cli-unrelated-AbC123"
+node -e '
+  const fs = require("node:fs");
+  const stale = new Date(Date.now() - 48 * 60 * 60 * 1000);
+  for (const dir of process.argv.slice(1)) fs.utimesSync(dir, stale, stale);
+' "$UPD_TMP/node_modules/.umadev-vv1jMlhy" \
+  "$UPD_TMP/node_modules/@umacloud/.cli-win32-x64-AbC123"
 
 # If the shim launched the platform binary for `update`, the stand-in manager
 # would never be called. A `y` on stdin carries the shim past confirmation.

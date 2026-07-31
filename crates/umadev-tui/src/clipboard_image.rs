@@ -148,9 +148,15 @@ pub(crate) fn start_capture(
         Preflight::Ready if !*in_flight => {
             *in_flight = true;
             let root = app.project_root.clone();
+            let filesystem = app.project_filesystem.clone();
             let tx = tx.clone();
             tokio::task::spawn_blocking(move || {
-                let _ = tx.send(capture(&root));
+                let result = filesystem
+                    .as_deref()
+                    .map_or(CaptureResult::Failed, |filesystem| {
+                        capture_with_root(&root, filesystem)
+                    });
+                let _ = tx.send(result);
             });
         }
         Preflight::Ready => {}
@@ -160,14 +166,21 @@ pub(crate) fn start_capture(
     }
 }
 
-/// Capture the current local clipboard image into the workspace.
-///
-/// This function blocks on a child process and must run on Tokio's blocking
-/// pool. Every failure is represented as data; it never panics.
-pub(crate) fn capture(project_root: &Path) -> CaptureResult {
-    let Some(target) = next_target(project_root) else {
+fn capture_with_root(
+    project_root: &Path,
+    filesystem: &umadev_state::fs::RootedDir,
+) -> CaptureResult {
+    let Some(relative) = next_relative_target(filesystem) else {
         return CaptureResult::Failed;
     };
+    let target = project_root.join(&relative);
+    let Ok(staging) = tempfile::Builder::new()
+        .prefix("umadev-clipboard-")
+        .tempdir()
+    else {
+        return CaptureResult::Failed;
+    };
+    let staging_target = staging.path().join("clipboard.png");
 
     let platform = select_platform(
         std::env::consts::OS,
@@ -175,9 +188,9 @@ pub(crate) fn capture(project_root: &Path) -> CaptureResult {
         std::env::var_os("WAYLAND_DISPLAY").is_some(),
     );
     let plan = match platform {
-        Platform::Macos => macos_plan(&target),
+        Platform::Macos => macos_plan(&staging_target),
         Platform::Windows => {
-            let Some(platform_path) = windows_target_path(&target) else {
+            let Some(platform_path) = windows_target_path(&staging_target) else {
                 return CaptureResult::Failed;
             };
             windows_plan(&platform_path)
@@ -186,29 +199,61 @@ pub(crate) fn capture(project_root: &Path) -> CaptureResult {
         Platform::X11 => linux_plan(false),
     };
 
-    run_plan(&plan, project_root, &target)
+    match run_plan(&plan, staging.path(), &staging_target) {
+        CaptureResult::Image(_) => {
+            let Ok(bytes) = umadev_state::fs::read_bounded_beneath(
+                staging.path(),
+                Path::new("clipboard.png"),
+                MAX_IMAGE_BYTES,
+            ) else {
+                return CaptureResult::Failed;
+            };
+            if filesystem
+                .publish_new_private(&relative, &bytes, true)
+                .is_err()
+            {
+                return CaptureResult::Failed;
+            }
+            if !filesystem.matches_path(project_root).unwrap_or(false) {
+                let _ = filesystem.remove_regular_file(&relative);
+                return CaptureResult::Failed;
+            }
+            CaptureResult::Image(target)
+        }
+        other => other,
+    }
 }
 
 /// Best-effort retention sweep. Only generated `.png` regular files older than
 /// seven days are touched; directories, symlinks, and unrelated files survive.
 pub(crate) fn cleanup_old(project_root: &Path) {
-    let dir = pasted_dir(project_root);
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(filesystem) = umadev_state::fs::RootedDir::open(project_root) else {
+        return;
+    };
+    cleanup_old_rooted(&filesystem);
+}
+
+/// Retention sweep through the workspace capability captured at TUI launch.
+/// This is used on shutdown so replacing the ambient project path while UmaDev
+/// is running cannot redirect cleanup into another directory.
+pub(crate) fn cleanup_old_rooted(filesystem: &umadev_state::fs::RootedDir) {
+    let relative_dir = Path::new(".umadev/pasted");
+    let Ok(entries) = filesystem.list_regular_files(relative_dir, MAX_CLEANUP_ENTRIES) else {
         return;
     };
     let now = SystemTime::now();
-    for entry in entries.flatten().take(MAX_CLEANUP_ENTRIES) {
-        let path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !meta.file_type().is_file() || path.extension().and_then(|e| e.to_str()) != Some("png") {
-            continue;
+    for entry in entries {
+        let name = Path::new(&entry.name);
+        if generated_png_expired(name, true, entry.modified, now) {
+            let _ = filesystem.remove_regular_file(&relative_dir.join(name));
         }
-        let old = generated_png_expired(&path, true, meta.modified().ok(), now);
-        if old {
-            let _ = fs::remove_file(path);
-        }
+    }
+}
+
+/// Run the rooted retention sweep only when launch captured a workspace capability.
+pub(crate) fn cleanup_old_if_available(filesystem: Option<&umadev_state::fs::RootedDir>) {
+    if let Some(filesystem) = filesystem {
+        cleanup_old_rooted(filesystem);
     }
 }
 
@@ -234,41 +279,24 @@ fn select_platform(os: &str, wsl: bool, wayland: bool) -> Platform {
     }
 }
 
-fn pasted_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".umadev").join("pasted")
-}
-
 /// Generate the path exclusively from process/time/counter state. Clipboard
 /// bytes never participate in path construction (the path-injection floor).
+#[cfg(test)]
 fn next_target(project_root: &Path) -> Option<PathBuf> {
-    let dir = pasted_dir(project_root);
-    if !safe_workspace_dir(project_root, &dir) {
-        return None;
-    }
+    let filesystem = umadev_state::fs::RootedDir::open(project_root).ok()?;
+    Some(project_root.join(next_relative_target(&filesystem)?))
+}
+
+fn next_relative_target(filesystem: &umadev_state::fs::RootedDir) -> Option<PathBuf> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_millis();
     let seq = NEXT_IMAGE.fetch_add(1, Ordering::Relaxed);
-    Some(dir.join(format!("{millis}-{}-{seq}.png", std::process::id())))
-}
-
-/// Create the destination and prove its canonical parent remains under the
-/// canonical workspace. Existing symlink components are rejected before and
-/// after creation so `.umadev/pasted` cannot redirect the write elsewhere.
-fn safe_workspace_dir(project_root: &Path, dir: &Path) -> bool {
-    for component in [project_root.join(".umadev"), dir.to_path_buf()] {
-        if fs::symlink_metadata(&component).is_ok_and(|m| m.file_type().is_symlink()) {
-            return false;
-        }
-    }
-    if fs::create_dir_all(dir).is_err() {
-        return false;
-    }
-    let (Ok(root), Ok(dir)) = (project_root.canonicalize(), dir.canonicalize()) else {
-        return false;
-    };
-    dir.starts_with(root)
+    let relative =
+        Path::new(".umadev/pasted").join(format!("{millis}-{}-{seq}.png", std::process::id()));
+    filesystem.validate_path(&relative).ok()?;
+    Some(relative)
 }
 
 fn macos_plan(target: &Path) -> CommandPlan {
@@ -970,7 +998,7 @@ mod tests {
     #[test]
     fn cleanup_only_removes_old_generated_png_files() {
         let root = tempfile::tempdir().unwrap();
-        let dir = pasted_dir(root.path());
+        let dir = root.path().join(".umadev/pasted");
         fs::create_dir_all(&dir).unwrap();
         let fresh = dir.join("fresh.png");
         let unrelated = dir.join("keep.txt");

@@ -97,6 +97,8 @@ const MAX_SKILLS: usize = 200;
 /// Hard bound for outstanding and historical attribution receipts. Once full,
 /// prompt delivery continues normally but no new learning receipt is issued.
 const MAX_SKILL_RECEIPTS: usize = 4096;
+const MAX_SKILL_RECEIPT_DIR_ENTRIES: usize = MAX_SKILL_RECEIPTS * 4;
+const MAX_SKILL_MIRROR_DIR_ENTRIES: usize = MAX_SKILLS * 8;
 
 /// Maximum skills attributed to one final prompt.
 const MAX_SKILLS_PER_RECEIPT: usize = 12;
@@ -457,7 +459,9 @@ pub fn graduate_skill(
     let clean_content = truncate(content.trim(), MAX_CONTENT_CHARS);
     let clean_keywords = dedup_keywords(keywords);
 
-    let mut store = read_skill_store_raw(project_root);
+    let Some(mut store) = read_skill_store_raw_checked(project_root) else {
+        return false;
+    };
     if let Some(existing) = store.iter_mut().find(|s| s.id == id) {
         // Re-graduation refreshes the validated content but does not claim a
         // reuse. Only an exact sent receipt followed by PASS may raise utility.
@@ -895,44 +899,23 @@ pub(crate) fn read_skills_for_automatic_use(project_root: &Path) -> Vec<Skill> {
 /// applying immutable receipt outcomes. Legacy raw requirements are erased in
 /// memory and disappear on the next successful write.
 fn read_skill_store_raw(project_root: &Path) -> Vec<Skill> {
+    read_skill_store_raw_checked(project_root).unwrap_or_default()
+}
+
+fn read_skill_store_raw_checked(project_root: &Path) -> Option<Vec<Skill>> {
     let Some(dir) = effective_existing_skills_dir(project_root) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    read_skill_store_from_dir(&dir)
+    read_skill_store_from_dir_checked(&dir)
 }
 
-/// Read one already-validated store directory. This helper deliberately knows
-/// nothing about migration precedence, so migration can compare a partial new
-/// generation with the legacy source without recursively selecting either.
-fn read_skill_store_from_dir(dir: &Path) -> Vec<Skill> {
-    let text = read_skill_store_text(dir);
-    let Some(text) = text else {
-        return Vec::new();
+fn read_skill_store_from_dir_checked(dir: &Path) -> Option<Vec<Skill>> {
+    let path = dir.join(SKILLS_FILE);
+    let text = match read_skill_store_text(dir) {
+        Some(text) => text,
+        None if !managed_file_or_backup_exists(&path) => return Some(Vec::new()),
+        None => return None,
     };
-    let mut store = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(mut skill) = serde_json::from_str::<Skill>(line) else {
-            continue;
-        };
-        normalize_loaded_skill(&mut skill);
-        if !skill_is_safe(&skill) {
-            continue;
-        }
-        store.retain(|existing: &Skill| existing.id != skill.id);
-        store.push(skill);
-        if store.len() > MAX_SKILLS.saturating_mul(4) {
-            store.remove(0);
-        }
-    }
-    store
-}
-
-/// Migration must distinguish a genuinely empty ledger from an unreadable or
-/// syntactically malformed one. Parsed rows still pass the normal quarantine
-/// policy: unsafe/private rows are omitted while safe legacy rows are
-/// normalized before the new authority is committed.
-fn read_skill_store_for_migration(dir: &Path) -> Option<Vec<Skill>> {
-    let text = read_skill_store_text(dir)?;
     let mut store = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let mut skill = serde_json::from_str::<Skill>(line).ok()?;
@@ -947,6 +930,14 @@ fn read_skill_store_for_migration(dir: &Path) -> Option<Vec<Skill>> {
         }
     }
     Some(store)
+}
+
+/// Migration must distinguish a genuinely empty ledger from an unreadable or
+/// syntactically malformed one. Parsed rows still pass the normal quarantine
+/// policy: unsafe/private rows are omitted while safe legacy rows are
+/// normalized before the new authority is committed.
+fn read_skill_store_for_migration(dir: &Path) -> Option<Vec<Skill>> {
+    read_skill_store_from_dir_checked(dir)
 }
 
 fn read_skill_store_text(dir: &Path) -> Option<String> {
@@ -1006,16 +997,14 @@ fn prune_skill_mirrors(project_root: &Path, store: &[Skill]) {
         return;
     };
     let keep: std::collections::HashSet<String> = store.iter().map(mirror_file_name).collect();
-    if let Ok(rd) = fs::read_dir(&dir) {
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if umadev_state::fs::real_file(&p)
-                && p.extension().and_then(|s| s.to_str()) == Some("md")
-            {
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
-                if !keep.contains(name) {
-                    let _ = umadev_state::fs::remove_regular_file(&p);
-                }
+    let Some(paths) = bounded_directory_paths(&dir, MAX_SKILL_MIRROR_DIR_ENTRIES) else {
+        return;
+    };
+    for p in paths {
+        if umadev_state::fs::real_file(&p) && p.extension().and_then(|s| s.to_str()) == Some("md") {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+            if !keep.contains(name) {
+                let _ = umadev_state::fs::remove_regular_file(&p);
             }
         }
     }
@@ -1386,12 +1375,11 @@ fn apply_settled_outcomes(project_root: &Path, skills: &mut [Skill]) {
     let Some(dir) = existing_receipts_dir(project_root) else {
         return;
     };
-    let Ok(entries) = fs::read_dir(&dir) else {
+    let Some(entries) = bounded_directory_paths(&dir, MAX_SKILL_RECEIPT_DIR_ENTRIES) else {
         return;
     };
     let mut paths = entries
-        .flatten()
-        .map(|entry| entry.path())
+        .into_iter()
         .filter(|path| umadev_state::fs::real_file(path))
         .filter(|path| {
             path.file_name()
@@ -1465,16 +1453,15 @@ fn apply_settled_outcomes(project_root: &Path, skills: &mut [Skill]) {
 }
 
 fn count_receipts(dir: &Path) -> usize {
-    fs::read_dir(dir)
-        .ok()
+    let Some(paths) = bounded_directory_paths(dir, MAX_SKILL_RECEIPT_DIR_ENTRIES) else {
+        return MAX_SKILL_RECEIPTS;
+    };
+    paths
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| umadev_state::fs::real_file(&entry.path()))
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
+        .filter(|path| umadev_state::fs::real_file(path))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
                 .is_some_and(|name| name.ends_with(".receipt.json"))
         })
         .take(MAX_SKILL_RECEIPTS)
@@ -1532,6 +1519,17 @@ fn read_json_no_follow<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T>
 
 fn read_text_no_follow(path: &Path, max_bytes: u64) -> Option<String> {
     String::from_utf8(umadev_state::fs::read_bounded(path, max_bytes).ok()?).ok()
+}
+
+fn bounded_directory_paths(dir: &Path, max_entries: usize) -> Option<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(max_entries.min(256));
+    for entry in fs::read_dir(dir).ok()? {
+        if paths.len() >= max_entries {
+            return None;
+        }
+        paths.push(entry.ok()?.path());
+    }
+    Some(paths)
 }
 
 fn canonical_project_root(project_root: &Path) -> Option<PathBuf> {
@@ -1749,10 +1747,8 @@ fn ensure_learned_skills_migrated_unlocked(project_root: &Path) -> bool {
 /// Unknown temp/lock files are ignored; a malformed file using a reserved
 /// receipt name aborts migration instead of blessing partial attribution data.
 fn read_receipt_artifacts(dir: &Path) -> Option<Vec<(String, Vec<u8>)>> {
-    let mut paths = fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
+    let mut paths = bounded_directory_paths(dir, MAX_SKILL_RECEIPT_DIR_ENTRIES)?
+        .into_iter()
         .filter(|path| umadev_state::fs::real_file(path))
         .filter(|path| {
             path.file_name()
@@ -2839,6 +2835,55 @@ mod tests {
             malformed.to_vec()
         );
         assert!(!migration_marker_path(&root.join(SKILLS_DIR)).exists());
+    }
+
+    #[test]
+    fn malformed_committed_store_is_not_partially_recalled_or_overwritten() {
+        let tmp = TempDir::new().unwrap();
+        seed_multi_step(tmp.path());
+        assert!(graduate_skill(
+            tmp.path(),
+            "Stable contract",
+            "Validate request and response schemas.",
+            "Validated boundary.",
+            "api",
+            &[],
+            "private",
+            true,
+        ));
+        let path = tmp.path().join(SKILLS_DIR).join(SKILLS_FILE);
+        let mut damaged = fs::read(&path).unwrap();
+        damaged.extend_from_slice(b"{malformed-current-generation}\n");
+        fs::write(&path, &damaged).unwrap();
+
+        assert!(
+            read_skills(tmp.path()).is_empty(),
+            "a malformed logical ledger must not become partially trusted memory"
+        );
+        assert!(!graduate_skill(
+            tmp.path(),
+            "Must not mask damage",
+            "new content",
+            "description",
+            "api",
+            &[],
+            "private",
+            true,
+        ));
+        assert_eq!(
+            fs::read(path).unwrap(),
+            damaged,
+            "a later mutation must preserve the damaged generation for recovery"
+        );
+    }
+
+    #[test]
+    fn unknown_skill_directory_entries_consume_the_scan_budget() {
+        let directory = TempDir::new().unwrap();
+        for index in 0..4 {
+            fs::write(directory.path().join(format!("unknown-{index}")), "x").unwrap();
+        }
+        assert!(bounded_directory_paths(directory.path(), 3).is_none());
     }
 
     #[test]

@@ -99,7 +99,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: xai-org/grok-build
-          ref: 47348d13ec4508dcfe440e34c6d511bb02998fb2
+          ref: 500129c714ad1b10e6095481f4a8387a2ec52649
           path: _upstream/grok-build
           fetch-depth: 1
       - name: Install Rust toolchain
@@ -138,6 +138,9 @@ jobs:
         with:
           toolchain: ${{ env.UMADEV_CI_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.UMADEV_CI_NODE }}
       - name: Install and verify Grok's Linux Plan sandbox prerequisite
         if: runner.os == 'Linux'
         shell: bash
@@ -155,41 +158,12 @@ jobs:
           # Grok's read-only profile fail-closes before ACP initialize unless
           # this exact mount-namespace primitive can re-exec the agent.
           bwrap --cap-drop ALL --bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
-      - name: Download and verify the exact official Grok artifact (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          install -d "$RUNNER_TEMP/umadev-grok-contract"
-          binary="$RUNNER_TEMP/umadev-grok-contract/${{ matrix.binary }}"
-          if ! curl --fail --location --silent --show-error --retry 3 \
-            "https://x.ai/cli/${{ matrix.artifact }}" --output "$binary"; then
-            curl --fail --location --silent --show-error --retry 3 \
-              "https://storage.googleapis.com/grok-build-public-artifacts/cli/${{ matrix.artifact }}" \
-              --output "$binary"
-          fi
-          printf '%s  %s\n' '${{ matrix.sha256 }}' "$binary" | shasum -a 256 --check
-          chmod +x "$binary"
-          version=$("$binary" --version)
-          [[ "$version" =~ ^grok\ 0\.2\.112\ \([0-9a-f]+\)$ ]]
-          printf 'UMADEV_GROK_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
-      - name: Download and verify the exact official Grok artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $dir = Join-Path $env:RUNNER_TEMP 'umadev-grok-contract'
-          New-Item -ItemType Directory -Path $dir -Force | Out-Null
-          $binary = Join-Path $dir '${{ matrix.binary }}'
-          try {
-            Invoke-WebRequest -Uri 'https://x.ai/cli/${{ matrix.artifact }}' -OutFile $binary
-          } catch {
-            Invoke-WebRequest -Uri 'https://storage.googleapis.com/grok-build-public-artifacts/cli/${{ matrix.artifact }}' -OutFile $binary
-          }
-          $actual = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
-          if ($actual -ne '${{ matrix.sha256 }}') { throw "Grok artifact SHA-256 mismatch: $actual" }
-          $version = (& $binary --version | Out-String).Trim()
-          if ($version -notmatch '^grok 0\.2\.112 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
-          "UMADEV_GROK_BIN=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Download and verify the exact bounded official Grok artifact
+        run: >-
+          node npm/scripts/grok-published-contract.mjs
+          "${{ matrix.artifact }}"
+          "${{ matrix.sha256 }}"
+          "${{ matrix.binary }}"
       - name: Verify real ACP identity and explicit authentication boundary
         env:
           UMADEV_GROK_PUBLISHED_CONTRACT: "1"
@@ -204,7 +178,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: MoonshotAI/kimi-code
-          ref: f4c3967a417a539372eadab6c809d27b8a14c005
+          ref: 17dfd49768f753a4f0fe97d8e7d3317dab560575
           path: _upstream/kimi-code
           fetch-depth: 1
       - name: Install Rust toolchain
@@ -235,7 +209,7 @@ jobs:
         with:
           node-version: "22.19.0"
       - name: Install the exact audited npm package
-        run: npm install -g @moonshot-ai/kimi-code@0.29.1
+        run: npm install -g @moonshot-ai/kimi-code@0.31.0
       - name: Verify real ACP identity and terminal-owned authentication
         env:
           KIMI_CODE_HOME: ${{ runner.temp }}/umadev-kimi-code-home
@@ -318,6 +292,14 @@ jobs:
         run: node --test npm/scripts/publish-registry.test.cjs
       - name: Verify platform binary header contracts
         run: node --test npm/scripts/verify-platform-binaries.test.mjs
+      - name: Verify release provenance, tag-only publishing, and native installers
+        run: >-
+          node --test --test-concurrency=1
+          npm/scripts/release-provenance.test.mjs
+          npm/scripts/release-manifest.test.mjs
+          npm/scripts/grok-published-contract.test.mjs
+          npm/scripts/release-workflow-contract.test.mjs
+          npm/scripts/native-installer-contract.test.cjs
       - name: Verify launcher, updater, and split-version repair
         run: ./npm/scripts/smoke.sh
 

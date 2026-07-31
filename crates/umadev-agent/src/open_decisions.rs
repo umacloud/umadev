@@ -48,9 +48,10 @@
 //! decisions" and behaves exactly as before — this module NEVER panics and NEVER
 //! returns an error that could block the base.
 
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt as _;
 use umadev_governance::redaction::{redact_json, redact_text};
 
 use crate::memory_control::{recall_enabled, MemoryScope, MemoryStore};
@@ -98,6 +99,7 @@ const MAX_RECALL_LINE_CHARS: usize = 130;
 /// Refuse unexpectedly large hand-edited registers instead of allocating an
 /// unbounded prompt input. Normal registers are far below this ceiling.
 const MAX_REGISTER_BYTES: u64 = 1_048_576;
+const REGISTER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Character budget for the firmware **recall** block. Tight by design: the
 /// recall rides in the always-on work-class head on TOP of identity + craft +
@@ -190,32 +192,18 @@ fn metadata_is_real_dir(meta: &std::fs::Metadata) -> bool {
     true
 }
 
-fn metadata_is_real_file(meta: &std::fs::Metadata) -> bool {
-    if !meta.file_type().is_file() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
-    }
-    true
-}
-
 fn ensure_real_child_dir(parent: &Path, child: &Path, create: bool) -> bool {
-    if !std::fs::symlink_metadata(parent).is_ok_and(|m| metadata_is_real_dir(&m)) {
+    if !umadev_state::fs::real_dir(parent) {
         return false;
+    }
+    if create {
+        let Some(name) = child.file_name().and_then(|value| value.to_str()) else {
+            return false;
+        };
+        return umadev_state::fs::ensure_real_child_dir(parent, name).is_ok();
     }
     match std::fs::symlink_metadata(child) {
         Ok(meta) => metadata_is_real_dir(&meta),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-            std::fs::create_dir(child).is_ok()
-                && std::fs::symlink_metadata(parent).is_ok_and(|m| metadata_is_real_dir(&m))
-                && std::fs::symlink_metadata(child).is_ok_and(|m| metadata_is_real_dir(&m))
-        }
         Err(_) => false,
     }
 }
@@ -237,43 +225,17 @@ fn safe_register_path(root: &Path, create_parents: bool) -> Option<PathBuf> {
     }
     let path = decisions.join("OPEN-DECISIONS.md");
     match std::fs::symlink_metadata(&path) {
-        Ok(meta) if metadata_is_real_file(&meta) => Some(path),
+        Ok(_) if umadev_state::fs::real_single_link_file(&path) => Some(path),
         Ok(_) => None,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(path),
         Err(_) => None,
     }
 }
 
-fn open_no_follow(path: &Path, append: bool, create: bool) -> Option<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(!append).append(append).create(create);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).ok()?;
-    if !file.metadata().is_ok_and(|m| metadata_is_real_file(&m)) {
-        return None;
-    }
-    Some(file)
-}
-
 fn read_register(root: &Path) -> Option<String> {
     let path = safe_register_path(root, false)?;
-    let mut file = open_no_follow(&path, false, false)?;
-    if file.metadata().ok()?.len() > MAX_REGISTER_BYTES {
-        return None;
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    Some(text)
+    crate::bounded_fs::read_utf8_beneath(root, &path, usize::try_from(MAX_REGISTER_BYTES).ok()?)
+        .ok()
 }
 
 /// Load + parse all entries from the register for `root`, oldest FIRST.
@@ -500,24 +462,47 @@ pub fn append_decision(root: &Path, entry: &NewDecision) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let Some(path) = safe_register_path(root, true) else {
+    let Ok(lock) = umadev_state::fs::open_private_lock_beneath(
+        root,
+        Path::new(".umadev/open-decisions.lock"),
+        true,
+    ) else {
         return false;
     };
-    let Some(mut file) = open_no_follow(&path, true, true) else {
+    let started = std::time::Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= REGISTER_LOCK_TIMEOUT {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(_) => return false,
+        }
+    }
+    let Ok(mut file) =
+        umadev_state::fs::open_regular_append_beneath(root, Path::new(REGISTER_REL_PATH), true)
+    else {
         return false;
     };
     let Ok(metadata) = file.metadata() else {
         return false;
     };
-    if metadata.len() > MAX_REGISTER_BYTES {
-        return false;
-    }
     let is_empty = metadata.len() == 0;
     let mut body = String::new();
     if is_empty {
         body.push_str(REGISTER_HEADER);
     }
     body.push_str(&render_entry(entry));
+    if metadata
+        .len()
+        .saturating_add(u64::try_from(body.len()).unwrap_or(u64::MAX))
+        > MAX_REGISTER_BYTES
+    {
+        return false;
+    }
     file.write_all(body.as_bytes())
         .and_then(|()| file.sync_data())
         .is_ok()
@@ -1336,6 +1321,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn oversized_register_is_neither_loaded_nor_extended() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = register_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_REGISTER_BYTES + 1)
+            .unwrap();
+
+        assert!(load_decisions(tmp.path()).is_empty());
+        assert!(!append_decision(
+            tmp.path(),
+            &NewDecision {
+                title: "bounded".to_string(),
+                open_item: "must not grow an oversized register".to_string(),
+                ..Default::default()
+            }
+        ));
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_REGISTER_BYTES + 1
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn final_symlink_is_never_read_or_appended() {
@@ -1366,6 +1376,33 @@ mod tests {
             before,
             "the symlink target remains untouched"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_register_is_never_read_or_appended() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            outside.path(),
+            "## OPEN — design-decision-to-evaluate — OUTSIDE_SECRET\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(outside.path()).unwrap();
+        let path = register_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::hard_link(outside.path(), &path).unwrap();
+
+        assert!(load_decisions(tmp.path()).is_empty());
+        assert!(!append_decision(
+            tmp.path(),
+            &NewDecision {
+                title: "must not alias".to_string(),
+                open_item: "safe local decision".to_string(),
+                ..Default::default()
+            }
+        ));
+        assert_eq!(std::fs::read_to_string(outside.path()).unwrap(), before);
     }
 
     #[test]

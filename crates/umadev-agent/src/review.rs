@@ -127,10 +127,15 @@ pub fn write_review_report(project_root: &Path, slug: &str) -> std::io::Result<P
     let report = build_review_report(project_root, slug);
     let md = render_review_md(&report);
     let path = project_root.join(review_report_rel_path(slug));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, md)?;
+    let root = std::fs::canonicalize(project_root)?;
+    let output = umadev_state::fs::ensure_real_child_dir(&root, "output")?;
+    let filename = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "review report has no safe filename",
+        )
+    })?;
+    umadev_state::fs::atomic_write(&output.join(filename), md.as_bytes())?;
     Ok(path)
 }
 
@@ -933,6 +938,20 @@ mod tests {
         let path = write_review_report(tmp.path(), "demo").unwrap();
         assert!(path.exists());
         assert!(fs::read_to_string(&path).unwrap().contains("Review report"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_report_does_not_write_through_linked_output_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        symlink(outside.path(), tmp.path().join("output")).unwrap();
+
+        let error = write_review_report(tmp.path(), "demo").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
     #[test]

@@ -30,8 +30,10 @@
 //! failure the function returns and knowledge recall simply degrades to the
 //! prior empty behaviour. The binary keeps running regardless.
 
+use fs2::FileExt as _;
 use include_dir::{include_dir, Dir};
 use std::path::{Path, PathBuf};
+use umadev_state::fs::RootedDir;
 
 /// The embedded, build-time-sanitized text corpus.
 static KNOWLEDGE: Dir<'static> = include_dir!("$OUT_DIR/embedded-knowledge");
@@ -44,6 +46,11 @@ const VERSION_MARKER: &str = ".umadev-knowledge-version";
 /// Environment variable that [`umadev_agent::phases::knowledge_root`] reads to
 /// find the bundled corpus. Set in-process by [`ensure_staged`].
 const KNOWLEDGE_DIR_ENV: &str = "UMADEV_KNOWLEDGE_DIR";
+const STAGE_LOCK: &str = ".knowledge-stage.lock";
+const MAX_STAGED_DEPTH: usize = 64;
+const MAX_STAGED_NODES: usize = 100_000;
+const MAX_STAGED_FILES: usize = 50_000;
+const MAX_STAGED_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Build-time identity of the embedded corpus: the crate version plus the
 /// embedded file count. Cheap to compute and changes whenever the shipped
@@ -93,24 +100,46 @@ pub fn ensure_staged() {
         tracing::debug!("knowledge bundle: no home dir; skipping corpus staging");
         return;
     };
+    let Some(home) = root.parent().and_then(Path::parent) else {
+        return;
+    };
+    let Ok(home_root) = RootedDir::open(home) else {
+        return;
+    };
+    if home_root.ensure_dir(Path::new(".umadev"), false).is_err() {
+        return;
+    }
+    let Ok(umadev_root) = home_root.open_dir(Path::new(".umadev")) else {
+        return;
+    };
 
     let want = corpus_version();
-    if !is_current(&root, &want) {
-        if let Err(e) = stage(&root, &want) {
-            // Best-effort: a failed extract leaves recall empty but never
-            // blocks the binary. Wipe a half-written tree so the env var below
-            // doesn't point the index at a corrupt corpus.
-            tracing::warn!("knowledge bundle: staging failed ({e}); knowledge recall disabled");
-            let _ = std::fs::remove_dir_all(&root);
+    if !is_current_in(&umadev_root, &want) {
+        let Ok(lock) = umadev_root.open_private_lock(Path::new(STAGE_LOCK), false) else {
+            return;
+        };
+        if lock.try_lock_exclusive().is_err() {
             return;
         }
-        tracing::debug!("knowledge bundle: staged corpus to {}", root.display());
+        // Another process may have completed staging between the first marker
+        // read and lock acquisition.
+        if !is_current_in(&umadev_root, &want) {
+            if let Err(e) = stage_in(&umadev_root, Path::new("knowledge"), &want) {
+                tracing::warn!("knowledge bundle: staging failed ({e}); knowledge recall disabled");
+                return;
+            }
+            tracing::debug!("knowledge bundle: staged corpus to {}", root.display());
+        }
     }
 
     // Point every downstream `knowledge_root` at the staged corpus. Only set it
     // when we actually have a populated dir, and don't clobber an explicit
     // user override (a power user pointing at their own corpus wins).
-    if root.is_dir() && std::env::var_os(KNOWLEDGE_DIR_ENV).is_none() {
+    let published = umadev_root
+        .open_dir(Path::new("knowledge"))
+        .and_then(|knowledge| knowledge.matches_path(&root))
+        .unwrap_or(false);
+    if published && std::env::var_os(KNOWLEDGE_DIR_ENV).is_none() {
         // Set once at startup before command dispatch, while no `knowledge_root`
         // consumer is running and the (idle) tokio workers touch no env — so this
         // races nothing. Every later `knowledge_root` then reads it via `var`.
@@ -120,7 +149,15 @@ pub fn ensure_staged() {
 
 /// Whether the staged corpus on disk already matches this build (marker hit).
 fn is_current(root: &Path, want: &str) -> bool {
-    umadev_state::fs::read_bounded(&root.join(VERSION_MARKER), 4 * 1024)
+    RootedDir::open_no_follow(root)
+        .ok()
+        .and_then(|root| root.read_bounded(Path::new(VERSION_MARKER), 4 * 1024).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|got| got.trim() == want)
+}
+
+fn is_current_in(root: &RootedDir, want: &str) -> bool {
+    root.read_bounded(&Path::new("knowledge").join(VERSION_MARKER), 4 * 1024)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .is_some_and(|got| got.trim() == want)
@@ -129,22 +166,64 @@ fn is_current(root: &Path, want: &str) -> bool {
 /// Extract the embedded corpus fresh into `root`, then drop the version marker.
 /// A stale tree is removed first so a shrinking corpus doesn't leave orphans.
 fn stage(root: &Path, version: &str) -> std::io::Result<()> {
-    // Start clean: a previous (stale or partial) corpus is removed wholesale so
-    // renamed/deleted files in a new build don't linger.
-    if root.exists() {
-        std::fs::remove_dir_all(root)?;
+    let parent = root.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "knowledge staging root has no parent",
+        )
+    })?;
+    let name = root.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "knowledge staging root has no name",
+        )
+    })?;
+    let parent = RootedDir::open_no_follow(parent)?;
+    stage_in(&parent, Path::new(name), version)
+}
+
+fn stage_in(root: &RootedDir, dest: &Path, version: &str) -> std::io::Result<()> {
+    match root.is_real_dir(dest) {
+        Ok(true) => remove_staged_tree(root, dest)?,
+        Ok(false) => match root.regular_file_exists(dest) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "knowledge staging target is a regular file",
+                ));
+            }
+            Err(error) => return Err(error),
+        },
+        Err(error) => return Err(error),
     }
-    std::fs::create_dir_all(root)?;
-    extract_dir(&KNOWLEDGE, root)?;
-    // Marker written LAST: if anything above failed we never claim "current",
-    // so the next launch re-stages.
-    umadev_state::fs::atomic_write(&root.join(VERSION_MARKER), version.as_bytes())?;
+    root.ensure_dir(dest, false)?;
+    if let Err(error) = extract_dir(&KNOWLEDGE, root, dest)
+        .and_then(|()| root.atomic_write(&dest.join(VERSION_MARKER), version.as_bytes(), false))
+    {
+        let _ = remove_staged_tree(root, dest);
+        return Err(error);
+    }
     Ok(())
 }
 
-/// Recursively write an embedded [`Dir`] under `dest`. Skips dotfiles (e.g. a
-/// stray `.DS_Store`) so editor/OS noise never lands in the staged corpus.
-fn extract_dir(dir: &Dir<'_>, dest: &Path) -> std::io::Result<()> {
+fn remove_staged_tree(root: &RootedDir, relative: &Path) -> std::io::Result<()> {
+    let files = root.list_regular_tree(
+        relative,
+        MAX_STAGED_DEPTH,
+        MAX_STAGED_NODES,
+        MAX_STAGED_FILES,
+        MAX_STAGED_BYTES,
+    )?;
+    for file in files {
+        root.remove_regular_file(&file.relative)?;
+    }
+    root.remove_empty_directory_tree(relative, MAX_STAGED_DEPTH, MAX_STAGED_NODES)?;
+    Ok(())
+}
+
+/// Recursively write an embedded [`Dir`] beneath a pinned staging root.
+fn extract_dir(dir: &Dir<'_>, root: &RootedDir, dest: &Path) -> std::io::Result<()> {
     for file in dir.files() {
         let Some(name) = file.path().file_name() else {
             continue;
@@ -152,7 +231,7 @@ fn extract_dir(dir: &Dir<'_>, dest: &Path) -> std::io::Result<()> {
         if name.to_string_lossy().starts_with('.') {
             continue;
         }
-        umadev_state::fs::atomic_write(&dest.join(name), file.contents())?;
+        root.atomic_write(&dest.join(name), file.contents(), false)?;
     }
     for sub in dir.dirs() {
         let Some(name) = sub.path().file_name() else {
@@ -162,8 +241,8 @@ fn extract_dir(dir: &Dir<'_>, dest: &Path) -> std::io::Result<()> {
             continue;
         }
         let child = dest.join(name);
-        std::fs::create_dir_all(&child)?;
-        extract_dir(sub, &child)?;
+        root.ensure_dir(&child, true)?;
+        extract_dir(sub, root, &child)?;
     }
     Ok(())
 }
@@ -216,7 +295,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("knowledge");
         std::fs::create_dir_all(&root).unwrap();
-        extract_dir(&KNOWLEDGE, &root).unwrap();
+        let rooted = RootedDir::open_no_follow(&root).unwrap();
+        extract_dir(&KNOWLEDGE, &rooted, Path::new("")).unwrap();
 
         // Files exist on disk.
         let staged = root.join("backend/01-standards/application-layering-and-packaging.md");
@@ -257,5 +337,25 @@ mod tests {
 
         stage(&root, &want).unwrap();
         assert!(!orphan.exists(), "re-stage must wipe orphaned files");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_refuses_a_symlink_staging_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("knowledge");
+        let sentinel = outside.path().join("sentinel.txt");
+        std::fs::write(&sentinel, "keep").unwrap();
+        symlink(outside.path(), &target).unwrap();
+
+        assert!(stage(&target, &corpus_version()).is_err());
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "keep");
+        assert!(
+            !outside.path().join(VERSION_MARKER).exists(),
+            "staging must not write through a linked target"
+        );
     }
 }

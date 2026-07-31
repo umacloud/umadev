@@ -4,7 +4,7 @@
 #
 # Assumes:
 #   - `stage.sh` has already populated each `npm/cli-<platform>/bin/`
-#     with the matching prebuilt binary.
+#     with the matching prebuilt binary and tag/commit provenance manifest.
 #   - `npm whoami` is logged in with publish rights to the `@umacloud`
 #     scope and to the `umadev` name.
 #   - All package.json versions are aligned (this script does NOT bump).
@@ -36,6 +36,29 @@ PLATFORM_PACKAGES=(
 
 node "$SCRIPT_DIR/verify-version-lock.mjs"
 
+RELEASE_VERSION="$(node -p "require('$NPM_ROOT/umadev/package.json').version")"
+EXPECTED_TAG="v$RELEASE_VERSION"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" != "push" \
+      || "${GITHUB_REF:-}" != "refs/tags/$EXPECTED_TAG" \
+      || "${GITHUB_REF_NAME:-}" != "$EXPECTED_TAG" ]]; then
+    echo "publish.sh: production publishing is allowed only for a pushed $EXPECTED_TAG tag" >&2
+    echo "            workflow_dispatch is validation-only, even when run against a tag" >&2
+    exit 1
+  fi
+  EXPECTED_COMMIT="${GITHUB_SHA:-}"
+elif [[ -n "$DRY_RUN" ]]; then
+  EXPECTED_COMMIT="$(git -C "$NPM_ROOT/.." rev-parse HEAD)"
+  if ! git -C "$NPM_ROOT/.." tag --points-at "$EXPECTED_COMMIT" | grep -Fxq "$EXPECTED_TAG"; then
+    echo "publish.sh: dry-run HEAD is not tagged $EXPECTED_TAG" >&2
+    exit 1
+  fi
+else
+  echo "publish.sh: production publishing is restricted to the GitHub tag-push workflow" >&2
+  echo "            use --dry-run locally; do not inject an npm token into this script" >&2
+  exit 1
+fi
+
 # 1) Verify every platform package has its binary staged.
 for pkg in "${PLATFORM_PACKAGES[@]}"; do
   case "$pkg" in
@@ -55,12 +78,25 @@ done
 # executable headers before packing or touching the registry.
 node "$SCRIPT_DIR/verify-platform-binaries.mjs" "$NPM_ROOT"
 
+# Header checks prove OS/CPU/libc placement. The release provenance manifests
+# independently prove that every exact byte sequence came from this pushed tag
+# and commit, and fail closed if any staged binary was replaced after staging.
+node "$SCRIPT_DIR/release-provenance.mjs" verify \
+  "$NPM_ROOT" "$RELEASE_VERSION" "$EXPECTED_TAG" "$EXPECTED_COMMIT"
+
 # Pack every package before the first publish. This catches missing files and
-# freezes the exact tarballs used by every later retry.
+# freezes the exact tarballs used by every later retry. Pack from temporary
+# release roots so every distributed MIT package contains the repository's
+# license notice without duplicating that file across nine source directories.
 PACK_ROOT="$(mktemp -d)"
 trap 'rm -rf "$PACK_ROOT"' EXIT
+LICENSE_SOURCE="$NPM_ROOT/../LICENSE"
 KNOWLEDGE_SOURCE="$NPM_ROOT/../knowledge"
 KNOWLEDGE_STAGE="$PACK_ROOT/knowledge-corpus"
+[[ -f "$LICENSE_SOURCE" ]] || {
+  echo "publish.sh: repository LICENSE not found" >&2
+  exit 1
+}
 [[ -d "$KNOWLEDGE_SOURCE" ]] || {
   echo "publish.sh: knowledge/ not found" >&2
   exit 1
@@ -68,12 +104,28 @@ KNOWLEDGE_STAGE="$PACK_ROOT/knowledge-corpus"
 mkdir -p "$KNOWLEDGE_STAGE"
 cp "$NPM_ROOT/knowledge-corpus/package.json" "$KNOWLEDGE_STAGE/"
 cp -R "$KNOWLEDGE_SOURCE/." "$KNOWLEDGE_STAGE/"
+cp "$LICENSE_SOURCE" "$KNOWLEDGE_STAGE/LICENSE"
 
 PACKAGE_DIRS=()
 for pkg in "${PLATFORM_PACKAGES[@]}"; do
-  PACKAGE_DIRS+=("$NPM_ROOT/$pkg")
+  stage="$PACK_ROOT/stage-$pkg"
+  case "$pkg" in
+    cli-win32-*) bin="umadev.exe" ;;
+    *)           bin="umadev" ;;
+  esac
+  mkdir -p "$stage/bin"
+  cp "$NPM_ROOT/$pkg/package.json" "$stage/package.json"
+  cp "$NPM_ROOT/$pkg/bin/$bin" "$stage/bin/$bin"
+  cp "$NPM_ROOT/$pkg/bin/umadev.provenance.json" "$stage/bin/umadev.provenance.json"
+  cp "$LICENSE_SOURCE" "$stage/LICENSE"
+  PACKAGE_DIRS+=("$stage")
 done
-PACKAGE_DIRS+=("$KNOWLEDGE_STAGE" "$NPM_ROOT/umadev")
+
+MAIN_STAGE="$PACK_ROOT/stage-umadev"
+mkdir -p "$MAIN_STAGE"
+cp -R "$NPM_ROOT/umadev/." "$MAIN_STAGE/"
+cp "$LICENSE_SOURCE" "$MAIN_STAGE/LICENSE"
+PACKAGE_DIRS+=("$KNOWLEDGE_STAGE" "$MAIN_STAGE")
 
 TARBALLS=()
 for dir in "${PACKAGE_DIRS[@]}"; do
@@ -84,7 +136,17 @@ for dir in "${PACKAGE_DIRS[@]}"; do
     if (!Array.isArray(result) || !result[0]?.filename) process.exit(1);
     process.stdout.write(result[0].filename);
   ' <<<"$pack_json")"
-  TARBALLS+=("$PACK_ROOT/$filename")
+  tarball="$PACK_ROOT/$filename"
+  if ! tar -xOf "$tarball" package/LICENSE >/dev/null; then
+    echo "publish.sh: packed tarball is missing package/LICENSE: $filename" >&2
+    exit 1
+  fi
+  if [[ "$(basename "$dir")" == stage-cli-* ]] \
+      && ! tar -xOf "$tarball" package/bin/umadev.provenance.json >/dev/null; then
+    echo "publish.sh: packed platform tarball is missing binary provenance: $filename" >&2
+    exit 1
+  fi
+  TARBALLS+=("$tarball")
 done
 
 integrity_of() {

@@ -7,6 +7,7 @@ use super::{
 };
 
 const MAX_BACKGROUND_PROCESS_ID_CHARS: usize = 512;
+const MAX_PERSISTED_TASK_BYTES: u64 = 1024 * 1024;
 
 fn valid_background_process_id(value: &str) -> bool {
     !value.is_empty()
@@ -65,18 +66,15 @@ impl App {
         self.persist_tasks();
     }
 
+    #[cfg(test)]
     pub(super) fn tasks_path(&self) -> std::path::PathBuf {
         self.project_root.join(".umadev").join("tasks.json")
     }
 
     fn persist_tasks(&self) {
-        let path = self.tasks_path();
-        let Some(parent) = path.parent() else {
+        let Some(root) = self.project_filesystem.as_deref() else {
             return;
         };
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
         let start = self.tasks.len().saturating_sub(TASKS_CAP);
         let rows = self.tasks[start..]
             .iter()
@@ -96,17 +94,24 @@ impl App {
         let Ok(body) = serde_json::to_string_pretty(&snapshot) else {
             return;
         };
-        let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        if std::fs::write(&temporary, body).is_err() {
-            return;
-        }
-        if std::fs::rename(&temporary, &path).is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
+        let _ = root.atomic_write(
+            std::path::Path::new(".umadev/tasks.json"),
+            body.as_bytes(),
+            true,
+        );
     }
 
     pub(super) fn load_tasks(&mut self) {
-        let Ok(body) = std::fs::read_to_string(self.tasks_path()) else {
+        let Some(root) = self.project_filesystem.as_deref() else {
+            return;
+        };
+        let Ok(bytes) = root.read_bounded(
+            std::path::Path::new(".umadev/tasks.json"),
+            MAX_PERSISTED_TASK_BYTES,
+        ) else {
+            return;
+        };
+        let Ok(body) = String::from_utf8(bytes) else {
             return;
         };
         let Ok(snapshot) = serde_json::from_str::<PersistedTasks>(&body) else {

@@ -329,13 +329,7 @@ pub fn extract_frontend_calls(project_root: &Path) -> Vec<FrontendCall> {
         // hand-written source): running the multi-regex + comment-strip over a
         // megabyte of minified code both wastes work and floods phantom calls.
         // Mirrors `backend::MAX_FILE_BYTES`.
-        let Ok(meta) = std::fs::metadata(file) else {
-            continue;
-        };
-        if meta.len() > MAX_FRONTEND_FILE_BYTES {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(file) else {
+        let Ok(content) = crate::backend::read_source_file(file, MAX_FRONTEND_FILE_BYTES) else {
             continue;
         };
         let rel = file
@@ -514,6 +508,12 @@ const MAX_FRONTEND_DEPTH: usize = 16;
 /// make contract extraction read + multi-regex an unbounded file set.
 const MAX_FRONTEND_FILES: usize = 800;
 
+/// Hard cap on directory entries inspected by the frontend walk. A tree can
+/// contain millions of non-source files while still yielding fewer than
+/// [`MAX_FRONTEND_FILES`] matches, so the match cap alone does not bound the
+/// memory used to collect and sort directory entries.
+const MAX_FRONTEND_WALK_ENTRIES: usize = 6_400;
+
 /// Skip frontend files larger than this. A bundled / minified asset
 /// (`app.min.js`, a vendored `*.bundle.js`) is not hand-written call source;
 /// scanning it wastes work and, on a single-line minified blob, would flood
@@ -530,7 +530,26 @@ fn collect_frontend_sources_bounded(
     depth: usize,
     max_files: usize,
 ) {
-    if depth > MAX_FRONTEND_DEPTH || out.len() >= max_files {
+    let mut entries_seen = 0;
+    collect_frontend_sources_with_budget(
+        dir,
+        out,
+        depth,
+        max_files,
+        MAX_FRONTEND_WALK_ENTRIES,
+        &mut entries_seen,
+    );
+}
+
+fn collect_frontend_sources_with_budget(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    max_files: usize,
+    max_entries: usize,
+    entries_seen: &mut usize,
+) {
+    if depth > MAX_FRONTEND_DEPTH || out.len() >= max_files || *entries_seen >= max_entries {
         // Library code must never write directly to stdout/stderr: the TUI owns
         // the terminal. A deep or wide tree is bounded silently here and
         // higher-level verification remains fail-open.
@@ -539,7 +558,9 @@ fn collect_frontend_sources_bounded(
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut entries = rd.flatten().collect::<Vec<_>>();
+    let remaining = max_entries.saturating_sub(*entries_seen);
+    let mut entries = rd.flatten().take(remaining).collect::<Vec<_>>();
+    *entries_seen = (*entries_seen).saturating_add(entries.len());
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         if out.len() >= max_files {
@@ -562,7 +583,14 @@ fn collect_frontend_sources_bounded(
             if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                 continue;
             }
-            collect_frontend_sources_bounded(&p, out, depth + 1, max_files);
+            collect_frontend_sources_with_budget(
+                &p,
+                out,
+                depth + 1,
+                max_files,
+                max_entries,
+                entries_seen,
+            );
         } else if meta.is_file() {
             let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
             if FRONTEND_EXTS.contains(&ext) {
@@ -775,6 +803,26 @@ mod tests {
             "collection must be bounded by MAX_FRONTEND_FILES, got {}",
             files.len()
         );
+    }
+
+    #[test]
+    fn frontend_scan_has_a_total_directory_entry_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        for index in 0..20 {
+            std::fs::write(tmp.path().join(format!("unrelated-{index}.txt")), "x").unwrap();
+        }
+        let mut files = Vec::new();
+        let mut entries_seen = 0;
+        collect_frontend_sources_with_budget(
+            tmp.path(),
+            &mut files,
+            0,
+            MAX_FRONTEND_FILES,
+            3,
+            &mut entries_seen,
+        );
+        assert_eq!(entries_seen, 3);
+        assert!(files.is_empty());
     }
 
     #[test]

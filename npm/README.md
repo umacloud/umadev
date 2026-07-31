@@ -24,7 +24,8 @@ npm/
 ├── cli-win32-x64/                    ← Windows x86_64
 ├── knowledge-corpus/                 ← platform-independent curated knowledge
 └── scripts/
-    ├── stage.sh                      ← copy a built binary into its sub-package
+    ├── stage.sh                      ← stage a binary + tag/commit digest manifest
+    ├── release-provenance.mjs        ← write/verify all platform proof manifests
     ├── smoke.sh                      ← local end-to-end smoke test
     └── publish.sh                    ← preflight + publish all 9 runtime packages
 ```
@@ -52,10 +53,15 @@ exec its binary. `stdio: 'inherit'` preserves the TTY so the ratatui UI works.
 ## How a release flows
 
 1. CI builds `umadev` for each target (see `.github/workflows/release.yml`).
-2. For each target the CI calls `npm/scripts/stage.sh <platform> <binary>`.
-3. `npm/scripts/publish.sh` verifies the version lock, stages the knowledge
-   corpus in a clean temporary directory, and packs all nine tarballs before
-   the first irreversible publish.
+2. For each target a tag-push CI run calls
+   `npm/scripts/stage.sh <platform> <binary>`. Staging also writes a published
+   SHA-256 manifest that binds the exact binary bytes to the npm version,
+   release tag, target triple, and full source commit.
+3. `npm/scripts/publish.sh` verifies the version lock and all seven provenance
+   manifests against the current tag/commit, stages the knowledge corpus in a
+   clean temporary directory, and packs all nine tarballs before the first
+   irreversible publish. Manual `workflow_dispatch` runs validation only and
+   cannot publish, including when it is dispatched against a tag.
 4. Exact versions are first published under a temporary `staging` dist-tag.
    After every registry integrity check passes, `latest` is promoted in
    dependency order with the main `umadev` package last. A rerun skips an
@@ -71,7 +77,9 @@ exec its binary. `stdio: 'inherit'` preserves the TTY so the ratatui UI works.
 Builds umadev release-mode for the host platform, stages it into
 the matching `cli-<platform>/bin/`, then invokes
 `node npm/umadev/bin/cli.js --version` and asserts the binary's
-real version string came through.
+real version string came through. Local staging records `tag: "local"`; the
+publish preflight rejects that manifest, so smoke-test bytes cannot be mistaken
+for tag-built release bytes.
 
 ## Maintenance
 
@@ -80,8 +88,14 @@ the workspace `Cargo.toml#workspace.package.version` must agree. The release
 tag must be `v<version>`. `verify-version-lock.mjs` enforces this; `smoke.sh`
 also fails if the resolved binary reports a different version.
 
+`publish.sh` packs all nine published packages from temporary release roots,
+injects the repository `LICENSE` into each tarball, and verifies that notice
+before the first registry mutation. Production publishing is accepted only in
+the GitHub tag-push workflow; local execution is restricted to `--dry-run` from
+the matching tag.
+
 When bumping versions, update:
-- `Cargo.toml` (workspace + 6 internal-dep refs)
+- `Cargo.toml` (`[workspace.package].version`; `bump-version.sh` then refreshes the lockfile)
 - `npm/umadev/package.json`
 - `npm/cli-*/package.json` (×7)
 - `npm/knowledge-corpus/package.json` and `npm/model-e5-small/package.json`

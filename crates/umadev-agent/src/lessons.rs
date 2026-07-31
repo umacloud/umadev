@@ -29,6 +29,8 @@ use crate::memory_control::{capture_enabled, recall_enabled, MemoryScope, Memory
 use crate::phases::QualityCheck;
 use umadev_contract::ApiSpec;
 
+const MAX_SEDIMENT_MARKDOWN_BYTES: usize = 512 * 1024;
+
 fn project_capture_enabled(project_root: &Path, store: MemoryStore) -> bool {
     capture_enabled(project_root, MemoryScope::Project, store)
 }
@@ -1597,12 +1599,32 @@ fn safe_dev_error_keywords(insight: &crate::error_kb::ErrorInsight) -> Vec<Strin
 }
 
 fn privacy_fingerprint(domain: &str, value: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(domain.as_bytes());
-    hasher.update([0]);
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+    static EPHEMERAL_KEY: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
+    let key = persistent_privacy_key()
+        .or_else(|| *EPHEMERAL_KEY.get_or_init(umadev_state::privacy::ephemeral_key));
+    let Some(key) = key else {
+        // Never fall back to an unkeyed digest. An OS RNG failure loses correlation rather
+        // than exposing low-entropy requirements/evidence to offline enumeration.
+        return "privacy-key-unavailable".to_string();
+    };
+    umadev_governance::privacy_fingerprint(&key, domain.as_bytes(), value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[cfg(not(test))]
+fn persistent_privacy_key() -> Option<[u8; 32]> {
+    umadev_state::privacy::installation_key()
+}
+
+#[cfg(test)]
+fn persistent_privacy_key() -> Option<[u8; 32]> {
+    // Respect the existing thread-local TempHome harness. Tests without that harness use the
+    // process-local ephemeral fallback above and therefore never touch the developer's home.
+    TEST_HOME_OVERRIDE
+        .with(|slot| slot.borrow().clone())
+        .and_then(|home| umadev_state::privacy::installation_key_in(&home))
 }
 
 fn project_workspace_scope(project_root: &Path) -> String {
@@ -2020,7 +2042,11 @@ pub fn project_context_tokens(project_root: &Path) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
 
     // package.json — parse the dependency maps' keys.
-    if let Ok(text) = fs::read_to_string(project_root.join("package.json")) {
+    if let Ok(text) = crate::bounded_fs::read_utf8_beneath(
+        project_root,
+        &project_root.join("package.json"),
+        1024 * 1024,
+    ) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
             for field in ["dependencies", "devDependencies", "peerDependencies"] {
                 if let Some(map) = json.get(field).and_then(serde_json::Value::as_object) {
@@ -2034,7 +2060,11 @@ pub fn project_context_tokens(project_root: &Path) -> Vec<String> {
 
     // Cargo.toml — line-scan the [dependencies] / [dev-dependencies] tables
     // (no `toml` dep needed for this crate).
-    if let Ok(text) = fs::read_to_string(project_root.join("Cargo.toml")) {
+    if let Ok(text) = crate::bounded_fs::read_utf8_beneath(
+        project_root,
+        &project_root.join("Cargo.toml"),
+        1024 * 1024,
+    ) {
         let mut in_deps = false;
         for raw in text.lines() {
             let line = raw.trim();
@@ -4356,7 +4386,7 @@ fn clear_auto_sediment_files(domain_dir: &Path) {
         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
         let is_md = p.extension().and_then(|s| s.to_str()) == Some("md");
         if is_md && name.starts_with("lesson-") {
-            let _ = fs::remove_file(&p);
+            let _ = umadev_state::fs::remove_regular_file(&p);
         }
     }
 }
@@ -4399,7 +4429,9 @@ fn quarantine_unsafe_global_sediments_with(root: &Path, mut before_commit: impl 
             {
                 continue;
             }
-            let Ok(text) = fs::read_to_string(&path) else {
+            let Ok(text) =
+                crate::bounded_fs::read_utf8_beneath(root, &path, MAX_SEDIMENT_MARKDOWN_BYTES)
+            else {
                 continue;
             };
             if !is_unsafe_global_sediment(&text) {
@@ -4415,7 +4447,9 @@ fn quarantine_unsafe_global_sediments_with(root: &Path, mut before_commit: impl 
             {
                 continue;
             }
-            let Ok(staged_text) = fs::read_to_string(&staged) else {
+            let Ok(staged_text) =
+                crate::bounded_fs::read_utf8_beneath(root, &staged, MAX_SEDIMENT_MARKDOWN_BYTES)
+            else {
                 restore_staged_file_no_replace(&staged, &path);
                 continue;
             };
@@ -6244,6 +6278,28 @@ mod tests {
     use crate::phases::QualityCheck;
     use tempfile::TempDir;
 
+    #[test]
+    fn persisted_privacy_fingerprints_are_keyed_not_dictionary_testable_sha256() {
+        use sha2::{Digest as _, Sha256};
+
+        let _home = TempHome::new();
+        let domain = "umadev:pitfall-requirement:v1";
+        let requirement = "fix login";
+        let first = privacy_fingerprint(domain, requirement);
+        let second = privacy_fingerprint(domain, requirement);
+        assert_eq!(first, second, "an installation keeps cross-run identity");
+
+        let mut old = Sha256::new();
+        old.update(domain.as_bytes());
+        old.update([0]);
+        old.update(requirement.as_bytes());
+        assert_ne!(
+            first,
+            format!("{:x}", old.finalize()),
+            "the prior unkeyed digest allowed offline requirement enumeration"
+        );
+    }
+
     fn check(name: &str, status: &str, score: i32) -> QualityCheck {
         QualityCheck {
             name: name.to_string(),
@@ -6672,6 +6728,10 @@ mod tests {
             return;
         };
         let root = PathBuf::from(root);
+        let privacy_home = std::env::var_os("UMADEV_LESSONS_MP_HOME")
+            .map(PathBuf::from)
+            .expect("parent must provide one shared privacy home");
+        set_test_home_override(Some(privacy_home));
         let index = std::env::var("UMADEV_LESSONS_MP_INDEX").unwrap();
         fs::write(root.join(format!("ready-{index}")), b"").unwrap();
         let started = std::time::Instant::now();
@@ -6733,6 +6793,8 @@ mod tests {
             "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
         ];
         let exe = std::env::current_exe().unwrap();
+        let privacy_home = root.join("privacy-home");
+        fs::create_dir_all(&privacy_home).unwrap();
         let mut children = Vec::new();
         for (index, name) in NAMES.iter().enumerate() {
             let mut command = std::process::Command::new(&exe);
@@ -6743,6 +6805,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("UMADEV_LESSONS_MP_ROOT", root)
+                .env("UMADEV_LESSONS_MP_HOME", &privacy_home)
                 .env("UMADEV_LESSONS_MP_MODE", mode)
                 .env("UMADEV_LESSONS_MP_INDEX", index.to_string())
                 .env("UMADEV_LESSONS_MP_NAME", name);
@@ -7327,6 +7390,21 @@ mod tests {
         assert!(toks.iter().any(|t| t == "react"));
         assert!(toks.iter().any(|t| t == "vite"));
         assert!(toks.iter().any(|t| t == "typescript"));
+    }
+
+    #[test]
+    fn project_context_tokens_ignore_oversized_manifests() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::File::create(tmp.path().join("package.json"))
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+        std::fs::File::create(tmp.path().join("Cargo.toml"))
+            .unwrap()
+            .set_len(1024 * 1024 + 1)
+            .unwrap();
+
+        assert!(project_context_tokens(tmp.path()).is_empty());
     }
 
     #[test]
@@ -10679,6 +10757,31 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .contains("quarantine-pending")));
+    }
+
+    #[test]
+    fn quarantine_scan_does_not_load_or_move_oversized_markdown() {
+        let _home = TempHome::new();
+        let home = home_dir().unwrap();
+        let root = home.join(GLOBAL_LEARNED_DIRNAME);
+        let domain = root.join("general");
+        fs::create_dir_all(&domain).unwrap();
+        let source = domain.join("oversized.md");
+        fs::write(&source, "---\nmaintainer: auto-sediment\n---\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len((MAX_SEDIMENT_MARKDOWN_BYTES + 1) as u64)
+            .unwrap();
+
+        quarantine_unsafe_global_sediments_at(&root);
+
+        assert_eq!(
+            fs::metadata(source).unwrap().len(),
+            (MAX_SEDIMENT_MARKDOWN_BYTES + 1) as u64
+        );
+        assert!(!home.join(".umadev/quarantine").exists());
     }
 
     #[test]

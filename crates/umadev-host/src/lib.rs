@@ -73,6 +73,7 @@ pub mod session_bootstrap;
 mod redaction;
 mod turn_input;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -121,10 +122,10 @@ pub const GOVERN_ROOT_ENV: &str = "UMADEV_GOVERN_ROOT";
 /// UmaDev driving and which root to govern. Returns a single-element vec so it
 /// composes with any existing provider env the caller already passes.
 #[must_use]
-pub fn govern_root_env(workspace: &std::path::Path) -> Vec<(String, String)> {
+pub fn govern_root_env(workspace: &std::path::Path) -> Vec<(OsString, OsString)> {
     vec![(
-        GOVERN_ROOT_ENV.to_string(),
-        workspace.to_string_lossy().into_owned(),
+        OsString::from(GOVERN_ROOT_ENV),
+        workspace.as_os_str().to_os_string(),
     )]
 }
 
@@ -391,7 +392,7 @@ pub(crate) struct SubprocessCall<'a> {
     /// scrub a conflicting `ANTHROPIC_API_KEY` when an auth token is set). This
     /// is how a third-party API is routed THROUGH the base CLI — the base keeps
     /// its own file/bash tools, only the model endpoint is redirected.
-    pub env: &'a [(String, String)],
+    pub env: &'a [(OsString, OsString)],
 }
 
 /// What a successful subprocess call produced.
@@ -777,19 +778,8 @@ pub(crate) fn kill_isolated_process_tree(child: &mut tokio::process::Child) {
 /// Terminate the owned process tree, then reap the direct launcher under a
 /// separate bounded cleanup grace. Whole-tree termination happens before the
 /// wait, so even a pathological reap delay cannot leave a live descendant.
-async fn terminate_and_reap_subprocess(
-    child: &mut tokio::process::Child,
-    #[cfg(windows)] process_job: &umadev_process::KillOnCloseJob,
-) {
-    #[cfg(windows)]
-    {
-        process_job.terminate();
-        let _ = child.start_kill();
-    }
-    #[cfg(not(windows))]
-    kill_isolated_process_tree(child);
-
-    let _ = tokio::time::timeout(SUBPROCESS_REAP_GRACE, child.wait()).await;
+async fn terminate_and_reap_subprocess(child: &mut umadev_process::ManagedChild) {
+    let _ = child.terminate_and_reap(SUBPROCESS_REAP_GRACE).await;
 }
 
 /// Poll a resident base process without orphaning descendants when its direct
@@ -933,15 +923,11 @@ pub(crate) fn kill_isolated_process_tree_blocking(child: &std::sync::Mutex<tokio
 /// are textually distinguishable (`… of stdout silence`).
 #[allow(clippy::too_many_lines)] // one subprocess lifecycle state machine
 async fn drain_and_wait(
-    child: &mut tokio::process::Child,
-    #[cfg(windows)] process_job: &umadev_process::KillOnCloseJob,
+    child: &mut umadev_process::ManagedChild,
     deadline: Instant,
     timeout: std::time::Duration,
     program: &str,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), String> {
-    #[cfg(unix)]
-    let tree_pid = child.id();
-
     // Drain stderr on its own task: a child can flood stderr or hold it open,
     // which would stall a single-task stdout+stderr join AND confuse the
     // stdout-only idle watchdog (stderr traffic is not stdout liveness). Reading
@@ -951,7 +937,7 @@ async fn drain_and_wait(
     // the child's own exit, so the drain task must be reaped OR aborted on EVERY
     // return path, not just the happy one. The guard aborts it on drop (any early
     // `return Err(..)` below), and the happy path disarms it via `into_inner`.
-    let stderr_task = AbortOnDrop::new(spawn_stderr_capture(child.stderr.take()));
+    let stderr_task = AbortOnDrop::new(spawn_stderr_capture(child.take_stderr()));
 
     // Same env + default + collapse semantics as the streaming path.
     let idle_timeout = std::cmp::min(
@@ -967,7 +953,7 @@ async fn drain_and_wait(
     // Read stdout in chunks with a per-read idle watchdog + first-byte grace.
     let mut stdout_tail = umadev_process::BoundedTail::new(STDOUT_CAPTURE_CAP);
     let mut exited_status = None;
-    if let Some(mut stdout) = child.stdout.take() {
+    if let Some(mut stdout) = child.take_stdout() {
         let mut seen_first_byte = false;
         let mut chunk = [0u8; 8192];
         loop {
@@ -976,12 +962,7 @@ async fn drain_and_wait(
                 // Group-kill: the child is isolated in its own process group, so a
                 // direct-child kill would orphan any tool/subagent (or npm-trampoline
                 // native-base) grandchild. See `kill_isolated_process_tree`.
-                terminate_and_reap_subprocess(
-                    child,
-                    #[cfg(windows)]
-                    process_job,
-                )
-                .await;
+                terminate_and_reap_subprocess(child).await;
                 return Err(format!(
                     "`{program}` timed out after {}s",
                     timeout.as_secs()
@@ -1006,12 +987,7 @@ async fn drain_and_wait(
             match event {
                 ReadOrExit::Exit(Ok(status)) => {
                     exited_status = Some(status);
-                    #[cfg(unix)]
-                    if let Some(pid) = tree_pid {
-                        kill_isolated_process_group(pid);
-                    }
-                    #[cfg(windows)]
-                    process_job.terminate();
+                    child.terminate();
 
                     // The direct wrapper is gone, so any remaining bytes are
                     // already buffered or come from a descendant being torn
@@ -1030,12 +1006,7 @@ async fn drain_and_wait(
                     break;
                 }
                 ReadOrExit::Exit(Err(e)) => {
-                    #[cfg(unix)]
-                    if let Some(pid) = tree_pid {
-                        kill_isolated_process_group(pid);
-                    }
-                    #[cfg(windows)]
-                    process_job.terminate();
+                    child.terminate();
                     return Err(format!("`{program}` failed: {e}"));
                 }
                 ReadOrExit::Read(Ok(Ok(0))) => break, // EOF — stdout closed
@@ -1044,24 +1015,14 @@ async fn drain_and_wait(
                     stdout_tail.push(&chunk[..n]);
                 }
                 ReadOrExit::Read(Ok(Err(e))) => {
-                    terminate_and_reap_subprocess(
-                        child,
-                        #[cfg(windows)]
-                        process_job,
-                    )
-                    .await;
+                    terminate_and_reap_subprocess(child).await;
                     return Err(format!("`{program}` stdout read error: {e}"));
                 }
                 ReadOrExit::Read(Err(_)) if !seen_first_byte => {
                     // The wait that elapsed was the hard-ceiling remaining time
                     // (idle is not armed before the first byte) — a true silent
                     // hang, reported as the overall timeout.
-                    terminate_and_reap_subprocess(
-                        child,
-                        #[cfg(windows)]
-                        process_job,
-                    )
-                    .await;
+                    terminate_and_reap_subprocess(child).await;
                     return Err(format!(
                         "`{program}` timed out after {}s",
                         timeout.as_secs()
@@ -1071,12 +1032,7 @@ async fn drain_and_wait(
                     // **Idle timeout** — output started, then no further byte for
                     // `idle_timeout` (a base that hangs while holding the stdout
                     // pipe open). Kill + return a distinguishable, retriable error.
-                    terminate_and_reap_subprocess(
-                        child,
-                        #[cfg(windows)]
-                        process_job,
-                    )
-                    .await;
+                    terminate_and_reap_subprocess(child).await;
                     let bytes = stdout_tail.total_seen();
                     return Err(format!(
                         "`{program}` timed out after {}s of stdout silence (hang while holding the pipe open? bytes so far: {bytes}). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
@@ -1097,21 +1053,11 @@ async fn drain_and_wait(
         match tokio::time::timeout(remaining, child.wait()).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                #[cfg(unix)]
-                if let Some(pid) = tree_pid {
-                    kill_isolated_process_group(pid);
-                }
-                #[cfg(windows)]
-                process_job.terminate();
+                child.terminate();
                 return Err(format!("`{program}` failed: {e}"));
             }
             Err(_) => {
-                terminate_and_reap_subprocess(
-                    child,
-                    #[cfg(windows)]
-                    process_job,
-                )
-                .await;
+                terminate_and_reap_subprocess(child).await;
                 return Err(format!(
                     "`{program}` timed out after {}s",
                     timeout.as_secs()
@@ -1120,15 +1066,7 @@ async fn drain_and_wait(
         }
     };
 
-    // `wait()` clears Tokio's child id. Retain the original Unix process-group
-    // id so a wrapper that exits after backgrounding a pipe-holding descendant
-    // does not leave that descendant alive for the remainder of its sleep.
-    #[cfg(unix)]
-    if let Some(pid) = tree_pid {
-        kill_isolated_process_group(pid);
-    }
-    #[cfg(windows)]
-    process_job.terminate();
+    child.terminate();
 
     // H1: the child has exited, but a grandchild that inherited the stderr write
     // fd can hold the pipe open so this read never EOFs. Reap under a bounded
@@ -1151,7 +1089,7 @@ async fn drain_and_wait(
 /// with its own login / API. The one thing UmaDev DOES set on a base it drives is
 /// [`GOVERN_ROOT_ENV`] (via [`govern_root_env`]), the signal that scopes the
 /// `PreToolUse` governance hook to this run.
-fn apply_provider_env(cmd: &mut Command, env: &[(String, String)]) {
+fn apply_provider_env(cmd: &mut Command, env: &[(OsString, OsString)]) {
     for (key, value) in env {
         if value.is_empty() {
             cmd.env_remove(key);
@@ -1190,10 +1128,19 @@ fn apply_provider_env(cmd: &mut Command, env: &[(String, String)]) {
 /// wrong-dir hit just fails `--version`, never a false "installed").
 #[must_use]
 pub fn resolve_program(program: &str) -> String {
-    // An explicit path (relative or absolute) is taken as-is — the caller
-    // already pinned the binary; we never second-guess it.
+    // Pin a relative explicit path to the launcher cwd. Version preflight and
+    // the real child may use different workspaces, so leaving `./bin/base`
+    // relative could probe one file and execute another.
     if program.contains(std::path::is_separator) {
-        return program.to_string();
+        let path = std::path::Path::new(program);
+        if path.is_absolute() {
+            return program.to_string();
+        }
+        return std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join(path))
+            .and_then(|path| path.to_str().map(str::to_string))
+            .unwrap_or_else(|| program.to_string());
     }
     // 0. Explicit override — the ultimate escape hatch when a base lives
     //    somewhere no heuristic finds it. `UMADEV_<NAME>_BIN` (e.g.
@@ -1207,17 +1154,18 @@ pub fn resolve_program(program: &str) -> String {
         program.to_ascii_uppercase().replace('-', "_")
     );
     if let Ok(p) = std::env::var(&override_var) {
-        if std::path::Path::new(p.trim()).is_file() {
+        if is_spawnable_file(std::path::Path::new(p.trim())) {
             return p.trim().to_string();
         }
     }
     let exts = path_extensions();
     // 1. PATH first — authoritative, matches the user's shell.
-    if let Ok(path_var) = std::env::var("PATH") {
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        for dir in path_var.split(sep) {
-            if let Some(hit) = match_in_dir(std::path::Path::new(dir), program, &exts) {
-                return hit;
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if let Some(hit) = match_in_dir(&dir, program, &exts) {
+                if let Some(hit) = resolved_candidate(&hit, program, true) {
+                    return hit;
+                }
             }
         }
     }
@@ -1225,7 +1173,9 @@ pub fn resolve_program(program: &str) -> String {
     //    process's PATH" (GUI/service launch, or a richer login-shell PATH).
     for dir in known_install_dirs(program) {
         if let Some(hit) = match_in_dir(&dir, program, &exts) {
-            return hit;
+            if let Some(hit) = resolved_candidate(&hit, program, false) {
+                return hit;
+            }
         }
     }
     // Fail-open: nothing matched — hand back the bare name so the spawn (and,
@@ -1241,35 +1191,82 @@ pub fn resolve_program(program: &str) -> String {
 /// in the same dir, so `.cmd`/`.exe`/`.bat` MUST win over the bare name. Off
 /// Windows there are no extensions — just the bare name.
 fn path_extensions() -> Vec<String> {
-    if cfg!(windows) {
-        let pathext =
-            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        pathext
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .map(str::to_string)
-            .chain(std::iter::once(String::new()))
-            .collect()
-    } else {
-        vec![String::new()]
+    path_extensions_for_platform(std::env::var("PATHEXT").ok().as_deref(), cfg!(windows))
+}
+
+fn path_extensions_for_platform(pathext: Option<&str>, windows: bool) -> Vec<String> {
+    const SAFE: [&str; 4] = [".COM", ".EXE", ".BAT", ".CMD"];
+
+    if !windows {
+        return vec![String::new()];
     }
+    let mut extensions = Vec::with_capacity(SAFE.len() + 1);
+    for extension in pathext.unwrap_or_default().split(';') {
+        let extension = extension.trim();
+        if let Some(canonical) = SAFE
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(extension))
+        {
+            if !extensions
+                .iter()
+                .any(|existing: &String| existing.as_str() == *canonical)
+            {
+                extensions.push((*canonical).to_string());
+            }
+        }
+    }
+    for extension in SAFE {
+        if !extensions.iter().any(|existing| existing == extension) {
+            extensions.push(extension.to_string());
+        }
+    }
+    extensions.push(String::new());
+    extensions
 }
 
 /// Return the full path of `program{ext}` for the first `ext` that names a
 /// real file in `dir`, or `None`. Fail-open: an empty/unreadable dir yields
 /// `None` (the `is_file` probe simply returns false). `exts` is ordered
 /// most-specific-first (see [`path_extensions`]).
-fn match_in_dir(dir: &std::path::Path, program: &str, exts: &[String]) -> Option<String> {
+fn match_in_dir(dir: &std::path::Path, program: &str, exts: &[String]) -> Option<PathBuf> {
     if dir.as_os_str().is_empty() {
         return None;
     }
     for ext in exts {
         let candidate = dir.join(format!("{program}{ext}"));
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
+        if is_spawnable_file(&candidate) {
+            return Some(candidate);
         }
     }
     None
+}
+
+fn resolved_candidate(candidate: &std::path::Path, program: &str, on_path: bool) -> Option<String> {
+    candidate
+        .to_str()
+        .map(str::to_string)
+        .or_else(|| on_path.then(|| program.to_string()))
+}
+
+/// Whether a resolved command candidate can actually be spawned on this OS.
+///
+/// `Path::is_file` alone is insufficient on Unix: package-manager debris or a
+/// downloaded source file can appear earlier on `PATH` than the real CLI. If
+/// that non-executable file wins resolution, the subsequent `--version` probe
+/// reports the base as missing even though a valid executable exists later on
+/// `PATH`. Windows decides executability from the selected extension and file
+/// format at process creation, so a regular-file check remains appropriate.
+#[cfg(unix)]
+fn is_spawnable_file(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_spawnable_file(path: &std::path::Path) -> bool {
+    path.is_file()
 }
 
 /// Read an environment variable into a non-empty `PathBuf`, or `None`. Empty
@@ -1420,11 +1417,30 @@ fn versioned_node_bins(parent: &std::path::Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return Vec::new();
     };
-    entries
+    let mut version_dirs = entries
         .flatten()
         .take(MAX_INSTALL_DISCOVERY_ENTRIES)
-        .map(|e| e.path().join("bin"))
-        .filter(|p| p.is_dir())
+        .map(|entry| entry.path())
+        .filter(|path| path.join("bin").is_dir())
+        .collect::<Vec<_>>();
+    // `read_dir` order is filesystem-dependent. Picking its first match made a
+    // GUI-launched UmaDev randomly select an old nvm installation when several
+    // Node versions each contained the same global CLI. Prefer the newest
+    // semantic Node directory (`v22.12.0` before `v20.18.0`) and use a stable
+    // lexical fallback for non-standard version-manager directory names.
+    version_dirs.sort_by(|left, right| {
+        let version = |path: &std::path::Path| {
+            path.file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(|name| semver::Version::parse(name.trim_start_matches('v')).ok())
+        };
+        version(right)
+            .cmp(&version(left))
+            .then_with(|| right.as_os_str().cmp(left.as_os_str()))
+    });
+    version_dirs
+        .into_iter()
+        .map(|path| path.join("bin"))
         .collect()
 }
 
@@ -1446,6 +1462,18 @@ fn versioned_node_bins(parent: &std::path::Path) -> Vec<PathBuf> {
 /// Volta, Scoop shims, Chocolatey bin, and the winget Links shim dir.
 fn known_install_dirs(program: &str) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // Kimi's native installer keeps the executable under its product home,
+    // whose name differs from the command (`kimi`). GUI-launched UmaDev often
+    // lacks the shell PATH entry the installer added, so honor both an explicit
+    // KIMI_CODE_HOME and the official ~/.kimi-code default before generic dirs.
+    if program.eq_ignore_ascii_case("kimi") {
+        if let Some(kimi_home) =
+            env_dir("KIMI_CODE_HOME").or_else(|| home_dir().map(|home| home.join(".kimi-code")))
+        {
+            dirs.push(kimi_home.join("bin"));
+        }
+    }
 
     // ---- Cross-platform, HOME-relative (every package manager's user dir) ----
     if let Some(home) = home_dir() {
@@ -1723,30 +1751,13 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-    // Own process group so a kill on the timeout/idle/read-error path (see
-    // `drain_and_wait`) tears down the WHOLE tree at once. An npm-installed base is
-    // a Node trampoline that execs the native base as a grandchild; a direct-child
-    // kill would reparent that grandchild (and any shell/subagent it spawned) to
-    // init so it keeps writing files after a cancel/timeout. This mirrors the four
-    // continuous session drivers.
-    isolate_process_tree(&mut cmd);
-
-    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
+    let mut child = umadev_process::ManagedChild::spawn(cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{}` not found on PATH", call.program)
         } else {
             format!("failed to spawn `{}`: {e}", call.program)
         }
     })?;
-    // Windows: the process-group flag only enables Ctrl-events; a leaked grandchild
-    // survives once the trampoline exits (taskkill walks the LIVE parent chain). A
-    // kill-on-close Job Object captures every descendant, so dropping it (any return
-    // path) or an explicit group-kill terminates the real base too. Held for the
-    // call's lifetime; on the happy path the child has already exited (no-op).
-    #[cfg(windows)]
-    let process_job = umadev_process::KillOnCloseJob::attach(&mut child)
-        .map_err(|error| format!("failed to secure `{}` process tree: {error}", call.program))?;
 
     // M4: write the prompt CONCURRENTLY with draining stdout, not before it. A
     // `write_all` that fully completes before any stdout read DEADLOCKS when the
@@ -1756,9 +1767,9 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     // stdin, so our write blocks — and `drain_and_wait`'s ceiling hasn't started.
     // Spawning the writer lets stdout drain while the prompt streams in.
     let stdin_writer = if matches!(channel, PromptChannel::Stdin) {
-        child.stdin.take().map(|mut stdin| {
+        child.take_stdin().map(|mut stdin| {
             let prompt = call.prompt.as_bytes().to_vec();
-            tokio::spawn(async move {
+            AbortOnDrop::new(tokio::spawn(async move {
                 // Best-effort: a base that exits early closes its stdin read end
                 // (EPIPE) — `drain_and_wait` surfaces the real outcome, not this.
                 // `shutdown` flushes the buffered prompt AND signals EOF (without
@@ -1768,14 +1779,14 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
                 if stdin.write_all(&prompt).await.is_ok() {
                     let _ = stdin.shutdown().await;
                 }
-            })
+            }))
         })
     } else {
         // Arg channel: the prompt is a CLI arg, so we never write stdin. But
         // the pipe is still open — take and drop it so the child sees EOF
         // immediately instead of blocking on an idle stdin (some CLIs peek
         // stdin in non-interactive mode and would otherwise hang to timeout).
-        drop(child.stdin.take());
+        drop(child.take_stdin());
         None
     };
 
@@ -1783,19 +1794,11 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     // `drain_and_wait`): the reads themselves must be bounded, or a child that
     // emits output then hangs with its stdout pipe open blocks forever and
     // defeats the timeout.
-    let drained = drain_and_wait(
-        &mut child,
-        #[cfg(windows)]
-        &process_job,
-        deadline,
-        call.timeout,
-        call.program,
-    )
-    .await;
+    let drained = drain_and_wait(&mut child, deadline, call.timeout, call.program).await;
     // Reap the writer (the child is now dead/exited, so it returns at once) —
     // before propagating any drain error, so the task can never leak.
     if let Some(writer) = stdin_writer {
-        let _ = reap_bounded(writer).await;
+        let _ = reap_bounded(writer.into_inner()).await;
     }
     let (status, stdout_buf, stderr_buf) = drained?;
 
@@ -1897,30 +1900,14 @@ pub(crate) async fn run_auth_status(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-    // Own process group so a probe that hangs and trips `auth_probe_timeout` is
-    // group-killed (an npm-trampoline base's native grandchild would otherwise
-    // orphan) — same isolation the one-shot generation paths use.
-    isolate_process_tree(&mut cmd);
-
-    let mut child = spawn_retrying_etxtbsy(&mut cmd).ok()?;
-    // Windows kill-on-close Job Object backstop; held for the probe's lifetime.
-    #[cfg(windows)]
-    let process_job = umadev_process::KillOnCloseJob::attach(&mut child).ok()?;
+    let mut child = umadev_process::ManagedChild::spawn(cmd).ok()?;
     // Close stdin immediately (EOF) so a status command that peeks stdin in a
     // non-interactive context returns instead of blocking to the timeout.
-    drop(child.stdin.take());
+    drop(child.take_stdin());
 
-    let (status, stdout_buf, stderr_buf) = drain_and_wait(
-        &mut child,
-        #[cfg(windows)]
-        &process_job,
-        deadline,
-        timeout,
-        program,
-    )
-    .await
-    .ok()?;
+    let (status, stdout_buf, stderr_buf) = drain_and_wait(&mut child, deadline, timeout, program)
+        .await
+        .ok()?;
 
     if success_required && !status.success() {
         return None;
@@ -1983,48 +1970,34 @@ pub(crate) async fn run_subprocess_streaming(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.kill_on_drop(true);
-    // Own process group so a kill on the idle/hard-timeout/read-error path below
-    // group-kills the whole tree, not just the direct Node child (see
-    // `run_subprocess` / the continuous session drivers).
-    isolate_process_tree(&mut cmd);
-
-    let mut child = spawn_retrying_etxtbsy(&mut cmd).map_err(|e| {
+    let mut child = umadev_process::ManagedChild::spawn(cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{}` not found on PATH", call.program)
         } else {
             format!("failed to spawn `{}`: {e}", call.program)
         }
     })?;
-    #[cfg(unix)]
-    let tree_pid = child.id();
-    // Windows kill-on-close Job Object: the real backstop once the trampoline exits
-    // and taskkill can no longer walk to the native grandchild. Held for the call.
-    #[cfg(windows)]
-    let process_job = umadev_process::KillOnCloseJob::attach(&mut child)
-        .map_err(|error| format!("failed to secure `{}` process tree: {error}", call.program))?;
-
     // M4: write the prompt CONCURRENTLY with streaming stdout (see
     // `run_subprocess`) — a >64 KiB prompt that fully writes before any stdout
     // read deadlocks a base that emits before draining all of stdin. Spawning
     // the writer lets the stdout loop below drain while the prompt streams in.
     let stdin_writer = if matches!(channel, PromptChannel::Stdin) {
-        child.stdin.take().map(|mut stdin| {
+        child.take_stdin().map(|mut stdin| {
             let prompt = call.prompt.as_bytes().to_vec();
-            tokio::spawn(async move {
+            AbortOnDrop::new(tokio::spawn(async move {
                 // Flush + close the write half (a bare write + drop can leave the
                 // prompt unflushed, starving the child); best-effort on EPIPE.
                 if stdin.write_all(&prompt).await.is_ok() {
                     let _ = stdin.shutdown().await;
                 }
-            })
+            }))
         })
     } else {
         // Arg channel: the prompt is a CLI arg, so we never write stdin. Drop the
         // pipe so the child sees EOF immediately — otherwise a CLI that peeks
         // stdin in non-interactive `stream-json` mode blocks until the idle
         // watchdog kills it (the same defence `run_subprocess` already has).
-        drop(child.stdin.take());
+        drop(child.take_stdin());
         None
     };
 
@@ -2033,7 +2006,7 @@ pub(crate) async fn run_subprocess_streaming(
     // Guarded so an early `return Err(..)` on the stdout-loop timeout/read-error
     // paths below aborts (not detaches) the drain task — a grandchild holding the
     // stderr fd open would otherwise leave it running forever.
-    let stderr_task = AbortOnDrop::new(spawn_stderr_capture(child.stderr.take()));
+    let stderr_task = AbortOnDrop::new(spawn_stderr_capture(child.take_stderr()));
 
     // Stream stdout line by line.
     // **Watchdog**: once the stream is live, a per-line idle timeout (not the
@@ -2081,7 +2054,7 @@ pub(crate) async fn run_subprocess_streaming(
     // that the grace can never bypass). AFTER the first line, every subsequent
     // wait is bounded by `idle_timeout` (still also capped by the hard ceiling),
     // restoring the mid-stream-hang protection.
-    if let Some(stdout) = child.stdout.take() {
+    if let Some(stdout) = child.take_stdout() {
         // The reader task owns partial-line state across every process-exit poll;
         // the main loop only selects on cancellation-safe channel receives.
         let (mut line_rx, stdout_task) = spawn_stdout_line_capture(stdout);
@@ -2092,12 +2065,7 @@ pub(crate) async fn run_subprocess_streaming(
             if remaining.is_zero() {
                 // Group-kill the isolated tree (see `isolate_process_tree` above):
                 // a direct-child kill would orphan the native base grandchild.
-                terminate_and_reap_subprocess(
-                    &mut child,
-                    #[cfg(windows)]
-                    &process_job,
-                )
-                .await;
+                terminate_and_reap_subprocess(&mut child).await;
                 return Err(format!(
                     "`{}` timed out after {}s",
                     call.program,
@@ -2123,12 +2091,7 @@ pub(crate) async fn run_subprocess_streaming(
             match event {
                 LineOrExit::Exit(Ok(status)) => {
                     exited_status = Some(status);
-                    #[cfg(unix)]
-                    if let Some(pid) = tree_pid {
-                        kill_isolated_process_group(pid);
-                    }
-                    #[cfg(windows)]
-                    process_job.terminate();
+                    child.terminate();
 
                     // Preserve complete records already buffered after exit,
                     // bounded in case a descendant still owns the pipe.
@@ -2150,12 +2113,7 @@ pub(crate) async fn run_subprocess_streaming(
                     break;
                 }
                 LineOrExit::Exit(Err(e)) => {
-                    #[cfg(unix)]
-                    if let Some(pid) = tree_pid {
-                        kill_isolated_process_group(pid);
-                    }
-                    #[cfg(windows)]
-                    process_job.terminate();
+                    child.terminate();
                     return Err(format!("`{}` failed: {e}", call.program));
                 }
                 LineOrExit::Line(Ok(Some(StdoutLineEvent::End))) => break,
@@ -2170,21 +2128,11 @@ pub(crate) async fn run_subprocess_streaming(
                     );
                 }
                 LineOrExit::Line(Ok(Some(StdoutLineEvent::Error(e)))) => {
-                    terminate_and_reap_subprocess(
-                        &mut child,
-                        #[cfg(windows)]
-                        &process_job,
-                    )
-                    .await;
+                    terminate_and_reap_subprocess(&mut child).await;
                     return Err(format!("`{}` stdout read error: {e}", call.program));
                 }
                 LineOrExit::Line(Ok(None)) => {
-                    terminate_and_reap_subprocess(
-                        &mut child,
-                        #[cfg(windows)]
-                        &process_job,
-                    )
-                    .await;
+                    terminate_and_reap_subprocess(&mut child).await;
                     return Err(format!(
                         "`{}` stdout reader ended unexpectedly",
                         call.program
@@ -2195,12 +2143,7 @@ pub(crate) async fn run_subprocess_streaming(
                     // (the idle sub-timeout is not armed before the first line),
                     // so a timeout here means we hit `call.timeout` with no output
                     // at all — a true hang, reported as the overall timeout.
-                    terminate_and_reap_subprocess(
-                        &mut child,
-                        #[cfg(windows)]
-                        &process_job,
-                    )
-                    .await;
+                    terminate_and_reap_subprocess(&mut child).await;
                     return Err(format!(
                         "`{}` timed out after {}s",
                         call.program,
@@ -2212,12 +2155,7 @@ pub(crate) async fn run_subprocess_streaming(
                     // line for `idle_timeout` (the stream-json hang scenario,
                     // #53584). Kill + return a distinguishable error so callers
                     // can retry.
-                    terminate_and_reap_subprocess(
-                        &mut child,
-                        #[cfg(windows)]
-                        &process_job,
-                    )
-                    .await;
+                    terminate_and_reap_subprocess(&mut child).await;
                     let lines_so_far = all_lines.len();
                     return Err(format!(
                         "`{}` idle timeout: no stdout for {}s (stream-json hang? lines so far: {lines_so_far}). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
@@ -2242,23 +2180,13 @@ pub(crate) async fn run_subprocess_streaming(
         match tokio::time::timeout(remaining, child.wait()).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                #[cfg(unix)]
-                if let Some(pid) = tree_pid {
-                    kill_isolated_process_group(pid);
-                }
-                #[cfg(windows)]
-                process_job.terminate();
+                child.terminate();
                 return Err(format!("`{}` failed: {e}", call.program));
             }
             Err(_) => {
-                terminate_and_reap_subprocess(
-                    &mut child,
-                    #[cfg(windows)]
-                    &process_job,
-                )
-                .await;
+                terminate_and_reap_subprocess(&mut child).await;
                 if let Some(writer) = stdin_writer {
-                    let _ = reap_bounded(writer).await;
+                    let _ = reap_bounded(writer.into_inner()).await;
                 }
                 return Err(format!(
                     "`{}` timed out after {}s",
@@ -2269,18 +2197,13 @@ pub(crate) async fn run_subprocess_streaming(
         }
     };
 
-    #[cfg(unix)]
-    if let Some(pid) = tree_pid {
-        kill_isolated_process_group(pid);
-    }
-    #[cfg(windows)]
-    process_job.terminate();
+    child.terminate();
 
     // Reap the concurrent stdin writer (the child has exited, so it returns at
     // once) and the stderr capture under the bounded flush grace (H1 mirror — a
     // leaked grandchild stderr fd must not hang us).
     if let Some(writer) = stdin_writer {
-        let _ = reap_bounded(writer).await;
+        let _ = reap_bounded(writer.into_inner()).await;
     }
     // Disarm the abort guard on the happy path: join the drain task instead.
     let stderr_buf = reap_bounded(stderr_task.into_inner())
@@ -4381,6 +4304,120 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn wait_for_published_pid(path: &std::path::Path) -> i32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .trim()
+                .parse::<i32>()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fake base did not publish its descendant pid"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_tree_was_cancelled(pid: i32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while unix_process_alive(pid) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !unix_process_alive(pid),
+            "cancelling the host future must terminate its complete process tree (leaf pid {pid})"
+        );
+    }
+
+    #[cfg(unix)]
+    fn descendant_publisher_args(pid_path: &std::path::Path) -> Vec<String> {
+        vec![
+            "-c".to_string(),
+            "sleep 30 & leaf=$!; printf '%s' \"$leaf\" > \"$1\"; wait \"$leaf\"".to_string(),
+            "umadev-cancellation-test".to_string(),
+            pid_path.to_string_lossy().into_owned(),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_run_subprocess_kills_the_complete_process_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("run-subprocess-leaf.pid");
+        let workspace = dir.path().to_path_buf();
+        let args = descendant_publisher_args(&pid_path);
+        // Larger than a normal pipe buffer: cancellation must abort the blocked
+        // stdin writer as well as killing the managed process tree.
+        let prompt = "x".repeat(512 * 1024);
+        let task = tokio::spawn(async move {
+            run_subprocess(SubprocessCall {
+                program: "sh",
+                args: &args,
+                prompt: &prompt,
+                channel: PromptChannel::Stdin,
+                workspace: &workspace,
+                timeout: Duration::from_secs(30),
+                env: &[],
+            })
+            .await
+        });
+
+        let leaf = wait_for_published_pid(&pid_path).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_process_tree_was_cancelled(leaf).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_run_auth_status_kills_the_complete_process_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("auth-status-leaf.pid");
+        let args = descendant_publisher_args(&pid_path);
+        let task = tokio::spawn(async move { run_auth_status("sh", &args, false).await });
+
+        let leaf = wait_for_published_pid(&pid_path).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_process_tree_was_cancelled(leaf).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_streaming_subprocess_kills_the_complete_process_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_path = dir.path().join("streaming-leaf.pid");
+        let workspace = dir.path().to_path_buf();
+        let args = descendant_publisher_args(&pid_path);
+        let task = tokio::spawn(async move {
+            let callback = |_line: &str| {};
+            run_subprocess_streaming(
+                SubprocessCall {
+                    program: "sh",
+                    args: &args,
+                    prompt: "",
+                    channel: PromptChannel::Arg,
+                    workspace: &workspace,
+                    timeout: Duration::from_secs(30),
+                    env: &[],
+                },
+                &callback,
+            )
+            .await
+        });
+
+        let leaf = wait_for_published_pid(&pid_path).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_process_tree_was_cancelled(leaf).await;
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_subprocess_group_kills_a_grandchild_on_timeout() {
         // Fix #1: the one-shot generation path is process-group isolated, so a kill
@@ -4682,8 +4719,22 @@ mod tests {
         let env = govern_root_env(std::path::Path::new("/projects/app"));
         assert_eq!(
             env,
-            vec![(GOVERN_ROOT_ENV.to_string(), "/projects/app".to_string())]
+            vec![(
+                OsString::from(GOVERN_ROOT_ENV),
+                OsString::from("/projects/app")
+            )]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn govern_root_env_preserves_non_utf8_workspace_bytes() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let raw = b"/projects/non-utf8-\xff".to_vec();
+        let workspace = PathBuf::from(OsString::from_vec(raw.clone()));
+        let env = govern_root_env(&workspace);
+        assert_eq!(env[0].1.as_os_str().as_bytes(), raw);
     }
 
     // `printenv` exists on macOS/Linux; the env propagation it proves is the
@@ -4908,11 +4959,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_program_passes_through_explicit_paths() {
-        // An explicit path (has a separator) is taken as-is — never rewritten.
+    fn resolve_program_absolutizes_explicit_relative_paths() {
         let sep = std::path::MAIN_SEPARATOR;
         let p = format!("some{sep}dir{sep}codex");
-        assert_eq!(resolve_program(&p), p);
+        let expected = std::env::current_dir().unwrap().join(&p);
+        assert_eq!(resolve_program(&p), expected.to_string_lossy());
+
+        let absolute = expected.to_string_lossy();
+        assert_eq!(resolve_program(&absolute), absolute);
     }
 
     #[cfg(windows)]
@@ -4963,6 +5017,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_path_extensions_ignore_unspawnable_shell_types() {
+        assert_eq!(
+            path_extensions_for_platform(Some(".PS1;.CMD;.EXE;.JS;.cmd"), true),
+            [".CMD", ".EXE", ".COM", ".BAT", ""]
+        );
+        assert_eq!(path_extensions_for_platform(Some(".PS1"), false), [""]);
+    }
+
+    #[test]
+    fn versioned_node_bins_are_newest_first_and_deterministic() {
+        let parent = tempfile::TempDir::new().unwrap();
+        for version in ["v9.11.2", "v22.1.0", "v10.24.1"] {
+            std::fs::create_dir_all(parent.path().join(version).join("bin")).unwrap();
+        }
+        // A version directory without a bin dir is not a usable install root.
+        std::fs::create_dir_all(parent.path().join("v99.0.0")).unwrap();
+
+        let names = versioned_node_bins(parent.path())
+            .into_iter()
+            .map(|path| {
+                path.parent()
+                    .and_then(std::path::Path::file_name)
+                    .and_then(std::ffi::OsStr::to_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["v22.1.0", "v10.24.1", "v9.11.2"]);
+    }
+
     // On Unix the known-install scan locates a binary that is NOT on PATH but
     // lives in a per-base standalone dir (`~/.codex/bin`). We point HOME at a
     // temp dir and clear PATH so only the known-dir branch can match.
@@ -4989,6 +5074,24 @@ mod tests {
             got,
             exe.to_string_lossy(),
             "a base in ~/.mybase/bin must resolve even when absent from PATH"
+        );
+    }
+
+    #[test]
+    fn kimi_native_install_dir_honors_product_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _kimi_home = EnvRestore::set("KIMI_CODE_HOME", tmp.path());
+
+        assert_eq!(
+            known_install_dirs("kimi").first(),
+            Some(&tmp.path().join("bin")),
+            "the official native Kimi install must be discoverable without a shell PATH"
+        );
+        assert_ne!(
+            known_install_dirs("not-kimi").first(),
+            Some(&tmp.path().join("bin")),
+            "KIMI_CODE_HOME must not affect unrelated commands"
         );
     }
 
@@ -5019,6 +5122,86 @@ mod tests {
         );
     }
 
+    // A non-executable same-named file must not shadow the real CLI later on
+    // PATH. `is_file()` alone used to stop at the first entry and the ensuing
+    // spawn failed with EACCES, incorrectly reporting the base as unavailable.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_program_skips_non_executable_path_shadow() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let shadow_dir = tempfile::TempDir::new().unwrap();
+        let shadow = shadow_dir.path().join("shadowed-base");
+        std::fs::write(&shadow, "not executable\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let executable_dir = tempfile::TempDir::new().unwrap();
+        let executable = executable_dir.path().join("shadowed-base");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = std::env::join_paths([shadow_dir.path(), executable_dir.path()]).unwrap();
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _path = EnvRestore::set("PATH", path);
+
+        assert_eq!(
+            resolve_program("shadowed-base"),
+            executable.to_string_lossy()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_program_delegates_a_non_utf8_path_hit_to_execvp() {
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let bin = root
+            .path()
+            .join(OsString::from_vec(b"non-utf8-\xff".to_vec()));
+        std::fs::create_dir(&bin).unwrap();
+        let executable = bin.join("byte-safe-base");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([&bin]).unwrap();
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _path = EnvRestore::set("PATH", path);
+        let resolved = resolve_program("byte-safe-base");
+        assert_eq!(resolved, "byte-safe-base");
+        assert!(std::process::Command::new(&resolved)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_candidate_never_becomes_a_lossy_command_path() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let candidate = PathBuf::from(OsString::from_vec(b"/tmp/base-\xff".to_vec()));
+        assert_eq!(
+            resolved_candidate(&candidate, "base", true),
+            Some("base".to_string())
+        );
+        assert_eq!(resolved_candidate(&candidate, "base", false), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn match_in_dir_rejects_a_non_executable_regular_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let candidate = dir.path().join("not-a-command");
+        std::fs::write(&candidate, "plain text\n").unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(match_in_dir(dir.path(), "not-a-command", &path_extensions()).is_none());
+    }
+
     // On Windows, when both `codex` (bare *nix shim) and `codex.cmd` exist in
     // the same dir, the `.cmd` must win — the bare shim is not a PE (os 193).
     #[cfg(windows)]
@@ -5026,11 +5209,12 @@ mod tests {
     fn resolve_program_prefers_cmd_over_bare_on_windows() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("winbase"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(tmp.path().join("winbase.ps1"), b"exit 9\n").unwrap();
         std::fs::write(tmp.path().join("winbase.cmd"), b"@echo off\n").unwrap();
 
         let _guard = ENV_LOCK.lock().unwrap();
         let _path = EnvRestore::set("PATH", tmp.path());
-        let _pathext = EnvRestore::set("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        let _pathext = EnvRestore::set("PATHEXT", ".PS1;.CMD;.EXE");
         let got = resolve_program("winbase");
 
         assert!(

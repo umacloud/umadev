@@ -5,4 +5,5 @@
 pub mod fs;
 pub mod lifecycle;
 pub mod memory;
+pub mod privacy;
 pub mod store_lock;

@@ -186,7 +186,10 @@ impl Usage {
             return None;
         }
         match self.cost_usd_ticks {
-            Some(ticks) if ticks > 0 => Some(ticks),
+            // Zero is an exact, meaningful value for a free/local model. Missing
+            // cost is represented by `None`; conflating the two makes one free
+            // call erase otherwise exact cost when whole-prompt reports merge.
+            Some(ticks) if ticks >= 0 => Some(ticks),
             _ => None,
         }
     }
@@ -3573,6 +3576,26 @@ mod tests {
         assert_eq!(merged.input_tokens, above_u32 + 3);
         assert_eq!(merged.total_tokens, above_u32 + 9);
         assert_eq!(merged.trusted_cost_usd_ticks(), Some(18));
+    }
+
+    #[test]
+    fn exact_zero_cost_is_trusted_and_merges_as_zero() {
+        let free = Usage {
+            cost_usd_ticks: Some(0),
+            ..Usage::exact(4, 1)
+        };
+        let paid = Usage {
+            cost_usd_ticks: Some(9),
+            ..Usage::exact(2, 2)
+        };
+        assert_eq!(free.trusted_cost_usd_ticks(), Some(0));
+        assert_eq!(free.merge(paid).trusted_cost_usd_ticks(), Some(9));
+
+        let malformed = Usage {
+            cost_usd_ticks: Some(-1),
+            ..Usage::exact(1, 1)
+        };
+        assert_eq!(malformed.trusted_cost_usd_ticks(), None);
     }
 
     fn grok_resume_identity(effective_sandbox: EffectiveSandboxEvidence) -> BaseResumeIdentity {

@@ -41,6 +41,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+const MAX_TRUST_LEDGER_BYTES: usize = 1024 * 1024;
+
 /// Autonomy tier selected for a conversation/run. The mode controls whether
 /// execution may start and, if so, the gate auto-pass policy; it never
 /// introduces non-determinism into phase content.
@@ -1781,11 +1783,14 @@ impl TrustLedger {
     /// or corrupt file yields a fresh empty ledger (never an error).
     #[must_use]
     pub fn load(project_root: &Path) -> Self {
-        let path = Self::path(project_root);
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default()
+        crate::bounded_fs::read_utf8_beneath(
+            project_root,
+            &Self::path(project_root),
+            MAX_TRUST_LEDGER_BYTES,
+        )
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
     }
 
     /// Persist the ledger **atomically**: serialize, write a sibling temp file,
@@ -1794,21 +1799,18 @@ impl TrustLedger {
     /// default on next load. Best-effort: any IO error is swallowed (fail-open —
     /// trust tracking must never block or fail the pipeline).
     pub fn save(&self, project_root: &Path) {
-        let dir = project_root.join(".umadev");
-        if std::fs::create_dir_all(&dir).is_err() {
+        let Ok(dir) =
+            crate::bounded_fs::ensure_real_dir_beneath(project_root, Path::new(".umadev"))
+        else {
             return;
-        }
+        };
         let Ok(text) = serde_json::to_string_pretty(self) else {
             return;
         };
-        let tmp = dir.join("trust.json.tmp");
-        if std::fs::write(&tmp, text).is_err() {
+        if text.len() > MAX_TRUST_LEDGER_BYTES {
             return;
         }
-        // Atomic publish. If the rename fails, drop the temp so we don't litter.
-        if std::fs::rename(&tmp, Self::path(project_root)).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
+        let _ = umadev_state::fs::atomic_write(&dir.join("trust.json"), text.as_bytes());
     }
 
     fn path(project_root: &Path) -> PathBuf {
@@ -2803,6 +2805,49 @@ mod tests {
             tmp2.path(),
             &none
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_persistence_never_follows_managed_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_ledger = outside.path().join("trust.json");
+        std::fs::write(&outside_ledger, r#"{"outside":true}"#).unwrap();
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+
+        let mut ledger = TrustLedger::default();
+        ledger.allow_rules.insert("shell".to_string());
+        ledger.save(root.path());
+        assert_eq!(
+            std::fs::read_to_string(&outside_ledger).unwrap(),
+            r#"{"outside":true}"#
+        );
+        assert_eq!(TrustLedger::load(root.path()), TrustLedger::default());
+
+        std::fs::remove_file(root.path().join(".umadev")).unwrap();
+        std::fs::create_dir(root.path().join(".umadev")).unwrap();
+        symlink(&outside_ledger, root.path().join(".umadev/trust.json")).unwrap();
+        ledger.save(root.path());
+        assert_eq!(
+            std::fs::read_to_string(&outside_ledger).unwrap(),
+            r#"{"outside":true}"#
+        );
+        assert_eq!(TrustLedger::load(root.path()), TrustLedger::default());
+    }
+
+    #[test]
+    fn oversized_trust_ledger_fails_open() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".umadev")).unwrap();
+        std::fs::File::create(root.path().join(".umadev/trust.json"))
+            .unwrap()
+            .set_len((MAX_TRUST_LEDGER_BYTES + 1) as u64)
+            .unwrap();
+
+        assert_eq!(TrustLedger::load(root.path()), TrustLedger::default());
     }
 
     #[test]

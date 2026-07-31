@@ -233,7 +233,7 @@ pub use router::{
     request_uses_literal_git_commit_command, requirement_demands_read_only, route,
     route_with_context_and_readonly_session, route_with_context_and_source, route_with_source,
     Budget, ClarifyQuestion, Depth, GitCommitIntent, GitVerifier, HostGitCommitRequest,
-    LiteralGitCommitSpec, RouteClass, RoutePlan, RouteSource, RoutedIntent,
+    LiteralGitCommitSpec, RouteClass, RouteFallbackReason, RoutePlan, RouteSource, RoutedIntent,
 };
 pub use runner::{
     setup_new_run_isolation, setup_run_isolation, strict_coverage_from_env, AgentRunner,

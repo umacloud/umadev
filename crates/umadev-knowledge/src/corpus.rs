@@ -133,13 +133,31 @@ impl CorpusRoot {
 }
 
 /// One canonical markdown file selected from a [`CorpusSet`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CorpusFile {
     path: PathBuf,
+    root: std::sync::Arc<umadev_state::fs::RootedDir>,
+    relative: PathBuf,
     relative_path: String,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
     origin: CorpusOrigin,
     scope: CorpusScope,
 }
+
+impl PartialEq for CorpusFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.relative == other.relative
+            && self.relative_path == other.relative_path
+            && self.len == other.len
+            && self.modified == other.modified
+            && self.origin == other.origin
+            && self.scope == other.scope
+    }
+}
+
+impl Eq for CorpusFile {}
 
 impl CorpusFile {
     /// Canonical absolute path.
@@ -164,6 +182,18 @@ impl CorpusFile {
     #[must_use]
     pub const fn scope(&self) -> CorpusScope {
         self.scope
+    }
+
+    pub(crate) const fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) const fn modified(&self) -> Option<std::time::SystemTime> {
+        self.modified
+    }
+
+    pub(crate) fn read_bounded(&self, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+        self.root.read_bounded(&self.relative, max_bytes)
     }
 }
 
@@ -316,14 +346,14 @@ impl CorpusRecallFilter {
             .as_ref()
             .is_some_and(|root| file.path.starts_with(root))
         {
-            return classify_global_learned(file.path());
+            return classify_global_learned(file);
         }
         match file.origin {
             CorpusOrigin::BundledCurated => RecallClass::BundledKnowledge,
             CorpusOrigin::ProjectCustom => RecallClass::CustomKnowledge,
             CorpusOrigin::ProjectSkillPackage => RecallClass::SkillPackages,
             CorpusOrigin::ProjectLearned => RecallClass::LessonSediment,
-            CorpusOrigin::GlobalSafeLearned => classify_global_learned(file.path()),
+            CorpusOrigin::GlobalSafeLearned => classify_global_learned(file),
             CorpusOrigin::Unknown => RecallClass::UnmanagedExplicit,
         }
     }
@@ -333,8 +363,8 @@ fn policy_recall(policy: Option<&MemoryPolicy>, store: MemoryStore) -> bool {
     policy.is_some_and(|policy| policy.recall_enabled(store))
 }
 
-fn classify_global_learned(path: &Path) -> RecallClass {
-    let Ok(bytes) = umadev_state::fs::read_bounded(path, MAX_PROVENANCE_HEADER_FILE_BYTES) else {
+fn classify_global_learned(file: &CorpusFile) -> RecallClass {
+    let Ok(bytes) = file.read_bounded(MAX_PROVENANCE_HEADER_FILE_BYTES) else {
         return RecallClass::Reject;
     };
     let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -428,25 +458,24 @@ impl CorpusSet {
 
         let mut chosen = BTreeMap::<String, Candidate>::new();
         for (root_index, root) in self.roots.iter().enumerate() {
-            let mut paths = Vec::new();
-            crate::index::walk_md(&root.path, &mut paths, 0);
-            for path in paths {
-                let Ok(canonical) = std::fs::canonicalize(&path) else {
-                    continue;
-                };
-                let relative_path = canonical.strip_prefix(&root.path).map_or_else(
-                    |_| {
-                        canonical
-                            .file_name()
-                            .map(|name| name.to_string_lossy().to_string())
-                            .unwrap_or_default()
-                    },
-                    slash_path,
-                );
+            let Ok(rooted) = umadev_state::fs::RootedDir::open_no_follow(&root.path) else {
+                continue;
+            };
+            let Some(paths) = crate::index::walk_md_rooted(&rooted) else {
+                continue;
+            };
+            let rooted = std::sync::Arc::new(rooted);
+            for selected in paths {
+                let canonical = root.path.join(&selected.relative);
+                let relative_path = slash_path(&selected.relative);
                 let candidate = Candidate {
                     file: CorpusFile {
                         path: canonical.clone(),
+                        root: std::sync::Arc::clone(&rooted),
+                        relative: selected.relative,
                         relative_path,
+                        len: selected.len,
+                        modified: selected.modified,
                         origin: root.origin,
                         scope: root.scope,
                     },
@@ -790,6 +819,29 @@ mod tests {
         assert_eq!(set.roots().len(), 1);
         assert_eq!(set.markdown_files().len(), 1);
         assert_eq!(set.roots()[0].origin(), CorpusOrigin::ProjectCustom);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_file_read_stays_on_the_inventoried_root_generation() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("knowledge");
+        std::fs::create_dir(&root).unwrap();
+        write(&root.join("source.md"), "# original");
+        let set = CorpusSet::from_roots([(
+            root.clone(),
+            CorpusOrigin::ProjectCustom,
+            CorpusScope::Project,
+        )]);
+        let file = set.markdown_files().pop().unwrap();
+
+        let moved = parent.path().join("knowledge-moved");
+        std::fs::rename(&root, &moved).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        write(&root.join("source.md"), "# replacement");
+
+        let text = String::from_utf8(file.read_bounded(1024).unwrap()).unwrap();
+        assert_eq!(text, "# original");
     }
 
     #[test]

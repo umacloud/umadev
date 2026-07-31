@@ -50,6 +50,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 use sha2::{Digest as _, Sha256};
+use umadev_state::fs::{RootedDir, RootedEntryKind};
 
 /// Source extensions we extract symbols from. A subset of the acceptance
 /// crate's `SRC_EXT` (we only map *code*, not styles/markup), kept local so
@@ -97,6 +98,8 @@ mod limits {
     pub const MAX_DEPTH: usize = 12;
     /// Max source files scanned.
     pub const MAX_FILES: usize = 4000;
+    /// Max directory entries inspected, including ignored and non-code files.
+    pub const MAX_NODES: usize = 32_000;
     /// Max bytes read per file (a generated bundle can be megabytes — we only
     /// need the top declarations, and a giant minified line is useless anyway).
     pub const MAX_FILE_BYTES: usize = 512 * 1024;
@@ -207,63 +210,92 @@ impl SymbolIndex {
 // File walk (bounded, fail-open) — mirrors acceptance::source_files locally.
 // ---------------------------------------------------------------------------
 
-/// Recursively collect code files under `dir`, bounded by [`limits`].
-fn collect(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-    collect_bounded(dir, out, depth, limits::MAX_FILES);
+#[derive(Debug, Clone)]
+struct RepoFile {
+    relative: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
 }
 
-fn collect_bounded(dir: &Path, out: &mut Vec<PathBuf>, depth: usize, max_files: usize) {
+fn is_code_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| CODE_EXT.contains(&extension.as_str()))
+}
+
+fn collect_bounded(
+    root: &RootedDir,
+    relative_dir: &Path,
+    out: &mut Vec<RepoFile>,
+    depth: usize,
+    visited: &mut usize,
+    max_files: usize,
+    max_nodes: usize,
+) -> std::io::Result<()> {
     if depth > limits::MAX_DEPTH || out.len() >= max_files {
-        return;
+        return Ok(());
     }
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return; // unreadable dir → skip (fail-open)
-    };
-    // `read_dir` order is explicitly unspecified. Sort BEFORE applying the cap,
-    // otherwise two filesystems can index different subsets of the same large
-    // repository and produce different prompts/cache signatures.
-    let mut entries = rd.flatten().collect::<Vec<_>>();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for e in entries {
+    let remaining = max_nodes.saturating_sub(*visited);
+    if remaining == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "repo map exceeds its directory-entry bound",
+        ));
+    }
+    let entries = root.list_entries(relative_dir, remaining)?;
+    *visited = visited.checked_add(entries.len()).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "repo map directory-entry count overflow",
+        )
+    })?;
+    for entry in entries {
         if out.len() >= max_files {
-            return;
+            return Ok(());
         }
-        let p = e.path();
-        // Use the dir entry's file_type when available to avoid an extra stat;
-        // fall back to is_dir() which itself is fail-open (false on error).
-        let is_dir = e
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or_else(|_| p.is_dir());
-        if is_dir {
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+        let path = relative_dir.join(&entry.name);
+        match entry.kind {
+            RootedEntryKind::Directory => {
+                let name = entry.name.to_str().unwrap_or("");
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                    continue;
+                }
+                collect_bounded(root, &path, out, depth + 1, visited, max_files, max_nodes)?;
+            }
+            RootedEntryKind::RegularFile if is_code_path(&path) => out.push(RepoFile {
+                relative: path,
+                len: entry.len,
+                modified: entry.modified,
+            }),
+            RootedEntryKind::RegularFile | RootedEntryKind::Unsafe => {
                 continue;
             }
-            collect_bounded(&p, out, depth + 1, max_files);
-        } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-            // Extension match is case-insensitive (`.RS`, `.PY` on Windows).
-            let ext_lc = ext.to_ascii_lowercase();
-            if CODE_EXT.contains(&ext_lc.as_str()) {
-                out.push(p);
-            }
         }
     }
+    Ok(())
 }
 
-/// Collect the repo's code files (bounded; skips build/vendor/VCS dirs).
-fn code_files(root: &Path) -> Vec<PathBuf> {
+/// Collect the repo's code files beneath one pinned, no-follow root.
+fn code_files(root: &RootedDir, max_files: usize, max_nodes: usize) -> Option<Vec<RepoFile>> {
     let mut files = Vec::new();
-    collect(root, &mut files, 0);
-    // Deterministic order so the index / cache signature is stable.
-    files.sort();
-    files
+    let mut visited = 0usize;
+    collect_bounded(
+        root,
+        Path::new(""),
+        &mut files,
+        0,
+        &mut visited,
+        max_files,
+        max_nodes,
+    )
+    .ok()?;
+    files.sort_by(|left, right| left.relative.cmp(&right.relative));
+    Some(files)
 }
 
-/// Render a path relative to `root` as a `/`-separated string (cross-platform).
-fn rel_display(path: &Path, root: &Path) -> String {
-    let rel = path.strip_prefix(root).unwrap_or(path);
-    rel.to_string_lossy().replace('\\', "/")
+fn rel_display(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,26 +1436,35 @@ pub fn symbol_index(root: &Path) -> SymbolIndex {
 }
 
 /// Scan from scratch (no cache) — exposed for tests and for the cache miss path.
+#[cfg(test)]
 fn scan(root: &Path) -> SymbolIndex {
-    let files = code_files(root);
+    let Ok(rooted) = RootedDir::open_no_follow(root) else {
+        return SymbolIndex::default();
+    };
+    let Some(files) = code_files(&rooted, limits::MAX_FILES, limits::MAX_NODES) else {
+        return SymbolIndex::default();
+    };
+    scan_files(&rooted, &files)
+}
+
+fn scan_files(root: &RootedDir, files: &[RepoFile]) -> SymbolIndex {
     let mut file_syms: Vec<FileSymbols> = Vec::new();
     let mut file_langs: Vec<Lang> = Vec::new();
     let mut file_imports: Vec<Vec<String>> = Vec::new();
     let mut total = 0usize;
-    for path in &files {
+    for file in files {
         if total >= limits::MAX_TOTAL_SYMBOLS {
             break;
         }
-        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+        let Some(ext) = file.relative.extension().and_then(|s| s.to_str()) else {
             continue;
         };
         let Some(lang) = Lang::from_ext(&ext.to_ascii_lowercase()) else {
             continue;
         };
-        // Bounded read: cap bytes so a giant generated file can't OOM us.
-        let text = match read_bounded(path, limits::MAX_FILE_BYTES) {
+        let text = match read_bounded(root, &file.relative, limits::MAX_FILE_BYTES) {
             Some(t) => t,
-            None => continue, // unreadable / non-UTF-8 → skip (fail-open)
+            None => continue,
         };
         let symbols = extract_symbols(&text, lang);
         if symbols.is_empty() {
@@ -1433,7 +1474,7 @@ fn scan(root: &Path) -> SymbolIndex {
         file_imports.push(extract_imports(&text, lang));
         file_langs.push(lang);
         file_syms.push(FileSymbols {
-            rel_path: rel_display(path, root),
+            rel_path: rel_display(&file.relative),
             symbols,
             score: 0.0,
         });
@@ -1447,13 +1488,11 @@ fn scan(root: &Path) -> SymbolIndex {
     index
 }
 
-/// Read up to `max` bytes of a file as UTF-8 (lossy), fail-open to `None`.
-fn read_bounded(path: &Path, max: usize) -> Option<String> {
-    use std::io::Read;
-    let f = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    f.take(max as u64).read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+fn read_bounded(root: &RootedDir, relative: &Path, max: usize) -> Option<String> {
+    let bytes = root
+        .read_prefix(relative, u64::try_from(max).unwrap_or(u64::MAX))
+        .ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -1895,27 +1934,14 @@ const MAX_REPOMAP_SIGNATURE_BYTES: u64 = 32 * 1024 * 1024;
 /// writer's symbol body and return a false cache hit.
 const REPOMAP_SCHEMA_VERSION: u32 = 3;
 
-fn canonical_real_root(root: &Path) -> Option<PathBuf> {
-    let root = std::fs::canonicalize(root).ok()?;
-    umadev_state::fs::real_dir(&root).then_some(root)
+fn read_cache_file(root: &RootedDir, name: &str, max_bytes: u64) -> Option<Vec<u8>> {
+    root.read_bounded(&Path::new(REPOMAP_CACHE_DIR).join(name), max_bytes)
+        .ok()
 }
 
-fn existing_repomap_cache_dir(root: &Path) -> Option<PathBuf> {
-    let root = canonical_real_root(root)?;
-    let umadev = root.join(".umadev");
-    let cache = umadev.join("repomap-cache");
-    (umadev_state::fs::real_dir(&umadev) && umadev_state::fs::real_dir(&cache)).then_some(cache)
-}
-
-fn ensure_repomap_cache_dir(root: &Path) -> Option<PathBuf> {
-    let root = canonical_real_root(root)?;
-    let umadev = umadev_state::fs::ensure_real_child_dir(&root, ".umadev").ok()?;
-    umadev_state::fs::ensure_real_child_dir(&umadev, "repomap-cache").ok()
-}
-
-fn read_cache_file(dir: &Path, name: &str, max_bytes: u64) -> Option<Vec<u8>> {
-    let path = dir.join(name);
-    umadev_state::fs::read_bounded(&path, max_bytes).ok()
+fn ensure_repomap_cache_dir(root: &RootedDir) -> bool {
+    root.ensure_dir(Path::new(".umadev"), false).is_ok()
+        && root.ensure_dir(Path::new(REPOMAP_CACHE_DIR), true).is_ok()
 }
 
 /// One in-process memo entry: the resolved index plus the cheap freshness keys.
@@ -1934,6 +1960,8 @@ struct MemoEntry {
     /// scan so the cache write under `.umadev/` is already accounted for.
     /// `None` when the root is unreadable (then the TTL alone governs).
     root_mtime: Option<std::time::SystemTime>,
+    /// The exact root generation this index came from.
+    root: RootedDir,
 }
 
 /// How long an in-process memo entry is trusted before the next call re-verifies
@@ -1967,6 +1995,9 @@ fn dir_mtime(root: &Path) -> Option<std::time::SystemTime> {
 /// so a real file change still refreshes. Fail-open throughout: a poisoned lock
 /// or a missing entry just takes the full scan.
 fn load_or_scan(root: &Path) -> SymbolIndex {
+    let Ok(rooted) = RootedDir::open_no_follow(root) else {
+        return SymbolIndex::default();
+    };
     let memo_key = root.to_path_buf();
     let now = std::time::Instant::now();
 
@@ -1974,7 +2005,8 @@ fn load_or_scan(root: &Path) -> SymbolIndex {
     // Valid iff inside the TTL AND the root dir's own mtime is unchanged.
     if let Ok(table) = memo_table().lock() {
         if let Some(entry) = table.get(&memo_key) {
-            if entry.root_mtime == dir_mtime(root)
+            if entry.root.matches_path(root).unwrap_or(false)
+                && entry.root_mtime == dir_mtime(root)
                 && now.duration_since(entry.validated_at) < MEMO_TTL
             {
                 return entry.index.clone();
@@ -1984,21 +2016,24 @@ fn load_or_scan(root: &Path) -> SymbolIndex {
 
     // Slow path: the authoritative on-disk-cached full scan. A real change (the
     // TTL elapsed or the dir bumped) always lands here, so correctness holds.
-    let index = load_or_scan_full(root);
+    let index = load_or_scan_full(&rooted);
 
     // Refresh the memo for the next rapid re-open. Capture the root mtime AFTER
     // the scan: writing the cache under `.umadev/` may itself bump it, so a
     // follow-up call's cheap re-stat must compare against the post-write value.
     // Fail-open: a poisoned lock just skips the memo (next call simply re-walks).
     if let Ok(mut table) = memo_table().lock() {
-        table.insert(
-            memo_key,
-            MemoEntry {
-                index: index.clone(),
-                validated_at: now,
-                root_mtime: dir_mtime(root),
-            },
-        );
+        if let Ok(root_capability) = rooted.try_clone() {
+            table.insert(
+                memo_key,
+                MemoEntry {
+                    index: index.clone(),
+                    validated_at: now,
+                    root_mtime: dir_mtime(root),
+                    root: root_capability,
+                },
+            );
+        }
     }
     index
 }
@@ -2007,38 +2042,45 @@ fn load_or_scan(root: &Path) -> SymbolIndex {
 /// scan fresh and refresh the cache. All cache I/O is fail-open: any error
 /// (no dir, corrupt file, write failure) falls through to a live scan and never
 /// surfaces an error.
-fn load_or_scan_full(root: &Path) -> SymbolIndex {
-    let files = code_files(root);
+fn load_or_scan_full(root: &RootedDir) -> SymbolIndex {
+    let Some(files) = code_files(root, limits::MAX_FILES, limits::MAX_NODES) else {
+        return SymbolIndex::default();
+    };
     if files.is_empty() {
         return SymbolIndex::default();
     }
-    let signature = mtime_signature(&files, root);
+    let signature = mtime_signature(&files);
     // Cache hit: signature matches AND the data deserialises.
-    if let Some(cache_dir) = existing_repomap_cache_dir(root) {
-        let stored_sig = read_cache_file(&cache_dir, "signature.txt", MAX_REPOMAP_SIGNATURE_BYTES)
-            .and_then(|bytes| String::from_utf8(bytes).ok());
-        if stored_sig.as_deref() == Some(signature.as_str()) {
-            if let Some(index) =
-                read_cache_file(&cache_dir, "symbols.json", MAX_REPOMAP_CACHE_BYTES)
-                    .and_then(|bytes| decode_index(&bytes, &signature))
-            {
-                return index;
-            }
+    let stored_sig = read_cache_file(root, "signature.txt", MAX_REPOMAP_SIGNATURE_BYTES)
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    if stored_sig.as_deref() == Some(signature.as_str()) {
+        if let Some(index) = read_cache_file(root, "symbols.json", MAX_REPOMAP_CACHE_BYTES)
+            .and_then(|bytes| decode_index(&bytes, &signature))
+        {
+            return index;
         }
     }
 
     // Miss → scan and best-effort write the cache.
-    let index = scan(root);
-    if let (Some(cache_dir), Some(bytes)) = (
-        ensure_repomap_cache_dir(root),
-        encode_index(&index, &signature),
-    ) {
+    let index = scan_files(root, &files);
+    if let Some(bytes) = ensure_repomap_cache_dir(root)
+        .then(|| encode_index(&index, &signature))
+        .flatten()
+    {
         // Body first, signature last: the signature is the generation commit
         // record. The digest inside the body rejects a cross-writer pairing.
-        if umadev_state::fs::atomic_write(&cache_dir.join("symbols.json"), &bytes).is_ok() {
-            let _ = umadev_state::fs::atomic_write(
-                &cache_dir.join("signature.txt"),
+        if root
+            .atomic_write(
+                &Path::new(REPOMAP_CACHE_DIR).join("symbols.json"),
+                &bytes,
+                true,
+            )
+            .is_ok()
+        {
+            let _ = root.atomic_write(
+                &Path::new(REPOMAP_CACHE_DIR).join("signature.txt"),
                 signature.as_bytes(),
+                true,
             );
         }
     }
@@ -2048,8 +2090,8 @@ fn load_or_scan_full(root: &Path) -> SymbolIndex {
 /// Force the next [`symbol_index`] / [`repo_map`] call to re-scan by deleting
 /// the cache signature. Fail-open (a missing cache is a no-op).
 pub fn invalidate_cache(root: &Path) {
-    if let Some(cache_dir) = existing_repomap_cache_dir(root) {
-        let _ = umadev_state::fs::remove_regular_file(&cache_dir.join("signature.txt"));
+    if let Ok(rooted) = RootedDir::open_no_follow(root) {
+        let _ = rooted.remove_regular_file(&Path::new(REPOMAP_CACHE_DIR).join("signature.txt"));
     }
     // Also drop the in-process fast-path memo, else the next call would return
     // the still-fresh memoized index instead of truly re-scanning. Fail-open: a
@@ -2071,18 +2113,16 @@ pub fn invalidate_cache(root: &Path) {
 /// equal byte length within the same second → identical signature → stale
 /// `symbols.json`). Nanosecond mtime (which every modern filesystem tracks)
 /// closes that window at no extra cost.
-fn mtime_signature(files: &[PathBuf], root: &Path) -> String {
+fn mtime_signature(files: &[RepoFile]) -> String {
     let mut entries: Vec<String> = files
         .iter()
-        .filter_map(|p| {
-            let meta = std::fs::metadata(p).ok()?;
-            let mtime = meta
-                .modified()
-                .ok()
+        .map(|file| {
+            let mtime = file
+                .modified
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0u128, |d| d.as_nanos());
-            let rel = rel_display(p, root);
-            Some(format!("{rel}\t{mtime}\t{}", meta.len()))
+            let rel = rel_display(&file.relative);
+            format!("{rel}\t{mtime}\t{}", file.len)
         })
         .collect();
     entries.sort();
@@ -2817,8 +2857,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         write(root, "a.rs", "pub fn one() {}\n");
-        let files = code_files(root);
-        let sig = mtime_signature(&files, root);
+        let rooted = RootedDir::open_no_follow(root).unwrap();
+        let files = code_files(&rooted, limits::MAX_FILES, limits::MAX_NODES).unwrap();
+        let sig = mtime_signature(&files);
         assert!(
             sig.starts_with(&format!("schema=v{REPOMAP_SCHEMA_VERSION}")),
             "signature must be prefixed with the schema version: {sig}"
@@ -2834,13 +2875,88 @@ mod tests {
         write(root, "z.rs", "fn z() {}\n");
         write(root, "b.rs", "fn b() {}\n");
         write(root, "a.rs", "fn a() {}\n");
-        let mut files = Vec::new();
-        collect_bounded(root, &mut files, 0, 2);
+        let rooted = RootedDir::open_no_follow(root).unwrap();
+        let files = code_files(&rooted, 2, limits::MAX_NODES).unwrap();
         let names = files
             .iter()
-            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .filter_map(|file| file.relative.file_name().and_then(|name| name.to_str()))
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn directory_entry_cap_is_enforced_before_collection_grows() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.rs", "fn a() {}\n");
+        write(root, "b.rs", "fn b() {}\n");
+        write(root, "c.rs", "fn c() {}\n");
+        let rooted = RootedDir::open_no_follow(root).unwrap();
+        assert!(
+            code_files(&rooted, limits::MAX_FILES, 2).is_none(),
+            "a directory larger than the node budget must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_links_and_fifos_are_never_followed_or_opened() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "safe.rs", "pub fn safe() {}\n");
+        fs::write(
+            outside.path().join("outside.rs"),
+            "pub fn outside_secret() {}\n",
+        )
+        .unwrap();
+        symlink(outside.path().join("outside.rs"), root.join("linked.rs")).unwrap();
+        symlink(outside.path(), root.join("linked-dir")).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(root.join("blocked.rs"))
+            .status()
+            .unwrap()
+            .success());
+
+        let started = std::time::Instant::now();
+        let index = scan(root);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let symbols = names(&index);
+        assert!(symbols.contains(&"safe".to_string()));
+        assert!(!symbols.contains(&"outside_secret".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_root_is_rejected_and_open_root_generation_stays_pinned() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        write(outside.path(), "outside.rs", "pub fn outside_secret() {}\n");
+        let linked_root = parent.path().join("linked-root");
+        symlink(outside.path(), &linked_root).unwrap();
+        assert!(
+            scan(&linked_root).is_empty(),
+            "a linked root must fail closed"
+        );
+
+        let root = parent.path().join("project");
+        fs::create_dir(&root).unwrap();
+        write(&root, "source.rs", "pub fn original() {}\n");
+        let rooted = RootedDir::open_no_follow(&root).unwrap();
+        let files = code_files(&rooted, limits::MAX_FILES, limits::MAX_NODES).unwrap();
+        let moved = parent.path().join("project-moved");
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        write(&root, "source.rs", "pub fn replacement() {}\n");
+
+        let index = scan_files(&rooted, &files);
+        let symbols = names(&index);
+        assert!(symbols.contains(&"original".to_string()));
+        assert!(!symbols.contains(&"replacement".to_string()));
     }
 
     #[test]
@@ -2872,7 +2988,8 @@ mod tests {
         fs::write(outside.path().join("symbols.json"), "outside-symbols").unwrap();
         symlink(outside.path(), root.join(".umadev").join("repomap-cache")).unwrap();
 
-        let scanned = load_or_scan_full(root);
+        let rooted = RootedDir::open_no_follow(root).unwrap();
+        let scanned = load_or_scan_full(&rooted);
         assert_eq!(
             scanned.symbol_count(),
             1,
@@ -3012,11 +3129,8 @@ mod tests {
     #[test]
     fn rel_display_normalises_separators() {
         // Simulate a Windows-style absolute path under a root.
-        let root = Path::new("C:\\proj");
         let file = Path::new("C:\\proj\\src\\app.ts");
-        // On non-Windows, strip_prefix on these backslash paths won't match, so
-        // we test the normalisation directly on a relative component instead.
-        let rel = rel_display(file, root);
+        let rel = rel_display(file);
         // Whatever the platform, the output must never contain a backslash.
         assert!(
             !rel.contains('\\'),
@@ -3581,9 +3695,10 @@ mod tests {
         );
         write(root, "src/util.ts", "export function util() {}\n");
         // First call scans + writes the cache; second hits the on-disk cache.
-        let first = load_or_scan_full(root);
+        let rooted = RootedDir::open_no_follow(root).unwrap();
+        let first = load_or_scan_full(&rooted);
         assert_eq!(first.edges.len(), 1);
-        let second = load_or_scan_full(root);
+        let second = load_or_scan_full(&rooted);
         assert_eq!(first, second, "edges round-trip through the on-disk cache");
     }
 }

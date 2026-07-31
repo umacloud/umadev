@@ -259,13 +259,16 @@ async fn grok_background_control_is_owned_authoritative_and_idempotent() {
 }
 
 #[test]
-fn every_official_grok_version_advertises_background_control() {
+fn unverified_future_grok_does_not_advertise_background_control() {
     let capabilities = negotiated_capabilities(
         AcpVendor::Grok,
         &json!({
             "protocolVersion":1,
+            "agentCapabilities":{"loadSession":true},
             "_meta":{"grokShell":true,"agentVersion":"99.7.3-future.5+adapter"}
         }),
     );
-    assert!(capabilities.background_process_control);
+    assert!(capabilities.grok_identity);
+    assert!(capabilities.load, "standard ACP remains available");
+    assert!(!capabilities.background_process_control);
 }

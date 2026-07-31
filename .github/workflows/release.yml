@@ -17,8 +17,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release
+  group: release-${{ github.ref }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   # A release tag must pass the same source and distribution checks as an
@@ -44,7 +45,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: xai-org/grok-build
-          ref: 47348d13ec4508dcfe440e34c6d511bb02998fb2
+          ref: 500129c714ad1b10e6095481f4a8387a2ec52649
           path: _upstream/grok-build
           fetch-depth: 1
 
@@ -52,7 +53,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           repository: MoonshotAI/kimi-code
-          ref: f4c3967a417a539372eadab6c809d27b8a14c005
+          ref: 17dfd49768f753a4f0fe97d8e7d3317dab560575
           path: _upstream/kimi-code
           fetch-depth: 1
 
@@ -62,8 +63,15 @@ jobs:
       - name: cargo clippy (all features)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+      # Keep the release gate identical to the ordinary CI contract. These
+      # real process-tree tests are timing-sensitive under a loaded parallel
+      # runner, so CI covers the crate serially and excludes it from the
+      # parallel workspace invocation.
+      - name: Process-tree teardown (serial)
+        run: cargo test -p umadev-process --lib --locked -- --test-threads=1
+
       - name: cargo test
-        run: cargo test --workspace --all-features --all-targets --locked --no-fail-fast
+        run: cargo test --workspace --exclude umadev-process --all-features --all-targets --locked --no-fail-fast
 
       - name: cargo test (doctests)
         run: cargo test --workspace --all-features --doc --locked --no-fail-fast
@@ -86,6 +94,15 @@ jobs:
 
       - name: Verify platform binary header contracts
         run: node --test npm/scripts/verify-platform-binaries.test.mjs
+
+      - name: Verify release provenance, tag-only publishing, and native installers
+        run: >-
+          node --test --test-concurrency=1
+          npm/scripts/release-provenance.test.mjs
+          npm/scripts/release-manifest.test.mjs
+          npm/scripts/grok-published-contract.test.mjs
+          npm/scripts/release-workflow-contract.test.mjs
+          npm/scripts/native-installer-contract.test.cjs
 
       - name: strict rustdoc (all features)
         env:
@@ -140,6 +157,9 @@ jobs:
         with:
           toolchain: ${{ env.UMADEV_RELEASE_RUST }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.UMADEV_RELEASE_NODE }}
       - name: Install and verify Grok's Linux Plan sandbox prerequisite
         if: runner.os == 'Linux'
         shell: bash
@@ -157,41 +177,12 @@ jobs:
           # Grok's read-only profile fail-closes before ACP initialize unless
           # this exact mount-namespace primitive can re-exec the agent.
           bwrap --cap-drop ALL --bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
-      - name: Download and verify the exact official Grok artifact (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          install -d "$RUNNER_TEMP/umadev-grok-contract"
-          binary="$RUNNER_TEMP/umadev-grok-contract/${{ matrix.binary }}"
-          if ! curl --fail --location --silent --show-error --retry 3 \
-            "https://x.ai/cli/${{ matrix.artifact }}" --output "$binary"; then
-            curl --fail --location --silent --show-error --retry 3 \
-              "https://storage.googleapis.com/grok-build-public-artifacts/cli/${{ matrix.artifact }}" \
-              --output "$binary"
-          fi
-          printf '%s  %s\n' '${{ matrix.sha256 }}' "$binary" | shasum -a 256 --check
-          chmod +x "$binary"
-          version=$("$binary" --version)
-          [[ "$version" =~ ^grok\ 0\.2\.112\ \([0-9a-f]+\)$ ]]
-          printf 'UMADEV_GROK_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
-      - name: Download and verify the exact official Grok artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $dir = Join-Path $env:RUNNER_TEMP 'umadev-grok-contract'
-          New-Item -ItemType Directory -Path $dir -Force | Out-Null
-          $binary = Join-Path $dir '${{ matrix.binary }}'
-          try {
-            Invoke-WebRequest -Uri 'https://x.ai/cli/${{ matrix.artifact }}' -OutFile $binary
-          } catch {
-            Invoke-WebRequest -Uri 'https://storage.googleapis.com/grok-build-public-artifacts/cli/${{ matrix.artifact }}' -OutFile $binary
-          }
-          $actual = (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant()
-          if ($actual -ne '${{ matrix.sha256 }}') { throw "Grok artifact SHA-256 mismatch: $actual" }
-          $version = (& $binary --version | Out-String).Trim()
-          if ($version -notmatch '^grok 0\.2\.112 \([0-9a-f]+\)$') { throw "Unexpected Grok version: $version" }
-          "UMADEV_GROK_BIN=$binary" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Download and verify the exact bounded official Grok artifact
+        run: >-
+          node npm/scripts/grok-published-contract.mjs
+          "${{ matrix.artifact }}"
+          "${{ matrix.sha256 }}"
+          "${{ matrix.binary }}"
       - name: Verify real ACP identity and explicit authentication boundary
         env:
           UMADEV_GROK_PUBLISHED_CONTRACT: "1"
@@ -215,7 +206,7 @@ jobs:
         with:
           node-version: "22.19.0"
       - name: Install the exact audited npm package
-        run: npm install -g @moonshot-ai/kimi-code@0.29.1
+        run: npm install -g @moonshot-ai/kimi-code@0.31.0
       - name: Verify real ACP identity and terminal-owned authentication
         env:
           KIMI_CODE_HOME: ${{ runner.temp }}/umadev-kimi-code-home
@@ -252,33 +243,57 @@ jobs:
       # before GitHub assets or npm packages can become visible, so a policy
       # regression cannot create a half-published release.
       - name: Require GitHub Pages to allow this release tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          policies=$(curl --fail --location --silent --show-error \
-            --retry 3 --retry-all-errors \
-            -H 'Accept: application/vnd.github+json' \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/environments/github-pages/deployment-branch-policies")
+          policy_patterns=$(mktemp)
+          trap 'rm -f "$policy_patterns"' EXIT
+          page=1
+          seen=0
+          total=0
+          while :; do
+            policies=$(curl --fail --location --silent --show-error \
+              --retry 3 --retry-all-errors \
+              --connect-timeout 20 --max-time 60 \
+              --max-redirs 5 --proto '=https' --proto-redir '=https' \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/environments/github-pages/deployment-branch-policies?per_page=100&page=$page")
+            total=$(jq -er '.total_count | numbers' <<<"$policies")
+            returned=$(jq -er '.branch_policies | length' <<<"$policies")
+            jq -r '.branch_policies[] | select(.type == "tag") | .name' \
+              <<<"$policies" >> "$policy_patterns"
+            seen=$((seen + returned))
+            (( seen >= total )) && break
+            (( returned > 0 )) || {
+              echo "::error::deployment policy pagination ended after $seen of $total entries"
+              exit 1
+            }
+            page=$((page + 1))
+            (( page <= 100 )) || {
+              echo "::error::deployment policy pagination exceeded 100 pages"
+              exit 1
+            }
+          done
           allowed=false
           while IFS= read -r pattern; do
             if [[ "$RELEASE_TAG" == $pattern ]]; then
               allowed=true
               break
             fi
-          done < <(jq -r '.branch_policies[] | select(.type == "tag") | .name' <<<"$policies")
+          done < "$policy_patterns"
           if [[ "$allowed" != true ]]; then
             echo "::error::github-pages has no tag deployment policy matching $RELEASE_TAG"
             exit 1
           fi
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
           registry-url: "https://registry.npmjs.org"
@@ -286,7 +301,7 @@ jobs:
       # platform build can start, so a missing token can never leave a public
       # GitHub Release behind with npm still on the previous version.
       - name: Require npm publishing credential for tags
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -306,7 +321,7 @@ jobs:
       # Native signing remains optional. Once SIGN_RELEASE=true, all platform
       # signing/notarization credentials become a fail-closed release gate.
       - name: Require native signing credentials for tags
-        if: startsWith(github.ref, 'refs/tags/v') && vars.SIGN_RELEASE == 'true'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.SIGN_RELEASE == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
@@ -387,11 +402,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
-      - name: Verify Windows Job Object process-tree teardown
-        if: runner.os == 'Windows'
+      - name: Process-tree teardown (serial, all platforms)
         run: cargo test -p umadev-process --lib --locked -- --test-threads=1
       - name: cargo test
-        run: cargo test --workspace --all-features --all-targets --locked --no-fail-fast
+        run: cargo test --workspace --exclude umadev-process --all-features --all-targets --locked --no-fail-fast
       - name: cargo test (doctests)
         run: cargo test --workspace --all-features --doc --locked --no-fail-fast
       - name: Verify deterministic TUI terminal contracts
@@ -480,9 +494,10 @@ jobs:
         if: matrix.cross == true
         run: cargo install cross --version 0.2.5 --locked
 
-      # --features vector-local bundles the candle local-embedding backend so the
-      # shipped binary embeds offline (zero user setup). candle is pure Rust on
-      # CPU, so it cross-compiles to every target with the standard toolchain.
+      # --features vector-local bundles the candle local-embedding backend. The
+      # model remains a separately verified Release asset: npm provisions it on
+      # demand, while native installs may point UMADEV_EMBED_MODEL_DIR at it.
+      # candle is pure Rust on CPU and cross-compiles to every target here.
       - name: Build (cargo)
         if: matrix.cross != true
         run: cargo build --release --bin umadev --features vector-local --locked --target ${{ matrix.target }}
@@ -492,7 +507,7 @@ jobs:
         run: cross build --release --bin umadev --features vector-local --locked --target ${{ matrix.target }}
 
       - name: Developer ID sign and notarize (macOS)
-        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'apple-darwin') && vars.SIGN_RELEASE == 'true'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'apple-darwin') && vars.SIGN_RELEASE == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
@@ -539,7 +554,7 @@ jobs:
           spctl --assess --type execute --verbose=4 "$binary"
 
       - name: Authenticode sign and timestamp (Windows)
-        if: startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'windows-msvc') && vars.SIGN_RELEASE == 'true'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && contains(matrix.target, 'windows-msvc') && vars.SIGN_RELEASE == 'true'
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_PFX_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
@@ -620,9 +635,10 @@ jobs:
             "$bin" --version
           fi
 
-      - name: Stage binary into dist/ + npm/
+      - name: Stage binary into dist/
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
           asset="dist/umadev-${{ matrix.target }}${{ matrix.ext }}"
           cp "target/${{ matrix.target }}/release/umadev${{ matrix.ext }}" "$asset"
@@ -637,12 +653,36 @@ jobs:
           const hash = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
           fs.writeFileSync(`${file}.sha256`, `${hash}  ${path.basename(file)}\n`);
           NODE
-          # Also stage into the matching npm sub-package so the publish
-          # job downstream finds binaries ready to ship.
-          ./npm/scripts/stage.sh "${{ matrix.npm_platform }}" \
-              "target/${{ matrix.target }}/release/umadev${{ matrix.ext }}"
 
-      - name: Verify staged package and native binary version
+      - name: Stage tag-bound npm sub-package
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          UMADEV_RELEASE_TAG: ${{ github.ref_name }}
+          UMADEV_RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ./npm/scripts/stage.sh "${{ matrix.npm_platform }}" \
+            "target/${{ matrix.target }}/release/umadev${{ matrix.ext }}"
+
+      - name: Verify native binary version when runnable
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_version=$(node -p "require('./npm/umadev/package.json').version")
+          host_platform="$(node -p "process.platform + '-' + process.arch")"
+          if [ "$host_platform" = "${{ matrix.npm_platform }}" ]; then
+            actual=$("dist/umadev-${{ matrix.target }}${{ matrix.ext }}" --version)
+            case "$actual" in
+              *"$source_version"*) ;;
+              *) echo "::error::native binary reported '$actual', expected $source_version"; exit 1 ;;
+            esac
+          else
+            echo "cross-architecture artifact: runtime smoke deferred ($host_platform)"
+          fi
+
+      - name: Verify tag-bound npm binary provenance
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
           set -euo pipefail
@@ -655,7 +695,7 @@ jobs:
 
           node - \
             "dist/umadev-${{ matrix.target }}${{ matrix.ext }}" \
-            "npm/cli-${{ matrix.npm_platform }}/bin/umadev${{ matrix.ext }}" <<'NODE'
+              "npm/cli-${{ matrix.npm_platform }}/bin/umadev${{ matrix.ext }}" <<'NODE'
           const crypto = require('node:crypto');
           const fs = require('node:fs');
           const digest = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -663,20 +703,12 @@ jobs:
             throw new Error('the npm binary differs from the GitHub Release binary');
           }
           NODE
-
-          host_platform="$(node -p "process.platform + '-' + process.arch")"
-          if [ "$host_platform" = "${{ matrix.npm_platform }}" ]; then
-            actual=$(node npm/umadev/bin/cli.js --version)
-            case "$actual" in
-              *"$source_version"*) ;;
-              *) echo "::error::native binary reported '$actual', expected $source_version"; exit 1 ;;
-            esac
-          else
-            echo "cross-architecture artifact: hash verified; runtime smoke deferred ($host_platform)"
-          fi
+          node npm/scripts/release-provenance.mjs verify-one \
+            npm "${{ matrix.npm_platform }}" "$source_version" \
+            "$GITHUB_REF_NAME" "$GITHUB_SHA"
 
       - name: Attest binary provenance
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: dist/umadev-${{ matrix.target }}${{ matrix.ext }}
@@ -689,23 +721,91 @@ jobs:
           if-no-files-found: error
 
       - name: Upload staged npm sub-package
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: npm-${{ matrix.npm_platform }}
           path: npm/cli-${{ matrix.npm_platform }}/
           if-no-files-found: error
 
+  dispatch-validation:
+    name: workflow dispatch completed (validation only)
+    needs: [build]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Confirm no production surface was invoked
+        run: |
+          echo "workflow_dispatch completed validation and build checks only."
+          echo "GitHub Release, npm, signing, attestation, and website deployment require a pushed v* tag."
+
   publish-github:
     name: publish github release
     needs: [quality, platform-tests, build]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.UMADEV_RELEASE_NODE }}
+          registry-url: "https://registry.npmjs.org"
+      - name: Wait for the immediately preceding public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=$(node -p "require('./npm/umadev/package.json').version")
+          mapfile -t stable_versions < <(
+            sed -n 's/^## \[\([0-9][0-9.]*\)\].*/\1/p' CHANGELOG.md
+          )
+          test "${stable_versions[0]:-}" = "$target" || {
+            echo "::error::CHANGELOG does not lead with release $target"
+            exit 1
+          }
+          previous="${stable_versions[1]:-}"
+          if [[ -z "$previous" ]]; then
+            echo "No preceding stable release is recorded; treating $target as the first release."
+            exit 0
+          fi
+
+          ready=false
+          for attempt in {1..120}; do
+            github_latest=$(timeout --signal=TERM --kill-after=5s 30s \
+              gh release view --repo "$GITHUB_REPOSITORY" \
+                --json tagName --jq '.tagName' 2>/dev/null || true)
+            npm_latest=$(timeout --signal=TERM --kill-after=5s 30s \
+              npm view umadev@latest version \
+                --registry=https://registry.npmjs.org --prefer-online 2>/dev/null || true)
+
+            github_allowed=false
+            npm_allowed=false
+            [[ "$github_latest" == "v$previous" || "$github_latest" == "v$target" ]] \
+              && github_allowed=true
+            [[ "$npm_latest" == "$previous" || "$npm_latest" == "$target" ]] \
+              && npm_allowed=true
+            if [[ "$github_allowed" == true && "$npm_allowed" == true ]]; then
+              ready=true
+              break
+            fi
+            if (( attempt < 120 )); then
+              echo "Waiting for v$previous before v$target (GitHub=${github_latest:-missing}, npm=${npm_latest:-missing})"
+              sleep 10
+            fi
+          done
+          [[ "$ready" == true ]] || {
+            echo "::error::release order blocked: v$target requires GitHub/npm to be at v$previous (or v$target for an idempotent retry), got GitHub=${github_latest:-missing}, npm=${npm_latest:-missing}"
+            exit 1
+          }
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
@@ -778,12 +878,27 @@ jobs:
           # `main`: the same UmaDev tag must always start from the same model.
           MODEL_REV=614241f622f53c4eeff9890bdc4f31cfecc418b3
           BASE="https://huggingface.co/intfloat/multilingual-e5-small/resolve/$MODEL_REV"
-          # --retry-all-errors retries a transient HuggingFace 429/5xx (it once
-          # failed the whole Release); 5 tries with a 15s backoff is plenty.
-          DL="curl --retry 5 --retry-delay 15 --retry-all-errors -fsSL"
-          $DL "$BASE/config.json"       -o model/config.json
-          $DL "$BASE/tokenizer.json"    -o model/tokenizer.json
-          $DL "$BASE/model.safetensors" -o model/model.f32.safetensors
+          # Hashes below bind the bytes; these transport bounds additionally
+          # ensure a stalled/oversized upstream cannot hang or fill the runner.
+          download_model() {
+            local url="$1" output="$2" max_bytes="$3" max_time="$4" actual_bytes
+            curl --fail --location --silent --show-error \
+              --retry 5 --retry-delay 15 --retry-all-errors \
+              --connect-timeout 20 --max-time "$max_time" \
+              --retry-max-time "$max_time" --max-redirs 10 \
+              --max-filesize "$max_bytes" \
+              --proto '=https' --proto-redir '=https' \
+              "$url" --output "$output"
+            actual_bytes=$(wc -c < "$output" | tr -d '[:space:]')
+            (( actual_bytes <= max_bytes )) || {
+              echo "::error::$output exceeded $max_bytes bytes"
+              rm -f "$output"
+              return 1
+            }
+          }
+          download_model "$BASE/config.json" model/config.json 1048576 60
+          download_model "$BASE/tokenizer.json" model/tokenizer.json 67108864 300
+          download_model "$BASE/model.safetensors" model/model.f32.safetensors 536870912 900
           # Verify the immutable upstream bytes, not only the files produced by
           # this run. The model hash is the Git-LFS object oid at MODEL_REV.
           printf '%s  %s\n' \
@@ -805,6 +920,41 @@ jobs:
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
         with:
           subject-path: model/*
+      - name: Create tag and commit bound release manifest
+        run: |
+          set -euo pipefail
+          mkdir -p release-manifest
+          node npm/scripts/release-manifest.mjs create \
+            release-manifest/umadev-release-manifest.json \
+            "$GITHUB_REF_NAME" "$GITHUB_SHA" \
+            dist/umadev-x86_64-unknown-linux-gnu \
+            dist/umadev-x86_64-unknown-linux-gnu.sha256 \
+            dist/umadev-aarch64-unknown-linux-gnu \
+            dist/umadev-aarch64-unknown-linux-gnu.sha256 \
+            dist/umadev-x86_64-unknown-linux-musl \
+            dist/umadev-x86_64-unknown-linux-musl.sha256 \
+            dist/umadev-aarch64-unknown-linux-musl \
+            dist/umadev-aarch64-unknown-linux-musl.sha256 \
+            dist/umadev-aarch64-apple-darwin \
+            dist/umadev-aarch64-apple-darwin.sha256 \
+            dist/umadev-x86_64-apple-darwin \
+            dist/umadev-x86_64-apple-darwin.sha256 \
+            dist/umadev-x86_64-pc-windows-msvc.exe \
+            dist/umadev-x86_64-pc-windows-msvc.exe.sha256 \
+            model/config.json model/config.json.sha256 \
+            model/tokenizer.json model/tokenizer.json.sha256 \
+            model/model.safetensors model/model.safetensors.sha256 \
+            sbom/umadev-${GITHUB_REF_NAME}.spdx.json \
+            sbom/umadev-${GITHUB_REF_NAME}.spdx.json.sha256
+          (
+            cd release-manifest
+            sha256sum umadev-release-manifest.json > umadev-release-manifest.json.sha256
+            sha256sum -c umadev-release-manifest.json.sha256
+          )
+      - name: Attest release manifest provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: release-manifest/*
       # Keep a new Release private until every asset has uploaded and its bytes
       # match the locally verified set. If a retry sees an already-public
       # Release, it is treated as immutable: identical content is a no-op, while
@@ -838,6 +988,8 @@ jobs:
             model/model.safetensors.sha256
             sbom/umadev-${GITHUB_REF_NAME}.spdx.json
             sbom/umadev-${GITHUB_REF_NAME}.spdx.json.sha256
+            release-manifest/umadev-release-manifest.json
+            release-manifest/umadev-release-manifest.json.sha256
           )
 
           for file in "${release_files[@]}"; do
@@ -846,6 +998,31 @@ jobs:
               exit 1
             }
           done
+
+          assert_remote_tag_commit() {
+            local object type sha
+            object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+            type=$(jq -er '.object.type' <<<"$object")
+            sha=$(jq -er '.object.sha' <<<"$object")
+            for _depth in {1..8}; do
+              [[ "$type" == "commit" ]] && break
+              [[ "$type" == "tag" ]] || {
+                echo "::error::release tag resolves to unsupported Git object type: $type"
+                exit 1
+              }
+              object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha")
+              type=$(jq -er '.object.type' <<<"$object")
+              sha=$(jq -er '.object.sha' <<<"$object")
+            done
+            [[ "$type" == "commit" && "$sha" == "$GITHUB_SHA" ]] || {
+              echo "::error::release tag moved: $GITHUB_REF_NAME resolves to $type $sha, workflow commit is $GITHUB_SHA"
+              exit 1
+            }
+          }
+          # Check both before touching a draft and immediately before making it
+          # public. A force-moved tag must never publish bytes built from the old
+          # workflow commit under the new public tag identity.
+          assert_remote_tag_commit
 
           state=missing
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -856,6 +1033,7 @@ jobs:
           if [[ "$state" == "missing" ]]; then
             gh release create "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
               --draft \
               --generate-notes \
               --verify-tag
@@ -899,15 +1077,45 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --dir "$verify_dir"
-          for file in "${release_files[@]}"; do
-            remote="$verify_dir/$(basename "$file")"
-            cmp -s "$file" "$remote" || {
-              echo "::error::published asset bytes differ: $(basename "$file")"
-              exit 1
-            }
-          done
+          node npm/scripts/release-manifest.mjs verify \
+            "$verify_dir/umadev-release-manifest.json" \
+            "$GITHUB_REF_NAME" "$GITHUB_SHA" "$verify_dir"
+          if [[ "$state" == "draft" ]]; then
+            for file in "${release_files[@]}"; do
+              remote="$verify_dir/$(basename "$file")"
+              cmp -s "$file" "$remote" || {
+                echo "::error::uploaded draft asset bytes differ: $(basename "$file")"
+                exit 1
+              }
+            done
+          else
+            # Signed binaries and SPDX creation metadata are intentionally not
+            # byte-reproducible across a workflow rerun. Once a release is public,
+            # treat its exact remote manifest as immutable and verify each remote
+            # file against its already-published checksum instead of comparing it
+            # with newly rebuilt bytes. The npm job below stages these same remote
+            # binaries, so a retry cannot split GitHub and npm artifacts.
+            (
+              cd "$verify_dir"
+              for checksum in *.sha256; do
+                sha256sum -c "$checksum"
+              done
+            )
+          fi
+
+          chmod +x "$verify_dir/umadev-x86_64-unknown-linux-gnu"
+          if ! reported=$(timeout --signal=TERM --kill-after=2s 10s \
+            "$verify_dir/umadev-x86_64-unknown-linux-gnu" --version); then
+            echo "::error::published Linux binary --version failed or timed out"
+            exit 1
+          fi
+          test "${reported,,}" = "umadev ${GITHUB_REF_NAME#v}" || {
+            echo "::error::published Linux binary reports '$reported', expected UmaDev ${GITHUB_REF_NAME#v}"
+            exit 1
+          }
 
           if [[ "$state" == "draft" ]]; then
+            assert_remote_tag_commit
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GITHUB_REPOSITORY" \
               --draft=false \
@@ -929,7 +1137,7 @@ jobs:
     # Never expose the main npm package until those assets are verified public.
     needs: [build, publish-github]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       id-token: write
@@ -940,30 +1148,55 @@ jobs:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
           registry-url: "https://registry.npmjs.org"
 
-      # Pull every staged platform sub-package back into npm/cli-<plat>/.
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: npm-staging
-          pattern: npm-*
-
-      - name: Re-hydrate npm/cli-*/ from staged artifacts
+      # GitHub Release is the canonical byte source for npm, including a rerun
+      # after GitHub succeeded but npm failed. Rebuilding a signed binary or SBOM
+      # is not byte-reproducible, so never publish a retry's rebuilt binary beside
+      # the already-public release asset.
+      - name: Stage npm binaries from the verified public GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UMADEV_RELEASE_TAG: ${{ github.ref_name }}
+          UMADEV_RELEASE_COMMIT: ${{ github.sha }}
+        shell: bash
         run: |
           set -euo pipefail
-          for d in npm-staging/npm-*; do
-            platform="${d##*npm-}"
-            cp -r "$d/." "npm/cli-${platform}/"
-            chmod +x "npm/cli-${platform}/bin/"* 2>/dev/null || true
-          done
-          # Sanity: every sub-package must have its binary.
-          for plat in darwin-arm64 darwin-x64 linux-x64 linux-arm64 linux-musl-x64 linux-musl-arm64 win32-x64; do
-            case "$plat" in win32-x64) bin="umadev.exe" ;; *) bin="umadev" ;; esac
-            test -f "npm/cli-$plat/bin/$bin" || {
-              echo "missing npm/cli-$plat/bin/$bin" >&2; exit 1;
+          mkdir -p release-assets
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets
+          node npm/scripts/release-manifest.mjs verify \
+            release-assets/umadev-release-manifest.json \
+            "$GITHUB_REF_NAME" "$GITHUB_SHA" release-assets
+          (
+            cd release-assets
+            for checksum in *.sha256; do
+              sha256sum -c "$checksum"
+            done
+          )
+          while read -r platform asset; do
+            test -f "release-assets/$asset" || {
+              echo "::error::public GitHub Release is missing $asset"
+              exit 1
             }
-          done
+            ./npm/scripts/stage.sh "$platform" "release-assets/$asset"
+          done <<'ASSETS'
+          darwin-arm64 umadev-aarch64-apple-darwin
+          darwin-x64 umadev-x86_64-apple-darwin
+          linux-x64 umadev-x86_64-unknown-linux-gnu
+          linux-arm64 umadev-aarch64-unknown-linux-gnu
+          linux-musl-x64 umadev-x86_64-unknown-linux-musl
+          linux-musl-arm64 umadev-aarch64-unknown-linux-musl
+          win32-x64 umadev-x86_64-pc-windows-msvc.exe
+          ASSETS
 
       - name: Verify every npm binary matches its OS, CPU, and libc package
         run: node npm/scripts/verify-platform-binaries.mjs
+
+      - name: Verify every npm binary matches this tag and commit
+        run: |
+          version=$(node -p "require('./npm/umadev/package.json').version")
+          node npm/scripts/release-provenance.mjs verify \
+            npm "$version" "$GITHUB_REF_NAME" "$GITHUB_SHA"
 
       # NOTE: the embedding model is NO LONGER published to npm — it's too large
       # (~224MB > npm's limit, which returned 413). It now ships as a GitHub
@@ -978,7 +1211,7 @@ jobs:
   deploy-website:
     name: deploy website from release tag
     needs: [publish-npm]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
       pages: write
@@ -988,8 +1221,9 @@ jobs:
   verify-publication:
     name: verify github, npm, and website publication
     needs: [publish-github, publish-npm, deploy-website]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       deployments: read
@@ -1016,39 +1250,94 @@ jobs:
             @umacloud/knowledge
           )
 
-          release=$(gh release view "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json isDraft,assets)
+          release=$(timeout --signal=TERM --kill-after=5s 30s \
+            gh release view "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,assets)
           test "$(jq -r '.isDraft' <<<"$release")" = "false"
-          test "$(jq '.assets | length' <<<"$release")" -eq 22
+          test "$(jq '.assets | length' <<<"$release")" -eq 24
 
-          for package in "${packages[@]}"; do
-            actual=$(npm view "${package}@latest" version --prefer-online)
-            test "$actual" = "$version" || {
-              echo "::error::$package latest is $actual, expected $version"
-              exit 1
-            }
+          mismatches=()
+          for attempt in {1..12}; do
+            mismatches=()
+            for package in "${packages[@]}"; do
+              actual=$(timeout --signal=TERM --kill-after=5s 30s \
+                npm view "${package}@latest" version \
+                  --registry=https://registry.npmjs.org \
+                  --prefer-online 2>/dev/null || true)
+              [[ "$actual" == "$version" ]] || mismatches+=("$package=${actual:-missing}")
+            done
+            (( ${#mismatches[@]} == 0 )) && break
+            if (( attempt < 12 )); then
+              sleep 10
+            fi
           done
+          if (( ${#mismatches[@]} > 0 )); then
+            printf '::error::npm latest did not converge to %s: %s\n' \
+              "$version" "${mismatches[*]}"
+            exit 1
+          fi
 
-          deployment_id=$(gh api \
-            "repos/$GITHUB_REPOSITORY/deployments?environment=github-pages&per_page=20" \
-            --jq ".[] | select(.sha == \"$GITHUB_SHA\") | .id" | head -1)
+          deployment_id=$(timeout --signal=TERM --kill-after=5s 30s \
+            gh api \
+              "repos/$GITHUB_REPOSITORY/deployments?environment=github-pages&per_page=20" \
+              --jq "map(select(.sha == \"$GITHUB_SHA\")) | first | .id // empty")
           test -n "$deployment_id" || {
             echo "::error::no github-pages deployment was recorded for $GITHUB_SHA"
             exit 1
           }
-          deployment_state=$(gh api \
-            "repos/$GITHUB_REPOSITORY/deployments/$deployment_id/statuses" \
-            --jq '.[0].state')
+          deployment_state=$(timeout --signal=TERM --kill-after=5s 30s \
+            gh api \
+              "repos/$GITHUB_REPOSITORY/deployments/$deployment_id/statuses" \
+              --jq '.[0].state')
           test "$deployment_state" = "success" || {
             echo "::error::github-pages deployment $deployment_id is $deployment_state"
             exit 1
           }
 
-          page=$(curl --fail --location --silent --show-error \
-            --retry 12 --retry-delay 10 --retry-all-errors \
-            https://umadev.goder.ai/)
-          grep -Fq "$version" <<<"$page" || {
-            echo "::error::the public website does not show $version"
-            exit 1
-          }
+          for path in '' 'changelog/'; do
+            visible=false
+            for attempt in {1..12}; do
+              page=$(curl --fail --location --silent --show-error \
+                --retry 3 --retry-delay 2 --retry-all-errors \
+                --connect-timeout 20 --max-time 60 --retry-max-time 60 \
+                --max-redirs 5 --max-filesize 5242880 \
+                --proto '=https' --proto-redir '=https' \
+                "https://umadev.goder.ai/$path" || true)
+              if grep -Fq "$version" <<<"$page"; then
+                visible=true
+                break
+              fi
+              if (( attempt < 12 )); then
+                sleep 10
+              fi
+            done
+            [[ "$visible" == true ]] || {
+              echo "::error::the public website path /$path does not show $version"
+              exit 1
+            }
+          done
+
+          for installer in install.sh install.ps1; do
+            visible=false
+            for attempt in {1..12}; do
+              installer_body=$(curl --fail --location --silent --show-error \
+                --retry 3 --retry-delay 2 --retry-all-errors \
+                --connect-timeout 20 --max-time 60 --retry-max-time 60 \
+                --max-redirs 5 --max-filesize 1048576 \
+                --proto '=https' --proto-redir '=https' \
+                "https://umadev.goder.ai/$installer" || true)
+              if grep -Fq 'umacloud/umadev' <<<"$installer_body" \
+                && grep -Fq 'UMADEV_INSTALL_DIR' <<<"$installer_body"; then
+                visible=true
+                break
+              fi
+              if (( attempt < 12 )); then
+                sleep 10
+              fi
+            done
+            [[ "$visible" == true ]] || {
+              echo "::error::the public website is missing the $installer native installer"
+              exit 1
+            }
+          done

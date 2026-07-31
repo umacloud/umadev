@@ -94,6 +94,20 @@ pub(super) struct PendingHostInput {
 /// while cloning metadata or taking the sender, never across an await.
 pub(super) type HostInputHolder = Arc<std::sync::Mutex<Option<PendingHostInput>>>;
 
+/// Mirror the currently registered resident-input lanes into the UI model.
+/// Registration is owned by a worker task and can disappear on a terminal
+/// route decision without another keypress. Keeping this sync at loop cadence
+/// prevents a completed/failed session from leaving a stale, actionable-looking
+/// native queue pane and queued-count chip on an otherwise idle screen.
+pub(super) fn sync_live_input_readiness(app: &mut App, hub: &super::LiveInputHub) -> bool {
+    let live_ready = hub.is_ready();
+    let queue_ready = hub.prompt_queue_ready();
+    let changed = app.live_input_ready != live_ready || app.prompt_queue.ready() != queue_ready;
+    app.live_input_ready = live_ready;
+    app.prompt_queue.set_ready(queue_ready);
+    changed
+}
+
 pub(super) static NEXT_HOST_INPUT_TOKEN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
@@ -112,10 +126,13 @@ pub(super) fn host_request_is_secret(request: &umadev_runtime::HostRequest) -> b
 
 /// Compact one-line form pinned above the input. Full prompts and options are
 /// emitted into the transcript by [`await_host_input`].
-pub(super) fn host_request_summary(request: &umadev_runtime::HostRequest) -> String {
+pub(super) fn host_request_summary_for_lang(
+    request: &umadev_runtime::HostRequest,
+    lang: umadev_i18n::Lang,
+) -> String {
     match request {
         umadev_runtime::HostRequest::UserInput { questions, .. } => questions.first().map_or_else(
-            || "base requested user input".to_string(),
+            || umadev_i18n::t(lang, "host.input.summary.user").to_string(),
             |question| {
                 question.header.as_ref().map_or_else(
                     || question.prompt.clone(),
@@ -130,17 +147,28 @@ pub(super) fn host_request_summary(request: &umadev_runtime::HostRequest) -> Str
         } => server_name
             .as_ref()
             .map_or_else(|| message.clone(), |server| format!("{server}: {message}")),
+        umadev_runtime::HostRequest::PlanConfirmation { message, .. } => message
+            .clone()
+            .unwrap_or_else(|| umadev_i18n::t(lang, "host.input.summary.plan").to_string()),
         umadev_runtime::HostRequest::FolderTrust { workspace, .. } => {
-            format!("Grok Build folder trust: {}", workspace.display())
+            let workspace = workspace.display().to_string();
+            umadev_i18n::tf(
+                lang,
+                "host.input.summary.folder_trust",
+                &[workspace.as_str()],
+            )
         }
-        _ => "base requested a response".to_string(),
+        _ => umadev_i18n::t(lang, "host.input.summary.response").to_string(),
     }
 }
 
 /// Full visible prompt for a typed request. It includes stable numbered option
 /// labels while retaining protocol values internally; no metadata/payload is
 /// printed because vendor fields may contain sensitive material.
-pub(super) fn host_request_note(request: &umadev_runtime::HostRequest) -> String {
+pub(super) fn host_request_note_for_lang(
+    request: &umadev_runtime::HostRequest,
+    lang: umadev_i18n::Lang,
+) -> String {
     match request {
         umadev_runtime::HostRequest::UserInput {
             questions,
@@ -156,9 +184,10 @@ pub(super) fn host_request_note(request: &umadev_runtime::HostRequest) -> String
                 .get("responseContract")
                 .and_then(serde_json::Value::as_str)
                 .is_some();
-            let mut out = String::from("[input] ");
+            let mut out = format!("{} ", umadev_i18n::t(lang, "host.input.note.marker"));
             if questions.len() > 1 {
-                out.push_str("The base is waiting for structured answers:\n");
+                out.push_str(umadev_i18n::t(lang, "host.input.note.structured_answers"));
+                out.push('\n');
             }
             for (question_index, question) in questions.iter().enumerate() {
                 if question_index > 0 {
@@ -181,13 +210,11 @@ pub(super) fn host_request_note(request: &umadev_runtime::HostRequest) -> String
                 }
             }
             if contract_picker {
-                out.push_str(
-                    "\nAnswer in the picker above the input box (↑↓ move · Space select · Enter confirm · Tab note) — typed free-form text is not read there.",
-                );
+                out.push('\n');
+                out.push_str(umadev_i18n::t(lang, "host.input.note.picker_only"));
             } else if questions.len() > 1 {
-                out.push_str(
-                    "\nReply with one line per question, or a JSON object keyed by question id.",
-                );
+                out.push('\n');
+                out.push_str(umadev_i18n::t(lang, "host.input.note.multi_reply"));
             }
             out
         }
@@ -202,20 +229,40 @@ pub(super) fn host_request_note(request: &umadev_runtime::HostRequest) -> String
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("JSON");
-            format!("[input] {server}: {message}\nExpected response type: {expected}")
+            let details = umadev_i18n::tf(
+                lang,
+                "host.input.note.mcp_expected",
+                &[server, message, expected],
+            );
+            format!(
+                "{} {details}",
+                umadev_i18n::t(lang, "host.input.note.marker")
+            )
         }
         umadev_runtime::HostRequest::FolderTrust {
             cwd,
             workspace,
             config_kinds,
-        } => format!(
-            "[folder trust] Grok Build is waiting before loading project configuration.\nWorkspace: {}\nSession cwd: {}\nConfiguration: {}\nTrust requires a separate explicit confirmation; Auto mode never answers this request.",
-            workspace.display(),
-            cwd.display(),
-            config_kinds.join(", ")
+        } => {
+            let workspace = workspace.display().to_string();
+            let cwd = cwd.display().to_string();
+            let config_kinds = config_kinds.join(", ");
+            umadev_i18n::tf(
+                lang,
+                "host.input.note.folder_trust",
+                &[workspace.as_str(), cwd.as_str(), config_kinds.as_str()],
+            )
+        }
+        _ => format!(
+            "{} {}",
+            umadev_i18n::t(lang, "host.input.note.marker"),
+            host_request_summary_for_lang(request, lang)
         ),
-        _ => format!("[input] {}", host_request_summary(request)),
     }
+}
+
+pub(super) fn host_request_note(request: &umadev_runtime::HostRequest) -> String {
+    host_request_note_for_lang(request, umadev_i18n::current())
 }
 
 pub(super) fn pending_host_input_item(holder: &HostInputHolder) -> Option<HostInputDescriptor> {
@@ -1007,8 +1054,7 @@ async fn await_user_approval_with_auto_release(
             // reports is never a mystery.
             if g.take().is_some() {
                 sink.emit(EngineEvent::Note(
-                    "[note] a newer approval request superseded the earlier unanswered one (it was declined safely)"
-                        .to_string(),
+                    umadev_i18n::tl("host.input.note.approval_superseded").to_string(),
                 ));
             }
             *g = Some(PendingApproval {

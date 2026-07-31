@@ -6181,55 +6181,68 @@ fn file_server_evidence_detection() {
 #[test]
 fn a_context_stands_a_rule_down_only_while_it_is_provably_current() {
     const DAY: u64 = 24 * 60 * 60;
+    const KEY: &[u8] = b"test-only-installation-key-material";
     let now = 1_800_000_000;
     let asked = "make our brand violet";
     let ctx = ProjectContext::unknown()
         .with_purple_allowed(true)
-        .derived_from(asked, now);
+        .derived_from(asked, KEY, now);
 
     // The requirement it was derived from is still the one in force → honoured,
     // however old it is. A violet brand does not expire, and blocking it at the commit
     // gate is exactly the unconvergeable failure this whole mechanism exists to avoid.
-    assert!(ctx.if_current(now, Some(asked)).purple_allowed);
+    assert!(ctx.if_current(now, Some(asked), Some(KEY)).purple_allowed);
     assert!(
-        ctx.if_current(now + 400 * DAY, Some(asked)).purple_allowed,
+        ctx.if_current(now + 400 * DAY, Some(asked), Some(KEY))
+            .purple_allowed,
         "a context that still matches the live requirement is current at any age"
     );
     // Whitespace from a paste is not a different requirement.
     assert!(
-        ctx.if_current(now, Some("  make our brand violet\n"))
+        ctx.if_current(now, Some("  make our brand violet\n"), Some(KEY))
             .purple_allowed
     );
 
     // A DIFFERENT requirement is in force now → the old permission is not evidence.
     assert!(
-        !ctx.if_current(now, Some("rebrand: no purple anywhere"))
+        !ctx.if_current(now, Some("rebrand: no purple anywhere"), Some(KEY))
             .purple_allowed,
         "a permission from another requirement must not stand the band down"
     );
 
     // Nothing to match against (no run has recorded a requirement) → the age fallback.
-    assert!(ctx.if_current(now + DAY, None).purple_allowed);
+    assert!(ctx.if_current(now + DAY, None, Some(KEY)).purple_allowed);
     assert!(
-        !ctx.if_current(now + ProjectContext::MAX_UNMATCHED_AGE_SECS + 1, None)
-            .purple_allowed,
+        !ctx.if_current(
+            now + ProjectContext::MAX_UNMATCHED_AGE_SECS + 1,
+            None,
+            Some(KEY)
+        )
+        .purple_allowed,
         "an un-attributable context stops being evidence once it is stale"
     );
 
     // NO PROVENANCE AT ALL (a legacy file, or one a user dropped in) → strict.
     let unstamped = ProjectContext::unknown().with_purple_allowed(true);
     assert_eq!(
-        unstamped.if_current(now, Some(asked)),
+        unstamped.if_current(now, Some(asked), Some(KEY)),
         ProjectContext::unknown()
     );
-    assert_eq!(unstamped.if_current(now, None), ProjectContext::unknown());
+    assert_eq!(
+        unstamped.if_current(now, None, Some(KEY)),
+        ProjectContext::unknown()
+    );
     // …including the static-frontend leniency, which is a permission too.
     let lenient = ProjectContext::static_frontend();
-    assert!(!lenient.if_current(now, None).static_frontend_only);
+    assert!(
+        !lenient
+            .if_current(now, None, Some(KEY))
+            .static_frontend_only
+    );
     assert!(
         lenient
-            .derived_from(asked, now)
-            .if_current(now, Some(asked))
+            .derived_from(asked, KEY, now)
+            .if_current(now, Some(asked), Some(KEY))
             .static_frontend_only,
         "a stamped, current context still stands the surface rules down"
     );
@@ -6239,20 +6252,93 @@ fn a_context_stands_a_rule_down_only_while_it_is_provably_current() {
 /// "unstamped" sentinel.
 #[test]
 fn requirement_fingerprint_is_stable_and_distinguishing() {
+    const KEY: &[u8] = b"test-only-installation-key-material";
     assert_eq!(
-        requirement_fingerprint("make our brand violet"),
-        requirement_fingerprint("  make our brand violet  ")
+        requirement_fingerprint(KEY, "make our brand violet"),
+        requirement_fingerprint(KEY, "  make our brand violet  ")
     );
     assert_ne!(
-        requirement_fingerprint("make our brand violet"),
-        requirement_fingerprint("make our brand teal")
+        requirement_fingerprint(KEY, "make our brand violet"),
+        requirement_fingerprint(KEY, "make our brand teal")
     );
     assert_ne!(
-        requirement_fingerprint(""),
-        0,
-        "0 is reserved for unstamped"
+        requirement_fingerprint(KEY, "make our brand violet"),
+        requirement_fingerprint(
+            b"another-installation-key-material",
+            "make our brand violet"
+        ),
+        "the persisted value must not be portable to a dictionary made for another key"
     );
-    assert_ne!(requirement_fingerprint("做一个紫色的品牌落地页"), 0);
+    assert_ne!(requirement_fingerprint(KEY, ""), [0; 32]);
+    assert_ne!(
+        requirement_fingerprint(KEY, "做一个紫色的品牌落地页"),
+        [0; 32]
+    );
+}
+
+#[test]
+fn hmac_sha256_matches_rfc_4231_test_case_one() {
+    let expected = [
+        0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1,
+        0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32,
+        0xcf, 0xf7,
+    ];
+    assert_eq!(hmac_sha256(&[0x0b; 20], &[b"Hi There"]), expected);
+}
+
+#[test]
+fn legacy_enumerable_requirement_hash_is_read_but_never_trusted_or_rewritten() {
+    let legacy: ProjectContext = serde_json::from_str(
+        r#"{"static_frontend_only":true,"purple_allowed":true,"requirement_hash":123,"derived_at":1800000000}"#,
+    )
+    .unwrap();
+    assert_eq!(legacy.requirement_hash, 123);
+    assert_eq!(legacy.requirement_fingerprint, [0; 32]);
+    assert_eq!(
+        legacy.if_current(
+            1_800_000_001,
+            Some("a low entropy requirement"),
+            Some(b"test-only-installation-key-material")
+        ),
+        ProjectContext::unknown(),
+        "legacy FNV provenance must fail closed"
+    );
+    assert!(
+        !serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("requirement_hash"),
+        "new writes must not perpetuate the enumerable field"
+    );
+}
+
+#[test]
+fn random_fingerprint_cannot_forge_a_fresh_permission_without_a_valid_context_mac() {
+    const KEY: &[u8] = b"test-only-installation-key-material";
+    let forged: ProjectContext = serde_json::from_value(serde_json::json!({
+        "static_frontend_only": true,
+        "purple_allowed": true,
+        "requirement_fingerprint": vec![7_u8; 32],
+        "provenance_auth": vec![9_u8; 32],
+        "derived_at": 1_800_000_000_u64
+    }))
+    .unwrap();
+    assert_eq!(
+        forged.if_current(1_800_000_001, None, Some(KEY)),
+        ProjectContext::unknown(),
+        "a hook must authenticate the persisted context, not trust a non-zero opaque value"
+    );
+
+    let tampered = ProjectContext::unknown()
+        .with_purple_allowed(true)
+        .derived_from("authorized purple site", KEY, 1_800_000_000);
+    let mut value = serde_json::to_value(tampered).unwrap();
+    value["static_frontend_only"] = serde_json::Value::Bool(true);
+    let tampered: ProjectContext = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        tampered.if_current(1_800_000_001, None, Some(KEY)),
+        ProjectContext::unknown(),
+        "changing a permission-bearing field must invalidate the context MAC"
+    );
 }
 
 /// The default ProjectContext is the conservative `unknown` (surface assumed

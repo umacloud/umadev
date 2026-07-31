@@ -56,7 +56,6 @@
 //! or a failed write degrades to "no recipe" and behaves exactly as before — this
 //! module NEVER panics and NEVER returns an error that could block a delivery.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -660,26 +659,6 @@ fn active_path(dir: &Path) -> PathBuf {
     dir.join(ACTIVE_RECEIPT_FILE)
 }
 
-fn open_no_follow(path: &Path, read: bool, append: bool, create: bool) -> Option<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(read).append(append).create(create);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).ok()?;
-    file.metadata()
-        .is_ok_and(|m| metadata_is_real_file(&m))
-        .then_some(file)
-}
-
 #[cfg(windows)]
 fn atomic_backup_path(path: &Path) -> PathBuf {
     let name = path
@@ -1239,10 +1218,7 @@ fn append_journal_event_unlocked(dir: &Path, event: &JournalEvent) -> bool {
             return false;
         }
     }
-    let Some(mut file) = open_no_follow(&path, false, true, true) else {
-        return false;
-    };
-    file.write_all(line.as_bytes()).is_ok() && file.sync_data().is_ok()
+    umadev_state::fs::append_private_synced(&path, line.as_bytes()).is_ok()
 }
 
 fn remove_active_unlocked(dir: &Path, receipt_id: Option<&str>) {
@@ -1259,7 +1235,7 @@ fn remove_active_unlocked(dir: &Path, receipt_id: Option<&str>) {
         }
     }
     if std::fs::symlink_metadata(&path).is_ok_and(|m| metadata_is_real_file(&m)) {
-        let _ = std::fs::remove_file(path);
+        let _ = umadev_state::fs::remove_regular_file(&path);
     }
 }
 

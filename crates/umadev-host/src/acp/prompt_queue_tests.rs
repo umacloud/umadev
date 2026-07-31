@@ -451,3 +451,134 @@ async fn grok_prompt_queue_is_server_authoritative_and_drains_each_prompt_once()
     exercise_queue_clear(&mut session).await;
     session.end().await.unwrap();
 }
+
+#[test]
+fn fake_unverified_future_grok_child() {
+    let invoked = std::env::args().any(|arg| arg == "--exact")
+        && std::env::args().any(|arg| arg.ends_with("fake_unverified_future_grok_child"));
+    if !invoked {
+        return;
+    }
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    writeln!(stdout).unwrap();
+    stdout.flush().unwrap();
+    for line in stdin.lock().lines().map_while(Result::ok) {
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        match frame.get("method").and_then(Value::as_str) {
+            Some("initialize") => {
+                assert!(
+                    frame["params"]["clientCapabilities"].get("_meta").is_none(),
+                    "future Grok received an unverified private client claim"
+                );
+                emit(
+                    &mut stdout,
+                    json!({
+                        "jsonrpc":"2.0", "id":frame["id"],
+                        "result":{
+                            "protocolVersion":1,
+                            "agentCapabilities":{"loadSession":true},
+                            "_meta":{
+                                "grokShell":true,
+                                "agentVersion":"99.7.3+future.adapter"
+                            }
+                        }
+                    }),
+                );
+            }
+            Some("session/new") => emit(
+                &mut stdout,
+                json!({
+                    "jsonrpc":"2.0", "id":frame["id"],
+                    "result":{"sessionId":"future-standard-session"}
+                }),
+            ),
+            Some(method) => {
+                std::fs::write("unexpected-future-private-method", method).unwrap();
+            }
+            None => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn unverified_future_grok_never_writes_queue_or_other_private_controls() {
+    let executable = std::env::current_exe().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let args = vec![
+        "--exact".to_string(),
+        "acp::prompt_queue_tests::fake_unverified_future_grok_child".to_string(),
+        "--nocapture".to_string(),
+        "--test-threads=1".to_string(),
+    ];
+    let mut session = AcpSession::start_with_program_args_and_firmware_and_policy(
+        AcpVendor::Grok,
+        executable.to_str().unwrap(),
+        args,
+        workspace.path(),
+        "",
+        BasePermissionProfile::Guarded,
+        None,
+        None,
+        SessionOpenPolicy::NonInteractive,
+        FolderTrustClientSurface::Headless,
+        Some(GrokSourceCapabilities::NONE),
+    )
+    .await
+    .map_err(legacy_session_open_error)
+    .unwrap();
+
+    let capabilities = session.capabilities();
+    assert_eq!(capabilities.image_input, InputDelivery::Unsupported);
+    assert_eq!(capabilities.steer, SteerSemantics::Unsupported);
+    assert_eq!(
+        capabilities.prompt_queue,
+        PromptQueueCapability::Unsupported
+    );
+    assert_eq!(
+        capabilities.background_process_control,
+        BackgroundProcessControlCapability::Unsupported
+    );
+    assert!(!capabilities.set_mode);
+
+    assert!(matches!(
+        session
+            .enqueue_input(
+                TurnInput::text("must stay local"),
+                PromptQueuePlacement::Tail
+            )
+            .await,
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::PromptQueue
+        ))
+    ));
+    assert!(matches!(
+        session
+            .mutate_prompt_queue(PromptQueueMutation::Clear)
+            .await,
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::PromptQueue
+        ))
+    ));
+    assert!(matches!(
+        session.steer("must not interject".to_string()).await,
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::MidTurnSteer
+        ))
+    ));
+    assert!(matches!(
+        session.list_background_processes().await,
+        Err(SessionError::CapabilityUnsupported(
+            SessionCapability::BackgroundProcessControl
+        ))
+    ));
+    session.end().await.unwrap();
+
+    assert!(
+        !workspace
+            .path()
+            .join("unexpected-future-private-method")
+            .exists(),
+        "a capability guard leaked an unverified private method to Grok"
+    );
+}

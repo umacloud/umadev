@@ -16,6 +16,7 @@ env:
 concurrency:
   group: github-pages
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build:
@@ -35,6 +36,66 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           cache: npm
           cache-dependency-path: umadev-website/package-lock.json
+
+      # This workflow is also manually dispatchable for recovery. Refuse a
+      # branch or an older tag: otherwise one click can overwrite production
+      # Pages with a website that disagrees with GitHub Releases and npm.
+      # The release caller reaches this job only after npm publication, so the
+      # same gate also prevents out-of-order multi-tag runs from downgrading
+      # Pages if their runner scheduling is reversed.
+      - name: Require the current public release identity
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./npm/umadev/package.json').version")
+          expected_tag="v$version"
+          [[ "$GITHUB_REF" == "refs/tags/$expected_tag" \
+              && "$GITHUB_REF_NAME" == "$expected_tag" ]] || {
+            echo "::error::production Pages may deploy only from $expected_tag, not $GITHUB_REF"
+            exit 1
+          }
+
+          object=$(timeout --signal=TERM --kill-after=5s 30s \
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$expected_tag")
+          type=$(jq -er '.object.type' <<<"$object")
+          sha=$(jq -er '.object.sha' <<<"$object")
+          for _depth in {1..8}; do
+            [[ "$type" == "commit" ]] && break
+            [[ "$type" == "tag" ]] || {
+              echo "::error::release tag resolves to unsupported Git object type: $type"
+              exit 1
+            }
+            object=$(timeout --signal=TERM --kill-after=5s 30s \
+              gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha")
+            type=$(jq -er '.object.type' <<<"$object")
+            sha=$(jq -er '.object.sha' <<<"$object")
+          done
+          [[ "$type" == "commit" && "$sha" == "$GITHUB_SHA" ]] || {
+            echo "::error::$expected_tag resolves to $type $sha, website commit is $GITHUB_SHA"
+            exit 1
+          }
+
+          release=$(timeout --signal=TERM --kill-after=5s 30s \
+            gh release view "$expected_tag" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,tagName)
+          [[ "$(jq -er '.isDraft' <<<"$release")" == "false" \
+              && "$(jq -er '.tagName' <<<"$release")" == "$expected_tag" ]] || {
+            echo "::error::$expected_tag is not a public GitHub Release"
+            exit 1
+          }
+          github_latest=$(timeout --signal=TERM --kill-after=5s 30s \
+            gh release view --repo "$GITHUB_REPOSITORY" \
+              --json tagName --jq '.tagName')
+          npm_latest=$(timeout --signal=TERM --kill-after=5s 30s \
+            npm view umadev@latest version \
+              --registry=https://registry.npmjs.org --prefer-online)
+          [[ "$github_latest" == "$expected_tag" && "$npm_latest" == "$version" ]] || {
+            echo "::error::public release surfaces moved: GitHub=$github_latest npm=$npm_latest expected=$version"
+            exit 1
+          }
 
       - name: Verify release version lock
         working-directory: ${{ github.workspace }}

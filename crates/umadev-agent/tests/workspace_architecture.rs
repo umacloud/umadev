@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use toml::Value;
 
 const HOTSPOT_LINES: &[(&str, usize)] = &[
-    ("crates/umadev-tui/src/app.rs", 18_435),
-    ("crates/umadev-tui/src/lib.rs", 11_920),
-    ("crates/umadev-agent/src/director_loop.rs", 7_142),
-    ("crates/umadev-governance/src/rules.rs", 8_832),
+    ("crates/umadev-tui/src/app.rs", 18_166),
+    ("crates/umadev-tui/src/lib.rs", 11_870),
+    ("crates/umadev-agent/src/director_loop.rs", 7_137),
+    ("crates/umadev-governance/src/rules.rs", 8_781),
 ];
 
 const CONTROL_FLOW_RATCHET_FILES: &[&str] = &[

@@ -284,6 +284,39 @@ mod tests {
     }
 
     #[test]
+    fn catalog_placeholders_match_and_values_cannot_inject_terminal_controls() {
+        let cats = catalogs();
+        for key in cats[Lang::En as usize].keys() {
+            let placeholder_counts: Vec<usize> = Lang::ALL
+                .iter()
+                .map(|lang| cats[*lang as usize][key].matches("{}").count())
+                .collect();
+            assert!(
+                placeholder_counts.windows(2).all(|pair| pair[0] == pair[1]),
+                "catalog key `{key}` has mismatched positional placeholders: \
+                 zh-CN={} zh-TW={} en={}",
+                placeholder_counts[0],
+                placeholder_counts[1],
+                placeholder_counts[2]
+            );
+
+            for lang in Lang::ALL {
+                let value = &cats[lang as usize][key];
+                assert!(
+                    !value.trim().is_empty(),
+                    "catalog {} has an empty value for `{key}`",
+                    lang.code()
+                );
+                assert!(
+                    !value.chars().any(|ch| ch.is_control() && ch != '\n'),
+                    "catalog {} key `{key}` contains a terminal control character",
+                    lang.code()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn retired_backends_are_not_advertised_by_the_catalog() {
         for lang in Lang::ALL {
             for key in [

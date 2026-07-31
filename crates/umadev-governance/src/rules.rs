@@ -9,6 +9,10 @@ use std::sync::OnceLock;
 
 mod deep_nesting;
 pub use deep_nesting::check_deep_nesting;
+mod provenance;
+#[cfg(test)]
+use provenance::hmac_sha256;
+pub use provenance::{privacy_fingerprint, requirement_fingerprint};
 mod debug_residue;
 pub use debug_residue::check_debug_residue;
 mod concurrency;
@@ -143,43 +147,35 @@ pub struct ProjectContext {
     #[serde(default)]
     pub purple_allowed: bool,
 
-    /// **Provenance**: [`requirement_fingerprint`] of the requirement this context was
-    /// derived from. `0` = unknown provenance (a legacy or hand-written file).
+    /// Legacy enumerable provenance written by UmaDev 1.0.70 and older. It remains
+    /// deserializable so old JSON is compatible, but is never serialized or trusted: a raw
+    /// FNV value lets an observer dictionary-test short requirements offline.
     ///
     /// Without this the context is two naked bools with nothing to date or attribute them
     /// to, and a permission is not a fact — it is a fact *about a specific requirement*. A
     /// `purple_allowed: true` left behind by last month's violet rebrand would otherwise
     /// stand the banned-hue band down FOREVER, including for the next requirement, whose
     /// first line is "no purple". See [`ProjectContext::if_current`].
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub requirement_hash: u64,
+
+    /// **Provenance**: keyed [`requirement_fingerprint`] of the requirement this context was
+    /// derived from. An all-zero value is unstamped. The installation key is deliberately
+    /// stored outside the workspace, so leaking this JSON does not permit offline enumeration
+    /// of low-entropy requirements.
+    #[serde(default)]
+    pub requirement_fingerprint: [u8; 32],
+
+    /// Authentication tag over the persisted permission-bearing fields. This lets a hook
+    /// verify a fresh context even while the new requirement is in flight and not yet present
+    /// in workflow state; a merely non-zero fingerprint is never treated as proof.
+    #[serde(default)]
+    pub provenance_auth: [u8; 32],
 
     /// **Provenance**: UNIX seconds at which this context was derived. `0` = unknown (a
     /// legacy or hand-written file). See [`ProjectContext::if_current`].
     #[serde(default)]
     pub derived_at: u64,
-}
-
-/// A stable, dependency-light fingerprint of the requirement a [`ProjectContext`] was
-/// derived from (FNV-1a over the trimmed bytes).
-///
-/// Not a security hash — it answers exactly one question: *is the context on disk the one
-/// this workspace's current requirement produced?* Trimmed, so trailing whitespace from a
-/// paste does not read as a different requirement. Never returns `0`, which is reserved
-/// for "no provenance recorded".
-#[must_use]
-pub fn requirement_fingerprint(requirement: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in requirement.trim().as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    // 0 means "unstamped"; a real fingerprint must never collide with it.
-    if h == 0 {
-        1
-    } else {
-        h
-    }
 }
 
 impl Default for ProjectContext {
@@ -206,6 +202,8 @@ impl ProjectContext {
             static_frontend_only: false,
             purple_allowed: false,
             requirement_hash: 0,
+            requirement_fingerprint: [0; 32],
+            provenance_auth: [0; 32],
             derived_at: 0,
         }
     }
@@ -219,6 +217,8 @@ impl ProjectContext {
             static_frontend_only: true,
             purple_allowed: false,
             requirement_hash: 0,
+            requirement_fingerprint: [0; 32],
+            provenance_auth: [0; 32],
             derived_at: 0,
         }
     }
@@ -229,57 +229,6 @@ impl ProjectContext {
     pub const fn with_purple_allowed(mut self, allowed: bool) -> Self {
         self.purple_allowed = allowed;
         self
-    }
-
-    /// Stamp the context with the PROVENANCE of the requirement it was derived from —
-    /// which requirement, and when. Every producer of a persisted context calls this; a
-    /// context with no stamp cannot be trusted to stand a rule down (see
-    /// [`Self::if_current`]).
-    #[must_use]
-    pub fn derived_from(mut self, requirement: &str, now: u64) -> Self {
-        self.requirement_hash = requirement_fingerprint(requirement);
-        self.derived_at = now;
-        self
-    }
-
-    /// The context AS READ FROM DISK, downgraded to [`Self::unknown`] (full strictness)
-    /// unless it is provably CURRENT.
-    ///
-    /// A persisted context is a **permission** — it stands rules down. The gates that read
-    /// it back (`umadev ci` in the pre-commit hook, the PreToolUse hook) run in a separate
-    /// process, long after the run that wrote it, with no idea what it was derived from.
-    /// So a permission with no provenance is not honoured:
-    ///
-    /// - **No stamp** (empty hash / zero timestamp — a legacy or hand-written file) →
-    ///   strict. We cannot attribute it to anything.
-    /// - **A requirement to check against** (the caller read the workspace's live
-    ///   requirement): the hashes must match. A `purple_allowed: true` derived from last
-    ///   month's "make our brand violet" must NOT stand the band down for today's "no
-    ///   purple anywhere" — and a context that DOES match today's requirement is current
-    ///   regardless of age, so the violet-branded project never gets falsely blocked.
-    /// - **Nothing to check against** (no workspace requirement on record) → the age
-    ///   fallback ([`Self::MAX_UNMATCHED_AGE_SECS`]).
-    ///
-    /// The strict direction is the safe one here: a false block on a color is loud and one
-    /// re-run from fixed, while a silently-permitted AI palette ships.
-    #[must_use]
-    pub fn if_current(self, now: u64, requirement: Option<&str>) -> Self {
-        if self.requirement_hash == 0 || self.derived_at == 0 {
-            return Self::unknown();
-        }
-        match requirement.map(str::trim).filter(|r| !r.is_empty()) {
-            Some(req) => {
-                if requirement_fingerprint(req) == self.requirement_hash {
-                    self
-                } else {
-                    Self::unknown()
-                }
-            }
-            // `saturating_sub` also means a future timestamp (clock skew) reads as fresh —
-            // never as "so stale it must be ignored".
-            None if now.saturating_sub(self.derived_at) <= Self::MAX_UNMATCHED_AGE_SECS => self,
-            None => Self::unknown(),
-        }
     }
 
     /// `true` when surface-bound (server/security) rules should be skipped for

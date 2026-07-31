@@ -20,11 +20,11 @@
 //! is the desired path for "build failed, here's why". Spawn errors
 //! produce a `passed: false` outcome with the OS error as `stderr`.
 
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
@@ -36,6 +36,9 @@ const CAPTURE_CAP: usize = 8 * 1024;
 /// verify plan are workspace-controlled input. Keep those probes bounded so a
 /// malformed file cannot allocate without limit or block on a special file.
 const MAX_VERIFY_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_VERIFY_AUDIT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_VERIFY_AUDIT_RECORD_BYTES: usize = 64 * 1024;
+const VERIFY_AUDIT_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Default per-step timeout (seconds) when neither the step's own
 /// [`VerifyStep::timeout_secs`] nor the `UMADEV_VERIFY_TIMEOUT_SECS`
@@ -1116,24 +1119,77 @@ pub fn record_verify_outcome(
     phase: &str,
     outcome: &VerifyOutcome,
 ) -> std::io::Result<PathBuf> {
-    let audit_dir = workspace.join(".umadev/audit");
-    std::fs::create_dir_all(&audit_dir)?;
-    let path = audit_dir.join("verify.jsonl");
+    let audit_dir =
+        crate::bounded_fs::ensure_real_dir_beneath(workspace, Path::new(".umadev/audit"))?;
+    let managed_path = audit_dir.join("verify.jsonl");
 
     let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let mut row = serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null);
+    let mut row = serde_json::to_value(outcome).map_err(std::io::Error::other)?;
     if let Some(obj) = row.as_object_mut() {
         obj.insert("timestamp".into(), serde_json::Value::String(timestamp));
         obj.insert("phase".into(), serde_json::Value::String(phase.to_string()));
     }
-    let line = serde_json::to_string(&row).unwrap_or_default();
+    let row = umadev_governance::redaction::redact_json(row);
+    let mut line = serde_json::to_vec(&row).map_err(std::io::Error::other)?;
+    if line.len() > MAX_VERIFY_AUDIT_RECORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "verify audit record exceeds the managed file limit",
+        ));
+    }
+    line.push(b'\n');
 
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    writeln!(f, "{line}")?;
-    Ok(path)
+    let lock = umadev_state::fs::open_private_lock(&audit_dir.join(".verify.jsonl.lock"))?;
+    let started = Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= VERIFY_AUDIT_LOCK_TIMEOUT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "verify audit trail is busy in another UmaDev process",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    match std::fs::symlink_metadata(&managed_path) {
+        Ok(metadata) if !umadev_state::fs::metadata_is_real_file(&metadata) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "verify audit path is not a regular non-link file",
+            ));
+        }
+        Ok(metadata)
+            if metadata
+                .len()
+                .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
+                > MAX_VERIFY_AUDIT_BYTES =>
+        {
+            let archive = audit_dir.join("verify.jsonl.1");
+            match std::fs::symlink_metadata(&archive) {
+                Ok(metadata) if !umadev_state::fs::metadata_is_real_file(&metadata) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "verify audit archive is not a regular non-link file",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            umadev_state::fs::replace_regular_file(&managed_path, &archive)?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    umadev_state::fs::append_private(&managed_path, &line)?;
+    Ok(workspace.join(".umadev/audit/verify.jsonl"))
 }
 
 fn truncate_in_place(s: &mut String, cap: usize) {
@@ -1522,6 +1578,45 @@ mod tests {
         }
         let body = fs::read_to_string(tmp.path().join(".umadev/audit/verify.jsonl")).unwrap();
         assert_eq!(body.lines().count(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_outcome_redacts_secrets_and_never_follows_managed_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_log = outside.path().join("verify.jsonl");
+        fs::write(&outside_log, "outside\n").unwrap();
+        let outcome = VerifyOutcome {
+            source_fingerprint: None,
+            project_kind: ProjectKind::Rust,
+            step: "test".into(),
+            command: "cargo test".into(),
+            exit_code: 1,
+            duration_ms: 42,
+            stdout: "api_key=sk-live-super-secret-value".into(),
+            stderr: "Authorization: Bearer live-secret-value".into(),
+            passed: false,
+            skipped: false,
+        };
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        assert!(record_verify_outcome(root.path(), "quality", &outcome).is_err());
+        assert_eq!(fs::read_to_string(&outside_log).unwrap(), "outside\n");
+
+        fs::remove_file(root.path().join(".umadev")).unwrap();
+        let path = record_verify_outcome(root.path(), "quality", &outcome).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(!body.contains("sk-live-super-secret-value"));
+        assert!(!body.contains("live-secret-value"));
+        assert!(body.contains("[redacted]"));
+
+        fs::remove_file(root.path().join(".umadev/audit/verify.jsonl")).unwrap();
+        symlink(&outside_log, root.path().join(".umadev/audit/verify.jsonl")).unwrap();
+        assert!(record_verify_outcome(root.path(), "quality", &outcome).is_err());
+        assert_eq!(fs::read_to_string(&outside_log).unwrap(), "outside\n");
     }
 
     #[test]

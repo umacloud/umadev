@@ -204,17 +204,19 @@ fn audited_grok_baseline_matches_the_wire_contract() {
         );
     }
 
-    // UmaDev deliberately does not re-authenticate an advertised cached token:
-    // initialize has already refreshed and selected it, while Grok's later
-    // cached-token fallback currently replaces the caller's meta before entering
-    // interactive grok.com auth. Keep both sides of that source dependency pinned.
+    // UmaDev deliberately does not re-authenticate an advertised current token.
+    // Grok now gives an expired initialize-time token one bounded refresh attempt;
+    // a current token remains selected without an extra interactive auth request.
+    // Keep both sides of that source dependency pinned.
     let acp_agent = read(
         &root,
         "crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs",
     );
     for marker in [
         "let mut has_cached_token = init_has_current",
-        "self.auth_manager.auth().await.is_ok()",
+        "crate::http::STARTUP_AUTH_REFRESH_TIMEOUT",
+        "self.auth_manager.auth()",
+        "Ok(Ok(_))",
         "self.set_auth_method(default_id)",
         "self.seed_client_config_auth_if_available()",
     ] {
@@ -483,8 +485,8 @@ fn audited_grok_baseline_matches_the_subagent_contract() {
         "subagent replay",
         &[
             "pub(crate) const XAI_SESSION_UPDATE_METHOD: &str = \"_x.ai/session/update\"",
-            "pub max_event_seq: Option<u64>",
-            "pub unfinished_subagents: Vec<(String, String)>",
+            "pub(crate) max_event_seq: Option<u64>",
+            "pub(crate) unfinished_subagents: Vec<(String, String)>",
             "fn collect_unfinished_subagents",
             "Update::SubagentSpawned {",
             "child_session_id",

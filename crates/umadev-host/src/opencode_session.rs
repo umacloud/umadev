@@ -104,6 +104,7 @@ use crate::{
 /// How many events the SSE-reader task may buffer ahead of the consumer.
 const EVENT_CHANNEL_CAP: usize = 256;
 const MAX_INPUT_BODY_BYTES: usize = 24 * 1024 * 1024;
+const MAX_JSON_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SSE_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SERVE_STDOUT_LINE_BYTES: usize = 64 * 1024;
@@ -927,7 +928,7 @@ impl OpenCodeSession {
                 "opencode resume requires a valid session id".to_string(),
             ));
         }
-        // Same posture-scoped floor as a fresh start: a read-only Plan resume on
+        // Same posture-scoped permission floor as a fresh start: a read-only Plan resume on
         // every installed version is allowed; the refreshed runtime ruleset is
         // the authority boundary.
         crate::opencode::ensure_opencode_available(program, workspace)
@@ -1624,10 +1625,8 @@ impl HttpCtx {
         if !resp.status().is_success() {
             return Err(format!("POST /session: HTTP {}", resp.status()));
         }
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("POST /session decode: {e}"))?;
+        let v = decode_bounded_json_response(resp, "POST /session decode", MAX_JSON_RESPONSE_BYTES)
+            .await?;
         v.get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -1645,10 +1644,12 @@ impl HttpCtx {
         if !resp.status().is_success() {
             return Err(format!("GET /session/{session_id}: HTTP {}", resp.status()));
         }
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("GET /session/{session_id} decode: {e}"))?;
+        let value = decode_bounded_json_response(
+            resp,
+            &format!("GET /session/{session_id} decode"),
+            MAX_JSON_RESPONSE_BYTES,
+        )
+        .await?;
         if value.get("id").and_then(Value::as_str) != Some(session_id) {
             return Err(format!(
                 "GET /session/{session_id}: response id does not match"
@@ -1703,10 +1704,12 @@ impl HttpCtx {
         if !resp.status().is_success() {
             return Err(format!("POST /session (fork): HTTP {}", resp.status()));
         }
-        let v: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("POST /session (fork) decode: {e}"))?;
+        let v = decode_bounded_json_response(
+            resp,
+            "POST /session (fork) decode",
+            MAX_JSON_RESPONSE_BYTES,
+        )
+        .await?;
         v.get("id")
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -1943,10 +1946,8 @@ impl HttpCtx {
         if !resp.status().is_success() {
             return Err(format!("children: HTTP {}", resp.status()));
         }
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("children decode: {e}"))?;
+        let value =
+            decode_bounded_json_response(resp, "children decode", MAX_JSON_RESPONSE_BYTES).await?;
         let Some(children) = value.as_array() else {
             return Err("children decode: expected array".to_string());
         };
@@ -1998,10 +1999,9 @@ impl HttpCtx {
         if !resp.status().is_success() {
             return Err(format!("session status: HTTP {}", resp.status()));
         }
-        let value: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("session status decode: {e}"))?;
+        let value =
+            decode_bounded_json_response(resp, "session status decode", MAX_JSON_RESPONSE_BYTES)
+                .await?;
         let Some(statuses) = value.as_object() else {
             return Err("session status decode: expected object".to_string());
         };
@@ -2015,6 +2015,43 @@ impl HttpCtx {
             })
             .collect())
     }
+}
+
+/// Decode one short OpenCode JSON response without allowing a buggy or
+/// compromised local server to grow the host process without bound. The
+/// `Content-Length` check rejects obvious oversize responses before reading;
+/// the streaming check remains authoritative for chunked, compressed, missing,
+/// or dishonest length headers.
+async fn decode_bounded_json_response(
+    response: reqwest::Response,
+    label: &str,
+    max_bytes: usize,
+) -> Result<Value, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(format!(
+            "{label}: response body exceeds the {max_bytes}-byte limit"
+        ));
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .map_or(0, |length| length.min(64 * 1024) as usize);
+    let mut body = Vec::with_capacity(initial_capacity);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("{label}: {error}"))?;
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(format!(
+                "{label}: response body exceeds the {max_bytes}-byte limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body).map_err(|error| format!("{label}: {error}"))
 }
 
 async fn send_event(tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) -> bool {
@@ -3659,6 +3696,67 @@ mod tests {
         let p = random_password();
         assert_eq!(p.len(), 32);
         assert!(p.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    async fn loopback_http_response(raw_response: Vec<u8>) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket.write_all(&raw_response).await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        reqwest::get(format!("http://{addr}/response"))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bounded_json_response_accepts_a_body_at_the_limit() {
+        let body = br#"{"ok":1}"#;
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let mut raw = raw;
+        raw.extend_from_slice(body);
+        let response = loopback_http_response(raw).await;
+
+        let value = decode_bounded_json_response(response, "test", body.len())
+            .await
+            .unwrap();
+        assert_eq!(value, json!({"ok": 1}));
+    }
+
+    #[tokio::test]
+    async fn bounded_json_response_rejects_declared_and_streamed_oversize_bodies() {
+        let declared = loopback_http_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\n123456789".to_vec(),
+        )
+        .await;
+        let error = decode_bounded_json_response(declared, "declared", 8)
+            .await
+            .unwrap_err();
+        assert!(error.contains("declared"));
+        assert!(error.contains("8-byte limit"));
+
+        // No Content-Length: the streaming accumulator must enforce the same
+        // bound instead of trusting headers to describe the decoded body.
+        let streamed = loopback_http_response(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n123456789".to_vec(),
+        )
+        .await;
+        let error = decode_bounded_json_response(streamed, "streamed", 8)
+            .await
+            .unwrap_err();
+        assert!(error.contains("streamed"));
+        assert!(error.contains("8-byte limit"));
     }
 
     // frame translation (the SSE -> event core)

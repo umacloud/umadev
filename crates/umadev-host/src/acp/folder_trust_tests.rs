@@ -271,6 +271,7 @@ async fn interactive_auto_profile_still_requires_exact_human_folder_trust_decisi
         None,
         SessionOpenPolicy::NonInteractive,
         FolderTrustClientSurface::Interactive,
+        Some(audited_grok_test_capabilities()),
     )
     .await
     .unwrap();
@@ -346,6 +347,7 @@ async fn interactive_folder_trust_is_buffered_until_session_new_binds_its_identi
         None,
         SessionOpenPolicy::NonInteractive,
         FolderTrustClientSurface::Interactive,
+        Some(audited_grok_test_capabilities()),
     )
     .await
     .unwrap();

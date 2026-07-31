@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
+use fs2::FileExt as _;
 use umadev_runtime::Runtime;
 use umadev_spec::{Phase, SPEC_VERSION};
 
@@ -68,6 +69,84 @@ const RUN_ARTIFACT_GROUP_BYTES: usize = 12 * 1024 * 1024;
 const RUN_SOURCE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const RUN_KNOWLEDGE_FILE_BYTES: usize = 512 * 1024;
 const RUN_KNOWLEDGE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const RUN_HISTORY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const RUN_HISTORY_RECORD_MAX_BYTES: usize = 64 * 1024;
+const RUN_HISTORY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+pub(crate) fn append_private_run_jsonl(
+    project_root: &Path,
+    filename: &str,
+    row: serde_json::Value,
+) -> std::io::Result<()> {
+    if filename.is_empty() || filename.contains(['/', '\\']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid run-history filename",
+        ));
+    }
+    let dir = crate::bounded_fs::ensure_real_dir_beneath(project_root, Path::new(".umadev"))?;
+    let row = umadev_governance::redaction::redact_json(row);
+    let mut line = serde_json::to_vec(&row).map_err(std::io::Error::other)?;
+    if line.len() > RUN_HISTORY_RECORD_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "run-history record exceeds the managed file limit",
+        ));
+    }
+    line.push(b'\n');
+
+    let path = dir.join(filename);
+    let lock = umadev_state::fs::open_private_lock(&dir.join(format!(".{filename}.lock")))?;
+    let started = std::time::Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= RUN_HISTORY_LOCK_TIMEOUT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "run-history log is busy in another UmaDev process",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if !umadev_state::fs::metadata_is_real_file(&metadata) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "run-history path is not a regular non-link file",
+            ));
+        }
+        Ok(metadata)
+            if metadata
+                .len()
+                .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
+                > RUN_HISTORY_MAX_BYTES =>
+        {
+            let archive = dir.join(format!("{filename}.1"));
+            match std::fs::symlink_metadata(&archive) {
+                Ok(metadata) if !umadev_state::fs::metadata_is_real_file(&metadata) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "run-history archive is not a regular non-link file",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            umadev_state::fs::replace_regular_file(&path, &archive)?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    umadev_state::fs::append_private(&path, &line)
+}
 
 /// Default wall-clock budget for ONE `consult` call (critic / judge / surfacer),
 /// in seconds. These bounded reads must NOT inherit the 600s generation-grade
@@ -1253,9 +1332,9 @@ impl<R: Runtime> AgentRunner<R> {
                         .and_then(|e| e.to_str())
                         .unwrap_or("out")
                 ));
-                let _ = std::fs::write(
+                let _ = crate::phases::atomic_write(
                     &marker,
-                    format!(
+                    &format!(
                         "DEGRADED FALLBACK — phase `{}` ran while the base was offline/empty.\n\
                          This artifact is the OFFLINE PLACEHOLDER TEMPLATE, not real base output.\n\
                          Re-run this phase (/redo) once the base is reachable to replace it.\n",
@@ -1280,23 +1359,13 @@ impl<R: Runtime> AgentRunner<R> {
     /// Record phase timing to `.umadev/phase-timing.jsonl`.
     fn record_phase_timing(&self, phase: Phase, started: std::time::Instant) {
         let elapsed_ms = started.elapsed().as_millis();
-        let dir = self.options.project_root.join(".umadev");
-        let _ = std::fs::create_dir_all(&dir);
         let entry = serde_json::json!({
             "timestamp": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "phase": phase.id(),
             "elapsed_ms": elapsed_ms,
             "slug": self.options.effective_slug(),
         });
-        let path = dir.join("phase-timing.jsonl");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{entry}");
-        }
+        let _ = append_private_run_jsonl(&self.options.project_root, "phase-timing.jsonl", entry);
         self.emit(EngineEvent::Note(format!(
             "[time] {} completed in {:.1}s",
             phase.id(),
@@ -1306,27 +1375,16 @@ impl<R: Runtime> AgentRunner<R> {
 
     /// Write a run summary entry to `.umadev/runs.jsonl` for historical tracking.
     fn record_run_history(&self, final_phase: Phase, passed: bool, artifact_count: usize) {
-        let dir = self.options.project_root.join(".umadev");
-        let _ = std::fs::create_dir_all(&dir);
         let entry = serde_json::json!({
             "timestamp": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "slug": self.options.effective_slug(),
-            "requirement": self.options.requirement,
             "backend": self.options.backend,
             "design_system": self.options.design_system,
             "final_phase": final_phase.id(),
             "quality_passed": passed,
             "artifact_count": artifact_count,
         });
-        let path = dir.join("runs.jsonl");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "{entry}");
-        }
+        let _ = append_private_run_jsonl(&self.options.project_root, "runs.jsonl", entry);
     }
 
     /// Run the workspace's build / install command after a
@@ -1908,9 +1966,10 @@ impl<R: Runtime> AgentRunner<R> {
             } else {
                 umadev_i18n::tl("clarify.offline_placeholder").to_string()
             };
-            if let Some(parent) = clarify_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            crate::bounded_fs::ensure_real_dir_beneath(
+                &self.options.project_root,
+                Path::new("output"),
+            )?;
             // Always replace this run's intake file. Reusing a previous run's
             // questions after a base timeout would silently mix two goals.
             crate::phases::atomic_write(&clarify_path, &questions)?;
@@ -3656,7 +3715,24 @@ impl<R: Runtime> AgentRunner<R> {
             .options
             .project_root
             .join(format!("output/{slug}-contract.md"));
-        let _ = std::fs::remove_file(&contract_path);
+        if crate::bounded_fs::ensure_real_dir_beneath(
+            &self.options.project_root,
+            Path::new("output"),
+        )
+        .is_err()
+        {
+            return;
+        }
+        match std::fs::symlink_metadata(&contract_path) {
+            Ok(metadata) if umadev_state::fs::metadata_is_real_file(&metadata) => {
+                if umadev_state::fs::remove_regular_file(&contract_path).is_err() {
+                    return;
+                }
+            }
+            Ok(_) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
         self.emit(EngineEvent::Note(
             "[contract] 把已批准的三文档蒸馏成绑定流水线契约,后续阶段统一遵循…".to_string(),
         ));
@@ -3665,7 +3741,7 @@ impl<R: Runtime> AgentRunner<R> {
             .await
         {
             if !text.trim().is_empty() {
-                let _ = std::fs::write(&contract_path, &text);
+                let _ = crate::phases::atomic_write(&contract_path, &text);
                 self.emit(EngineEvent::Note(
                     "[contract] 流水线契约已生成,build 阶段将统一遵循。".to_string(),
                 ));
@@ -5163,10 +5239,14 @@ impl<R: Runtime> AgentRunner<R> {
                                 .options
                                 .project_root
                                 .join(format!("output/{slug}-execution-plan.md"));
-                            if let Some(parent) = plan_path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                            if crate::bounded_fs::ensure_real_dir_beneath(
+                                &self.options.project_root,
+                                Path::new("output"),
+                            )
+                            .is_ok()
+                            {
+                                let _ = crate::phases::atomic_write(&plan_path, &text);
                             }
-                            let _ = crate::phases::atomic_write(&plan_path, &text);
                             false
                         } else {
                             true
@@ -5885,10 +5965,14 @@ impl<R: Runtime> AgentRunner<R> {
                         .options
                         .project_root
                         .join(format!("output/{slug}-execution-plan.md"));
-                    if let Some(parent) = plan_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+                    if crate::bounded_fs::ensure_real_dir_beneath(
+                        &self.options.project_root,
+                        Path::new("output"),
+                    )
+                    .is_ok()
+                    {
+                        let _ = crate::phases::atomic_write(&plan_path, &text);
                     }
-                    let _ = crate::phases::atomic_write(&plan_path, &text);
                 } else {
                     spec_degraded = true;
                 }
@@ -6183,10 +6267,14 @@ impl<R: Runtime> AgentRunner<R> {
                             .options
                             .project_root
                             .join(format!("output/{slug}-execution-plan.md"));
-                        if let Some(parent) = plan_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                        if crate::bounded_fs::ensure_real_dir_beneath(
+                            &self.options.project_root,
+                            Path::new("output"),
+                        )
+                        .is_ok()
+                        {
+                            let _ = crate::phases::atomic_write(&plan_path, &text);
                         }
-                        let _ = crate::phases::atomic_write(&plan_path, &text);
                     } else {
                         degraded = true;
                     }
@@ -6333,7 +6421,7 @@ impl<R: Runtime> AgentRunner<R> {
                     .and_then(|e| e.to_str())
                     .unwrap_or("out")
             ));
-            let _ = std::fs::remove_file(&marker);
+            let _ = umadev_state::fs::remove_regular_file(&marker);
         }
     }
 
@@ -6742,6 +6830,37 @@ fn parse_retry_base_ms(raw: Option<&str>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_history_append_redacts_and_never_follows_managed_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_log = outside.path().join("runs.jsonl");
+        std::fs::write(&outside_log, "outside\n").unwrap();
+        let row = serde_json::json!({
+            "slug": "demo",
+            "note": "api_key=sk-live-super-secret-value",
+        });
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        assert!(append_private_run_jsonl(root.path(), "runs.jsonl", row.clone()).is_err());
+        assert_eq!(std::fs::read_to_string(&outside_log).unwrap(), "outside\n");
+
+        std::fs::remove_file(root.path().join(".umadev")).unwrap();
+        append_private_run_jsonl(root.path(), "runs.jsonl", row.clone()).unwrap();
+        let live = root.path().join(".umadev/runs.jsonl");
+        let body = std::fs::read_to_string(&live).unwrap();
+        assert!(!body.contains("sk-live-super-secret-value"));
+        assert!(body.contains("[redacted]"));
+
+        std::fs::remove_file(&live).unwrap();
+        symlink(&outside_log, &live).unwrap();
+        assert!(append_private_run_jsonl(root.path(), "runs.jsonl", row).is_err());
+        assert_eq!(std::fs::read_to_string(&outside_log).unwrap(), "outside\n");
+    }
 
     #[test]
     fn reported_regression_new_run_rebaselines_without_a_phase_checkpoint() {

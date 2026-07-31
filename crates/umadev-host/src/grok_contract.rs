@@ -1,10 +1,14 @@
 //! Runtime identity classification for Grok Build.
 //!
-//! Grok Build's version is diagnostic evidence, not a compatibility gate. UmaDev
-//! accepts every official Grok ACP peer. Standard features are negotiated from ACP
-//! and Grok-specific messages are accepted only through typed, bounded parsers.
-//! The source metadata below records the baseline used by drift CI; it never
-//! decides whether an installed version may run.
+//! Grok Build's version is diagnostic evidence, not a startup compatibility gate.
+//! UmaDev accepts every official Grok ACP peer and negotiates standard features
+//! from live ACP fields. A private wire contract needs stronger evidence: each
+//! capability is enabled only on the source-audited stable compatibility line
+//! (or from an explicit live marker/probe). A newer patch on that same line is
+//! not disabled merely because its patch number is newer than UmaDev's latest
+//! source snapshot: every private parser remains typed and fail-soft. Unknown
+//! release lines keep working through standard ACP without inheriting private
+//! methods whose wire compatibility has not been established.
 
 use semver::Version;
 use serde_json::Value;
@@ -13,10 +17,10 @@ use serde_json::Value;
 pub const GROK_BUILD_SOURCE_REPOSITORY: &str = "https://github.com/xai-org/grok-build";
 
 /// Exact upstream commit used by source-contract drift CI.
-pub const GROK_BUILD_SOURCE_COMMIT: &str = "47348d13ec4508dcfe440e34c6d511bb02998fb2";
+pub const GROK_BUILD_SOURCE_COMMIT: &str = "500129c714ad1b10e6095481f4a8387a2ec52649";
 
 /// Release used as the current source-audited baseline, never as a runtime pin.
-pub const GROK_BUILD_SOURCE_VERSION: &str = "0.2.112";
+pub const GROK_BUILD_SOURCE_VERSION: &str = "0.2.114";
 
 /// `agent-client-protocol` version used by the audited baseline.
 pub const GROK_BUILD_SOURCE_ACP_VERSION: &str = "0.10.4";
@@ -25,6 +29,13 @@ pub const GROK_BUILD_SOURCE_ACP_VERSION: &str = "0.10.4";
 pub const GROK_BUILD_SOURCE_ACP_SCHEMA_VERSION: &str = "0.11.4";
 
 const MAX_AGENT_VERSION_BYTES: usize = 128;
+
+/// Oldest release included in the current private-wire compatibility audit.
+///
+/// This is deliberately not a minimum supported CLI version. Older Grok builds
+/// still start and use their live ACP advertisement; they simply do not receive
+/// private xAI capabilities that UmaDev has not proved for that release.
+const GROK_PRIVATE_CAPABILITY_AUDIT_FLOOR: (u64, u64, u64) = (0, 2, 101);
 
 /// What could be learned about an ACP peer claiming to be Grok Build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +77,12 @@ pub enum GrokSourceCapability {
     BackgroundTasks,
     /// Native `x.ai/task/list` and `x.ai/task/kill` control.
     BackgroundProcessControl,
+    /// Source-shaped tool permission reverse requests.
+    PermissionRequests,
+    /// Private `_x.ai/session/close` graceful shutdown.
+    PrivateSessionClose,
+    /// Standard `session/set_mode` support when the live session omits modes.
+    SetModeFallback,
     /// Native subagent lifecycle carried by rich updates.
     SubagentLifecycle,
     /// Source-specific incremental terminal output semantics.
@@ -76,7 +93,7 @@ pub enum GrokSourceCapability {
 
 impl GrokSourceCapability {
     /// Every source-specific capability represented by this profile.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 18] = [
         Self::ImagePromptFallback,
         Self::DefaultAuthMethod,
         Self::AskUserQuestion,
@@ -89,12 +106,15 @@ impl GrokSourceCapability {
         Self::PromptUsage,
         Self::BackgroundTasks,
         Self::BackgroundProcessControl,
+        Self::PermissionRequests,
+        Self::PrivateSessionClose,
+        Self::SetModeFallback,
         Self::SubagentLifecycle,
         Self::IncrementalTerminalOutput,
         Self::ModelAndCommandCatalog,
     ];
 
-    const fn bit(self) -> u16 {
+    const fn bit(self) -> u32 {
         match self {
             Self::ImagePromptFallback => 1 << 0,
             Self::DefaultAuthMethod => 1 << 1,
@@ -111,6 +131,36 @@ impl GrokSourceCapability {
             Self::PromptQueue => 1 << 12,
             Self::FolderTrust => 1 << 13,
             Self::BackgroundProcessControl => 1 << 14,
+            Self::PermissionRequests => 1 << 15,
+            Self::PrivateSessionClose => 1 << 16,
+            Self::SetModeFallback => 1 << 17,
+        }
+    }
+
+    /// Oldest release for which the capability's present wire shape was
+    /// source-audited and exercised. The match stays per-capability even while
+    /// the current audit floors coincide, so a later upstream change can
+    /// downgrade one private method without disabling unrelated ones.
+    const fn audited_floor(self) -> (u64, u64, u64) {
+        match self {
+            Self::ImagePromptFallback
+            | Self::DefaultAuthMethod
+            | Self::AskUserQuestion
+            | Self::ExitPlanMode
+            | Self::Interject
+            | Self::PromptQueue
+            | Self::FolderTrust
+            | Self::RichSessionUpdates
+            | Self::SessionLoadReplay
+            | Self::PromptUsage
+            | Self::BackgroundTasks
+            | Self::BackgroundProcessControl
+            | Self::PermissionRequests
+            | Self::PrivateSessionClose
+            | Self::SetModeFallback
+            | Self::SubagentLifecycle
+            | Self::IncrementalTerminalOutput
+            | Self::ModelAndCommandCatalog => GROK_PRIVATE_CAPABILITY_AUDIT_FLOOR,
         }
     }
 }
@@ -118,20 +168,68 @@ impl GrokSourceCapability {
 /// Source-shaped parsers available for an official Grok peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrokSourceCapabilities {
-    bits: u16,
+    bits: u32,
 }
 
 impl GrokSourceCapabilities {
     /// No Grok-specific source parser is enabled.
     pub const NONE: Self = Self { bits: 0 };
-    const OFFICIAL_SOURCE_LINEAGE: Self = Self {
-        bits: (1 << 15) - 1,
-    };
+    fn for_compatible_release_lineage(version: &Version) -> Self {
+        // Prereleases can carry an already-audited numeric version while still
+        // containing a different private wire. Keep them on standard ACP until
+        // their exact source is audited or a live capability marker exists.
+        if !version.pre.is_empty() {
+            return Self::NONE;
+        }
+        let Ok(baseline) = Version::parse(GROK_BUILD_SOURCE_VERSION) else {
+            // A malformed compiled-in baseline is a build defect; fail closed
+            // rather than granting every private method.
+            return Self::NONE;
+        };
+        let mut bits = 0;
+        for capability in GrokSourceCapability::ALL {
+            let (major, minor, patch) = capability.audited_floor();
+            let floor = Version::new(major, minor, patch);
+            // Grok is still in the 0.x SemVer era, where a minor-number change
+            // may intentionally break compatibility. Preserve every stable
+            // future PATCH on the source-audited major/minor line, but require
+            // live evidence (or a new source audit) before crossing a minor or
+            // major boundary. This avoids a patch-version lock without blindly
+            // opting an unknown protocol generation into private mutations.
+            if version.major == baseline.major
+                && version.minor == baseline.minor
+                && version >= &floor
+            {
+                bits |= capability.bit();
+            }
+        }
+        Self { bits }
+    }
 
     /// Whether a typed parser exists for one Grok-specific behavior.
     #[must_use]
     pub const fn contains(self, capability: GrokSourceCapability) -> bool {
         self.bits & capability.bit() != 0
+    }
+
+    /// Compact representation used by the ACP reader's atomic capability
+    /// snapshot. Only [`Self::encoded_contains`] should interpret it.
+    #[must_use]
+    pub const fn encoded(self) -> u32 {
+        self.bits
+    }
+
+    /// Test one capability in an atomically transported snapshot.
+    #[must_use]
+    pub const fn encoded_contains(bits: u32, capability: GrokSourceCapability) -> bool {
+        bits & capability.bit() != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn only(capability: GrokSourceCapability) -> Self {
+        Self {
+            bits: capability.bit(),
+        }
     }
 
     /// Whether no Grok-specific parser is enabled.
@@ -169,11 +267,11 @@ impl GrokSourceProfile {
     }
 
     fn official(source_match: GrokSourceMatch, reported_version: Option<Version>) -> Self {
-        Self::new(
-            source_match,
-            reported_version,
-            GrokSourceCapabilities::OFFICIAL_SOURCE_LINEAGE,
-        )
+        let capabilities = reported_version.as_ref().map_or(
+            GrokSourceCapabilities::NONE,
+            GrokSourceCapabilities::for_compatible_release_lineage,
+        );
+        Self::new(source_match, reported_version, capabilities)
     }
 
     /// Identity classification retained for diagnostics and tests.
@@ -194,8 +292,8 @@ impl GrokSourceProfile {
         self.capabilities
     }
 
-    /// A source-shaped parser may run for every official Grok version. Standard
-    /// method calls still require ACP advertisement or a successful response.
+    /// Whether this exact private behavior has source evidence for the reported
+    /// release. This never controls standard ACP startup or advertised methods.
     #[must_use]
     pub const fn supports(&self, capability: GrokSourceCapability) -> bool {
         self.capabilities.contains(capability)
@@ -255,22 +353,52 @@ mod tests {
     }
 
     #[test]
-    fn every_official_version_enables_typed_source_parsers() {
+    fn compatible_stable_patch_line_enables_private_contracts_without_a_ceiling() {
         for version in [
-            Some("0.1.0"),
-            Some(GROK_BUILD_SOURCE_VERSION),
+            "0.2.101",
+            "0.2.109+local.7",
+            GROK_BUILD_SOURCE_VERSION,
+            "0.2.115",
+            "0.2.999+future.patch",
+        ] {
+            let profile = profile(Some(version));
+            assert!(profile.is_grok_shell_identity(), "{version}");
+            for capability in GrokSourceCapability::ALL {
+                assert!(profile.supports(capability), "{version}: {capability:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unverified_versions_keep_identity_but_not_private_capabilities() {
+        for version in [
+            Some("0.2.100"),
             Some("0.2.109-alpha.1"),
-            Some("0.2.109+local.7"),
-            Some("0.99.0"),
-            Some("1.0.0"),
+            Some("0.3.0"),
+            Some("99.7.3+future.adapter"),
             Some("2026-07-22-nightly"),
             Some(""),
             None,
         ] {
             let profile = profile(version);
             assert!(profile.is_grok_shell_identity(), "{version:?}");
+            assert!(profile.capabilities().is_empty(), "{version:?}");
             for capability in GrokSourceCapability::ALL {
-                assert!(profile.supports(capability), "{version:?}: {capability:?}");
+                assert!(!profile.supports(capability), "{version:?}: {capability:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn one_atomic_capability_bit_never_unlocks_a_sibling() {
+        for enabled in GrokSourceCapability::ALL {
+            let snapshot = GrokSourceCapabilities::only(enabled).encoded();
+            for checked in GrokSourceCapability::ALL {
+                assert_eq!(
+                    GrokSourceCapabilities::encoded_contains(snapshot, checked),
+                    checked == enabled,
+                    "{enabled:?} unexpectedly changed {checked:?}"
+                );
             }
         }
     }

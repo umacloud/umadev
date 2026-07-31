@@ -58,6 +58,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 base64 = "0.22"
+# Clipboard helpers on macOS/Windows require a filesystem path. Capture into a
+# private OS-managed temporary directory first, validate the bytes, then publish
+# through the workspace capability so a helper can never follow a swapped
+# project path. Already used by this crate's tests, so this adds no new package.
+tempfile = "3"
 
 # Unix-only: the raw SIGCONT signal number for the job-control-resume self-heal
 # (R5). Pure-Rust bindings only (not a host SDK), and already in the tree via
@@ -73,7 +78,6 @@ libc = "0.2"
 crossterm_winapi = "0.9"
 
 [dev-dependencies]
-tempfile = "3"
 async-trait = { workspace = true }
 # `test-util` unlocks tokio's PAUSED virtual clock (`start_paused`), so the
 # reader's paste-state-aware flush-window tests (Wave 2 P1) assert real timer

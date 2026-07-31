@@ -1918,7 +1918,15 @@ async fn drive_plan_steps(
         let step_kind = step.kind;
         // PLAN RECITATION (bounded): a compact "where we are in the plan" line so the
         // base stays anchored to the whole plan over a long step-by-step run.
-        let plan_progress = plan_progress_recitation(plan, &step_id);
+        let mut plan_progress = plan_progress_recitation(plan, &step_id);
+        if plan_state::is_post_docs_implementation_step(&step, plan) {
+            if let Some((count, context)) = crate::governance_baseline::post_gate_context(options) {
+                events.emit(EngineEvent::Note(format!(
+                    "team · carrying {count} unchanged pre-run governance finding(s) past docs_confirm as bounded implementation context"
+                )));
+                plan_progress.push_str(&context);
+            }
+        }
         let mut step_review_route = route.clone();
         let mut retry_parked_review_once = false;
         if let Some(OperationalReviewCheckpoint::StepReview {
@@ -2683,20 +2691,7 @@ fn confirm_gate_after_step(
         }
         any
     };
-    let doc_seat = |s: Seat| {
-        matches!(
-            s,
-            Seat::ProductManager | Seat::Architect | Seat::UiuxDesigner
-        )
-    };
-    // A DOC-family member is a doc-seat BUILD step that is NOT designer code-phase
-    // PREP — neither the visual-direction step nor the design-tokens deliverable
-    // (both run AFTER the docs are confirmed, and neither may re-fire the gate).
-    let doc_member = |s: &plan_state::PlanStep| {
-        s.kind == plan_state::StepKind::Build
-            && doc_seat(s.seat)
-            && !plan_state::is_design_prep_step(s)
-    };
+    let doc_member = |s: &plan_state::PlanStep| plan_state::is_core_doc_build_step(s);
     if doc_member(step) && family_done(&doc_member) {
         return Some(crate::gates::Gate::DocsConfirm);
     }

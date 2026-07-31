@@ -192,7 +192,7 @@ pub fn extract_backend_routes(project_root: &Path) -> Vec<BackendRoute> {
 
 /// Open one discovered workspace source without following a replacement link,
 /// reject special/reparse nodes, and enforce the byte ceiling on the handle.
-fn read_source_file(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+pub(crate) fn read_source_file(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

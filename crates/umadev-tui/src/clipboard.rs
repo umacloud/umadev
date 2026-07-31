@@ -311,7 +311,7 @@ fn native_clipboard_plan_for(os: &str, wsl: bool) -> NativeClipboardPlan {
 /// [`clipboard_feedback_text`]; generation ordering prevents a late old helper
 /// from replacing a newer copy result.
 fn dispatch_native_clipboard(text: &str) -> bool {
-    let count = text.chars().count();
+    let count = crate::selection::user_perceived_char_count(text);
     let owned = text.to_string();
     dispatch_clipboard_job(count, move || copy_to_clipboard_native(&owned))
 }
@@ -606,7 +606,7 @@ pub(crate) fn finish_mouse_selection_copy(app: &mut crate::app::App, terminal: &
         app.selection_finish_copy()
     };
     if let Some(text) = copied {
-        let count = text.chars().count();
+        let count = crate::selection::user_perceived_char_count(&text);
         if copy_text_to_clipboard(app, terminal, &text) {
             // Remote OSC 52 completes synchronously; local native copy reports
             // its real result asynchronously through the status-area feedback.

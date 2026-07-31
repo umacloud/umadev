@@ -7,7 +7,8 @@ use umadev_runtime::{
     HostAnswer, HostFolderTrustDecision, HostPlanOutcome, HostQuestion, HostQuestionAnnotation,
     HostQuestionKind, HostRequest, HostResponse, HostUserInputOutcome,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::{App, ChatRole};
 
@@ -405,6 +406,82 @@ mod tests {
             .contains("未提供计划内容"));
     }
 
+    #[test]
+    fn grok_plan_wrap_keeps_extended_emoji_atomic_and_paints_tabs() {
+        // 22 narrow cells followed by a two-cell ZWJ grapheme fit exactly in
+        // the 24-cell plan viewport. Scalar-by-scalar folding used to split the
+        // person, skin tone, joiner, and laptop across unrelated rows.
+        let source = format!("{}🧑🏽‍💻\tnext", "a".repeat(22));
+        let rows = wrap_plan_rows(&source);
+        assert_eq!(rows[0], format!("{}🧑🏽‍💻", "a".repeat(22)));
+        assert_eq!(rows[1], " next");
+        assert!(rows.iter().all(|row| !row.contains('\t')));
+        assert!(rows
+            .iter()
+            .all(|row| { unicode_width::UnicodeWidthStr::width_cjk(row.as_str()) <= 24 }));
+    }
+
+    #[test]
+    fn host_input_copy_uses_the_explicit_ui_language() {
+        let empty_question = HostRequest::UserInput {
+            questions: Vec::new(),
+            metadata: serde_json::Value::Null,
+        };
+        assert_eq!(
+            crate::interaction_bridge::host_request_summary_for_lang(
+                &empty_question,
+                umadev_i18n::Lang::ZhCn,
+            ),
+            umadev_i18n::t(umadev_i18n::Lang::ZhCn, "host.input.summary.user")
+        );
+        assert_eq!(
+            crate::interaction_bridge::host_request_summary_for_lang(
+                &empty_question,
+                umadev_i18n::Lang::ZhTw,
+            ),
+            umadev_i18n::t(umadev_i18n::Lang::ZhTw, "host.input.summary.user")
+        );
+
+        let trust = folder_trust_request();
+        let zh_note =
+            crate::interaction_bridge::host_request_note_for_lang(&trust, umadev_i18n::Lang::ZhCn);
+        assert!(zh_note.contains("工作区：/repo/工作区"));
+        assert!(!zh_note.contains("Workspace:"));
+
+        let en_note =
+            crate::interaction_bridge::host_request_note_for_lang(&trust, umadev_i18n::Lang::En);
+        assert!(en_note.contains("Workspace: /repo/工作区"));
+        assert!(!en_note.contains("工作区："));
+    }
+
+    #[test]
+    fn pending_host_input_summary_is_built_from_app_language() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = App::new(
+            "localized-host-summary",
+            crate::config::UserConfig::default(),
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        app.lang = umadev_i18n::Lang::ZhCn;
+        let (_holder, _rx) = install_host_request(
+            &mut app,
+            50,
+            HostRequest::UserInput {
+                questions: Vec::new(),
+                metadata: serde_json::Value::Null,
+            },
+        );
+        let panel = app
+            .pending_host_input
+            .as_ref()
+            .unwrap()
+            .panel_lines(app.lang)
+            .join("\n");
+        assert!(panel.contains("底座请求用户输入"));
+        assert!(!panel.contains("base requested user input"));
+    }
+
     fn folder_trust_request() -> HostRequest {
         HostRequest::FolderTrust {
             cwd: std::path::PathBuf::from("/repo/工作区/app"),
@@ -583,34 +660,6 @@ fn response_contract(request: &HostRequest) -> Option<&str> {
     }
 }
 
-fn request_summary(request: &HostRequest) -> String {
-    match request {
-        HostRequest::UserInput { questions, .. } => questions.first().map_or_else(
-            || "base requested user input".to_string(),
-            |question| {
-                question.header.as_ref().map_or_else(
-                    || question.prompt.clone(),
-                    |header| format!("{header}: {}", question.prompt),
-                )
-            },
-        ),
-        HostRequest::McpElicitation {
-            server_name,
-            message,
-            ..
-        } => server_name
-            .as_ref()
-            .map_or_else(|| message.clone(), |server| format!("{server}: {message}")),
-        HostRequest::PlanConfirmation { message, .. } => message
-            .clone()
-            .unwrap_or_else(|| "Review the proposed plan".to_string()),
-        HostRequest::FolderTrust { workspace, .. } => {
-            format!("Grok Build folder trust: {}", workspace.display())
-        }
-        _ => "base requested a response".to_string(),
-    }
-}
-
 fn request_is_secret(request: &HostRequest) -> bool {
     matches!(
         request,
@@ -622,7 +671,7 @@ fn request_is_secret(request: &HostRequest) -> bool {
 }
 
 impl PendingHostInputView {
-    fn new(descriptor: HostInputDescriptor) -> Self {
+    fn new(descriptor: HostInputDescriptor, lang: umadev_i18n::Lang) -> Self {
         let kind = match &descriptor.request {
             HostRequest::UserInput {
                 questions,
@@ -661,7 +710,10 @@ impl PendingHostInputView {
         };
         Self {
             token: descriptor.token,
-            summary: request_summary(&descriptor.request),
+            summary: crate::interaction_bridge::host_request_summary_for_lang(
+                &descriptor.request,
+                lang,
+            ),
             secret: request_is_secret(&descriptor.request),
             kind,
         }
@@ -902,14 +954,23 @@ fn wrap_plan_rows(plan: &str) -> Vec<String> {
         }
         let mut row = String::new();
         let mut width = 0usize;
-        for ch in source.chars() {
-            let ch_width = ch.width_cjk().unwrap_or(0);
-            if !row.is_empty() && width.saturating_add(ch_width) > VIEW_CELLS {
+        for grapheme in source.graphemes(true) {
+            // Keep extended emoji / combining sequences atomic. Splitting a ZWJ
+            // sequence between panel rows makes each component take unrelated
+            // cells on the next ratatui render. Tabs are otherwise zero-width
+            // controls and disappear, so show the same safe one-cell substitute
+            // used by the composer while retaining every other grapheme verbatim.
+            let (painted, grapheme_width) = if grapheme == "\t" {
+                (" ", 1)
+            } else {
+                (grapheme, grapheme.width_cjk())
+            };
+            if !row.is_empty() && width.saturating_add(grapheme_width) > VIEW_CELLS {
                 rows.push(std::mem::take(&mut row));
                 width = 0;
             }
-            row.push(ch);
-            width = width.saturating_add(ch_width);
+            row.push_str(painted);
+            width = width.saturating_add(grapheme_width);
         }
         rows.push(row);
     }
@@ -1558,7 +1619,7 @@ impl App {
         if entering_secret {
             self.clear_sensitive_edit_recovery();
         }
-        self.pending_host_input = item.map(PendingHostInputView::new);
+        self.pending_host_input = item.map(|item| PendingHostInputView::new(item, self.lang));
         true
     }
 

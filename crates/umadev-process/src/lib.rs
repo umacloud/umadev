@@ -1055,7 +1055,7 @@ impl ManagedChild {
     fn spawn_prepared(mut command: tokio::process::Command) -> std::io::Result<Self> {
         child_reaper()?;
         command.kill_on_drop(true);
-        let mut child = command.spawn()?;
+        let mut child = spawn_managed_child(&mut command)?;
         let tree = match IsolatedCommandTree::attach(&mut child) {
             Ok(tree) => tree,
             Err(error) => {
@@ -1155,6 +1155,21 @@ impl ManagedChild {
             Err(_) => Ok(None),
         }
     }
+}
+
+fn spawn_managed_child(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<tokio::process::Child> {
+    #[cfg(unix)]
+    for _ in 0..30 {
+        match command.spawn() {
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+    command.spawn()
 }
 
 /// Observe an owned Unix child exit without consuming its wait status.

@@ -46,6 +46,7 @@ const SCAN_READER_GRACE: Duration = Duration::from_millis(500);
 
 const MAX_SAST_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SAST_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SECURITY_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 
 /// The outcome class of one scanner invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,14 +513,19 @@ fn collect_config_secret(
 /// Best-effort persist the detailed owned-SAST findings to
 /// `.umadev/audit/sast-findings.json`. Fail-open: a write error is swallowed.
 fn write_sast_findings(project_root: &Path, findings: &[umadev_governance::SastFinding]) {
-    let path = project_root.join(SAST_REL_PATH);
-    if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
+    let Ok(dir) =
+        crate::bounded_fs::ensure_real_dir_beneath(project_root, Path::new(".umadev/audit"))
+    else {
+        return;
+    };
+    let Ok(value) = serde_json::to_value(findings) else {
+        return;
+    };
+    let value = umadev_governance::redaction::redact_json(value);
+    if let Ok(json) = serde_json::to_vec_pretty(&value) {
+        if json.len() <= MAX_SECURITY_ARTIFACT_BYTES {
+            let _ = umadev_state::fs::atomic_write(&dir.join("sast-findings.json"), &json);
         }
-    }
-    if let Ok(json) = serde_json::to_string_pretty(findings) {
-        let _ = std::fs::write(&path, json);
     }
 }
 
@@ -539,12 +545,17 @@ pub fn write_security_scan(
     scan: &SecurityScan,
 ) -> std::io::Result<std::path::PathBuf> {
     let path = project_root.join(SCAN_REL_PATH);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let dir = crate::bounded_fs::ensure_real_dir_beneath(project_root, Path::new(".umadev/audit"))?;
+    let value = serde_json::to_value(scan).map_err(std::io::Error::other)?;
+    let value = umadev_governance::redaction::redact_json(value);
+    let json = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
+    if json.len() > MAX_SECURITY_ARTIFACT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "security scan artifact exceeds the managed file limit",
+        ));
     }
-    let json =
-        serde_json::to_string_pretty(scan).unwrap_or_else(|_| "{\"results\":[]}".to_string());
-    std::fs::write(&path, json)?;
+    umadev_state::fs::atomic_write(&dir.join("security-scan.json"), &json)?;
     Ok(path)
 }
 
@@ -1188,6 +1199,42 @@ mod tests {
         let back: SecurityScan =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back, scan);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn security_artifacts_are_redacted_and_never_follow_managed_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_scan = outside.path().join("security-scan.json");
+        std::fs::write(&outside_scan, "outside").unwrap();
+        let scan = SecurityScan {
+            timestamp: "2026-06-22T00:00:00Z".to_string(),
+            results: vec![ScanResult {
+                tool: "owned-sast".to_string(),
+                category: "secrets".to_string(),
+                status: ScanStatus::Findings,
+                findings: 1,
+                detail: "api_key=sk-live-super-secret-value".to_string(),
+            }],
+        };
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        assert!(write_security_scan(root.path(), &scan).is_err());
+        assert_eq!(std::fs::read_to_string(&outside_scan).unwrap(), "outside");
+
+        std::fs::remove_file(root.path().join(".umadev")).unwrap();
+        let path = write_security_scan(root.path(), &scan).unwrap();
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(!body.contains("sk-live-super-secret-value"));
+        assert!(body.contains("[redacted]"));
+
+        std::fs::remove_file(root.path().join(SCAN_REL_PATH)).unwrap();
+        symlink(&outside_scan, root.path().join(SCAN_REL_PATH)).unwrap();
+        assert!(write_security_scan(root.path(), &scan).is_err());
+        assert_eq!(std::fs::read_to_string(&outside_scan).unwrap(), "outside");
     }
 
     #[test]

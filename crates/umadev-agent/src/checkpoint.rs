@@ -14,6 +14,7 @@
 //! with (does not replace) a base CLI's own per-edit checkpointing.
 
 use std::collections::BTreeSet;
+use std::io::{Seek as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,53 +81,42 @@ fn git_dir(project_root: &Path) -> PathBuf {
     project_root.join(".umadev").join("checkpoints.git")
 }
 
-struct GitInputGuard(PathBuf);
+struct GitInputGuard {
+    root: umadev_state::fs::RootedDir,
+    relative: PathBuf,
+}
 
 impl Drop for GitInputGuard {
     fn drop(&mut self) {
-        let _ = umadev_state::fs::remove_regular_file(&self.0);
+        let _ = self.root.remove_regular_file(&self.relative);
     }
-}
-
-fn open_regular_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path)?;
-    if !file
-        .metadata()
-        .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_file(&metadata))
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Git input is not a regular non-link file",
-        ));
-    }
-    Ok(file)
 }
 
 fn git_input_file(
     project_root: &Path,
     bytes: &[u8],
 ) -> std::io::Result<(std::fs::File, GitInputGuard)> {
-    let directory = git_dir(project_root);
+    let rooted = umadev_state::fs::RootedDir::open(project_root)?;
     for _ in 0..16 {
         let sequence = NEXT_GIT_INPUT.fetch_add(1, Ordering::Relaxed);
-        let path = directory.join(format!("umadev-input-{}-{sequence}", std::process::id()));
-        match umadev_state::fs::write_new_private(&path, bytes) {
-            Ok(()) => {
-                let file = open_regular_no_follow(&path)?;
-                return Ok((file, GitInputGuard(path)));
+        let relative = PathBuf::from(".umadev/checkpoints.git")
+            .join(format!("umadev-input-{}-{sequence}", std::process::id()));
+        match rooted.create_new_private(&relative, false) {
+            Ok(mut file) => {
+                let guard = GitInputGuard {
+                    root: rooted,
+                    relative,
+                };
+                if let Err(error) = file
+                    .write_all(bytes)
+                    .and_then(|()| file.sync_all())
+                    .and_then(|()| file.rewind())
+                {
+                    drop(file);
+                    drop(guard);
+                    return Err(error);
+                }
+                return Ok((file, guard));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -1152,57 +1142,8 @@ fn load_tree(project_root: &Path, revision: &str) -> std::io::Result<Vec<TreeFil
     Ok(entries)
 }
 
-fn validate_live_path(project_root: &Path, relative: &Path) -> std::io::Result<()> {
-    let mut cursor = project_root.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(part) = component else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "unsafe checkpoint path component",
-            ));
-        };
-        cursor.push(part);
-        match std::fs::symlink_metadata(&cursor) {
-            Ok(metadata)
-                if umadev_state::fs::metadata_is_real_dir(&metadata)
-                    || umadev_state::fs::metadata_is_real_file(&metadata) => {}
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "checkpoint restore path contains a symlink/reparse/special entry",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-fn ensure_restore_parent(project_root: &Path, relative: &Path) -> std::io::Result<()> {
-    let Some(parent) = relative.parent() else {
-        return Ok(());
-    };
-    let mut cursor = project_root.to_path_buf();
-    for component in parent.components() {
-        let Component::Normal(part) = component else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "unsafe checkpoint parent component",
-            ));
-        };
-        match umadev_state::fs::ensure_real_child_dir(&cursor, part.to_string_lossy().as_ref()) {
-            Ok(next) => cursor = next,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                cursor.push(part);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
 fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> std::io::Result<()> {
+    let rooted = umadev_state::fs::RootedDir::open(project_root)?;
     let from_paths = from
         .iter()
         .map(|entry| entry.path.as_str())
@@ -1213,7 +1154,7 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
         .collect::<BTreeSet<_>>();
     for path in from_paths.union(&to_paths) {
         let relative = validated_tree_path(path)?;
-        validate_live_path(project_root, &relative)?;
+        rooted.validate_path(&relative)?;
     }
 
     let mut removals = from_paths
@@ -1223,8 +1164,7 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
     removals.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     let mut candidate_dirs = BTreeSet::new();
     for relative in &removals {
-        let absolute = project_root.join(relative);
-        umadev_state::fs::remove_regular_file(&absolute)?;
+        rooted.remove_regular_file(relative)?;
         let mut parent = relative.parent();
         while let Some(directory) = parent.filter(|directory| !directory.as_os_str().is_empty()) {
             candidate_dirs.insert(directory.to_path_buf());
@@ -1234,7 +1174,7 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
     let mut candidate_dirs = candidate_dirs.into_iter().collect::<Vec<_>>();
     candidate_dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for directory in candidate_dirs {
-        match umadev_state::fs::remove_empty_dir(&project_root.join(directory)) {
+        match rooted.remove_empty_dir(&directory) {
             Ok(_) => {}
             Err(error)
                 if matches!(
@@ -1247,25 +1187,13 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
 
     for entry in to {
         let relative = validated_tree_path(&entry.path)?;
-        ensure_restore_parent(project_root, &relative)?;
-        let absolute = project_root.join(&relative);
         #[cfg(unix)]
-        let previous_mode = std::fs::symlink_metadata(&absolute)
-            .ok()
-            .filter(umadev_state::fs::metadata_is_real_file)
-            .map(|metadata| {
-                use std::os::unix::fs::PermissionsExt as _;
-                metadata.permissions().mode() & 0o777
-            });
-        if std::fs::symlink_metadata(&absolute)
-            .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_dir(&metadata))
-        {
-            umadev_state::fs::remove_empty_dir(&absolute)?;
+        let previous_mode = rooted.unix_file_mode(&relative)?;
+        if rooted.is_real_dir(&relative)? {
+            rooted.remove_empty_dir(&relative)?;
         }
-        umadev_state::fs::atomic_write(&absolute, &entry.bytes)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
             // Replacing an existing file must never widen its visibility. Git trees
             // retain only the executable bit, so a deleted file has no trustworthy
             // group/other permissions to restore; recreate it owner-only instead.
@@ -1275,8 +1203,10 @@ fn apply_tree_once(project_root: &Path, from: &[TreeFile], to: &[TreeFile]) -> s
             } else {
                 mode &= !0o111;
             }
-            std::fs::set_permissions(&absolute, std::fs::Permissions::from_mode(mode))?;
+            rooted.atomic_write_with_unix_mode(&relative, &entry.bytes, true, mode)?;
         }
+        #[cfg(not(unix))]
+        rooted.atomic_write(&relative, &entry.bytes, true)?;
     }
     Ok(())
 }
@@ -1797,26 +1727,13 @@ fn marker_is_definitely_absent(path: &Path, error: &std::io::Error) -> bool {
             .is_err_and(|metadata_error| metadata_error.kind() == std::io::ErrorKind::NotFound)
 }
 
-fn remove_marker_leaf_no_follow(path: &Path) -> std::io::Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "rewind marker leaf is a directory",
-            ))
-        }
-        Ok(_) => {
-            umadev_state::fs::retry_transient(|| std::fs::remove_file(path))?;
-            Ok(true)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
+fn remove_marker_leaf_no_follow(project_root: &Path) -> std::io::Result<bool> {
+    umadev_state::fs::RootedDir::open(project_root)?
+        .remove_file_entry(Path::new(TEMP_REWIND_MARKER_REL))
 }
 
 fn invalid_temp_rewind_state(
     project_root: &Path,
-    path: &Path,
     dry_run: bool,
     detail: String,
 ) -> TempRewindState {
@@ -1827,7 +1744,7 @@ fn invalid_temp_rewind_state(
             cleared: false,
         };
     }
-    let cleared = remove_marker_leaf_no_follow(path).unwrap_or(false);
+    let cleared = remove_marker_leaf_no_follow(project_root).unwrap_or(false);
     if cleared {
         clear_workspace_in_past(project_root);
     }
@@ -1866,7 +1783,6 @@ pub fn clear_temp_rewind_state(project_root: &Path, dry_run: bool) -> TempRewind
         Err(error) => {
             return invalid_temp_rewind_state(
                 project_root,
-                &path,
                 dry_run,
                 format!("cannot safely read marker: {error}"),
             );
@@ -1877,7 +1793,6 @@ pub fn clear_temp_rewind_state(project_root: &Path, dry_run: bool) -> TempRewind
         Err(error) => {
             return invalid_temp_rewind_state(
                 project_root,
-                &path,
                 dry_run,
                 format!("marker JSON is invalid: {error}"),
             );
@@ -1890,7 +1805,7 @@ pub fn clear_temp_rewind_state(project_root: &Path, dry_run: bool) -> TempRewind
         return TempRewindState::Recoverable { head };
     }
     if !dry_run {
-        if let Err(error) = umadev_state::fs::remove_regular_file(&path) {
+        if let Err(error) = remove_marker_leaf_no_follow(project_root) {
             mark_workspace_in_past(project_root, InPastReason::Unrecoverable);
             return TempRewindState::Invalid {
                 detail: format!("cannot remove stale marker: {error}"),
@@ -1972,19 +1887,22 @@ fn write_temp_rewind_marker(root: &Path, head: &str, to: &str) -> bool {
         boot: crate::run_lock::boot_id(),
         host: crate::run_lock::hostname(),
     };
-    let Ok(directory) = umadev_state::fs::ensure_real_child_dir(root, ".umadev") else {
+    let Ok(rooted) = umadev_state::fs::RootedDir::open(root) else {
         return false;
     };
-    let path = directory.join("temp-rewind.json");
     serde_json::to_vec(&marker)
         .ok()
         .filter(|body| body.len() <= MAX_TEMP_REWIND_MARKER_BYTES)
-        .is_some_and(|body| umadev_state::fs::atomic_write(&path, &body).is_ok())
+        .is_some_and(|body| {
+            rooted
+                .atomic_write(Path::new(TEMP_REWIND_MARKER_REL), &body, true)
+                .is_ok()
+        })
 }
 
 /// Delete the crash marker — called ONLY after the tree is verified back at head.
 fn clear_temp_rewind_marker(root: &Path) {
-    let _ = umadev_state::fs::remove_regular_file(&root.join(TEMP_REWIND_MARKER_REL));
+    let _ = remove_marker_leaf_no_follow(root);
 }
 
 /// Workspace-integrity notices raised OUT OF BAND — outside any turn, before any UI exists.
@@ -2266,7 +2184,7 @@ pub fn recover_abandoned_temp_rewind(project_root: &Path) -> Option<String> {
             &[&marker.head, &path.display().to_string(), &manual],
         ));
     }
-    let _ = std::fs::remove_file(&path);
+    clear_temp_rewind_marker(project_root);
     clear_workspace_in_past(project_root);
     tracing::warn!(
         head = %marker.head,
@@ -2624,6 +2542,34 @@ mod tests {
         .is_ok_and(|output| {
             !output.timed_out && output.status.is_some_and(|status| status.success())
         })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_input_cleanup_stays_with_the_original_workspace_root() {
+        use std::os::unix::fs::symlink;
+
+        let container = tempfile::tempdir().unwrap();
+        let project = container.path().join("project");
+        let moved = container.path().join("moved");
+        let outside = container.path().join("outside");
+        std::fs::create_dir_all(project.join(".umadev/checkpoints.git")).unwrap();
+        std::fs::create_dir_all(outside.join(".umadev/checkpoints.git")).unwrap();
+
+        let (file, guard) = git_input_file(&project, b"private stdin").unwrap();
+        let relative = guard.relative.clone();
+        drop(file);
+        std::fs::rename(&project, &moved).unwrap();
+        std::fs::write(outside.join(&relative), b"outside keep").unwrap();
+        symlink(&outside, &project).unwrap();
+
+        drop(guard);
+
+        assert!(!moved.join(&relative).exists());
+        assert_eq!(
+            std::fs::read(outside.join(&relative)).unwrap(),
+            b"outside keep"
+        );
     }
 
     #[cfg(unix)]
@@ -3535,6 +3481,27 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "do-not-touch");
         let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn doctor_fix_never_removes_a_marker_through_a_linked_state_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_marker = outside.path().join("temp-rewind.json");
+        std::fs::write(&outside_marker, "not-json").unwrap();
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+
+        let result = clear_temp_rewind_state(root.path(), false);
+
+        assert!(matches!(
+            result,
+            TempRewindState::Invalid { cleared: false, .. }
+        ));
+        assert_eq!(std::fs::read_to_string(outside_marker).unwrap(), "not-json");
+        clear_workspace_in_past(root.path());
     }
 
     #[test]

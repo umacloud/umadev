@@ -37,7 +37,6 @@
 //!   process); the agent runner caches it for the pipeline lifetime.
 
 use std::collections::HashSet;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Why a policy load did not yield a parsed user policy. Lets the loader tell a
@@ -56,6 +55,7 @@ enum PolicyLoadError {
 
 /// Per-project governance policy loaded from `.umadev/rules.toml`.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     /// Rules the project has chosen to disable.
     #[serde(default)]
@@ -70,6 +70,7 @@ pub struct Policy {
 
 /// `[disabled]` section.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DisabledSection {
     /// Rule ids to turn off. The key remains `clauses` for file compatibility.
     #[serde(default)]
@@ -78,6 +79,7 @@ pub struct DisabledSection {
 
 /// `[exclusions]` section.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExclusionsSection {
     /// Path globs/patterns to skip (suffix or `**` wildcard match).
     #[serde(default)]
@@ -86,6 +88,7 @@ pub struct ExclusionsSection {
 
 /// `[extra]` section — project-specific additions.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExtraSection {
     /// Extra malicious domains to block (merged with built-ins).
     #[serde(default)]
@@ -106,6 +109,12 @@ fn canonical_rule_id(rule_id: &str) -> String {
 impl Policy {
     /// A governance policy is configuration, not an unbounded data store.
     const MAX_POLICY_BYTES: u64 = 1024 * 1024;
+    const MAX_EXCLUSION_PATTERNS: usize = 256;
+    const MAX_GLOB_BYTES: usize = 1024;
+    const MAX_GLOB_SEGMENTS: usize = 64;
+    const MAX_GLOB_STARS: usize = 64;
+    const MAX_MATCH_PATH_BYTES: usize = 16 * 1024;
+    const MAX_MATCH_PATH_SEGMENTS: usize = 256;
 
     /// Load the policy from `<project_root>/.umadev/rules.toml`.
     /// Fail-open: a missing or unparseable file returns the default policy
@@ -196,7 +205,29 @@ impl Policy {
             };
         let text = String::from_utf8(bytes)
             .map_err(|_| PolicyLoadError::Read("policy is not valid UTF-8".to_owned()))?;
-        toml::from_str(&text).map_err(|e| PolicyLoadError::Parse(e.to_string()))
+        let policy: Self =
+            toml::from_str(&text).map_err(|e| PolicyLoadError::Parse(e.to_string()))?;
+        policy.validate_limits()?;
+        Ok(policy)
+    }
+
+    fn validate_limits(&self) -> Result<(), PolicyLoadError> {
+        if self.exclusions.paths.len() > Self::MAX_EXCLUSION_PATTERNS {
+            return Err(PolicyLoadError::Parse(
+                "too many exclusion patterns".to_owned(),
+            ));
+        }
+        if self
+            .exclusions
+            .paths
+            .iter()
+            .any(|pattern| !valid_glob_pattern(pattern))
+        {
+            return Err(PolicyLoadError::Parse(
+                "an exclusion pattern exceeds the safe matcher limits".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Write the default policy template to `<project_root>/.umadev/rules.toml`
@@ -206,29 +237,38 @@ impl Policy {
     /// # Errors
     /// Returns an error only on filesystem failure (not on the file existing).
     pub fn write_default_template(project_root: &Path) -> std::io::Result<PathBuf> {
-        let dir = project_root.join(".umadev");
-        let path = dir.join("rules.toml");
-        std::fs::create_dir_all(&dir)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+        let root = std::fs::canonicalize(project_root)?;
+        if !umadev_state::fs::real_dir(&root) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "governance policy boundary is not a real directory",
+            ));
         }
-        match options.open(&path) {
-            Ok(mut file) => {
-                if let Err(error) = file
-                    .write_all(DEFAULT_TEMPLATE.as_bytes())
-                    .and_then(|()| file.sync_all())
-                {
-                    drop(file);
-                    let _ = std::fs::remove_file(&path);
-                    return Err(error);
-                }
-                Ok(path)
+        let dir = umadev_state::fs::ensure_real_child_dir(&root, ".umadev")?;
+        let path = dir.join("rules.toml");
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if umadev_state::fs::metadata_is_real_file(&metadata) => return Ok(path),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "governance policy path is linked or not a regular file",
+                ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        match umadev_state::fs::write_new_private(&path, DEFAULT_TEMPLATE.as_bytes()) {
+            Ok(()) => Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if umadev_state::fs::real_file(&path) {
+                    Ok(path)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "governance policy path changed during creation",
+                    ))
+                }
+            }
             Err(error) => Err(error),
         }
     }
@@ -251,7 +291,15 @@ impl Policy {
     /// segment, and a bare suffix like `.test.ts` matches by `ends_with`.
     #[must_use]
     pub fn is_excluded(&self, file_path: &str) -> bool {
+        if self.exclusions.paths.len() > Self::MAX_EXCLUSION_PATTERNS
+            || file_path.len() > Self::MAX_MATCH_PATH_BYTES
+        {
+            return false;
+        }
         let normalized = file_path.replace('\\', "/");
+        if normalized.split('/').count() > Self::MAX_MATCH_PATH_SEGMENTS {
+            return false;
+        }
         for pat in &self.exclusions.paths {
             if glob_match(pat, &normalized) {
                 return true;
@@ -272,6 +320,12 @@ impl Policy {
     }
 }
 
+fn valid_glob_pattern(pattern: &str) -> bool {
+    pattern.len() <= Policy::MAX_GLOB_BYTES
+        && pattern.split(['/', '\\']).count() <= Policy::MAX_GLOB_SEGMENTS
+        && pattern.bytes().filter(|byte| *byte == b'*').count() <= Policy::MAX_GLOB_STARS
+}
+
 /// Anchored, segment-aware glob matcher. Matching happens over `/`-split path
 /// segments so a pattern only excludes what it structurally targets — NOT any
 /// path that merely CONTAINS the fragment:
@@ -285,6 +339,12 @@ impl Policy {
 /// the historical `ends_with` semantics, so `.test.ts` still excludes
 /// `src/foo.test.ts`. Everything else goes through the anchored segment match.
 fn glob_match(pattern: &str, path: &str) -> bool {
+    if !valid_glob_pattern(pattern)
+        || path.len() > Policy::MAX_MATCH_PATH_BYTES
+        || path.split(['/', '\\']).count() > Policy::MAX_MATCH_PATH_SEGMENTS
+    {
+        return false;
+    }
     let pat = pattern.replace('\\', "/");
     let path = path.replace('\\', "/");
     // Bare suffix pattern (no slash, no wildcard): historical ends_with match.
@@ -297,28 +357,25 @@ fn glob_match(pattern: &str, path: &str) -> bool {
 }
 
 /// Match `/`-split pattern segments against `/`-split path segments, honoring
-/// `**` (zero or more whole segments) anchored to the full path. Recursion is
-/// bounded by the segment counts (short, fixed exclusion lists), so this is
-/// cheap and terminates.
+/// `**` (zero or more whole segments) anchored to the full path.
 fn glob_match_segments(pat: &[&str], path: &[&str]) -> bool {
-    let Some((&seg, rest)) = pat.split_first() else {
-        // Pattern exhausted → match iff the path is also exhausted (anchored).
-        return path.is_empty();
-    };
-    if seg == "**" {
-        // `**` matches zero or more whole segments: trailing `**` matches
-        // anything remaining; otherwise try consuming 0..=path.len() segments.
-        if rest.is_empty() {
-            return true;
+    let mut previous = vec![false; path.len() + 1];
+    previous[0] = true;
+    for segment in pat {
+        let mut current = vec![false; path.len() + 1];
+        if *segment == "**" {
+            current[0] = previous[0];
+            for index in 1..=path.len() {
+                current[index] = previous[index] || current[index - 1];
+            }
+        } else {
+            for index in 1..=path.len() {
+                current[index] = previous[index - 1] && segment_match(segment, path[index - 1]);
+            }
         }
-        return (0..=path.len()).any(|skip| glob_match_segments(rest, &path[skip..]));
+        previous = current;
     }
-    match path.split_first() {
-        Some((&first, path_rest)) if segment_match(seg, first) => {
-            glob_match_segments(rest, path_rest)
-        }
-        _ => false,
-    }
+    previous[path.len()]
 }
 
 /// Match a single path segment against a single pattern segment where `*` is a
@@ -605,6 +662,50 @@ mod tests {
     }
 
     #[test]
+    fn repeated_double_star_is_bounded_and_non_recursive() {
+        let pattern = std::iter::repeat_n("**", 32)
+            .chain(std::iter::once("never"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let path = std::iter::repeat_n("segment", 200)
+            .collect::<Vec<_>>()
+            .join("/");
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&pattern, &path));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn oversized_exclusion_cannot_relax_governance() {
+        let oversized = "*".repeat(Policy::MAX_GLOB_BYTES + 1);
+        let policy = Policy {
+            exclusions: ExclusionsSection {
+                paths: vec![oversized.clone()],
+            },
+            ..Default::default()
+        };
+        assert!(!policy.is_excluded(&oversized));
+
+        let too_many = Policy {
+            exclusions: ExclusionsSection {
+                paths: vec!["**".to_owned(); Policy::MAX_EXCLUSION_PATTERNS + 1],
+            },
+            ..Default::default()
+        };
+        assert!(!too_many.is_excluded("src/app.ts"));
+    }
+
+    #[test]
+    fn loaded_policy_over_matcher_limits_falls_back_to_strict_defaults() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rules.toml");
+        let pattern = "a".repeat(Policy::MAX_GLOB_BYTES + 1);
+        std::fs::write(&path, format!("[exclusions]\npaths = [\"{pattern}\"]\n")).unwrap();
+        let policy = Policy::load_from(&path);
+        assert!(!policy.is_excluded(&pattern));
+    }
+
+    #[test]
     fn write_template_is_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = Policy::write_default_template(tmp.path()).unwrap();
@@ -624,6 +725,34 @@ mod tests {
         // `ends_with` is component-based, so it matches regardless of the OS
         // path separator (backslash on Windows).
         assert!(path.ends_with(".umadev/rules.toml"));
+    }
+
+    #[test]
+    fn unknown_policy_fields_are_rejected_instead_of_silently_ignored() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("rules.toml");
+        std::fs::write(&path, "[disable]\nclauses = [\"UD-CODE-001\"]\n").unwrap();
+        assert!(matches!(
+            Policy::try_load_from(&path),
+            Err(PolicyLoadError::Parse(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_template_rejects_linked_policy_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        symlink(outside.path(), tmp.path().join(".umadev")).unwrap();
+        assert_eq!(
+            Policy::write_default_template(tmp.path())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(outside.path().read_dir().unwrap().next().is_none());
     }
 
     #[test]

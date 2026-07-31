@@ -810,7 +810,12 @@ fn load_project_context(root: &Path) -> ProjectContext {
         // Malformed / partial JSON → strict.
         ProjectContext::unknown()
     });
-    ctx.if_current(now_secs(), workspace_requirement(root).as_deref())
+    let key = umadev_state::privacy::installation_key();
+    ctx.if_current(
+        now_secs(),
+        workspace_requirement(root).as_deref(),
+        key.as_ref().map(<[u8; 32]>::as_slice),
+    )
 }
 
 /// Per-file governance-context resolution, memoized by directory.

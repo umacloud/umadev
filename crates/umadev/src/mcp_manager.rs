@@ -31,8 +31,43 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use fs2::FileExt as _;
+use umadev_state::fs::RootedDir;
 
 const MAX_MCP_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MCP_MUTATION_LOCK: &str = ".umadev/mcp-manager.lock";
+const MCP_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const MCP_LOCK_POLL: Duration = Duration::from_millis(5);
+
+fn with_mutation_lock<T>(
+    project_root: &Path,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let root = RootedDir::open_no_follow(project_root)?;
+    root.ensure_dir(Path::new(".umadev"), false)?;
+    let lock = root.open_private_lock(Path::new(MCP_MUTATION_LOCK), false)?;
+    let deadline = Instant::now() + MCP_LOCK_TIMEOUT;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(MCP_LOCK_POLL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "another MCP configuration update is still running",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    operation()
+}
 
 fn read_config(path: &Path) -> std::io::Result<String> {
     if let Some(parent) = path.parent() {
@@ -422,6 +457,17 @@ pub fn install(
     name: &str,
     entry: &McpServerEntry,
 ) -> std::io::Result<PathBuf> {
+    with_mutation_lock(project_root, || {
+        install_unlocked(backend, project_root, name, entry)
+    })
+}
+
+fn install_unlocked(
+    backend: Backend,
+    project_root: &Path,
+    name: &str,
+    entry: &McpServerEntry,
+) -> std::io::Result<PathBuf> {
     match backend {
         Backend::ClaudeCode => {
             let mut cfg = McpConfig::load(project_root)?;
@@ -443,8 +489,10 @@ pub fn install_all(
     name: &str,
     entry: &McpServerEntry,
 ) -> std::io::Result<Vec<(Backend, PathBuf)>> {
-    mutate_all(project_root, |backend| {
-        install(backend, project_root, name, entry)
+    with_mutation_lock(project_root, || {
+        mutate_all(project_root, |backend| {
+            install_unlocked(backend, project_root, name, entry)
+        })
     })
 }
 
@@ -454,6 +502,16 @@ pub fn install_all(
 /// # Errors
 /// Propagates I/O and parse errors (refuses to touch an unparseable file).
 pub fn remove(
+    backend: Backend,
+    project_root: &Path,
+    name: &str,
+) -> std::io::Result<(PathBuf, bool)> {
+    with_mutation_lock(project_root, || {
+        remove_unlocked(backend, project_root, name)
+    })
+}
+
+fn remove_unlocked(
     backend: Backend,
     project_root: &Path,
     name: &str,
@@ -482,7 +540,11 @@ pub fn remove_all(
     project_root: &Path,
     name: &str,
 ) -> std::io::Result<Vec<(Backend, (PathBuf, bool))>> {
-    mutate_all(project_root, |backend| remove(backend, project_root, name))
+    with_mutation_lock(project_root, || {
+        mutate_all(project_root, |backend| {
+            remove_unlocked(backend, project_root, name)
+        })
+    })
 }
 
 /// List all MCP servers the chosen base would discover from its config file.
@@ -1513,5 +1575,35 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftover.is_empty(), "atomic write left a temp file");
+    }
+
+    #[test]
+    fn concurrent_installs_do_not_lose_existing_servers() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Arc::new(tmp.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let root = Arc::clone(&root);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                install(
+                    Backend::ClaudeCode,
+                    &root,
+                    &format!("server-{index}"),
+                    &npx_entry(),
+                )
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        let servers = list(Backend::ClaudeCode, &root).unwrap();
+        assert_eq!(servers.len(), 8, "a concurrent read-modify-write was lost");
     }
 }

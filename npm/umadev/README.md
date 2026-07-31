@@ -45,11 +45,12 @@ The brain, account, credentials, and model
 stay in the selected base.
 
 Authentication, permissions, and resume are vendor-specific. Grok Plan adds its
-read-only sandbox, tool allowlist, and subagent fence. Kimi Code is exact-source
-pinned, uses `kimi acp`, and revalidates its existing login without UmaDev
-opening a browser. Resume/load is used only when the corresponding base contract
-advertises and authorizes it. See the repository README for install/login
-commands, Windows notes, and the complete capability matrix.
+read-only sandbox, tool allowlist, and subagent fence. Kimi Code is source-audited
+against an exact baseline, but runtime support is capability-negotiated rather
+than version-allowlisted; it uses `kimi acp` and revalidates its existing login
+without UmaDev opening a browser. Resume/load is used only when the corresponding
+base contract advertises and authorizes it. See the repository README for
+install/login commands, Windows notes, and the complete capability matrix.
 
 The coordinator routes each request: a chat stays chat, a one-line edit takes
 the fast path, and only a full product requirement expands into the team's

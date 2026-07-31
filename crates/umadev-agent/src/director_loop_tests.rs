@@ -4138,6 +4138,55 @@ fn phase_for_step_anchors_qa_test_authoring_to_spec_not_quality() {
 }
 
 #[test]
+fn pre_run_governance_inputs_enter_only_the_post_docs_build() {
+    use crate::critics::Seat;
+    use crate::plan_state::{
+        is_post_docs_implementation_step, AcceptanceSpec, PlanStep, StepKind, StepStatus,
+    };
+    let step = |id: &str, seat: Seat, kind: StepKind, status: StepStatus| PlanStep {
+        files: plan_state::StepFiles::default(),
+        id: id.into(),
+        title: id.into(),
+        seat,
+        kind,
+        depends_on: Vec::new(),
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence: Vec::new(),
+        status,
+    };
+    let docs = step(
+        "prd",
+        Seat::ProductManager,
+        StepKind::Build,
+        StepStatus::Done,
+    );
+    let implementation = step(
+        "backend",
+        Seat::BackendEngineer,
+        StepKind::Build,
+        StepStatus::Pending,
+    );
+    let review = step(
+        "review",
+        Seat::QaEngineer,
+        StepKind::Review,
+        StepStatus::Pending,
+    );
+    let mut plan = Plan {
+        steps: vec![docs.clone(), implementation.clone(), review.clone()],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+
+    assert!(!is_post_docs_implementation_step(&docs, &plan));
+    assert!(is_post_docs_implementation_step(&implementation, &plan));
+    assert!(!is_post_docs_implementation_step(&review, &plan));
+
+    plan.steps[0].status = StepStatus::Pending;
+    assert!(!is_post_docs_implementation_step(&implementation, &plan));
+}
+
+#[test]
 fn persisted_phase_never_regresses_across_writes() {
     // The monotonic clamp: once the state reached a deeper phase, a later write of
     // an EARLIER phase is ignored (a backend step finishing after a frontend step
@@ -4530,10 +4579,12 @@ async fn the_director_path_writes_the_governance_context_before_it_writes_code()
     );
     // And it is STAMPED, or the readers (which cannot see this run) would refuse to
     // honour it: a permission with no provenance belongs to nobody.
+    let key = umadev_state::privacy::installation_key().expect("provenance key");
     assert_eq!(
-        ctx.requirement_hash,
-        umadev_governance::requirement_fingerprint(&o.requirement)
+        ctx.requirement_fingerprint,
+        umadev_governance::requirement_fingerprint(&key, &o.requirement)
     );
+    assert_ne!(ctx.provenance_auth, [0; 32]);
     assert!(ctx.derived_at > 0);
 
     // (b) NO BRAIN (`can_fork: false`) — the STRICT floor. The SAME requirement, and the
@@ -9031,7 +9082,6 @@ fn stale_upstream_doc_reopens_steps_on_resume() {
     let root = tmp.path();
     std::fs::create_dir_all(root.join("output")).unwrap();
     std::fs::write(root.join("output").join("app-prd.md"), "prd v1").unwrap();
-    record_artifact_versions(root);
     let mut plan = Plan {
         steps: vec![
             resume_step("fe", "frontend", &[], StepStatus::Done),
@@ -9040,6 +9090,12 @@ fn stale_upstream_doc_reopens_steps_on_resume() {
         risks: vec![],
         open_questions: vec![],
     };
+    plan.steps[0].files.modify = vec!["output/app-prd.md".to_string()];
+    plan.steps[0].evidence = vec![crate::plan_state::EvidenceContract::FileExists {
+        path: "output/app-prd.md".to_string(),
+    }];
+    plan_state::save(&plan, root).unwrap();
+    record_artifact_versions(root);
     resume::invalidate_stale_steps(root, &mut plan);
     assert!(plan.steps.iter().all(|s| s.status == StepStatus::Done));
     std::fs::write(root.join("output").join("app-prd.md"), "prd v2 CHANGED").unwrap();
@@ -9051,6 +9107,152 @@ fn stale_upstream_doc_reopens_steps_on_resume() {
         "frontend re-opens on a prd change"
     );
     assert_eq!(by("qa"), StepStatus::Pending, "its downstream re-opens too");
+}
+
+#[test]
+fn issue_49_historical_same_kind_documents_never_stale_the_active_plan() {
+    use crate::plan_state::{EvidenceContract, Plan, StepStatus};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    let output = root.join("output");
+    std::fs::create_dir_all(&output).unwrap();
+    std::fs::write(output.join("current-prd.md"), "current prd").unwrap();
+    std::fs::write(
+        output.join("current-architecture.md"),
+        "current architecture",
+    )
+    .unwrap();
+    std::fs::write(output.join("old-prd.md"), "historical prd v1").unwrap();
+    std::fs::write(
+        output.join("old-architecture.md"),
+        "historical architecture v1",
+    )
+    .unwrap();
+    std::fs::write(output.join("old-uiux.md"), "historical uiux v1").unwrap();
+
+    let mut docs = resume_step("docs", "active docs", &[], StepStatus::Done);
+    // Exercise both sources of explicit active identity: StepFiles and typed file
+    // evidence. None of the historical files is part of this plan.
+    docs.files.modify = vec!["output/current-prd.md".to_string()];
+    docs.evidence = vec![EvidenceContract::FileContains {
+        path: "output/current-architecture.md".to_string(),
+        needle: "current".to_string(),
+    }];
+    let mut plan = Plan {
+        steps: vec![
+            docs,
+            resume_step(
+                "implementation",
+                "implementation",
+                &["docs"],
+                StepStatus::Done,
+            ),
+        ],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    plan_state::save(&plan, root).unwrap();
+    record_artifact_versions(root);
+
+    let recorded = crate::critics::read_artifact_versions(root);
+    assert_eq!(
+        recorded.get("prd"),
+        Some(&crate::critics::artifact_version("current prd"))
+    );
+    assert_eq!(
+        recorded.get("architecture"),
+        Some(&crate::critics::artifact_version("current architecture"))
+    );
+    assert!(!recorded.contains_key("uiux"));
+
+    std::fs::write(output.join("old-prd.md"), "historical prd v2").unwrap();
+    std::fs::write(
+        output.join("old-architecture.md"),
+        "historical architecture v2",
+    )
+    .unwrap();
+    std::fs::write(output.join("old-uiux.md"), "historical uiux v2").unwrap();
+    resume::invalidate_stale_steps(root, &mut plan);
+    assert!(
+        plan.steps
+            .iter()
+            .all(|step| step.status == StepStatus::Done),
+        "unreferenced historical output must not reopen the active plan"
+    );
+}
+
+#[test]
+fn legacy_plan_without_document_references_ignores_historical_output_versions() {
+    use crate::plan_state::{Plan, StepStatus};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("output")).unwrap();
+    std::fs::write(root.join("output/old-prd.md"), "historical prd v2").unwrap();
+    crate::critics::write_artifact_versions(
+        root,
+        &[(
+            "prd".to_string(),
+            crate::critics::artifact_version("historical prd v1"),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let mut legacy = Plan {
+        steps: vec![resume_step(
+            "implementation",
+            "implementation",
+            &[],
+            StepStatus::Done,
+        )],
+        risks: vec![],
+        open_questions: vec![],
+    };
+
+    resume::invalidate_stale_steps(root, &mut legacy);
+    assert_eq!(legacy.steps[0].status, StepStatus::Done);
+}
+
+#[test]
+fn multiple_active_documents_of_one_kind_have_a_deterministic_aggregate() {
+    use crate::plan_state::{EvidenceContract, Plan, StepStatus};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("output")).unwrap();
+    std::fs::write(root.join("output/main-prd.md"), "main").unwrap();
+    std::fs::write(root.join("output/addendum-prd.md"), "addendum").unwrap();
+
+    let mut first = resume_step("docs", "docs", &[], StepStatus::Done);
+    first.files.modify = vec![
+        "output/main-prd.md".to_string(),
+        "output/addendum-prd.md".to_string(),
+    ];
+    first.evidence = vec![EvidenceContract::FileExists {
+        path: "output/main-prd.md".to_string(),
+    }];
+    let mut second = first.clone();
+    second.files.modify.reverse();
+    second.evidence.push(EvidenceContract::FileExists {
+        path: "output/addendum-prd.md".to_string(),
+    });
+    let plan_a = Plan {
+        steps: vec![first],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    let plan_b = Plan {
+        steps: vec![second],
+        risks: vec![],
+        open_questions: vec![],
+    };
+
+    assert_eq!(
+        resume::current_artifact_versions(root, &plan_a).unwrap(),
+        resume::current_artifact_versions(root, &plan_b).unwrap(),
+        "step/file declaration order and duplicate evidence cannot change the version"
+    );
 }
 
 #[path = "director_loop/tests/late_contract_tests.rs"]

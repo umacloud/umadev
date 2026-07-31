@@ -27,6 +27,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::trust::TrustMode;
@@ -35,6 +36,8 @@ use crate::trust::TrustMode;
 /// `.umadev/` user-data dir).
 pub const STATS_FILE: &str = ".umadev/acceptance-stats.json";
 const MAX_STATS_BYTES: usize = 2 * 1024 * 1024;
+const STATS_FILENAME: &str = "acceptance-stats.json";
+const LOCK_FILENAME: &str = "acceptance-stats.lock";
 
 /// Minimum number of recorded attempts for a kind before its rate is TRUSTED.
 /// Below this the rate is statistically meaningless, so [`FirstPassStats::rate`]
@@ -155,18 +158,35 @@ pub fn record(project_root: &Path, kind: &str, first_pass: bool) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let mut stats = load(project_root);
-    stats.observe(kind, first_pass);
-
-    let dir = project_root.join(".umadev");
-    if std::fs::create_dir_all(&dir).is_err() {
+    let Ok(root) = std::fs::canonicalize(project_root) else {
+        return;
+    };
+    if !umadev_state::fs::real_dir(&root) {
         return;
     }
+    let Ok(dir) = umadev_state::fs::ensure_real_child_dir(&root, ".umadev") else {
+        return;
+    };
+    // The in-process mutex above covers parallel steps, while this advisory OS lock also
+    // serializes independent UmaDev processes. Telemetry is strictly best-effort: if another
+    // process owns the lock, skip this sample instead of ever delaying the user's run.
+    let Ok(lock) = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)) else {
+        return;
+    };
+    if lock.try_lock_exclusive().is_err() {
+        return;
+    }
+
+    let mut stats = load(&root);
+    stats.observe(kind, first_pass);
+
     let Ok(body) = serde_json::to_string_pretty(&stats) else {
         return;
     };
-    let path = project_root.join(STATS_FILE);
-    let _ = write_atomic(&path, &body);
+    if body.len() > MAX_STATS_BYTES {
+        return;
+    }
+    let _ = umadev_state::fs::atomic_write(&dir.join(STATS_FILENAME), body.as_bytes());
 }
 
 /// The trusted first-pass rate for a kind, loaded fresh — `None` until at least
@@ -243,32 +263,6 @@ pub fn summary(project_root: &Path) -> Vec<String> {
             })
         })
         .collect()
-}
-
-/// Atomically write `body` to `path` via a unique temp file then a rename, so a
-/// reader never observes a torn / partially-written file. The temp name carries
-/// the pid and a high-resolution timestamp so two writers don't collide on the
-/// temp itself, with best-effort cleanup of the temp on a rename failure.
-fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = dir.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("stats"),
-        std::process::id(),
-        stamp,
-    ));
-    std::fs::write(&tmp, body)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -361,12 +355,49 @@ mod tests {
         assert_eq!(first_pass_rate(tmp.path(), &seat_kind("qa-engineer")), None);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn record_never_follows_a_linked_managed_directory_or_stats_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_stats = outside.path().join(STATS_FILENAME);
+        std::fs::write(&outside_stats, b"outside").unwrap();
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        record(root.path(), "class:build", true);
+        assert_eq!(std::fs::read(&outside_stats).unwrap(), b"outside");
+
+        std::fs::remove_file(root.path().join(".umadev")).unwrap();
+        std::fs::create_dir(root.path().join(".umadev")).unwrap();
+        symlink(&outside_stats, root.path().join(STATS_FILE)).unwrap();
+        record(root.path(), "class:build", true);
+        assert_eq!(std::fs::read(&outside_stats).unwrap(), b"outside");
+    }
+
     #[test]
     fn missing_file_yields_no_signal() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(load(tmp.path()), FirstPassStats::default());
         assert_eq!(first_pass_rate(tmp.path(), &class_kind("debug")), None);
         assert_eq!(low_confidence_nudge(tmp.path(), &class_kind("debug")), None);
+    }
+
+    #[test]
+    fn a_busy_cross_process_lock_never_blocks_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&dir).unwrap();
+        let held = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)).unwrap();
+        held.lock_exclusive().unwrap();
+
+        let started = std::time::Instant::now();
+        record(tmp.path(), "class:build", true);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "best-effort telemetry must skip a contended sample"
+        );
+        assert_eq!(load(tmp.path()), FirstPassStats::default());
     }
 
     #[test]

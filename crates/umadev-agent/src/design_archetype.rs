@@ -284,15 +284,22 @@ pub(crate) fn persist_design_archetype(
     let Some(id) = decision.archetype.as_deref() else {
         return;
     };
+    let Some(key) = umadev_state::privacy::installation_key() else {
+        return;
+    };
     let payload = serde_json::json!({
         "archetype": id,
-        "requirement_hash": umadev_governance::requirement_fingerprint(requirement),
+        "requirement_fingerprint": umadev_governance::requirement_fingerprint(&key, requirement),
         "derived_at": now_secs(),
     });
-    let dir = project_root.join(".umadev");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        if let Ok(json) = serde_json::to_string_pretty(&payload) {
-            let _ = std::fs::write(project_root.join(DESIGN_ARCHETYPE_REL), json);
+    let Ok(dir) =
+        crate::bounded_fs::ensure_real_dir_beneath(project_root, std::path::Path::new(".umadev"))
+    else {
+        return;
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(&payload) {
+        if json.len() <= MAX_DESIGN_ARCHETYPE_BYTES {
+            let _ = umadev_state::fs::atomic_write(&dir.join("design-archetype.json"), &json);
         }
     }
 }
@@ -312,9 +319,10 @@ pub(crate) fn stored_design_archetype(project_root: &Path, requirement: &str) ->
     )
     .ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    if v.get("requirement_hash")?.as_u64()?
-        != umadev_governance::requirement_fingerprint(requirement)
-    {
+    let key = umadev_state::privacy::installation_key()?;
+    let stored: [u8; 32] =
+        serde_json::from_value(v.get("requirement_fingerprint")?.clone()).ok()?;
+    if stored != umadev_governance::requirement_fingerprint(&key, requirement) {
         return None;
     }
     let id = v.get("archetype")?.as_str()?.trim();
@@ -521,6 +529,27 @@ mod tests {
             stored_design_archetype(tmp.path(), "做一个数据监控后台"),
             None
         );
+        let raw = std::fs::read_to_string(tmp.path().join(DESIGN_ARCHETYPE_REL)).unwrap();
+        assert!(
+            !raw.contains(req),
+            "the requirement itself is never persisted"
+        );
+        assert!(raw.contains("requirement_fingerprint"));
+        assert!(
+            !raw.contains("requirement_hash"),
+            "new writes must not retain the enumerable FNV field"
+        );
+
+        std::fs::write(
+            tmp.path().join(DESIGN_ARCHETYPE_REL),
+            r#"{"archetype":"premium-luxury","requirement_hash":123,"derived_at":1800000000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stored_design_archetype(tmp.path(), req),
+            None,
+            "legacy enumerable fingerprints are compatible JSON but not trusted"
+        );
     }
 
     #[test]
@@ -542,9 +571,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        let key = umadev_state::privacy::installation_key().unwrap();
         let payload = serde_json::json!({
             "archetype": "premium-luxury",
-            "requirement_hash": umadev_governance::requirement_fingerprint("a product"),
+            "requirement_fingerprint": umadev_governance::requirement_fingerprint(&key, "a product"),
             "derived_at": now_secs(),
         });
         let outside_path = outside.path().join("pick.json");
@@ -552,6 +582,28 @@ mod tests {
         symlink(&outside_path, tmp.path().join(DESIGN_ARCHETYPE_REL)).unwrap();
 
         assert_eq!(stored_design_archetype(tmp.path(), "a product"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_pick_never_follows_managed_directory_or_leaf_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_pick = outside.path().join("design-archetype.json");
+        std::fs::write(&outside_pick, b"outside").unwrap();
+        let decision = DesignArchetype::chosen("premium-luxury", "fit");
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        persist_design_archetype(root.path(), "a product", &decision);
+        assert_eq!(std::fs::read(&outside_pick).unwrap(), b"outside");
+
+        std::fs::remove_file(root.path().join(".umadev")).unwrap();
+        std::fs::create_dir(root.path().join(".umadev")).unwrap();
+        symlink(&outside_pick, root.path().join(DESIGN_ARCHETYPE_REL)).unwrap();
+        persist_design_archetype(root.path(), "a product", &decision);
+        assert_eq!(std::fs::read(&outside_pick).unwrap(), b"outside");
     }
 
     #[test]
@@ -570,9 +622,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let req = "a product";
         std::fs::create_dir_all(tmp.path().join(".umadev")).unwrap();
+        let key = umadev_state::privacy::installation_key().unwrap();
         let payload = serde_json::json!({
             "archetype": "neon-cyberpunk",
-            "requirement_hash": umadev_governance::requirement_fingerprint(req),
+            "requirement_fingerprint": umadev_governance::requirement_fingerprint(&key, req),
             "derived_at": now_secs(),
         });
         std::fs::write(

@@ -22,12 +22,22 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use fs2::FileExt as _;
+use umadev_state::fs::{RootedDir, RootedEntryKind};
 
 const MAX_SKILL_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SKILL_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SKILL_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PROJECT_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_INSTALLED_SKILLS: usize = 1_024;
+const MAX_SKILL_TREE_DEPTH: usize = 64;
+const MAX_SKILL_TREE_NODES: usize = 16_384;
+const MAX_SKILL_TREE_FILES: usize = 4_096;
+const SKILL_MUTATION_LOCK: &str = ".umadev/skill-manager.lock";
+const SKILL_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const SKILL_LOCK_POLL: Duration = Duration::from_millis(5);
 
 fn bounded_text(path: &Path, max_bytes: u64) -> std::io::Result<String> {
     let bytes = umadev_state::fs::read_bounded(path, max_bytes)?;
@@ -86,26 +96,28 @@ impl SkillRegistry {
 
     /// Install a skill from a source directory (must contain `manifest.json`).
     pub fn install(&self, source_dir: &Path) -> std::io::Result<SkillInstallResult> {
+        self.with_mutation_lock(|| self.install_unlocked(source_dir))
+    }
+
+    fn install_unlocked(&self, source_dir: &Path) -> std::io::Result<SkillInstallResult> {
         if !umadev_state::fs::real_dir(source_dir) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "skill source must be a real directory",
             ));
         }
-        let manifest_bytes = umadev_state::fs::read_bounded_beneath(
-            source_dir,
-            Path::new("manifest.json"),
-            MAX_SKILL_MANIFEST_BYTES,
-        )
-        .map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to read manifest.json in {}: {e}",
-                    source_dir.display()
-                ),
-            )
-        })?;
+        let source_root = RootedDir::open_no_follow(source_dir)?;
+        let manifest_bytes = source_root
+            .read_bounded(Path::new("manifest.json"), MAX_SKILL_MANIFEST_BYTES)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to read manifest.json in {}: {e}",
+                        source_dir.display()
+                    ),
+                )
+            })?;
         let manifest: SkillManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -155,20 +167,13 @@ impl SkillRegistry {
                     format!("skill knowledge exceeds {MAX_SKILL_TOTAL_BYTES} bytes"),
                 ));
             }
-            let bytes = match umadev_state::fs::read_bounded_beneath(
-                source_dir,
-                rel,
-                MAX_SKILL_DOCUMENT_BYTES.min(remaining),
-            ) {
+            let bytes = match source_root.read_bounded(rel, MAX_SKILL_DOCUMENT_BYTES.min(remaining))
+            {
                 Ok(bytes) => Some(bytes),
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     return Err(error);
                 }
-                Err(_)
-                    if std::fs::symlink_metadata(source_dir.join(rel)).is_ok_and(|metadata| {
-                        umadev_state::fs::metadata_is_real_dir(&metadata)
-                    }) =>
-                {
+                Err(_) if source_root.is_real_dir(rel).unwrap_or(false) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidInput,
                         format!(
@@ -292,22 +297,25 @@ impl SkillRegistry {
 
     /// List all installed skills.
     pub fn list(&self) -> Vec<SkillManifest> {
-        let dir = self.skills_dir();
+        let Ok(root) = RootedDir::open_no_follow(&self.project_root) else {
+            return Vec::new();
+        };
+        let Ok(entries) = root.list_entries(Path::new(".umadev/skills"), MAX_INSTALLED_SKILLS)
+        else {
+            return Vec::new();
+        };
         let mut skills = Vec::new();
-        if umadev_state::fs::real_dir(&dir) {
-            if let Ok(entries) = std::fs::read_dir(&dir) {
-                for entry in entries.flatten().take(MAX_INSTALLED_SKILLS) {
-                    if !std::fs::symlink_metadata(entry.path())
-                        .is_ok_and(|metadata| umadev_state::fs::metadata_is_real_dir(&metadata))
-                    {
-                        continue;
-                    }
-                    let manifest_path = entry.path().join("manifest.json");
-                    if let Ok(text) = bounded_text(&manifest_path, MAX_SKILL_MANIFEST_BYTES) {
-                        if let Ok(manifest) = serde_json::from_str::<SkillManifest>(&text) {
-                            skills.push(manifest);
-                        }
-                    }
+        for entry in entries {
+            if entry.kind != RootedEntryKind::Directory {
+                continue;
+            }
+            let manifest_path = Path::new(".umadev")
+                .join("skills")
+                .join(entry.name)
+                .join("manifest.json");
+            if let Ok(bytes) = root.read_bounded(&manifest_path, MAX_SKILL_MANIFEST_BYTES) {
+                if let Ok(manifest) = serde_json::from_slice::<SkillManifest>(&bytes) {
+                    skills.push(manifest);
                 }
             }
         }
@@ -317,6 +325,10 @@ impl SkillRegistry {
 
     /// Remove a skill by name.
     pub fn remove(&self, name: &str) -> std::io::Result<()> {
+        self.with_mutation_lock(|| self.remove_unlocked(name))
+    }
+
+    fn remove_unlocked(&self, name: &str) -> std::io::Result<()> {
         safe_component(name)?;
         reject_learned_skill_reserved_name(name)?;
         let dir = self.skills_dir().join(name);
@@ -360,13 +372,64 @@ impl SkillRegistry {
             remove_managed_prompt_block(&self.project_root, name)?;
         }
         if knowledge_dir.exists() {
-            std::fs::remove_dir_all(&knowledge_dir)?;
+            remove_project_tree(
+                &self.project_root,
+                &Path::new("knowledge").join("skills").join(name),
+            )?;
         }
 
         // Remove the skill directory.
-        std::fs::remove_dir_all(&dir)?;
+        remove_project_tree(
+            &self.project_root,
+            &Path::new(".umadev").join("skills").join(name),
+        )?;
         Ok(())
     }
+
+    fn with_mutation_lock<T>(
+        &self,
+        operation: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let root = RootedDir::open_no_follow(&self.project_root)?;
+        root.ensure_dir(Path::new(".umadev"), false)?;
+        let lock = root.open_private_lock(Path::new(SKILL_MUTATION_LOCK), false)?;
+        let deadline = Instant::now() + SKILL_LOCK_TIMEOUT;
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(SKILL_LOCK_POLL);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "another skill update is still running",
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        operation()
+    }
+}
+
+fn remove_project_tree(project_root: &Path, relative: &Path) -> std::io::Result<()> {
+    let root = RootedDir::open_no_follow(project_root)?;
+    let files = root.list_regular_tree(
+        relative,
+        MAX_SKILL_TREE_DEPTH,
+        MAX_SKILL_TREE_NODES,
+        MAX_SKILL_TREE_FILES,
+        MAX_SKILL_TOTAL_BYTES,
+    )?;
+    for file in files {
+        root.remove_regular_file(&file.relative)?;
+    }
+    root.remove_empty_directory_tree(relative, MAX_SKILL_TREE_DEPTH, MAX_SKILL_TREE_NODES)?;
+    Ok(())
 }
 
 fn remove_managed_prompt_block(project_root: &Path, name: &str) -> std::io::Result<()> {

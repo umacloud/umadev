@@ -5110,6 +5110,17 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // hundreds of screens — generous for any human session, still bounded.
     const MAX_RENDER_ROWS: usize = 8000;
     let inner_height = area.height as usize;
+    let (content_area, scrollbar_x) = if area.width > 1 {
+        (
+            Rect {
+                width: area.width - 1,
+                ..area
+            },
+            Some(area.right().saturating_sub(1)),
+        )
+    } else {
+        (area, None)
+    };
 
     // Each logical line carries a `hang` (its left-gutter width). When the line
     // is pre-folded to the viewport width, continuation rows are indented by
@@ -5125,9 +5136,13 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // Tables rendered inside `markdown_to_lines` below must fit this width (minus a
     // small margin) instead of overflowing + getting char-folded into a scrambled
     // grid. Set once per render; read by `render_table`.
-    set_table_width_budget((area.width as usize).saturating_sub(GUTTER_W + 2).max(20));
+    set_table_width_budget(
+        (content_area.width as usize)
+            .saturating_sub(GUTTER_W + 2)
+            .max(20),
+    );
 
-    let w = usize::from(area.width).max(1);
+    let w = usize::from(content_area.width).max(1);
     let theme_gen = theme::theme_id();
 
     // ── R7: whole-transcript assembly cache ─────────────────────────────
@@ -5206,7 +5221,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 );
             }
             let (lines, wraps, join_space_counts) =
-                message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
+                message_folded_lines(app, msg, msg_idx, content_area, w, theme_gen);
             asm.lines.extend(lines);
             asm.wraps.extend(wraps);
             asm.join_space_counts.extend(join_space_counts);
@@ -5246,7 +5261,7 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
             );
         }
         let (lines, wraps, join_space_counts) =
-            message_folded_lines(app, msg, msg_idx, area, w, theme_gen);
+            message_folded_lines(app, msg, msg_idx, content_area, w, theme_gen);
         tail_lines.extend(lines);
         tail_wraps.extend(wraps);
         tail_join_space_counts.extend(join_space_counts);
@@ -5514,17 +5529,21 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
     // actually begins at `area.top + 1` with one row less height; publish that
     // adjusted rect so a click lands on the right content row.
     let content_top = if title_shown {
-        area.y.saturating_add(1)
+        content_area.y.saturating_add(1)
     } else {
-        area.y
+        content_area.y
     };
     let content_height = if title_shown {
-        area.height.saturating_sub(1)
+        content_area.height.saturating_sub(1)
     } else {
-        area.height
+        content_area.height
     };
-    app.transcript_area
-        .set((area.x, content_top, area.width, content_height));
+    app.transcript_area.set((
+        content_area.x,
+        content_top,
+        content_area.width,
+        content_height,
+    ));
     app.transcript_first_visible.set(scroll_rows);
 
     // ── R7: materialize ONLY the visible window ──
@@ -5624,7 +5643,42 @@ fn render_transcript(frame: &mut Frame, area: Rect, app: &App) {
                 .title_alignment(ratatui::layout::Alignment::Right),
         )
     };
-    frame.render_widget(para, area);
+    frame.render_widget(para, content_area);
+
+    let scrollbar_thumb = scrollbar_x.zip(crate::app::transcript_scrollbar_thumb(
+        content_height,
+        total,
+        viewport,
+        scroll_rows,
+    ));
+    if let Some((x, (thumb_top, thumb_height))) = scrollbar_thumb {
+        app.transcript_scrollbar_area
+            .set((x, content_top, 1, content_height));
+        app.transcript_scrollbar_thumb
+            .set((thumb_top, thumb_height));
+        let buffer = frame.buffer_mut();
+        for offset in 0..content_height {
+            buffer.set_string(
+                x,
+                content_top.saturating_add(offset),
+                if offset >= thumb_top && offset < thumb_top.saturating_add(thumb_height) {
+                    "┃"
+                } else {
+                    "│"
+                },
+                Style::default().fg(
+                    if offset >= thumb_top && offset < thumb_top.saturating_add(thumb_height) {
+                        theme::PRIMARY()
+                    } else {
+                        theme::BORDER()
+                    },
+                ),
+            );
+        }
+    } else {
+        app.transcript_scrollbar_area.set((0, 0, 0, 0));
+        app.transcript_scrollbar_thumb.set((0, 0));
+    }
 }
 
 /// Gate messages render as a single bordered warning panel — a compact,
@@ -5694,6 +5748,20 @@ pub(crate) fn char_width(c: char) -> usize {
 /// = 0).
 fn disp_width(s: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Width used by editable/wrapped text. A raw tab has no intrinsic cell width:
+/// `unicode-width` reports zero and ratatui drops control graphemes, making a
+/// pasted tab invisible even though the editor will submit it. Render it as one
+/// ordinary cell on every backend instead. The editor still keeps the original
+/// `\t`, and one source scalar remains one painted scalar so mouse/caret offsets
+/// stay reversible.
+fn editable_grapheme_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        1
+    } else {
+        disp_width(grapheme)
+    }
 }
 
 /// Worst-case display columns: the East-Asian width table with AMBIGUOUS
@@ -5775,12 +5843,25 @@ pub(crate) fn wrap_input_rows(text: &str, width: u16) -> Vec<String> {
             col = 0;
             continue;
         }
-        let cw = disp_width(grapheme);
+        // Overlay bodies may contain raw stderr, paths, or base-owned text,
+        // unlike the ordinary editor which filters control keys at insertion.
+        // Never pass CR / ESC / BEL / NUL (or any other terminal control) into
+        // ratatui's paint buffer. Newline is handled above and tab is rendered
+        // as one reversible space below; every other control has no user-visible
+        // content and is dropped.
+        if grapheme.chars().any(char::is_control) && grapheme != "\t" {
+            continue;
+        }
+        let cw = editable_grapheme_width(grapheme);
         if col + cw > w && col > 0 {
             rows.push(std::mem::take(&mut cur));
             col = 0;
         }
-        cur.push_str(grapheme);
+        if grapheme == "\t" {
+            cur.push(' ');
+        } else {
+            cur.push_str(grapheme);
+        }
         col += cw;
     }
     rows.push(cur);
@@ -5815,7 +5896,7 @@ pub(crate) fn caret_in_wrapped(text: &str, cursor: usize, width: u16) -> (u16, u
             consumed += grapheme_chars;
             continue;
         }
-        let cw = disp_width(grapheme);
+        let cw = editable_grapheme_width(grapheme);
         if col + cw > w && col > 0 {
             row += 1;
             col = 0;
@@ -5857,7 +5938,7 @@ pub(crate) fn wrapped_row_count(text: &str, width: u16) -> u16 {
             col = 0;
             continue;
         }
-        let cw = disp_width(grapheme);
+        let cw = editable_grapheme_width(grapheme);
         if col + cw > w && col > 0 {
             rows += 1;
             col = 0;
@@ -5892,7 +5973,7 @@ pub(crate) fn offset_at_wrapped(text: &str, target_row: u16, target_col: u16, wi
             idx += grapheme_chars;
             continue;
         }
-        let cw = disp_width(grapheme);
+        let cw = editable_grapheme_width(grapheme);
         if col + cw > w && col > 0 {
             if row == target_row {
                 // Soft-wrap: the target row ended just before this glyph.
@@ -9200,7 +9281,7 @@ mod tests {
         }
         let _ = app.apply_key(crossterm::event::KeyCode::Enter);
 
-        let _ = render_chat_to_string(&app, 44, 12);
+        let screen = render_chat_to_string(&app, 44, 12);
         let transcript = app.transcript_rows.borrow().join("\n");
         let compact_transcript = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
         for expected in [
@@ -9219,11 +9300,17 @@ mod tests {
             );
         }
         assert!(app.transcript_max_scroll.get() > 0, "fixture must overflow");
+        assert!(
+            screen.contains('┃') && app.transcript_scrollbar_area.get().2 == 1,
+            "overflowing /plan output exposes a visible one-column scrollbar: {screen}"
+        );
 
-        app.transcript_scroll_to_top();
+        let (bar_x, bar_y, _, bar_height) = app.transcript_scrollbar_area.get();
+        assert!(app.transcript_scrollbar_begin(bar_x, bar_y));
         let _ = render_chat_to_string(&app, 44, 12);
         assert_eq!(app.transcript_scroll(), app.transcript_max_scroll.get());
-        app.transcript_scroll_to_bottom();
+        assert!(app.transcript_scrollbar_drag(bar_y.saturating_add(bar_height).saturating_sub(1)));
+        assert!(app.transcript_scrollbar_end(bar_y.saturating_add(bar_height).saturating_sub(1)));
         let _ = render_chat_to_string(&app, 44, 12);
         assert_eq!(app.transcript_scroll(), 0);
     }
@@ -9398,6 +9485,42 @@ mod tests {
                 "caret col must equal the painted width of its row for {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn input_tabs_paint_as_safe_cells_and_keep_caret_offsets_reversible() {
+        let text = "\t甲\tb";
+        let rows = wrap_input_rows(text, 4);
+        assert_eq!(rows, vec![" 甲 ", "b"]);
+        assert!(
+            rows.iter().all(|row| !row.contains('\t')),
+            "raw tabs must never reach the terminal paint path"
+        );
+        assert!(rows.iter().all(|row| disp_width(row) <= 4));
+
+        // Rendering substitutes one cell but does not mutate or re-index the
+        // editor buffer: every source caret position still round-trips through
+        // its wrapped visual coordinate, including the exact-width boundary.
+        assert_eq!(text, "\t甲\tb");
+        for cursor in 0..=text.chars().count() {
+            let (row, col) = caret_in_wrapped(text, cursor, 4);
+            assert_eq!(
+                offset_at_wrapped(text, row, col, 4),
+                cursor,
+                "caret {cursor} did not survive the visual mapping"
+            );
+        }
+        assert_eq!(wrapped_row_count(text, 4), 2);
+    }
+
+    #[test]
+    fn wrapped_overlay_text_never_emits_terminal_control_characters() {
+        let rows = wrap_input_rows("before\r\x1b[2J\x07\x00after\t好", 80);
+        assert_eq!(rows, vec!["before[2Jafter 好"]);
+        assert!(rows
+            .iter()
+            .flat_map(|row| row.chars())
+            .all(|ch| !ch.is_control()));
     }
 
     #[test]

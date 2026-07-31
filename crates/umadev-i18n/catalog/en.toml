@@ -133,6 +133,17 @@
 "host.input.bar.hint" = "Enter=submit · Shift+Enter=newline · Esc=cancel"
 "host.input.secret_suffix" = " (sensitive input masked)"
 "host.input.marker" = "[?]"
+"host.input.summary.user" = "the base requested user input"
+"host.input.summary.response" = "the base requested a response"
+"host.input.summary.plan" = "Review the proposed plan"
+"host.input.summary.folder_trust" = "Grok Build folder trust: {}"
+"host.input.note.marker" = "[input]"
+"host.input.note.structured_answers" = "The base is waiting for structured answers:"
+"host.input.note.picker_only" = "Answer in the picker above the input box (↑↓ move · Space select · Enter confirm · Tab note) — typed free-form text is not read there."
+"host.input.note.multi_reply" = "Reply with one line per question, or a JSON object keyed by question id."
+"host.input.note.mcp_expected" = "{}: {}\nExpected response type: {}"
+"host.input.note.folder_trust" = "[folder trust] Grok Build is waiting before loading project configuration.\nWorkspace: {}\nSession cwd: {}\nConfiguration: {}\nTrust requires a separate explicit confirmation; Auto mode never answers this request."
+"host.input.note.approval_superseded" = "[note] A newer approval request superseded the earlier unanswered one; the earlier request was declined safely."
 "host.grok.question.empty" = "Questionnaire has no questions · Esc cancel"
 "host.grok.question.title" = "Question {}/{} · {}"
 "host.grok.question.preview" = "  preview: {}"
@@ -872,6 +883,8 @@
 "deploy.detected" = "[deploy] Detected deploy target: {} (deploy command auto-selected if the base recorded none)."
 "deploy.proof_written" = "[ok] Deploy evidence written: {} (folded into the next proof-pack)."
 "deploy.no_target" = "No deploy target detected (no vercel.json / netlify.toml / Dockerfile / fly.toml / built bundle). Add a platform config, or deploy manually."
+"deploy.irreversible_prompt" = "About to run an IRREVERSIBLE network deploy:\n  {}\nProceed?"
+"deploy.cancelled" = "Deploy cancelled."
 
 # --- usage / lessons read-only views (umadev usage · umadev lessons · /usage · /lessons) ---
 "usage.empty" = "No usage records yet. After a `run`, per-phase token usage is tracked automatically.\n(UmaDev drives your own base CLI subscription — it never bills you.)"
@@ -1014,6 +1027,11 @@
 "pr.create_failed" = "`gh pr create` failed (fail-open): {}"
 "pr.git_failed" = "git `{}` failed (fail-open): {}"
 "pr.fallback" = "Could not finish automatically — falling back to the manual steps below. Your repo is left as it was (no force-push, no rewritten commits)."
+"pr.diff_unavailable" = "Cannot establish this run's source diff (missing or unreadable run baseline); refusing to publish a partial PR."
+"pr.diff_too_large" = "This run changed {}+ files, beyond the {}-file verified-diff limit; split the run before publishing."
+"pr.no_changes" = "No source or evidence paths changed in this run — nothing to commit for a PR."
+"pr.irreversible_prompt" = "About to stage + commit ONLY these run-owned paths: {}\nthen push `{}` and open a PR (IRREVERSIBLE network action). Proceed?"
+"pr.cancelled" = "PR cancelled."
 
 # auto mode — clarify skip + per-path gate auto-approval announcement
 "auto.clarify_skipped" = "[auto] Skipped clarifying questions automatically (using the original requirement as-is). Switch to /mode guarded if you'd rather answer them."

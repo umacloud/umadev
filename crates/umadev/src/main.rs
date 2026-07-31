@@ -5941,12 +5941,9 @@ async fn cmd_deploy(
                                               // --prod` that the generic classifier wouldn't flag on its own.
     let deploy_probe = format!("git push (deploy) {recipe}");
     if umadev_agent::requires_confirmation(mode, &deploy_probe, "") && !yes {
-        let prompt = format!(
-            "About to run an IRREVERSIBLE network deploy:\n  {recipe}\nProceed? \
-             即将执行不可逆的网络部署,确认继续?"
-        );
+        let prompt = umadev_i18n::tf(lang, "deploy.irreversible_prompt", &[&recipe]);
         if !confirm(&prompt) {
-            println!("Deploy cancelled. 已取消部署。");
+            println!("{}", umadev_i18n::t(lang, "deploy.cancelled"));
             let _ = record_tool_call(
                 &project_root,
                 "umadev/cli.deploy",
@@ -6366,26 +6363,21 @@ fn cmd_pr(
     let stage_paths = match pr_stage_paths(&project_root, &slug) {
         PrStagePaths::Ready(paths) => paths,
         PrStagePaths::Unavailable => {
-            println!(
-                "Cannot establish this run's source diff (missing/unreadable run baseline); refusing to publish a partial PR. \
-                 无法确认本轮源码差异，已拒绝发布不完整 PR。"
-            );
+            println!("{}", umadev_i18n::t(lang, "pr.diff_unavailable"));
             return pr_fallback(&readiness, &slug, &body_rel, lang);
         }
         PrStagePaths::TooLarge(count) => {
+            let count = count.to_string();
+            let limit = umadev_agent::checkpoint::MAX_CHANGED_FILES.to_string();
             println!(
-                "This run changed {count}+ files, beyond the {}-file verified-diff limit; split the run before publishing. \
-                 本轮改动超过可验证上限，请拆分后再发布。",
-                umadev_agent::checkpoint::MAX_CHANGED_FILES
+                "{}",
+                umadev_i18n::tf(lang, "pr.diff_too_large", &[&count, &limit])
             );
             return pr_fallback(&readiness, &slug, &body_rel, lang);
         }
     };
     if stage_paths.is_empty() {
-        println!(
-            "No source or evidence paths changed in this run — nothing to commit for a PR. \
-             本轮没有可提交的源码或证据。"
-        );
+        println!("{}", umadev_i18n::t(lang, "pr.no_changes"));
         return pr_fallback(&readiness, &slug, &body_rel, lang);
     }
     let push_cmd = format!("git push -u origin {}", plan.head_branch);
@@ -6393,15 +6385,10 @@ fn cmd_pr(
     if umadev_agent::requires_confirmation(mode, &push_cmd, "") && !yes {
         // List exactly what will be staged so the user can verify both the source
         // implementation and the run evidence before the network action.
-        let prompt = format!(
-            "About to stage + commit ONLY these run-owned paths: {}\n\
-             then push `{}` and open a PR (IRREVERSIBLE network action). Proceed? \
-             即将仅提交以上本轮源码与证据并推送分支开 PR(不可逆网络动作),确认继续?",
-            stage_paths.join(", "),
-            plan.head_branch
-        );
+        let paths = stage_paths.join(", ");
+        let prompt = umadev_i18n::tf(lang, "pr.irreversible_prompt", &[&paths, &plan.head_branch]);
         if !confirm(&prompt) {
-            println!("PR cancelled. 已取消开 PR。");
+            println!("{}", umadev_i18n::t(lang, "pr.cancelled"));
             let _ = record_tool_call(
                 &project_root,
                 "umadev/cli.pr",

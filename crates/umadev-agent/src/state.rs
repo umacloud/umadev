@@ -7,9 +7,15 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use umadev_spec::Phase;
+
+const STATE_FILE: &str = "workflow-state.json";
+const HISTORY_DIR: &str = "history";
+const MAX_WORKFLOW_STATE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_HISTORY_DIRECTORY_ENTRIES: usize = 1024;
 
 /// Snapshot of pipeline progress for one project.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -105,15 +111,86 @@ impl WorkflowState {
 /// recoverable — `umadev rollback` can restore any prior state. Best-effort:
 /// a missing current file or a history-write failure is silently skipped
 /// (the atomic overwrite below must still proceed).
+fn canonical_project_root(project_root: &Path) -> io::Result<PathBuf> {
+    let root = fs::canonicalize(project_root)?;
+    if !umadev_state::fs::real_dir(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "project root is not a real directory",
+        ));
+    }
+    Ok(root)
+}
+
+fn managed_state_dir(project_root: &Path, create: bool) -> io::Result<PathBuf> {
+    let root = canonical_project_root(project_root)?;
+    let dir = root.join(".umadev");
+    if create {
+        umadev_state::fs::ensure_real_child_dir(&root, ".umadev")
+    } else if umadev_state::fs::real_dir(&dir) {
+        Ok(dir)
+    } else {
+        Err(io::Error::new(
+            if dir.exists() {
+                io::ErrorKind::PermissionDenied
+            } else {
+                io::ErrorKind::NotFound
+            },
+            "managed state directory is missing or unsafe",
+        ))
+    }
+}
+
+fn managed_history_dir(project_root: &Path, create: bool) -> io::Result<PathBuf> {
+    let state_dir = managed_state_dir(project_root, create)?;
+    let history = state_dir.join(HISTORY_DIR);
+    if create {
+        umadev_state::fs::ensure_real_child_dir(&state_dir, HISTORY_DIR)
+    } else if umadev_state::fs::real_dir(&history) {
+        Ok(history)
+    } else {
+        Err(io::Error::new(
+            if history.exists() {
+                io::ErrorKind::PermissionDenied
+            } else {
+                io::ErrorKind::NotFound
+            },
+            "workflow history directory is missing or unsafe",
+        ))
+    }
+}
+
+fn read_state_file(project_root: &Path) -> io::Result<Vec<u8>> {
+    let root = canonical_project_root(project_root)?;
+    umadev_state::fs::read_bounded_beneath(
+        &root,
+        Path::new(".umadev").join(STATE_FILE).as_path(),
+        MAX_WORKFLOW_STATE_BYTES,
+    )
+}
+
+fn valid_snapshot_name(timestamp: &str) -> bool {
+    !timestamp.is_empty()
+        && timestamp.len() <= 128
+        && timestamp != "."
+        && timestamp != ".."
+        && timestamp
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | 'T' | 'Z'))
+        && Path::new(timestamp)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
 fn snapshot_previous(project_root: &Path) {
-    let current = project_root.join(".umadev").join("workflow-state.json");
-    let Some(text) = fs::read_to_string(&current).ok() else {
+    let Some(text) = read_state_file(project_root).ok() else {
         return; // first-ever write — nothing to snapshot
     };
-    let history_dir = project_root.join(".umadev/history");
-    let _ = fs::create_dir_all(&history_dir);
+    let Some(history_dir) = managed_history_dir(project_root, true).ok() else {
+        return;
+    };
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S%.f");
-    let _ = fs::write(history_dir.join(format!("{ts}.json")), text);
+    let _ = umadev_state::fs::atomic_write(&history_dir.join(format!("{ts}.json")), &text);
     prune_history(&history_dir, HISTORY_KEEP);
 }
 
@@ -124,22 +201,35 @@ const HISTORY_KEEP: usize = 50;
 /// Keep only the `keep` most-recent history snapshots, deleting older ones.
 /// Best-effort: any IO error just leaves the extra files in place.
 fn prune_history(dir: &Path, keep: usize) {
-    let Ok(rd) = fs::read_dir(dir) else {
+    let Some(mut files) = bounded_history_files(dir, MAX_HISTORY_DIRECTORY_ENTRIES) else {
         return;
     };
-    let mut files: Vec<_> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-        .collect();
     if files.len() <= keep {
         return;
     }
     files.sort(); // timestamp-named -> lexicographic == chronological
     let excess = files.len() - keep;
     for old in files.into_iter().take(excess) {
-        let _ = fs::remove_file(old);
+        let _ = umadev_state::fs::remove_regular_file(&old);
     }
+}
+
+fn bounded_history_files(dir: &Path, max_entries: usize) -> Option<Vec<PathBuf>> {
+    let mut files = Vec::with_capacity(max_entries.min(HISTORY_KEEP.saturating_mul(2)));
+    let mut entries_seen = 0usize;
+    for entry in fs::read_dir(dir).ok()? {
+        if entries_seen >= max_entries {
+            return None;
+        }
+        entries_seen = entries_seen.saturating_add(1);
+        let path = entry.ok()?.path();
+        if path.extension().and_then(|suffix| suffix.to_str()) == Some("json")
+            && umadev_state::fs::real_file(&path)
+        {
+            files.push(path);
+        }
+    }
+    Some(files)
 }
 
 /// Persist the workflow state to `<project_root>/.umadev/workflow-state.json`.
@@ -149,34 +239,36 @@ fn prune_history(dir: &Path, keep: usize) {
 /// is snapshotted to `.umadev/history/` by the internal snapshot writer so
 /// every transition is recoverable via `umadev rollback`.
 pub fn write_workflow_state(project_root: &Path, state: &WorkflowState) -> std::io::Result<()> {
+    let dir = managed_state_dir(project_root, true)?;
     snapshot_previous(project_root);
-    let dir = project_root.join(".umadev");
-    fs::create_dir_all(&dir)?;
     let text = serde_json::to_string_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let final_path = dir.join("workflow-state.json");
-    let tmp_path = dir.join("workflow-state.json.tmp");
-    fs::write(&tmp_path, text)?;
-    fs::rename(&tmp_path, &final_path)
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_WORKFLOW_STATE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workflow state exceeds the durable-state byte limit",
+        ));
+    }
+    umadev_state::fs::atomic_write(&dir.join(STATE_FILE), text.as_bytes())
 }
 
 /// List available rollback snapshots, newest first. Each entry is the
 /// timestamp filename stem (e.g. `20260614T120000Z`). Empty when no history.
 #[must_use]
 pub fn list_snapshots(project_root: &Path) -> Vec<String> {
-    let history_dir = project_root.join(".umadev/history");
-    let Ok(rd) = fs::read_dir(&history_dir) else {
+    let Ok(history_dir) = managed_history_dir(project_root, false) else {
         return Vec::new();
     };
-    let mut snaps: Vec<String> = rd
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("json") {
-                p.file_stem()?.to_str().map(String::from)
-            } else {
-                None
-            }
+    let Some(paths) = bounded_history_files(&history_dir, MAX_HISTORY_DIRECTORY_ENTRIES) else {
+        return Vec::new();
+    };
+    let mut snaps: Vec<String> = paths
+        .into_iter()
+        .filter_map(|path| {
+            path.file_stem()?
+                .to_str()
+                .filter(|stem| valid_snapshot_name(stem))
+                .map(String::from)
         })
         .collect();
     snaps.sort_unstable();
@@ -188,12 +280,22 @@ pub fn list_snapshots(project_root: &Path) -> Vec<String> {
 /// Copies the snapshot over `workflow-state.json` (via the atomic write path so
 /// the restore itself is snapshotted). Returns `Err` when the snapshot is missing.
 pub fn restore_snapshot(project_root: &Path, timestamp: &str) -> std::io::Result<()> {
-    let snap = project_root
-        .join(".umadev/history")
+    if !valid_snapshot_name(timestamp) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "snapshot id is not a safe history entry",
+        ));
+    }
+    let root = canonical_project_root(project_root)?;
+    let relative = Path::new(".umadev")
+        .join(HISTORY_DIR)
         .join(format!("{timestamp}.json"));
-    let text = fs::read_to_string(&snap).map_err(|e| {
-        std::io::Error::new(e.kind(), format!("snapshot {timestamp} not found: {e}"))
-    })?;
+    let bytes = umadev_state::fs::read_bounded_beneath(&root, &relative, MAX_WORKFLOW_STATE_BYTES)
+        .map_err(|e| {
+            std::io::Error::new(e.kind(), format!("snapshot {timestamp} not found: {e}"))
+        })?;
+    let text =
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let state: WorkflowState = serde_json::from_str(&text)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     write_workflow_state(project_root, &state)
@@ -226,13 +328,22 @@ pub enum ReadState {
 /// best-effort reads where `None` is an acceptable fallback.
 pub fn read_workflow_state_diagnostic(project_root: &Path) -> ReadState {
     let path = project_root.join(".umadev").join("workflow-state.json");
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
+    let bytes = match read_state_file(project_root) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReadState::Missing,
         Err(e) => {
             return ReadState::Corrupt {
                 path,
                 error: format!("read error: {e}"),
+            }
+        }
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            return ReadState::Corrupt {
+                path,
+                error: format!("read error: {error}"),
             }
         }
     };
@@ -533,9 +644,90 @@ mod tests {
     }
 
     #[test]
+    fn rollback_rejects_snapshot_path_traversal() {
+        let tmp = TempDir::new().unwrap();
+        let current = WorkflowState::new(Phase::Frontend);
+        write_workflow_state(tmp.path(), &current).unwrap();
+
+        // This file is deliberately placed where the old join-based lookup
+        // resolved `.umadev/history/../../outside.json`. A rollback id is an
+        // opaque history entry, never a caller-controlled relative path.
+        let outside = WorkflowState::new(Phase::Docs);
+        std::fs::write(
+            tmp.path().join("outside.json"),
+            serde_json::to_vec(&outside).unwrap(),
+        )
+        .unwrap();
+
+        let error = restore_snapshot(tmp.path(), "../../outside").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            read_workflow_state(tmp.path()).unwrap().phase,
+            "frontend",
+            "an invalid rollback id must not replace current state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_state_rejects_linked_leaf_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let state_dir = tmp.path().join(".umadev");
+        std::fs::create_dir(&state_dir).unwrap();
+        let external = tmp.path().join("external-state.json");
+        let external_bytes = serde_json::to_vec(&WorkflowState::new(Phase::Docs)).unwrap();
+        std::fs::write(&external, &external_bytes).unwrap();
+        symlink(&external, state_dir.join(STATE_FILE)).unwrap();
+
+        assert!(matches!(
+            read_workflow_state_diagnostic(tmp.path()),
+            ReadState::Corrupt { .. }
+        ));
+        let error =
+            write_workflow_state(tmp.path(), &WorkflowState::new(Phase::Frontend)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&external).unwrap(),
+            external_bytes,
+            "managed state must never overwrite a symlink target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_writer_ignores_linked_history_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        write_workflow_state(tmp.path(), &WorkflowState::new(Phase::Docs)).unwrap();
+        let external = TempDir::new().unwrap();
+        let sentinel = external.path().join("sentinel.json");
+        std::fs::write(&sentinel, b"outside").unwrap();
+        symlink(external.path(), tmp.path().join(".umadev/history")).unwrap();
+
+        // Snapshotting is best-effort, so a hostile/accidental linked history
+        // directory must not block the actual state transition or receive data.
+        write_workflow_state(tmp.path(), &WorkflowState::new(Phase::Frontend)).unwrap();
+        assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside");
+        assert!(list_snapshots(tmp.path()).is_empty());
+    }
+
+    #[test]
     fn list_snapshots_empty_when_no_history() {
         let tmp = TempDir::new().unwrap();
         assert!(list_snapshots(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn history_scan_counts_unknown_entries_toward_its_budget() {
+        let tmp = TempDir::new().unwrap();
+        for index in 0..4 {
+            std::fs::write(tmp.path().join(format!("unknown-{index}")), b"x").unwrap();
+        }
+        assert!(bounded_history_files(tmp.path(), 3).is_none());
     }
 
     #[test]

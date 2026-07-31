@@ -218,10 +218,20 @@ pub fn materialize(project_root: &Path, slug: &str) -> DerivedContracts {
         design_tokens: parse_design_tokens(&read("uiux")),
         acceptance: parse_acceptance(&read("prd")),
     };
-    let dir = project_root.join(".umadev").join("contracts");
-    let _ = std::fs::create_dir_all(&dir);
     if let Ok(json) = serde_json::to_string_pretty(&contracts) {
-        let _ = std::fs::write(dir.join("derived-contracts.json"), json);
+        // This is managed durable state. Refuse linked/special directory and
+        // leaf entries so a repository cannot redirect materialization outside
+        // the project; the operation remains fail-open for the caller.
+        if let Ok(root) = std::fs::canonicalize(project_root) {
+            if let Ok(state_dir) = umadev_state::fs::ensure_real_child_dir(&root, ".umadev") {
+                if let Ok(dir) = umadev_state::fs::ensure_real_child_dir(&state_dir, "contracts") {
+                    let _ = umadev_state::fs::atomic_write(
+                        &dir.join("derived-contracts.json"),
+                        json.as_bytes(),
+                    );
+                }
+            }
+        }
     }
     contracts
 }
@@ -305,5 +315,23 @@ mod tests {
         let round: DerivedContracts =
             serde_json::from_str(&std::fs::read_to_string(emitted).unwrap()).unwrap();
         assert_eq!(round.data_model[0].name, "User");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_does_not_write_through_linked_contract_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".umadev")).unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        symlink(outside.path(), tmp.path().join(".umadev/contracts")).unwrap();
+
+        let contracts = materialize(tmp.path(), "app");
+        assert_eq!(contracts, DerivedContracts::default());
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "managed output must not escape through the directory link"
+        );
     }
 }

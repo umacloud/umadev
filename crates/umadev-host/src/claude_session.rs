@@ -5559,7 +5559,7 @@ cat >/dev/null
         let capture = tmp.join("cancel.json");
         let body = format!(
             r#"#!/bin/sh
-printf '%s\n' '{{"type":"system","subtype":"init","capabilities":["interrupt_receipt_v1"]}}'
+printf '%s\n' '{{"type":"system","subtype":"init","model":"fixture","capabilities":["interrupt_receipt_v1"]}}'
 IFS= read -r user_line
 uuid=$(printf '%s\n' "$user_line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
 printf '{{"type":"command_lifecycle","command_uuid":"%s","state":"queued"}}\n' "$uuid"
@@ -5584,23 +5584,26 @@ cat >/dev/null
         .await
         .expect("start");
 
-        // Wait for the init capability to be consumed; this is feature
-        // detection, never version sniffing.
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if session
-                    .protocol
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .interrupt_receipt_v1
-                {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("init capability observed");
+        // Synchronize on the init frame's public model event instead of polling
+        // an internal flag against a short wall-clock deadline. The protocol
+        // observer consumes capabilities before publishing this event, so this
+        // remains exact feature detection while staying deterministic under a
+        // heavily parallel workspace test run.
+        let init = tokio::time::timeout(std::time::Duration::from_secs(15), session.next_event())
+            .await
+            .expect("init frame observed");
+        assert!(matches!(
+            init,
+            Some(SessionEvent::SessionModel(model)) if model == "fixture"
+        ));
+        assert!(
+            session
+                .protocol
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .interrupt_receipt_v1,
+            "init capability is observed before its model event is published"
+        );
 
         session
             .send_turn("queued command".to_string())

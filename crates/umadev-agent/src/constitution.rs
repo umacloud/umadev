@@ -177,14 +177,19 @@ pub struct ConstitutionDoc {
     pub generated: bool,
 }
 
-/// Persist `markdown` to `path`, creating the parent dir. Best-effort; the
+/// Persist `markdown` below `root`, creating the managed dir. Best-effort; the
 /// caller treats any error as "couldn't write" and falls back to the in-memory
 /// charter (fail-open).
-fn persist(path: &Path, markdown: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+fn persist(root: &Path, markdown: &str) -> std::io::Result<()> {
+    let root = std::fs::canonicalize(root)?;
+    if !umadev_state::fs::real_dir(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "project root is not a real directory",
+        ));
     }
-    std::fs::write(path, markdown)
+    let dir = umadev_state::fs::ensure_real_child_dir(&root, ".umadev")?;
+    umadev_state::fs::atomic_write(&dir.join("constitution.md"), markdown.as_bytes())
 }
 
 /// Resolve the charter for `root`: show the user's existing file if present
@@ -208,7 +213,7 @@ pub fn ensure_constitution(root: &Path) -> ConstitutionDoc {
     }
     // Otherwise generate the default and try to write it (fail-open).
     let markdown = render_constitution(umadev_i18n::current());
-    let _ = persist(&path, &markdown);
+    let _ = persist(root, &markdown);
     ConstitutionDoc {
         markdown,
         path,
@@ -224,7 +229,7 @@ pub fn ensure_constitution(root: &Path) -> ConstitutionDoc {
 pub fn regenerate_constitution(root: &Path) -> ConstitutionDoc {
     let path = constitution_path(root);
     let markdown = render_constitution(umadev_i18n::current());
-    let _ = persist(&path, &markdown);
+    let _ = persist(root, &markdown);
     ConstitutionDoc {
         markdown,
         path,
@@ -390,6 +395,35 @@ mod tests {
         assert!(doc.markdown.contains("UD-CODE-001"));
         // Read-only helper under the unwritable root is None (fail-open).
         assert!(read_constitution(&unwritable).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generation_never_follows_a_linked_managed_directory_or_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let outside_charter = outside.path().join("constitution.md");
+        std::fs::write(&outside_charter, "outside charter").unwrap();
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        let doc = regenerate_constitution(root.path());
+        assert!(doc.generated);
+        assert_eq!(
+            std::fs::read_to_string(&outside_charter).unwrap(),
+            "outside charter"
+        );
+
+        std::fs::remove_file(root.path().join(".umadev")).unwrap();
+        std::fs::create_dir(root.path().join(".umadev")).unwrap();
+        symlink(&outside_charter, root.path().join(constitution_rel_path())).unwrap();
+        let doc = regenerate_constitution(root.path());
+        assert!(doc.generated);
+        assert_eq!(
+            std::fs::read_to_string(&outside_charter).unwrap(),
+            "outside charter"
+        );
     }
 
     #[test]

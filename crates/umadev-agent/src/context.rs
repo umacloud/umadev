@@ -65,8 +65,7 @@
 //! result is just the always-on identity, which is exactly the pre-Wave-2
 //! behaviour. This function NEVER returns an error and NEVER blocks the base.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use umadev_governance::redaction::{redact_json, redact_text};
 
@@ -682,97 +681,12 @@ pub(crate) fn run_notes_directive() -> &'static str {
      passwords, cookie/auth contents, private-key material, or redacted placeholders."
 }
 
-fn metadata_is_real_dir(meta: &std::fs::Metadata) -> bool {
-    if !meta.file_type().is_dir() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
-    }
-    true
-}
-
-fn metadata_is_real_file(meta: &std::fs::Metadata) -> bool {
-    if !meta.file_type().is_file() {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return false;
-        }
-    }
-    true
-}
-
-fn managed_run_notes_path(root: &Path, file_name: &str, create_parent: bool) -> Option<PathBuf> {
-    if !matches!(
-        file_name,
-        "run-notes.md" | "run-notes.prev.md" | "run-notes.prev.pending.md"
-    ) {
-        return None;
-    }
-    let root = std::fs::canonicalize(root).ok()?;
-    if !std::fs::symlink_metadata(&root).is_ok_and(|m| metadata_is_real_dir(&m)) {
-        return None;
-    }
-    let managed = root.join(".umadev");
-    match std::fs::symlink_metadata(&managed) {
-        Ok(meta) if metadata_is_real_dir(&meta) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_parent => {
-            std::fs::create_dir(&managed).ok()?;
-            if !std::fs::symlink_metadata(&managed).is_ok_and(|m| metadata_is_real_dir(&m)) {
-                return None;
-            }
-        }
-        _ => return None,
-    }
-    let path = managed.join(file_name);
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if metadata_is_real_file(&meta) => Some(path),
-        Ok(_) => None,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(path),
-        Err(_) => None,
-    }
-}
-
-fn open_run_notes_no_follow(path: &Path, append: bool, create: bool) -> Option<std::fs::File> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(!append).append(append).create(create);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options.open(path).ok()?;
-    if !file.metadata().is_ok_and(|m| metadata_is_real_file(&m)) {
-        return None;
-    }
-    Some(file)
-}
-
 fn read_run_notes(root: &Path) -> Option<String> {
-    let trusted_root = std::fs::canonicalize(root).ok()?;
-    let path = managed_run_notes_path(root, "run-notes.md", false)?;
-    crate::bounded_fs::read_utf8_beneath(
-        &trusted_root,
-        &path,
-        usize::try_from(MAX_RUN_NOTES_BYTES).ok()?,
-    )
-    .ok()
+    let root = umadev_state::fs::RootedDir::open(root).ok()?;
+    let bytes = root
+        .read_bounded(Path::new(RUN_NOTES_REL_PATH), MAX_RUN_NOTES_BYTES)
+        .ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 fn contains_redaction_marker(text: &str) -> bool {
@@ -872,6 +786,11 @@ fn safe_run_note_lines(body: &str) -> Vec<&str> {
 
 /// Append one validated note through UmaDev's managed writer.
 pub fn record_run_note(root: &Path, note: &str) -> bool {
+    // Capture the workspace identity before policy lookup or other work. A
+    // later replacement of the ambient path cannot retarget the append.
+    let Ok(rooted) = umadev_state::fs::RootedDir::open(root) else {
+        return false;
+    };
     if !capture_enabled(root, MemoryScope::Project, MemoryStore::RunNotes) {
         return false;
     }
@@ -883,21 +802,22 @@ pub fn record_run_note(root: &Path, note: &str) -> bool {
     let _guard = RUN_NOTES_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(path) = managed_run_notes_path(root, "run-notes.md", true) else {
-        return false;
-    };
-    let Some(mut file) = open_run_notes_no_follow(&path, true, true) else {
+    let Ok(_store_lock) = umadev_state::store_lock::acquire_rooted(&rooted, MemoryStore::RunNotes)
+    else {
         return false;
     };
     let body = format!("- {note}\n");
-    let Ok(metadata) = file.metadata() else {
-        return false;
+    let current_len = match rooted.read_bounded(Path::new(RUN_NOTES_REL_PATH), MAX_RUN_NOTES_BYTES)
+    {
+        Ok(bytes) => bytes.len() as u64,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        _ => return false,
     };
-    if metadata.len().saturating_add(body.len() as u64) > MAX_RUN_NOTES_BYTES {
+    if current_len.saturating_add(body.len() as u64) > MAX_RUN_NOTES_BYTES {
         return false;
     }
-    file.write_all(body.as_bytes())
-        .and_then(|()| file.sync_data())
+    rooted
+        .append_private_synced(Path::new(RUN_NOTES_REL_PATH), body.as_bytes(), true)
         .is_ok()
 }
 
@@ -939,70 +859,40 @@ pub fn run_notes_tail_block(root: &Path, max_lines: usize) -> String {
     format!("{header}{tail}")
 }
 
-#[cfg(not(windows))]
-fn replace_run_notes_file(_root: &Path, current: &Path, previous: &Path) -> bool {
-    std::fs::rename(current, previous).is_ok()
-}
-
-#[cfg(windows)]
-fn replace_run_notes_file(root: &Path, current: &Path, previous: &Path) -> bool {
-    let Some(pending) = managed_run_notes_path(root, "run-notes.prev.pending.md", false) else {
-        return false;
-    };
-    if pending.exists() {
-        if previous.exists() {
-            if std::fs::remove_file(&pending).is_err() {
-                return false;
-            }
-        } else if std::fs::rename(&pending, previous).is_err() {
-            return false;
-        }
-    }
-    if !previous.exists() {
-        return std::fs::rename(current, previous).is_ok();
-    }
-    if std::fs::rename(previous, &pending).is_err() {
-        return false;
-    }
-    if std::fs::rename(current, previous).is_ok() {
-        let _ = std::fs::remove_file(pending);
-        true
-    } else {
-        let _ = std::fs::rename(pending, previous);
-        false
-    }
-}
-
 /// Rotate the run-notes file at the start of a NEW deliberate run (fresh plan
 /// synthesis): `.umadev/run-notes.md` → `.umadev/run-notes.prev.md` (replacing
 /// any older prev), so notes stay scoped to ONE run. A RESUME re-attaches the
 /// SAME plan and never rotates — its notes are exactly the memory it wants back.
 /// Best-effort + fail-open at every step: an absent/unsafe file is a no-op and a
-/// failed replacement leaves the live notes untouched. Windows uses a recoverable
-/// same-directory pending generation because safe `std::fs::rename` cannot replace
-/// an existing target there.
+/// failed replacement leaves the live notes untouched. Rotation publishes the
+/// complete previous generation before removing the live file, which has the
+/// same crash-safe behavior on Unix and Windows.
 pub fn rotate_run_notes(root: &Path) {
     let _guard = RUN_NOTES_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(cur) = managed_run_notes_path(root, "run-notes.md", false) else {
+    let Ok(root) = umadev_state::fs::RootedDir::open(root) else {
         return;
     };
-    let Some(prev) = managed_run_notes_path(root, "run-notes.prev.md", false) else {
+    let Ok(_store_lock) = umadev_state::store_lock::acquire_rooted(&root, MemoryStore::RunNotes)
+    else {
         return;
     };
-    match read_run_notes(root) {
-        Some(body) if !body.trim().is_empty() => {
-            // Windows' safe standard-library rename does not replace an existing
-            // target; there we use a recoverable same-directory pending generation.
-            let _ = replace_run_notes_file(root, &cur, &prev);
+    match root.read_bounded(Path::new(RUN_NOTES_REL_PATH), MAX_RUN_NOTES_BYTES) {
+        Ok(body) if body.iter().any(|byte| !byte.is_ascii_whitespace()) => {
+            if root
+                .atomic_write(Path::new(RUN_NOTES_PREV_REL_PATH), &body, false)
+                .is_ok()
+            {
+                let _ = root.remove_regular_file(Path::new(RUN_NOTES_REL_PATH));
+            }
         }
         // An empty notes file carries nothing worth keeping — just clear it.
-        Some(_) => {
-            let _ = std::fs::remove_file(&cur);
+        Ok(_) => {
+            let _ = root.remove_regular_file(Path::new(RUN_NOTES_REL_PATH));
         }
         // No notes (or unreadable) → nothing to rotate.
-        None => {}
+        Err(_) => {}
     }
 }
 

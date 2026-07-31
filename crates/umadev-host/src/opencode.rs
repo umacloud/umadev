@@ -67,10 +67,9 @@ fn version_output_excerpt(raw: &str) -> String {
 }
 
 /// Resolve the installed `opencode` binary by reading its `--version`, WITHOUT
-/// enforcing the read-only floor. This only proves the base is installed and
-/// answering, so discovery and the Guarded/Auto postures run ANY installed
-/// version. `Ok` carries the raw `--version` output for a caller that then
-/// applies the Plan-only floor; `Err` distinguishes an absent binary
+/// enforcing a version floor or allowlist. This only proves the base is installed
+/// and answering, so every permission posture runs ANY installed version. `Ok`
+/// carries the raw `--version` output for diagnostics; `Err` distinguishes an absent binary
 /// (`... not found on PATH`, surfaced as `NotInstalled`) from a `--version`
 /// that genuinely failed (surfaced as `Unhealthy`).
 pub(crate) async fn probe_opencode_version(
@@ -793,7 +792,7 @@ impl HostDriver for OpenCodeDriver {
         match self.require_resolved_version(&tmp).await {
             // Installed AND answering `--version` → Ready regardless of the
             // version NUMBER: an old build is installed, not "refused". The
-            // read-only Plan floor is applied at run time, never at discovery,
+            // read-only Plan permission rules are applied at run time, never at discovery,
             // so the picker treats OpenCode like every other base and can still
             // show the detected version. Resolve the honest auth state too
             // (gap G10).
@@ -966,7 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_reports_ready_for_an_installed_old_version() {
-        // Installed but below the Plan floor is still INSTALLED: the doctor/picker
+        // An old installed version is still INSTALLED: the doctor/picker
         // shows Ready (with the detected version), like claude/codex/kimi/grok —
         // the read-only refusal is deferred to a Plan run, not shown as Unhealthy.
         let d = OpenCodeDriver::with_program("echo").with_version_output_for_test("1.14.30");

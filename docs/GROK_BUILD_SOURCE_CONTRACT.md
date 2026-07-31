@@ -13,12 +13,13 @@
 | Item | Audited value |
 |---|---|
 | Official repository | <https://github.com/xai-org/grok-build> |
-| Audited commit | `47348d13ec4508dcfe440e34c6d511bb02998fb2` |
-| Grok Build version | `0.2.112` |
+| Latest source-audited commit | `500129c714ad1b10e6095481f4a8387a2ec52649` |
+| Latest source-audited Grok Build version | `0.2.114` |
+| Real-artifact regression version | `0.2.112` |
 | `agent-client-protocol` | `0.10.4`, with upstream's `unstable` feature |
 | `agent-client-protocol-schema` resolved by upstream | `0.11.4` |
 | ACP wire protocol negotiated by this build | V1 |
-| Audit date | 2026-07-26 |
+| Audit date | 2026-07-31 |
 
 The version is declared by the upstream `xai-grok-pager`,
 `xai-grok-pager-bin`, `xai-grok-shell`, and related crates. The ACP dependency
@@ -27,11 +28,18 @@ recorded in its `Cargo.lock`.
 
 This commit is the latest source snapshot used to detect upstream drift. It is
 not a runtime version gate. Every official peer reporting `grokShell: true` may
-run; standard features come from ACP advertisement/session state, and private
-messages pass only typed, bounded parsers with method-level fallback.
+run and standard features always come from ACP advertisement/session state.
+Private methods additionally require per-capability evidence: an explicit live
+marker, a successful side-effect-free probe, or the stable major/minor
+compatibility line established by the source audit. A newer stable patch on that
+line is not disabled just because its patch number exceeds this document's
+snapshot; every typed parser and bounded RPC still fails soft on its own shape
+or response. Missing, malformed, old, prerelease, and different major/minor
+labels degrade to standard ACP and live-advertised controls instead of
+inheriting a different private wire generation.
 
-The audited `0.2.112` release artifacts are retained by content
-as cross-platform regression fixtures, rather than trusting a mutable installer:
+The source audit has advanced to `0.2.114`, while the content-addressed
+cross-platform real-binary regression set remains at `0.2.112`:
 
 | Official artifact | SHA-256 |
 |---|---|
@@ -50,6 +58,16 @@ confirmation. The other two hashes lock the official artifact bytes for the
 architectures UmaDev can encounter even though GitHub-hosted runners cannot
 execute those foreign-architecture binaries.
 
+This distinction is intentional and must stay visible: `0.2.114` private-wire
+compatibility is currently supported by source review, typed fixtures, and
+adapter tests; the isolated real-process artifact proof still covers `0.2.112`.
+Until the artifact matrix and digests are refreshed, release notes must not
+describe `0.2.114` as real-binary proven. This evidence gap does not reject any
+installed Grok version. Stable future patches on the audited `0.2` line keep
+the compatible typed extensions; an old, prerelease, missing, malformed, or
+future different-line version continues through its live standard ACP
+advertisement, with only unproved private extensions disabled.
+
 The previous audit point was `8adf9013a0929e5c7f1d4e849492d2387837a28d`
 (`0.2.101`). Versions 0.2.102 through 0.2.106 substantially changed
 authentication single-flight/cancellation, prompt admission and background
@@ -61,7 +79,7 @@ were rerun for this pin. New optional client-driven methods such as
 `x.ai/mcp/setup` and `x.ai/session/import` are not advertised as UmaDev features
 merely because the vendor pager uses them.
 
-The latest source re-audit additionally compared `0.2.109` through `0.2.112`.
+The latest source re-audit additionally compared `0.2.109` through `0.2.114`.
 The public ACP version and schema remain unchanged. Interjection, lifecycle
 notifications, turn completion, permission choices and authentication ordering
 remain wire-compatible. Subagent execution moved behind a coordinator actor and
@@ -93,14 +111,20 @@ only when all of these are true:
 1. the selected base is `grok-build`;
 2. `initialize._meta.grokShell` is exactly `true`;
 3. the exact method and payload have a typed, bounded parser;
-4. outbound optional methods either have live advertisement or treat
-   method-not-found as a local capability downgrade;
+4. outbound optional methods have a live advertisement, pass a side-effect-free
+   typed probe, or fall on that method's source-audited stable compatibility
+   line;
 5. the feature's acceptance tests are green.
 
-An old, future, prerelease, build-metadata, missing, or non-SemVer version label
-does not block Grok. Unknown methods or changed payloads degrade only that
-feature. A method-not-found response to an optional private method is a
-capability result, not a fatal session error.
+No version label blocks Grok. Stable future patches on the source-audited
+major/minor line retain its per-method contracts without a compiled-in maximum
+patch. An old, prerelease, missing, non-SemVer, or different-line version runs
+on standard ACP unless separate live evidence proves an optional feature.
+Unknown methods or changed payloads degrade only that feature. A
+method-not-found response to an optional private method is a capability result,
+not a fatal session error. In particular, queue enqueue/mutation, interjection,
+background control, Folder Trust settlement, image fallback, and unadvertised
+mode switching are never inferred from `grokShell: true` alone.
 
 No `x.ai` behavior is described as ACP-standard. ACP is a transport protocol,
 not evidence that one CLI was derived from another product.
@@ -423,8 +447,9 @@ workspace/session, or any unknown outcome stays untrusted. Granting trust can
 hot-reload MCP/plugins/hooks, while the pinned source requires a new session for
 LSP and for sessions created while another trust modal was already open.
 
-Current status: **Implemented for official Grok interactive sessions without a
-version allowlist**. Headless sessions still do not advertise the capability. The
+Current status: **Implemented for source-audited Grok interactive sessions,
+without making that private evidence range a startup allowlist**. Headless
+sessions still do not advertise the capability. The
 resident TUI carries the typed reverse request, displays the bounded workspace
 and gated configuration kinds, and grants only an explicit Trust choice;
 foreign scope, malformed input, close, timeout, cancellation and transport

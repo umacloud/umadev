@@ -19,6 +19,10 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use fs2::FileExt as _;
+use umadev_state::fs::RootedDir;
 
 /// The custom knowledge directory: `knowledge/custom/`.
 /// Files here are picked up by the existing RAG indexer automatically.
@@ -29,6 +33,37 @@ const MAX_TOTAL_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DOCUMENT_FILES: usize = 1_024;
 const MAX_WALK_DEPTH: usize = 32;
 const MAX_WALK_ENTRIES: usize = 4_096;
+const KNOWLEDGE_MUTATION_LOCK: &str = ".umadev/knowledge-manager.lock";
+const KNOWLEDGE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const KNOWLEDGE_LOCK_POLL: Duration = Duration::from_millis(5);
+
+fn with_mutation_lock<T>(
+    project_root: &Path,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let root = RootedDir::open_no_follow(project_root)?;
+    root.ensure_dir(Path::new(".umadev"), false)?;
+    let lock = root.open_private_lock(Path::new(KNOWLEDGE_MUTATION_LOCK), false)?;
+    let deadline = Instant::now() + KNOWLEDGE_LOCK_TIMEOUT;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(KNOWLEDGE_LOCK_POLL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "another knowledge update is still running",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    operation()
+}
 
 /// Registry of custom-added documents (stored in `.umadev/knowledge.json`).
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -140,6 +175,16 @@ pub fn add_knowledge(
     source: &Path,
     name: Option<&str>,
 ) -> std::io::Result<AddResult> {
+    with_mutation_lock(project_root, || {
+        add_knowledge_unlocked(project_root, source, name)
+    })
+}
+
+fn add_knowledge_unlocked(
+    project_root: &Path,
+    source: &Path,
+    name: Option<&str>,
+) -> std::io::Result<AddResult> {
     // Validate the registry before copying anything. A corrupt registry must
     // never be silently replaced after files have already been staged.
     let mut registry = KnowledgeRegistry::load_strict(project_root)?;
@@ -230,7 +275,7 @@ pub fn add_knowledge(
             // base will never index — clean up and tell the user plainly what was
             // skipped (non-markdown and/or symlinked files).
             if !dest_pre_existed {
-                let _ = std::fs::remove_dir_all(&dest_dir);
+                let _ = remove_custom_tree(project_root, &entry_name);
             }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -245,7 +290,7 @@ pub fn add_knowledge(
     } else if umadev_state::fs::metadata_is_real_file(&source_metadata) {
         if !is_markdown(source) {
             if !dest_pre_existed {
-                let _ = std::fs::remove_dir_all(&dest_dir);
+                let _ = remove_custom_tree(project_root, &entry_name);
             }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -281,6 +326,12 @@ pub fn add_knowledge(
 
 /// Remove custom knowledge by name.
 pub fn remove_knowledge(project_root: &Path, name: &str) -> std::io::Result<()> {
+    with_mutation_lock(project_root, || {
+        remove_knowledge_unlocked(project_root, name)
+    })
+}
+
+fn remove_knowledge_unlocked(project_root: &Path, name: &str) -> std::io::Result<()> {
     safe_component(name)?;
     let mut registry = KnowledgeRegistry::load_strict(project_root)?;
     if !registry.entries.contains_key(name) {
@@ -289,18 +340,26 @@ pub fn remove_knowledge(project_root: &Path, name: &str) -> std::io::Result<()> 
             format!("knowledge '{name}' not found"),
         ));
     }
-    let dir = project_root.join(CUSTOM_DIR).join(name);
-    if dir.exists() {
-        if !umadev_state::fs::real_dir(&dir) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "refusing to remove a linked/non-directory knowledge path",
-            ));
-        }
-        std::fs::remove_dir_all(&dir)?;
-    }
+    remove_custom_tree(project_root, name)?;
     registry.entries.remove(name);
     registry.save(project_root)?;
+    Ok(())
+}
+
+fn remove_custom_tree(project_root: &Path, name: &str) -> std::io::Result<()> {
+    let root = RootedDir::open_no_follow(project_root)?;
+    let relative = Path::new(CUSTOM_DIR).join(name);
+    let files = root.list_regular_tree(
+        &relative,
+        MAX_WALK_DEPTH,
+        MAX_WALK_ENTRIES,
+        MAX_DOCUMENT_FILES,
+        MAX_TOTAL_DOCUMENT_BYTES,
+    )?;
+    for file in files {
+        root.remove_regular_file(&file.relative)?;
+    }
+    root.remove_empty_directory_tree(&relative, MAX_WALK_DEPTH, MAX_WALK_ENTRIES)?;
     Ok(())
 }
 
@@ -763,5 +822,31 @@ mod tests {
         walk_source_bounded(tmp.path(), &mut files, 0, &mut entries_seen);
         assert_eq!(entries_seen, MAX_WALK_ENTRIES);
         assert!(files.len() <= 2);
+    }
+
+    #[test]
+    fn concurrent_adds_preserve_every_registry_entry() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = Arc::new(tmp.path().to_path_buf());
+        let barrier = Arc::new(Barrier::new(9));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let source = root.join(format!("source-{index}.md"));
+            std::fs::write(&source, format!("# Source {index}")).unwrap();
+            let root = Arc::clone(&root);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                add_knowledge(&root, &source, Some(&format!("entry-{index}")))
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap().unwrap();
+        }
+
+        assert_eq!(list_knowledge(&root).len(), 8);
     }
 }

@@ -47,6 +47,7 @@ const DEPLOY_TIMEOUT_SECS: u64 = 600;
 /// stored `log_tail` is capped smaller still, at [`CAPTURE_CAP`].
 const OUTPUT_CAP: usize = 256 * 1024;
 const MAX_DEPLOY_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DEPLOY_PROOF_BYTES: usize = 1024 * 1024;
 
 /// Bounded reap / pipe-reader grace after a deploy tree is terminated.
 const KILL_REAP_SECS: u64 = 5;
@@ -466,12 +467,19 @@ async fn run_deploy_command(
 /// success; a write failure is fail-open (callers swallow the `Err`) — it must
 /// not block delivery.
 pub fn write_deploy_proof(workspace: &Path, proof: &DeployProof) -> std::io::Result<PathBuf> {
-    let audit_dir = workspace.join(".umadev/audit");
-    std::fs::create_dir_all(&audit_dir)?;
-    let path = audit_dir.join("deploy-proof.json");
-    let body = serde_json::to_string_pretty(proof).unwrap_or_else(|_| "{}".into());
-    std::fs::write(&path, body)?;
-    Ok(path)
+    let audit_dir =
+        crate::bounded_fs::ensure_real_dir_beneath(workspace, Path::new(".umadev/audit"))?;
+    let value = serde_json::to_value(proof).map_err(std::io::Error::other)?;
+    let value = umadev_governance::redaction::redact_json(value);
+    let body = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
+    if body.len() > MAX_DEPLOY_PROOF_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "deploy proof exceeds the managed file limit",
+        ));
+    }
+    umadev_state::fs::atomic_write(&audit_dir.join("deploy-proof.json"), &body)?;
+    Ok(workspace.join(deploy_proof_rel_path()))
 }
 
 /// The canonical location of the deploy-proof artifact relative to the
@@ -775,6 +783,36 @@ mod tests {
         // Even a not-deployed record surfaces the command the user can run.
         assert_eq!(p.command.as_deref(), Some("npx vercel --prod --yes"));
         assert!(p.summary_line().contains("vercel not on PATH"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_proof_is_redacted_and_never_follows_managed_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_proof = outside.path().join("deploy-proof.json");
+        fs::write(&outside_proof, "outside").unwrap();
+        let mut proof = DeployProof::not_deployed(DeployTarget::Vercel, "failed");
+        proof.command = Some("deploy --api_key=sk-live-super-secret-value".to_string());
+        proof.log_tail = "Authorization: Bearer live-secret-value".to_string();
+
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        assert!(write_deploy_proof(root.path(), &proof).is_err());
+        assert_eq!(fs::read_to_string(&outside_proof).unwrap(), "outside");
+
+        fs::remove_file(root.path().join(".umadev")).unwrap();
+        let path = write_deploy_proof(root.path(), &proof).unwrap();
+        let body = fs::read_to_string(path).unwrap();
+        assert!(!body.contains("sk-live-super-secret-value"));
+        assert!(!body.contains("live-secret-value"));
+        assert!(body.contains("[redacted]"));
+
+        fs::remove_file(root.path().join(deploy_proof_rel_path())).unwrap();
+        symlink(&outside_proof, root.path().join(deploy_proof_rel_path())).unwrap();
+        assert!(write_deploy_proof(root.path(), &proof).is_err());
+        assert_eq!(fs::read_to_string(&outside_proof).unwrap(), "outside");
     }
 
     #[tokio::test]

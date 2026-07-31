@@ -59,6 +59,14 @@ use serde::{Deserialize, Serialize};
 
 /// Embedding dimension for `text-embedding-3-small`.
 const EMBED_DIM: usize = 1536;
+const MAX_EMBED_DIM: usize = 65_536;
+
+/// Hard ceiling for an untrusted embeddings HTTP response. The standard
+/// 100-item batch at 3072 dimensions is comfortably below this even with
+/// verbose JSON number formatting, while a provider (or proxy) cannot make us
+/// buffer an unbounded body before `serde_json` gets a chance to reject it.
+#[cfg(feature = "vector")]
+const MAX_EMBED_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Known model → embedding dimension. Used to validate that a configured
 /// model matches the dimension the store was built with — previously
@@ -95,7 +103,7 @@ const KNOWN_MODEL_DIMS: &[(&str, usize)] = &[
 pub fn active_dim() -> usize {
     if let Ok(v) = std::env::var("UMADEV_EMBED_DIM") {
         if let Ok(d) = v.parse::<usize>() {
-            if d > 0 {
+            if (1..=MAX_EMBED_DIM).contains(&d) {
                 return d;
             }
         }
@@ -104,7 +112,7 @@ pub fn active_dim() -> usize {
     {
         // The local backend is consulted first at embed time, so when it is
         // usable its real width is what the store actually contains.
-        if let Some(d) = crate::local_embed::local_dim() {
+        if let Some(d) = crate::local_embed::local_dim().filter(|d| *d <= MAX_EMBED_DIM) {
             return d;
         }
     }
@@ -118,6 +126,23 @@ pub fn active_dim() -> usize {
 /// `search` accepts queries of the same (real) width. See [`VectorStore::from_embedded`].
 fn store_dim(entries: &[(u32, String, String, u64, Vec<f32>)]) -> usize {
     entries.first().map_or_else(active_dim, |e| e.4.len())
+}
+
+fn embedded_entries_are_valid(entries: &[(u32, String, String, u64, Vec<f32>)]) -> bool {
+    if entries.len() > crate::index::MAX_INDEX_CHUNKS {
+        return false;
+    }
+    let Some(first) = entries.first() else {
+        return true;
+    };
+    let dimension = first.4.len();
+    (1..=MAX_EMBED_DIM).contains(&dimension)
+        && entries.iter().all(|(_, path, section, _, vector)| {
+            path.len() <= 16 * 1024
+                && section.len() <= 16 * 1024
+                && vector.len() == dimension
+                && vector.iter().all(|value| value.is_finite())
+        })
 }
 
 /// The documented dimension for a known embedding model, or `None` when the
@@ -327,7 +352,7 @@ impl VectorStore {
         };
         if store.vectors.len() > crate::index::MAX_INDEX_CHUNKS
             || store.dim == 0
-            || store.dim > 65_536
+            || store.dim > MAX_EMBED_DIM
             || store.model.len() > 512
             || store.corpus_sig.len() > 512
             || store.vectors.iter().any(|entry| {
@@ -461,6 +486,10 @@ impl VectorStore {
     /// body_hash, vec) tuples. Used by the index builder after embedding.
     #[must_use]
     pub fn from_embedded(model: &str, entries: Vec<(u32, String, String, u64, Vec<f32>)>) -> Self {
+        if model.len() > 512 || !embedded_entries_are_valid(&entries) {
+            tracing::warn!("refusing to construct a vector store from invalid embedding data");
+            return Self::disabled();
+        }
         // H3 fix: tag the store with the ACTUAL embedding width produced
         // (`vec[0].len()`), NOT `active_dim()`. The active backend (e.g. the
         // bundled 384-dim local model) can emit a different width than the
@@ -493,6 +522,11 @@ impl VectorStore {
     /// rebuild). Takes the same shape as [`Self::from_embedded`] without
     /// exposing the private stored-vector representation.
     pub fn replace(&mut self, model: &str, entries: Vec<(u32, String, String, u64, Vec<f32>)>) {
+        if model.len() > 512 || !embedded_entries_are_valid(&entries) {
+            tracing::warn!("discarding invalid replacement embedding data");
+            *self = Self::disabled();
+            return;
+        }
         self.model = model.to_string();
         // H3 fix: see [`from_embedded`] — dim follows the real vector width.
         self.dim = store_dim(&entries);
@@ -558,6 +592,23 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Whether a backend produced one finite, non-empty, consistently sized vector
+/// for every requested input. Both the bundled model and HTTP providers cross
+/// this boundary before their output may enter a persisted vector store.
+fn embeddings_have_valid_shape(vectors: &[Vec<f32>], expected_count: usize) -> bool {
+    if vectors.len() != expected_count {
+        return false;
+    }
+    if vectors.is_empty() {
+        return expected_count == 0;
+    }
+    let dimension = vectors[0].len();
+    (1..=MAX_EMBED_DIM).contains(&dimension)
+        && vectors
+            .iter()
+            .all(|vector| vector.len() == dimension && vector.iter().all(|value| value.is_finite()))
+}
+
 // ---------------------------------------------------------------------------
 // HTTP transport — only compiled when the `vector` feature is on. Without
 // it, embed_query/embed_batch compile to stubs returning None, and the crate
@@ -583,7 +634,7 @@ pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
             .ok()
             .flatten();
             if let Some(mut v) = local {
-                if v.len() == 1 {
+                if embeddings_have_valid_shape(&v, 1) {
                     return Some(v.swap_remove(0));
                 }
             }
@@ -596,12 +647,8 @@ pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
         let key = cloud_embed_key()?;
         let url = format!("{}/v1/embeddings", api_base());
         let body = serde_json::json!({ "model": DEFAULT_MODEL, "input": text });
-        let mut vecs = http_embed(&url, &key, body).await?;
-        if vecs.len() == 1 {
-            Some(vecs.pop()?)
-        } else {
-            None
-        }
+        let mut vecs = http_embed(&url, &key, body, 1).await?;
+        vecs.pop()
     }
     #[cfg(not(feature = "vector"))]
     {
@@ -629,7 +676,7 @@ pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
                     .ok()
                     .flatten();
             if let Some(v) = local {
-                if v.len() == texts.len() {
+                if embeddings_have_valid_shape(&v, texts.len()) {
                     return Some(v);
                 }
             }
@@ -649,14 +696,14 @@ pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(EMBED_BATCH_MAX) {
             let body = serde_json::json!({ "model": DEFAULT_MODEL, "input": chunk });
-            let mut vecs = http_embed(&url, &key, body).await?;
+            let mut vecs = http_embed(&url, &key, body, chunk.len()).await?;
             out.append(&mut vecs);
         }
-        if out.len() == texts.len() {
+        if embeddings_have_valid_shape(&out, texts.len()) {
             Some(out)
         } else {
             tracing::warn!(
-                "embeddings count mismatch: got {} expected {} — discarding batch",
+                "embeddings shape mismatch: got {} vectors for {} inputs — discarding batch",
                 out.len(),
                 texts.len()
             );
@@ -713,7 +760,12 @@ async fn backoff_sleep(n: u32) {
 }
 
 #[cfg(feature = "vector")]
-async fn http_embed(url: &str, key: &str, body: serde_json::Value) -> Option<Vec<Vec<f32>>> {
+async fn http_embed(
+    url: &str,
+    key: &str,
+    body: serde_json::Value,
+    expected_count: usize,
+) -> Option<Vec<Vec<f32>>> {
     // Pooled client reused across all calls (connection keep-alive + TLS
     // reuse). Built once on first use so startup cost is zero when vectors
     // are never activated.
@@ -762,19 +814,76 @@ async fn http_embed(url: &str, key: &str, body: serde_json::Value) -> Option<Vec
             tracing::warn!("embeddings API returned {status} (fail-open → BM25)");
             return None;
         }
-        let json: EmbedResponse = match resp.json().await {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!("embeddings response parse failed (fail-open → BM25): {e}");
+        return read_embed_response(resp, expected_count).await;
+    }
+}
+
+/// Read and decode a successful provider response without ever buffering more
+/// than [`MAX_EMBED_RESPONSE_BYTES`]. Checking `Content-Length` is only an early
+/// rejection: chunked/misreported responses are independently capped while
+/// streaming, and JSON deserialization happens only after the bounded read.
+#[cfg(feature = "vector")]
+async fn read_embed_response(
+    mut response: reqwest::Response,
+    expected_count: usize,
+) -> Option<Vec<Vec<f32>>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > u64::try_from(MAX_EMBED_RESPONSE_BYTES).unwrap_or(u64::MAX))
+    {
+        tracing::warn!(
+            "embeddings response exceeds {MAX_EMBED_RESPONSE_BYTES} bytes (fail-open → BM25)"
+        );
+        return None;
+    }
+
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(MAX_EMBED_RESPONSE_BYTES);
+    let mut bytes = Vec::with_capacity(initial_capacity);
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!("embeddings response read failed (fail-open → BM25): {error}");
                 return None;
             }
         };
-        let mut items = json.data;
-        // OpenAI may return embeddings out of input order; sort by the `index`
-        // field to guarantee alignment with the input batch.
-        items.sort_by_key(|d| d.index);
-        return Some(items.into_iter().map(|d| d.embedding).collect());
+        let Some(new_len) = bytes.len().checked_add(chunk.len()) else {
+            tracing::warn!("embeddings response size overflow (fail-open → BM25)");
+            return None;
+        };
+        if new_len > MAX_EMBED_RESPONSE_BYTES {
+            tracing::warn!(
+                "embeddings response exceeds {MAX_EMBED_RESPONSE_BYTES} bytes (fail-open → BM25)"
+            );
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
     }
+
+    decode_embed_response(&bytes, expected_count)
+}
+
+#[cfg(feature = "vector")]
+fn decode_embed_response(bytes: &[u8], expected_count: usize) -> Option<Vec<Vec<f32>>> {
+    if bytes.len() > MAX_EMBED_RESPONSE_BYTES {
+        tracing::warn!(
+            "embeddings response exceeds {MAX_EMBED_RESPONSE_BYTES} bytes (fail-open → BM25)"
+        );
+        return None;
+    }
+    let json: EmbedResponse = match serde_json::from_slice(bytes) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::warn!("embeddings response parse failed (fail-open → BM25): {error}");
+            return None;
+        }
+    };
+    validate_embeddings(json.data, expected_count)
 }
 
 /// Per-request timeout for embeddings calls. Generous because a full corpus
@@ -791,15 +900,111 @@ static EMBED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock:
 #[cfg(feature = "vector")]
 #[derive(Debug, Deserialize)]
 struct EmbedResponse {
+    #[serde(deserialize_with = "deserialize_embed_items")]
     data: Vec<EmbedItem>,
 }
 
 #[cfg(feature = "vector")]
 #[derive(Debug, Deserialize)]
 struct EmbedItem {
+    #[serde(deserialize_with = "deserialize_embedding")]
     embedding: Vec<f32>,
-    #[allow(dead_code)]
     index: usize,
+}
+
+/// Deserialize a JSON sequence with an allocation-aware element ceiling. The
+/// post-parse validator below still owns semantic shape, but these visitors
+/// stop a compact malicious JSON body from amplifying into an enormous `Vec`
+/// before validation runs.
+#[cfg(feature = "vector")]
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T, const MAX: usize>(std::marker::PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedVecVisitor<T, MAX>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "an array with at most {MAX} elements")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+            while let Some(value) = sequence.next_element()? {
+                if values.len() == MAX {
+                    return Err(serde::de::Error::custom(format_args!(
+                        "array exceeds {MAX} elements"
+                    )));
+                }
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(std::marker::PhantomData))
+}
+
+#[cfg(feature = "vector")]
+fn deserialize_embed_items<'de, D>(deserializer: D) -> Result<Vec<EmbedItem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, EmbedItem, EMBED_BATCH_MAX>(deserializer)
+}
+
+#[cfg(feature = "vector")]
+fn deserialize_embedding<'de, D>(deserializer: D) -> Result<Vec<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, f32, MAX_EMBED_DIM>(deserializer)
+}
+
+/// Validate the untrusted provider response before aligning it with corpus
+/// chunks. Count alone is insufficient: duplicate/missing indices silently
+/// attach vectors to the wrong text, while empty, non-finite, or mixed-width
+/// vectors poison similarity ranking and the persisted cache.
+#[cfg(feature = "vector")]
+fn validate_embeddings(mut items: Vec<EmbedItem>, expected_count: usize) -> Option<Vec<Vec<f32>>> {
+    if expected_count == 0
+        || expected_count > EMBED_BATCH_MAX
+        || items.len() > EMBED_BATCH_MAX
+        || items.len() != expected_count
+    {
+        tracing::warn!(
+            "embeddings response count mismatch: got {} expected {expected_count}",
+            items.len()
+        );
+        return None;
+    }
+
+    items.sort_by_key(|item| item.index);
+    if items
+        .iter()
+        .enumerate()
+        .any(|(expected_index, item)| item.index != expected_index)
+    {
+        tracing::warn!("embeddings response indices are duplicate, missing, or out of range");
+        return None;
+    }
+
+    let vectors: Vec<Vec<f32>> = items.into_iter().map(|item| item.embedding).collect();
+    if !embeddings_have_valid_shape(&vectors, expected_count) {
+        tracing::warn!("embeddings response contains invalid vector data");
+        return None;
+    }
+
+    Some(vectors)
 }
 
 #[cfg(test)]
@@ -843,6 +1048,137 @@ mod tests {
         assert!(cosine(&nan, &good).abs() < 1e-9, "NaN component -> 0.0");
         assert!(cosine(&inf, &good).abs() < 1e-9, "inf component -> 0.0");
         assert!(cosine(&good, &good).is_finite());
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn provider_embeddings_are_ordered_by_complete_unique_indices() {
+        let ordered = validate_embeddings(
+            vec![
+                EmbedItem {
+                    embedding: vec![0.0, 1.0],
+                    index: 1,
+                },
+                EmbedItem {
+                    embedding: vec![1.0, 0.0],
+                    index: 0,
+                },
+            ],
+            2,
+        )
+        .expect("valid out-of-order response");
+        assert_eq!(ordered, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+
+        assert!(validate_embeddings(
+            vec![
+                EmbedItem {
+                    embedding: vec![1.0, 0.0],
+                    index: 0,
+                },
+                EmbedItem {
+                    embedding: vec![0.0, 1.0],
+                    index: 0,
+                },
+            ],
+            2,
+        )
+        .is_none());
+        assert!(validate_embeddings(
+            vec![EmbedItem {
+                embedding: vec![1.0, 0.0],
+                index: 1,
+            }],
+            1,
+        )
+        .is_none());
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn provider_embeddings_reject_invalid_vector_shapes_and_values() {
+        for items in [
+            vec![EmbedItem {
+                embedding: Vec::new(),
+                index: 0,
+            }],
+            vec![EmbedItem {
+                embedding: vec![f32::NAN],
+                index: 0,
+            }],
+            vec![EmbedItem {
+                embedding: vec![f32::INFINITY],
+                index: 0,
+            }],
+        ] {
+            assert!(validate_embeddings(items, 1).is_none());
+        }
+
+        assert!(validate_embeddings(
+            vec![
+                EmbedItem {
+                    embedding: vec![1.0, 0.0],
+                    index: 0,
+                },
+                EmbedItem {
+                    embedding: vec![1.0],
+                    index: 1,
+                },
+            ],
+            2,
+        )
+        .is_none());
+
+        assert!(validate_embeddings(
+            vec![EmbedItem {
+                embedding: vec![0.0; MAX_EMBED_DIM + 1],
+                index: 0,
+            }],
+            1,
+        )
+        .is_none());
+
+        let too_many = (0..=EMBED_BATCH_MAX)
+            .map(|index| EmbedItem {
+                embedding: vec![1.0],
+                index,
+            })
+            .collect();
+        assert!(validate_embeddings(too_many, EMBED_BATCH_MAX + 1).is_none());
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn provider_response_is_byte_bounded_before_json_decode() {
+        let oversized = vec![b' '; MAX_EMBED_RESPONSE_BYTES + 1];
+        assert!(decode_embed_response(&oversized, 1).is_none());
+
+        // The same decoder remains compatible with ordinary OpenAI-compatible
+        // providers and ignores response fields outside our minimal schema.
+        let ordinary = br#"{
+            "object":"list",
+            "data":[{"object":"embedding","embedding":[0.25,-0.5],"index":0}],
+            "model":"custom-compatible-provider",
+            "usage":{"prompt_tokens":1,"total_tokens":1}
+        }"#;
+        assert_eq!(
+            decode_embed_response(ordinary, 1),
+            Some(vec![vec![0.25, -0.5]])
+        );
+
+        let overwide = format!(
+            r#"{{"data":[{{"embedding":[{}0],"index":0}}]}}"#,
+            "0,".repeat(MAX_EMBED_DIM)
+        );
+        assert!(decode_embed_response(overwide.as_bytes(), 1).is_none());
+
+        let item = r#"{"embedding":[1.0],"index":0}"#;
+        let too_many = format!(
+            r#"{{"data":[{}]}}"#,
+            std::iter::repeat_n(item, EMBED_BATCH_MAX + 1)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(decode_embed_response(too_many.as_bytes(), 1).is_none());
     }
 
     #[test]
@@ -901,6 +1237,29 @@ mod tests {
             !store.search(&q, 3).is_empty(),
             "search must accept the replaced store's real width"
         );
+    }
+
+    #[test]
+    fn constructors_discard_mixed_width_or_non_finite_vectors() {
+        let mixed = vec![
+            (0, "a".into(), "s".into(), 0, vec![1.0, 0.0]),
+            (1, "b".into(), "s".into(), 0, vec![1.0]),
+        ];
+        assert!(VectorStore::from_embedded("m", mixed.clone()).is_empty());
+
+        let mut store = VectorStore::from_embedded(
+            "m",
+            vec![(0, "valid".into(), "s".into(), 0, vec![1.0, 0.0])],
+        );
+        assert!(!store.is_empty());
+        store.replace("m", mixed);
+        assert!(store.is_empty());
+
+        assert!(VectorStore::from_embedded(
+            "m",
+            vec![(0, "nan".into(), "s".into(), 0, vec![f32::NAN])],
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1246,6 +1605,15 @@ mod tests {
         // Invalid (0) → fall back to model default.
         std::env::set_var("UMADEV_EMBED_DIM", "0");
         assert_eq!(active_dim(), 1536, "invalid dim falls back");
+        std::env::set_var(
+            "UMADEV_EMBED_DIM",
+            MAX_EMBED_DIM.saturating_add(1).to_string(),
+        );
+        assert_eq!(
+            active_dim(),
+            1536,
+            "an implausible width must not force perpetual cache invalidation"
+        );
         std::env::remove_var("UMADEV_EMBED_DIM");
     }
 

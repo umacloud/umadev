@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use umadev_state::fs::{RootedDir, RootedEntryKind};
 
 use umadev_governance::{
     check_dangerous_bash, pre_write_floor_decision, scan_content_with_policy, Policy,
@@ -58,8 +59,8 @@ const MAX_ARCHITECTURE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_AUDIT_TAIL_SOURCE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_OUTPUT_ENTRIES: usize = 1_024;
 
-fn managed_utf8(path: &Path, max_bytes: u64) -> Option<String> {
-    let bytes = umadev_state::fs::read_bounded(path, max_bytes).ok()?;
+fn managed_utf8(root: &RootedDir, relative: &Path, max_bytes: u64) -> Option<String> {
+    let bytes = root.read_bounded(relative, max_bytes).ok()?;
     String::from_utf8(bytes).ok()
 }
 
@@ -565,7 +566,11 @@ fn contract_check_tool(args: &Value) -> (String, bool) {
 /// non-empty `*-architecture.md` and derive the slug from its name. Returns
 /// `(slug, content)` or `None` when no usable doc exists (fail-open).
 fn find_architecture_doc(root: &Path, explicit_slug: Option<&str>) -> Option<(String, String)> {
-    let output = root.join("output");
+    // Pin the caller-designated workspace once and resolve every descendant
+    // through that capability. An `output` symlink/reparse point (or one swapped
+    // in concurrently) must never turn this read-only MCP query into an
+    // arbitrary host-file reader.
+    let rooted = RootedDir::open_no_follow(root).ok()?;
     if let Some(slug) = explicit_slug {
         // A caller-supplied slug is interpolated straight into a filename, so a
         // value like `../../../../etc/foo` would escape `output/` and read an
@@ -574,27 +579,28 @@ fn find_architecture_doc(root: &Path, explicit_slug: Option<&str>) -> Option<(St
         if !is_safe_slug(slug) {
             return None;
         }
-        let path = output.join(format!("{slug}-architecture.md"));
-        let text = managed_utf8(&path, MAX_ARCHITECTURE_BYTES)?;
+        let relative = PathBuf::from("output").join(format!("{slug}-architecture.md"));
+        let text = managed_utf8(&rooted, &relative, MAX_ARCHITECTURE_BYTES)?;
         if text.trim().is_empty() {
             return None;
         }
         return Some((slug.to_string(), text));
     }
-    let mut entries = std::fs::read_dir(&output)
-        .ok()?
-        .flatten()
-        .take(MAX_OUTPUT_ENTRIES)
-        .collect::<Vec<_>>();
-    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let entries = rooted
+        .list_entries(Path::new("output"), MAX_OUTPUT_ENTRIES)
+        .ok()?;
     for entry in entries {
-        let name = entry.file_name();
+        if entry.kind != RootedEntryKind::RegularFile {
+            continue;
+        }
+        let name = entry.name;
         let name = name.to_string_lossy();
         if let Some(slug) = name.strip_suffix("-architecture.md") {
             if slug.is_empty() {
                 continue;
             }
-            if let Some(text) = managed_utf8(&entry.path(), MAX_ARCHITECTURE_BYTES) {
+            let relative = PathBuf::from("output").join(name.as_ref());
+            if let Some(text) = managed_utf8(&rooted, &relative, MAX_ARCHITECTURE_BYTES) {
                 if !text.trim().is_empty() {
                     return Some((slug.to_string(), text));
                 }
@@ -900,8 +906,11 @@ const AUDIT_TAIL_LEN: usize = 10;
 /// (`.umadev/audit/tool-calls.jsonl`) as parsed JSON, oldest-first. Fail-open: a
 /// missing/unreadable log yields an empty vec; unparseable rows are skipped.
 fn read_audit_tail(root: &Path, n: usize) -> Vec<Value> {
-    let path = root.join(".umadev").join("audit").join("tool-calls.jsonl");
-    let Some(text) = managed_utf8(&path, MAX_AUDIT_TAIL_SOURCE_BYTES) else {
+    let Ok(rooted) = RootedDir::open_no_follow(root) else {
+        return Vec::new();
+    };
+    let relative = Path::new(".umadev").join("audit").join("tool-calls.jsonl");
+    let Some(text) = managed_utf8(&rooted, &relative, MAX_AUDIT_TAIL_SOURCE_BYTES) else {
         return Vec::new();
     };
     let mut tail: Vec<Value> = text
@@ -1779,6 +1788,51 @@ mod tests {
         assert!(
             find_architecture_doc(root, Some("../secret")).is_none(),
             "a `..` slug must not escape output/"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_architecture_doc_does_not_follow_output_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            outside.path().join("leaked-architecture.md"),
+            "# private architecture\n",
+        )
+        .unwrap();
+        symlink(outside.path(), workspace.path().join("output")).unwrap();
+
+        assert!(
+            find_architecture_doc(workspace.path(), Some("leaked")).is_none(),
+            "an output-directory symlink must not expose an external contract"
+        );
+        assert!(
+            find_architecture_doc(workspace.path(), None).is_none(),
+            "automatic discovery must not enumerate an external output directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_audit_tail_does_not_follow_managed_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(outside.path().join("audit")).unwrap();
+        std::fs::write(
+            outside.path().join("audit/tool-calls.jsonl"),
+            "{\"secret\":\"outside\"}\n",
+        )
+        .unwrap();
+        symlink(outside.path(), workspace.path().join(".umadev")).unwrap();
+
+        assert!(
+            read_audit_tail(workspace.path(), 10).is_empty(),
+            "a .umadev-directory symlink must not expose an external audit log"
         );
     }
 }

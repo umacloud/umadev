@@ -34,6 +34,17 @@ pub(crate) const COPY_TOAST_TTL: std::time::Duration = std::time::Duration::from
 /// silently truncated into a misleading partial copy.
 pub(crate) const OSC52_MAX_TEXT_BYTES: usize = 64 * 1024;
 
+/// Count user-perceived characters for clipboard feedback.
+///
+/// Rust `char` counts Unicode scalars, so one visible emoji such as
+/// `🧑🏽‍💻`, a flag, or a base letter plus combining mark would otherwise be
+/// reported as several copied "characters". The status area describes what the
+/// user selected, so count extended grapheme clusters instead.
+#[must_use]
+pub(crate) fn user_perceived_char_count(text: &str) -> usize {
+    text.graphemes(true).count()
+}
+
 /// Ephemeral clipboard feedback. It lives with selection state instead of the
 /// main application state machine because it never enters chat history or the
 /// persisted transcript.
@@ -620,6 +631,14 @@ mod tests {
             Some((0, family_end)),
             "the family ZWJ sequence is one selectable terminal glyph"
         );
+    }
+
+    #[test]
+    fn clipboard_feedback_counts_visible_graphemes_not_unicode_scalars() {
+        assert_eq!(user_perceived_char_count("A好"), 2);
+        assert_eq!(user_perceived_char_count("e\u{301}"), 1);
+        assert_eq!(user_perceived_char_count("🧑🏽‍💻"), 1);
+        assert_eq!(user_perceived_char_count("🇨🇳"), 1);
     }
 
     // ── Normalization ─────────────────────────────────────────────────────

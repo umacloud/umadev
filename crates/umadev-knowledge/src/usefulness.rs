@@ -85,12 +85,80 @@ const MAX_OUTCOME_BYTES: u64 = 256 * 1024;
 const MAX_LEGACY_STORE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OUTCOME_RECORDS: usize = 20_000;
 const OUTCOME_PRUNE_TARGET: usize = 18_000;
+const MAX_OUTCOME_DIRECTORY_ENTRIES: usize = 24_000;
+const MAX_STORE_KEY_BYTES: usize = 16 * 1024;
 
 /// Version tag for exact knowledge-memory identities.
 const MEMORY_ID_VERSION: &str = "km1";
 
-static OUTCOME_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static SCOPE_KEY_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[derive(Debug, Clone)]
+enum StoreLocation {
+    /// A user-home boundary below which UmaDev owns `.umadev/`.
+    Home(PathBuf),
+    /// The state directory itself, as specified by `UMADEV_HOME`.
+    State(PathBuf),
+}
+
+impl StoreLocation {
+    fn state_root(&self, create: bool) -> Option<umadev_state::fs::RootedDir> {
+        match self {
+            Self::Home(home) => {
+                let root = umadev_state::fs::RootedDir::open_no_follow(home).ok()?;
+                if create {
+                    root.ensure_dir(Path::new(STATE_SUBDIR), false).ok()?;
+                }
+                root.open_dir(Path::new(STATE_SUBDIR)).ok()
+            }
+            Self::State(state) => match umadev_state::fs::RootedDir::open_no_follow(state) {
+                Ok(root) => Some(root),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                    let parent =
+                        umadev_state::fs::RootedDir::open_no_follow(state.parent()?).ok()?;
+                    let name = Path::new(state.file_name()?);
+                    parent.ensure_dir(name, false).ok()?;
+                    parent.open_dir(name).ok()
+                }
+                Err(_) => None,
+            },
+        }
+    }
+
+    fn capture_enabled(&self) -> bool {
+        match self {
+            Self::Home(home) => umadev_state::memory::capture_enabled(
+                home,
+                umadev_state::memory::MemoryStore::KnowledgeUtility,
+            ),
+            Self::State(state) => umadev_state::memory::capture_enabled_in_state(
+                state,
+                umadev_state::memory::MemoryStore::KnowledgeUtility,
+            ),
+        }
+    }
+
+    fn acquire_lock(
+        state: &umadev_state::fs::RootedDir,
+    ) -> std::io::Result<umadev_state::store_lock::StoreLock> {
+        umadev_state::store_lock::acquire_rooted_in_state(
+            state,
+            umadev_state::memory::MemoryStore::KnowledgeUtility,
+        )
+    }
+}
+
+fn capture_enabled_rooted(state: &umadev_state::fs::RootedDir) -> bool {
+    let store = umadev_state::memory::MemoryStore::KnowledgeUtility;
+    store.capture_controllable()
+        && umadev_state::memory::load_policy_rooted(state, true)
+            .is_ok_and(|policy| policy.capture_enabled(store))
+}
+
+fn recall_enabled_rooted(state: &umadev_state::fs::RootedDir) -> bool {
+    let store = umadev_state::memory::MemoryStore::KnowledgeUtility;
+    store.recall_controllable()
+        && umadev_state::memory::load_policy_rooted(state, true)
+            .is_ok_and(|policy| policy.recall_enabled(store))
+}
 
 /// Exact identity of one knowledge chunk that actually reached a host turn.
 ///
@@ -238,58 +306,72 @@ fn exact_chunk_key(id: &str) -> String {
     format!("id\u{1f}{id}")
 }
 
+fn valid_store_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > MAX_STORE_KEY_BYTES {
+        return false;
+    }
+    if let Some(id) = key.strip_prefix("id\u{1f}") {
+        return valid_memory_id(id);
+    }
+    key.split_once('\u{1f}').is_some_and(|(path, section)| {
+        !path.is_empty()
+            && !section.is_empty()
+            && !section.contains('\u{1f}')
+            && path.len().saturating_add(section.len()) < MAX_STORE_KEY_BYTES
+    })
+}
+
 /// Resolve the store file path under an explicit home dir.
+#[cfg(test)]
 fn usefulness_path(home: &Path) -> PathBuf {
     home.join(STATE_SUBDIR).join(USEFULNESS_FILE)
 }
 
+#[cfg(test)]
 fn outcomes_dir(home: &Path) -> PathBuf {
     home.join(STATE_SUBDIR).join(OUTCOMES_SUBDIR)
 }
 
-/// Resolve the user home dir the cross-project store lives under. Honors an
-/// explicit `UMADEV_HOME` override first (so callers + tests can redirect it),
-/// then `HOME` (Unix) / `USERPROFILE` (Windows). `None` when none is set —
-/// callers then no-op (fail-open).
-fn usefulness_home() -> Option<PathBuf> {
-    std::env::var("UMADEV_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .filter(|s| !s.is_empty())
+/// Resolve the cross-project store layout. `UMADEV_HOME` already denotes the
+/// state directory itself; the platform home variables denote its parent.
+fn usefulness_location() -> Option<StoreLocation> {
+    if let Some(state) = std::env::var_os("UMADEV_HOME").filter(|value| !value.is_empty()) {
+        return Some(StoreLocation::State(PathBuf::from(state)));
+    }
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
         .map(PathBuf::from)
+        .map(StoreLocation::Home)
 }
 
 /// Whether the global usefulness store may accept new feedback under the
 /// resolved UmaDev home. Missing/malformed policy is privacy-conservative off.
 #[must_use]
 pub fn knowledge_utility_capture_enabled() -> bool {
-    usefulness_home().is_some_and(|home| knowledge_utility_capture_enabled_in(&home))
+    usefulness_location().is_some_and(|location| location.capture_enabled())
 }
 
 /// Explicit-home policy check used by the agent's durable receipt bridge.
 #[must_use]
 pub fn knowledge_utility_capture_enabled_in(home: &Path) -> bool {
-    umadev_state::memory::capture_enabled(home, umadev_state::memory::MemoryStore::KnowledgeUtility)
+    StoreLocation::Home(home.to_path_buf()).capture_enabled()
 }
 
-fn knowledge_utility_recall_enabled_in(home: &Path) -> bool {
-    umadev_state::memory::recall_enabled(home, umadev_state::memory::MemoryStore::KnowledgeUtility)
-}
-
-fn scope_key_path(home: &Path) -> Option<PathBuf> {
-    let root = std::fs::canonicalize(home).ok()?;
-    if !umadev_state::fs::real_dir(&root) {
+fn read_scope_key(state: &umadev_state::fs::RootedDir) -> Option<[u8; SCOPE_KEY_BYTES]> {
+    if state
+        .regular_file_len(&Path::new("memory").join(SCOPE_KEY_FILE))
+        .ok()
+        .flatten()
+        != Some(SCOPE_KEY_BYTES as u64)
+    {
         return None;
     }
-    let state = umadev_state::fs::ensure_real_child_dir(&root, STATE_SUBDIR).ok()?;
-    let memory = umadev_state::fs::ensure_real_child_dir(&state, "memory").ok()?;
-    Some(memory.join(SCOPE_KEY_FILE))
-}
-
-fn read_scope_key(path: &Path) -> Option<[u8; SCOPE_KEY_BYTES]> {
-    umadev_state::fs::read_bounded(path, SCOPE_KEY_BYTES as u64)
+    state
+        .read_bounded(
+            &Path::new("memory").join(SCOPE_KEY_FILE),
+            SCOPE_KEY_BYTES as u64,
+        )
         .ok()?
         .try_into()
         .ok()
@@ -299,52 +381,30 @@ fn read_scope_key(path: &Path) -> Option<[u8; SCOPE_KEY_BYTES]> {
 /// The candidate itself is written by the shared state layer (no-follow, 0600
 /// on Unix, reparse-safe on Windows), then hard-linked into the final name so
 /// concurrent processes converge on one key rather than rotating identities.
-fn read_or_create_scope_key(home: &Path) -> Option<[u8; SCOPE_KEY_BYTES]> {
-    let path = scope_key_path(home)?;
-    if let Some(key) = read_scope_key(&path) {
+fn read_or_create_scope_key(state: &umadev_state::fs::RootedDir) -> Option<[u8; SCOPE_KEY_BYTES]> {
+    state.ensure_dir(Path::new("memory"), false).ok()?;
+    let path = Path::new("memory").join(SCOPE_KEY_FILE);
+    if let Some(key) = read_scope_key(state) {
         return Some(key);
     }
-    if std::fs::symlink_metadata(&path)
-        .is_ok_and(|meta| !umadev_state::fs::metadata_is_real_file(&meta))
-    {
-        return None;
+    match state.regular_file_len(&path) {
+        Ok(Some(_)) => return None,
+        Ok(None) => {}
+        Err(_) => return None,
     }
     let mut key = [0_u8; SCOPE_KEY_BYTES];
     getrandom::getrandom(&mut key).ok()?;
-    let parent = path.parent()?;
-    if !umadev_state::fs::real_dir(parent) {
-        return None;
-    }
-    let sequence = SCOPE_KEY_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let candidate = parent.join(format!(
-        ".{SCOPE_KEY_FILE}.{}.{}.{}.candidate",
-        std::process::id(),
-        stamp,
-        sequence
-    ));
-    if umadev_state::fs::atomic_write(&candidate, &key).is_err() {
-        return None;
-    }
-    let published = std::fs::hard_link(&candidate, &path);
-    let _ = umadev_state::fs::remove_regular_file(&candidate);
-    match published {
-        Ok(()) => {
-            #[cfg(unix)]
-            if let Ok(directory) = std::fs::File::open(parent) {
-                let _ = directory.sync_all();
-            }
-            Some(key)
-        }
-        Err(_) => read_scope_key(&path),
+    match state.publish_new_private(&path, &key, false) {
+        Ok(()) => Some(key),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_scope_key(state),
+        Err(_) => None,
     }
 }
 
 fn canonical_project_identity(project_root: &Path) -> Option<Vec<u8>> {
+    let rooted = umadev_state::fs::RootedDir::open_no_follow(project_root).ok()?;
     let canonical = std::fs::canonicalize(project_root).ok()?;
-    if !umadev_state::fs::real_dir(&canonical) {
+    if !rooted.matches_path(&canonical).ok()? {
         return None;
     }
     #[cfg(unix)]
@@ -407,9 +467,9 @@ fn hex_digest(digest: &[u8]) -> String {
 /// Installation-keyed, versioned pseudonym for one canonical project root.
 /// Called only after global capture was explicitly authorized, so recall-only
 /// and default-opt-out paths never create the secret key.
-fn project_scope_id_in(home: &Path, project_root: &Path) -> Option<String> {
-    let key = read_or_create_scope_key(home)?;
+fn project_scope_id_at(state: &umadev_state::fs::RootedDir, project_root: &Path) -> Option<String> {
     let identity = canonical_project_identity(project_root)?;
+    let key = read_or_create_scope_key(state)?;
     let mut message = Vec::with_capacity(PROJECT_SCOPE_ID_VERSION.len() + identity.len() + 1);
     message.extend_from_slice(PROJECT_SCOPE_ID_VERSION.as_bytes());
     message.push(0);
@@ -426,7 +486,7 @@ impl UsefulnessStore {
     /// weight then neutral — today's static ranking), never an error.
     #[must_use]
     pub fn load() -> Self {
-        usefulness_home().map_or_else(Self::default, |home| Self::load_from(&home))
+        usefulness_location().map_or_else(Self::default, |location| Self::load_at(&location))
     }
 
     /// Load the store from an explicit home dir (the durable file is at
@@ -434,11 +494,22 @@ impl UsefulnessStore {
     /// Exposed so the record bridge + tests can point at a temp home.
     #[must_use]
     pub fn load_from(home: &Path) -> Self {
-        if !knowledge_utility_recall_enabled_in(home) {
+        Self::load_at(&StoreLocation::Home(home.to_path_buf()))
+    }
+
+    fn load_at(location: &StoreLocation) -> Self {
+        let Some(state) = location.state_root(false) else {
+            return Self::default();
+        };
+        Self::load_from_root(&state)
+    }
+
+    fn load_from_root(state: &umadev_state::fs::RootedDir) -> Self {
+        if !recall_enabled_rooted(state) {
             return Self::default();
         }
-        let mut store = Self::load_legacy_from(home);
-        for record in read_receipt_outcomes(home) {
+        let mut store = Self::load_legacy_from(state);
+        for record in read_receipt_outcomes_from(state) {
             store.record_memory_ids(&record.memory_ids, record.helpful);
         }
         store
@@ -448,10 +519,20 @@ impl UsefulnessStore {
     /// included here: legacy mutation uses this seam before saving, otherwise a
     /// load→save would bake immutable receipts into the aggregate and the next
     /// load would replay them a second time.
-    fn load_legacy_from(home: &Path) -> Self {
-        umadev_state::fs::read_bounded(&usefulness_path(home), MAX_LEGACY_STORE_BYTES)
+    fn load_legacy_from(state: &umadev_state::fs::RootedDir) -> Self {
+        if !state
+            .regular_file_len(Path::new(USEFULNESS_FILE))
+            .ok()
+            .flatten()
+            .is_some_and(|len| len <= MAX_LEGACY_STORE_BYTES)
+        {
+            return Self::default();
+        }
+        state
+            .read_bounded(Path::new(USEFULNESS_FILE), MAX_LEGACY_STORE_BYTES)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .map(Self::sanitize_loaded)
             .unwrap_or_default()
     }
 
@@ -501,7 +582,7 @@ impl UsefulnessStore {
         let mut seen = HashSet::new();
         for (path, section) in keys.iter().take(MAX_RECORD_BATCH) {
             let key = chunk_key(path, section);
-            if !seen.insert(key.clone()) {
+            if !valid_store_key(&key) || !seen.insert(key.clone()) {
                 continue;
             }
             self.seq = self.seq.saturating_add(1);
@@ -566,27 +647,46 @@ impl UsefulnessStore {
         }
     }
 
+    fn sanitize_loaded(mut self) -> Self {
+        self.entries.retain(|key, _| valid_store_key(key));
+        self.enforce_cap();
+        let mut order = self
+            .entries
+            .iter()
+            .map(|(key, stat)| (stat.updated, key.clone()))
+            .collect::<Vec<_>>();
+        order.sort();
+        for (index, (_, key)) in order.into_iter().enumerate() {
+            if let Some(stat) = self.entries.get_mut(&key) {
+                stat.updated = u64::try_from(index + 1).unwrap_or(u64::MAX);
+            }
+        }
+        self.seq = u64::try_from(self.entries.len()).unwrap_or(u64::MAX);
+        self
+    }
+
     /// Persist the store to an explicit home dir via an atomic temp+rename write.
     /// Fail-open: an unmakeable dir or a write error is swallowed (the prior just
     /// doesn't advance) — never a panic, never an error surfaced to a caller.
     pub fn save_to(&self, home: &Path) {
-        if !knowledge_utility_capture_enabled_in(home) {
+        let location = StoreLocation::Home(home.to_path_buf());
+        let Some(state) = location.state_root(false) else {
+            return;
+        };
+        if !capture_enabled_rooted(&state) {
             return;
         }
-        let Ok(root) = std::fs::canonicalize(home) else {
+        let Ok(_store_lock) = StoreLocation::acquire_lock(&state) else {
             return;
         };
-        if !umadev_state::fs::real_dir(&root) {
-            return;
-        }
-        let Ok(state_dir) = umadev_state::fs::ensure_real_child_dir(&root, STATE_SUBDIR) else {
-            return;
-        };
-        let path = state_dir.join(USEFULNESS_FILE);
-        let Ok(body) = serde_json::to_string(self) else {
+        self.save_to_root(&state);
+    }
+
+    fn save_to_root(&self, state: &umadev_state::fs::RootedDir) {
+        let Ok(body) = serde_json::to_string(&self.clone().sanitize_loaded()) else {
             return;
         };
-        let _ = umadev_state::fs::atomic_write(&path, body.as_bytes());
+        let _ = state.atomic_write(Path::new(USEFULNESS_FILE), body.as_bytes(), false);
     }
 
     /// Number of distinct chunk keys tracked (for tests / introspection).
@@ -615,11 +715,38 @@ fn valid_memory_id(memory_id: &str) -> bool {
     })
 }
 
-fn existing_outcome_result(path: &Path, expected: &ReceiptOutcomeRecord) -> ReceiptOutcomeWrite {
-    let Ok(body) = umadev_state::fs::read_bounded(path, MAX_OUTCOME_BYTES) else {
+fn valid_outcome_record(record: &ReceiptOutcomeRecord) -> bool {
+    record.version == OUTCOME_RECORD_VERSION
+        && valid_receipt_id(&record.receipt_id)
+        && valid_project_scope_id(&record.project_scope_id)
+        && (1..=MAX_RECORD_BATCH).contains(&record.memory_ids.len())
+        && record.memory_ids.iter().all(|id| valid_memory_id(id))
+}
+
+fn valid_legacy_outcome_record(record: &LegacyReceiptOutcomeRecord) -> bool {
+    record.version == 1
+        && valid_receipt_id(&record.receipt_id)
+        && (1..=MAX_RECORD_BATCH).contains(&record.memories.len())
+        && record.memories.iter().all(|memory| {
+            valid_memory_id(&memory.id)
+                && !memory.path.is_empty()
+                && !memory.section.is_empty()
+                && memory.path.len().saturating_add(memory.section.len()) <= MAX_STORE_KEY_BYTES
+        })
+}
+
+fn existing_outcome_result(
+    state: &umadev_state::fs::RootedDir,
+    path: &Path,
+    expected: &ReceiptOutcomeRecord,
+) -> ReceiptOutcomeWrite {
+    let Ok(body) = state.read_bounded(path, MAX_OUTCOME_BYTES) else {
         return ReceiptOutcomeWrite::Unavailable;
     };
     if let Ok(actual) = serde_json::from_slice::<ReceiptOutcomeRecord>(&body) {
+        if !valid_outcome_record(&actual) {
+            return ReceiptOutcomeWrite::Unavailable;
+        }
         return if actual == *expected {
             ReceiptOutcomeWrite::AlreadyRecorded
         } else {
@@ -639,7 +766,7 @@ fn existing_outcome_result(path: &Path, expected: &ReceiptOutcomeRecord) -> Rece
                 .collect::<Vec<_>>();
             legacy_ids.sort();
             legacy_ids.dedup();
-            if legacy.version == 1
+            if valid_legacy_outcome_record(&legacy)
                 && legacy.receipt_id == expected.receipt_id
                 && legacy.helpful == expected.helpful
                 && legacy_ids == expected.memory_ids
@@ -652,13 +779,8 @@ fn existing_outcome_result(path: &Path, expected: &ReceiptOutcomeRecord) -> Rece
     )
 }
 
-fn ensure_outcomes_dir(home: &Path) -> Option<PathBuf> {
-    let root = std::fs::canonicalize(home).ok()?;
-    if !umadev_state::fs::real_dir(&root) {
-        return None;
-    }
-    let state = umadev_state::fs::ensure_real_child_dir(&root, STATE_SUBDIR).ok()?;
-    umadev_state::fs::ensure_real_child_dir(&state, OUTCOMES_SUBDIR).ok()
+fn ensure_outcomes_dir(state: &umadev_state::fs::RootedDir) -> bool {
+    state.ensure_dir(Path::new(OUTCOMES_SUBDIR), false).is_ok()
 }
 
 fn outcome_record_path(path: &Path) -> bool {
@@ -670,31 +792,30 @@ fn outcome_record_path(path: &Path) -> bool {
             .is_some_and(valid_receipt_id)
 }
 
-fn prune_outcome_records_to(dir: &Path, maximum: usize, target: usize) {
+fn prune_outcome_records_to(
+    state: &umadev_state::fs::RootedDir,
+    dir: &Path,
+    maximum: usize,
+    target: usize,
+) -> bool {
     if maximum == 0 || target >= maximum {
-        return;
+        return false;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let Ok(entries) = state.list_entries(dir, MAX_OUTCOME_DIRECTORY_ENTRIES) else {
+        return false;
     };
     let mut newest = BinaryHeap::with_capacity(target);
     let mut total = 0_usize;
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+    for entry in &entries {
+        if entry.kind != umadev_state::fs::RootedEntryKind::RegularFile {
             continue;
         }
-        let path = entry.path();
+        let path = PathBuf::from(&entry.name);
         if !outcome_record_path(&path) {
             continue;
         }
         total = total.saturating_add(1);
-        let candidate = (
-            entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::UNIX_EPOCH),
-            path,
-        );
+        let candidate = (entry.modified.unwrap_or(std::time::UNIX_EPOCH), path);
         if target == 0 {
             continue;
         }
@@ -709,27 +830,31 @@ fn prune_outcome_records_to(dir: &Path, maximum: usize, target: usize) {
         }
     }
     if total < maximum {
-        return;
+        return true;
     }
     let retained = newest
         .into_iter()
         .map(|Reverse((_, path))| path)
         .collect::<HashSet<_>>();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-            if outcome_record_path(&path) && !retained.contains(&path) {
-                let _ = umadev_state::fs::remove_regular_file(&path);
-            }
+    for entry in entries {
+        if entry.kind != umadev_state::fs::RootedEntryKind::RegularFile {
+            continue;
+        }
+        let path = PathBuf::from(entry.name);
+        if outcome_record_path(&path) && !retained.contains(&path) {
+            let _ = state.remove_regular_file(&dir.join(path));
         }
     }
+    true
 }
 
-fn prune_outcome_records(dir: &Path) {
-    prune_outcome_records_to(dir, MAX_OUTCOME_RECORDS, OUTCOME_PRUNE_TARGET);
+fn prune_outcome_records(state: &umadev_state::fs::RootedDir) -> bool {
+    prune_outcome_records_to(
+        state,
+        Path::new(OUTCOMES_SUBDIR),
+        MAX_OUTCOME_RECORDS,
+        OUTCOME_PRUNE_TARGET,
+    )
 }
 
 /// Publish a PASS/FAIL outcome for one sent-memory receipt under the resolved
@@ -744,8 +869,8 @@ pub fn record_receipt_outcome(
     memories: &[MemoryRef],
     helpful: bool,
 ) -> ReceiptOutcomeWrite {
-    usefulness_home().map_or(ReceiptOutcomeWrite::Unavailable, |home| {
-        record_receipt_outcome_in(&home, project_root, receipt_id, memories, helpful)
+    usefulness_location().map_or(ReceiptOutcomeWrite::Unavailable, |location| {
+        record_receipt_outcome_at(&location, project_root, receipt_id, memories, helpful)
     })
 }
 
@@ -759,9 +884,22 @@ pub fn record_receipt_outcome_in(
     memories: &[MemoryRef],
     helpful: bool,
 ) -> ReceiptOutcomeWrite {
-    if !knowledge_utility_capture_enabled_in(home) {
-        return ReceiptOutcomeWrite::SuppressedByPolicy;
-    }
+    record_receipt_outcome_at(
+        &StoreLocation::Home(home.to_path_buf()),
+        project_root,
+        receipt_id,
+        memories,
+        helpful,
+    )
+}
+
+fn record_receipt_outcome_at(
+    location: &StoreLocation,
+    project_root: &Path,
+    receipt_id: &str,
+    memories: &[MemoryRef],
+    helpful: bool,
+) -> ReceiptOutcomeWrite {
     if !valid_receipt_id(receipt_id) || memories.is_empty() {
         return ReceiptOutcomeWrite::Unavailable;
     }
@@ -776,7 +914,16 @@ pub fn record_receipt_outcome_in(
     if memory_ids.is_empty() {
         return ReceiptOutcomeWrite::Unavailable;
     }
-    let Some(project_scope_id) = project_scope_id_in(home, project_root) else {
+    let Some(state) = location.state_root(false) else {
+        return ReceiptOutcomeWrite::SuppressedByPolicy;
+    };
+    if !capture_enabled_rooted(&state) {
+        return ReceiptOutcomeWrite::SuppressedByPolicy;
+    }
+    let Ok(_store_lock) = StoreLocation::acquire_lock(&state) else {
+        return ReceiptOutcomeWrite::Unavailable;
+    };
+    let Some(project_scope_id) = project_scope_id_at(&state, project_root) else {
         return ReceiptOutcomeWrite::Unavailable;
     };
     let record = ReceiptOutcomeRecord {
@@ -786,81 +933,45 @@ pub fn record_receipt_outcome_in(
         helpful,
         memory_ids,
     };
-    let Some(dir) = ensure_outcomes_dir(home) else {
+    if !ensure_outcomes_dir(&state) {
         return ReceiptOutcomeWrite::Unavailable;
-    };
-    let Ok(_store_lock) = umadev_state::store_lock::acquire(
-        home,
-        umadev_state::memory::MemoryStore::KnowledgeUtility,
-    ) else {
+    }
+    if !prune_outcome_records(&state) {
         return ReceiptOutcomeWrite::Unavailable;
-    };
-    prune_outcome_records(&dir);
-    let final_path = dir.join(format!("{receipt_id}.json"));
-    if std::fs::symlink_metadata(&final_path).is_ok() {
-        return existing_outcome_result(&final_path, &record);
+    }
+    let relative = Path::new(OUTCOMES_SUBDIR).join(format!("{receipt_id}.json"));
+    match state.regular_file_len(&relative) {
+        Ok(Some(_)) => return existing_outcome_result(&state, &relative, &record),
+        Ok(None) => {}
+        Err(_) => return ReceiptOutcomeWrite::Unavailable,
     }
     let Ok(body) = serde_json::to_vec(&record) else {
         return ReceiptOutcomeWrite::Unavailable;
     };
-    let sequence = OUTCOME_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let temp_path = dir.join(format!(
-        ".{receipt_id}.{}.{}.{}.tmp",
-        std::process::id(),
-        stamp,
-        sequence
-    ));
-    if umadev_state::fs::atomic_write(&temp_path, &body).is_err() {
-        return ReceiptOutcomeWrite::Unavailable;
-    }
-    // `hard_link` is an atomic no-replace publication on the three supported
-    // desktop families. Unlike rename, it cannot overwrite a concurrently
-    // published outcome on Unix. The temp and final live in the same dir.
-    let published = std::fs::hard_link(&temp_path, &final_path);
-    let _ = umadev_state::fs::remove_regular_file(&temp_path);
-    match published {
-        Ok(()) => {
-            #[cfg(unix)]
-            if let Ok(directory) = std::fs::File::open(&dir) {
-                let _ = directory.sync_all();
-            }
-            ReceiptOutcomeWrite::Recorded
-        }
-        Err(_) if std::fs::symlink_metadata(&final_path).is_ok() => {
-            existing_outcome_result(&final_path, &record)
+    match state.publish_new_private(&relative, &body, false) {
+        Ok(()) => ReceiptOutcomeWrite::Recorded,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            existing_outcome_result(&state, &relative, &record)
         }
         Err(_) => ReceiptOutcomeWrite::Unavailable,
     }
 }
 
-fn read_receipt_outcomes(home: &Path) -> Vec<AppliedOutcomeRecord> {
-    let dir = outcomes_dir(home);
-    if !umadev_state::fs::real_dir(&dir) {
-        return Vec::new();
-    }
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+fn read_receipt_outcomes_from(state: &umadev_state::fs::RootedDir) -> Vec<AppliedOutcomeRecord> {
+    let dir = Path::new(OUTCOMES_SUBDIR);
+    let Ok(entries) = state.list_entries(dir, MAX_OUTCOME_DIRECTORY_ENTRIES) else {
         return Vec::new();
     };
     let mut newest = BinaryHeap::with_capacity(MAX_OUTCOME_RECORDS);
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+    for entry in entries {
+        if entry.kind != umadev_state::fs::RootedEntryKind::RegularFile {
             continue;
         }
-        let path = entry.path();
+        let path = PathBuf::from(entry.name);
         if !outcome_record_path(&path) {
             continue;
         }
-        let candidate = (
-            entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::UNIX_EPOCH),
-            path,
-        );
+        let candidate = (entry.modified.unwrap_or(std::time::UNIX_EPOCH), path);
         if newest.len() < MAX_OUTCOME_RECORDS {
             newest.push(Reverse(candidate));
         } else if newest
@@ -879,15 +990,11 @@ fn read_receipt_outcomes(home: &Path) -> Vec<AppliedOutcomeRecord> {
     let mut seen_receipts = HashSet::new();
     let mut records = Vec::new();
     for (_, path) in paths {
-        let Ok(body) = umadev_state::fs::read_bounded(&path, MAX_OUTCOME_BYTES) else {
+        let Ok(body) = state.read_bounded(&dir.join(&path), MAX_OUTCOME_BYTES) else {
             continue;
         };
         let applied = if let Ok(record) = serde_json::from_slice::<ReceiptOutcomeRecord>(&body) {
-            (record.version == OUTCOME_RECORD_VERSION
-                && valid_project_scope_id(&record.project_scope_id)
-                && !record.memory_ids.is_empty()
-                && record.memory_ids.iter().all(|id| valid_memory_id(id)))
-            .then_some(AppliedOutcomeRecord {
+            valid_outcome_record(&record).then_some(AppliedOutcomeRecord {
                 receipt_id: record.receipt_id,
                 helpful: record.helpful,
                 memory_ids: record.memory_ids,
@@ -895,14 +1002,7 @@ fn read_receipt_outcomes(home: &Path) -> Vec<AppliedOutcomeRecord> {
         } else {
             serde_json::from_slice::<LegacyReceiptOutcomeRecord>(&body)
                 .ok()
-                .filter(|record| {
-                    record.version == 1
-                        && !record.memories.is_empty()
-                        && record
-                            .memories
-                            .iter()
-                            .all(|memory| valid_memory_id(&memory.id))
-                })
+                .filter(valid_legacy_outcome_record)
                 .map(|record| AppliedOutcomeRecord {
                     receipt_id: record.receipt_id,
                     helpful: record.helpful,
@@ -941,22 +1041,46 @@ pub fn record_chunk_outcomes(keys: &[(String, String)], helpful: bool) {
     if keys.is_empty() {
         return;
     }
-    let Some(home) = usefulness_home() else {
+    let Some(location) = usefulness_location() else {
         return;
     };
-    record_chunk_outcomes_in(&home, keys, helpful);
+    record_chunk_outcomes_at(&location, keys, helpful);
 }
 
 /// Explicit-home variant of [`record_chunk_outcomes`] — the durable file is at
 /// `<home>/.umadev/knowledge-usefulness.json`. The bridge in the agent crate +
 /// tests use this so the cross-project store can be redirected to a temp home.
 pub fn record_chunk_outcomes_in(home: &Path, keys: &[(String, String)], helpful: bool) {
-    if keys.is_empty() || !knowledge_utility_capture_enabled_in(home) {
+    record_chunk_outcomes_at(&StoreLocation::Home(home.to_path_buf()), keys, helpful);
+}
+
+fn record_chunk_outcomes_at(location: &StoreLocation, keys: &[(String, String)], helpful: bool) {
+    if keys.is_empty() {
         return;
     }
-    let mut store = UsefulnessStore::load_legacy_from(home);
+    let Some(state) = location.state_root(false) else {
+        return;
+    };
+    record_chunk_outcomes_rooted(&state, keys, helpful);
+}
+
+fn record_chunk_outcomes_rooted(
+    state: &umadev_state::fs::RootedDir,
+    keys: &[(String, String)],
+    helpful: bool,
+) {
+    if keys.is_empty() || !capture_enabled_rooted(state) {
+        return;
+    }
+    // Serialize the complete legacy read-modify-write transaction. Previously
+    // concurrent projects could both load the same prior and silently discard
+    // whichever update saved first.
+    let Ok(_store_lock) = StoreLocation::acquire_lock(state) else {
+        return;
+    };
+    let mut store = UsefulnessStore::load_legacy_from(state);
     store.record(keys, helpful);
-    store.save_to(home);
+    store.save_to_root(state);
 }
 
 #[cfg(test)]
@@ -980,6 +1104,158 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    fn enable_global_utility_capture_in_state(state: &Path) {
+        let memory = umadev_state::fs::ensure_real_child_dir(state, "memory").unwrap();
+        umadev_state::fs::atomic_write(
+            &memory.join("policy.toml"),
+            b"version = 1\ncapture = true\nrecall = true\n\n[stores.\"knowledge-utility\"]\ncapture = true\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn explicit_state_location_does_not_append_a_second_umadev_directory() {
+        let state = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        enable_global_utility_capture_in_state(state.path());
+        let location = StoreLocation::State(state.path().to_path_buf());
+        let item = memory("a.md", "S", "body");
+        assert_eq!(
+            record_receipt_outcome_at(
+                &location,
+                project.path(),
+                "receipt-state-home",
+                std::slice::from_ref(&item),
+                true,
+            ),
+            ReceiptOutcomeWrite::Recorded
+        );
+        assert!(state
+            .path()
+            .join(OUTCOMES_SUBDIR)
+            .join("receipt-state-home.json")
+            .is_file());
+        assert!(state.path().join("memory").join(SCOPE_KEY_FILE).is_file());
+        assert!(!state.path().join(STATE_SUBDIR).exists());
+        assert_eq!(UsefulnessStore::load_at(&location).len(), 1);
+    }
+
+    #[test]
+    fn concurrent_legacy_feedback_does_not_lose_independent_updates() {
+        let home = tempfile::TempDir::new().unwrap();
+        enable_global_utility_capture(home.path());
+        let home_path = home.path();
+        std::thread::scope(|scope| {
+            for index in 0..12 {
+                scope.spawn(move || {
+                    record_chunk_outcomes_in(
+                        home_path,
+                        &[(format!("chunk-{index}.md"), "S".to_string())],
+                        true,
+                    );
+                });
+            }
+        });
+        assert_eq!(UsefulnessStore::load_from(home.path()).len(), 12);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn usefulness_state_operations_stay_on_the_open_generation() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let home = parent.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let location = StoreLocation::Home(home.clone());
+        let state = location.state_root(true).unwrap();
+
+        let moved = parent.path().join("state-moved");
+        std::fs::rename(home.join(STATE_SUBDIR), &moved).unwrap();
+        std::fs::create_dir(home.join(STATE_SUBDIR)).unwrap();
+        let mut store = UsefulnessStore::default();
+        store.record(&[key("pinned.md", "S")], true);
+        store.save_to_root(&state);
+
+        assert!(moved.join(USEFULNESS_FILE).is_file());
+        assert!(!home.join(STATE_SUBDIR).join(USEFULNESS_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn policy_and_usefulness_lifecycle_share_one_state_generation() {
+        let parent = tempfile::TempDir::new().unwrap();
+        let home = parent.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        enable_global_utility_capture(&home);
+        record_chunk_outcomes_in(&home, &[key("before.md", "S")], true);
+
+        let location = StoreLocation::Home(home.clone());
+        let state = location.state_root(false).unwrap();
+        let moved = parent.path().join("state-moved");
+        std::fs::rename(home.join(STATE_SUBDIR), &moved).unwrap();
+        std::fs::create_dir(home.join(STATE_SUBDIR)).unwrap();
+        umadev_state::memory::update_policy(&home, |policy| {
+            policy.set_capture(
+                Some(umadev_state::memory::MemoryStore::KnowledgeUtility),
+                false,
+            );
+            policy.set_recall(
+                Some(umadev_state::memory::MemoryStore::KnowledgeUtility),
+                false,
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        record_chunk_outcomes_rooted(&state, &[key("after.md", "S")], true);
+
+        assert_eq!(UsefulnessStore::load_from_root(&state).len(), 2);
+        assert!(UsefulnessStore::load_at(&location).is_empty());
+        assert!(moved.join(USEFULNESS_FILE).is_file());
+        assert!(!home.join(STATE_SUBDIR).join(USEFULNESS_FILE).exists());
+    }
+
+    #[test]
+    fn legacy_store_is_validated_capped_and_rebased_immediately() {
+        let home = tempfile::TempDir::new().unwrap();
+        enable_global_utility_capture(home.path());
+        let mut entries = HashMap::new();
+        for index in 0..(MAX_ENTRIES + 20) {
+            entries.insert(
+                chunk_key(&format!("file-{index}.md"), "S"),
+                ChunkStat {
+                    helpful: 1,
+                    harmful: 0,
+                    updated: u64::MAX.saturating_sub(index as u64),
+                },
+            );
+        }
+        entries.insert(
+            "x".repeat(MAX_STORE_KEY_BYTES + 1),
+            ChunkStat {
+                helpful: 1,
+                harmful: 1,
+                updated: u64::MAX,
+            },
+        );
+        let untrusted = UsefulnessStore {
+            seq: u64::MAX,
+            entries,
+        };
+        std::fs::write(
+            usefulness_path(home.path()),
+            serde_json::to_vec(&untrusted).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = UsefulnessStore::load_from(home.path());
+        assert_eq!(loaded.len(), MAX_ENTRIES);
+        assert_eq!(loaded.seq, MAX_ENTRIES as u64);
+        assert!(loaded
+            .entries
+            .iter()
+            .all(|(key, stat)| valid_store_key(key) && stat.updated <= loaded.seq));
     }
 
     #[test]
@@ -1006,6 +1282,7 @@ mod tests {
             ),
             ReceiptOutcomeWrite::SuppressedByPolicy
         );
+        assert!(!home.path().join(STATE_SUBDIR).exists());
         assert!(!home
             .path()
             .join(STATE_SUBDIR)
@@ -1187,7 +1464,8 @@ mod tests {
             std::fs::write(dir.join(format!("receipt-{index}.json")), b"{}").unwrap();
         }
         std::fs::write(dir.join("unmanaged.txt"), b"keep").unwrap();
-        prune_outcome_records_to(&dir, 3, 2);
+        let rooted = umadev_state::fs::RootedDir::open_no_follow(&dir).unwrap();
+        prune_outcome_records_to(&rooted, Path::new(""), 3, 2);
         let remaining = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -1206,7 +1484,8 @@ mod tests {
         for index in 0..3 {
             std::fs::write(dir.join(format!("receipt-{index}.json")), b"{}").unwrap();
         }
-        prune_outcome_records_to(&dir, 3, 2);
+        let rooted = umadev_state::fs::RootedDir::open_no_follow(&dir).unwrap();
+        prune_outcome_records_to(&rooted, Path::new(""), 3, 2);
         let remaining = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -1214,6 +1493,37 @@ mod tests {
             .filter(|path| outcome_record_path(path))
             .count();
         assert_eq!(remaining, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_outcome_and_aggregate_paths_fail_closed() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        enable_global_utility_capture(home.path());
+
+        let state = home.path().join(STATE_SUBDIR);
+        symlink(outside.path(), state.join(OUTCOMES_SUBDIR)).unwrap();
+        let item = memory("a.md", "S", "body");
+        assert_eq!(
+            record_receipt_outcome_in(
+                home.path(),
+                project.path(),
+                "receipt-linked-outcomes",
+                &[item],
+                true,
+            ),
+            ReceiptOutcomeWrite::Unavailable
+        );
+        assert!(outside.path().read_dir().unwrap().next().is_none());
+
+        let external_store = outside.path().join("external.json");
+        std::fs::write(&external_store, br#"{"seq":0,"entries":{}}"#).unwrap();
+        symlink(&external_store, state.join(USEFULNESS_FILE)).unwrap();
+        assert!(UsefulnessStore::load_from(home.path()).is_empty());
     }
 
     #[test]

@@ -87,6 +87,61 @@ if (JSON.stringify(actualManifests) !== JSON.stringify(expectedManifests)) {
 
 const main = packagesByName.get('umadev');
 if (!main) fail('the main umadev npm package is missing');
+if (main.bin?.umadev !== 'bin/cli.js') {
+  fail(`umadev bin mapping must be umadev=bin/cli.js, got ${JSON.stringify(main.bin)}`);
+}
+if (JSON.stringify([...(main.files ?? [])].sort()) !== JSON.stringify(['README.md', 'bin/'])) {
+  fail(`umadev files must be README.md and bin/, got ${JSON.stringify(main.files)}`);
+}
+if (main.engines?.node !== '>=18') {
+  fail(`umadev Node engine must remain >=18, got ${JSON.stringify(main.engines?.node)}`);
+}
+
+// Lock the platform metadata as tightly as the artifact matrix. A swapped os,
+// cpu, libc, or files declaration can make a correct binary impossible for npm
+// to select (or allow it onto an incompatible machine) while publish succeeds.
+const platformContracts = new Map([
+  ['@umacloud/cli-darwin-arm64', { os: ['darwin'], cpu: ['arm64'] }],
+  ['@umacloud/cli-darwin-x64', { os: ['darwin'], cpu: ['x64'] }],
+  ['@umacloud/cli-linux-arm64', { os: ['linux'], cpu: ['arm64'], libc: 'glibc' }],
+  ['@umacloud/cli-linux-musl-arm64', { os: ['linux'], cpu: ['arm64'], libc: 'musl' }],
+  ['@umacloud/cli-linux-musl-x64', { os: ['linux'], cpu: ['x64'], libc: 'musl' }],
+  ['@umacloud/cli-linux-x64', { os: ['linux'], cpu: ['x64'], libc: 'glibc' }],
+  // Windows on ARM runs the x64 build through the OS compatibility layer.
+  ['@umacloud/cli-win32-x64', { os: ['win32'], cpu: ['x64', 'arm64'] }],
+]);
+for (const [name, expected] of platformContracts) {
+  const manifest = packagesByName.get(name);
+  if (!manifest) fail(`platform contract has no manifest: ${name}`);
+  for (const field of ['os', 'cpu']) {
+    if (JSON.stringify(manifest[field]) !== JSON.stringify(expected[field])) {
+      fail(`${name} ${field} ${JSON.stringify(manifest[field])} != ${JSON.stringify(expected[field])}`);
+    }
+  }
+  if ((manifest.libc ?? undefined) !== expected.libc) {
+    fail(`${name} libc ${JSON.stringify(manifest.libc)} != ${JSON.stringify(expected.libc)}`);
+  }
+  if (JSON.stringify(manifest.files) !== JSON.stringify(['bin/'])) {
+    fail(`${name} files must be ["bin/"], got ${JSON.stringify(manifest.files)}`);
+  }
+  if (manifest.preferUnplugged !== true) {
+    fail(`${name} must set preferUnplugged=true so the native executable is materialized`);
+  }
+}
+
+const knowledge = packagesByName.get('@umacloud/knowledge');
+if (JSON.stringify(knowledge?.files) !== JSON.stringify(['**/*.md'])) {
+  fail(`@umacloud/knowledge files must be ["**/*.md"], got ${JSON.stringify(knowledge?.files)}`);
+}
+const archivedModel = packagesByName.get('@umacloud/model-e5-small');
+const expectedModelFiles = ['README.md', 'config.json', 'model.safetensors', 'tokenizer.json'];
+const actualModelFiles = [...(archivedModel?.files ?? [])].sort();
+if (JSON.stringify(actualModelFiles) !== JSON.stringify(expectedModelFiles)) {
+  fail(
+    `archived model files ${JSON.stringify(archivedModel?.files)} != ${JSON.stringify(expectedModelFiles)}`,
+  );
+}
+
 const actualDependencies = Object.keys(main.optionalDependencies ?? {}).sort();
 if (JSON.stringify(actualDependencies) !== JSON.stringify(publishedDependencies)) {
   fail(
@@ -139,6 +194,16 @@ const enVersion = website.match(
 if (!zhVersion || !enVersion) fail('could not read both stable website changelog versions');
 if (zhVersion !== cargoVersion || enVersion !== cargoVersion) {
   fail(`website zh=${zhVersion}, en=${enVersion} != Cargo ${cargoVersion}`);
+}
+const currentWebsiteVersions = [...website.matchAll(/\bver:\s*"(\d+\.\d+\.\d+)"[^\n]*\bcurrent:\s*true/g)]
+  .map((match) => match[1]);
+if (
+  currentWebsiteVersions.length !== 2
+  || currentWebsiteVersions.some((version) => version !== cargoVersion)
+) {
+  fail(
+    `website must mark exactly the zh/en ${cargoVersion} entries current, got ${currentWebsiteVersions.join(', ') || '<none>'}`,
+  );
 }
 
 if (process.env.GITHUB_REF?.startsWith('refs/tags/v')) {

@@ -20,6 +20,7 @@ sha2 = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+fs2 = { workspace = true }
 
 [dev-dependencies]
 umadev-contract = { workspace = true }

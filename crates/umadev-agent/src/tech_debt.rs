@@ -29,6 +29,7 @@ use crate::bounded_fs::{read_utf8_beneath, Utf8ReadBudget};
 
 /// On-disk ledger location, relative to project root.
 pub const DEBT_LEDGER: &str = ".umadev/tech-debt.jsonl";
+const DEBT_LEDGER_FILENAME: &str = "tech-debt.jsonl";
 
 const MAX_DEBT_SCAN_FILES: usize = 256;
 const MAX_DEBT_FILE_BYTES: usize = 2 * 1024 * 1024;
@@ -193,17 +194,49 @@ fn classify_line(line: &str, lower: &str) -> Option<DebtKind> {
 /// report` (two identical reports printed the same large "resolved" count).
 pub fn write_ledger(project_root: &Path, items: &[DebtItem]) -> PathBuf {
     let path = project_root.join(DEBT_LEDGER);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    if items.len() > MAX_DEBT_ITEMS {
+        return path;
     }
-    let mut body = String::new();
+    let mut body = Vec::new();
     for item in items {
-        if let Ok(line) = serde_json::to_string(item) {
-            body.push_str(&line);
-            body.push('\n');
+        // Refuse a caller-supplied pathological record before asking serde to
+        // allocate a similarly pathological temporary string. Scanner-created
+        // rows are tiny (the snippet is already capped at 80 characters).
+        let field_bytes = item
+            .file
+            .len()
+            .checked_add(item.snippet.len())
+            .and_then(|bytes| bytes.checked_add(item.first_seen.len()))
+            .and_then(|bytes| bytes.checked_add(item.resolved_at.len()));
+        if field_bytes.is_none_or(|bytes| bytes > MAX_DEBT_LEDGER_BYTES) {
+            return path;
         }
+        let Ok(line) = serde_json::to_vec(item) else {
+            return path;
+        };
+        let Some(next_len) = body
+            .len()
+            .checked_add(line.len())
+            .and_then(|n| n.checked_add(1))
+        else {
+            return path;
+        };
+        if next_len > MAX_DEBT_LEDGER_BYTES {
+            return path;
+        }
+        body.extend_from_slice(&line);
+        body.push(b'\n');
     }
-    let _ = fs::write(&path, body);
+    let Ok(root) = fs::canonicalize(project_root) else {
+        return path;
+    };
+    if !umadev_state::fs::real_dir(&root) {
+        return path;
+    }
+    let Ok(dir) = umadev_state::fs::ensure_real_child_dir(&root, ".umadev") else {
+        return path;
+    };
+    let _ = umadev_state::fs::atomic_write(&dir.join(DEBT_LEDGER_FILENAME), &body);
     path
 }
 
@@ -215,10 +248,20 @@ pub fn read_ledger(project_root: &Path) -> Vec<DebtItem> {
     let Ok(text) = read_utf8_beneath(project_root, &path, MAX_DEBT_LEDGER_BYTES) else {
         return Vec::new();
     };
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<DebtItem>(l).ok())
-        .collect()
+    let mut items = Vec::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        if items.len() >= MAX_DEBT_ITEMS {
+            return Vec::new();
+        }
+        let Ok(item) = serde_json::from_str::<DebtItem>(line) else {
+            // A snapshot is one logical document: treating only its parseable
+            // rows as the prior state would manufacture false new/resolved
+            // debt. Fail open with no prior signal instead.
+            return Vec::new();
+        };
+        items.push(item);
+    }
+    items
 }
 
 /// Summarise the ledger: counts by kind + total severity weight. Used by
@@ -431,6 +474,45 @@ mod tests {
         let back = read_ledger(tmp.path());
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].file, "b");
+    }
+
+    #[test]
+    fn malformed_snapshot_is_not_partially_trusted() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev");
+        fs::create_dir(&dir).unwrap();
+        let valid = serde_json::to_string(&DebtItem {
+            file: "a".into(),
+            line: 1,
+            kind: DebtKind::Todo,
+            snippet: "x".into(),
+            first_seen: "t".into(),
+            status: DebtStatus::Open,
+            resolved_at: String::new(),
+        })
+        .unwrap();
+        fs::write(dir.join(DEBT_LEDGER_FILENAME), format!("{valid}\n{{bad\n")).unwrap();
+        assert!(read_ledger(tmp.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_never_follows_a_linked_managed_directory_or_ledger_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_ledger = outside.path().join(DEBT_LEDGER_FILENAME);
+        fs::write(&outside_ledger, b"outside").unwrap();
+        symlink(outside.path(), root.path().join(".umadev")).unwrap();
+        write_ledger(root.path(), &[]);
+        assert_eq!(fs::read(&outside_ledger).unwrap(), b"outside");
+
+        fs::remove_file(root.path().join(".umadev")).unwrap();
+        fs::create_dir(root.path().join(".umadev")).unwrap();
+        symlink(&outside_ledger, root.path().join(DEBT_LEDGER)).unwrap();
+        write_ledger(root.path(), &[]);
+        assert_eq!(fs::read(&outside_ledger).unwrap(), b"outside");
     }
 
     #[test]

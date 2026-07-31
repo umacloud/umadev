@@ -9,7 +9,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use umadev_spec::SPEC_VERSION;
@@ -400,7 +399,7 @@ pub fn build_compliance_mapping(inputs: &ComplianceInputs<'_>) -> ComplianceMapp
         let entry = evidence
             .entry(row.clause.clone())
             .or_insert_with(|| ClauseEvidence::new(&row.clause));
-        entry.bump(&row.decision);
+        entry.bump(&crate::audit::normalize_decision(&row.decision));
         entry.ensure_evidence(".umadev/audit/tool-calls.jsonl");
     }
 
@@ -545,13 +544,20 @@ pub fn write_compliance_mapping(
         project_root: Some(project_root),
     });
 
-    let out_dir = project_root.join("output");
-    let _ = fs::create_dir_all(&out_dir);
-    let out_path = out_dir.join(format!("{safe_slug}-compliance-mapping.json"));
-    if let Ok(text) = serde_json::to_string_pretty(&doc) {
-        atomic_write(&out_path, &text);
+    let root = std::fs::canonicalize(project_root).ok()?;
+    if !umadev_state::fs::real_dir(&root) {
+        return None;
     }
-    Some((out_path, doc))
+    let out_dir = umadev_state::fs::ensure_real_child_dir(&root, "output").ok()?;
+    let filename = format!("{safe_slug}-compliance-mapping.json");
+    let out_path = out_dir.join(&filename);
+    let text = serde_json::to_string_pretty(&doc).ok()?;
+    umadev_state::fs::atomic_write(&out_path, text.as_bytes()).ok()?;
+    // Preserve the public API's caller-relative path. The canonical path above
+    // is only the hardened write target; returning it here turns a workspace
+    // artifact into an absolute path that downstream lifecycle validation must
+    // (correctly) reject.
+    Some((project_root.join("output").join(filename), doc))
 }
 
 /// Reduce a project slug to a filename-safe component: strip path
@@ -575,25 +581,6 @@ fn sanitize_slug(slug: &str) -> String {
         "project".to_string()
     } else {
         no_traversal
-    }
-}
-
-/// Atomically write `content` to `path` (write to a temp file in the same
-/// dir, then rename). Same-filesystem rename is atomic on POSIX, so a
-/// concurrent reader never sees a half-written compliance-mapping file.
-/// Falls back to a direct write on cross-filesystem rename failure.
-fn atomic_write(path: &Path, content: &str) {
-    // Per-process temp name so concurrent writers can't share + clobber the
-    // same scratch file before the rename.
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    if fs::write(&tmp, content).is_err() {
-        // Can't even write the temp — fall back to direct write.
-        let _ = fs::write(path, content);
-        return;
-    }
-    if fs::rename(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
-        let _ = fs::write(path, content);
     }
 }
 
@@ -631,9 +618,13 @@ where
         if records > max_records {
             return Vec::new();
         }
-        if let Ok(value) = serde_json::from_str::<T>(line) {
-            parsed.push(value);
-        }
+        let Ok(value) = serde_json::from_str::<T>(line) else {
+            // Evidence is an all-or-nothing chain. Silently skipping one
+            // malformed row could hide exactly the blocked call an attacker
+            // corrupted while leaving a plausible-looking partial mapping.
+            return Vec::new();
+        };
+        parsed.push(value);
     }
     parsed
 }
@@ -643,6 +634,7 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
+    use std::fs;
 
     fn fake_tool_call(clause: &str, decision: &str) -> ToolCallRecord {
         ToolCallRecord {
@@ -812,6 +804,20 @@ mod tests {
         assert!(read_jsonl_with_limits::<ToolCallRecord>(tmp.path(), relative, 4096, 1).is_empty());
     }
 
+    #[test]
+    fn audit_reader_rejects_a_malformed_row_without_partial_evidence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let relative = Path::new(".umadev/audit/tool-calls.jsonl");
+        fs::create_dir_all(tmp.path().join(".umadev/audit")).unwrap();
+        let row = serde_json::to_string(&fake_tool_call("UD-CODE-001", "block")).unwrap();
+        fs::write(
+            tmp.path().join(relative),
+            format!("{row}\n{{malformed\n{row}\n"),
+        )
+        .unwrap();
+        assert!(read_jsonl::<ToolCallRecord>(tmp.path(), relative).is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn linked_and_fifo_compliance_inputs_are_rejected_without_blocking() {
@@ -924,5 +930,28 @@ mod tests {
             "compliance mapping escaped output dir: {}",
             path.display()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_compliance_mapping_rejects_a_linked_output_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(root.join(".umadev/audit")).unwrap();
+        fs::write(
+            root.join(".umadev/audit/tool-calls.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::to_string(&fake_tool_call("UD-CODE-001", "block")).unwrap()
+            ),
+        )
+        .unwrap();
+        symlink(outside.path(), root.join("output")).unwrap();
+
+        assert!(write_compliance_mapping(root, "demo").is_none());
+        assert!(outside.path().read_dir().unwrap().next().is_none());
     }
 }

@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -65,7 +65,9 @@ use crate::grok_background_control::{
     parse_list_response as parse_grok_task_list_response, GROK_TASK_KILL_METHOD,
     GROK_TASK_LIST_METHOD,
 };
-use crate::grok_contract::{source_profile_from_initialize, GrokSourceCapability};
+use crate::grok_contract::{
+    source_profile_from_initialize, GrokSourceCapabilities, GrokSourceCapability,
+};
 use crate::grok_prompt_queue::{
     grok_prompt_meta as grok_queue_prompt_meta, GrokPromptQueue, GrokQueueMutation,
     GrokQueueSnapshot, QUEUE_CHANGED_METHOD,
@@ -585,7 +587,14 @@ struct NegotiatedCapabilities {
     set_model: bool,
     set_mode: bool,
     set_thinking: bool,
-    grok_source_contract: bool,
+    grok_identity: bool,
+    grok_source_capabilities: GrokSourceCapabilities,
+}
+
+impl NegotiatedCapabilities {
+    fn grok_supports(self, capability: GrokSourceCapability) -> bool {
+        self.grok_source_capabilities.contains(capability)
+    }
 }
 
 /// Capabilities implemented by the UmaDev ACP client itself.
@@ -600,6 +609,7 @@ struct NegotiatedCapabilities {
 fn acp_client_capabilities(
     vendor: AcpVendor,
     surface: FolderTrustClientSurface,
+    grok_source_capabilities: GrokSourceCapabilities,
 ) -> ClientCapabilities {
     let mut capabilities = ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
@@ -607,21 +617,52 @@ fn acp_client_capabilities(
             .write_text_file(false))
         .terminal(false);
     if matches!(vendor, AcpVendor::Grok) {
-        let mut meta = json!({
+        let mut meta = serde_json::Map::new();
+        if grok_source_capabilities.contains(GrokSourceCapability::IncrementalTerminalOutput) {
             // Published xAI capability metadata: UmaDev consumes incremental
             // tool output and requests colour-free bytes.
-            "x.ai/incrementalBashOutput": true,
-            "x.ai/bashOutputNoColor": true
-        })
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+            meta.insert("x.ai/incrementalBashOutput".to_string(), Value::Bool(true));
+            meta.insert("x.ai/bashOutputNoColor".to_string(), Value::Bool(true));
+        }
         // Folder Trust is a Grok extension and must never be advertised to a
-        // different ACP vendor merely because it shares this transport core.
-        meta.extend(folder_trust_client_capabilities_meta(true, surface));
-        capabilities = capabilities.meta(Some(meta));
+        // different ACP vendor or an unverified release merely because it
+        // shares this transport core.
+        meta.extend(folder_trust_client_capabilities_meta(
+            grok_source_capabilities.contains(GrokSourceCapability::FolderTrust),
+            surface,
+        ));
+        if !meta.is_empty() {
+            capabilities = capabilities.meta(Some(meta));
+        }
     }
     capabilities
+}
+
+fn grok_preflight_source_capabilities(version_line: Option<&str>) -> GrokSourceCapabilities {
+    let Some(version) = version_line.and_then(|line| {
+        let mut words = line.split_whitespace();
+        (words.next()? == "grok")
+            .then(|| words.next())
+            .flatten()
+            .map(|value| value.trim_start_matches('v'))
+    }) else {
+        return GrokSourceCapabilities::NONE;
+    };
+    source_profile_from_initialize(&json!({
+        "_meta":{"grokShell":true,"agentVersion":version}
+    }))
+    .capabilities()
+}
+
+#[cfg(test)]
+fn audited_grok_test_capabilities() -> GrokSourceCapabilities {
+    source_profile_from_initialize(&json!({
+        "_meta":{
+            "grokShell":true,
+            "agentVersion":crate::grok_contract::GROK_BUILD_SOURCE_VERSION
+        }
+    }))
+    .capabilities()
 }
 
 fn grok_initialize_meta() -> Value {
@@ -798,33 +839,156 @@ impl AcpVendor {
     }
 }
 
-fn grok_auth_state_from_api_key(value: Option<&OsStr>) -> AuthState {
-    if value.is_some_and(|value| !value.is_empty()) {
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)] // fields mirror and validate Grok's persisted source schema
+struct GrokProbeCredential {
+    key: String,
+    auth_mode: GrokProbeAuthMode,
+    create_time: chrono::DateTime<chrono::Utc>,
+    user_id: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<String>,
+    #[serde(default)]
+    profile_image_asset_id: Option<String>,
+    #[serde(default)]
+    principal_type: Option<String>,
+    #[serde(default)]
+    principal_id: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
+    team_name: Option<String>,
+    #[serde(default)]
+    team_role: Option<String>,
+    #[serde(default)]
+    organization_id: Option<String>,
+    #[serde(default)]
+    organization_name: Option<String>,
+    #[serde(default)]
+    organization_role: Option<String>,
+    #[serde(default)]
+    user_blocked_reason: Option<String>,
+    #[serde(default)]
+    team_blocked_reasons: Vec<String>,
+    #[serde(default)]
+    coding_data_retention_opt_out: bool,
+    #[serde(default)]
+    has_grok_code_access: Option<bool>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    oidc_issuer: Option<String>,
+    #[serde(default)]
+    oidc_client_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum GrokProbeAuthMode {
+    #[serde(alias = "grok")]
+    WebLogin,
+    #[serde(alias = "oidc")]
+    Oidc,
+    External,
+    ApiKey,
+}
+
+impl GrokProbeCredential {
+    fn has_nonempty_key(&self) -> bool {
+        !self.key.trim().is_empty()
+    }
+
+    fn is_supported_file_credential(&self) -> bool {
+        self.has_nonempty_key() && !matches!(self.auth_mode, GrokProbeAuthMode::WebLogin)
+    }
+}
+
+fn grok_auth_state_from_sources(
+    api_key: Option<&OsStr>,
+    legacy_api_key: Option<&OsStr>,
+    inline_auth: Option<&OsStr>,
+    auth_file: Option<&std::path::Path>,
+) -> AuthState {
+    if [api_key, legacy_api_key]
+        .into_iter()
+        .flatten()
+        .any(|value| value.to_str().is_some_and(|value| !value.is_empty()))
+    {
         return AuthState::LoggedIn;
     }
-    // No API key — fall back to the cached browser/device login. Grok writes its
-    // OAuth credential to `~/.grok/auth.json` (keyed by the x.ai auth endpoint),
-    // exactly as codex (`~/.codex/auth.json`) and opencode (`…/opencode/auth.json`)
-    // store theirs. A non-empty JSON object there is a stored login, so a user who
-    // authenticated through the browser flow no longer reads as "unverified".
-    // Fail-open: absent / empty `{}` / unreadable stays Unknown — never a false
-    // LoggedIn.
-    if grok_cached_login_present() {
+    // GROK_AUTH is Grok's highest-priority, read-only inline credential. Unlike
+    // file-backed stores, upstream deliberately still accepts a legacy
+    // WebLogin value here, so validate the exact record shape but do not apply
+    // the file-store migration rule.
+    if inline_auth
+        .and_then(OsStr::to_str)
+        .and_then(|json| serde_json::from_str::<GrokProbeCredential>(json).ok())
+        .is_some_and(|credential| credential.has_nonempty_key())
+    {
+        return AuthState::LoggedIn;
+    }
+    if auth_file.is_some_and(grok_cached_login_present_at) {
         AuthState::LoggedIn
     } else {
         AuthState::Unknown
     }
 }
 
-/// Grok's cached-login credential file: `~/.grok/auth.json`. `None` when no home
-/// directory can be derived (fail-open — the probe then stays Unknown).
-fn grok_auth_file() -> Option<std::path::PathBuf> {
-    crate::home_dir().map(|home| home.join(".grok").join("auth.json"))
+/// Resolve Grok's source-defined credential location. Empty UTF-8 values are
+/// intentionally preserved: upstream treats an empty `GROK_AUTH_PATH` as an
+/// explicit (and unusable) path, and an empty `GROK_HOME` as the current
+/// directory. Non-UTF-8 values behave like unset because Grok reads them with
+/// `std::env::var`.
+fn grok_auth_file_from(
+    auth_path: Option<String>,
+    grok_home: Option<String>,
+    home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if let Some(path) = auth_path {
+        return Some(std::path::PathBuf::from(path));
+    }
+    grok_home_from(grok_home, home).map(|home| home.join("auth.json"))
 }
 
-/// Whether Grok has a stored browser/device login on disk.
-fn grok_cached_login_present() -> bool {
-    grok_auth_file().is_some_and(|path| credential_file_has_entries(&path))
+fn grok_home_from(
+    grok_home: Option<String>,
+    home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    grok_home
+        .map(std::path::PathBuf::from)
+        .or_else(|| home.map(|home| home.join(".grok")))
+}
+
+/// Grok's cached-login credential file. `GROK_AUTH_PATH` overrides
+/// `$GROK_HOME/auth.json`, whose default is `~/.grok/auth.json`. `None` means a
+/// user home could not be derived, so the diagnostic probe stays Unknown.
+fn grok_auth_file() -> Option<std::path::PathBuf> {
+    grok_auth_file_from(
+        std::env::var("GROK_AUTH_PATH").ok(),
+        std::env::var("GROK_HOME").ok(),
+        crate::home_dir(),
+    )
+}
+
+fn grok_cached_login_present_at(path: &std::path::Path) -> bool {
+    const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
+    let Ok(body) = crate::read_user_file_bounded(path, MAX_CREDENTIAL_BYTES) else {
+        return false;
+    };
+    let Ok(store) =
+        serde_json::from_slice::<std::collections::BTreeMap<String, GrokProbeCredential>>(&body)
+    else {
+        return false;
+    };
+    store
+        .values()
+        .any(GrokProbeCredential::is_supported_file_credential)
 }
 
 /// Kimi Code's cached-login credential file: `$KIMI_CODE_HOME/credentials/
@@ -839,26 +1003,41 @@ fn kimi_auth_file() -> Option<std::path::PathBuf> {
     Some(root.join("credentials").join("kimi-code.json"))
 }
 
-/// Whether Kimi Code has a stored login on disk. The ACP `authenticate(login)`
-/// check at session open stays authoritative for actually USING the token; this
-/// only makes the picker show a real login instead of "unverified".
-fn kimi_cached_login_present() -> bool {
-    kimi_auth_file().is_some_and(|path| credential_file_has_entries(&path))
+/// Classify Kimi's source-defined token file. A non-empty `access_token` is a
+/// stored login; an explicitly empty token is Kimi's persisted revoked
+/// tombstone and must surface as logged out. Missing, malformed, or
+/// future-shaped data remains indeterminate instead of becoming a false green.
+fn kimi_cached_login_state() -> AuthState {
+    let Some(path) = kimi_auth_file() else {
+        return AuthState::Unknown;
+    };
+    kimi_cached_login_state_at(&path)
 }
 
-/// Pure check shared by the grok/kimi login probes: `path` exists and holds a
-/// non-empty JSON object (at least one credential entry). Fail-open: an absent
-/// file, an empty `{}`, a non-object, or any read/parse failure returns `false`,
-/// so the auth probe never claims a login it cannot actually see.
-fn credential_file_has_entries(path: &std::path::Path) -> bool {
-    const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
-    let Ok(body) = crate::read_user_file_bounded(path, MAX_CREDENTIAL_BYTES) else {
-        return false;
+fn kimi_cached_login_state_at(path: &std::path::Path) -> AuthState {
+    let Some(value) = credential_file_json(path) else {
+        return AuthState::Unknown;
     };
-    serde_json::from_slice::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|value| value.as_object().map(|object| !object.is_empty()))
-        .unwrap_or(false)
+    let Some(access_token) = value
+        .as_object()
+        .and_then(|object| object.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return AuthState::Unknown;
+    };
+    if access_token.trim().is_empty() {
+        AuthState::NotLoggedIn
+    } else {
+        AuthState::LoggedIn
+    }
+}
+
+/// Bounded parser shared by the Grok and Kimi credential probes. Callers must
+/// validate their own source-defined schema before claiming authentication.
+fn credential_file_json(path: &std::path::Path) -> Option<serde_json::Value> {
+    const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
+    let body = crate::read_user_file_bounded(path, MAX_CREDENTIAL_BYTES).ok()?;
+    serde_json::from_slice(&body).ok()
 }
 
 fn permission_mode(
@@ -1249,21 +1428,21 @@ impl HostDriver for AcpDriver {
     async fn probe_auth(&self) -> AuthState {
         match self.vendor {
             AcpVendor::Grok => {
-                let value = std::env::var_os("XAI_API_KEY");
-                grok_auth_state_from_api_key(value.as_deref())
+                let api_key = std::env::var_os("XAI_API_KEY");
+                let legacy_api_key = std::env::var_os("GROK_CODE_XAI_API_KEY");
+                let inline_auth = std::env::var_os("GROK_AUTH");
+                let auth_file = grok_auth_file();
+                grok_auth_state_from_sources(
+                    api_key.as_deref(),
+                    legacy_api_key.as_deref(),
+                    inline_auth.as_deref(),
+                    auth_file.as_deref(),
+                )
             }
-            // Kimi keeps its OAuth credential under its own data root. The ACP
-            // `authenticate(login)` check at session open remains authoritative for
-            // USING the token, but a stored credential on disk is enough for the
-            // picker to show a real login instead of "unverified". Fail-open:
-            // absent/empty/unreadable stays Unknown — never a false LoggedIn.
-            AcpVendor::Kimi => {
-                if kimi_cached_login_present() {
-                    AuthState::LoggedIn
-                } else {
-                    AuthState::Unknown
-                }
-            }
+            // Kimi persists an empty-token tombstone after a refresh token is
+            // revoked. Respect that source-defined state instead of treating any
+            // non-empty JSON object as authenticated.
+            AcpVendor::Kimi => kimi_cached_login_state(),
         }
     }
 }
@@ -1293,8 +1472,9 @@ pub struct AcpSession {
     reader_task: Option<tokio::task::JoinHandle<()>>,
     turn_active: Arc<AtomicBool>,
     latest_usage: LatestUsage,
+    grok_client_source_capabilities: GrokSourceCapabilities,
     negotiated: NegotiatedCapabilities,
-    grok_source_contract: Arc<AtomicBool>,
+    grok_source_capabilities: Arc<AtomicU32>,
     handshake_in_progress: Arc<AtomicBool>,
     fresh_session_bind_in_progress: Arc<AtomicBool>,
     session_routes: SessionRoutes,
@@ -1439,6 +1619,7 @@ impl AcpSession {
             launch.append_system,
             policy,
             FolderTrustClientSurface::Headless,
+            None,
         )
         .await
     }
@@ -1469,6 +1650,7 @@ impl AcpSession {
             launch.append_system,
             policy,
             surface,
+            None,
         )
         .await
     }
@@ -1547,6 +1729,7 @@ impl AcpSession {
             launch.append_system,
             policy,
             FolderTrustClientSurface::Headless,
+            None,
         )
         .await
     }
@@ -1562,7 +1745,7 @@ impl AcpSession {
         permissions: BasePermissionProfile,
         resume_session_id: Option<&str>,
     ) -> Result<Self, SessionError> {
-        Self::start_with_program_args_and_firmware(
+        Self::start_with_program_args_and_firmware_and_policy(
             vendor,
             program,
             args,
@@ -1571,8 +1754,12 @@ impl AcpSession {
             permissions,
             resume_session_id,
             None,
+            SessionOpenPolicy::NonInteractive,
+            FolderTrustClientSurface::Headless,
+            Some(audited_grok_test_capabilities()),
         )
         .await
+        .map_err(legacy_session_open_error)
     }
 
     #[cfg(test)]
@@ -1597,6 +1784,7 @@ impl AcpSession {
             None,
             policy,
             FolderTrustClientSurface::Headless,
+            Some(audited_grok_test_capabilities()),
         )
         .await
     }
@@ -1623,6 +1811,7 @@ impl AcpSession {
             append_system,
             SessionOpenPolicy::NonInteractive,
             FolderTrustClientSurface::Headless,
+            None,
         )
         .await
         .map_err(legacy_session_open_error)
@@ -1640,6 +1829,7 @@ impl AcpSession {
         append_system: Option<String>,
         policy: SessionOpenPolicy,
         folder_trust_surface: FolderTrustClientSurface,
+        grok_preflight_override: Option<GrokSourceCapabilities>,
     ) -> Result<Self, SessionOpenError> {
         if !workspace.is_absolute() {
             return Err(SessionOpenError::from(SessionError::Start(
@@ -1651,6 +1841,16 @@ impl AcpSession {
         // validation happened first, ACP arguments would later target a batch
         // shim through `spawn_parts` rather than the intended native binary.
         let program = resolve_and_validate_vendor_program(vendor, program)?;
+        let grok_client_source_capabilities = if matches!(vendor, AcpVendor::Grok) {
+            match grok_preflight_override {
+                Some(capabilities) => capabilities,
+                None => {
+                    grok_preflight_source_capabilities(version_output(&program).await.as_deref())
+                }
+            }
+        } else {
+            GrokSourceCapabilities::NONE
+        };
         let (spawn_program, lead) = spawn_parts(&program);
         let mut cmd = Command::new(spawn_program);
         cmd.args(lead);
@@ -1703,7 +1903,7 @@ impl AcpSession {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
         let turn_active = Arc::new(AtomicBool::new(false));
-        let grok_source_contract = Arc::new(AtomicBool::new(false));
+        let grok_source_capabilities = Arc::new(AtomicU32::new(0));
         // Fresh sessions have no replay window. Recovery flips this only for
         // the bounded resume/load request and clears it on every result path.
         let handshake_in_progress = Arc::new(AtomicBool::new(false));
@@ -1735,7 +1935,7 @@ impl AcpSession {
             latest_usage: Arc::clone(&latest_usage),
             event_tx: event_tx.clone(),
             permissions,
-            grok_source_contract: Arc::clone(&grok_source_contract),
+            grok_source_capabilities: Arc::clone(&grok_source_capabilities),
             handshake_in_progress: Arc::clone(&handshake_in_progress),
             fresh_session_bind_in_progress: Arc::clone(&fresh_session_bind_in_progress),
             session_routes: Arc::clone(&session_routes),
@@ -1775,8 +1975,9 @@ impl AcpSession {
             reader_task: Some(reader_task),
             turn_active,
             latest_usage,
+            grok_client_source_capabilities,
             negotiated: NegotiatedCapabilities::default(),
-            grok_source_contract,
+            grok_source_capabilities,
             handshake_in_progress,
             fresh_session_bind_in_progress,
             session_routes,
@@ -1809,6 +2010,7 @@ impl AcpSession {
             .client_capabilities(acp_client_capabilities(
                 self.vendor,
                 self.folder_trust_surface,
+                self.grok_client_source_capabilities,
             ))
             .client_info(Implementation::new("umadev", env!("CARGO_PKG_VERSION")).title("UmaDev"));
         let initialize = if matches!(self.vendor, AcpVendor::Grok) {
@@ -1823,9 +2025,14 @@ impl AcpSession {
             .await?;
         validate_initialize(self.vendor, &initialized)?;
         self.negotiated = negotiated_capabilities(self.vendor, &initialized);
-        self.grok_source_contract
-            .store(self.negotiated.grok_source_contract, Ordering::Release);
-        if self.negotiated.grok_source_contract {
+        self.grok_source_capabilities.store(
+            self.negotiated.grok_source_capabilities.encoded(),
+            Ordering::Release,
+        );
+        if self
+            .negotiated
+            .grok_supports(GrokSourceCapability::ModelAndCommandCatalog)
+        {
             if let Some(update) = parse_initialize_model_catalog(&initialized) {
                 self.deferred_events
                     .push_back(SessionEvent::StateUpdate(update));
@@ -1837,7 +2044,10 @@ impl AcpSession {
         }
 
         let grok_auth_offer = match self.vendor {
-            AcpVendor::Grok if self.negotiated.grok_source_contract => {
+            // Authentication methods are a live initialize advertisement. They
+            // remain usable for every official Grok identity even when that
+            // release is outside the audited private session-wire range.
+            AcpVendor::Grok if self.negotiated.grok_identity => {
                 validate_grok_auth_gate(&initialized)?;
                 self.apply_grok_auth_policy(&initialized, policy).await?
             }
@@ -1937,7 +2147,10 @@ impl AcpSession {
                 *active = Some(self.session_id.clone());
             }
             self.bind_folder_trust_scope(&self.session_id)?;
-            if self.negotiated.grok_source_contract {
+            if self
+                .negotiated
+                .grok_supports(GrokSourceCapability::SubagentLifecycle)
+            {
                 self.resync_grok_subagent_routes().await;
             }
             self.handshake_in_progress.store(false, Ordering::Release);
@@ -2055,10 +2268,18 @@ impl AcpSession {
             self.negotiated.set_model = config_option(&setup, "model").is_some();
             self.negotiated.set_mode = config_option(&setup, "mode").is_some();
             self.negotiated.set_thinking = config_option(&setup, "thinking").is_some();
+        } else if matches!(self.vendor, AcpVendor::Grok) {
+            // A standard session mode catalog is live evidence for
+            // session/set_mode even on an old or future build. Preserve the
+            // source-audited fallback only inside its bounded release range.
+            self.negotiated.set_mode |=
+                select_session_mode(&setup, self.vendor, self.permissions, false).is_some();
         }
         if let Some(update) = parse_setup_model_catalog(&setup) {
             if matches!(self.vendor, AcpVendor::Grok) {
-                self.negotiated.set_model = self.negotiated.grok_source_contract;
+                // The returned catalog is the live session marker for the
+                // standard set-model method; no version inference is needed.
+                self.negotiated.set_model = true;
             }
             let current_model_id = match &update {
                 SessionStateUpdate::ModelCatalogReplaced {
@@ -2699,8 +2920,10 @@ impl AcpSession {
     }
 
     async fn apply_permission_mode(&mut self, setup: &Value) -> Result<(), SessionError> {
-        let source_contract =
-            matches!(self.vendor, AcpVendor::Grok) && self.negotiated.grok_source_contract;
+        let source_contract = matches!(self.vendor, AcpVendor::Grok)
+            && self
+                .negotiated
+                .grok_supports(GrokSourceCapability::SetModeFallback);
         let Some(mode_id) =
             select_session_mode(setup, self.vendor, self.permissions, source_contract)
         else {
@@ -3473,7 +3696,10 @@ impl BaseSession for AcpSession {
             } else {
                 ResumeCapability::Unsupported
             },
-            subagents: if self.negotiated.grok_source_contract {
+            subagents: if self
+                .negotiated
+                .grok_supports(GrokSourceCapability::SubagentLifecycle)
+            {
                 SubagentVisibility::Lifecycle
             } else {
                 SubagentVisibility::None
@@ -3938,7 +4164,11 @@ impl BaseSession for AcpSession {
 
 async fn graceful_end(session: &mut AcpSession) -> bool {
     let _ = session.interrupt().await;
-    if session.negotiated.grok_source_contract && !session.session_id.is_empty() {
+    if session
+        .negotiated
+        .grok_supports(GrokSourceCapability::PrivateSessionClose)
+        && !session.session_id.is_empty()
+    {
         // The audited Grok source exposes terminal session shutdown through
         // this private extension rather than the optional ACP close flag.
         let _ = tokio::time::timeout(
@@ -3967,7 +4197,10 @@ async fn graceful_end(session: &mut AcpSession) -> bool {
         }
     }
     let _ = tokio::time::timeout(CONTROL_WRITE_WAIT, close_acp_stdin(&session.writer)).await;
-    let graceful_budget = if session.negotiated.grok_source_contract {
+    let graceful_budget = if session
+        .negotiated
+        .grok_supports(GrokSourceCapability::PrivateSessionClose)
+    {
         GROK_EOF_GRACE
     } else {
         END_REAP_BUDGET
@@ -4186,7 +4419,7 @@ struct ReaderContext {
     latest_usage: LatestUsage,
     event_tx: mpsc::Sender<SessionEvent>,
     permissions: BasePermissionProfile,
-    grok_source_contract: Arc<AtomicBool>,
+    grok_source_capabilities: Arc<AtomicU32>,
     handshake_in_progress: Arc<AtomicBool>,
     fresh_session_bind_in_progress: Arc<AtomicBool>,
     session_routes: SessionRoutes,
@@ -4199,6 +4432,13 @@ struct ReaderContext {
     folder_trust_scope: FolderTrustScopeState,
     deferred_folder_trust_requests: DeferredFolderTrustRequests,
     folder_trust_surface: FolderTrustClientSurface,
+}
+
+fn reader_grok_supports(context: &ReaderContext, capability: GrokSourceCapability) -> bool {
+    GrokSourceCapabilities::encoded_contains(
+        context.grok_source_capabilities.load(Ordering::Acquire),
+        capability,
+    )
 }
 
 async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext) {
@@ -4418,7 +4658,7 @@ async fn dispatch_server_message(
     // still fails route authorization.
     let early_folder_trust = has_id
         && method == GROK_FOLDER_TRUST_REQUEST_METHOD
-        && context.grok_source_contract.load(Ordering::Acquire)
+        && reader_grok_supports(context, GrokSourceCapability::FolderTrust)
         && matches!(
             context.folder_trust_surface,
             FolderTrustClientSurface::Interactive
@@ -4426,8 +4666,12 @@ async fn dispatch_server_message(
         && context
             .fresh_session_bind_in_progress
             .load(Ordering::Acquire);
+    let source_route_enabled =
+        reader_grok_supports(context, GrokSourceCapability::SubagentLifecycle)
+            || (replaying
+                && reader_grok_supports(context, GrokSourceCapability::SessionLoadReplay));
     let session_matches = early_folder_trust
-        || if context.grok_source_contract.load(Ordering::Acquire) {
+        || if source_route_enabled {
             context
                 .session_routes
                 .lock()
@@ -4448,12 +4692,18 @@ async fn dispatch_server_message(
         }
         return;
     }
+    let strict_grok_interaction = match method {
+        "session/request_permission" => {
+            reader_grok_supports(context, GrokSourceCapability::PermissionRequests)
+        }
+        "x.ai/ask_user_question" => {
+            reader_grok_supports(context, GrokSourceCapability::AskUserQuestion)
+        }
+        "x.ai/exit_plan_mode" => reader_grok_supports(context, GrokSourceCapability::ExitPlanMode),
+        _ => false,
+    };
     if has_id
-        && context.grok_source_contract.load(Ordering::Acquire)
-        && matches!(
-            method,
-            "session/request_permission" | "x.ai/ask_user_question" | "x.ai/exit_plan_mode"
-        )
+        && strict_grok_interaction
         && params
             .get("sessionId")
             .or_else(|| params.get("session_id"))
@@ -4499,7 +4749,6 @@ async fn dispatch_host_request(
     context: &ReaderContext,
     replaying: bool,
 ) {
-    let grok_contract = context.grok_source_contract.load(Ordering::Acquire);
     match method {
         GROK_FOLDER_TRUST_REQUEST_METHOD => {
             handle_folder_trust_request(frame, params, context, replaying).await;
@@ -4518,11 +4767,18 @@ async fn dispatch_host_request(
                     KimiPermissionSurface::Ordinary => {}
                 }
             }
-            handle_permission_request(frame, params, context, grok_contract).await;
+            handle_permission_request(
+                frame,
+                params,
+                context,
+                reader_grok_supports(context, GrokSourceCapability::PermissionRequests),
+            )
+            .await;
         }
         method
             if is_standard_ask_question_method(method)
-                || (is_grok_ask_user_question_method(method) && grok_contract) =>
+                || (is_grok_ask_user_question_method(method)
+                    && reader_grok_supports(context, GrokSourceCapability::AskUserQuestion)) =>
         {
             handle_user_input_request(
                 frame,
@@ -4559,7 +4815,8 @@ async fn dispatch_host_request(
         }
         method
             if is_standard_plan_confirmation_method(method)
-                || (is_grok_exit_plan_mode_method(method) && grok_contract) =>
+                || (is_grok_exit_plan_mode_method(method)
+                    && reader_grok_supports(context, GrokSourceCapability::ExitPlanMode)) =>
         {
             handle_plan_confirmation_request(
                 frame,
@@ -4639,20 +4896,35 @@ async fn handle_grok_session_notification(
     tools: &mut ToolState,
     replaying: bool,
 ) {
-    if !context.grok_source_contract.load(Ordering::Acquire) {
+    let rich_updates = reader_grok_supports(context, GrokSourceCapability::RichSessionUpdates);
+    let prompt_usage = reader_grok_supports(context, GrokSourceCapability::PromptUsage);
+    let model_catalog = reader_grok_supports(context, GrokSourceCapability::ModelAndCommandCatalog);
+    let background_tasks = reader_grok_supports(context, GrokSourceCapability::BackgroundTasks);
+    let subagents = reader_grok_supports(context, GrokSourceCapability::SubagentLifecycle);
+    if !(rich_updates || prompt_usage || model_catalog || background_tasks || subagents) {
         return;
     }
     if !replaying {
-        if let Some(usage) = usage_from_event(params) {
-            record_stream_usage(&context.latest_usage, &context.active_prompt, params, usage).await;
+        if prompt_usage {
+            if let Some(usage) = usage_from_event(params) {
+                record_stream_usage(&context.latest_usage, &context.active_prompt, params, usage)
+                    .await;
+            }
         }
-        if handle_grok_turn_completed(params, context).await {
+        if rich_updates && handle_grok_turn_completed(params, context, prompt_usage).await {
             return;
         }
     }
-    remember_or_emit_model_events(parse_grok_model_state_events(params), context, replaying).await;
-    handle_grok_background_lifecycle(method, params, context, tools, replaying).await;
-    handle_grok_subagent_lifecycle(params, context, replaying).await;
+    if model_catalog {
+        remember_or_emit_model_events(parse_grok_model_state_events(params), context, replaying)
+            .await;
+    }
+    if background_tasks {
+        handle_grok_background_lifecycle(method, params, context, tools, replaying).await;
+    }
+    if subagents {
+        handle_grok_subagent_lifecycle(params, context, replaying).await;
+    }
 }
 
 async fn handle_grok_background_lifecycle(
@@ -4662,7 +4934,7 @@ async fn handle_grok_background_lifecycle(
     tools: &mut ToolState,
     replaying: bool,
 ) {
-    if !context.grok_source_contract.load(Ordering::Acquire) {
+    if !reader_grok_supports(context, GrokSourceCapability::BackgroundTasks) {
         return;
     }
     let Some(update) = grok_background_process_lifecycle_event(method, params, tools, true) else {
@@ -4679,7 +4951,7 @@ async fn handle_grok_background_lifecycle(
 }
 
 async fn handle_grok_model_update(params: &Value, context: &ReaderContext, replaying: bool) {
-    if !context.grok_source_contract.load(Ordering::Acquire) {
+    if !reader_grok_supports(context, GrokSourceCapability::ModelAndCommandCatalog) {
         return;
     }
     let events = parse_model_catalog(params)
@@ -4706,7 +4978,7 @@ async fn remember_or_emit_model_events(
 }
 
 async fn handle_grok_queue_changed(params: &Value, context: &ReaderContext, replaying: bool) {
-    if !context.grok_source_contract.load(Ordering::Acquire) {
+    if !reader_grok_supports(context, GrokSourceCapability::PromptQueue) {
         return;
     }
     let active_session_id = context.active_session_id.read().ok().and_then(|guard| {
@@ -4865,7 +5137,11 @@ async fn cancel_interactions_for_session(context: &ReaderContext, session_id: &s
     }
 }
 
-async fn handle_grok_turn_completed(params: &Value, context: &ReaderContext) -> bool {
+async fn handle_grok_turn_completed(
+    params: &Value,
+    context: &ReaderContext,
+    prompt_usage: bool,
+) -> bool {
     let update = params.get("update").unwrap_or(params);
     let kind = update
         .get("sessionUpdate")
@@ -4898,7 +5174,9 @@ async fn handle_grok_turn_completed(params: &Value, context: &ReaderContext) -> 
     let status = grok_turn_status(stop_reason, detail);
     if prompt_id.starts_with("subagent-completed-") {
         let streamed_usage = take_usage_for(&context.latest_usage, prompt_id).await;
-        let usage = usage_from_event(params).or(streamed_usage);
+        let usage = prompt_usage
+            .then(|| usage_from_event(params).or(streamed_usage))
+            .flatten();
         let terminal = context
             .session_routes
             .lock()
@@ -4929,7 +5207,9 @@ async fn handle_grok_turn_completed(params: &Value, context: &ReaderContext) -> 
         .remove(&active_prompt.request_id);
     context.queued_prompts.lock().await.remove(prompt_id);
     let streamed_usage = take_usage_for(&context.latest_usage, prompt_id).await;
-    let usage = usage_from_event(params).or(streamed_usage);
+    let usage = prompt_usage
+        .then(|| usage_from_event(params).or(streamed_usage))
+        .flatten();
     let terminal = context
         .session_routes
         .lock()
@@ -5393,7 +5673,7 @@ async fn handle_folder_trust_request(
     // Folder Trust is a human-only vendor extension. A headless opener, replay
     // window, unknown peer, or unbound session must never manufacture trust.
     if replaying
-        || !context.grok_source_contract.load(Ordering::Acquire)
+        || !reader_grok_supports(context, GrokSourceCapability::FolderTrust)
         || !matches!(
             context.folder_trust_surface,
             FolderTrustClientSurface::Interactive
@@ -5937,9 +6217,9 @@ impl ToolState {
 fn grok_subagent_lifecycle_event(
     params: &Value,
     state: &mut ToolState,
-    grok_source_contract: bool,
+    capability_enabled: bool,
 ) -> Option<SessionEvent> {
-    if !grok_source_contract {
+    if !capability_enabled {
         return None;
     }
     let update = params.get("update")?;
@@ -5994,9 +6274,9 @@ fn grok_background_process_lifecycle_event(
     method: &str,
     params: &Value,
     state: &mut ToolState,
-    grok_source_contract: bool,
+    capability_enabled: bool,
 ) -> Option<ParsedBackgroundProcess> {
-    if !grok_source_contract {
+    if !capability_enabled {
         return None;
     }
     let update = params.get("update")?;
@@ -8572,12 +8852,18 @@ fn validate_initialize(vendor: AcpVendor, result: &Value) -> Result<(), SessionE
 
 fn negotiated_capabilities(vendor: AcpVendor, result: &Value) -> NegotiatedCapabilities {
     let source_profile = source_profile_from_initialize(result);
-    // Grok's official identity enables the typed source-lineage parsers for every
-    // CLI version. The version label is diagnostic only. Standard methods still
-    // depend on ACP advertisement/session responses and optional private calls
-    // remain response-gated, so this does not invent a capability from SemVer.
-    let grok_source_contract =
+    let grok_identity =
         matches!(vendor, AcpVendor::Grok) && source_profile.is_grok_shell_identity();
+    // Identity controls only whether this is the selected official product.
+    // Private xAI behavior needs per-method source evidence. Stable future
+    // patches on the currently audited compatibility line retain the typed,
+    // fail-soft adapters; an old, missing, malformed, prerelease, or different
+    // major/minor line keeps standard ACP and live-advertised controls only.
+    let grok_source_capabilities = if grok_identity {
+        source_profile.capabilities()
+    } else {
+        GrokSourceCapabilities::NONE
+    };
     NegotiatedCapabilities {
         // The published Grok agent accepts ContentBlock::Image in its prompt
         // parser but currently omits the standard image flag from initialize.
@@ -8619,9 +8905,11 @@ fn negotiated_capabilities(vendor: AcpVendor, result: &Value) -> NegotiatedCapab
         // session's model switch surface is enabled only after session/new or
         // session/load also returns the source-shaped model catalog.
         set_model: false,
-        set_mode: grok_source_contract,
+        set_mode: matches!(vendor, AcpVendor::Grok)
+            && source_profile.supports(GrokSourceCapability::SetModeFallback),
         set_thinking: false,
-        grok_source_contract,
+        grok_identity,
+        grok_source_capabilities,
     }
 }
 
@@ -8812,13 +9100,26 @@ async fn require_resolved_vendor_program(
     // Only require that the program is installed and answers `--version`. The
     // version string never authorizes or refuses a base; ACP identity, live
     // advertisement, typed responses, and permission policy decide behavior.
-    if version_output(&program).await.is_none() {
+    let Some(version) = version_output(&program).await else {
         return Err(SessionError::Start(format!(
             "{} is not installed or not on PATH",
             vendor.display_name()
         )));
+    };
+    if matches!(vendor, AcpVendor::Kimi) && is_retired_python_kimi_version(&version) {
+        return Err(SessionError::Start(
+            "the `kimi` on PATH is the retired Python kimi-cli, not Kimi Code CLI; remove or reorder that PATH entry, or set UMADEV_KIMI_BIN to the official Kimi Code executable"
+                .to_string(),
+        ));
     }
     Ok(program)
+}
+
+fn is_retired_python_kimi_version(version: &str) -> bool {
+    version
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("kimi, version ")
 }
 
 fn resolve_and_validate_vendor_program(
@@ -8842,7 +9143,7 @@ fn resolve_grok_windows_native_program(program: &str) -> String {
     // searches only for the native PE, independent of PATHEXT ordering; a PATH
     // containing only npm's grok.cmd intentionally remains unresolved.
     if program.contains('/') || program.contains('\\') {
-        return program.to_string();
+        return resolve_program(program);
     }
     let extension = Path::new(program)
         .extension()
@@ -8856,30 +9157,58 @@ fn resolve_grok_windows_native_program(program: &str) -> String {
     } else {
         format!("{program}.exe")
     };
-    if let Some(canonical) = grok_canonical_native_program() {
-        if Path::new(&canonical)
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case(&native_name))
-        {
-            return canonical;
-        }
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(&native_name);
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
+    let path_dirs = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    select_grok_windows_native_program(
+        &native_name,
+        &path_dirs,
+        grok_canonical_native_program().as_deref(),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn select_grok_windows_native_program(
+    native_name: &str,
+    path_dirs: &[PathBuf],
+    canonical: Option<&str>,
+) -> String {
+    for dir in path_dirs {
+        let candidate = dir.join(native_name);
+        if candidate.is_file() {
+            if let Some(candidate) = candidate.to_str() {
+                return candidate.to_string();
             }
         }
     }
-    native_name
+    if let Some(canonical) = canonical {
+        if Path::new(canonical)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case(native_name))
+        {
+            return canonical.to_string();
+        }
+    }
+    native_name.to_string()
 }
 
 fn grok_canonical_native_program() -> Option<String> {
-    let name = if cfg!(windows) { "grok.exe" } else { "grok" };
-    let path = home_dir()?.join(".grok").join("bin").join(name);
-    path.is_file().then(|| path.to_string_lossy().into_owned())
+    grok_canonical_native_program_from(std::env::var("GROK_HOME").ok(), home_dir(), cfg!(windows))
+}
+
+fn grok_canonical_native_program_from(
+    grok_home: Option<String>,
+    home: Option<PathBuf>,
+    windows: bool,
+) -> Option<String> {
+    let name = if windows { "grok.exe" } else { "grok" };
+    let home = grok_home_from(grok_home, home)?;
+    let path = home.join("bin").join(name);
+    if !crate::is_spawnable_file(&path) {
+        return None;
+    }
+    path.to_str().map(str::to_string)
 }
 
 fn validate_vendor_program(vendor: AcpVendor, program: &str) -> Result<String, SessionError> {
@@ -9552,6 +9881,18 @@ mod tests {
     }
 
     #[test]
+    fn retired_python_kimi_is_rejected_by_identity_shape_not_version_number() {
+        assert!(is_retired_python_kimi_version("kimi, version 0.53"));
+        assert!(is_retired_python_kimi_version(" KIMI, VERSION 99.0 "));
+        for official in ["0.27.0", "0.31.0", "Kimi Code CLI 0.31.0", "future-build"] {
+            assert!(
+                !is_retired_python_kimi_version(official),
+                "official/future version text stays version-agnostic: {official}"
+            );
+        }
+    }
+
+    #[test]
     fn a_newer_kimi_is_accepted_and_only_a_wrong_identity_is_rejected() {
         // The reported regression: a routine Kimi upgrade (0.26.0 → 0.27.0) must NOT
         // make the base unusable. A newer, correctly-identified Kimi Code passes
@@ -10002,63 +10343,200 @@ mod tests {
     }
 
     #[test]
-    fn grok_auth_probe_treats_a_nonempty_api_key_as_logged_in() {
-        // The env-key path is deterministic and independent of the machine's real
-        // ~/.grok — a non-empty key is an instant LoggedIn, and the key itself is
-        // never rendered into the state. (The no-key path now consults the cached
-        // login file, covered by `grok_login_file_is_present_*` below, so it is not
-        // asserted here where the ambient home is uncontrolled.)
+    fn grok_auth_probe_accepts_current_and_legacy_api_key_sources() {
+        // These pure source probes are independent of the machine's real
+        // ~/.grok. The secret itself must never be rendered into diagnostic state.
         let secret = OsStr::new("xai-secret-value-must-never-be-rendered");
-        let state = grok_auth_state_from_api_key(Some(secret));
-        assert_eq!(state, AuthState::LoggedIn);
-        assert!(!format!("{state:?}").contains(secret.to_string_lossy().as_ref()));
+        for state in [
+            grok_auth_state_from_sources(Some(secret), None, None, None),
+            grok_auth_state_from_sources(None, Some(secret), None, None),
+        ] {
+            assert_eq!(state, AuthState::LoggedIn);
+            assert!(!format!("{state:?}").contains(secret.to_string_lossy().as_ref()));
+        }
+
+        assert_eq!(
+            grok_auth_state_from_sources(Some(OsStr::new("")), None, None, None),
+            AuthState::Unknown,
+            "an empty environment variable is not a usable credential"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_auth_probe_rejects_a_non_utf8_api_key_like_upstream() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+        assert_eq!(
+            grok_auth_state_from_sources(Some(&invalid), None, None, None),
+            AuthState::Unknown
+        );
     }
 
     #[test]
-    fn a_stored_credential_reads_as_login_only_on_a_nonempty_json_object() {
-        // Regression: a browser/device login must read as a stored login so it no
-        // longer shows "installed · login unverified" — Grok writes ~/.grok/auth.json
-        // (keyed by the x.ai auth endpoint) and Kimi writes
-        // ~/.kimi-code/credentials/kimi-code.json (an OAuth token set), both
-        // non-empty JSON objects. An empty object, a non-object, garbage, or an
-        // absent file must NOT — the probe never claims a login it cannot see.
+    fn grok_inline_auth_matches_the_single_credential_source_contract() {
+        // Upstream deliberately accepts the legacy `grok` alias for WebLogin
+        // only in the read-only inline GROK_AUTH source.
+        let inline = OsStr::new(
+            r#"{"key":"inline-token","auth_mode":"grok","create_time":"2026-07-31T00:00:00Z","user_id":"user","email":null}"#,
+        );
+        assert_eq!(
+            grok_auth_state_from_sources(None, None, Some(inline), None),
+            AuthState::LoggedIn
+        );
+
+        let incomplete = OsStr::new(r#"{"key":"inline-token","auth_mode":"oidc"}"#);
+        assert_eq!(
+            grok_auth_state_from_sources(None, None, Some(incomplete), None),
+            AuthState::Unknown,
+            "a shape that upstream Grok cannot deserialize must not look logged in"
+        );
+    }
+
+    #[test]
+    fn credential_json_reader_is_bounded_and_schema_neutral() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.json");
 
-        std::fs::write(&path, r#"{"https://auth.x.ai::client-abc":{"t":"…"}}"#).unwrap();
-        assert!(
-            credential_file_has_entries(&path),
-            "a grok login is present"
-        );
-
-        std::fs::write(&path, r#"{"access_token":"…","refresh_token":"…"}"#).unwrap();
-        assert!(
-            credential_file_has_entries(&path),
-            "a kimi login is present"
-        );
-
-        std::fs::write(&path, "{}").unwrap();
-        assert!(
-            !credential_file_has_entries(&path),
-            "empty object is not a login"
-        );
-
-        std::fs::write(&path, "[]").unwrap();
-        assert!(
-            !credential_file_has_entries(&path),
-            "a non-object is not a login"
+        std::fs::write(&path, r#"{"access_token":"token"}"#).unwrap();
+        assert_eq!(
+            credential_file_json(&path)
+                .and_then(|value| value["access_token"].as_str().map(str::to_owned)),
+            Some("token".to_string())
         );
 
         std::fs::write(&path, "not json").unwrap();
-        assert!(
-            !credential_file_has_entries(&path),
-            "garbage is not a login"
-        );
+        assert!(credential_file_json(&path).is_none(), "garbage is rejected");
 
         assert!(
-            !credential_file_has_entries(&dir.path().join("absent.json")),
-            "an absent file is not a login"
+            credential_file_json(&dir.path().join("absent.json")).is_none(),
+            "an absent file is indeterminate"
         );
+    }
+
+    #[test]
+    fn grok_cached_login_requires_the_source_defined_key_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        std::fs::write(
+            &path,
+            r#"{"https://auth.x.ai::client-abc":{"key":"access-token","auth_mode":"oidc","create_time":"2026-07-31T00:00:00Z","user_id":"user","email":null}}"#,
+        )
+        .unwrap();
+        assert!(grok_cached_login_present_at(&path));
+
+        for invalid in [
+            r#"{"https://auth.x.ai::client-abc":{"key":"","auth_mode":"oidc","create_time":"2026-07-31T00:00:00Z","user_id":"user","email":null}}"#,
+            r#"{"https://auth.x.ai::client-abc":{"key":"legacy-token","auth_mode":"web_login","create_time":"2026-07-31T00:00:00Z","user_id":"user","email":null}}"#,
+            r#"{"https://auth.x.ai::client-abc":{"key":"legacy-token","auth_mode":"grok","create_time":"2026-07-31T00:00:00Z","user_id":"user","email":null}}"#,
+            r#"{"https://auth.x.ai::client-abc":{"key":"token","auth_mode":"oidc","create_time":"not-a-date","user_id":"user","email":null}}"#,
+            r#"{"https://auth.x.ai::client-abc":{"metadata":"only"}}"#,
+            r"{}",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(!grok_cached_login_present_at(&path));
+        }
+    }
+
+    #[test]
+    fn grok_auth_path_precedence_matches_upstream() {
+        let home = PathBuf::from("/users/example");
+        assert_eq!(
+            grok_auth_file_from(
+                Some("/custom/auth.json".to_string()),
+                Some("/custom/home".to_string()),
+                Some(home.clone()),
+            ),
+            Some(PathBuf::from("/custom/auth.json"))
+        );
+        assert_eq!(
+            grok_auth_file_from(None, Some("/custom/home".to_string()), Some(home.clone())),
+            Some(PathBuf::from("/custom/home/auth.json"))
+        );
+        assert_eq!(
+            grok_auth_file_from(None, None, Some(home)),
+            Some(PathBuf::from("/users/example/.grok/auth.json"))
+        );
+        assert_eq!(
+            grok_auth_file_from(Some(String::new()), None, None),
+            Some(PathBuf::new()),
+            "an explicitly empty GROK_AUTH_PATH must not fall back to ~/.grok"
+        );
+        assert_eq!(
+            grok_home_from(Some("/custom/home".to_string()), None),
+            Some(PathBuf::from("/custom/home"))
+        );
+        assert_eq!(
+            grok_home_from(Some(String::new()), None),
+            Some(PathBuf::new()),
+            "an empty GROK_HOME is the current directory in upstream Grok"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_native_program_discovery_honors_a_custom_home() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let grok = bin.join("grok");
+        std::fs::write(&grok, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            grok_canonical_native_program_from(
+                Some(root.path().to_string_lossy().into_owned()),
+                None,
+                false,
+            ),
+            Some(grok.to_string_lossy().into_owned())
+        );
+    }
+
+    #[test]
+    fn a_path_grok_candidate_wins_after_a_stale_canonical_probe() {
+        let path_dir = tempfile::tempdir().unwrap();
+        let path_grok = path_dir.path().join("grok.exe");
+        std::fs::write(&path_grok, b"healthy candidate").unwrap();
+        let stale = tempfile::tempdir().unwrap().path().join("grok.exe");
+
+        assert_eq!(
+            select_grok_windows_native_program(
+                "grok.exe",
+                &[path_dir.path().to_path_buf()],
+                stale.to_str(),
+            ),
+            path_grok.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn kimi_revoked_tombstone_is_not_reported_as_logged_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = dir.path().join("credentials");
+        std::fs::create_dir_all(&credentials).unwrap();
+        let path = credentials.join("kimi-code.json");
+
+        std::fs::write(
+            &path,
+            r#"{"access_token":"access","refresh_token":"refresh","expires_at":1}"#,
+        )
+        .unwrap();
+        assert_eq!(kimi_cached_login_state_at(&path), AuthState::LoggedIn);
+
+        std::fs::write(
+            &path,
+            r#"{"access_token":"","refresh_token":"","expires_at":0}"#,
+        )
+        .unwrap();
+        assert_eq!(kimi_cached_login_state_at(&path), AuthState::NotLoggedIn);
+
+        std::fs::write(&path, r#"{"metadata":"future shape"}"#).unwrap();
+        assert_eq!(kimi_cached_login_state_at(&path), AuthState::Unknown);
     }
 
     #[test]
@@ -10109,7 +10587,7 @@ mod tests {
     }
 
     #[test]
-    fn published_grok_initialize_fixture_recovers_only_source_backed_capabilities() {
+    fn grok_private_capabilities_require_audited_source_evidence() {
         // Mirrors the open-source InitializeResponse: embedded context and load
         // are advertised; image is accepted by the published prompt parser but
         // omitted from PromptCapabilities.
@@ -10122,28 +10600,91 @@ mod tests {
             "_meta": {"grokShell": true, "agentVersion": crate::grok_contract::GROK_BUILD_SOURCE_VERSION}
         });
         let capabilities = negotiated_capabilities(AcpVendor::Grok, &official);
-        assert!(capabilities.grok_source_contract);
+        assert!(capabilities.grok_identity);
+        assert!(!capabilities.grok_source_capabilities.is_empty());
         assert!(capabilities.image);
         assert!(capabilities.embedded_context);
         assert!(capabilities.load);
         assert!(!capabilities.resume);
+        assert!(capabilities.interject && capabilities.prompt_queue);
+        assert!(capabilities.folder_trust && capabilities.background_process_control);
+        assert!(capabilities.set_mode);
 
         let unversioned = json!({
             "agentCapabilities": {"promptCapabilities": {"embeddedContext": true}},
             "_meta": {"grokShell": true}
         });
         let capabilities = negotiated_capabilities(AcpVendor::Grok, &unversioned);
-        assert!(capabilities.grok_source_contract);
-        assert!(capabilities.image);
+        assert!(capabilities.grok_identity);
+        assert!(capabilities.grok_source_capabilities.is_empty());
+        assert!(!capabilities.image, "image fallback is private evidence");
+        assert!(
+            capabilities.embedded_context,
+            "standard advertisement survives"
+        );
+        assert!(!capabilities.interject && !capabilities.prompt_queue);
+        assert!(!capabilities.folder_trust && !capabilities.background_process_control);
+        assert!(!capabilities.set_mode);
 
         let future = json!({
-            "agentCapabilities": {"loadSession": true},
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": {"image": true},
+                "sessionCapabilities": {"resume": {}}
+            },
             "_meta": {"grokShell": true, "agentVersion": "99.7.3+future.adapter"}
         });
         let capabilities = negotiated_capabilities(AcpVendor::Grok, &future);
-        assert!(capabilities.grok_source_contract);
-        assert!(capabilities.image);
-        assert!(capabilities.load);
+        assert!(capabilities.grok_identity);
+        assert!(capabilities.grok_source_capabilities.is_empty());
+        assert!(capabilities.image && capabilities.load && capabilities.resume);
+        assert!(!capabilities.interject && !capabilities.prompt_queue);
+        assert!(!capabilities.folder_trust && !capabilities.background_process_control);
+        assert!(!capabilities.set_mode);
+
+        // A stable patch after the latest audited source snapshot stays on the
+        // same 0.2 compatibility line. Its standard fields are still live
+        // advertisements, while the private profile has no maximum patch lock.
+        let future_patch = json!({
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": {"embeddedContext": true}
+            },
+            "_meta": {"grokShell": true, "agentVersion": "0.2.115"}
+        });
+        let capabilities = negotiated_capabilities(AcpVendor::Grok, &future_patch);
+        assert!(capabilities.grok_identity);
+        for capability in GrokSourceCapability::ALL {
+            assert!(capabilities.grok_supports(capability), "{capability:?}");
+        }
+        assert!(
+            capabilities.image,
+            "source-backed image fallback was patch-locked"
+        );
+        assert!(capabilities.load && capabilities.embedded_context);
+        assert!(capabilities.interject && capabilities.prompt_queue);
+        assert!(capabilities.folder_trust && capabilities.background_process_control);
+        assert!(capabilities.set_mode);
+
+        for version in ["0.2.100", "0.2.109-alpha.1", "not-semver"] {
+            let capabilities = negotiated_capabilities(
+                AcpVendor::Grok,
+                &json!({
+                    "agentCapabilities":{"loadSession":true},
+                    "_meta":{"grokShell":true,"agentVersion":version}
+                }),
+            );
+            assert!(capabilities.grok_identity, "{version}");
+            assert!(
+                capabilities.grok_source_capabilities.is_empty(),
+                "{version}"
+            );
+            assert!(capabilities.load, "{version}: standard ACP was lost");
+            assert!(
+                !capabilities.interject && !capabilities.prompt_queue,
+                "{version}"
+            );
+        }
     }
 
     #[test]
@@ -10163,7 +10704,7 @@ mod tests {
         });
         validate_initialize(AcpVendor::Kimi, &official).unwrap();
         let capabilities = negotiated_capabilities(AcpVendor::Kimi, &official);
-        assert!(!capabilities.grok_source_contract);
+        assert!(capabilities.grok_source_capabilities.is_empty());
         assert!(capabilities.image && capabilities.embedded_context);
         assert!(capabilities.resume && capabilities.load);
         assert!(!capabilities.set_model && !capabilities.set_mode && !capabilities.set_thinking);
@@ -10190,7 +10731,11 @@ mod tests {
 
         let wire = serde_json::to_value(
             InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
-                acp_client_capabilities(AcpVendor::Kimi, FolderTrustClientSurface::Headless),
+                acp_client_capabilities(
+                    AcpVendor::Kimi,
+                    FolderTrustClientSurface::Headless,
+                    GrokSourceCapabilities::NONE,
+                ),
             ),
         )
         .unwrap();
@@ -10203,6 +10748,7 @@ mod tests {
             .client_capabilities(acp_client_capabilities(
                 AcpVendor::Grok,
                 FolderTrustClientSurface::Headless,
+                audited_grok_test_capabilities(),
             ))
             .meta(grok_initialize_meta().as_object().cloned());
         let wire = serde_json::to_value(request).unwrap();
@@ -10227,6 +10773,66 @@ mod tests {
             wire["clientCapabilities"]["_meta"]["x.ai/bashOutputNoColor"],
             true
         );
+
+        let unverified = serde_json::to_value(
+            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                acp_client_capabilities(
+                    AcpVendor::Grok,
+                    FolderTrustClientSurface::Interactive,
+                    GrokSourceCapabilities::NONE,
+                ),
+            ),
+        )
+        .unwrap();
+        assert!(
+            unverified["clientCapabilities"].get("_meta").is_none(),
+            "an unverified Grok release must not receive private client claims"
+        );
+
+        let interactive = serde_json::to_value(
+            InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                acp_client_capabilities(
+                    AcpVendor::Grok,
+                    FolderTrustClientSurface::Interactive,
+                    audited_grok_test_capabilities(),
+                ),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            interactive["clientCapabilities"]["_meta"]["x.ai/folderTrust"]["interactive"],
+            true
+        );
+    }
+
+    #[test]
+    fn grok_private_client_preflight_has_no_future_patch_ceiling() {
+        for line in [
+            format!(
+                "grok {} (audited)",
+                crate::grok_contract::GROK_BUILD_SOURCE_VERSION
+            ),
+            "grok 0.2.101 (oldest-audited)".to_string(),
+            "grok 0.2.115 (future-compatible-patch)".to_string(),
+            "grok 0.2.999+future.patch".to_string(),
+        ] {
+            assert!(!grok_preflight_source_capabilities(Some(&line)).is_empty());
+        }
+        for line in [
+            None,
+            Some(""),
+            Some("grok 0.2.100 (older)"),
+            Some("grok 0.3.0 (new-protocol-line)"),
+            Some("grok 99.7.3+future.adapter"),
+            Some("grok 0.2.109-alpha.1"),
+            Some("not-grok 0.2.114"),
+            Some("grok nightly"),
+        ] {
+            assert!(
+                grok_preflight_source_capabilities(line).is_empty(),
+                "unexpected private preflight for {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -10409,7 +11015,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(session.negotiated.grok_source_contract);
+        assert!(!session.negotiated.grok_source_capabilities.is_empty());
         assert!(session.negotiated.image);
         assert_eq!(
             session.capabilities().subagents,
@@ -15083,7 +15689,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!session.negotiated.grok_source_contract);
+        assert!(session.negotiated.grok_source_capabilities.is_empty());
         assert!(session.capabilities().set_model);
         assert!(session.capabilities().set_mode);
         assert!(session.capabilities().set_thinking);

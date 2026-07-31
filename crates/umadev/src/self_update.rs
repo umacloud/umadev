@@ -25,6 +25,7 @@
 //! failure leaves the existing binary byte-for-byte untouched and prints an official
 //! npm fallback command.
 
+use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -47,6 +48,13 @@ const NPM_FALLBACK: &str =
 /// error page, or a redirect stub — never a usable executable.
 const MIN_BINARY_BYTES: u64 = 1_048_576;
 
+/// Hard ceiling for a release executable. A missing or malicious
+/// `Content-Length` must not let an updater fill the user's disk indefinitely.
+const MAX_BINARY_BYTES: u64 = 512 * 1_048_576;
+
+/// Latest-release JSON should remain small even when a release has many assets.
+const MAX_RELEASE_METADATA_BYTES: usize = 1_048_576;
+
 /// A checksum sidecar is one short SHA-256 line. Refuse an unexpectedly large
 /// response instead of buffering an arbitrary release asset into memory.
 const MAX_CHECKSUM_BYTES: usize = 4_096;
@@ -57,6 +65,10 @@ const API_TIMEOUT: Duration = Duration::from_secs(20);
 /// Timeout for the whole asset download. Generous: the binary is tens of MB and a
 /// slow link must not be cut off mid-update.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// A release binary's `--version` probe is local and should finish almost
+/// instantly. Keep it bounded so a bad artifact cannot strand the updater.
+const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where this binary lives — which decides how (or whether) it can update itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +174,34 @@ fn semver_triple(v: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+/// Exact stable version encoded by an official release tag.
+///
+/// Release CI publishes only `v<major>.<minor>.<patch>`. Keep the updater just
+/// as strict: a malformed API response must never become the version authority
+/// for the executable swap.
+fn release_version(tag: &str) -> Option<&str> {
+    if tag.trim() != tag {
+        return None;
+    }
+    let version = tag.strip_prefix('v')?;
+    let mut parts = version.split('.');
+    for _ in 0..3 {
+        let part = parts.next()?;
+        if part.is_empty()
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+            || part.parse::<u64>().is_err()
+        {
+            return None;
+        }
+    }
+    parts.next().is_none().then_some(version)
+}
+
+fn version_order(latest: &str, current: &str) -> Option<Ordering> {
+    Some(semver_triple(latest)?.cmp(&semver_triple(current)?))
+}
+
 /// Is the published `latest` release actually newer than what is installed?
 ///
 /// Equal versions are **not** newer (that is the "already on the latest version"
@@ -169,8 +209,8 @@ fn semver_triple(v: &str) -> Option<(u64, u64, u64)> {
 /// mid-release) is not downgraded. If either side is not a plain semver, fall back
 /// to string inequality — an unknown-but-different tag is treated as an update.
 pub fn is_newer(latest: &str, current: &str) -> bool {
-    match (semver_triple(latest), semver_triple(current)) {
-        (Some(l), Some(c)) => l > c,
+    match version_order(latest, current) {
+        Some(order) => order == Ordering::Greater,
         _ => latest.trim().trim_start_matches('v') != current.trim().trim_start_matches('v'),
     }
 }
@@ -446,11 +486,34 @@ async fn fetch_latest_release() -> Result<LatestRelease> {
     if !resp.status().is_success() {
         bail!("the GitHub release API returned HTTP {}", resp.status());
     }
-    let body = resp
-        .text()
+    let body = response_bytes_bounded(resp, MAX_RELEASE_METADATA_BYTES, "release metadata").await?;
+    let text = std::str::from_utf8(&body).context("the release API response is not UTF-8")?;
+    parse_latest_release(text)
+}
+
+async fn response_bytes_bounded(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        bail!("the {label} response is unexpectedly large");
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .context("could not read the GitHub release API response")?;
-    parse_latest_release(&body)
+        .with_context(|| format!("the {label} response was interrupted"))?
+    {
+        if body.len().saturating_add(chunk.len()) > max_bytes {
+            bail!("the {label} response exceeds {max_bytes} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Stream one URL to `dest`, with a coarse progress line on stderr. Returns the
@@ -468,8 +531,11 @@ async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Result
         bail!("HTTP {} from {url}", resp.status());
     }
     let total = resp.content_length().unwrap_or(0);
+    if total > MAX_BINARY_BYTES {
+        bail!("the release asset is unexpectedly large ({total} bytes)");
+    }
 
-    let mut file = std::fs::File::create(dest).with_context(|| {
+    let mut file = umadev_state::fs::create_new_private(dest).with_context(|| {
         format!(
             "could not write next to the installed binary ({}) — is the install dir writable?",
             dest.display()
@@ -484,7 +550,12 @@ async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Result
     {
         file.write_all(&chunk)
             .with_context(|| format!("could not write to {}", dest.display()))?;
-        got += chunk.len() as u64;
+        got = got
+            .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+            .context("release asset byte count overflow")?;
+        if got > MAX_BINARY_BYTES {
+            bail!("the release asset exceeds {MAX_BINARY_BYTES} bytes");
+        }
         // One line per ~4 MiB — enough to show life on a slow link, quiet enough for
         // a piped/CI log. Integer math throughout: a byte count is exact in u64 and
         // an approximate percentage needs no float.
@@ -503,6 +574,8 @@ async fn download_to(client: &reqwest::Client, url: &str, dest: &Path) -> Result
     }
     file.flush()
         .with_context(|| format!("could not flush {}", dest.display()))?;
+    file.sync_all()
+        .with_context(|| format!("could not sync {}", dest.display()))?;
     drop(file);
     if last_report > 0 {
         eprintln!();
@@ -516,7 +589,7 @@ async fn fetch_checksum(client: &reqwest::Client, url: &str, asset: &str) -> Res
     if download_urls(url).is_empty() {
         bail!("refusing a checksum URL outside the official GitHub release source");
     }
-    let mut resp = client
+    let resp = client
         .get(url)
         .header("Accept", "text/plain")
         .send()
@@ -525,23 +598,7 @@ async fn fetch_checksum(client: &reqwest::Client, url: &str, asset: &str) -> Res
     if !resp.status().is_success() {
         bail!("HTTP {} from checksum {url}", resp.status());
     }
-    if resp
-        .content_length()
-        .is_some_and(|length| length > MAX_CHECKSUM_BYTES as u64)
-    {
-        bail!("the checksum sidecar is unexpectedly large");
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("the checksum download from {url} was interrupted"))?
-    {
-        if body.len().saturating_add(chunk.len()) > MAX_CHECKSUM_BYTES {
-            bail!("the checksum sidecar exceeds {MAX_CHECKSUM_BYTES} bytes");
-        }
-        body.extend_from_slice(&chunk);
-    }
+    let body = response_bytes_bounded(resp, MAX_CHECKSUM_BYTES, "checksum sidecar").await?;
     let text = std::str::from_utf8(&body).context("the checksum sidecar is not UTF-8")?;
     parse_sha256_sidecar(text, asset)
 }
@@ -585,14 +642,20 @@ fn sha256_file(path: &Path) -> Result<String> {
 /// Checksum + size + magic-byte gate on a finished download. Runs BEFORE any
 /// rename, so a rejected file never reaches the installed path.
 fn verify_download(path: &Path, os: &str, expected_sha256: &str) -> Result<()> {
-    let size = std::fs::metadata(path)
-        .with_context(|| format!("the download vanished: {}", path.display()))?
-        .len();
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("the download vanished: {}", path.display()))?;
+    if !umadev_state::fs::metadata_is_real_file(&metadata) {
+        bail!("the staged download is linked, reparsed, or not a regular file");
+    }
+    let size = metadata.len();
     if size < MIN_BINARY_BYTES {
         bail!(
             "the download is only {size} bytes — that is not a umadev binary (a truncated \
              transfer or an error page served with HTTP 200)"
         );
+    }
+    if size > MAX_BINARY_BYTES {
+        bail!("the staged download exceeds {MAX_BINARY_BYTES} bytes");
     }
     let head = {
         use std::io::Read as _;
@@ -609,6 +672,55 @@ fn verify_download(path: &Path, os: &str, expected_sha256: &str) -> Result<()> {
     if actual != expected_sha256.to_ascii_lowercase() {
         bail!(
             "the downloaded binary failed SHA-256 verification (expected {expected_sha256}, got {actual})"
+        );
+    }
+    Ok(())
+}
+
+/// Execute the fully downloaded candidate and bind its own embedded version to
+/// the selected release tag before replacing the installed executable.
+fn verify_staged_version(path: &Path, expected: &str) -> Result<()> {
+    let mut command = std::process::Command::new(path);
+    command.arg("--version");
+    let output = umadev_process::run_bounded_std_command(
+        command,
+        umadev_process::BoundedCommandOptions {
+            timeout: VERSION_CHECK_TIMEOUT,
+            stdout_bytes: 4_096,
+            stderr_bytes: 4_096,
+            reader_grace: Duration::from_secs(1),
+        },
+    )
+    .with_context(|| format!("could not run staged binary {}", path.display()))?;
+    if output.timed_out {
+        bail!("the staged binary timed out while reporting its version");
+    }
+    if output.stdout_truncated || output.stderr_truncated {
+        bail!("the staged binary produced excessive version output");
+    }
+    if !output.status.is_some_and(|status| status.success()) {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "the staged binary could not report its version{}",
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        );
+    }
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("the staged binary's version output is not UTF-8")?;
+    let mut fields = stdout.split_whitespace();
+    let product = fields.next().unwrap_or_default();
+    let reported = fields
+        .next()
+        .unwrap_or_default()
+        .trim_start_matches(['v', 'V']);
+    if !product.eq_ignore_ascii_case("umadev") || reported != expected || fields.next().is_some() {
+        bail!(
+            "the staged binary reports `{}`, expected `UmaDev {expected}`",
+            stdout.trim()
         );
     }
     Ok(())
@@ -643,6 +755,28 @@ fn print_manual_instructions() {
     println!("{}", manual_instructions());
 }
 
+fn staging_path(exe: &Path) -> Result<PathBuf> {
+    use std::fmt::Write as _;
+
+    let parent = exe
+        .parent()
+        .context("the installed binary has no parent directory")?;
+    let mut nonce = [0_u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|error| anyhow::anyhow!("could not allocate a secure update filename: {error}"))?;
+    let mut token = String::with_capacity(nonce.len() * 2);
+    for byte in nonce {
+        write!(&mut token, "{byte:02x}")
+            .map_err(|_| anyhow::anyhow!("could not encode a secure update filename"))?;
+    }
+    Ok(parent.join(staging_filename(cfg!(windows), std::process::id(), &token)))
+}
+
+fn staging_filename(windows: bool, process_id: u32, token: &str) -> String {
+    let extension = if windows { ".exe" } else { "" };
+    format!(".umadev-update-{process_id}-{token}{extension}")
+}
+
 /// `umadev update` for a [`InstallKind::Standalone`] install: resolve the latest
 /// release, download + verify this platform's asset, and swap it over `exe`.
 ///
@@ -674,6 +808,22 @@ pub async fn run(
             return Err(e);
         }
     };
+    let Some(release_version) = release_version(&release.tag).map(str::to_string) else {
+        println!(
+            "The latest GitHub release has an invalid tag: {}.",
+            release.tag
+        );
+        print_manual_instructions();
+        bail!("invalid stable release tag `{}`", release.tag);
+    };
+
+    if version_order(&release.tag, current) == Some(Ordering::Less) {
+        println!(
+            "Installed version {current} is newer than the latest release ({}). Refusing to downgrade.",
+            release.tag
+        );
+        return Ok(());
+    }
 
     if !is_newer(&release.tag, current) && !force {
         println!("Already on the latest version ({current}). Nothing to do.");
@@ -726,11 +876,9 @@ pub async fn run(
 
     // Stage NEXT TO the exe: same filesystem, so the final rename is atomic (a temp
     // dir is often a different mount, where `rename` fails with EXDEV).
-    let mut tmp = exe.as_os_str().to_os_string();
-    tmp.push(format!(".new-{}", std::process::id()));
-    let tmp = PathBuf::from(tmp);
+    let tmp = staging_path(exe)?;
 
-    let result = install(&tmp, exe, &url, &checksum_url, &asset, os).await;
+    let result = install(&tmp, exe, &url, &checksum_url, &asset, os, &release_version).await;
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp); // never leave a partial download behind
         print_manual_instructions();
@@ -753,6 +901,7 @@ async fn install(
     checksum_url: &str,
     asset: &str,
     os: &str,
+    expected_version: &str,
 ) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("umadev-cli")
@@ -783,6 +932,7 @@ async fn install(
 
     verify_download(tmp, os, &expected_sha256)?;
     make_executable(tmp)?;
+    verify_staged_version(tmp, expected_version)?;
     apply_swap(&swap_plan(exe, tmp, cfg!(windows)))?;
     Ok(())
 }
@@ -867,6 +1017,15 @@ mod tests {
     }
 
     #[test]
+    fn staged_binary_size_is_bounded_even_if_the_file_changes_after_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary = tmp.path().join("oversized");
+        let file = std::fs::File::create(&binary).unwrap();
+        file.set_len(MAX_BINARY_BYTES + 1).unwrap();
+        assert!(verify_download(&binary, "linux", &"0".repeat(64)).is_err());
+    }
+
+    #[test]
     fn windows_on_arm_reuses_the_x64_asset() {
         assert_eq!(
             release_asset_name("windows", "aarch64").unwrap(),
@@ -908,6 +1067,60 @@ mod tests {
     fn a_non_semver_tag_falls_back_to_string_inequality() {
         assert!(is_newer("nightly", "1.0.40"));
         assert!(!is_newer("weird", "weird"));
+    }
+
+    #[test]
+    fn updater_accepts_only_exact_stable_release_tags() {
+        assert_eq!(release_version("v1.2.3"), Some("1.2.3"));
+        for invalid in [
+            "1.2.3",
+            "v1.2",
+            "v1.2.3.4",
+            "v1.2.3-beta.1",
+            "v1.2.3+local",
+            "v01.2.3",
+            "v1.02.3",
+            "vnext",
+            " v1.2.3 ",
+        ] {
+            assert_eq!(release_version(invalid), None, "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn windows_staging_binary_keeps_an_executable_suffix() {
+        assert_eq!(
+            staging_filename(true, 42, "abc"),
+            ".umadev-update-42-abc.exe"
+        );
+        assert_eq!(staging_filename(false, 42, "abc"), ".umadev-update-42-abc");
+    }
+
+    #[test]
+    fn force_reinstall_comparison_can_distinguish_equal_from_downgrade() {
+        assert_eq!(version_order("v1.2.3", "1.2.3"), Some(Ordering::Equal));
+        assert_eq!(version_order("v1.2.2", "1.2.3"), Some(Ordering::Less));
+        assert_eq!(version_order("v1.2.4", "1.2.3"), Some(Ordering::Greater));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_binary_version_must_match_the_release_before_swap() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let candidate = temp.path().join("umadev-candidate");
+        std::fs::write(&candidate, "#!/bin/sh\nprintf 'UmaDev 1.2.3\\n'\n").unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o700)).unwrap();
+        verify_staged_version(&candidate, "1.2.3").unwrap();
+        assert!(verify_staged_version(&candidate, "1.2.4").is_err());
+
+        std::fs::write(
+            &candidate,
+            "#!/bin/sh\nprintf 'not-umadev 1.2.3 extra\\n'\n",
+        )
+        .unwrap();
+        assert!(verify_staged_version(&candidate, "1.2.3").is_err());
     }
 
     #[test]
