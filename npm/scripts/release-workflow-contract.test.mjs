@@ -196,6 +196,14 @@ test("CI and release both gate launcher classification and Windows GNU", () => {
   );
 });
 
+test("cross release builds never restore host-compiled target artifacts", () => {
+  const build = jobBlock("build");
+  assert.match(
+    build,
+    /uses: Swatinem\/rust-cache@[^\n]+\n\s+with:\n\s+cache-targets: false/,
+  );
+});
+
 test("public release verification bounds every external read", () => {
   const block = jobBlock("verify-publication");
   assert.match(block, /^    timeout-minutes: 60$/m);

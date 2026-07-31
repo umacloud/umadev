@@ -497,6 +497,8 @@ jobs:
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-targets: false
 
       # Every Linux target builds via `cross`: GNU uses its old glibc sysroot,
       # while musl produces the Alpine-compatible static-libc variants. Pinning
