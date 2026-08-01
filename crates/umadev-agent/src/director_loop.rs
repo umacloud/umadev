@@ -53,7 +53,8 @@ use resume::{
 };
 pub use resume::{
     has_resumable_director_plan, has_resumable_run, is_budget_pause_reason,
-    terminal_review_circuit_reason, transient_resume_hint,
+    rearm_operational_review_for_explicit_retry, terminal_review_circuit_reason,
+    transient_resume_hint,
 };
 use resume::{load_resumable_plan, record_artifact_versions};
 use review_checkpoint::{
@@ -1403,19 +1404,13 @@ async fn drive_director_loop_with_idle(
                 }
             }
             ensure_final_review_retry_step(&mut plan, route, events);
-            let mut checkpoint = next_final_review_checkpoint(
+            let checkpoint = next_final_review_checkpoint(
                 None,
                 crate::freshness::workspace_qc_fingerprint(&options.project_root),
                 route.map(|route| route.team.clone()),
                 None,
                 OperationalReviewEvidence::new(&qc.blocking, &qc.operational),
             );
-            if options.mode == crate::trust::TrustMode::Auto {
-                checkpoint.settle_terminally();
-                if let Some(plan) = plan.as_mut() {
-                    block_open_steps(plan, events);
-                }
-            }
             let saved_plan = plan
                 .as_ref()
                 .is_some_and(|plan| plan_state::save(plan, &options.project_root).is_ok());

@@ -2188,6 +2188,51 @@ mod tests {
     }
 
     #[test]
+    fn routing_timeout_never_turns_context_free_approval_into_new_write_authority() {
+        for request in [
+            "确认",
+            "继续",
+            "继续推进执行",
+            "批准执行",
+            "授权按流水线继续执行",
+            "好的",
+            "approved?",
+            "proceed with execution",
+        ] {
+            assert!(
+                !safe_fallback_route(request).class.mutates_workspace(),
+                "a context-free acknowledgement must not create a new writable task: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn routing_timeout_preserves_clear_fresh_execution_commands() {
+        for request in [
+            "完成这个功能",
+            "帮我完成当前需求",
+            "继续开发登录模块",
+            "finish this feature",
+            "complete the implementation",
+        ] {
+            assert!(
+                safe_fallback_route(request).class.mutates_workspace(),
+                "a clear current-turn execution command must survive router unavailability: {request}"
+            );
+        }
+        for request in [
+            "这个功能完成了吗",
+            "为什么还没完成",
+            "how do I finish this feature?",
+        ] {
+            assert!(
+                !safe_fallback_route(request).class.mutates_workspace(),
+                "questions about completion remain read-only: {request}"
+            );
+        }
+    }
+
+    #[test]
     fn triage_prompt_firewalls_inherited_plans_and_separates_authorization() {
         assert!(ROUTER_TRIAGE_SYSTEM.contains("umadev.intent_input.v1"));
         assert!(ROUTER_TRIAGE_SYSTEM.contains("ONLY its `current_request` field"));

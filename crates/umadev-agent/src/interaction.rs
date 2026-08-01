@@ -152,6 +152,100 @@ pub fn is_running_cancel_intent(text: &str) -> bool {
     )
 }
 
+/// Whether a line is an exact host-level request to resume the currently parked
+/// run. This is deliberately a tiny control vocabulary, not semantic intent
+/// classification: callers must additionally prove that an unfinished run or an
+/// open gate exists before acting on it. That context guard keeps ordinary prose
+/// such as "继续按钮" or "确认页面" model-owned, while a real parked run can never
+/// lose its continuation to a slow/unavailable intent-routing child.
+#[must_use]
+pub fn is_run_resume_intent(text: &str) -> bool {
+    let normalized = normalize_resume_phrase(text);
+    matches!(
+        normalized.as_str(),
+        "继续"
+            | "繼續"
+            | "继续执行"
+            | "繼續執行"
+            | "继续推进"
+            | "繼續推進"
+            | "继续推进执行"
+            | "繼續推進執行"
+            | "继续按计划执行"
+            | "繼續按計劃執行"
+            | "继续按原计划执行"
+            | "繼續按原計劃執行"
+            | "按计划继续"
+            | "按計劃繼續"
+            | "按原计划继续"
+            | "按原計劃繼續"
+            | "批准执行"
+            | "批准執行"
+            | "批准继续执行"
+            | "批准繼續執行"
+            | "确认"
+            | "確認"
+            | "确认执行"
+            | "確認執行"
+            | "授权执行"
+            | "授權執行"
+            | "授权继续执行"
+            | "授權繼續執行"
+            | "授权按流水线继续执行"
+            | "授權按流水線繼續執行"
+            | "continue"
+            | "continue execution"
+            | "continue executing"
+            | "continue the plan"
+            | "continue with the plan"
+            | "continue with the pipeline"
+            | "resume"
+            | "resume execution"
+            | "resume the plan"
+            | "resume the existing plan"
+            | "approve"
+            | "approved"
+            | "approve execution"
+            | "proceed"
+            | "proceed with execution"
+    )
+}
+
+fn normalize_resume_phrase(text: &str) -> String {
+    let mut value = text
+        .trim()
+        .to_lowercase()
+        .trim_matches(|ch: char| matches!(ch, '。' | '！' | '!' | '.' | ',' | '，' | ';' | '；'))
+        .trim()
+        .to_string();
+
+    loop {
+        let before = value.clone();
+        for prefix in ["please ", "请先", "請先", "请", "請", "麻烦", "麻煩", "先"] {
+            if let Some(rest) = value.strip_prefix(prefix) {
+                value = rest.trim().to_string();
+                break;
+            }
+        }
+        if value == before {
+            break;
+        }
+    }
+    loop {
+        let before = value.clone();
+        for suffix in [" please", "一下吧", "一下", "吧"] {
+            if let Some(rest) = value.strip_suffix(suffix) {
+                value = rest.trim().to_string();
+                break;
+            }
+        }
+        if value == before {
+            break;
+        }
+    }
+    value
+}
+
 /// Remove only conventional politeness/softening around an otherwise exact
 /// cancellation phrase. The core still must match the allow-list above, so
 /// ordinary content such as “实现停止按钮” cannot accidentally become control.
@@ -718,6 +812,33 @@ mod tests {
             "please cancel it",
         ] {
             assert!(!is_explicit_clarification_answer(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn resume_is_an_exact_control_intent_not_a_keyword_guess() {
+        for text in [
+            "继续",
+            "请继续推进执行",
+            "批准执行",
+            "确认",
+            "授权按流水线继续执行",
+            "請繼續按原計劃執行吧",
+            "continue",
+            "please resume the existing plan",
+            "proceed with execution",
+        ] {
+            assert!(is_run_resume_intent(text), "{text}");
+        }
+        for text in [
+            "继续按钮不能点击",
+            "确认页面的样式",
+            "不要继续评审",
+            "解释如何继续",
+            "after this, continue with SEO",
+            "continue button",
+        ] {
+            assert!(!is_run_resume_intent(text), "{text}");
         }
     }
 

@@ -128,8 +128,9 @@ pub(super) enum OperationalReviewCheckpoint {
         /// evidence returned by unavailable seats, kept as separate channels.
         #[serde(default)]
         evidence: OperationalReviewEvidence,
-        /// `auto` has no human retry gate: one boundary (which already includes
-        /// the seat's fresh-session retry) settles terminally.
+        /// Legacy compatibility bit written by older `auto` releases after the
+        /// first outage. New readers deliberately ignore it: the bounded circuit
+        /// is driven solely by `consecutive_outages`.
         #[serde(default)]
         terminally_settled: bool,
     },
@@ -157,17 +158,24 @@ pub(super) enum OperationalReviewCheckpoint {
         /// evidence returned by unavailable seats, kept as separate channels.
         #[serde(default)]
         evidence: OperationalReviewEvidence,
-        /// `auto` has no human retry gate: one boundary (which already includes
-        /// the seat's fresh-session retry) settles terminally.
+        /// Legacy compatibility bit written by older `auto` releases after the
+        /// first outage. New readers deliberately ignore it: the bounded circuit
+        /// is driven solely by `consecutive_outages`.
         #[serde(default)]
         terminally_settled: bool,
     },
 }
 
 impl OperationalReviewCheckpoint {
-    /// Old checkpoints predate the counter but necessarily represent one outage.
+    /// Number of unavailable boundaries since the last explicit user retry.
+    ///
+    /// A missing counter from an older checkpoint deserializes to zero. Treating
+    /// that value as one made a re-armed cursor impossible to represent: the very
+    /// next outage jumped straight back to the two-strike circuit. Conservatively
+    /// granting an old checkpoint one additional retry is preferable to trapping
+    /// a current run in that loop.
     pub(super) const fn effective_outages(&self) -> u8 {
-        let recorded = match self {
+        match self {
             Self::StepReview {
                 consecutive_outages,
                 ..
@@ -176,24 +184,15 @@ impl OperationalReviewCheckpoint {
                 consecutive_outages,
                 ..
             } => *consecutive_outages,
-        };
-        if recorded == 0 {
-            1
-        } else {
-            recorded
         }
     }
 
     pub(super) const fn circuit_open(&self) -> bool {
-        let terminally_settled = match self {
-            Self::StepReview {
-                terminally_settled, ..
-            }
-            | Self::FinalGateReview {
-                terminally_settled, ..
-            } => *terminally_settled,
-        };
-        terminally_settled || self.effective_outages() >= MAX_CONSECUTIVE_REVIEW_OUTAGES
+        // Releases before this fix marked the FIRST automatic-mode outage as
+        // terminal. Ignore that legacy bit: one unavailable reviewer boundary is
+        // always resumable; only the second identical boundary opens the bounded
+        // retry circuit.
+        self.effective_outages() >= MAX_CONSECUTIVE_REVIEW_OUTAGES
     }
 
     pub(super) const fn evidence(&self) -> &OperationalReviewEvidence {
@@ -202,14 +201,21 @@ impl OperationalReviewCheckpoint {
         }
     }
 
-    pub(super) fn settle_terminally(&mut self) {
+    fn rearm_for_explicit_retry(&mut self) {
         match self {
             Self::StepReview {
-                terminally_settled, ..
+                consecutive_outages,
+                terminally_settled,
+                ..
             }
             | Self::FinalGateReview {
-                terminally_settled, ..
-            } => *terminally_settled = true,
+                consecutive_outages,
+                terminally_settled,
+                ..
+            } => {
+                *consecutive_outages = 0;
+                *terminally_settled = false;
+            }
         }
     }
 }
@@ -221,10 +227,33 @@ pub fn terminal_review_circuit_reason(root: &Path) -> Option<String> {
     let checkpoint = load_operational_review_checkpoint(root)?;
     checkpoint.circuit_open().then(|| {
         format!(
-            "required review remained unavailable after {} bounded review boundaries; this run is stopped incomplete and cannot be continued. No source repair was started. Start a new /run or send a new requirement when the reviewer service is available",
+            "required review remained unavailable after {} bounded review boundaries; automatic retries are paused. No source repair was started. Send /continue to retry this same saved review when the reviewer service is available; UmaDev will not start a replacement plan",
             checkpoint.effective_outages()
         )
     })
+}
+
+/// Re-arm an automatic review circuit for one explicit user-driven retry.
+///
+/// Automatic retries stay bounded by the persisted review circuit.
+/// Once that circuit opens, however, `/continue` or an exact host-level approval
+/// is fresh authority to retry the SAME durable review cursor. Keeping the cursor
+/// and its evidence avoids both bad historical outcomes: silently starting a new
+/// plan, or permanently trapping the user behind a receipt that only suggested a
+/// new `/run`.
+pub fn rearm_operational_review_for_explicit_retry(root: &Path) -> Result<bool, String> {
+    if let Some(mut checkpoint) = load_operational_review_checkpoint(root) {
+        if checkpoint.circuit_open() {
+            checkpoint.rearm_for_explicit_retry();
+            save_operational_review_checkpoint(root, &checkpoint)
+                .map_err(|error| format!("could not re-open review checkpoint: {error}"))?;
+            // A Director checkpoint is authoritative for this run. Do not also
+            // rewrite a stale legacy workflow marker that may belong to an older
+            // engine generation in the same workspace.
+            return Ok(true);
+        }
+    }
+    crate::continuous::rearm_legacy_operational_review_circuit(root)
 }
 
 pub(super) fn next_step_review_checkpoint(
@@ -1044,6 +1073,72 @@ mod tests {
             load_resumable_plan(root).is_none(),
             "an open circuit never reopens blocked steps"
         );
+    }
+
+    #[test]
+    fn explicit_retry_rearms_the_same_review_cursor_without_losing_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        save_plan(root, StepStatus::Blocked);
+        let checkpoint = OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint: Some("same-tree".to_string()),
+            required_seats: Some(vec![Seat::QaEngineer]),
+            entry_task_run_id: Some("run-42".to_string()),
+            consecutive_outages: 2,
+            evidence: OperationalReviewEvidence {
+                semantic_blocking: vec!["real product finding".to_string()],
+                operational_unavailable: vec!["review transport timed out".to_string()],
+            },
+            terminally_settled: true,
+        };
+        save_operational_review_checkpoint(root, &checkpoint).unwrap();
+
+        assert!(terminal_review_circuit_reason(root).is_some());
+        assert!(rearm_operational_review_for_explicit_retry(root).unwrap());
+        assert!(terminal_review_circuit_reason(root).is_none());
+
+        let rearmed = load_operational_review_checkpoint(root).unwrap();
+        let first_outage_after_explicit_retry = next_final_review_checkpoint(
+            Some(&rearmed),
+            Some("same-tree".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            Some("run-42".to_string()),
+            OperationalReviewEvidence::new(&[], &["review transport still unavailable".into()]),
+        );
+        assert_eq!(first_outage_after_explicit_retry.effective_outages(), 1);
+        assert!(
+            !first_outage_after_explicit_retry.circuit_open(),
+            "the first outage after an explicit retry must park once, not immediately re-open the circuit"
+        );
+        let OperationalReviewCheckpoint::FinalGateReview {
+            qc_source_fingerprint,
+            required_seats,
+            entry_task_run_id,
+            consecutive_outages,
+            evidence,
+            terminally_settled,
+        } = rearmed
+        else {
+            panic!("the final-review cursor must not change kind");
+        };
+        assert_eq!(qc_source_fingerprint.as_deref(), Some("same-tree"));
+        assert_eq!(required_seats, Some(vec![Seat::QaEngineer]));
+        assert_eq!(entry_task_run_id.as_deref(), Some("run-42"));
+        assert_eq!(consecutive_outages, 0);
+        assert!(!terminally_settled);
+        assert_eq!(
+            evidence.semantic_blocking,
+            vec!["real product finding".to_string()]
+        );
+        assert_eq!(
+            evidence.operational_unavailable,
+            vec!["review transport timed out".to_string()]
+        );
+        let plan = load_resumable_plan(root).expect("the same plan becomes resumable");
+        assert_eq!(plan.steps.len(), 2, "only the final review cursor is added");
+        assert_eq!(plan.steps[0].id, "s1");
+        assert_eq!(plan.steps[0].status, StepStatus::Pending);
+        assert_eq!(plan.steps[1].id, FINAL_REVIEW_RETRY_STEP_ID);
     }
 
     #[test]

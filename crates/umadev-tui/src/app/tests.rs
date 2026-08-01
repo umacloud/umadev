@@ -6267,6 +6267,81 @@ fn explicit_retry_after_recoverable_base_failure_is_never_swallowed() {
 }
 
 #[test]
+fn failed_director_settles_phantom_live_state_and_resumes_the_saved_plan() {
+    let mut app = fresh_app(Some("codex"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "remaining".into(),
+            title: "finish existing work".into(),
+            seat: umadev_agent::Seat::BackendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Pending,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Backend);
+    state.requirement = "完成已有计划".into();
+    state.backend = "codex".into();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+    app.register_run_task("完成已有计划");
+    app.director_run_in_flight = true;
+
+    app.record_route_failed(
+        "[blocked] read-only resident session attempted an explicit workspace edit".into(),
+        FailedRouteOrigin::Director,
+    );
+
+    assert!(!app.run_started);
+    assert!(app.aborted);
+    assert!(!app.has_interruptible_work());
+    assert_eq!(
+        app.submit_text("继续推进执行".into()),
+        Action::ResumeRun("完成已有计划".into())
+    );
+}
+
+#[test]
+fn stopped_director_never_leaves_a_phantom_live_run() {
+    let mut app = fresh_app(Some("codex"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "remaining".into(),
+            title: "resume after interruption".into(),
+            seat: umadev_agent::Seat::BackendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Pending,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Backend);
+    state.requirement = "继续原任务".into();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+    app.register_run_task("继续原任务");
+    app.director_run_in_flight = true;
+
+    app.record_agentic_stopped("agentic.interrupted", None, None);
+
+    assert!(!app.run_started);
+    assert!(app.aborted);
+    assert_eq!(
+        app.submit_text("继续".into()),
+        Action::ResumeRun("继续原任务".into())
+    );
+}
+
+#[test]
 fn session_tokens_accumulate_across_turns_and_reset_on_clear() {
     let mut a = fresh_app(Some("offline"));
     assert_eq!(
@@ -6349,8 +6424,44 @@ fn slash_continue_without_gate_is_noop_with_hint() {
 }
 
 #[test]
-fn slash_continue_rejects_terminal_director_review_before_consuming_a_stale_gate() {
+fn plan_mode_continue_without_saved_work_reports_that_nothing_started() {
+    let mut app = fresh_app(Some("offline"));
+    app.set_trust_mode(umadev_agent::TrustMode::Plan);
+
+    assert_eq!(app.try_slash_command("/continue"), Some(Action::None));
+    assert!(app
+        .history
+        .iter()
+        .any(|message| message.body().contains("还没启动流水线")));
+    assert!(!app
+        .history
+        .iter()
+        .any(|message| message.body().contains("执行未启动")));
+}
+
+#[test]
+fn slash_continue_rearms_terminal_director_review_without_consuming_a_stale_gate() {
     let mut app = fresh_app(Some("claude-code"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "build".into(),
+            title: "finish the original build".into(),
+            seat: umadev_agent::Seat::FrontendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Done,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Quality);
+    state.requirement = "finish the original build".into();
+    state.backend = "claude-code".into();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
     std::fs::create_dir_all(app.project_root.join(".umadev")).unwrap();
     std::fs::write(
         app.project_root
@@ -6363,53 +6474,73 @@ fn slash_continue_rejects_terminal_director_review_before_consuming_a_stale_gate
     .unwrap();
     app.active_gate = Some(Gate::DocsConfirm);
 
-    let before = app.history.len();
     assert_eq!(
         app.try_slash_command("/continue"),
-        Some(Action::None),
-        "a terminal receipt is never dispatched as ResumeRun/Continue"
+        Some(Action::ResumeRun("finish the original build".into())),
+        "an explicit retry reopens the same durable review cursor"
     );
-    assert_eq!(
-        app.active_gate,
-        Some(Gate::DocsConfirm),
-        "terminal preflight runs before stale gate consumption"
-    );
-    let added = app
-        .history
-        .iter()
-        .skip(before)
-        .map(|message| message.body());
-    let added = added.collect::<Vec<_>>().join("\n");
-    assert!(added.contains("cannot be continued") && added.contains("new /run"));
-    assert!(!added.contains(umadev_i18n::t(app.lang, "continue.resuming")));
+    assert!(app.active_gate.is_none(), "the stale gate is discarded");
+    assert!(umadev_agent::terminal_review_circuit_reason(&app.project_root).is_none());
+    assert!(umadev_agent::has_resumable_run(&app.project_root));
 }
 
 #[test]
-fn slash_continue_rejects_terminal_legacy_review_without_resuming() {
+fn plan_mode_continue_never_rearms_or_rewrites_the_review_cursor() {
+    let mut app = fresh_app(Some("claude-code"));
+    app.set_trust_mode(umadev_agent::TrustMode::Plan);
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "review".into(),
+            title: "retry the same review".into(),
+            seat: umadev_agent::Seat::QaEngineer,
+            kind: umadev_agent::StepKind::Review,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::ReviewClean,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Blocked,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    std::fs::create_dir_all(app.project_root.join(".umadev")).unwrap();
+    let checkpoint_path = app
+        .project_root
+        .join(".umadev/director-operational-review.json");
+    std::fs::write(
+        &checkpoint_path,
+        br#"{"kind":"final-gate-review","consecutive_outages":2}"#,
+    )
+    .unwrap();
+    let before = std::fs::read(&checkpoint_path).unwrap();
+
+    assert_eq!(app.try_slash_command("/continue"), Some(Action::None));
+    assert_eq!(std::fs::read(&checkpoint_path).unwrap(), before);
+    assert!(umadev_agent::terminal_review_circuit_reason(&app.project_root).is_some());
+}
+
+#[test]
+fn slash_continue_rearms_terminal_legacy_review_without_starting_a_new_plan() {
     let mut app = fresh_app(Some("offline"));
     let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Quality);
     state.note = "operational-review-circuit-open:v1:quality (continuous session)".to_string();
     state.requirement = "old requirement".to_string();
     umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
 
-    let before = app.history.len();
     assert_eq!(
         app.try_slash_command("/continue"),
-        Some(Action::None),
-        "the legacy terminal receipt is never dispatched as ResumeRun"
+        Some(Action::ResumeRun("old requirement".into())),
+        "the same legacy requirement is resumed"
     );
-    let added = app
-        .history
-        .iter()
-        .skip(before)
-        .map(|message| message.body());
-    let added = added.collect::<Vec<_>>().join("\n");
-    assert!(added.contains("circuit is open") && added.contains("new /run"));
-    assert!(!added.contains(umadev_i18n::t(app.lang, "continue.resuming")));
+    assert!(umadev_agent::legacy_operational_review_pending(
+        &app.project_root
+    ));
+    assert!(umadev_agent::legacy_operational_review_circuit_reason(&app.project_root).is_none());
 }
 
 #[test]
-fn terminal_review_receipt_is_aborted_not_paused_and_tasks_cannot_resume() {
+fn terminal_review_receipt_stops_automatic_retry_but_explicit_tasks_resume_rearms_it() {
     let mut app = fresh_app(Some("claude-code"));
     let plan = umadev_agent::Plan {
         steps: vec![umadev_agent::PlanStep {
@@ -6458,23 +6589,18 @@ fn terminal_review_receipt_is_aborted_not_paused_and_tasks_cannot_resume() {
     assert!(
         umadev_agent::transient_resume_hint("429 too many requests", &app.project_root).is_none()
     );
-    let before = app.history.len();
-    assert_eq!(app.slash_tasks("resume"), Action::None);
-    let added = app
-        .history
-        .iter()
-        .skip(before)
-        .map(|message| message.body());
-    let added = added.collect::<Vec<_>>().join("\n");
-    assert!(added.contains(umadev_i18n::t(app.lang, "tasks.nothing_to_resume")));
-    assert!(!added.contains(umadev_i18n::t(app.lang, "continue.resuming")));
+    assert_eq!(
+        app.slash_tasks("resume"),
+        Action::ResumeRun("old requirement".into())
+    );
+    assert!(umadev_agent::terminal_review_circuit_reason(&app.project_root).is_none());
 
     let footer = app
         .exit_footer_text()
         .expect("the conversation has a footer");
     assert!(
-        !footer.contains(".umadev/"),
-        "a terminal circuit is retained as evidence, not advertised as a resumable artifact"
+        footer.contains(".umadev/"),
+        "after explicit re-arm the same saved run is again a resumable artifact"
     );
 }
 
@@ -6532,6 +6658,83 @@ fn slash_continue_with_a_resumable_plan_resumes_instead_of_hinting() {
             .any(|m| m.body().contains("还没启动流水线")),
         "the restart hint is NOT shown"
     );
+}
+
+#[test]
+fn natural_language_continue_resumes_the_same_persisted_plan_without_routing() {
+    let mut app = fresh_app(Some("claude-code"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "remaining".into(),
+            title: "finish the existing implementation".into(),
+            seat: umadev_agent::Seat::FrontendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Pending,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+    state.requirement = "完成原计划".into();
+    state.backend = "claude-code".into();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+
+    for control in ["继续", "继续推进执行", "批准执行", "授权按流水线继续执行"]
+    {
+        let action = app.submit_text(control.to_string());
+        assert_eq!(
+            action,
+            Action::ResumeRun("完成原计划".to_string()),
+            "{control} must attach the saved run directly"
+        );
+        assert!(
+            app.history.back().is_some_and(|message| message
+                .body()
+                .contains(umadev_i18n::t(app.lang, "continue.resuming"))),
+            "{control} must use the host continuation path"
+        );
+    }
+}
+
+#[test]
+fn natural_language_continue_without_a_checkpoint_remains_model_owned() {
+    let mut app = fresh_app(Some("offline"));
+    assert_eq!(
+        app.submit_text("继续".to_string()),
+        Action::Route("继续".to_string())
+    );
+}
+
+#[test]
+fn natural_language_continue_without_a_durable_plan_keeps_its_exact_text_for_routing() {
+    let mut app = fresh_app(Some("claude-code"));
+    app.host_chat_session_active = true;
+    app.chat_session_id = Some("native-session".to_string());
+
+    assert_eq!(
+        app.submit_text("继续".to_string()),
+        Action::Route("继续".to_string())
+    );
+    assert!(app
+        .history
+        .back()
+        .is_some_and(|message| message.body() == "继续"));
+}
+
+#[test]
+fn natural_language_confirmation_approves_the_existing_gate() {
+    let mut app = fresh_app(Some("claude-code"));
+    app.active_gate = Some(Gate::PreviewConfirm);
+    assert_eq!(
+        app.submit_text("确认".to_string()),
+        Action::Continue(Gate::PreviewConfirm)
+    );
+    assert!(app.active_gate.is_none());
 }
 
 #[test]

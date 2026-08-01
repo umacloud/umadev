@@ -448,18 +448,14 @@ pub fn checkpoint_post_build_review_pause(
         open_questions: Vec::new(),
     });
     ensure_final_review_retry_step(&mut plan, Some(route), events);
-    let mut plan = plan.expect("the helper always creates a final-review cursor");
-    let mut checkpoint = super::next_final_review_checkpoint(
+    let plan = plan.expect("the helper always creates a final-review cursor");
+    let checkpoint = super::next_final_review_checkpoint(
         None,
         crate::freshness::workspace_qc_fingerprint(&options.project_root),
         Some(route.team.clone()),
         entry_task_run_id.map(str::to_string),
         super::OperationalReviewEvidence::new(&qc.blocking, &qc.operational_unavailable),
     );
-    if options.mode == crate::trust::TrustMode::Auto {
-        checkpoint.settle_terminally();
-        super::block_open_steps(&mut plan, events);
-    }
     let plan_path = plan_state::save(&plan, &options.project_root)
         .map_err(|error| format!("could not persist post-build review plan: {error}"))?;
 

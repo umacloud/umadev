@@ -259,23 +259,7 @@ impl App {
                 );
                 Action::None
             }
-            "resume" | "continue"
-                if !self.finished && umadev_agent::has_resumable_run(&self.project_root) =>
-            {
-                if self.reject_director_execution_in_plan() {
-                    return Action::None;
-                }
-                let requirement = self.resume_run_requirement();
-                if self.reject_replayed_host_git_operation(&requirement) {
-                    return Action::None;
-                }
-                self.push_resume_separator();
-                self.push(
-                    ChatRole::UmaDev,
-                    umadev_i18n::t(self.lang, "continue.resuming"),
-                );
-                Action::ResumeRun(requirement)
-            }
+            "resume" | "continue" if self.has_run_resume_target() => self.continue_run_action(),
             "resume" | "continue" => {
                 self.push(
                     ChatRole::System,

@@ -4446,26 +4446,41 @@ async fn cmd_continue(
     };
     reject_replayed_git_requirement(&state.requirement)?;
 
-    if let Some(reason) = umadev_agent::legacy_operational_review_terminal_reason(&project_root) {
-        anyhow::bail!(
-            "{reason}. This exhausted review boundary is terminal; run `umadev run` to start a fresh run"
-        );
+    let review_circuit_open = umadev_agent::terminal_review_circuit_reason(&project_root).is_some()
+        || umadev_agent::legacy_operational_review_circuit_reason(&project_root).is_some();
+    // Re-arming the saved review cursor mutates durable run state. Keep Plan mode
+    // genuinely read-only even though `/continue` would otherwise be explicit
+    // authority to retry the same review.
+    if review_circuit_open && !trust_for_resume(&state).executes() {
+        println!("{}", umadev_i18n::tl("continuous.plan_mode_skip"));
+        println!("{}", umadev_i18n::tl("mode.plan.gate"));
+        return Ok(());
     }
-    let legacy_review_pending = umadev_agent::legacy_operational_review_pending(&project_root);
+    let rearmed_review = umadev_agent::rearm_operational_review_for_explicit_retry(&project_root)
+        .map_err(anyhow::Error::msg)?;
 
-    // A terminal Director review circuit owns this `/continue`. Refuse before
-    // backend probe/login/session creation so repeated commands cannot look hung
-    // on vendor handshakes. The inner resume guard still prevents fresh fallback
-    // for direct/programmatic callers.
-    if let Some(reason) = umadev_agent::terminal_review_circuit_reason(&project_root) {
+    // Explicit cancellation remains terminal. An automatic retry circuit was
+    // re-armed above, but a user-cancelled cursor must never be resurrected.
+    if let Some(reason) = umadev_agent::legacy_operational_review_terminal_reason(&project_root) {
         anyhow::bail!("{reason}");
     }
+    if let Some(reason) = umadev_agent::terminal_review_circuit_reason(&project_root) {
+        anyhow::bail!("could not re-open the saved review cursor: {reason}");
+    }
+    let legacy_review_pending = umadev_agent::legacy_operational_review_pending(&project_root);
 
     // Director runs persist a typed plan whose Done/Pending statuses are the
     // authoritative resume point. Route these runs back into the Director
     // scheduler before interpreting the legacy phase/gate state; otherwise a
     // CLI `continue` re-runs a fixed gate block and discards the completed DAG.
-    if !legacy_review_pending && umadev_agent::has_resumable_director_plan(&project_root) {
+    if !legacy_review_pending
+        && (rearmed_review || umadev_agent::has_resumable_director_plan(&project_root))
+    {
+        if !umadev_agent::has_resumable_director_plan(&project_root) {
+            anyhow::bail!(
+                "the saved review cursor has no matching Director plan; no replacement plan was started"
+            );
+        }
         return Box::pin(drive_director_continue(
             &project_root,
             &state,
@@ -7866,9 +7881,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_continue_refuses_a_terminal_review_before_backend_probe() {
+    async fn cli_continue_rearms_a_terminal_review_without_starting_a_replacement_plan() {
+        use umadev_agent::plan_state::{
+            AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus,
+        };
+        use umadev_agent::Seat;
+
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
+        umadev_agent::plan_state::save(
+            &Plan {
+                steps: vec![PlanStep {
+                    id: "saved-step".to_string(),
+                    title: "finish the saved implementation".to_string(),
+                    seat: Seat::BackendEngineer,
+                    kind: StepKind::Build,
+                    depends_on: Vec::new(),
+                    acceptance: AcceptanceSpec::SourcePresent,
+                    evidence: Vec::new(),
+                    files: StepFiles {
+                        create: vec!["src/main.rs".to_string()],
+                        modify: Vec::new(),
+                    },
+                    status: StepStatus::Done,
+                }],
+                risks: Vec::new(),
+                open_questions: Vec::new(),
+            },
+            root,
+        )
+        .unwrap();
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Delivery);
         state.requirement = "finish the existing product".to_string();
         state.slug = "terminal-review".to_string();
@@ -7889,26 +7931,62 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
-
         let error = Box::pin(cmd_continue(Some(root.to_path_buf()), None))
             .await
-            .expect_err("an exhausted review boundary cannot be continued")
+            .expect_err("the invalid saved backend must fail after the review is re-armed")
             .to_string();
 
         assert!(
-            error.contains("cannot be continued") && error.contains("review"),
-            "terminal review evidence must own the result: {error}"
+            error.contains("definitely-not-an-installed-backend"),
+            "backend resolution did not follow the explicit review retry: {error}"
         );
         assert!(
-            !error.contains("definitely-not-an-installed-backend"),
-            "backend resolution happened before the terminal review preflight: {error}"
+            umadev_agent::terminal_review_circuit_reason(root).is_none(),
+            "the automatic retry circuit was not re-armed"
         );
-        assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint_path).unwrap()).unwrap();
+        assert_eq!(checkpoint["consecutive_outages"], 0);
+        let saved = umadev_agent::plan_state::load(root).unwrap();
+        assert_eq!(saved.steps[0].id, "saved-step");
+        assert_eq!(saved.steps[0].status, StepStatus::Done);
         assert!(
             !root.join(".umadev/agent-tasks").exists(),
-            "a refused continuation must not fabricate a task ledger"
+            "a failed backend handoff must not fabricate a replacement task ledger"
         );
+    }
+
+    #[tokio::test]
+    async fn cli_plan_mode_continue_never_rearms_a_terminal_review_cursor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Delivery);
+        state.requirement = "inspect the saved run".to_string();
+        state.slug = "terminal-review-plan".to_string();
+        state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Plan);
+        umadev_agent::write_workflow_state(root, &state).unwrap();
+        let checkpoint_path = root
+            .join(".umadev")
+            .join("director-operational-review.json");
+        std::fs::write(
+            &checkpoint_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "kind": "final-gate-review",
+                "qc_source_fingerprint": null,
+                "consecutive_outages": 2
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
+
+        Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+            .await
+            .expect("Plan mode should settle read-only before rewriting the cursor");
+
+        assert_eq!(std::fs::read(&checkpoint_path).unwrap(), checkpoint_before);
+        assert!(umadev_agent::terminal_review_circuit_reason(root).is_some());
+        assert!(!root.join(".umadev/agent-tasks").exists());
     }
 
     #[tokio::test]

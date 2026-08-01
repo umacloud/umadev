@@ -16,6 +16,26 @@ use crate::{
     RouteDecision, ABORT_SENTINEL,
 };
 
+/// Select the Director only for fresh runs or a resume with a real Director
+/// cursor. Workflow-only legacy resumes must stay on their persisted phase path.
+pub(super) fn use_director_engine(project_root: &std::path::Path, resume: bool) -> bool {
+    !umadev_agent::legacy_pipeline_from_env()
+        && (!resume || umadev_agent::has_resumable_director_plan(project_root))
+}
+
+/// Resume a workflow-only legacy run from its persisted phase. A fresh run, or
+/// an unreadable/obsolete phase id, starts from research.
+pub(super) fn continuous_resume_phase(
+    project_root: &std::path::Path,
+    resume: bool,
+) -> umadev_spec::Phase {
+    resume
+        .then(|| umadev_agent::read_workflow_state(project_root))
+        .flatten()
+        .and_then(|state| umadev_agent::phase_from_id(&state.phase))
+        .unwrap_or(umadev_spec::Phase::Research)
+}
+
 /// Settle ownership of a Director base after one drive.
 ///
 /// A Guarded operational-review pause is resumable. Keep that live process only
@@ -75,7 +95,7 @@ pub(super) async fn settle_terminal_post_build_review(
         return Ok(session);
     }
     let reason = format!(
-        "{}; automatic mode exhausted its bounded reviewer retry and stopped this run incomplete. Start a new /run when the reviewer service is available",
+        "{}; automatic mode exhausted its bounded reviewer retry and paused this run incomplete. Send /continue to retry the same saved review when the reviewer service is available",
         pause.reason
     );
     fail_entry_task(entry_task, "resident review unavailable", reason.clone());
@@ -148,6 +168,26 @@ pub(super) async fn run_director_loop(
         return;
     }
 
+    // A resume is never authority to synthesize replacement work. Validate the
+    // Director cursor before taking the writer lock, creating an isolation branch,
+    // rewriting workflow state, or opening a base process. Legacy workflow-only
+    // resumes are dispatched through the continuous phase path by the caller.
+    if resume {
+        if let Some(reason) = umadev_agent::terminal_review_circuit_reason(&options.project_root) {
+            sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
+            let _ = route_tx.send(RouteDecision::Failed(reason));
+            return;
+        }
+        if !umadev_agent::has_resumable_director_plan(&options.project_root) {
+            let reason =
+                "the saved Director run has no resumable plan cursor; no new plan was started"
+                    .to_string();
+            sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
+            let _ = route_tx.send(RouteDecision::Failed(reason));
+            return;
+        }
+    }
+
     {
         let backend = options.backend.clone();
         let model = options.model.clone();
@@ -170,18 +210,6 @@ pub(super) async fn run_director_loop(
                 return;
             }
         };
-
-        // A persisted terminal review circuit is a caller-level failure receipt,
-        // not a resumable session. Settle it before isolation, workflow writes,
-        // firmware work, or any base login/ACP handshake; the inner resume guard
-        // remains as defense against stale direct callers and fallback.
-        if resume {
-            if let Some(reason) = umadev_agent::terminal_review_circuit_reason(&root) {
-                sink.emit(EngineEvent::Note(format!("{ABORT_SENTINEL}{reason}")));
-                let _ = route_tx.send(RouteDecision::Failed(reason));
-                return;
-            }
-        }
 
         // A fresh run supersedes an operational-review pause, but settlement
         // must use the OLD workflow identity. Do this before writing the new
@@ -479,29 +507,22 @@ pub(super) async fn run_director_loop(
                 } else {
                     None
                 };
-                if let Some(o) = resumed {
-                    o
-                } else {
-                    // An explicitly requested resume found nothing resumable
-                    // (plan gone, or already terminal). Falling open to a
-                    // fresh run is the safe behaviour — but it must SAY so:
-                    // the user just read a "resuming your last task" banner,
-                    // and silently restarting from scratch under it was the
-                    // reported trap. Blocked-settled plans no longer land
-                    // here (they reopen as a repair); this is the residue.
-                    if resume {
-                        sink_dyn.emit(umadev_agent::EngineEvent::Note(
-                            umadev_i18n::tl("continue.fresh_fallback").to_string(),
-                        ));
+                match (resume, resumed) {
+                    (_, Some(outcome)) => outcome,
+                    (true, None) => umadev_agent::DirectorLoopOutcome::Failed(
+                        "the saved Director cursor disappeared while resuming; no new plan was started"
+                            .to_string(),
+                    ),
+                    (false, None) => {
+                        umadev_agent::drive_director_loop_routed(
+                            session.as_mut(),
+                            &options,
+                            &sink_dyn,
+                            directive,
+                            Some(&route),
+                        )
+                        .await
                     }
-                    umadev_agent::drive_director_loop_routed(
-                        session.as_mut(),
-                        &options,
-                        &sink_dyn,
-                        directive,
-                        Some(&route),
-                    )
-                    .await
                 }
             })),
         )

@@ -5560,8 +5560,8 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
         // Drain THIS attempt's turn. ANY event resets the idle clock; while a tool runs
         // the path keeps waiting as long as the base stays alive (the liveness poll), so
         // a long healthy tool survives ordinary idle windows. The independent resident
-        // limiter is the absolute runaway backstop: continuous tiny output, tool-call
-        // floods, or huge usage can no longer evade the idle detector forever. A `None`
+        // limiter uses a sliding progress window plus an absolute runaway backstop;
+        // tiny output, tool floods, or huge usage cannot evade the latter. A `None`
         // / a `Failed` status is an honest terminal. The terminal `break` carries
         // whether the finish was truncated (mid-stream cut-off) AND the live session.
         loop {
@@ -9208,7 +9208,7 @@ fn start_requested_run(
         return (tokio::spawn(async {}), false);
     }
     let host_cli = matches!(app.brain_spec(), BrainSpec::HostCli(_));
-    if host_cli && !umadev_agent::legacy_pipeline_from_env() {
+    if host_cli && director_run::use_director_engine(&opts.project_root, resume) {
         app.thinking = true;
         app.thinking_started = Some(Instant::now());
         app.last_output_at = None;
@@ -9264,7 +9264,7 @@ fn start_requested_run(
             run_opts,
             sink.clone(),
             session_holder.clone(),
-            umadev_spec::Phase::Research,
+            director_run::continuous_resume_phase(&opts.project_root, resume),
             permissions,
             resume,
         )

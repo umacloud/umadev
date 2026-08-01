@@ -2225,6 +2225,11 @@ fn safe_fallback_route(requirement: &str) -> RoutePlan {
         plan.est_budget = Budget::for_route(plan.class, plan.depth);
         plan.confidence = plan.confidence.min(0.45);
     }
+    // The semantic child being unavailable cannot revoke an unmistakable
+    // current-turn write instruction. Reuse the same narrow authority floor as
+    // the healthy model path; Plan mode is still applied by the caller and
+    // explicit read-only wording is still the final ceiling below.
+    let plan = apply_explicit_mutation_floor(plan, requirement, crate::trust::TrustMode::Guarded);
     apply_authorization_ceiling(plan, requirement)
 }
 
@@ -2425,6 +2430,9 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "重構",
         "实现",
         "實現",
+        "开发",
+        "開發",
+        "完成",
         "登记",
         "登記",
         "记录",
@@ -2470,6 +2478,8 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "繼續補充",
         "继续完成",
         "繼續完成",
+        "继续开发",
+        "繼續開發",
         "继续做",
         "繼續做",
         "接着做",
@@ -2521,6 +2531,8 @@ fn explicit_mutation_command(requirement: &str) -> bool {
         "then add",
         "continue the work",
         "continue working",
+        "complete ",
+        "finish ",
     ];
     let past_tense_prefix = [
         "修复了",

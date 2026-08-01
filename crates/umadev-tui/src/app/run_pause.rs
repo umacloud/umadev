@@ -1,8 +1,131 @@
 //! Director run-pause settlement for budget and operational stops.
 
-use super::{App, ChatRole, TaskStatus};
+use super::{Action, App, ChatRole, TaskStatus};
 
 impl App {
+    /// Whether an exact natural-language continuation has host-owned state to
+    /// resume. The state guard prevents prose about a "continue" button from
+    /// being stolen from the model.
+    pub(super) fn has_run_resume_target(&self) -> bool {
+        self.active_gate.is_some()
+            || (!self.finished && umadev_agent::has_resumable_director_plan(&self.project_root))
+            || (!self.finished && umadev_agent::has_resumable_run(&self.project_root))
+            || (!self.finished
+                && umadev_agent::legacy_operational_review_circuit_reason(&self.project_root)
+                    .is_some())
+    }
+
+    /// Shared state transition for `/continue` and its exact natural-language
+    /// aliases, kept outside semantic routing so a routing timeout cannot demote
+    /// an existing run to read-only or synthesize a replacement plan.
+    pub(super) fn continue_run_action(&mut self) -> Action {
+        let replay_requirement = self.resume_run_requirement();
+        if self.reject_replayed_host_git_operation(&replay_requirement) {
+            return Action::None;
+        }
+        let has_resume_target = self.has_run_resume_target();
+        // Re-arming a durable cursor is itself state-changing. Plan mode must stop
+        // before that write, not merely before the later ResumeRun dispatch.
+        if has_resume_target && self.effective_trust_mode() == umadev_agent::TrustMode::Plan {
+            self.reject_director_execution_in_plan();
+            return Action::None;
+        }
+        let rearmed_review =
+            match umadev_agent::rearm_operational_review_for_explicit_retry(&self.project_root) {
+                Ok(rearmed) => rearmed,
+                Err(reason) => {
+                    self.push(ChatRole::System, reason);
+                    return Action::None;
+                }
+            };
+        // Explicit cancellation remains terminal. Review *circuits* were re-armed
+        // above because this command is fresh user authority to retry the same
+        // cursor; a cancelled cursor must never be resurrected implicitly.
+        if let Some(reason) =
+            umadev_agent::legacy_operational_review_terminal_reason(&self.project_root)
+        {
+            self.push(ChatRole::System, reason);
+            return Action::None;
+        }
+        if rearmed_review {
+            // A stale presentation gate may coexist with the review receipt after
+            // an interrupted event drain. The explicit retry owns the durable
+            // review cursor, never that unrelated in-memory gate.
+            self.active_gate = None;
+            self.gate_choice = None;
+            self.director_gate_paused = false;
+            self.push_resume_separator();
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::t(self.lang, "continue.resuming"),
+            );
+            Action::ResumeRun(replay_requirement)
+        } else if let Some(gate) = self.active_gate.take() {
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::tf(
+                    self.lang,
+                    "slash.gate_approved",
+                    &[umadev_i18n::t(self.lang, gate.human_label_key())],
+                ),
+            );
+            self.record_trust_pass(gate.id_str());
+            Action::Continue(gate)
+        } else if !self.finished
+            && (self.budget_paused || self.aborted)
+            && umadev_agent::has_resumable_run(&self.project_root)
+        {
+            if self.reject_director_execution_in_plan() {
+                return Action::None;
+            }
+            self.push_resume_separator();
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::t(self.lang, "continue.resuming"),
+            );
+            Action::ResumeRun(replay_requirement.clone())
+        } else if self.has_interruptible_work() || self.thinking {
+            self.push(
+                ChatRole::System,
+                umadev_i18n::t(self.lang, "continue.running"),
+            );
+            Action::None
+        } else if !self.run_started
+            && !self.finished
+            && umadev_agent::has_resumable_run(&self.project_root)
+        {
+            if self.reject_director_execution_in_plan() {
+                return Action::None;
+            }
+            self.push_resume_separator();
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::t(self.lang, "continue.resuming"),
+            );
+            Action::ResumeRun(replay_requirement)
+        } else if !self.run_started
+            && !self.finished
+            && self.host_chat_session_active
+            && self.chat_session_id.is_some()
+        {
+            self.push(
+                ChatRole::UmaDev,
+                umadev_i18n::t(self.lang, "continue.resuming_chat"),
+            );
+            Action::Route(umadev_i18n::t(self.lang, "continue.chat_directive").to_string())
+        } else {
+            let hint = if self.run_started && !self.finished {
+                umadev_i18n::t(self.lang, "continue.running")
+            } else if self.finished {
+                umadev_i18n::t(self.lang, "continue.finished")
+            } else {
+                umadev_i18n::t(self.lang, "continue.not_started")
+            };
+            self.push(ChatRole::System, hint);
+            Action::None
+        }
+    }
+
     /// A DIRECTOR build parked because its wall-clock budget was exhausted while
     /// resumable steps remained (Stage 1/2) — the terminal `RunPausedAtBudget`
     /// decision's recorder. Mirrors [`Self::record_run_paused_at_gate`] but for a

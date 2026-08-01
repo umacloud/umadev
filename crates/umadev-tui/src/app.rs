@@ -10488,6 +10488,20 @@ impl App {
                 return Action::ApprovalReply(allow);
             }
         }
+        // An unfinished durable plan/gate turns a small, exact continuation
+        // vocabulary into a host control frame. Do this before
+        // semantic routing: the read-only intent child may legitimately time out,
+        // but that availability failure must never turn "继续 / 批准执行" into an
+        // Explain turn or create a second plan. Attachments keep the line
+        // model-owned because they may add new scope rather than merely resume
+        // saved state.
+        if !turn.has_attachments()
+            && self.has_run_resume_target()
+            && umadev_agent::is_run_resume_intent(&text)
+        {
+            self.push(ChatRole::You, text);
+            return self.continue_run_action();
+        }
         // Natural-language cancel is a protocol action only while work is live.
         // Keep it outside semantic routing so it cannot sit in queued_chat while
         // the writer the user asked to stop keeps running.
@@ -10985,6 +10999,24 @@ impl App {
         // which never registered a task).
         self.mark_active_task(TaskStatus::Failed);
         if origin == FailedRouteOrigin::Director {
+            // A few resident-side failures (notably a read-only write barrier or
+            // a base-emitted stop) arrive directly on the route channel without
+            // an earlier ABORT_SENTINEL engine event. Leaving `run_started` true
+            // here creates a phantom live run: every later continuation says
+            // "already running" even though the writer task has joined. Settle
+            // the in-memory lifecycle while preserving the durable unfinished
+            // plan for exact `/continue`/natural-language resume.
+            self.run_started = false;
+            self.finished = false;
+            self.aborted = true;
+            self.degraded = false;
+            self.budget_paused = false;
+            self.operational_pause_reason = None;
+            self.run_started_at = None;
+            self.phase_started_at = None;
+            self.last_output_at = None;
+            self.clear_live_panels();
+            self.rehydrate_frozen_plan_if_resumable(&note);
             // A Director failure has no safe chat dedup key. Explicit `/run`
             // never dispatched `last_dispatched_chat`; a model-promoted run
             // crossed ownership boundaries after setting it.
@@ -11144,10 +11176,29 @@ impl App {
         base_session_id: Option<String>,
         base_resume_identity: Option<BaseResumeIdentity>,
     ) {
+        let director_run = self.director_run_in_flight;
         self.stream_compacted = None;
         self.settle_agentic_bookkeeping(base_session_id, base_resume_identity);
         // The turn stopped; its task row (when any) settles as Stopped — never Done.
         self.mark_active_task(TaskStatus::Stopped);
+        if director_run {
+            // The task has joined, so a Director-originated stop cannot remain a
+            // live pipeline. This was the `[route] [note] [stopped]` phantom:
+            // `run_started` survived and every later continuation was queued or
+            // told the run was still active. A saved plan remains resumable; an
+            // awaiting-answer stop can now route the user's answer back into the
+            // parked resident session.
+            self.run_started = false;
+            self.finished = false;
+            self.run_started_at = None;
+            self.phase_started_at = None;
+            self.last_output_at = None;
+            if message_key == "agentic.interrupted" {
+                self.aborted = true;
+                self.clear_live_panels();
+                self.rehydrate_frozen_plan_now();
+            }
+        }
         self.refresh_status();
         let marker = umadev_i18n::t(self.lang, message_key).to_string();
         self.push(ChatRole::System, marker.clone());
@@ -12775,135 +12826,7 @@ impl App {
                 }
                 Action::None
             }
-            "continue" => {
-                // A durable/in-memory requirement is context, never fresh
-                // authority to repeat a Git commit. Refuse before consuming a
-                // gate, registering a task, or constructing any resumed base
-                // session. This covers every `/continue` branch, including the
-                // chat-resume fallback when an obsolete workflow file remains.
-                let replay_requirement = self.resume_run_requirement();
-                if self.reject_replayed_host_git_operation(&replay_requirement) {
-                    return Some(Action::None);
-                }
-                // A persisted operational-review circuit is a terminal receipt,
-                // not a paused run. Reject it here, before gate consumption,
-                // task registration, or any resumed base-session construction.
-                // `has_resumable_run()` also returns false for these receipts,
-                // but that truth alone would fall through to a generic/no-run
-                // hint and could still let an unrelated stale gate win.
-                let terminal_review =
-                    umadev_agent::legacy_operational_review_terminal_reason(&self.project_root)
-                        .or_else(|| {
-                            umadev_agent::terminal_review_circuit_reason(&self.project_root)
-                        });
-                if let Some(reason) = terminal_review {
-                    self.push(ChatRole::System, reason);
-                    return Some(Action::None);
-                }
-                // Plan may collect clarification, but it must never approve the
-                // docs/preview execution boundary or resume a mutating Director.
-                // Check before `take()` so the gate remains open and recoverable
-                // after the user switches to guarded/auto.
-                if self.effective_trust_mode() == umadev_agent::TrustMode::Plan
-                    && self.active_gate.is_some()
-                {
-                    self.reject_director_execution_in_plan();
-                    Action::None
-                } else if let Some(gate) = self.active_gate.take() {
-                    self.push(
-                        ChatRole::UmaDev,
-                        umadev_i18n::tf(
-                            self.lang,
-                            "slash.gate_approved",
-                            &[umadev_i18n::t(self.lang, gate.human_label_key())],
-                        ),
-                    );
-                    self.record_trust_pass(gate.id_str());
-                    Action::Continue(gate)
-                } else if !self.finished
-                    && (self.budget_paused || self.aborted)
-                    && umadev_agent::has_resumable_run(&self.project_root)
-                {
-                    // A budget pause OR a resumable transient abort parked the run with
-                    // its plan intact on disk — `/continue` RE-ATTACHES and drives only
-                    // the remaining steps. This fires AHEAD of the
-                    // `has_interruptible_work` and `!run_started` guards below (mirroring
-                    // `/tasks continue`, which likewise omits the `!run_started` guard):
-                    // a freshly-parked/aborted run can still carry a stale live flag or a
-                    // not-yet-settled registry task, and without this pre-emption
-                    // `/continue` would wrongly answer "a run is still in flight" and do
-                    // nothing on a run that has actually stopped.
-                    if self.reject_director_execution_in_plan() {
-                        return Some(Action::None);
-                    }
-                    let req = replay_requirement.clone();
-                    self.push_resume_separator();
-                    self.push(
-                        ChatRole::UmaDev,
-                        umadev_i18n::t(self.lang, "continue.resuming"),
-                    );
-                    Action::ResumeRun(req)
-                } else if self.has_interruptible_work() || self.thinking {
-                    self.push(
-                        ChatRole::System,
-                        umadev_i18n::t(self.lang, "continue.running"),
-                    );
-                    Action::None
-                } else if !self.run_started
-                    && !self.finished
-                    && umadev_agent::has_resumable_run(&self.project_root)
-                {
-                    if self.reject_director_execution_in_plan() {
-                        return Some(Action::None);
-                    }
-                    // Fresh session (no in-memory gate, no in-flight run) but the
-                    // previous `/run` left a resumable director-loop run on disk —
-                    // RE-ATTACH to the saved plan and drive only the remaining steps
-                    // rather than telling the user to restart the whole pipeline. The
-                    // requirement is read back from `.umadev/workflow-state.json` when
-                    // the in-memory one is empty (a reopened TUI has none).
-                    let req = replay_requirement;
-                    // Divider BEFORE the resuming note: the earlier steps stay in
-                    // scrollback (the block never cleared the transcript) and the
-                    // resumed run appends below this, so the whole run reads as one
-                    // continuous history instead of looking like the earlier steps
-                    // vanished.
-                    self.push_resume_separator();
-                    self.push(
-                        ChatRole::UmaDev,
-                        umadev_i18n::t(self.lang, "continue.resuming"),
-                    );
-                    Action::ResumeRun(req)
-                } else if !self.run_started
-                    && !self.finished
-                    && self.host_chat_session_active
-                    && self.chat_session_id.is_some()
-                {
-                    // No director-run plan on disk, but the prior progress was a
-                    // CHAT-driven agentic loop (the base built reactively and
-                    // persisted only its OWN session — no plan.json /
-                    // workflow-state.json, which is all `has_resumable_run` reads).
-                    // Resume the CONVERSATION: a routed turn re-attaches the same base
-                    // session (`continue_session = host_chat_session_active`), so the
-                    // base picks up its full context where it left off, instead of
-                    // wrongly telling the user "no pipeline started".
-                    self.push(
-                        ChatRole::UmaDev,
-                        umadev_i18n::t(self.lang, "continue.resuming_chat"),
-                    );
-                    Action::Route(umadev_i18n::t(self.lang, "continue.chat_directive").to_string())
-                } else {
-                    let hint = if self.run_started && !self.finished {
-                        umadev_i18n::t(self.lang, "continue.running")
-                    } else if self.finished {
-                        umadev_i18n::t(self.lang, "continue.finished")
-                    } else {
-                        umadev_i18n::t(self.lang, "continue.not_started")
-                    };
-                    self.push(ChatRole::System, hint);
-                    Action::None
-                }
-            }
+            "continue" => self.continue_run_action(),
             "revise" => {
                 if rest.is_empty() {
                     self.push(ChatRole::System, umadev_i18n::t(self.lang, "revise.usage"));

@@ -1205,7 +1205,7 @@ async fn qc_review_blocking_is_fed_back_as_a_fix_directive() {
 }
 
 #[tokio::test]
-async fn auto_unavailable_review_stops_terminally_without_a_source_fix_turn() {
+async fn auto_unavailable_review_parks_once_without_a_source_fix_turn() {
     let tmp = tempfile::TempDir::new().unwrap();
     seed_source(tmp.path());
     let (events, rec) = sink();
@@ -1218,11 +1218,10 @@ async fn auto_unavailable_review_stops_terminally_without_a_source_fix_turn() {
 
     let outcome =
         drive_director_loop(&mut sess, &opts(tmp.path()), &events, "GO".to_string()).await;
-    let DirectorLoopOutcome::Failed(reason) = outcome else {
-        panic!("auto mode must terminally settle an unavailable required review: {outcome:?}");
+    let DirectorLoopOutcome::PausedAtOperational { reason, .. } = outcome else {
+        panic!("auto mode must checkpoint the first unavailable review: {outcome:?}");
     };
     assert!(reason.contains("review unavailable"), "{reason}");
-    assert!(reason.contains("automatic mode exhausted"), "{reason}");
     assert_eq!(
         sent.lock().unwrap().len(),
         1,
@@ -1232,12 +1231,13 @@ async fn auto_unavailable_review_stops_terminally_without_a_source_fix_turn() {
         event,
         EngineEvent::Note(note)
             if note.contains("no source repair was started")
+                || note.contains("paused without source rework")
     )));
     let saved = plan_state::load(tmp.path()).expect("typed retry plan persisted");
     assert_eq!(saved.steps.len(), 1);
     assert_eq!(saved.steps[0].kind, plan_state::StepKind::Review);
-    assert_eq!(saved.steps[0].status, plan_state::StepStatus::Blocked);
-    assert!(!has_resumable_run(tmp.path()));
+    assert_eq!(saved.steps[0].status, plan_state::StepStatus::Pending);
+    assert!(has_resumable_run(tmp.path()));
 }
 
 #[tokio::test]
@@ -6973,7 +6973,7 @@ async fn scheduler_parks_operational_review_without_blocking_the_plan() {
 }
 
 #[tokio::test]
-async fn auto_review_outage_terminally_settles_and_keeps_semantic_evidence_separate() {
+async fn auto_review_outage_parks_and_keeps_semantic_evidence_separate() {
     use crate::critics::Seat;
     use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
 
@@ -7019,23 +7019,20 @@ async fn auto_review_outage_terminally_settles_and_keeps_semantic_evidence_separ
 
     assert!(matches!(
         outcome,
-        Some(DirectorLoopOutcome::Failed(ref reason))
-            if reason.contains("stopped incomplete") && reason.contains("new /run")
+        Some(DirectorLoopOutcome::PausedAtOperational { ref reason, .. })
+            if reason.contains("unavailable")
     ));
     assert!(sent.lock().unwrap().is_empty(), "no source repair may run");
     let checkpoint =
-        load_operational_review_checkpoint(tmp.path()).expect("terminal review checkpoint");
-    assert!(checkpoint.circuit_open());
+        load_operational_review_checkpoint(tmp.path()).expect("paused review checkpoint");
+    assert!(!checkpoint.circuit_open());
     assert_eq!(
         checkpoint.evidence().semantic_blocking,
         vec!["[backend-engineer] missing auth regression test"]
     );
     assert_eq!(checkpoint.evidence().operational_unavailable.len(), 1);
-    assert!(!has_resumable_run(tmp.path()));
-    assert!(plan
-        .steps
-        .iter()
-        .all(|step| step.status == StepStatus::Blocked));
+    assert!(has_resumable_run(tmp.path()));
+    assert_eq!(plan.steps[0].status, StepStatus::Active);
 }
 
 #[tokio::test]
@@ -7111,7 +7108,7 @@ async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases
     assert!(matches!(
         &repeated_outcome,
         Some(DirectorLoopOutcome::Failed(reason))
-            if reason.contains("stopped incomplete") && reason.contains("new /run")
+            if reason.contains("stopped incomplete") && reason.contains("/continue")
     ));
     assert!(
         repeated_sent.lock().unwrap().is_empty(),
@@ -7159,7 +7156,7 @@ async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases
     assert!(matches!(
         caller_outcome,
         DirectorLoopOutcome::Failed(reason)
-            if reason.contains("cannot be continued") && reason.contains("new /run")
+            if reason.contains("automatic retries are paused") && reason.contains("/continue")
     ));
     assert!(
         caller_sent.lock().unwrap().is_empty(),
@@ -7173,7 +7170,7 @@ async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases
     assert!(rec.events().iter().any(|event| matches!(
         event,
         EngineEvent::Note(note)
-            if note.contains("send a new requirement") && note.contains("no reviewer outage")
+            if note.contains("/continue") && note.contains("no reviewer outage")
     )));
 }
 
@@ -7271,7 +7268,7 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
         matches!(
             &repeated_outcome,
             Some(DirectorLoopOutcome::Failed(reason))
-                if reason.contains("stopped incomplete") && reason.contains("new /run")
+                if reason.contains("stopped incomplete") && reason.contains("/continue")
         ),
         "the second identical outage boundary opens the bounded circuit: {repeated_outcome:?}"
     );
@@ -7603,7 +7600,6 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
         required_seats,
         consecutive_outages,
         evidence,
-        terminally_settled,
         ..
     } = checkpoint
     else {
@@ -7615,12 +7611,17 @@ async fn final_review_checkpoint_retries_once_without_replaying_step_review() {
             qc_source_fingerprint,
             required_seats,
             entry_task_run_id: Some(resident_run_id.clone()),
-            consecutive_outages,
+            // Reproduce the field loop after the automatic retry circuit has
+            // opened, then prove an explicit user retry re-arms THIS cursor.
+            consecutive_outages: consecutive_outages.max(2),
             evidence,
-            terminally_settled,
+            terminally_settled: true,
         },
     )
     .unwrap();
+    assert!(terminal_review_circuit_reason(tmp.path()).is_some());
+    assert!(rearm_operational_review_for_explicit_retry(tmp.path()).unwrap());
+    assert!(terminal_review_circuit_reason(tmp.path()).is_none());
 
     let mut resumed = FakeSession::new(vec![text_turn("final report")], true, "")
         .with_fork_replies([r#"{"accepts":true,"blocking":[]}"#, "not a verdict"]);

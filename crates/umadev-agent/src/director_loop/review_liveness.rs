@@ -20,7 +20,7 @@ fn evidence_summary(items: &[String]) -> String {
 
 fn stop_reason(boundary: &str, checkpoint: &OperationalReviewCheckpoint, evidence: &str) -> String {
     format!(
-        "{boundary} remained unavailable after {} bounded review boundaries (each included one fresh-session retry): {evidence}. This run is stopped incomplete; no reviewer outage was sent to source repair. Start a new /run or send a new requirement when the reviewer service is available",
+        "{boundary} remained unavailable after {} bounded review boundaries (each included one fresh-session retry): {evidence}. This run is stopped incomplete; no reviewer outage was sent to source repair. Send /continue to explicitly retry this same saved review when the reviewer service is available",
         checkpoint.effective_outages()
     )
 }
@@ -40,10 +40,9 @@ pub(super) fn block_open_steps(plan: &mut Plan, events: &Arc<dyn EventSink>) {
 
 /// Persist or terminally settle one unavailable step-review boundary.
 ///
-/// Guarded mode parks one final `/continue` opportunity. Auto mode has no human
-/// gate: one boundary already includes the per-seat fresh-session retry, so it
-/// settles terminally when that retry is unavailable. A guarded retry that fails
-/// over the same QC fingerprint also opens the durable circuit.
+/// The first unavailable boundary parks the exact review cursor. A second
+/// consecutive boundary opens the automatic retry circuit; a later explicit
+/// `/continue` may re-arm that same cursor without replaying source work.
 pub(super) struct StepReviewOutage<'a> {
     pub options: &'a RunOptions,
     pub events: &'a Arc<dyn EventSink>,
@@ -71,7 +70,7 @@ pub(super) fn handle_step_review_outage(context: StepReviewOutage<'_>) -> Direct
         prior,
     } = context;
     let typed_evidence = OperationalReviewEvidence::new(semantic_blocking, operational_unavailable);
-    let mut checkpoint = next_step_review_checkpoint(
+    let checkpoint = next_step_review_checkpoint(
         prior,
         step.id.clone(),
         crate::freshness::workspace_qc_fingerprint(&options.project_root),
@@ -79,9 +78,6 @@ pub(super) fn handle_step_review_outage(context: StepReviewOutage<'_>) -> Direct
         step.kind == plan_state::StepKind::Build,
         typed_evidence,
     );
-    if options.mode == crate::trust::TrustMode::Auto {
-        checkpoint.settle_terminally();
-    }
     let evidence = evidence_summary(&checkpoint.evidence().operational_unavailable);
     let boundary = format!("required review at step `{}`", step.title);
     if checkpoint.circuit_open() {
@@ -171,16 +167,13 @@ pub(super) fn handle_final_review_outage(context: FinalReviewOutage<'_>) -> Dire
         .as_ref()
         .map(|task| task.run_id().to_string())
         .or_else(|| checkpoint_entry_task_run_id.map(str::to_string));
-    let mut checkpoint = next_final_review_checkpoint(
+    let checkpoint = next_final_review_checkpoint(
         prior,
         crate::freshness::workspace_qc_fingerprint(&options.project_root),
         Some(route.team.clone()),
         entry_task_run_id,
         typed_evidence,
     );
-    if options.mode == crate::trust::TrustMode::Auto {
-        checkpoint.settle_terminally();
-    }
     let evidence = evidence_summary(&checkpoint.evidence().operational_unavailable);
     if checkpoint.circuit_open() {
         let reason = stop_reason("final quality review", &checkpoint, &evidence);

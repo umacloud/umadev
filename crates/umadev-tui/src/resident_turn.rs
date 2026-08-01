@@ -76,8 +76,12 @@ pub(super) fn chat_idle_budget() -> IdleBudget {
     IdleBudget::from_env()
 }
 
-const DEFAULT_RESIDENT_TURN_MAX_SECS: u64 = 600;
-pub(super) const HARD_RESIDENT_TURN_MAX_SECS: u64 = 1_800;
+// Ten minutes was too short for a healthy coding turn. This is now the sliding
+// no-progress window, not an absolute guillotine: productive stream/tool events
+// renew it, while the independent absolute ceiling below still bounds a base that
+// emits forever without converging.
+pub(super) const DEFAULT_RESIDENT_TURN_MAX_SECS: u64 = 1_800;
+pub(super) const HARD_RESIDENT_TURN_MAX_SECS: u64 = 3_600;
 pub(super) const DEFAULT_RESIDENT_TURN_MAX_TOKENS: u64 = 500_000;
 pub(super) const HARD_RESIDENT_TURN_MAX_TOKENS: u64 = 2_000_000;
 pub(super) const DEFAULT_RESIDENT_TURN_MAX_EVENTS: u64 = 20_000;
@@ -131,7 +135,9 @@ impl ResidentTurnLimit {
 #[derive(Debug)]
 pub(super) struct ResidentTurnLimiter {
     pub(super) started: std::time::Instant,
+    pub(super) last_progress: std::time::Instant,
     pub(super) wall_seconds: u64,
+    pub(super) absolute_seconds: u64,
     pub(super) token_ceiling: u64,
     stream_token_ceiling: u64,
     pub(super) event_ceiling: u64,
@@ -172,7 +178,11 @@ impl ResidentTurnLimiter {
             .min(token_ceiling);
         Self {
             started: std::time::Instant::now(),
+            last_progress: std::time::Instant::now(),
             wall_seconds,
+            absolute_seconds: wall_seconds
+                .saturating_mul(4)
+                .min(HARD_RESIDENT_TURN_MAX_SECS),
             token_ceiling,
             stream_token_ceiling,
             event_ceiling,
@@ -184,15 +194,25 @@ impl ResidentTurnLimiter {
     }
 
     pub(super) fn deadline(&self) -> std::time::Instant {
-        self.started + std::time::Duration::from_secs(self.wall_seconds)
+        let absolute = self.started + std::time::Duration::from_secs(self.absolute_seconds);
+        self.last_progress
+            .checked_add(std::time::Duration::from_secs(self.wall_seconds))
+            .map_or(absolute, |sliding| sliding.min(absolute))
     }
 
     pub(super) fn wall_limit(&self) -> Option<ResidentTurnLimit> {
-        (self.started.elapsed() >= std::time::Duration::from_secs(self.wall_seconds)).then_some(
-            ResidentTurnLimit::WallClock {
-                seconds: self.wall_seconds,
+        let now = std::time::Instant::now();
+        let absolute_elapsed = now.saturating_duration_since(self.started)
+            >= std::time::Duration::from_secs(self.absolute_seconds);
+        let idle_elapsed = now.saturating_duration_since(self.last_progress)
+            >= std::time::Duration::from_secs(self.wall_seconds);
+        (absolute_elapsed || idle_elapsed).then_some(ResidentTurnLimit::WallClock {
+            seconds: if absolute_elapsed {
+                self.absolute_seconds
+            } else {
+                self.wall_seconds
             },
-        )
+        })
     }
 
     pub(super) fn observe(&mut self, event: &SessionEvent) -> Option<ResidentTurnLimit> {
@@ -233,6 +253,22 @@ impl ResidentTurnLimiter {
                 });
             }
             _ => {}
+        }
+        if matches!(
+            event,
+            SessionEvent::TextDelta(_)
+                | SessionEvent::ThinkingDelta(_)
+                | SessionEvent::ToolCall { .. }
+                | SessionEvent::ToolCallCorrelated { .. }
+                | SessionEvent::ToolProgressCorrelated { .. }
+                | SessionEvent::ToolOutputDelta(_)
+                | SessionEvent::ToolOutputDeltaCorrelated { .. }
+                | SessionEvent::ToolOutputSnapshot(_)
+                | SessionEvent::ToolOutputSnapshotCorrelated { .. }
+                | SessionEvent::ToolResult { .. }
+                | SessionEvent::ToolResultCorrelated { .. }
+        ) {
+            self.last_progress = std::time::Instant::now();
         }
         self.wall_limit()
     }

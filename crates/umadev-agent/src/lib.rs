@@ -156,9 +156,9 @@ pub use director::{
 pub use director_loop::{
     cancel_operational_review_pause, checkpoint_post_build_review_pause, drive_director_loop,
     drive_director_loop_resume, drive_director_loop_routed, has_resumable_director_plan,
-    has_resumable_run, is_budget_pause_reason, persist_run_governance_context, run_post_build_qc,
-    terminal_review_circuit_reason, transient_resume_hint, DirectorLoopOutcome,
-    PostBuildOperationalPause, PostBuildQcOutcome,
+    has_resumable_run, is_budget_pause_reason, persist_run_governance_context,
+    rearm_operational_review_for_explicit_retry, run_post_build_qc, terminal_review_circuit_reason,
+    transient_resume_hint, DirectorLoopOutcome, PostBuildOperationalPause, PostBuildQcOutcome,
 };
 pub use events::{ChannelReceiver, ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use execution_contract::{ContractViolation, ExecutionContract};
@@ -174,8 +174,9 @@ pub use gates::{
 pub use init_assets::{scaffold_init_knowledge, KnowledgeScaffoldReport};
 pub use interaction::{
     classify_running_input, hosted as hosted_interaction, is_explicit_clarification_answer,
-    is_explicit_later_work, is_running_cancel_intent, ApprovalFn, ApprovalFuture, HostRequestFn,
-    HostRequestFuture, RunInteraction, RunningInputDisposition, SteerIntake,
+    is_explicit_later_work, is_run_resume_intent, is_running_cancel_intent, ApprovalFn,
+    ApprovalFuture, HostRequestFn, HostRequestFuture, RunInteraction, RunningInputDisposition,
+    SteerIntake,
 };
 pub use lessons::{
     apply_dev_error_trust, apply_trust_for_identities, apply_trust_for_signatures,

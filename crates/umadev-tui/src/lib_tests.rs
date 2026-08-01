@@ -5654,7 +5654,9 @@ async fn tui_director_terminal_review_preflight_skips_session_factory_and_baseli
     assert!(
         matches!(
             &route_decision,
-            Ok(RouteDecision::Failed(reason)) if reason.contains("cannot be continued")
+            Ok(RouteDecision::Failed(reason))
+                if reason.contains("automatic retries are paused")
+                    && reason.contains("/continue")
         ),
         "terminal route result: {route_decision:?}"
     );
@@ -5665,7 +5667,7 @@ async fn tui_director_terminal_review_preflight_skips_session_factory_and_baseli
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(notes.contains("cannot be continued"));
+    assert!(notes.contains("automatic retries are paused"));
     assert!(
         !notes.contains("session unavailable") && !notes.contains("nonexistent-backend"),
         "the terminal preflight must return before constructing a base session: {notes}"
@@ -5675,6 +5677,64 @@ async fn tui_director_terminal_review_preflight_skips_session_factory_and_baseli
         workflow_before,
         "terminal preflight must not replace the parked run's baseline"
     );
+}
+
+#[tokio::test]
+async fn director_resume_without_a_cursor_never_starts_a_replacement_plan() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (session, sent, ended) =
+        FakeChatSession::new(vec![vec![umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        }]]);
+    let (sink, mut engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    let options = RunOptions {
+        project_root: tmp.path().to_path_buf(),
+        requirement: "continue the old plan".into(),
+        slug: "old-plan".into(),
+        model: String::new(),
+        backend: "claude-code".into(),
+        design_system: String::new(),
+        seed_template: String::new(),
+        mode: umadev_agent::TrustMode::Guarded,
+        strict_coverage: false,
+    };
+
+    Box::pin(run_director_loop(
+        options,
+        Arc::new(sink),
+        route_tx,
+        Arc::new(tokio::sync::Mutex::new(None)),
+        umadev_runtime::BasePermissionProfile::Guarded,
+        Vec::new(),
+        None,
+        false,
+        true,
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+        Arc::new(std::sync::Mutex::new(None)),
+        Arc::new(std::sync::Mutex::new(None)),
+        Some(Box::new(session)),
+    ))
+    .await;
+
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "no fresh goal reaches the base"
+    );
+    assert!(
+        !ended.load(std::sync::atomic::Ordering::SeqCst),
+        "preflight returns before taking ownership of the supplied session"
+    );
+    assert!(!tmp.path().join(".umadev/plan.json").exists());
+    assert!(!tmp.path().join(".umadev/workflow-state.json").exists());
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::Failed(reason)) if reason.contains("no resumable plan cursor")
+    ));
+    assert!(std::iter::from_fn(|| engine_rx.try_recv().ok()).any(
+        |event| matches!(event, EngineEvent::Note(note) if note.contains("no new plan was started"))
+    ));
 }
 
 fn workflow_state_with_session(backend: &str, session_id: &str) -> umadev_agent::WorkflowState {
@@ -9459,7 +9519,7 @@ async fn resident_fallback_build_review_outage_pauses_without_repair_or_repeat()
 }
 
 #[tokio::test]
-async fn resident_auto_review_outage_fails_terminally_without_dead_continue() {
+async fn resident_auto_review_outage_parks_for_the_same_plan() {
     let _qc = ReactiveQcOverride::force(true);
     let tmp = tempfile::TempDir::new().unwrap();
     let requirement =
@@ -9500,32 +9560,31 @@ async fn resident_auto_review_outage_fails_terminally_without_dead_continue() {
 
     let routes = std::iter::from_fn(|| route_rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(
-        routes.iter().any(|route| matches!(
-            route,
-            RouteDecision::Failed(reason) if reason.contains("automatic mode exhausted")
-        )),
+        routes
+            .iter()
+            .any(|route| matches!(route, RouteDecision::RunPausedAtOperational { .. })),
         "{routes:?}"
     );
     assert!(!routes
         .iter()
-        .any(|route| matches!(route, RouteDecision::RunPausedAtOperational { .. })));
+        .any(|route| matches!(route, RouteDecision::Failed(_))));
     assert_eq!(writer_sent.lock().unwrap().len(), 1);
     assert!(
-        writer_ended.load(std::sync::atomic::Ordering::SeqCst),
-        "terminal Auto settlement closes the resident base"
+        !writer_ended.load(std::sync::atomic::Ordering::SeqCst),
+        "the first review outage parks the resident base for exact resume"
     );
     assert!(chat_holder.lock().await.is_none());
-    assert!(director_holder.lock().await.is_none());
-    assert!(!umadev_agent::has_resumable_run(tmp.path()));
+    assert!(director_holder.lock().await.is_some());
+    assert!(umadev_agent::has_resumable_run(tmp.path()));
     let events = std::iter::from_fn(|| engine_rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(events
         .iter()
-        .all(|event| !matches!(event, EngineEvent::Note(note) if note.contains("type /continue"))));
+        .any(|event| matches!(event, EngineEvent::Note(note) if note.contains("/continue"))));
     let runs = umadev_agent::task_lifecycle::recent_agent_runs(tmp.path(), 8);
     assert!(runs.iter().any(|run| run
         .tasks
         .iter()
-        .any(|task| { task.state == umadev_agent::task_lifecycle::AgentTaskState::Failed })));
+        .any(|task| { task.state == umadev_agent::task_lifecycle::AgentTaskState::Waiting })));
 }
 
 #[tokio::test]
@@ -10118,6 +10177,22 @@ async fn resident_turn_limits_are_configurable_but_globally_clamped_and_fail_saf
 }
 
 #[tokio::test]
+async fn resident_turn_default_no_longer_kills_healthy_work_at_ten_minutes() {
+    let _env = CHAT_IDLE_ENV_LOCK.lock().await;
+    let _wall = EnvRestore::remove("UMADEV_CHAT_TURN_MAX_SECS");
+
+    let limiter = ResidentTurnLimiter::new(&light_default_route());
+    assert_eq!(
+        limiter.wall_seconds,
+        crate::resident_turn::DEFAULT_RESIDENT_TURN_MAX_SECS
+    );
+    assert!(
+        limiter.wall_seconds > 600,
+        "a healthy streaming build must not be terminated by the old 600s policy"
+    );
+}
+
+#[tokio::test]
 async fn resident_turn_usage_limit_handles_missing_and_saturating_reports() {
     let _env = CHAT_IDLE_ENV_LOCK.lock().await;
     let _tokens = EnvRestore::set("UMADEV_CHAT_TURN_MAX_TOKENS", "100");
@@ -10157,20 +10232,34 @@ async fn resident_turn_usage_limit_handles_missing_and_saturating_reports() {
 }
 
 #[tokio::test]
-async fn resident_turn_wall_clock_is_absolute_even_when_events_keep_arriving() {
+async fn resident_turn_progress_renews_the_window_but_not_the_absolute_ceiling() {
     let _env = CHAT_IDLE_ENV_LOCK.lock().await;
     let mut limiter = ResidentTurnLimiter::new(&light_default_route());
     limiter.started = std::time::Instant::now()
         .checked_sub(Duration::from_secs(limiter.wall_seconds.saturating_add(1)))
         .expect("the resident turn test duration must fit in Instant");
+    limiter.last_progress = limiter.started;
     assert_eq!(
         limiter.observe(&umadev_runtime::SessionEvent::ThinkingDelta(
             "still producing tiny chunks".into()
         )),
+        None,
+        "genuine progress renews the no-progress window"
+    );
+
+    limiter.started = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(
+            limiter.absolute_seconds.saturating_add(1),
+        ))
+        .expect("the resident absolute test duration must fit in Instant");
+    assert_eq!(
+        limiter.observe(&umadev_runtime::SessionEvent::ThinkingDelta(
+            "output cannot stream forever".into()
+        )),
         Some(ResidentTurnLimit::WallClock {
-            seconds: limiter.wall_seconds
+            seconds: limiter.absolute_seconds
         }),
-        "productive-looking output cannot reset the absolute turn deadline"
+        "progress never moves the independent absolute ceiling"
     );
 }
 

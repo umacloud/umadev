@@ -295,14 +295,15 @@ pub fn legacy_operational_review_pending(project_root: &Path) -> bool {
 /// Terminal reason for an exhausted legacy operational-review retry, if any.
 ///
 /// The receipt deliberately remains on disk after the second identical outage:
-/// `/continue` must stop before opening a writer/reviewer session. A deliberate
-/// new `/run` replaces the workflow state through [`crate::runner::AgentRunner::start`].
+/// automatic retries stop, while an explicit `/continue` may re-arm this same
+/// review boundary. A deliberate new `/run` replaces the workflow state through
+/// [`crate::runner::AgentRunner::start`].
 #[must_use]
 pub fn legacy_operational_review_circuit_reason(project_root: &Path) -> Option<String> {
     let state = crate::state::read_workflow_state(project_root)?;
     let kind = review_kind_from_circuit_marker(state.note.as_str())?;
     Some(format!(
-        "required {} review infrastructure remained unavailable after bounded schema/transport retries; the legacy review circuit is open. No source work was repeated. Start a new /run to retry with a fresh run",
+        "required {} review infrastructure remained unavailable after bounded schema/transport retries; automatic review retries are paused. No source work was repeated. Send /continue to retry this same saved review boundary",
         kind_phase_label(kind)
     ))
 }
@@ -320,6 +321,27 @@ pub fn legacy_operational_review_terminal_reason(project_root: &Path) -> Option<
         "the paused {} review was cancelled explicitly; it cannot be continued. Start a new /run to begin again",
         kind_phase_label(kind)
     ))
+}
+
+/// Re-open a legacy review circuit after an explicit user retry.
+///
+/// The circuit is an automatic-loop breaker, not a permanent ban on the user's
+/// current run. Turning its durable marker back into the pending marker lets an
+/// explicit `/continue` retry the same review boundary without synthesising a new
+/// requirement or replaying completed source work. An explicitly cancelled review
+/// is deliberately untouched.
+pub(crate) fn rearm_legacy_operational_review_circuit(project_root: &Path) -> Result<bool, String> {
+    let Some(mut state) = crate::state::read_workflow_state(project_root) else {
+        return Ok(false);
+    };
+    let Some(kind) = review_kind_from_circuit_marker(state.note.as_str()) else {
+        return Ok(false);
+    };
+    state.note = operational_review_marker(kind).to_string();
+    state.last_transition_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    write_workflow_state(project_root, &state)
+        .map_err(|error| format!("could not re-open legacy review cursor: {error}"))?;
+    Ok(true)
 }
 
 /// Consume a pending or circuit-open legacy review boundary after explicit
@@ -386,7 +408,7 @@ fn open_operational_review_circuit(
         Some(operational_review_circuit_marker(kind)),
     );
     RunOutcome::HardStop(format!(
-        "{}; the review boundary remained unavailable after bounded schema/transport retries, so the legacy review circuit opened. No source work was repeated. Start a new /run to retry with a fresh run",
+        "{}; the review boundary remained unavailable after bounded schema/transport retries, so automatic retries paused. No source work was repeated. Send /continue to retry this same saved review boundary",
         review_incomplete_reason(kind, review)
     ))
 }
@@ -672,7 +694,7 @@ pub async fn run_block(
                         "{reason} — workflow paused before the gate; retry the review with /continue"
                     )
                 } else {
-                    format!("{reason} — automatic review retries exhausted; start a new /run")
+                    format!("{reason} — automatic review retries paused; send /continue to retry this saved review")
                 };
                 events.emit(EngineEvent::Note(note));
                 return outcome;
@@ -806,7 +828,7 @@ pub async fn run_block(
                 let note = if matches!(outcome, RunOutcome::PausedAtOperational { .. }) {
                     format!("{reason} — workflow paused; retry the review with /continue")
                 } else {
-                    format!("{reason} — automatic review retries exhausted; start a new /run")
+                    format!("{reason} — automatic review retries paused; send /continue to retry this saved review")
                 };
                 events.emit(EngineEvent::Note(note));
                 return outcome;
@@ -6504,7 +6526,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_first_review_outage_pauses_guarded_but_settles_auto_terminally() {
+    fn legacy_first_review_outage_pauses_guarded_but_stops_auto_retries() {
         let review = TeamReviewResult {
             blocking: Vec::new(),
             unavailable: vec!["[qa-engineer] review turn timed out".into()],
@@ -6525,7 +6547,7 @@ mod tests {
         assert!(matches!(
             pause_at_operational_review(&auto, &plan, ReviewKind::Quality, &review),
             RunOutcome::HardStop(ref reason)
-                if reason.contains("review circuit opened")
+                if reason.contains("automatic retries paused")
                     && reason.contains("No source work was repeated")
         ));
         assert!(legacy_operational_review_circuit_reason(auto_root.path()).is_some());
@@ -6555,7 +6577,7 @@ mod tests {
         assert!(matches!(
             outcome,
             RunOutcome::HardStop(ref reason)
-                if reason.contains("review circuit opened")
+                if reason.contains("automatic retries paused")
                     && reason.contains("No source work was repeated")
         ));
         assert_eq!(*resumed_forks.lock().unwrap(), 6);
