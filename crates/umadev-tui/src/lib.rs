@@ -69,7 +69,6 @@ pub use base_config::{
 use director_run::resolve_workflow_resume_identity;
 use director_run::{
     cancel_entry_task, fail_entry_task, run_director_loop, settle_director_session,
-    settle_terminal_post_build_review,
 };
 pub use host_git::execute_host_git_commit;
 
@@ -143,9 +142,12 @@ use crate::resident_turn::{
 };
 use crate::resident_turn_support::{
     capture_resident_tool_pitfall, delivery_report_status, directive_turn_input,
-    input_failure_decision, input_failure_note, route_clarification_reply, route_fallback_note,
-    routed_turn_executes_read_only, select_resident_turn_payload,
+    first_chat_directive_for_turn, input_failure_decision, input_failure_note,
+    route_clarification_reply, routed_turn_executes_read_only, scoped_chat_directive_for_turn,
+    select_resident_turn_payload,
 };
+#[cfg(test)]
+use crate::resident_turn_support::{first_chat_directive, scoped_chat_directive};
 use crate::route_decision::RouteDecision;
 use crate::run_options::{
     current_run_options, persisted_run_mode, resume_run_options,
@@ -4104,32 +4106,6 @@ async fn open_warm_chat_session_for_turn(
     }
 }
 
-/// Build the first warm-session directive with bounded history and, for
-/// non-Claude bases, the resident firmware.
-fn first_chat_directive(
-    firmware: Option<&str>,
-    backend: &str,
-    conversation: &[Message],
-    current_text: &str,
-    directive_text: &str,
-    route: &RoutePlan,
-) -> String {
-    let scoped = scoped_chat_directive(directive_text, route);
-    let with_history = director_directive_with_history(conversation, current_text, scoped);
-    match firmware {
-        // claude gets the firmware natively via --append-system-prompt, and
-        // grok-build receives the IDENTICAL bytes as session/new `_meta.rules`
-        // (folded into its <human_rules> system section) — prefixing it again
-        // here sent the whole firmware twice in one prompt on every first grok
-        // turn. The CLI's firmware_requires_directive_prefix already excludes
-        // both; keep the surfaces consistent.
-        Some(fw) if backend != "claude-code" && backend != "grok-build" => {
-            format!("{fw}\n\n---\n\n{with_history}")
-        }
-        _ => with_history,
-    }
-}
-
 /// Prefix the firmware selected for THIS model-routed turn. The resident process
 /// was pre-warmed with identity only, so a real work turn receives its proportional
 /// craft/repo/pitfall/JIT overlay here after intent is known. `None` keeps a pure
@@ -4139,49 +4115,6 @@ fn with_turn_firmware(firmware: Option<&str>, directive: String) -> String {
         Some(fw) => format!("{fw}\n\n---\n\n{directive}"),
         None => directive,
     }
-}
-
-/// Per-turn authority boundary for a resident session. Native base memory and
-/// project guidance remain useful context, but only the latest request grants work.
-fn scoped_chat_directive(text: &str, route: &RoutePlan) -> String {
-    use umadev_agent::RouteClass;
-
-    let lane = match route.class {
-            RouteClass::Chat => {
-                "Use an inspection-only child for this answer. Respond from current context without tools, commands, file writes, reviews, or QC."
-            }
-            RouteClass::Explain => {
-                "Use an inspection-only child for this answer. You may use only the necessary read/search tools to inspect the requested project files; do not run mutating commands, write files, launch reviews, or run QC."
-            }
-            RouteClass::QuickEdit => {
-                "Make the smallest necessary edit and only a targeted verification. Do not launch a team or broad review."
-            }
-            RouteClass::Debug => {
-                "Diagnose and fix only the reported defect with the smallest justified blast radius and a targeted regression check. Do not launch a team or broad review."
-            }
-            RouteClass::Build => {
-                "Implement only the requested feature/product. Adjacent work is allowed only when required for that request; state why it is required."
-            }
-    };
-    let hinted_scope = if route.scope.is_empty() {
-        "Use only files strictly necessary for the latest request.".to_string()
-    } else {
-        format!("Suggested file scope: {}.", route.scope.join(", "))
-    };
-
-    format!(
-        "## Current-turn authority\n\
-         - Model-decided route: {} / {}.\n\
-         - The latest request below is the sole authorization for this turn.\n\
-         - Permission is scoped to this turn. The inspection-only child used for a chat/explanation does NOT mean the UmaDev session or its base is read-only. Never answer \"the current session cannot write\" from this child. A concrete edit request is re-evaluated and handled by a writable worker unless the host explicitly reports Plan mode or a read-only launch sandbox.\n\
-         - Prior conversation, plans, TODOs, project documents, and remembered facts are context only. Do not resume or execute them unless the latest request explicitly asks you to.\n\
-         - {lane}\n\
-         - {hinted_scope}\n\
-         - Do not add opportunistic cleanup, refactors, dependencies, features, governance work, or reviews.\n\n\
-         ## Latest request\n{text}",
-        route.class.as_str(),
-        route.depth.as_str(),
-    )
 }
 
 /// Turn-time guard for the parked resident session: return the parked session if
@@ -4898,7 +4831,16 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             route = decided.plan;
             route_source = Some(decided.source);
             if let Some(reason) = decided.fallback_reason {
-                sink.emit(EngineEvent::Note(route_fallback_note(&route, reason)));
+                // This is an internal preflight degradation, not a user error.
+                // The writable resident base now performs the semantic decision
+                // itself, so keep the detail in diagnostics instead of alarming
+                // the transcript with `turn-timeout` and a guessed read-only lane.
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    class = route.class.as_str(),
+                    depth = route.depth.as_str(),
+                    "intent preflight unavailable; delegating semantics to resident base"
+                );
             }
         }
 
@@ -4966,6 +4908,11 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             user_asked_read_only,
             permissions,
         );
+        let semantic_fallback = matches!(
+            route_source,
+            Some(umadev_agent::RouteSource::DeterministicFallback)
+        ) && !execution_read_only;
+        let fallback_intent_still_unknown = semantic_fallback && !route.class.mutates_workspace();
         // VISIBILITY (permission audit CRITICAL): when the user's live tier is
         // WRITABLE (Guarded/Auto) but this turn was routed read-only purely
         // because the brain classified it non-mutating (chat/explain), the base
@@ -5265,7 +5212,11 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             // A clean transient redrive is the same logical entry. Keep its
             // existing tracker alive instead of reopening the scope: replacing
             // a live handle would make Drop recovery race a stale ledger view.
-            if !native_command && entry_task.is_none() {
+            // An unavailable intent preflight grants the resident base writer
+            // capability, not proof that this is a write task. Start its durable
+            // ledger only if a real write tool event is observed below; pure chat
+            // must remain ledger-free even though the process could have edited.
+            if !native_command && !fallback_intent_still_unknown && entry_task.is_none() {
                 match umadev_agent::task_lifecycle::EntryTaskTracker::begin(
                     &project_root,
                     &scope,
@@ -5298,7 +5249,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     }
                 }
             }
-            if !native_command {
+            if !native_command && !fallback_intent_still_unknown {
                 let slug = project_root
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -5363,20 +5314,26 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             let first_directive_template = match &attempt_directive {
                 AttemptDirective::Bare => with_turn_firmware(
                     turn_firmware.as_deref(),
-                    scoped_chat_directive(TYPED_USER_INPUT_SLOT, &route),
+                    scoped_chat_directive_for_turn(
+                        TYPED_USER_INPUT_SLOT,
+                        &route,
+                        route_source,
+                        execution_read_only,
+                    ),
                 ),
                 AttemptDirective::FrontLoaded { firmware } => {
                     let resident_firmware = turn_firmware
                         .is_none()
                         .then_some(firmware.as_deref())
                         .flatten();
-                    let directive = first_chat_directive(
+                    let directive = first_chat_directive_for_turn(
                         resident_firmware,
                         &backend,
                         &conversation,
                         &text,
                         TYPED_USER_INPUT_SLOT,
                         &route,
+                        (route_source, execution_read_only),
                     );
                     with_turn_firmware(turn_firmware.as_deref(), directive)
                 }
@@ -5440,7 +5397,11 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             Option<umadev_runtime::Usage>,
         )> = None;
 
-        if !native_command && !execution_read_only && !governance_context_persisted {
+        if !native_command
+            && !execution_read_only
+            && !fallback_intent_still_unknown
+            && !governance_context_persisted
+        {
             let gov_opts = RunOptions {
                 project_root: project_root.clone(),
                 requirement: text.clone(),
@@ -6691,20 +6652,6 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                     let _ = route_tx.send(RouteDecision::Failed(note));
                     return;
                 }
-            };
-            session = match settle_terminal_post_build_review(
-                &pause,
-                &mut entry_task,
-                &*sink,
-                session,
-                &director_session_holder,
-                requested_session_identity.clone(),
-                &route_tx,
-            )
-            .await
-            {
-                Ok(session) => session,
-                Err(()) => return,
             };
             if let Some(task) = entry_task.as_mut() {
                 if let Err(error) = task.wait(&pause.reason) {

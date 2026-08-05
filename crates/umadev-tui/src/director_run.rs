@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use umadev_agent::{
-    task_lifecycle::EntryTaskTracker, ChannelSink, EngineEvent, EventSink,
-    PostBuildOperationalPause, RoutePlan, RunOptions,
+    task_lifecycle::EntryTaskTracker, ChannelSink, EngineEvent, EventSink, RoutePlan, RunOptions,
 };
-use umadev_runtime::{BaseSession, Message};
+use umadev_runtime::Message;
 
 use crate::interaction_bridge::{
     await_host_input, await_user_approval, ApprovalHolder, ApprovalReply, HostInputHolder,
@@ -38,11 +37,10 @@ pub(super) fn continuous_resume_phase(
 
 /// Settle ownership of a Director base after one drive.
 ///
-/// A Guarded operational-review pause is resumable. Keep that live process only
-/// when its complete immutable launch identity is known; `/continue` then consumes
-/// it through the same exact-match check used by the legacy continuous path.
-/// Auto mode settles an exhausted reviewer retry as `Failed`, so it follows the
-/// terminal path and closes the process instead of advertising a dead resume.
+/// An operational-review pause is resumable in both Guarded and Auto modes. Keep
+/// that live process only when its complete immutable launch identity is known;
+/// `/continue` then consumes it through the same exact-match check used by the
+/// legacy continuous path. The persisted circuit bounds automatic retries only.
 pub(super) async fn settle_director_session(
     mut session: Box<dyn umadev_runtime::BaseSession>,
     holder: &SessionHolder,
@@ -78,33 +76,6 @@ pub(super) fn cancel_entry_task(task: &mut Option<EntryTaskTracker>, detail: &st
     if let Some(task) = task.as_mut() {
         let _ = task.cancel(detail);
     }
-}
-
-/// Close an Auto-mode resident review outage as a terminal failure. Guarded
-/// pauses return the untouched session so the caller can park it for `/continue`.
-pub(super) async fn settle_terminal_post_build_review(
-    pause: &PostBuildOperationalPause,
-    entry_task: &mut Option<EntryTaskTracker>,
-    sink: &dyn EventSink,
-    session: Box<dyn BaseSession>,
-    holder: &SessionHolder,
-    identity: Option<SessionIdentity>,
-    route_tx: &tokio::sync::mpsc::UnboundedSender<RouteDecision>,
-) -> Result<Box<dyn BaseSession>, ()> {
-    if !pause.terminal {
-        return Ok(session);
-    }
-    let reason = format!(
-        "{}; automatic mode exhausted its bounded reviewer retry and paused this run incomplete. Send /continue to retry the same saved review when the reviewer service is available",
-        pause.reason
-    );
-    fail_entry_task(entry_task, "resident review unavailable", reason.clone());
-    sink.emit(EngineEvent::Note(format!(
-        "team · {reason} — no source repair was started"
-    )));
-    settle_director_session(session, holder, identity, false).await;
-    let _ = route_tx.send(RouteDecision::Failed(reason));
-    Err(())
 }
 
 /// The director build loop body — the non-spawning core of

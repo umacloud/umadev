@@ -35,7 +35,7 @@ test("workflow_dispatch is validation-only even when dispatched on a tag", () =>
 test("credential, signing, attestation, and npm artifact steps require a tag push", () => {
   const protectedSteps = [
     "Require GitHub Pages to allow this release tag",
-    "Require npm publishing credential for tags",
+    "Require npm Trusted Publishing for tags",
     "Require native signing credentials for tags",
     "Developer ID sign and notarize (macOS)",
     "Authenticode sign and timestamp (Windows)",
@@ -67,6 +67,23 @@ test("npm publication re-verifies tag and commit provenance before publish", () 
   assert.ok(verifyIndex >= 0, "publish-npm does not verify release provenance");
   assert.ok(publishIndex > verifyIndex, "npm publish can run before provenance verification");
   assert.match(block, /"\$GITHUB_REF_NAME" "\$GITHUB_SHA"/);
+});
+
+test("npm publication is OIDC-only and rejects lifecycle payloads", () => {
+  const credentials = jobBlock("release-credentials");
+  const publish = jobBlock("publish-npm");
+  assert.match(publish, /^    environment: npm-production$/m);
+  assert.match(publish, /^      id-token: write$/m);
+  assert.match(publish, /package-manager-cache: false/);
+  assert.match(publish, /UMADEV_TRUSTED_PUBLISHING: "1"/);
+  assert.match(publish, /NPM_CONFIG_PROVENANCE: "true"/);
+  assert.doesNotMatch(workflow, /secrets\.NPM_TOKEN|NODE_AUTH_TOKEN:\s*\$\{\{/);
+  assert.match(credentials, /long-lived npm credentials are forbidden/);
+  const script = fs.readFileSync(path.join(repoRoot, "npm", "scripts", "publish.sh"), "utf8");
+  assert.match(script, /release-package-contract\.mjs/);
+  assert.match(script, /UMADEV_TRUSTED_PUBLISHING/);
+  assert.match(script, /--tag latest/);
+  assert.doesNotMatch(script, /--tag staging|npm dist-tag (?:add|rm)|^\s*npm whoami/m);
 });
 
 test("release concurrency preserves every tag without mixing different tags", () => {

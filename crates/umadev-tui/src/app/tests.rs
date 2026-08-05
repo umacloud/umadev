@@ -6661,6 +6661,46 @@ fn slash_continue_with_a_resumable_plan_resumes_instead_of_hinting() {
 }
 
 #[test]
+fn durable_incomplete_plan_wins_over_stale_finished_ui_state() {
+    let mut app = fresh_app(Some("claude-code"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "remaining-after-upgrade".into(),
+            title: "finish the persisted task".into(),
+            seat: umadev_agent::Seat::BackendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Pending,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Backend);
+    state.requirement = "继续升级前没有完成的任务".into();
+    state.backend = "claude-code".into();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+
+    // Reproduce the stale resident flag left by a previously settled block. The
+    // durable plan belongs to a later/incomplete run and must be authoritative.
+    app.finished = true;
+    assert!(app.has_run_resume_target());
+    assert_eq!(
+        app.try_slash_command("/continue"),
+        Some(Action::ResumeRun("继续升级前没有完成的任务".into()))
+    );
+
+    app.finished = true;
+    assert_eq!(
+        app.submit_text("继续推进执行".into()),
+        Action::ResumeRun("继续升级前没有完成的任务".into())
+    );
+}
+
+#[test]
 fn natural_language_continue_resumes_the_same_persisted_plan_without_routing() {
     let mut app = fresh_app(Some("claude-code"));
     let plan = umadev_agent::Plan {

@@ -41,6 +41,35 @@ available; please avoid publishing exploit details beforehand.
 
 ## Release authenticity
 
+### 1.0.74 npm incident
+
+The npm-only `umadev@1.0.74` publication was not produced from this repository,
+has no matching Git tag or GitHub release, and contained an install-time
+JavaScript payload. It is malicious and must not be installed or executed. The
+last safe public release before the incident is `1.0.73`.
+
+If `1.0.74` was installed, disconnect the host from the network, preserve a
+copy of the npm logs for investigation, remove the package, rotate npm and
+developer credentials from a known-clean device, and reinstall a verified safe
+release. Do not treat leftover `bun-dl-*` temporary directories alone as proof
+of compromise; confirm against the package version, lifecycle payloads, and
+the indicators below.
+
+Known indicators:
+
+- npm tarball SHA-256:
+  `1990199f10112b3851f6da4a04bb392bb44b4ef42b2feaa7cc3839eceb07e3c5`;
+- `setup.mjs` SHA-256:
+  `fd3ca4007b225fdf8de7af4345a19179d5efa8c4bb9205f88cda806e5684b1eb`;
+- `math_init.js` SHA-256:
+  `9fc2570b7cef51c1b8df116d144d11ff4096357be7d2c4c6367cfc2509cf1bcc`.
+
+The updater now accepts a release only when the official npm registry returns
+the expected inert package shape, exact platform-package version set, SHA-512
+integrity, registry signature, and npm provenance attestation. Release jobs
+also reject lifecycle scripts and unexpected package files before any registry
+write.
+
 Tag releases fail before artifact construction unless all publishing and native
 signing credentials are configured. macOS executables are signed with a
 Developer ID Application certificate, hardened runtime, and a secure timestamp,
@@ -53,8 +82,15 @@ The release workflow expects these repository or protected-environment secrets:
 - `APPLE_CERTIFICATE_P12_BASE64`, `APPLE_CERTIFICATE_PASSWORD`,
   `APPLE_SIGNING_IDENTITY`;
 - `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_SPECIFIC_PASSWORD`;
-- `WINDOWS_CERTIFICATE_PFX_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD`;
-- `NPM_TOKEN`.
+- `WINDOWS_CERTIFICATE_PFX_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD`.
+
+npm publication is tokenless. Every UmaDev npm package must configure npm
+Trusted Publishing for repository `umacloud/umadev` and workflow
+`release.yml`; the GitHub `npm-production` environment must protect the publish
+job. Package settings must require two-factor authentication and disallow
+token-based publication. The workflow requires npm 11.5.1 or newer, requests an
+OIDC identity token only in the publish job, and publishes with provenance. It
+fails closed if `NODE_AUTH_TOKEN` or `NPM_TOKEN` is present.
 
 Certificates and passwords are decoded only on their native ephemeral runner and
 are deleted before the job ends. A manual non-tag workflow run may build unsigned

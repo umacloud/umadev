@@ -5,8 +5,8 @@
 # Assumes:
 #   - `stage.sh` has already populated each `npm/cli-<platform>/bin/`
 #     with the matching prebuilt binary and tag/commit provenance manifest.
-#   - `npm whoami` is logged in with publish rights to the `@umacloud`
-#     scope and to the `umadev` name.
+#   - every package has this GitHub workflow configured as its npm Trusted
+#     Publisher. Production publishing intentionally accepts no long-lived token.
 #   - All package.json versions are aligned (this script does NOT bump).
 #
 # Use `--dry-run` to validate without actually publishing.
@@ -149,6 +149,12 @@ for dir in "${PACKAGE_DIRS[@]}"; do
   TARBALLS+=("$tarball")
 done
 
+# The tarball, not the source directory, is the release boundary. Reject every
+# lifecycle script and every unexpected file before the first registry write.
+# This is the deterministic guard for the 1.0.74 ChainDrop incident, where an
+# otherwise plausible package gained `preinstall`, setup.mjs, and math_init.js.
+node "$SCRIPT_DIR/release-package-contract.mjs" "$RELEASE_VERSION" "${TARBALLS[@]}"
+
 integrity_of() {
   node - "$1" <<'NODE'
 const crypto = require('node:crypto');
@@ -187,10 +193,17 @@ remote_version() {
 # Validate the complete registry state before publishing one package. In
 # particular, an old tag rerun must never move `latest` backwards.
 if [[ -z "$DRY_RUN" ]]; then
-  # Fail before publishing the first exact version when CI has no usable npm
-  # identity. Package-level authorization is still decided by the registry, but
-  # this catches a missing/expired token without leaving a partial staging set.
-  npm whoami >/dev/null
+  # npm exchanges GitHub's short-lived OIDC identity only inside `npm publish`;
+  # `npm whoami` cannot test it. Fail closed if a legacy credential was injected,
+  # so a stolen repository secret can never silently become the publish path.
+  if [[ -n "${NODE_AUTH_TOKEN:-}" || -n "${NPM_TOKEN:-}" ]]; then
+    echo "publish.sh: refusing long-lived npm credentials; use Trusted Publishing (OIDC)" >&2
+    exit 1
+  fi
+  if [[ "${UMADEV_TRUSTED_PUBLISHING:-}" != "1" ]]; then
+    echo "publish.sh: production publish is restricted to the Trusted Publishing workflow" >&2
+    exit 1
+  fi
   for tarball in "${TARBALLS[@]}"; do
     manifest="$(tar -xOf "$tarball" package/package.json)"
     name="$(node -p 'JSON.parse(process.argv[1]).name' "$manifest")"
@@ -242,9 +255,9 @@ for tarball in "${TARBALLS[@]}"; do
     continue
   fi
 
-  echo "▶ publish.sh: npm publish $name@$version..."
+  echo "▶ publish.sh: npm publish $name@$version through Trusted Publishing..."
   publish_status=0
-  publish_output="$(npm publish "$tarball" --access public --tag staging 2>&1)" || publish_status=$?
+  publish_output="$(npm publish "$tarball" --access public --tag latest 2>&1)" || publish_status=$?
   printf '%s\n' "$publish_output"
 
   if ((publish_status != 0)); then
@@ -266,21 +279,19 @@ for tarball in "${TARBALLS[@]}"; do
   fi
 done
 
-# All exact versions now exist and passed integrity verification. Promote tags
-# in dependency order; `umadev` is last, so ordinary installs stay on the prior
-# complete release until every dependency is ready.
+# Every package is published directly under `latest` in dependency order, with
+# `umadev` last. Trusted Publishing deliberately authenticates only publish/stage
+# operations, not a later `npm dist-tag` mutation. Publishing the launcher last
+# preserves the same atomic user-facing boundary without retaining a reusable
+# registry token solely for tag promotion.
 if [[ -z "$DRY_RUN" ]]; then
   for tarball in "${TARBALLS[@]}"; do
     manifest="$(tar -xOf "$tarball" package/package.json)"
     name="$(node -p 'JSON.parse(process.argv[1]).name' "$manifest")"
     version="$(node -p 'JSON.parse(process.argv[1]).version' "$manifest")"
-    npm dist-tag add "$name@$version" latest
-    # npm's registry is read-after-write eventually consistent: a read
-    # immediately after `dist-tag add` can still return the previous value from a
-    # replica or CDN edge. The add above is authoritative, so poll the read-back
-    # (up to ~40s) rather than failing an otherwise-successful promotion on the
-    # first stale reply — the exact flake that left 1.0.56 published but with
-    # `latest` still pointing at the prior version.
+    # npm registry reads are eventually consistent. Poll the publish-created tag
+    # before moving to the next package; no separately authenticated mutation is
+    # allowed here.
     tagged=""
     for ((attempt = 1; attempt <= VISIBILITY_ATTEMPTS; attempt += 1)); do
       tagged="$(remote_version "$name" latest || true)"
@@ -293,12 +304,6 @@ if [[ -z "$DRY_RUN" ]]; then
       echo "publish.sh: latest for $name is $tagged, expected $version" >&2
       exit 1
     }
-  done
-
-  for tarball in "${TARBALLS[@]}"; do
-    manifest="$(tar -xOf "$tarball" package/package.json)"
-    name="$(node -p 'JSON.parse(process.argv[1]).name' "$manifest")"
-    npm dist-tag rm "$name" staging >/dev/null 2>&1 || true
   done
 fi
 

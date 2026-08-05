@@ -220,9 +220,9 @@ impl OperationalReviewCheckpoint {
     }
 }
 
-/// A durable terminal review circuit must still route `/continue` into the
+/// A durable automatic-review circuit must still route `/continue` into the
 /// director. Returning `None` would make hosted callers fail open to a fresh run
-/// and replay the task that the circuit just stopped.
+/// and replay the task that the circuit just paused.
 pub fn terminal_review_circuit_reason(root: &Path) -> Option<String> {
     let checkpoint = load_operational_review_checkpoint(root)?;
     checkpoint.circuit_open().then(|| {
@@ -776,7 +776,7 @@ pub(super) fn invalidate_stale_steps(root: &Path, plan: &mut Plan) {
 }
 
 /// Whether `/continue` must route into the Director: either an incomplete plan
-/// or a terminal review circuit that must return `Failed` instead of replaying.
+/// or an automatic-review circuit waiting for an explicit re-arm.
 #[must_use]
 pub fn has_resumable_director_plan(root: &Path) -> bool {
     terminal_review_circuit_reason(root).is_some() || load_resumable_plan(root).is_some()
@@ -817,12 +817,10 @@ pub fn is_budget_pause_reason(reason: &str) -> bool {
 /// the read-only plan probe.
 #[must_use]
 pub fn transient_resume_hint(reason: &str, root: &Path) -> Option<String> {
-    // A terminal review receipt can coexist with a mechanically incomplete
-    // plan. It is nevertheless not resumable: never let a coincidental 429 or
-    // timeout string advertise `/continue` after the bounded circuit opened.
-    if terminal_review_circuit_reason(root).is_some()
-        || crate::continuous::legacy_operational_review_terminal_reason(root).is_some()
-    {
+    // Explicit cancellation remains terminal. An automatic-review circuit does
+    // not: it only stops automatic retries and an explicit `/continue` re-arms
+    // the same saved cursor.
+    if crate::continuous::legacy_operational_review_terminal_reason(root).is_some() {
         return None;
     }
     // The plan must still be resumable for EITHER hint — probe once and read its
@@ -858,20 +856,21 @@ pub fn has_resumable_run(root: &Path) -> bool {
             return false;
         }
     }
-    // The legacy fixed pipeline already consumed its one review-only retry.
-    // This is a terminal receipt, not an interrupted phase: advertising it as
-    // resumable makes the TUI dispatch `/continue` back into a fresh writer
-    // session and recreates the outage loop. A deliberate new `/run` replaces
-    // the workflow state and therefore clears this receipt.
+    // A legacy automatic-review circuit is also an explicit pause: the host
+    // re-arms its exact marker before `/continue` dispatches the saved phase.
+    if crate::continuous::legacy_operational_review_circuit_reason(root).is_some() {
+        return true;
+    }
+    // An explicitly cancelled legacy pause remains terminal.
     if crate::continuous::legacy_operational_review_terminal_reason(root).is_some() {
         return false;
     }
     if terminal_review_circuit_reason(root).is_some() {
-        // User-facing status and slash routing must not advertise a terminal
-        // circuit as resumable. `has_resumable_director_plan` intentionally stays
-        // true for programmatic callers so they route into the inner Failed guard
-        // instead of falling back to a fresh run.
-        return false;
+        // The circuit stops AUTOMATIC retry only. The exact saved cursor remains
+        // explicitly resumable, and `/continue` re-arms it before entering the
+        // Director. Reporting false here made status/footer callers contradict
+        // that contract and was one cause of the "pipeline never started" loop.
+        return true;
     }
     if load_resumable_plan(root).is_some() {
         return true;
@@ -1187,7 +1186,7 @@ mod tests {
 
         assert!(
             transient_resume_hint("429 too many requests", root).is_none(),
-            "a terminal review circuit cannot advertise /continue even when the latest error text is transient"
+            "an operational-review pause uses its own exact resume hint, not an unrelated transient-error hint"
         );
     }
 

@@ -19,7 +19,9 @@ const {
   REPAIR_COMMANDS,
   runSelfUpdate,
   linuxLibcFromEvidence,
-  registryLatestVersion,
+  registryLatestRelease,
+  validateTrustedUpdateManifest,
+  exactUpdateCommand,
   sweepAbandonedStagingDirs,
   ABANDONED_STAGING_MIN_AGE_MS,
   ensureModelCacheDirectory,
@@ -31,6 +33,36 @@ const {
   modelDownloadTempPath,
   MODEL_DOWNLOAD_LOCK_NAME,
 } = require('../umadev/bin/cli.js');
+
+function trustedUpdateManifest(version) {
+  const dependencies = [
+    '@umacloud/cli-darwin-arm64',
+    '@umacloud/cli-darwin-x64',
+    '@umacloud/cli-linux-arm64',
+    '@umacloud/cli-linux-musl-arm64',
+    '@umacloud/cli-linux-musl-x64',
+    '@umacloud/cli-linux-x64',
+    '@umacloud/cli-win32-x64',
+    '@umacloud/knowledge',
+  ];
+  return {
+    name: 'umadev',
+    version,
+    repository: { type: 'git', url: 'git+https://github.com/umacloud/umadev.git' },
+    bin: { umadev: 'bin/cli.js' },
+    optionalDependencies: Object.fromEntries(dependencies.map((name) => [name, version])),
+    dist: {
+      tarball: `https://registry.npmjs.org/umadev/-/umadev-${version}.tgz`,
+      integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
+      fileCount: 5,
+      signatures: [{ keyid: 'test', sig: 'test' }],
+      attestations: {
+        url: `https://registry.npmjs.org/-/npm/v1/attestations/umadev@${version}`,
+        provenance: { predicateType: 'https://slsa.dev/provenance/v1' },
+      },
+    },
+  };
+}
 
 const PLATFORM_LEAVES = {
   'darwin-arm64': 'cli-darwin-arm64',
@@ -139,6 +171,36 @@ test('terminal contract: updater follows strict SemVer precedence', () => {
   assert.equal(versionAtLeast('1.0.071', '1.0.071'), true);
 });
 
+test('terminal contract: updater accepts only inert Trusted Publishing releases', () => {
+  const clean = trustedUpdateManifest('1.0.73');
+  assert.deepEqual(validateTrustedUpdateManifest(clean), { trusted: true, version: '1.0.73' });
+
+  const lifecyclePayload = structuredClone(clean);
+  lifecyclePayload.version = '1.0.74';
+  lifecyclePayload.scripts = { preinstall: 'node setup.mjs' };
+  for (const name of Object.keys(lifecyclePayload.optionalDependencies)) {
+    lifecyclePayload.optionalDependencies[name] = '1.0.74';
+  }
+  lifecyclePayload.dist.tarball = 'https://registry.npmjs.org/umadev/-/umadev-1.0.74.tgz';
+  lifecyclePayload.dist.attestations.url =
+    'https://registry.npmjs.org/-/npm/v1/attestations/umadev@1.0.74';
+  assert.match(validateTrustedUpdateManifest(lifecyclePayload).reason, /lifecycle scripts/);
+
+  const noProvenance = structuredClone(clean);
+  delete noProvenance.dist.attestations;
+  assert.match(validateTrustedUpdateManifest(noProvenance).reason, /provenance/);
+
+  const splitDependency = structuredClone(clean);
+  splitDependency.optionalDependencies['@umacloud/knowledge'] = '1.0.72';
+  assert.match(validateTrustedUpdateManifest(splitDependency).reason, /dependency set/);
+
+  assert.equal(
+    exactUpdateCommand('npm', '1.0.73', true),
+    'npm install -g umadev@1.0.73 --registry=https://registry.npmjs.org --force',
+  );
+  assert.throws(() => exactUpdateCommand('npm', 'latest; touch /tmp/owned'));
+});
+
 test('terminal contract: an oversized registry response cannot hang update', async (t) => {
   const server = http.createServer((_request, response) => {
     response.writeHead(200, { 'content-type': 'application/json' });
@@ -161,12 +223,15 @@ test('terminal contract: an oversized registry response cannot hang update', asy
   });
 
   const result = await Promise.race([
-    registryLatestVersion(),
+    registryLatestRelease(),
     new Promise((_, reject) =>
       setTimeout(() => reject(new Error('registry response cap did not settle')), 2_000),
     ),
   ]);
-  assert.equal(result, null);
+  assert.deepEqual(result, {
+    status: 'untrusted',
+    reason: 'registry manifest exceeded 256 KiB',
+  });
 });
 
 test('terminal contract: updater cleanup preserves fresh package-manager staging', (t) => {
@@ -462,11 +527,12 @@ test(
         `catch (error) { fs.writeFileSync(process.argv[3], String(error && error.code || error)); }\n`,
     );
     const manager = path.join(binDir, 'npm.cmd');
+    const manifest = JSON.stringify(trustedUpdateManifest(expected));
     fs.writeFileSync(
       manager,
       `@echo off\r\n` +
         `if "%1"=="--version" (echo 9.9.9& exit /b 0)\r\n` +
-        `if "%1"=="view" (echo ${expected}& exit /b 0)\r\n` +
+        `if "%1"=="view" (echo ${manifest}& exit /b 0)\r\n` +
         `"${process.execPath}" "${lockProbe}" "${binary}" "${lockResult}"\r\n` +
         `exit /b 0\r\n`,
     );
@@ -524,7 +590,10 @@ test(
     const text = diagnostics.join('\n');
     assert.match(text, /upgrade verification failed/);
     assert.match(text, /Windows EPERM/);
-    assert.match(text, /npm install -g umadev@latest --force/);
+    assert.match(
+      text,
+      /npm install -g umadev@999\.0\.0 --registry=https:\/\/registry\.npmjs\.org --force/,
+    );
     assert.match(text, /where umadev/);
     assert.doesNotMatch(text, /upgraded and verified|repaired and verified/);
   },

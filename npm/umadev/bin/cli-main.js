@@ -38,6 +38,14 @@ const PLATFORM_PACKAGES = {
   'win32-arm64': '@umacloud/cli-win32-x64',
 };
 
+const TRUSTED_NPM_REGISTRY = 'https://registry.npmjs.org';
+const TRUSTED_PROVENANCE_PREDICATE = 'https://slsa.dev/provenance/v1';
+const TRUSTED_RELEASE_REPOSITORY = 'git+https://github.com/umacloud/umadev.git';
+const RELEASE_DEPENDENCIES = [
+  ...new Set(Object.values(PLATFORM_PACKAGES)),
+  '@umacloud/knowledge',
+].sort();
+
 function platformKey() {
   if (process.platform === 'linux' && linuxLibc() === 'musl') {
     return `linux-musl-${process.arch}`;
@@ -996,13 +1004,15 @@ function isPackageManaged(pkgRoot) {
 //         ~/.yarn/global/…  |  %LOCALAPPDATA%\Yarn\Data\global\…
 //   npm   <prefix>/lib/node_modules/umadev — the default, and the fallback
 //
-// Each manager's global-upgrade command. Constant strings — nothing from argv is
-// ever interpolated into a shell command.
+// Recovery hints can use `latest`, but the live updater replaces it with the
+// exact version from a verified npm Trusted Publishing manifest before spawning
+// a manager. Pinning both the version and registry prevents a stale or poisoned
+// third-party mirror from selecting a different tarball after preflight.
 const UPGRADE_COMMANDS = {
-  pnpm: 'pnpm add -g umadev@latest',
-  yarn: 'yarn global add umadev@latest',
-  bun: 'bun add -g umadev@latest',
-  npm: 'npm install -g umadev@latest',
+  pnpm: `pnpm add -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
+  yarn: `yarn global add umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
+  bun: `bun add -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
+  npm: `npm install -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
 };
 
 // A normal upgrade is allowed to reuse an already-installed optional package.
@@ -1011,11 +1021,25 @@ const UPGRADE_COMMANDS = {
 // still old. In that state the owning manager must re-materialize the package
 // tree instead of deciding the same version is already satisfied.
 const REPAIR_COMMANDS = {
-  pnpm: 'pnpm add -g umadev@latest --force',
-  yarn: 'yarn global add umadev@latest --force',
-  bun: 'bun add -g umadev@latest --force',
-  npm: 'npm install -g umadev@latest --force',
+  pnpm: `pnpm add -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
+  yarn: `yarn global add umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
+  bun: `bun add -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
+  npm: `npm install -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
 };
+
+function exactUpdateCommand(mgr, version, repair = false) {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(version || '')) {
+    throw new Error(`unsafe release version ${JSON.stringify(version)}`);
+  }
+  const verb = {
+    pnpm: 'pnpm add -g',
+    yarn: 'yarn global add',
+    bun: 'bun add -g',
+    npm: 'npm install -g',
+  }[mgr];
+  if (!verb) throw new Error(`unsupported package manager ${JSON.stringify(mgr)}`);
+  return `${verb} umadev@${version} --registry=${TRUSTED_NPM_REGISTRY}${repair ? ' --force' : ''}`;
+}
 
 function detectPackageManager(pkgRoot, env = process.env) {
   const p = path.resolve(pkgRoot);
@@ -1159,33 +1183,97 @@ function readLineSync() {
 // ── "Am I already on the latest?" — so `umadev update` on a current install is a
 // no-op instead of a multi-hundred-MB reinstall.
 //
-// Fail-open by contract: any failure returns null and the caller just proceeds with
-// the upgrade. An offline / firewalled / private-registry box must never be BLOCKED
-// from updating by the check that was only meant to save it a reinstall.
-
-// The registry to ask. Honors npm's own config (`npm_config_registry`, set for a
-// company mirror / npmmirror.com) and an explicit override, so a user behind a
-// private registry checks THEIR registry, not npmjs.org.
+// The registry to ask. Production updates deliberately ignore
+// `npm_config_registry`: a mirror is useful for ordinary dependencies, but it
+// must not be the authority that selects UmaDev's executable. The explicit
+// override exists for the local contract tests only.
 function registryBase() {
-  const raw =
-    process.env.UMADEV_REGISTRY_URL ||
-    process.env.npm_config_registry ||
-    'https://registry.npmjs.org';
+  const raw = process.env.UMADEV_REGISTRY_URL || TRUSTED_NPM_REGISTRY;
   return raw.replace(/\/+$/, '');
 }
 
 // The registry lookup is a convenience, not a gate — keep it snappy.
 const REGISTRY_TIMEOUT_MS = 5000;
 
-// Cheap, dependency-free registry query: one GET of the `latest` dist-tag document
-// (a few hundred bytes), short timeout. Resolves to a version string or null.
-function registryLatestVersion() {
+function validateTrustedUpdateManifest(manifest) {
+  const reject = (reason) => ({ trusted: false, reason });
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return reject('registry response is not a package manifest');
+  }
+  const version = manifest.version;
+  if (
+    manifest.name !== 'umadev' ||
+    !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(version || '')
+  ) {
+    return reject('package name or release version is invalid');
+  }
+  if (Object.hasOwn(manifest, 'scripts')) {
+    return reject('the release declares package lifecycle scripts');
+  }
+  if (manifest.repository?.url !== TRUSTED_RELEASE_REPOSITORY) {
+    return reject('the release repository identity changed');
+  }
+  if (!manifest.bin || manifest.bin.umadev !== 'bin/cli.js') {
+    return reject('the release launcher contract changed');
+  }
+
+  const optional = manifest.optionalDependencies;
+  if (!optional || typeof optional !== 'object' || Array.isArray(optional)) {
+    return reject('the release dependency set is missing');
+  }
+  const actualDependencies = Object.keys(optional).sort();
+  if (
+    actualDependencies.length !== RELEASE_DEPENDENCIES.length ||
+    actualDependencies.some((name, index) => name !== RELEASE_DEPENDENCIES[index]) ||
+    RELEASE_DEPENDENCIES.some((name) => optional[name] !== version)
+  ) {
+    return reject('the release dependency set or versions do not match');
+  }
+
+  const dist = manifest.dist;
+  const expectedTarball = `${TRUSTED_NPM_REGISTRY}/umadev/-/umadev-${version}.tgz`;
+  const expectedAttestations = `${TRUSTED_NPM_REGISTRY}/-/npm/v1/attestations/umadev@${version}`;
+  if (!dist || typeof dist !== 'object') return reject('the registry distribution is missing');
+  if (dist.tarball !== expectedTarball) return reject('the tarball is not hosted by npmjs.org');
+  const integrity = dist.integrity || '';
+  const encodedDigest = integrity.startsWith('sha512-') ? integrity.slice(7) : '';
+  if (
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(encodedDigest) ||
+    Buffer.from(encodedDigest, 'base64').length !== 64
+  ) {
+    return reject('the registry integrity digest is missing');
+  }
+  if (dist.fileCount !== 5) return reject('the release file count changed');
+  if (
+    !Array.isArray(dist.signatures) ||
+    dist.signatures.length === 0 ||
+    dist.signatures.some(
+      (signature) =>
+        !signature ||
+        typeof signature.keyid !== 'string' ||
+        signature.keyid.length === 0 ||
+        typeof signature.sig !== 'string' ||
+        signature.sig.length === 0,
+    )
+  ) {
+    return reject('the npm registry signature is missing');
+  }
+  if (
+    dist.attestations?.url !== expectedAttestations ||
+    dist.attestations?.provenance?.predicateType !== TRUSTED_PROVENANCE_PREDICATE
+  ) {
+    return reject('Trusted Publishing provenance is missing');
+  }
+  return { trusted: true, version };
+}
+
+function registryLatestRelease() {
   return new Promise((resolve) => {
     let settled = false;
-    const done = (v) => {
+    const done = (result) => {
       if (!settled) {
         settled = true;
-        resolve(v);
+        resolve(result);
       }
     };
     let url;
@@ -1198,63 +1286,68 @@ function registryLatestVersion() {
         (res) => {
           if (res.statusCode !== 200) {
             res.resume();
-            return done(null);
+            return done({ status: 'unavailable', reason: `registry returned HTTP ${res.statusCode}` });
           }
           let body = '';
           res.setEncoding('utf8');
-          res.on('data', (c) => {
-            body += c;
+          res.on('data', (chunk) => {
+            body += chunk;
             if (body.length > 262144) {
-              // `ClientRequest.destroy()` without an Error is only guaranteed
-              // to emit `close`, not `error`; resolve here as well or a registry
-              // that streams an oversized/non-ending document can strand
-              // `umadev update` forever after the request has been destroyed.
               req.destroy();
-              done(null);
+              done({ status: 'untrusted', reason: 'registry manifest exceeded 256 KiB' });
             }
           });
           res.on('end', () => {
             try {
-              const v = JSON.parse(body).version;
-              done(typeof v === 'string' ? v : null);
+              const verdict = validateTrustedUpdateManifest(JSON.parse(body));
+              done(
+                verdict.trusted
+                  ? { status: 'trusted', version: verdict.version }
+                  : { status: 'untrusted', reason: verdict.reason },
+              );
             } catch (_) {
-              done(null);
+              done({ status: 'untrusted', reason: 'registry manifest is not valid JSON' });
             }
           });
-          res.on('error', () => done(null));
+          res.on('error', () => done({ status: 'unavailable', reason: 'registry response failed' }));
         },
       );
-      req.on('error', () => done(null));
+      req.on('error', () => done({ status: 'unavailable', reason: 'registry request failed' }));
       req.setTimeout(REGISTRY_TIMEOUT_MS, () => {
         req.destroy();
-        done(null);
+        done({ status: 'unavailable', reason: 'registry request timed out' });
       });
     } catch (_) {
-      done(null);
+      done({ status: 'unavailable', reason: 'registry request could not start' });
     }
   });
 }
 
-// Fallback when the direct GET fails (proxy-only network, custom CA, …): ask npm,
-// which already knows the user's proxy/registry/auth config. Returns null if npm is
-// absent or errors.
-function npmViewLatestVersion() {
+function npmViewLatestRelease() {
   try {
-    const r = spawnSync('npm view umadev version', {
+    const command = `npm view umadev@latest --json --registry=${TRUSTED_NPM_REGISTRY}`;
+    const result = spawnSync(command, {
       encoding: 'utf8',
       shell: true,
       timeout: 20000,
+      maxBuffer: 262144,
     });
-    if (r.error || r.status !== 0 || !r.stdout) return null;
-    const v = r.stdout.trim().split(/\s+/).pop();
-    return /^\d+\.\d+\.\d+/.test(v || '') ? v : null;
+    if (result.error || result.status !== 0 || !result.stdout) {
+      return { status: 'unavailable', reason: 'npm could not read official release metadata' };
+    }
+    const verdict = validateTrustedUpdateManifest(JSON.parse(result.stdout));
+    return verdict.trusted
+      ? { status: 'trusted', version: verdict.version }
+      : { status: 'untrusted', reason: verdict.reason };
   } catch (_) {
-    return null;
+    return { status: 'unavailable', reason: 'npm returned invalid release metadata' };
   }
 }
 
-async function latestPublishedVersion() {
-  return (await registryLatestVersion()) || npmViewLatestVersion();
+async function latestTrustedRelease() {
+  const direct = await registryLatestRelease();
+  if (direct.status !== 'unavailable') return direct;
+  return npmViewLatestRelease();
 }
 
 // Is `current` >= `latest`? Used to short-circuit an update that would change
@@ -1362,22 +1455,31 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
   }
 
   const force = args.includes('--force');
-  let latest = null;
-  if (!force) {
-    latest = await latestPublishedVersion();
-    if (latest && versionAtLeast(current, latest) && versionStateMatches(before, current)) {
-      console.log(`Already on the latest version (${latest}). Nothing to do.`);
-      return true;
-    }
-    if (latest) console.log(`Latest published version: ${latest}.`);
+  const release = await latestTrustedRelease();
+  if (release.status !== 'trusted') {
+    console.error(
+      `\numadev: refusing to update because the official release could not be verified (${release.reason}).`,
+    );
+    console.error(
+      '        UmaDev releases must be script-free, internally version-locked, registry-signed,\n' +
+        '        and carry npm Trusted Publishing provenance. Try again when npmjs.org is reachable.\n',
+    );
+    process.exitCode = 1;
+    return true;
   }
+  const latest = release.version;
+  if (!force && current === latest && versionStateMatches(before, current)) {
+    console.log(`Already on the latest verified version (${latest}). Nothing to do.`);
+    return true;
+  }
+  console.log(`Latest verified published version: ${latest}.`);
 
   // `--force` is not merely a request to skip the registry short-circuit: pass
   // it through to the owner manager. A detected split also starts directly on
   // this repair path, because a same-version ordinary install may legitimately
   // reuse the stale optional platform package.
   let repairAttempted = force || splitBefore;
-  const command = repairAttempted ? REPAIR_COMMANDS[mgr] : UPGRADE_COMMANDS[mgr];
+  const command = exactUpdateCommand(mgr, latest, repairAttempted);
 
   // Upgrade only with the manager that OWNS this install. Falling back to npm for
   // a pnpm/yarn/bun-owned tree does not replace that tree; it creates a second
@@ -1429,7 +1531,7 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
     Boolean(
       after.main &&
         versionStateMatches(after, after.main) &&
-        (!latest || versionAtLeast(after.main, latest)),
+        after.main === latest,
     );
 
   // npm treats platform packages as optional: it may return status 0 after the
@@ -1438,7 +1540,7 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
   // user to intervene. This also covers a registry/cache race where an ordinary
   // install reports success but leaves the previous complete version in place.
   if (!stateReachedLatest() && !repairAttempted) {
-    const repairCommand = REPAIR_COMMANDS[mgr];
+    const repairCommand = exactUpdateCommand(mgr, latest, true);
     console.warn(
       `The first upgrade left inconsistent artifacts (${describeVersionState(after)}).`,
     );
@@ -1465,9 +1567,8 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
 
   if (!stateReachedLatest()) {
     console.error(`\numadev: upgrade verification failed (${describeVersionState(after)}).`);
-    if (latest) console.error(`        Expected a complete installation at ${latest} or newer.`);
-    else console.error('        Expected the package and executable versions to agree.');
-    console.error(windowsLockRecoveryMessage(REPAIR_COMMANDS[mgr]));
+    console.error(`        Expected a complete installation at exactly ${latest}.`);
+    console.error(windowsLockRecoveryMessage(exactUpdateCommand(mgr, latest, true)));
     process.exitCode = 1;
     return true;
   }
@@ -1477,13 +1578,8 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
     console.log(`[ok] UmaDev ${installed} repaired and verified (${path.basename(after.binaryPath)}).`);
   } else if (before.main !== installed) {
     console.log(`[ok] UmaDev ${installed} upgraded and verified (${path.basename(after.binaryPath)}).`);
-  } else if (latest) {
-    console.log(`[ok] UmaDev ${installed} verified (${path.basename(after.binaryPath)}).`);
   } else {
-    console.log(
-      `[ok] UmaDev ${installed} package and executable agree (${path.basename(after.binaryPath)}).`,
-    );
-    console.warn('The registry latest version could not be confirmed, so no upgrade claim was made.');
+    console.log(`[ok] UmaDev ${installed} verified (${path.basename(after.binaryPath)}).`);
   }
   return true;
 }
@@ -1582,7 +1678,9 @@ module.exports = {
   invocationNeedsModel,
   platformKey,
   linuxLibcFromEvidence,
-  registryLatestVersion,
+  registryLatestRelease,
+  validateTrustedUpdateManifest,
+  exactUpdateCommand,
   sweepAbandonedStagingDirs,
   ABANDONED_STAGING_MIN_AGE_MS,
   ensureModelCacheDirectory,

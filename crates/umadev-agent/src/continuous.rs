@@ -292,7 +292,7 @@ pub fn legacy_operational_review_pending(project_root: &Path) -> bool {
         .is_some()
 }
 
-/// Terminal reason for an exhausted legacy operational-review retry, if any.
+/// Pause reason for an exhausted legacy automatic-review retry, if any.
 ///
 /// The receipt deliberately remains on disk after the second identical outage:
 /// automatic retries stop, while an explicit `/continue` may re-arm this same
@@ -308,8 +308,8 @@ pub fn legacy_operational_review_circuit_reason(project_root: &Path) -> Option<S
     ))
 }
 
-/// Terminal reason for any legacy operational-review receipt that must not be
-/// resumed, including an opened retry circuit and an explicit user cancel.
+/// Guard reason for a legacy receipt that cannot be entered directly. An opened
+/// circuit is re-armed by the host on explicit `/continue`; cancellation is final.
 #[must_use]
 pub fn legacy_operational_review_terminal_reason(project_root: &Path) -> Option<String> {
     if let Some(reason) = legacy_operational_review_circuit_reason(project_root) {
@@ -378,7 +378,7 @@ fn pause_at_operational_review(
     review: &TeamReviewResult,
 ) -> RunOutcome {
     if options.mode == crate::trust::TrustMode::Auto {
-        return open_operational_review_circuit(options, kind, review);
+        return open_operational_review_circuit(options, plan, kind, review);
     }
     let phase = operational_checkpoint_phase(kind);
     persist_state_impl(options, phase, "", Some(operational_review_marker(kind)));
@@ -397,6 +397,7 @@ fn pause_at_operational_review(
 
 fn open_operational_review_circuit(
     options: &RunOptions,
+    plan: &crate::planner::PhasePlan,
     kind: ReviewKind,
     review: &TeamReviewResult,
 ) -> RunOutcome {
@@ -407,10 +408,20 @@ fn open_operational_review_circuit(
         "",
         Some(operational_review_circuit_marker(kind)),
     );
-    RunOutcome::HardStop(format!(
+    let reason = format!(
         "{}; the review boundary remained unavailable after bounded schema/transport retries, so automatic retries paused. No source work was repeated. Send /continue to retry this same saved review boundary",
         review_incomplete_reason(kind, review)
-    ))
+    );
+    let done = plan
+        .phases
+        .iter()
+        .filter(|candidate| phase_order(**candidate) < phase_order(phase))
+        .count();
+    RunOutcome::PausedAtOperational {
+        reason,
+        done,
+        total: plan.phases.len(),
+    }
 }
 
 fn persist_state_impl(
@@ -526,10 +537,9 @@ pub async fn run_block(
     let mut phases = block_phases(start_after, &plan);
     let mut resumed_operational_review = false;
 
-    // An exhausted retry is a terminal, persisted receipt. Repeated `/continue`
-    // commands must not reopen a base session, rerun source phases, or turn a
-    // reviewer outage into an endless pause loop. An explicit fresh `/run`
-    // replaces this workflow state through `AgentRunner::start`.
+    // An exhausted retry is a persisted automatic-loop circuit. Direct stale
+    // callers cannot reopen it; the host handles an explicit `/continue` by
+    // re-arming the same marker before this function is entered.
     if let Some(reason) = legacy_operational_review_terminal_reason(&options.project_root) {
         events.emit(EngineEvent::Note(reason.clone()));
         return RunOutcome::HardStop(reason);
@@ -552,8 +562,8 @@ pub async fn run_block(
             run_review_team(session, options, events, kind, &team, 0).await
         };
         if review.status() == ReviewStatus::Unavailable {
-            let outcome = open_operational_review_circuit(options, kind, &review);
-            if let RunOutcome::HardStop(reason) = &outcome {
+            let outcome = open_operational_review_circuit(options, &plan, kind, &review);
+            if let RunOutcome::PausedAtOperational { reason, .. } = &outcome {
                 events.emit(EngineEvent::Note(reason.clone()));
             }
             return outcome;
@@ -6526,7 +6536,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_first_review_outage_pauses_guarded_but_stops_auto_retries() {
+    fn legacy_first_review_outage_pauses_both_modes_and_stops_auto_retries() {
         let review = TeamReviewResult {
             blocking: Vec::new(),
             unavailable: vec!["[qa-engineer] review turn timed out".into()],
@@ -6546,7 +6556,7 @@ mod tests {
         let auto = opts(auto_root.path(), requirement, TrustMode::Auto);
         assert!(matches!(
             pause_at_operational_review(&auto, &plan, ReviewKind::Quality, &review),
-            RunOutcome::HardStop(ref reason)
+            RunOutcome::PausedAtOperational { ref reason, .. }
                 if reason.contains("automatic retries paused")
                     && reason.contains("No source work was repeated")
         ));
@@ -6555,7 +6565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_operational_review_opens_a_terminal_circuit_after_one_continue() {
+    async fn legacy_operational_review_opens_a_resumable_circuit_after_one_continue() {
         let tmp = tempfile::tempdir().unwrap();
         seed_docs(tmp.path());
         let options = opts(
@@ -6576,7 +6586,7 @@ mod tests {
         let outcome = run_block(&mut resumed, &options, &events, Phase::Research).await;
         assert!(matches!(
             outcome,
-            RunOutcome::HardStop(ref reason)
+            RunOutcome::PausedAtOperational { ref reason, .. }
                 if reason.contains("automatic retries paused")
                     && reason.contains("No source work was repeated")
         ));
@@ -6584,8 +6594,8 @@ mod tests {
         assert!(resumed_sent.lock().unwrap().is_empty());
         assert!(legacy_operational_review_circuit_reason(tmp.path()).is_some());
         assert!(
-            !crate::director_loop::has_resumable_run(tmp.path()),
-            "the TUI must not advertise a circuit-open receipt as resumable"
+            crate::director_loop::has_resumable_run(tmp.path()),
+            "the TUI must advertise the exact circuit-open receipt as explicitly resumable"
         );
 
         // Even a direct stale caller cannot fall back to a fresh phase walk: the

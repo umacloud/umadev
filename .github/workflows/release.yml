@@ -308,24 +308,25 @@ jobs:
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
           registry-url: "https://registry.npmjs.org"
-      # npm is always part of a tagged release. Check its credential before any
-      # platform build can start, so a missing token can never leave a public
-      # GitHub Release behind with npm still on the previous version.
-      - name: Require npm publishing credential for tags
+      # npm is always part of a tagged release. Trusted Publishing exchanges the
+      # workflow's short-lived OIDC identity inside `npm publish`; `npm whoami`
+      # cannot test that identity. Verify the runner is capable and make the
+      # absence of the retired long-lived token an explicit release contract.
+      - name: Require npm Trusted Publishing for tags
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ -z "${NPM_TOKEN:-}" ]]; then
-            echo '::error::missing required release secret: NPM_TOKEN'
-            exit 1
-          fi
-          identity=$(npm whoami --registry=https://registry.npmjs.org)
-          if [[ -z "$identity" ]]; then
-            echo '::error::npm accepted the credential but returned no registry identity'
+          version=$(npm --version)
+          node - "$version" <<'NODE'
+          const [major = 0, minor = 0, patch = 0] = process.argv[2].split('.').map(Number);
+          if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
+            console.error(`npm ${process.argv[2]} is too old for Trusted Publishing (need >=11.5.1)`);
+            process.exit(1);
+          }
+          NODE
+          if [[ -n "${NODE_AUTH_TOKEN:-}" || -n "${NPM_TOKEN:-}" ]]; then
+            echo '::error::long-lived npm credentials are forbidden; configure Trusted Publishing'
             exit 1
           fi
 
@@ -1150,6 +1151,7 @@ jobs:
     # Never expose the main npm package until those assets are verified public.
     needs: [build, publish-github]
     runs-on: ubuntu-latest
+    environment: npm-production
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
@@ -1160,6 +1162,7 @@ jobs:
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
 
       # GitHub Release is the canonical byte source for npm, including a rerun
       # after GitHub succeeded but npm failed. Rebuilding a signed binary or SBOM
@@ -1217,7 +1220,7 @@ jobs:
       # bin/cli.js. publish.sh therefore skips the model package.
       - name: npm publish (platforms + main)
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          UMADEV_TRUSTED_PUBLISHING: "1"
           NPM_CONFIG_PROVENANCE: "true"
         run: ./npm/scripts/publish.sh
 

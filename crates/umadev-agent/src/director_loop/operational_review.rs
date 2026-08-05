@@ -321,8 +321,8 @@ pub struct PostBuildOperationalPause {
     pub done: usize,
     /// Total steps in the minimal persisted resume plan.
     pub total: usize,
-    /// Auto mode has no human gate. Its bounded reviewer retry is exhausted and
-    /// the persisted cursor is a terminal circuit rather than a resumable pause.
+    /// Compatibility signal that the bounded automatic-retry circuit is open.
+    /// This never makes the cursor terminal to an explicit `/continue`.
     pub terminal: bool,
 }
 

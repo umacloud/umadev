@@ -8,11 +8,14 @@ impl App {
     /// being stolen from the model.
     pub(super) fn has_run_resume_target(&self) -> bool {
         self.active_gate.is_some()
-            || (!self.finished && umadev_agent::has_resumable_director_plan(&self.project_root))
-            || (!self.finished && umadev_agent::has_resumable_run(&self.project_root))
-            || (!self.finished
-                && umadev_agent::legacy_operational_review_circuit_reason(&self.project_root)
-                    .is_some())
+            // Durable state is authoritative across a completed in-memory turn,
+            // TUI restart, and binary upgrade. `finished` describes only the last
+            // resident block; using it as a filesystem-resume ceiling hid a newer
+            // incomplete plan and made `/continue` claim that no pipeline started.
+            || umadev_agent::has_resumable_director_plan(&self.project_root)
+            || umadev_agent::has_resumable_run(&self.project_root)
+            || umadev_agent::legacy_operational_review_circuit_reason(&self.project_root)
+                .is_some()
     }
 
     /// Shared state transition for `/continue` and its exact natural-language
@@ -71,8 +74,7 @@ impl App {
             );
             self.record_trust_pass(gate.id_str());
             Action::Continue(gate)
-        } else if !self.finished
-            && (self.budget_paused || self.aborted)
+        } else if (self.budget_paused || self.aborted)
             && umadev_agent::has_resumable_run(&self.project_root)
         {
             if self.reject_director_execution_in_plan() {
@@ -90,10 +92,7 @@ impl App {
                 umadev_i18n::t(self.lang, "continue.running"),
             );
             Action::None
-        } else if !self.run_started
-            && !self.finished
-            && umadev_agent::has_resumable_run(&self.project_root)
-        {
+        } else if !self.run_started && has_resume_target {
             if self.reject_director_execution_in_plan() {
                 return Action::None;
             }

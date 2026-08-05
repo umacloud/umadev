@@ -120,8 +120,8 @@ pub(super) fn operational_stop_note(operational: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "team · required review infrastructure unavailable — stopping incomplete without \
-         source rework (retry review; code edits/builds cannot repair this): {evidence}"
+        "team · required review infrastructure unavailable — pausing the saved run without \
+         source rework (retry the same review; code edits/builds cannot repair this): {evidence}"
     )
 }
 

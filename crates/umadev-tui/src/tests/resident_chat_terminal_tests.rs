@@ -1511,10 +1511,12 @@ async fn preloaded_warm_session_is_used_without_a_cold_start() {
     ];
     drive_chat_session_turn(turn).await;
 
-    // The warm session was consumed and re-parked as a mechanically read-only
-    // primed session (alive and reusable for the next routed answer).
+    // With no reusable intent fork, the semantic preflight falls back to the
+    // resident base itself. Keep that process writable so it can understand and
+    // execute a later concrete request instead of trapping the conversation in a
+    // read-only child.
     assert!(
-        matches!(*holder.lock().await, Some(ResidentChat::ReadOnlyPrimed(_))),
+        matches!(*holder.lock().await, Some(ResidentChat::Primed(_))),
         "a warm session becomes primed after its first turn"
     );
     assert!(
@@ -1948,8 +1950,8 @@ async fn unabsorbed_first_directive_failure_refeeds_the_transcript_on_the_next_t
         sent[1]
     );
     assert!(
-        matches!(*holder.lock().await, Some(ResidentChat::ReadOnlyPrimed(_))),
-        "a completed read-only turn parks a reusable read-only resident"
+        matches!(*holder.lock().await, Some(ResidentChat::Primed(_))),
+        "a fallback turn parks the resident base with its write capability intact"
     );
 }
 

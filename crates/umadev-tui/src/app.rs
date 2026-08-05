@@ -5769,11 +5769,11 @@ impl App {
         if dir_scan::directory_has_real_entry(&output) {
             return Some("output/");
         }
-        let terminal_review = umadev_agent::terminal_review_circuit_reason(&self.project_root)
-            .is_some()
-            || umadev_agent::legacy_operational_review_terminal_reason(&self.project_root)
-                .is_some();
-        if !terminal_review && umadev_agent::read_workflow_state(&self.project_root).is_some() {
+        // Match `/continue`: a review circuit pauses automatic retry but keeps
+        // the saved cursor resumable; completed/cancelled receipts stay hidden.
+        if umadev_agent::read_workflow_state(&self.project_root).is_some()
+            && umadev_agent::has_resumable_run(&self.project_root)
+        {
             return Some(".umadev/");
         }
         None

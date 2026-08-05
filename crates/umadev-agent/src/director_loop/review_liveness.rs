@@ -18,9 +18,13 @@ fn evidence_summary(items: &[String]) -> String {
         .join("; ")
 }
 
-fn stop_reason(boundary: &str, checkpoint: &OperationalReviewCheckpoint, evidence: &str) -> String {
+fn paused_circuit_reason(
+    boundary: &str,
+    checkpoint: &OperationalReviewCheckpoint,
+    evidence: &str,
+) -> String {
     format!(
-        "{boundary} remained unavailable after {} bounded review boundaries (each included one fresh-session retry): {evidence}. This run is stopped incomplete; no reviewer outage was sent to source repair. Send /continue to explicitly retry this same saved review when the reviewer service is available",
+        "{boundary} remained unavailable after {} bounded review boundaries (each included one fresh-session retry): {evidence}. Automatic review retries are paused; the saved run remains resumable and no reviewer outage was sent to source repair",
         checkpoint.effective_outages()
     )
 }
@@ -38,11 +42,12 @@ pub(super) fn block_open_steps(plan: &mut Plan, events: &Arc<dyn EventSink>) {
     }
 }
 
-/// Persist or terminally settle one unavailable step-review boundary.
+/// Persist and pause one unavailable step-review boundary.
 ///
 /// The first unavailable boundary parks the exact review cursor. A second
-/// consecutive boundary opens the automatic retry circuit; a later explicit
-/// `/continue` may re-arm that same cursor without replaying source work.
+/// consecutive boundary opens the automatic retry circuit; it still remains a
+/// PAUSE, and a later explicit `/continue` re-arms that same cursor without
+/// replaying source work.
 pub(super) struct StepReviewOutage<'a> {
     pub options: &'a RunOptions,
     pub events: &'a Arc<dyn EventSink>,
@@ -80,28 +85,6 @@ pub(super) fn handle_step_review_outage(context: StepReviewOutage<'_>) -> Direct
     );
     let evidence = evidence_summary(&checkpoint.evidence().operational_unavailable);
     let boundary = format!("required review at step `{}`", step.title);
-    if checkpoint.circuit_open() {
-        let reason = stop_reason(&boundary, &checkpoint, &evidence);
-        let _ = save_operational_review_checkpoint(&options.project_root, &checkpoint);
-        block_open_steps(plan, events);
-        let blockers = checkpoint.evidence().ledger_blockers();
-        let _ = task_tracker.settle_base_agents(
-            step,
-            base_agents,
-            StepStatus::Blocked,
-            true,
-            &reason,
-            &blockers,
-        );
-        let _ =
-            task_tracker.settle_step(step, StepStatus::Blocked, true, &reason, blockers.clone());
-        let _ = task_tracker.finish(false, &reason, blockers);
-        let _ = plan_state::save(plan, &options.project_root);
-        record_artifact_versions(&options.project_root);
-        events.emit(EngineEvent::Note(format!("team · {reason}")));
-        return DirectorLoopOutcome::Failed(reason);
-    }
-
     let semantic = if checkpoint.evidence().semantic_blocking.is_empty() {
         String::new()
     } else {
@@ -110,14 +93,42 @@ pub(super) fn handle_step_review_outage(context: StepReviewOutage<'_>) -> Direct
             checkpoint.evidence().semantic_blocking.len()
         )
     };
-    let reason = format!("{boundary} unavailable: {evidence}{semantic}");
+    let circuit_open = checkpoint.circuit_open();
+    let reason = if circuit_open {
+        paused_circuit_reason(&boundary, &checkpoint, &evidence)
+    } else {
+        format!("{boundary} unavailable: {evidence}{semantic}")
+    };
     let saved = save_operational_review_checkpoint(&options.project_root, &checkpoint).is_ok()
         && plan_state::save(plan, &options.project_root).is_ok();
-    if saved && task_tracker.wait_for_user(&reason).is_ok() {
+    if saved {
+        let blockers = checkpoint.evidence().ledger_blockers();
+        if let Err(error) = task_tracker.settle_base_agents(
+            step,
+            base_agents,
+            StepStatus::Blocked,
+            true,
+            &reason,
+            &blockers,
+        ) {
+            events.emit(EngineEvent::Note(format!(
+                "team · reviewer child ledger could not settle its outage ({error}); the typed review checkpoint remains resumable"
+            )));
+        }
+        if let Err(error) = task_tracker.wait_for_user(&reason) {
+            events.emit(EngineEvent::Note(format!(
+                "team · plan task ledger could not append its pause ({error}); the typed review checkpoint remains resumable"
+            )));
+        }
         record_artifact_versions(&options.project_root);
         let (done, total) = plan.progress();
+        let retry = if circuit_open {
+            "automatic retries are paused; type /continue to retry this same saved review when the reviewer service is available"
+        } else {
+            "the automatic fresh-session retry also failed; type /continue to retry this same saved review, or enter a new requirement"
+        };
         events.emit(EngineEvent::Note(format!(
-            "team · {reason} — the automatic fresh-session retry also failed; plan paused without source rework. Type /continue for one final bounded retry, or enter a new requirement"
+            "team · {reason} — plan paused without source rework; {retry}"
         )));
         return DirectorLoopOutcome::PausedAtOperational {
             reason,
@@ -134,7 +145,7 @@ pub(super) fn handle_step_review_outage(context: StepReviewOutage<'_>) -> Direct
     DirectorLoopOutcome::Failed(reason)
 }
 
-/// Persist or terminally settle an unavailable final whole-build review.
+/// Persist and pause an unavailable final whole-build review.
 pub(super) struct FinalReviewOutage<'a> {
     pub options: &'a RunOptions,
     pub events: &'a Arc<dyn EventSink>,
@@ -175,27 +186,17 @@ pub(super) fn handle_final_review_outage(context: FinalReviewOutage<'_>) -> Dire
         typed_evidence,
     );
     let evidence = evidence_summary(&checkpoint.evidence().operational_unavailable);
-    if checkpoint.circuit_open() {
-        let reason = stop_reason("final quality review", &checkpoint, &evidence);
-        let _ = save_operational_review_checkpoint(&options.project_root, &checkpoint);
-        block_open_steps(plan, events);
-        let blockers = checkpoint.evidence().ledger_blockers();
-        if let Some(task) = resident_task.as_mut() {
-            let _ = task.fail(&reason, blockers.clone());
-        }
-        let _ = task_tracker.finish(false, &reason, blockers);
-        let _ = plan_state::save(plan, &options.project_root);
-        record_artifact_versions(&options.project_root);
-        events.emit(EngineEvent::Note(format!("team · {reason}")));
-        return DirectorLoopOutcome::Failed(reason);
-    }
-
     let semantic = if semantic_blocking.is_empty() {
         String::new()
     } else {
         format!("; {} semantic finding(s) retained", semantic_blocking.len())
     };
-    let reason = format!("final quality review unavailable: {evidence}{semantic}");
+    let circuit_open = checkpoint.circuit_open();
+    let reason = if circuit_open {
+        paused_circuit_reason("final quality review", &checkpoint, &evidence)
+    } else {
+        format!("final quality review unavailable: {evidence}{semantic}")
+    };
     let saved = save_operational_review_checkpoint(&options.project_root, &checkpoint).is_ok()
         && plan_state::save(plan, &options.project_root).is_ok();
     if saved {
@@ -213,8 +214,13 @@ pub(super) fn handle_final_review_outage(context: FinalReviewOutage<'_>) -> Dire
         }
         record_artifact_versions(&options.project_root);
         let (done, total) = plan.progress();
+        let retry = if circuit_open {
+            "automatic retries are paused; type /continue to retry this same saved review when the reviewer service is available"
+        } else {
+            "the automatic fresh-session retry also failed; type /continue to retry this same saved review, or enter a new requirement"
+        };
         events.emit(EngineEvent::Note(format!(
-            "team · {reason} — the automatic fresh-session retry also failed; plan paused without source rework. Type /continue for one final bounded retry, or enter a new requirement"
+            "team · {reason} — plan paused without source rework; {retry}"
         )));
         return DirectorLoopOutcome::PausedAtOperational {
             reason,

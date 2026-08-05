@@ -320,6 +320,7 @@ jobs:
           node --test --test-concurrency=1
           npm/scripts/release-provenance.test.mjs
           npm/scripts/release-manifest.test.mjs
+          npm/scripts/release-package-contract.test.mjs
           npm/scripts/grok-published-contract.test.mjs
           npm/scripts/release-workflow-contract.test.mjs
           npm/scripts/native-installer-contract.test.cjs

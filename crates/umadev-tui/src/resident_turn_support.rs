@@ -3,13 +3,13 @@ use std::sync::Arc;
 
 use umadev_agent::{ChannelSink, EngineEvent, EventSink, RoutePlan};
 use umadev_runtime::{
-    BasePermissionProfile, DeliveryReceiptStage, DeliveryReport, InputDelivery, SessionError,
-    TurnInput, TurnInputBlock, TurnInputBlockKind,
+    BasePermissionProfile, DeliveryReceiptStage, DeliveryReport, InputDelivery, Message,
+    SessionError, TurnInput, TurnInputBlock, TurnInputBlockKind,
 };
 
 use crate::interaction_bridge::PendingAskHolder;
 
-use super::{RouteDecision, SubmittedTurn, TYPED_USER_INPUT_SLOT};
+use super::{director_directive_with_history, RouteDecision, SubmittedTurn, TYPED_USER_INPUT_SLOT};
 
 /// Select the exact payload for one resident turn.
 ///
@@ -48,6 +48,7 @@ pub(super) fn route_clarification_reply(question: &umadev_agent::ClarifyQuestion
     out
 }
 
+#[cfg(test)]
 pub(super) fn route_fallback_note(
     route: &RoutePlan,
     reason: umadev_agent::RouteFallbackReason,
@@ -84,7 +85,7 @@ pub(super) fn capture_resident_tool_pitfall(
 pub(super) fn routed_turn_executes_read_only(
     native_command: bool,
     route: &RoutePlan,
-    _source: Option<umadev_agent::RouteSource>,
+    source: Option<umadev_agent::RouteSource>,
     explicit_read_only: bool,
     permissions: BasePermissionProfile,
 ) -> bool {
@@ -94,7 +95,121 @@ pub(super) fn routed_turn_executes_read_only(
     if explicit_read_only || permissions == BasePermissionProfile::Plan {
         return true;
     }
+    // A failed semantic preflight is not an authorization decision. Keep the
+    // resident base writable and let that same base model interpret the complete
+    // latest request while executing it. The prompt still makes the request the
+    // sole authority, so capability does not grant unsolicited mutation.
+    if matches!(
+        source,
+        Some(umadev_agent::RouteSource::DeterministicFallback)
+    ) {
+        return false;
+    }
     !route.class.mutates_workspace()
+}
+
+/// Build the first warm-session directive with bounded history and, for
+/// non-Claude bases, the resident firmware.
+#[cfg(test)]
+pub(super) fn first_chat_directive(
+    firmware: Option<&str>,
+    backend: &str,
+    conversation: &[Message],
+    current_text: &str,
+    directive_text: &str,
+    route: &RoutePlan,
+) -> String {
+    let scoped = scoped_chat_directive(directive_text, route);
+    let with_history = director_directive_with_history(conversation, current_text, scoped);
+    match firmware {
+        Some(fw) if backend != "claude-code" && backend != "grok-build" => {
+            format!("{fw}\n\n---\n\n{with_history}")
+        }
+        _ => with_history,
+    }
+}
+
+/// Production form of [`first_chat_directive`] that preserves preflight
+/// provenance so an unavailable classifier cannot become a read-only verdict.
+pub(super) fn first_chat_directive_for_turn(
+    firmware: Option<&str>,
+    backend: &str,
+    conversation: &[Message],
+    current_text: &str,
+    directive_text: &str,
+    route: &RoutePlan,
+    preflight: (Option<umadev_agent::RouteSource>, bool),
+) -> String {
+    let (source, execution_read_only) = preflight;
+    let scoped = scoped_chat_directive_for_turn(directive_text, route, source, execution_read_only);
+    let with_history = director_directive_with_history(conversation, current_text, scoped);
+    match firmware {
+        Some(fw) if backend != "claude-code" && backend != "grok-build" => {
+            format!("{fw}\n\n---\n\n{with_history}")
+        }
+        _ => with_history,
+    }
+}
+
+/// Per-turn authority boundary for a resident session. Native base memory and
+/// project guidance remain context; only the latest request grants work.
+#[cfg(test)]
+pub(super) fn scoped_chat_directive(text: &str, route: &RoutePlan) -> String {
+    scoped_chat_directive_for_turn(text, route, Some(umadev_agent::RouteSource::Brain), false)
+}
+
+pub(super) fn scoped_chat_directive_for_turn(
+    text: &str,
+    route: &RoutePlan,
+    source: Option<umadev_agent::RouteSource>,
+    execution_read_only: bool,
+) -> String {
+    use umadev_agent::RouteClass;
+
+    let semantic_fallback = matches!(
+        source,
+        Some(umadev_agent::RouteSource::DeterministicFallback)
+    ) && !execution_read_only;
+    let lane = if semantic_fallback {
+        "The bounded intent preflight was unavailable. Use your own full model understanding of the complete latest request now: answer when it asks for information; inspect when it asks for diagnosis; and edit/run proportionally when it asks for a change. Do not treat the preflight's guessed route as authority, and do not mutate anything the latest request did not ask to change."
+    } else {
+        match route.class {
+            RouteClass::Chat => {
+                "Use an inspection-only child for this answer. Respond from current context without tools, commands, file writes, reviews, or QC."
+            }
+            RouteClass::Explain => {
+                "Use an inspection-only child for this answer. You may use only the necessary read/search tools to inspect the requested project files; do not run mutating commands, write files, launch reviews, or run QC."
+            }
+            RouteClass::QuickEdit => {
+                "Make the smallest necessary edit and only a targeted verification. Do not launch a team or broad review."
+            }
+            RouteClass::Debug => {
+                "Diagnose and fix only the reported defect with the smallest justified blast radius and a targeted regression check. Do not launch a team or broad review."
+            }
+            RouteClass::Build => {
+                "Implement only the requested feature/product. Adjacent work is allowed only when required for that request; state why it is required."
+            }
+        }
+    };
+    let hinted_scope = if route.scope.is_empty() {
+        "Use only files strictly necessary for the latest request.".to_string()
+    } else {
+        format!("Suggested file scope: {}.", route.scope.join(", "))
+    };
+
+    format!(
+        "## Current-turn authority\n\
+         - Host preflight route: {} / {}.\n\
+         - The latest request below is the sole authorization for this turn.\n\
+         - Permission is scoped to this turn. The inspection-only child used for a chat/explanation does NOT mean the UmaDev session or its base is read-only. Never answer \"the current session cannot write\" from this child. A concrete edit request is re-evaluated and handled by a writable worker unless the host explicitly reports Plan mode or a read-only launch sandbox.\n\
+         - Prior conversation, plans, TODOs, project documents, and remembered facts are context only. Do not resume or execute them unless the latest request explicitly asks you to.\n\
+         - {lane}\n\
+         - {hinted_scope}\n\
+         - Do not add opportunistic cleanup, refactors, dependencies, features, governance work, or reviews.\n\n\
+         ## Latest request\n{text}",
+        route.class.as_str(),
+        route.depth.as_str(),
+    )
 }
 
 pub(super) fn directive_turn_input(

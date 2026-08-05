@@ -3998,11 +3998,7 @@ fn resident_route_sandbox_mechanically_follows_final_route_mutability() {
     };
 
     for route in [&chat, &explain] {
-        for source in [
-            Some(umadev_agent::RouteSource::Brain),
-            Some(umadev_agent::RouteSource::DeterministicFallback),
-            None,
-        ] {
+        for source in [Some(umadev_agent::RouteSource::Brain), None] {
             for permissions in [
                 umadev_runtime::BasePermissionProfile::Guarded,
                 umadev_runtime::BasePermissionProfile::Auto,
@@ -4015,6 +4011,21 @@ fn resident_route_sandbox_mechanically_follows_final_route_mutability() {
                     permissions,
                 ));
             }
+        }
+        for permissions in [
+            umadev_runtime::BasePermissionProfile::Guarded,
+            umadev_runtime::BasePermissionProfile::Auto,
+        ] {
+            assert!(
+                !routed_turn_executes_read_only(
+                    false,
+                    route,
+                    Some(umadev_agent::RouteSource::DeterministicFallback),
+                    false,
+                    permissions,
+                ),
+                "a failed preflight delegates semantics to the writable resident base"
+            );
         }
     }
     for source in [
@@ -4055,6 +4066,16 @@ fn resident_route_sandbox_mechanically_follows_final_route_mutability() {
     let directive = scoped_chat_directive("修复以上发现的问题", &debug);
     assert!(directive.contains("Diagnose and fix only the reported defect"));
     assert!(!directive.contains("This is read-only"));
+
+    let fallback = scoped_chat_directive_for_turn(
+        "帮我搞一下 SEO",
+        &explain,
+        Some(umadev_agent::RouteSource::DeterministicFallback),
+        false,
+    );
+    assert!(fallback.contains("Use your own full model understanding"));
+    assert!(fallback.contains("edit/run proportionally"));
+    assert!(!fallback.contains("do not run mutating commands"));
 }
 
 #[test]
@@ -6941,7 +6962,7 @@ async fn resident_model_fix_intent_reaches_writer_with_mutating_authority() {
     );
     let directives = writer_sent.lock().unwrap();
     assert_eq!(directives.len(), 1, "the writer receives exactly one task");
-    assert!(directives[0].contains("Model-decided route: debug / fast"));
+    assert!(directives[0].contains("Host preflight route: debug / fast"));
     assert!(directives[0].contains("Diagnose and fix only the reported defect"));
     assert!(directives[0].contains("Permission is scoped to this turn"));
     assert!(
@@ -8205,6 +8226,54 @@ async fn resident_writable_fallback_fails_before_send_when_another_writer_holds_
                 if note.contains("单写者锁") || note.contains("workspace writer lock"))),
         "the lock failure must be visible in the transcript"
     );
+}
+
+#[tokio::test]
+async fn resident_semantic_fallback_chat_does_not_create_an_unasked_branch() {
+    let tmp = init_git_repo();
+    std::fs::write(tmp.path().join("seed.txt"), "seed\n").unwrap();
+    let run = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    run(&["add", "-A"]);
+    run(&["commit", "-q", "-m", "seed"]);
+    let original_branch = git_branch(tmp.path());
+
+    let (writer, _sent, _ended) = FakeChatSession::new(vec![vec![
+        umadev_runtime::SessionEvent::TextDelta("你好，我可以帮你开发和排查项目。".into()),
+        umadev_runtime::SessionEvent::TurnDone {
+            status: umadev_runtime::TurnStatus::Completed,
+            usage: None,
+        },
+    ]]);
+    let holder = ChatSessionHolder::from_mutex(tokio::sync::Mutex::new(Some(
+        ResidentChat::Primed(Box::new(writer)),
+    )));
+    let (sink, _engine_rx) = ChannelSink::new();
+    let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
+    drive_chat_session_turn(chat_turn(
+        "你好，介绍一下你自己",
+        holder,
+        Arc::new(sink),
+        route_tx,
+        tmp.path().to_path_buf(),
+    ))
+    .await;
+
+    assert!(matches!(
+        route_rx.try_recv(),
+        Ok(RouteDecision::AgenticDone {
+            director_build: false,
+            ..
+        })
+    ));
+    assert_eq!(git_branch(tmp.path()), original_branch);
 }
 
 #[tokio::test]

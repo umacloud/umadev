@@ -79,6 +79,41 @@ trap 'rm -rf "$UPD_TMP"' EXIT
 
 INSTALLED_VERSION="$(node -p "require('$NPM_ROOT/umadev/package.json').version")"
 
+trusted_manifest() {
+  node -e '
+    const version = process.argv[1];
+    const dependencies = [
+      "@umacloud/cli-darwin-arm64",
+      "@umacloud/cli-darwin-x64",
+      "@umacloud/cli-linux-arm64",
+      "@umacloud/cli-linux-musl-arm64",
+      "@umacloud/cli-linux-musl-x64",
+      "@umacloud/cli-linux-x64",
+      "@umacloud/cli-win32-x64",
+      "@umacloud/knowledge",
+    ];
+    const optionalDependencies = Object.fromEntries(dependencies.map((name) => [name, version]));
+    process.stdout.write(JSON.stringify({
+      name: "umadev",
+      version,
+      repository: { type: "git", url: "git+https://github.com/umacloud/umadev.git" },
+      bin: { umadev: "bin/cli.js" },
+      optionalDependencies,
+      dist: {
+        tarball: `https://registry.npmjs.org/umadev/-/umadev-${version}.tgz`,
+        integrity: `sha512-${Buffer.alloc(64, 1).toString("base64")}`,
+        fileCount: 5,
+        signatures: [{ keyid: "test", sig: "test" }],
+        attestations: {
+          url: `https://registry.npmjs.org/-/npm/v1/attestations/umadev@${version}`,
+          provenance: { predicateType: "https://slsa.dev/provenance/v1" },
+        },
+      },
+    }));
+  ' "$1"
+}
+INSTALLED_MANIFEST="$(trusted_manifest "$INSTALLED_VERSION")"
+
 # Point the registry probe at a closed port so it fails INSTANTLY and the
 # already-latest check falls back to the stand-in `npm view` on PATH. That keeps
 # every assertion below fully offline AND exercises the real fallback chain.
@@ -103,11 +138,12 @@ make_install() {
 # check never touches the network), and otherwise just records what it was told to
 # run — a real global install is never performed.
 make_stub() {
+  STUB_MANIFEST="$(trusted_manifest "$2")"
   cat > "$UPD_TMP/bin/$1" <<STUB
 #!/bin/sh
 case "\$1" in
   --version) echo "9.9.9"; exit 0 ;;
-  view)      echo "$2"; exit 0 ;;
+  view)      echo '$STUB_MANIFEST'; exit 0 ;;
 esac
 if [ -n "\${SMOKE_INSTALL_ROOT:-}" ]; then
   node -e '
@@ -165,7 +201,7 @@ else
   exit "$STATUS"
 fi
 
-if [[ "$UPD_OUT" != *"npm-called: install -g umadev@latest"* ]]; then
+if [[ "$UPD_OUT" != *"npm-called: install -g umadev@999.0.0 --registry=https://registry.npmjs.org"* ]]; then
   echo "✗ smoke.sh: the shim did not run the npm upgrade" >&2
   echo "$UPD_OUT" >&2
   exit 1
@@ -213,7 +249,7 @@ UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
   SMOKE_INSTALL_ROOT="$PNPM_ROOT" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$PNPM_ROOT/umadev/bin/cli.js" update -y 2>&1)"
-if [[ "$UPD_OUT" != *"pnpm-called: add -g umadev@latest"* ]]; then
+if [[ "$UPD_OUT" != *"pnpm-called: add -g umadev@999.0.0 --registry=https://registry.npmjs.org"* ]]; then
   echo "✗ smoke.sh: a pnpm-owned install did not upgrade via pnpm" >&2
   echo "$UPD_OUT" >&2
   exit 1
@@ -232,7 +268,7 @@ UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/bin:$PATH" \
   SMOKE_INSTALL_ROOT="$BUN_ROOT" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$BUN_ROOT/umadev/bin/cli.js" update -y 2>&1)"
-if [[ "$UPD_OUT" != *"bun-called: add -g umadev@latest"* ]]; then
+if [[ "$UPD_OUT" != *"bun-called: add -g umadev@999.0.0 --registry=https://registry.npmjs.org"* ]]; then
   echo "✗ smoke.sh: a bun-owned install did not upgrade via bun" >&2
   echo "$UPD_OUT" >&2
   exit 1
@@ -253,7 +289,7 @@ cat > "$LATEST_NPM_TMP" <<STUB
 #!/bin/sh
 case "\$1" in
   --version) echo "9.9.9"; exit 0 ;;
-  view)      echo "$INSTALLED_VERSION"; exit 0 ;;
+  view)      echo '$INSTALLED_MANIFEST'; exit 0 ;;
 esac
 echo "npm-called: \$*"
 STUB
@@ -262,7 +298,7 @@ mv -f "$LATEST_NPM_TMP" "$LATEST_NPM"
 UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/latest-bin:$PATH" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$UPD_TMP/node_modules/umadev/bin/cli.js" update -y 2>&1)"
-if [[ "$UPD_OUT" != *"Already on the latest version"* ]]; then
+if [[ "$UPD_OUT" != *"Already on the latest verified version"* ]]; then
   echo "✗ smoke.sh: an up-to-date install did not short-circuit" >&2
   echo "$UPD_OUT" >&2
   exit 1
@@ -322,7 +358,7 @@ cat > "$LATEST_NPM_TMP" <<STUB
 #!/bin/sh
 case "\$1" in
   --version) echo "9.9.9"; exit 0 ;;
-  view)      echo "$INSTALLED_VERSION"; exit 0 ;;
+  view)      echo '$INSTALLED_MANIFEST'; exit 0 ;;
 esac
 case " \$* " in
   *" --force "*)
@@ -342,7 +378,7 @@ UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/latest-bin:$PATH" \
   node "$UPD_TMP/node_modules/umadev/bin/cli.js" update -y 2>&1)"
 if [[ "$UPD_OUT" == *"Nothing to do"* ]] ||
    [[ "$UPD_OUT" != *"Version split detected"* ]] ||
-   [[ "$UPD_OUT" != *"npm-called: install -g umadev@latest --force"* ]] ||
+   [[ "$UPD_OUT" != *"npm-called: install -g umadev@$INSTALLED_VERSION --registry=https://registry.npmjs.org --force"* ]] ||
    [[ "$UPD_OUT" != *"repaired and verified"* ]]; then
   echo "✗ smoke.sh: a current package with a stale executable was not repaired" >&2
   echo "$UPD_OUT" >&2
@@ -381,7 +417,7 @@ cat > "$PARTIAL_NPM_TMP" <<STUB
 #!/bin/sh
 case "\$1" in
   --version) echo "9.9.9"; exit 0 ;;
-  view)      echo "$INSTALLED_VERSION"; exit 0 ;;
+  view)      echo '$INSTALLED_MANIFEST'; exit 0 ;;
 esac
 node -e '
   const fs = require("node:fs");
@@ -409,8 +445,8 @@ mv -f "$PARTIAL_NPM_TMP" "$PARTIAL_NPM"
 UPD_OUT="$(cd "$UPD_TMP" && PATH="$UPD_TMP/partial-npm:$PATH" \
   UMADEV_REGISTRY_URL="$DEAD_REGISTRY" \
   node "$PARTIAL_ROOT/umadev/bin/cli.js" update -y 2>&1)"
-NORMAL_COUNT="$(printf '%s\n' "$UPD_OUT" | grep -Fxc 'npm-called: install -g umadev@latest' || true)"
-FORCE_COUNT="$(printf '%s\n' "$UPD_OUT" | grep -Fxc 'npm-called: install -g umadev@latest --force' || true)"
+NORMAL_COUNT="$(printf '%s\n' "$UPD_OUT" | grep -Fxc "npm-called: install -g umadev@$INSTALLED_VERSION --registry=https://registry.npmjs.org" || true)"
+FORCE_COUNT="$(printf '%s\n' "$UPD_OUT" | grep -Fxc "npm-called: install -g umadev@$INSTALLED_VERSION --registry=https://registry.npmjs.org --force" || true)"
 if [[ "$NORMAL_COUNT" -ne 1 ]] || [[ "$FORCE_COUNT" -ne 1 ]] ||
    [[ "$UPD_OUT" != *"The first upgrade left inconsistent artifacts"* ]] ||
    [[ "$UPD_OUT" != *"repaired and verified"* ]]; then
@@ -561,7 +597,7 @@ MISSING_OWNER_RC=$?
 set -e
 if [[ "$MISSING_OWNER_RC" -eq 0 ]] ||
    [[ "$MISSING_OWNER_OUT" != *"owns this install but is not runnable"* ]] ||
-   [[ "$MISSING_OWNER_OUT" != *"pnpm add -g umadev@latest"* ]] ||
+     [[ "$MISSING_OWNER_OUT" != *"pnpm add -g umadev@999.0.0 --registry=https://registry.npmjs.org"* ]] ||
    [[ "$MISSING_OWNER_OUT" != *"shadowed UmaDev install"* ]]; then
   echo "✗ smoke.sh: a missing owner manager was not refused clearly" >&2
   echo "$MISSING_OWNER_OUT" >&2

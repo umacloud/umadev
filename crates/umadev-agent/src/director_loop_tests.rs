@@ -7036,7 +7036,7 @@ async fn auto_review_outage_parks_and_keeps_semantic_evidence_separate() {
 }
 
 #[tokio::test]
-async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases_run() {
+async fn repeated_operational_review_outage_pauses_persisted_cursor_and_releases_run() {
     use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind, StepStatus};
     let tmp = tempfile::TempDir::new().unwrap();
     seed_source(tmp.path());
@@ -7107,8 +7107,8 @@ async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases
         drive_director_loop_resume(&mut repeated, &options, &events, &route).await;
     assert!(matches!(
         &repeated_outcome,
-        Some(DirectorLoopOutcome::Failed(reason))
-            if reason.contains("stopped incomplete") && reason.contains("/continue")
+        Some(DirectorLoopOutcome::PausedAtOperational { reason, .. })
+            if reason.contains("Automatic review retries are paused")
     ));
     assert!(
         repeated_sent.lock().unwrap().is_empty(),
@@ -7121,16 +7121,15 @@ async fn repeated_operational_review_outage_opens_persisted_circuit_and_releases
             ..
         })
     ));
-    let persisted = crate::plan_state::load(tmp.path()).expect("terminal plan persisted");
+    let persisted = crate::plan_state::load(tmp.path()).expect("paused plan persisted");
     assert!(persisted
         .steps
         .iter()
-        .all(|step| step.status == StepStatus::Blocked));
+        .all(|step| step.status != StepStatus::Blocked));
     assert!(has_resumable_director_plan(tmp.path()));
     assert!(
-        !has_resumable_run(tmp.path()),
-        "a terminal review circuit remains internally routable to the Failed guard, \
-         but must never be advertised to users as resumable"
+        has_resumable_run(tmp.path()),
+        "an automatic-review circuit remains explicitly resumable"
     );
 
     // Match the hosted caller's exact `Some => return it, None => fresh run`
@@ -7267,10 +7266,10 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
     assert!(
         matches!(
             &repeated_outcome,
-            Some(DirectorLoopOutcome::Failed(reason))
-                if reason.contains("stopped incomplete") && reason.contains("/continue")
+            Some(DirectorLoopOutcome::PausedAtOperational { reason, .. })
+                if reason.contains("Automatic review retries are paused")
         ),
-        "the second identical outage boundary opens the bounded circuit: {repeated_outcome:?}"
+        "the second identical outage boundary pauses the bounded circuit: {repeated_outcome:?}"
     );
     assert!(
         repeated_sent.lock().unwrap().is_empty(),
@@ -7312,11 +7311,11 @@ async fn step_review_checkpoint_retries_saved_roster_without_replaying_build() {
             ..
         })
     ));
-    let persisted = crate::plan_state::load(tmp.path()).expect("terminal plan persisted");
+    let persisted = crate::plan_state::load(tmp.path()).expect("paused plan persisted");
     assert!(persisted
         .steps
         .iter()
-        .all(|step| step.status == crate::plan_state::StepStatus::Blocked));
+        .all(|step| step.status != crate::plan_state::StepStatus::Blocked));
 }
 
 #[tokio::test]
