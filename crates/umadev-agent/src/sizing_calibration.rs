@@ -39,7 +39,7 @@ pub const STATS_FILE: &str = ".umadev/sizing-calibration.json";
 const MAX_STATS_BYTES: usize = 2 * 1024 * 1024;
 const STATS_FILENAME: &str = "sizing-calibration.json";
 const LOCK_FILENAME: &str = "sizing-calibration.lock";
-const LOCK_RETRY_BUDGET: Duration = Duration::from_millis(25);
+const LOCK_RETRY_BUDGET: Duration = Duration::from_millis(100);
 
 /// Minimum recorded runs for a route-class before its calibration is TRUSTED. Below
 /// this the over/under-size fractions are statistically meaningless, so
