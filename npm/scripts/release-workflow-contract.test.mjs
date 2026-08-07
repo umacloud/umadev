@@ -179,17 +179,16 @@ test("npm publication is OIDC-only and rejects lifecycle payloads", () => {
   assert.match(publish, /UMADEV_TRUSTED_PUBLISHING: "1"/);
   assert.match(publish, /NPM_CONFIG_PROVENANCE: "true"/);
   assert.match(workflow, /^  NPM_CONFIG_REGISTRY: "https:\/\/registry\.npmjs\.org"$/m);
-  assert.doesNotMatch(
-    workflow,
-    /registry-url:/,
-    "setup-node registry-url injects an auth placeholder that disables OIDC",
-  );
   assert.match(pagesWorkflow, /^  NPM_CONFIG_REGISTRY: "https:\/\/registry\.npmjs\.org"$/m);
-  assert.doesNotMatch(pagesWorkflow, /registry-url:/);
-  assert.doesNotMatch(workflow, /^\s+(?:NODE_AUTH_TOKEN|NPM_TOKEN):\s*/m);
-  assert.doesNotMatch(pagesWorkflow, /^\s+(?:NODE_AUTH_TOKEN|NPM_TOKEN):\s*/m);
-  assert.doesNotMatch(workflow, /_authToken|NPM_CONFIG_USERCONFIG/);
-  assert.doesNotMatch(pagesWorkflow, /_authToken|NPM_CONFIG_USERCONFIG/);
+  for (const [name, source] of allWorkflows) {
+    assert.doesNotMatch(
+      source,
+      /registry-url:/i,
+      `${name}: setup-node registry-url injects a dummy auth configuration`,
+    );
+    assert.doesNotMatch(source, /^\s+(?:NODE_AUTH_TOKEN|NPM_TOKEN):\s*/im);
+    assert.doesNotMatch(source, /_authToken|NPM_CONFIG_USERCONFIG/i);
+  }
   assert.match(credentials, /long-lived npm credentials are forbidden/);
   const script = fs.readFileSync(path.join(repoRoot, "npm", "scripts", "publish.sh"), "utf8");
   assert.match(script, /release-package-contract\.mjs/);
