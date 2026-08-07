@@ -42,9 +42,17 @@ jobs:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
           registry-url: "https://registry.npmjs.org"
       - name: Install Windows GNU C toolchain
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-mingw-w64-x86-64
+          sudo timeout --signal=TERM --kill-after=30s 300s \
+            apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+          sudo timeout --signal=TERM --kill-after=30s 300s \
+            apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=60 \
+              install --yes gcc-mingw-w64-x86-64
 
       - name: Checkout audited Grok Build source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

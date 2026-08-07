@@ -217,6 +217,11 @@ test("CI and release both gate launcher classification and Windows GNU", () => {
     );
     assert.match(
       source,
+      /- name: Install Windows GNU C toolchain\n\s+timeout-minutes: 10[\s\S]*?Acquire::Retries=3[\s\S]*?DPkg::Lock::Timeout=60/,
+      `${name} can wait indefinitely for the Windows GNU apt toolchain`,
+    );
+    assert.match(
+      source,
       /cargo clippy --workspace --all-(?:features --all-targets|targets --all-features) --locked --target x86_64-pc-windows-gnu -- -D warnings/,
       `${name} does not run the full Windows GNU strict-Clippy gate`,
     );

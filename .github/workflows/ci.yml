@@ -56,9 +56,17 @@ jobs:
           components: clippy
           targets: x86_64-pc-windows-gnu
       - name: Install Windows GNU C toolchain
+        timeout-minutes: 10
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes gcc-mingw-w64-x86-64
+          sudo timeout --signal=TERM --kill-after=30s 300s \
+            apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 update
+          sudo timeout --signal=TERM --kill-after=30s 300s \
+            apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=60 \
+              install --yes gcc-mingw-w64-x86-64
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: windows-gnu-cross
