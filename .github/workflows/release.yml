@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  NPM_CONFIG_REGISTRY: "https://registry.npmjs.org"
   # Pin the release builders themselves. A tag retry months later must compile
   # with the same Rust/Node toolchains instead of whatever `stable`/`20` means
   # on that future date. Node 20 is EOL as of 2026-03-24; use the current LTS.
@@ -40,7 +41,6 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
-          registry-url: "https://registry.npmjs.org"
       - name: Install Windows GNU C toolchain
         timeout-minutes: 10
         env:
@@ -315,7 +315,6 @@ jobs:
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
-          registry-url: "https://registry.npmjs.org"
       # npm is always part of a tagged release. Trusted Publishing exchanges the
       # workflow's short-lived OIDC identity inside `npm publish`; `npm whoami`
       # cannot test that identity. Verify the runner is capable and make the
@@ -780,7 +779,6 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
-          registry-url: "https://registry.npmjs.org"
       - name: Wait for the immediately preceding public release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1170,7 +1168,6 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
       # GitHub Release is the canonical byte source for npm, including a rerun

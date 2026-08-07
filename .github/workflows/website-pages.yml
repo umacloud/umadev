@@ -12,6 +12,7 @@ permissions:
 env:
   # Keep Pages builds reproducible and off the EOL Node 20 line.
   UMADEV_WEBSITE_NODE: "24.18.0"
+  NPM_CONFIG_REGISTRY: "https://registry.npmjs.org"
 
 concurrency:
   group: github-pages
@@ -33,7 +34,6 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: ${{ env.UMADEV_WEBSITE_NODE }}
-          registry-url: "https://registry.npmjs.org"
           cache: npm
           cache-dependency-path: umadev-website/package-lock.json
 

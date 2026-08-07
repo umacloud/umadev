@@ -12,7 +12,7 @@
 - 评审服务故障改为持久化暂停和有界熔断；显式续跑只重试原步骤，查询类请求不再触发团队评审，常驻会话的状态、底部提示与磁盘计划保持一致。
 - 自进化体量校准的跨进程锁扩大短暂交接窗口，在高负载 macOS/Windows 调度下不再丢失已完成运行的学习样本，同时保留忙锁快速失败上限。
 - npm 更新器固定从官方 registry 读取并验证精确包结构、平台包版本、SHA-512、registry 签名与 provenance，拒绝缺少证明或携带生命周期脚本的版本；被污染的高版本也可回退到最新可信版本。
-- npm 正式发布改为 GitHub OIDC / Trusted Publishing，拒绝长期 token；发布前对九个 tarball 执行精确文件白名单和恶意载荷回归，依赖包先发布、主包最后发布，避免半发布版本成为用户入口。
+- npm 正式发布改为 GitHub OIDC / Trusted Publishing，拒绝长期 token 和 `setup-node` 生成的占位认证；官方 registry 由无凭据环境变量固定。发布前对九个 tarball 执行精确文件白名单和恶意载荷回归，依赖包先发布、主包最后发布，避免半发布版本成为用户入口。
 - `SECURITY.md` 公布恶意 npm-only `1.0.74` 的哈希、处置步骤与恢复边界；该版本没有对应 Git tag 或 GitHub Release。`1.0.75` 是跳过受污染版本身份后的首个可信恢复版。
 - 官网升级到 Next.js 16.3.0，并固定已修复的 PostCSS 8.5.26、brace-expansion 5.0.9；依赖审计恢复为 0 漏洞。RustSec 工作流补齐维护告警 Issue 的最小权限，避免“实际 0 漏洞、告警同步失败”造成假红。
 - GitHub 仓库中残留的旧 `NPM_TOKEN` secret 已撤销；安装文档与官网复制命令显式固定 npm 官方 registry，避免仍缓存恶意 `1.0.74` 的第三方镜像继续下发旧包。
