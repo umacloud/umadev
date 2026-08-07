@@ -144,6 +144,18 @@ impl StoreLocation {
             umadev_state::memory::MemoryStore::KnowledgeUtility,
         )
     }
+
+    #[cfg(test)]
+    fn acquire_lock_with_timeout(
+        state: &umadev_state::fs::RootedDir,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<umadev_state::store_lock::StoreLock> {
+        umadev_state::store_lock::acquire_rooted_in_state_with_timeout(
+            state,
+            umadev_state::memory::MemoryStore::KnowledgeUtility,
+            timeout,
+        )
+    }
 }
 
 fn capture_enabled_rooted(state: &umadev_state::fs::RootedDir) -> bool {
@@ -1069,18 +1081,48 @@ fn record_chunk_outcomes_rooted(
     keys: &[(String, String)],
     helpful: bool,
 ) {
+    record_chunk_outcomes_rooted_with_lock(state, keys, helpful, || {
+        StoreLocation::acquire_lock(state)
+    });
+}
+
+fn record_chunk_outcomes_rooted_with_lock(
+    state: &umadev_state::fs::RootedDir,
+    keys: &[(String, String)],
+    helpful: bool,
+    acquire_lock: impl FnOnce() -> std::io::Result<umadev_state::store_lock::StoreLock>,
+) {
     if keys.is_empty() || !capture_enabled_rooted(state) {
         return;
     }
     // Serialize the complete legacy read-modify-write transaction. Previously
     // concurrent projects could both load the same prior and silently discard
     // whichever update saved first.
-    let Ok(_store_lock) = StoreLocation::acquire_lock(state) else {
+    let Ok(_store_lock) = acquire_lock() else {
         return;
     };
     let mut store = UsefulnessStore::load_legacy_from(state);
     store.record(keys, helpful);
     store.save_to_root(state);
+}
+
+#[cfg(test)]
+fn record_chunk_outcomes_in_with_lock_timeout(
+    home: &Path,
+    keys: &[(String, String)],
+    helpful: bool,
+    timeout: std::time::Duration,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    let location = StoreLocation::Home(home.to_path_buf());
+    let Some(state) = location.state_root(false) else {
+        return;
+    };
+    record_chunk_outcomes_rooted_with_lock(&state, keys, helpful, || {
+        StoreLocation::acquire_lock_with_timeout(&state, timeout)
+    });
 }
 
 #[cfg(test)]
@@ -1147,13 +1189,16 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         enable_global_utility_capture(home.path());
         let home_path = home.path();
+        // Exercise transaction serialization, not the product's 2s fail-open
+        // budget: twelve Windows fsync/replace turns can legitimately exceed it.
         std::thread::scope(|scope| {
             for index in 0..12 {
                 scope.spawn(move || {
-                    record_chunk_outcomes_in(
+                    record_chunk_outcomes_in_with_lock_timeout(
                         home_path,
                         &[(format!("chunk-{index}.md"), "S".to_string())],
                         true,
+                        std::time::Duration::from_secs(30),
                     );
                 });
             }

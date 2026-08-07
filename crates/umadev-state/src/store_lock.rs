@@ -361,16 +361,25 @@ pub fn acquire_rooted_in_state(
     root: &crate::fs::RootedDir,
     store: MemoryStore,
 ) -> std::io::Result<StoreLock> {
+    acquire_rooted_in_state_with_timeout(root, store, ACQUIRE_TIMEOUT)
+}
+
+/// State-directory counterpart of [`acquire_rooted`] with an explicit bounded
+/// acquisition budget.
+///
+/// Durable-store contract tests use this seam to separate lock/transaction
+/// correctness from the product's deliberately short fail-open deadline. Normal
+/// callers should use [`acquire_rooted_in_state`], which retains the shared
+/// two-second product budget.
+#[doc(hidden)]
+pub fn acquire_rooted_in_state_with_timeout(
+    root: &crate::fs::RootedDir,
+    store: MemoryStore,
+    timeout: Duration,
+) -> std::io::Result<StoreLock> {
     let root = Arc::new(root.try_clone()?);
     let lock_root = ensure_lock_root(&root, true)?;
-    acquire_from_root_with_timing(
-        root,
-        &lock_root,
-        store,
-        ACQUIRE_TIMEOUT,
-        POLL_INTERVAL,
-        STALE_AFTER,
-    )
+    acquire_from_root_with_timing(root, &lock_root, store, timeout, POLL_INTERVAL, STALE_AFTER)
 }
 
 #[cfg(test)]
