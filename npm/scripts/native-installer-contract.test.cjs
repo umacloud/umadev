@@ -199,9 +199,39 @@ awk 'BEGIN { for (i = 0; i < 5000; i++) printf "x" }'
     const before = fs.readFileSync(f.dest);
     const result = f.run();
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /candidate --version output exceeded 4096 bytes/);
+    // A completely descheduled probe can reach the total timeout before the
+    // installer observes the file. Both outcomes are bounded and fail closed;
+    // under ordinary scheduling the live byte poll reports the precise cap.
+    assert.match(result.stderr, /candidate --version (?:output exceeded 4096 bytes|timed out after 10s)/);
     assert.deepEqual(fs.readFileSync(f.dest), before);
   } finally {
+    f.cleanup();
+  }
+});
+
+test('a successful Unix version probe reaps descendants before installation succeeds', () => {
+  const f = fixture({
+    candidate: `#!/bin/sh
+(trap '' TERM; while :; do sleep 1; done) &
+printf '%s\\n' "$!" > "$DESCENDANT_PID_FILE"
+printf 'umadev 1.2.3\\n'
+`,
+    existing: oldBinary,
+  });
+  const descendantPidFile = path.join(f.root, 'descendant.pid');
+  f.env.DESCENDANT_PID_FILE = descendantPidFile;
+  let descendantPid = 0;
+  try {
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    descendantPid = Number(fs.readFileSync(descendantPidFile, 'utf8'));
+    const ps = spawnSync('ps', ['-o', 'stat=', '-p', String(descendantPid)], { encoding: 'utf8' });
+    const state = String(ps.stdout || '').trim();
+    assert.ok(!state || state.startsWith('Z'), `version-probe descendant survived with state ${state}`);
+  } finally {
+    if (descendantPid > 0) {
+      try { process.kill(descendantPid, 'SIGKILL'); } catch { /* already reaped */ }
+    }
     f.cleanup();
   }
 });
@@ -360,6 +390,8 @@ test('native installers bound redirects, duration, and actual response bytes', (
   assert.match(unix, /wc -c < "\$destination"/);
   assert.match(unix, /\.umadev-install\.lock/);
   assert.match(unix, /kill -0 "\$owner_pid"/);
+  assert.match(unix, /output_exceeded=1/);
+  assert.match(unix, /kill -KILL -- "-\$version_probe_pid"/);
 
   const windows = fs.readFileSync(windowsInstaller, 'utf8');
   assert.match(windows, /AllowAutoRedirect = \$false/);

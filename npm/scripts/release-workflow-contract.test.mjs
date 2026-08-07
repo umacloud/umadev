@@ -52,6 +52,21 @@ test("credential, signing, attestation, and npm artifact steps require a tag pus
   }
 });
 
+test("RustSec jobs can maintain advisory findings without turning clean audits red", () => {
+  const security = fs.readFileSync(
+    path.join(repoRoot, ".github", "workflows", "security.yml"),
+    "utf8",
+  );
+  for (const [name, content] of [
+    ["security", security],
+    ["release", workflow],
+  ]) {
+    const rustsecJob = content.match(/\n  rustsec:\n[\s\S]*?(?=\n  [a-zA-Z0-9_-]+:\n|$)/)?.[0];
+    assert.ok(rustsecJob, `${name} workflow must define a rustsec job`);
+    assert.match(rustsecJob, /permissions:\s*\n(?:\s+[a-z-]+:\s+\w+\s*\n)*\s+issues:\s+write\b/);
+  }
+});
+
 test("Pages tag policy gate consumes every paginated policy", () => {
   const gate = jobBlock("release-credentials");
   assert.match(gate, /deployment-branch-policies\?per_page=100&page=\$page/);

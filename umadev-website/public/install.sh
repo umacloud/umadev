@@ -136,37 +136,67 @@ run_version_probe() {
   local deadline=0
   local grace_deadline=0
   local timed_out=0
+  local output_exceeded=0
+  local version_probe_group=0
   VERSION_PROBE_RESULT=""
   version_probe_output="$(mktemp "${TMPDIR:-/tmp}/umadev-version.XXXXXX")" \
     || return 1
   # Bound output at the OS file limit as well as checking its final byte count.
   # A corrupt candidate therefore cannot fill the disk while the deadline runs.
-  (ulimit -f 8; "$binary" --version) >"$version_probe_output" 2>&1 &
+  # Bash monitor mode gives this background probe its own process group on
+  # both macOS and Linux. The candidate may fork before returning; a timeout,
+  # output cap, or successful leader exit must not leave that descendant alive.
+  set -m 2>/dev/null || true
+  (ulimit -f 8; exec "$binary" --version) >"$version_probe_output" 2>&1 &
   version_probe_pid=$!
+  if kill -0 -- "-$version_probe_pid" 2>/dev/null; then
+    version_probe_group=1
+  fi
+  set +m 2>/dev/null || true
   deadline=$((SECONDS + BINARY_VERSION_TIMEOUT))
   while kill -0 "$version_probe_pid" 2>/dev/null; do
-    if [ "$SECONDS" -ge "$deadline" ]; then
+    version_probe_bytes="$(wc -c < "$version_probe_output" | tr -d '[:space:]')"
+    if [ "$version_probe_bytes" -ge "$MAX_BINARY_VERSION_OUTPUT_BYTES" ]; then
+      output_exceeded=1
+    elif [ "$SECONDS" -ge "$deadline" ]; then
       timed_out=1
-      kill -TERM "$version_probe_pid" 2>/dev/null || true
-      grace_deadline=$((SECONDS + BINARY_VERSION_KILL_GRACE))
-      while kill -0 "$version_probe_pid" 2>/dev/null \
-        && [ "$SECONDS" -lt "$grace_deadline" ]; do
-        sleep 0.1
-      done
-      kill -KILL "$version_probe_pid" 2>/dev/null || true
-      break
+    else
+      sleep 0.1
+      continue
     fi
-    sleep 0.1
+    if [ "$version_probe_group" -eq 1 ]; then
+      kill -TERM -- "-$version_probe_pid" 2>/dev/null || true
+    else
+      kill -TERM "$version_probe_pid" 2>/dev/null || true
+    fi
+    grace_deadline=$((SECONDS + BINARY_VERSION_KILL_GRACE))
+    while kill -0 "$version_probe_pid" 2>/dev/null \
+      && [ "$SECONDS" -lt "$grace_deadline" ]; do
+      sleep 0.1
+    done
+    if [ "$version_probe_group" -eq 1 ]; then
+      kill -KILL -- "-$version_probe_pid" 2>/dev/null || true
+    else
+      kill -KILL "$version_probe_pid" 2>/dev/null || true
+    fi
+    break
   done
 
   wait "$version_probe_pid" || status=$?
+  # A clean group leader can still have forked a child that inherited no pipe.
+  # Reap the group before accepting the version rather than trusting the leader.
+  if [ "$version_probe_group" -eq 1 ]; then
+    kill -KILL -- "-$version_probe_pid" 2>/dev/null || true
+  fi
   version_probe_pid=""
   VERSION_PROBE_RESULT="$(cat "$version_probe_output")"
   version_probe_bytes="$(wc -c < "$version_probe_output" | tr -d '[:space:]')"
   if [ "$version_probe_bytes" -ge "$MAX_BINARY_VERSION_OUTPUT_BYTES" ]; then
-    status=125
+    output_exceeded=1
   fi
-  if [ "$timed_out" -eq 1 ]; then
+  if [ "$output_exceeded" -eq 1 ]; then
+    status=125
+  elif [ "$timed_out" -eq 1 ]; then
     status=124
   fi
   rm -f "$version_probe_output"

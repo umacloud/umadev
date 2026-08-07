@@ -409,7 +409,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
   }
 
   function copyInstall() {
-    navigator.clipboard?.writeText("npm install -g umadev").catch(() => undefined);
+    navigator.clipboard?.writeText("npm install -g umadev --registry=https://registry.npmjs.org").catch(() => undefined);
     setCopied(true);
     if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
     copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
@@ -559,7 +559,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   <div className={styles.heroActionRow}>
                     <button className={styles.heroInstall} type="button" onClick={copyInstall}>
                       <span>$</span>
-                      <code>npm install -g umadev</code>
+                      <code>npm install -g umadev --registry=https://registry.npmjs.org</code>
                       <strong>{copied ? (lang === "zh" ? "已复制" : "COPIED") : (lang === "zh" ? "复制" : "COPY")}</strong>
                     </button>
                   </div>
@@ -973,7 +973,7 @@ export default function Home({ initialView }: { initialView?: View } = {}) {
                   {lang === "zh" ? "把你的底座，变成一支团队" : "Turn your base into a team"}
                 </h2>
                 <div className={styles.spaceCtaConsole}>
-                  <span className={styles.spaceCtaConsolePrompt}>$</span> npm install -g umadev
+                  <span className={styles.spaceCtaConsolePrompt}>$</span> npm install -g umadev --registry=https://registry.npmjs.org
                   <button className={`${styles.umaCopy} ${styles.umaMagnet} ${styles.spaceCtaCopy}`} onClick={copyInstall} onMouseMove={handleMagnetMove} onMouseLeave={handleMagnetLeave}>
                     {copied ? (lang === "zh" ? "已复制 ✓" : "Copied ✓") : (lang === "zh" ? "复制" : "Copy")}
                   </button>

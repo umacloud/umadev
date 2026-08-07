@@ -46,7 +46,8 @@ available; please avoid publishing exploit details beforehand.
 The npm-only `umadev@1.0.74` publication was not produced from this repository,
 has no matching Git tag or GitHub release, and contained an install-time
 JavaScript payload. It is malicious and must not be installed or executed. The
-last safe public release before the incident is `1.0.73`.
+last safe public release before the incident is `1.0.73`; `1.0.75` is the first
+recovery release produced by the hardened tokenless publishing pipeline.
 
 If `1.0.74` was installed, disconnect the host from the network, preserve a
 copy of the npm logs for investigation, remove the package, rotate npm and
@@ -70,11 +71,19 @@ integrity, registry signature, and npm provenance attestation. Release jobs
 also reject lifecycle scripts and unexpected package files before any registry
 write.
 
-Tag releases fail before artifact construction unless all publishing and native
-signing credentials are configured. macOS executables are signed with a
-Developer ID Application certificate, hardened runtime, and a secure timestamp,
-then submitted with `notarytool` and assessed by Gatekeeper. Windows executables
-are Authenticode-signed, RFC 3161 timestamped with SHA-256, and verified with
+Some third-party npm mirrors may continue serving a stale cached copy of the
+withdrawn `1.0.74`. Install or recover through the official registry explicitly:
+`npm install -g umadev --registry=https://registry.npmjs.org`. A mirror reporting
+a higher version is not release evidence; require the matching Git tag, GitHub
+Release, integrity, signatures, and provenance.
+
+Tag releases always require the protected tokenless publishing identity. Native
+signing is enabled only when the repository variable `SIGN_RELEASE=true`; in
+that mode the release fails before artifact construction unless every signing
+credential is configured. macOS executables are then signed with a Developer ID
+Application certificate, hardened runtime, and a secure timestamp, submitted
+with `notarytool`, and assessed by Gatekeeper. Windows executables are then
+Authenticode-signed, RFC 3161 timestamped with SHA-256, and verified with
 SignTool before checksums, npm packages, or GitHub attestations are created.
 
 The release workflow expects these repository or protected-environment secrets:
