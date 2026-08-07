@@ -41,10 +41,18 @@ fn with_mutation_lock<T>(
     project_root: &Path,
     operation: impl FnOnce() -> std::io::Result<T>,
 ) -> std::io::Result<T> {
+    with_mutation_lock_timeout(project_root, KNOWLEDGE_LOCK_TIMEOUT, operation)
+}
+
+fn with_mutation_lock_timeout<T>(
+    project_root: &Path,
+    timeout: Duration,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
     let root = RootedDir::open_no_follow(project_root)?;
     root.ensure_dir(Path::new(".umadev"), false)?;
     let lock = root.open_private_lock(Path::new(KNOWLEDGE_MUTATION_LOCK), false)?;
-    let deadline = Instant::now() + KNOWLEDGE_LOCK_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => break,
@@ -840,7 +848,10 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             workers.push(std::thread::spawn(move || {
                 barrier.wait();
-                add_knowledge(&root, &source, Some(&format!("entry-{index}")))
+                let name = format!("entry-{index}");
+                with_mutation_lock_timeout(&root, Duration::from_secs(30), || {
+                    add_knowledge_unlocked(&root, &source, Some(&name))
+                })
             }));
         }
         barrier.wait();

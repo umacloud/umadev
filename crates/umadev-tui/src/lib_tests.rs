@@ -2688,8 +2688,6 @@ impl Drop for EnvRestore {
     }
 }
 
-static OPENCODE_CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Serializes the resolve_goal_mode tests: they all read/write the process-global
 /// UMADEV_NO_GOAL_MODE env var, so without this the opt-out test set_var leaked into a
 /// concurrent sibling reader and flipped its expected Some(true) to None (a load-only
@@ -3455,7 +3453,7 @@ async fn offline_chat_never_returns_silence() {
 
 #[test]
 fn detect_base_model_reads_each_base_config() {
-    let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+    let _guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
     let _env = isolate_opencode_config_env();
     // The base's OWN model is read from its own config, in the base's order.
     let tmp = tempfile::TempDir::new().unwrap();
@@ -3496,7 +3494,7 @@ fn detect_base_model_reads_each_base_config() {
 
 #[test]
 fn detect_opencode_context_window_reads_provider_limit() {
-    let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+    let _guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
     let _env = isolate_opencode_config_env();
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
@@ -3532,7 +3530,7 @@ fn detect_opencode_context_window_reads_provider_limit() {
 
 #[test]
 fn detect_opencode_model_reads_legacy_dot_opencode_project_config() {
-    let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+    let _guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
     let _env = isolate_opencode_config_env();
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
@@ -3551,7 +3549,7 @@ fn detect_opencode_model_reads_legacy_dot_opencode_project_config() {
 
 #[test]
 fn detect_opencode_model_walks_parent_project_configs_to_workspace_boundary() {
-    let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+    let _guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
     let _env = isolate_opencode_config_env();
     let tmp = tempfile::TempDir::new().unwrap();
     let outer = tmp.path();
@@ -3597,7 +3595,7 @@ fn detect_opencode_model_walks_parent_project_configs_to_workspace_boundary() {
 
 #[test]
 fn detect_opencode_model_reads_session_model_object_shapes() {
-    let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+    let _guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
     let _env = isolate_opencode_config_env();
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
@@ -3632,7 +3630,7 @@ fn detect_opencode_model_reads_session_model_object_shapes() {
 
 #[test]
 fn detect_opencode_model_honors_env_config_sources() {
-    let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+    let _guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
     let _env = isolate_opencode_config_env();
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();
@@ -3671,7 +3669,7 @@ fn detect_opencode_model_honors_env_config_sources() {
 
 #[test]
 fn detect_opencode_model_honors_project_config_disable() {
-    let _guard = OPENCODE_CONFIG_ENV_LOCK.lock().unwrap();
+    let _guard = crate::config::CONFIG_ENV_LOCK.lock().unwrap();
     let _env = isolate_opencode_config_env();
     let tmp = tempfile::TempDir::new().unwrap();
     let root = tmp.path();

@@ -6,6 +6,12 @@ import { fileURLToPath } from "node:url";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(scriptDir, "..", "..");
+const workflowDir = path.join(repoRoot, ".github", "workflows");
+const allWorkflows = fs
+  .readdirSync(workflowDir)
+  .filter((name) => /\.ya?ml$/.test(name))
+  .sort()
+  .map((name) => [name, fs.readFileSync(path.join(workflowDir, name), "utf8")]);
 const workflow = fs.readFileSync(path.join(repoRoot, ".github", "workflows", "release.yml"), "utf8");
 const ciWorkflow = fs.readFileSync(path.join(repoRoot, ".github", "workflows", "ci.yml"), "utf8");
 const pagesWorkflow = fs.readFileSync(
@@ -23,6 +29,86 @@ function jobBlock(name) {
   const next = tail.search(/^  [a-zA-Z0-9_-]+:\n/m);
   return next === -1 ? tail : tail.slice(0, next);
 }
+
+test("external Actions are immutable and deprecated Node 20 pins cannot return", () => {
+  const externalRef = /^\s*(?:-\s+)?uses:\s+([^\s#]+)\s*(?:#.*)?$/gm;
+  const approvedRefs = new Map([
+    ["actions/attest", "actions/attest@a1948c3f048ba23858d222213b7c278aabede763"],
+    [
+      "actions/checkout",
+      "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803",
+    ],
+    [
+      "actions/deploy-pages",
+      "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128",
+    ],
+    [
+      "actions/download-artifact",
+      "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+    ],
+    ["actions/setup-node", "actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38"],
+    [
+      "actions/upload-artifact",
+      "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    ],
+    [
+      "actions/upload-pages-artifact",
+      "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9",
+    ],
+    [
+      "anchore/sbom-action",
+      "anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610",
+    ],
+    [
+      "dtolnay/rust-toolchain",
+      "dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30",
+    ],
+    [
+      "rustsec/audit-check",
+      "rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432",
+    ],
+    [
+      "Swatinem/rust-cache",
+      "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6",
+    ],
+  ]);
+  const seen = new Set();
+
+  for (const [name, source] of allWorkflows) {
+    let parsedUses = 0;
+    for (const match of source.matchAll(externalRef)) {
+      const ref = match[1];
+      parsedUses += 1;
+      if (ref.startsWith("./")) continue;
+      assert.match(
+        ref,
+        /^[^/@\s]+\/[^@\s]+@[0-9a-f]{40}$/,
+        `${name} has mutable Action ref ${ref}`,
+      );
+      const repository = ref.slice(0, ref.indexOf("@"));
+      assert.ok(
+        approvedRefs.has(repository),
+        `${name} added unaudited Action repository ${repository}`,
+      );
+      assert.equal(
+        ref,
+        approvedRefs.get(repository),
+        `${name} changed audited Action pin ${repository}`,
+      );
+      seen.add(ref);
+    }
+    const declaredUses = source.match(/\buses\s*:/g)?.length ?? 0;
+    assert.equal(
+      parsedUses,
+      declaredUses,
+      `${name} contains a uses declaration outside the audited line form`,
+    );
+  }
+
+  for (const ref of approvedRefs.values()) {
+    assert.ok(seen.has(ref), `missing approved Node 24 Action pin ${ref}`);
+  }
+});
 
 test("workflow_dispatch is validation-only even when dispatched on a tag", () => {
   assert.match(workflow, /^  workflow_dispatch:\s*$/m);

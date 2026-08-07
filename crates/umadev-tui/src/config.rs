@@ -30,6 +30,9 @@ const DIR_NAME: &str = ".umadev";
 /// model catalogs embedded by OpenCode.
 pub(crate) const MAX_USER_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 
+#[cfg(test)]
+pub(crate) static CONFIG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Read a small user-owned config through one already-open handle.
 ///
 /// Dotfile managers commonly expose these files through symlinks, so unlike
@@ -459,8 +462,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct RestoreXdg(Option<String>);
 
     impl Drop for RestoreXdg {
@@ -822,7 +823,7 @@ mod tests {
 
     #[test]
     fn default_path_honours_xdg_config_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = CONFIG_ENV_LOCK.lock().unwrap();
         let prev = std::env::var("XDG_CONFIG_HOME").ok();
         let _restore = RestoreXdg(prev);
         let tmp = TempDir::new().unwrap();

@@ -111,9 +111,10 @@ fn rotate_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{base}.audit-lock"))
 }
 
-fn acquire_audit_lock(
+fn acquire_audit_lock_with_timeout(
     root: &umadev_state::fs::RootedDir,
     path: &Path,
+    timeout: Duration,
 ) -> std::io::Result<AuditLock> {
     let lock_path = rotate_lock_path(path);
     let file = root.open_private_lock(&lock_path, false)?;
@@ -122,7 +123,7 @@ fn acquire_audit_lock(
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(AuditLock { _file: file }),
             Err(error) if umadev_state::fs::lock_error_is_contention(&error) => {
-                if started.elapsed() >= AUDIT_LOCK_TIMEOUT {
+                if started.elapsed() >= timeout {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::WouldBlock,
                         "audit trail is busy in another UmaDev process",
@@ -140,7 +141,7 @@ fn rotate_if_needed(path: &Path) {
     let Some((root, relative)) = test_rooted_file(path) else {
         return;
     };
-    let Ok(_lock) = acquire_audit_lock(&root, &relative) else {
+    let Ok(_lock) = acquire_audit_lock_with_timeout(&root, &relative, AUDIT_LOCK_TIMEOUT) else {
         return;
     };
     rotate_if_needed_locked(&root, &relative);
@@ -310,7 +311,16 @@ fn append_jsonl(
     path: &Path,
     line: &str,
 ) -> std::io::Result<()> {
-    let _lock = acquire_audit_lock(root, path).map_err(|error| {
+    append_jsonl_with_timeout(root, path, line, AUDIT_LOCK_TIMEOUT)
+}
+
+fn append_jsonl_with_timeout(
+    root: &umadev_state::fs::RootedDir,
+    path: &Path,
+    line: &str,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let _lock = acquire_audit_lock_with_timeout(root, path, timeout).map_err(|error| {
         std::io::Error::new(error.kind(), format!("acquire audit lock: {error}"))
     })?;
     // Hold the same OS lock across rotation and append. Otherwise a peer can
@@ -330,10 +340,15 @@ fn test_rooted_file(path: &Path) -> Option<(umadev_state::fs::RootedDir, PathBuf
 
 #[cfg(test)]
 fn append_jsonl_at(path: &Path, line: &str) -> std::io::Result<()> {
+    append_jsonl_at_with_timeout(path, line, AUDIT_LOCK_TIMEOUT)
+}
+
+#[cfg(test)]
+fn append_jsonl_at_with_timeout(path: &Path, line: &str, timeout: Duration) -> std::io::Result<()> {
     let (root, relative) = test_rooted_file(path).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "audit path has no parent")
     })?;
-    append_jsonl(&root, &relative, line)
+    append_jsonl_with_timeout(&root, &relative, line, timeout)
 }
 
 /// Append an API-audit record. Implements `UD-EVID-001`.
@@ -654,7 +669,8 @@ mod tests {
                         session_id: String::new(),
                     };
                     let serialized = serde_json::to_string(&rec).unwrap();
-                    append_jsonl_at(&live, &serialized).unwrap();
+                    append_jsonl_at_with_timeout(&live, &serialized, Duration::from_secs(30))
+                        .unwrap();
                 }
             }));
         }
@@ -696,7 +712,12 @@ mod tests {
         let writer = std::env::var("UMADEV_AUDIT_PROCESS_TEST_WRITER").unwrap();
         let live = Path::new(&root).join("tool-calls.jsonl");
         for line in 0..50 {
-            append_jsonl_at(&live, &format!(r#"{{"writer":"{writer}","line":{line}}}"#)).unwrap();
+            append_jsonl_at_with_timeout(
+                &live,
+                &format!(r#"{{"writer":"{writer}","line":{line}}}"#),
+                Duration::from_secs(30),
+            )
+            .unwrap();
         }
     }
 

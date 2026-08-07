@@ -232,6 +232,18 @@ fn run_pre_write_scoped(
     policy: &umadev_governance::Policy,
     scope: Option<&Path>,
 ) -> Decision {
+    run_pre_write_scoped_with_context_key(stdin, policy, scope, None)
+}
+
+/// Write-hook core with an optional explicit provenance key. Production leaves
+/// the key ambient; tests inject one rooted in their own temporary home so they
+/// never depend on or mutate the runner's process-global HOME.
+fn run_pre_write_scoped_with_context_key(
+    stdin: &str,
+    policy: &umadev_governance::Policy,
+    scope: Option<&Path>,
+    context_key: Option<&[u8]>,
+) -> Decision {
     // Self-limit: govern ONLY when UmaDev is itself driving this run/session
     // (it set `UMADEV_GOVERN_ROOT` on the base subprocess). Absent → the user is
     // driving the base directly; UmaDev passes EVERYTHING.
@@ -297,7 +309,10 @@ fn run_pre_write_scoped(
     // time. Conservative: a missing/unreadable context file resolves to
     // `ProjectContext::unknown()` (full strictness), and even under a static
     // context any file with its own server evidence is still governed normally.
-    let project_ctx = load_project_context(file_path);
+    let project_ctx = context_key.map_or_else(
+        || load_project_context(file_path),
+        |key| load_project_context_at(file_path, now_secs(), Some(key)),
+    );
     let decision =
         umadev_governance::scan_content_with_context(file_path, content, policy, project_ctx);
     // Governance is a SAFETY NET, not a gate on the base's hands. The product's
@@ -708,12 +723,17 @@ fn home_dir() -> Option<PathBuf> {
 /// so a symlinked home still matches. Fail-open: if home can't be resolved, we
 /// can't prove a match, so we DON'T block the install (the runtime self-limit in
 /// the hook itself is the second line of defence).
-fn is_home_claude(project_root: &Path) -> bool {
-    let Some(home) = home_dir() else {
+fn is_home_claude_at(project_root: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else {
         return false;
     };
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(project_root) == canon(&home)
+    canon(project_root) == canon(home)
+}
+
+fn is_home_claude(project_root: &Path) -> bool {
+    let home = home_dir();
+    is_home_claude_at(project_root, home.as_deref())
 }
 
 /// The hook subcommands UmaDev registers as a host (Pre/PostToolUse `command`s).
@@ -865,15 +885,23 @@ fn remove_claude_hooks_from_path(path: &Path, self_bin: Option<&str>) -> std::io
 /// the settings path on install, or `None` when the install was
 /// deliberately SKIPPED because `project_root` is the user's home directory
 /// (writing there would register the hook GLOBALLY and pollute every other
-/// project/tool — see [`is_home_claude`]). Skipping is fail-open: no error, just
+/// project/tool — see [`is_home_claude_at`]). Skipping is fail-open: no error, just
 /// no global install.
 pub fn install_claude_hook(
     project_root: &std::path::Path,
 ) -> std::io::Result<Option<std::path::PathBuf>> {
+    let home = home_dir();
+    install_claude_hook_at_home(project_root, home.as_deref())
+}
+
+fn install_claude_hook_at_home(
+    project_root: &std::path::Path,
+    home: Option<&Path>,
+) -> std::io::Result<Option<std::path::PathBuf>> {
     // Never install into the global `~/.claude` — that would govern the user's
     // whole environment (every other project + tool), exactly the over-reach we
     // are fixing. A project-level install (any non-home dir) is fine.
-    if is_home_claude(project_root) {
+    if is_home_claude_at(project_root, home) {
         return Ok(None);
     }
     let claude_dir = project_root.join(".claude");
@@ -1216,6 +1244,17 @@ mod tests {
         run_pre_write_scoped(payload, &umadev_governance::Policy::default(), Some(root))
     }
 
+    /// Run a context-sensitive hook test with provenance isolated beneath its
+    /// temporary project/home rather than the runner's process-global HOME.
+    fn pre_write_in_with_context_key(payload: &str, root: &Path, key: &[u8]) -> Decision {
+        run_pre_write_scoped_with_context_key(
+            payload,
+            &umadev_governance::Policy::default(),
+            Some(root),
+            Some(key),
+        )
+    }
+
     /// Run the bash hook AS IF UmaDev is driving a run (scope present).
     fn pre_bash(payload: &str) -> Decision {
         run_pre_bash_scoped(payload, true)
@@ -1335,9 +1374,6 @@ mod tests {
         let secret =
             r#"{"tool_name":"Write","tool_input":{"file_path":".env","content":"SECRET=x"}}"#;
         assert!(!run_pre_write_scoped(secret, &umadev_governance::Policy::default(), None).block);
-        // The public entry point reads the (unset, in this test process) env and
-        // also passes — proving the production default is fail-open.
-        assert!(!run_pre_write(emoji).block);
     }
 
     #[test]
@@ -1358,7 +1394,6 @@ mod tests {
         // dangerous one (UmaDev is not their general-purpose shell guard).
         let payload = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#;
         assert!(!run_pre_bash_scoped(payload, false).block);
-        assert!(!run_pre_bash(payload).block); // public entry, env unset → pass
     }
 
     #[test]
@@ -1728,20 +1763,12 @@ mod tests {
     fn install_refuses_global_home_claude() {
         // Installing into the user's HOME would register the hook GLOBALLY and
         // pollute every other project/tool — the worst over-reach. The guard must
-        // SKIP it (return None) and write NOTHING to ~/.claude. Hermetic: set HOME
-        // to a temp dir under a serialized lock.
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let prior_home = std::env::var_os("HOME");
-        let prior_profile = std::env::var_os("USERPROFILE");
-
+        // SKIP it (return None) and write NOTHING to ~/.claude. The home path is
+        // injected explicitly so this test never mutates process-global HOME.
         let fake_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", fake_home.path());
-        std::env::set_var("USERPROFILE", fake_home.path());
 
         // project_root == HOME → refused.
-        let out = install_claude_hook(fake_home.path()).unwrap();
+        let out = install_claude_hook_at_home(fake_home.path(), Some(fake_home.path())).unwrap();
         assert!(out.is_none(), "install into ~/.claude must be skipped");
         assert!(
             !fake_home.path().join(".claude").exists(),
@@ -1752,18 +1779,9 @@ mod tests {
         // refused, not its subdirectories — those are legitimate projects).
         let proj = fake_home.path().join("my-project");
         std::fs::create_dir_all(&proj).unwrap();
-        let out2 = install_claude_hook(&proj).unwrap();
+        let out2 = install_claude_hook_at_home(&proj, Some(fake_home.path())).unwrap();
         assert!(out2.is_some(), "a project under home still installs");
         assert!(proj.join(".claude/settings.local.json").is_file());
-
-        match prior_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prior_profile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
     }
 
     #[test]
@@ -1933,8 +1951,6 @@ mod tests {
         let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"x.ts"},"tool_response":{"success":true}}"#;
         assert!(run_post_tool_scoped(payload, tmp.path(), false).is_none());
         assert!(!tmp.path().join(".umadev").exists());
-        // The public entry reads the (unset, in this test process) env → also None.
-        assert!(run_post_tool(payload, tmp.path()).is_none());
     }
 
     #[test]
@@ -1962,29 +1978,31 @@ mod tests {
     /// STAMPED, as a real run writes it: an unstamped context has no provenance and is
     /// downgraded to full strictness on read (see [`load_project_context`]), so a fixture
     /// without the stamp would silently stop testing the lenient path at all.
-    fn project_with_context(static_frontend_only: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+    fn project_with_context(
+        static_frontend_only: bool,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        [u8; umadev_state::privacy::PROVENANCE_KEY_BYTES],
+    ) {
         let tmp = tempfile::TempDir::new().unwrap();
         // Canonicalize so the path the hook reconstructs (via ancestors) matches
         // even when the temp dir lives under a symlinked /var -> /private/var.
         let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let key = umadev_state::privacy::installation_key_in(&root).expect("provenance key");
         let dir = root.join(".umadev");
-        std::fs::create_dir_all(&dir).unwrap();
         let ctx = if static_frontend_only {
             ProjectContext::static_frontend()
         } else {
             ProjectContext::unknown()
         }
-        .derived_from(
-            "a static frontend page",
-            &umadev_state::privacy::installation_key().expect("provenance key"),
-            now_secs(),
-        );
+        .derived_from("a static frontend page", &key, now_secs());
         std::fs::write(
             dir.join("governance-context.json"),
             serde_json::to_string(&ctx).unwrap(),
         )
         .unwrap();
-        (tmp, root)
+        (tmp, root, key)
     }
 
     #[test]
@@ -1993,7 +2011,7 @@ mod tests {
         // a `{"static_frontend_only":true}` blob anyone could drop in must not stand the
         // server-surface rules down, and neither must one from a run months ago that no
         // longer describes this workspace.
-        let (_tmp, root) = project_with_context(true);
+        let (_tmp, root, _fixture_key) = project_with_context(true);
         let ctx_path = root.join(".umadev").join("governance-context.json");
         let key = [0x5a_u8; 32];
         let now = 1_800_000_000_u64;
@@ -2064,9 +2082,9 @@ mod tests {
 
     #[test]
     fn static_context_skips_csp_clickjacking_on_index_html() {
-        let (_tmp, root) = project_with_context(true);
+        let (_tmp, root, key) = project_with_context(true);
         let file = root.join("index.html");
-        let d = pre_write_in(&write_payload(&file, &static_html()), &root);
+        let d = pre_write_in_with_context_key(&write_payload(&file, &static_html()), &root, &key);
         assert!(
             !d.block,
             "static-frontend context must skip CSP/clickjacking on index.html: {}",
@@ -2080,9 +2098,9 @@ mod tests {
         // the write hook lets it through on ANY context (the post-write QC scan
         // catches it). This is the architecture fix — the hook only refuses the
         // irreversible floor, never pins the base's hands for a fixable nit.
-        let (_tmp, root) = project_with_context(false); // strict context
+        let (_tmp, root, key) = project_with_context(false); // strict context
         let file = root.join("index.html");
-        let d = pre_write_in(&write_payload(&file, &static_html()), &root);
+        let d = pre_write_in_with_context_key(&write_payload(&file, &static_html()), &root, &key);
         assert!(
             !d.block,
             "a surface rule must be deferred to QC, never block the write: {}",
@@ -2101,10 +2119,14 @@ mod tests {
 
     #[test]
     fn static_context_skips_logging_and_rng_on_app_js() {
-        let (_tmp, root) = project_with_context(true);
+        let (_tmp, root, key) = project_with_context(true);
         // Browser console logging -- UD-ARCH-012 structured-logging surface rule.
         let log_js = format!("{}.{}('boot ok');", "console", "error");
-        let d = pre_write_in(&write_payload(&root.join("app.js"), &log_js), &root);
+        let d = pre_write_in_with_context_key(
+            &write_payload(&root.join("app.js"), &log_js),
+            &root,
+            &key,
+        );
         assert!(
             !d.block,
             "static frontend needs no structured logger: {}",
@@ -2113,7 +2135,11 @@ mod tests {
         // Non-crypto RNG for a local UI id -- UD-ARCH-043 token-context RNG rule.
         let rng = format!("{}.{}()", "Math", "random");
         let rng_js = format!("const sessionKey = {rng}.toString(36); list.push(sessionKey);");
-        let d2 = pre_write_in(&write_payload(&root.join("app.js"), &rng_js), &root);
+        let d2 = pre_write_in_with_context_key(
+            &write_payload(&root.join("app.js"), &rng_js),
+            &root,
+            &key,
+        );
         assert!(
             !d2.block,
             "static frontend: a local UI id is not a security token: {}",
@@ -2130,11 +2156,10 @@ mod tests {
         let secret = secret_content();
 
         // (a) proven static-frontend context
-        let (_t1, r1) = project_with_context(true);
-        assert!(
-            pre_write_in(&write_payload(&r1.join("cfg.js"), &secret), &r1).block,
-            "secret must block under a static context"
-        );
+        let (_t1, r1, key1) = project_with_context(true);
+        let decision =
+            pre_write_in_with_context_key(&write_payload(&r1.join("cfg.js"), &secret), &r1, &key1);
+        assert!(decision.block, "secret must block under a static context");
 
         // (b) project root with .umadev/ but NO context file → strict default
         let t2 = tempfile::TempDir::new().unwrap();
@@ -2199,10 +2224,11 @@ mod tests {
         // scan still finds it, the write hook lets it through so the base can
         // produce the file — the post-write QC governance scan repairs it. (This is
         // the inverse of the old behavior, where emoji blocked the write.)
-        let (_tmp, root) = project_with_context(true);
-        let d = pre_write_in(
+        let (_tmp, root, key) = project_with_context(true);
+        let d = pre_write_in_with_context_key(
             &write_payload(&root.join("app.js"), "const x = '\u{1F680}';"),
             &root,
+            &key,
         );
         assert!(
             !d.block,
@@ -2214,8 +2240,12 @@ mod tests {
     fn sensitive_path_blocks_under_static_context() {
         // UD-SEC-001 is a bypass-immune safety floor -- a static-frontend context
         // must NOT let a write into .env through (when UmaDev IS driving).
-        let (_tmp, root) = project_with_context(true);
-        let d = pre_write_in(&write_payload(&root.join(".env"), "SECRET=x"), &root);
+        let (_tmp, root, key) = project_with_context(true);
+        let d = pre_write_in_with_context_key(
+            &write_payload(&root.join(".env"), "SECRET=x"),
+            &root,
+            &key,
+        );
         assert!(d.block, "UD-SEC-001 must block regardless of context");
         assert_eq!(d.clause, "UD-SEC-001");
     }
@@ -2232,6 +2262,14 @@ mod tests {
 
         std::env::remove_var(GOVERN_ROOT_ENV);
         assert!(govern_root().is_none(), "unset → None (not driving)");
+        let write =
+            r#"{"tool_name":"Write","tool_input":{"file_path":".env","content":"SECRET=x"}}"#;
+        let bash = r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"}}"#;
+        let post = r#"{"tool_name":"Write","tool_input":{"file_path":"x.ts"},"tool_response":{"success":true}}"#;
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!run_pre_write(write).block);
+        assert!(!run_pre_bash(bash).block);
+        assert!(run_post_tool(post, tmp.path()).is_none());
 
         std::env::set_var(GOVERN_ROOT_ENV, "");
         assert!(govern_root().is_none(), "empty value → None (fail-open)");
