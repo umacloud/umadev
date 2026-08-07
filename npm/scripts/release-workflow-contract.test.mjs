@@ -121,7 +121,7 @@ test("workflow_dispatch is validation-only even when dispatched on a tag", () =>
 test("credential, signing, attestation, and npm artifact steps require a tag push", () => {
   const protectedSteps = [
     "Require GitHub Pages to allow this release tag",
-    "Require npm Trusted Publishing for tags",
+    "Require modern npm provenance support for tags",
     "Require native signing credentials for tags",
     "Developer ID sign and notarize (macOS)",
     "Authenticode sign and timestamp (Windows)",
@@ -170,30 +170,44 @@ test("npm publication re-verifies tag and commit provenance before publish", () 
   assert.match(block, /"\$GITHUB_REF_NAME" "\$GITHUB_SHA"/);
 });
 
-test("npm publication is OIDC-only and rejects lifecycle payloads", () => {
+test("npm token publication remains scoped and generates OIDC provenance", () => {
   const credentials = jobBlock("release-credentials");
   const publish = jobBlock("publish-npm");
   assert.match(publish, /^    environment: npm-production$/m);
   assert.match(publish, /^      id-token: write$/m);
   assert.match(publish, /package-manager-cache: false/);
-  assert.match(publish, /UMADEV_TRUSTED_PUBLISHING: "1"/);
+  assert.match(publish, /NPM_TOKEN: \$\{\{ secrets\.NPM_TOKEN \}\}/);
+  assert.match(publish, /UMADEV_NPM_AUTH_MODE: "token"/);
   assert.match(publish, /NPM_CONFIG_PROVENANCE: "true"/);
+  assert.match(publish, /NPM_CONFIG_USERCONFIG: \$\{\{ runner\.temp \}\}\/umadev-release\.npmrc/);
+  assert.match(publish, /umask 077/);
+  assert.match(publish, /_authToken=\$\{NPM_TOKEN\}/);
+  assert.match(publish, /trap 'rm -f "\$NPM_CONFIG_USERCONFIG"' EXIT/);
   assert.match(workflow, /^  NPM_CONFIG_REGISTRY: "https:\/\/registry\.npmjs\.org"$/m);
   assert.match(pagesWorkflow, /^  NPM_CONFIG_REGISTRY: "https:\/\/registry\.npmjs\.org"$/m);
+  const releaseWithoutPublish = workflow.replace(publish, "");
   for (const [name, source] of allWorkflows) {
+    const checked = name === "release.yml" ? releaseWithoutPublish : source;
     assert.doesNotMatch(
-      source,
+      checked,
       /registry-url:/i,
       `${name}: setup-node registry-url injects a dummy auth configuration`,
     );
-    assert.doesNotMatch(source, /^\s+(?:NODE_AUTH_TOKEN|NPM_TOKEN):\s*/im);
-    assert.doesNotMatch(source, /_authToken|NPM_CONFIG_USERCONFIG/i);
+    assert.doesNotMatch(checked, /^\s+(?:NODE_AUTH_TOKEN|NPM_TOKEN):\s*/im);
+    assert.doesNotMatch(checked, /_authToken|NPM_CONFIG_USERCONFIG/i);
   }
-  assert.match(credentials, /long-lived npm credentials are forbidden/);
+  assert.match(credentials, /credentials must be scoped to the npm-production publish step/);
   const script = fs.readFileSync(path.join(repoRoot, "npm", "scripts", "publish.sh"), "utf8");
   assert.match(script, /release-package-contract\.mjs/);
+  assert.match(script, /UMADEV_NPM_AUTH_MODE/);
+  assert.match(script, /token mode requires npm provenance/);
+  assert.match(script, /scoped npm-production userconfig/);
+  assert.match(script, /-L "\$expected_userconfig"/);
+  assert.match(script, /stat -c '%a' "\$expected_userconfig"\)" != "600"/);
   assert.match(script, /UMADEV_TRUSTED_PUBLISHING/);
   assert.match(script, /--tag latest/);
+  assert.match(script, /npm pack "\$dir" --ignore-scripts/);
+  assert.match(script, /npm publish "\$tarball" --ignore-scripts/);
   assert.doesNotMatch(script, /--tag staging|npm dist-tag (?:add|rm)|^\s*npm whoami/m);
 });
 

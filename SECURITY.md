@@ -77,7 +77,7 @@ withdrawn `1.0.74`. Install or recover through the official registry explicitly:
 a higher version is not release evidence; require the matching Git tag, GitHub
 Release, integrity, signatures, and provenance.
 
-Tag releases always require the protected tokenless publishing identity. Native
+Tag releases always require a protected publishing identity. Native
 signing is enabled only when the repository variable `SIGN_RELEASE=true`; in
 that mode the release fails before artifact construction unless every signing
 credential is configured. macOS executables are then signed with a Developer ID
@@ -92,14 +92,19 @@ The release workflow expects these repository or protected-environment secrets:
   `APPLE_SIGNING_IDENTITY`;
 - `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_SPECIFIC_PASSWORD`;
 - `WINDOWS_CERTIFICATE_PFX_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD`.
+- `NPM_TOKEN`, a freshly issued granular token scoped to the nine public UmaDev
+  packages, stored only in the protected `npm-production` environment.
 
-npm publication is tokenless. Every UmaDev npm package must configure npm
-Trusted Publishing for repository `umacloud/umadev` and workflow
-`release.yml`; the GitHub `npm-production` environment must protect the publish
-job. Package settings must require two-factor authentication and disallow
-token-based publication. The workflow requires npm 11.5.1 or newer, requests an
-OIDC identity token only in the publish job, and publishes with provenance. It
-fails closed if `NODE_AUTH_TOKEN` or `NPM_TOKEN` is present.
+npm publication uses explicit token authentication only inside the protected
+`npm-production` publish step. The workflow writes a temporary npmrc containing
+only an environment-variable placeholder, never the token bytes, and keeps
+`id-token: write` plus npm provenance enabled so every package remains linked to
+the GitHub tag workflow. It rejects credentials injected into any earlier job,
+an unselected authentication mode, missing provenance, or a userconfig outside
+the runner's temporary directory. The environment secret must be deleted and
+the npm token revoked after release verification. Trusted Publishing remains
+the preferred steady-state replacement once all nine package connections are
+configured.
 
 Certificates and passwords are decoded only on their native ephemeral runner and
 are deleted before the job ends. A manual non-tag workflow run may build unsigned

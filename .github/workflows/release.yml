@@ -315,11 +315,10 @@ jobs:
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         with:
           node-version: ${{ env.UMADEV_RELEASE_NODE }}
-      # npm is always part of a tagged release. Trusted Publishing exchanges the
-      # workflow's short-lived OIDC identity inside `npm publish`; `npm whoami`
-      # cannot test that identity. Verify the runner is capable and make the
-      # absence of the retired long-lived token an explicit release contract.
-      - name: Require npm Trusted Publishing for tags
+      # npm is always part of a tagged release. Keep credentials out of this
+      # global gate: the one-time token is scoped to the npm-production job,
+      # while GitHub's OIDC identity remains available there for provenance.
+      - name: Require modern npm provenance support for tags
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         run: |
@@ -328,12 +327,12 @@ jobs:
           node - "$version" <<'NODE'
           const [major = 0, minor = 0, patch = 0] = process.argv[2].split('.').map(Number);
           if (major < 11 || (major === 11 && (minor < 5 || (minor === 5 && patch < 1)))) {
-            console.error(`npm ${process.argv[2]} is too old for Trusted Publishing (need >=11.5.1)`);
+            console.error(`npm ${process.argv[2]} is too old for verified publication (need >=11.5.1)`);
             process.exit(1);
           }
           NODE
           if [[ -n "${NODE_AUTH_TOKEN:-}" || -n "${NPM_TOKEN:-}" ]]; then
-            echo '::error::long-lived npm credentials are forbidden; configure Trusted Publishing'
+            echo '::error::npm credentials must be scoped to the npm-production publish step'
             exit 1
           fi
 
@@ -1226,9 +1225,17 @@ jobs:
       # bin/cli.js. publish.sh therefore skips the model package.
       - name: npm publish (platforms + main)
         env:
-          UMADEV_TRUSTED_PUBLISHING: "1"
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          UMADEV_NPM_AUTH_MODE: "token"
           NPM_CONFIG_PROVENANCE: "true"
-        run: ./npm/scripts/publish.sh
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/umadev-release.npmrc
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' '//registry.npmjs.org/:_authToken=${NPM_TOKEN}' > "$NPM_CONFIG_USERCONFIG"
+          trap 'rm -f "$NPM_CONFIG_USERCONFIG"' EXIT
+          ./npm/scripts/publish.sh
 
   deploy-website:
     name: deploy website from release tag

@@ -5,8 +5,9 @@
 # Assumes:
 #   - `stage.sh` has already populated each `npm/cli-<platform>/bin/`
 #     with the matching prebuilt binary and tag/commit provenance manifest.
-#   - every package has this GitHub workflow configured as its npm Trusted
-#     Publisher. Production publishing intentionally accepts no long-lived token.
+#   - authentication is explicitly selected by the GitHub tag workflow. The
+#     token path is scoped to npm-production and still uses GitHub OIDC solely
+#     to generate provenance for every published tarball.
 #   - All package.json versions are aligned (this script does NOT bump).
 #
 # Use `--dry-run` to validate without actually publishing.
@@ -129,7 +130,10 @@ PACKAGE_DIRS+=("$KNOWLEDGE_STAGE" "$MAIN_STAGE")
 
 TARBALLS=()
 for dir in "${PACKAGE_DIRS[@]}"; do
-  pack_json="$(npm pack "$dir" --pack-destination "$PACK_ROOT" --json)"
+  # The token is present only in the protected publish step. Even though the
+  # exact file contract rejects lifecycle scripts, npm must not execute a
+  # prepack/prepare payload before that contract gets a chance to inspect it.
+  pack_json="$(npm pack "$dir" --ignore-scripts --pack-destination "$PACK_ROOT" --json)"
   filename="$(node -e '
     const fs = require("node:fs");
     const result = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -193,17 +197,48 @@ remote_version() {
 # Validate the complete registry state before publishing one package. In
 # particular, an old tag rerun must never move `latest` backwards.
 if [[ -z "$DRY_RUN" ]]; then
-  # npm exchanges GitHub's short-lived OIDC identity only inside `npm publish`;
-  # `npm whoami` cannot test it. Fail closed if a legacy credential was injected,
-  # so a stolen repository secret can never silently become the publish path.
-  if [[ -n "${NODE_AUTH_TOKEN:-}" || -n "${NPM_TOKEN:-}" ]]; then
-    echo "publish.sh: refusing long-lived npm credentials; use Trusted Publishing (OIDC)" >&2
-    exit 1
-  fi
-  if [[ "${UMADEV_TRUSTED_PUBLISHING:-}" != "1" ]]; then
-    echo "publish.sh: production publish is restricted to the Trusted Publishing workflow" >&2
-    exit 1
-  fi
+  # Authentication must be selected explicitly; merely injecting a credential
+  # can never switch the release path. Token bytes live only in the environment,
+  # while the temporary npmrc contains the literal substitution placeholder.
+  case "${UMADEV_NPM_AUTH_MODE:-}" in
+    token)
+      if [[ -z "${NPM_TOKEN:-}" || -n "${NODE_AUTH_TOKEN:-}" ]]; then
+        echo "publish.sh: token mode requires only NPM_TOKEN" >&2
+        exit 1
+      fi
+      if [[ "${NPM_CONFIG_PROVENANCE:-}" != "true" ]]; then
+        echo "publish.sh: token mode requires npm provenance" >&2
+        exit 1
+      fi
+      expected_userconfig="${RUNNER_TEMP:-}/umadev-release.npmrc"
+      if [[ -z "${RUNNER_TEMP:-}" \
+          || "${NPM_CONFIG_USERCONFIG:-}" != "$expected_userconfig" \
+          || ! -f "$expected_userconfig" \
+          || -L "$expected_userconfig" \
+          || "$(stat -c '%a' "$expected_userconfig")" != "600" \
+          || "$(wc -l < "$expected_userconfig" | tr -d ' ')" != "1" \
+          || "$(cat "$expected_userconfig")" != '//registry.npmjs.org/:_authToken=${NPM_TOKEN}' ]]; then
+        echo "publish.sh: token mode requires the scoped npm-production userconfig" >&2
+        exit 1
+      fi
+      PUBLISH_AUTH_LABEL="token authentication with GitHub provenance"
+      ;;
+    oidc)
+      if [[ -n "${NODE_AUTH_TOKEN:-}" || -n "${NPM_TOKEN:-}" ]]; then
+        echo "publish.sh: OIDC mode refuses reusable npm credentials" >&2
+        exit 1
+      fi
+      if [[ "${UMADEV_TRUSTED_PUBLISHING:-}" != "1" ]]; then
+        echo "publish.sh: OIDC mode requires Trusted Publishing" >&2
+        exit 1
+      fi
+      PUBLISH_AUTH_LABEL="Trusted Publishing"
+      ;;
+    *)
+      echo "publish.sh: select token or oidc authentication explicitly" >&2
+      exit 1
+      ;;
+  esac
   for tarball in "${TARBALLS[@]}"; do
     manifest="$(tar -xOf "$tarball" package/package.json)"
     name="$(node -p 'JSON.parse(process.argv[1]).name' "$manifest")"
@@ -255,9 +290,9 @@ for tarball in "${TARBALLS[@]}"; do
     continue
   fi
 
-  echo "▶ publish.sh: npm publish $name@$version through Trusted Publishing..."
+  echo "▶ publish.sh: npm publish $name@$version through $PUBLISH_AUTH_LABEL..."
   publish_status=0
-  publish_output="$(npm publish "$tarball" --access public --tag latest 2>&1)" || publish_status=$?
+  publish_output="$(npm publish "$tarball" --ignore-scripts --access public --tag latest 2>&1)" || publish_status=$?
   printf '%s\n' "$publish_output"
 
   if ((publish_status != 0)); then
@@ -280,10 +315,9 @@ for tarball in "${TARBALLS[@]}"; do
 done
 
 # Every package is published directly under `latest` in dependency order, with
-# `umadev` last. Trusted Publishing deliberately authenticates only publish/stage
-# operations, not a later `npm dist-tag` mutation. Publishing the launcher last
-# preserves the same atomic user-facing boundary without retaining a reusable
-# registry token solely for tag promotion.
+# `umadev` last. There is no later `npm dist-tag` mutation: publishing the
+# launcher last preserves the atomic user-facing boundary and confines the
+# temporary registry credential to the publish operations themselves.
 if [[ -z "$DRY_RUN" ]]; then
   for tarball in "${TARBALLS[@]}"; do
     manifest="$(tar -xOf "$tarball" package/package.json)"
