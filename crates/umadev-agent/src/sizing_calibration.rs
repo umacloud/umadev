@@ -247,6 +247,16 @@ pub fn load(project_root: &Path) -> SizingStats {
 /// missing dir, unreadable file, busy lock past the bound, or write error is swallowed
 /// — recording is telemetry and never changes the run outcome.
 pub fn record(project_root: &Path, class: &str, predicted: SizeRank, actual: SizeRank) {
+    record_with_lock_budget(project_root, class, predicted, actual, LOCK_RETRY_BUDGET);
+}
+
+fn record_with_lock_budget(
+    project_root: &Path,
+    class: &str,
+    predicted: SizeRank,
+    actual: SizeRank,
+    lock_retry_budget: Duration,
+) {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK
         .lock()
@@ -264,7 +274,7 @@ pub fn record(project_root: &Path, class: &str, predicted: SizeRank, actual: Siz
     let Ok(lock) = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)) else {
         return;
     };
-    if !umadev_state::fs::try_lock_exclusive_bounded(&lock, LOCK_RETRY_BUDGET)
+    if !umadev_state::fs::try_lock_exclusive_bounded(&lock, lock_retry_budget)
         .is_ok_and(|acquired| acquired)
     {
         return;
@@ -603,13 +613,23 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let held = umadev_state::fs::open_private_lock(&dir.join(LOCK_FILENAME)).unwrap();
         fs2::FileExt::lock_exclusive(&held).unwrap();
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(5));
-            drop(held);
+        let root = tmp.path().to_path_buf();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let recorder = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            record_with_lock_budget(
+                &root,
+                "build",
+                SizeRank::Light,
+                SizeRank::Heavy,
+                Duration::from_secs(5),
+            );
         });
 
-        record(tmp.path(), "build", SizeRank::Light, SizeRank::Heavy);
-        release.join().unwrap();
+        ready_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        drop(held);
+        recorder.join().unwrap();
 
         let value = load(tmp.path())
             .classes
