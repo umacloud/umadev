@@ -2474,7 +2474,32 @@ struct SubagentOutputGate {
     grouper: SubagentGrouper,
     live: std::collections::BTreeSet<String>,
     held_main: Vec<SessionEvent>,
+    /// Running byte size of `held_main`, so a lost background terminal signal (an id
+    /// stuck in `live` forever) cannot silently buffer main-line output without bound.
+    held_main_bytes: usize,
+    /// Set for the rest of the turn once `held_main` overflowed its ceiling: the gate
+    /// stops deferring and shows main output live (fail-open), so a wedged `live` set
+    /// can never hide the main agent or masquerade as an idle hang.
+    deferral_broken: bool,
     pending_done: Option<SessionEvent>,
+}
+
+/// Fail-open ceiling on buffered main-line output while a background sub-agent is
+/// live. A normal deferral (a few seconds of main streaming while a sub-agent runs)
+/// is small; only a genuinely wedged turn — a background sub-agent whose terminal
+/// `Finished`/`Live` signal was dropped — grows past this, and on exceed the gate
+/// flushes and stops hiding the main agent. Generous so a legitimately busy turn is
+/// never cut over to live early.
+const HELD_MAIN_CAP_BYTES: usize = 256 * 1024;
+
+/// Byte size a held event contributes to [`SubagentOutputGate::held_main_bytes`].
+/// `held_main` only ever holds streamed main-line text/thinking deltas (the hold
+/// gate matches only those), so this is exact.
+fn held_event_bytes(event: &SessionEvent) -> usize {
+    match event {
+        SessionEvent::TextDelta(text) | SessionEvent::ThinkingDelta(text) => text.len(),
+        _ => 0,
+    }
 }
 
 impl SubagentOutputGate {
@@ -2503,12 +2528,21 @@ impl SubagentOutputGate {
         for event in events {
             if main_stream_delta
                 && !self.live.is_empty()
+                && !self.deferral_broken
                 && matches!(
                     &event,
                     SessionEvent::TextDelta(_) | SessionEvent::ThinkingDelta(_)
                 )
             {
+                self.held_main_bytes = self
+                    .held_main_bytes
+                    .saturating_add(held_event_bytes(&event));
                 self.held_main.push(event);
+                if self.held_main_bytes > HELD_MAIN_CAP_BYTES {
+                    // The live set has evidently lost a terminal signal — release
+                    // everything held and stop deferring for the rest of the turn.
+                    self.break_deferral(&mut out);
+                }
                 continue;
             }
 
@@ -2530,13 +2564,15 @@ impl SubagentOutputGate {
                 event @ SessionEvent::TurnDone {
                     status: TurnStatus::Completed,
                     ..
-                } if !self.live.is_empty() => {
+                } if !self.live.is_empty() && !self.deferral_broken => {
                     if self.pending_done.is_none() {
                         self.pending_done = Some(event);
                     }
                 }
                 event @ SessionEvent::TurnDone { .. } => {
                     out.append(&mut self.held_main);
+                    self.held_main_bytes = 0;
+                    self.deferral_broken = false;
                     self.pending_done = None;
                     out.push(event);
                 }
@@ -2567,14 +2603,34 @@ impl SubagentOutputGate {
 
     fn release_deferred(&mut self, out: &mut Vec<SessionEvent>) {
         out.append(&mut self.held_main);
+        self.held_main_bytes = 0;
+        self.deferral_broken = false;
         if let Some(done) = self.pending_done.take() {
             out.push(done);
         }
     }
 
+    /// Fail OPEN when `held_main` overflowed its ceiling: a background sub-agent's
+    /// terminal `Finished`/`Live` signal was evidently lost (its id is stuck in
+    /// `live`), so flush every held frame (sub-agent buffers, held main-line output,
+    /// any deferred `TurnDone`) and stop deferring for the rest of the turn. Without
+    /// this the main agent would go silent and the turn would masquerade as an idle
+    /// hang even though the base was streaming the whole time.
+    fn break_deferral(&mut self, out: &mut Vec<SessionEvent>) {
+        out.extend(self.grouper.flush_all());
+        out.append(&mut self.held_main);
+        if let Some(done) = self.pending_done.take() {
+            out.push(done);
+        }
+        self.held_main_bytes = 0;
+        self.deferral_broken = true;
+    }
+
     fn finish_stream(&mut self) -> Vec<SessionEvent> {
         let mut out = self.grouper.flush_all();
         out.append(&mut self.held_main);
+        self.held_main_bytes = 0;
+        self.deferral_broken = false;
         self.pending_done = None;
         out
     }
@@ -5046,6 +5102,61 @@ mod tests {
             &evs[2],
             &parse_stdout_line(report)[0],
             "the main-line final report event is untouched"
+        );
+    }
+
+    #[test]
+    fn held_main_fails_open_when_a_background_signal_is_lost() {
+        // A background sub-agent starts but its terminal `task_notification` is NEVER
+        // sent (a dropped signal / crashed agent), so its id is stuck in `live`. The
+        // main agent keeps streaming. Without a ceiling, every main delta is held
+        // forever → the agent goes silent and the turn masquerades as an idle hang.
+        // The fail-open cap must release held output and stop deferring once it grows
+        // past HELD_MAIN_CAP_BYTES.
+        let mut gate = SubagentOutputGate::default();
+        let started = r#"{"type":"system","subtype":"task_started","task_id":"bg_lost","task_type":"agent","subagent_type":"Explore"}"#;
+        let started_out = gate.on_line(started);
+        assert!(
+            matches!(
+                started_out.as_slice(),
+                [SessionEvent::BackgroundTask(BackgroundTaskSignal::Started { id })] if id == "bg_lost"
+            ),
+            "the task_started surfaces and marks the sub-agent live: {started_out:?}"
+        );
+
+        // A main-line text delta (no parent_tool_use_id) worth ~64 KiB each.
+        let big_delta = || {
+            let text = "x".repeat(64 * 1024);
+            format!(
+                r#"{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{text}"}}}}}}"#
+            )
+        };
+        // Below the cap the deltas are HELD (the base is streaming but the user sees
+        // nothing yet — normal deferral while a sub-agent is live).
+        for _ in 0..4 {
+            assert!(
+                gate.on_line(&big_delta()).is_empty(),
+                "main output is held while a sub-agent is live and under the cap"
+            );
+        }
+        // The delta that pushes held_main past the ceiling FLUSHES everything held —
+        // the wedged `live` set can no longer hide the main agent.
+        let released = gate.on_line(&big_delta());
+        assert!(
+            released
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TextDelta(_))),
+            "held main output is released once the cap is exceeded: {} events",
+            released.len()
+        );
+        // Deferral is now broken for the rest of the turn: further main output flows
+        // LIVE instead of being buffered behind the lost signal.
+        let after = gate.on_line(&big_delta());
+        assert!(
+            after
+                .iter()
+                .any(|e| matches!(e, SessionEvent::TextDelta(_))),
+            "after overflow, main deltas are emitted live, not re-held: {after:?}"
         );
     }
 
