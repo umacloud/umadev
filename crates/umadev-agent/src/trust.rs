@@ -902,6 +902,16 @@ fn requires_confirmation_rooted(
     target_path: &str,
     workspace_root: Option<&Path>,
 ) -> bool {
+    // 0) A capability-WIDENING request — the base asking to expand its own sandbox
+    //    (gain network / out-of-cwd filesystem access). This is consequential like
+    //    the ordinary network reach, so it escalates under Guarded/Plan and runs
+    //    freely only under Auto. Without this a HEADLESS Guarded run (no live user)
+    //    classified `permission-expansion` as a reversible shell action and SILENTLY
+    //    auto-granted the widen (bug audit F3); escalating makes headless Guarded
+    //    fail closed to a deny instead. Auto keeps its autonomy contract.
+    if command.trim() == "permission-expansion" {
+        return mode != TrustMode::Auto;
+    }
     // 1) Irreversible floor — tier-aware ([`floor_escalates`]): the disaster
     //    classes escalate in EVERY mode; the ordinary network reach escalates in
     //    guarded/plan but runs freely under Auto.
@@ -3548,6 +3558,25 @@ mod tests {
         assert!(!ledger.remembers_rooted("", out_of_tree_abs(), root));
         // An irreversible-floor action is never remembered (its class is None).
         assert!(!ledger.remembers_rooted("git push origin main", "", root));
+    }
+
+    #[test]
+    fn permission_expansion_escalates_under_guarded_and_plan_but_not_auto() {
+        // A base's capability-widen request (gain network / out-of-cwd fs) must not be
+        // silently auto-granted in a HEADLESS Guarded run: Guarded and Plan escalate
+        // (a headless run then denies fail-closed), while Auto keeps its autonomy.
+        assert!(
+            requires_confirmation(TrustMode::Guarded, "permission-expansion", "network"),
+            "Guarded must confirm a sandbox-widen request"
+        );
+        assert!(
+            requires_confirmation(TrustMode::Plan, "permission-expansion", "network"),
+            "Plan must confirm a sandbox-widen request"
+        );
+        assert!(
+            !requires_confirmation(TrustMode::Auto, "permission-expansion", "network"),
+            "Auto keeps its autonomy for a sandbox-widen request"
+        );
     }
 
     #[test]
