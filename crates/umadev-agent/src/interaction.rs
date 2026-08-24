@@ -659,7 +659,15 @@ pub(crate) fn take_steer() -> Vec<String> {
         .try_with(|i| i.steer.clone())
         .ok()
         .flatten()
-        .and_then(|q| q.lock().ok().map(|mut v| std::mem::take(&mut *v)))
+        // Recover a poisoned lock instead of dropping the user's queued steer input:
+        // `.lock().ok()` would map a poisoned mutex to None and silently discard every
+        // mid-run steering directive. Matches the codebase-wide poison convention
+        // (claude_session / context) — the guarded body is only a push/take, so the
+        // data behind a poisoned lock is still valid to drain.
+        .map(|q| {
+            let mut queued = q.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *queued)
+        })
         .unwrap_or_default()
 }
 
