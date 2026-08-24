@@ -874,8 +874,15 @@ impl BaseSession for ClaudeSession {
         req_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), SessionError> {
-        let pending = self.pending_control(req_id);
-        let payload = legacy_approval_payload(decision, pending.as_ref());
+        // Answered-once guard (mirrors codex `answered` / opencode `remove-or-Ok`): a
+        // req_id whose pending control is already gone was answered, or was withdrawn
+        // by claude (`control_cancel_request`) and is no longer awaited. Writing a
+        // second control_response — built from a None pending, so a degraded deny — is
+        // a contradictory frame for a tool claude already resolved. No-op instead.
+        let Some(pending) = self.pending_control(req_id) else {
+            return Ok(());
+        };
+        let payload = legacy_approval_payload(decision, Some(&pending));
         let line = control_response_line(req_id, &payload);
         self.write_line(&line)
             .await
@@ -889,8 +896,12 @@ impl BaseSession for ClaudeSession {
         req_id: &str,
         response: HostResponse,
     ) -> Result<(), SessionError> {
-        let pending = self.pending_control(req_id);
-        let payload = typed_host_response_payload(response, pending.as_ref());
+        // Answered-once guard (see `respond`): a withdrawn/already-answered req_id no
+        // longer has a pending control; a late answer must not double-write to claude.
+        let Some(pending) = self.pending_control(req_id) else {
+            return Ok(());
+        };
+        let payload = typed_host_response_payload(response, Some(&pending));
         let line = control_response_line(req_id, &payload);
         self.write_line(&line)
             .await
