@@ -2092,6 +2092,14 @@ const SUBAGENT_BUFFER_CAP_BYTES: usize = 32 * 1024;
 /// a missed label degrades to the plain marker header, never an error.
 const SUBAGENT_LABELS_CAP: usize = 128;
 
+/// Bound on the number of concurrently OPEN sub-agent buffers. Per-buffer bytes are
+/// already capped ([`SUBAGENT_BUFFER_CAP_BYTES`]), but a buffer only closes on its
+/// terminating id — so a lost terminal signal (a `parent_tool_use_id` that never
+/// receives its `tool_result`/`task_notification`) would otherwise let the buffer
+/// COUNT grow one per distinct pid without bound. On overflow the OLDEST buffer is
+/// flushed and dropped (fail-open — its content is emitted, never silently lost).
+const SUBAGENT_BUFFERS_CAP: usize = 64;
+
 /// Suffix on the ONE lightweight "working" row yielded when a sub-agent buffer
 /// OPENS, so the spawn is visible immediately while its output is grouped.
 /// Hardcoded CJK next to [`SUBAGENT_MARKER`] by the same convention (driver-level
@@ -2362,6 +2370,13 @@ impl SubagentGrouper {
         let pos = if let Some(p) = self.buffers.iter().position(|b| b.id == pid) {
             p
         } else {
+            if self.buffers.len() >= SUBAGENT_BUFFERS_CAP {
+                // Count backstop: a buffer whose terminating id was lost would never
+                // close. Flush and drop the OLDEST open buffer (fail-open — its held
+                // content is emitted, never silently dropped) before opening a new one.
+                let oldest = self.buffers.remove(0);
+                out.extend(render_subagent_flush(&oldest.label, &oldest.entries, false));
+            }
             let label = self.label_for(pid);
             out.push(SessionEvent::ToolCall {
                 name: subagent_working_row(&label),
@@ -5157,6 +5172,49 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, SessionEvent::TextDelta(_))),
             "after overflow, main deltas are emitted live, not re-held: {after:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_buffer_count_caps_and_flushes_the_oldest() {
+        // Per-buffer bytes are capped, but a buffer only closes on its terminating id.
+        // A lost terminal signal would let the buffer COUNT grow one per distinct pid
+        // without bound. The count cap must flush+drop the OLDEST (fail-open) on
+        // overflow so nothing the sub-agent produced is silently lost.
+        let mut g = SubagentGrouper::default();
+        let delta = |pid: &str| {
+            format!(
+                r#"{{"type":"stream_event","parent_tool_use_id":"{pid}","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"work by {pid} "}}}}}}"#
+            )
+        };
+        // Open exactly the cap: each distinct pid emits one working row, none flush.
+        for i in 0..SUBAGENT_BUFFERS_CAP {
+            let evs = g.on_line(&delta(&format!("pid_{i}")));
+            assert_eq!(
+                evs.len(),
+                1,
+                "buffer {i} opens with one working row: {evs:?}"
+            );
+        }
+        assert_eq!(g.buffers.len(), SUBAGENT_BUFFERS_CAP);
+        // One more distinct pid overflows: the OLDEST (pid_0) flushes before the new
+        // buffer opens, and the count stays capped.
+        let evs = g.on_line(&delta("pid_over"));
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                SessionEvent::ToolResult { summary, .. } if summary.contains("pid_0")
+            )),
+            "the oldest buffer's held content is flushed on overflow: {evs:?}"
+        );
+        assert_eq!(
+            g.buffers.len(),
+            SUBAGENT_BUFFERS_CAP,
+            "buffer count stays capped"
+        );
+        assert!(
+            !g.buffers.iter().any(|b| b.id == "pid_0"),
+            "the oldest buffer was dropped after flushing"
         );
     }
 
