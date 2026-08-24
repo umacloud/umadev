@@ -4233,6 +4233,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "getrandom 0.2.17",
  "nix 0.29.0",
  "reqwest",
  "semver",

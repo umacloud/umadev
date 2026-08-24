@@ -3527,10 +3527,24 @@ pub fn serve_args() -> Vec<String> {
     ]
 }
 
-/// A random server password for the loopback-only `opencode serve`. Not a
-/// secret-grade RNG — it only fences a 127.0.0.1 server from a same-host
-/// process that doesn't know the value; derived from time + pid + an address.
+/// A random server password for the loopback-only `opencode serve`. It fences a
+/// 127.0.0.1 server from any same-host process that doesn't know the value, so it
+/// is filled from the OS CSPRNG (16 bytes → 32 hex chars): the previous
+/// time+pid+stack-address derivation was low-entropy and partly predictable (pid
+/// range, coarse time), which a co-tenant process could brute-force within the
+/// ephemeral-port range. The time+pid fallback runs only if the OS RNG is
+/// unavailable (essentially impossible on supported platforms), so the server is
+/// never left password-less.
 fn random_password() -> String {
+    let mut bytes = [0u8; 16];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        use std::fmt::Write as _;
+        let mut password = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(password, "{byte:02x}");
+        }
+        return password;
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
