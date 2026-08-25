@@ -93,7 +93,12 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
 
     // Wait for a rendered frame rather than racing startup on slower Windows CI,
     // then prove that the full input decoder and slash-command route can quit it.
-    let render_deadline = Instant::now() + Duration::from_secs(15);
+    // Generous cold-start grace, NOT a behavioural assertion: a healthy TUI renders
+    // its first frame in well under a second, so this only matters when a loaded CI
+    // runner's ConPTY hand-off + binary launch is slow — the exact timing flake that
+    // hit terminal-contract-windows (passed on re-run). 60s removes it without
+    // changing what the test verifies. (Mirrors the PowerShell cold-start grace fix.)
+    let render_deadline = Instant::now() + Duration::from_secs(60);
     let mut cursor_position_answered_at: Option<Instant> = None;
     loop {
         let (rendered, requested_cursor_position) = {
@@ -156,7 +161,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
         })
         .expect("expand native pseudo-terminal");
 
-    let repaint_deadline = Instant::now() + Duration::from_secs(5);
+    let repaint_deadline = Instant::now() + Duration::from_secs(20);
     while captured.lock().expect("lock terminal capture").len() <= bytes_before_resize {
         assert!(
             Instant::now() < repaint_deadline,
@@ -176,7 +181,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
         .expect("send bracketed multiline CJK paste");
     writer.flush().expect("flush bracketed multiline CJK paste");
 
-    let paste_deadline = Instant::now() + Duration::from_secs(5);
+    let paste_deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let rendered = captured
             .lock()
@@ -239,7 +244,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
             .expect("send raw ConPTY multiline paste burst");
         writer.flush().expect("flush raw ConPTY paste burst");
 
-        let raw_paste_deadline = Instant::now() + Duration::from_secs(5);
+        let raw_paste_deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let rendered_marker = captured
                 .lock()
@@ -279,7 +284,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
         .write_all(format!("/quit {SUBMIT_SYNC}").as_bytes())
         .expect("type synchronized /quit command");
     writer.flush().expect("flush synchronized /quit text");
-    let command_deadline = Instant::now() + Duration::from_secs(5);
+    let command_deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let rendered = {
             let bytes = captured.lock().expect("lock terminal capture");
@@ -310,7 +315,7 @@ fn tui_handles_resize_multiline_cjk_paste_and_quit_through_native_pty() {
     writer.write_all(submit).expect("press Enter after /quit");
     writer.flush().expect("flush /quit submit key");
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let (status, timed_out) = loop {
         if let Some(status) = child.try_wait().expect("poll UmaDev child") {
             break (status, false);
