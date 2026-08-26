@@ -13,7 +13,7 @@ UmaDev itself doesn't write code: the brain stays in the base. The team decides 
 
 ```bash
 # 1. Install
-npm install -g umadev
+npm install -g @umatech/umadev
 
 # 2. Initialize a project
 cd my-project

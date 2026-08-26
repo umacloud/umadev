@@ -11,7 +11,7 @@
 ## Install
 
 ```bash
-npm install -g umadev
+npm install -g @umatech/umadev
 ```
 
 ## Use

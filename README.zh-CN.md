@@ -117,7 +117,7 @@ flowchart LR
 推荐用 npm 安装预编译二进制：
 
 ```bash
-npm install -g umadev --registry=https://registry.npmjs.org
+npm install -g @umatech/umadev --registry=https://registry.npmjs.org
 ```
 
 **Linux 上不要用 sudo。** npm 默认前缀（`/usr/local`）属主是 root，普通用户 `npm i -g` 会 `EACCES`；而 `sudo npm i -g` 看似「解决」了，实则在 npm 前缀里留下一棵 **root 属主**的目录树——之后你以普通用户执行的每一条 npm 全局命令（`npm update -g`、`npm i -g <任何包>`）都会 `EACCES`，且 npm 会整体回滚，**连带**你的其它全局包（含底座 CLI `@anthropic-ai/claude-code`、`@openai/codex`）也再也更新不动。正确做法是换一个你自己拥有的前缀：
@@ -125,17 +125,17 @@ npm install -g umadev --registry=https://registry.npmjs.org
 ```bash
 npm config set prefix ~/.npm-global
 export PATH="$HOME/.npm-global/bin:$PATH"   # 写进 ~/.zshrc 或 ~/.bashrc
-npm install -g umadev --registry=https://registry.npmjs.org
+npm install -g @umatech/umadev --registry=https://registry.npmjs.org
 ```
 
 或者干脆不做全局安装——不改前缀、不用 sudo、不占 PATH：
 
 ```bash
-npx --yes --registry=https://registry.npmjs.org umadev       # 直接运行官方包
-npm i umadev --registry=https://registry.npmjs.org && npx umadev # 或先作为项目本地依赖安装
+npx --yes --registry=https://registry.npmjs.org @umatech/umadev       # 直接运行官方包
+npm i @umatech/umadev --registry=https://registry.npmjs.org && npx umadev # 或先作为项目本地依赖安装
 ```
 
-（不带 `-g` 的 `npm i umadev` 是能装上的，只是 npm 按设计**不会**把本地命令挂到 PATH 上，直接敲 `umadev` 会提示 command not found——这不是装坏了，用 `npx umadev` 运行即可。）
+（不带 `-g` 的 `npm i @umatech/umadev` 是能装上的，只是 npm 按设计**不会**把本地命令挂到 PATH 上，直接敲 `umadev` 会提示 command not found——这不是装坏了，用 `npx umadev` 运行即可。）
 
 **请使用 npm 官方 registry。** 部分第三方镜像仍缓存着已撤下的恶意 `1.0.74`；上面显式指定 `--registry=https://registry.npmjs.org`，可避免旧镜像继续下发该版本。
 

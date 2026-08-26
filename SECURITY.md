@@ -73,7 +73,7 @@ write.
 
 Some third-party npm mirrors may continue serving a stale cached copy of the
 withdrawn `1.0.74`. Install or recover through the official registry explicitly:
-`npm install -g umadev --registry=https://registry.npmjs.org`. A mirror reporting
+`npm install -g @umatech/umadev --registry=https://registry.npmjs.org`. A mirror reporting
 a higher version is not release evidence; require the matching Git tag, GitHub
 Release, integrity, signatures, and provenance.
 

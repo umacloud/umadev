@@ -1,6 +1,6 @@
 # UmaDev — npm distribution
 
-This directory packages UmaDev for `npm install -g umadev`. End
+This directory packages UmaDev for `npm install -g @umatech/umadev`. End
 users only ever see the `umadev` name; the multi-package layout is
 the standard pattern used by `esbuild`, `biome`, `swc`, `@tailwindcss/oxide`,
 etc. to ship a prebuilt Rust binary via npm without forcing every user
@@ -10,7 +10,7 @@ to download every platform's binary.
 
 ```
 npm/
-├── umadev/                        ← the user-facing package (`npm i -g umadev`)
+├── umadev/                        ← the user-facing package (`npm i -g @umatech/umadev`)
 │   ├── package.json                  ← optionalDependencies for every platform
 │   ├── bin/cli.js                    ← thin JS shim, resolves + execs the binary
 │   └── README.md                     ← end-user README rendered on the npm page
@@ -39,7 +39,7 @@ Every platform sub-package declares `os` / `cpu` in its `package.json`:
 ```
 
 The main `umadev` package lists all seven platform packages and the knowledge
-corpus under `optionalDependencies`. When a user runs `npm i -g umadev`, npm:
+corpus under `optionalDependencies`. When a user runs `npm i -g @umatech/umadev`, npm:
 
 1. Tries to install every `optionalDependency`.
 2. Silently skips any whose `os` / `cpu` does not match the current host.

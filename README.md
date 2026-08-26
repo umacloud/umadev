@@ -54,7 +54,7 @@ It's a single Rust binary. npm is just the delivery shell.
 ## Install
 
 ```bash
-npm install -g umadev --registry=https://registry.npmjs.org
+npm install -g @umatech/umadev --registry=https://registry.npmjs.org
 ```
 
 **On Linux, don't reach for `sudo`.** The default npm prefix (`/usr/local`) is root-owned, so `npm i -g` there fails with `EACCES` — and `sudo npm i -g` "fixes" it by writing a **root-owned** tree into the npm prefix, which then breaks every *later* non-root npm command on that prefix (`npm update -g`, `npm i -g <anything>`) with `EACCES`. npm aborts the whole transaction, so your **other** global packages — including your base CLI (`@anthropic-ai/claude-code`, `@openai/codex`) — can no longer be updated either. Use a prefix you own instead:
@@ -62,17 +62,17 @@ npm install -g umadev --registry=https://registry.npmjs.org
 ```bash
 npm config set prefix ~/.npm-global
 export PATH="$HOME/.npm-global/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc
-npm install -g umadev --registry=https://registry.npmjs.org
+npm install -g @umatech/umadev --registry=https://registry.npmjs.org
 ```
 
 Or skip the global install entirely — no prefix, no sudo, nothing on PATH:
 
 ```bash
-npx --yes --registry=https://registry.npmjs.org umadev       # run the official package directly
-npm i umadev --registry=https://registry.npmjs.org && npx umadev # or install it locally first
+npx --yes --registry=https://registry.npmjs.org @umatech/umadev       # run the official package directly
+npm i @umatech/umadev --registry=https://registry.npmjs.org && npx umadev # or install it locally first
 ```
 
-(`npm i umadev` without `-g` installs fine, but npm deliberately does **not** put a local command on PATH — bare `umadev` will say "command not found". That's npm, not a broken install: run it as `npx umadev`.)
+(`npm i @umatech/umadev` without `-g` installs fine, but npm deliberately does **not** put a local command on PATH — bare `umadev` will say "command not found". That's npm, not a broken install: run it as `npx umadev`.)
 
 **Use the official npm registry.** Some third-party mirrors still cache the withdrawn malicious `1.0.74`; the explicit `--registry=https://registry.npmjs.org` above prevents a stale mirror from serving it.
 
