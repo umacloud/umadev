@@ -1268,7 +1268,7 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           packages=(
-            umadev
+            @umatech/umadev
             @umatech/cli-darwin-arm64
             @umatech/cli-darwin-x64
             @umatech/cli-linux-x64
