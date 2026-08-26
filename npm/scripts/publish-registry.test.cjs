@@ -27,7 +27,7 @@ test('npm publish waits beyond the old six-read visibility window', () => {
         printf '%s' "$reads" >"$counter"
         if ((reads >= 8)); then printf '%s' 'sha512-expected'; fi
       }
-      wait_for_remote_integrity '@umacloud/example' '1.2.3' 'sha512-expected'
+      wait_for_remote_integrity '@umatech/example' '1.2.3' 'sha512-expected'
       cat "$counter"
     `,
     {
@@ -45,7 +45,7 @@ test('npm publish rejects visible content with a different integrity', () => {
     String.raw`
       source "$1"
       remote_integrity() { printf '%s' 'sha512-other'; }
-      wait_for_remote_integrity '@umacloud/example' '1.2.3' 'sha512-expected'
+      wait_for_remote_integrity '@umatech/example' '1.2.3' 'sha512-expected'
     `,
     {
       UMADEV_NPM_VISIBILITY_ATTEMPTS: '10',

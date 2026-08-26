@@ -222,11 +222,11 @@ test("publication waits for the immediately preceding GitHub and npm release", (
   assert.ok(orderGate >= 0, "missing predecessor publication gate");
   assert.ok(createRelease > orderGate, "GitHub Release can become visible before the order gate");
   assert.match(block, /stable_versions\[1\]/);
-  assert.match(block, /npm view umadev@latest version/);
+  assert.match(block, /npm view @umatech\/umadev@latest version/);
   assert.match(block, /github_latest.*v\$previous/);
   assert.match(block, /npm_latest.*\$previous/);
   assert.match(block, /timeout --signal=TERM --kill-after=5s 30s[\s\\]+gh release view/);
-  assert.match(block, /timeout --signal=TERM --kill-after=5s 30s[\s\\]+npm view umadev@latest version/);
+  assert.match(block, /timeout --signal=TERM --kill-after=5s 30s[\s\\]+npm view @umatech\/umadev@latest version/);
 });
 
 test("Pages cannot be manually or concurrently downgraded from the current public release", () => {
@@ -242,7 +242,7 @@ test("Pages cannot be manually or concurrently downgraded from the current publi
   assert.match(pagesWorkflow, /"\$sha" == "\$GITHUB_SHA"/);
   assert.match(pagesWorkflow, /gh release view "\$expected_tag"[\s\S]*--json isDraft,tagName/);
   assert.match(pagesWorkflow, /gh release view --repo "\$GITHUB_REPOSITORY"[\s\S]*--json tagName/);
-  assert.match(pagesWorkflow, /npm view umadev@latest version/);
+  assert.match(pagesWorkflow, /npm view @umatech\/umadev@latest version/);
   assert.match(pagesWorkflow, /"\$github_latest" == "\$expected_tag"/);
   assert.match(pagesWorkflow, /"\$npm_latest" == "\$version"/);
 });

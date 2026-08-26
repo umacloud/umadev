@@ -36,28 +36,28 @@ const {
 
 function trustedUpdateManifest(version) {
   const dependencies = [
-    '@umacloud/cli-darwin-arm64',
-    '@umacloud/cli-darwin-x64',
-    '@umacloud/cli-linux-arm64',
-    '@umacloud/cli-linux-musl-arm64',
-    '@umacloud/cli-linux-musl-x64',
-    '@umacloud/cli-linux-x64',
-    '@umacloud/cli-win32-x64',
-    '@umacloud/knowledge',
+    '@umatech/cli-darwin-arm64',
+    '@umatech/cli-darwin-x64',
+    '@umatech/cli-linux-arm64',
+    '@umatech/cli-linux-musl-arm64',
+    '@umatech/cli-linux-musl-x64',
+    '@umatech/cli-linux-x64',
+    '@umatech/cli-win32-x64',
+    '@umatech/knowledge',
   ];
   return {
-    name: 'umadev',
+    name: '@umatech/umadev',
     version,
     repository: { type: 'git', url: 'git+https://github.com/umacloud/umadev.git' },
     bin: { umadev: 'bin/cli.js' },
     optionalDependencies: Object.fromEntries(dependencies.map((name) => [name, version])),
     dist: {
-      tarball: `https://registry.npmjs.org/umadev/-/umadev-${version}.tgz`,
+      tarball: `https://registry.npmjs.org/@umatech/umadev/-/umadev-${version}.tgz`,
       integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
       fileCount: 5,
       signatures: [{ keyid: 'test', sig: 'test' }],
       attestations: {
-        url: `https://registry.npmjs.org/-/npm/v1/attestations/umadev@${version}`,
+        url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@${version}`,
         provenance: { predicateType: 'https://slsa.dev/provenance/v1' },
       },
     },
@@ -99,12 +99,12 @@ test('terminal contract: package and executable versions agree through Unicode p
       retryDelay: 100,
     }),
   );
-  const packageRoot = path.join(root, '用户 空格', 'node_modules', 'umadev');
+  const packageRoot = path.join(root, '用户 空格', 'node_modules', '@umatech', 'umadev');
   const platformRoot = path.join(
     root,
     '用户 空格',
     'node_modules',
-    '@umacloud',
+    '@umatech',
     platformLeaf,
   );
   const binary = path.join(
@@ -118,11 +118,11 @@ test('terminal contract: package and executable versions agree through Unicode p
   const version = process.versions.node;
   fs.writeFileSync(
     path.join(packageRoot, 'package.json'),
-    `${JSON.stringify({ name: 'umadev', version })}\n`,
+    `${JSON.stringify({ name: '@umatech/umadev', version })}\n`,
   );
   fs.writeFileSync(
     path.join(platformRoot, 'package.json'),
-    `${JSON.stringify({ name: `@umacloud/${platformLeaf}`, version })}\n`,
+    `${JSON.stringify({ name: `@umatech/${platformLeaf}`, version })}\n`,
   );
   fs.copyFileSync(process.execPath, binary);
   fs.chmodSync(binary, 0o755);
@@ -137,7 +137,7 @@ test('terminal contract: package and executable versions agree through Unicode p
 
   fs.writeFileSync(
     path.join(platformRoot, 'package.json'),
-    `${JSON.stringify({ name: `@umacloud/${platformLeaf}`, version: '0.0.1' })}\n`,
+    `${JSON.stringify({ name: `@umatech/${platformLeaf}`, version: '0.0.1' })}\n`,
   );
   assert.equal(versionStateMatches(installedVersionState(packageRoot), version), false);
 });
@@ -181,9 +181,9 @@ test('terminal contract: updater accepts only inert Trusted Publishing releases'
   for (const name of Object.keys(lifecyclePayload.optionalDependencies)) {
     lifecyclePayload.optionalDependencies[name] = '1.0.74';
   }
-  lifecyclePayload.dist.tarball = 'https://registry.npmjs.org/umadev/-/umadev-1.0.74.tgz';
+  lifecyclePayload.dist.tarball = 'https://registry.npmjs.org/@umatech/umadev/-/umadev-1.0.74.tgz';
   lifecyclePayload.dist.attestations.url =
-    'https://registry.npmjs.org/-/npm/v1/attestations/umadev@1.0.74';
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@1.0.74';
   assert.match(validateTrustedUpdateManifest(lifecyclePayload).reason, /lifecycle scripts/);
 
   const noProvenance = structuredClone(clean);
@@ -191,12 +191,12 @@ test('terminal contract: updater accepts only inert Trusted Publishing releases'
   assert.match(validateTrustedUpdateManifest(noProvenance).reason, /provenance/);
 
   const splitDependency = structuredClone(clean);
-  splitDependency.optionalDependencies['@umacloud/knowledge'] = '1.0.72';
+  splitDependency.optionalDependencies['@umatech/knowledge'] = '1.0.72';
   assert.match(validateTrustedUpdateManifest(splitDependency).reason, /dependency set/);
 
   assert.equal(
     exactUpdateCommand('npm', '1.0.73', true),
-    'npm install -g umadev@1.0.73 --registry=https://registry.npmjs.org --force',
+    'npm install -g @umatech/umadev@1.0.73 --registry=https://registry.npmjs.org --force',
   );
   assert.throws(() => exactUpdateCommand('npm', 'latest; touch /tmp/owned'));
 });
@@ -238,10 +238,10 @@ test('terminal contract: updater cleanup preserves fresh package-manager staging
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev-staging-cleanup-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const nodeModules = path.join(root, 'node_modules');
-  const packageRoot = path.join(nodeModules, 'umadev');
-  const fresh = path.join(nodeModules, '.umadev-FreshTxn');
-  const stale = path.join(nodeModules, '.umadev-StaleTxn');
-  const unrelated = path.join(nodeModules, '.another-package-StaleTxn');
+  const packageRoot = path.join(nodeModules, '@umatech', 'umadev');
+  const fresh = path.join(nodeModules, '@umatech', '.umadev-FreshTxn');
+  const stale = path.join(nodeModules, '@umatech', '.umadev-StaleTxn');
+  const unrelated = path.join(nodeModules, '@umatech', '.another-package-StaleTxn');
   for (const directory of [packageRoot, fresh, stale, unrelated]) {
     fs.mkdirSync(directory, { recursive: true });
   }
@@ -497,8 +497,8 @@ test(
   async (t) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev 占用更新-'));
     const nodeModules = path.join(root, '用户 空格', 'node_modules');
-    const packageRoot = path.join(nodeModules, 'umadev');
-    const platformRoot = path.join(nodeModules, '@umacloud', 'cli-win32-x64');
+    const packageRoot = path.join(nodeModules, '@umatech', 'umadev');
+    const platformRoot = path.join(nodeModules, '@umatech', 'cli-win32-x64');
     const binary = path.join(platformRoot, 'bin', 'umadev.exe');
     const binDir = path.join(root, 'manager bin');
     fs.mkdirSync(path.join(packageRoot, 'bin'), { recursive: true });
@@ -509,11 +509,11 @@ test(
     const expected = '999.0.0';
     fs.writeFileSync(
       path.join(packageRoot, 'package.json'),
-      `${JSON.stringify({ name: 'umadev', version: expected })}\n`,
+      `${JSON.stringify({ name: '@umatech/umadev', version: expected })}\n`,
     );
     fs.writeFileSync(
       path.join(platformRoot, 'package.json'),
-      `${JSON.stringify({ name: '@umacloud/cli-win32-x64', version: expected })}\n`,
+      `${JSON.stringify({ name: '@umatech/cli-win32-x64', version: expected })}\n`,
     );
     fs.copyFileSync(process.execPath, binary);
 
@@ -592,7 +592,7 @@ test(
     assert.match(text, /Windows EPERM/);
     assert.match(
       text,
-      /npm install -g umadev@999\.0\.0 --registry=https:\/\/registry\.npmjs\.org --force/,
+      /npm install -g @umatech\/umadev@999\.0\.0 --registry=https:\/\/registry\.npmjs\.org --force/,
     );
     assert.match(text, /where umadev/);
     assert.doesNotMatch(text, /upgraded and verified|repaired and verified/);

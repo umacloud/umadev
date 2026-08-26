@@ -78,3 +78,6 @@ AGENTS.md
 /UMADEV.md
 /super_dev/
 /.playwright-mcp/
+
+# smoke.sh / release staging artifacts (generated, never committed)
+npm/cli-*/bin/umadev.provenance.json
