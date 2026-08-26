@@ -1,6 +1,6 @@
 {
   "name": "@umatech/knowledge",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "UmaDev curated engineering knowledge corpus (standards, methodologies, expert playbooks, design systems, miniprogram/uniapp guides). Platform-independent data shipped once so npm users get the full KB offline.",
   "license": "MIT",
   "repository": {

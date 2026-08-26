@@ -19,7 +19,7 @@ for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
   if (!entry.isDirectory() || !fs.existsSync(file)) continue;
   const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
   pkg.version = next;
-  if (pkg.name === 'umadev') {
+  if (pkg.name === '@umatech/umadev') {
     for (const name of Object.keys(pkg.optionalDependencies || {})) {
       if (name.startsWith('@umatech/')) pkg.optionalDependencies[name] = next;
     }

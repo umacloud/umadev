@@ -2,6 +2,21 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.1.1] - 2026-08-26
+
+npm 发布渠道迁移到 @umatech · 自更新器修复
+
+### 变更(npm 发布身份迁移)
+
+- 原 npm 账号(及未加 scope 的 `umadev` 包名)不再可用,全部已发布包迁移到 `@umatech` scope。GitHub 仓库不变:模型下载、自更新、可信仓库来源校验等所有 `github.com/umacloud/umadev` 地址保持不动。
+- 主包 `umadev` → `@umatech/umadev`(命令名仍是 `umadev`);7 个平台包 + knowledge + model-e5-small → `@umatech/*`。
+- 安装命令改为:`npm i -g @umatech/umadev`。
+
+### 修复(自更新器)
+
+- 启动器的 `umadev update` 之前在 1.1.0 里仍指向旧的未加 scope 包名(注册表查询、安装命令、清单校验、tarball/attestation 校验、遗留暂存目录清理),会把已发布的 @umatech 版本误判为“已是最新”而无法自更新。本版将全部指向 `@umatech/umadev` 并把清理逻辑收敛到单一 `@umatech` scope 目录(scoped 主包布局)。
+- 二进制自更新回退命令与 `umadev doctor` 的重装提示同步更新为 `@umatech/umadev`。
+
 ## [1.1.0] - 2026-08-26
 
 供应链暴露面彻底加固 · 五镜头 bug 深审 · 交互健壮性修复
