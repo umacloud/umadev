@@ -64,19 +64,19 @@ for (const { file, manifest } of packages) {
 }
 
 const publishedDependencies = [
-  '@umacloud/cli-darwin-arm64',
-  '@umacloud/cli-darwin-x64',
-  '@umacloud/cli-linux-arm64',
-  '@umacloud/cli-linux-musl-arm64',
-  '@umacloud/cli-linux-musl-x64',
-  '@umacloud/cli-linux-x64',
-  '@umacloud/cli-win32-x64',
-  '@umacloud/knowledge',
+  '@umatech/cli-darwin-arm64',
+  '@umatech/cli-darwin-x64',
+  '@umatech/cli-linux-arm64',
+  '@umatech/cli-linux-musl-arm64',
+  '@umatech/cli-linux-musl-x64',
+  '@umatech/cli-linux-x64',
+  '@umatech/cli-win32-x64',
+  '@umatech/knowledge',
 ].sort();
 const expectedManifests = [
   ...publishedDependencies,
-  '@umacloud/model-e5-small', // archived manifest; the model ships on GitHub Releases
-  'umadev',
+  '@umatech/model-e5-small', // archived manifest; the model ships on GitHub Releases
+  '@umatech/umadev',
 ].sort();
 const actualManifests = [...packagesByName.keys()].sort();
 if (JSON.stringify(actualManifests) !== JSON.stringify(expectedManifests)) {
@@ -85,7 +85,7 @@ if (JSON.stringify(actualManifests) !== JSON.stringify(expectedManifests)) {
   );
 }
 
-const main = packagesByName.get('umadev');
+const main = packagesByName.get('@umatech/umadev');
 if (!main) fail('the main umadev npm package is missing');
 if (main.bin?.umadev !== 'bin/cli.js') {
   fail(`umadev bin mapping must be umadev=bin/cli.js, got ${JSON.stringify(main.bin)}`);
@@ -101,14 +101,14 @@ if (main.engines?.node !== '>=18') {
 // cpu, libc, or files declaration can make a correct binary impossible for npm
 // to select (or allow it onto an incompatible machine) while publish succeeds.
 const platformContracts = new Map([
-  ['@umacloud/cli-darwin-arm64', { os: ['darwin'], cpu: ['arm64'] }],
-  ['@umacloud/cli-darwin-x64', { os: ['darwin'], cpu: ['x64'] }],
-  ['@umacloud/cli-linux-arm64', { os: ['linux'], cpu: ['arm64'], libc: 'glibc' }],
-  ['@umacloud/cli-linux-musl-arm64', { os: ['linux'], cpu: ['arm64'], libc: 'musl' }],
-  ['@umacloud/cli-linux-musl-x64', { os: ['linux'], cpu: ['x64'], libc: 'musl' }],
-  ['@umacloud/cli-linux-x64', { os: ['linux'], cpu: ['x64'], libc: 'glibc' }],
+  ['@umatech/cli-darwin-arm64', { os: ['darwin'], cpu: ['arm64'] }],
+  ['@umatech/cli-darwin-x64', { os: ['darwin'], cpu: ['x64'] }],
+  ['@umatech/cli-linux-arm64', { os: ['linux'], cpu: ['arm64'], libc: 'glibc' }],
+  ['@umatech/cli-linux-musl-arm64', { os: ['linux'], cpu: ['arm64'], libc: 'musl' }],
+  ['@umatech/cli-linux-musl-x64', { os: ['linux'], cpu: ['x64'], libc: 'musl' }],
+  ['@umatech/cli-linux-x64', { os: ['linux'], cpu: ['x64'], libc: 'glibc' }],
   // Windows on ARM runs the x64 build through the OS compatibility layer.
-  ['@umacloud/cli-win32-x64', { os: ['win32'], cpu: ['x64', 'arm64'] }],
+  ['@umatech/cli-win32-x64', { os: ['win32'], cpu: ['x64', 'arm64'] }],
 ]);
 for (const [name, expected] of platformContracts) {
   const manifest = packagesByName.get(name);
@@ -129,11 +129,11 @@ for (const [name, expected] of platformContracts) {
   }
 }
 
-const knowledge = packagesByName.get('@umacloud/knowledge');
+const knowledge = packagesByName.get('@umatech/knowledge');
 if (JSON.stringify(knowledge?.files) !== JSON.stringify(['**/*.md'])) {
-  fail(`@umacloud/knowledge files must be ["**/*.md"], got ${JSON.stringify(knowledge?.files)}`);
+  fail(`@umatech/knowledge files must be ["**/*.md"], got ${JSON.stringify(knowledge?.files)}`);
 }
-const archivedModel = packagesByName.get('@umacloud/model-e5-small');
+const archivedModel = packagesByName.get('@umatech/model-e5-small');
 const expectedModelFiles = ['README.md', 'config.json', 'model.safetensors', 'tokenizer.json'];
 const actualModelFiles = [...(archivedModel?.files ?? [])].sort();
 if (JSON.stringify(actualModelFiles) !== JSON.stringify(expectedModelFiles)) {

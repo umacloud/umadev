@@ -5,24 +5,24 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PLATFORM_BINARIES = new Map([
-  ["@umacloud/cli-darwin-arm64", "bin/umadev"],
-  ["@umacloud/cli-darwin-x64", "bin/umadev"],
-  ["@umacloud/cli-linux-x64", "bin/umadev"],
-  ["@umacloud/cli-linux-arm64", "bin/umadev"],
-  ["@umacloud/cli-linux-musl-x64", "bin/umadev"],
-  ["@umacloud/cli-linux-musl-arm64", "bin/umadev"],
-  ["@umacloud/cli-win32-x64", "bin/umadev.exe"],
+  ["@umatech/cli-darwin-arm64", "bin/umadev"],
+  ["@umatech/cli-darwin-x64", "bin/umadev"],
+  ["@umatech/cli-linux-x64", "bin/umadev"],
+  ["@umatech/cli-linux-arm64", "bin/umadev"],
+  ["@umatech/cli-linux-musl-x64", "bin/umadev"],
+  ["@umatech/cli-linux-musl-arm64", "bin/umadev"],
+  ["@umatech/cli-win32-x64", "bin/umadev.exe"],
 ]);
 
 export const RELEASE_PACKAGE_NAMES = Object.freeze([
   ...PLATFORM_BINARIES.keys(),
-  "@umacloud/knowledge",
-  "umadev",
+  "@umatech/knowledge",
+  "@umatech/umadev",
 ]);
 
 const MAIN_OPTIONAL_DEPENDENCIES = Object.freeze([
   ...PLATFORM_BINARIES.keys(),
-  "@umacloud/knowledge",
+  "@umatech/knowledge",
 ]);
 
 const MAIN_FILES = new Set([
@@ -133,11 +133,11 @@ function validatePlatform(name, entries) {
 
 function validateKnowledge(entries) {
   if (!entries.includes("LICENSE") || !entries.includes("package.json")) {
-    fail("@umacloud/knowledge is missing LICENSE or package.json");
+    fail("@umatech/knowledge is missing LICENSE or package.json");
   }
   const documents = entries.filter((entry) => entry !== "LICENSE" && entry !== "package.json");
   if (documents.length === 0 || documents.some((entry) => !entry.endsWith(".md"))) {
-    fail("@umacloud/knowledge may contain only Markdown documents, LICENSE, and package.json");
+    fail("@umatech/knowledge may contain only Markdown documents, LICENSE, and package.json");
   }
 }
 
@@ -147,9 +147,9 @@ export function validatePackageRecord(record, expectedVersion) {
   if (new Set(entries).size !== entries.length) {
     fail(`${record.manifest.name} contains duplicate tar entries`);
   }
-  if (record.manifest.name === "umadev") {
+  if (record.manifest.name === "@umatech/umadev") {
     validateMain(record.manifest, entries, expectedVersion);
-  } else if (record.manifest.name === "@umacloud/knowledge") {
+  } else if (record.manifest.name === "@umatech/knowledge") {
     validateKnowledge(entries);
   } else {
     validatePlatform(record.manifest.name, entries);

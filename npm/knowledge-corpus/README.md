@@ -1,4 +1,4 @@
-# @umacloud/knowledge
+# @umatech/knowledge
 
 The curated engineering knowledge corpus bundled with
 [UmaDev](https://github.com/umacloud/umadev). The main `umadev` package depends

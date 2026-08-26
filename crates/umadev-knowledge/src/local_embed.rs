@@ -190,7 +190,7 @@ fn warn_corrupt_cache_once(dir: &Path) {
 
 fn model_source() -> Option<ModelSource> {
     // 1. Explicit override — set by the npm `bin/cli.js` wrapper to the bundled
-    //    `@umacloud/model-e5-small` package path under `node_modules`.
+    //    `@umatech/model-e5-small` package path under `node_modules`.
     if let Some(d) = std::env::var(ENV_MODEL_DIR).ok().filter(|s| !s.is_empty()) {
         let p = PathBuf::from(d);
         if let Ok(root) = RootedDir::open_no_follow(&p) {

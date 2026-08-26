@@ -6,7 +6,7 @@
 // "please upgrade" message instead of a `SyntaxError: Use of const in strict mode`
 // parse failure. Keeping the two files apart is what lets that message ever print.
 //
-// npm picks the matching `@umacloud/cli-*` platform sub-package (via
+// npm picks the matching `@umatech/cli-*` platform sub-package (via
 // optionalDependencies + the `os` / `cpu` fields in each sub-package); this file
 // resolves that sub-package's prebuilt Rust binary and exec's it with the user's
 // argv.
@@ -27,15 +27,15 @@ const crypto = require('node:crypto');
 
 // Node platform/arch → our sub-package name.
 const PLATFORM_PACKAGES = {
-  'darwin-arm64': '@umacloud/cli-darwin-arm64',
-  'darwin-x64': '@umacloud/cli-darwin-x64',
-  'linux-x64': '@umacloud/cli-linux-x64',
-  'linux-arm64': '@umacloud/cli-linux-arm64',
-  'linux-musl-x64': '@umacloud/cli-linux-musl-x64',
-  'linux-musl-arm64': '@umacloud/cli-linux-musl-arm64',
-  'win32-x64': '@umacloud/cli-win32-x64',
+  'darwin-arm64': '@umatech/cli-darwin-arm64',
+  'darwin-x64': '@umatech/cli-darwin-x64',
+  'linux-x64': '@umatech/cli-linux-x64',
+  'linux-arm64': '@umatech/cli-linux-arm64',
+  'linux-musl-x64': '@umatech/cli-linux-musl-x64',
+  'linux-musl-arm64': '@umatech/cli-linux-musl-arm64',
+  'win32-x64': '@umatech/cli-win32-x64',
   // Windows on ARM runs x64 binaries via built-in emulation; reuse the x64 build.
-  'win32-arm64': '@umacloud/cli-win32-x64',
+  'win32-arm64': '@umatech/cli-win32-x64',
 };
 
 const TRUSTED_NPM_REGISTRY = 'https://registry.npmjs.org';
@@ -43,7 +43,7 @@ const TRUSTED_PROVENANCE_PREDICATE = 'https://slsa.dev/provenance/v1';
 const TRUSTED_RELEASE_REPOSITORY = 'git+https://github.com/umacloud/umadev.git';
 const RELEASE_DEPENDENCIES = [
   ...new Set(Object.values(PLATFORM_PACKAGES)),
-  '@umacloud/knowledge',
+  '@umatech/knowledge',
 ].sort();
 
 function platformKey() {
@@ -129,7 +129,7 @@ function findBinary() {
 
   console.error(
     `umadev: ${pkg} not installed.\n` +
-      'Try: npm install -g umadev --force\n' +
+      'Try: npm install -g @umatech/umadev --force\n' +
       "(npm 'optionalDependencies' should normally pick the right one.)",
   );
   process.exit(1);
@@ -194,7 +194,7 @@ function describeVersionState(state) {
 // Fail-open: if the model package is absent the binary degrades to BM25.
 function findModelDir() {
   try {
-    return path.dirname(require.resolve('@umacloud/model-e5-small/package.json'));
+    return path.dirname(require.resolve('@umatech/model-e5-small/package.json'));
   } catch (_) {
     const sibling = path.resolve(__dirname, '..', '..', 'model-e5-small');
     if (fs.existsSync(path.join(sibling, 'tokenizer.json'))) return sibling;
@@ -208,7 +208,7 @@ function findModelDir() {
 // own knowledge/ (if any) still wins. Fail-open: absent -> BM25 over nothing.
 function findKnowledgeDir() {
   try {
-    return path.dirname(require.resolve('@umacloud/knowledge/package.json'));
+    return path.dirname(require.resolve('@umatech/knowledge/package.json'));
   } catch (_) {
     const sibling = path.resolve(__dirname, '..', '..', '..', 'knowledge');
     if (fs.existsSync(path.join(sibling, 'frontend'))) return sibling;
@@ -934,11 +934,11 @@ function sudoFootgunLines() {
     '         用 sudo 安装会留下 root 属主文件,之后普通用户跑 npm 会 EACCES,并连带影响其它全局包。',
     '',
     '  Repair (no sudo from here on):',
-    '           sudo npm uninstall -g umadev',
+    '           sudo npm uninstall -g @umatech/umadev',
     '           sudo chown -R $(whoami) ~/.npm',
     '           npm config set prefix ~/.npm-global',
     '           export PATH="$HOME/.npm-global/bin:$PATH"   # add to ~/.zshrc or ~/.bashrc',
-    '           npm i -g umadev',
+    '           npm i -g @umatech/umadev',
     '',
   ];
 }
@@ -1009,10 +1009,10 @@ function isPackageManaged(pkgRoot) {
 // a manager. Pinning both the version and registry prevents a stale or poisoned
 // third-party mirror from selecting a different tarball after preflight.
 const UPGRADE_COMMANDS = {
-  pnpm: `pnpm add -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
-  yarn: `yarn global add umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
-  bun: `bun add -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
-  npm: `npm install -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
+  pnpm: `pnpm add -g @umatech/umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
+  yarn: `yarn global add @umatech/umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
+  bun: `bun add -g @umatech/umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
+  npm: `npm install -g @umatech/umadev@latest --registry=${TRUSTED_NPM_REGISTRY}`,
 };
 
 // A normal upgrade is allowed to reuse an already-installed optional package.
@@ -1021,10 +1021,10 @@ const UPGRADE_COMMANDS = {
 // still old. In that state the owning manager must re-materialize the package
 // tree instead of deciding the same version is already satisfied.
 const REPAIR_COMMANDS = {
-  pnpm: `pnpm add -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
-  yarn: `yarn global add umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
-  bun: `bun add -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
-  npm: `npm install -g umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
+  pnpm: `pnpm add -g @umatech/umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
+  yarn: `yarn global add @umatech/umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
+  bun: `bun add -g @umatech/umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
+  npm: `npm install -g @umatech/umadev@latest --registry=${TRUSTED_NPM_REGISTRY} --force`,
 };
 
 function exactUpdateCommand(mgr, version, repair = false) {
@@ -1038,7 +1038,7 @@ function exactUpdateCommand(mgr, version, repair = false) {
     npm: 'npm install -g',
   }[mgr];
   if (!verb) throw new Error(`unsupported package manager ${JSON.stringify(mgr)}`);
-  return `${verb} umadev@${version} --registry=${TRUSTED_NPM_REGISTRY}${repair ? ' --force' : ''}`;
+  return `${verb} @umatech/umadev@${version} --registry=${TRUSTED_NPM_REGISTRY}${repair ? ' --force' : ''}`;
 }
 
 function detectPackageManager(pkgRoot, env = process.env) {
@@ -1096,14 +1096,14 @@ function managerRunnable(mgr) {
 // same-user directory whose mtime is at least one day old is considered abandoned.
 const ABANDONED_STAGING_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 function sweepAbandonedStagingDirs(pkgRoot, now = Date.now()) {
+  // The main package is scoped (`@umatech/umadev`), so it and every platform
+  // sub-package are siblings under one …/node_modules/@umatech directory. npm's
+  // abandoned-upgrade debris for all of them therefore lands in that single dir,
+  // so one root with a combined pattern sweeps both the main and the sub-packages.
   const roots = [
     {
-      root: path.dirname(pkgRoot), // …/node_modules
-      staging: /^\.umadev-[^/\\]+$/,
-    },
-    {
-      root: path.join(path.dirname(pkgRoot), '@umacloud'), // …/node_modules/@umacloud
-      staging: /^\.(?:cli-(?:darwin-arm64|darwin-x64|linux-x64|linux-arm64|linux-musl-x64|linux-musl-arm64|win32-x64)|knowledge|model-e5-small)-[^/\\]+$/,
+      root: path.dirname(pkgRoot), // …/node_modules/@umatech
+      staging: /^\.(?:umadev|cli-(?:darwin-arm64|darwin-x64|linux-x64|linux-arm64|linux-musl-x64|linux-musl-arm64|win32-x64)|knowledge|model-e5-small)-[^/\\]+$/,
     },
   ];
   let swept = 0;
@@ -1202,7 +1202,7 @@ function validateTrustedUpdateManifest(manifest) {
   }
   const version = manifest.version;
   if (
-    manifest.name !== 'umadev' ||
+    manifest.name !== '@umatech/umadev' ||
     !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(version || '')
   ) {
     return reject('package name or release version is invalid');
@@ -1231,8 +1231,8 @@ function validateTrustedUpdateManifest(manifest) {
   }
 
   const dist = manifest.dist;
-  const expectedTarball = `${TRUSTED_NPM_REGISTRY}/umadev/-/umadev-${version}.tgz`;
-  const expectedAttestations = `${TRUSTED_NPM_REGISTRY}/-/npm/v1/attestations/umadev@${version}`;
+  const expectedTarball = `${TRUSTED_NPM_REGISTRY}/@umatech/umadev/-/umadev-${version}.tgz`;
+  const expectedAttestations = `${TRUSTED_NPM_REGISTRY}/-/npm/v1/attestations/@umatech/umadev@${version}`;
   if (!dist || typeof dist !== 'object') return reject('the registry distribution is missing');
   if (dist.tarball !== expectedTarball) return reject('the tarball is not hosted by npmjs.org');
   const integrity = dist.integrity || '';
@@ -1278,7 +1278,7 @@ function registryLatestRelease() {
     };
     let url;
     try {
-      url = registryBase() + '/umadev/latest';
+      url = registryBase() + '/@umatech/umadev/latest';
       const client = url.startsWith('http://') ? require('node:http') : https;
       const req = client.get(
         url,
@@ -1325,7 +1325,7 @@ function registryLatestRelease() {
 
 function npmViewLatestRelease() {
   try {
-    const command = `npm view umadev@latest --json --registry=${TRUSTED_NPM_REGISTRY}`;
+    const command = `npm view @umatech/umadev@latest --json --registry=${TRUSTED_NPM_REGISTRY}`;
     const result = spawnSync(command, {
       encoding: 'utf8',
       shell: true,
@@ -1641,7 +1641,7 @@ async function main() {
         '\numadev: the binary IS present, so this is a C-library mismatch —\n' +
           `  detected host libc: ${linuxLibc()}\n` +
           '  reinstall so npm selects the matching Linux platform package:\n' +
-          '    npm install -g umadev@latest --force\n',
+          '    npm install -g @umatech/umadev@latest --force\n',
       );
     }
     process.exit(1);

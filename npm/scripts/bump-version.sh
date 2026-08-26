@@ -21,7 +21,7 @@ for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
   pkg.version = next;
   if (pkg.name === 'umadev') {
     for (const name of Object.keys(pkg.optionalDependencies || {})) {
-      if (name.startsWith('@umacloud/')) pkg.optionalDependencies[name] = next;
+      if (name.startsWith('@umatech/')) pkg.optionalDependencies[name] = next;
     }
   }
   fs.writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`);

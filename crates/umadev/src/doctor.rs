@@ -20,7 +20,7 @@
 //!    global tree or a root-owned `~/.npm` cache — which wedge every LATER
 //!    non-root npm operation on that prefix, including the user's *other* global
 //!    packages — and the "installed locally, so the command is not on PATH"
-//!    confusion (`npm i umadev` without `-g` → run it via `npx umadev`).
+//!    confusion (`npm i @umatech/umadev` without `-g` → run it via `npx umadev`).
 //! 10. Workspace run-lock compatibility fence (`check_run_lock_fence`) — diagnoses
 //!     a legacy/incomplete fence and, with `--fix`, performs an explicit offline
 //!     migration after the user has stopped every older UmaDev process.
@@ -937,7 +937,7 @@ const NPM_CHECK: &str = "npm install health";
 
 /// Is `path` inside an npm `node_modules` tree? That is how we recognise an
 /// npm-delivered umadev (the JS shim exec's the platform sub-package binary at
-/// `…/node_modules/@umacloud/cli-<plat>/bin/umadev`) versus a source / release
+/// `…/node_modules/@umatech/cli-<plat>/bin/umadev`) versus a source / release
 /// binary the user placed on PATH themselves.
 fn under_node_modules(path: &Path) -> bool {
     path.components().any(|c| c.as_os_str() == "node_modules")
@@ -1018,13 +1018,13 @@ fn first_root_owned(_dir: &Path, _cap: usize) -> Option<std::path::PathBuf> {
 /// "installed but not working", both of which are npm/OS setup rather than a
 /// umadev bug, and both of which have an exact fix we can print:
 ///
-/// 1. **Root-owned global install** (`sudo npm i -g umadev`). It works *today*,
+/// 1. **Root-owned global install** (`sudo npm i -g @umatech/umadev`). It works *today*,
 ///    but every later NON-root npm operation on that prefix — including the
 ///    tree-wide `npm update -g` — then fails with `EACCES`, which wedges the
 ///    user's *other* global packages (their base CLI: `@anthropic-ai/claude-code`,
 ///    `@openai/codex`) too, since npm aborts the whole transaction. Same for a
 ///    root-owned `~/.npm` cache (what `sudo -E npm …` leaves behind).
-/// 2. **Local install** (`npm i umadev`, no `-g`). npm deliberately does not put
+/// 2. **Local install** (`npm i @umatech/umadev`, no `-g`). npm deliberately does not put
 ///    a locally-installed command on PATH — `umadev` then reports "command not
 ///    found" and the install looks broken when it is in fact fine: it is reached
 ///    via `npx umadev`.
@@ -1056,10 +1056,10 @@ fn check_npm_install() -> CheckResult {
     if !under_global_node_modules(&exe) && !which_on_path("umadev") {
         return row(
             Status::Warning,
-            "installed locally (`npm i umadev`, no `-g`): npm does NOT put a local command on PATH, \
+            "installed locally (`npm i @umatech/umadev`, no `-g`): npm does NOT put a local command on PATH, \
              so bare `umadev` says \"command not found\" — the install is fine. Run it as `npx umadev`, \
              or install it as a command with a user-owned prefix (no sudo): \
-             `npm config set prefix ~/.npm-global && npm i -g umadev` \
+             `npm config set prefix ~/.npm-global && npm i -g @umatech/umadev` \
              (then add ~/.npm-global/bin to PATH)."
                 .to_string(),
         );
@@ -1088,8 +1088,8 @@ fn check_npm_install() -> CheckResult {
              EACCES, and npm aborts the WHOLE transaction, so your other global packages (e.g. your \
              base CLI @anthropic-ai/claude-code / @openai/codex) can no longer be updated either. \
              Fix — reinstall without sudo into a user-owned prefix: \
-             `sudo npm un -g umadev` then `npm config set prefix ~/.npm-global` \
-             (add ~/.npm-global/bin to PATH) then `npm i -g umadev`."
+             `sudo npm un -g @umatech/umadev` then `npm config set prefix ~/.npm-global` \
+             (add ~/.npm-global/bin to PATH) then `npm i -g @umatech/umadev`."
                 .to_string(),
         );
     }
@@ -1623,14 +1623,14 @@ mod tests {
         // Global install: the shim exec's the platform sub-package binary under
         // <prefix>/lib/node_modules/… — a command IS linked onto PATH.
         let global = Path::new(
-            "/home/dev/.npm-global/lib/node_modules/umadev/node_modules/@umacloud/cli-linux-x64/bin/umadev",
+            "/home/dev/.npm-global/lib/node_modules/umadev/node_modules/@umatech/cli-linux-x64/bin/umadev",
         );
         assert!(under_node_modules(global));
         assert!(under_global_node_modules(global));
 
-        // Local install (`npm i umadev`): a project ./node_modules — npm links NO
+        // Local install (`npm i @umatech/umadev`): a project ./node_modules — npm links NO
         // command onto PATH, which is exactly the "it didn't install" confusion.
-        let local = Path::new("/home/dev/proj/node_modules/@umacloud/cli-linux-x64/bin/umadev");
+        let local = Path::new("/home/dev/proj/node_modules/@umatech/cli-linux-x64/bin/umadev");
         assert!(under_node_modules(local));
         assert!(!under_global_node_modules(local));
 

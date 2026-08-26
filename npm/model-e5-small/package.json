@@ -1,5 +1,5 @@
 {
-  "name": "@umacloud/model-e5-small",
+  "name": "@umatech/model-e5-small",
   "version": "1.1.0",
   "description": "Bundled multilingual-e5-small embedding model for UmaDev's offline local retrieval. Platform-independent data (config.json + model.safetensors + tokenizer.json) — shipped once for all OSes so `npm i -g umadev` gives zero-setup offline hybrid search.",
   "license": "MIT",

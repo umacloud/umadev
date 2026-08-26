@@ -1,4 +1,4 @@
-# @umacloud/model-e5-small
+# @umatech/model-e5-small
 
 Platform-independent embedding model bundled with [UmaDev](https://github.com/umacloud/umadev)
 for **offline, zero-setup** local retrieval. The main `umadev` package depends on

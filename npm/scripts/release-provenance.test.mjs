@@ -62,7 +62,7 @@ test("stage.sh atomically stages a binary and writes its release manifest", (t) 
   );
   fs.writeFileSync(
     path.join(packageRoot, "package.json"),
-    `${JSON.stringify({ name: "@umacloud/cli-linux-x64", version: VERSION })}\n`,
+    `${JSON.stringify({ name: "@umatech/cli-linux-x64", version: VERSION })}\n`,
   );
   const candidate = path.join(root, "candidate");
   fs.writeFileSync(candidate, "staged release bytes\n");

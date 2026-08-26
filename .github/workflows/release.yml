@@ -804,7 +804,7 @@ jobs:
               gh release view --repo "$GITHUB_REPOSITORY" \
                 --json tagName --jq '.tagName' 2>/dev/null || true)
             npm_latest=$(timeout --signal=TERM --kill-after=5s 30s \
-              npm view umadev@latest version \
+              npm view @umatech/umadev@latest version \
                 --registry=https://registry.npmjs.org --prefer-online 2>/dev/null || true)
 
             github_allowed=false
@@ -1269,14 +1269,14 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           packages=(
             umadev
-            @umacloud/cli-darwin-arm64
-            @umacloud/cli-darwin-x64
-            @umacloud/cli-linux-x64
-            @umacloud/cli-linux-arm64
-            @umacloud/cli-linux-musl-x64
-            @umacloud/cli-linux-musl-arm64
-            @umacloud/cli-win32-x64
-            @umacloud/knowledge
+            @umatech/cli-darwin-arm64
+            @umatech/cli-darwin-x64
+            @umatech/cli-linux-x64
+            @umatech/cli-linux-arm64
+            @umatech/cli-linux-musl-x64
+            @umatech/cli-linux-musl-arm64
+            @umatech/cli-win32-x64
+            @umatech/knowledge
           )
 
           release=$(timeout --signal=TERM --kill-after=5s 30s \

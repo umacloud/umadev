@@ -41,7 +41,7 @@ const RELEASES_PAGE: &str = "https://github.com/umacloud/umadev/releases";
 
 /// Package-manager fallback when the official GitHub release cannot be reached.
 const NPM_FALLBACK: &str =
-    "npm install -g umadev@latest --force --registry=https://registry.npmjs.org";
+    "npm install -g @umatech/umadev@latest --force --registry=https://registry.npmjs.org";
 
 /// Smallest plausible size, in bytes, of a real `umadev` release binary. The
 /// shipped binary is tens of MB; anything under 1 MiB is a truncated download, an
@@ -145,7 +145,7 @@ fn release_asset_name_for(os: &str, arch: &str, linux_env: &str) -> Option<Strin
         ("linux", "aarch64", "musl") => "aarch64-unknown-linux-musl",
         // Windows on ARM runs x64 binaries under built-in emulation, and we publish
         // no arm64 Windows build — reuse the x64 asset, exactly as the npm shim's
-        // PLATFORM_PACKAGES maps `win32-arm64` to `@umacloud/cli-win32-x64`.
+        // PLATFORM_PACKAGES maps `win32-arm64` to `@umatech/cli-win32-x64`.
         ("windows", "x86_64" | "aarch64", _) => "x86_64-pc-windows-msvc",
         _ => return None,
     };
@@ -1188,14 +1188,14 @@ mod tests {
     fn an_npm_install_is_package_managed() {
         assert_eq!(
             classify_install(Path::new(
-                "/usr/local/lib/node_modules/@umacloud/cli-linux-x64/bin/umadev"
+                "/usr/local/lib/node_modules/@umatech/cli-linux-x64/bin/umadev"
             )),
             InstallKind::PackageManaged
         );
         // pnpm's content-addressed layout still lives under node_modules.
         assert_eq!(
             classify_install(Path::new(
-                "/home/u/Library/pnpm/global/5/.pnpm/@umacloud+cli-linux-x64@1.0.0/node_modules/@umacloud/cli-linux-x64/bin/umadev"
+                "/home/u/Library/pnpm/global/5/.pnpm/@umatech+cli-linux-x64@1.0.0/node_modules/@umatech/cli-linux-x64/bin/umadev"
             )),
             InstallKind::PackageManaged
         );

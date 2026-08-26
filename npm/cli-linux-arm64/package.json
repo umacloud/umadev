@@ -1,5 +1,5 @@
 {
-  "name": "@umacloud/cli-linux-arm64",
+  "name": "@umatech/cli-linux-arm64",
   "version": "1.1.0",
   "description": "umadev prebuilt binary for Linux (aarch64 / gnu).",
   "homepage": "https://github.com/umacloud/umadev",
