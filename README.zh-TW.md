@@ -59,29 +59,10 @@ umadev 是**一個模擬真實開發團隊來工作的 Coding Agent**。它驅�
 推薦用 npm 安裝預編譯二進位：
 
 ```bash
-npm install -g @umatech/umadev --registry=https://registry.npmjs.org
+npm i -g @umatech/umadev
 ```
 
-**Linux 上不要用 sudo。** npm 預設前綴（`/usr/local`）屬主是 root，一般使用者 `npm i -g` 會 `EACCES`；而 `sudo npm i -g` 看似「解決」了，實則在 npm 前綴裡留下一棵 **root 屬主**的目錄樹——之後你以一般使用者執行的每一條 npm 全域指令（`npm update -g`、`npm i -g <任何套件>`）都會 `EACCES`，且 npm 會整體回滾，**連帶**你的其它全域套件（含底座 CLI `@anthropic-ai/claude-code`、`@openai/codex`）也再也更新不動。正確做法是換一個你自己擁有的前綴：
-
-```bash
-npm config set prefix ~/.npm-global
-export PATH="$HOME/.npm-global/bin:$PATH"   # 寫進 ~/.zshrc 或 ~/.bashrc
-npm install -g @umatech/umadev --registry=https://registry.npmjs.org
-```
-
-或者乾脆不做全域安裝——不改前綴、不用 sudo、不佔 PATH：
-
-```bash
-npx --yes --registry=https://registry.npmjs.org @umatech/umadev       # 直接執行官方套件
-npm i @umatech/umadev --registry=https://registry.npmjs.org && npx umadev # 或先安裝為專案本地相依
-```
-
-（不帶 `-g` 的 `npm i @umatech/umadev` 是能裝上的，只是 npm 按設計**不會**把本地指令掛到 PATH 上，直接敲 `umadev` 會提示 command not found——這不是裝壞了，用 `npx umadev` 執行即可。）
-
-**請使用 npm 官方 registry。** 部分第三方鏡像仍快取已撤下的惡意 `1.0.74`；上面明確指定 `--registry=https://registry.npmjs.org`，可避免舊鏡像繼續下發該版本。
-
-已經踩到 sudo 的坑？`umadev doctor` 會檢出 root 屬主的安裝目錄或 npm 快取，並印出確切的修復指令（`sudo chown -R $(whoami) ~/.npm`，然後在自有前綴下重裝）。
+裝完直接敲 `umadev`。遇到權限或 PATH 報錯（通常是 `sudo` 裝出的 root 屬主前綴）？跑 `umadev doctor`，它會印出確切的修復指令。
 
 也可以完全跳過 npm。原生安裝器不需要 Node、不使用 sudo，會下載對應平台的 GitHub Release 二進位並驗證公開的 SHA-256：
 
