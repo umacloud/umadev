@@ -732,10 +732,10 @@ pub enum Action {
     },
     /// The user TYPED the decision for a paused consequential-action approval
     /// (「批准」/"approve"/"y" → `true`, 「拒绝」/"deny"/"n" → `false`) while
-    /// [`App::pending_approval`] was live. The event loop resolves the shared
-    /// approval waiter with it (A2#5 — the typed-reply path; the empty-input
-    /// y/n/Esc fast keys are handled before the key pipeline in lib.rs).
-    ApprovalReply(bool),
+    /// [`App::pending_approval`] showed the `(action, target)` carried here, which
+    /// an allow must still match. The event loop resolves the shared waiter (A2#5;
+    /// the empty-input y/n/Esc fast keys are handled before the key pipeline).
+    ApprovalReply(bool, (String, String)),
     /// `/compact` — fold the older conversation turns into one structured summary
     /// via a forked base `complete()`. The event loop drives the async summary
     /// (and falls back to FIFO if the base is unreachable); the slash handler only
@@ -10487,12 +10487,12 @@ impl App {
         // lanes below — a real steering message typed mid-pause still lands, and
         // the sticky bar keeps showing how to answer. The paused drain emits its
         // own allowed/denied Note, so only the user's turn is echoed here.
-        if self.pending_approval.is_some() {
+        if let Some(seen) = self.pending_approval.clone() {
             if let Some(allow) = classify_approval_reply(&text) {
                 self.pending_approval = None;
                 self.push(ChatRole::You, text);
                 self.refresh_status();
-                return Action::ApprovalReply(allow);
+                return Action::ApprovalReply(allow, seen);
             }
         }
         // An unfinished durable plan/gate turns a small, exact continuation

@@ -8727,9 +8727,9 @@ fn start_manual_compaction(
     }
 }
 
-fn resolve_approval_reply(approval_holder: &ApprovalHolder, allow: bool) {
+fn resolve_approval_reply(approval_holder: &ApprovalHolder, allow: bool, seen: &(String, String)) {
     if allow {
-        allow_pending_approval(approval_holder);
+        allow_pending_approval(approval_holder, seen);
     } else {
         deny_pending_approval(approval_holder);
     }
@@ -10228,8 +10228,8 @@ async fn event_loop(
                         &clipboard_image_tx,
                     );
                 }
-                Action::ApprovalReply(allow) => {
-                    resolve_approval_reply(&approval_holder, allow);
+                Action::ApprovalReply(allow, seen) => {
+                    resolve_approval_reply(&approval_holder, allow, &seen);
                 }
                 Action::BackendChanged => {
                     // A base was just chosen — either first-launch picker

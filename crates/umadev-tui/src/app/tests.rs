@@ -586,7 +586,7 @@ fn typed_approval_reply_resolves_pause_instead_of_queueing() {
     // resolves the pause as ALLOW — and must NOT also park on a queue.
     assert_eq!(
         app.submit_text("批准".to_string()),
-        Action::ApprovalReply(true)
+        Action::ApprovalReply(true, ("Bash".into(), "npm install".into()))
     );
     assert!(app.pending_approval.is_none());
     assert!(
@@ -597,7 +597,7 @@ fn typed_approval_reply_resolves_pause_instead_of_queueing() {
     let _ = app.set_pending_approval(Some(("Write".into(), ".claude/skills/x.md".into())));
     assert_eq!(
         app.submit_text("拒绝".to_string()),
-        Action::ApprovalReply(false)
+        Action::ApprovalReply(false, ("Write".into(), ".claude/skills/x.md".into()))
     );
     // A NON-decision message mid-pause keeps the pause and parks on the
     // normal queued-chat lane, exactly as before.
