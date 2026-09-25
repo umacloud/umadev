@@ -34,6 +34,8 @@ use std::path::Path;
 use crate::acceptance::{is_python_venv, MAX_SOURCE_DEPTH, SKIP_DIRS};
 use crate::fswalk::{classify_no_follow, EntryKind};
 
+mod weakening;
+
 /// Code extensions a test file can carry. Used to decide which files even get
 /// classified as a possible test (harness configs are matched separately by
 /// exact name, since they carry non-code extensions like `.ini` / `.xml`).
@@ -43,11 +45,13 @@ const CODE_EXT: &[&str] = &[
 ];
 
 /// Exact filenames (case-insensitive) of dedicated test-runner / harness config.
-/// An EDIT or DELETE of one of these during a build step is a gaming signal (the
-/// runner is being weakened to pass); a fresh ADD is legitimate test setup and is
-/// NOT flagged. Deliberately narrow — multi-purpose files (`pyproject.toml`,
-/// `Cargo.toml`, `vite.config.*`) are excluded so an unrelated edit never trips
-/// the guard.
+/// A DELETE of one of these during a build step, or an EDIT that drops existing
+/// tests from the run or skips / excuses them, is a gaming signal (the runner is
+/// being weakened to pass). An edit that only sets the runner up — a test
+/// environment, setup files, fixtures, mocks — and a fresh ADD are legitimate
+/// test setup and are NOT flagged. Deliberately narrow — multi-purpose files
+/// (`pyproject.toml`, `Cargo.toml`, `vite.config.*`) are excluded so an
+/// unrelated edit never trips the guard.
 const HARNESS_FILES: &[&str] = &[
     "jest.config.js",
     "jest.config.ts",
@@ -87,6 +91,7 @@ const MAX_TEST_SURFACE_FILES: usize = 800;
 const MAX_TEST_SCAN_ENTRIES: usize = 20_000;
 const MAX_IMPL_SURFACE_BYTES: usize = 1_500_000;
 const MAX_PACKAGE_JSON_BYTES: usize = 1024 * 1024;
+const MAX_ASSERTION_LINES: usize = 1024;
 
 /// Per-file test metrics captured in a [`TestSnapshot`] — the comparable surface
 /// the before/after diff reasons over.
@@ -110,10 +115,19 @@ struct FileMetrics {
     /// Distinctive quoted literals on assertion lines (≥ 12 chars), capped — the
     /// best-effort "hard-coded the impl's output into the test" needle.
     literals: BTreeSet<String>,
+    /// Hashes of the file's assertion lines (at most [`MAX_ASSERTION_LINES`]) —
+    /// whether a pre-existing assertion was REWRITTEN, the only way an impl's
+    /// output can be baked into a test that already checked something else.
+    assertion_lines: BTreeSet<u64>,
+    /// `assertion_lines` hit its cap, so it cannot answer "was one rewritten?".
+    assertion_lines_capped: bool,
+    /// A Playwright / Cypress end-to-end spec rather than a unit test — which
+    /// runner's config decides whether it is collected.
+    end_to_end: bool,
 }
 
 /// A point-in-time snapshot of the project's TEST surface — every test file's
-/// the private per-file metrics, every harness-config file's content hash, and the
+/// the private per-file metrics, every harness-config file's content, and the
 /// `package.json` test command. Captured once before a build step's doer turn and
 /// compared to the after-state by [`check`].
 ///
@@ -124,8 +138,8 @@ struct FileMetrics {
 pub struct TestSnapshot {
     /// Workspace-relative path → metrics, for each identified test file.
     tests: BTreeMap<String, FileMetrics>,
-    /// Workspace-relative path → content hash, for each harness-config file.
-    harness: BTreeMap<String, u64>,
+    /// Workspace-relative path → content, for each harness-config file.
+    harness: BTreeMap<String, String>,
     /// The `scripts.test` value from `package.json`, if present.
     test_command: Option<String>,
     /// False when any directory/file or the aggregate budget prevented a full
@@ -287,50 +301,68 @@ pub fn check(project_root: &Path, before: Option<&TestSnapshot>) -> Vec<String> 
     // --- Hard-coded literal matching the implementation output (best-effort) ---
     out.extend(hardcoded_literal_findings(project_root, before, &after));
 
-    // --- Harness / runner config edited or deleted during a build step ---
-    for (path, before_hash) in &before.harness {
-        match after.harness.get(path) {
-            None => out.push(format!(
+    // --- Harness / runner config deleted, or edited so it runs fewer tests or
+    //     excuses failures. Setting the runner up (an environment, setup files,
+    //     fixtures, mocks) is test setup, not a weakening. ---
+    for (path, before_body) in &before.harness {
+        let Some(after_body) = after.harness.get(path) else {
+            out.push(format!(
                 "test-integrity: test harness/runner config deleted during this build step — \
                  {path} (do not remove the test runner config to pass; restore it)"
-            )),
-            Some(after_hash) if after_hash != before_hash => out.push(format!(
+            ));
+            continue;
+        };
+        if after_body == before_body {
+            continue;
+        }
+        if let Some(why) = weakening::harness_weakening(path, before_body, after_body, &after.tests)
+        {
+            out.push(format!(
                 "test-integrity: test harness/runner config modified during this build step — \
-                 {path} (do not weaken the test runner to pass; revert the harness change and fix \
+                 {path}: {why} (do not weaken the test runner to pass; revert that change and fix \
                  the code instead)"
-            )),
-            Some(_) => {}
+            ));
         }
     }
 
-    // --- The test command itself (package.json scripts.test) was changed ---
+    // --- The test command itself (package.json scripts.test) stopped running the
+    //     suite or started excusing failures. Replacing `npm init`'s placeholder
+    //     with a real runner, or switching runners, is not a weakening. ---
     if let Some(before_cmd) = &before.test_command {
         match &after.test_command {
-            None => out.push(
+            None if weakening::test_script_ran_tests(before_cmd) => out.push(
                 "test-integrity: the project's test command (package.json scripts.test) was \
                  removed during this build step — restore it; the suite cannot be trusted if the \
                  command that runs it was deleted"
                     .to_string(),
             ),
-            Some(after_cmd) if after_cmd != before_cmd => out.push(format!(
-                "test-integrity: the test command was changed during this build step \
-                 (scripts.test: {before_cmd:?} -> {after_cmd:?}) — do not weaken the test command \
-                 to force a green; revert it and fix the code"
-            )),
-            Some(_) => {}
+            Some(after_cmd) => {
+                if let Some(why) = weakening::test_script_weakening(before_cmd, after_cmd) {
+                    out.push(format!(
+                        "test-integrity: the test command was changed during this build step \
+                         (scripts.test: {before_cmd:?} -> {after_cmd:?}) — {why}; do not weaken \
+                         the test command to force a green, revert it and fix the code"
+                    ));
+                }
+            }
+            None => {}
         }
     }
 
     out
 }
 
-/// Best-effort: a test file that, this step, started asserting a distinctive
-/// literal which appears VERBATIM in the (non-test) implementation source — the
-/// classic "bake the impl's exact output into the expected value so the test
-/// trivially passes" move. Conservative on purpose: only NEW literals (absent
-/// from the before snapshot), only ≥ 12 chars, only when found in impl source,
-/// and at most one report per file — so a legitimately-shared constant rarely
-/// trips it, and the bound caps any residual noise.
+/// Best-effort: a PRE-EXISTING test whose assertion was rewritten this step to
+/// assert a distinctive literal that appears VERBATIM in the (non-test)
+/// implementation source — the classic "bake the impl's exact output into the
+/// expected value so the test trivially passes" move. Conservative on purpose:
+/// only NEW literals (absent from the before snapshot), only ≥ 12 chars, only when
+/// found in impl source, and at most one report per file.
+///
+/// Asserting the contract's own text — the error message an API returns, a
+/// button's label — is how that text is tested, so a brand-new test file, or new
+/// assertions added beside every old one, are never flagged: only a file that
+/// lost (rewrote) one of its earlier assertion lines is a candidate.
 fn hardcoded_literal_findings(
     project_root: &Path,
     before: &TestSnapshot,
@@ -338,12 +370,18 @@ fn hardcoded_literal_findings(
 ) -> Vec<String> {
     // Collect the NEW literals across all test files first; only read the impl
     // surface if there is at least one candidate (keeps the common path cheap).
-    let empty_lits: BTreeSet<String> = BTreeSet::new();
     let mut candidates: Vec<(&String, &String)> = Vec::new();
     for (path, after_m) in &after.tests {
-        let before_lits = before.tests.get(path).map_or(&empty_lits, |m| &m.literals);
+        let Some(before_m) = before.tests.get(path) else {
+            continue; // a new test file adds coverage; it has nothing to weaken
+        };
+        if after_m.assertion_lines_capped
+            || before_m.assertion_lines.is_subset(&after_m.assertion_lines)
+        {
+            continue; // every earlier assertion survives: the literal is new coverage
+        }
         for lit in &after_m.literals {
-            if !before_lits.contains(lit) {
+            if !before_m.literals.contains(lit) {
                 candidates.push((path, lit));
             }
         }
@@ -455,13 +493,13 @@ fn walk(
             .replace(std::path::MAIN_SEPARATOR, "/");
         let rel_lower = rel.to_ascii_lowercase();
 
-        // Harness config (matched by exact name) — record a content hash.
+        // Harness config (matched by exact name) — record its content.
         if HARNESS_FILES.contains(&name_lower.as_str()) {
             let Ok(content) = budget.read_utf8_beneath(root, &p) else {
                 snap.complete = false;
                 return;
             };
-            snap.harness.insert(rel, hash_str(&content));
+            snap.harness.insert(rel, content);
             continue;
         }
         // Test file? Code ext + path/name heuristic, or a Rust file with inline
@@ -625,20 +663,23 @@ fn file_metrics(content: &str) -> FileMetrics {
         + count_token(&lower, "context(")
         + count_token(&lower, "specify(")
         + count_token(&lower, "scenario(")
-        + count_token(&lower, "fit(")
-        + count_token(&lower, "xit(")
-        + count_token(&lower, "fdescribe(")
-        + count_token(&lower, "xdescribe(")
-        + count_token(&lower, "xtest(");
+        + JASMINE_DECLARATIONS
+            .iter()
+            .map(|token| count_statement_call(&lower, token))
+            .sum::<usize>();
 
-    let skips = count_token(&lower, ".only(")
-        + count_token(&lower, ".skip(")
-        + count_token(&lower, ".todo(")
-        + count_token(&lower, "xit(")
-        + count_token(&lower, "xdescribe(")
-        + count_token(&lower, "xtest(")
-        + count_token(&lower, "fit(")
-        + count_token(&lower, "fdescribe(")
+    // Skip / focus markers in TEST-CALL position only: `it.skip(` / `describe.only(`
+    // / `test.todo(` and jasmine's `xit(` / `fit(` starting a statement — never a
+    // query builder's `.skip(10)` or an estimator's `model.fit(X, y)`.
+    let skips = TEST_APIS
+        .iter()
+        .flat_map(|api| TEST_MODIFIERS.iter().map(move |m| format!("{api}.{m}")))
+        .map(|marker| count_token(&lower, &marker))
+        .sum::<usize>()
+        + JASMINE_DECLARATIONS
+            .iter()
+            .map(|token| count_statement_call(&lower, token))
+            .sum::<usize>()
         + count_token(&lower, "@pytest.mark.skip")
         + count_token(&lower, "@pytest.mark.xfail")
         + count_token(&lower, "@unittest.skip")
@@ -649,23 +690,27 @@ fn file_metrics(content: &str) -> FileMetrics {
         + count_token(&lower, "@disabled")
         + count_token(&lower, "@ignore")
         + count_token(&lower, "xfail")
-        + count_token(&lower, "skip_if")
-        + count_token(&lower, "test.skip")
-        + count_token(&lower, "it.skip")
-        + count_token(&lower, "describe.skip");
+        + count_token(&lower, "skip_if");
 
     let mut commented = 0usize;
     let mut literals = BTreeSet::new();
+    let mut assertion_lines = BTreeSet::new();
+    let mut assertion_lines_capped = false;
     for line in content.lines() {
         let trimmed = line.trim_start();
+        // Rust doc comments (`///`, `//!` — their examples run as doc-tests) and
+        // attributes (`#[tokio::test(flavor = …)]`) open like comments but are code.
+        let doc_or_attribute = trimmed.starts_with("///")
+            || trimmed.starts_with("//!")
+            || trimmed.starts_with("#[")
+            || trimmed.starts_with("#!");
         // A FULL-LINE comment (`//` / `#` / leading-`*` jsdoc / `/*` / `--`).
-        // `#` also opens Rust attributes (`#[test]`), but those carry no
-        // assert/expect/it/test token so they never count as a commented test.
-        let full_line_comment = trimmed.starts_with("//")
-            || trimmed.starts_with('#')
-            || trimmed.starts_with("* ")
-            || trimmed.starts_with("/*")
-            || trimmed.starts_with("--");
+        let full_line_comment = !doc_or_attribute
+            && (trimmed.starts_with("//")
+                || trimmed.starts_with('#')
+                || trimmed.starts_with("* ")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with("--"));
         // An INLINE block comment `/* … */` wrapping a test/assertion token —
         // the common "comment the check out in place" gaming form. Only the text
         // BETWEEN the delimiters is inspected, so a live line with an unrelated
@@ -677,8 +722,13 @@ fn file_metrics(content: &str) -> FileMetrics {
         if (full_line_comment && contains_test_token(line)) || inline_commented_test {
             commented += 1;
         }
-        if !full_line_comment {
+        if !full_line_comment && is_assertion_line(line) {
             collect_assertion_literals(line, &mut literals);
+            if assertion_lines.len() < MAX_ASSERTION_LINES {
+                assertion_lines.insert(hash_str(line.trim()));
+            } else {
+                assertion_lines_capped = true;
+            }
         }
     }
 
@@ -689,6 +739,11 @@ fn file_metrics(content: &str) -> FileMetrics {
         skips,
         commented,
         literals,
+        assertion_lines,
+        assertion_lines_capped,
+        end_to_end: lower.contains("@playwright/test")
+            || lower.contains("cypress")
+            || lower.contains("cy.visit("),
     }
 }
 
@@ -715,37 +770,95 @@ fn count_trivial_true_asserts(lower: &str) -> usize {
     TRIVIAL.iter().map(|n| lower.matches(n).count()).sum()
 }
 
-/// `true` when `s` (any case) mentions an assertion / test-declaration token —
-/// the needle for "is there test code here?" used by the commented-out-test
-/// detection.
+/// `true` when `s` (any case) holds assertion / test-declaration CODE — the
+/// needle for "is there test code here?" used by the commented-out-test
+/// detection. Whole tokens only, so `limit(10)` is not `it(` and the word
+/// "Assert" labelling an Arrange / Act / Assert step is not an assertion.
 fn contains_test_token(s: &str) -> bool {
     let lc = s.to_ascii_lowercase();
-    lc.contains("assert")
-        || lc.contains("expect(")
-        || lc.contains(".should")
-        || lc.contains("it(")
-        || lc.contains("test(")
-        || lc.contains("describe(")
+    lc.contains(".should")
+        || ["expect(", "it(", "test(", "describe("]
+            .iter()
+            .any(|token| count_token(&lc, token) > 0)
+        || asserts_as_code(&lc)
 }
 
-/// From an assertion line, collect distinctive quoted literals (≥ 12 chars) — the
-/// hard-coded-output needle. Only lines that look like an assertion contribute, so
-/// import paths / test descriptions are ignored. Capped at 20 literals per file
-/// (enforced by the `BTreeSet` callers via [`file_metrics`]'s overall bound below).
-fn collect_assertion_literals(line: &str, out: &mut BTreeSet<String>) {
-    if out.len() >= 20 {
-        return;
+/// Words that follow "assert" in prose ("Assert that …", "assert the result …")
+/// rather than in Python's `assert <expression>` statement.
+const ASSERT_PROSE: &[&str] = &[
+    "that", "the", "it", "we", "this", "there", "all", "no", "nothing", "on", "and",
+];
+
+/// Whether lowercased `lc` uses `assert` as code: `assert(…)`, `assert!(…)` /
+/// `assert_eq!`, `assertEquals(…)`, `assert.equal(…)`, or Python's
+/// `assert total == 3` — not the word "Assert" in a comment.
+fn asserts_as_code(lc: &str) -> bool {
+    let bytes = lc.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(idx) = lc[from..].find("assert") {
+        let at = from + idx;
+        from = at + "assert".len();
+        if at > 0 && is_word(bytes[at - 1]) {
+            continue;
+        }
+        let mut end = from;
+        while end < bytes.len() && is_word(bytes[end]) {
+            end += 1;
+        }
+        match bytes.get(end) {
+            Some(b'(' | b'!') => return true,
+            // `assert.equal(…)`: a member CALL, not a sentence's full stop.
+            Some(b'.') => {
+                let mut member = end + 1;
+                while member < bytes.len() && is_word(bytes[member]) {
+                    member += 1;
+                }
+                if member > end + 1 && bytes.get(member) == Some(&b'(') {
+                    return true;
+                }
+            }
+            // Python's statement form, `assert <expression>`.
+            Some(b' ') if end == from => {
+                let rest = lc[end..].trim_start();
+                let first_word = rest
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("");
+                if !ASSERT_PROSE.contains(&first_word)
+                    && ["==", "!=", "(", "<", ">", " is ", " in "]
+                        .iter()
+                        .any(|op| rest.contains(op))
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
     }
+    false
+}
+
+/// Whether a line looks like an assertion (`assert…` / `expect…` / `.should` /
+/// `toBe` / `toEqual` / `to_eq` / `equal(` / `==`).
+fn is_assertion_line(line: &str) -> bool {
     let lc = line.to_ascii_lowercase();
-    let assertish = lc.contains("assert")
+    lc.contains("assert")
         || lc.contains("expect")
         || lc.contains(".should")
         || lc.contains("tobe")
         || lc.contains("toequal")
         || lc.contains("to_eq")
         || lc.contains("equal(")
-        || lc.contains("==");
-    if !assertish {
+        || lc.contains("==")
+}
+
+/// From an assertion line ([`is_assertion_line`]), collect distinctive quoted
+/// literals (≥ 12 chars) — the hard-coded-output needle. Only assertion lines
+/// contribute, so import paths / test descriptions are ignored. Capped at 20
+/// literals per file.
+fn collect_assertion_literals(line: &str, out: &mut BTreeSet<String>) {
+    if out.len() >= 20 {
         return;
     }
     for quote in ['"', '\'', '`'] {
@@ -766,6 +879,35 @@ fn collect_assertion_literals(line: &str, out: &mut BTreeSet<String>) {
             }
         }
     }
+}
+
+/// Test APIs whose `.skip` / `.only` / `.todo` modifier disables or focuses tests.
+const TEST_APIS: &[&str] = &["it", "test", "describe", "context", "suite", "specify"];
+const TEST_MODIFIERS: &[&str] = &["skip", "only", "todo"];
+
+/// Jasmine-style disabled (`x…`) and focused (`f…`) test declarations.
+const JASMINE_DECLARATIONS: &[&str] = &["xit(", "xdescribe(", "xtest(", "fit(", "fdescribe("];
+
+/// Count `token` (a call such as `fit(`) where it STARTS A STATEMENT: preceded on
+/// its line by nothing but whitespace or a `{`, `(`, `;`, `,`, `}` or an arrow's
+/// `>`. So jasmine's `fit('focuses', …)` counts, while `model.fit(X, y)`,
+/// `def fit(self, X)` and `refit(` do not. `haystack` / `token` are lowercased.
+fn count_statement_call(haystack: &str, token: &str) -> usize {
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(idx) = haystack[from..].find(token) {
+        let at = from + idx;
+        let line_start = haystack[..at].rfind('\n').map_or(0, |i| i + 1);
+        let before = haystack[line_start..at].trim_end();
+        if matches!(
+            before.chars().next_back(),
+            None | Some('{' | '(' | ';' | ',' | '}' | '>')
+        ) {
+            count += 1;
+        }
+        from = at + token.len();
+    }
+    count
 }
 
 /// Count occurrences of `token` in `haystack`. For a token that begins with an
@@ -829,9 +971,9 @@ fn read_test_command(
         .map(str::to_string))
 }
 
-/// A stable, dependency-free 64-bit content hash (FNV-1a) — enough to detect that
-/// a harness-config file changed between two snapshots. Not cryptographic; only
-/// ever compared for equality.
+/// A stable, dependency-free 64-bit content hash (FNV-1a) — enough to tell
+/// whether an assertion line survived between two snapshots. Not cryptographic;
+/// only ever compared for equality.
 fn hash_str(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
@@ -1328,6 +1470,264 @@ mod tests {
             "walk must not traverse an escaping symlink: {:?}",
             snap.tests.keys().collect::<Vec<_>>()
         );
+    }
+
+    // ── legitimate test setup is not gaming (S04-4) ──────────────────────────
+
+    #[test]
+    fn replacing_npm_placeholder_test_script_is_not_gaming() {
+        // `npm init -y` writes a test script that always fails; replacing it with a
+        // real runner is the first thing a QA step does, not a weakened test command.
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{ "scripts": { "test": "echo \"Error: no test specified\" && exit 1" } }"#,
+        );
+        write(tmp.path(), "src/app.test.js", GOOD_TEST);
+        let before = snapshot(tmp.path());
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{ "scripts": { "test": "vitest run" } }"#,
+        );
+        let findings = check(tmp.path(), Some(&before));
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn switching_or_extending_a_real_test_runner_is_not_gaming() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{ "scripts": { "test": "jest" } }"#,
+        );
+        write(tmp.path(), "src/app.test.js", GOOD_TEST);
+        let before = snapshot(tmp.path());
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{ "scripts": { "test": "jest --coverage" } }"#,
+        );
+        assert!(check(tmp.path(), Some(&before)).is_empty());
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{ "scripts": { "test": "vitest run" } }"#,
+        );
+        assert!(check(tmp.path(), Some(&before)).is_empty());
+    }
+
+    #[test]
+    fn a_test_command_that_stops_running_or_masks_failures_is_flagged() {
+        for weakened in [
+            "echo ok",
+            "exit 0",
+            "true",
+            "jest --passWithNoTests",
+            "jest || true",
+            "jest; exit 0",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            write(
+                tmp.path(),
+                "package.json",
+                r#"{ "scripts": { "test": "jest" } }"#,
+            );
+            write(tmp.path(), "src/app.test.js", GOOD_TEST);
+            let before = snapshot(tmp.path());
+            write(
+                tmp.path(),
+                "package.json",
+                &format!(r#"{{ "scripts": {{ "test": "{weakened}" }} }}"#),
+            );
+            let findings = check(tmp.path(), Some(&before));
+            assert!(
+                findings.iter().any(|f| f.contains("test command")),
+                "`{weakened}` weakens the test command: {findings:?}"
+            );
+        }
+        // Removing a command that ran the suite is still a weakening.
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{ "scripts": { "test": "jest" } }"#,
+        );
+        write(tmp.path(), "src/app.test.js", GOOD_TEST);
+        let before = snapshot(tmp.path());
+        write(tmp.path(), "package.json", r#"{ "scripts": {} }"#);
+        assert!(check(tmp.path(), Some(&before))
+            .iter()
+            .any(|f| f.contains("test command")));
+    }
+
+    #[test]
+    fn adding_a_fixture_to_conftest_is_not_gaming() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "tests/conftest.py",
+            "import pytest\n\n@pytest.fixture\ndef app():\n    return create_app()\n",
+        );
+        write(
+            tmp.path(),
+            "tests/test_app.py",
+            "def test_home(app):\n    assert app.get('/').status_code == 200\n",
+        );
+        let before = snapshot(tmp.path());
+        write(
+            tmp.path(),
+            "tests/conftest.py",
+            "import pytest\n\n@pytest.fixture\ndef app():\n    return create_app()\n\n\
+             @pytest.fixture\ndef client(app):\n    return app.test_client()\n",
+        );
+        let findings = check(tmp.path(), Some(&before));
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn runner_setup_edits_are_not_gaming() {
+        // A first component test needs `environment: 'jsdom'`; a global mock lives in
+        // the jest setup file. Neither changes which tests run or how they pass.
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "vitest.config.ts",
+            "export default defineConfig({\n  test: {\n    globals: true,\n  },\n});\n",
+        );
+        write(
+            tmp.path(),
+            "jest.setup.js",
+            "import '@testing-library/jest-dom';\n",
+        );
+        write(tmp.path(), "src/app.test.js", GOOD_TEST);
+        let before = snapshot(tmp.path());
+        write(
+            tmp.path(),
+            "vitest.config.ts",
+            "export default defineConfig({\n  test: {\n    globals: true,\n    \
+             environment: 'jsdom',\n    setupFiles: ['./src/setupTests.ts'],\n  },\n});\n",
+        );
+        write(
+            tmp.path(),
+            "jest.setup.js",
+            "import '@testing-library/jest-dom';\njest.mock('./src/api');\n",
+        );
+        let findings = check(tmp.path(), Some(&before));
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_harness_edit_that_drops_or_skips_tests_is_flagged() {
+        for (before_cfg, after_cfg) in [
+            (
+                "module.exports = { testMatch: ['**/*.test.js'] };\n",
+                "module.exports = { testMatch: ['**/*.test.js'], passWithNoTests: true };\n",
+            ),
+            (
+                "module.exports = {};\n",
+                "module.exports = { testPathIgnorePatterns: ['/src/'] };\n",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            write(tmp.path(), "jest.config.js", before_cfg);
+            write(tmp.path(), "src/app.test.js", GOOD_TEST);
+            let before = snapshot(tmp.path());
+            write(tmp.path(), "jest.config.js", after_cfg);
+            let findings = check(tmp.path(), Some(&before));
+            assert!(
+                findings.iter().any(|f| f.contains("harness")),
+                "`{after_cfg}`: {findings:?}"
+            );
+        }
+        // A conftest that starts deselecting collected tests.
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "tests/conftest.py", "import pytest\n");
+        write(
+            tmp.path(),
+            "tests/test_app.py",
+            "def test_home():\n    assert home() == 200\n",
+        );
+        let before = snapshot(tmp.path());
+        write(
+            tmp.path(),
+            "tests/conftest.py",
+            "import pytest\n\ncollect_ignore = ['test_app.py']\n",
+        );
+        let findings = check(tmp.path(), Some(&before));
+        assert!(
+            findings.iter().any(|f| f.contains("harness")),
+            "{findings:?}"
+        );
+    }
+
+    // ── asserting the contract's own text is not gaming (S04-5) ──────────────
+
+    #[test]
+    fn asserting_an_error_message_the_api_returns_is_not_gaming() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "src/a.test.js", GOOD_TEST);
+        write(
+            tmp.path(),
+            "src/auth.js",
+            "export function login() { return { error: 'Invalid email or password' }; }\n",
+        );
+        let before = snapshot(tmp.path());
+        // A brand-new test file asserting the error text the PRD specifies.
+        write(
+            tmp.path(),
+            "src/auth.test.js",
+            "it('rejects a bad password', async () => {\n  \
+             const res = await login('a@b.c', 'nope');\n  \
+             expect(res.error).toBe('Invalid email or password');\n});\n",
+        );
+        let findings = check(tmp.path(), Some(&before));
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn a_new_test_in_an_existing_file_may_assert_ui_text() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "src/SignUp.jsx",
+            "export const SignUp = () => <button>Create account</button>;\n",
+        );
+        write(tmp.path(), "src/SignUp.test.jsx", GOOD_TEST);
+        let before = snapshot(tmp.path());
+        write(
+            tmp.path(),
+            "src/SignUp.test.jsx",
+            &format!(
+                "{GOOD_TEST}it('shows the call to action', () => {{\n  render(<SignUp />);\n  \
+                 expect(screen.getByRole('button', {{ name: 'Create account' }})).toBeInTheDocument();\n}});\n"
+            ),
+        );
+        let findings = check(tmp.path(), Some(&before));
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    // ── counters see code, not substrings (S04-7) ────────────────────────────
+
+    #[test]
+    fn ordinary_calls_and_aaa_comments_are_not_gaming_markers() {
+        let mongoose = "it('paginates', async () => {\n  // Arrange\n  await seed(30);\n  \
+                        // Act: fetch page two with limit(10)\n  \
+                        const users = await User.find().skip(10).limit(10);\n  \
+                        // Assert\n  expect(users).toHaveLength(10);\n});\n";
+        let sklearn = "def test_model_fits():\n    model = LinearRegression()\n    \
+                       model.fit(X, y)\n    assert model.score(X, y) > 0.9\n";
+        let rust = "/// Adds two numbers.\n///\n/// ```\n/// assert_eq!(add(1, 2), 3);\n/// ```\n\
+                    pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests {\n    \
+                    use super::*;\n\n    #[tokio::test(flavor = \"multi_thread\")]\n    \
+                    async fn adds() { assert_eq!(add(1, 2), 3); }\n}\n";
+        for (name, body) in [("mongoose", mongoose), ("sklearn", sklearn), ("rust", rust)] {
+            let m = file_metrics(body);
+            assert_eq!(m.skips, 0, "{name}: {m:?}");
+            assert_eq!(m.commented, 0, "{name}: {m:?}");
+        }
     }
 
     // ── deep and virtualenv trees keep the guard armed (S04-8) ───────────────
