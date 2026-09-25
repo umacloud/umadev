@@ -182,6 +182,34 @@ pub fn is_safe_url(url: &str) -> bool {
     url.chars().all(is_url_char)
 }
 
+/// `true` for a [safe](is_safe_url) URL whose host is this machine:
+/// `localhost` or a loopback / unspecified IP literal (`127.0.0.1`, `[::1]`,
+/// `0.0.0.0`, which dev servers print). Userinfo (`http://a@b/`) is refused
+/// so the visible prefix can never disguise the real host.
+#[must_use]
+pub fn is_loopback_url(url: &str) -> bool {
+    if !is_safe_url(url) {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or_default();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
 /// `true` for characters that may appear inside a file-path token. Unicode
 /// alphanumerics are allowed (CJK file names are real), plus the separator /
 /// extension / drive punctuation. Quotes, backticks, brackets and whitespace
@@ -629,6 +657,29 @@ mod tests {
         assert!(!is_safe_url("http://x.dev/\x1b[31m"));
         assert!(!is_safe_url("http://x.dev/a b"));
         assert!(!is_safe_url("http://x.dev/\\back"));
+    }
+
+    #[test]
+    fn only_urls_naming_this_machine_are_loopback() {
+        for url in [
+            "http://localhost:5173",
+            "http://127.0.0.1:4173/",
+            "https://[::1]:3000/app",
+            "http://0.0.0.0:8000",
+            "HTTP://LOCALHOST:3000",
+        ] {
+            assert!(is_loopback_url(url), "{url}");
+        }
+        for url in [
+            "http://10.0.0.5:8080",
+            "http://metadata.internal/",
+            "http://localhost.evil.example:80",
+            "http://localhost@evil.example/",
+            "http://127.0.0.1@169.254.169.254/",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_loopback_url(url), "{url}");
+        }
     }
 
     // ── path candidates ───────────────────────────────────────────────────

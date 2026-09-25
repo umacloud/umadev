@@ -761,6 +761,7 @@
 # /preview
 "preview.detected" = "[preview] 检测到 {},启动预览…\n  命令:`{}` -> {}"
 "preview.starting" = "启动 dev server 并打开预览:{}\n  命令:`{}`"
+"preview.confirm_command" = "下面的预览命令读自前端说明文件，仓库或模型都能修改它。尚未运行：\n  {}\n  -> {}\n确认无误后输入 /preview confirm 运行。"
 "preview.opened" = "已打开预览:{}\n  (未找到 Run command,如页面打不开请手动启动 dev server)"
 "preview.none_yet" = "还没有可预览的前端。先输入需求跑完到 frontend 阶段(会停在预览 gate),\n                   或确认底座已把 Preview URL 写进 output/xxx-frontend-notes.md。"
 "preview.gate_announce" = "[preview] 前端已生成,预览地址:{}\n                       在浏览器打开查看效果。满意就输入 c 继续(进入后端);\n                       要改就描述修改意见。也可 /preview 自动启动 dev server、/stop-preview 停止。"

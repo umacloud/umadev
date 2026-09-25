@@ -389,6 +389,7 @@ mod tests {
             "rewind.restored",
             "rewind.failed",
             "deploy.confirm_preflight",
+            "preview.confirm_command",
             "worker.init_failed",
             "pipeline.start_failed",
             "worker.timeout",

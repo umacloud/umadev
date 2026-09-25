@@ -771,6 +771,7 @@
 # /preview
 "preview.detected" = "[preview] Detected {}, starting preview…\n  command: `{}` -> {}"
 "preview.starting" = "Starting dev server and opening the preview: {}\n  command: `{}`"
+"preview.confirm_command" = "The preview command below was read from the frontend notes, which the repository or the model can edit. Not run yet:\n  {}\n  -> {}\nCheck it, then type /preview confirm to run it."
 "preview.opened" = "Opened the preview: {}\n  (no Run command found; if the page won't open, start the dev server manually)"
 "preview.none_yet" = "No previewable frontend yet. Type a requirement and run through the frontend phase (it pauses at the preview gate),\n                   or confirm the base wrote a Preview URL into output/xxx-frontend-notes.md."
 "preview.gate_announce" = "[preview] Frontend generated, preview at: {}\n                       Open it in the browser to see the result. Happy? type c to continue (into the backend);\n                       to change it, describe your edits. You can also /preview to auto-start the dev server, /stop-preview to stop."
