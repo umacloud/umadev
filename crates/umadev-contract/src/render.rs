@@ -472,6 +472,14 @@ mod tests {
     }
 
     #[test]
+    fn yaml_scalar_quotes_special() {
+        assert_eq!(yaml_scalar("simple"), "simple");
+        assert_eq!(yaml_scalar(""), "\"\"");
+        assert_eq!(yaml_scalar("has: colon"), "\"has: colon\"");
+        assert_eq!(yaml_scalar("-123"), "\"-123\"");
+    }
+
+    #[test]
     fn render_yaml_value_emits_block_scalar_for_multiline() {
         // Regression: multi-line strings used to be quoted + \n-escaped
         // (single ugly line). Now they emit a YAML `|` literal block scalar
