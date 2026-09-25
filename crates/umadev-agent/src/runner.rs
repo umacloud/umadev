@@ -9590,11 +9590,11 @@ error TS2304: Cannot find name 'Foo'
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".umadevrc"),
-            "[quality]\nthreshold = 75\n\n[pipeline]\nmax_review_rounds = 1\n",
+            "[quality]\nthreshold = 95\n\n[pipeline]\nmax_review_rounds = 1\n",
         )
         .unwrap();
         let cfg = crate::config::load_project_config(tmp.path());
-        assert_eq!(cfg.quality.threshold, 75);
+        assert_eq!(cfg.quality.threshold, 95);
         assert_eq!(cfg.pipeline.max_review_rounds, 1);
     }
 

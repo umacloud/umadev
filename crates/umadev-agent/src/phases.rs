@@ -1865,7 +1865,7 @@ fn run_quality_scored(
     let skip = &project_config.quality.skip_checks;
     if !skip.is_empty() {
         checks.retain(|c| {
-            let s = c.name.to_ascii_lowercase().replace(' ', "_");
+            let s = crate::config::quality_check_key(&c.name);
             !skip.iter().any(|sk| sk == &s || sk == &c.name)
         });
     }
@@ -1933,6 +1933,7 @@ fn run_quality_scored(
         .iter()
         .filter(|c| c.status != "passed" && !is_na(c))
         .map(|c| format!("Address `{}`: {}", c.name, c.details))
+        .chain(project_config.quality.ignored.iter().cloned())
         .collect();
     let passed = total_score >= pass_threshold && critical_failures.is_empty();
     let mut summary_context = std::collections::BTreeMap::new();
