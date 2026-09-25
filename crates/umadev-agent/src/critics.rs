@@ -708,7 +708,9 @@ pub struct ReviewPayloadCoverage {
     pub supplied_chars: usize,
     /// The bundle failed a host-side structural/file-boundary check.
     pub malformed: bool,
-    /// The bounded host walk hit a depth/file/entry or directory-stability limit.
+    /// The bounded host walk hit a depth/file/entry or directory-stability limit,
+    /// or the run-change scope could not be read. The review still runs on the
+    /// declared priority sample; this only makes its scope [reduced](Self::is_reduced).
     pub discovery_incomplete: bool,
     /// Whether this review surface is required to carry implementation source.
     ///
@@ -726,11 +728,12 @@ pub struct ReviewPayloadCoverage {
     pub discovered_source_files: usize,
     /// Discovered files represented by at least one non-empty bounded sample.
     pub represented_source_files: usize,
-    /// Host-mandated plan/evidence and run-changed source files that must be
-    /// represented completely before the review may run. Heuristic lane samples
-    /// do not inflate this gate.
+    /// Host-mandated plan/evidence and run-changed source files the review is
+    /// meant to cover in full. Heuristic lane samples do not inflate this count.
     pub required_focus_files: usize,
-    /// Required focus files actually represented in the bounded payload.
+    /// Required focus files represented WHOLE in the bounded payload. Any shortfall
+    /// was sent as a declared bounded sample (or a declared omission) and makes the
+    /// review scope [reduced](Self::is_reduced) — never unavailable.
     pub represented_focus_files: usize,
 }
 
@@ -763,8 +766,8 @@ impl ReviewPayloadCoverage {
     }
 
     /// Attach the host's explicit bounded-sampling scope. Omitted background
-    /// files remain visible in the manifest; only the small, deterministic focus
-    /// set is required to be represented.
+    /// files remain visible in the manifest; a required focus file that did not
+    /// fit whole marks the scope reduced.
     #[must_use]
     pub const fn with_file_scope(
         mut self,
@@ -782,13 +785,49 @@ impl ReviewPayloadCoverage {
 
     /// Whether the bounded payload is safe to review. This does not mean the
     /// entire workspace was supplied; the explicit file counts describe scope.
+    ///
+    /// Only a structurally broken payload is unreviewable. A deterministic budget
+    /// shortfall (a required file sent as a declared sample, a capped walk, no
+    /// run-change view) is a [reduced](Self::is_reduced) review the manifest
+    /// discloses — it must never read as a reviewer outage, which would pause the
+    /// run for a `/continue` that rebuilds the identical bundle.
     #[must_use]
     pub const fn is_reviewable(self) -> bool {
         !self.malformed
-            && !self.discovery_incomplete
             && self.declared_chars == self.supplied_chars
             && (!self.requires_source || self.substantive_source_chars > 0)
-            && self.required_focus_files == self.represented_focus_files
+    }
+
+    /// Whether the review covers less than its required scope: a required
+    /// changed/plan file was sent as a declared bounded sample or omission, or the
+    /// source walk / run-change scope was unavailable or capped. The reviewers
+    /// still run on the disclosed sample; the coverage record says `reduced`.
+    #[must_use]
+    pub const fn is_reduced(self) -> bool {
+        self.discovery_incomplete || self.represented_focus_files < self.required_focus_files
+    }
+
+    /// Stable host-owned disclosure for a reviewable payload whose scope was
+    /// reduced (see [`Self::is_reduced`]); `None` for a full or unreviewable one.
+    #[must_use]
+    pub fn reduced_reason(self) -> Option<String> {
+        if !self.is_reviewable() || !self.is_reduced() {
+            return None;
+        }
+        let mut causes = Vec::new();
+        if self.represented_focus_files < self.required_focus_files {
+            causes.push(format!(
+                "{} of {} required changed/plan source files fit whole; the rest were sent as declared bounded samples or omissions",
+                self.represented_focus_files, self.required_focus_files
+            ));
+        }
+        if self.discovery_incomplete {
+            causes.push(
+                "the source walk or run-change scope was unavailable or capped, so the payload is a priority-ranked sample"
+                    .to_string(),
+            );
+        }
+        Some(format!("review scope reduced: {}", causes.join("; ")))
     }
 
     /// Stable host-owned diagnosis for an incomplete review surface.
@@ -799,14 +838,6 @@ impl ReviewPayloadCoverage {
         }
         let cause = if self.malformed {
             "host bundle failed its structural/file-boundary check".to_string()
-        } else if self.discovery_incomplete {
-            "host source discovery or run-change scope was unavailable, bounded, or unstable"
-                .to_string()
-        } else if self.required_focus_files != self.represented_focus_files {
-            format!(
-                "host bundle represented {} of {} mandatory changed/plan source files",
-                self.represented_focus_files, self.required_focus_files
-            )
         } else if self.requires_source && self.substantive_source_chars == 0 {
             "host bundle contained no substantive source content".to_string()
         } else {
@@ -843,8 +874,9 @@ pub struct CriticArtifacts<'a> {
     /// runs (governance scan / any `security-scan.json`). Same role as
     /// `qa_floor` for the security-critic.
     pub security_floor: &'a str,
-    /// Host-computed coverage of the supplied artifact payload. An incomplete
-    /// surface makes the seat unavailable before any model verdict is requested.
+    /// Host-computed coverage of the supplied artifact payload. A structurally
+    /// broken surface makes the seat unavailable before any model verdict is
+    /// requested; a reduced (declared-sample) surface is still reviewed.
     pub coverage: ReviewPayloadCoverage,
 }
 

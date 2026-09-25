@@ -1359,6 +1359,8 @@
 "continuous.team.cross_review_header" = "[team] {} 角色團隊交叉評審(唯讀分叉,並行):{} 名 critic 各從本職審一遍…"
 "continuous.team.seat_passed" = "[team] {}:通過,無阻塞項。"
 "continuous.team.seat_blocking" = "[team] {}:提出 {} 個阻塞項。"
+"continuous.team.review_reduced_files" = "[team] {} 評審依縮減範圍進行:{} / {} 個必審變更檔案完整送審,其餘以已聲明的抽樣或省略送審(見評審清單)。"
+"continuous.team.review_reduced_scope" = "[team] {} 評審依縮減範圍進行:無法完整讀取本次執行改動的檔案集,評審看到的是已聲明的優先順序抽樣。"
 "continuous.verify_failed" = "[verify] 真實建置/測試/lint 有失敗步驟(已記入稽核,品質關卡會據此評分)。"
 "continuous.quality_gate_result" = "品質關卡結果:{}/100 · {}(確定性硬信號)"
 "continuous.quality_gate_advisory" = "品質評分:{}/100 —— 建議改進(輕量任務,不阻斷)"
