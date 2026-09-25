@@ -379,11 +379,14 @@ fn claim_covers(claim: &str, path: &str) -> bool {
 /// Whether a changed path is outside the team's source surface entirely (UmaDev's own
 /// artifacts, generated lockfiles, the doc blackboard, vendored/build/cache trees) —
 /// the ignored DIRECTORY NAMES matched at ANY depth (see [`IGNORED_DIR_SEGMENTS`]).
+/// The open-decisions register is UmaDev-owned too: the firmware tells every work
+/// turn to append to it and never delete the trail, so it can never be unclaimed work.
 fn is_ignored(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
     LOCKFILES.contains(&name)
         || IGNORED_FILE_NAMES.contains(&name)
+        || lower.eq_ignore_ascii_case(crate::open_decisions::REGISTER_REL_PATH)
         || IGNORED_PREFIXES.iter().any(|p| lower.starts_with(p))
         || lower
             .split('/')
@@ -711,6 +714,32 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.file == "src/planned.ts"),
             "a claimed file is in scope: {f:?}"
+        );
+    }
+
+    #[test]
+    fn the_open_decisions_register_the_firmware_mandates_is_never_scope_creep() {
+        let Some(tmp) = baselined_workspace() else {
+            return;
+        };
+        // Every work turn's firmware tells the base to append deferred decisions to
+        // this register and never to delete the trail; the scope floor must not then
+        // ask for its removal. A genuinely unplanned edit beside it still blocks.
+        write(tmp.path(), "src/planned.ts", "export const planned = 1;\n");
+        write(
+            tmp.path(),
+            crate::open_decisions::REGISTER_REL_PATH,
+            "## OPEN — design-decision-to-evaluate — cache layer\n",
+        );
+        write(tmp.path(), "docs/notes.md", "an unplanned doc edit\n");
+        let f = unclaimed_changes(tmp.path(), &plan_claiming(&["src/"]));
+        assert!(
+            !f.iter().any(|x| x.file.contains("OPEN-DECISIONS")),
+            "the register is UmaDev-owned, not unclaimed work: {f:?}"
+        );
+        assert!(
+            f.iter().any(|x| x.blocking && x.file == "docs/notes.md"),
+            "an unplanned edit next to it is still blocking: {f:?}"
         );
     }
 
