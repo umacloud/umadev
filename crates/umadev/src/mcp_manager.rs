@@ -434,6 +434,22 @@ pub fn parse_command_parts(parts: &[String]) -> McpServerEntry {
     }
 }
 
+/// The `.mcp.json` `type` Claude Code needs for a URL server: `sse` for the
+/// legacy HTTP+SSE convention of an endpoint path ending in `/sse`, otherwise
+/// the Streamable HTTP transport, `http`.
+fn claude_url_transport(url: &str) -> &'static str {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    if path.to_ascii_lowercase().ends_with("/sse") {
+        "sse"
+    } else {
+        "http"
+    }
+}
+
 /// One server as surfaced by a `list` across any backend: a name + a
 /// human-readable command/url summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +489,16 @@ fn install_unlocked(
         Backend::ClaudeCode => {
             let mut cfg = McpConfig::load(project_root)?;
             cfg.install(name, entry.clone());
+            // Claude Code skips a URL server that does not name its transport.
+            if let Some(url) = &entry.url {
+                if let Some(server) = cfg
+                    .servers
+                    .get_mut(name)
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    server.insert("type".into(), claude_url_transport(url).into());
+                }
+            }
             cfg.save(project_root)
         }
         Backend::Codex => codex::install(project_root, name, entry),
@@ -1235,6 +1261,39 @@ mod tests {
         let grok = std::fs::read_to_string(tmp.path().join(".grok/config.toml")).unwrap();
         assert!(grok.contains("[mcp_servers.gh]"));
         assert!(grok.contains("command = \"npx\""));
+    }
+
+    #[test]
+    fn claude_url_server_entry_has_transport_type() {
+        // Claude Code skips a `.mcp.json` URL server that has no "type"
+        // ("has a url but no type; add type: http (or sse / ws)").
+        let tmp = tempfile::TempDir::new().unwrap();
+        for (name, url, transport) in [
+            ("docs", "https://mcp.example.com/mcp", "http"),
+            ("events", "https://mcp.example.com/sse", "sse"),
+            (
+                "events2",
+                "https://mcp.example.com/v1/SSE/?token=1#x",
+                "sse",
+            ),
+            ("sseish", "https://mcp.example.com/sse-proxy/mcp", "http"),
+        ] {
+            let entry = parse_command_parts(&[url.to_string()]);
+            install(Backend::ClaudeCode, tmp.path(), name, &entry).unwrap();
+            let value: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["mcpServers"][name]["type"], transport, "{url}");
+            assert_eq!(value["mcpServers"][name]["url"], url);
+        }
+        // A stdio server keeps its plain command shape.
+        install(Backend::ClaudeCode, tmp.path(), "gh", &npx_entry()).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert!(value["mcpServers"]["gh"].get("type").is_none());
+        assert_eq!(value["mcpServers"]["gh"]["command"], "npx");
     }
 
     #[test]
