@@ -209,16 +209,16 @@ pub fn codex_sandbox_override() -> Option<String> {
 /// and tiered by trust mode:
 /// - **Plan** → `read-only`; a project override can never silently widen a mode
 ///   whose public contract is read-only.
-/// - **Guarded** (the default) → `danger-full-access` with approvals retained.
-///   UmaDev is a development host: package managers, local ports, subprocesses,
-///   git and network access must reach the real environment.
+/// - **Guarded** (the default) → `danger-full-access` with approvals retained
+///   (`untrusted`, see [`codex_approval_policy`]). UmaDev is a development
+///   host: package managers, local ports, subprocesses, git and network access
+///   must reach the real environment.
 /// - **Auto** → `danger-full-access` with ordinary approvals pre-authorized.
 ///
 /// An explicit override (env / project config) wins for either writable tier, so
 /// a user can deliberately narrow Guarded or Auto to `workspace-write` /
 /// `read-only`. Guarded is the approval posture, not a second OS sandbox tier:
-/// its `approvalPolicy:on-request` remains independent from filesystem/network
-/// access.
+/// it keeps raising approvals whatever filesystem/network access it has.
 ///
 /// (The read-only critic fork — [`thread_start_params_readonly`] — is NEVER driven
 /// by this: its `read-only` sandbox is the single-writer invariant, not a knob.)
@@ -276,12 +276,19 @@ fn resolve_codex_sandbox(raw: Option<&str>) -> &'static str {
     }
 }
 
-/// Pair environment access with approval automation. Guarded keeps approval
-/// events active even with full access; Auto pre-authorizes them; Plan is
-/// non-interactive inside a read-only sandbox.
+/// Pair environment access with approval automation. Auto pre-authorizes; Plan
+/// is non-interactive inside a read-only sandbox. Guarded must keep raising
+/// approval events, which depends on the sandbox: under `on-request` Codex asks
+/// only when a command has to leave its sandbox, and `danger-full-access` has
+/// none to leave, so every command and patch would run unasked. Guarded with
+/// full access therefore uses `untrusted`, which asks for everything outside
+/// Codex's small set of known read-only commands; with a narrower sandbox,
+/// `on-request` escalations are the approvals.
 fn codex_approval_policy(sandbox: &str, permissions: BasePermissionProfile) -> &'static str {
     if sandbox == "read-only" || permissions.auto_approve() {
         "never"
+    } else if sandbox == "danger-full-access" {
+        "untrusted"
     } else {
         "on-request"
     }
@@ -993,9 +1000,10 @@ impl CodexSession {
             .await
             .map_err(|e| SessionError::Start(format!("codex initialized: {e}")))?;
 
-        // 3. thread/start. `sandbox:"workspace-write"` + `approvalPolicy:"never"`
-        //    is the autonomous "write code without asking" tier; the gate tier
-        //    uses `on-request` so the server raises `requestApproval`. Bounded too.
+        // 3. thread/start. `approvalPolicy:"never"` is the autonomous "write code
+        //    without asking" tier; the gate tier picks a policy under which the
+        //    server raises `requestApproval` (see `codex_approval_policy`).
+        //    Bounded too.
         let started = self
             .request_bounded(
                 "thread/start",
@@ -3925,7 +3933,7 @@ mod tests {
             BasePermissionProfile::Guarded,
             resolve_codex_launch_sandbox(true, false, None),
         );
-        assert_eq!(guarded["approvalPolicy"], "on-request");
+        assert_eq!(guarded["approvalPolicy"], "untrusted");
         // Guarded (the default) retains approval prompts without restricting the
         // development environment.
         assert_eq!(guarded["sandbox"], "danger-full-access");
@@ -3980,7 +3988,7 @@ mod tests {
     fn writable_profiles_default_full_and_honor_explicit_restrictions() {
         // Guarded controls approval automation, not the worker's OS sandbox. Its
         // default is the same complete development environment as Auto, while
-        // preserving approvalPolicy=on-request at thread creation.
+        // its approval policy keeps raising approvals at thread creation.
         assert_eq!(
             resolve_codex_launch_sandbox(true, false, Some("danger-full-access")),
             "danger-full-access"
@@ -4162,9 +4170,11 @@ mod tests {
 
     #[test]
     fn codex_approval_policy_is_independent_from_full_access() {
+        // `on-request` with no sandbox to escalate out of never asks, so full
+        // access Guarded asks for every untrusted command instead.
         assert_eq!(
             codex_approval_policy("danger-full-access", BasePermissionProfile::Guarded),
-            "on-request"
+            "untrusted"
         );
         assert_eq!(
             codex_approval_policy("danger-full-access", BasePermissionProfile::Auto),
@@ -4209,7 +4219,7 @@ mod tests {
         );
         assert_eq!(full["sandbox"], "danger-full-access");
         assert_eq!(
-            full["approvalPolicy"], "on-request",
+            full["approvalPolicy"], "untrusted",
             "full access does not erase Guarded approval events"
         );
         // Model handling is unchanged regardless of sandbox.
@@ -4227,7 +4237,7 @@ mod tests {
         );
         assert_eq!(full["threadId"], "thr_main");
         assert_eq!(full["sandbox"], "danger-full-access");
-        assert_eq!(full["approvalPolicy"], "on-request");
+        assert_eq!(full["approvalPolicy"], "untrusted");
         assert_eq!(
             full["developerInstructions"], UMADEV_CODEX_DEVELOPER_INSTRUCTIONS,
             "an explicit resume retains the current-turn authority boundary"
@@ -4252,7 +4262,7 @@ mod tests {
             (
                 BasePermissionProfile::Guarded,
                 "danger-full-access",
-                "on-request",
+                "untrusted",
             ),
             (BasePermissionProfile::Auto, "danger-full-access", "never"),
         ] {

@@ -3439,7 +3439,7 @@ fn plan_session_ruleset() -> Value {
 }
 
 /// Build the `POST /session` permission ruleset for the autonomy tier — the
-/// opencode counterpart of codex's `approvalPolicy` (`never` vs `on-request`) and
+/// opencode counterpart of codex's `approvalPolicy` (`never` vs `untrusted`) and
 /// claude's `--permission-mode` (`acceptEdits` vs `default`), so all three native
 /// bases share ONE gate posture.
 ///
@@ -3451,7 +3451,7 @@ fn plan_session_ruleset() -> Value {
 ///   patches, shells, delegation, unknown future tools, and MCP-provided tools all
 ///   raise `permission.asked` (→ a `NeedApproval` the orchestrator answers via the
 ///   trust-tiered `approval_decision`). opencode evaluates a specific permission
-///   over the wildcard floor. Mirrors codex's `on-request`, while making the
+///   over the wildcard floor. Mirrors codex's `untrusted`, while making the
 ///   authorization boundary fail-closed when the tool vocabulary grows.
 ///
 /// Runtime/protocol failures remain fail-open to UmaDev's governance contract (an
@@ -5809,7 +5809,7 @@ mod tests {
         // End-to-end: a guarded (`autonomous = false`) create_session POSTs the
         // ask-by-default ruleset, so opencode will raise `permission.asked` for a
         // write, patch, shell, future tool, or MCP mutator — the same
-        // human-in-the-loop posture codex gets from `on-request`.
+        // human-in-the-loop posture codex gets from `untrusted`.
         use tokio::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
