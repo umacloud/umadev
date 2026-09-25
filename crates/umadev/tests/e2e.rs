@@ -1224,6 +1224,43 @@ fn cli_verbs_follow_the_configured_language() {
     assert!(!has_cjk(&stdout), "doctor printed Chinese rows: {stdout}");
 }
 
+/// REGRESSION: `umadev deploy` ended with the TUI instruction "type /deploy
+/// confirm", which does not exist in the CLI. It must name the CLI step, keep
+/// an explicit --command, and not repeat the step when --run was given.
+#[test]
+fn deploy_names_the_cli_step_to_actually_deploy() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("vercel.json"), "{}\n").unwrap();
+    let detect = hermetic_command(tmp.path())
+        .arg("deploy")
+        .output()
+        .expect("deploy should run");
+    let stdout = String::from_utf8_lossy(&detect.stdout);
+    assert!(stdout.contains("`umadev deploy --run`"), "{stdout}");
+    assert!(!stdout.contains("/deploy confirm"), "{stdout}");
+
+    let custom = hermetic_command(tmp.path())
+        .args(["deploy", "--command", "npx vercel deploy"])
+        .output()
+        .expect("deploy should run");
+    let stdout = String::from_utf8_lossy(&custom.stdout);
+    assert!(
+        stdout.contains("umadev deploy --run --command \"npx vercel deploy\""),
+        "{stdout}"
+    );
+
+    // With --run the confirmation prompt follows; declining it (closed stdin)
+    // must not tell the user to run the command they just ran.
+    let declined = hermetic_command(tmp.path())
+        .args(["deploy", "--run"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("deploy should run");
+    let stdout = String::from_utf8_lossy(&declined.stdout);
+    assert!(!stdout.contains("umadev deploy --run"), "{stdout}");
+    assert!(!stdout.contains("/deploy confirm"), "{stdout}");
+}
+
 /// Helper: run `umadev run` to the docs gate in a fresh workspace.
 fn workspace_at_docs_gate(slug: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();

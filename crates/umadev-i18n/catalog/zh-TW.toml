@@ -835,6 +835,8 @@
 
 # /deploy 確認前自檢
 "deploy.confirm_preflight" = "準備部署(尚未執行)。將執行:\n  {}\n\n部署前自檢:1) 建置/測試已過  2) 環境變數與密鑰已在目標平台配好  3) 目標環境(prod/preview)正確  4) 資料庫遷移/回滾預案就緒。\n確認無誤後輸入 /deploy confirm 才真正部署。"
+"deploy.cli_preflight" = "準備部署(尚未執行)。將執行:\n  {}\n\n部署前自檢:1) 建置/測試已過  2) 環境變數與密鑰已在目標平台配好  3) 目標環境(prod/preview)正確  4) 資料庫遷移/回滾預案就緒。"
+"deploy.cli_run_hint" = "確認無誤後執行 `{}` 才真正部署(在腳本中可加 `--yes` 略過確認)。"
 
 # Worker / 底座 spawn 錯誤提示(後台任務裡發出,走行程級目前語言)
 "worker.init_failed" = "[warn] 無法初始化 worker `{}`: {}\n  請檢查: 自訂 provider 的 kind/base_url/key 是否正確? 或用 /backend 選一個已登入的 CLI; /offline 切離線範本。"

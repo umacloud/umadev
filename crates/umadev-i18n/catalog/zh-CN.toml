@@ -835,6 +835,8 @@
 
 # /deploy 确认前自检
 "deploy.confirm_preflight" = "准备部署(尚未执行)。将运行:\n  {}\n\n部署前自检:1) 构建/测试已过  2) 环境变量与密钥已在目标平台配好  3) 目标环境(prod/preview)正确  4) 数据库迁移/回滚预案就绪。\n确认无误后输入 /deploy confirm 才真正部署。"
+"deploy.cli_preflight" = "准备部署(尚未执行)。将运行:\n  {}\n\n部署前自检:1) 构建/测试已过  2) 环境变量与密钥已在目标平台配好  3) 目标环境(prod/preview)正确  4) 数据库迁移/回滚预案就绪。"
+"deploy.cli_run_hint" = "确认无误后运行 `{}` 才真正部署(在脚本中可加 `--yes` 跳过确认)。"
 
 # Worker / 底座 spawn 错误提示(后台任务里发出,走进程级当前语言)
 "worker.init_failed" = "[warn] 无法初始化 worker `{}`: {}\n  请检查: 自定义 provider 的 kind/base_url/key 是否正确? 或用 /backend 选一个已登录的 CLI; /offline 切离线模板。"

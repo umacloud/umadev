@@ -845,6 +845,8 @@
 
 # /deploy pre-confirm preflight
 "deploy.confirm_preflight" = "Ready to deploy (not run yet). Will run:\n  {}\n\nPre-deploy checklist: 1) build/tests passed  2) env vars and secrets configured on the target platform  3) target environment (prod/preview) correct  4) DB migration / rollback plan ready.\nWhen everything checks out, type /deploy confirm to actually deploy."
+"deploy.cli_preflight" = "Ready to deploy (not run yet). Will run:\n  {}\n\nPre-deploy checklist: 1) build/tests passed  2) env vars and secrets configured on the target platform  3) target environment (prod/preview) correct  4) DB migration / rollback plan ready."
+"deploy.cli_run_hint" = "When everything checks out, run `{}` to actually deploy (add `--yes` to skip the confirmation in scripts)."
 
 # Worker / base spawn error hints (emitted from background tasks, use the process-wide language)
 "worker.init_failed" = "[warn] Could not initialize worker `{}`: {}\n  Check: is the custom provider's kind/base_url/key correct? Or use /backend to pick a logged-in CLI; /offline to switch to offline templates."
