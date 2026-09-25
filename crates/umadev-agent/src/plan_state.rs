@@ -2118,12 +2118,17 @@ fn parse_brain_files(v: &serde_json::Value) -> StepFiles {
 const MAX_DECLARED_PATHS: usize = 64;
 
 /// Canonicalise ONE declared path: trim, normalise `\` → `/`, strip a leading `./`
-/// and any leading `/` (declarations are repo-relative), and reject an empty result
-/// or an absolute / parent-escaping path (a declaration can only claim things INSIDE
-/// the workspace). `None` ⇒ the entry is dropped.
+/// and a single leading `/` (declarations are repo-relative), and reject an empty
+/// result or a drive-letter / UNC / colon-bearing / parent-escaping path (a
+/// declaration can only claim things INSIDE the workspace — the same paths the
+/// execution contract's claim normaliser rejects). `None` ⇒ the entry is dropped.
 fn normalize_declared_path(raw: &str) -> Option<String> {
     let p = raw.trim().replace('\\', "/");
-    let p = p.trim_start_matches("./").trim_start_matches('/').trim();
+    let p = p.trim_start_matches("./");
+    if p.starts_with("//") || p.contains(':') {
+        return None;
+    }
+    let p = p.strip_prefix('/').unwrap_or(p).trim();
     if p.is_empty() || p.split('/').any(|seg| seg == "..") {
         return None;
     }
@@ -4908,6 +4913,33 @@ mod tests {
         assert!(parse_brain_files(&json!("src/a.ts")).is_empty());
         assert!(parse_brain_files(&json!(null)).is_empty());
         assert!(parse_brain_files(&json!(7)).is_empty());
+    }
+
+    #[test]
+    fn drive_letter_and_unc_declarations_are_dropped_not_made_relative() {
+        // A drive-letter or UNC path is absolute on Windows. Kept as `C:/proj/…`
+        // (or folded into `srv/x`) it passes the plan, then the ledger rejects it as
+        // an artifact when the step settles Done and the whole run fails. Like the
+        // execution contract's claim normaliser, never read one as repo-relative.
+        for raw in [
+            "C:/proj/src/app.ts",
+            "C:\\proj\\src\\app.ts",
+            "c:relative.ts",
+            "\\\\srv\\share\\x.ts",
+            "//srv/x",
+            "src/a:b.ts",
+        ] {
+            assert_eq!(normalize_declared_path(raw), None, "{raw}");
+        }
+        // A single leading `/` stays the repo-root convention the brain uses.
+        assert_eq!(
+            normalize_declared_path("/src/y.ts").as_deref(),
+            Some("src/y.ts")
+        );
+        assert_eq!(
+            normalize_declared_path(".\\src\\api\\x.ts").as_deref(),
+            Some("src/api/x.ts")
+        );
     }
 
     #[test]
