@@ -90,11 +90,20 @@ pub(crate) fn display_paths(paths: &[String]) -> String {
 }
 
 pub(crate) fn snapshot_blocked(error: WorkspaceSnapshotError) -> ResidentExecutionBlocked {
+    // A size ceiling is the one snapshot failure the user can fix directly.
+    let hint = if matches!(error, WorkspaceSnapshotError::Limit(_)) {
+        "\n提示:把构建产物、依赖、数据等大目录写进项目的 .gitignore(不是 Git 仓库也生效)\
+         后重试;只需分析时可先切换到 /mode plan / hint: add large build-output, dependency, \
+         or data directories to the project's .gitignore (honored without a Git repository \
+         too) and retry; for analysis only, switch to /mode plan"
+    } else {
+        ""
+    };
     ResidentExecutionBlocked {
         note: format!(
             "[blocked] 无法完整核对本轮工作区内容指纹,因此不能标记成功 / unable to \
              verify the complete workspace content fingerprint; this turn cannot be marked \
-             successful: {error}"
+             successful: {error}{hint}"
         ),
     }
 }

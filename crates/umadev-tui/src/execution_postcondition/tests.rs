@@ -131,6 +131,24 @@ fn capture_failure_is_explicitly_unverified() {
     .into_note();
     assert!(note.contains("[blocked]"));
     assert!(note.contains("cannot be marked successful"));
+    assert!(
+        !note.contains(".gitignore"),
+        "only a size limit earns the hint"
+    );
+}
+
+#[test]
+fn snapshot_limit_note_tells_the_user_how_to_recover() {
+    let note = snapshot_blocked(WorkspaceSnapshotError::Limit(
+        "hashed content exceeded 2147483648 bytes; largest top-level entry: `release` \
+         (2048.0 MiB hashed)"
+            .to_string(),
+    ))
+    .into_note();
+    assert!(note.contains("[blocked]"));
+    assert!(note.contains("largest top-level entry: `release`"));
+    assert!(note.contains(".gitignore"));
+    assert!(note.contains("/mode plan"));
 }
 
 #[tokio::test]
