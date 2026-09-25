@@ -1086,6 +1086,38 @@ fn unknown_subcommand_suggests_a_correction() {
     );
 }
 
+/// REGRESSION: a mistyped `--mode` (asking for the read-only `plan` tier)
+/// silently became Guarded, which writes project state and drives the base.
+/// It must be a usage error, listing the tiers, before anything is written.
+#[test]
+fn run_and_quick_reject_an_unknown_mode_before_writing() {
+    for verb in ["run", "quick"] {
+        let tmp = TempDir::new().unwrap();
+        let out = hermetic_command(tmp.path())
+            .args([verb, "做一个登录页", "--mode", "pln"])
+            .output()
+            .expect("umadev should run");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{verb} accepted --mode pln: {out:?}");
+        for tier in ["plan", "guarded", "auto"] {
+            assert!(
+                stderr.contains(tier),
+                "{verb}: the error must list `{tier}`: {stderr}"
+            );
+        }
+        assert!(!tmp.path().join("output").exists(), "{verb} wrote output/");
+        let state: Vec<_> = std::fs::read_dir(tmp.path().join(".umadev"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            state,
+            vec![std::ffi::OsString::from("e2e-home")],
+            "{verb} wrote project state"
+        );
+    }
+}
+
 /// Helper: run `umadev run` to the docs gate in a fresh workspace.
 fn workspace_at_docs_gate(slug: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
