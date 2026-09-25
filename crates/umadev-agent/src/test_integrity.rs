@@ -31,25 +31,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::acceptance::{is_python_venv, MAX_SOURCE_DEPTH, SKIP_DIRS};
 use crate::fswalk::{classify_no_follow, EntryKind};
-
-/// Directories never worth scanning — build output / vendored deps / VCS /
-/// UmaDev's own artifact dirs. Mirrors the acceptance/checkpoint skip sets so the
-/// guard never walks `node_modules` or a base's `output/` doc blackboard.
-const SKIP_DIRS: &[&str] = &[
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".git",
-    "vendor",
-    "__pycache__",
-    ".pytest_cache",
-    ".next",
-    "out",
-    "coverage",
-    "output",
-];
 
 /// Code extensions a test file can carry. Used to decide which files even get
 /// classified as a possible test (harness configs are matched separately by
@@ -405,9 +388,14 @@ fn truncate_literal(lit: &str) -> String {
 }
 
 /// Bounded recursive walk: classify each file as a harness config or a test file
-/// and record it into `snap`. Mirrors the depth/skip bounds of the acceptance
-/// scan. An unreadable directory marks the whole snapshot incomplete so a
-/// missing entry cannot be misreported as a deleted test.
+/// and record it into `snap`. Uses the depth/skip bounds of the acceptance scan:
+/// the same skipped build/vendor dirs, Python virtualenvs whatever their name, and
+/// the same depth. Past that depth the walk stops descending — the same cut on
+/// both sides of a comparison, so it cannot fabricate a deleted test — instead of
+/// discarding the whole snapshot, which silenced the guard for every deep Maven
+/// or Java package tree. An unreadable directory, or a tree over the file/entry
+/// caps, still marks the whole snapshot incomplete so a missing entry cannot be
+/// misreported as a deleted test.
 fn walk(
     root: &Path,
     dir: &Path,
@@ -416,7 +404,10 @@ fn walk(
     entries_seen: &mut usize,
     depth: usize,
 ) {
-    if depth > 8 || snap.tests.len() + snap.harness.len() >= MAX_TEST_SURFACE_FILES {
+    if depth > MAX_SOURCE_DEPTH {
+        return;
+    }
+    if snap.tests.len() + snap.harness.len() >= MAX_TEST_SURFACE_FILES {
         snap.complete = false;
         return;
     }
@@ -443,7 +434,7 @@ fn walk(
         match classify_no_follow(&p) {
             EntryKind::Dir => {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) || is_python_venv(&p) {
                     continue;
                 }
                 walk(root, &p, snap, budget, entries_seen, depth + 1);
@@ -1336,6 +1327,42 @@ mod tests {
             !snap.tests.keys().any(|k| k.contains("escape")),
             "walk must not traverse an escaping symlink: {:?}",
             snap.tests.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ── deep and virtualenv trees keep the guard armed (S04-8) ───────────────
+
+    #[test]
+    fn deep_package_tree_keeps_the_guard_armed() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "tests/test_a.py",
+            "def test_a():\n    assert a() == 1\n",
+        );
+        // A Maven / enterprise Java tree nests source ten levels down.
+        write(
+            tmp.path(),
+            "jeecg-boot/jeecg-module-system/jeecg-system-biz/src/main/java/org/jeecg/modules/system/Service.java",
+            "public class Service {}\n",
+        );
+        // A `python -m venv venv` tree is not the project's code.
+        write(tmp.path(), "venv/pyvenv.cfg", "home = /usr/bin\n");
+        for i in 0..40 {
+            write(
+                tmp.path(),
+                &format!("venv/lib/python3.12/site-packages/pkg{i}/tests/test_x.py"),
+                "def test_x():\n    assert True\n",
+            );
+        }
+        let before = snapshot(tmp.path());
+        fs::remove_file(tmp.path().join("tests/test_a.py")).unwrap();
+        let findings = check(tmp.path(), Some(&before));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("test file deleted") && f.contains("tests/test_a.py")),
+            "{findings:?}"
         );
     }
 

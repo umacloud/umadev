@@ -172,6 +172,7 @@ const SKIP_DIRS: &[&str] = &[
     "third_party",
     "__pycache__",
     ".pytest_cache",
+    "venv",
     ".next",
     "out",
     "coverage",
@@ -400,7 +401,10 @@ fn collect(
             EntryKind::Dir => {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 let lower_name = name.to_ascii_lowercase();
-                if name.starts_with('.') || SKIP_DIRS.contains(&lower_name.as_str()) {
+                if name.starts_with('.')
+                    || SKIP_DIRS.contains(&lower_name.as_str())
+                    || crate::acceptance::is_python_venv(&p)
+                {
                     continue;
                 }
                 if !collect(root, &p, out, entries_seen, depth + 1) {
@@ -1673,6 +1677,34 @@ mod tests {
             "only the file that CROSSED the ceiling blocks (a light edit to a \
              pre-existing giant is not this step's doing): {}",
             god[0].message
+        );
+    }
+
+    #[test]
+    fn a_python_virtualenv_is_not_project_source() {
+        // `python -m venv venv` (or any name: `env`, `.venv`, `py311`) holds installed
+        // packages; walking them exhausted the file cap and disabled the baseline.
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "app.py", "def main():\n    return 1\n");
+        for venv in ["venv", "env"] {
+            write(
+                tmp.path(),
+                &format!("{venv}/pyvenv.cfg"),
+                "home = /usr/bin\n",
+            );
+            write(
+                tmp.path(),
+                &format!("{venv}/lib/python3.12/site-packages/pkg/core.py"),
+                "def helper():\n    return 2\n",
+            );
+        }
+        let base = baseline(tmp.path());
+        assert!(!base.disabled);
+        assert!(base.files.contains_key("app.py"), "{:?}", base.files.keys());
+        assert!(
+            base.files.keys().all(|k| !k.contains("site-packages")),
+            "{:?}",
+            base.files.keys()
         );
     }
 
