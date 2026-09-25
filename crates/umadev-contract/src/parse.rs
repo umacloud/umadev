@@ -93,11 +93,13 @@ pub enum SecurityKind {
 
 impl SecurityKind {
     /// Parse the Auth column text into a security kind. Tolerant: common
-    /// synonyms (`jwt` → Bearer, `token` → Bearer) are mapped.
+    /// synonyms (`jwt` → Bearer, `token` → Bearer) are mapped, and placeholder
+    /// or negative markers (`-`, `n/a`, `无`, `否`, `公开`, `None (public)`,
+    /// `No token`) mean a public endpoint.
     #[must_use]
     pub fn parse(s: &str) -> Self {
         let lower = s.trim().to_ascii_lowercase();
-        if lower.is_empty() || lower == "none" || lower == "no" || lower == "public" {
+        if marks_public_endpoint(&lower) {
             return Self::None;
         }
         if lower.contains("bearer") || lower.contains("jwt") || lower.contains("token") {
@@ -118,6 +120,38 @@ impl SecurityKind {
         }
         Self::Other
     }
+}
+
+/// Whether a (lower-cased) Auth cell marks the endpoint as public: an empty or
+/// placeholder cell (`-`, `—`, `n/a`, a cross mark), a Chinese negative or public
+/// marker (`无`, `否`, `无需登录`, `不需要`, `公开`, `匿名`), or a cell whose first
+/// word is negative or public (`None (public)`, `No token`, `Not required`). It is
+/// checked before the substring rules, so `No token` is not read as Bearer.
+fn marks_public_endpoint(lower: &str) -> bool {
+    const PLACEHOLDERS: &[&str] = &["", "-", "--", "—", "–", "na", "✗", "✘", "×", "❌"];
+    const PREFIXES: &[&str] = &[
+        "n/a", "无需", "無需", "无须", "無須", "不需", "不用", "免登", "公开", "公開", "匿名", "否",
+    ];
+    const FIRST_WORDS: &[&str] = &[
+        "none",
+        "no",
+        "not",
+        "false",
+        "public",
+        "anonymous",
+        "无",
+        "無",
+    ];
+    if PLACEHOLDERS.contains(&lower) || PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return true;
+    }
+    let first_word = lower
+        .split(|c: char| {
+            c.is_whitespace() || c.is_ascii_punctuation() || matches!(c, '（' | '，' | '、' | '；')
+        })
+        .find(|word| !word.is_empty())
+        .unwrap_or("");
+    FIRST_WORDS.contains(&first_word)
 }
 
 /// One API endpoint: method + path + metadata.
@@ -756,6 +790,62 @@ mod tests {
         assert_eq!(SecurityKind::parse("api-key"), SecurityKind::ApiKey);
         assert_eq!(SecurityKind::parse("OAuth2"), SecurityKind::OAuth2);
         assert_eq!(SecurityKind::parse("session cookie"), SecurityKind::Session);
+    }
+
+    #[test]
+    fn security_kind_public_markers() {
+        // Auth cells are free text, and Chinese docs write Chinese markers. A
+        // placeholder or negative marker means the endpoint is public; before,
+        // these fell through to `Other` (counted as protected) or, for
+        // `No token`, to `Bearer`.
+        for public in [
+            "-",
+            "—",
+            "n/a",
+            "N/A",
+            "无",
+            "無",
+            "否",
+            "否（公开）",
+            "不需要",
+            "无需登录",
+            "無需登入",
+            "公开",
+            "公開接口",
+            "匿名",
+            "免登录",
+            "✗",
+            "×",
+            "None (public)",
+            "No token",
+            "no-auth",
+            "Not required",
+            "Public (rate limited)",
+            "anonymous",
+        ] {
+            assert_eq!(
+                SecurityKind::parse(public),
+                SecurityKind::None,
+                "{public:?} marks a public endpoint"
+            );
+        }
+        // Cells that require auth keep their protected kind.
+        assert_eq!(SecurityKind::parse("Bearer token"), SecurityKind::Bearer);
+        assert_eq!(SecurityKind::parse("需要 token"), SecurityKind::Bearer);
+        for protected in [
+            "是",
+            "需要登录",
+            "登录用户",
+            "required",
+            "admin only",
+            "无效即拒绝",
+        ] {
+            assert_eq!(
+                SecurityKind::parse(protected),
+                SecurityKind::Other,
+                "{protected:?} requires auth"
+            );
+        }
     }
 
     #[test]
