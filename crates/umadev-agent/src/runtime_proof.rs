@@ -109,6 +109,16 @@ const BOOT_RECORD_BYTES: usize = 8 * 1024;
 /// unbounded memory while `curl` is being polled.
 const BOOT_SIGNAL_QUEUE: usize = 32;
 
+/// Dev-server output lines kept (the last ones) so a boot that fails can say what
+/// the server said, instead of guessing a cause.
+const BOOT_TAIL_LINES: usize = 12;
+
+/// Characters kept of each of those lines.
+const BOOT_TAIL_LINE_CHARS: usize = 240;
+
+/// Lines of that tail quoted in a failed boot's reason.
+const BOOT_REASON_LINES: usize = 3;
+
 /// Hard resource envelope for short pidfile-reclaim helpers.
 const PID_HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(unix)]
@@ -360,8 +370,9 @@ async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
     });
 
     // Drain + scan the child's output on owned tasks. Each record and the signal
-    // queue have hard bounds; non-signals are discarded immediately.
-    let (mut readers, mut rx) = BootReaders::spawn(&mut child);
+    // queue have hard bounds; only the last few lines are kept (for a diagnosis).
+    let tail = BootTail::default();
+    let (mut readers, mut rx) = BootReaders::spawn(&mut child, &tail);
 
     // 5. Bounded boot: read output for readiness / port-fallback / already-running
     //    signals AND poll the (possibly re-pointed) base URL, all within one
@@ -379,8 +390,13 @@ async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
             // a PRE-EXISTING server we did not boot, so verify it strictly (reused=true).
             finish_proof(workspace, &dev, existing, Some(0), true).await
         }
-        BootOutcome::Timeout => {
-            let mut proof = RuntimeProof::not_verified(boot_timeout_reason(READY_TIMEOUT_SECS));
+        BootOutcome::Timeout | BootOutcome::Exited => {
+            let reason = if outcome == BootOutcome::Exited {
+                "the dev server exited before it answered".to_string()
+            } else {
+                boot_timeout_reason(READY_TIMEOUT_SECS)
+            };
+            let mut proof = RuntimeProof::not_verified(with_last_output(reason, &tail.lines()));
             proof.dev_server = Some(dev.label.to_string());
             proof.command = Some(dev.command.clone());
             proof.base_url = Some(base_url);
@@ -437,6 +453,20 @@ enum BootPlan {
 /// leaving a bare timeout, and is what the CLI surfaces via `runtime.not_verified`.
 fn boot_timeout_reason(secs: u64) -> String {
     format!("dev server did not bind within {secs}s — a leftover process may hold the port")
+}
+
+/// `reason`, followed by the last lines the dev server printed (redacted), so a
+/// failed boot shows what the server said — `vite: not found`, a config syntax
+/// error, the port it really bound — instead of only our guess at the cause.
+fn with_last_output(reason: String, tail: &[String]) -> String {
+    let start = tail.len().saturating_sub(BOOT_REASON_LINES);
+    let last = tail[start..].join(" | ");
+    if last.is_empty() {
+        reason
+    } else {
+        let last = umadev_governance::redaction::redact_text(&last);
+        format!("{reason} (last output: {last})")
+    }
 }
 
 /// Run the route-probe + optional e2e steps against a known-good base URL and
@@ -749,6 +779,8 @@ enum BootOutcome {
     AlreadyRunning { base_url: String },
     /// Nothing answered within the budget — bounded, never a hang.
     Timeout,
+    /// The dev server's output closed (it exited) and its URL did not answer.
+    Exited,
 }
 
 /// What a single output line tells us about boot progress.
@@ -765,7 +797,9 @@ enum LineVerdict {
 /// signals while polling `curl`. A port fallback re-points the probe at the
 /// actually-bound port; a "ready" line is confirmed with a `curl` before we trust
 /// it (so a `Verified` proof always means the URL truly answered). Returns
-/// [`BootOutcome::Timeout`] when nothing answers in time — never blocks forever.
+/// [`BootOutcome::Exited`] when the server's output closes without its URL
+/// answering, and [`BootOutcome::Timeout`] when nothing answers in time — never
+/// blocks forever.
 async fn wait_for_boot(
     rx: &mut tokio::sync::mpsc::Receiver<DevSignal>,
     base_url: &str,
@@ -805,14 +839,14 @@ async fn wait_for_boot(
                     }
                 } else {
                     // Output is exhausted (the process closed its pipes / exited).
-                    // One final probe decides ready-vs-failed; bounded either way.
+                    // One final probe decides ready-vs-exited; bounded either way.
                     if curl_status(&effective, 3).await.is_some() {
                         return BootOutcome::Ready {
                             base_url: effective,
                             ready_ms: elapsed_ms(started),
                         };
                     }
-                    return BootOutcome::Timeout;
+                    return BootOutcome::Exited;
                 }
             }
             _ = poll.tick() => {
@@ -939,24 +973,74 @@ fn scan_dev_line(line: &str) -> Option<DevSignal> {
     if lower.contains("ready") || lower.contains("started server") {
         return Some(DevSignal::Ready(ready_port(&lower)));
     }
-    if let Some(idx) = lower.find("listening on") {
-        let port = port_from_url_in(&lower)
-            .or_else(|| parse_uint_after(&lower, idx + "listening on".len()));
+    if let Some(idx) = lower.find("listening") {
+        let port = ready_port(&lower).or_else(|| {
+            parse_uint_after(&lower, idx + "listening".len()).filter(|port| *port != 0)
+        });
         return Some(DevSignal::Ready(port));
     }
-    if lower.contains("running at") || lower.contains("server running") {
-        return Some(DevSignal::Ready(port_from_url_in(&lower)));
+    // `Server running on port 8080`, `running at http://…`, `Server started on port
+    // 3000`, and the same announcement in Chinese (`服务已启动 http://localhost:8080`).
+    // A proxy's log line names the BACKEND's URL, never the dev server's own port.
+    if READY_PHRASES.iter().any(|phrase| lower.contains(phrase)) && !lower.contains("proxy") {
+        return Some(DevSignal::Ready(ready_port(&lower)));
     }
     None
 }
 
-/// Best-effort port from a readiness line: a URL port, else the integer after
-/// the word "port".
+/// Phrases a server's "I am up" log line carries, in English and Chinese.
+const READY_PHRASES: &[&str] = &[
+    "running at",
+    "running on",
+    "server running",
+    "server is running",
+    "server started",
+    "started on",
+    "启动",
+    "运行在",
+    "运行于",
+    "监听",
+    "访问地址",
+];
+
+/// Best-effort port from a readiness line: a URL port, else the number written
+/// right after the word "port" (`port 8080`, `port: 8080`, `端口：8080`) or after a
+/// host (`0.0.0.0:3000`, `localhost:3000`). Never port 0.
 fn ready_port(lower: &str) -> Option<u16> {
-    port_from_url_in(lower).or_else(|| {
-        lower
-            .find("port ")
-            .and_then(|i| parse_uint_after(lower, i + "port ".len()))
+    port_from_url_in(lower)
+        .filter(|port| *port != 0)
+        .or_else(|| {
+            [
+                "port",
+                "端口",
+                "localhost:",
+                "127.0.0.1:",
+                "0.0.0.0:",
+                "[::]:",
+                ":::",
+            ]
+            .iter()
+            .find_map(|marker| port_after(lower, marker))
+        })
+}
+
+/// The non-zero port written right after `marker`, separated from it only by
+/// spaces, `:`, `=` or `：` — `port 8080`, `port=8080`, `localhost:8080`. A marker
+/// that starts with a letter must start a word, so `report 3` or `export 1` is not
+/// a port.
+fn port_after(lower: &str, marker: &str) -> Option<u16> {
+    let word_marker = marker.starts_with(|c: char| c.is_ascii_alphabetic());
+    lower.match_indices(marker).find_map(|(at, _)| {
+        let starts_word = lower[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        if word_marker && !starts_word {
+            return None;
+        }
+        let rest = lower[at + marker.len()..].trim_start_matches([' ', ':', '=', '\t', '：']);
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u16>().ok().filter(|port| *port != 0)
     })
 }
 
@@ -1014,6 +1098,35 @@ fn replace_port(base_url: &str, port: u16) -> String {
     format!("{}://{host}:{port}{path}", &base_url[..scheme_end])
 }
 
+/// The last lines a dev server printed, bounded to [`BOOT_TAIL_LINES`] lines of at
+/// most [`BOOT_TAIL_LINE_CHARS`] characters, shared by its stdout and stderr readers.
+#[derive(Clone, Default)]
+struct BootTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+impl BootTail {
+    fn push(&self, line: &str) {
+        let line = crate::verify::strip_ansi(line);
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        let kept: String = line.chars().take(BOOT_TAIL_LINE_CHARS).collect();
+        if let Ok(mut lines) = self.0.lock() {
+            if lines.len() == BOOT_TAIL_LINES {
+                lines.pop_front();
+            }
+            lines.push_back(kept);
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .map(|lines| lines.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
 /// Owned dev-server pipe readers. Dropping this value aborts both tasks; normal
 /// teardown joins them within an explicit grace after the process tree dies.
 struct BootReaders {
@@ -1023,14 +1136,15 @@ struct BootReaders {
 impl BootReaders {
     fn spawn(
         child: &mut umadev_process::ManagedChild,
+        tail: &BootTail,
     ) -> (Self, tokio::sync::mpsc::Receiver<DevSignal>) {
         let (tx, rx) = tokio::sync::mpsc::channel(BOOT_SIGNAL_QUEUE);
         let mut tasks = Vec::with_capacity(2);
         if let Some(stdout) = child.take_stdout() {
-            tasks.push(spawn_boot_reader(stdout, tx.clone()));
+            tasks.push(spawn_boot_reader(stdout, tx.clone(), tail.clone()));
         }
         if let Some(stderr) = child.take_stderr() {
-            tasks.push(spawn_boot_reader(stderr, tx.clone()));
+            tasks.push(spawn_boot_reader(stderr, tx.clone(), tail.clone()));
         }
         drop(tx);
         (Self { tasks }, rx)
@@ -1060,15 +1174,19 @@ impl Drop for BootReaders {
 fn spawn_boot_reader<R>(
     reader: R,
     tx: tokio::sync::mpsc::Sender<DevSignal>,
+    tail: BootTail,
 ) -> tokio::task::JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
-    tokio::spawn(read_boot_records(reader, tx))
+    tokio::spawn(read_boot_records(reader, tx, tail))
 }
 
-async fn read_boot_records<R>(mut reader: R, tx: tokio::sync::mpsc::Sender<DevSignal>)
-where
+async fn read_boot_records<R>(
+    mut reader: R,
+    tx: tokio::sync::mpsc::Sender<DevSignal>,
+    tail: BootTail,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt as _;
@@ -1082,7 +1200,7 @@ where
         };
         for byte in &chunk[..read] {
             if *byte == b'\n' || record.len() == BOOT_RECORD_BYTES {
-                publish_boot_record(&record, &tx);
+                publish_boot_record(&record, &tx, &tail);
                 record.clear();
             }
             if *byte != b'\n' {
@@ -1090,14 +1208,15 @@ where
             }
         }
     }
-    publish_boot_record(&record, &tx);
+    publish_boot_record(&record, &tx, &tail);
 }
 
-fn publish_boot_record(record: &[u8], tx: &tokio::sync::mpsc::Sender<DevSignal>) {
+fn publish_boot_record(record: &[u8], tx: &tokio::sync::mpsc::Sender<DevSignal>, tail: &BootTail) {
     if record.is_empty() {
         return;
     }
     let line = String::from_utf8_lossy(record);
+    tail.push(&line);
     if let Some(signal) = scan_dev_line(&line) {
         // Never wait on a full signal queue: the pipe must remain continuously
         // drained. Periodic curl polling is the readiness safety net.
@@ -2107,6 +2226,25 @@ mod tests {
     }
 
     #[test]
+    fn scan_server_running_on_port_line_reports_the_port() {
+        // The common Express log line: without its port the probe stayed on the
+        // default 3000 for the whole boot budget and blamed "a leftover process".
+        assert_eq!(
+            scan_dev_line("Server running on port 8080"),
+            Some(DevSignal::Ready(Some(8080)))
+        );
+        // A log line in Chinese carries the URL the server bound.
+        assert_eq!(
+            scan_dev_line("服务已启动 http://localhost:8080"),
+            Some(DevSignal::Ready(Some(8080)))
+        );
+        assert_eq!(
+            scan_dev_line("后端服务运行在 http://127.0.0.1:9000/api"),
+            Some(DevSignal::Ready(Some(9000)))
+        );
+    }
+
+    #[test]
     fn scan_ignores_unremarkable_lines() {
         assert_eq!(scan_dev_line("info  - Loaded env from .env"), None);
         assert_eq!(scan_dev_line(""), None);
@@ -2589,12 +2727,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_boot_times_out_when_output_closes_with_no_server() {
-        // Sender dropped → channel closed → final probe fails → bounded Timeout.
+    async fn wait_for_boot_reports_an_exit_when_output_closes_with_no_server() {
+        // Sender dropped → channel closed → final probe fails → the server exited. A
+        // crash one second in is not "did not bind within 60s — a leftover process".
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DevSignal>(1);
         drop(tx);
         let outcome = wait_for_boot(&mut rx, "http://127.0.0.1:1", 60).await;
-        assert_eq!(outcome, BootOutcome::Timeout);
+        assert_eq!(outcome, BootOutcome::Exited);
+    }
+
+    #[tokio::test]
+    async fn a_crashed_dev_server_keeps_its_last_words() {
+        let tail = BootTail::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(BOOT_SIGNAL_QUEUE);
+        let output: &[u8] = b"> app@1.0.0 dev\n> vite\n\nsh: 1: vite: not found\n";
+        read_boot_records(output, tx, tail.clone()).await;
+        let reason = with_last_output(
+            "the dev server exited before it answered".to_string(),
+            &tail.lines(),
+        );
+        assert!(reason.contains("exited before it answered"), "{reason}");
+        assert!(reason.contains("vite: not found"), "{reason}");
+        assert!(!reason.contains("leftover"), "{reason}");
+
+        // Bounded: only the last lines, each capped.
+        let tail = BootTail::default();
+        for i in 0..100 {
+            tail.push(&format!("line {i} {}", "x".repeat(1000)));
+        }
+        let lines = tail.lines();
+        assert_eq!(lines.len(), BOOT_TAIL_LINES);
+        assert!(lines[0].starts_with("line 88 "), "{}", lines[0]);
+        assert!(lines
+            .iter()
+            .all(|l| l.chars().count() <= BOOT_TAIL_LINE_CHARS));
+        // Secrets the server printed are not copied into the proof.
+        let reason = with_last_output(
+            "x".to_string(),
+            &["DATABASE_URL=postgres://admin:hunter2@db:5432/app".to_string()],
+        );
+        assert!(!reason.contains("hunter2"), "{reason}");
+    }
+
+    #[test]
+    fn scan_reads_host_port_forms_and_never_port_zero() {
+        assert_eq!(
+            scan_dev_line("Listening on 0.0.0.0:3000"),
+            Some(DevSignal::Ready(Some(3000)))
+        );
+        assert_eq!(
+            scan_dev_line("App listening at http://localhost:4000"),
+            Some(DevSignal::Ready(Some(4000)))
+        );
+        assert_eq!(
+            scan_dev_line("Server started on port: 5000"),
+            Some(DevSignal::Ready(Some(5000)))
+        );
+        assert_eq!(
+            scan_dev_line("服务运行在端口：7001"),
+            Some(DevSignal::Ready(Some(7001)))
+        );
+        // A proxy announcing its BACKEND target is not the dev server's port.
+        assert_eq!(
+            scan_dev_line("[HPM] Proxy created: /api  -> http://localhost:8080"),
+            None
+        );
+        assert_eq!(scan_dev_line("Exported 3 reports"), None);
     }
 
     // -------------------------------------------------------------------
@@ -2682,7 +2880,7 @@ mod tests {
                 "sh",
                 owner_token,
             );
-            let (_readers, _signals) = BootReaders::spawn(&mut child);
+            let (_readers, _signals) = BootReaders::spawn(&mut child, &BootTail::default());
             std::future::pending::<()>().await;
         });
 
@@ -2718,7 +2916,7 @@ mod tests {
     async fn newline_free_boot_flood_has_a_bounded_signal_queue() {
         let flood = "ready".repeat(BOOT_RECORD_BYTES * (BOOT_SIGNAL_QUEUE + 8));
         let (tx, rx) = tokio::sync::mpsc::channel(BOOT_SIGNAL_QUEUE);
-        read_boot_records(flood.as_bytes(), tx).await;
+        read_boot_records(flood.as_bytes(), tx, BootTail::default()).await;
         assert_eq!(rx.len(), BOOT_SIGNAL_QUEUE);
     }
 }
