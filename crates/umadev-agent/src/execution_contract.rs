@@ -397,9 +397,14 @@ pub(crate) fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     p == pattern.len()
 }
 
+/// UmaDev's own runtime state, plus the open-decisions register the firmware tells
+/// every work turn to append to (and never delete) — neither is the turn's product
+/// work, so neither may be rejected as out of scope or counted against the budget.
 fn is_internal_runtime_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower == ".umadev" || lower.starts_with(".umadev/")
+    lower == ".umadev"
+        || lower.starts_with(".umadev/")
+        || lower.eq_ignore_ascii_case(crate::open_decisions::REGISTER_REL_PATH)
 }
 
 /// Whether a workspace-relative directory can contain a path that
@@ -530,6 +535,30 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].code, "execution-path-out-of-scope");
         assert_eq!(violations[0].path.as_deref(), Some("src/auth.rs"));
+    }
+
+    #[test]
+    fn the_firmware_mandated_decision_register_is_an_internal_artifact() {
+        // Every work turn is told to append deferred decisions to this register; the
+        // contract must neither reject that write nor count it against the budget.
+        let contract = ExecutionContract::from_route(
+            &route(RouteClass::QuickEdit, Depth::Fast, &["src/seo/a.ts"]),
+            "adjust SEO",
+        );
+        assert!(contract
+            .validate_changed_paths([
+                "src/seo/a.ts",
+                crate::open_decisions::REGISTER_REL_PATH,
+                "docs/decisions/open-decisions.md",
+            ])
+            .is_empty());
+        assert_eq!(
+            contract
+                .validate_changed_paths(["src/seo/a.ts", "docs/decisions/ADR-7.md"])
+                .len(),
+            1,
+            "only the register itself is internal, not its directory"
+        );
     }
 
     #[test]
