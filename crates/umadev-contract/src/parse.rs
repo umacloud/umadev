@@ -368,7 +368,10 @@ fn extract_endpoints_from_table(md: &str) -> Vec<Endpoint> {
         if cells.len() <= method_col.max(path_col) {
             continue;
         }
-        let Some(method) = HttpVerb::parse(&cells[method_col]) else {
+        // Unwrap a verb written as a code span or in bold / italics (`` `GET` ``,
+        // `**POST**`, `_PUT_`) before parsing it, like the path cell below.
+        let method_cell = cells[method_col].trim().trim_matches(['`', '*', '_']);
+        let Some(method) = HttpVerb::parse(method_cell) else {
             continue; // skip rows whose method isn't a real verb (e.g. "TODO")
         };
         // Strip markdown backtick wrapping so `/api/subscribe` in
@@ -565,6 +568,23 @@ mod tests {
         assert_eq!(spec.endpoints[0].path, "/api/health");
         assert_eq!(spec.endpoints[1].method, HttpVerb::Post);
         assert_eq!(spec.endpoints[1].path, "/api/auth/login");
+    }
+
+    #[test]
+    fn parses_backticked_and_bold_verbs() {
+        // LLM-written tables often wrap the verb in a code span or bold. Every
+        // row used to be skipped, leaving an empty contract.
+        let md = "| Method | Path | Description |\n|---|---|---|\n\
+                  | `GET` | `/api/products` | List |\n\
+                  | **POST** | /api/orders | Create |\n\
+                  | __PUT__ | /api/orders/:id | Update |\n\
+                  | **TODO** | /api/later | Not a verb |\n";
+        let spec = parse_architecture(md, "t");
+        assert!(spec.has_endpoint(HttpVerb::Get, "/api/products"));
+        assert!(spec.has_endpoint(HttpVerb::Post, "/api/orders"));
+        assert!(spec.has_endpoint(HttpVerb::Put, "/api/orders/7"));
+        // A cell that is still not a verb once unwrapped stays skipped.
+        assert_eq!(spec.len(), 3, "{:?}", spec.declared_paths());
     }
 
     #[test]
