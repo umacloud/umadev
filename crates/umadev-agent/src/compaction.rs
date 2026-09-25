@@ -28,6 +28,10 @@ pub const MIN_FOLD: usize = 2;
 /// the summary REQUEST itself can never blow the budget we are reclaiming.
 const FOLDED_INPUT_CHARS: usize = 12_000;
 
+/// A leading folded message at most this long (room for a prior
+/// [`SUMMARY_MAX_CHARS`] summary plus its framing) survives an overflow whole.
+const FOLDED_HEAD_CHARS: usize = 3_000;
+
 /// Hard cap (chars) on the returned summary, so the fold can't reintroduce the
 /// bloat it just removed. The summary block stays small and bounded.
 pub const SUMMARY_MAX_CHARS: usize = 2_400;
@@ -101,15 +105,46 @@ pub fn plan(
 
 /// Render the folded prefix as a plain `role: content` transcript, oldest →
 /// newest, bounded to [`FOLDED_INPUT_CHARS`] so the request stays small. Pure.
+///
+/// On overflow the NEWEST content is kept: the turns just before the verbatim
+/// tail are what "## Current work" is summarised from. A small leading message
+/// (typically the previous fold's summary) is kept whole ahead of the cut.
 fn render_folded(folded: &[Message]) -> String {
-    let mut out = String::new();
-    for m in folded {
-        out.push_str(&m.role);
-        out.push_str(": ");
-        out.push_str(&m.content);
-        out.push_str("\n\n");
+    fn render(messages: &[Message]) -> String {
+        let mut out = String::new();
+        for m in messages {
+            out.push_str(&m.role);
+            out.push_str(": ");
+            out.push_str(&m.content);
+            out.push_str("\n\n");
+        }
+        out.trim_end().to_string()
     }
-    crate::experts::excerpt(out.trim_end(), FOLDED_INPUT_CHARS)
+    let full = render(folded);
+    if full.chars().count() <= FOLDED_INPUT_CHARS {
+        return full;
+    }
+    let (mut out, rest) = match folded.split_first() {
+        Some((first, rest)) => {
+            let head = render(std::slice::from_ref(first));
+            if head.chars().count() <= FOLDED_HEAD_CHARS {
+                (head + "\n\n", rest)
+            } else {
+                (String::new(), folded)
+            }
+        }
+        None => (String::new(), folded),
+    };
+    let rest = render(rest);
+    let budget = FOLDED_INPUT_CHARS
+        .saturating_sub(out.chars().count())
+        .saturating_sub(1);
+    out.push('…');
+    out.extend(
+        rest.chars()
+            .skip(rest.chars().count().saturating_sub(budget)),
+    );
+    out
 }
 
 /// Build the structured-summary prompt for the folded prefix. The base is asked
@@ -319,6 +354,25 @@ mod tests {
         }
         // The folded transcript is carried in the user body.
         assert!(p.user.contains("user message number 0"));
+    }
+
+    #[test]
+    fn oversized_fold_keeps_the_newest_turns_and_a_small_prior_summary() {
+        let big = "a".repeat(13_000);
+        let p = summary_prompt(&[msg("user", &big), msg("assistant", "DECISION_X")]);
+        assert!(p.user.contains("DECISION_X"), "newest folded turn must survive");
+
+        let p = summary_prompt(&[
+            msg("user", "PRIOR_SUMMARY"),
+            msg("user", &big),
+            msg("assistant", "DECISION_X"),
+        ]);
+        assert!(p.user.contains("PRIOR_SUMMARY"));
+        assert!(p.user.contains("DECISION_X"));
+        assert!(render_folded(&[msg("user", "PRIOR_SUMMARY"), msg("user", &big)])
+            .chars()
+            .count()
+            <= FOLDED_INPUT_CHARS);
     }
 
     #[tokio::test]
