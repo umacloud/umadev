@@ -279,8 +279,9 @@ impl UsageRecordV2 {
         token_shape_valid
             && match self.cost.quality {
                 CostQuality::Exact => {
+                    // Zero is an exact cost for a free/local model.
                     t.quality == MeasurementQuality::Exact
-                        && self.cost.usd_ticks.is_some_and(|ticks| ticks > 0)
+                        && self.cost.usd_ticks.is_some_and(|ticks| ticks >= 0)
                 }
                 CostQuality::Unknown => self.cost.usd_ticks.is_none(),
             }
@@ -388,7 +389,7 @@ impl CostBreakdown {
 
     fn add(&mut self, cost: &CostMeasurement) {
         match (cost.quality, cost.usd_ticks) {
-            (CostQuality::Exact, Some(ticks)) if ticks > 0 => {
+            (CostQuality::Exact, Some(ticks)) if ticks >= 0 => {
                 self.reported_usd_ticks = self
                     .reported_usd_ticks
                     .saturating_add(u128::try_from(ticks).unwrap_or(0));
@@ -1526,6 +1527,29 @@ mod tests {
             })
             .collect();
         assert_eq!(ids.len() as u64, children * per_child);
+    }
+
+    #[test]
+    fn free_model_zero_cost_is_recorded_as_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage.jsonl");
+        let record = UsageRecordV2::from_runtime(
+            "opencode",
+            "frontend",
+            Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                cost_usd_ticks: Some(0),
+                usage_incomplete: false,
+                ..Usage::default()
+            },
+        );
+        append_record_to_path(&path, &record, config(64 * 1024, 3)).unwrap();
+        let report = usage_report_from_path(&path, config(64 * 1024, 3));
+        assert_eq!(report.token_breakdown.exact_tokens, 15);
+        assert_eq!(report.cost_breakdown.exact_calls, 1);
+        assert_eq!(report.cost_breakdown.complete_total_usd_ticks(), Some(0));
     }
 
     #[test]
