@@ -6366,6 +6366,13 @@ fn cmd_pr(
         println!("\n{}", umadev_i18n::t(lang, "pr.dry_run"));
         return Ok(());
     }
+    // Both names come from the repository (the checked-out branch, origin/HEAD,
+    // init.defaultBranch) and reach `git push` and `gh` as arguments.
+    for branch in [&plan.head_branch, &plan.base_branch] {
+        if !pr_branch_is_safe(&project_root, branch) {
+            anyhow::bail!("PR was not created: {branch:?} is not a safe branch name");
+        }
+    }
 
     // Reversibility floor (fail-SAFE): a `git push` + `gh pr create` reach the
     // network and publish work outward — irreversible actions the trust floor
@@ -6467,7 +6474,8 @@ fn cmd_pr(
         "",
         None,
     );
-    if !run_pr_git(&project_root, &["push", "-u", "origin", &plan.head_branch]) {
+    let refspec = pr_push_refspec(&plan.head_branch);
+    if !run_pr_git(&project_root, &pr_push_args(&refspec)) {
         // The commit already landed on a branch we created a moment ago; only the
         // network push failed. Don't silently move the working tree (a `git switch`
         // could itself fail on unrelated WIP) — instead name the branch that holds
@@ -6578,6 +6586,31 @@ fn run_pr_git(project_root: &Path, args: &[&str]) -> bool {
             false
         }
     }
+}
+
+/// Whether `branch` can reach `git push` and `gh` as data: no leading `-`, which
+/// either would parse as an option (`--receive-pack=<cmd>` runs a program), and
+/// a valid branch ref name.
+fn pr_branch_is_safe(project_root: &Path, branch: &str) -> bool {
+    let reference = format!("refs/heads/{branch}");
+    !branch.starts_with('-')
+        && bounded_cli_output(
+            pr_git_command(project_root, &["check-ref-format", &reference]),
+            Duration::from_secs(10),
+            4 * 1024,
+            64 * 1024,
+        )
+        .is_ok_and(|output| output.status.success())
+}
+
+/// The explicit `refs/heads/<b>:refs/heads/<b>` refspec the PR push publishes.
+fn pr_push_refspec(branch: &str) -> String {
+    format!("refs/heads/{branch}:refs/heads/{branch}")
+}
+
+/// The PR push argv. The refspec follows `--`, so it is never an option.
+fn pr_push_args(refspec: &str) -> [&str; 5] {
+    ["push", "-u", "origin", "--", refspec]
 }
 
 #[cfg(windows)]
@@ -6890,6 +6923,69 @@ mod tests {
         assert!(command
             .get_args()
             .any(|arg| arg == OsStr::new(PR_INERT_HOOKS)));
+    }
+
+    #[test]
+    fn pr_branch_names_that_git_or_gh_would_parse_as_options_are_refused() {
+        if !test_git_available() {
+            return;
+        }
+        let root = Path::new(".");
+        assert!(pr_branch_is_safe(root, "umadev/demo"));
+        assert!(pr_branch_is_safe(root, "main"));
+        for branch in [
+            "--receive-pack=touch pwned",
+            "-u",
+            "",
+            "a..b",
+            "x y",
+            "bad~1",
+        ] {
+            assert!(!pr_branch_is_safe(root, branch), "{branch:?}");
+        }
+    }
+
+    #[test]
+    fn pr_push_sends_an_explicit_refspec_after_the_option_terminator() {
+        if !test_git_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let remote = temp.path().join("remote.git");
+        let root = temp.path().join("work");
+        std::fs::create_dir_all(&root).unwrap();
+        let remote_arg = remote.to_string_lossy().to_string();
+        assert!(
+            run_test_git(temp.path(), &["init", "-q", "--bare", &remote_arg])
+                .status
+                .success()
+        );
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["remote", "add", "origin", &remote_arg],
+            vec!["commit", "-q", "--allow-empty", "-m", "seed"],
+            vec!["switch", "-q", "-c", "umadev/demo"],
+        ] {
+            assert!(run_test_git(&root, &args).status.success(), "{args:?}");
+        }
+
+        let refspec = pr_push_refspec("umadev/demo");
+        let args = pr_push_args(&refspec);
+        assert_eq!(
+            args[3..],
+            ["--", "refs/heads/umadev/demo:refs/heads/umadev/demo"]
+        );
+        assert!(run_pr_git(&root, &args));
+        let upstream = run_test_git(&root, &["config", "branch.umadev/demo.remote"]);
+        assert_eq!(String::from_utf8_lossy(&upstream.stdout).trim(), "origin");
+        assert!(run_test_git(
+            &remote,
+            &["rev-parse", "--verify", "refs/heads/umadev/demo"]
+        )
+        .status
+        .success());
     }
 
     #[cfg(unix)]
