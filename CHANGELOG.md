@@ -2,6 +2,18 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.1.2] - 2026-09-25
+
+安装命令精简为一行 · 发布终检修复
+
+### 文档
+
+- 安装说明精简为一行:`npm i -g @umatech/umadev`。README(三语)、SECURITY 与官网去掉 `--registry` 参数和 sudo/prefix/npx 说明——该参数原为绕开仍缓存旧未加 scope `umadev` 恶意 `1.0.74` 的镜像,全新的 `@umatech/umadev` 没有这段历史,不再需要;权限或 PATH 问题交给 `umadev doctor` 给出确切修复命令。
+
+### 修复(发布链路)
+
+- 发布流程最后一步“核验所有公开发布面”仍在检查旧的未加 scope 包名 `umadev`(停在 `1.0.73`),导致 1.1.1 在 `@umatech/umadev` 已正确发布的情况下仍被判失败;现改为核验 `@umatech/umadev`,与其余八个包一致。
+
 ## [1.1.1] - 2026-08-26
 
 npm 发布渠道迁移到 @umatech · 自更新器修复
