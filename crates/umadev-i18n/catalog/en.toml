@@ -1355,7 +1355,7 @@
 "gate.name.clarify" = "the clarifying-questions checkpoint"
 "gate.name.docs" = "the core-docs checkpoint"
 "gate.name.preview" = "the frontend-preview checkpoint"
-"continuous.dangerous_action_denied" = "[gate] Irreversible action needs user confirmation; denied this turn: {} -> {} (to relax: /mode auto; for full bypass on the claude base set UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
+"continuous.dangerous_action_denied" = "[gate] Irreversible action needs user confirmation; denied this turn: {} -> {} (to relax: after /mode auto, installs, fetches and other ordinary network work no longer ask; an irreversible action needs your confirmation on every tier, so approve it in the interactive TUI or run it yourself)"
 "continuous.dangerous_action_denied_plan" = "[plan] This is read-only (Plan) mode; the write/command the base wanted is declined as read-only (not your decision): {} -> {}. To let it actually act, /mode guarded (confirm each step) or /mode auto, then retry."
 "continuous.tool_call_blocked" = "[gov] {} phase: base tool call tripped {} — {} (target: {})"
 "continuous.phase_truncated" = "[warn] {} phase was truncated (base hit its turn limit); keeping what was produced, continuing."

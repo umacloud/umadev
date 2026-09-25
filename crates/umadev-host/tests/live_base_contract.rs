@@ -142,7 +142,23 @@ async fn run_read_only_turn(session: &mut dyn BaseSession, token: &str) -> Strin
     .await
 }
 
-async fn run_full_access_turn(session: &mut dyn BaseSession, token: &str) {
+/// The one approval a Claude Auto session may ask for in the full-access probe:
+/// Claude asks UmaDev before every tool outside its read-only allowlist, and
+/// UmaDev's floor allows these reversible in-workspace steps without a prompt.
+fn claude_auto_step_is_reversible(workspace: &Path, action: &str, target: &str) -> bool {
+    match action {
+        "Write" | "Edit" | "MultiEdit" => Path::new(target).starts_with(workspace),
+        "Bash" => target.contains("cargo") && !target.contains("publish"),
+        _ => false,
+    }
+}
+
+async fn run_full_access_turn(
+    session: &mut dyn BaseSession,
+    backend: &str,
+    workspace: &Path,
+    token: &str,
+) {
     session
         .send_turn(format!(
             "Perform this isolated development acceptance task using real tools. First create `write-probe.txt` with exactly `{token}` and one trailing newline. Then run exactly `cargo run --quiet --manifest-path port-probe/Cargo.toml`. The supplied Rust program binds an ephemeral 127.0.0.1 port, connects to it, and writes `port-probe.ok` only after the round trip succeeds. Do not modify any other source file. Finish with a brief confirmation."
@@ -169,8 +185,20 @@ async fn run_full_access_turn(session: &mut dyn BaseSession, token: &str) {
                 }
                 tool_evidence.push(format!("{name}: {input}"));
             }
-            SessionEvent::NeedApproval { action, target, .. } => {
-                panic!("Auto profile unexpectedly requested approval for {action}: {target}");
+            SessionEvent::NeedApproval {
+                req_id,
+                action,
+                target,
+            } => {
+                assert!(
+                    backend == "claude-code"
+                        && claude_auto_step_is_reversible(workspace, &action, &target),
+                    "Auto profile unexpectedly requested approval for {action}: {target}"
+                );
+                session
+                    .respond(&req_id, ApprovalDecision::Allow)
+                    .await
+                    .expect("allow a reversible Auto step");
             }
             SessionEvent::HostRequest { request, .. } => {
                 panic!("Auto profile unexpectedly requested host input: {request:?}");
@@ -303,7 +331,7 @@ fn main() {{
     .expect("full-access base did not finish opening in time")
     .unwrap_or_else(|error| panic!("failed to open Auto `{backend}` session: {error}"));
 
-    run_full_access_turn(session.as_mut(), &token).await;
+    run_full_access_turn(session.as_mut(), &backend, workspace.path(), &token).await;
     session.end().await.expect("close live full-access session");
 
     assert_eq!(
