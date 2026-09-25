@@ -1460,9 +1460,18 @@ impl FirmwareFile {
     /// propagates the I/O error so the caller can fall back to the inline arg.
     fn write_in(dir: &Path, text: &str) -> std::io::Result<Self> {
         // A UUID name avoids collisions across concurrent sessions / critic forks.
+        // `dir` is usually the shared system temp directory, so the prompt is
+        // created exclusively (never through a pre-planted link) and owner-only.
         let path = dir.join(format!("umadev-firmware-{}.txt", new_session_id()));
-        std::fs::write(&path, text)?;
-        Ok(Self { path })
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&path)?;
+        // From here the file is ours, so the guard removes it on any failure.
+        let guard = Self { path };
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        Ok(guard)
     }
 }
 
@@ -3693,6 +3702,15 @@ mod tests {
         );
         assert!(out.contains(&"--append-system-prompt-file".to_string()));
         assert!(!out.iter().any(|a| a.contains(&firmware)));
+        // The prompt sits in the shared temp dir, so other local users must not
+        // be able to read it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = &guard.as_ref().unwrap().path;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "firmware file must be owner-only");
+        }
     }
 
     #[test]
