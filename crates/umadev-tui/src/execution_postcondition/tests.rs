@@ -605,13 +605,18 @@ fn git_commit_only_requires_the_project_root_to_equal_the_worktree_root() {
 fn install_active_hook(root: &Path, name: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    let hook = git_required_text(
-        root,
-        &["rev-parse", "--git-path", &format!("hooks/{name}")],
-        "test-hook-path",
-    )
-    .unwrap();
-    let hook = PathBuf::from(hook);
+    // Resolve the hook the way a user's own `git commit` would; the lane's
+    // probes pin `core.hooksPath` to the null device.
+    let mut command = std::process::Command::new("git");
+    umadev_process::git::remove_git_environment(&mut command);
+    let output = command
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", &format!("hooks/{name}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "test-hook-path");
+    let hook = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
     let hook = if hook.is_absolute() {
         hook
     } else {
