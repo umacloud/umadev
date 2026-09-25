@@ -67,6 +67,8 @@ pub mod opencode;
 /// alongside the single-shot `opencode` module — see
 /// `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`.
 pub mod opencode_session;
+/// Whether a base may load the project's own vendor configuration.
+pub mod project_config;
 /// Typed pre-session authentication and session-opening interaction primitives.
 pub mod session_bootstrap;
 

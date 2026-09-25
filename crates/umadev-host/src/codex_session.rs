@@ -1323,6 +1323,15 @@ fn thread_start_params_for(
     if let Some(m) = codex_model(model) {
         params["model"] = json!(m);
     }
+    with_project_config_policy(params, workspace)
+}
+
+/// Keep an untrusted project's `.codex/` config, hooks and exec policies off
+/// for this thread (see [`crate::project_config`]).
+fn with_project_config_policy(mut params: Value, workspace: &Path) -> Value {
+    if let Some(config) = crate::project_config::codex_thread_config(workspace) {
+        params["config"] = config;
+    }
     params
 }
 
@@ -1344,7 +1353,7 @@ fn thread_start_params_readonly(workspace: &Path, model: &str) -> Value {
     if let Some(m) = codex_model(model) {
         params["model"] = json!(m);
     }
-    params
+    with_project_config_policy(params, workspace)
 }
 
 /// Build the `thread/resume` params for the main cross-session resume, using the
@@ -1389,7 +1398,7 @@ fn thread_resume_params_writable_for(
     if let Some(m) = codex_model(model) {
         params["model"] = json!(m);
     }
-    params
+    with_project_config_policy(params, workspace)
 }
 
 /// A JSON-RPC request envelope (the `"jsonrpc"` member is omitted on the wire).
@@ -3928,6 +3937,32 @@ mod tests {
                 .is_err(),
             "malformed metadata is a fail-open no-op"
         );
+    }
+
+    #[test]
+    fn every_thread_keeps_an_untrusted_projects_codex_config_off() {
+        let project = tempfile::TempDir::new().unwrap();
+        let workspace = project.path();
+        let key = workspace.to_string_lossy().into_owned();
+        let threads = || {
+            [
+                thread_start_params(workspace, "", BasePermissionProfile::Guarded),
+                thread_start_params_readonly(workspace, ""),
+                thread_resume_params_writable("t", workspace, "", BasePermissionProfile::Auto),
+            ]
+        };
+        for params in threads() {
+            assert_eq!(
+                params["config"]["projects"][key.as_str()]["trust_level"],
+                "untrusted"
+            );
+        }
+
+        crate::project_config::set_project_trusted(workspace, true);
+        for params in threads() {
+            assert!(params.get("config").is_none(), "{params}");
+        }
+        crate::project_config::set_project_trusted(workspace, false);
     }
 
     #[test]

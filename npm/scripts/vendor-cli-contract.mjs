@@ -80,6 +80,8 @@ requireText(
     "--session-id",
     "--model",
     "--verbose",
+    "--setting-sources",
+    "--strict-mcp-config",
   ],
   "Claude Code",
 );
@@ -119,6 +121,9 @@ const claudeStream = run("claude", [
   "Read,Grep,Glob",
   "--max-turns",
   "1",
+  "--setting-sources",
+  "user",
+  "--strict-mcp-config",
 ]);
 assert.equal(
   claudeStream.status,
@@ -164,6 +169,16 @@ for (const args of [
     'approval_policy="never"',
     "--color",
     "never",
+    "--json",
+    "--help",
+  ],
+  [
+    "exec",
+    "--skip-git-repo-check",
+    "--sandbox",
+    "read-only",
+    "--config",
+    'projects={"/tmp/untrusted.project"={trust_level="untrusted"}}',
     "--json",
     "--help",
   ],
