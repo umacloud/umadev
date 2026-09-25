@@ -57,6 +57,8 @@ It's a single Rust binary. npm is just the delivery shell.
 npm i -g @umatech/umadev
 ```
 
+> **Moving from the old `umadev` package?** UmaDev now ships only as `@umatech/umadev`. The unscoped `umadev` package is retired and was the target of a malicious `1.0.74` publish, so run `npm uninstall -g umadev` first and use `npx @umatech/umadev`, never `npx umadev`. Details: [SECURITY.md](SECURITY.md#retired-package-names).
+
 Then run `umadev`. Hit a permission or PATH error (a `sudo`-owned prefix is the usual cause)? Run `umadev doctor` — it prints the exact fix.
 
 **Or skip npm entirely** — the native installer needs no Node, no npm, and never sudo. It downloads the official release binary for your platform, verifies its published SHA-256, and installs to a directory you own (`~/.local/bin`, or `%LOCALAPPDATA%\Programs\umadev` on Windows):

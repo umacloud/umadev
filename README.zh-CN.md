@@ -120,6 +120,8 @@ flowchart LR
 npm i -g @umatech/umadev
 ```
 
+> **还在用旧的 `umadev` 包？** UmaDev 现在只以 `@umatech/umadev` 发布。未加 scope 的 `umadev` 包已停用，并曾被恶意发布 `1.0.74`：请先执行 `npm uninstall -g umadev`，免安装运行请用 `npx @umatech/umadev`，不要用 `npx umadev`。详见 [SECURITY.md](SECURITY.md#retired-package-names)。
+
 装完直接敲 `umadev`。遇到权限或 PATH 报错（通常是 `sudo` 装出的 root 属主前缀）？跑 `umadev doctor`，它会打印确切的修复命令。
 
 也可以完全跳过 npm。原生安装器不需要 Node、不使用 sudo，会下载对应平台的 GitHub Release 二进制并校验公开的 SHA-256：

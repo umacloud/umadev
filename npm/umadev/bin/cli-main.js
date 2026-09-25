@@ -896,7 +896,7 @@ function invocationNeedsModel(argv) {
 // actually reaches the user.
 //
 // What it catches: an install whose files are ROOT-OWNED while the user is not
-// root — i.e. `sudo npm i -g umadev`. It runs fine today, but it leaves a
+// root — i.e. `sudo npm i -g @umatech/umadev`. It runs fine today, but it leaves a
 // root-owned tree in the npm prefix, so every LATER non-root npm command on
 // that prefix (`npm update -g`, `npm i -g <anything>`) dies with EACCES and npm
 // aborts the whole transaction — taking the user's OTHER global packages (their
@@ -1396,7 +1396,7 @@ function versionAtLeast(current, latest) {
   return true;
 }
 
-// A root-owned install (`sudo npm i -g umadev`) cannot be upgraded by a package
+// A root-owned install (`sudo npm i -g @umatech/umadev`) cannot be upgraded by a package
 // manager running as the user: it dies with EACCES PART-WAY THROUGH and aborts the
 // whole global transaction, which can leave the user's OTHER global packages (their
 // base CLI) broken. So: name the problem and print the repair instead of running the

@@ -1720,7 +1720,7 @@ async fn cmd_update(yes: bool, force: bool) -> Result<()> {
     let Some(exe) = std::env::current_exe().ok() else {
         println!(
             "Could not locate the running binary, so it cannot be replaced safely.\n  \
-             upgrade:  npm install -g umadev@latest\n  \
+             upgrade:  npm install -g @umatech/umadev@latest --registry=https://registry.npmjs.org\n  \
              releases: https://github.com/umacloud/umadev/releases"
         );
         return Ok(());
@@ -1729,7 +1729,7 @@ async fn cmd_update(yes: bool, force: bool) -> Result<()> {
         self_update::InstallKind::DevBuild => {
             println!(
                 "This is a dev build from a cargo target/ dir (not an install).\n  \
-                 upgrade:  npm install -g umadev@latest\n  \
+                 upgrade:  npm install -g @umatech/umadev@latest --registry=https://registry.npmjs.org\n  \
                  releases: https://github.com/umacloud/umadev/releases"
             );
             Ok(())
@@ -1738,7 +1738,8 @@ async fn cmd_update(yes: bool, force: bool) -> Result<()> {
             anyhow::bail!(
                 "this is the package's raw platform binary; it cannot update while it is \
                  running. Invoke `umadev update` through the npm/pnpm/yarn/bun launcher \
-                 instead, or exit this process and run `npm install -g umadev@latest --force`"
+                 instead, or exit this process and run \
+                 `npm install -g @umatech/umadev@latest --force --registry=https://registry.npmjs.org`"
             )
         }
         self_update::InstallKind::Standalone => {

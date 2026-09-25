@@ -4,7 +4,7 @@
 
 ## [1.1.2] - 2026-09-25
 
-安装命令精简为一行 · 发布终检修复 · 依赖安全更新
+依赖安全更新 · 旧包名安装提示收尾 · 发布终检修复
 
 ### 安全(依赖)
 
@@ -13,9 +13,14 @@
 - 依赖锁文件整体刷新到各依赖的最新兼容补丁/小版本(如 tokio 1.53.1、hyper 1.11.1、clap 4.6.7、serde_json 1.0.151、chrono 0.4.45)。
 - `paste` 的“不再维护”提示(RUSTSEC-2024-0436,仅信息级,无已知漏洞)在 `.cargo/audit.toml` 中带理由忽略:它只是可选 `vector-local` 功能经 candle/tokenizers 引入的编译期宏,上游最新版仍依赖它,待上游移除后撤销该忽略。
 
+### 修复(旧包名收尾)
+
+- 所有剩余的安装提示统一指向 `@umatech/umadev`:官网首页的复制安装按钮与底部行动区(此前仍复制旧的未加 scope 包名 `umadev`)、文档中的 npx 用法、`umadev update` 在无法自更新时给出的升级命令、`umadev doctor` 的本地安装提示。官网按钮、npx 与升级命令显式固定 npm 官方 registry。
+- SECURITY.md 新增“已停用的包名”一节,列出不再发布的 `umadev` 与八个 `@umacloud/*` 包,并给出迁移命令;三语 README 的安装部分加上旧包迁移提示(先 `npm uninstall -g umadev`,用 `npx @umatech/umadev`,不要用 `npx umadev`)。
+
 ### 文档
 
-- 安装说明精简为一行:`npm i -g @umatech/umadev`。README(三语)、SECURITY 与官网去掉 `--registry` 参数和 sudo/prefix/npx 说明——该参数原为绕开仍缓存旧未加 scope `umadev` 恶意 `1.0.74` 的镜像,全新的 `@umatech/umadev` 没有这段历史,不再需要;权限或 PATH 问题交给 `umadev doctor` 给出确切修复命令。
+- README(三语)与文档的安装说明精简为一行:`npm i -g @umatech/umadev`,去掉 sudo/prefix/npx 大段说明;权限或 PATH 问题交给 `umadev doctor` 给出确切修复命令。
 
 ### 修复(发布链路)
 
