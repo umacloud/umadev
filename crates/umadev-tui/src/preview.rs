@@ -36,6 +36,13 @@ pub(super) fn parse_run_command(
                 project_root.join(dir)
             };
             let rest = rest.trim();
+            if needs_shell(rest) {
+                // A further `&&` chain, env assignment, quoting, or redirect is
+                // shell syntax: run it verbatim through the platform shell in
+                // the `cd` directory rather than splitting it into argv.
+                let (shell, shell_args) = platform_shell(rest);
+                return (resolved, shell, shell_args);
+            }
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
                 // Route the bare program through `spawn_parts` (resolves the real
@@ -49,16 +56,33 @@ pub(super) fn parse_run_command(
     }
     // Fallback: shell out via `cmd /c` (Windows) / `sh -c` (Unix) in the
     // workspace root, so the whole multi-token command runs as written.
+    let (shell, shell_args) = platform_shell(command);
+    (project_root.to_path_buf(), shell, shell_args)
+}
+
+/// `cmd /c <command>` on Windows (which has no `sh`), `sh -c <command>` elsewhere.
+fn platform_shell(command: &str) -> (String, Vec<String>) {
     let (shell, shell_arg) = if cfg!(windows) {
         ("cmd", "/c")
     } else {
         ("sh", "-c")
     };
     (
-        project_root.to_path_buf(),
         shell.to_string(),
         vec![shell_arg.to_string(), command.to_string()],
     )
+}
+
+/// Whether `command` uses shell syntax that whitespace splitting would mangle:
+/// operators, redirects, quoting, expansions, or a leading `NAME=value`
+/// environment assignment.
+fn needs_shell(command: &str) -> bool {
+    command.contains([
+        '&', '|', ';', '<', '>', '(', ')', '$', '`', '\'', '"', '\\', '*', '?', '\n',
+    ]) || command
+        .split_whitespace()
+        .next()
+        .is_some_and(|program| program.contains('='))
 }
 
 /// Extract the host:port from a `http://host:port/...` URL, returning None

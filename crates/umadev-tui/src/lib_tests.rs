@@ -4791,6 +4791,36 @@ fn parse_run_command_cd_form() {
 }
 
 #[test]
+fn parse_run_command_cd_form_shells_out_for_chains_and_env_assignments() {
+    // Only the leading `cd` is peeled off; anything that needs a shell (a
+    // further `&&` chain, an env assignment, quotes, redirects) must run via
+    // the platform shell in the `cd` directory instead of becoming argv.
+    let root = std::path::PathBuf::from("/proj");
+    let (shell, shell_arg) = if cfg!(windows) {
+        ("cmd", "/c")
+    } else {
+        ("sh", "-c")
+    };
+    for (command, rest) in [
+        (
+            "cd web && npm install && npm run dev",
+            "npm install && npm run dev",
+        ),
+        ("cd web && PORT=3000 npm run dev", "PORT=3000 npm run dev"),
+        (
+            "cd web && npm run dev -- --host \"0.0.0.0\"",
+            "npm run dev -- --host \"0.0.0.0\"",
+        ),
+        ("cd web && npm run dev > dev.log", "npm run dev > dev.log"),
+    ] {
+        let (dir, prog, args) = parse_run_command(command, &root);
+        assert_eq!(dir, std::path::PathBuf::from("/proj/web"), "{command}");
+        assert_eq!(prog, shell, "{command}");
+        assert_eq!(args, vec![shell_arg.to_string(), rest.into()], "{command}");
+    }
+}
+
+#[test]
 fn parse_run_command_absolute_dir() {
     let root = std::path::PathBuf::from("/proj");
     let (dir, prog, args) = parse_run_command("cd /abs/app && pnpm dev", &root);
