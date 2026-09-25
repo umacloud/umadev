@@ -517,17 +517,23 @@ fn detect_dev_server_in_dir(workspace: &Path) -> Option<DevServer> {
         });
     }
     // 3. Static HTML — Python's http.server as a zero-dependency fallback.
-    let has_html = ["index.html", "public/index.html"]
+    //    `http.server` listens on every interface by default, which would
+    //    publish the whole directory (`.env`, `.git/`, `.umadev/` chat logs)
+    //    to the LAN for the rest of the session: bind loopback only, and
+    //    serve `public/` rather than the workspace when the page lives there.
+    let served_dir = ["index.html", "public/index.html"]
         .iter()
-        .any(|p| workspace_file(workspace, p));
-    if has_html {
-        return Some(DevServer {
-            label: "Static file server",
-            command: "python3 -m http.server 8000".to_string(),
-            default_url: "http://localhost:8000",
-        });
-    }
-    None
+        .find(|p| workspace_file(workspace, p))
+        .and_then(|p| Path::new(p).parent())?;
+    let directory = match served_dir.to_str() {
+        Some("") | None => ".",
+        Some(dir) => dir,
+    };
+    Some(DevServer {
+        label: "Static file server",
+        command: format!("python3 -m http.server 8000 --bind 127.0.0.1 --directory {directory}"),
+        default_url: "http://127.0.0.1:8000",
+    })
 }
 
 fn looks_like_root_acceptance_harness(workspace: &Path) -> bool {
@@ -2160,7 +2166,22 @@ mod tests {
         std::fs::write(tmp.path().join("index.html"), "<h1>hi</h1>").unwrap();
         let ds = detect_dev_server(tmp.path()).expect("static project");
         assert_eq!(ds.label, "Static file server");
-        assert_eq!(ds.command, "python3 -m http.server 8000");
+        assert_eq!(
+            ds.command,
+            "python3 -m http.server 8000 --bind 127.0.0.1 --directory ."
+        );
+    }
+
+    #[test]
+    fn static_server_serves_public_on_loopback_only() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("public")).unwrap();
+        std::fs::write(tmp.path().join("public/index.html"), "<h1>hi</h1>").unwrap();
+        let ds = detect_dev_server(tmp.path()).expect("static project");
+        assert_eq!(
+            ds.command, "python3 -m http.server 8000 --bind 127.0.0.1 --directory public",
+            "never the workspace root, never every interface"
+        );
     }
 
     #[test]
