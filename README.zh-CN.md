@@ -529,6 +529,8 @@ flowchart LR
     D["quality gate<br/>交付前补扫"] --> G
 ```
 
+其中 Claude Code / Kimi Code 钩子只在 UmaDev 驱动的会话里生效；你自己直接启动的 `claude` 或 Kimi Code 会话不会被它检查或记录。
+
 项目可以通过 `.umadev/rules.toml` 调整：
 
 ```toml
@@ -784,7 +786,7 @@ umadev 有两套入口，一一对应：
 | 命令 | 作用 |
 |---|---|
 | `umadev ci [--changed-only] [--report-only]` | 对工作区每个源文件跑治理（CI 模式） |
-| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | 安装项目作用域的原生 pre/post-tool 治理钩子，或 git 兜底 |
+| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | 安装项目作用域的原生 pre/post-tool 治理钩子（只作用于 UmaDev 驱动的底座会话），或 git 兜底（检查每次提交） |
 
 **平台扩展**
 

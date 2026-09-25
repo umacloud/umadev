@@ -672,7 +672,9 @@ enum Command {
                       kimi-code     merge-writes scoped Pre/PostToolUse hooks into Kimi config.toml\n  \
                       pre-commit    writes .git/hooks/pre-commit (runs `umadev ci --changed-only`)\n\
                       \n\
-                      The hook checks every Write/Edit tool call, but HARD-BLOCKS only the\n\
+                      The hooks govern the base sessions UmaDev drives in this project (a\n\
+                      session you start yourself is not checked). There the hook checks every\n\
+                      Write/Edit tool call, but HARD-BLOCKS only the\n\
                       irreversible-if-written floor: hardcoded secrets/credentials in source\n\
                       (UD-SEC-003) and sensitive-path writes to .git/.env/.ssh (UD-SEC-001,\n\
                       bypass-immune). Craft/quality findings — emoji-as-icon (UD-CODE-001),\n\
@@ -1518,8 +1520,17 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("[ok] Installed UmaDev PreToolUse hook for Claude Code.");
                 println!("  → {}", path.display());
                 println!();
-                println!("Every Write/Edit tool call is checked. Only the irreversible-if-written");
-                println!("floor is HARD-BLOCKED at write time:");
+                // The hook acts only when UmaDev set UMADEV_GOVERN_ROOT on the
+                // base it spawned (see hook.rs); say so, rather than promise
+                // governance for a `claude` the user starts themselves.
+                println!("The hook governs only the Claude Code sessions UmaDev drives in this");
+                println!(
+                    "project (the `umadev` TUI, `umadev run` / `continue`). A `claude` session"
+                );
+                println!("you start yourself is neither checked nor recorded.");
+                println!();
+                println!("In those sessions every Write/Edit tool call is checked. Only the");
+                println!("irreversible-if-written floor is HARD-BLOCKED at write time:");
                 println!("  • hardcoded secrets / credentials in source  (UD-SEC-003)");
                 println!(
                     "  • sensitive-path writes (.git/.env/.ssh)     (UD-SEC-001) — bypass-immune"
@@ -1533,10 +1544,9 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("  • hardcoded color literals   (UD-CODE-002)");
                 println!("  • AI-slop / placeholders     (UD-CODE-002)");
                 println!();
-                println!("A PostToolUse audit hook also records every executed Write/Edit/Bash");
-                println!(
-                    "to .umadev/audit/tool-calls.jsonl (UD-EVID-002 — audit only, never blocks)."
-                );
+                println!("A PostToolUse audit hook also records every Write/Edit/Bash those");
+                println!("sessions execute to .umadev/audit/tool-calls.jsonl (UD-EVID-002 — audit");
+                println!("only, never blocks).");
                 println!();
                 println!("To remove: umadev uninstall --host claude-code");
             } else {
@@ -1557,11 +1567,13 @@ fn cmd_install(host: String, project_root: Option<PathBuf>) -> Result<()> {
                 println!("[ok] Installed project-scoped UmaDev hooks for Kimi Code.");
                 println!("  → {}", path.display());
                 println!();
+                println!("The hooks govern only the Kimi Code sessions UmaDev drives in this");
+                println!("project; a Kimi Code session you start yourself is neither checked nor");
+                println!("recorded. In those sessions PreToolUse governs Write/Edit/Bash and");
+                println!("PostToolUse records the audit trail.");
+                println!();
                 println!("Kimi's hook registry is user-level, but every UmaDev command is scoped");
                 println!("to this exact project root and fails open immediately elsewhere.");
-                println!(
-                    "PreToolUse governs Write/Edit/Bash; PostToolUse records the audit trail."
-                );
                 println!();
                 println!("To remove: umadev uninstall --base kimi-code");
             } else {
@@ -2484,6 +2496,37 @@ fn restrict_to_owner(dir: &Path, mode: u32) {
     }
 }
 
+/// The CLAUDE.md `init` writes when the project initializer has not already
+/// created one.
+fn claude_md_template() -> String {
+    format!(
+        "# CLAUDE.md — UmaDev managed project\n\n\
+         This project is managed by **UmaDev** ({version}), an AI coding project-director Agent.\n\n\
+         ## How this works\n\n\
+         1. UmaDev orchestrates a 9-phase pipeline (clarify → research → docs → spec → frontend → backend → quality → delivery).\n\
+         2. During an active pipeline, UmaDev writes the dispatched phase's **coach prompt** to `.umadev/coach/CURRENT.md`.\n\
+         3. The latest user message is the current objective. Read `CURRENT.md` only when the current turn explicitly dispatches that active phase (or the user explicitly asks to continue); the file's mere presence never authorizes resuming old work.\n\
+         4. Existing plans, run notes, output documents, and earlier conversation are context only. Do not widen scope or fix adjacent issues unless the user asks.\n\
+         5. After completing an explicitly active pipeline phase, run `umadev continue` to advance.\n\n\
+         ## Rules (non-negotiable)\n\n\
+         - **No emoji as functional icons** — use Lucide / Heroicons / Tabler icon libraries.\n\
+         - **No hardcoded colors** — use CSS design tokens (Tailwind config).\n\
+         - **No secrets in source code** — use environment variables.\n\
+         - **Follow the spec preamble** in each coach prompt.\n\n\
+         ## Governance\n\n\
+         When UmaDev drives this session (the `umadev` TUI, `umadev run` /\n\
+         `continue`), your Write/Edit/Bash calls pass through UmaDev's governance\n\
+         hook; a `claude` session started directly is not checked by it. The hook is\n\
+         fail-open: only the irreversible-if-written floor (hardcoded secrets /\n\
+         credentials, sensitive-path writes to .git/.env/.ssh, destructive shell)\n\
+         is HARD-BLOCKED at write time. Craft / quality findings (emoji-as-icons,\n\
+         hardcoded colors, AI-slop) are FLAGGED and repaired by the post-write QC\n\
+         loop — never hard-blocked mid-write, so a single nit can't stop you from\n\
+         finishing the file. Configure: `.umadev/rules.toml`.\n",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) -> Result<()> {
     let workspace = resolve_root(project_root)?;
     let slug = match slug {
@@ -2520,30 +2563,7 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
     // host doesn't know to follow UmaDev's pipeline instructions.
     let claude_md = workspace.join("CLAUDE.md");
     if !claude_md.is_file() {
-        let claude_content = format!(
-            "# CLAUDE.md — UmaDev managed project\n\n\
-             This project is managed by **UmaDev** ({version}), an AI coding project-director Agent.\n\n\
-             ## How this works\n\n\
-             1. UmaDev orchestrates a 9-phase pipeline (clarify → research → docs → spec → frontend → backend → quality → delivery).\n\
-             2. During an active pipeline, UmaDev writes the dispatched phase's **coach prompt** to `.umadev/coach/CURRENT.md`.\n\
-             3. The latest user message is the current objective. Read `CURRENT.md` only when the current turn explicitly dispatches that active phase (or the user explicitly asks to continue); the file's mere presence never authorizes resuming old work.\n\
-             4. Existing plans, run notes, output documents, and earlier conversation are context only. Do not widen scope or fix adjacent issues unless the user asks.\n\
-             5. After completing an explicitly active pipeline phase, run `umadev continue` to advance.\n\n\
-             ## Rules (non-negotiable)\n\n\
-             - **No emoji as functional icons** — use Lucide / Heroicons / Tabler icon libraries.\n\
-             - **No hardcoded colors** — use CSS design tokens (Tailwind config).\n\
-             - **No secrets in source code** — use environment variables.\n\
-             - **Follow the spec preamble** in each coach prompt.\n\n\
-             ## Governance\n\n\
-             Your Write/Edit/Bash calls pass through UmaDev's governance hook. It is\n\
-             fail-open: only the irreversible-if-written floor (hardcoded secrets /\n\
-             credentials, sensitive-path writes to .git/.env/.ssh, destructive shell)\n\
-             is HARD-BLOCKED at write time. Craft / quality findings (emoji-as-icons,\n\
-             hardcoded colors, AI-slop) are FLAGGED and repaired by the post-write QC\n\
-             loop — never hard-blocked mid-write, so a single nit can't stop you from\n\
-             finishing the file. Configure: `.umadev/rules.toml`.\n",
-            version = env!("CARGO_PKG_VERSION"),
-        );
+        let claude_content = claude_md_template();
         umadev_state::fs::atomic_write(&claude_md, claude_content.as_bytes())
             .with_context(|| format!("write {}", claude_md.display()))?;
         println!("  claude:  {}", claude_md.display());
@@ -7760,6 +7780,17 @@ mod tests {
         // A single launcher (the healthy case) reports exactly one → no shadow warning.
         let single = std::env::join_paths([a.path(), empty.path()]).unwrap();
         assert_eq!(find_all_umadev_in(&single).len(), 1);
+    }
+
+    #[test]
+    fn claude_md_template_scopes_the_hook_to_sessions_umadev_drives() {
+        let template = claude_md_template();
+        assert!(
+            template.contains("When UmaDev drives this session"),
+            "{template}"
+        );
+        assert!(template.contains("not checked by it"), "{template}");
+        assert!(!template.contains("\nYour Write/Edit/Bash calls pass through"));
     }
 
     #[test]

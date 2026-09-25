@@ -341,9 +341,9 @@ Build, lint, typecheck, and test results are checked directly. The acceptance fl
 
 Tool calls, verification runs, and critic verdicts are written to `.umadev/audit/` as JSONL. The proof pack includes the evidence chain.
 
-**4. Governance runs on every file write**
+**4. Governance runs on every file write UmaDev drives**
 
-113 content checks cover emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook into Claude Code, as a pre-commit hook in git, and as part of the quality gate. At write time only the irreversible floor (leaked secrets / credentials, sensitive-path writes, destructive shell) is hard-blocked; craft and quality findings (emoji, color, AI-slop) are flagged and repaired by the post-write QC loop rather than pinning the base's hands mid-file. All rules are configurable in `.umadev/rules.toml` and are fail-open — a bug in the governor never blocks your work.
+113 content checks cover emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook in the Claude Code and Kimi Code sessions UmaDev drives (a `claude` or Kimi Code session you start yourself is not checked or recorded), as a pre-commit hook in git, and as part of the quality gate. At write time only the irreversible floor (leaked secrets / credentials, sensitive-path writes, destructive shell) is hard-blocked; craft and quality findings (emoji, color, AI-slop) are flagged and repaired by the post-write QC loop rather than pinning the base's hands mid-file. All rules are configurable in `.umadev/rules.toml` and are fail-open — a bug in the governor never blocks your work.
 
 ---
 
@@ -729,7 +729,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | Command | What it does |
 |---|---|
 | `umadev ci [--changed-only] [--report-only]` | Run governance over every source file (CI mode) |
-| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | Install native project-scoped pre/post-tool governance where supported, or the git fallback |
+| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | Install native project-scoped pre/post-tool governance for the base sessions UmaDev drives, or the git fallback, which checks every commit |
 
 **Platform extensions**
 

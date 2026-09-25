@@ -509,6 +509,8 @@ flowchart LR
     D["品質門<br/>交付前補掃"] --> G
 ```
 
+其中 Claude Code / Kimi Code 掛鉤只在 UmaDev 驅動的工作階段裡生效；你自己直接啟動的 `claude` 或 Kimi Code 工作階段不會被它檢查或記錄。
+
 專案可以透過 `.umadev/rules.toml` 調整：
 
 ```toml
@@ -756,7 +758,7 @@ umadev 有兩套入口，一一對應：
 | 命令 | 作用 |
 |---|---|
 | `umadev ci [--changed-only] [--report-only]` | 對工作區每個原始檔跑治理（CI 模式） |
-| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | 安裝專案作用域的原生 pre/post-tool 治理掛鉤，或 git 備援 |
+| `umadev install --base <claude-code\|kimi-code\|pre-commit>` | 安裝專案作用域的原生 pre/post-tool 治理掛鉤（只作用於 UmaDev 驅動的底座工作階段），或 git 備援（檢查每次提交） |
 
 **平台擴充**
 
