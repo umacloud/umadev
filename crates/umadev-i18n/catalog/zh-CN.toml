@@ -1345,6 +1345,8 @@
 "continuous.team.cross_review_header" = "[team] {} 角色团队交叉评审(只读分叉,并行):{} 名 critic 各从本职审一遍…"
 "continuous.team.seat_passed" = "[team] {}:通过,无阻塞项。"
 "continuous.team.seat_blocking" = "[team] {}:提出 {} 个阻塞项。"
+"continuous.team.review_reduced_files" = "[team] {} 评审按缩减范围进行:{} / {} 个必审变更文件完整送审,其余以已声明的抽样或省略送审(见评审清单)。"
+"continuous.team.review_reduced_scope" = "[team] {} 评审按缩减范围进行:无法完整读取本次运行改动的文件集,评审看到的是已声明的优先级抽样。"
 "continuous.verify_failed" = "[verify] 真实构建/测试/lint 有失败步骤(已记入审计,质量门会据此打分)。"
 "continuous.quality_gate_result" = "质量门结果:{}/100 · {}(确定性硬信号)"
 "continuous.quality_gate_advisory" = "质量评分:{}/100 —— 建议改进(轻量任务,不阻断)"

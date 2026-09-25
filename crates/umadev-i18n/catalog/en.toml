@@ -1369,6 +1369,8 @@
 "continuous.team.cross_review_header" = "[team] {} role-team cross-review (read-only forks, parallel): {} critic(s) each review from their own seat…"
 "continuous.team.seat_passed" = "[team] {}: passed, no blocking items."
 "continuous.team.seat_blocking" = "[team] {}: raised {} blocking item(s)."
+"continuous.team.review_reduced_files" = "[team] {} review runs on a reduced scope: {} of {} required changed file(s) fit whole; the rest were sent as declared samples or omissions (see the review manifest)."
+"continuous.team.review_reduced_scope" = "[team] {} review runs on a reduced scope: the set of files this run changed could not be read in full, so the reviewers see a declared priority sample."
 "continuous.verify_failed" = "[verify] Real build/test/lint had failing step(s) (recorded to the audit; the quality gate scores against it)."
 "continuous.quality_gate_result" = "Quality gate result: {}/100 · {} (deterministic hard signal)"
 "continuous.quality_gate_advisory" = "Quality score: {}/100 — advisory suggestions (a lean task; not a blocker)"
