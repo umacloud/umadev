@@ -4002,7 +4002,7 @@ impl App {
             // rebuilds the exact screen the user left instead of an empty one.
             display: Some(self.history.iter().cloned().collect()),
         };
-        let Ok(body) = serde_json::to_string_pretty(&session) else {
+        let Ok(body) = umadev_agent::redaction::to_redacted_json_pretty(&session) else {
             return;
         };
         if body.len() > usize::try_from(MAX_CHAT_FILE_BYTES).unwrap_or(usize::MAX) {
@@ -16405,7 +16405,7 @@ impl App {
             .backend
             .clone()
             .unwrap_or_else(|| "offline".to_string());
-        let report = format!(
+        let report = umadev_agent::redaction::redact_text(&format!(
             "# UmaDev bug report\n\n\
              version: {}\n\
              backend: {backend}\n\
@@ -16431,7 +16431,7 @@ impl App {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-        );
+        ));
         let report_path = self.project_root.join("umadev-bug-report.md");
         match umadev_state::fs::atomic_write(&report_path, report.as_bytes()) {
             Ok(()) => {

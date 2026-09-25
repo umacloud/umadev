@@ -89,6 +89,7 @@ pub mod pr;
 pub mod project_facts;
 pub mod project_init;
 pub mod recipes;
+pub mod redaction;
 pub(crate) mod retrieval_relevance;
 pub mod review;
 pub mod router;
