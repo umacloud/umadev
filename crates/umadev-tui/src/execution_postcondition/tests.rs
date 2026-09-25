@@ -1113,6 +1113,37 @@ async fn batch_index_info_preserves_split_index_semantics() {
     );
 }
 
+#[tokio::test]
+async fn early_git_failure_reports_its_own_error_instead_of_a_broken_pipe() {
+    let root = dirty_git_repo();
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt"]),
+        "提交git记录: one.txt",
+    )
+    .unwrap();
+    let baseline = postcondition.git_commit.as_ref().unwrap();
+    let mut transaction = GitTransactionGuard::new(root.path(), baseline);
+
+    // Git rejects the option and exits before reading any of the 1 MiB input.
+    let output = git_mutating_output_with_input(
+        root.path(),
+        &["hash-object", "--umadev-no-such-option", "--stdin"],
+        &vec![b'x'; 1024 * 1024],
+        Duration::from_secs(5),
+        "test-input-timeout",
+        "git hash-object",
+        &mut transaction,
+    )
+    .await
+    .unwrap();
+    transaction.disarm();
+
+    assert!(!output.status.success());
+    let note = git_command_failed("test-hash-failed", "git hash-object", &output).into_note();
+    assert!(note.contains("umadev-no-such-option"), "{note}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn host_commit_honors_core_file_mode_false_like_native_git() {
