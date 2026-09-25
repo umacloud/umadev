@@ -415,6 +415,84 @@ async fn installed_base_resumes_native_context_without_writing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "makes a real Claude model call and writes one file in a tempdir"]
+async fn installed_claude_guarded_write_raises_need_approval() {
+    if selected_backend() != "claude-code" {
+        eprintln!("skipped: this vendor-private acceptance check requires claude-code");
+        return;
+    }
+    let workspace = TempDir::new().expect("create isolated Guarded workspace");
+    let target = workspace.path().join("approval-probe.txt");
+    let token = format!("UMADEV_GUARDED_WRITE_{}", std::process::id());
+
+    let mut session = timeout(
+        OPEN_TIMEOUT,
+        umadev_host::session_for_with_policy(
+            "claude-code",
+            workspace.path(),
+            "",
+            BasePermissionProfile::Guarded,
+            Some("Operate only inside the supplied isolated acceptance workspace."),
+            SessionOpenPolicy::NonInteractive,
+        ),
+    )
+    .await
+    .expect("Guarded Claude session did not finish opening in time")
+    .unwrap_or_else(|error| panic!("failed to open Guarded claude-code session: {error}"));
+    session
+        .send_turn(format!(
+            "Use the Write tool once to create `{}` containing exactly `{token}`. Do not run any other tool. Finish with a brief confirmation.",
+            target.display()
+        ))
+        .await
+        .expect("send Guarded write turn");
+
+    let deadline = Instant::now() + TURN_TIMEOUT;
+    let mut approved = Vec::new();
+    loop {
+        let event = timeout_at(deadline, session.next_event())
+            .await
+            .expect("Guarded write turn exceeded its acceptance deadline")
+            .expect("Guarded session ended before TurnDone");
+        match event {
+            SessionEvent::NeedApproval { req_id, action, .. } => {
+                assert!(
+                    !target.exists(),
+                    "Claude wrote before UmaDev answered its `{action}` request"
+                );
+                approved.push(action);
+                session
+                    .respond(&req_id, ApprovalDecision::Allow)
+                    .await
+                    .expect("allow the Guarded write");
+            }
+            SessionEvent::HostRequest { req_id, request } => session
+                .respond_host(
+                    &req_id,
+                    request.safe_rejection("the Guarded write probe answers only approvals"),
+                )
+                .await
+                .expect("reject unexpected host request"),
+            SessionEvent::TurnDone { status, .. } => {
+                assert_eq!(status, TurnStatus::Completed, "Guarded write turn failed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    session.end().await.expect("close Guarded session");
+
+    assert!(
+        approved.iter().any(|action| action == "Write"),
+        "a Guarded write never asked UmaDev: {approved:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("the approved write did not land"),
+        token
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "makes real Grok model calls and executes tools in a tempdir"]
 async fn installed_grok_uses_its_server_authoritative_prompt_queue() {
     if selected_backend() != "grok-build" {

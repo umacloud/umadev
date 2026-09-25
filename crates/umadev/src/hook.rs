@@ -29,10 +29,11 @@
 //! ```
 //! When all rules pass we print nothing. Exit 0 with no output is "no
 //! decision" in both hosts, so the call continues through the host's own
-//! permission flow. An explicit `"allow"` would instead approve the call and
-//! skip that flow: every Write, Edit and Bash the user runs through plain
-//! `claude` in an installed project would stop asking, and in a Guarded
-//! UmaDev session the base's approval requests would never reach UmaDev.
+//! permission flow; in a UmaDev Claude session that flow sends the approval
+//! request to UmaDev (`--permission-prompt-tool stdio`). An explicit `"allow"`
+//! would instead approve the call and skip that flow: every Write, Edit and
+//! Bash the user runs through plain `claude` in an installed project would stop
+//! asking, and the base's approval requests would never reach UmaDev.
 //!
 //! Fail-open: if the payload can't be parsed or the tool isn't a write,
 //! we pass (never block a legitimate operation on a parse error).
