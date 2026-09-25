@@ -6022,7 +6022,7 @@ fn code_for_in_ignores_non_js() {
     assert!(!d.block);
 }
 
-// --- UD-SEC-018: weak crypto -----------------------------------------
+// --- UD-SEC-032: weak crypto -----------------------------------------
 
 #[test]
 fn crypto_blocks_node_createhash_md5() {
@@ -6031,7 +6031,37 @@ fn crypto_blocks_node_createhash_md5() {
         concat!("const h = crypto.createHash('md", "5').update(x);"),
     );
     assert!(d.block);
-    assert_eq!(d.clause, "UD-SEC-018");
+    assert_eq!(d.clause, "UD-SEC-032");
+}
+
+#[test]
+fn weak_crypto_is_qc_work_not_the_irreversible_floor() {
+    // MD5 / SHA-1 have legitimate non-security uses (a Gravatar URL, an S3
+    // `Content-MD5` header, WeChat Pay v2 signing, content addressing). The
+    // finding is fixable after the file exists, so it has its own clause that
+    // never rides the bypass-immune plaintext-password floor.
+    let gravatar = concat!(
+        "import { createHash } from 'crypto';\n",
+        "export const avatar = (email: string) =>\n",
+        "  `https://www.gravatar.com/avatar/${createHash('md",
+        "5').update(email.trim().toLowerCase()).digest('hex')}`;\n"
+    );
+    let d = scan_content("src/lib/gravatar.ts", gravatar);
+    assert!(d.block, "QC still reports weak crypto");
+    assert_eq!(d.clause, "UD-SEC-032");
+    assert!(!is_irreversible_write_floor(&d.clause));
+    assert!(!pre_write_floor_decision("src/lib/gravatar.ts", gravatar).block);
+    assert!(
+        !crate::compliance::framework_for("UD-SEC-032")
+            .iso27001_annex_a
+            .is_empty(),
+        "the new clause maps to compliance controls"
+    );
+    // The plaintext-password comparison keeps the floor clause.
+    assert!(is_irreversible_write_floor(
+        &check_plaintext_password("server/auth.ts", "if (user.password === inputPassword) {}")
+            .clause
+    ));
 }
 
 #[test]

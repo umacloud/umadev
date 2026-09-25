@@ -662,7 +662,7 @@ fn sast_severity(clause: &str) -> SastSeverity {
         | "UD-SEC-013" // XXE
         | "UD-SEC-014" // command injection (string-built shell)
         | "UD-SEC-015" // JWT defects (alg:none / hardcoded secret)
-        | "UD-SEC-018" // plaintext password / weak crypto over secrets
+        | "UD-SEC-018" // plaintext password comparison
         | "UD-SEC-020" // path traversal
         | "UD-ARCH-023" // OS command injection (shell exec of input)
         | "UD-ARCH-025" // ruby eval/send metaprogramming injection
@@ -674,6 +674,7 @@ fn sast_severity(clause: &str) -> SastSeverity {
         | "UD-SEC-010" // insecure CORS (reflected/wildcard origin)
         | "UD-SEC-019" // open redirect
         | "UD-ARCH-061" // client-side redirect injection
+        | "UD-SEC-032" // broken hash / cipher primitive
         | "UD-ARCH-043" // insecure RNG in a token/secret context
         => Medium,
         // Hardening gaps.
