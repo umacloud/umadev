@@ -129,7 +129,8 @@ pub struct VerifyStep {
 /// - Node → install → lint (if script exists) → typecheck (if tsc) →
 ///   test (if script exists) → build (if script exists)
 /// - Rust → fmt-check → clippy → test → build
-/// - Python → install → ruff check → mypy (if configured) → pytest
+/// - Python → install (`poetry install` / `uv sync` / `pip install`, by how the
+///   project is declared) → ruff check → mypy (if configured) → pytest
 /// - Go → vet → test → build
 /// - Deno → lint → test → check
 #[must_use]
@@ -197,24 +198,7 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
             slow("test", "cargo", &["test", "--quiet"], false),
             slow("build", "cargo", &["build", "--release", "--quiet"], false),
         ]),
-        ProjectKind::Python => {
-            let mut steps = Vec::new();
-            // Install: prefer uv (fast), fall back to pip.
-            if which("uv") {
-                steps.push(slow("install", "uv", &["sync"], false));
-            } else {
-                steps.push(slow("install", "pip", &["install", "-e", "."], true));
-            }
-            steps.push(s("lint", "ruff", &["check"], true));
-            if workspace_file(workspace, "mypy.ini")
-                || (workspace_file(workspace, "pyproject.toml")
-                    && file_contains(workspace, "pyproject.toml", "[tool.mypy]"))
-            {
-                steps.push(s("typecheck", "mypy", &["."], true));
-            }
-            steps.push(slow("test", "pytest", &[], true));
-            Some(steps)
-        }
+        ProjectKind::Python => Some(python_steps(workspace, &which)),
         ProjectKind::Go => Some(vec![
             s("vet", "go", &["vet", "./..."], true),
             slow("test", "go", &["test", "./..."], false),
@@ -227,6 +211,174 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
         ]),
         ProjectKind::None => None,
     }
+}
+
+/// Where a Python project's dependencies are installed, and so how its tools run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PythonEnv {
+    /// A virtualenv uv manages (`uv sync`, or `uv pip install` into `.venv`): tools
+    /// run through `uv run --no-sync`, which puts that virtualenv first on PATH.
+    Uv,
+    /// Poetry's virtualenv: tools run through `poetry run`.
+    Poetry,
+    /// Whatever `pip` on PATH installs into: tools run from PATH.
+    Pip,
+}
+
+/// The install step for a Python project, chosen by how the project is declared,
+/// and the environment its tools then run in:
+/// - `[tool.poetry]` with Poetry on PATH → `poetry install`;
+/// - a PEP 621 `[project]` table with uv on PATH → `uv sync`;
+/// - any other installable project (`[project]`, `[tool.poetry]`, `setup.py`,
+///   `setup.cfg`) → `pip install -e .`;
+/// - only `requirements.txt` → `uv pip install -r requirements.txt` into the
+///   virtualenv uv would use, else `pip install -r requirements.txt`;
+/// - nothing to install (a `pyproject.toml` that only configures tools) → none.
+///
+/// `uv sync` fails on a requirements-only project ("No `pyproject.toml` found")
+/// and on a Poetry-format one ("No `project` table found"), and `pip install -e .`
+/// fails on a requirements-only one, so any other choice failed every verify of a
+/// healthy project.
+fn python_install(
+    workspace: &Path,
+    available: &dyn Fn(&str) -> bool,
+) -> (PythonEnv, Option<VerifyStep>) {
+    let install = |program: &str, args: &[&str], skippable: bool| {
+        Some(VerifyStep {
+            name: "install",
+            program: program.to_string(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            skippable,
+            timeout_secs: SLOW_STEP_TIMEOUT_SECS,
+        })
+    };
+    let project = pyproject_declares(workspace, "project");
+    let poetry = pyproject_declares(workspace, "tool.poetry");
+    if poetry && available("poetry") {
+        (PythonEnv::Poetry, install("poetry", &["install"], false))
+    } else if project && available("uv") {
+        (PythonEnv::Uv, install("uv", &["sync"], false))
+    } else if project
+        || poetry
+        || workspace_file(workspace, "setup.py")
+        || workspace_file(workspace, "setup.cfg")
+    {
+        (
+            PythonEnv::Pip,
+            install("pip", &["install", "-e", "."], true),
+        )
+    } else if workspace_file(workspace, "requirements.txt") {
+        if available("uv") && python_venv_present(workspace) {
+            let args = ["pip", "install", "-r", "requirements.txt"];
+            (PythonEnv::Uv, install("uv", &args, false))
+        } else {
+            let args = ["install", "-r", "requirements.txt"];
+            (PythonEnv::Pip, install("pip", &args, true))
+        }
+    } else {
+        (PythonEnv::Pip, None)
+    }
+}
+
+/// The Python verify sequence: install, then `ruff check`, `mypy .` (when
+/// configured) and `pytest`, each run inside the environment the install filled.
+fn python_steps(workspace: &Path, available: &dyn Fn(&str) -> bool) -> Vec<VerifyStep> {
+    let (env, install) = python_install(workspace, available);
+    let tool = |name: &'static str, tool: &str, args: &[&str], timeout_secs: u64| {
+        let (program, mut argv) = python_tool(workspace, env, tool, available);
+        argv.extend(args.iter().map(|a| (*a).to_string()));
+        VerifyStep {
+            name,
+            program,
+            args: argv,
+            skippable: true,
+            timeout_secs,
+        }
+    };
+    let mut steps: Vec<VerifyStep> = install.into_iter().collect();
+    steps.push(tool("lint", "ruff", &["check"], 0));
+    if workspace_file(workspace, "mypy.ini")
+        || (workspace_file(workspace, "pyproject.toml")
+            && file_contains(workspace, "pyproject.toml", "[tool.mypy]"))
+    {
+        steps.push(tool("typecheck", "mypy", &["."], 0));
+    }
+    steps.push(tool("test", "pytest", &[], SLOW_STEP_TIMEOUT_SECS));
+    steps
+}
+
+/// How to run the Python tool `tool` (`ruff`, `mypy`, `pytest`) as
+/// `(program, leading arguments)`. Inside a uv or Poetry virtualenv it runs
+/// through that manager — a global pytest cannot import what `uv sync` installed
+/// into `.venv` — as long as the tool is there to run (the project declares it,
+/// or it is on PATH). Otherwise it is looked up on PATH and, being skippable,
+/// recorded as skipped when absent.
+fn python_tool(
+    workspace: &Path,
+    env: PythonEnv,
+    tool: &str,
+    available: &dyn Fn(&str) -> bool,
+) -> (String, Vec<String>) {
+    let runner: &[&str] = match env {
+        PythonEnv::Uv => &["uv", "run", "--no-sync"],
+        PythonEnv::Poetry => &["poetry", "run"],
+        PythonEnv::Pip => &[],
+    };
+    match runner.split_first() {
+        Some((program, args)) if available(tool) || python_project_declares(workspace, tool) => {
+            let mut argv: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            argv.push(tool.to_string());
+            ((*program).to_string(), argv)
+        }
+        _ => (tool.to_string(), Vec::new()),
+    }
+}
+
+/// Whether `pyproject.toml` declares the table `table` (`project`, `tool.poetry`)
+/// or one of its sub-tables.
+fn pyproject_declares(workspace: &Path, table: &str) -> bool {
+    let header = format!("[{table}]");
+    let sub_table = format!("[{table}.");
+    crate::bounded_fs::read_utf8_beneath(
+        workspace,
+        &workspace.join("pyproject.toml"),
+        MAX_VERIFY_CONFIG_BYTES,
+    )
+    .is_ok_and(|content| {
+        content
+            .lines()
+            .map(str::trim)
+            .any(|line| line == header || line.starts_with(&sub_table))
+    })
+}
+
+/// Whether the project lists the Python tool `tool` among its dependencies or
+/// configures it (in `pyproject.toml` or a requirements file).
+fn python_project_declares(workspace: &Path, tool: &str) -> bool {
+    [
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "dev-requirements.txt",
+    ]
+    .iter()
+    .any(|file| file_contains(workspace, file, tool))
+}
+
+/// Whether uv has a virtualenv to install a requirements file into: an activated
+/// one (`VIRTUAL_ENV`) or the project's `.venv`.
+fn python_venv_present(workspace: &Path) -> bool {
+    std::env::var_os("VIRTUAL_ENV").is_some_and(|v| !v.is_empty())
+        || workspace_file(workspace, ".venv/pyvenv.cfg")
+}
+
+/// Whether a pytest `test` step ended with exit code 5, "no tests collected": a
+/// project with no tests yet has nothing to run, which is not a failing suite
+/// (Node skips a missing test script; cargo and go pass with no tests).
+fn pytest_collected_nothing(step: &VerifyStep, outcome: &VerifyOutcome) -> bool {
+    step.name == "test"
+        && outcome.exit_code == 5
+        && (step.program == "pytest" || step.args.iter().any(|a| a == "pytest"))
 }
 
 /// Wall-clock budget for ONE named-test run ([`run_named_test`]). A single test is a
@@ -360,9 +512,12 @@ fn named_test_step(
         // pytest `-k` is an EXPRESSION (`and` / `or` / `not` / parens). A `-`, a space,
         // a bracket, or a parenthesis in the name is a syntax error → exit 4, which is
         // NOT a failing test.
-        ProjectKind::Python => {
-            is_plain_test_ident(test).then(|| step("pytest", vec!["-k".into(), t, "-q".into()]))
-        }
+        ProjectKind::Python => is_plain_test_ident(test).then(|| {
+            let env = python_install(workspace, &which).0;
+            let (program, mut args) = python_tool(workspace, env, "pytest", &which);
+            args.extend(["-k".into(), t, "-q".into()]);
+            step(&program, args)
+        }),
         // Go `-run` is a REGEX. A name carrying `[`, `(`, `+`, `.` … is either an
         // invalid pattern (exit != 0) or a pattern that matches the wrong set.
         ProjectKind::Go => is_plain_test_ident(test).then(|| {
@@ -1008,7 +1163,17 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
         // (ran, exited non-zero / timed out — not a skip) is picked up by
         // `install_has_failed` on the next iteration, arming the dependent-step
         // short-circuit above (P1-8).
-        outcomes.push(run_step_command(workspace, kind, &step, command_str, timeout_secs).await);
+        let outcome = run_step_command(workspace, kind, &step, command_str, timeout_secs).await;
+        outcomes.push(if pytest_collected_nothing(&step, &outcome) {
+            VerifyOutcome::skipped_due_to(
+                kind,
+                step.name,
+                outcome.command,
+                "pytest collected no tests (exit 5) — there is nothing to run yet",
+            )
+        } else {
+            outcome
+        });
     }
 
     // FRESHNESS STAMP: record WHICH source tree these outcomes describe, so a later
@@ -1783,6 +1948,168 @@ mod tests {
     fn verify_steps_none_returns_empty() {
         let tmp = TempDir::new().unwrap();
         assert!(verify_steps(ProjectKind::None, tmp.path()).is_none());
+    }
+
+    // ── Python: install the way the project is declared ──────────────────────
+
+    fn install_step(steps: &[VerifyStep]) -> Option<&VerifyStep> {
+        steps.iter().find(|s| s.name == "install")
+    }
+
+    #[test]
+    fn python_requirements_only_project_gets_a_requirements_install() {
+        // A Flask/FastAPI/Django app with only `requirements.txt`: `uv sync` fails with
+        // "No `pyproject.toml` found" and `pip install -e .` with "does not appear to
+        // be a Python project", which failed every verify of a healthy project.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("requirements.txt"), "flask==3.0.3\n").unwrap();
+        let steps = verify_steps(ProjectKind::Python, tmp.path()).unwrap();
+        let install = install_step(&steps).expect("the requirements are installed");
+        assert!(
+            !install.args.iter().any(|a| a == "sync" || a == "-e"),
+            "{} {:?}",
+            install.program,
+            install.args
+        );
+        assert!(
+            install
+                .args
+                .windows(2)
+                .any(|w| w[0] == "-r" && w[1] == "requirements.txt"),
+            "{} {:?}",
+            install.program,
+            install.args
+        );
+    }
+
+    #[test]
+    fn a_poetry_project_is_never_uv_synced() {
+        // A Poetry-format pyproject has no `[project]` table, so `uv sync` fails with
+        // "No `project` table found".
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.poetry]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [tool.poetry.dependencies]\npython = \"^3.11\"\n",
+        )
+        .unwrap();
+        let steps = verify_steps(ProjectKind::Python, tmp.path()).unwrap();
+        let install = install_step(&steps).expect("a Poetry project is installed");
+        assert!(
+            !install.args.iter().any(|a| a == "sync"),
+            "{} {:?}",
+            install.program,
+            install.args
+        );
+    }
+
+    #[test]
+    fn a_uv_project_runs_its_tools_inside_its_virtualenv() {
+        // `uv sync` installs into `.venv`; a global pytest cannot import from there.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [dependency-groups]\ndev = [\"pytest>=8\"]\n",
+        )
+        .unwrap();
+        let steps = python_steps(tmp.path(), &|bin| bin == "uv");
+        let install = install_step(&steps).expect("install");
+        assert_eq!(
+            (install.program.as_str(), install.args.clone()),
+            ("uv", vec!["sync".to_string()])
+        );
+        let test = steps.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(test.program, "uv");
+        assert_eq!(test.args, ["run", "--no-sync", "pytest"]);
+        // ruff is neither declared nor installed: a plain lookup, skipped when absent.
+        let lint = steps.iter().find(|s| s.name == "lint").expect("lint");
+        assert_eq!(lint.program, "ruff");
+        assert!(lint.skippable);
+
+        // Without uv the project installs with pip and runs the tools from PATH.
+        let steps = python_steps(tmp.path(), &|_| false);
+        let install = install_step(&steps).expect("install");
+        assert_eq!(install.program, "pip");
+        assert_eq!(install.args, ["install", "-e", "."]);
+        assert_eq!(
+            steps.iter().find(|s| s.name == "test").unwrap().program,
+            "pytest"
+        );
+    }
+
+    #[test]
+    fn a_poetry_project_installs_and_tests_with_poetry() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.poetry]\nname = \"app\"\n\n[tool.poetry.group.dev.dependencies]\n\
+             pytest = \"^8.0\"\n",
+        )
+        .unwrap();
+        let steps = python_steps(tmp.path(), &|bin| bin == "poetry" || bin == "uv");
+        let install = install_step(&steps).expect("install");
+        assert_eq!(install.program, "poetry");
+        assert_eq!(install.args, ["install"]);
+        let test = steps.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(test.program, "poetry");
+        assert_eq!(test.args, ["run", "pytest"]);
+    }
+
+    #[test]
+    fn a_requirements_project_uses_the_virtualenv_uv_would_install_into() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("requirements.txt"), "fastapi\npytest\n").unwrap();
+        fs::create_dir_all(tmp.path().join(".venv")).unwrap();
+        fs::write(tmp.path().join(".venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let steps = python_steps(tmp.path(), &|bin| bin == "uv");
+        let install = install_step(&steps).expect("install");
+        assert_eq!(install.program, "uv");
+        assert_eq!(install.args, ["pip", "install", "-r", "requirements.txt"]);
+        let test = steps.iter().find(|s| s.name == "test").expect("test");
+        assert_eq!(test.args, ["run", "--no-sync", "pytest"]);
+    }
+
+    #[test]
+    fn pytest_exit_5_is_not_a_failure() {
+        // pytest exits 5 when it collects no tests — a new project has none yet.
+        let step = VerifyStep {
+            name: "test",
+            program: "uv".to_string(),
+            args: vec!["run".into(), "--no-sync".into(), "pytest".into()],
+            skippable: true,
+            timeout_secs: 0,
+        };
+        let mut outcome = outcome("test", false, false);
+        outcome.exit_code = 5;
+        assert!(pytest_collected_nothing(&step, &outcome));
+        // A real pytest failure is still a failure.
+        outcome.exit_code = 1;
+        assert!(!pytest_collected_nothing(&step, &outcome));
+        // Exit 5 from another tool means what that tool says it means.
+        let cargo = VerifyStep {
+            program: "cargo".to_string(),
+            args: vec!["test".into()],
+            ..step
+        };
+        outcome.exit_code = 5;
+        assert!(!pytest_collected_nothing(&cargo, &outcome));
+    }
+
+    #[tokio::test]
+    async fn a_python_project_with_no_tests_yet_verifies_clean() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\naddopts = \"-q\"\n",
+        )
+        .unwrap();
+        let outcomes = run_verify(tmp.path()).await;
+        assert!(!outcomes.is_empty());
+        assert!(
+            outcomes.iter().all(|o| o.passed || o.skipped),
+            "{outcomes:?}"
+        );
     }
 
     #[test]
