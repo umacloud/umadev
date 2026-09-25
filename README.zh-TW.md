@@ -62,6 +62,8 @@ umadev 是**一個模擬真實開發團隊來工作的 Coding Agent**。它驅�
 npm i -g @umatech/umadev
 ```
 
+> **還在用舊的 `umadev` 套件？** UmaDev 現在只以 `@umatech/umadev` 發佈。未加 scope 的 `umadev` 套件已停用，且曾被惡意發佈 `1.0.74`：請先執行 `npm uninstall -g umadev`，免安裝執行請用 `npx @umatech/umadev`，不要用 `npx umadev`。詳見 [SECURITY.md](SECURITY.md#retired-package-names)。
+
 裝完直接敲 `umadev`。遇到權限或 PATH 報錯（通常是 `sudo` 裝出的 root 屬主前綴）？跑 `umadev doctor`，它會印出確切的修復指令。
 
 也可以完全跳過 npm。原生安裝器不需要 Node、不使用 sudo，會下載對應平台的 GitHub Release 二進位並驗證公開的 SHA-256：

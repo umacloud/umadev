@@ -49,7 +49,7 @@ same-file = "1"
 [features]
 default = []
 # Bundle the local candle embedding model into the shipped binary. The release
-# CI builds with `--features vector-local` so `npm i -g umadev` gives offline
+# CI builds with `--features vector-local` so `npm i -g @umatech/umadev` gives offline
 # hybrid retrieval with zero user setup; dev/CI omit it to skip candle's heavy
 # compile. Fail-open: without the model the binary degrades to BM25.
 vector-local = ["umadev-agent/vector-local"]

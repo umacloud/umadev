@@ -2,9 +2,9 @@
 
 ## Supported versions
 
-Security fixes are made on the latest `1.0.x` release. Users should reproduce
-and report a security issue on the newest published UmaDev version whenever it
-is safe to do so.
+Security fixes are made on the latest `1.1.x` release of `@umatech/umadev`.
+Users should reproduce and report a security issue on the newest published
+UmaDev version whenever it is safe to do so.
 
 ## Reporting a vulnerability
 
@@ -46,8 +46,10 @@ available; please avoid publishing exploit details beforehand.
 The npm-only `umadev@1.0.74` publication was not produced from this repository,
 has no matching Git tag or GitHub release, and contained an install-time
 JavaScript payload. It is malicious and must not be installed or executed. The
-last safe public release before the incident is `1.0.73`; `1.0.75` is the first
-recovery release produced by the hardened tokenless publishing pipeline.
+last safe public release before the incident is `1.0.73`. The `1.0.74` and
+`1.0.75` version numbers were skipped; `1.1.0`, published as `@umatech/umadev`,
+is the first recovery release produced by the hardened tokenless publishing
+pipeline.
 
 If `1.0.74` was installed, disconnect the host from the network, preserve a
 copy of the npm logs for investigation, remove the package, rotate npm and
@@ -110,3 +112,27 @@ Certificates and passwords are decoded only on their native ephemeral runner and
 are deleted before the job ends. A manual non-tag workflow run may build unsigned
 test artifacts, but only a `v*` tag can publish a release and every such tag must
 pass both native signature gates.
+
+### Retired package names
+
+UmaDev is published only under the `@umatech` npm scope. The names below are
+retired: this project no longer publishes to them, and any version that
+appears under them after `1.0.73` is not an UmaDev release.
+
+- `umadev` (replaced by `@umatech/umadev`);
+- `@umacloud/cli-darwin-arm64`, `@umacloud/cli-darwin-x64`,
+  `@umacloud/cli-linux-arm64`, `@umacloud/cli-linux-musl-arm64`,
+  `@umacloud/cli-linux-musl-x64`, `@umacloud/cli-linux-x64`,
+  `@umacloud/cli-win32-x64`, `@umacloud/knowledge` (replaced by the matching
+  `@umatech/*` packages, which `@umatech/umadev` installs for you).
+
+Move an existing install to the trusted package:
+
+```bash
+npm uninstall -g umadev
+npm install -g @umatech/umadev --registry=https://registry.npmjs.org
+```
+
+The command name stays `umadev`. Run it without installing through
+`npx @umatech/umadev`, never `npx umadev`, which resolves to the retired
+package.
