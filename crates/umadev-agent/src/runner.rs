@@ -25,8 +25,9 @@ use crate::experts::{
 };
 use crate::gates::Gate;
 use crate::phases::{
-    run_backend, run_delivery, run_docs, run_frontend, run_frontend_with_kind, run_quality,
-    run_quality_with_kind, run_research, run_spec, DocsContent, PhaseOutput,
+    run_backend, run_delivery, run_delivery_with_quality, run_docs, run_frontend,
+    run_frontend_with_kind, run_quality, run_research, run_spec, DeliveryVerdict, DocsContent,
+    PhaseOutput,
 };
 use crate::state::{write_workflow_state, WorkflowState};
 
@@ -389,37 +390,21 @@ fn run_budget() -> std::time::Duration {
 /// turn it into an error path.
 async fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
     use std::process::Stdio;
+    use umadev_process::git::{hardened_git_tokio_command, GitAccess, IGNORE_DIRTY_SUBMODULES};
 
     const STDOUT_CAP: usize = 512 * 1024;
-    #[cfg(windows)]
-    const EMPTY_GIT_CONFIG: &str = "NUL";
-    #[cfg(not(windows))]
-    const EMPTY_GIT_CONFIG: &str = "/dev/null";
 
-    let mut command = tokio::process::Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    // Taken automatically around every code step, so the repository's own
+    // config, hooks and filter drivers must not run (see `umadev_process::git`).
+    let mut command = hardened_git_tokio_command(root, GitAccess::ReadOnly)
+        .await
+        .ok()?;
     command
-        .arg("--no-pager")
-        .arg("--literal-pathspecs")
-        .args(["-c", "core.fsmonitor=false"])
-        .arg("-C")
-        .arg(root)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", IGNORE_DIRTY_SUBMODULES])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "Never");
+        .env("GIT_CONFIG_GLOBAL", umadev_process::git::NULL_DEVICE);
     let out = umadev_process::run_bounded_command(
         command,
         umadev_process::BoundedCommandOptions {
@@ -891,32 +876,27 @@ fn unresolved_degraded_artifacts(options: &RunOptions) -> bool {
     })
 }
 
-fn recorded_quality_passed(options: &RunOptions) -> bool {
-    let path = options
-        .project_root
-        .join("output")
-        .join(format!("{}-quality-gate.json", options.effective_slug()));
-    match crate::bounded_fs::read_utf8_beneath(
-        &options.project_root,
-        &path,
-        RUN_ARTIFACT_FILE_BYTES,
-    ) {
-        Ok(body) => crate::phases::extract_quality_score(&body).1,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
-    }
-}
-
+/// Settle an entry's task-ledger record from how its block ended.
+///
+/// `quality_verdict` is the verdict of a quality phase this block ran, taken
+/// from the gate JSON it produced in memory (`None` when the block ran none).
+/// A block that ends at Quality or Delivery must carry a passing one: the
+/// report in `output/` is model-writable, so it never decides a success.
 fn settle_pipeline_entry(
     task: &mut crate::task_lifecycle::EntryTaskTracker,
     options: &RunOptions,
     result: &std::io::Result<RunReport>,
     quality_is_hard: bool,
+    quality_verdict: Option<bool>,
 ) -> std::io::Result<()> {
+    let quality_is_clean = |report: &RunReport| match report.final_phase {
+        Phase::Quality | Phase::Delivery => quality_verdict == Some(true),
+        _ => quality_verdict != Some(false),
+    };
     let terminal_evidence_is_clean = |report: &RunReport| {
         !report.completed.iter().any(|phase| phase.degraded)
             && !unresolved_degraded_artifacts(options)
-            && (!quality_is_hard || recorded_quality_passed(options))
+            && (!quality_is_hard || quality_is_clean(report))
     };
     let settle = match result {
         Err(error) => task.fail("pipeline block failed", vec![error.to_string()]),
@@ -1986,7 +1966,7 @@ impl<R: Runtime> AgentRunner<R> {
             })
         }
         .await;
-        settle_pipeline_entry(&mut task, &self.options, &result, use_runtime)?;
+        settle_pipeline_entry(&mut task, &self.options, &result, use_runtime, None)?;
         result
     }
 
@@ -2436,7 +2416,7 @@ impl<R: Runtime> AgentRunner<R> {
             })
         }
         .await;
-        settle_pipeline_entry(&mut task, &self.options, &result, use_runtime)?;
+        settle_pipeline_entry(&mut task, &self.options, &result, use_runtime, None)?;
         result
     }
 
@@ -5487,6 +5467,7 @@ impl<R: Runtime> AgentRunner<R> {
             &self.options,
             &result,
             !self.runtime.is_offline(),
+            None,
         )?;
         result
     }
@@ -5502,6 +5483,7 @@ impl<R: Runtime> AgentRunner<R> {
             "pipeline-worker",
             "execute and verify the legacy single-shot pipeline",
         )?;
+        let mut quality_verdict = None;
         let result: std::io::Result<RunReport> = async {
             let use_runtime = !self.runtime.is_offline();
             // Re-derive the (deterministic) plan to honour its skips in this block
@@ -5669,16 +5651,11 @@ impl<R: Runtime> AgentRunner<R> {
             let phase_start = std::time::Instant::now();
             self.transition(Phase::Quality, "")?;
             self.start_phase(Phase::Quality);
-            let quality_result = run_quality(&self.options);
-            // Did the quality phase PRODUCE a gate file? If it did and we can't
-            // read it back, that's a disk/permission failure, not "offline mode" —
-            // we must NOT assume pass (that would mask a write failure as success).
-            let produced_gate_file = quality_result.as_ref().is_ok_and(|o| {
-                o.artifacts
-                    .iter()
-                    .any(|p| p.to_string_lossy().ends_with("-quality-gate.json"))
-            });
-            completed.push(self.record_phase(Phase::Quality, quality_result)?);
+            // The verdict is the gate JSON as the quality phase produced it, never
+            // a read-back of the file: `output/` is model-writable, and a
+            // left-running background process could forge a pass in between.
+            let (quality_out, qg_body) = crate::phases::run_quality_report(&self.options)?;
+            completed.push(self.record_phase(Phase::Quality, Ok(quality_out))?);
             self.record_phase_timing(Phase::Quality, phase_start);
             self.maybe_verify(Phase::Quality).await;
 
@@ -5717,58 +5694,26 @@ impl<R: Runtime> AgentRunner<R> {
                 }
             }
 
-            let qg_path = self.options.project_root.join("output").join(format!(
-                "{}-quality-gate.json",
-                self.options.effective_slug()
-            ));
-            // Keep the gate JSON around: we need it both for the score line AND, when
-            // the gate blocks, to inline the top findings instead of telling the user
-            // to open the file themselves.
-            let qg_body = match crate::bounded_fs::read_utf8_beneath(
-                &self.options.project_root,
-                &qg_path,
-                RUN_ARTIFACT_FILE_BYTES,
-            ) {
-                Ok(body) => Some(body),
-                Err(error) => {
-                    self.note_unavailable_workspace_input("quality-gate.json", &error);
-                    None
+            // Keep the gate JSON around: we need it for the score line, when the
+            // gate blocks to inline the top findings instead of telling the user to
+            // open the file themselves, and as the verdict delivery acts on.
+            let (qg_score, quality_passed) = crate::phases::extract_quality_score(&qg_body);
+            self.emit(EngineEvent::Note(format!(
+                "质量门结果: {qg_score}/100 · {}",
+                if quality_passed {
+                    "PASSED [ok]"
+                } else {
+                    "BLOCKED [fail]"
                 }
-            };
-            let mut qg_score = "?".to_string();
-            let quality_passed = if let Some(qg) = qg_body.as_deref() {
-                let (score_str, passed) = crate::phases::extract_quality_score(qg);
-                self.emit(EngineEvent::Note(format!(
-                    "质量门结果: {score_str}/100 · {}",
-                    if passed {
-                        "PASSED [ok]"
-                    } else {
-                        "BLOCKED [fail]"
-                    }
-                )));
-                qg_score = score_str;
-                passed
-            } else if produced_gate_file {
-                // The quality phase wrote the file but we can't read it back —
-                // treat as a real failure rather than silently assuming pass.
-                self.emit(EngineEvent::Note(umadev_i18n::tlf(
-                    "quality.gate_unreadable",
-                    &[&qg_path.display().to_string()],
-                )));
-                false
-            } else {
-                true // no gate file produced = offline/empty run → assume pass
-            };
+            )));
+            quality_verdict = Some(quality_passed);
 
             if !quality_passed && use_runtime {
                 // Inline the score + top findings so the user sees WHAT failed and by
                 // HOW much, right here — no need to open the JSON. Fail-open: an
                 // unparsable gate yields no findings block, and we still print the
                 // blocked banner + next steps.
-                let findings = qg_body
-                    .as_deref()
-                    .map(|b| crate::phases::quality_findings(b, 5))
-                    .unwrap_or_default();
+                let findings = crate::phases::quality_findings(&qg_body, 5);
                 let findings_block = if findings.is_empty() {
                     String::new()
                 } else {
@@ -5846,7 +5791,10 @@ impl<R: Runtime> AgentRunner<R> {
                         ok: del_ok,
                     });
                 }
-                completed.push(self.record_phase(Phase::Delivery, run_delivery(&self.options))?);
+                completed.push(self.record_phase(
+                    Phase::Delivery,
+                    run_delivery_with_quality(&self.options, DeliveryVerdict::Gate(&qg_body)),
+                )?);
                 // Base-driven self-evolution upkeep: reconcile the lesson corpus and
                 // write reusable skill cards (no-op offline; fail-open).
                 self.evolve_memory_at_delivery().await;
@@ -5891,6 +5839,7 @@ impl<R: Runtime> AgentRunner<R> {
             &self.options,
             &result,
             !self.runtime.is_offline(),
+            quality_verdict,
         )?;
         result
     }
@@ -6034,29 +5983,14 @@ impl<R: Runtime> AgentRunner<R> {
             // M8: thread the FORCED Light kind so the doc-N/A guard reads the EXECUTED
             // plan (no Docs) rather than re-classifying the requirement (which could
             // re-derive Greenfield and penalise the run for PRD/arch/UIUX it skipped).
-            let quality_result = run_quality_with_kind(&self.options, Some(plan.kind));
-            completed.push(self.record_phase(Phase::Quality, quality_result)?);
+            // The verdict is the gate JSON as produced, never a read-back of the
+            // model-writable file (see the full path).
+            let (quality_out, qg_body) =
+                crate::phases::run_quality_report_with_kind(&self.options, Some(plan.kind))?;
+            completed.push(self.record_phase(Phase::Quality, Ok(quality_out))?);
             self.record_phase_timing(Phase::Quality, phase_start);
             self.maybe_verify(Phase::Quality).await;
-
-            let quality_passed = {
-                let qg_path = self.options.project_root.join("output").join(format!(
-                    "{}-quality-gate.json",
-                    self.options.effective_slug()
-                ));
-                match crate::bounded_fs::read_utf8_beneath(
-                    &self.options.project_root,
-                    &qg_path,
-                    RUN_ARTIFACT_FILE_BYTES,
-                ) {
-                    Ok(qg) => crate::phases::extract_quality_score(&qg).1,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(error) => {
-                        self.note_unavailable_workspace_input("quality-gate.json", &error);
-                        false
-                    }
-                }
-            };
+            let quality_passed = crate::phases::extract_quality_score(&qg_body).1;
 
             // Mark the lean run complete — phase stays at quality (Light has no
             // delivery phase), gate cleared.
@@ -6383,6 +6317,10 @@ impl<R: Runtime> AgentRunner<R> {
                     );
                     degraded = self.try_generate(phase, del_p).await.is_none();
                 }
+                // A redo runs this one phase body and no quality gate, so there is
+                // no verdict this process produced: the redo repackages the
+                // delivery but graduates nothing (the report in `output/` is
+                // model-writable and only shown). A full run delivers with one.
                 Ok((run_delivery(&self.options)?, degraded))
             }
             // The two gate phases have no body to re-run — they only pause the
@@ -9606,11 +9544,11 @@ error TS2304: Cannot find name 'Foo'
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".umadevrc"),
-            "[quality]\nthreshold = 75\n\n[pipeline]\nmax_review_rounds = 1\n",
+            "[quality]\nthreshold = 95\n\n[pipeline]\nmax_review_rounds = 1\n",
         )
         .unwrap();
         let cfg = crate::config::load_project_config(tmp.path());
-        assert_eq!(cfg.quality.threshold, 75);
+        assert_eq!(cfg.quality.threshold, 95);
         assert_eq!(cfg.pipeline.max_review_rounds, 1);
     }
 
@@ -10155,6 +10093,51 @@ error TS2304: Cannot find name 'Foo'
         let tmp = TempDir::new().unwrap();
         // No `git init` → not a repo → None (fail-open, the caller skips the check).
         assert!(git_worktree_snapshot(tmp.path()).await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_worktree_snapshot_never_runs_repository_hooks_or_filters() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git_init_repo(&root);
+        std::fs::write(root.join(".gitattributes"), "* filter=x\n").unwrap();
+        std::fs::write(root.join("app.ts"), "one\n").unwrap();
+        for args in [
+            vec!["add", "."],
+            vec!["-c", "core.hooksPath=/dev/null", "commit", "-qm", "init"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let clean = format!("touch '{}'; cat", tmp.path().join("filter-ran").display());
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "filter.x.clean", &clean])
+            .status()
+            .unwrap();
+        let hook = root.join(".git/hooks/post-index-change");
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\n",
+            tmp.path().join("hook-ran").display()
+        );
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.join("app.ts"), "two\n").unwrap();
+
+        let snapshot = git_worktree_snapshot(&root).await;
+        assert!(snapshot.is_some_and(|status| status.contains("app.ts")));
+        assert!(!tmp.path().join("filter-ran").exists(), "clean filter ran");
+        assert!(!tmp.path().join("hook-ran").exists(), "index hook ran");
     }
 
     #[test]

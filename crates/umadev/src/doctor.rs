@@ -99,6 +99,7 @@ pub async fn run_all(workspace: &Path, fix: bool) -> Vec<CheckResult> {
         check_run_lock_fence(workspace, fix),
         check_workspace_rewind_marker(workspace, fix),
         check_spec_manifest(workspace),
+        check_workspace_trust(workspace),
     ];
     results.push(check_ai_backends().await);
     // Distinct from the reachability check above: when `claude-code` is the
@@ -779,6 +780,17 @@ fn check_spec_manifest(workspace: &Path) -> CheckResult {
     }
 }
 
+/// Whether the user trusts this project. Informational: every answer is a
+/// valid choice, and an untrusted project still runs (at most in guarded mode,
+/// with bases ignoring the project's own settings).
+fn check_workspace_trust(workspace: &Path) -> CheckResult {
+    CheckResult {
+        name: "workspace trust".to_string(),
+        status: Status::Passed,
+        detail: crate::workspace_trust::describe(workspace),
+    }
+}
+
 /// Check which of the five first-class host CLIs are installed and
 /// usable. This is the most important doctor check for enterprise use —
 /// without a backend, UmaDev falls back to offline templates.
@@ -1132,22 +1144,7 @@ fn check_npm_install() -> CheckResult {
 
 /// Check if an executable is on PATH (without spawning a subprocess).
 fn which_on_path(cmd: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        // Check common executable extensions on the current platform.
-        let candidates = if cfg!(windows) {
-            vec![
-                dir.join(format!("{cmd}.exe")),
-                dir.join(format!("{cmd}.bat")),
-                dir.join(format!("{cmd}.cmd")),
-            ]
-        } else {
-            vec![dir.join(cmd)]
-        };
-        candidates.iter().any(|p| p.is_file())
-    })
+    umadev_process::path_lookup::find_on_path(cmd).is_some()
 }
 
 /// Return true iff every result in `results` is `Passed`.
@@ -1582,6 +1579,7 @@ mod tests {
                 umadev_i18n::tl("doctor.run_lock_fence_name"),
                 umadev_i18n::tl("doctor.rewind_marker_name"),
                 "spec manifest (UD-META-001)",
+                "workspace trust",
                 "AI host backends",
                 "Claude non-interactive auth",
                 "git (file checkpoints)",

@@ -114,6 +114,13 @@
 "mode.unknown" = "未知模式「{}」。可选:plan(只读出计划)/ guarded(逐门审核,默认)/ auto(全自动)。"
 "mode.plan.gate" = "[plan] 计划模式:本次执行未启动；没有加锁、建分支、写入工作流/治理状态或产物，也没有启动写会话。可继续使用底座的请求规划/只读配置对话（有效沙箱能力取决于底座与平台），或切换 /mode guarded、/mode auto 后重新输入需求执行。"
 "trust.suggest_auto" = "[trust] 你已连续 {} 次通过 `{}` 门 —— 要不要让它自动推进?输入 /mode auto 全自动,或继续保持手动审核(此提示仅出现一次,不会自动改你的默认设置)。"
+"workspace_trust.question" = "信任这个项目吗?UmaDev 和底座会读取项目里可能执行代码或放宽权限的文件:.umadevrc、保存的运行状态，以及底座自己的设置、钩子和 MCP 服务器。"
+"workspace_trust.trust" = "信任此项目:加载它的设置，可使用 Auto"
+"workspace_trust.distrust" = "不信任：最高 Guarded,底座忽略项目自带设置"
+"workspace_trust.trusted" = "[ok] 已在本机信任此项目。底座现在会加载它自带的设置、钩子和 MCP 服务器，也可以使用 /mode auto。可用 /trust 修改。"
+"workspace_trust.untrusted" = "[trust] 未信任此项目。它最高以 Guarded 运行，底座启动时不加载项目自带的设置、钩子或 MCP 服务器(项目自带 MCP 服务器时拒绝启动 Kimi Code)。可用 /trust 修改。"
+"workspace_trust.save_failed" = "[warn] 本次会话已生效，但无法保存该决定，下次启动会再次询问:{}"
+"workspace_trust.auto_refused" = "只有已信任的项目才能使用 Auto。请先执行 /trust;当前档位保持不变。"
 "trust.reason.reversible" = "项目内可逆编辑"
 "trust.reason.git" = "触及 .git 版本库内部(可能改写历史)"
 "trust.reason.network" = "涉及网络(推送/拉取/下载)"
@@ -621,6 +628,7 @@
 "continue.resuming_chat" = "继续上次的对话 —— 底座带着完整上下文接着干。"
 "continue.chat_directive" = "继续完成我们上次未完成的工作。"
 "continue.resuming_plan" = "团队 · 续跑已保存的计划(已完成 {}/{} 步)— 只跑剩下的部分"
+"continue.unowned_run" = ".umadev 里保存的任务不是本机 UmaDev 写入的(可能随仓库一起带来),因此没有续跑。请先查看:\n{}\n确认要按上面的计划执行,请发送 /continue adopt;要重新开始,直接输入新需求。"
 "revise.usage" = "用法:/revise <修订说明>。\n  示例:/revise 去掉社交登录,只留邮箱密码"
 "revise.no_gate" = "目前没有打开的检查点,无法修订 — 要修改产出需要先等运行停在检查点(确认核心文档 / 确认前端预览)。"
 
@@ -760,6 +768,7 @@
 # /preview
 "preview.detected" = "[preview] 检测到 {},启动预览…\n  命令:`{}` -> {}"
 "preview.starting" = "启动 dev server 并打开预览:{}\n  命令:`{}`"
+"preview.confirm_command" = "下面的预览命令读自前端说明文件，仓库或模型都能修改它。尚未运行：\n  {}\n  -> {}\n确认无误后输入 /preview confirm 运行。"
 "preview.opened" = "已打开预览:{}\n  (未找到 Run command,如页面打不开请手动启动 dev server)"
 "preview.none_yet" = "还没有可预览的前端。先输入需求跑完到 frontend 阶段(会停在预览 gate),\n                   或确认底座已把 Preview URL 写进 output/xxx-frontend-notes.md。"
 "preview.gate_announce" = "[preview] 前端已生成,预览地址:{}\n                       在浏览器打开查看效果。满意就输入 c 继续(进入后端);\n                       要改就描述修改意见。也可 /preview 自动启动 dev server、/stop-preview 停止。"
@@ -1039,7 +1048,6 @@
 "diag.call_failed" = "[warn] {} 阶段:底座调用失败({})—— 本阶段改用【离线骨架】占位(非真实生成)。{}"
 
 # 质量门 — 内联分数 + 问题清单,别让用户另开 json
-"quality.gate_unreadable" = "[warn] 质量门文件写出后无法读回 ({}) — 判定未通过以防掩盖写盘失败。"
 "quality.gate_blocked" = "[warn] 质量门未通过(得分 {}/100)— 阻断 delivery(UD-EVID-003)。修复下列问题后重跑:\n  /redo 重跑整个流水线\n  或修复后 /continue 继续"
 "quality.top_findings_header" = "待修复的主要问题:"
 
@@ -1062,6 +1070,7 @@
 # Ctrl+点击打开记录里的链接 / 文件({} = 打开的目标;iTerm2 原生 Cmd+点击不受影响)
 "tui.link.opened" = "已打开 {}"
 "tui.link.open_failed" = "无法打开 {}"
+"tui.link.revealed" = "已在所在文件夹中显示 {}（未直接打开：它可能作为程序运行）"
 # 工具调用行:连续只读工具合并后的标题 + grep 命中计数
 "tui.tool.batch" = "读取 {} 个文件"
 "tui.tool.matches" = "{} 处匹配"
@@ -1232,6 +1241,7 @@
 "tui.cmd.cancel" = "停止正在运行的流水线 / 智能体回合"
 "tui.cmd.adopt" = "接管现有项目(识别技术栈、索引源码、反推契约)"
 "tui.cmd.mode" = "信任档位:plan / guarded / auto"
+"tui.cmd.trust" = "信任或取消信任此项目"
 "tui.cmd.sandbox" = "Codex 底座启动沙箱:read-only / workspace-write / danger-full-access"
 "tui.cmd.lessons" = "从事故/验证结果提炼的可复用规则(不是事故列表)"
 "tui.cmd.memory" = "查看并安全管理项目/全局记忆策略、保留、导出与软删除"

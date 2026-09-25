@@ -8,11 +8,11 @@
 //!
 //! IMPORTANT — the prompt goes on STDIN, not as a positional arg. codex 0.141's
 //! `exec` reads its prompt from stdin ("Reading prompt from stdin…"); when the
-//! prompt is passed as an arg and stdin is then closed (UmaDev's Arg channel
-//! closes stdin to avoid hangs), codex prints "Reading additional input from
-//! stdin…" and exits 1 — every call fails and falls back to an offline scaffold.
-//! Feeding the prompt via `PromptChannel::Stdin` is what makes real codex runs
-//! work. `--json` makes codex emit JSONL events we parse for the answer.
+//! prompt is passed as an arg and stdin is then closed, codex prints "Reading
+//! additional input from stdin…" and exits 1 — every call fails and falls back
+//! to an offline scaffold. The shared subprocess layer always writes the prompt
+//! to stdin, which is what makes real codex runs work. `--json` makes codex emit
+//! JSONL events we parse for the answer.
 //!
 //! Like the Claude Code driver, it uses the user's already-authenticated
 //! `codex` session — no API key required.
@@ -55,7 +55,7 @@ use umadev_runtime::{
 
 use crate::{
     default_workspace, merge_prompt, model_args, run_auth_status, run_subprocess,
-    run_subprocess_streaming, AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
+    run_subprocess_streaming, AuthState, HostDriver, ProbeResult, SubprocessCall,
 };
 
 /// Drives the `codex` CLI as a subprocess.
@@ -189,10 +189,10 @@ impl CodexDriver {
     /// - `--skip-git-repo-check`: UmaDev workspaces are frequently
     ///   `output/` + `.umadev/` scratch dirs that aren't git repos;
     ///   codex otherwise refuses to run.
-    /// - `--sandbox`: Plan is hard-pinned to `read-only`; Guarded uses the
-    ///   resolved writable sandbox (`danger-full-access` by default, or an
-    ///   explicit narrower project setting). Emitted for every profile EXCEPT
-    ///   Auto+full-access (which uses the bypass flag below instead).
+    /// - `--sandbox`: `read-only` for everything but an effective Auto, which
+    ///   uses the resolved writable sandbox (`danger-full-access` by default,
+    ///   or an explicit narrower project setting). Emitted for every profile
+    ///   EXCEPT Auto+full-access (which uses the bypass flag below instead).
     /// - `--dangerously-bypass-approvals-and-sandbox`: Auto only, and only when
     ///   the resolved sandbox is already `danger-full-access`. Emitted ALONE (it
     ///   disables the sandbox entirely, so a paired `--sandbox` is redundant and
@@ -213,26 +213,18 @@ impl CodexDriver {
     }
 
     fn base_args_with_sandbox(&self, no_skip: bool, sandbox: &str) -> Vec<String> {
-        // A Plan driver has a second local fence even if a future caller hands
-        // this helper an unsafe value. Explicit project restrictions also stay
+        // `codex exec` has no channel to ask UmaDev anything, and under
+        // `on-request` with full access Codex asks for nothing either, so a
+        // writable one-shot outside Auto would run every command and patch
+        // unreviewed. Like the OpenCode one-shot, only an effective Auto may
+        // write here; Plan, Guarded and Auto under `UMADEV_NO_SKIP_PERMS` run
+        // read-only. Writable Guarded work goes through `CodexSession`, whose
+        // approvals reach UmaDev. Explicit project restrictions also stay
         // effective in Auto: the dangerous bypass is only valid with the actual
         // full-access sandbox, otherwise it would silently nullify that override.
-        let sandbox = if matches!(self.permissions, BasePermissionProfile::Plan) {
-            "read-only"
-        } else {
-            sandbox
-        };
         let effective_auto = self.permissions.auto_approve() && !no_skip;
+        let sandbox = if effective_auto { sandbox } else { "read-only" };
         let bypass = effective_auto && sandbox == "danger-full-access";
-        // Exec has no dedicated `--ask-for-approval` option, but its `-c`
-        // override is authoritative over user/project config. This prevents a
-        // local `approval_policy = "never"` from widening Plan/Guarded.
-        let approval = if matches!(self.permissions, BasePermissionProfile::Plan) || effective_auto
-        {
-            "never"
-        } else {
-            "on-request"
-        };
         let mut args = vec![
             self.exec_subcmd.clone(),
             "--skip-git-repo-check".to_string(),
@@ -251,8 +243,12 @@ impl CodexDriver {
             args.push(sandbox.to_string());
         }
         args.extend([
+            // Exec has no dedicated `--ask-for-approval` option, but its `-c`
+            // override is authoritative over user/project config. Nothing here
+            // can be asked, so the policy is always `never`, which also keeps a
+            // local `approval_policy` from changing that.
             "--config".to_string(),
-            format!("approval_policy=\"{approval}\""),
+            "approval_policy=\"never\"".to_string(),
             "--color".to_string(),
             "never".to_string(),
             // Emit newline-delimited JSON events so BOTH the streaming path AND
@@ -262,6 +258,9 @@ impl CodexDriver {
             // `complete` returned that whole banner as the "answer".
             "--json".to_string(),
         ]);
+        // An untrusted project's `.codex/` config, hooks and exec policies stay off.
+        let workspace = self.workspace.clone().unwrap_or_else(default_workspace);
+        args.extend(crate::project_config::codex_exec_args(&workspace));
         args
     }
 }
@@ -308,7 +307,6 @@ impl Runtime for CodexDriver {
             program: &self.program,
             args: &args,
             prompt: &prompt,
-            channel: PromptChannel::Stdin,
             workspace: &ws,
             timeout: self.timeout,
             env: &[],
@@ -330,14 +328,12 @@ impl Runtime for CodexDriver {
         if text.trim().is_empty() && !out.stdout.trim().is_empty() {
             text = out.stdout;
         }
-        Ok(crate::redaction::sanitize_completion_response(
-            &CompletionResponse {
-                text,
-                id: "codex-cli".to_string(),
-                model: req.model,
-                usage,
-            },
-        ))
+        Ok(CompletionResponse {
+            text,
+            id: "codex-cli".to_string(),
+            model: req.model,
+            usage,
+        })
     }
 
     /// Streaming completion via `codex exec --json`.
@@ -381,7 +377,6 @@ impl Runtime for CodexDriver {
                 program: &program,
                 args: &args,
                 prompt: &prompt,
-                channel: PromptChannel::Stdin,
                 workspace: &ws,
                 timeout,
                 env: &[],
@@ -408,14 +403,12 @@ impl Runtime for CodexDriver {
                 if final_text.trim().is_empty() && !out.stdout.trim().is_empty() {
                     final_text = out.stdout;
                 }
-                Ok(crate::redaction::sanitize_completion_response(
-                    &CompletionResponse {
-                        text: final_text,
-                        id: "codex-cli".to_string(),
-                        model,
-                        usage,
-                    },
-                ))
+                Ok(CompletionResponse {
+                    text: final_text,
+                    id: "codex-cli".to_string(),
+                    model,
+                    usage,
+                })
             }
             Err(e) => {
                 // Routine self-healing (often the base being SIGTERM/SIGALRM'd —
@@ -426,14 +419,12 @@ impl Runtime for CodexDriver {
                 let salvaged = extract_codex_messages(&partial);
                 if !salvaged.trim().is_empty() {
                     let usage = extract_codex_usage(&partial);
-                    return Ok(crate::redaction::sanitize_completion_response(
-                        &CompletionResponse {
-                            text: salvaged,
-                            id: "codex-cli".to_string(),
-                            model,
-                            usage,
-                        },
-                    ));
+                    return Ok(CompletionResponse {
+                        text: salvaged,
+                        id: "codex-cli".to_string(),
+                        model,
+                        usage,
+                    });
                 }
                 let stream_error = crate::map_subprocess_error(&e);
                 if matches!(stream_error, RuntimeError::Timeout(_, _)) {
@@ -761,7 +752,6 @@ impl HostDriver for CodexDriver {
             program: &self.program,
             args: &["--version".to_string()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: &tmp,
             timeout: Duration::from_secs(10),
             env: &[],
@@ -1037,12 +1027,7 @@ mod tests {
     fn permission_profiles_shape_legacy_args_and_no_skip_only_tightens() {
         let cases = [
             (BasePermissionProfile::Plan, "read-only", "never", false),
-            (
-                BasePermissionProfile::Guarded,
-                "danger-full-access",
-                "on-request",
-                false,
-            ),
+            (BasePermissionProfile::Guarded, "read-only", "never", false),
             (
                 BasePermissionProfile::Auto,
                 "danger-full-access",
@@ -1051,9 +1036,10 @@ mod tests {
             ),
         ];
         for (profile, sandbox, approval, bypass) in cases {
+            // Every profile is offered full access; only Auto may keep it.
             let args = CodexDriver::default()
                 .with_permissions(profile)
-                .base_args_with_sandbox(false, sandbox);
+                .base_args_with_sandbox(false, "danger-full-access");
             let has_sandbox = args.windows(2).any(|w| w[0] == "--sandbox");
             let has_bypass = args
                 .iter()
@@ -1089,8 +1075,9 @@ mod tests {
             .with_permissions(BasePermissionProfile::Auto)
             .base_args_with_sandbox(true, "danger-full-access");
         assert!(tightened
-            .iter()
-            .any(|a| a == "approval_policy=\"on-request\""));
+            .windows(2)
+            .any(|w| w[0] == "--sandbox" && w[1] == "read-only"));
+        assert!(tightened.iter().any(|a| a == "approval_policy=\"never\""));
         assert!(!tightened
             .iter()
             .any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
@@ -1364,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_events_redact_synthetic_secrets() {
+    fn stream_events_keep_model_text_and_tool_input_whole() {
         const SECRET: &str = "SYNTH_CODEX_SECRET_DO_NOT_LEAK_72";
         let text = serde_json::json!({
             "type": "item.completed",
@@ -1385,8 +1372,8 @@ mod tests {
             parse_codex_stream_line(&tool)
         );
         assert!(
-            !rendered.contains(SECRET),
-            "stream event leaked: {rendered}"
+            rendered.contains(SECRET),
+            "stream event was rewritten: {rendered}"
         );
     }
 }

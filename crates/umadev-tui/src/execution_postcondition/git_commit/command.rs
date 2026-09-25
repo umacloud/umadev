@@ -130,14 +130,21 @@ pub(crate) fn reject_git_environment_redirects() -> Result<(), ResidentExecution
     }
 }
 
+/// Probes and index plumbing for the host-only commit lane. The lane refuses a
+/// repository with active hooks up front; inert hooks here also close the gap
+/// between that check and these commands, and `--no-optional-locks` keeps a
+/// probe from rewriting the index as a side effect.
 pub(crate) fn git_std_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .arg("--no-pager")
         .arg("--literal-pathspecs")
+        .arg("--no-optional-locks")
         .args([
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            INERT_HOOKS_CONFIG,
             "-c",
             EMPTY_ATTRIBUTES_CONFIG,
             "-c",
@@ -342,6 +349,7 @@ mod tests {
     use super::{bounded_git_command_output, GitCommandLimits};
     use super::{
         git_environment_override, git_environment_variable, git_std_command, EMPTY_GIT_CONFIG,
+        INERT_HOOKS_CONFIG,
     };
     use std::ffi::OsStr;
     use std::path::Path;
@@ -415,6 +423,9 @@ mod tests {
             })
             .flatten();
         assert_eq!(config.as_deref(), Some(OsStr::new(EMPTY_GIT_CONFIG)));
+        let args = command.get_args().collect::<Vec<_>>();
+        assert!(args.contains(&OsStr::new("--no-optional-locks")));
+        assert!(args.contains(&OsStr::new(INERT_HOOKS_CONFIG)));
     }
 
     #[cfg(unix)]

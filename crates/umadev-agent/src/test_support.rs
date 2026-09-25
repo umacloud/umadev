@@ -108,6 +108,18 @@ impl Drop for TempHome {
     }
 }
 
+/// Pin this test process's installation state directory (`~/.umadev`) to a
+/// scratch directory, so approval memory, saved-run stamps and the provenance
+/// key never touch the developer's real home. Idempotent; the directory lives
+/// for the whole process and is shared by every test in it.
+pub(crate) fn isolate_state_directory() {
+    umadev_state::privacy::pin_state_directory(|| {
+        TempDir::with_prefix("umadev-test-state-")
+            .expect("scratch state directory")
+            .keep()
+    });
+}
+
 fn restore(key: &str, val: Option<OsString>) {
     match val {
         Some(v) => std::env::set_var(key, v),

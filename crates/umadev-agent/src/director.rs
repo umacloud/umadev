@@ -987,7 +987,7 @@ impl FinalizeResult {
 ///   doc ceremony, no zipped proof-pack + scorecard (that would be ceremony nobody
 ///   asked for). The owned `.umadev/plan.json` records what was built.
 /// - **Deliberate (`Standard` / `Deep`)** → the FULL delivery
-///   ([`crate::phases::run_delivery`]): compliance mapping + the owned + tool
+///   ([`crate::phases::run_delivery_with_quality`]): compliance mapping + the owned + tool
 ///   security scan + the PR-ready review report + the zipped proof-pack + the
 ///   shareable HTML scorecard, over the docs the base actually produced.
 ///
@@ -1114,9 +1114,14 @@ pub fn finalize(
         return result;
     }
 
-    // … plus the full, shareable proof-pack + scorecard.
+    // … plus the full, shareable proof-pack + scorecard. Reaching here means the
+    // final review settled clean (`clean` above), and that review is the gate
+    // this path runs: it is the verdict validated patterns and skills graduate on.
     {
-        match crate::phases::run_delivery(options) {
+        match crate::phases::run_delivery_with_quality(
+            options,
+            crate::phases::DeliveryVerdict::ReviewedClean,
+        ) {
             Ok(out) => {
                 let rels: Vec<String> = out
                     .artifacts

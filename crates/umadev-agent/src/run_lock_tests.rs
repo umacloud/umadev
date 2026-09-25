@@ -1041,3 +1041,19 @@ fn pid_liveness_self_is_alive() {
         "an impossible PID must not probe as alive"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn the_external_guard_namespace_is_private_and_never_a_shared_tmp_name() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = namespace::external_guard_dir().expect("guard namespace");
+    assert!(
+        !dir.starts_with("/tmp/.umadev-run-locks"),
+        "another local user can squat a predictable /tmp name: {}",
+        dir.display()
+    );
+    let meta = std::fs::symlink_metadata(&dir).unwrap();
+    assert_eq!(meta.mode() & 0o077, 0, "{:o}", meta.mode());
+    assert_eq!(meta.uid(), namespace::current_unix_uid());
+}
