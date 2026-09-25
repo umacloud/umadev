@@ -1074,6 +1074,7 @@
 # Ctrl+click opened a URL / file from the transcript ({} = the opened target; iTerm2's native Cmd+click is unaffected)
 "tui.link.opened" = "Opened {}"
 "tui.link.open_failed" = "Could not open {}"
+"tui.link.revealed" = "Showed {} in its folder (not opened: it could run as a program)"
 # Tool-call rows: merged read/grep batch headline + grep metric
 "tui.tool.batch" = "inspected {} files"
 "tui.tool.matches" = "{} matches"

@@ -5664,8 +5664,8 @@ impl App {
     }
 
     /// Ctrl+click at screen `(col, row)`: open the URL / existing file under
-    /// the cursor with the platform opener, spawned detached (all stdio null,
-    /// reaped off-thread — see [`crate::link::spawn_opener`]). Arms
+    /// the cursor with the platform opener (or reveal a file that could run,
+    /// spawned detached — see [`crate::link::open_link_target`]). Arms
     /// [`Self::link_click_pending`] unconditionally so the rest of the mouse
     /// gesture (drag / up) never touches the selection layer. Affordance: one
     /// status note on success or on a failed spawn; a click that hits nothing
@@ -5676,11 +5676,7 @@ impl App {
         let Some(target) = self.link_target_at(col, row) else {
             return;
         };
-        let key = if crate::link::spawn_opener(&target).is_ok() {
-            "tui.link.opened"
-        } else {
-            "tui.link.open_failed"
-        };
+        let key = crate::link::open_link_target(&target);
         self.push(
             ChatRole::System,
             umadev_i18n::tf(self.lang, key, &[&target]),

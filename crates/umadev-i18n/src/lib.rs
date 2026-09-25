@@ -549,6 +549,7 @@ mod tests {
             "tui.help.key.link",
             "tui.link.opened",
             "tui.link.open_failed",
+            "tui.link.revealed",
             "tui.bang.exit",
             "tui.bang.failed",
             "tui.bang.spawn_failed",

@@ -1063,6 +1063,7 @@
 # Ctrl+点击打开记录里的链接 / 文件({} = 打开的目标;iTerm2 原生 Cmd+点击不受影响)
 "tui.link.opened" = "已打开 {}"
 "tui.link.open_failed" = "无法打开 {}"
+"tui.link.revealed" = "已在所在文件夹中显示 {}（未直接打开：它可能作为程序运行）"
 # 工具调用行:连续只读工具合并后的标题 + grep 命中计数
 "tui.tool.batch" = "读取 {} 个文件"
 "tui.tool.matches" = "{} 处匹配"

@@ -18,8 +18,14 @@
 //! ever opened (no `file:` / `javascript:` / other schemes), paths must
 //! canonicalize to an existing file/dir, targets with embedded quotes,
 //! backticks or control characters are rejected, and the opener is always an
-//! argv vector — never a shell-interpolated string. A miss or a failed spawn
-//! is a silent no-op / one status note; nothing here can block the UI.
+//! argv vector — never a shell-interpolated string. The platform opener RUNS
+//! programs (`.command` / `.app` on macOS, `.exe` / `.lnk` / `.bat` through
+//! Explorer, `.desktop` through xdg-open), so a path is opened only when it is
+//! a plain folder or a known document type without an executable bit; every
+//! other path is revealed in its folder instead, and UNC / network paths are
+//! never touched (resolving one already authenticates to the remote host). A
+//! miss or a failed spawn is a silent no-op / one status note; nothing here
+//! can block the UI.
 
 use std::path::{Path, PathBuf};
 
@@ -316,7 +322,7 @@ fn undecorate(p: PathBuf) -> PathBuf {
 /// nothing is created or touched.
 #[must_use]
 pub fn resolve_path(token: &str, workspace_root: &Path) -> Option<PathBuf> {
-    if has_forbidden_chars(token) {
+    if has_forbidden_chars(token) || is_network_path(token) {
         return None;
     }
     let stripped = strip_line_suffix(token);
@@ -337,10 +343,130 @@ pub fn resolve_path(token: &str, workspace_root: &Path) -> Option<PathBuf> {
             workspace_root.join(tok)
         };
         if let Ok(canon) = expanded.canonicalize() {
-            return Some(undecorate(canon));
+            let canon = undecorate(canon);
+            // A mapped network drive canonicalizes to `\\?\UNC\…`: still remote.
+            return (!is_network_path(&canon.to_string_lossy())).then_some(canon);
         }
     }
     None
+}
+
+/// `true` for a UNC / device path (`\\host\share`, `//host/share`,
+/// `\\?\UNC\…`, `\\.\pipe\…`): two leading separators of either kind,
+/// which Windows treats as a network or device name. Checked BEFORE
+/// `canonicalize`, because merely resolving `\\attacker\share\x` opens an
+/// SMB session that hands the attacker the user's NTLM hash.
+fn is_network_path(tok: &str) -> bool {
+    let mut chars = tok.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some('/' | '\\'), Some('/' | '\\'))
+    )
+}
+
+/// Document extensions no stock platform opener executes: they land in a
+/// viewer, editor or browser. Deliberately excludes script types a platform
+/// may associate with an interpreter (`.js` → Windows Script Host, `.py` /
+/// `.rb` / `.pl` → an installed runtime, `.sh`, `.ps1`), every shortcut /
+/// launcher format (`.lnk`, `.url`, `.desktop`, `.webloc`, `.command`,
+/// `.terminal`) and every bundle, so an allowlist miss degrades to a reveal.
+const OPENABLE_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "rst", "adoc", "log", "csv", "tsv", "json", "jsonl", "yaml", "yml",
+    "toml", "xml", "html", "htm", "pdf", "png", "jpg", "jpeg", "gif", "webp", "avif", "svg", "bmp",
+    "ico", "mp4", "webm", "mov", "mp3", "wav", "ogg", "rs", "go", "c", "h", "cc", "cpp", "hpp",
+    "cs", "java", "kt", "swift", "ts", "tsx", "jsx", "css", "scss", "sass", "less", "vue",
+    "svelte", "sql", "proto", "lock", "diff", "patch",
+];
+
+/// How a resolved path goes to the platform opener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathOpen {
+    /// A plain folder or an allowlisted document: open it directly.
+    Open,
+    /// Anything that might run when opened (an executable-bit file, an
+    /// unknown or launcher extension, an `.app`-style bundle directory):
+    /// show it in its folder without launching it.
+    Reveal,
+}
+
+/// Decide how to hand a CANONICAL path to the opener. Pure over the facts
+/// the caller gathered, so every platform's decision is unit-testable on any
+/// host: `is_dir` / `executable` describe the resolved target (after
+/// symlinks, so a `README.md` link to `payload.command` is judged as the
+/// payload). A directory is opened only when its name has no extension —
+/// macOS launches `X.app`, `X.prefPane`, `X.workflow` … bundles on `open`.
+#[must_use]
+pub fn path_open_mode(path: &Path, is_dir: bool, executable: bool) -> PathOpen {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    let openable = match ext {
+        None => is_dir,
+        Some(ext) => !is_dir && !executable && OPENABLE_EXTENSIONS.contains(&ext.as_str()),
+    };
+    if openable {
+        PathOpen::Open
+    } else {
+        PathOpen::Reveal
+    }
+}
+
+/// `true` when any unix execute bit is set on `meta` (always `false` off
+/// unix, where the extension alone decides).
+fn has_exec_bit(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// The opener argv that REVEALS `path` without launching it: `open -R` on
+/// macOS selects it in Finder; elsewhere the containing folder is opened
+/// (Explorer and file managers never execute a folder). `None` when a
+/// non-macOS path has no parent to open.
+#[must_use]
+pub fn reveal_argv(os: &str, path: &Path) -> Option<(String, Vec<String>)> {
+    if os == "macos" {
+        let target = path.display().to_string();
+        return Some(("open".to_string(), vec!["-R".to_string(), target]));
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+    Some(opener_argv(os, &parent.display().to_string()))
+}
+
+/// Open what a Ctrl+click resolved to — an `http(s)` URL as-is, or a
+/// canonical path from [`resolve_path`] opened or revealed per
+/// [`path_open_mode`] — and return the i18n key of the status note to show.
+pub fn open_link_target(target: &str) -> &'static str {
+    let spawned = if is_safe_url(target) {
+        spawn_opener(target).map(|()| "tui.link.opened")
+    } else {
+        open_resolved_path(Path::new(target))
+    };
+    spawned.unwrap_or("tui.link.open_failed")
+}
+
+/// Re-stat the resolved path at click time and open or reveal it.
+fn open_resolved_path(path: &Path) -> std::io::Result<&'static str> {
+    let meta = std::fs::metadata(path)?;
+    let os = std::env::consts::OS;
+    match path_open_mode(path, meta.is_dir(), has_exec_bit(&meta)) {
+        PathOpen::Open => {
+            spawn_argv(opener_argv(os, &path.display().to_string()))?;
+            Ok("tui.link.opened")
+        }
+        PathOpen::Reveal => {
+            let argv = reveal_argv(os, path).ok_or(std::io::ErrorKind::NotFound)?;
+            spawn_argv(argv)?;
+            Ok("tui.link.revealed")
+        }
+    }
 }
 
 /// The platform-opener argv for `target` — `(program, args)`, argv-vector
@@ -374,7 +500,11 @@ pub fn opener_argv(os: &str, target: &str) -> (String, Vec<String>) {
 /// `/preview` browser open). Fail-open: the only error surfaced is a failed
 /// `spawn`, which the caller turns into one status note.
 pub fn spawn_opener(target: &str) -> std::io::Result<()> {
-    let (prog, args) = opener_argv(std::env::consts::OS, target);
+    spawn_argv(opener_argv(std::env::consts::OS, target))
+}
+
+/// Spawn one opener argv detached, reaping it off-thread.
+fn spawn_argv((prog, args): (String, Vec<String>)) -> std::io::Result<()> {
     let child = std::process::Command::new(prog)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -602,6 +732,86 @@ mod tests {
         assert_eq!(
             undecorate(PathBuf::from("/tmp/x.png")),
             PathBuf::from("/tmp/x.png")
+        );
+    }
+
+    #[test]
+    fn resolve_path_never_touches_unc_or_device_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        for tok in [
+            r"\\attacker.example\share\x.txt",
+            "//attacker.example/share/x.txt",
+            r"\\?\UNC\host\share\a.txt",
+            r"\\.\pipe\x",
+            r"/\host\share",
+        ] {
+            assert_eq!(resolve_path(tok, dir.path()), None, "{tok}");
+        }
+    }
+
+    // ── open vs reveal (a click never launches a program) ─────────────────
+    #[test]
+    fn launchable_targets_are_revealed_not_opened() {
+        let reveal = |p: &str, is_dir: bool, exec: bool| {
+            path_open_mode(Path::new(p), is_dir, exec) == PathOpen::Reveal
+        };
+        for file in [
+            "/w/x.command",
+            "/w/x.exe",
+            "/w/x.lnk",
+            "/w/x.url",
+            "/w/x.desktop",
+            "/w/x.bat",
+            "/w/x.js",
+            "/w/x.webloc",
+            "/w/X.EXE",
+            "/w/Makefile",
+        ] {
+            assert!(reveal(file, false, false), "{file} must be revealed");
+        }
+        assert!(reveal("/w/Helper.app", true, false), "bundle dir");
+        assert!(reveal("/w/Pane.prefPane", true, false), "bundle dir");
+        assert!(reveal("/w/run.md", false, true), "executable bit wins");
+        for (path, is_dir) in [
+            ("/w/a.png", false),
+            ("/w/README.md", false),
+            ("/w/src", true),
+        ] {
+            assert_eq!(
+                path_open_mode(Path::new(path), is_dir, false),
+                PathOpen::Open
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_document_symlink_to_a_launcher_is_judged_by_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.command"), b"#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink("a.command", dir.path().join("README.md")).unwrap();
+        let resolved = resolve_path("README.md", dir.path()).expect("link resolves");
+        assert!(resolved.ends_with("a.command"), "{}", resolved.display());
+        assert_eq!(path_open_mode(&resolved, false, false), PathOpen::Reveal);
+    }
+
+    #[test]
+    fn reveal_argv_never_names_the_target_as_the_thing_to_open() {
+        let p = Path::new("/w/tools/x.command");
+        assert_eq!(
+            reveal_argv("macos", p),
+            Some((
+                "open".to_string(),
+                vec!["-R".to_string(), "/w/tools/x.command".to_string()]
+            ))
+        );
+        assert_eq!(
+            reveal_argv("linux", p),
+            Some(("xdg-open".to_string(), vec!["/w/tools".to_string()]))
+        );
+        assert_eq!(
+            reveal_argv("windows", p),
+            Some(("explorer".to_string(), vec!["/w/tools".to_string()]))
         );
     }
 
