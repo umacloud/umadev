@@ -4078,7 +4078,8 @@ async fn verify_step_evidence(
         .iter()
         .any(|c| matches!(c, E::RouteResponds { .. }));
     let runtime = if needs_runtime {
-        let proof = crate::runtime_proof::run_runtime_proof(root).await;
+        let declared = declared_evidence::declared_routes(step);
+        let proof = crate::runtime_proof::run_runtime_proof_probing(root, &declared).await;
         // FRESHNESS: a proof is a statement about the tree it ran against. If the
         // source moved between the probe and this instant (a concurrent write, a base
         // still finishing a file), the proof no longer describes the code we are about
@@ -4119,7 +4120,13 @@ async fn verify_step_evidence(
                 method,
                 path,
                 status,
-            } => route_responds_outcome(runtime.as_ref(), method, path, *status),
+            } => declared_evidence::route_responds_outcome(
+                events,
+                runtime.as_ref(),
+                method,
+                path,
+                *status,
+            ),
             // M6: an under-specified brain evidence entry is ALWAYS an unmet gap — it
             // never auto-passes, so the step is held to a falsifiable bar instead of
             // silently degrading to the coarse "any source exists" default.
@@ -4487,70 +4494,11 @@ fn contract_outcome(contract: Option<&VerifyResult>) -> EvidenceOutcome {
     }
 }
 
-/// `RouteResponds` contract → reuse the already-run runtime proof: if the app booted
-/// (Verified), the named path must have answered with the expected status (`status ==
-/// 0` ⇒ any non-error). A route that wasn't probed / answered wrong is a typed gap; a
-/// runtime that could NOT be verified at all (no dev server / no curl) is a neutral
-/// skip (fail-open — an unbootable app never blocks a step on this contract).
-fn route_responds_outcome(
-    runtime: Option<&crate::runtime_proof::RuntimeProof>,
-    method: &str,
-    path: &str,
-    status: Option<u16>,
-) -> EvidenceOutcome {
-    let Some(proof) = runtime else {
-        return EvidenceOutcome::Skip;
-    };
-    if !proof.status.is_verified() {
-        // The app couldn't be booted/probed at all — neutral, not a false failure.
-        return EvidenceOutcome::Skip;
-    }
-    let want = normalize_route(path);
-    let Some(probe) = proof
-        .routes
-        .iter()
-        .find(|r| normalize_route(&r.path) == want)
-    else {
-        return EvidenceOutcome::Gap(format!(
-            "declared {method} {path} responds but that route was not among the probed routes"
-        ));
-    };
-    // L2: `None` = any non-error response; `Some(code)` = require exactly `code`
-    // (including a required error status like 401).
-    let ok = match status {
-        None => probe.ok,
-        Some(want) => probe.status == want,
-    };
-    if ok {
-        EvidenceOutcome::Pass
-    } else {
-        match status {
-            None => EvidenceOutcome::Gap(format!(
-                "declared {method} {path} responds OK but it returned status {}",
-                probe.status
-            )),
-            Some(want) => EvidenceOutcome::Gap(format!(
-                "declared {method} {path} responds {want} but it returned status {}",
-                probe.status
-            )),
-        }
-    }
-}
-
 /// Resolve whether a repo-relative `path` exists under `root`. A blank path is never
 /// "present". Reads disk only; fail-open (a stat error ⇒ absent).
 fn step_path_exists(root: &std::path::Path, path: &str) -> bool {
     let p = path.trim();
     !p.is_empty() && root.join(p).exists()
-}
-
-/// Normalise a route path for comparison: trim, ensure a single leading `/`, drop a
-/// trailing `/` (except the root). So `api/users/` and `/api/users` compare equal.
-fn normalize_route(path: &str) -> String {
-    let t = path.trim();
-    let t = t.strip_prefix('/').unwrap_or(t);
-    let trimmed = t.trim_end_matches('/');
-    format!("/{trimmed}")
 }
 
 /// Whether any of the project's source files mentions `needle` — the deterministic

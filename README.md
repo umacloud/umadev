@@ -275,7 +275,7 @@ umadev convenes a nine-seat team — eight specialists plus a coordinator — an
 | Role | What it owns (deliverable on the shared blackboard) |
 |---|---|
 | Product manager | Scope, user stories, EARS acceptance criteria — `*-prd.md` |
-| Architect | Layering, data model, API contract — `*-architecture.md` + `openapi.*` |
+| Architect | Layering, data model, API contract — `*-architecture.md` (its API table is the contract; `umadev adopt` also writes `openapi.*`) |
 | UI/UX designer | Design system: tokens, typography, component states, page skeleton — `*-uiux.md` |
 | Frontend engineer | Components and pages that import the tokens and call the contract URLs |
 | Backend engineer | Data model, endpoints, and business logic aligned to the contract |
@@ -335,7 +335,7 @@ Build, lint, typecheck, and test results are checked directly. The acceptance fl
 
 **2. The frontend↔backend contract is verified mechanically**
 
-`umadev-contract` parses the architecture doc's API table into a typed spec, renders `openapi.json` to `.umadev/contracts/`, extracts every `fetch`/`axios` call in the frontend source, and cross-validates the paths. A mismatch is a blocking finding.
+`umadev-contract` parses the architecture doc's API table into a typed spec, extracts every `fetch`/`axios` call in the frontend source, and cross-validates the paths. A mismatch is a blocking finding. (`umadev adopt` also renders the spec as `openapi.json` in `.umadev/contracts/`.)
 
 **3. Every important action leaves evidence**
 
