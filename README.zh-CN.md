@@ -750,7 +750,7 @@ umadev 有两套入口，一一对应：
 | `umadev adopt [path]` | 接管现有仓库：识别技术栈、索引源码、反推 API 契约 |
 | `umadev`（无子命令） | 启动聊天 TUI |
 | `umadev doctor` | 自检 |
-| `umadev verify` | 工作区合规 + 证据链状态（`--runtime` 启动应用并探测路由） |
+| `umadev verify` | 工作区合规 + 证据链状态，并实际运行项目的安装 / lint / 类型检查 / 测试 / 构建步骤（会执行项目代码、可能改写锁文件，任一步失败即以非零退出；`--runtime` 另外启动应用并探测路由） |
 | `umadev report` | 合规映射（SOC 2 / ISO 27001 / EU AI Act）；`--review` 生成 PR 级评审报告 + 跑 pre-PR 安全扫描 |
 | `umadev usage` | 按运行 / 阶段的 token 用量 + 粗略成本估算 |
 | `umadev lessons` | 查看由复发事故或机械验证结果形成的可复用规则及其 pending / validated / needs-revision 状态；具体事故看 TUI `/pitfalls` |

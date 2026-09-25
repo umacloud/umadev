@@ -435,12 +435,26 @@ enum Command {
         #[arg(long)]
         clauses: bool,
     },
-    /// Verify spec conformance of a workspace.
+    /// Report workspace conformance and run the project's install / lint /
+    /// test / build steps.
     #[command(
         hide = true,
         long_about = "Print a structured conformance report for the workspace:\n\
                       spec manifest health, workflow state, evidence chain row counts,\n\
                       latest quality-gate score, and proof-pack zips.\n\
+                      \n\
+                      It also RUNS the project's own checks for the detected stack, in\n\
+                      the workspace, and records each result for the quality gate:\n  \
+                      Node    install with its package manager (this can rewrite the\n          \
+                      lockfile), then the lint / typecheck / test / build scripts\n          \
+                      it declares\n  \
+                      Rust    cargo fmt --check, clippy, test, build --release\n  \
+                      Python  install the project into the active environment (uv or\n          \
+                      pip), then ruff, mypy when configured, pytest\n  \
+                      Go      go vet, test, build\n  \
+                      Deno    deno lint, test, check\n\
+                      This executes project code and can change files. The command exits\n\
+                      non-zero when a step fails, so it works as a CI gate.\n\
                       \n\
                       With --runtime, additionally PROVE the app runs: boot the\n\
                       detected dev server, wait for it to answer, probe the documented\n\

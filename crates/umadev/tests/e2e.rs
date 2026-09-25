@@ -1084,6 +1084,27 @@ fn run_and_quick_reject_an_unknown_mode_before_writing() {
     }
 }
 
+/// REGRESSION: `umadev verify` installs dependencies and runs the project's
+/// lint / test / build steps (and fails on a failing step), but its help
+/// described a read-only conformance report and reserved execution for
+/// `--runtime`.
+#[test]
+fn verify_help_says_it_runs_the_projects_install_and_checks() {
+    let tmp = TempDir::new().unwrap();
+    let out = hermetic_command(tmp.path())
+        .args(["verify", "--help"])
+        .output()
+        .expect("verify --help should run");
+    assert!(out.status.success());
+    let help = String::from_utf8_lossy(&out.stdout);
+    for step in ["install", "lint", "test", "build", "lockfile", "non-zero"] {
+        assert!(
+            help.contains(step),
+            "verify --help must mention `{step}`: {help}"
+        );
+    }
+}
+
 /// Helper: run `umadev run` to the docs gate in a fresh workspace.
 fn workspace_at_docs_gate(slug: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
