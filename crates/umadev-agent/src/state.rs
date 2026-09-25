@@ -249,7 +249,13 @@ pub fn write_workflow_state(project_root: &Path, state: &WorkflowState) -> std::
             "workflow state exceeds the durable-state byte limit",
         ));
     }
-    umadev_state::fs::atomic_write(&dir.join(STATE_FILE), text.as_bytes())
+    umadev_state::fs::atomic_write(&dir.join(STATE_FILE), text.as_bytes())?;
+    crate::run_provenance::record(
+        project_root,
+        crate::run_provenance::WORKFLOW_STATE,
+        text.as_bytes(),
+    );
+    Ok(())
 }
 
 /// List available rollback snapshots, newest first. Each entry is the

@@ -621,6 +621,7 @@
 "continue.resuming_chat" = "继续上次的对话 —— 底座带着完整上下文接着干。"
 "continue.chat_directive" = "继续完成我们上次未完成的工作。"
 "continue.resuming_plan" = "团队 · 续跑已保存的计划(已完成 {}/{} 步)— 只跑剩下的部分"
+"continue.unowned_run" = ".umadev 里保存的任务不是本机 UmaDev 写入的(可能随仓库一起带来),因此没有续跑。请先查看:\n{}\n确认要按上面的计划执行,请发送 /continue adopt;要重新开始,直接输入新需求。"
 "revise.usage" = "用法:/revise <修订说明>。\n  示例:/revise 去掉社交登录,只留邮箱密码"
 "revise.no_gate" = "目前没有打开的检查点,无法修订 — 要修改产出需要先等运行停在检查点(确认核心文档 / 确认前端预览)。"
 

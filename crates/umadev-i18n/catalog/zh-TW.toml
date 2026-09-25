@@ -621,6 +621,7 @@
 "continue.resuming_chat" = "繼續上次的對話 —— 底座帶著完整上下文接著做。"
 "continue.chat_directive" = "繼續完成我們上次未完成的工作。"
 "continue.resuming_plan" = "團隊 · 續跑已儲存的計畫(已完成 {}/{} 步)— 只跑剩下的部分"
+"continue.unowned_run" = ".umadev 裡儲存的任務不是本機 UmaDev 寫入的(可能隨儲存庫一起帶來),因此沒有續跑。請先查看:\n{}\n確認要按上面的計畫執行,請傳送 /continue adopt;要重新開始,直接輸入新需求。"
 "revise.usage" = "用法:/revise <修訂說明>。\n  範例:/revise 去掉社交登入,只留 Email 密碼"
 "revise.no_gate" = "目前沒有開啟的檢查點,無法修訂 — 要修改產出需要先等執行停在檢查點(確認核心文件 / 確認前端預覽)。"
 

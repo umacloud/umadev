@@ -12833,7 +12833,7 @@ impl App {
                 }
                 Action::None
             }
-            "continue" => self.continue_run_action(),
+            "continue" => self.continue_run_command(rest),
             "revise" => {
                 if rest.is_empty() {
                     self.push(ChatRole::System, umadev_i18n::t(self.lang, "revise.usage"));
