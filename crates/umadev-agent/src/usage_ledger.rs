@@ -734,6 +734,9 @@ fn safe_read_tail(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
 enum ParsedLine {
     V2(UsageRecordV2),
     Legacy(UsageRecordV2),
+    /// A well-formed row from a newer schema. It is kept byte-for-byte so a
+    /// downgraded binary never deletes usage it cannot interpret.
+    Future(String),
     Corrupt,
 }
 
@@ -744,11 +747,13 @@ fn parse_line(raw: &str, source: &str, line: usize) -> ParsedLine {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return ParsedLine::Corrupt;
     };
-    if value
+    let schema_version = value
         .get("schema_version")
-        .and_then(serde_json::Value::as_u64)
-        == Some(2)
-    {
+        .and_then(serde_json::Value::as_u64);
+    if schema_version.is_some_and(|version| version > u64::from(SCHEMA_VERSION)) {
+        return ParsedLine::Future(raw.to_owned());
+    }
+    if schema_version == Some(u64::from(SCHEMA_VERSION)) {
         return serde_json::from_value::<UsageRecordV2>(value)
             .ok()
             .filter(UsageRecordV2::valid)
@@ -759,9 +764,14 @@ fn parse_line(raw: &str, source: &str, line: usize) -> ParsedLine {
     })
 }
 
+enum StoredRow {
+    Record(UsageRecordV2),
+    Future(String),
+}
+
 #[derive(Default)]
 struct ParsedFile {
-    records: Vec<UsageRecordV2>,
+    rows: Vec<StoredRow>,
     corrupt_rows: u64,
     changed: bool,
 }
@@ -795,11 +805,12 @@ fn parse_file(path: &Path, config: LedgerConfig) -> std::io::Result<ParsedFile> 
     };
     for (index, line) in body.lines().enumerate() {
         match parse_line(line, &source, index) {
-            ParsedLine::V2(record) => parsed.records.push(record),
+            ParsedLine::V2(record) => parsed.rows.push(StoredRow::Record(record)),
             ParsedLine::Legacy(record) => {
                 parsed.changed = true;
-                parsed.records.push(record);
+                parsed.rows.push(StoredRow::Record(record));
             }
+            ParsedLine::Future(raw) => parsed.rows.push(StoredRow::Future(raw)),
             ParsedLine::Corrupt => {
                 parsed.changed = true;
                 parsed.corrupt_rows = parsed.corrupt_rows.saturating_add(1);
@@ -837,7 +848,18 @@ fn normalize_existing_files(path: &Path, config: LedgerConfig) -> std::io::Resul
         };
         corrupt = corrupt.saturating_add(parsed.corrupt_rows);
         if parsed.changed {
-            let body = render_records(&parsed.records)?;
+            let mut body = Vec::new();
+            for row in &parsed.rows {
+                match row {
+                    StoredRow::Record(record) => {
+                        body.extend(render_records(std::slice::from_ref(record))?);
+                    }
+                    StoredRow::Future(raw) => {
+                        body.extend_from_slice(raw.as_bytes());
+                        body.push(b'\n');
+                    }
+                }
+            }
             umadev_state::fs::atomic_write(&source, &body)?;
         }
     }
@@ -996,7 +1018,11 @@ fn read_ledger(path: &Path, config: LedgerConfig) -> ParsedLedger {
         match parse_file(&source, config) {
             Ok(file) => {
                 parsed.corrupt_rows = parsed.corrupt_rows.saturating_add(file.corrupt_rows);
-                for record in file.records {
+                // Newer-schema rows are preserved on disk but not reported.
+                for row in file.rows {
+                    let StoredRow::Record(record) = row else {
+                        continue;
+                    };
                     if seen.insert(record.record_id.clone()) {
                         parsed.records.push(record);
                     }
@@ -1550,6 +1576,25 @@ mod tests {
         assert_eq!(report.token_breakdown.exact_tokens, 15);
         assert_eq!(report.cost_breakdown.exact_calls, 1);
         assert_eq!(report.cost_breakdown.complete_total_usd_ticks(), Some(0));
+    }
+
+    #[test]
+    fn future_schema_rows_are_preserved_but_not_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("usage.jsonl");
+        let future = r#"{"schema_version":3,"record_id":"future-1","tokens":{"new":1}}"#;
+        fs::write(&path, format!("{future}\n")).unwrap();
+        append_record_to_path(
+            &path,
+            &UsageRecordV2::estimated("codex", "frontend", 7),
+            config(64 * 1024, 3),
+        )
+        .unwrap();
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.lines().any(|line| line == future));
+        let report = usage_report_from_path(&path, config(64 * 1024, 3));
+        assert_eq!(report.total_calls, 1);
+        assert_eq!(report.corrupt_rows, 0);
     }
 
     #[test]
