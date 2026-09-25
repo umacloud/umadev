@@ -361,10 +361,13 @@ impl ClaudeCodeDriver {
             self.permissions
         };
         let (permission_mode, allowed_tools) = match permissions {
-            BasePermissionProfile::Plan => ("plan", "Read,Grep,Glob,WebSearch,WebFetch"),
+            // Plan and Guarded pre-approve no web tool: they confirm every network
+            // reach, and a one-shot call has no approval channel, so a fetch that
+            // could carry data out is refused instead.
+            BasePermissionProfile::Plan => ("plan", "Read,Grep,Glob"),
             BasePermissionProfile::Guarded => (
                 "default",
-                "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,Agent,Task,TaskOutput,BashOutput,AgentOutput",
+                "Read,Grep,Glob,TodoWrite,Agent,Task,TaskOutput,BashOutput,AgentOutput",
             ),
             BasePermissionProfile::Auto => (
                 "bypassPermissions",
