@@ -293,8 +293,7 @@ pub async fn run_post_build_qc(
     // the `/run` loop reads it — a chat-build's post-QC rework can never run unbounded.
     let deadline = std::time::Instant::now() + run_budget();
     events.emit(EngineEvent::Note(
-        "team · 构建执行已结束，尚未验收 — 正在运行设计/质量扫描 + 团队评审(和 /run 同一套验收)"
-            .to_string(),
+        umadev_i18n::tl("team.post_build_qc_started").to_string(),
     ));
     // Recall the commercial-engineering knowledge digest + the project's prior pitfalls
     // ONCE, to front-load onto every fix directive (deliverable 3). The chat session

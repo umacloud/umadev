@@ -2374,9 +2374,9 @@ async fn drive_plan_steps(
     // strands nothing → no Note.
     let stranded = mark_unreachable_pending_blocked(plan, events);
     if stranded > 0 {
-        events.emit(EngineEvent::Note(format!(
-            "team · {stranded} 个计划步骤因前置被阻塞而跳过(标记为已阻塞,未执行)"
-        )));
+        let count = stranded.to_string();
+        let note = umadev_i18n::tlf("plan.stranded_skipped", &[&count]);
+        events.emit(EngineEvent::Note(note));
         persist_plan_ref(plan, options);
     }
 

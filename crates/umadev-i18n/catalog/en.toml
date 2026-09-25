@@ -639,6 +639,11 @@
 "continue.chat_directive" = "Continue the work from where we left off."
 "continue.resuming_plan" = "team · resuming the saved plan ({}/{} steps already done) — driving only what's left"
 "continue.unowned_run" = "The saved run in .umadev was not written by UmaDev on this machine (it may have come with the repository), so it was not resumed. Review it:\n{}\nTo run this plan as shown, send /continue adopt. To start over, type a new requirement."
+"plan.stranded_skipped" = "team · {} plan step(s) skipped because a prerequisite was blocked (marked blocked, not run)"
+"team.post_build_qc_started" = "team · the build has finished but is not accepted yet — running the design/quality scan + team review (the same acceptance as /run)"
+"signal.first_pass_low" = "signal · requests of this kind rarely pass acceptance on the first try ({}%) — the light path has been unreliable here; consider more checks or a lower autonomy mode (advisory only; the deterministic floor is unchanged)"
+"signal.sizing_heavier" = "signal · requests of this kind have often been under-sized (the light path kept escalating into a real multi-step build) — future defaults could be one size heavier (advisory only; this run and the deterministic floor are unchanged)"
+"signal.sizing_lighter" = "signal · requests of this kind have often been over-sized (the heavy path kept producing only a tiny result) — future defaults could be one size lighter (advisory only; this run and the deterministic floor are unchanged)"
 "revise.usage" = "Usage: /revise <revision notes>.\n  Example: /revise drop social login, keep only email + password"
 "revise.no_gate" = "No checkpoint is open, nothing to revise — to change output, wait for the run to pause at a checkpoint (confirm the core docs / confirm the frontend preview)."
 
