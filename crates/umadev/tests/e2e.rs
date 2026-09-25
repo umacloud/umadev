@@ -1105,6 +1105,51 @@ fn verify_help_says_it_runs_the_projects_install_and_checks() {
     }
 }
 
+/// Han ideographs and CJK / full-width punctuation.
+fn has_cjk(text: &str) -> bool {
+    text.chars().any(|c| {
+        ('\u{4e00}'..='\u{9fff}').contains(&c)
+            || ('\u{3000}'..='\u{303f}').contains(&c)
+            || ('\u{ff00}'..='\u{ffef}').contains(&c)
+    })
+}
+
+/// REGRESSION: only init / adopt / usage / lessons / memory resolved the saved
+/// UI language, so every other verb printed catalog text in the Simplified
+/// Chinese default even with `lang = "en"` saved (deploy, report, pr, run
+/// outcome lines, doctor rows).
+#[test]
+fn cli_verbs_follow_the_configured_language() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("vercel.json"), "{}\n").unwrap();
+    // hermetic_command points XDG_CONFIG_HOME here, so this is the user config.
+    let config = tmp
+        .path()
+        .join(".umadev/e2e-home/.config/umadev/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "lang = \"en\"\n").unwrap();
+
+    let deploy = hermetic_command(tmp.path())
+        .env("LANG", "zh_CN.UTF-8")
+        .arg("deploy")
+        .output()
+        .expect("deploy should run");
+    let stdout = String::from_utf8_lossy(&deploy.stdout);
+    assert!(
+        stdout.contains("Detected deploy target: Vercel"),
+        "deploy ignored lang = \"en\": {stdout}"
+    );
+    assert!(!has_cjk(&stdout), "deploy printed Chinese: {stdout}");
+
+    let doctor = hermetic_command(tmp.path())
+        .env("LANG", "zh_CN.UTF-8")
+        .arg("doctor")
+        .output()
+        .expect("doctor should run");
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(!has_cjk(&stdout), "doctor printed Chinese rows: {stdout}");
+}
+
 /// Helper: run `umadev run` to the docs gate in a fresh workspace.
 fn workspace_at_docs_gate(slug: &str) -> TempDir {
     let tmp = TempDir::new().unwrap();
