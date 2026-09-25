@@ -1553,16 +1553,21 @@ impl HttpCtx {
                 let _ = write!(encoded, "%{b:02X}");
             }
         }
+        // Both clients only ever talk to the loopback `opencode serve` child, so
+        // they must never route through HTTP(S)_PROXY / ALL_PROXY: a proxy would
+        // receive the server password and every prompt and response.
         Self {
             // A client with no global request timeout: the SSE stream is a
             // long-lived GET, so a per-call timeout would kill the event stream.
             client: reqwest::Client::builder()
+                .no_proxy()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             // A SEPARATE client WITH a request timeout for the short JSON calls
             // (create / prompt / abort / delete / permission-reply) so a wedged
             // server can never hang start / send / interrupt / end.
             json_client: reqwest::Client::builder()
+                .no_proxy()
                 .timeout(json_timeout)
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
