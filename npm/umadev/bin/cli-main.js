@@ -1215,6 +1215,19 @@ function registryBase() {
 // The registry lookup is a convenience, not a gate — keep it snappy.
 const REGISTRY_TIMEOUT_MS = 5000;
 
+// npmjs.org percent-encodes the scope separator in the attestation URL
+// (`…/attestations/@umatech%2fumadev@1.1.1`). Decode it so the exact comparison
+// below accepts both spellings of the same URL. A non-string or a malformed
+// escape decodes to null and therefore never matches.
+function decodedAttestationUrl(raw) {
+  if (typeof raw !== 'string') return null;
+  try {
+    return decodeURIComponent(raw);
+  } catch (_) {
+    return null;
+  }
+}
+
 function validateTrustedUpdateManifest(manifest) {
   const reject = (reason) => ({ trusted: false, reason });
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
@@ -1279,7 +1292,7 @@ function validateTrustedUpdateManifest(manifest) {
     return reject('the npm registry signature is missing');
   }
   if (
-    dist.attestations?.url !== expectedAttestations ||
+    decodedAttestationUrl(dist.attestations?.url) !== expectedAttestations ||
     dist.attestations?.provenance?.predicateType !== TRUSTED_PROVENANCE_PREDICATE
   ) {
     return reject('Trusted Publishing provenance is missing');
