@@ -45,9 +45,10 @@ pub(super) fn is_reserved_alias(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::validated_tree_path;
+    #[cfg(unix)]
     use super::super::{
         create_checkpoint, git, git_with_input, restore_checkpoint, scan_checkpoint_files,
-        validated_tree_path,
     };
     use super::is_reserved_alias;
 
