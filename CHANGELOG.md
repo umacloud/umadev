@@ -10,6 +10,8 @@
 
 - `rustls` 升级到 0.23.45(RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc:TLS 1.3 握手消息跨加密级别被错误接受),同时带上 `rustls-webpki` 0.103.15。
 - `lru` 升级到 0.18.5(RUSTSEC-2026-0253:`LruCache::pop()` 非 panic 安全,可致释放后使用)。
+- 依赖锁文件整体刷新到各依赖的最新兼容补丁/小版本(如 tokio 1.53.1、hyper 1.11.1、clap 4.6.7、serde_json 1.0.151、chrono 0.4.45)。
+- `paste` 的“不再维护”提示(RUSTSEC-2024-0436,仅信息级,无已知漏洞)在 `.cargo/audit.toml` 中带理由忽略:它只是可选 `vector-local` 功能经 candle/tokenizers 引入的编译期宏,上游最新版仍依赖它,待上游移除后撤销该忽略。
 
 ### 文档
 
