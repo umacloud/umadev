@@ -400,6 +400,19 @@ fn is_internal_runtime_path(path: &str) -> bool {
     lower == ".umadev" || lower.starts_with(".umadev/")
 }
 
+/// Whether a workspace-relative directory can contain a path that
+/// [`is_sensitive_surface`] matches by location (CI configuration or
+/// migrations). A project's ignore rules may prune a directory from the
+/// workspace content snapshot, but never one of these.
+pub(crate) fn is_sensitive_directory(relative_dir: &str) -> bool {
+    let lower = relative_dir.to_ascii_lowercase();
+    lower == ".github"
+        || lower.starts_with(".github/")
+        || lower == ".circleci"
+        || lower.starts_with(".circleci/")
+        || lower.split('/').any(|component| component == "migrations")
+}
+
 fn is_sensitive_surface(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let name = lower.rsplit('/').next().unwrap_or(&lower);
