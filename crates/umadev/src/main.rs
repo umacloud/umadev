@@ -3548,6 +3548,8 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
             driver.set_session_id(Some(new_run_session_id()));
         }
         driver.set_continue_session(true);
+        // Without this the first call would already `--resume` the fresh id.
+        driver.set_session_autoresume(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
@@ -3853,6 +3855,8 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
             driver.set_session_id(Some(new_run_session_id()));
         }
         driver.set_continue_session(true);
+        // Without this the first call would already `--resume` the fresh id.
+        driver.set_session_autoresume(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());
@@ -4050,6 +4054,8 @@ async fn cmd_redo(
             driver.set_session_id(Some(new_run_session_id()));
         }
         driver.set_continue_session(true);
+        // Without this the first call would already `--resume` the fresh id.
+        driver.set_session_autoresume(true);
         match driver.probe().await {
             umadev_host::ProbeResult::Ready { version, .. } => {
                 println!("Backend {} ready ({version}).", driver.display_name());

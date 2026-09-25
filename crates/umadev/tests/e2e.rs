@@ -318,6 +318,80 @@ fn run_with_backend_drives_a_fake_host_cli() {
     );
 }
 
+/// `umadev quick --backend claude-code` pins one fresh session id for the run.
+/// The fake `claude` keeps Claude's real rule: `--resume` of an id it never
+/// created fails with "No conversation found". So the first model call must
+/// create the pinned id and every later call must resume that same id.
+#[test]
+#[cfg(unix)]
+fn quick_with_claude_creates_its_pinned_session_before_resuming_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let fake = root.join("fake-claude");
+    let created = root.join("created-sessions.log");
+    let calls = root.join("session-calls.log");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         case \"$1\" in --version) echo '2.1.42 (Claude Code)'; exit 0 ;; auth) echo '{\"loggedIn\":true}'; exit 0 ;; esac\n\
+         cat >/dev/null\n\
+         prev=''; mode=none; id=''\n\
+         for arg in \"$@\"; do\n\
+           [ \"$prev\" = --session-id ] && { mode=create; id=\"$arg\"; }\n\
+           [ \"$prev\" = --resume ] && { mode=resume; id=\"$arg\"; }\n\
+           prev=\"$arg\"\n\
+         done\n\
+         printf '%s %s\\n' \"$mode\" \"$id\" >> \"$FAKE_SESSION_CALLS\"\n\
+         if [ \"$mode\" = resume ] && ! grep -qx \"$id\" \"$FAKE_CREATED_SESSIONS\" 2>/dev/null; then\n\
+           printf '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"errors\":[\"No conversation found with session ID: %s\"]}\\n' \"$id\"\n\
+           exit 1\n\
+         fi\n\
+         [ \"$mode\" = create ] && printf '%s\\n' \"$id\" >> \"$FAKE_CREATED_SESSIONS\"\n\
+         printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"Changed the header text.\"}'\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&fake, perms).unwrap();
+
+    let output = hermetic_command(root)
+        .args(["quick", "tweak the header text", "--backend", "claude-code"])
+        .env("UMADEV_CLAUDE_BIN", &fake)
+        .env("FAKE_CREATED_SESSIONS", &created)
+        .env("FAKE_SESSION_CALLS", &calls)
+        .output()
+        .expect("umadev quick --backend should be invocable");
+    let log = std::fs::read_to_string(&calls).unwrap_or_default();
+    // A concurrent fork runs on its own fresh conversation ("none"); only the
+    // calls that carry the run's pinned id are ordered.
+    let model_calls: Vec<(&str, &str)> = log
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter(|(mode, _)| *mode != "none")
+        .collect();
+    assert!(
+        model_calls.len() >= 2,
+        "quick made fewer than two pinned model calls ({}): {log}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (first_mode, pinned) = model_calls[0];
+    assert_eq!(
+        first_mode, "create",
+        "the first call must create the pinned id: {log}"
+    );
+    assert!(!pinned.is_empty(), "the run pinned no session id: {log}");
+    for (mode, id) in &model_calls[1..] {
+        assert_eq!(
+            (*mode, *id),
+            ("resume", pinned),
+            "every later call resumes the created session: {log}"
+        );
+    }
+}
+
 /// Full-chain fake-host e2e: drive run → continue → continue with a fake
 /// `claude` so the real subprocess path (not offline templates) executes for
 /// EVERY phase. Asserts the host's output threads through multiple artifacts
