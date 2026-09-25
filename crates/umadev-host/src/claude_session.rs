@@ -18,14 +18,12 @@
 //!
 //! Launch flags (from the headless stream-json contract):
 //! `claude --print --input-format stream-json --output-format stream-json
-//! --verbose --session-id <uuid> --permission-mode <plan|default|bypassPermissions>
-//! --allowedTools <read-only + research + sub-agent set; auto adds the mutating
-//! Edit/Write/Bash/NotebookEdit> --permission-prompt-tool stdio` (+ optional
-//! `--append-system-prompt`). The base's
-//! native read/research/delegate tools (incl. `Agent`/`Task` sub-agents) are
-//! pre-approved so they run natively instead of eating a per-tool approval — see
-//! the internal `PLAN_ALLOWED_TOOLS` / `GUARDED_ALLOWED_TOOLS` /
-//! `AUTO_ALLOWED_TOOLS` allowlists.
+//! --verbose --session-id <uuid> --permission-mode <plan|default>
+//! --allowedTools <read-only + research + sub-agent set>
+//! --permission-prompt-tool stdio` (+ optional `--append-system-prompt`). The
+//! base's native read/research/delegate tools (incl. `Agent`/`Task` sub-agents)
+//! are pre-approved so they run natively instead of eating a per-tool approval —
+//! see the internal `PLAN_ALLOWED_TOOLS` / `GUARDED_ALLOWED_TOOLS` allowlists.
 //! We deliberately use `--append-system-prompt` (NOT `--system-prompt`, which
 //! would replace the tool guidance and degrade the base into a chat box).
 //!
@@ -33,22 +31,21 @@
 //! UmaDev as a `can_use_tool` control request on this same channel. Without it
 //! claude answers each ask itself and, in `--print` mode, denies it.
 //!
-//! The permission mode tracks the autonomy tier so claude is consistent with the
-//! codex / opencode drivers: `autonomous` (auto tier) → `bypassPermissions` (the
-//! base runs with FULL ACCESS and never interrupts — matching codex
-//! `approvalPolicy: never` + full-access sandbox and opencode's wildcard-allow
-//! ruleset; UmaDev's PreToolUse/PostToolUse governance hooks still see every
-//! tool call, since claude runs hooks regardless of the permission mode),
-//! Guarded → `default` (claude raises a
-//! `can_use_tool` approval for each tool outside the allowlist, which becomes a
-//! `NeedApproval` the orchestrator answers — the human-in-the-loop floor, so the
-//! irreversible-action gate is not bypassed), and Plan → `plan` with a strict
-//! read-only allowlist. In `plan` mode claude asks before a write instead of
-//! refusing it, so a Plan-profile session (and every read-only fork) denies each
-//! ordinary tool request itself. On every tier `AskUserQuestion` and
-//! `ExitPlanMode` reach UmaDev as typed `HostRequest`s, and a request claude
-//! withdraws settles as `HostRequestSettled`. `UMADEV_CLAUDE_PERMISSION_MODE` can
-//! only tighten Auto; it can never widen Plan or Guarded.
+//! The permission mode tracks the autonomy tier. Guarded and Auto both run
+//! claude's `default` mode with the read-only + delegate allowlist, so every
+//! other tool call (an edit, a shell command, a web fetch) raises a
+//! `can_use_tool` approval that becomes a `NeedApproval` the orchestrator answers
+//! with UmaDev's trust floor: Guarded asks the user about consequential actions;
+//! Auto allows reversible work at once and still asks before an irreversible or
+//! uncertain one (a force-push, a publish, a deploy, `rm -rf`, a write outside
+//! the workspace). UmaDev's optional PreToolUse/PostToolUse hooks still see every
+//! tool call. Plan → `plan` with a strict read-only allowlist. In `plan` mode
+//! claude asks before a write instead of refusing it, so a Plan-profile session
+//! (and every read-only fork) denies each ordinary tool request itself. On every
+//! tier `AskUserQuestion` and `ExitPlanMode` reach UmaDev as typed
+//! `HostRequest`s, and a request claude withdraws settles as
+//! `HostRequestSettled`. `UMADEV_CLAUDE_PERMISSION_MODE` can only tighten Auto;
+//! it can never widen Plan or Guarded.
 //!
 //! Fail-open by contract: a garbled line is skipped, a dead session surfaces a
 //! [`umadev_runtime::TurnStatus::Failed`], never a panic.
@@ -421,8 +418,8 @@ impl ClaudeSession {
     /// appending `append_system` to the base's system prompt. A fresh pinned
     /// session id is generated.
     ///
-    /// The permission profile maps Plan/Guarded/Auto to Claude's native
-    /// `plan`/`default`/`bypassPermissions` modes.
+    /// The permission profile maps Plan to Claude's native `plan` mode and
+    /// Guarded/Auto to `default`; every permission ask reaches UmaDev.
     ///
     /// `max_turns` is an OPTIONAL per-run turn ceiling (a runaway backstop): `Some(n)`
     /// spawns claude with `--max-turns <n>`, `None` leaves it unbounded (today's
@@ -1603,8 +1600,8 @@ fn maybe_divert_firmware(
     divert_append_system_to_file_in(args.to_vec(), &std::env::temp_dir())
 }
 
-/// The read-only + delegate native tools UmaDev ALWAYS pre-approves — even in
-/// Guarded — so the base keeps its native capabilities under UmaDev instead of
+/// The read-only + delegate native tools UmaDev ALWAYS pre-approves — in Guarded
+/// and Auto — so the base keeps its native capabilities under UmaDev instead of
 /// eating a `can_use_tool` round-trip (and, in interactive Guarded chat, a
 /// confusing user pause that fail-open DENIES) for every `Grep` / `Glob`,
 /// Claude's task-list tools, and every sub-agent spawn.
@@ -1632,35 +1629,34 @@ const PLAN_ALLOWED_TOOLS: &str = "Read,Grep,Glob";
 
 const GUARDED_ALLOWED_TOOLS: &str = "Read,Grep,Glob,TodoWrite,TaskCreate,TaskGet,TaskUpdate,TaskList,Agent,Task,TaskOutput,BashOutput,AgentOutput";
 
-/// AUTO additionally pre-approves the MUTATING working set (`Edit` / `Write` / `Bash`
-/// / `NotebookEdit`) so an unattended autonomous run is never interrupted by a
-/// per-tool prompt — the autonomy tier the user opted into.
-const AUTO_ALLOWED_TOOLS: &str = "Read,Edit,Write,Bash,Grep,Glob,WebSearch,WebFetch,TodoWrite,\
-     TaskCreate,TaskGet,TaskUpdate,TaskList,NotebookEdit,Agent,Task,TaskOutput,BashOutput,AgentOutput";
-
 /// Resolve Claude's permission mode and allowlist as one policy pair. Keeping
-/// them coupled matters: changing Auto's mode to `default` while retaining its
-/// mutating `--allowedTools` list would still pre-authorize those mutations.
+/// them coupled matters: a mutating `--allowedTools` entry would pre-authorize
+/// that mutation whatever the mode, and UmaDev would never be asked.
 fn claude_permission_args_for_profile(
     permissions: BasePermissionProfile,
 ) -> (&'static str, &'static str) {
     let override_mode = std::env::var("UMADEV_CLAUDE_PERMISSION_MODE").ok();
-    let no_skip = std::env::var("UMADEV_NO_SKIP_PERMS").as_deref() == Ok("1");
-    resolve_claude_permission_args(permissions, override_mode.as_deref(), no_skip)
+    resolve_claude_permission_args(permissions, override_mode.as_deref())
 }
 
 /// Pure permission-policy core. Plan and Guarded are fixed postures, so no
-/// environment/config override can widen them. Auto accepts only a small
-/// whitelist of known Claude modes, all at or below its native bypass posture.
-/// Claude's classifier-backed `auto` is deliberately distinct from raw
-/// `bypassPermissions`: it gets the non-mutating allowlist so Edit/Bash still
-/// pass through Claude's classifier. Unknown future values fail safely to
-/// Guarded. `UMADEV_NO_SKIP_PERMS=1` forbids bypass while still permitting the
-/// official classifier-backed Auto and tighter Plan/dontAsk postures.
+/// environment/config override can widen them.
+///
+/// Auto runs Claude's `default` mode with the same read-only allowlist as
+/// Guarded, so every other call (an edit, a shell command, a web fetch) asks
+/// UmaDev over the stdio permission channel and the trust floor answers it:
+/// reversible work at once, an irreversible or uncertain action only after a
+/// confirmation. Guarded and Auto differ only in how UmaDev answers. Claude's
+/// `acceptEdits` is not used: it also runs `rm`, `mv`, `cp`, `sed`, `mkdir` and
+/// `touch` in the workspace without asking, so an `rm -rf` would skip the floor.
+///
+/// The internal `UMADEV_CLAUDE_PERMISSION_MODE` override may only pick a known
+/// posture in which Claude never approves on its own: `plan`, `dontAsk` (denies
+/// instead of asking) or `default`/`manual`. `bypassPermissions`, `acceptEdits`,
+/// Claude's classifier-backed `auto` and any unknown value keep the native pair.
 fn resolve_claude_permission_args(
     permissions: BasePermissionProfile,
     override_mode: Option<&str>,
-    no_skip: bool,
 ) -> (&'static str, &'static str) {
     match permissions {
         BasePermissionProfile::Plan => ("plan", PLAN_ALLOWED_TOOLS),
@@ -1670,26 +1666,11 @@ fn resolve_claude_permission_args(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_ascii_lowercase);
-            if no_skip {
-                return match requested.as_deref() {
-                    Some("plan") => ("plan", PLAN_ALLOWED_TOOLS),
-                    Some("dontask") => ("dontAsk", GUARDED_ALLOWED_TOOLS),
-                    Some("auto") => ("auto", GUARDED_ALLOWED_TOOLS),
-                    Some("manual") => ("manual", GUARDED_ALLOWED_TOOLS),
-                    _ => ("default", GUARDED_ALLOWED_TOOLS),
-                };
-            }
             match requested.as_deref() {
-                None | Some("bypasspermissions") => ("bypassPermissions", AUTO_ALLOWED_TOOLS),
-                Some("auto") => ("auto", GUARDED_ALLOWED_TOOLS),
-                Some("acceptedits") => ("acceptEdits", GUARDED_ALLOWED_TOOLS),
-                Some("dontask") => ("dontAsk", GUARDED_ALLOWED_TOOLS),
                 Some("plan") => ("plan", PLAN_ALLOWED_TOOLS),
+                Some("dontask") => ("dontAsk", GUARDED_ALLOWED_TOOLS),
                 Some("manual") => ("manual", GUARDED_ALLOWED_TOOLS),
-                // Never pass through an unknown mode: a future Claude release
-                // could assign it broader semantics than UmaDev understands.
-                // The known `default` mode lands on the same guarded pair.
-                Some(_) => ("default", GUARDED_ALLOWED_TOOLS),
+                _ => ("default", GUARDED_ALLOWED_TOOLS),
             }
         }
     }
@@ -1698,13 +1679,12 @@ fn resolve_claude_permission_args(
 /// The argument vector preceding any input — the stream-json continuous-session
 /// flags. Exposed for tests. `--append-system-prompt` (NOT `--system-prompt`).
 ///
-/// `autonomous` picks the permission mode so claude tracks the trust tier like
-/// the codex / opencode drivers: `true` → `bypassPermissions` (full access,
-/// never interrupts; governance hooks still audit every call), `false` →
-/// `default` (claude raises a `can_use_tool` approval per tool, which
-/// the orchestrator answers — keeping the human-in-the-loop / irreversible-action
-/// floor live). Environment overrides are confined to Auto and may only select
-/// a known equal-or-tighter posture; Plan/Guarded remain fixed.
+/// `autonomous` picks the trust tier: `true` → Auto, `false` → Guarded. Both run
+/// claude's `default` mode with the read-only allowlist, so every other tool call
+/// raises a `can_use_tool` approval that the orchestrator answers — Guarded with
+/// the human in the loop, Auto with the irreversible-action floor alone.
+/// Environment overrides are confined to Auto and may only select a known
+/// equal-or-tighter posture; Plan/Guarded remain fixed.
 ///
 /// `max_turns` is the OPTIONAL per-run turn ceiling (a runaway backstop): `Some(n)`
 /// appends `--max-turns <n>`, `None` omits the flag entirely — leaving claude's
@@ -3809,58 +3789,56 @@ mod tests {
         assert_eq!(out, args);
     }
 
-    /// The permission mode tracks the autonomy tier (claude consistent with
-    /// codex / opencode): autonomous → `bypassPermissions` (full access, never
-    /// interrupts; governance hooks still audit), guarded → `default` (claude
-    /// asks per tool → a NeedApproval the orchestrator answers, so the
-    /// human-in-the-loop / irreversible-action floor is live).
+    /// Guarded and Auto pre-approve only read-only / delegate tools, so every
+    /// mutation raises a `can_use_tool` request that UmaDev's trust floor
+    /// answers — Guarded with the user, Auto with the irreversible-action floor.
     #[test]
-    fn guarded_gates_mutating_tools_but_auto_pre_approves_all() {
+    fn guarded_and_auto_ask_umadev_before_every_mutating_tool() {
         let _lock = PERM_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _env = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
         let _no_skip = EnvRestore::remove("UMADEV_NO_SKIP_PERMS");
-        // P1: under GUARDED (autonomous=false) the allowlist pre-approves the read-only +
-        // research + sub-agent set but NOT the MUTATING tools (Edit/Write/Bash/NotebookEdit),
-        // so each mutation still raises a `can_use_tool` control request that UmaDev's trust
-        // floor gates (the guarded gate must not be silently bypassed). The base's native
-        // read/research/delegate tools (incl. Agent/Task sub-agents) ARE pre-approved so they
-        // run natively instead of eating a per-tool pause. AUTO pre-approves the full set.
-        let guarded = session_args("sid", None, false, None);
-        let t = guarded.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(guarded[t + 1], GUARDED_ALLOWED_TOOLS);
-        for mutating in ["Edit", "Write", "Bash", "NotebookEdit"] {
+        // The allowlist pre-approves the read-only + research + sub-agent set but
+        // NOT the MUTATING tools, so each mutation raises a `can_use_tool` request
+        // that UmaDev's trust floor gates. The base's native read/delegate tools
+        // (incl. Agent/Task sub-agents) run natively instead of eating a pause.
+        for autonomous in [false, true] {
+            let args = session_args("sid", None, autonomous, None);
+            let t = args.iter().position(|a| a == "--allowedTools").unwrap();
+            assert_eq!(
+                args[t + 1],
+                GUARDED_ALLOWED_TOOLS,
+                "autonomous={autonomous}"
+            );
+            for mutating in ["Edit", "Write", "MultiEdit", "Bash", "NotebookEdit"] {
+                assert!(
+                    !args[t + 1].split(',').any(|x| x == mutating),
+                    "autonomous={autonomous} must not pre-approve {mutating}: it must reach UmaDev"
+                );
+            }
+            for native in ["Agent", "Task", "Grep", "Glob"] {
+                assert!(
+                    args[t + 1].split(',').any(|x| x == native),
+                    "autonomous={autonomous} must pre-approve the read-only/delegate tool {native}"
+                );
+            }
+            let p = args.iter().position(|a| a == "--permission-mode").unwrap();
+            assert_eq!(args[p + 1], "default", "autonomous={autonomous}");
             assert!(
-                !guarded[t + 1].split(',').any(|x| x == mutating),
-                "guarded must NOT pre-approve the mutating tool {mutating} (it must hit the gate)"
+                !args.iter().any(|a| a == "--dangerously-skip-permissions"),
+                "no session ever skips Claude's permission checks: {args:?}"
             );
         }
-        for native in ["Agent", "Task", "Grep", "Glob"] {
-            assert!(
-                guarded[t + 1].split(',').any(|x| x == native),
-                "guarded must pre-approve the read-only/delegate tool {native} so it runs natively"
-            );
-        }
-        // Plan and Guarded confirm every network reach, so neither pre-approves
-        // a web tool: a fetched URL is an exfiltration channel.
+        // No tier pre-approves a web tool: a fetched URL is an exfiltration
+        // channel, so UmaDev's floor sees every network reach.
         for list in [PLAN_ALLOWED_TOOLS, GUARDED_ALLOWED_TOOLS] {
             for web in ["WebFetch", "WebSearch"] {
                 assert!(
                     !list.split(',').any(|x| x == web),
-                    "{web} must reach the approval gate outside Auto"
+                    "{web} must reach the approval gate"
                 );
             }
-        }
-        let auto = session_args("sid", None, true, None);
-        let t = auto.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(auto[t + 1], AUTO_ALLOWED_TOOLS);
-        // Auto pre-approves the mutating set too (the autonomy tier the user opted into).
-        for tool in ["Edit", "Write", "Bash", "Agent", "Task"] {
-            assert!(
-                auto[t + 1].split(',').any(|x| x == tool),
-                "auto must pre-approve {tool}"
-            );
         }
     }
 
@@ -3879,9 +3857,8 @@ mod tests {
         let auto_idx = auto.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(
             auto[auto_idx + 1],
-            "bypassPermissions",
-            "auto → bypassPermissions (full access — the base itself never prompts; \
-             cross-base parity with codex `approvalPolicy: never` + opencode wildcard-allow)"
+            "default",
+            "auto → default: Claude asks UmaDev, whose floor still stops the irreversible"
         );
 
         let guarded = session_args("sid-g", None, false, None);
@@ -4049,7 +4026,7 @@ mod tests {
     }
 
     #[test]
-    fn bypass_override_is_confined_to_auto_and_no_skip_tightens_it() {
+    fn no_override_lets_claude_skip_umadev() {
         let _lock = PERM_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4059,53 +4036,41 @@ mod tests {
         for (profile, expected) in [
             (BasePermissionProfile::Plan, "plan"),
             (BasePermissionProfile::Guarded, "default"),
-            (BasePermissionProfile::Auto, "bypassPermissions"),
+            (BasePermissionProfile::Auto, "default"),
         ] {
             let args = session_args_for_profile("sid-b", None, profile, None, "");
             let p = args.iter().position(|a| a == "--permission-mode").unwrap();
             assert_eq!(args[p + 1], expected, "profile {profile:?}: {args:?}");
+            let tools = args.iter().position(|a| a == "--allowedTools").unwrap();
+            assert!(!args[tools + 1].split(',').any(|tool| tool == "Bash"));
         }
-
-        std::env::set_var("UMADEV_NO_SKIP_PERMS", "1");
-        let tightened =
-            session_args_for_profile("sid-t", None, BasePermissionProfile::Auto, None, "");
-        let p = tightened
-            .iter()
-            .position(|a| a == "--permission-mode")
-            .unwrap();
-        assert_eq!(tightened[p + 1], "default");
-        let tools = tightened
-            .iter()
-            .position(|a| a == "--allowedTools")
-            .unwrap();
-        assert_eq!(tightened[tools + 1], GUARDED_ALLOWED_TOOLS);
     }
 
     #[test]
     fn pure_permission_policy_rejects_widening_and_only_tightens_auto() {
         for hostile in ["bypassPermissions", "acceptEdits", "future-root-mode"] {
             assert_eq!(
-                resolve_claude_permission_args(BasePermissionProfile::Plan, Some(hostile), false,),
+                resolve_claude_permission_args(BasePermissionProfile::Plan, Some(hostile)),
                 ("plan", PLAN_ALLOWED_TOOLS)
             );
             assert_eq!(
-                resolve_claude_permission_args(
-                    BasePermissionProfile::Guarded,
-                    Some(hostile),
-                    false,
-                ),
+                resolve_claude_permission_args(BasePermissionProfile::Guarded, Some(hostile)),
                 ("default", GUARDED_ALLOWED_TOOLS)
             );
         }
 
+        // Auto's native pair asks UmaDev before every mutation. An override can
+        // only pick a posture in which Claude never approves on its own:
+        // `bypassPermissions`, `acceptEdits` (which runs `rm`/`mv`/`cp` in the
+        // workspace unasked) and Claude's own classifier `auto` keep the native pair.
         for (override_mode, expected) in [
-            (None, ("bypassPermissions", AUTO_ALLOWED_TOOLS)),
+            (None, ("default", GUARDED_ALLOWED_TOOLS)),
             (
                 Some("bypassPermissions"),
-                ("bypassPermissions", AUTO_ALLOWED_TOOLS),
+                ("default", GUARDED_ALLOWED_TOOLS),
             ),
-            (Some("auto"), ("auto", GUARDED_ALLOWED_TOOLS)),
-            (Some("acceptEdits"), ("acceptEdits", GUARDED_ALLOWED_TOOLS)),
+            (Some("acceptEdits"), ("default", GUARDED_ALLOWED_TOOLS)),
+            (Some("auto"), ("default", GUARDED_ALLOWED_TOOLS)),
             (Some("default"), ("default", GUARDED_ALLOWED_TOOLS)),
             (Some("manual"), ("manual", GUARDED_ALLOWED_TOOLS)),
             (Some("dontAsk"), ("dontAsk", GUARDED_ALLOWED_TOOLS)),
@@ -4113,23 +4078,11 @@ mod tests {
             (Some("unknown"), ("default", GUARDED_ALLOWED_TOOLS)),
         ] {
             assert_eq!(
-                resolve_claude_permission_args(BasePermissionProfile::Auto, override_mode, false,),
-                expected
+                resolve_claude_permission_args(BasePermissionProfile::Auto, override_mode),
+                expected,
+                "override {override_mode:?}"
             );
         }
-        assert_eq!(
-            resolve_claude_permission_args(
-                BasePermissionProfile::Auto,
-                Some("bypassPermissions"),
-                true,
-            ),
-            ("default", GUARDED_ALLOWED_TOOLS)
-        );
-        assert_eq!(
-            resolve_claude_permission_args(BasePermissionProfile::Auto, Some("auto"), true),
-            ("auto", GUARDED_ALLOWED_TOOLS),
-            "official classifier-backed auto is not raw bypass and remains available under no-skip"
-        );
     }
 
     #[test]
@@ -4242,16 +4195,13 @@ mod tests {
             !args.contains(&"--session-id".to_string()),
             "a writable resume continues the existing id, never mints a new one"
         );
-        // Writable toolset (Write/Edit), NOT the read-only fork allowlist.
+        // The same allowlist as a fresh Auto start, NOT the read-only fork one:
+        // writes go through UmaDev's approval, not a plan-mode refusal.
         let tools = args.iter().position(|a| a == "--allowedTools").unwrap();
-        assert_eq!(args[tools + 1], AUTO_ALLOWED_TOOLS);
+        assert_eq!(args[tools + 1], GUARDED_ALLOWED_TOOLS);
         // Permission mode tracks autonomy exactly like a fresh start.
         let perm = args.iter().position(|a| a == "--permission-mode").unwrap();
-        assert_eq!(
-            args[perm + 1],
-            "bypassPermissions",
-            "autonomous → bypassPermissions"
-        );
+        assert_eq!(args[perm + 1], "default", "autonomous → default");
         // Streams partial messages so a resumed reply renders token-by-token.
         assert!(args.iter().any(|a| a == "--include-partial-messages"));
         assert!(args.iter().any(|a| a == "--replay-user-messages"));

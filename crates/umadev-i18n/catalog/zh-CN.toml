@@ -1344,7 +1344,7 @@
 "gate.name.clarify" = "澄清提问检查点"
 "gate.name.docs" = "核心文档确认检查点"
 "gate.name.preview" = "前端预览确认检查点"
-"continuous.dangerous_action_denied" = "[gate] 危险动作需用户确认,本回合按拒绝处理:{} -> {}(放宽:/mode auto;claude 底座要完全放行可设 UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions)"
+"continuous.dangerous_action_denied" = "[gate] 危险动作需用户确认,本回合按拒绝处理:{} -> {}(放宽:/mode auto 后,安装依赖、拉取代码等常规联网操作不再询问;不可逆动作在任何档位都需要你确认,请在交互式 TUI 中批准,或自行执行)"
 "continuous.dangerous_action_denied_plan" = "[plan] 当前是只读(计划)模式,底座想执行的写入/命令按只读拒绝(非你的决定):{} -> {}。要让它真正动手,请 /mode guarded(每步确认)或 /mode auto(自动过门)后重试。"
 "continuous.tool_call_blocked" = "[gov] {} 阶段:底座工具调用触发 {} —— {}(target: {})"
 "continuous.phase_truncated" = "[warn] {} 阶段被截断(底座到达回合上限),保留已产出,继续。"

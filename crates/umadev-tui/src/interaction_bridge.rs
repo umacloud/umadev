@@ -1282,11 +1282,11 @@ pub(super) async fn resident_approval_decision(
         }
     } else if needs_confirm {
         // The remediation must match the tier. Under Plan (read-only) this
-        // branch is the common case, and the generic message pointed at
-        // `UMADEV_CLAUDE_PERMISSION_MODE=bypassPermissions` — which is IGNORED in
-        // Plan (it is read only in the Auto arm), so following it changed nothing
-        // (the reported misleading advice). Plan gets a tier-correct message
-        // pointing at `/mode guarded`; other tiers keep the existing text.
+        // branch is the common case, and the generic message's remedy (relax
+        // with `/mode auto`, confirm the irreversible) does not describe why
+        // Plan declined (the reported misleading advice). Plan gets a
+        // tier-correct message pointing at `/mode guarded`; other tiers keep
+        // the generic text.
         let key = if mode == umadev_agent::TrustMode::Plan {
             "continuous.dangerous_action_denied_plan"
         } else {
