@@ -148,12 +148,16 @@ fn is_shutdown_request(line: &str) -> bool {
 fn build_response(line: &str, policy: &Policy) -> Option<JsonRpcResponse> {
     let Ok(req) = serde_json::from_str::<JsonRpcRequest>(line) else {
         // Don't silently drop a malformed request: a client that sent an `id`
-        // would wait forever. Emit a JSON-RPC error, recovering the id when the
-        // line is at least valid JSON.
-        let id = serde_json::from_str::<Value>(line)
-            .ok()
-            .and_then(|v| v.get("id").cloned());
-        let (code, message) = if id.is_some() {
+        // would wait forever. Valid JSON that is not a request object is an
+        // Invalid Request (answered with its id when it has a usable one);
+        // anything else is a Parse error. An unknown id is serialized as null.
+        let parsed = serde_json::from_str::<Value>(line).ok();
+        let id = parsed
+            .as_ref()
+            .and_then(|v| v.get("id"))
+            .filter(|id| id.is_string() || id.is_number())
+            .cloned();
+        let (code, message) = if parsed.is_some() {
             (-32600, "Invalid Request")
         } else {
             (-32700, "Parse error")
@@ -192,25 +196,35 @@ fn drain_to_newline<R: BufRead>(reader: &mut R) {
 
 /// One JSON-RPC 2.0 request.
 ///
-/// `id` is `Option<Value>` so a request with NO `id` member (a notification)
-/// is distinguishable from one carrying `"id": null`. Per JSON-RPC 2.0 a
-/// notification gets no response; only requests (with an id) do.
+/// `id` is `None` only when the request has NO `id` member (a notification);
+/// `"id": null` deserializes to `Some(Value::Null)` (see [`present_value`]), so
+/// the two stay distinguishable. Per JSON-RPC 2.0 a notification gets no
+/// response; only requests (with an id) do.
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
     #[serde(default)]
     jsonrpc: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_value")]
     id: Option<Value>,
     method: String,
     #[serde(default)]
     params: Value,
 }
 
+/// A member that is present deserializes to `Some`, even when it is `null`;
+/// `#[serde(default)]` leaves an absent member `None`.
+fn present_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
 /// One JSON-RPC 2.0 response (success or error).
 #[derive(Debug, Serialize)]
 struct JsonRpcResponse {
     jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized: an error whose request id could not be determined
+    /// carries `"id": null`, as JSON-RPC 2.0 requires.
     id: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
@@ -230,6 +244,20 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
     // A request with no `id` member is a NOTIFICATION: per JSON-RPC 2.0 the
     // server MUST NOT reply (even on error). Drop it silently.
     let id = req.id.clone()?;
+
+    // MCP request ids are strings or integers and never null; a client that
+    // sent anything else is waiting on a reply, so answer Invalid Request.
+    if !(id.is_string() || id.is_number()) {
+        return Some(JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: None,
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32600,
+                message: "Invalid Request: id must be a string or a number".into(),
+            }),
+        });
+    }
 
     // Validate the protocol version. A request that omits `jsonrpc` or sends a
     // value other than "2.0" (e.g. "1.0") is an Invalid Request — answer with
@@ -350,7 +378,8 @@ fn handle_request(req: &JsonRpcRequest, policy: &Policy) -> Option<JsonRpcRespon
             error: None,
         }),
         "tools/call" => Some(handle_tool_call(req, &id, policy)),
-        "shutdown" => Some(JsonRpcResponse {
+        // MCP keepalive: answer promptly with an empty result.
+        "ping" | "shutdown" => Some(JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id: Some(id),
             result: Some(json!({})),
@@ -383,6 +412,17 @@ fn handle_tool_call(req: &JsonRpcRequest, id: &Value, policy: &Policy) -> JsonRp
         .and_then(|n| n.as_str())
         .unwrap_or("");
     let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
+    if let Some(missing) = missing_required_argument(name, &args) {
+        return JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: Some(id.clone()),
+            result: None,
+            error: Some(JsonRpcError {
+                code: -32602,
+                message: format!("{name} requires the string argument `{missing}`"),
+            }),
+        };
+    }
     let outcome: Option<(String, bool)> = match name {
         TOOL_GOVERN_FILE => Some(govern_file_tool(&args, policy)),
         TOOL_GOVERN_COMMAND => Some(govern_command_tool(&args)),
@@ -405,6 +445,21 @@ fn handle_tool_call(req: &JsonRpcRequest, id: &Value, policy: &Policy) -> JsonRp
             }),
         },
     }
+}
+
+/// The first required string argument a governance tool call lacks. Scanning
+/// an absent `content` as empty text would report PASS for text that was
+/// never checked, so the call is refused as Invalid params instead.
+fn missing_required_argument(tool: &str, args: &Value) -> Option<&'static str> {
+    let required: &[&'static str] = match tool {
+        TOOL_GOVERN_FILE => &["file_path", "content"],
+        TOOL_GOVERN_COMMAND => &["command"],
+        _ => &[],
+    };
+    required
+        .iter()
+        .copied()
+        .find(|key| !args.get(*key).is_some_and(Value::is_string))
 }
 
 /// Wrap a tool's `(text, is_error)` outcome in the standard MCP `tools/call`
@@ -1199,17 +1254,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_null_id_both_parse_as_notification() {
+    fn only_a_missing_id_parses_as_notification() {
         // No `id` key → `id: None` → notification.
         let req: JsonRpcRequest =
             serde_json::from_str(r#"{"jsonrpc":"2.0","method":"initialize"}"#).unwrap();
         assert!(req.id.is_none());
-        // serde maps an explicit `"id": null` to None too (Option treats JSON
-        // null as absent). The JSON-RPC spec discourages a null id anyway, so
-        // folding it into "notification → no reply" is a safe interpretation.
+        // An explicit `"id": null` is present: a request (which MCP rejects as
+        // Invalid Request), not a notification the client never hears back on.
         let req2: JsonRpcRequest =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":null,"method":"initialize"}"#).unwrap();
-        assert!(req2.id.is_none());
+        assert_eq!(req2.id, Some(Value::Null));
         // A real id round-trips.
         let req3: JsonRpcRequest =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#).unwrap();
@@ -1744,6 +1798,90 @@ mod tests {
             answered_seven,
             "the request AFTER an over-long line must be answered: {text}"
         );
+    }
+
+    /// Feed `lines` to [`serve_io`] and parse every reply.
+    fn exchange(lines: &[&str]) -> Vec<Value> {
+        let mut input = lines.join("\n").into_bytes();
+        input.push(b'\n');
+        let mut out: Vec<u8> = Vec::new();
+        serve_io(
+            &mut std::io::Cursor::new(input),
+            &mut out,
+            &Policy::default(),
+        )
+        .unwrap();
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn ping_gets_an_empty_result() {
+        // MCP keepalive: the receiver must answer promptly with an empty result.
+        let replies = exchange(&[r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#]);
+        assert_eq!(replies, vec![json!({"jsonrpc":"2.0","id":2,"result":{}})]);
+    }
+
+    #[test]
+    fn a_null_id_is_an_invalid_request_not_a_notification() {
+        // MCP forbids a null request id; answering nothing left the client
+        // waiting forever. Only an absent id is a notification.
+        let replies = exchange(&[
+            r#"{"jsonrpc":"2.0","id":null,"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","id":{"x":1},"method":"tools/list"}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        ]);
+        assert_eq!(replies.len(), 2, "{replies:?}");
+        for reply in &replies {
+            assert_eq!(reply["id"], Value::Null, "{reply}");
+            assert_eq!(reply["error"]["code"], -32600, "{reply}");
+            assert!(reply.get("result").is_none(), "{reply}");
+        }
+    }
+
+    #[test]
+    fn error_replies_always_carry_an_id_member() {
+        // JSON-RPC 2.0: when the id cannot be determined, the error response's
+        // id MUST be null — not missing.
+        let replies = exchange(&[
+            "not json",
+            r#"{"jsonrpc":"2.0","id":5}"#,
+            r#"{"jsonrpc":"2.0"}"#,
+        ]);
+        assert_eq!(replies.len(), 3, "{replies:?}");
+        assert_eq!(replies[0]["error"]["code"], -32700);
+        assert_eq!(replies[0]["id"], Value::Null);
+        assert!(replies[0].as_object().unwrap().contains_key("id"));
+        // Valid JSON that is not a request object is an Invalid Request.
+        assert_eq!(replies[1]["error"]["code"], -32600);
+        assert_eq!(replies[1]["id"], 5);
+        assert_eq!(replies[2]["error"]["code"], -32600);
+        assert!(replies[2].as_object().unwrap().contains_key("id"));
+        assert_eq!(replies[2]["id"], Value::Null);
+    }
+
+    #[test]
+    fn governance_tools_reject_missing_required_arguments() {
+        // `govern_file` with the wrong argument names used to scan "" and answer
+        // PASS for content it never saw.
+        let replies = exchange(&[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"govern_file","arguments":{"path":"a.ts","text":"const k = \"sk_live_not_a_real_key\""}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"govern_file","arguments":{"file_path":"a.ts"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"govern_command","arguments":{"cmd":"rm -rf /"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"govern_file","arguments":{"file_path":"a.ts","content":""}}}"#,
+        ]);
+        assert_eq!(replies.len(), 4, "{replies:?}");
+        for (reply, missing) in replies.iter().zip(["file_path", "content", "command"]) {
+            assert_eq!(reply["error"]["code"], -32602, "{reply}");
+            let message = reply["error"]["message"].as_str().unwrap();
+            assert!(message.contains(missing), "{message}");
+            assert!(reply.get("result").is_none(), "{reply}");
+        }
+        // Present but empty content is a real (empty) file and is scanned.
+        assert_eq!(replies[3]["result"]["isError"], false, "{}", replies[3]);
     }
 
     #[test]
