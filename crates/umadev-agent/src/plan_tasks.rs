@@ -608,7 +608,7 @@ fn plan_scope(backend: &str, requirement: &str, plan: &Plan) -> Result<String, P
     // it would make `/continue` mint a new ledger and strand the waiting one.
     identity
         .steps
-        .retain(|step| step.id != crate::director_loop::FINAL_REVIEW_RETRY_STEP_ID);
+        .retain(|step| step.id != crate::director_loop::resume::FINAL_REVIEW_RETRY_STEP_ID);
     for step in &mut identity.steps {
         step.status = StepStatus::Pending;
     }
@@ -708,7 +708,7 @@ mod tests {
 
         let mut resumed = plan.clone();
         let mut retry = step(
-            crate::director_loop::FINAL_REVIEW_RETRY_STEP_ID,
+            crate::director_loop::resume::FINAL_REVIEW_RETRY_STEP_ID,
             StepKind::Review,
             &["api"],
         );
@@ -722,7 +722,7 @@ mod tests {
         );
         assert!(tracker
             .logical_to_task
-            .contains_key(crate::director_loop::FINAL_REVIEW_RETRY_STEP_ID));
+            .contains_key(crate::director_loop::resume::FINAL_REVIEW_RETRY_STEP_ID));
     }
 
     #[test]
