@@ -177,8 +177,10 @@ pub fn verify_steps(kind: ProjectKind, workspace: &Path) -> Option<Vec<VerifySte
                 };
                 steps.push(s("typecheck", tsc, &["--noEmit"], true));
             }
-            // Test: only if a test script exists.
-            if has_node_script(workspace, "test") {
+            // Test: only if a test script exists. `npm init`'s placeholder is not a
+            // test suite: it runs nothing and always exits 1 (a visible skip, see
+            // `skipped_checks`).
+            if has_node_script(workspace, "test") && !node_test_script_is_placeholder(workspace) {
                 steps.push(slow("test", pm, &["run", "test"], false));
             }
             // Build: only if a build script exists.
@@ -827,6 +829,33 @@ fn has_node_script(workspace: &Path, script: &str) -> bool {
     json.get("scripts").and_then(|s| s.get(script)).is_some()
 }
 
+/// Whether `package.json`'s test script is the placeholder `npm init` / `pnpm init`
+/// writes — `echo "Error: no test specified" && exit 1` — which runs no test and
+/// always fails.
+fn node_test_script_is_placeholder(workspace: &Path) -> bool {
+    package_json(workspace)
+        .and_then(|json| {
+            let script = json.get("scripts")?.get("test")?.as_str()?;
+            Some(script.to_ascii_lowercase())
+        })
+        .is_some_and(|script| script.contains("no test specified") && script.contains("exit 1"))
+}
+
+/// Checks the project's manifest names that cannot run as a real check here,
+/// recorded as visible skips rather than dropped silently.
+fn skipped_checks(kind: ProjectKind, workspace: &Path) -> Vec<VerifyOutcome> {
+    let mut out = Vec::new();
+    if kind == ProjectKind::Node && node_test_script_is_placeholder(workspace) {
+        out.push(VerifyOutcome::skipped_due_to(
+            kind,
+            "test",
+            format!("{} run test", node_package_manager(workspace).0),
+            "package.json's test script is the `npm init` placeholder, which runs no test",
+        ));
+    }
+    out
+}
+
 /// Pick the Node package manager + install args from the workspace's
 /// lockfile. Falls back to `npm` when no lockfile is present.
 fn node_package_manager(workspace: &Path) -> (&'static str, &'static [&'static str]) {
@@ -1175,6 +1204,7 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
             outcome
         });
     }
+    outcomes.extend(skipped_checks(kind, workspace));
 
     // FRESHNESS STAMP: record WHICH source tree these outcomes describe, so a later
     // reader can tell a green run of today's code from a green run of code that has
@@ -2126,6 +2156,37 @@ mod tests {
         assert!(package_json_depends_on(tmp.path(), "vue-tsc"));
         assert!(package_json_depends_on(tmp.path(), "typescript"));
         assert!(!package_json_depends_on(tmp.path(), "eslint"));
+    }
+
+    #[test]
+    fn npm_init_placeholder_test_script_is_a_visible_skip_not_a_test_run() {
+        // The placeholder always exits 1: running it failed every build-clean check
+        // of a project that simply has no tests yet.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","scripts":{"test":"echo \"Error: no test specified\" && exit 1"}}"#,
+        )
+        .unwrap();
+        let steps = verify_steps(ProjectKind::Node, tmp.path()).unwrap();
+        assert!(steps.iter().all(|s| s.name != "test"), "{steps:?}");
+        let skipped = skipped_checks(ProjectKind::Node, tmp.path());
+        assert!(
+            skipped.iter().any(|o| o.step == "test"
+                && o.skipped
+                && o.passed
+                && o.stderr.contains("placeholder")),
+            "{skipped:?}"
+        );
+        // A real test script still runs.
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        let steps = verify_steps(ProjectKind::Node, tmp.path()).unwrap();
+        assert!(steps.iter().any(|s| s.name == "test"));
+        assert!(skipped_checks(ProjectKind::Node, tmp.path()).is_empty());
     }
 
     #[test]
