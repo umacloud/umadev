@@ -28,6 +28,7 @@ use crate::runner::RunOptions;
 use crate::trust::requires_confirmation_with_ledger;
 use umadev_spec::Phase;
 
+mod declared_evidence;
 mod operational_review;
 mod quality_evidence;
 pub(crate) mod resume;
@@ -37,6 +38,7 @@ mod step_metrics;
 mod step_outcome;
 mod step_review;
 
+use declared_evidence::red_half_verdict;
 #[cfg(test)]
 use operational_review::post_build_rework_context;
 use operational_review::run_final_gate;
@@ -4310,6 +4312,7 @@ async fn test_red_green_outcome(
                  is not done until its own test is green"
             ));
         }
+        T::NotFound => return EvidenceOutcome::Gap(declared_evidence::named_test_not_run(test)),
         // We could not run it at all (no runner / unrecognised project / timeout). Fall
         // open to the ordinary named-test bar — never block on our own blindness.
         T::Unavailable => return test_passes_outcome(root, Some(needle), build),
@@ -4444,31 +4447,6 @@ fn red_half_remember(
         memo.clear();
     }
     memo.insert(red_half_key(root, pre, test), outcome);
-}
-
-/// The RED half's verdict, given how the named test behaved at the step's PRE-state.
-/// Pure — the decision, separated from the IO that produces it (see
-/// [`test_red_green_outcome`], which has already established that the test is present
-/// and GREEN at head before asking this).
-///
-/// `None` ⇒ **inconclusive**: the caller must fall open to the ordinary `TestPasses`
-/// bar rather than reach a verdict it could not support.
-fn red_half_verdict(test: &str, red: crate::verify::NamedTestOutcome) -> Option<EvidenceOutcome> {
-    use crate::verify::NamedTestOutcome as T;
-    match red {
-        // The step's test was RED before it ran and is GREEN now. That is a test.
-        T::Failed => Some(EvidenceOutcome::Pass),
-        // THE FINDING. The test passed BEFORE the step's work existed, so it cannot be
-        // asserting that work — it was written to match code that was already there.
-        T::Passed => Some(EvidenceOutcome::Gap(format!(
-            "test \"{test}\" ALREADY PASSED at this step's pre-state — it was written after (or \
-             around) the code, so it has never demonstrated that it can detect the behaviour's \
-             absence. Make it a real test: assert the behaviour this step is supposed to add, \
-             confirm it FAILS without that code, then make it pass"
-        ))),
-        // We could not run it in the rewound tree — inconclusive, never a verdict.
-        T::Unavailable => None,
-    }
 }
 
 /// `BuildClean` contract → reuse the already-run build/test floor: green = positive,

@@ -410,6 +410,12 @@ pub enum NamedTestOutcome {
     Passed,
     /// The runner ran the named test and it FAILED.
     Failed,
+    /// The runner ran, but no test by that name was among the tests it ran: the
+    /// name filter matched nothing (Go's `[no tests to run]`, jest / vitest skipping
+    /// every test) or matched only OTHER tests (`pytest -k test_login` running
+    /// `test_login_redirect`). The named test does not exist in that tree, so it
+    /// neither passed nor failed there.
+    NotFound,
     /// The question could not be asked at all — no recognised project, no test runner
     /// on PATH, a spawn error, or a timeout. **Not a verdict**: a caller must treat
     /// this as "we could not check", never as a pass or a fail.
@@ -485,12 +491,12 @@ fn named_test_step(
         // `cargo test <substring>` is a plain SUBSTRING match, not a pattern, but
         // the filter sits BEFORE `--`, where cargo still parses its own options:
         // accept only a Rust path (`module::tests::name`).
-        ProjectKind::Rust => test.split("::").all(is_plain_test_ident).then(|| {
-            step(
-                "cargo",
-                vec!["test".into(), "--quiet".into(), t, "--".into()],
-            )
-        }),
+        // Without `--quiet`, libtest prints one `test <path> ... ok` line per test, which
+        // is how the verdict tells THIS test from others the substring filter ran.
+        ProjectKind::Rust => test
+            .split("::")
+            .all(is_plain_test_ident)
+            .then(|| step("cargo", vec!["test".into(), t, "--".into()])),
         ProjectKind::Node => {
             // Only meaningful when the project declares a test script AND that script
             // runs a runner for which `-t` means "filter by name" (jest / vitest).
@@ -508,7 +514,7 @@ fn named_test_step(
             if package_manager_strips_separator(workspace, pm) {
                 args.push("--".into());
             }
-            args.extend(["-t".into(), t]);
+            args.extend(["-t".into(), jest_name_pattern(test)]);
             Some(step(pm, args))
         }
         // pytest `-k` is an EXPRESSION (`and` / `or` / `not` / parens). A `-`, a space,
@@ -517,7 +523,9 @@ fn named_test_step(
         ProjectKind::Python => is_plain_test_ident(test).then(|| {
             let env = python_install(workspace, &which).0;
             let (program, mut args) = python_tool(workspace, env, "pytest", &which);
-            args.extend(["-k".into(), t, "-q".into()]);
+            // `-v` prints one `<file>::<test> PASSED` line per test: `-k` is a
+            // substring match, so the verdict must find THIS test among them.
+            args.extend(["-k".into(), t, "-v".into()]);
             step(&program, args)
         }),
         // Go `-run` is a REGEX. A name carrying `[`, `(`, `+`, `.` … is either an
@@ -550,7 +558,8 @@ fn named_test_step(
 /// uses, so a wedged runner can never hang the director.
 ///
 /// Fail-open: an unrecognised project, a missing runner, a spawn error, or a timeout
-/// is [`NamedTestOutcome::Unavailable`] — the caller must degrade, never block.
+/// is [`NamedTestOutcome::Unavailable`] — the caller must degrade, never block. A
+/// run in which no test by that name ran is [`NamedTestOutcome::NotFound`].
 pub async fn run_named_test(workspace: &Path, test: &str) -> NamedTestOutcome {
     run_named_test_bounded(workspace, test, NAMED_TEST_TIMEOUT_SECS).await
 }
@@ -578,17 +587,219 @@ pub async fn run_named_test_bounded(
         return NamedTestOutcome::Unavailable; // no runner on PATH → cannot ask
     }
     let command_str = format!("{} {}", step.program, step.args.join(" "));
-    let out = run_step_command(workspace, kind, &step, command_str, timeout_secs).await;
+    let (out, truncated) =
+        run_step_command_capture(workspace, kind, &step, command_str, timeout_secs).await;
     // A spawn failure / timeout records `exit_code == -1`; neither is a verdict about
     // the test — they are our own inability to ask.
     if out.exit_code < 0 {
         return NamedTestOutcome::Unavailable;
     }
-    if out.passed {
-        NamedTestOutcome::Passed
-    } else {
-        NamedTestOutcome::Failed
+    named_test_verdict(kind, test, &out, truncated)
+}
+
+/// `test` as a jest / vitest `-t` pattern. `-t` is an unanchored regular
+/// expression over a test's full name ("describe … test"), so a bare `login` also
+/// ran `login redirect`; escaped and anchored at the end, it runs the test whose
+/// name IS `test` (inside any `describe`).
+fn jest_name_pattern(test: &str) -> String {
+    let mut pattern = String::with_capacity(test.len() + 8);
+    for c in test.chars() {
+        if "\\^$.|?*+()[]{}".contains(c) {
+            pattern.push('\\');
+        }
+        pattern.push(c);
     }
+    pattern.push('$');
+    pattern
+}
+
+/// What a runner's output says about the ONE named test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestSighting {
+    Passed,
+    Failed,
+    /// The runner reported the tests it ran, and the named test was not one of them.
+    NotRun,
+    /// The output does not say (an unrecognised format, or a run that ended before
+    /// any test ran).
+    Unknown,
+}
+
+/// Read ONE named test's verdict out of its runner's output. The exit code alone
+/// does not say: every runner exits 0 when its name filter matched NOTHING (Go's
+/// `[no tests to run]`, jest / vitest skipping every test, deno filtering all out),
+/// and cargo's and pytest's filters are substring matches that can run OTHER tests
+/// (`test_login_redirect` for `test_login`). So a test the runner did not report
+/// running is [`NamedTestOutcome::NotFound`], never a pass. When the answer should
+/// be in output that was cut to its bounded tail, the question is
+/// [`NamedTestOutcome::Unavailable`] rather than a guess.
+fn named_test_verdict(
+    kind: ProjectKind,
+    test: &str,
+    out: &VerifyOutcome,
+    truncated: bool,
+) -> NamedTestOutcome {
+    let text = format!("{}\n{}", out.stdout, out.stderr);
+    let sighting = match kind {
+        ProjectKind::Rust => cargo_test_sighting(&text, test),
+        ProjectKind::Python => pytest_sighting(&text, test, out.exit_code),
+        ProjectKind::Go => go_test_sighting(&text),
+        ProjectKind::Node => node_test_sighting(&text),
+        ProjectKind::Deno => deno_test_sighting(&text),
+        _ => TestSighting::Unknown,
+    };
+    match sighting {
+        TestSighting::Passed => NamedTestOutcome::Passed,
+        TestSighting::Failed => NamedTestOutcome::Failed,
+        TestSighting::NotRun if truncated => NamedTestOutcome::Unavailable,
+        TestSighting::NotRun => NamedTestOutcome::NotFound,
+        TestSighting::Unknown if !out.passed => NamedTestOutcome::Failed,
+        TestSighting::Unknown if truncated => NamedTestOutcome::Unavailable,
+        TestSighting::Unknown => NamedTestOutcome::Passed,
+    }
+}
+
+/// cargo / libtest: `test tests::adds_numbers ... ok` lines, matched on the exact
+/// name or the last path segments (`adds_numbers`, `tests::adds_numbers`).
+fn cargo_test_sighting(text: &str, test: &str) -> TestSighting {
+    let suffix = format!("::{test}");
+    let mut harness_ran = false;
+    let mut passed = false;
+    for line in text.lines().map(str::trim) {
+        harness_ran |= line.starts_with("running ") || line.starts_with("test result:");
+        let Some((name, result)) = line
+            .strip_prefix("test ")
+            .and_then(|rest| rest.split_once(" ... "))
+        else {
+            continue;
+        };
+        let name = name.trim();
+        if name != test && !name.ends_with(&suffix) {
+            continue;
+        }
+        if result.starts_with("FAILED") {
+            return TestSighting::Failed;
+        }
+        passed |= result.starts_with("ok");
+    }
+    if passed {
+        TestSighting::Passed
+    } else if harness_ran {
+        TestSighting::NotRun
+    } else {
+        TestSighting::Unknown
+    }
+}
+
+/// pytest `-v`: `tests/test_a.py::test_login PASSED` lines and the summary's
+/// `FAILED tests/test_a.py::test_login - …`, matched on the node id's last part
+/// (a parametrized `test_login[1-2]` included). Exit 5 means nothing was collected.
+fn pytest_sighting(text: &str, test: &str, exit_code: i32) -> TestSighting {
+    let mut passed = false;
+    for line in text.lines() {
+        let is_ours = line.split_whitespace().any(|token| {
+            token.rsplit_once("::").is_some_and(|(_, last)| {
+                last.split_once('[').map_or(last, |(name, _)| name) == test
+            })
+        });
+        if !is_ours {
+            continue;
+        }
+        if line.contains("FAILED") || line.contains("ERROR") {
+            return TestSighting::Failed;
+        }
+        passed |= line.contains("PASSED") || line.contains("XPASS");
+    }
+    match (passed, exit_code) {
+        (true, _) => TestSighting::Passed,
+        // 0: tests ran and passed; 1: some failed; 5: none collected — in every
+        // case the output lists the tests that ran, and this one is not there.
+        (false, 0 | 1 | 5) => TestSighting::NotRun,
+        _ => TestSighting::Unknown,
+    }
+}
+
+/// `go test -run ^Name$`: the pattern is anchored, so any package that ran a test
+/// ran THIS one. A package that ran none prints `ok … [no tests to run]`.
+fn go_test_sighting(text: &str) -> TestSighting {
+    let mut listed = false;
+    for line in text.lines() {
+        if line.starts_with("--- FAIL") || line.starts_with("FAIL") {
+            return TestSighting::Failed;
+        }
+        if line.starts_with("ok") && !line.contains("[no tests to run]") {
+            return TestSighting::Passed;
+        }
+        listed |= line.starts_with("ok") || line.starts_with('?');
+    }
+    if listed {
+        TestSighting::NotRun
+    } else {
+        TestSighting::Unknown
+    }
+}
+
+/// jest (`Tests:       1 passed, 2 skipped, 3 total`) and vitest
+/// (`Tests  1 passed | 2 skipped (3)`) summaries: with no test passed or failed,
+/// the name filter skipped every test.
+fn node_test_sighting(text: &str) -> TestSighting {
+    for line in text.lines().rev() {
+        let line = strip_ansi(line).trim().to_ascii_lowercase();
+        if !(line.starts_with("tests:") || line.starts_with("tests ")) {
+            continue;
+        }
+        return if line.contains("failed") {
+            TestSighting::Failed
+        } else if line.contains("passed") {
+            TestSighting::Passed
+        } else {
+            TestSighting::NotRun
+        };
+    }
+    TestSighting::Unknown
+}
+
+/// deno's summary, `ok | 0 passed | 0 failed | 4 filtered out`.
+fn deno_test_sighting(text: &str) -> TestSighting {
+    let count = |line: &str, label: &str| {
+        line.split('|').find_map(|part| {
+            let (n, rest) = part.trim().split_once(' ')?;
+            (rest.trim_start().starts_with(label)).then(|| n.parse::<u64>().ok())?
+        })
+    };
+    for line in text.lines().rev().map(strip_ansi) {
+        let (Some(passed), Some(failed)) = (count(&line, "passed"), count(&line, "failed")) else {
+            continue;
+        };
+        return if failed > 0 {
+            TestSighting::Failed
+        } else if passed > 0 {
+            TestSighting::Passed
+        } else {
+            TestSighting::NotRun
+        };
+    }
+    TestSighting::Unknown
+}
+
+/// `line` without ANSI colour / cursor escape sequences.
+pub(crate) fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The dev-server configuration UmaDev uses for `/preview`, so the command
@@ -1233,6 +1444,21 @@ async fn run_step_command(
     command_str: String,
     timeout_secs: u64,
 ) -> VerifyOutcome {
+    run_step_command_capture(workspace, kind, step, command_str, timeout_secs)
+        .await
+        .0
+}
+
+/// [`run_step_command`], also saying whether older output was dropped to keep
+/// the captured tails bounded — a reader looking for ONE line (a named test's
+/// verdict) must not read a line that was cut away as a line that never existed.
+async fn run_step_command_capture(
+    workspace: &Path,
+    kind: ProjectKind,
+    step: &VerifyStep,
+    command_str: String,
+    timeout_secs: u64,
+) -> (VerifyOutcome, bool) {
     let started = Instant::now();
     // A resolved `.cmd`/`.bat` shim is spawned directly, never via `cmd /c`, so
     // Rust's hardened batch-argument encoding applies to model-supplied
@@ -1253,7 +1479,7 @@ async fn run_step_command(
             // A non-skippable install that can't even spawn is an install failure
             // too — passed=false, so `install_has_failed` picks it up and arms the
             // dependent-step short-circuit (P1-8).
-            return VerifyOutcome::from_spawn_error(
+            let outcome = VerifyOutcome::from_spawn_error(
                 kind,
                 step.name,
                 command_str,
@@ -1261,24 +1487,21 @@ async fn run_step_command(
                 started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                 step.skippable,
             );
+            return (outcome, false);
         }
     };
+    let truncated = output.stdout_truncated || output.stderr_truncated;
     let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     truncate_in_place(&mut stdout, CAPTURE_CAP);
     truncate_in_place(&mut stderr, CAPTURE_CAP);
 
     if output.timed_out {
-        return VerifyOutcome::from_timeout(
-            kind,
-            step.name,
-            command_str,
-            timeout_secs,
-            stdout,
-            stderr,
-        );
+        let outcome =
+            VerifyOutcome::from_timeout(kind, step.name, command_str, timeout_secs, stdout, stderr);
+        return (outcome, truncated);
     }
-    match output.status {
+    let outcome = match output.status {
         Some(status) => VerifyOutcome {
             project_kind: kind,
             step: step.name.to_string(),
@@ -1299,7 +1522,8 @@ async fn run_step_command(
             started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             step.skippable,
         ),
-    }
+    };
+    (outcome, truncated)
 }
 
 /// Append an outcome (plus timestamp + phase tag) to
@@ -2140,6 +2364,196 @@ mod tests {
             outcomes.iter().all(|o| o.passed || o.skipped),
             "{outcomes:?}"
         );
+    }
+
+    // ── a named-test filter that matched nothing is not a pass ───────────────
+
+    #[tokio::test]
+    async fn named_test_that_matches_nothing_is_not_passed() {
+        // `go test -run ^TestAdd$` prints `[no tests to run]` and exits 0 when only
+        // `TestAddNegative` exists. Read as a pass, a brand-new `TestAdd` was reported
+        // as "ALREADY PASSED" at its step's pre-state.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("go.mod"), "module example.com/x\n\ngo 1.18\n").unwrap();
+        fs::write(
+            root.join("add.go"),
+            "package x\n\nfunc Add(a, b int) int { return a + b }\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("add_test.go"),
+            "package x\n\nimport \"testing\"\n\nfunc TestAddNegative(t *testing.T) {\n\
+             \tif Add(-1, -1) != -2 {\n\t\tt.Fatal(\"bad\")\n\t}\n}\n",
+        )
+        .unwrap();
+        let absent = run_named_test(root, "TestAdd").await;
+        assert_ne!(absent, NamedTestOutcome::Passed, "nothing ran");
+        let present = run_named_test(root, "TestAddNegative").await;
+        assert_ne!(present, NamedTestOutcome::Failed, "the real test passes");
+    }
+
+    fn named_outcome(passed: bool, exit_code: i32, stdout: &str, stderr: &str) -> VerifyOutcome {
+        VerifyOutcome {
+            exit_code,
+            passed,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            ..outcome("named-test", passed, false)
+        }
+    }
+
+    #[test]
+    fn named_test_verdicts_read_which_tests_actually_ran() {
+        use NamedTestOutcome as T;
+        let verdict = |kind, test, out: &VerifyOutcome| named_test_verdict(kind, test, out, false);
+
+        // Go: `-run ^TestAdd$` with only `TestAddNegative` in the module.
+        let none = named_outcome(
+            true,
+            0,
+            "ok  \tex.com/x\t0.003s [no tests to run]\n?   \tex.com/x/e\t[no test files]\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Go, "TestAdd", &none), T::NotFound);
+        let ran = named_outcome(
+            true,
+            0,
+            "ok  \tex.com/x\t(cached)\nok  \tex.com/x/sub\t0.002s [no tests to run]\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Go, "TestAdd", &ran), T::Passed);
+        let failed = named_outcome(
+            false,
+            1,
+            "--- FAIL: TestAdd (0.00s)\nFAIL\tex.com/x\t0.008s\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Go, "TestAdd", &failed), T::Failed);
+
+        // cargo: the substring filter ran `add_negative`, not `add`.
+        let other = named_outcome(true, 0, "\nrunning 1 test\ntest tests::add_negative ... ok\n\ntest result: ok. 1 passed; 0 failed\n", "");
+        assert_eq!(verdict(ProjectKind::Rust, "add", &other), T::NotFound);
+        assert_eq!(
+            verdict(ProjectKind::Rust, "tests::add_negative", &other),
+            T::Passed
+        );
+        assert_eq!(
+            verdict(ProjectKind::Rust, "add_negative", &other),
+            T::Passed
+        );
+        // Our test passed while another matching one failed: our verdict is a pass.
+        let mixed = named_outcome(
+            false,
+            101,
+            "running 2 tests\ntest tests::add ... ok\ntest tests::add_more ... FAILED\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Rust, "add", &mixed), T::Passed);
+        // It does not compile: no test ran, and none can pass.
+        let broken = named_outcome(false, 101, "", "error[E0425]: cannot find value `x`");
+        assert_eq!(verdict(ProjectKind::Rust, "add", &broken), T::Failed);
+
+        // pytest `-k test_login -v` ran only `test_login_redirect`.
+        let longer = named_outcome(
+            true,
+            0,
+            "tests/test_a.py::test_login_redirect PASSED [100%]\n=== 1 passed in 0.01s ===\n",
+            "",
+        );
+        assert_eq!(
+            verdict(ProjectKind::Python, "test_login", &longer),
+            T::NotFound
+        );
+        assert_eq!(
+            verdict(ProjectKind::Python, "test_login_redirect", &longer),
+            T::Passed
+        );
+        let deselected = named_outcome(
+            false,
+            5,
+            "collected 2 items / 2 deselected / 0 selected\n",
+            "",
+        );
+        assert_eq!(
+            verdict(ProjectKind::Python, "test_login", &deselected),
+            T::NotFound
+        );
+        let class_param = named_outcome(
+            false,
+            1,
+            "tests/t.py::TestAuth::test_login[admin] FAILED [ 50%]\n",
+            "",
+        );
+        assert_eq!(
+            verdict(ProjectKind::Python, "test_login", &class_param),
+            T::Failed
+        );
+
+        // jest / vitest: `-t` skipped every test.
+        let skipped = named_outcome(true, 0, "", "Tests:       2 skipped, 2 total\n");
+        assert_eq!(verdict(ProjectKind::Node, "adds", &skipped), T::NotFound);
+        let vitest = named_outcome(true, 0, "      Tests  1 passed | 1 skipped (2)\n", "");
+        assert_eq!(verdict(ProjectKind::Node, "adds", &vitest), T::Passed);
+        let colored = named_outcome(
+            true,
+            0,
+            "\u{1b}[1mTests:\u{1b}[22m       \u{1b}[33m3 skipped\u{1b}[39m, 3 total",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Node, "adds", &colored), T::NotFound);
+
+        // deno: everything filtered out.
+        let filtered = named_outcome(
+            true,
+            0,
+            "ok | 0 passed | 0 failed | 4 filtered out (3ms)\n",
+            "",
+        );
+        assert_eq!(verdict(ProjectKind::Deno, "adds", &filtered), T::NotFound);
+
+        // An unrecognised report keeps the exit code's answer.
+        let plain = named_outcome(true, 0, "all good\n", "");
+        assert_eq!(verdict(ProjectKind::Node, "adds", &plain), T::Passed);
+        // A verdict cut out of a truncated tail is unknown, not "absent".
+        assert_eq!(
+            named_test_verdict(ProjectKind::Go, "TestAdd", &none, true),
+            T::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_jest_name_filter_matches_the_whole_test_name_not_a_prefix() {
+        assert_eq!(jest_name_pattern("login"), "login$");
+        assert_eq!(
+            jest_name_pattern("adds 1 + 2 (fast)"),
+            "adds 1 \\+ 2 \\(fast\\)$"
+        );
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","scripts":{"test":"jest"}}"#,
+        )
+        .unwrap();
+        let s = named_test_step(ProjectKind::Node, tmp.path(), "login", 90).expect("jest");
+        assert_eq!(s.args.last().map(String::as_str), Some("login$"));
+    }
+
+    #[tokio::test]
+    async fn a_pytest_name_filter_does_not_pass_on_a_longer_test_name() {
+        // `pytest -k test_login` is a substring match: it runs `test_login_redirect`,
+        // which says nothing about a `test_login` that does not exist yet.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("pyproject.toml"), "[tool.pytest.ini_options]\n").unwrap();
+        fs::create_dir_all(root.join("tests")).unwrap();
+        fs::write(
+            root.join("tests/test_auth.py"),
+            "def test_login_redirect():\n    assert 1 == 1\n",
+        )
+        .unwrap();
+        let outcome = run_named_test(root, "test_login").await;
+        assert_ne!(outcome, NamedTestOutcome::Passed, "test_login never ran");
     }
 
     #[test]
