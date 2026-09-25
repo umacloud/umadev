@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -105,6 +105,12 @@ assert.ok(
   `Claude Code did not reach the expected no-input boundary:\n${claudeLegacyManual.output}`,
 );
 
+// `--settings` takes a JSON string or a file path. Pass a file: on Windows this
+// script reaches `claude.cmd` through `shell: true`, which does not quote the
+// arguments, so cmd.exe would strip the JSON's double quotes.
+const emptySettings = join(cleanHome, "umadev-contract-settings.json");
+writeFileSync(emptySettings, '{"hooks":{}}');
+
 const claudeStream = run("claude", [
   "--print",
   "--input-format",
@@ -126,7 +132,7 @@ const claudeStream = run("claude", [
   "user",
   "--strict-mcp-config",
   "--settings",
-  '{"hooks":{}}',
+  emptySettings,
 ]);
 assert.equal(
   claudeStream.status,
