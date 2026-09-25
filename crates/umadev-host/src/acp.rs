@@ -9157,12 +9157,9 @@ fn resolve_grok_windows_native_program(program: &str) -> String {
     } else {
         format!("{program}.exe")
     };
-    let path_dirs = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
     select_grok_windows_native_program(
         &native_name,
-        &path_dirs,
+        &umadev_process::path_lookup::search_dirs(),
         grok_canonical_native_program().as_deref(),
     )
 }
@@ -9205,7 +9202,7 @@ fn grok_canonical_native_program_from(
     let name = if windows { "grok.exe" } else { "grok" };
     let home = grok_home_from(grok_home, home)?;
     let path = home.join("bin").join(name);
-    if !crate::is_spawnable_file(&path) {
+    if !umadev_process::path_lookup::is_spawnable_file(&path) {
         return None;
     }
     path.to_str().map(str::to_string)

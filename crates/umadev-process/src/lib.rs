@@ -8,6 +8,7 @@
 
 pub mod child_env;
 pub mod git;
+pub mod path_lookup;
 
 use std::collections::VecDeque;
 

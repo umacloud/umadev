@@ -82,6 +82,9 @@ use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use umadev_process::path_lookup::{
+    executable_extensions, find_in_dir, is_spawnable_file, search_dirs,
+};
 
 const MAX_INSTALL_DISCOVERY_ENTRIES: usize = 1_024;
 
@@ -1217,21 +1220,21 @@ pub fn resolve_program(program: &str) -> String {
             return p.trim().to_string();
         }
     }
-    let exts = path_extensions();
-    // 1. PATH first — authoritative, matches the user's shell.
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            if let Some(hit) = match_in_dir(&dir, program, &exts) {
-                if let Some(hit) = resolved_candidate(&hit, program, true) {
-                    return hit;
-                }
+    let exts = executable_extensions();
+    // 1. PATH first — authoritative, matches the user's shell. Only absolute
+    //    entries: a relative one (`.`, `node_modules/.bin`) would resolve in
+    //    the workspace (see `umadev_process::path_lookup`).
+    for dir in search_dirs() {
+        if let Some(hit) = find_in_dir(&dir, program, &exts) {
+            if let Some(hit) = resolved_candidate(&hit, program, true) {
+                return hit;
             }
         }
     }
     // 2. Known install locations second — "installed but not on this
     //    process's PATH" (GUI/service launch, or a richer login-shell PATH).
     for dir in known_install_dirs(program) {
-        if let Some(hit) = match_in_dir(&dir, program, &exts) {
+        if let Some(hit) = find_in_dir(&dir, program, &exts) {
             if let Some(hit) = resolved_candidate(&hit, program, false) {
                 return hit;
             }
@@ -1242,90 +1245,11 @@ pub fn resolve_program(program: &str) -> String {
     program.to_string()
 }
 
-/// Candidate file extensions to try for `program`, **most-specific first**.
-///
-/// On Windows we honor `PATHEXT` (defaulting to the standard set) and append a
-/// trailing empty extension so a bare-named file is the LAST resort: npm drops
-/// both `codex` (a *nix shell shim, not a PE → os error 193) and `codex.cmd`
-/// in the same dir, so `.cmd`/`.exe`/`.bat` MUST win over the bare name. Off
-/// Windows there are no extensions — just the bare name.
-fn path_extensions() -> Vec<String> {
-    path_extensions_for_platform(std::env::var("PATHEXT").ok().as_deref(), cfg!(windows))
-}
-
-fn path_extensions_for_platform(pathext: Option<&str>, windows: bool) -> Vec<String> {
-    const SAFE: [&str; 4] = [".COM", ".EXE", ".BAT", ".CMD"];
-
-    if !windows {
-        return vec![String::new()];
-    }
-    let mut extensions = Vec::with_capacity(SAFE.len() + 1);
-    for extension in pathext.unwrap_or_default().split(';') {
-        let extension = extension.trim();
-        if let Some(canonical) = SAFE
-            .iter()
-            .find(|candidate| candidate.eq_ignore_ascii_case(extension))
-        {
-            if !extensions
-                .iter()
-                .any(|existing: &String| existing.as_str() == *canonical)
-            {
-                extensions.push((*canonical).to_string());
-            }
-        }
-    }
-    for extension in SAFE {
-        if !extensions.iter().any(|existing| existing == extension) {
-            extensions.push(extension.to_string());
-        }
-    }
-    extensions.push(String::new());
-    extensions
-}
-
-/// Return the full path of `program{ext}` for the first `ext` that names a
-/// real file in `dir`, or `None`. Fail-open: an empty/unreadable dir yields
-/// `None` (the `is_file` probe simply returns false). `exts` is ordered
-/// most-specific-first (see [`path_extensions`]).
-fn match_in_dir(dir: &std::path::Path, program: &str, exts: &[String]) -> Option<PathBuf> {
-    if dir.as_os_str().is_empty() {
-        return None;
-    }
-    for ext in exts {
-        let candidate = dir.join(format!("{program}{ext}"));
-        if is_spawnable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 fn resolved_candidate(candidate: &std::path::Path, program: &str, on_path: bool) -> Option<String> {
     candidate
         .to_str()
         .map(str::to_string)
         .or_else(|| on_path.then(|| program.to_string()))
-}
-
-/// Whether a resolved command candidate can actually be spawned on this OS.
-///
-/// `Path::is_file` alone is insufficient on Unix: package-manager debris or a
-/// downloaded source file can appear earlier on `PATH` than the real CLI. If
-/// that non-executable file wins resolution, the subsequent `--version` probe
-/// reports the base as missing even though a valid executable exists later on
-/// `PATH`. Windows decides executability from the selected extension and file
-/// format at process creation, so a regular-file check remains appropriate.
-#[cfg(unix)]
-fn is_spawnable_file(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    path.metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_spawnable_file(path: &std::path::Path) -> bool {
-    path.is_file()
 }
 
 /// Read an environment variable into a non-empty `PathBuf`, or `None`. Empty
@@ -1504,7 +1428,7 @@ fn versioned_node_bins(parent: &std::path::Path) -> Vec<PathBuf> {
 }
 
 /// Every well-known install location for a base/tool CLI, across package
-/// managers and OSes. Each is tried (over [`path_extensions`]) only after a
+/// managers and OSes. Each is tried (over [`executable_extensions`]) only after a
 /// plain `PATH` lookup misses — so a normal install is unaffected and this is
 /// purely a fail-open safety net for "installed but not on my PATH".
 ///
@@ -5122,32 +5046,6 @@ mod tests {
     }
 
     #[test]
-    fn match_in_dir_skips_empty_and_missing() {
-        // Fail-open building blocks: an empty dir name or a non-existent dir
-        // yields no hit rather than erroring.
-        let exts = path_extensions();
-        assert!(match_in_dir(std::path::Path::new(""), "codex", &exts).is_none());
-        assert!(
-            match_in_dir(
-                std::path::Path::new("/umadev/no/such/dir/at/all"),
-                "codex",
-                &exts
-            )
-            .is_none(),
-            "a missing dir must fail-open to None"
-        );
-    }
-
-    #[test]
-    fn windows_path_extensions_ignore_unspawnable_shell_types() {
-        assert_eq!(
-            path_extensions_for_platform(Some(".PS1;.CMD;.EXE;.JS;.cmd"), true),
-            [".CMD", ".EXE", ".COM", ".BAT", ""]
-        );
-        assert_eq!(path_extensions_for_platform(Some(".PS1"), false), [""]);
-    }
-
-    #[test]
     fn versioned_node_bins_are_newest_first_and_deterministic() {
         let parent = tempfile::TempDir::new().unwrap();
         for version in ["v9.11.2", "v22.1.0", "v10.24.1"] {
@@ -5308,19 +5206,6 @@ mod tests {
             Some("base".to_string())
         );
         assert_eq!(resolved_candidate(&candidate, "base", false), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn match_in_dir_rejects_a_non_executable_regular_file() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let candidate = dir.path().join("not-a-command");
-        std::fs::write(&candidate, "plain text\n").unwrap();
-        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert!(match_in_dir(dir.path(), "not-a-command", &path_extensions()).is_none());
     }
 
     // On Windows, when both `codex` (bare *nix shim) and `codex.cmd` exist in

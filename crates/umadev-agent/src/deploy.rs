@@ -541,34 +541,9 @@ fn tail_capped(s: &str, cap: usize) -> String {
     format!("...[truncated]\n{}", &s[start..])
 }
 
-/// Check whether a PATH-resolvable binary exists. Splits `PATH` on the
-/// platform-native separator and honours `PATHEXT` on Windows so `which("npx")`
-/// finds `npx.cmd`. Mirrors the verify/runtime-proof helpers.
+/// Check whether a PATH-resolvable binary exists.
 fn which(bin: &str) -> bool {
-    let Ok(path_var) = std::env::var("PATH") else {
-        return false;
-    };
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    let exts: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.BAT;.CMD;.COM".to_string())
-            .split(';')
-            .map(str::to_string)
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    for dir in path_var.split(separator) {
-        if dir.is_empty() {
-            continue;
-        }
-        for ext in &exts {
-            if Path::new(dir).join(format!("{bin}{ext}")).is_file() {
-                return true;
-            }
-        }
-    }
-    false
+    umadev_process::path_lookup::is_installed(bin)
 }
 
 #[cfg(test)]

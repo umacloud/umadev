@@ -17500,53 +17500,7 @@ fn new_chat_session_id() -> String {
 }
 
 fn which_on_path(program: &str) -> bool {
-    if program.trim().is_empty() {
-        return false;
-    }
-    let path = std::path::Path::new(program);
-    if path.components().count() > 1 {
-        return executable_file(path);
-    }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    #[cfg(windows)]
-    let extensions = {
-        let mut values = vec![String::new()];
-        values.extend(
-            std::env::var("PATHEXT")
-                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-                .split(';')
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-        );
-        values
-    };
-    #[cfg(not(windows))]
-    let extensions = [String::new()];
-    std::env::split_paths(&paths).any(|directory| {
-        extensions
-            .iter()
-            .any(|extension| executable_file(&directory.join(format!("{program}{extension}"))))
-    })
-}
-
-fn executable_file(path: &std::path::Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    !program.trim().is_empty() && umadev_process::path_lookup::is_installed(program)
 }
 
 fn parse_notes_section<'a>(body: &'a str, heading: &str) -> Option<&'a str> {

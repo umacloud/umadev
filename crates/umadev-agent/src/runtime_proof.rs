@@ -1623,63 +1623,19 @@ fn truncate(s: &mut String, cap: usize) {
     }
 }
 
-/// Whether a PATH-resolvable binary exists. Mirrors the verify module's helper
-/// (kept local so this module doesn't widen verify's surface). Honours
-/// `PATHEXT` on Windows.
+/// Whether a PATH-resolvable binary exists.
 fn which(bin: &str) -> bool {
-    let Ok(path_var) = std::env::var("PATH") else {
-        return false;
-    };
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    let exts: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.BAT;.CMD;.COM".to_string())
-            .split(';')
-            .map(str::to_string)
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    for dir in path_var.split(separator) {
-        if dir.is_empty() {
-            continue;
-        }
-        for ext in &exts {
-            let candidate = Path::new(dir).join(format!("{bin}{ext}"));
-            if candidate.is_file() {
-                return true;
-            }
-        }
-    }
-    false
+    umadev_process::path_lookup::is_installed(bin)
 }
 
-/// Resolve a bare program name to a spawnable path on Windows (npm shims are
-/// `.cmd`/`.bat` that `Command::new` won't find). No-op off Windows. A resolved
-/// batch shim is returned as the program itself, never wrapped in `cmd /c`:
-/// Rust then applies its hardened batch-argument encoding, whereas an explicit
+/// Resolve a bare program name to a spawnable path (npm shims are
+/// `.cmd`/`.bat` that `Command::new` won't find on Windows). A resolved batch
+/// shim is returned as the program itself, never wrapped in `cmd /c`: Rust then
+/// applies its hardened batch-argument encoding, whereas an explicit
 /// `cmd /c <shim> <args>` lets `cmd.exe` expand `%VAR%` and run `&` / `|` found
-/// in the project's own run command. Mirrors `umadev_host::spawn_parts`.
+/// in the project's own run command.
 fn resolve_program(program: &str) -> String {
-    if !cfg!(windows) || program.contains(std::path::is_separator) {
-        return program.to_string();
-    }
-    let Ok(path_var) = std::env::var("PATH") else {
-        return program.to_string();
-    };
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    for dir in path_var.split(';') {
-        if dir.is_empty() {
-            continue;
-        }
-        for ext in std::iter::once("").chain(pathext.split(';')) {
-            let candidate = Path::new(dir).join(format!("{program}{ext}"));
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-    program.to_string()
+    umadev_process::path_lookup::resolve_on_path(program)
 }
 
 #[cfg(test)]
