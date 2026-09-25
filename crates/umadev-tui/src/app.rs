@@ -16450,8 +16450,6 @@ impl App {
         Action::None
     }
 
-    /// Called by `apply_engine` when the preview gate opens: surface the
-    /// recorded URL so the user knows where to look before pressing `c`.
     /// Append the user's answer to `output/{slug}-clarify-answers.md`.
     /// Called during `ClarifyGate` so each answer is persisted; on resume
     /// `merged_requirement` reads this file and folds answers into the
@@ -16461,10 +16459,11 @@ impl App {
     /// false "recorded" line. On a write failure the resume path would lose the
     /// answer silently, so the user must be told.
     fn append_clarify_answer(&self, answer: &str) -> std::io::Result<()> {
-        let output = umadev_state::fs::ensure_real_child_dir(&self.project_root, "output")?;
-        let path = output.join(format!("{}-clarify-answers.md", self.slug));
-        let existing = match read_bounded_utf8(&path, MAX_UI_ARTIFACT_BYTES) {
-            Ok(body) => body,
+        // Rooted at the project so the slug can never lead the write outside it.
+        let root = umadev_state::fs::RootedDir::open(&self.project_root)?;
+        let path = std::path::Path::new("output").join(format!("{}-clarify-answers.md", self.slug));
+        let existing = match root.read_bounded(&path, MAX_UI_ARTIFACT_BYTES) {
+            Ok(body) => String::from_utf8_lossy(&body).into_owned(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error),
         };
@@ -16473,7 +16472,7 @@ impl App {
         } else {
             format!("{existing}\n{answer}")
         };
-        umadev_state::fs::atomic_write(&path, updated.as_bytes())
+        root.atomic_write(&path, updated.as_bytes(), true)
     }
 
     /// Called by `apply_engine` when the preview gate opens: surface the

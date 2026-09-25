@@ -354,7 +354,15 @@ pub fn read_workflow_state_diagnostic(project_root: &Path) -> ReadState {
         }
     };
     match serde_json::from_str::<WorkflowState>(&text) {
-        Ok(s) => ReadState::Ok(Box::new(s)),
+        Ok(mut s) => {
+            // The file can ship with the repository, and every consumer joins
+            // the slug into `output/<slug>-*` paths: neutralize separators and
+            // `..` once here, at load. A blank slug stays blank ("unset").
+            if !s.slug.trim().is_empty() {
+                s.slug = crate::runner::sanitize_slug(&s.slug);
+            }
+            ReadState::Ok(Box::new(s))
+        }
         Err(e) => ReadState::Corrupt {
             path,
             error: format!("parse error: {e}"),
@@ -437,6 +445,23 @@ mod tests {
         write_workflow_state(tmp.path(), &s).unwrap();
         let back = read_workflow_state(tmp.path()).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn a_shipped_traversal_slug_is_neutralized_at_load() {
+        let tmp = TempDir::new().unwrap();
+        let mut s = WorkflowState::new(Phase::Frontend);
+        s.slug = "../../home/victim/.config/x".into();
+        write_workflow_state(tmp.path(), &s).unwrap();
+        let slug = read_workflow_state(tmp.path()).unwrap().slug;
+        assert!(
+            !slug.contains(['/', '\\']) && !slug.contains(".."),
+            "{slug}"
+        );
+
+        s.slug = "my-app".into();
+        write_workflow_state(tmp.path(), &s).unwrap();
+        assert_eq!(read_workflow_state(tmp.path()).unwrap().slug, "my-app");
     }
 
     #[test]
