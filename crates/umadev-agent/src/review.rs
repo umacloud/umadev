@@ -713,26 +713,10 @@ pub fn scan_ci_weakening(diff: &str) -> Vec<String> {
     signals
 }
 
-/// Heuristic: does this path look like a test file? (Matches the common
-/// conventions across the stacks UmaDev targets.)
+/// Heuristic: does this repo-relative diff path look like a test file? Shares
+/// the test-integrity guard's classifier so both agree on what a test is.
 fn is_test_path(path: &str) -> bool {
-    let p = path.to_ascii_lowercase();
-    p.contains("/tests/")
-        || p.contains("/test/")
-        || p.contains("__tests__")
-        || p.ends_with("_test.go")
-        || p.ends_with("_test.py")
-        || p.ends_with("test.ts")
-        || p.ends_with("test.tsx")
-        || p.ends_with("test.js")
-        || p.ends_with("test.jsx")
-        || p.ends_with(".test.ts")
-        || p.ends_with(".test.tsx")
-        || p.ends_with(".test.js")
-        || p.ends_with(".spec.ts")
-        || p.ends_with(".spec.tsx")
-        || p.ends_with(".spec.js")
-        || p.ends_with("_spec.rb")
+    crate::test_integrity::is_test_source_path(path)
 }
 
 #[cfg(test)]
@@ -897,6 +881,30 @@ mod tests {
         assert!(is_test_path("app/__tests__/Button.jsx"));
         assert!(!is_test_path("src/main.rs"));
         assert!(!is_test_path("docs/readme.md"));
+    }
+
+    #[test]
+    fn detects_deleted_repo_root_test_files() {
+        // Diff paths are repo-relative, so a top-level test dir has no leading `/`.
+        for path in [
+            "tests/test_api.py",
+            "tests/integration.rs",
+            "test/foo.js",
+            "app/test_models.py",
+            "__tests__/App.jsx",
+        ] {
+            let diff = format!(
+                "diff --git a/{path} b/{path}\ndeleted file mode 100644\nindex abc..000\n\
+                 --- a/{path}\n+++ /dev/null\n"
+            );
+            let s = scan_ci_weakening(&diff);
+            assert_eq!(s.len(), 1, "{path}: {s:?}");
+            assert!(s[0].contains("deleted test file"), "{path}: {s:?}");
+        }
+        // A name that merely ends in `test.js` is not a test file.
+        let diff = "diff --git a/src/latest.js b/src/latest.js\ndeleted file mode 100644\n\
+                    index abc..000\n--- a/src/latest.js\n+++ /dev/null\n";
+        assert!(scan_ci_weakening(diff).is_empty());
     }
 
     #[test]

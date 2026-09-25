@@ -571,7 +571,7 @@ fn is_test_file(rel_lower: &str, name_lower: &str, ext: &str, content: &str) -> 
 /// The path/name half of [`is_test_file`]: `true` when the workspace-relative
 /// path (`rel_lower`, `/`-separated) or the file name (`name_lower`), both
 /// pre-lowercased, follow a universal test-file convention. Needs no content.
-pub(crate) fn is_test_path(rel_lower: &str, name_lower: &str) -> bool {
+fn is_test_path(rel_lower: &str, name_lower: &str) -> bool {
     let by_name = name_lower.contains(".test.")
         || name_lower.contains(".spec.")
         || name_lower.starts_with("test_")
@@ -592,11 +592,22 @@ pub(crate) fn is_test_path(rel_lower: &str, name_lower: &str) -> bool {
     let by_dir = rel_lower.contains("/tests/")
         || rel_lower.contains("/test/")
         || rel_lower.contains("/__tests__/")
+        || rel_lower.starts_with("__tests__/")
         || rel_lower.starts_with("tests/")
         || rel_lower.starts_with("test/")
         || rel_lower.contains("/spec/")
         || rel_lower.starts_with("spec/");
     by_name || by_dir
+}
+
+/// Content-free test-file classification for a repo-relative, `/`-separated
+/// path (e.g. from a diff header): a code file whose path/name follows a test
+/// convention. The same heuristic the snapshot uses, minus Rust inline tests.
+pub(crate) fn is_test_source_path(rel: &str) -> bool {
+    let rel_lower = rel.to_ascii_lowercase();
+    let name_lower = rel_lower.rsplit('/').next().unwrap_or("");
+    let ext = name_lower.rsplit_once('.').map_or("", |(_, ext)| ext);
+    CODE_EXT.contains(&ext) && is_test_path(&rel_lower, name_lower)
 }
 
 /// Compute [`FileMetrics`] for one test file's content. Deterministic + language
