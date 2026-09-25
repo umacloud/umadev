@@ -325,14 +325,12 @@ impl Runtime for CodexDriver {
         if text.trim().is_empty() && !out.stdout.trim().is_empty() {
             text = out.stdout;
         }
-        Ok(crate::redaction::sanitize_completion_response(
-            &CompletionResponse {
-                text,
-                id: "codex-cli".to_string(),
-                model: req.model,
-                usage,
-            },
-        ))
+        Ok(CompletionResponse {
+            text,
+            id: "codex-cli".to_string(),
+            model: req.model,
+            usage,
+        })
     }
 
     /// Streaming completion via `codex exec --json`.
@@ -402,14 +400,12 @@ impl Runtime for CodexDriver {
                 if final_text.trim().is_empty() && !out.stdout.trim().is_empty() {
                     final_text = out.stdout;
                 }
-                Ok(crate::redaction::sanitize_completion_response(
-                    &CompletionResponse {
-                        text: final_text,
-                        id: "codex-cli".to_string(),
-                        model,
-                        usage,
-                    },
-                ))
+                Ok(CompletionResponse {
+                    text: final_text,
+                    id: "codex-cli".to_string(),
+                    model,
+                    usage,
+                })
             }
             Err(e) => {
                 // Routine self-healing (often the base being SIGTERM/SIGALRM'd —
@@ -420,14 +416,12 @@ impl Runtime for CodexDriver {
                 let salvaged = extract_codex_messages(&partial);
                 if !salvaged.trim().is_empty() {
                     let usage = extract_codex_usage(&partial);
-                    return Ok(crate::redaction::sanitize_completion_response(
-                        &CompletionResponse {
-                            text: salvaged,
-                            id: "codex-cli".to_string(),
-                            model,
-                            usage,
-                        },
-                    ));
+                    return Ok(CompletionResponse {
+                        text: salvaged,
+                        id: "codex-cli".to_string(),
+                        model,
+                        usage,
+                    });
                 }
                 let stream_error = crate::map_subprocess_error(&e);
                 if matches!(stream_error, RuntimeError::Timeout(_, _)) {
@@ -1354,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_events_redact_synthetic_secrets() {
+    fn stream_events_keep_model_text_and_tool_input_whole() {
         const SECRET: &str = "SYNTH_CODEX_SECRET_DO_NOT_LEAK_72";
         let text = serde_json::json!({
             "type": "item.completed",
@@ -1375,8 +1369,8 @@ mod tests {
             parse_codex_stream_line(&tool)
         );
         assert!(
-            !rendered.contains(SECRET),
-            "stream event leaked: {rendered}"
+            rendered.contains(SECRET),
+            "stream event was rewritten: {rendered}"
         );
     }
 }

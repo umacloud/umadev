@@ -379,14 +379,12 @@ impl Runtime for OpenCodeDriver {
         // through verbatim.
         let text = resolve_opencode_answer(&out.stdout);
 
-        Ok(crate::redaction::sanitize_completion_response(
-            &CompletionResponse {
-                text,
-                id: "opencode-cli".to_string(),
-                model: req.model,
-                usage: Usage::default(),
-            },
-        ))
+        Ok(CompletionResponse {
+            text,
+            id: "opencode-cli".to_string(),
+            model: req.model,
+            usage: Usage::default(),
+        })
     }
 
     /// Streaming completion via `opencode run`, forwarding stdout **line by
@@ -447,14 +445,12 @@ impl Runtime for OpenCodeDriver {
                     self.remember_session_id(&session_id);
                 }
                 let text = resolve_opencode_answer(&out.stdout);
-                Ok(crate::redaction::sanitize_completion_response(
-                    &CompletionResponse {
-                        text,
-                        id: "opencode-cli".to_string(),
-                        model,
-                        usage: Usage::default(),
-                    },
-                ))
+                Ok(CompletionResponse {
+                    text,
+                    id: "opencode-cli".to_string(),
+                    model,
+                    usage: Usage::default(),
+                })
             }
             Err(e) => {
                 // Fail-open: drop to the non-streaming path so a streaming-only
@@ -467,14 +463,12 @@ impl Runtime for OpenCodeDriver {
                 let partial = stream_buf.into_string();
                 let salvaged = resolve_opencode_answer(&partial);
                 if !salvaged.trim().is_empty() {
-                    return Ok(crate::redaction::sanitize_completion_response(
-                        &CompletionResponse {
-                            text: salvaged,
-                            id: "opencode-cli".to_string(),
-                            model,
-                            usage: Usage::default(),
-                        },
-                    ));
+                    return Ok(CompletionResponse {
+                        text: salvaged,
+                        id: "opencode-cli".to_string(),
+                        model,
+                        usage: Usage::default(),
+                    });
                 }
                 let stream_error = crate::map_subprocess_error(&e);
                 if matches!(stream_error, RuntimeError::Timeout(_, _)) {
@@ -1403,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_events_redact_synthetic_secrets() {
+    fn stream_events_keep_model_text_and_tool_input_whole() {
         const SECRET: &str = "SYNTH_OPENCODE_SECRET_DO_NOT_LEAK_73";
         let text = parse_opencode_stream_line(&format!("password={SECRET}"));
         let tool = parse_opencode_stream_line(&format!(
@@ -1411,8 +1405,8 @@ mod tests {
         ));
         let rendered = format!("{text:?}{tool:?}");
         assert!(
-            !rendered.contains(SECRET),
-            "stream event leaked: {rendered}"
+            rendered.contains(SECRET),
+            "stream event was rewritten: {rendered}"
         );
     }
 }

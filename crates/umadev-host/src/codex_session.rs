@@ -6798,7 +6798,7 @@ done
     }
 
     #[tokio::test]
-    async fn native_events_redact_before_transcript_tool_activity_and_audit() {
+    async fn native_events_keep_model_text_and_tool_traffic_whole() {
         const SECRET: &str = "SYNTH_CODEX_SESSION_SECRET_82";
         let (tx, mut rx) = chan();
         emit_text_delta(&json!({"delta": format!("password={SECRET}")}), &tx);
@@ -6821,8 +6821,8 @@ done
         }
         let audit_view = format!("{events:?}");
         assert!(
-            !audit_view.contains(SECRET),
-            "event/audit leaked: {audit_view}"
+            audit_view.contains(SECRET),
+            "event was rewritten: {audit_view}"
         );
 
         let mut activity = umadev_runtime::ToolActivity::default();
