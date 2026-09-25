@@ -1355,11 +1355,8 @@ fn cmd_hook(check: String, scoped_project_root: Option<PathBuf>) -> Result<()> {
         if !actual_cwd.starts_with(&project_root) {
             // Kimi's hook registry is user-level. Every row installed by
             // UmaDev carries its project root, and an unrelated workspace
-            // must pay only this bounded no-op. Pre hooks need an explicit
-            // allow object; observation-only post hooks can return silently.
-            if check != "tool-audit" && check != "post-tool" {
-                hook::print_decision(&umadev_governance::Decision::pass());
-            }
+            // must pay only this bounded no-op: exit 0 with no output leaves
+            // the call to the host's own permission flow.
             return Ok(());
         }
     }
@@ -1382,21 +1379,20 @@ fn cmd_hook(check: String, scoped_project_root: Option<PathBuf>) -> Result<()> {
     // ── P0-1: fail-open is a HARD CONTRACT, not a hope ────────────────────
     // The whole rule book (≈110 `check_*` content scanners) runs on arbitrary
     // base-authored content INSIDE this hook subprocess. If ANY rule panics on
-    // a pathological input, an unwinding hook process produces empty stdout +
-    // a non-zero exit — which Claude Code interprets as a hard DENY, turning
-    // governance fail-CLOSED and wedging the base on every write. We refuse to
-    // let that happen: the entire decision computation (policy load + scan) is
-    // wrapped in `catch_unwind`; a panic collapses to `Decision::pass()`
-    // (allow). The `AssertUnwindSafe` is sound here — on the panic path we
-    // discard all of `compute`'s captured state and emit a fresh `pass()`, so
-    // no logically-inconsistent value can escape.
+    // a pathological input, an unwinding hook process exits non-zero, which
+    // both hosts report as a hook error on every write (only exit 2 blocks).
+    // We refuse to let that happen: the entire decision computation (policy
+    // load + scan) is wrapped in `catch_unwind`; a panic collapses to
+    // `Decision::pass()` (no output). The `AssertUnwindSafe` is sound here — on
+    // the panic path we discard all of `compute`'s captured state and emit a
+    // fresh `pass()`, so no logically-inconsistent value can escape.
     let check_for_panic = check.clone();
     let decision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         compute_hook_decision(&check_for_panic, &stdin, &project_root)
     }))
     .unwrap_or_else(|_| {
         eprintln!(
-            "umadev: hook `{check}` panicked while scanning content — failing OPEN (allow). \
+            "umadev: hook `{check}` panicked while scanning content — failing OPEN (no decision). \
              Governance must never block the base on a rule bug."
         );
         umadev_governance::Decision::pass()
@@ -1421,20 +1417,11 @@ fn cmd_hook(check: String, scoped_project_root: Option<PathBuf>) -> Result<()> {
             )
         }));
     }
-    // Printing the decision must also never unwind: a serialization/IO panic
-    // here would otherwise exit non-zero with no `allow` on stdout. Catch it
-    // and, on the block-less path, still try to emit a bare allow so the base
-    // is never silently denied. (`print_decision` already uses
-    // `to_string(...).unwrap_or_default()`, so this is belt-and-braces.)
-    let printed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // Printing the decision must also never unwind: an IO panic here (a closed
+    // stdout) would otherwise exit non-zero. A pass prints nothing anyway.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         hook::print_decision(&decision);
     }));
-    if printed.is_err() && !decision.block {
-        // Last-resort allow so a print panic can't read as a deny.
-        println!(
-            r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
-        );
-    }
     Ok(())
 }
 
@@ -9786,7 +9773,7 @@ mod tests {
     #[test]
     fn hook_print_decision_never_panics_on_allow_or_block() {
         // print_decision must always be panic-safe so the hook process exits 0
-        // with a valid JSON decision (never empty stdout + non-zero exit).
+        // (a deny object for a block, no output for a pass).
         let allow = umadev_governance::Decision::pass();
         let block = umadev_governance::Decision::block("UD-SEC-001", "leaked secret");
         // Wrapped exactly as cmd_hook wraps it; neither may unwind.
