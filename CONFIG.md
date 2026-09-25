@@ -44,7 +44,7 @@ budget (3600s).** Same variable, different clocks.
 | --- | --- | --- |
 | `UMADEV_PHASE_BUDGET_SECS` | Per-phase wall-clock ceiling in the legacy fixed pipeline. | `900` (15 min) |
 | `UMADEV_DOCS_BUDGET_SECS` | Docs/planning-phase ceiling (tighter than a build phase). Falls back to `UMADEV_PHASE_BUDGET_SECS`, then the default. | `480` (8 min) |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | Global override applied to **every** verify step's budget (build/test/lint). When unset, each step uses its own per-step default. | per-step |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | Global override applied to **every** verify step's budget (install/lint/test/build), lowering as well as raising it. When unset (or `0`), each step uses its own per-step default: 120 s, 600 s for install/test/build. | per-step |
 
 > All budgets are graceful ceilings: they stop scheduling new work and finalize on
 > what exists; they do not hard-kill an in-flight write.

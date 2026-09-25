@@ -755,7 +755,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `UMADEV_GROK_BIN` | Override the Grok Build executable | `grok` |
 | `UMADEV_KIMI_BIN` | Override the Kimi Code executable | `kimi` |
 | `UMADEV_WORKER_TIMEOUT` | Per-call worker timeout in seconds | `300` |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | Verify-loop per-call timeout in seconds | `120` |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | Timeout in seconds for every verify step (install, lint, test, build); when unset each step uses its own budget | `120` (`600` for install / test / build) |
 | `UMADEV_NO_GOAL_MODE` | Disable `/goal` mode if set to `1` | — |
 | `UMADEV_SHOW_PROCESS_LOGS` | Seed the base's live process-log visibility (also toggled in-app with `/logs`) | off |
 | `UMADEV_CONTINUOUS` | Set to `0` (or `UMADEV_LEGACY_RUN=1`) to opt out of the continuous single-session path | on |
