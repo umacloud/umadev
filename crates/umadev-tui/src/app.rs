@@ -21,6 +21,7 @@ use crate::config::UserConfig;
 use crate::local_command::{LocalCommandRequest, LocalCommandResult};
 use crate::prompt_queue_ui::PromptQueueUi;
 
+mod animation_settings;
 mod backend;
 mod bounded_text;
 mod deploy;
@@ -41,6 +42,9 @@ mod submission;
 mod task_control;
 mod usage_meter;
 
+use animation_settings::{
+    animation_settings_root, animations_enabled_default, read_animation_settings,
+};
 pub(crate) use backend::{parse_probe_detail, PROBE_AUTH_SENTINEL};
 use backend::{refresh_picker_with_probes, step_items};
 use bounded_text::{prefix_with_char_limit, read_utf8 as read_bounded_utf8, trim_tail};
@@ -3580,6 +3584,8 @@ impl App {
         config_path: std::path::PathBuf,
         project_root: std::path::PathBuf,
     ) -> Self {
+        #[cfg(test)]
+        tests::isolate_state_directory();
         let phases = PHASE_CHAIN
             .iter()
             .map(|&phase| PhaseRow {
@@ -17205,39 +17211,6 @@ pub(crate) fn spinner_frame(tick: u8, animated: bool, stalled: bool) -> char {
         return SPINNER_FRAMES[0];
     }
     SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
-}
-
-/// P5d: the initial animation state — `false` (static spinner) when stdout is not
-/// a real terminal (CI / piped output) OR the user persisted `animations_enabled
-/// = false`; `true` otherwise. Fail-open to `true` (animated, today's behaviour)
-/// on any read error.
-fn animations_enabled_default() -> bool {
-    use std::io::IsTerminal;
-    // A non-interactive stdout (piped / redirected) never benefits from a spinner
-    // and a strobing braille frame just spams the log — render static there.
-    if !std::io::stdout().is_terminal() {
-        return false;
-    }
-    // Honor a persisted `/animations off`. Absent / unreadable → animated.
-    animation_settings_root(false)
-        .as_ref()
-        .and_then(read_animation_settings)
-        .and_then(|v| {
-            v.get("animations_enabled")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(true)
-}
-
-fn animation_settings_root(create_state: bool) -> Option<umadev_state::fs::RootedDir> {
-    umadev_state::privacy::state_root(create_state)
-}
-
-fn read_animation_settings(settings: &umadev_state::fs::RootedDir) -> Option<serde_json::Value> {
-    let bytes = settings
-        .read_bounded(std::path::Path::new("settings.json"), MAX_UI_STATE_BYTES)
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
 }
 
 pub(crate) fn has_open_code_fence(body: &str) -> bool {

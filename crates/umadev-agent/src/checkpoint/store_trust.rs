@@ -46,6 +46,8 @@ fn installation_key() -> Option<[u8; umadev_state::privacy::PROVENANCE_KEY_BYTES
     if let Some(key) = KEY.get() {
         return Some(*key);
     }
+    #[cfg(test)]
+    crate::test_support::isolate_state_directory();
     let key = umadev_state::privacy::installation_key()?;
     Some(*KEY.get_or_init(|| key))
 }
@@ -55,6 +57,15 @@ fn expected_stamp(project_root: &Path) -> Option<String> {
         STAMP_DOMAIN,
         &[project_root_bytes(project_root)?.as_slice()],
     )
+}
+
+/// The installation state directory (`~/.umadev`) that holds the per-project
+/// records keyed by [`installation_tag`], as a pinned capability. This crate's
+/// unit tests resolve it to a per-process scratch directory.
+pub(crate) fn installation_state_root(create: bool) -> Option<umadev_state::fs::RootedDir> {
+    #[cfg(test)]
+    crate::test_support::isolate_state_directory();
+    umadev_state::privacy::state_root(create)
 }
 
 /// The canonical project path as bytes, the identity every per-project tag

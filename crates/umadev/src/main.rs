@@ -6898,6 +6898,18 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
+    /// Pin this test process's installation state directory (`~/.umadev`) to a
+    /// scratch directory, so the approvals and saved-run stamps a test writes
+    /// never reach the developer's real home. Call it first in any test that
+    /// persists run state.
+    pub(crate) fn isolate_state_directory() {
+        umadev_state::privacy::pin_state_directory(|| {
+            tempfile::TempDir::with_prefix("umadev-test-state-")
+                .expect("scratch state directory")
+                .keep()
+        });
+    }
+
     fn test_git_available() -> bool {
         bounded_cli_output(
             pr_git_command(Path::new("."), &["--version"]),
@@ -7313,6 +7325,7 @@ mod tests {
 
     #[test]
     fn rollback_still_restores_a_workflow_snapshot_and_says_which_subsystem_it_touched() {
+        isolate_state_directory();
         // The file-checkpoint arm must not weaken the workflow-state arm: a timestamp (and
         // `latest`) still resolves in the workflow subsystem FIRST, and still reverts no file.
         let tmp = tempfile::tempdir().unwrap();
@@ -7945,6 +7958,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_continue_routes_a_persisted_director_plan_before_legacy_gate_logic() {
+        isolate_state_directory();
         use umadev_agent::plan_state::{
             AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus,
         };
@@ -7989,6 +8003,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_continue_rearms_a_terminal_review_without_starting_a_replacement_plan() {
+        isolate_state_directory();
         use umadev_agent::plan_state::{
             AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus,
         };
@@ -8065,6 +8080,7 @@ mod tests {
 
     #[tokio::test]
     async fn cli_plan_mode_continue_never_rearms_a_terminal_review_cursor() {
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Delivery);
@@ -8296,6 +8312,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_git_commit_is_blocked_at_every_cli_replay_boundary() {
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Docs);
@@ -8930,6 +8947,7 @@ mod tests {
 
     #[test]
     fn successful_cross_base_identity_never_keeps_the_old_session_id() {
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
         state.backend = "cursor".to_string();

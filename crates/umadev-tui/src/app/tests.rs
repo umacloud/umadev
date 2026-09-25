@@ -367,6 +367,17 @@ fn codex_sandbox_warning_only_for_danger_full_access_on_codex() {
     ));
 }
 
+/// Pin this test process's installation state directory (`~/.umadev`) to a
+/// scratch directory before any `App` exists, so approval memory, saved-run
+/// stamps and settings written by these tests never reach the real home.
+pub(super) fn isolate_state_directory() {
+    umadev_state::privacy::pin_state_directory(|| {
+        tempfile::TempDir::with_prefix("umadev-test-state-")
+            .expect("scratch state directory")
+            .keep()
+    });
+}
+
 fn fresh_app(backend: Option<&str>) -> App {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
