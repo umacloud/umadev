@@ -192,8 +192,8 @@ enum Command {
         /// `guarded` (default — pause at every confirmation gate), or `auto`
         /// (fully autonomous). Irreversible actions (.git / network /
         /// destructive shell) are always confirmed, even in `auto`.
-        #[arg(long, default_value = "guarded")]
-        mode: String,
+        #[arg(long, default_value = "guarded", value_parser = parse_mode_arg)]
+        mode: umadev_agent::TrustMode,
         /// Force the continuous long-session path (one base session for the whole
         /// run — see `docs/CONTINUOUS_SESSION_ARCHITECTURE.md`). This is now the
         /// DEFAULT for a host-CLI run, so the flag is rarely needed; it only
@@ -240,8 +240,8 @@ enum Command {
         slug: String,
         /// Trust / autonomy tier: `plan` / `guarded` (default) / `auto`.
         /// See `umadev run --help`. Irreversible actions always confirm.
-        #[arg(long, default_value = "guarded")]
-        mode: String,
+        #[arg(long, default_value = "guarded", value_parser = parse_mode_arg)]
+        mode: umadev_agent::TrustMode,
     },
     /// Re-run a single named phase (reuses the prior run's context).
     #[command(
@@ -949,6 +949,15 @@ impl From<MemoryCacheArg> for umadev_agent::memory_control::MemoryStore {
             MemoryCacheArg::Repomap => Self::RepoMap,
         }
     }
+}
+
+/// Parse `--mode` for `run` / `quick`. An unknown value is a usage error, never
+/// a silent fall back to `guarded`: a mistyped read-only `plan` must not start a
+/// pipeline that writes project state. The tier aliases are
+/// [`umadev_agent::TrustMode::parse`]'s.
+fn parse_mode_arg(raw: &str) -> std::result::Result<umadev_agent::TrustMode, String> {
+    umadev_agent::TrustMode::parse(raw)
+        .ok_or_else(|| "expected one of: plan, guarded, auto".to_string())
 }
 
 /// Host CLI backend selector for `umadev run --backend`.
@@ -2648,9 +2657,8 @@ struct RunArgs {
     backend: Option<BackendArg>,
     project_root: Option<PathBuf>,
     slug: String,
-    /// Trust / autonomy tier string (`plan` / `guarded` / `auto`); parsed into
-    /// [`umadev_agent::TrustMode`] at the boundary, fail-open to `guarded`.
-    mode: String,
+    /// Trust / autonomy tier, validated by clap (see [`parse_mode_arg`]).
+    mode: umadev_agent::TrustMode,
     /// Force the continuous long-session run path (one base session for the whole
     /// run). The continuous path is now the DEFAULT for a host-CLI run via
     /// [`umadev_agent::continuous_enabled_from_env`]; this flag only OR's in a
@@ -3503,7 +3511,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
-    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
+    let mode = args.mode;
     if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
         return Ok(());
     }
@@ -3828,7 +3836,7 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
-    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
+    let mode = args.mode;
     if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
         return Ok(());
     }
@@ -7697,6 +7705,43 @@ mod tests {
     }
 
     #[test]
+    fn mode_flag_accepts_the_tiers_and_their_aliases_and_rejects_anything_else() {
+        use umadev_agent::TrustMode;
+        let mode_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Some(Command::Run { mode, .. } | Command::Quick { mode, .. }) => mode,
+            other => panic!("unexpected command: {other:?}"),
+        };
+        assert_eq!(mode_of(&["umadev", "run", "x"]), TrustMode::Guarded);
+        assert_eq!(
+            mode_of(&["umadev", "run", "x", "--mode", "plan"]),
+            TrustMode::Plan
+        );
+        assert_eq!(
+            mode_of(&["umadev", "run", "x", "--mode", "read-only"]),
+            TrustMode::Plan
+        );
+        assert_eq!(
+            mode_of(&["umadev", "quick", "x", "--mode", "AUTO"]),
+            TrustMode::Auto
+        );
+        assert_eq!(
+            mode_of(&["umadev", "quick", "x", "--mode", "guarded"]),
+            TrustMode::Guarded
+        );
+        for verb in ["run", "quick"] {
+            for typo in ["pln", "planned", "plan-only", ""] {
+                let error = Cli::try_parse_from(["umadev", verb, "x", "--mode", typo]).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+                let text = error.to_string();
+                assert!(
+                    text.contains("plan, guarded, auto"),
+                    "{verb} --mode {typo}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn full_uninstall_leaves_a_package_install_to_its_launcher() {
         let packaged = PathBuf::from(
             "/usr/lib/node_modules/@umatech/umadev/node_modules/@umatech/cli-linux-x64/bin/umadev",
@@ -8704,7 +8749,7 @@ mod tests {
             backend: None,
             project_root: Some(tmp.path().to_path_buf()),
             slug: "demo".into(),
-            mode: "plan".into(),
+            mode: umadev_agent::TrustMode::Plan,
             continuous: false,
         }))
         .await
@@ -8754,7 +8799,7 @@ mod tests {
             backend: None,
             project_root: Some(tmp.path().to_path_buf()),
             slug: String::new(),
-            mode: "auto".to_string(),
+            mode: umadev_agent::TrustMode::Auto,
             continuous: false,
         })
         .await
@@ -8767,7 +8812,7 @@ mod tests {
             backend: None,
             project_root: Some(tmp.path().to_path_buf()),
             slug: String::new(),
-            mode: "auto".to_string(),
+            mode: umadev_agent::TrustMode::Auto,
             continuous: false,
         })
         .await
@@ -8925,7 +8970,7 @@ mod tests {
             backend: None,
             project_root: Some(root.to_path_buf()),
             slug: String::new(),
-            mode: "auto".to_string(),
+            mode: umadev_agent::TrustMode::Auto,
             continuous: false,
         })
         .await
@@ -8952,7 +8997,7 @@ mod tests {
             backend: None,
             project_root: Some(root.to_path_buf()),
             slug: String::new(),
-            mode: "auto".to_string(),
+            mode: umadev_agent::TrustMode::Auto,
             continuous: false,
         })
         .await
