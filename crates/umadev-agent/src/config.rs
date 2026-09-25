@@ -107,14 +107,10 @@ pub struct PipelineConfig {
     /// Overridable per run by the `UMADEV_STRICT_COVERAGE=1` environment flag.
     #[serde(default)]
     pub strict_coverage: bool,
-    /// Auto-approve the pipeline's ordinary document/preview gates without
-    /// waiting for input (default `true`). The gates (`docs_confirm`,
-    /// `preview_confirm`) still appear as checkpoints in the event stream and
-    /// status bar. This setting does not bypass irreversible-action
-    /// confirmations, deterministic acceptance, or the trust-mode safety
-    /// floor. Set it to `false` to require manual gate approval.
-    #[serde(default = "default_auto_approve")]
-    pub auto_approve_gates: bool,
+    // There is deliberately no gate auto-approval switch here. `.umadevrc`
+    // travels with the repository, so a cloned project could otherwise start
+    // itself in Auto. Only the user raises the tier (`/mode auto`, Shift+Tab,
+    // `--mode auto`); an old `auto_approve_gates` key is ignored.
 }
 
 impl Default for PipelineConfig {
@@ -123,13 +119,8 @@ impl Default for PipelineConfig {
             skip_phases: Vec::new(),
             max_review_rounds: default_review_rounds(),
             strict_coverage: false,
-            auto_approve_gates: default_auto_approve(),
         }
     }
-}
-
-fn default_auto_approve() -> bool {
-    true
 }
 
 fn default_review_rounds() -> usize {
@@ -795,21 +786,18 @@ mod tests {
         // must keep both and only touch [codex] sandbox_mode.
         std::fs::write(
             tmp.path().join(".umadevrc"),
-            "# my notes\n[pipeline]\nauto_approve_gates = false\n",
+            "# my notes\n[pipeline]\nmax_review_rounds = 2\n",
         )
         .unwrap();
         persist_codex_sandbox(tmp.path(), CodexSandbox::DangerFullAccess).unwrap();
         let body = std::fs::read_to_string(tmp.path().join(".umadevrc")).unwrap();
         assert!(body.contains("# my notes"), "comment preserved");
-        assert!(
-            body.contains("auto_approve_gates = false"),
-            "sibling preserved"
-        );
+        assert!(body.contains("max_review_rounds = 2"), "sibling preserved");
         assert!(body.contains("danger-full-access"));
         // And it round-trips through the loader as the chosen tier.
         let cfg = load_project_config(tmp.path());
         assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
-        assert!(!cfg.pipeline.auto_approve_gates);
+        assert_eq!(cfg.pipeline.max_review_rounds, 2);
     }
 
     #[test]

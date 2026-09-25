@@ -353,7 +353,7 @@ flowchart TB
 | "给用户模型加个字段" / "修结账的 bug" | bugfix / 小改（不组队） | 几分钟，硬门把关 |
 | "做一个订阅管理后台" | 完整 build（展开 9 阶段、全套团队） | 按需求规模从十几分钟到更长；中途在确认门停下等你 |
 
-> 看得见进度：完整 build 会显示实时计划和团队评审状态；长时间没有进展时状态区会提示，而不是把沉默当完成。CLI `run/quick --mode` 默认是 `guarded`；TUI 则兼容 `.umadevrc` 的 `auto_approve_gates` 映射，当前生成值 `true` 对应自动普通 gate。不可逆操作仍始终确认。
+> 看得见进度：完整 build 会显示实时计划和团队评审状态；长时间没有进展时状态区会提示，而不是把沉默当完成。CLI `run/quick --mode` 和 TUI 默认都是 `guarded`（逐门审核）。项目配置不能选择档位：`.umadevrc` 会随仓库一起分发，否则别人的仓库可以让自己一打开就是 Auto（旧的 `auto_approve_gates` 设置会被忽略）。想全自动时按 Shift+Tab 或输入 `/mode auto`，只对当前会话生效。不可逆操作仍始终确认。
 
 **命令可发现性**：
 
@@ -852,7 +852,6 @@ skip_checks = []
 [pipeline]
 skip_phases = []
 max_review_rounds = 3
-auto_approve_gates = true
 
 [knowledge]
 enabled = true

@@ -789,7 +789,6 @@ skip_checks = []
 [pipeline]
 skip_phases = []
 max_review_rounds = 3
-auto_approve_gates = true
 
 [knowledge]
 enabled = true
@@ -797,7 +796,7 @@ engine = "hybrid"
 top_k = 6
 ```
 
-For `umadev run` and `umadev quick`, the CLI `--mode` default is `guarded`. The TUI also maps `.umadevrc` `pipeline.auto_approve_gates = true` to its Auto gate behavior (the currently generated default), or `false` to Guarded; `/mode` can change the live tier. This legacy gate setting never removes the irreversible-action confirmation floor. Git merge/reset, deletes, deploys, and network pushes always require confirmation on every tier.
+For `umadev run` and `umadev quick`, the CLI `--mode` default is `guarded`, and every TUI session also starts in Guarded. Project configuration cannot select the tier: `.umadevrc` travels with the repository, so a cloned project could otherwise start itself in Auto (an old `auto_approve_gates` key is ignored). Press Shift+Tab or use `/mode auto` to switch the current session to Auto. No tier removes the irreversible-action confirmation floor. Git merge/reset, deletes, deploys, and network pushes always require confirmation on every tier.
 
 ---
 

@@ -3016,32 +3016,19 @@ pub struct App {
     /// Its settle/cancel path must never reset a parked Director run or consume
     /// any resident base-session identity.
     pub(crate) host_git_in_flight: bool,
-    /// Session-level override for `auto_approve_gates` set via `/manual`
-    /// (`Some(false)`) or `/auto` (`Some(true)`). `None` → use the project's
-    /// `.umadevrc` value. Lets the user flip review mode mid-session without
-    /// hand-editing config or losing it on restart-of-flow.
+    /// Session-level gate auto-approval set via `/manual` (`Some(false)`) or
+    /// `/auto` (`Some(true)`). `None` → the default `guarded` tier. Lets the
+    /// user flip review mode mid-session without losing it on restart-of-flow.
     ///
     /// Kept as the compatibility surface for the binary `/auto` `/manual`
     /// toggle; `trust_mode_override` is the richer three-tier control that
     /// supersedes it. The two stay consistent — flipping one updates the other.
     pub auto_approve_override: Option<bool>,
 
-    /// Session-level trust / autonomy tier override (`/mode plan|guarded|auto`).
-    /// `None` → derive from `.umadevrc` (`auto_approve_gates`). When `Some`, it
-    /// takes precedence and also drives the legacy `auto_approve_override`.
-    /// The default tier is `guarded` (the existing human-in-the-loop behaviour).
+    /// Session-level trust / autonomy tier override (`/mode plan|guarded|auto`,
+    /// Shift+Tab). `None` → the default `guarded` tier. When `Some`, it takes
+    /// precedence and also drives the legacy `auto_approve_override`.
     pub trust_mode_override: Option<umadev_agent::TrustMode>,
-
-    /// Process-local cache of the trust tier *derived from `.umadevrc`* (used
-    /// only when no session override is set). [`effective_trust_mode`] runs in
-    /// the render hot path (~12/s at the 80 ms tick); without this it would
-    /// `load_project_config` — i.e. read `.umadevrc` off disk — on every frame,
-    /// which stutters on a slow / network-mounted workspace. We read the config
-    /// once, memoise the result here, and only refresh when the config could
-    /// actually have changed (a `/mode` switch or an explicit reload). Interior
-    /// mutability keeps `effective_trust_mode` a `&self` reader. Fail-open: a
-    /// config read error resolves to `Guarded`, same as before.
-    config_trust_cache: std::cell::Cell<Option<umadev_agent::TrustMode>>,
 
     /// Per-project collaborative trust ledger (`.umadev/trust.json`). Records
     /// how many times in a row each gate passed; after a threshold it *suggests*
@@ -3183,7 +3170,7 @@ pub struct App {
     /// `PhaseStarted` so the status bar can show per-phase elapsed time.
     pub phase_started_at: Option<std::time::Instant>,
 
-    /// When `auto_approve_gates` is on and a gate just opened, this holds
+    /// When the tier auto-approves gates and a gate just opened, this holds
     /// the gate to auto-continue. The event loop picks it up right after
     /// `apply_engine_event` returns and fires `Action::Continue`.
     pub pending_auto_continue: Option<Gate>,
@@ -3752,7 +3739,6 @@ impl App {
             host_git_in_flight: false,
             auto_approve_override: None,
             trust_mode_override: None,
-            config_trust_cache: std::cell::Cell::new(None),
             trust_ledger: umadev_agent::TrustLedger::load(&project_root),
             backends: Vec::new(),
             backend_probe_generation: 0,
@@ -15700,9 +15686,11 @@ impl App {
     }
 
     /// Resolve the active trust tier: an explicit `/mode` (or `/auto` /
-    /// `/manual`) session override wins; otherwise derive from `.umadevrc`'s
-    /// `auto_approve_gates` (`true` → `auto`, `false` → `guarded`). The default
-    /// is `guarded` — the existing human-in-the-loop behaviour.
+    /// `/manual`, Shift+Tab) session override wins; otherwise `guarded`.
+    ///
+    /// Project configuration never selects the tier. `.umadevrc` travels with
+    /// the repository, so honouring it would let a cloned project start itself
+    /// in Auto; only the user raises the tier, one session at a time.
     #[must_use]
     pub fn effective_trust_mode(&self) -> umadev_agent::TrustMode {
         if let Some(m) = self.trust_mode_override {
@@ -15710,31 +15698,10 @@ impl App {
         }
         // Legacy binary override (set via `/auto` / `/manual` before any
         // `/mode`) still maps onto a tier for back-compat.
-        if let Some(auto) = self.auto_approve_override {
-            return if auto {
-                umadev_agent::TrustMode::Auto
-            } else {
-                umadev_agent::TrustMode::Guarded
-            };
+        match self.auto_approve_override {
+            Some(true) => umadev_agent::TrustMode::Auto,
+            Some(false) | None => umadev_agent::TrustMode::Guarded,
         }
-        // No session override → derive from `.umadevrc`, but serve it from the
-        // process-local cache so the render hot path never touches disk. The
-        // cache is invalidated whenever the config could have changed (see
-        // `invalidate_trust_cache`), so this stays correct. Fail-open: a read
-        // error inside `load_project_config` yields the default (`guarded`).
-        if let Some(cached) = self.config_trust_cache.get() {
-            return cached;
-        }
-        let config_auto = umadev_agent::config::load_project_config(&self.project_root)
-            .pipeline
-            .auto_approve_gates;
-        let mode = if config_auto {
-            umadev_agent::TrustMode::Auto
-        } else {
-            umadev_agent::TrustMode::Guarded
-        };
-        self.config_trust_cache.set(Some(mode));
-        mode
     }
 
     /// Codex sandbox a newly opened worker will actually request for the
@@ -15770,15 +15737,6 @@ impl App {
         (self.effective_trust_mode().is_downgrade_to(next)
             && (self.has_interruptible_work() || self.thinking))
             || self.codex_mode_change_requires_idle(next)
-    }
-
-    /// Drop the cached config-derived trust tier so the next
-    /// [`effective_trust_mode`] re-reads `.umadevrc`. Call after anything that
-    /// could change the on-disk `auto_approve_gates` (a `/mode` switch is held
-    /// in `trust_mode_override` and wins outright, but clearing here keeps the
-    /// cache honest if the override is later removed). Cheap and fail-open.
-    fn invalidate_trust_cache(&self) {
-        self.config_trust_cache.set(None);
     }
 
     /// Whether gates currently auto-approve (true) or pause for review (false).
@@ -16085,8 +16043,6 @@ impl App {
         let changed = self.effective_trust_mode() != mode;
         self.trust_mode_override = Some(mode);
         self.auto_approve_override = Some(mode.gates_auto_approve());
-        // Keep a future config-derived fallback honest if this override is cleared.
-        self.invalidate_trust_cache();
         if changed {
             // Native sessions retain launch permissions and a persisted vendor id
             // is authority-bound to that exact profile. Rebuild at the boundary

@@ -107,7 +107,7 @@
 "mode.auto_chip" = "auto-approve (shift+Tab for manual)"
 "mode.manual_chip" = "manual review (shift+Tab for auto)"
 "mode.plan_chip" = "plan · read-only requested (/mode to switch)"
-"mode.guarded_chip" = "guarded · review each gate (/mode to switch)"
+"mode.guarded_chip" = "guarded · review gates (/mode)"
 "mode.plan.on" = "[ok] Plan mode: on. UmaDev refuses explicit execution before any lock, branch, run state, artifact, or writer session. Normal conversation requests the base's strongest planning/read-only profile; actual filesystem enforcement, network access, and local-port access remain vendor/platform/policy specific and are unverified unless the base reports effective state. Switch to /mode guarded or /mode auto to execute."
 "mode.guarded.on" = "[ok] Guarded mode: on (default). UmaDev requests normal development access while every checkpoint pauses for your review; type c to approve, or text to revise. Actions touching .git / the network / destructive shell always require confirmation. The base's effective filesystem/network/local-port access may still be restricted by its platform or enterprise policy."
 "mode.auto.on" = "[ok] Autonomous mode: on. UmaDev requests full development access and auto-approves ordinary checkpoints. Only genuinely irreversible/destructive actions (rm -rf, force-push, .git rewrites, deploy/push/publish, credential exfiltration, writes outside the workspace) still ask for confirmation. Effective filesystem, network, and local-port access depend on the base, platform, inherited sandbox, and enterprise policy; a request is not proof of access. Governance hooks and the audit trail stay fully active."
@@ -782,7 +782,7 @@
 "deploy.starting" = "Starting deploy, running: `{}`\n  (this may require logging into the platform CLI; follow the prompts)"
 
 # /auto and /manual
-"review.auto_on" = "[ok] Autonomous mode: on. Doc and preview checkpoints auto-approve, delivering directly.\n  (to review step by step -> /manual · permanent setting -> auto_approve_gates in .umadevrc)"
+"review.auto_on" = "[ok] Autonomous mode: on. Doc and preview checkpoints auto-approve, delivering directly.\n  (to review step by step -> /manual · applies to this session; new sessions start guarded)"
 "review.manual_on" = "[ok] Review mode: on. Every checkpoint pauses, shows the output, and waits for you to type c to approve or text to revise.\n  (to go fully automatic -> /auto · clarifying questions always ask you first)"
 
 # /animations

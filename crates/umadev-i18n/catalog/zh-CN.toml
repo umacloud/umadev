@@ -772,7 +772,7 @@
 "deploy.starting" = "开始部署,执行:`{}`\n  (这可能需要登录平台 CLI,按提示操作)"
 
 # /auto and /manual
-"review.auto_on" = "[ok] 自主模式:已开启。文档与预览检查点将自动通过,直接交付。\n  (想逐步审核 -> /manual · 永久设置 -> .umadevrc 的 auto_approve_gates)"
+"review.auto_on" = "[ok] 自主模式:已开启。文档与预览检查点将自动通过,直接交付。\n  (想逐步审核 -> /manual · 只对本次会话有效,新会话默认逐门审核)"
 "review.manual_on" = "[ok] 审核模式:已开启。每个检查点都会停下,展示产出,等你输入 c 通过或打字修改。\n  (想全自动 -> /auto · 澄清问题始终会先问你)"
 
 # /animations

@@ -404,13 +404,12 @@ fn ensure_project_config(
     let body = format!(
         "# UmaDev project configuration\n\
          [quality]\nthreshold = {}\nskip_checks = []\n\n\
-         [pipeline]\nskip_phases = []\nmax_review_rounds = {}\nstrict_coverage = {}\nauto_approve_gates = {}\n\n\
+         [pipeline]\nskip_phases = []\nmax_review_rounds = {}\nstrict_coverage = {}\n\n\
          [knowledge]\nenabled = {}\nengine = {:?}\ntop_k = {}\n\n\
          [codex]\nsandbox_mode = {:?}\n",
         config.quality.threshold,
         config.pipeline.max_review_rounds,
         config.pipeline.strict_coverage,
-        config.pipeline.auto_approve_gates,
         config.knowledge.enabled,
         config.knowledge.engine,
         config.knowledge.top_k,

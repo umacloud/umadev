@@ -380,8 +380,8 @@ fn fresh_app(backend: Option<&str>) -> App {
         ..Default::default()
     };
     // PID + counter keeps the workspace unique across parallel test processes.
-    // The .umadevrc disables auto_approve_gates so
-    // gate-card tests see the manual-approval path. Remove any leftover dir
+    // The default tier is Guarded, so gate-card tests see the manual-approval
+    // path. Remove any leftover dir
     // from a PRIOR run first so a persisted `.umadev/chat/` (Wave 5) can't
     // bleed into a test that expects a clean conversation buffer.
     let workspace = std::env::temp_dir().join(format!("sd-test-ws-{pid}-{id}"));
@@ -389,7 +389,7 @@ fn fresh_app(backend: Option<&str>) -> App {
     let _ = std::fs::create_dir_all(&workspace);
     let _ = std::fs::write(
         workspace.join(".umadevrc"),
-        "[pipeline]\nauto_approve_gates = false\n",
+        "[pipeline]\nmax_review_rounds = 3\n",
     );
     let mut app = App::new(
         "demo",

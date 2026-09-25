@@ -818,7 +818,6 @@ skip_checks = []
 [pipeline]
 skip_phases = []
 max_review_rounds = 3
-auto_approve_gates = true
 
 [knowledge]
 enabled = true
@@ -826,7 +825,7 @@ engine = "hybrid"
 top_k = 6
 ```
 
-`umadev run` 與 `umadev quick` 的 CLI `--mode` 預設為 `guarded`。TUI 另會相容 `.umadevrc` 的 `pipeline.auto_approve_gates` 映射：目前產生的 `true` 對應 Auto 一般 gate，`false` 對應 Guarded；`/mode` 可修改當前檔位。這個舊設定不會移除不可逆操作確認；git merge/reset、刪除、部署與連網推送在任何檔位都要確認。
+`umadev run` 與 `umadev quick` 的 CLI `--mode` 預設為 `guarded`，TUI 的每個會話也都從 Guarded 開始。專案設定不能選擇檔位：`.umadevrc` 會隨儲存庫一起散佈，否則別人的儲存庫可以讓自己一開啟就是 Auto（舊的 `auto_approve_gates` 設定會被忽略）。按 Shift+Tab 或輸入 `/mode auto` 可把當前會話切換為 Auto。任何檔位都不會移除不可逆操作確認；git merge/reset、刪除、部署與連網推送都要確認。
 
 ---
 

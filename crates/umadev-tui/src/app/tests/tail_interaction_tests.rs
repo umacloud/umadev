@@ -2677,8 +2677,7 @@ fn notable_warning_still_shows_in_transcript() {
 
 #[test]
 fn default_trust_mode_is_guarded() {
-    // fresh_app writes `.umadevrc` with auto_approve_gates = false, so the
-    // default tier is the existing human-in-the-loop behaviour.
+    // With no session override the tier is the human-in-the-loop default.
     let a = fresh_app(Some("offline"));
     assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
     assert!(!a.auto_approve_on());
@@ -2729,38 +2728,21 @@ fn shift_tab_toggles_guarded_auto_and_never_enters_read_only_plan() {
 }
 
 #[test]
-fn config_trust_mode_is_cached_not_re_read_per_call() {
-    // P2-B: `effective_trust_mode` runs in the render hot path (~12/s). It
-    // must NOT `load_project_config` (a disk read) on every call. Proof: the
-    // first call memoises `Guarded`; rewriting `.umadevrc` to auto ON DISK is
-    // then IGNORED (cache still serves `Guarded`) — i.e. no per-call read.
-    // Only after an explicit invalidation does it pick up the new value.
-    let a = fresh_app(Some("offline"));
-    assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
-
-    // Flip the on-disk config behind the running app's back.
+fn project_config_never_selects_auto() {
+    // `.umadevrc` travels with the repository. The old
+    // `auto_approve_gates = true` let a cloned project start itself in Auto;
+    // it is now ignored, and only the user raises the tier.
+    let mut a = fresh_app(Some("offline"));
     std::fs::write(
         a.project_root.join(".umadevrc"),
         "[pipeline]\nauto_approve_gates = true\n",
     )
     .unwrap();
+    assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Guarded);
+    assert!(!a.auto_approve_on());
 
-    // No session override is set, so without a cache this would re-read disk
-    // and flip to Auto. The cache means it stays Guarded — that is the proof
-    // the hot path no longer touches the filesystem.
-    assert_eq!(
-        a.effective_trust_mode(),
-        umadev_agent::TrustMode::Guarded,
-        "config-derived tier must come from the process cache, not a fresh disk read"
-    );
-
-    // After an explicit invalidation, the next call re-reads and sees Auto.
-    a.invalidate_trust_cache();
-    assert_eq!(
-        a.effective_trust_mode(),
-        umadev_agent::TrustMode::Auto,
-        "invalidation must let the next call pick up the new on-disk config"
-    );
+    a.set_trust_mode(umadev_agent::TrustMode::Auto);
+    assert_eq!(a.effective_trust_mode(), umadev_agent::TrustMode::Auto);
 }
 
 #[test]
