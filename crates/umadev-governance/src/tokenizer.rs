@@ -113,7 +113,9 @@ impl Tokenized {
                 i += 1;
                 while i < n {
                     if bytes[i] == '\\' {
-                        i += 2; // skip escaped char
+                        // Skip the escaped char; a trailing `\` at EOF must not
+                        // step past the end (the span end indexes `byte_offsets`).
+                        i = (i + 2).min(n);
                         continue;
                     }
                     if bytes[i] == quote {
@@ -430,6 +432,21 @@ mod tests {
         let t = Tokenized::new(src);
         // Must not loop forever or panic.
         let _ = t.without_comments(src);
+    }
+
+    #[test]
+    fn tokenizer_trailing_backslash_in_open_string_does_not_panic() {
+        // A file whose LAST char is a backslash while the lexer is inside an
+        // unterminated quote (an apostrophe in JSX text opens a "string" that
+        // runs to EOF) used to step the cursor past the end and index out of
+        // bounds when the spans were translated to byte offsets.
+        for src in ["a = '\\", "<p>Don't</p>\nx \\", "const s = \"\\", "`\\"] {
+            let t = Tokenized::new(src);
+            assert_eq!(t.without_comments(src), src, "{src:?}");
+            let _ = t.jsx_text(src);
+        }
+        // The design scan tokenizes UI files without a panic guard of its own.
+        let _ = crate::design::scan_design_quality("src/App.tsx", "<p>Don't</p>\nx \\");
     }
 
     #[test]
