@@ -431,8 +431,8 @@ const EVENT_CHANNEL_CAP: usize = 256;
 
 /// Sender half for translated session events. **Bounded** (see
 /// [`EVENT_CHANNEL_CAP`]); the reader task multiplexes JSON-RPC RESPONSES and
-/// events on one stdout loop. Text and live-output presentation deltas use
-/// non-blocking `try_send`; tool facts, control transitions, and terminal state
+/// events on one stdout loop. Live-output presentation deltas use non-blocking
+/// `try_send`; answer text, tool facts, control transitions, and terminal state
 /// await bounded-channel delivery. Pending RPC waiters are always released before
 /// the terminal EOF event is awaited, preserving the no-deadlock invariant.
 type EventTx = mpsc::Sender<SessionEvent>;
@@ -2492,7 +2492,7 @@ async fn handle_notification(
         // Only the main thread may write into the main transcript. Native Codex
         // sub-agent deltas carry their own `threadId` on the same stream.
         "item/agentMessage/delta" if main && active_turn => {
-            emit_text_delta(&params, context.event_tx);
+            emit_text_delta(&params, context.event_tx).await;
         }
         // Process-log visibility (opt-in): a long-running command's lifecycle.
         // codex emits `item/started` when the command BEGINS and streams its captured
@@ -2730,14 +2730,16 @@ async fn remember_item_target(item: &Value, item_targets: &ItemTargetMap) {
 }
 
 /// Emit a [`SessionEvent::TextDelta`] from an `item/agentMessage/delta` payload.
-fn emit_text_delta(params: &Value, event_tx: &EventTx) {
+///
+/// Awaits bounded-channel delivery like the other critical events: the deltas
+/// ARE the answer (replies and JSON verdicts are assembled from them), so a
+/// full queue must backpressure the reader rather than drop text.
+async fn emit_text_delta(params: &Value, event_tx: &EventTx) {
     let Some(delta) = params.get("delta").and_then(Value::as_str) else {
         return;
     };
     if !delta.is_empty() {
-        let _ = event_tx.try_send(crate::redaction::sanitize_session_event(
-            SessionEvent::TextDelta(delta.to_string()),
-        ));
+        let _ = emit_critical_event(event_tx, SessionEvent::TextDelta(delta.to_string())).await;
     }
 }
 
@@ -4928,10 +4930,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_deltas_survive_a_slow_consumer() {
+        // `TextDelta` IS the answer (the agent builds replies and JSON verdicts
+        // from it), so a full queue must backpressure, never drop a delta.
+        let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let total = EVENT_CHANNEL_CAP + 10;
+        let producer = tokio::spawn(async move {
+            for index in 0..total {
+                emit_text_delta(&json!({"delta": format!("d{index};")}), &event_tx).await;
+            }
+        });
+        let mut received = String::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("a slow consumer must keep receiving deltas")
+        {
+            if let SessionEvent::TextDelta(delta) = event {
+                received.push_str(&delta);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        producer.await.expect("producer task should not panic");
+        let expected = (0..total).fold(String::new(), |mut expected, index| {
+            std::fmt::Write::write_fmt(&mut expected, format_args!("d{index};")).unwrap();
+            expected
+        });
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
     async fn critical_events_survive_a_slow_consumer_after_a_large_display_burst() {
         let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
         for index in 0..(EVENT_CHANNEL_CAP + 64) {
-            emit_text_delta(&json!({"delta":format!("decorative-{index}")}), &event_tx);
+            emit_output_delta(&json!({"delta":format!("decorative-{index}")}), &event_tx);
         }
 
         let producer = tokio::spawn(async move {
@@ -6791,7 +6822,7 @@ done
     async fn native_events_redact_before_transcript_tool_activity_and_audit() {
         const SECRET: &str = "SYNTH_CODEX_SESSION_SECRET_82";
         let (tx, mut rx) = chan();
-        emit_text_delta(&json!({"delta": format!("password={SECRET}")}), &tx);
+        emit_text_delta(&json!({"delta": format!("password={SECRET}")}), &tx).await;
         emit_item(
             &json!({
                 "id": "item-secret",
