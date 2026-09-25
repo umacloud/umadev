@@ -36,6 +36,13 @@ pub(super) fn parse_run_command(
                 project_root.join(dir)
             };
             let rest = rest.trim();
+            if needs_shell(rest) {
+                // A further `&&` chain, env assignment, quoting, or redirect is
+                // shell syntax: run it verbatim through the platform shell in
+                // the `cd` directory rather than splitting it into argv.
+                let (shell, shell_args) = platform_shell(rest);
+                return (resolved, shell, shell_args);
+            }
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if let Some((prog, args)) = parts.split_first() {
                 // Route the bare program through `spawn_parts` (resolves the real
@@ -49,28 +56,59 @@ pub(super) fn parse_run_command(
     }
     // Fallback: shell out via `cmd /c` (Windows) / `sh -c` (Unix) in the
     // workspace root, so the whole multi-token command runs as written.
+    let (shell, shell_args) = platform_shell(command);
+    (project_root.to_path_buf(), shell, shell_args)
+}
+
+/// `cmd /c <command>` on Windows (which has no `sh`), `sh -c <command>` elsewhere.
+fn platform_shell(command: &str) -> (String, Vec<String>) {
     let (shell, shell_arg) = if cfg!(windows) {
         ("cmd", "/c")
     } else {
         ("sh", "-c")
     };
     (
-        project_root.to_path_buf(),
         shell.to_string(),
         vec![shell_arg.to_string(), command.to_string()],
     )
+}
+
+/// Whether `command` uses shell syntax that whitespace splitting would mangle:
+/// operators, redirects, quoting, expansions, or a leading `NAME=value`
+/// environment assignment.
+fn needs_shell(command: &str) -> bool {
+    command.contains([
+        '&', '|', ';', '<', '>', '(', ')', '$', '`', '\'', '"', '\\', '*', '?', '\n',
+    ]) || command
+        .split_whitespace()
+        .next()
+        .is_some_and(|program| program.contains('='))
 }
 
 /// Extract the host:port from a `http://host:port/...` URL, returning None
 /// when parsing fails. Used by [`wait_for_port`] so we only open the browser
 /// after the dev server is actually accepting connections — not 0ms after
 /// spawn, when Vite is still compiling and the page would 404.
+/// A missing port defaults by scheme (80/443); `[ipv6]` hosts keep brackets.
 pub(super) fn url_host_port(url: &str) -> Option<String> {
-    let after_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let host_port = after_scheme.split('/').next()?;
-    Some(host_port.to_string())
+    let (after_scheme, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, 80)
+    } else {
+        (url.strip_prefix("https://")?, 443)
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?;
+    let (host, port) = match authority.rfind(':') {
+        Some(colon) if !authority[colon..].contains(']') => (
+            &authority[..colon],
+            authority[colon + 1..].parse::<u16>().ok()?,
+        ),
+        _ => (authority, default_port),
+    };
+    (!host.is_empty()).then(|| format!("{host}:{port}"))
 }
 
 /// Poll a `host:port` with a TCP connect until it succeeds or `timeout`

@@ -2061,6 +2061,41 @@ const PRE_COMMIT_END_MARKER: &str = "# end umadev pre-commit governance hook";
 /// script that bailed early silence UmaDev entirely — governance that never
 /// runs is worse than no promise of it.
 fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
+    let bin = std::env::current_exe().map_or_else(
+        |_| "umadev".to_string(),
+        |p| p.to_string_lossy().to_string(),
+    );
+    install_pre_commit_hook_with_bin(project_root, &bin)
+}
+
+/// Quote `value` as one POSIX-shell word. The binary path comes from
+/// `current_exe()`, so it can hold spaces (`/Users/Jane Doe/...`) or Windows
+/// backslashes; unquoted, `sh` would split or unescape it and the hook would
+/// fail with "not found" on every commit.
+fn sh_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Whether a hook's shebang runs a POSIX-compatible shell, so our block (shell
+/// syntax) can be spliced into it. A `python3`/`node` hook would hit a syntax
+/// error on our line and then block every commit.
+fn shebang_is_posix_shell(shebang: &str) -> bool {
+    const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "busybox"];
+    let mut words = shebang.trim_start_matches("#!").split_whitespace();
+    let Some(interpreter) = words.next() else {
+        return false;
+    };
+    let name = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
+    let mut program = name(interpreter);
+    if program == "env" {
+        program = words
+            .find(|word| !word.starts_with('-'))
+            .map_or_else(String::new, name);
+    }
+    SHELLS.contains(&program.as_str())
+}
+
+fn install_pre_commit_hook_with_bin(project_root: &Path, bin: &str) -> Result<PathBuf> {
     let git_dir = project_root.join(".git");
     if !git_dir.exists() {
         anyhow::bail!(
@@ -2071,26 +2106,31 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
     let hooks_dir = git_dir.join("hooks");
     std::fs::create_dir_all(&hooks_dir)?;
     let hook_path = hooks_dir.join("pre-commit");
-    let bin = std::env::current_exe().map_or_else(
-        |_| "umadev".to_string(),
-        |p| p.to_string_lossy().to_string(),
-    );
-    // If the hook exists and already has our marker, it's idempotent.
-    if let Ok(existing) = managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
-        if existing.contains(PRE_COMMIT_MARKER) {
-            return Ok(hook_path);
-        }
-    }
+    // `|| exit $?` is load-bearing: a shell script's status is its LAST
+    // command's, so without it a user hook below our block would swallow a
+    // governance failure and let the commit through.
     let our_block = format!(
         "{marker}\n\
          # Runs `umadev ci --changed-only` on staged files before commit.\n\
          # A governance violation aborts the commit. Remove with:\n\
          #   umadev uninstall --host pre-commit\n\
-         {bin} ci --changed-only\n\
+         {bin} ci --changed-only || exit $?\n\
          {end}\n",
         marker = PRE_COMMIT_MARKER,
+        bin = sh_single_quote(bin),
         end = PRE_COMMIT_END_MARKER,
     );
+    if let Ok(existing) = managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
+        // Already current: idempotent no-op.
+        if existing.contains(&our_block) {
+            return Ok(hook_path);
+        }
+        // An older UmaDev block (unquoted path, no `|| exit $?`): replace it so
+        // re-running install repairs hooks written by earlier versions.
+        if existing.contains(PRE_COMMIT_MARKER) {
+            uninstall_pre_commit_hook(project_root)?;
+        }
+    }
     // Preserve a pre-existing user hook but run our check FIRST. If the file has
     // a shebang, insert our block immediately after it (keeping the user's
     // interpreter line); otherwise prepend a fresh shebang + our block above the
@@ -2100,6 +2140,14 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
     let script = match managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
         Ok(existing) if existing.starts_with("#!") => {
             let (shebang, body) = existing.split_once('\n').unwrap_or((existing.as_str(), ""));
+            if !shebang_is_posix_shell(shebang) {
+                anyhow::bail!(
+                    "{} is not a shell script ({}); add `{} ci --changed-only` to it by hand",
+                    hook_path.display(),
+                    shebang.trim(),
+                    sh_single_quote(bin),
+                );
+            }
             format!("{shebang}\n{our_block}\n{body}")
         }
         Ok(existing) => format!("#!/bin/sh\n{our_block}\n{existing}"),
@@ -5570,18 +5618,18 @@ fn cmd_rollback(timestamp: String, project_root: Option<PathBuf>) -> Result<()> 
             ),
         }
     } else {
-        // Allow partial match (e.g. user passes 20260614T12 to match 20260614T120000.123).
-        let matches: Vec<&String> = snaps.iter().filter(|s| s.starts_with(&timestamp)).collect();
-        match matches.len() {
+        if timestamp.trim().is_empty() {
+            anyhow::bail!("no snapshot id given — run `umadev history` to list them");
+        }
+        match match_snapshot(&snaps, &timestamp) {
             // Not a workflow snapshot — it may be a FILE checkpoint from the shadow repo
             // (a run baseline, a phase rewind point, or the rescue snapshot the workspace
             // heal just handed the user by id).
-            0 => return rollback_file_checkpoint(&project_root, &timestamp),
-            1 => matches[0].clone(),
-            _ => anyhow::bail!(
-                "`{timestamp}` is ambiguous ({} matches). Use more digits.",
-                matches.len()
-            ),
+            SnapshotMatch::None => return rollback_file_checkpoint(&project_root, &timestamp),
+            SnapshotMatch::One(target) => target.clone(),
+            SnapshotMatch::Ambiguous(count) => {
+                anyhow::bail!("`{timestamp}` is ambiguous ({count} matches). Use more digits.")
+            }
         }
     };
     let before = read_workflow_state(&project_root).map_or("none".to_string(), |s| s.phase);
@@ -5593,6 +5641,31 @@ fn cmd_rollback(timestamp: String, project_root: Option<PathBuf>) -> Result<()> 
     println!("      The pipeline now resumes from phase `{after}` on the next `umadev continue`.");
     println!("      To restore FILES, roll back to a file checkpoint: `umadev history`.");
     Ok(())
+}
+
+/// How a user-typed id resolves against the workflow snapshot names.
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotMatch<'a> {
+    None,
+    One(&'a String),
+    Ambiguous(usize),
+}
+
+/// Resolve `id` to one snapshot. A prefix is accepted (`20260614T12` finds
+/// `20260614T120000.123`), but an EXACT name always wins: chrono's `%.f` prints
+/// 0/3/6/9 fraction digits, so one real snapshot name can be a prefix of
+/// another (`…T120000.123` vs `…T120000.123456`), and typing the full id must
+/// never be "ambiguous".
+fn match_snapshot<'a>(snaps: &'a [String], id: &str) -> SnapshotMatch<'a> {
+    if let Some(exact) = snaps.iter().find(|snap| *snap == id) {
+        return SnapshotMatch::One(exact);
+    }
+    let mut matches = snaps.iter().filter(|snap| snap.starts_with(id));
+    match (matches.next(), matches.count()) {
+        (None, _) => SnapshotMatch::None,
+        (Some(only), 0) => SnapshotMatch::One(only),
+        (Some(_), rest) => SnapshotMatch::Ambiguous(rest + 1),
+    }
 }
 
 /// Restore the SOURCE TREE to a shadow-repo file checkpoint — the second half of
@@ -7237,6 +7310,50 @@ mod tests {
     }
 
     #[test]
+    fn rollback_id_prefers_an_exact_snapshot_over_longer_prefix_matches() {
+        let snaps = vec![
+            "20260614T120000.123456".to_string(),
+            "20260614T120000.123".to_string(),
+            "20260614T130000".to_string(),
+        ];
+        assert_eq!(
+            match_snapshot(&snaps, "20260614T120000.123"),
+            SnapshotMatch::One(&snaps[1])
+        );
+        assert_eq!(
+            match_snapshot(&snaps, "20260614T13"),
+            SnapshotMatch::One(&snaps[2])
+        );
+        assert_eq!(
+            match_snapshot(&snaps, "20260614T12"),
+            SnapshotMatch::Ambiguous(2)
+        );
+        assert_eq!(match_snapshot(&snaps, "2027"), SnapshotMatch::None);
+    }
+
+    #[test]
+    fn rollback_rejects_an_empty_id_instead_of_matching_every_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        umadev_agent::write_workflow_state(root, &WorkflowState::new(umadev_spec::Phase::Frontend))
+            .unwrap();
+        umadev_agent::write_workflow_state(root, &WorkflowState::new(umadev_spec::Phase::Delivery))
+            .unwrap();
+        assert_eq!(
+            list_snapshots(root).len(),
+            1,
+            "precondition: exactly one snapshot"
+        );
+
+        assert!(cmd_rollback(String::new(), Some(root.to_path_buf())).is_err());
+        assert_eq!(
+            read_workflow_state(root).map(|s| s.phase).as_deref(),
+            Some("delivery"),
+            "an empty id must not restore the only snapshot"
+        );
+    }
+
+    #[test]
     fn the_pre_commit_gate_heals_the_tree_before_it_judges_it() {
         // `umadev ci` is what `.git/hooks/pre-commit` runs, and it was the ONE workspace verb
         // that skipped `resolve_root` (it took the bare cwd). So the gate could scan — and
@@ -7410,6 +7527,124 @@ mod tests {
 
         assert!(uninstall_pre_commit_hook(root).is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+    }
+
+    /// Run a hook script with `sh` and return its exit code.
+    #[cfg(unix)]
+    fn run_hook(path: &Path) -> i32 {
+        std::process::Command::new("sh")
+            .arg(path)
+            .status()
+            .expect("sh runs")
+            .code()
+            .expect("exit code")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_commit_hook_failure_is_not_swallowed_by_a_user_hook_below_it() {
+        // A shell script exits with its LAST command's status, so a user hook
+        // that succeeds after our block used to hide a governance failure.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook_path = hooks.join("pre-commit");
+        std::fs::write(&hook_path, "#!/bin/sh\ntrue\n").unwrap();
+        // `false` stands in for a `umadev ci` run that finds a violation.
+        install_pre_commit_hook_with_bin(root, "false").unwrap();
+
+        assert_ne!(
+            run_hook(&hook_path),
+            0,
+            "a failed check must abort the commit"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_commit_hook_quotes_a_binary_path_with_spaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let bin_dir = root.join("Jane Doe's bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join("umadev");
+        let ran = root.join("ran");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho \"$@\" > '{}'\n", ran.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hook_path = install_pre_commit_hook_with_bin(root, bin.to_str().unwrap()).unwrap();
+
+        assert_eq!(run_hook(&hook_path), 0);
+        assert_eq!(std::fs::read_to_string(ran).unwrap(), "ci --changed-only\n");
+    }
+
+    #[test]
+    fn pre_commit_install_refuses_to_splice_into_a_non_shell_hook() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook_path = hooks.join("pre-commit");
+        let original = "#!/usr/bin/env python3\nprint('checks')\n";
+        std::fs::write(&hook_path, original).unwrap();
+
+        assert!(install_pre_commit_hook_with_bin(root, "umadev").is_err());
+        assert_eq!(std::fs::read_to_string(&hook_path).unwrap(), original);
+    }
+
+    #[test]
+    fn pre_commit_install_upgrades_a_block_from_an_older_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook_path = hooks.join("pre-commit");
+        std::fs::write(
+            &hook_path,
+            format!(
+                "#!/bin/sh\n{PRE_COMMIT_MARKER}\n/old/umadev ci --changed-only\n\
+                 {PRE_COMMIT_END_MARKER}\n\nnpm test\n"
+            ),
+        )
+        .unwrap();
+
+        install_pre_commit_hook_with_bin(root, "/new/umadev").unwrap();
+
+        let body = std::fs::read_to_string(&hook_path).unwrap();
+        assert_eq!(body.matches(PRE_COMMIT_MARKER).count(), 1, "{body}");
+        assert!(!body.contains("/old/umadev"), "{body}");
+        assert!(
+            body.contains("'/new/umadev' ci --changed-only || exit $?"),
+            "{body}"
+        );
+        assert!(body.contains("npm test"), "user hook kept: {body}");
+    }
+
+    #[test]
+    fn shebang_detection_accepts_shells_and_rejects_other_interpreters() {
+        for shell in [
+            "#!/bin/sh",
+            "#!/bin/bash -e",
+            "#!/usr/bin/env bash",
+            "#!/usr/bin/env -S zsh",
+        ] {
+            assert!(shebang_is_posix_shell(shell), "{shell}");
+        }
+        for other in [
+            "#!/usr/bin/env python3",
+            "#!/usr/bin/node",
+            "#!",
+            "#!/usr/bin/env",
+        ] {
+            assert!(!shebang_is_posix_shell(other), "{other}");
+        }
     }
 
     #[test]

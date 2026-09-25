@@ -30,7 +30,7 @@ use umadev_spec::Phase;
 
 mod operational_review;
 mod quality_evidence;
-mod resume;
+pub(crate) mod resume;
 mod review_checkpoint;
 mod review_liveness;
 mod step_metrics;

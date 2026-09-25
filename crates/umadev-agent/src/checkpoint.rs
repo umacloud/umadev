@@ -754,7 +754,12 @@ const DISPLAY_CHECKPOINTS: usize = 50;
 /// So: widen the window until 50 user checkpoints are found or the history is exhausted.
 /// Bounded (at most three `git log` calls, and only on a history deep enough to need
 /// them) — a run that never reaches the first window pays exactly what it paid before.
-const CHECKPOINT_SCAN_WINDOWS: &[usize] = &[200, 1_000, 5_000];
+const CHECKPOINT_SCAN_WINDOWS: &[usize] = &[200, 1_000, KNOWN_CHECKPOINT_WINDOW];
+
+/// History depth every id-validating / baseline lookup scans. It must equal the
+/// picker's widest scan window: anything [`list_checkpoints`] can show has to be
+/// restorable, or `/rewind` offers a checkpoint that restore rejects as unknown.
+const KNOWN_CHECKPOINT_WINDOW: usize = 5_000;
 
 /// A shadow-repo history read is attempted this many times before it is reported
 /// as unreadable. The read can transiently fail under load — a brief index lock, a
@@ -1276,7 +1281,7 @@ pub fn restore_checkpoint(project_root: &Path, id: &str) -> Result<(), String> {
     // checkpoints, and a user must still be able to rewind to an older valid one (the display
     // cap is cosmetic, not a security boundary - the id must still be a real UmaDev-reachable
     // commit, just not necessarily in the newest 50).
-    let known = list_checkpoints_limited(project_root, 1000);
+    let known = list_checkpoints_limited(project_root, KNOWN_CHECKPOINT_WINDOW);
     let Some(target) = resolve_checkpoint_id(id, &known) else {
         return Err(umadev_i18n::tlf("checkpoint.unknown_id", &[id]));
     };
@@ -1342,7 +1347,7 @@ pub fn run_baseline(project_root: &Path) -> Option<Checkpoint> {
     // snapshots (red→green pre-states, temp-rewind heads) between the baseline and
     // HEAD, and the baseline must stay findable behind all of them — the run diff, the
     // scope floor, and `rollback` all hang off it.
-    list_checkpoints_limited(project_root, 1000)
+    list_checkpoints_limited(project_root, KNOWN_CHECKPOINT_WINDOW)
         .into_iter()
         .find(|c| c.label.starts_with(RUN_BASELINE_PREFIX))
 }
@@ -1800,7 +1805,10 @@ pub fn clear_temp_rewind_state(project_root: &Path, dry_run: bool) -> TempRewind
     };
     let recoverable = !head.is_empty()
         && has_checkpoints(project_root)
-        && id_is_known_checkpoint(&head, &list_checkpoints_limited(project_root, 1000));
+        && id_is_known_checkpoint(
+            &head,
+            &list_checkpoints_limited(project_root, KNOWN_CHECKPOINT_WINDOW),
+        );
     if recoverable {
         return TempRewindState::Recoverable { head };
     }
@@ -2088,7 +2096,10 @@ pub fn recover_abandoned_temp_rewind(project_root: &Path) -> Option<String> {
     // no explanation, and a `rollback` that moves the wrong way. So neither path is
     // silent — each warns and hands the caller a note to SURFACE.
     let head_is_known = has_checkpoints(project_root)
-        && id_is_known_checkpoint(&marker.head, &list_checkpoints_limited(project_root, 1000));
+        && id_is_known_checkpoint(
+            &marker.head,
+            &list_checkpoints_limited(project_root, KNOWN_CHECKPOINT_WINDOW),
+        );
     if !head_is_known {
         tracing::warn!(
             head = %marker.head,
@@ -2265,7 +2276,7 @@ pub fn begin_temp_rewind(project_root: &Path, to: &str) -> Option<TempRewind> {
     if !has_checkpoints(project_root) {
         return None;
     }
-    let known = list_checkpoints_limited(project_root, 1000);
+    let known = list_checkpoints_limited(project_root, KNOWN_CHECKPOINT_WINDOW);
     // RESOLVE, don't merely validate — and rewind to the RESOLVED commit below. The same
     // reason `restore_checkpoint` does: a bool guard followed by a reset to the caller's raw
     // string lets any revision EXPRESSION built on a known checkpoint (`<known>^`, `<known>~1`)
@@ -2952,6 +2963,64 @@ mod tests {
         assert!(
             second.starts_with(&target.id) || target.id.starts_with(&second) || second == target.id
         );
+    }
+
+    /// Stack `count` internal-machinery commits on the shadow HEAD in one
+    /// `fast-import`, dated after "now" so they sort ahead of real checkpoints.
+    fn bury_under_internal_commits(root: &Path, count: u64) {
+        let head = git(root, &["rev-parse", "HEAD"]).expect("rev-parse");
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let branch = git(root, &["symbolic-ref", "HEAD"]).expect("symbolic-ref");
+        let branch = String::from_utf8_lossy(&branch.stdout).trim().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut stream = String::new();
+        for i in 1..=count {
+            let msg = format!("{RED_GREEN_PRE_PREFIX}{i}");
+            stream.push_str(&format!(
+                "commit {branch}\ncommitter t <t@t> {} +0000\ndata {}\n{msg}\n",
+                now + i,
+                msg.len()
+            ));
+            if i == 1 {
+                stream.push_str(&format!("from {head}\n"));
+            }
+            stream.push('\n');
+        }
+        let mut child = Command::new("git")
+            .arg("--git-dir")
+            .arg(git_dir(root))
+            .args(["fast-import", "--quiet"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("fast-import");
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), stream.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn a_listed_checkpoint_behind_deep_internal_history_is_restorable() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::TempDir::new().expect("tmp");
+        let root = tmp.path();
+        std::fs::write(root.join("f.txt"), "1").unwrap();
+        let _ = create_run_baseline(root, "deep-run").expect("baseline");
+        bury_under_internal_commits(root, 1_100);
+        let listed = list_checkpoints(root);
+        let baseline = listed
+            .iter()
+            .find(|c| c.label.starts_with(RUN_BASELINE_PREFIX))
+            .expect("the picker widens its scan to show the buried baseline");
+        assert_eq!(
+            run_baseline(root).map(|c| c.id),
+            Some(baseline.id.clone()),
+            "run_baseline must see what the picker shows"
+        );
+        restore_checkpoint(root, &baseline.id).expect("a listed checkpoint must be restorable");
     }
 
     #[test]

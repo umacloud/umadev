@@ -354,14 +354,60 @@ fn read_project_config(project_root: &Path) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-/// Read `.umadevrc` from the project root. Returns `Default` if missing
-/// or malformed (fail-soft, same as UserConfig).
+/// Deserialize one top-level `.umadevrc` section independently, so a type
+/// error in it falls back to that section's defaults (with a warning) instead
+/// of discarding every other section. `None` means the section was present but
+/// invalid; an absent section is its `Default`.
+fn parse_section<T: Default + serde::de::DeserializeOwned>(
+    table: &toml::Table,
+    name: &str,
+) -> Option<T> {
+    let Some(value) = table.get(name) else {
+        return Some(T::default());
+    };
+    match value.clone().try_into() {
+        Ok(section) => Some(section),
+        Err(error) => {
+            tracing::warn!(".umadevrc [{name}] is invalid ({error}) — using its defaults");
+            None
+        }
+    }
+}
+
+/// Read `.umadevrc` from the project root. Returns `Default` if missing.
+/// Malformed input is fail-soft but never widens access: each section is
+/// parsed independently (an invalid one falls back to its defaults), and when
+/// the file is not valid TOML at all — or `[codex]` itself is invalid — the
+/// sandbox resolves to the restricted `workspace-write` tier, because a
+/// restriction the user wrote may be hiding in the unreadable part.
 #[must_use]
 pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     let Ok(body) = read_project_config(project_root) else {
         return ProjectConfig::default();
     };
-    let mut cfg: ProjectConfig = toml::from_str(&body).unwrap_or_default();
+    let restricted = || CodexConfig {
+        sandbox_mode: CodexSandbox::WorkspaceWrite.as_codex_arg().to_string(),
+    };
+    let mut cfg = match body.parse::<toml::Table>() {
+        Ok(table) => ProjectConfig {
+            quality: parse_section(&table, "quality").unwrap_or_default(),
+            pipeline: parse_section(&table, "pipeline").unwrap_or_default(),
+            experts: parse_section(&table, "experts").unwrap_or_default(),
+            knowledge: parse_section(&table, "knowledge").unwrap_or_default(),
+            model: parse_section(&table, "model").unwrap_or_default(),
+            codex: parse_section(&table, "codex").unwrap_or_else(restricted),
+        },
+        Err(error) => {
+            tracing::warn!(
+                ".umadevrc is not valid TOML ({error}) — using defaults with the Codex \
+                 sandbox restricted to workspace-write"
+            );
+            ProjectConfig {
+                codex: restricted(),
+                ..ProjectConfig::default()
+            }
+        }
+    };
     // Validate the knowledge engine: only "bm25" and "hybrid" are legal.
     // Unknown values (e.g. "quantum") silently fall back to "bm25" so a
     // typo never breaks retrieval.
@@ -873,5 +919,48 @@ mod tests {
         .unwrap();
         persist_codex_sandbox(explicitly_saved.path(), CodexSandbox::WorkspaceWrite).unwrap();
         assert!(!migrate_legacy_generated_codex_sandbox(explicitly_saved.path()).unwrap());
+    }
+
+    #[test]
+    fn type_error_in_one_section_keeps_the_others() {
+        // A float threshold is a type error in `[quality]` only; it must not
+        // discard `[codex]` and silently widen a read-only sandbox to full access.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"read-only\"\n\n[quality]\nthreshold = 95.5\n\n\
+             [pipeline]\nmax_review_rounds = 2\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::ReadOnly);
+        assert_eq!(cfg.pipeline.max_review_rounds, 2);
+        assert_eq!(
+            cfg.quality.threshold, 90,
+            "the bad section falls back to its default"
+        );
+    }
+
+    #[test]
+    fn unparseable_config_never_widens_the_sandbox() {
+        // A syntax error hides whether a restriction was configured, so the
+        // sandbox resolves to the restricted tier instead of the full-access default.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"read-only\"\n[quality\nthreshold = 80\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
+        assert_eq!(cfg.quality.threshold, 90);
+    }
+
+    #[test]
+    fn invalid_codex_section_restricts_the_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".umadevrc"), "[codex]\nsandbox_mode = 1\n").unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
     }
 }

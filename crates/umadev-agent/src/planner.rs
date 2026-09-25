@@ -1093,12 +1093,17 @@ fn any_source_has_server_surface(project_root: &std::path::Path) -> bool {
     // detector indirectly by scanning a benign HTML-shaped probe per file is not
     // possible from here, so we read each file and look for the same evidence the
     // kernel uses, via the public lenient/strict differential.
-    let files = crate::acceptance::source_files(project_root);
+    let scan = crate::acceptance::source_scan(project_root);
+    if scan.incomplete {
+        // Files the bounded scan never reached could carry a server surface, so
+        // "none found" is not evidence of a static frontend: choose strict.
+        return true;
+    }
     let mut budget = crate::bounded_fs::Utf8ReadBudget::new(
         MAX_PLANNER_SOURCE_TOTAL_BYTES,
         MAX_PLANNER_DOC_BYTES,
     );
-    for f in files.iter().take(400) {
+    for f in &scan.files {
         let Ok(content) = budget.read_utf8_beneath(project_root, f) else {
             // This predicate controls whether strict server-surface governance
             // is armed. Unavailable evidence must choose the strict direction.
@@ -1852,6 +1857,24 @@ mod tests {
             ctx.static_frontend_only,
             "a proven static frontend should get the lenient context"
         );
+    }
+
+    #[test]
+    fn server_surface_is_assumed_when_the_source_scan_is_incomplete() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("app.js"), "document.title = 'todo';\n").unwrap();
+        assert!(!any_source_has_server_surface(tmp.path()));
+        // More static files than the scan will ever collect: the unscanned rest
+        // could hold a server, so "no server surface" cannot be concluded.
+        for i in 0..crate::acceptance::MAX_SOURCE_FILES {
+            std::fs::write(
+                tmp.path().join(format!("page{i}.js")),
+                "document.title = 'todo';\n",
+            )
+            .unwrap();
+        }
+        assert!(crate::acceptance::source_scan(tmp.path()).incomplete);
+        assert!(any_source_has_server_surface(tmp.path()));
     }
 
     #[test]

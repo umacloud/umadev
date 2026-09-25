@@ -6115,11 +6115,11 @@ async fn remember_interaction_owner(
 async fn emit_event(event_tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
     match event {
         // High-volume presentation deltas are intentionally lossy. Every other
-        // event carries session, tool, approval, lifecycle, or terminal state and
-        // therefore must apply bounded backpressure instead of disappearing when
-        // the 256-slot queue is full.
-        SessionEvent::TextDelta(_)
-        | SessionEvent::ThinkingDelta(_)
+        // event — including `TextDelta`, which IS the answer the agent builds
+        // replies and verdicts from — carries state and therefore must apply
+        // bounded backpressure instead of disappearing when the 256-slot queue
+        // is full.
+        SessionEvent::ThinkingDelta(_)
         | SessionEvent::ToolOutputDelta(_)
         | SessionEvent::ToolOutputDeltaCorrelated { .. } => {
             let _ = event_tx.try_send(event);
@@ -12661,12 +12661,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_deltas_survive_a_slow_consumer() {
+        // `TextDelta` IS the answer (the agent builds replies and JSON verdicts
+        // from it), so a full queue must backpressure, never drop a delta.
+        let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let total = EVENT_CHANNEL_CAP + 10;
+        let producer = tokio::spawn(async move {
+            for index in 0..total {
+                emit_event(&event_tx, SessionEvent::TextDelta(format!("d{index};"))).await;
+            }
+        });
+        let mut received = String::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("a slow consumer must keep receiving deltas")
+        {
+            if let SessionEvent::TextDelta(delta) = event {
+                received.push_str(&delta);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        producer.await.expect("producer task should not panic");
+        let expected = (0..total).fold(String::new(), |mut expected, index| {
+            std::fmt::Write::write_fmt(&mut expected, format_args!("d{index};")).unwrap();
+            expected
+        });
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
     async fn critical_events_survive_a_slow_consumer_after_a_large_display_burst() {
         let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
         for index in 0..(EVENT_CHANNEL_CAP + 64) {
             emit_event(
                 &event_tx,
-                SessionEvent::TextDelta(format!("decorative-{index}")),
+                SessionEvent::ThinkingDelta(format!("decorative-{index}")),
             )
             .await;
         }

@@ -373,7 +373,14 @@ pub(super) fn parse_host_question_answer(
     question: &umadev_runtime::HostQuestion,
     raw: &str,
 ) -> std::result::Result<umadev_runtime::HostAnswer, String> {
-    let raw = raw.trim();
+    let raw = if matches!(question.kind, umadev_runtime::HostQuestionKind::Secret) {
+        // Whitespace can be part of a password or token; only the line
+        // terminator is not.
+        raw.strip_suffix('\n')
+            .map_or(raw, |line| line.strip_suffix('\r').unwrap_or(line))
+    } else {
+        raw.trim()
+    };
     if question.required && raw.is_empty() {
         return Err(format!("`{}` requires an answer", question.id));
     }
@@ -475,7 +482,8 @@ pub(super) fn parse_user_input_response(
             })
             .collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        let lines = raw.lines().map(str::trim).collect::<Vec<_>>();
+        // Each answer is trimmed per its question kind (secrets are not).
+        let lines = raw.lines().collect::<Vec<_>>();
         if lines.len() != questions.len() {
             return Err(format!(
                 "expected {} answer lines or a JSON object keyed by question id",
@@ -528,10 +536,16 @@ pub(super) fn parse_host_input_response(
             let expected = requested_schema
                 .get("type")
                 .and_then(serde_json::Value::as_str);
-            let content = match serde_json::from_str::<serde_json::Value>(raw) {
-                Ok(value) => value,
-                Err(_) if expected == Some("string") => serde_json::Value::String(raw.to_string()),
-                Err(error) => return Err(format!("invalid JSON response: {error}")),
+            let content = if expected == Some("string") {
+                // Only a JSON string literal is unwrapped; anything else
+                // (`94107`, `true`, `null`, prose) is the string as typed.
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .filter(serde_json::Value::is_string)
+                    .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+            } else {
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .map_err(|error| format!("invalid JSON response: {error}"))?
             };
             if !schema_accepts_top_level(requested_schema, &content) {
                 return Err(format!(

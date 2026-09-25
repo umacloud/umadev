@@ -160,12 +160,17 @@ async fn git_mutating_output_inner(
             &format!("读取 Git stderr 失败 / unable to read Git stderr: {error}"),
         )
     })?;
-    write.map_err(|error| {
-        git_commit_blocked(
-            "git-input-failed",
-            &format!("无法写入 Git stdin / unable to write Git stdin: {error}"),
-        )
-    })?;
+    if let Err(error) = write {
+        // Git that fails early (bad arguments, a held lock) exits without
+        // draining stdin. Its exit status and stderr then explain the failure
+        // to the caller; the resulting broken pipe is only a symptom.
+        if error.kind() != std::io::ErrorKind::BrokenPipe || status.success() {
+            return Err(git_commit_blocked(
+                "git-input-failed",
+                &format!("无法写入 Git stdin / unable to write Git stdin: {error}"),
+            ));
+        }
+    }
     if stdout.truncated || stderr.truncated {
         return Err(git_commit_blocked(
             "git-output-limit-exceeded",

@@ -474,8 +474,10 @@ fn walk(
             continue;
         }
         // Test file? Code ext + path/name heuristic, or a Rust file with inline
-        // `#[test]`. Read content once and reuse for the inline-test check + the
-        // metrics, so we never read a file twice.
+        // `#[test]`. Only those candidates are read at all: an ordinary source
+        // file (e.g. a vendored `three.min.js` over the per-file cap) is never a
+        // test, so it must neither be read nor able to mark the snapshot
+        // incomplete — that would silence the guard for the whole project.
         let ext = p
             .extension()
             .and_then(|s| s.to_str())
@@ -484,11 +486,25 @@ fn walk(
         if !CODE_EXT.contains(&ext.as_str()) {
             continue;
         }
-        let Ok(content) = budget.read_utf8_beneath(root, &p) else {
-            snap.complete = false;
-            return;
+        let by_path = is_test_path(&rel_lower, &name_lower);
+        if !by_path && ext != "rs" {
+            continue;
+        }
+        // A per-file failure is only knowable as such while a full per-file
+        // allowance remains; below that, a failure may be aggregate exhaustion.
+        let full_allowance = budget.remaining_bytes() >= MAX_TEST_FILE_BYTES;
+        let content = match budget.read_utf8_beneath(root, &p) {
+            Ok(content) => content,
+            // A Rust file that is not a test by path/name is only read to look
+            // for inline `#[test]`s; if that file itself is unreadable (too big,
+            // not UTF-8) it is treated as non-test, consistently before and after.
+            Err(_) if !by_path && full_allowance => continue,
+            Err(_) => {
+                snap.complete = false;
+                return;
+            }
         };
-        if is_test_file(&rel_lower, &name_lower, &ext, &content) {
+        if by_path || is_test_file(&rel_lower, &name_lower, &ext, &content) {
             snap.tests.insert(rel, file_metrics(&content));
         }
     }
@@ -544,6 +560,18 @@ fn impl_surface(project_root: &Path) -> Option<String> {
 /// `ext` are pre-lowercased; `content` is the file body (for the Rust inline
 /// case).
 fn is_test_file(rel_lower: &str, name_lower: &str, ext: &str, content: &str) -> bool {
+    if is_test_path(rel_lower, name_lower) {
+        return true;
+    }
+    // Rust: a file carrying inline `#[test]` / `#[tokio::test]` is a real test
+    // file even when its path/name follows no convention.
+    ext == "rs" && (content.contains("#[test]") || content.contains("#[tokio::test]"))
+}
+
+/// The path/name half of [`is_test_file`]: `true` when the workspace-relative
+/// path (`rel_lower`, `/`-separated) or the file name (`name_lower`), both
+/// pre-lowercased, follow a universal test-file convention. Needs no content.
+fn is_test_path(rel_lower: &str, name_lower: &str) -> bool {
     let by_name = name_lower.contains(".test.")
         || name_lower.contains(".spec.")
         || name_lower.starts_with("test_")
@@ -564,19 +592,22 @@ fn is_test_file(rel_lower: &str, name_lower: &str, ext: &str, content: &str) -> 
     let by_dir = rel_lower.contains("/tests/")
         || rel_lower.contains("/test/")
         || rel_lower.contains("/__tests__/")
+        || rel_lower.starts_with("__tests__/")
         || rel_lower.starts_with("tests/")
         || rel_lower.starts_with("test/")
         || rel_lower.contains("/spec/")
         || rel_lower.starts_with("spec/");
-    if by_name || by_dir {
-        return true;
-    }
-    // Rust: a file carrying inline `#[test]` / `#[tokio::test]` is a real test
-    // file even when its path/name follows no convention.
-    if ext == "rs" && (content.contains("#[test]") || content.contains("#[tokio::test]")) {
-        return true;
-    }
-    false
+    by_name || by_dir
+}
+
+/// Content-free test-file classification for a repo-relative, `/`-separated
+/// path (e.g. from a diff header): a code file whose path/name follows a test
+/// convention. The same heuristic the snapshot uses, minus Rust inline tests.
+pub(crate) fn is_test_source_path(rel: &str) -> bool {
+    let rel_lower = rel.to_ascii_lowercase();
+    let name_lower = rel_lower.rsplit('/').next().unwrap_or("");
+    let ext = name_lower.rsplit_once('.').map_or("", |(_, ext)| ext);
+    CODE_EXT.contains(&ext) && is_test_path(&rel_lower, name_lower)
 }
 
 /// Compute [`FileMetrics`] for one test file's content. Deterministic + language
@@ -1305,6 +1336,32 @@ mod tests {
             !snap.tests.keys().any(|k| k.contains("escape")),
             "walk must not traverse an escaping symlink: {:?}",
             snap.tests.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn oversized_non_test_source_does_not_disable_the_guard() {
+        // A vendored minified bundle (> the per-file read cap) is not a test file;
+        // it must not make the snapshot incomplete and silence every finding.
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "tests/a.test.js", GOOD_TEST);
+        write(
+            tmp.path(),
+            "public/vendor.js",
+            &"x".repeat(MAX_TEST_FILE_BYTES + 100 * 1024),
+        );
+        let before = snapshot(tmp.path());
+        assert!(
+            before.complete,
+            "a big non-test file must not mark the snapshot incomplete"
+        );
+        fs::remove_file(tmp.path().join("tests/a.test.js")).unwrap();
+        let findings = check(tmp.path(), Some(&before));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.contains("test file deleted") && f.contains("a.test.js")),
+            "{findings:?}"
         );
     }
 }

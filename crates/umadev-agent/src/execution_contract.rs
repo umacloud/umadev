@@ -371,7 +371,9 @@ fn claim_covers(claim: &str, path: &str) -> bool {
     path == directory || path.starts_with(&format!("{directory}/"))
 }
 
-fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
+/// Glob match where `*` matches any run of bytes, `/` included (so `**` acts
+/// the same). Callers lowercase both sides for case-insensitive matching.
+pub(crate) fn wildcard_match(pattern: &[u8], value: &[u8]) -> bool {
     let (mut p, mut v, mut star, mut mark) = (0usize, 0usize, None, 0usize);
     while v < value.len() {
         if p < pattern.len() && pattern[p] == value[v] {

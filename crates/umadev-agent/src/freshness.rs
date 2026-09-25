@@ -152,7 +152,25 @@ fn is_qc_input_file(path: &Path) -> bool {
             | ".npmrc"
             | ".yarnrc"
             | ".yarnrc.yml"
+            | "rust-toolchain"
+            | ".nvmrc"
+            | ".node-version"
+            | ".python-version"
+            | ".tool-versions"
     ) || name.starts_with("requirements")
+        // Data / config a build or test reads: fixtures, app config, SQL seeds
+        // and migrations. Metadata only, so secrets are never read.
+        || matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json" | "jsonc" | "yaml" | "yml" | "toml" | "sql")
+        )
+        || name.starts_with(".env.")
+        || name.starts_with(".eslintrc")
+        || name.starts_with(".babelrc")
+        || name.starts_with(".prettierrc")
+        || name.starts_with(".swcrc")
+        || name.starts_with("eslint.config.")
+        || name.starts_with("babel.config.")
         || name.starts_with("dockerfile.")
         || name.starts_with("tsconfig")
         || name.starts_with("vite.config.")
@@ -198,6 +216,7 @@ fn collect_qc_inputs(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> bool {
                     .unwrap_or_default();
                 if SKIP_DIRS.contains(&name)
                     || (name.starts_with('.') && name != ".github" && name != ".cargo")
+                    || crate::acceptance::is_python_venv(&path)
                 {
                     continue;
                 }
@@ -389,6 +408,44 @@ mod tests {
         write(root, ".github/workflows/ci.yml", "jobs: {}\n");
         let workflow = workspace_qc_fingerprint(root);
         assert_ne!(lockfile, workflow);
+    }
+
+    #[test]
+    fn qc_fingerprint_changes_for_data_and_tool_config_inputs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write(root, "src/main.ts", "export const a = 1;\n");
+        let inputs = [
+            "tests/fixtures/users.json",
+            "config/app.yaml",
+            "config/app.yml",
+            "config/settings.toml",
+            "db/seed.sql",
+            ".env.test",
+            ".eslintrc",
+            ".babelrc",
+            "eslint.config.mjs",
+            "babel.config.js",
+            "rust-toolchain",
+        ];
+        for rel in inputs {
+            write(root, rel, "a");
+        }
+        for rel in inputs {
+            let before = workspace_qc_fingerprint(root);
+            write(root, rel, "changed");
+            assert_ne!(
+                before,
+                workspace_qc_fingerprint(root),
+                "{rel} must expire the receipt"
+            );
+        }
+        // Dependency / virtualenv trees stay out of the QC identity.
+        let before = workspace_qc_fingerprint(root);
+        write(root, "node_modules/pkg/package.json", "{}");
+        write(root, "env/pyvenv.cfg", "home = /usr/bin\n");
+        write(root, "env/lib/site-packages/pkg/data.json", "{}");
+        assert_eq!(before, workspace_qc_fingerprint(root));
     }
 
     #[test]
