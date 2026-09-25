@@ -478,17 +478,20 @@ fn allow_pending_approval_resolves_the_waiter_as_allow() {
     let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
     let (tx, rx) = tokio::sync::oneshot::channel();
     *holder.lock().unwrap() = Some(test_pending_approval(tx));
-    release_pending_approval_on_auto_switch(&holder);
+    release_pending_approval_on_auto_switch(&holder, std::path::Path::new("."));
     assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
     // The holder is cleared, so a second call is a harmless no-op.
     assert!(holder.lock().unwrap().is_none());
-    release_pending_approval_on_auto_switch(&holder);
+    release_pending_approval_on_auto_switch(&holder, std::path::Path::new("."));
 
-    // The EXPLICIT verdict path (typed 「批准」 → Action::ApprovalReply(true))
-    // resolves unconditionally — whatever the item.
+    // The EXPLICIT verdict path (typed 「批准」 → Action::ApprovalReply) resolves
+    // the request the bar showed — whatever the item.
     let (tx, rx) = tokio::sync::oneshot::channel();
     *holder.lock().unwrap() = Some(test_pending_approval(tx));
-    allow_pending_approval(&holder);
+    assert!(allow_pending_approval(
+        &holder,
+        &pending_approval_item(&holder).unwrap()
+    ));
     assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
     assert!(holder.lock().unwrap().is_none());
 }
@@ -506,8 +509,9 @@ fn auto_switch_keeps_a_true_disaster_pending_but_explicit_approve_resolves() {
         action: "Bash".to_string(),
         target: "rm -rf node_modules".to_string(),
         auto_releasable: true,
+        armed_at: None,
     });
-    release_pending_approval_on_auto_switch(&holder);
+    release_pending_approval_on_auto_switch(&holder, std::path::Path::new("."));
     assert!(
         holder.lock().unwrap().is_some(),
         "a still-escalating disaster stays pending across the mode switch"
@@ -535,9 +539,84 @@ fn auto_switch_keeps_a_true_disaster_pending_but_explicit_approve_resolves() {
         action: "Bash".to_string(),
         target: "rm -rf node_modules".to_string(),
         auto_releasable: true,
+        armed_at: None,
     });
-    allow_pending_approval(&holder);
+    assert!(allow_pending_approval(
+        &holder,
+        &pending_approval_item(&holder).unwrap()
+    ));
     assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
+}
+
+#[tokio::test]
+async fn an_approval_that_replaces_a_pending_one_cannot_take_a_stale_answer() {
+    let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let (sink, _events) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let ask = |target: &'static str| {
+        let (holder, sink) = (holder.clone(), sink.clone());
+        tokio::spawn(async move { await_user_approval(&holder, &sink, "Bash", target).await })
+    };
+    let pending_target = || {
+        holder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pending| pending.target.clone())
+    };
+    let first = ask("npm test");
+    while pending_target().as_deref() != Some("npm test") {
+        tokio::task::yield_now().await;
+    }
+    let second = ask("rm -rf src");
+    while pending_target().as_deref() != Some("rm -rf src") {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(first.await.unwrap(), ApprovalReply::Deny);
+
+    // A `y` meant for the request on screen a moment ago is swallowed, and a
+    // typed approval of that request does not resolve its replacement.
+    assert!(resolve_pending_approval(
+        &holder,
+        KeyCode::Char('y'),
+        KeyModifiers::NONE,
+        true
+    ));
+    assert!(!allow_pending_approval(
+        &holder,
+        &("Bash".to_string(), "npm test".to_string())
+    ));
+    assert_eq!(pending_target().as_deref(), Some("rm -rf src"));
+
+    // Once it has been on screen, the new request is answerable as shown.
+    tokio::time::sleep(interaction_bridge::APPROVAL_ARM_DELAY).await;
+    assert!(allow_pending_approval(
+        &holder,
+        &("Bash".to_string(), "rm -rf src".to_string())
+    ));
+    assert_eq!(second.await.unwrap(), ApprovalReply::Allow);
+}
+
+#[test]
+fn auto_switch_keeps_a_write_outside_the_real_workspace_pending() {
+    // Only the real project root tells an escaping write from an in-tree one.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let outside = tmp.path().join("other-project").join("notes.txt");
+    let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    *holder.lock().unwrap() = Some(PendingApproval {
+        reply_tx: tx,
+        req_id: String::new(),
+        action: "Write".to_string(),
+        target: outside.display().to_string(),
+        auto_releasable: true,
+        armed_at: None,
+    });
+    release_pending_approval_on_auto_switch(&holder, &root);
+    assert!(holder.lock().unwrap().is_some(), "still needs an answer");
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
@@ -550,9 +629,10 @@ fn auto_switch_never_releases_an_upstream_permission_boundary() {
         action: "Bash".to_string(),
         target: "npm install".to_string(),
         auto_releasable: false,
+        armed_at: None,
     });
 
-    release_pending_approval_on_auto_switch(&holder);
+    release_pending_approval_on_auto_switch(&holder, std::path::Path::new("."));
 
     assert!(
         holder.lock().unwrap().is_some(),
@@ -723,9 +803,12 @@ async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
         .unwrap()
         .as_ref()
         .is_some_and(|pending| !pending.auto_releasable));
-    release_pending_approval_on_auto_switch(&approval_holder);
+    release_pending_approval_on_auto_switch(&approval_holder, std::path::Path::new("."));
     assert!(approval_holder.lock().unwrap().is_some());
-    allow_pending_approval(&approval_holder);
+    assert!(allow_pending_approval(
+        &approval_holder,
+        &pending_approval_item(&approval_holder).unwrap()
+    ));
 
     let approved = tokio::time::timeout(TURN_HANG_GUARD, interactive)
         .await
@@ -863,6 +946,7 @@ fn test_pending_approval(tx: tokio::sync::oneshot::Sender<ApprovalReply>) -> Pen
         action: "Bash".to_string(),
         target: "npm install".to_string(),
         auto_releasable: true,
+        armed_at: None,
     }
 }
 
@@ -982,6 +1066,36 @@ fn typed_host_questions_return_protocol_values_and_correlated_ids() {
 }
 
 #[test]
+fn secret_host_answers_keep_surrounding_whitespace() {
+    let umadev_runtime::HostRequest::UserInput { questions, .. } = secret_host_request() else {
+        unreachable!();
+    };
+    let response = parse_user_input_response(&questions, " p@ss word \n").unwrap();
+    let umadev_runtime::HostResponse::UserInput { answers } = response else {
+        panic!("expected a structured user-input response");
+    };
+    assert_eq!(answers[0].values, [" p@ss word "]);
+
+    let questions = vec![
+        umadev_runtime::HostQuestion {
+            id: "name".to_string(),
+            header: None,
+            prompt: "Name".to_string(),
+            kind: umadev_runtime::HostQuestionKind::Text,
+            required: true,
+            options: Vec::new(),
+        },
+        questions[0].clone(),
+    ];
+    let response = parse_user_input_response(&questions, "  alice  \r\n  s3cret \r\n").unwrap();
+    let umadev_runtime::HostResponse::UserInput { answers } = response else {
+        panic!("expected a structured user-input response");
+    };
+    assert_eq!(answers[0].values, ["alice"]);
+    assert_eq!(answers[1].values, ["  s3cret "]);
+}
+
+#[test]
 fn kimi_plan_review_picker_returns_exact_option_and_headless_paths_cancel() {
     let request = umadev_runtime::HostRequest::UserInput {
         questions: vec![umadev_runtime::HostQuestion {
@@ -1051,6 +1165,33 @@ fn mcp_elicitation_enforces_top_level_schema_without_losing_draft() {
             content: Some(_)
         }
     ));
+}
+
+#[test]
+fn mcp_string_elicitation_takes_json_looking_text_as_the_string() {
+    let request = umadev_runtime::HostRequest::McpElicitation {
+        server_name: Some("shipping".to_string()),
+        message: "Provide the ZIP code".to_string(),
+        requested_schema: serde_json::json!({"type":"string"}),
+        metadata: serde_json::Value::Null,
+    };
+    for (raw, expected) in [
+        ("94107", "94107"),
+        ("true", "true"),
+        ("null", "null"),
+        ("[1]", "[1]"),
+        ("plain text", "plain text"),
+        (r#""quoted""#, "quoted"),
+    ] {
+        assert_eq!(
+            parse_host_input_response(&request, raw).unwrap(),
+            umadev_runtime::HostResponse::McpElicitation {
+                action: umadev_runtime::HostElicitationAction::Accept,
+                content: Some(serde_json::Value::String(expected.to_string())),
+            },
+            "{raw}"
+        );
+    }
 }
 
 #[test]
@@ -4751,6 +4892,26 @@ fn url_host_port_extracts_127_0_0_1_3000() {
 }
 
 #[test]
+fn url_host_port_defaults_port_and_strips_path_query_fragment() {
+    for (url, expected) in [
+        ("http://localhost/", "localhost:80"),
+        ("http://localhost", "localhost:80"),
+        ("https://example.com/app", "example.com:443"),
+        ("http://h:5173?x=1", "h:5173"),
+        ("http://h:5173#top", "h:5173"),
+        ("http://h?x=1", "h:80"),
+        ("http://[::1]:5173/", "[::1]:5173"),
+        ("https://[::1]", "[::1]:443"),
+        ("http://user@h:5173/", "h:5173"),
+    ] {
+        assert_eq!(url_host_port(url), Some(expected.into()), "{url}");
+    }
+    assert_eq!(url_host_port("http://"), None);
+    assert_eq!(url_host_port("http://h:/"), None);
+    assert_eq!(url_host_port("http://h:abc/"), None);
+}
+
+#[test]
 fn url_host_port_none_for_garbage() {
     assert_eq!(url_host_port("not a url"), None);
     assert_eq!(url_host_port("ftp://example.com"), None);
@@ -4791,6 +4952,36 @@ fn parse_run_command_cd_form() {
 }
 
 #[test]
+fn parse_run_command_cd_form_shells_out_for_chains_and_env_assignments() {
+    // Only the leading `cd` is peeled off; on Unix anything that needs a shell
+    // (a further `&&` chain, an env assignment, quotes, redirects) must run via
+    // `sh -c` in the `cd` directory instead of becoming argv. Windows never
+    // hands a run to `cmd /c` (see `parse_run_command_never_hands_windows_runs_to_cmd`).
+    let root = std::path::PathBuf::from("/proj");
+    for (command, rest) in [
+        (
+            "cd web && npm install && npm run dev",
+            "npm install && npm run dev",
+        ),
+        ("cd web && PORT=3000 npm run dev", "PORT=3000 npm run dev"),
+        (
+            "cd web && npm run dev -- --host \"0.0.0.0\"",
+            "npm run dev -- --host \"0.0.0.0\"",
+        ),
+        ("cd web && npm run dev > dev.log", "npm run dev > dev.log"),
+    ] {
+        let (dir, prog, args) = parse_run_command(command, &root);
+        assert_eq!(dir, std::path::PathBuf::from("/proj/web"), "{command}");
+        if cfg!(windows) {
+            assert_ne!(prog, "cmd", "{command}");
+        } else {
+            assert_eq!(prog, "sh", "{command}");
+            assert_eq!(args, vec!["-c".to_string(), rest.into()], "{command}");
+        }
+    }
+}
+
+#[test]
 fn parse_run_command_absolute_dir() {
     let root = std::path::PathBuf::from("/proj");
     let (dir, prog, args) = parse_run_command("cd /abs/app && pnpm dev", &root);
@@ -4801,42 +4992,51 @@ fn parse_run_command_absolute_dir() {
     assert_eq!(args, exp_args);
 }
 
-#[test]
-fn parse_run_command_fallback_shells() {
-    let root = std::path::PathBuf::from("/proj");
-    let (dir, prog, args) = parse_run_command("npm run dev", &root);
-    // No `cd &&` prefix → fallback to the platform shell in the workspace root:
-    // `cmd /c` on Windows (which has no `sh`), `sh -c` elsewhere.
-    assert_eq!(dir, root);
-    let (shell, shell_arg) = if cfg!(windows) {
-        ("cmd", "/c")
+/// The command a run without a `cd X &&` prefix is expected to spawn: `sh -c`
+/// on Unix, and on Windows the resolved program itself, never `cmd /c`, which
+/// would look the program up in the workspace first.
+fn expected_root_run(command: &str) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        let mut words = command.split_whitespace();
+        let (program, mut args) = umadev_host::spawn_parts(words.next().unwrap());
+        args.extend(words.map(str::to_string));
+        (program, args)
     } else {
-        ("sh", "-c")
-    };
-    assert_eq!(prog, shell);
-    assert_eq!(args, vec![shell_arg.to_string(), "npm run dev".into()]);
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )
+    }
 }
 
 #[test]
-fn parse_run_command_picks_cmd_on_windows_sh_on_unix() {
+fn parse_run_command_without_cd_runs_in_the_workspace_root() {
+    let root = std::path::PathBuf::from("/proj");
+    let (dir, prog, args) = parse_run_command("npm run dev", &root);
+    assert_eq!(dir, root);
+    assert_eq!((prog, args), expected_root_run("npm run dev"));
+}
+
+#[test]
+fn parse_run_command_never_hands_windows_runs_to_cmd() {
     // Regression (HIGH): the preview dev-server never booted on Windows because
     // the fallback hardcoded `sh -c` (no `sh` on Windows) and the `cd` path
-    // spawned a bare `npm` (CreateProcess can't find `npm.cmd`). The fallback
-    // must pick `cmd /c` on Windows / `sh -c` on Unix...
+    // spawned a bare `npm` (CreateProcess can't find `npm.cmd`). A later
+    // `cmd /c` fallback let a repository's `python3.bat` shadow the real
+    // program, so Windows now spawns the resolved program directly.
     let root = std::path::PathBuf::from("/proj");
-    let (_, prog, args) = parse_run_command("npm run dev", &root);
+    let (_, prog, args) = parse_run_command("python3 -m http.server 8000", &root);
+    assert_ne!(prog, "cmd");
     if cfg!(windows) {
-        assert_eq!(prog, "cmd");
-        assert_eq!(args.first().map(String::as_str), Some("/c"));
+        assert_eq!(prog, umadev_host::spawn_parts("python3").0);
+        assert_eq!(args, ["-m", "http.server", "8000"]);
     } else {
         assert_eq!(prog, "sh");
         assert_eq!(args.first().map(String::as_str), Some("-c"));
     }
-    // ...and the `cd <dir> && <prog>` path must route the program through
-    // `spawn_parts` so a Windows `.cmd` shim runs via `cmd /c` (its lead prefix)
-    // instead of failing the spawn. `vite` is unlikely to be installed, so on
-    // every platform spawn_parts fail-opens to the bare name — but the contract
-    // (parse routes through spawn_parts) is still pinned.
+    // ...and the `cd <dir> && <prog>` path routes the program through
+    // `spawn_parts` on every platform. `vite` is unlikely to be installed, so
+    // spawn_parts fail-opens to the bare name, but the contract is still pinned.
     let (_, prog2, args2) = parse_run_command("cd web && vite --host", &root);
     let (exp_prog, mut exp_args) = umadev_host::spawn_parts("vite");
     exp_args.extend(["--host".to_string()]);
@@ -5031,21 +5231,12 @@ fn non_web_build_completion_card_pushes_card_without_a_server() {
 
 #[test]
 fn parse_run_command_npx_vercel_deploy() {
-    // The canonical /deploy command. No `cd &&` → sh -c fallback,
-    // preserving the full command (flags included).
+    // The canonical /deploy command. No `cd &&` → the workspace-root run,
+    // preserving every flag.
     let root = std::path::PathBuf::from("/proj");
     let (dir, prog, args) = parse_run_command("npx vercel --prod", &root);
     assert_eq!(dir, root);
-    let (shell, shell_arg) = if cfg!(windows) {
-        ("cmd", "/c")
-    } else {
-        ("sh", "-c")
-    };
-    assert_eq!(prog, shell);
-    assert_eq!(
-        args,
-        vec![shell_arg.to_string(), "npx vercel --prod".into()]
-    );
+    assert_eq!((prog, args), expected_root_run("npx vercel --prod"));
 }
 
 #[test]
@@ -7364,7 +7555,10 @@ async fn guarded_git_commit_waits_for_exactly_one_current_turn_approval() {
         assert_eq!(approval.action, "git commit");
         assert_eq!(approval.target, tmp.path().display().to_string());
     }
-    allow_pending_approval(&approval_holder);
+    assert!(allow_pending_approval(
+        &approval_holder,
+        &pending_approval_item(&approval_holder).unwrap()
+    ));
     task.await.unwrap();
 
     assert!(matches!(

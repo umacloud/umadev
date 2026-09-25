@@ -247,6 +247,17 @@ fn grapheme_safe_slice(s: &str, from: usize, to: usize) -> String {
     out
 }
 
+/// Clamp a normalized selection end past the last row onto the end of the last
+/// row. Callers guarantee `rows` is non-empty.
+fn clamp_end(rows: &[String], er: usize, ec: usize) -> (usize, usize) {
+    let last = rows.len() - 1;
+    if er > last {
+        (last, usize::MAX)
+    } else {
+        (er, ec)
+    }
+}
+
 /// Extract the selected text from the cached `rows` for `sel`.
 ///
 /// Single row → the substring `[start.col, end.col)` of that row. Multi-row →
@@ -265,8 +276,9 @@ pub fn extract(rows: &[String], sel: &Selection) -> String {
         return String::new();
     }
     // Clamp the END row to the last real row so a too-large cursor row can't
-    // append `\n`s for rows that don't exist.
-    let er = er.min(rows.len() - 1);
+    // append `\n`s for rows that don't exist. The cursor column then belongs to
+    // a row past the content, so the selection runs to the end of the last row.
+    let (er, ec) = clamp_end(rows, er, ec);
     // A row slice by CHAR index `[from, to)`, clamped + fail-open: an
     // out-of-range row yields "", and the columns are clamped to the row's char
     // length so `to < from` or a past-the-end index can never panic.
@@ -282,12 +294,9 @@ pub fn extract(rows: &[String], sel: &Selection) -> String {
         }
         grapheme_safe_slice(s, from, to)
     };
-    if sr >= er {
+    if sr == er {
         // Single effective row (start row == clamped end row): one substring.
-        // When the clamp collapsed a multi-row selection onto the last line, the
-        // whole line from `sc` to its end is the intent, so widen the end col.
-        let end_col = if sr == er { ec } else { usize::MAX };
-        return slice(sr, sc, end_col);
+        return slice(sr, sc, ec);
     }
     let mut out = String::new();
     // First (partial) row: from the anchor col to end of line.
@@ -321,7 +330,7 @@ pub fn extract_wrapped(rows: &[String], wraps: &[bool], sel: &Selection) -> Stri
     if sr >= rows.len() {
         return String::new();
     }
-    let er = er.min(rows.len() - 1);
+    let (er, ec) = clamp_end(rows, er, ec);
     // A row is JOINED to its predecessor (no newline) only when it is a soft-wrap
     // continuation. A missing flag fails open to a real break (a newline).
     let is_continuation = |r: usize| wraps.get(r).copied().unwrap_or(false);
@@ -337,9 +346,8 @@ pub fn extract_wrapped(rows: &[String], wraps: &[bool], sel: &Selection) -> Stri
         }
         grapheme_safe_slice(s, from, to)
     };
-    if sr >= er {
-        let end_col = if sr == er { ec } else { usize::MAX };
-        return slice(sr, sc, end_col);
+    if sr == er {
+        return slice(sr, sc, ec);
     }
     let mut out = String::new();
     out.push_str(&slice(sr, sc, usize::MAX));
@@ -736,6 +744,25 @@ mod tests {
         };
         // Row 0 from col 1 ("ne") + all of the (clamped) last row "two".
         assert_eq!(extract(&rows, &sel), "ne\ntwo");
+    }
+
+    #[test]
+    fn extract_widens_a_clamped_end_row_to_the_end_of_the_line() {
+        // A cursor dragged below the content clamps onto the last row; its
+        // column belongs to a row that doesn't exist, so select to end of line.
+        let rows = vec!["abc".to_string(), "def".to_string()];
+        let onto_last = Selection {
+            anchor: (1, 1),
+            cursor: (5, 0),
+        };
+        assert_eq!(extract(&rows, &onto_last), "ef");
+        assert_eq!(extract_wrapped(&rows, &[], &onto_last), "ef");
+        let across = Selection {
+            anchor: (0, 1),
+            cursor: (5, 0),
+        };
+        assert_eq!(extract(&rows, &across), "bc\ndef");
+        assert_eq!(extract_wrapped(&rows, &[false, true], &across), "bcdef");
     }
 
     #[test]

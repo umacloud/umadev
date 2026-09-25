@@ -550,8 +550,8 @@ fn hook_pre_write_blocks_the_irreversible_floor_but_defers_craft() {
     let emoji = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
     let s = run_hook_pre_write(emoji, Some(tmp.path()));
     assert!(
-        s.contains("allow"),
-        "emoji craft nit must be deferred, not denied: {s}"
+        s.trim().is_empty(),
+        "emoji craft nit must be deferred (no decision), not denied: {s}"
     );
     // A leaked secret is irreversible-if-written — it MUST be denied at the write.
     let secret = format!(
@@ -567,24 +567,28 @@ fn hook_pre_write_blocks_the_irreversible_floor_but_defers_craft() {
 
 /// Self-limit: with NO governance scope (the user is driving the base directly,
 /// e.g. plain claude / spec-kit), the hook passes EVERYTHING — UmaDev does not
-/// touch the user's other tools/projects.
+/// touch the user's other tools/projects. Passing prints nothing: an explicit
+/// `"allow"` would approve the call and skip the user's own permission prompt.
 #[test]
 fn hook_pre_write_passes_when_not_driving() {
     let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>🔍</button>"}}"#;
     let s = run_hook_pre_write(payload, None);
     assert!(
-        s.contains("allow"),
-        "not-driving → UmaDev must not interfere, even with an emoji: {s}"
+        s.trim().is_empty(),
+        "not-driving → UmaDev must not interfere or approve, even with an emoji: {s}"
     );
 }
 
-/// `umadev hook pre-write` allows clean code (when driving).
+/// `umadev hook pre-write` passes clean code (when driving) without approving it.
 #[test]
 fn hook_pre_write_allows_clean() {
     let tmp = TempDir::new().unwrap();
     let payload = r#"{"tool_name":"Write","tool_input":{"file_path":"src/Btn.tsx","content":"<button>Search</button>"}}"#;
     let s = run_hook_pre_write(payload, Some(tmp.path()));
-    assert!(s.contains("allow"), "clean code must be allowed: {s}");
+    assert!(
+        s.trim().is_empty(),
+        "clean code passes with no decision: {s}"
+    );
 }
 
 /// `umadev install` writes the PreToolUse hook into machine-local Claude settings.
@@ -679,8 +683,8 @@ fn kimi_user_level_hook_row_fails_open_outside_its_project_scope() {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("allow"),
-        "another project's global Kimi hook row must be a no-op"
+        output.stdout.is_empty(),
+        "another project's global Kimi hook row must be a silent no-op"
     );
 }
 

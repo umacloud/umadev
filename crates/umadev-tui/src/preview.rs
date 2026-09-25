@@ -15,13 +15,15 @@ const PREVIEW_OWNER_SCRIPT: &str =
 /// `tokio::process::Command::new(program).args(args)`.
 ///
 /// Windows-aware (mirrors `deploy.rs` / `verify.rs` / `runtime_proof.rs`): the
-/// `cd X && <prog> ...` shape routes the bare program through
-/// [`umadev_host::spawn_parts`], so a Windows npm/pnpm `.cmd` shim is resolved
-/// explicitly and Rust's hardened batch-argument encoder handles its argv;
-/// the catch-all fallback shells out via `cmd /c` on Windows and `sh -c` on Unix
-/// (Windows has no `sh`). Without this the preview dev-server never booted on
-/// Windows — `npm run dev` spawned a non-existent `sh`, and `cd web && npm run
-/// dev` spawned a bare `npm` that `CreateProcess` can't find.
+/// program is resolved through [`umadev_host::spawn_parts`], so a Windows
+/// npm/pnpm `.cmd` shim is found on `PATH` and Rust's hardened batch-argument
+/// encoder handles its argv. A command without a `cd X &&` prefix runs in the
+/// workspace root, through `sh -c` on Unix so a recorded command keeps its shell
+/// syntax; after a `cd X &&` prefix, Unix uses `sh -c` in `X` only when the rest
+/// needs a shell ([`needs_shell`]). Windows never uses `cmd /c`: `cmd.exe` would
+/// look the program up in the workspace before `PATH`, so a static-HTML
+/// repository could ship a `python3.bat` that the automatic post-build preview
+/// then ran on the host.
 pub(super) fn parse_run_command(
     command: &str,
     project_root: &std::path::Path,
@@ -36,41 +38,81 @@ pub(super) fn parse_run_command(
                 project_root.join(dir)
             };
             let rest = rest.trim();
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            if let Some((prog, args)) = parts.split_first() {
-                // Route the bare program through `spawn_parts` (resolves the real
-                // binary + safely preserves a Windows `.cmd`/`.bat` shim target),
-                // then append the original args after whatever lead it produced.
-                let (program, mut spawn_args) = umadev_host::spawn_parts(prog);
-                spawn_args.extend(args.iter().map(std::string::ToString::to_string));
-                return (resolved, program, spawn_args);
+            if !cfg!(windows) && needs_shell(rest) {
+                // A further `&&` chain, env assignment, quoting, or redirect is
+                // shell syntax: run it verbatim through `sh -c` in the `cd`
+                // directory rather than splitting it into argv. Windows has no
+                // shell it can hand this to safely (see above), so it keeps the
+                // direct spawn.
+                return (
+                    resolved,
+                    "sh".to_string(),
+                    vec!["-c".to_string(), rest.to_string()],
+                );
+            }
+            if let Some((program, args)) = direct_program(rest) {
+                return (resolved, program, args);
             }
         }
     }
-    // Fallback: shell out via `cmd /c` (Windows) / `sh -c` (Unix) in the
-    // workspace root, so the whole multi-token command runs as written.
-    let (shell, shell_arg) = if cfg!(windows) {
-        ("cmd", "/c")
-    } else {
-        ("sh", "-c")
-    };
+    if cfg!(windows) {
+        if let Some((program, args)) = direct_program(command) {
+            return (project_root.to_path_buf(), program, args);
+        }
+    }
     (
         project_root.to_path_buf(),
-        shell.to_string(),
-        vec![shell_arg.to_string(), command.to_string()],
+        "sh".to_string(),
+        vec!["-c".to_string(), command.to_string()],
     )
+}
+
+/// Split `words` on whitespace and resolve the first word through
+/// [`umadev_host::spawn_parts`], appending the rest after whatever lead it
+/// produced. `None` for an empty command.
+fn direct_program(words: &str) -> Option<(String, Vec<String>)> {
+    let mut words = words.split_whitespace();
+    let (program, mut args) = umadev_host::spawn_parts(words.next()?);
+    args.extend(words.map(str::to_string));
+    Some((program, args))
+}
+
+/// Whether `command` uses shell syntax that whitespace splitting would mangle:
+/// operators, redirects, quoting, expansions, or a leading `NAME=value`
+/// environment assignment.
+fn needs_shell(command: &str) -> bool {
+    command.contains([
+        '&', '|', ';', '<', '>', '(', ')', '$', '`', '\'', '"', '\\', '*', '?', '\n',
+    ]) || command
+        .split_whitespace()
+        .next()
+        .is_some_and(|program| program.contains('='))
 }
 
 /// Extract the host:port from a `http://host:port/...` URL, returning None
 /// when parsing fails. Used by [`wait_for_port`] so we only open the browser
 /// after the dev server is actually accepting connections — not 0ms after
 /// spawn, when Vite is still compiling and the page would 404.
+/// A missing port defaults by scheme (80/443); `[ipv6]` hosts keep brackets.
 pub(super) fn url_host_port(url: &str) -> Option<String> {
-    let after_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let host_port = after_scheme.split('/').next()?;
-    Some(host_port.to_string())
+    let (after_scheme, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, 80)
+    } else {
+        (url.strip_prefix("https://")?, 443)
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?;
+    let (host, port) = match authority.rfind(':') {
+        Some(colon) if !authority[colon..].contains(']') => (
+            &authority[..colon],
+            authority[colon + 1..].parse::<u16>().ok()?,
+        ),
+        _ => (authority, default_port),
+    };
+    (!host.is_empty()).then(|| format!("{host}:{port}"))
 }
 
 /// Poll a `host:port` with a TCP connect until it succeeds or `timeout`
@@ -164,6 +206,7 @@ pub(super) fn start_preview_server(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    umadev_process::child_env::scrub_leaked_secrets(cmd.as_std_mut());
     // Port-conflict guard: if the port is already bound (the user's own
     // Vite/Next/Express), DON'T spawn a second server — it would either fail or
     // bind a different port while we open the wrong URL. Open / surface what's

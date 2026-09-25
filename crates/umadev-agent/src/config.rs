@@ -7,8 +7,8 @@
 //! ```toml
 //! # .umadevrc
 //! [quality]
-//! threshold = 85              # override quality gate pass threshold
-//! skip_checks = ["dark_mode"] # skip specific quality checks
+//! threshold = 95              # raise the quality gate pass threshold (never lower)
+//! skip_checks = ["dark_mode"] # skip specific non-security quality checks
 //!
 //! [pipeline]
 //! skip_phases = ["research"]  # skip research if you already did it
@@ -67,14 +67,23 @@ pub struct ProjectConfig {
 }
 
 /// Quality gate customization.
+///
+/// `.umadevrc` travels with the repository, so a clone or a contributor PR
+/// controls it: it may make the gate stricter, never weaker. A threshold
+/// below the default and a skip of a [protected check](PROTECTED_QUALITY_CHECKS)
+/// are dropped at load and listed in [`Self::ignored`] for the gate report.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QualityConfig {
-    /// Minimum score to pass (default 90).
+    /// Minimum score to pass (default 90; a lower value is ignored).
     #[serde(default = "default_threshold")]
     pub threshold: u32,
-    /// Check names to skip (e.g. `dark_mode`).
+    /// Check names to skip (e.g. `dark_mode`); protected checks stay.
     #[serde(default)]
     pub skip_checks: Vec<String>,
+    /// Human-readable notes for every repository override that was ignored
+    /// because it would have weakened the gate. Never read from the file.
+    #[serde(skip)]
+    pub ignored: Vec<String>,
 }
 
 impl Default for QualityConfig {
@@ -82,6 +91,54 @@ impl Default for QualityConfig {
         Self {
             threshold: default_threshold(),
             skip_checks: Vec::new(),
+            ignored: Vec::new(),
+        }
+    }
+}
+
+/// Quality checks a repository `.umadevrc` cannot skip: they guard leaked
+/// secrets, security findings, access control and the build/test evidence.
+pub const PROTECTED_QUALITY_CHECKS: &[&str] = &[
+    "No leaked secrets",
+    "Pre-PR security scan",
+    "Auth coverage",
+    "Input validation coverage",
+    "Build & test results",
+];
+
+/// The `skip_checks` spelling of a check name (`Dark mode support` →
+/// `dark_mode_support`); a skip entry matches either form.
+#[must_use]
+pub fn quality_check_key(name: &str) -> String {
+    name.to_ascii_lowercase().replace(' ', "_")
+}
+
+impl QualityConfig {
+    /// Drop every override that would weaken the gate, noting each in
+    /// [`Self::ignored`].
+    fn keep_only_stricter(&mut self) {
+        if self.threshold < default_threshold() {
+            self.ignored.push(format!(
+                "Ignored `.umadevrc` [quality] threshold = {}: a repository config may only raise the pass threshold ({}).",
+                self.threshold,
+                default_threshold()
+            ));
+            self.threshold = default_threshold();
+        }
+        let ignored = &mut self.ignored;
+        self.skip_checks.retain(|skip| {
+            let protected = PROTECTED_QUALITY_CHECKS
+                .iter()
+                .find(|name| skip == *name || *skip == quality_check_key(name));
+            if let Some(name) = protected {
+                ignored.push(format!(
+                    "Ignored `.umadevrc` [quality] skip_checks entry `{skip}`: `{name}` is a security check and always runs."
+                ));
+            }
+            protected.is_none()
+        });
+        for note in &self.ignored {
+            tracing::warn!("{note}");
         }
     }
 }
@@ -107,14 +164,10 @@ pub struct PipelineConfig {
     /// Overridable per run by the `UMADEV_STRICT_COVERAGE=1` environment flag.
     #[serde(default)]
     pub strict_coverage: bool,
-    /// Auto-approve the pipeline's ordinary document/preview gates without
-    /// waiting for input (default `true`). The gates (`docs_confirm`,
-    /// `preview_confirm`) still appear as checkpoints in the event stream and
-    /// status bar. This setting does not bypass irreversible-action
-    /// confirmations, deterministic acceptance, or the trust-mode safety
-    /// floor. Set it to `false` to require manual gate approval.
-    #[serde(default = "default_auto_approve")]
-    pub auto_approve_gates: bool,
+    // There is deliberately no gate auto-approval switch here. `.umadevrc`
+    // travels with the repository, so a cloned project could otherwise start
+    // itself in Auto. Only the user raises the tier (`/mode auto`, Shift+Tab,
+    // `--mode auto`); an old `auto_approve_gates` key is ignored.
 }
 
 impl Default for PipelineConfig {
@@ -123,13 +176,8 @@ impl Default for PipelineConfig {
             skip_phases: Vec::new(),
             max_review_rounds: default_review_rounds(),
             strict_coverage: false,
-            auto_approve_gates: default_auto_approve(),
         }
     }
-}
-
-fn default_auto_approve() -> bool {
-    true
 }
 
 fn default_review_rounds() -> usize {
@@ -354,14 +402,60 @@ fn read_project_config(project_root: &Path) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-/// Read `.umadevrc` from the project root. Returns `Default` if missing
-/// or malformed (fail-soft, same as UserConfig).
+/// Deserialize one top-level `.umadevrc` section independently, so a type
+/// error in it falls back to that section's defaults (with a warning) instead
+/// of discarding every other section. `None` means the section was present but
+/// invalid; an absent section is its `Default`.
+fn parse_section<T: Default + serde::de::DeserializeOwned>(
+    table: &toml::Table,
+    name: &str,
+) -> Option<T> {
+    let Some(value) = table.get(name) else {
+        return Some(T::default());
+    };
+    match value.clone().try_into() {
+        Ok(section) => Some(section),
+        Err(error) => {
+            tracing::warn!(".umadevrc [{name}] is invalid ({error}) — using its defaults");
+            None
+        }
+    }
+}
+
+/// Read `.umadevrc` from the project root. Returns `Default` if missing.
+/// Malformed input is fail-soft but never widens access: each section is
+/// parsed independently (an invalid one falls back to its defaults), and when
+/// the file is not valid TOML at all — or `[codex]` itself is invalid — the
+/// sandbox resolves to the restricted `workspace-write` tier, because a
+/// restriction the user wrote may be hiding in the unreadable part.
 #[must_use]
 pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     let Ok(body) = read_project_config(project_root) else {
         return ProjectConfig::default();
     };
-    let mut cfg: ProjectConfig = toml::from_str(&body).unwrap_or_default();
+    let restricted = || CodexConfig {
+        sandbox_mode: CodexSandbox::WorkspaceWrite.as_codex_arg().to_string(),
+    };
+    let mut cfg = match body.parse::<toml::Table>() {
+        Ok(table) => ProjectConfig {
+            quality: parse_section(&table, "quality").unwrap_or_default(),
+            pipeline: parse_section(&table, "pipeline").unwrap_or_default(),
+            experts: parse_section(&table, "experts").unwrap_or_default(),
+            knowledge: parse_section(&table, "knowledge").unwrap_or_default(),
+            model: parse_section(&table, "model").unwrap_or_default(),
+            codex: parse_section(&table, "codex").unwrap_or_else(restricted),
+        },
+        Err(error) => {
+            tracing::warn!(
+                ".umadevrc is not valid TOML ({error}) — using defaults with the Codex \
+                 sandbox restricted to workspace-write"
+            );
+            ProjectConfig {
+                codex: restricted(),
+                ..ProjectConfig::default()
+            }
+        }
+    };
     // Validate the knowledge engine: only "bm25" and "hybrid" are legal.
     // Unknown values (e.g. "quantum") silently fall back to "bm25" so a
     // typo never breaks retrieval.
@@ -376,6 +470,7 @@ pub fn load_project_config(project_root: &Path) -> ProjectConfig {
     }
     // Clamp quality threshold and top_k to sensible bounds.
     cfg.quality.threshold = cfg.quality.threshold.min(100);
+    cfg.quality.keep_only_stricter();
     cfg.knowledge.top_k = cfg.knowledge.top_k.clamp(1, 50);
     // Normalise the codex sandbox to a canonical kebab id; an unrecognised
     // explicitly invalid value falls back to the restricted `workspace-write`
@@ -513,6 +608,29 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_config_cannot_weaken_the_quality_gate() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[quality]\nthreshold = 0\nskip_checks = [\"no_leaked_secrets\", \"Pre-PR security scan\", \"dark_mode_support\"]\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path()).quality;
+        assert_eq!(cfg.threshold, 90, "a lower threshold is ignored");
+        assert_eq!(
+            cfg.skip_checks,
+            ["dark_mode_support"],
+            "only non-security skips stay"
+        );
+        assert_eq!(
+            cfg.ignored.len(),
+            3,
+            "each ignored override is reported: {:?}",
+            cfg.ignored
+        );
+    }
+
+    #[test]
     fn threshold_clamped_to_100() {
         let tmp = TempDir::new().unwrap();
         std::fs::write(tmp.path().join(".umadevrc"), "[quality]\nthreshold = 999\n").unwrap();
@@ -635,11 +753,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::fs::write(
             tmp.path().join(".umadevrc"),
-            "[quality]\nthreshold = 80\nskip_checks = [\"dark_mode\"]\n\n[pipeline]\nmax_review_rounds = 2\n",
+            "[quality]\nthreshold = 95\nskip_checks = [\"dark_mode\"]\n\n[pipeline]\nmax_review_rounds = 2\n",
         )
         .unwrap();
         let cfg = load_project_config(tmp.path());
-        assert_eq!(cfg.quality.threshold, 80);
+        assert_eq!(cfg.quality.threshold, 95);
         assert_eq!(cfg.quality.skip_checks, vec!["dark_mode"]);
         assert_eq!(cfg.pipeline.max_review_rounds, 2);
     }
@@ -749,21 +867,18 @@ mod tests {
         // must keep both and only touch [codex] sandbox_mode.
         std::fs::write(
             tmp.path().join(".umadevrc"),
-            "# my notes\n[pipeline]\nauto_approve_gates = false\n",
+            "# my notes\n[pipeline]\nmax_review_rounds = 2\n",
         )
         .unwrap();
         persist_codex_sandbox(tmp.path(), CodexSandbox::DangerFullAccess).unwrap();
         let body = std::fs::read_to_string(tmp.path().join(".umadevrc")).unwrap();
         assert!(body.contains("# my notes"), "comment preserved");
-        assert!(
-            body.contains("auto_approve_gates = false"),
-            "sibling preserved"
-        );
+        assert!(body.contains("max_review_rounds = 2"), "sibling preserved");
         assert!(body.contains("danger-full-access"));
         // And it round-trips through the loader as the chosen tier.
         let cfg = load_project_config(tmp.path());
         assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::DangerFullAccess);
-        assert!(!cfg.pipeline.auto_approve_gates);
+        assert_eq!(cfg.pipeline.max_review_rounds, 2);
     }
 
     #[test]
@@ -873,5 +988,48 @@ mod tests {
         .unwrap();
         persist_codex_sandbox(explicitly_saved.path(), CodexSandbox::WorkspaceWrite).unwrap();
         assert!(!migrate_legacy_generated_codex_sandbox(explicitly_saved.path()).unwrap());
+    }
+
+    #[test]
+    fn type_error_in_one_section_keeps_the_others() {
+        // A float threshold is a type error in `[quality]` only; it must not
+        // discard `[codex]` and silently widen a read-only sandbox to full access.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"read-only\"\n\n[quality]\nthreshold = 95.5\n\n\
+             [pipeline]\nmax_review_rounds = 2\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::ReadOnly);
+        assert_eq!(cfg.pipeline.max_review_rounds, 2);
+        assert_eq!(
+            cfg.quality.threshold, 90,
+            "the bad section falls back to its default"
+        );
+    }
+
+    #[test]
+    fn unparseable_config_never_widens_the_sandbox() {
+        // A syntax error hides whether a restriction was configured, so the
+        // sandbox resolves to the restricted tier instead of the full-access default.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".umadevrc"),
+            "[codex]\nsandbox_mode = \"read-only\"\n[quality\nthreshold = 80\n",
+        )
+        .unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
+        assert_eq!(cfg.quality.threshold, 90);
+    }
+
+    #[test]
+    fn invalid_codex_section_restricts_the_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join(".umadevrc"), "[codex]\nsandbox_mode = 1\n").unwrap();
+        let cfg = load_project_config(tmp.path());
+        assert_eq!(cfg.codex.resolved_sandbox(), CodexSandbox::WorkspaceWrite);
     }
 }

@@ -107,7 +107,7 @@
 "mode.auto_chip" = "auto-approve (shift+Tab for manual)"
 "mode.manual_chip" = "manual review (shift+Tab for auto)"
 "mode.plan_chip" = "plan · read-only requested (/mode to switch)"
-"mode.guarded_chip" = "guarded · review each gate (/mode to switch)"
+"mode.guarded_chip" = "guarded · review gates (/mode)"
 "mode.plan.on" = "[ok] Plan mode: on. UmaDev refuses explicit execution before any lock, branch, run state, artifact, or writer session. Normal conversation requests the base's strongest planning/read-only profile; actual filesystem enforcement, network access, and local-port access remain vendor/platform/policy specific and are unverified unless the base reports effective state. Switch to /mode guarded or /mode auto to execute."
 "mode.guarded.on" = "[ok] Guarded mode: on (default). UmaDev requests normal development access while every checkpoint pauses for your review; type c to approve, or text to revise. Actions touching .git / the network / destructive shell always require confirmation. The base's effective filesystem/network/local-port access may still be restricted by its platform or enterprise policy."
 "mode.auto.on" = "[ok] Autonomous mode: on. UmaDev requests full development access and auto-approves ordinary checkpoints. Only genuinely irreversible/destructive actions (rm -rf, force-push, .git rewrites, deploy/push/publish, credential exfiltration, writes outside the workspace) still ask for confirmation. Effective filesystem, network, and local-port access depend on the base, platform, inherited sandbox, and enterprise policy; a request is not proof of access. Governance hooks and the audit trail stay fully active."
@@ -376,7 +376,7 @@
 "plan.panel.collapsed" = "Plan {}/{} — /plan to expand"
 "plan.panel.active_step" = "step {}/{} · running"
 "plan.panel.interrupted" = "Plan (interrupted — /continue to resume)"
-"run.transient_resume_hint" = "Rate-limited or briefly interrupted — this run's plan is saved; type `/continue` to resume the unfinished steps."
+"run.transient_resume_hint" = "Rate-limited, out of quota or briefly interrupted — this run's plan is saved; type `/continue` to resume the unfinished steps."
 "run.budget_pause_resume_hint" = "Time budget reached — this run paused at step {}/{}; type `/continue` to finish the remaining steps."
 "run.operational_pause_resume_hint" = "Required review service is temporarily unavailable ({}) — this run paused at step {}/{} without changing code or failing the plan. Type `/continue` to retry this step."
 "plan.summary.header" = "Task summary — {} done · {} in progress · {} blocked · {} not started"
@@ -631,6 +631,7 @@
 "continue.resuming_chat" = "Resuming the previous conversation — the base picks up with full context."
 "continue.chat_directive" = "Continue the work from where we left off."
 "continue.resuming_plan" = "team · resuming the saved plan ({}/{} steps already done) — driving only what's left"
+"continue.unowned_run" = "The saved run in .umadev was not written by UmaDev on this machine (it may have come with the repository), so it was not resumed. Review it:\n{}\nTo run this plan as shown, send /continue adopt. To start over, type a new requirement."
 "revise.usage" = "Usage: /revise <revision notes>.\n  Example: /revise drop social login, keep only email + password"
 "revise.no_gate" = "No checkpoint is open, nothing to revise — to change output, wait for the run to pause at a checkpoint (confirm the core docs / confirm the frontend preview)."
 
@@ -770,6 +771,7 @@
 # /preview
 "preview.detected" = "[preview] Detected {}, starting preview…\n  command: `{}` -> {}"
 "preview.starting" = "Starting dev server and opening the preview: {}\n  command: `{}`"
+"preview.confirm_command" = "The preview command below was read from the frontend notes, which the repository or the model can edit. Not run yet:\n  {}\n  -> {}\nCheck it, then type /preview confirm to run it."
 "preview.opened" = "Opened the preview: {}\n  (no Run command found; if the page won't open, start the dev server manually)"
 "preview.none_yet" = "No previewable frontend yet. Type a requirement and run through the frontend phase (it pauses at the preview gate),\n                   or confirm the base wrote a Preview URL into output/xxx-frontend-notes.md."
 "preview.gate_announce" = "[preview] Frontend generated, preview at: {}\n                       Open it in the browser to see the result. Happy? type c to continue (into the backend);\n                       to change it, describe your edits. You can also /preview to auto-start the dev server, /stop-preview to stop."
@@ -782,7 +784,7 @@
 "deploy.starting" = "Starting deploy, running: `{}`\n  (this may require logging into the platform CLI; follow the prompts)"
 
 # /auto and /manual
-"review.auto_on" = "[ok] Autonomous mode: on. Doc and preview checkpoints auto-approve, delivering directly.\n  (to review step by step -> /manual · permanent setting -> auto_approve_gates in .umadevrc)"
+"review.auto_on" = "[ok] Autonomous mode: on. Doc and preview checkpoints auto-approve, delivering directly.\n  (to review step by step -> /manual · applies to this session; new sessions start guarded)"
 "review.manual_on" = "[ok] Review mode: on. Every checkpoint pauses, shows the output, and waits for you to type c to approve or text to revise.\n  (to go fully automatic -> /auto · clarifying questions always ask you first)"
 
 # /animations
@@ -853,6 +855,7 @@
 "base.fail.auth.grok" = "Grok Build is not logged in — run `grok login` in your terminal, then /continue; UmaDev never opens a login browser automatically"
 "base.fail.auth.generic" = "Base not logged in / auth failed — run the base's login command (or check your API key), then /continue"
 "base.fail.ratelimit" = "Base hit a rate limit — wait for it to reset (see the base's message below), or /model to switch model, or switch base"
+"base.fail.quota" = "Base usage quota or account balance is used up — wait for it to reset (see the base's message below), top up, or /model to switch model; retrying won't help"
 "base.fail.overloaded" = "Base is overloaded (busy) — retry shortly, or /model to a lighter model, or switch base"
 "base.fail.network" = "Cannot reach the base model endpoint — check your network or proxy settings"
 "base.fail.network.ssl" = "SSL / certificate verification failed — check your proxy or corporate cert (NODE_EXTRA_CA_CERTS)"
@@ -1050,7 +1053,6 @@
 "diag.call_failed" = "[warn] {} phase: base call failed ({}) — falling back to an OFFLINE SKELETON for this phase (not a real generation). {}"
 
 # quality gate — inline score + findings instead of pointing at the JSON
-"quality.gate_unreadable" = "[warn] Quality gate file was written but can't be read back ({}) — treating as not-passed to avoid masking a write failure."
 "quality.gate_blocked" = "[warn] Quality gate did NOT pass (score {}/100) — blocking delivery (UD-EVID-003). Fix the items below, then:\n  /redo to re-run the whole pipeline\n  or /continue after fixing to resume"
 "quality.top_findings_header" = "Top findings to fix:"
 
@@ -1073,6 +1075,7 @@
 # Ctrl+click opened a URL / file from the transcript ({} = the opened target; iTerm2's native Cmd+click is unaffected)
 "tui.link.opened" = "Opened {}"
 "tui.link.open_failed" = "Could not open {}"
+"tui.link.revealed" = "Showed {} in its folder (not opened: it could run as a program)"
 # Tool-call rows: merged read/grep batch headline + grep metric
 "tui.tool.batch" = "inspected {} files"
 "tui.tool.matches" = "{} matches"

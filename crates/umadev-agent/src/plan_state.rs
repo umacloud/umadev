@@ -2003,6 +2003,7 @@ pub fn save(plan: &Plan, root: &Path) -> std::io::Result<PathBuf> {
         ));
     }
     umadev_state::fs::atomic_write(&final_path, json.as_bytes())?;
+    crate::run_provenance::record(root, crate::run_provenance::PLAN, json.as_bytes());
     Ok(root.join(plan_rel_path()))
 }
 

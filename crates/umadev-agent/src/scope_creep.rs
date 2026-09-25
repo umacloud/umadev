@@ -350,7 +350,8 @@ pub fn unclaimed_changes(root: &Path, plan: &Plan) -> Vec<ScopeFinding> {
 
 /// Whether a declared claim covers a changed path. A claim is either an exact
 /// (normalised) path or a DIRECTORY prefix — `src/api/`, or a bare `src/api` that the
-/// changed path sits under — so a step can claim a subtree without enumerating it.
+/// changed path sits under — so a step can claim a subtree without enumerating it —
+/// or a glob (`src/components/*.tsx`, `src/api/**`).
 ///
 /// Compared CASE-INSENSITIVELY: macOS and Windows both ship case-insensitive
 /// filesystems by default, so a step that claimed `src/Api/` and a diff that reports
@@ -366,6 +367,11 @@ fn claim_covers(claim: &str, path: &str) -> bool {
         return false;
     }
     let path = path.to_ascii_lowercase();
+    // A glob claim (`src/components/*.tsx`, `src/api/**`) uses the same matcher
+    // as the execution contract, so both scope checks agree on what it covers.
+    if claim.contains('*') {
+        return crate::execution_contract::wildcard_match(claim.as_bytes(), path.as_bytes());
+    }
     let dir = claim.trim_end_matches('/');
     path == dir || path.starts_with(&format!("{dir}/"))
 }
@@ -800,6 +806,25 @@ mod tests {
         assert!(!claim_covers("src/api", "src/apikeys.ts"));
         assert!(!claim_covers("src/api", "src/other.ts"));
         assert!(!claim_covers("", "src/a.ts"));
+    }
+
+    #[test]
+    fn claim_covers_glob_claims() {
+        assert!(claim_covers(
+            "src/components/*.tsx",
+            "src/components/Button.tsx"
+        ));
+        assert!(claim_covers(
+            "src/Components/*.TSX",
+            "src/components/Button.tsx"
+        ));
+        assert!(claim_covers("src/api/**", "src/api/v1/login.ts"));
+        assert!(claim_covers("**/*.test.ts", "src/api/login.test.ts"));
+        assert!(!claim_covers(
+            "src/components/*.tsx",
+            "src/components/Button.css"
+        ));
+        assert!(!claim_covers("src/components/*.tsx", "src/pages/Home.tsx"));
     }
 
     #[test]

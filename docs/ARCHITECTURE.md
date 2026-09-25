@@ -205,7 +205,7 @@ fail-soft；评审意见不替代确定性地板，但已调度的必需评审�
 | **运行时证据** | `runtime_proof`（`verify --runtime`） | 不止"能编译"——启动 dev server、对路由做 HTTP 探测，把真启动证据写 `.umadev/audit/runtime-proof.json`，并入 proof-pack。 |
 | **部署闭环** | `deploy`（`umadev deploy`） | 从工件探测部署目标（Vercel / Netlify / Fly / Cloudflare Pages / 容器镜像 / 静态托管），默认只打印配方；`--run` 经你已登录的平台 CLI 真部署并写 `deploy-proof.json`。UmaDev 不持有任何凭证、不注入任何东西。 |
 | **PR 模式** | `pr` / `review` / `security`（`umadev pr` / `report --review`） | `report --review` 跑 pre-PR 安全扫描并生成 PR 级评审报告；`umadev pr` 默认 dry-run（写 body + 打印计划），`--create` 才真正推送并 `gh pr create`。 |
-| **信任分级** | `trust` | `TrustMode::Plan`（只读）/ `Guarded` / `Auto` 三档。`run/quick --mode` 的 CLI 默认是 Guarded；TUI 还兼容 `.umadevrc` 的 `auto_approve_gates` 映射，当前生成值 `true` 对应 Auto 普通 gate。无论哪档，**不可逆动作**（.git / 网络 / 破坏性 shell）都保留确认地板。 |
+| **信任分级** | `trust` | `TrustMode::Plan`（只读）/ `Guarded` / `Auto` 三档。CLI `run/quick --mode` 与 TUI 默认都是 Guarded；项目配置（`.umadevrc`）不能选择档位，Auto 只能由用户为当前会话开启（`/mode auto`、Shift+Tab）。无论哪档，**不可逆动作**（.git / 网络 / 破坏性 shell）都保留确认地板。 |
 | **技能库** | `skills`（`umadev skill`） | 安装 / 列出 / 移除 知识+规则+prompt 技能包。 |
 | **证据门控记忆** | `lessons` + `error_kb` + skills/recipes/facts/run-notes + RAG | 见下「证据门控记忆」节。 |
 

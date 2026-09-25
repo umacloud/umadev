@@ -336,7 +336,7 @@ pub(super) fn next_final_review_checkpoint(
 /// die between their renames. Keeping a distinctive cursor in the plan lets the
 /// loader reconstruct a missing checkpoint without scheduling an ordinary review
 /// and then immediately reviewing again in the final gate.
-pub(super) const FINAL_REVIEW_RETRY_STEP_ID: &str = "umadev-final-review-retry";
+pub(crate) const FINAL_REVIEW_RETRY_STEP_ID: &str = "umadev-final-review-retry";
 
 #[cfg(test)]
 fn operational_review_checkpoint_path(root: &Path) -> std::path::PathBuf {
@@ -405,7 +405,9 @@ pub(super) fn save_operational_review_checkpoint(
     umadev_state::fs::atomic_write(
         &dir.join(OPERATIONAL_REVIEW_CHECKPOINT_FILE),
         body.as_slice(),
-    )
+    )?;
+    crate::run_provenance::record(root, crate::run_provenance::REVIEW_CHECKPOINT, &body);
+    Ok(())
 }
 
 pub(super) fn load_operational_review_checkpoint(
@@ -798,8 +800,9 @@ pub fn is_budget_pause_reason(reason: &str) -> bool {
 }
 
 /// A ONE-LINE localized discoverability hint to emit when a director run stops with a
-/// still-resumable plan on disk AND the stop was either a **transient** base failure
-/// (a rate limit / an overloaded base / a network blip — [`crate::base_error::is_transient`])
+/// still-resumable plan on disk AND the stop was either a **resumable** base failure
+/// (a rate limit / an overloaded base / a network blip / an exhausted quota —
+/// [`crate::base_error::is_resumable_later`])
 /// OR a **run-time-budget** exhaustion ([`is_budget_pause_reason`]): the plan was
 /// saved and `/continue` picks up the unfinished steps.
 ///
@@ -827,7 +830,7 @@ pub fn transient_resume_hint(reason: &str, root: &Path) -> Option<String> {
     // progress for the budget-pause variant (done/total).
     let plan = load_resumable_plan(root)?;
     let failure = crate::base_error::classify(None, None, Some(reason.trim()));
-    if crate::base_error::is_transient(&failure) {
+    if crate::base_error::is_resumable_later(&failure) {
         return Some(umadev_i18n::tl("run.transient_resume_hint").to_string());
     }
     if is_budget_pause_reason(reason) {

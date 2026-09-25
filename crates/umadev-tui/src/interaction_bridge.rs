@@ -67,6 +67,18 @@ pub(super) struct PendingApproval {
     /// RPC). Retained so a [`umadev_runtime::SessionEvent::HostRequestSettled`]
     /// can retract exactly this approval when the base withdraws its request.
     pub(super) req_id: String,
+    /// When set, the `y` key cannot allow this approval before that instant.
+    /// Set when this approval replaced one that was still pending, so a key
+    /// pressed for the request the user was looking at cannot land on the one
+    /// that just took its place ([`APPROVAL_ARM_DELAY`]).
+    pub(super) armed_at: Option<std::time::Instant>,
+}
+
+impl PendingApproval {
+    fn is_armed(&self) -> bool {
+        self.armed_at
+            .is_none_or(|at| std::time::Instant::now() >= at)
+    }
 }
 
 /// Shared slot for the single in-flight [`PendingApproval`]. A plain `std::sync::Mutex`
@@ -373,7 +385,14 @@ pub(super) fn parse_host_question_answer(
     question: &umadev_runtime::HostQuestion,
     raw: &str,
 ) -> std::result::Result<umadev_runtime::HostAnswer, String> {
-    let raw = raw.trim();
+    let raw = if matches!(question.kind, umadev_runtime::HostQuestionKind::Secret) {
+        // Whitespace can be part of a password or token; only the line
+        // terminator is not.
+        raw.strip_suffix('\n')
+            .map_or(raw, |line| line.strip_suffix('\r').unwrap_or(line))
+    } else {
+        raw.trim()
+    };
     if question.required && raw.is_empty() {
         return Err(format!("`{}` requires an answer", question.id));
     }
@@ -475,7 +494,8 @@ pub(super) fn parse_user_input_response(
             })
             .collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        let lines = raw.lines().map(str::trim).collect::<Vec<_>>();
+        // Each answer is trimmed per its question kind (secrets are not).
+        let lines = raw.lines().collect::<Vec<_>>();
         if lines.len() != questions.len() {
             return Err(format!(
                 "expected {} answer lines or a JSON object keyed by question id",
@@ -528,10 +548,16 @@ pub(super) fn parse_host_input_response(
             let expected = requested_schema
                 .get("type")
                 .and_then(serde_json::Value::as_str);
-            let content = match serde_json::from_str::<serde_json::Value>(raw) {
-                Ok(value) => value,
-                Err(_) if expected == Some("string") => serde_json::Value::String(raw.to_string()),
-                Err(error) => return Err(format!("invalid JSON response: {error}")),
+            let content = if expected == Some("string") {
+                // Only a JSON string literal is unwrapped; anything else
+                // (`94107`, `true`, `null`, prose) is the string as typed.
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .filter(serde_json::Value::is_string)
+                    .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+            } else {
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .map_err(|error| format!("invalid JSON response: {error}"))?
             };
             if !schema_accepts_top_level(requested_schema, &content) {
                 return Err(format!(
@@ -765,6 +791,11 @@ pub(super) fn resolve_pending_host_input_key(
 /// bounded so a walked-away user can never hold the resident session open forever.
 pub(super) const APPROVAL_WAIT_BUDGET: Duration = Duration::from_secs(300);
 
+/// How long an approval that superseded a still-pending one must be on screen
+/// before the `y` key can allow it: several frames, so the sticky bar has
+/// shown the new request before a keypress can approve it.
+pub(super) const APPROVAL_ARM_DELAY: Duration = Duration::from_millis(600);
+
 /// Process-global LIVE trust tier so a MID-TURN mode switch (shift+Tab / `/mode` /
 /// `/auto` / `/manual`) takes effect on the IN-FLIGHT chat turn — not just the snapshot
 /// captured when the turn was spawned. Reported bug: a user sent a command in Guarded,
@@ -887,6 +918,13 @@ pub(super) fn resolve_pending_approval(
         // letting it fall through with text in the box would reach the Esc interrupt
         // arm (`is_pipeline_active`) — a double-Esc there cancels the WHOLE run.
         KeyCode::Esc => Some(ApprovalReply::Deny),
+        // A just-superseded request swallows the key instead: it was meant for
+        // the request on screen a moment ago, not this one.
+        KeyCode::Char('y' | 'Y')
+            if input_empty && guard.as_ref().is_some_and(|p| !p.is_armed()) =>
+        {
+            return true;
+        }
         KeyCode::Char('y' | 'Y') if input_empty => Some(ApprovalReply::Allow),
         KeyCode::Char('n' | 'N') if input_empty => Some(ApprovalReply::Deny),
         _ => None,
@@ -954,17 +992,25 @@ pub(super) fn clear_pending_approval(holder: &ApprovalHolder) {
     }
 }
 
-/// Resolve an in-flight guarded approval as ALLOW — the user's EXPLICIT verdict
-/// (a typed 「批准」/"approve" via [`crate::app::Action::ApprovalReply`], or the
-/// empty-input `y` key). Always resolves, whatever the item: an explicit human
-/// approval is exactly what the prompt asked for. Fail-open: a poisoned lock /
-/// no pending approval is a no-op.
-pub(super) fn allow_pending_approval(holder: &ApprovalHolder) {
-    if let Ok(mut g) = holder.lock() {
-        if let Some(p) = g.take() {
-            let _ = p.reply_tx.send(ApprovalReply::Allow);
-        }
+/// Resolve an in-flight guarded approval as ALLOW — the user's EXPLICIT typed
+/// verdict (「批准」/"approve" via [`crate::app::Action::ApprovalReply`]). `seen`
+/// is the `(action, target)` the approval bar showed when the reply was
+/// submitted: the approval resolves only if it is still that request and has
+/// been on screen long enough ([`APPROVAL_ARM_DELAY`]), so a request that
+/// replaced it while the user was typing stays pending and visible instead.
+/// Returns whether it resolved. Fail-open: a poisoned lock / no pending
+/// approval is a no-op.
+pub(super) fn allow_pending_approval(holder: &ApprovalHolder, seen: &(String, String)) -> bool {
+    let Ok(mut g) = holder.lock() else {
+        return false;
+    };
+    let matches = g
+        .as_ref()
+        .is_some_and(|p| p.is_armed() && p.action == seen.0 && p.target == seen.1);
+    if let Some(p) = g.take_if(|_| matches) {
+        let _ = p.reply_tx.send(ApprovalReply::Allow);
     }
+    matches
 }
 
 /// Release an in-flight approval on a MODE SWITCH to Auto (shift+Tab / `/mode`
@@ -981,13 +1027,25 @@ pub(super) fn allow_pending_approval(holder: &ApprovalHolder) {
 /// ordinary item (an npm install, an in-tree write) resolves Allow, matching the
 /// tier the user just opted into. Fail-open: a poisoned lock / no pending
 /// approval is a no-op.
-pub(super) fn release_pending_approval_on_auto_switch(holder: &ApprovalHolder) {
+pub(super) fn release_pending_approval_on_auto_switch(
+    holder: &ApprovalHolder,
+    project_root: &std::path::Path,
+) {
     if let Ok(mut g) = holder.lock() {
         if g.as_ref().is_some_and(|p| !p.auto_releasable) {
             return; // the base's effective policy still requires a human answer
         }
+        // The same root-aware decision the live gate makes under Auto: without the
+        // real workspace root a write escaping it (or into a permission file) would
+        // look in-tree and be released unanswered.
         let still_escalates = g.as_ref().is_some_and(|p| {
-            umadev_agent::requires_confirmation(umadev_agent::TrustMode::Auto, &p.action, &p.target)
+            umadev_agent::requires_confirmation_with_ledger(
+                umadev_agent::TrustMode::Auto,
+                &p.action,
+                &p.target,
+                project_root,
+                &umadev_agent::TrustLedger::load(project_root),
+            )
         });
         if still_escalates {
             return; // a true disaster keeps its explicit prompt even in Auto
@@ -1052,7 +1110,8 @@ async fn await_user_approval_with_auto_release(
             // supersede). The newest ask from a serially-asking base is the
             // live one; say the old one was superseded so a rejection the base
             // reports is never a mystery.
-            if g.take().is_some() {
+            let superseded = g.take().is_some();
+            if superseded {
                 sink.emit(EngineEvent::Note(
                     umadev_i18n::tl("host.input.note.approval_superseded").to_string(),
                 ));
@@ -1063,13 +1122,17 @@ async fn await_user_approval_with_auto_release(
                 target: target.to_string(),
                 auto_releasable,
                 req_id: req_id.to_string(),
+                armed_at: superseded.then(|| std::time::Instant::now() + APPROVAL_ARM_DELAY),
             });
         }
         Err(_) => return ApprovalReply::Deny,
     }
     sink.emit(EngineEvent::Note(umadev_i18n::tlf(
         "trust.pause.approve",
-        &[action, target],
+        &[
+            &crate::ui::visible_approval_text(action),
+            &crate::ui::visible_approval_text(target),
+        ],
     )));
     // Bounded wait. A dropped sender (cancel / quit / a cleared holder / a dead session)
     // resolves the inner `rx` to `Err` → DENY; the outer timeout is the walked-away-user
@@ -1085,7 +1148,12 @@ async fn await_user_approval_with_auto_release(
             ApprovalReply::Deny
         }
     };
-    clear_pending_approval(holder);
+    // Clear only our own entry: the waiter this approval superseded must not
+    // wipe the request that replaced it (and so deny it before it is seen).
+    // Ours is the one whose receiver is gone now that the wait has ended.
+    if let Ok(mut g) = holder.lock() {
+        let _ = g.take_if(|p| p.reply_tx.is_closed());
+    }
     reply
 }
 

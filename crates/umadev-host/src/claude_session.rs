@@ -1460,9 +1460,18 @@ impl FirmwareFile {
     /// propagates the I/O error so the caller can fall back to the inline arg.
     fn write_in(dir: &Path, text: &str) -> std::io::Result<Self> {
         // A UUID name avoids collisions across concurrent sessions / critic forks.
+        // `dir` is usually the shared system temp directory, so the prompt is
+        // created exclusively (never through a pre-planted link) and owner-only.
         let path = dir.join(format!("umadev-firmware-{}.txt", new_session_id()));
-        std::fs::write(&path, text)?;
-        Ok(Self { path })
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&path)?;
+        // From here the file is ours, so the guard removes it on any failure.
+        let guard = Self { path };
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        Ok(guard)
     }
 }
 
@@ -1533,11 +1542,17 @@ fn maybe_divert_firmware(
     divert_append_system_to_file_in(args.to_vec(), &std::env::temp_dir())
 }
 
-/// The read-only + research + delegate native tools UmaDev ALWAYS pre-approves —
-/// even in Guarded — so the base keeps its native capabilities under UmaDev instead
-/// of eating a `can_use_tool` round-trip (and, in interactive Guarded chat, a
-/// confusing user pause that fail-open DENIES) for every `Grep` / `Glob` /
-/// `WebSearch` / `WebFetch`, Claude's task-list tools, and every sub-agent spawn.
+/// The read-only + delegate native tools UmaDev ALWAYS pre-approves — even in
+/// Guarded — so the base keeps its native capabilities under UmaDev instead of
+/// eating a `can_use_tool` round-trip (and, in interactive Guarded chat, a
+/// confusing user pause that fail-open DENIES) for every `Grep` / `Glob`,
+/// Claude's task-list tools, and every sub-agent spawn.
+///
+/// `WebFetch` / `WebSearch` are deliberately NOT here: Plan and Guarded confirm
+/// every network reach (see `umadev_agent::trust::floor_escalates`), matching
+/// OpenCode's plan/guarded rulesets. Pre-approved, a prompt injected through a
+/// repository file could read a secret and send it out in a fetched URL with no
+/// approval ever shown, even in read-only Plan.
 /// `TodoWrite` remains as a compatibility alias for older Claude builds;
 /// `TaskCreate` / `TaskGet` / `TaskUpdate` / `TaskList` are the current official
 /// task tools. `Agent` / `Task`
@@ -1552,9 +1567,9 @@ fn maybe_divert_firmware(
 /// background sub-agents' results (the outstanding-agents settle guard re-drives it
 /// to do exactly that) without eating an approval pause; `KillShell` mutates (stops
 /// a task) and stays gated.
-const PLAN_ALLOWED_TOOLS: &str = "Read,Grep,Glob,WebSearch,WebFetch";
+const PLAN_ALLOWED_TOOLS: &str = "Read,Grep,Glob";
 
-const GUARDED_ALLOWED_TOOLS: &str = "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,TaskCreate,TaskGet,TaskUpdate,TaskList,Agent,Task,TaskOutput,BashOutput,AgentOutput";
+const GUARDED_ALLOWED_TOOLS: &str = "Read,Grep,Glob,TodoWrite,TaskCreate,TaskGet,TaskUpdate,TaskList,Agent,Task,TaskOutput,BashOutput,AgentOutput";
 
 /// AUTO additionally pre-approves the MUTATING working set (`Edit` / `Write` / `Bash`
 /// / `NotebookEdit`) so an unattended autonomous run is never interrupted by a
@@ -3693,6 +3708,15 @@ mod tests {
         );
         assert!(out.contains(&"--append-system-prompt-file".to_string()));
         assert!(!out.iter().any(|a| a.contains(&firmware)));
+        // The prompt sits in the shared temp dir, so other local users must not
+        // be able to read it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let path = &guard.as_ref().unwrap().path;
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "firmware file must be owner-only");
+        }
     }
 
     #[test]
@@ -3732,11 +3756,21 @@ mod tests {
                 "guarded must NOT pre-approve the mutating tool {mutating} (it must hit the gate)"
             );
         }
-        for native in ["Agent", "Task", "Grep", "Glob", "WebSearch"] {
+        for native in ["Agent", "Task", "Grep", "Glob"] {
             assert!(
                 guarded[t + 1].split(',').any(|x| x == native),
                 "guarded must pre-approve the read-only/delegate tool {native} so it runs natively"
             );
+        }
+        // Plan and Guarded confirm every network reach, so neither pre-approves
+        // a web tool: a fetched URL is an exfiltration channel.
+        for list in [PLAN_ALLOWED_TOOLS, GUARDED_ALLOWED_TOOLS] {
+            for web in ["WebFetch", "WebSearch"] {
+                assert!(
+                    !list.split(',').any(|x| x == web),
+                    "{web} must reach the approval gate outside Auto"
+                );
+            }
         }
         let auto = session_args("sid", None, true, None);
         let t = auto.iter().position(|a| a == "--allowedTools").unwrap();
@@ -6589,7 +6623,7 @@ cat >/dev/null
     }
 
     #[test]
-    fn native_events_redact_before_transcript_tool_activity_and_audit() {
+    fn native_events_keep_model_text_and_tool_traffic_whole() {
         const SECRET: &str = "SYNTH_CLAUDE_SESSION_SECRET_81";
         let call = serde_json::json!({
             "type": "assistant",
@@ -6626,8 +6660,8 @@ cat >/dev/null
         events.extend(parse_stdout_line(&text));
         let audit_view = format!("{events:?}");
         assert!(
-            !audit_view.contains(SECRET),
-            "event/audit leaked: {audit_view}"
+            audit_view.contains(SECRET),
+            "event was rewritten: {audit_view}"
         );
         assert!(audit_view.contains("safe-page-2"));
 

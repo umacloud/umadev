@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use umadev_process::git::GitAccess;
 
 use crate::phases::QualityReport;
 use crate::security::SecurityScan;
@@ -544,7 +545,15 @@ fn git_diff(project_root: &Path) -> Option<String> {
 fn run_git_diff(project_root: &Path, against: &str) -> Option<String> {
     let out = crate::external_command::bounded_git_output(
         project_root,
-        &["diff", "--no-ext-diff", "--find-renames", against],
+        GitAccess::ReadOnly,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            umadev_process::git::IGNORE_DIRTY_SUBMODULES,
+            "--find-renames",
+            against,
+        ],
         REVIEW_GIT_TIMEOUT,
         REVIEW_DIFF_BYTES,
     )?;
@@ -561,6 +570,7 @@ fn merge_base_with_default(project_root: &Path) -> Option<String> {
     for base in ["origin/main", "origin/master", "main", "master"] {
         let out = crate::external_command::bounded_git_output(
             project_root,
+            GitAccess::ReadOnly,
             &["merge-base", "HEAD", base],
             REVIEW_GIT_TIMEOUT,
             8 * 1024,
@@ -713,26 +723,10 @@ pub fn scan_ci_weakening(diff: &str) -> Vec<String> {
     signals
 }
 
-/// Heuristic: does this path look like a test file? (Matches the common
-/// conventions across the stacks UmaDev targets.)
+/// Heuristic: does this repo-relative diff path look like a test file? Shares
+/// the test-integrity guard's classifier so both agree on what a test is.
 fn is_test_path(path: &str) -> bool {
-    let p = path.to_ascii_lowercase();
-    p.contains("/tests/")
-        || p.contains("/test/")
-        || p.contains("__tests__")
-        || p.ends_with("_test.go")
-        || p.ends_with("_test.py")
-        || p.ends_with("test.ts")
-        || p.ends_with("test.tsx")
-        || p.ends_with("test.js")
-        || p.ends_with("test.jsx")
-        || p.ends_with(".test.ts")
-        || p.ends_with(".test.tsx")
-        || p.ends_with(".test.js")
-        || p.ends_with(".spec.ts")
-        || p.ends_with(".spec.tsx")
-        || p.ends_with(".spec.js")
-        || p.ends_with("_spec.rb")
+    crate::test_integrity::is_test_source_path(path)
 }
 
 #[cfg(test)]
@@ -757,6 +751,59 @@ mod tests {
                 !std::path::Path::new(&rel).is_absolute(),
                 "{hostile:?} -> absolute {rel:?}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_review_diff_runs_no_repository_diff_or_filter_program() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = crate::external_command::bounded_git_output(
+                &root,
+                GitAccess::Mutating,
+                args,
+                REVIEW_GIT_TIMEOUT,
+                64 * 1024,
+            );
+            assert!(output.is_some_and(|output| output.status.success()));
+        };
+        if crate::external_command::bounded_git_output(
+            tmp.path(),
+            GitAccess::ReadOnly,
+            &["--version"],
+            REVIEW_GIT_TIMEOUT,
+            1024,
+        )
+        .is_none()
+        {
+            return;
+        }
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join(".gitattributes"), "* filter=x diff=x\n").unwrap();
+        fs::write(root.join("app.ts"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        for (key, marker) in [
+            ("filter.x.clean", "clean"),
+            ("filter.x.smudge", "smudge"),
+            ("diff.x.textconv", "textconv"),
+            ("diff.x.command", "command"),
+            ("diff.external", "external"),
+        ] {
+            let program = format!("touch '{}'; cat", tmp.path().join(marker).display());
+            git(&["config", key, &program]);
+        }
+        fs::write(root.join("app.ts"), "two\n").unwrap();
+
+        let diff = git_diff(&root).expect("review diff");
+        assert!(diff.contains("+two"), "{diff}");
+        for marker in ["clean", "smudge", "textconv", "command", "external"] {
+            assert!(!tmp.path().join(marker).exists(), "{marker} ran");
         }
     }
 
@@ -897,6 +944,30 @@ mod tests {
         assert!(is_test_path("app/__tests__/Button.jsx"));
         assert!(!is_test_path("src/main.rs"));
         assert!(!is_test_path("docs/readme.md"));
+    }
+
+    #[test]
+    fn detects_deleted_repo_root_test_files() {
+        // Diff paths are repo-relative, so a top-level test dir has no leading `/`.
+        for path in [
+            "tests/test_api.py",
+            "tests/integration.rs",
+            "test/foo.js",
+            "app/test_models.py",
+            "__tests__/App.jsx",
+        ] {
+            let diff = format!(
+                "diff --git a/{path} b/{path}\ndeleted file mode 100644\nindex abc..000\n\
+                 --- a/{path}\n+++ /dev/null\n"
+            );
+            let s = scan_ci_weakening(&diff);
+            assert_eq!(s.len(), 1, "{path}: {s:?}");
+            assert!(s[0].contains("deleted test file"), "{path}: {s:?}");
+        }
+        // A name that merely ends in `test.js` is not a test file.
+        let diff = "diff --git a/src/latest.js b/src/latest.js\ndeleted file mode 100644\n\
+                    index abc..000\n--- a/src/latest.js\n+++ /dev/null\n";
+        assert!(scan_ci_weakening(diff).is_empty());
     }
 
     #[test]

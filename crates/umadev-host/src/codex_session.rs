@@ -122,6 +122,14 @@ enum CodexFrameRead {
     Oversized,
 }
 
+/// The frame [`read_bounded_codex_frame`] is still assembling, kept across calls
+/// so a cancelled read resumes instead of dropping consumed bytes.
+#[derive(Default)]
+struct CodexPartialFrame {
+    bytes: Vec<u8>,
+    oversized: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CodexUserInput {
     Text(String),
@@ -209,16 +217,16 @@ pub fn codex_sandbox_override() -> Option<String> {
 /// and tiered by trust mode:
 /// - **Plan** → `read-only`; a project override can never silently widen a mode
 ///   whose public contract is read-only.
-/// - **Guarded** (the default) → `danger-full-access` with approvals retained.
-///   UmaDev is a development host: package managers, local ports, subprocesses,
-///   git and network access must reach the real environment.
+/// - **Guarded** (the default) → `danger-full-access` with approvals retained
+///   (`untrusted`, see [`codex_approval_policy`]). UmaDev is a development
+///   host: package managers, local ports, subprocesses, git and network access
+///   must reach the real environment.
 /// - **Auto** → `danger-full-access` with ordinary approvals pre-authorized.
 ///
 /// An explicit override (env / project config) wins for either writable tier, so
 /// a user can deliberately narrow Guarded or Auto to `workspace-write` /
 /// `read-only`. Guarded is the approval posture, not a second OS sandbox tier:
-/// its `approvalPolicy:on-request` remains independent from filesystem/network
-/// access.
+/// it keeps raising approvals whatever filesystem/network access it has.
 ///
 /// (The read-only critic fork — [`thread_start_params_readonly`] — is NEVER driven
 /// by this: its `read-only` sandbox is the single-writer invariant, not a knob.)
@@ -276,12 +284,19 @@ fn resolve_codex_sandbox(raw: Option<&str>) -> &'static str {
     }
 }
 
-/// Pair environment access with approval automation. Guarded keeps approval
-/// events active even with full access; Auto pre-authorizes them; Plan is
-/// non-interactive inside a read-only sandbox.
+/// Pair environment access with approval automation. Auto pre-authorizes; Plan
+/// is non-interactive inside a read-only sandbox. Guarded must keep raising
+/// approval events, which depends on the sandbox: under `on-request` Codex asks
+/// only when a command has to leave its sandbox, and `danger-full-access` has
+/// none to leave, so every command and patch would run unasked. Guarded with
+/// full access therefore uses `untrusted`, which asks for everything outside
+/// Codex's small set of known read-only commands; with a narrower sandbox,
+/// `on-request` escalations are the approvals.
 fn codex_approval_policy(sandbox: &str, permissions: BasePermissionProfile) -> &'static str {
     if sandbox == "read-only" || permissions.auto_approve() {
         "never"
+    } else if sandbox == "danger-full-access" {
+        "untrusted"
     } else {
         "on-request"
     }
@@ -431,8 +446,8 @@ const EVENT_CHANNEL_CAP: usize = 256;
 
 /// Sender half for translated session events. **Bounded** (see
 /// [`EVENT_CHANNEL_CAP`]); the reader task multiplexes JSON-RPC RESPONSES and
-/// events on one stdout loop. Text and live-output presentation deltas use
-/// non-blocking `try_send`; tool facts, control transitions, and terminal state
+/// events on one stdout loop. Live-output presentation deltas use non-blocking
+/// `try_send`; answer text, tool facts, control transitions, and terminal state
 /// await bounded-channel delivery. Pending RPC waiters are always released before
 /// the terminal EOF event is awaited, preserving the no-deadlock invariant.
 type EventTx = mpsc::Sender<SessionEvent>;
@@ -993,9 +1008,10 @@ impl CodexSession {
             .await
             .map_err(|e| SessionError::Start(format!("codex initialized: {e}")))?;
 
-        // 3. thread/start. `sandbox:"workspace-write"` + `approvalPolicy:"never"`
-        //    is the autonomous "write code without asking" tier; the gate tier
-        //    uses `on-request` so the server raises `requestApproval`. Bounded too.
+        // 3. thread/start. `approvalPolicy:"never"` is the autonomous "write code
+        //    without asking" tier; the gate tier picks a policy under which the
+        //    server raises `requestApproval` (see `codex_approval_policy`).
+        //    Bounded too.
         let started = self
             .request_bounded(
                 "thread/start",
@@ -1462,6 +1478,7 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, state: CodexReaderStat
     // tolerates a bad byte (one non-JSON line is dropped by `dispatch_line`,
     // not the stream) without unbounded retention.
     let mut reader = BufReader::new(stdout);
+    let mut partial_frame = CodexPartialFrame::default();
     let mut collab = CodexCollabTracker::default();
     let dispatch = CodexDispatchContext {
         pending: &state.pending,
@@ -1484,7 +1501,7 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, state: CodexReaderStat
         let read = if state.trailing_usage.lock().await.pending.is_some() {
             let Ok(result) = tokio::time::timeout(
                 TRAILING_USAGE_GRACE,
-                read_bounded_codex_frame(&mut reader, MAX_OUTPUT_FRAME_BYTES),
+                read_bounded_codex_frame(&mut reader, &mut partial_frame, MAX_OUTPUT_FRAME_BYTES),
             )
             .await
             else {
@@ -1495,7 +1512,7 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, state: CodexReaderStat
             };
             result
         } else {
-            read_bounded_codex_frame(&mut reader, MAX_OUTPUT_FRAME_BYTES).await
+            read_bounded_codex_frame(&mut reader, &mut partial_frame, MAX_OUTPUT_FRAME_BYTES).await
         };
         match read {
             Ok(Some(CodexFrameRead::Line(line_buf))) => {
@@ -1557,29 +1574,33 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, state: CodexReaderStat
 /// Read one JSONL frame with bounded retained memory. `fill_buf` makes ordinary
 /// pipe fragmentation invisible; once the limit is crossed, bytes are discarded
 /// through the record boundary before `Oversized` is returned.
+///
+/// Cancel-safe: the partially read frame lives in the caller-owned `partial`,
+/// updated in the same synchronous step that consumes the bytes, so dropping
+/// the future (the reader loop's `TRAILING_USAGE_GRACE` timeout) between
+/// `fill_buf` awaits loses nothing — the next call resumes the same frame.
 async fn read_bounded_codex_frame<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
+    partial: &mut CodexPartialFrame,
     limit: usize,
 ) -> std::io::Result<Option<CodexFrameRead>> {
-    let mut bytes = Vec::new();
-    let mut oversized = false;
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            if bytes.is_empty() && !oversized {
+            if partial.bytes.is_empty() && !partial.oversized {
                 return Ok(None);
             }
             break;
         }
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(available.len(), |index| index + 1);
-        if !oversized {
-            let remaining = limit.saturating_sub(bytes.len());
+        if !partial.oversized {
+            let remaining = limit.saturating_sub(partial.bytes.len());
             if take > remaining {
-                oversized = true;
-                bytes.clear();
+                partial.oversized = true;
+                partial.bytes.clear();
             } else {
-                bytes.extend_from_slice(&available[..take]);
+                partial.bytes.extend_from_slice(&available[..take]);
             }
         }
         reader.consume(take);
@@ -1587,6 +1608,7 @@ async fn read_bounded_codex_frame<R: tokio::io::AsyncBufRead + Unpin>(
             break;
         }
     }
+    let CodexPartialFrame { bytes, oversized } = std::mem::take(partial);
     if oversized {
         Ok(Some(CodexFrameRead::Oversized))
     } else {
@@ -1882,14 +1904,19 @@ async fn classify_server_request(
         "item/fileChange/requestApproval" => {
             let item_id = string_field(params, "itemId");
             let remembered = remembered_item(item_targets, item_id.as_deref()).await;
-            let target = nonempty(file_change_path(params))
-                .or_else(|| {
-                    remembered
-                        .map(|item| item.files.join(", "))
-                        .filter(|paths| !paths.is_empty())
-                })
-                .or_else(|| string_field(params, "grantRoot"))
-                .unwrap_or_default();
+            let files = nonempty(file_change_path(params)).or_else(|| {
+                remembered
+                    .map(|item| item.files.join(", "))
+                    .filter(|paths| !paths.is_empty())
+            });
+            // A `grantRoot` asks for write access to a whole directory. Show and
+            // classify it next to the files so an approval never grants a root
+            // the policy did not see.
+            let target = files
+                .into_iter()
+                .chain(string_field(params, "grantRoot"))
+                .collect::<Vec<_>>()
+                .join(", ");
             (
                 HostRequest::Approval {
                     action: "Write".to_string(),
@@ -2492,7 +2519,7 @@ async fn handle_notification(
         // Only the main thread may write into the main transcript. Native Codex
         // sub-agent deltas carry their own `threadId` on the same stream.
         "item/agentMessage/delta" if main && active_turn => {
-            emit_text_delta(&params, context.event_tx);
+            emit_text_delta(&params, context.event_tx).await;
         }
         // Process-log visibility (opt-in): a long-running command's lifecycle.
         // codex emits `item/started` when the command BEGINS and streams its captured
@@ -2730,14 +2757,16 @@ async fn remember_item_target(item: &Value, item_targets: &ItemTargetMap) {
 }
 
 /// Emit a [`SessionEvent::TextDelta`] from an `item/agentMessage/delta` payload.
-fn emit_text_delta(params: &Value, event_tx: &EventTx) {
+///
+/// Awaits bounded-channel delivery like the other critical events: the deltas
+/// ARE the answer (replies and JSON verdicts are assembled from them), so a
+/// full queue must backpressure the reader rather than drop text.
+async fn emit_text_delta(params: &Value, event_tx: &EventTx) {
     let Some(delta) = params.get("delta").and_then(Value::as_str) else {
         return;
     };
     if !delta.is_empty() {
-        let _ = event_tx.try_send(crate::redaction::sanitize_session_event(
-            SessionEvent::TextDelta(delta.to_string()),
-        ));
+        let _ = emit_critical_event(event_tx, SessionEvent::TextDelta(delta.to_string())).await;
     }
 }
 
@@ -3925,7 +3954,7 @@ mod tests {
             BasePermissionProfile::Guarded,
             resolve_codex_launch_sandbox(true, false, None),
         );
-        assert_eq!(guarded["approvalPolicy"], "on-request");
+        assert_eq!(guarded["approvalPolicy"], "untrusted");
         // Guarded (the default) retains approval prompts without restricting the
         // development environment.
         assert_eq!(guarded["sandbox"], "danger-full-access");
@@ -3980,7 +4009,7 @@ mod tests {
     fn writable_profiles_default_full_and_honor_explicit_restrictions() {
         // Guarded controls approval automation, not the worker's OS sandbox. Its
         // default is the same complete development environment as Auto, while
-        // preserving approvalPolicy=on-request at thread creation.
+        // its approval policy keeps raising approvals at thread creation.
         assert_eq!(
             resolve_codex_launch_sandbox(true, false, Some("danger-full-access")),
             "danger-full-access"
@@ -4162,9 +4191,11 @@ mod tests {
 
     #[test]
     fn codex_approval_policy_is_independent_from_full_access() {
+        // `on-request` with no sandbox to escalate out of never asks, so full
+        // access Guarded asks for every untrusted command instead.
         assert_eq!(
             codex_approval_policy("danger-full-access", BasePermissionProfile::Guarded),
-            "on-request"
+            "untrusted"
         );
         assert_eq!(
             codex_approval_policy("danger-full-access", BasePermissionProfile::Auto),
@@ -4209,7 +4240,7 @@ mod tests {
         );
         assert_eq!(full["sandbox"], "danger-full-access");
         assert_eq!(
-            full["approvalPolicy"], "on-request",
+            full["approvalPolicy"], "untrusted",
             "full access does not erase Guarded approval events"
         );
         // Model handling is unchanged regardless of sandbox.
@@ -4227,7 +4258,7 @@ mod tests {
         );
         assert_eq!(full["threadId"], "thr_main");
         assert_eq!(full["sandbox"], "danger-full-access");
-        assert_eq!(full["approvalPolicy"], "on-request");
+        assert_eq!(full["approvalPolicy"], "untrusted");
         assert_eq!(
             full["developerInstructions"], UMADEV_CODEX_DEVELOPER_INSTRUCTIONS,
             "an explicit resume retains the current-turn authority boundary"
@@ -4252,7 +4283,7 @@ mod tests {
             (
                 BasePermissionProfile::Guarded,
                 "danger-full-access",
-                "on-request",
+                "untrusted",
             ),
             (BasePermissionProfile::Auto, "danger-full-access", "never"),
         ] {
@@ -4440,6 +4471,15 @@ mod tests {
         assert!(matches!(
             request,
             HostRequest::Approval { target, .. } if target == "src/a.ts"
+        ));
+
+        // A requested write root is shown and classified next to the files.
+        let grant = v(r#"{"changes":[{"path":"src/a.ts"}],"grantRoot":"/home/u"}"#);
+        let (request, _) =
+            classify_server_request("item/fileChange/requestApproval", &grant, &items).await;
+        assert!(matches!(
+            request,
+            HostRequest::Approval { target, .. } if target == "src/a.ts, /home/u"
         ));
     }
 
@@ -4928,10 +4968,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_deltas_survive_a_slow_consumer() {
+        // `TextDelta` IS the answer (the agent builds replies and JSON verdicts
+        // from it), so a full queue must backpressure, never drop a delta.
+        let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
+        let total = EVENT_CHANNEL_CAP + 10;
+        let producer = tokio::spawn(async move {
+            for index in 0..total {
+                emit_text_delta(&json!({"delta": format!("d{index};")}), &event_tx).await;
+            }
+        });
+        let mut received = String::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("a slow consumer must keep receiving deltas")
+        {
+            if let SessionEvent::TextDelta(delta) = event {
+                received.push_str(&delta);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        producer.await.expect("producer task should not panic");
+        let expected = (0..total).fold(String::new(), |mut expected, index| {
+            std::fmt::Write::write_fmt(&mut expected, format_args!("d{index};")).unwrap();
+            expected
+        });
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
     async fn critical_events_survive_a_slow_consumer_after_a_large_display_burst() {
         let (event_tx, mut events) = mpsc::channel(EVENT_CHANNEL_CAP);
         for index in 0..(EVENT_CHANNEL_CAP + 64) {
-            emit_text_delta(&json!({"delta":format!("decorative-{index}")}), &event_tx);
+            emit_output_delta(&json!({"delta":format!("decorative-{index}")}), &event_tx);
         }
 
         let producer = tokio::spawn(async move {
@@ -5455,14 +5524,19 @@ mod tests {
     async fn bounded_jsonl_reader_handles_fragmented_crlf_eof_and_oversize() {
         let bytes = b"{\"id\":1}\r\n{\"id\":2}";
         let mut reader = BufReader::with_capacity(3, &bytes[..]);
+        let mut partial = CodexPartialFrame::default();
         let Some(CodexFrameRead::Line(first)) =
-            read_bounded_codex_frame(&mut reader, 32).await.unwrap()
+            read_bounded_codex_frame(&mut reader, &mut partial, 32)
+                .await
+                .unwrap()
         else {
             panic!("first frame");
         };
         assert_eq!(first, b"{\"id\":1}\r\n");
         let Some(CodexFrameRead::Line(second)) =
-            read_bounded_codex_frame(&mut reader, 32).await.unwrap()
+            read_bounded_codex_frame(&mut reader, &mut partial, 32)
+                .await
+                .unwrap()
         else {
             panic!("EOF frame");
         };
@@ -5471,13 +5545,40 @@ mod tests {
         let oversized = b"0123456789\n{\"ok\":true}\n";
         let mut reader = BufReader::with_capacity(2, &oversized[..]);
         assert!(matches!(
-            read_bounded_codex_frame(&mut reader, 8).await.unwrap(),
+            read_bounded_codex_frame(&mut reader, &mut partial, 8)
+                .await
+                .unwrap(),
             Some(CodexFrameRead::Oversized)
         ));
         assert!(matches!(
-            read_bounded_codex_frame(&mut reader, 32).await.unwrap(),
+            read_bounded_codex_frame(&mut reader, &mut partial, 32).await.unwrap(),
             Some(CodexFrameRead::Line(line)) if line == b"{\"ok\":true}\n"
         ));
+    }
+
+    #[tokio::test]
+    async fn bounded_jsonl_reader_is_cancel_safe_mid_frame() {
+        // The reader loop wraps a read in `TRAILING_USAGE_GRACE`; a timeout that
+        // lands mid-line must not lose the bytes already consumed.
+        use tokio::io::AsyncWriteExt;
+        let (mut writer, pipe) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(pipe);
+        let mut partial = CodexPartialFrame::default();
+        writer.write_all(b"{\"method\":").await.unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(20),
+            read_bounded_codex_frame(&mut reader, &mut partial, 1024),
+        )
+        .await
+        .is_err());
+        writer.write_all(b"\"turn/completed\"}\n").await.unwrap();
+        let frame = read_bounded_codex_frame(&mut reader, &mut partial, 1024)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&frame, Some(CodexFrameRead::Line(line)) if line == b"{\"method\":\"turn/completed\"}\n"),
+            "the partial frame must survive the cancelled read"
+        );
     }
 
     #[tokio::test]
@@ -6788,10 +6889,10 @@ done
     }
 
     #[tokio::test]
-    async fn native_events_redact_before_transcript_tool_activity_and_audit() {
+    async fn native_events_keep_model_text_and_tool_traffic_whole() {
         const SECRET: &str = "SYNTH_CODEX_SESSION_SECRET_82";
         let (tx, mut rx) = chan();
-        emit_text_delta(&json!({"delta": format!("password={SECRET}")}), &tx);
+        emit_text_delta(&json!({"delta": format!("password={SECRET}")}), &tx).await;
         emit_item(
             &json!({
                 "id": "item-secret",
@@ -6811,8 +6912,8 @@ done
         }
         let audit_view = format!("{events:?}");
         assert!(
-            !audit_view.contains(SECRET),
-            "event/audit leaked: {audit_view}"
+            audit_view.contains(SECRET),
+            "event was rewritten: {audit_view}"
         );
 
         let mut activity = umadev_runtime::ToolActivity::default();

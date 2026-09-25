@@ -130,14 +130,21 @@ pub(crate) fn reject_git_environment_redirects() -> Result<(), ResidentExecution
     }
 }
 
+/// Probes and index plumbing for the host-only commit lane. The lane refuses a
+/// repository with active hooks up front; inert hooks here also close the gap
+/// between that check and these commands, and `--no-optional-locks` keeps a
+/// probe from rewriting the index as a side effect.
 pub(crate) fn git_std_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .arg("--no-pager")
         .arg("--literal-pathspecs")
+        .arg("--no-optional-locks")
         .args([
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            INERT_HOOKS_CONFIG,
             "-c",
             EMPTY_ATTRIBUTES_CONFIG,
             "-c",
@@ -273,6 +280,48 @@ pub(crate) fn configured_git_path(
     Ok(Some(PathBuf::from(value)))
 }
 
+/// Read a boolean from the user's effective Git configuration (repository,
+/// global, and system), normalized by Git itself.
+pub(crate) fn configured_git_bool(
+    root: &Path,
+    key: &str,
+) -> Result<Option<bool>, ResidentExecutionBlocked> {
+    let mut command = Command::new("git");
+    command
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--bool", "--get", key]);
+    remove_git_environment_overrides(&mut command);
+    let output = bounded_git_command_output(
+        command,
+        GitCommandLimits {
+            stdout_bytes: 1024,
+            ..GitCommandLimits::default()
+        },
+        "git-config-unverifiable",
+        "git config --bool --get",
+    )?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(git_command_failed(
+            "git-config-unverifiable",
+            "git config --bool --get",
+            &output,
+        ));
+    }
+    match output.stdout.trim_ascii() {
+        b"true" => Ok(Some(true)),
+        b"false" => Ok(Some(false)),
+        _ => Err(git_commit_blocked(
+            "git-config-invalid",
+            "Git 布尔配置无效 / Git boolean configuration is invalid",
+        )),
+    }
+}
+
 pub(crate) fn git_output(
     root: &Path,
     args: &[&str],
@@ -342,6 +391,7 @@ mod tests {
     use super::{bounded_git_command_output, GitCommandLimits};
     use super::{
         git_environment_override, git_environment_variable, git_std_command, EMPTY_GIT_CONFIG,
+        INERT_HOOKS_CONFIG,
     };
     use std::ffi::OsStr;
     use std::path::Path;
@@ -415,6 +465,9 @@ mod tests {
             })
             .flatten();
         assert_eq!(config.as_deref(), Some(OsStr::new(EMPTY_GIT_CONFIG)));
+        let args = command.get_args().collect::<Vec<_>>();
+        assert!(args.contains(&OsStr::new("--no-optional-locks")));
+        assert!(args.contains(&OsStr::new(INERT_HOOKS_CONFIG)));
     }
 
     #[cfg(unix)]

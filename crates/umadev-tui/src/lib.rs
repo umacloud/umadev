@@ -111,7 +111,7 @@ use crate::clipboard::finish_mouse_selection_copy;
 #[cfg(test)]
 use crate::execution_postcondition::changed_files_between;
 use crate::execution_postcondition::{
-    agentic_fact_line, changed_files_after_git_status, git_status_porcelain_bounded,
+    agentic_fact_line, changed_files_after_git_status, git_diff_stat, git_status_porcelain_bounded,
     ResidentExecutionPostcondition,
 };
 use crate::input::InputSource;
@@ -314,7 +314,7 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
 /// is best-effort (fail-open).
 fn print_scrollback_handoff(app: &App) {
     use std::io::Write;
-    let text = app.transcript_plaintext();
+    let text = crate::ui::terminal_safe_lines(&app.transcript_plaintext());
     if text.trim().is_empty() {
         return;
     }
@@ -2449,35 +2449,6 @@ async fn run_agentic(
             reactive.as_ref(),
         )
         .await;
-    }
-}
-
-/// A compact `git diff --stat` of the working tree (unstaged changes), run in
-/// `root`, used only to give the agentic system prompt a sense of what is
-/// already modified. **Fail-open**: any failure returns `None` and the prompt
-/// simply omits the diff-stat section.
-async fn git_diff_stat(root: &std::path::Path) -> Option<String> {
-    let mut command = tokio::process::Command::new("git");
-    command.arg("-C").arg(root).args(["diff", "--stat"]);
-    let out = umadev_process::run_bounded_command(
-        command,
-        umadev_process::BoundedCommandOptions {
-            timeout: std::time::Duration::from_secs(5),
-            stdout_bytes: 256 * 1024,
-            stderr_bytes: 16 * 1024,
-            reader_grace: std::time::Duration::from_millis(500),
-        },
-    )
-    .await
-    .ok()?;
-    if out.timed_out || out.stdout_truncated || !out.status.is_some_and(|status| status.success()) {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
     }
 }
 
@@ -8756,9 +8727,9 @@ fn start_manual_compaction(
     }
 }
 
-fn resolve_approval_reply(approval_holder: &ApprovalHolder, allow: bool) {
+fn resolve_approval_reply(approval_holder: &ApprovalHolder, allow: bool, seen: &(String, String)) {
     if allow {
-        allow_pending_approval(approval_holder);
+        allow_pending_approval(approval_holder, seen);
     } else {
         deny_pending_approval(approval_holder);
     }
@@ -8772,7 +8743,7 @@ fn publish_trust_after_key(
     let current = app.effective_trust_mode();
     publish_live_trust(current);
     if current != trust_before_key && matches!(current, umadev_agent::TrustMode::Auto) {
-        release_pending_approval_on_auto_switch(approval_holder);
+        release_pending_approval_on_auto_switch(approval_holder, &app.project_root);
     }
 }
 
@@ -10257,8 +10228,8 @@ async fn event_loop(
                         &clipboard_image_tx,
                     );
                 }
-                Action::ApprovalReply(allow) => {
-                    resolve_approval_reply(&approval_holder, allow);
+                Action::ApprovalReply(allow, seen) => {
+                    resolve_approval_reply(&approval_holder, allow, &seen);
                 }
                 Action::BackendChanged => {
                     // A base was just chosen — either first-launch picker

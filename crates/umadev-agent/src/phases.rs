@@ -1080,6 +1080,14 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
     run_quality_with_kind(opts, None)
 }
 
+/// [`run_quality`], also handing back the gate JSON exactly as it was written.
+/// A caller that DECIDES on the verdict reads these bytes, never the file: the
+/// file sits in `output/`, where a model-left background process can rewrite it
+/// between the write and a read-back and forge a pass.
+pub fn run_quality_report(opts: &RunOptions) -> io::Result<(PhaseOutput, String)> {
+    run_quality_report_with_kind(opts, None)
+}
+
 /// [`run_quality`] with the run's EXECUTED kind threaded in (M8). The doc-N/A guard
 /// (which marks PRD / architecture / UIUX checks `n/a` for a lean plan that skips the
 /// Docs phase) must read the plan the run ACTUALLY executed — not a re-classification
@@ -1092,6 +1100,15 @@ pub fn run_quality_with_kind(
     opts: &RunOptions,
     executed_kind: Option<crate::planner::TaskKind>,
 ) -> io::Result<PhaseOutput> {
+    run_quality_report_with_kind(opts, executed_kind).map(|(out, _)| out)
+}
+
+/// [`run_quality_with_kind`], also handing back the gate JSON exactly as it
+/// was written (see [`run_quality_report`]).
+pub fn run_quality_report_with_kind(
+    opts: &RunOptions,
+    executed_kind: Option<crate::planner::TaskKind>,
+) -> io::Result<(PhaseOutput, String)> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
     crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
@@ -1850,7 +1867,7 @@ pub fn run_quality_with_kind(
     let skip = &project_config.quality.skip_checks;
     if !skip.is_empty() {
         checks.retain(|c| {
-            let s = c.name.to_ascii_lowercase().replace(' ', "_");
+            let s = crate::config::quality_check_key(&c.name);
             !skip.iter().any(|sk| sk == &s || sk == &c.name)
         });
     }
@@ -1918,6 +1935,7 @@ pub fn run_quality_with_kind(
         .iter()
         .filter(|c| c.status != "passed" && !is_na(c))
         .map(|c| format!("Address `{}`: {}", c.name, c.details))
+        .chain(project_config.quality.ignored.iter().cloned())
         .collect();
     let passed = total_score >= pass_threshold && critical_failures.is_empty();
     let mut summary_context = std::collections::BTreeMap::new();
@@ -1950,10 +1968,8 @@ pub fn run_quality_with_kind(
 
     let json_path = output_dir.join(format!("{slug}-quality-gate.json"));
     let md_path = output_dir.join(format!("{slug}-quality-gate.md"));
-    atomic_write(
-        &json_path,
-        &serde_json::to_string_pretty(&report).unwrap_or_default(),
-    )?;
+    let report_json = serde_json::to_string_pretty(&report).unwrap_or_default();
+    atomic_write(&json_path, &report_json)?;
     atomic_write(&md_path, &render_quality_md(&report))?;
 
     audit(
@@ -1990,12 +2006,13 @@ pub fn run_quality_with_kind(
         crate::lessons::capture_tech_debt(&opts.project_root, &debt_items, &opts.requirement);
     }
 
-    Ok(PhaseOutput {
+    let out = PhaseOutput {
         phase: Phase::Quality,
         artifacts: vec![json_path, md_path],
         gate: None,
         degraded: false,
-    })
+    };
+    Ok((out, report_json))
 }
 
 fn evidence_check(
@@ -2053,18 +2070,44 @@ fn verify_results_check(project_root: &Path) -> Option<QualityCheck> {
         skipped: bool,
         #[serde(default)]
         timestamp: String,
+        #[serde(default)]
+        source_fingerprint: Option<String>,
     }
-    let rows: Vec<VRow> = content
+    // The log can ship with the repository, and the latest run wins: a row
+    // must carry the RFC 3339 stamp `record_verify_outcome` writes, and one
+    // stamped in the future (a forged `"9999"` or year-9999 row that would
+    // outrank every real failure forever) is ignored. Small clock skew
+    // between processes is tolerated.
+    let now = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let mut rows: Vec<(chrono::DateTime<chrono::Utc>, VRow)> = content
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| serde_json::from_str::<VRow>(l).ok())
+        .filter_map(|r| {
+            let at = chrono::DateTime::parse_from_rfc3339(&r.timestamp).ok()?;
+            Some((at.with_timezone(&chrono::Utc), r)).filter(|(at, _)| *at <= now)
+        })
         .collect();
-    if rows.is_empty() {
-        return None;
-    }
-    let dts = String::new();
-    let lts = rows.iter().map(|r| &r.timestamp).max().unwrap_or(&dts);
-    let latest: Vec<&VRow> = rows.iter().filter(|r| r.timestamp == *lts).collect();
+    // The latest run is the trailing batch of rows. A batch is appended in one
+    // tight loop, but timestamps have 1 s resolution, so a batch can straddle a
+    // second boundary — matching only the newest timestamp would drop its
+    // earlier rows (e.g. a failed build). Order by stamp (stable, so a batch
+    // keeps its append order), then walk back from the newest row while rows
+    // stay within a second of it, carry the same tree fingerprint, and don't
+    // repeat a step (each run records a step once).
+    rows.sort_by_key(|(at, _)| *at);
+    let (last_at, last) = rows.last()?;
+    let mut seen_steps = std::collections::HashSet::new();
+    let latest: Vec<&VRow> = rows
+        .iter()
+        .rev()
+        .take_while(|(at, r)| {
+            (*last_at - *at).num_seconds() <= 1
+                && r.source_fingerprint == last.source_fingerprint
+                && seen_steps.insert(r.step.as_str())
+        })
+        .map(|(_, r)| r)
+        .collect();
     let ns: Vec<&VRow> = latest.iter().copied().filter(|r| !r.skipped).collect();
     let passed = ns.iter().filter(|r| r.passed).count();
     let total = ns.len();
@@ -2472,21 +2515,32 @@ fn render_quality_md(r: &QualityReport) -> String {
 
 /// Run the `delivery` phase (`UD-EVID-005`). Emits compliance mapping
 /// and a proof-pack zip in `release/`.
+///
+/// Without the gate JSON of a quality phase this process just ran, the run
+/// is treated as not having passed: nothing is graduated or recorded as
+/// validated, and the report on disk is only shown. See
+/// [`run_delivery_with_quality`].
 pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
+    run_delivery_with_quality(opts, None)
+}
+
+/// [`run_delivery`] for a caller holding the gate JSON its quality phase
+/// produced (see [`run_quality_report`]). Only that verdict can graduate
+/// skills or word a lesson as "passed": `output/<slug>-quality-gate.json` is
+/// model-writable, so a report read back from it is display-only.
+pub fn run_delivery_with_quality(
+    opts: &RunOptions,
+    quality_json: Option<&str>,
+) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
 
-    // Read the REAL quality-gate result first — it gates both the skill
-    // graduation below AND the wording of the captured-pattern lesson (we must
-    // never sediment "passed the quality gate" when it did not pass). Fail-open:
-    // a missing/unreadable gate file reads as "not passed".
-    let quality_passed = Some(read_phase_artifact(
-        &opts.project_root,
-        opts.project_root
-            .join(format!("output/{slug}-quality-gate.json")),
-    ))
-    .and_then(|j| serde_json::from_str::<QualityReport>(&j).ok())
-    .is_some_and(|r| r.passed);
+    // The verdict gates both the skill graduation below AND the wording of the
+    // captured-pattern lesson (we must never sediment "passed the quality
+    // gate" when it did not pass). Fail-closed: no in-memory verdict, or one
+    // that does not parse, reads as "not passed".
+    let quality_report = quality_json.and_then(|j| serde_json::from_str::<QualityReport>(j).ok());
+    let quality_passed = quality_report.as_ref().is_some_and(|r| r.passed);
 
     // 0. Capture validated patterns (D2: success -> sediment -> retrieval loop)
     let arch_text = read_phase_artifact(
@@ -2529,7 +2583,15 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
 
     // 1. Compliance mapping
     let mut artifacts = Vec::new();
-    if let Some((path, _)) = write_compliance_mapping(&opts.project_root, &slug) {
+    let compliance = match quality_json {
+        Some(json) => umadev_governance::compliance::write_compliance_mapping_with_quality(
+            &opts.project_root,
+            &slug,
+            Some(json.as_bytes()),
+        ),
+        None => write_compliance_mapping(&opts.project_root, &slug),
+    };
+    if let Some((path, _)) = compliance {
         audit(
             opts,
             "umadev/agent.delivery",
@@ -2635,8 +2697,22 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
 
     // Shareable, self-contained HTML scorecard — the visible, credible,
     // tamper-evident proof the user can open and hand to a teammate/client.
-    let scorecard =
-        write_scorecard_html(&opts.project_root, &release_dir, &slug, &run_id, &zip_path);
+    let scorecard_report = quality_report.or_else(|| {
+        serde_json::from_str(&read_phase_artifact(
+            &opts.project_root,
+            opts.project_root
+                .join(format!("output/{slug}-quality-gate.json")),
+        ))
+        .ok()
+    });
+    let scorecard = write_scorecard_html(
+        &opts.project_root,
+        &release_dir,
+        &slug,
+        &run_id,
+        &zip_path,
+        scorecard_report.as_ref(),
+    );
 
     artifacts.push(zip_path);
     artifacts.push(manifest_path);
@@ -2666,14 +2742,10 @@ fn write_scorecard_html(
     slug: &str,
     run_id: &str,
     zip_path: &Path,
+    report: Option<&QualityReport>,
 ) -> io::Result<PathBuf> {
-    let report: Option<QualityReport> = serde_json::from_str(&read_phase_artifact(
-        project_root,
-        project_root.join(format!("output/{slug}-quality-gate.json")),
-    ))
-    .ok();
-    let score = report.as_ref().map_or(0, |r| r.total_score);
-    let passed = report.as_ref().is_some_and(|r| r.passed);
+    let score = report.map_or(0, |r| r.total_score);
+    let passed = report.is_some_and(|r| r.passed);
     let has_compliance = crate::bounded_fs::is_real_file_beneath(
         project_root,
         &project_root.join(format!("output/{slug}-compliance-mapping.json")),
@@ -2697,7 +2769,7 @@ fn write_scorecard_html(
     };
 
     let mut rows = String::new();
-    if let Some(r) = &report {
+    if let Some(r) = report {
         for c in &r.checks {
             let cls = match c.status.as_str() {
                 "passed" => "ok",
@@ -5069,14 +5141,9 @@ mod tests {
                 details: "no tells".into(),
             }],
         };
-        fs::write(
-            out.join("app-quality-gate.json"),
-            serde_json::to_string(&report).unwrap(),
-        )
-        .unwrap();
         let zip = rel.join("proof-pack-app-x.zip");
         fs::write(&zip, b"zip-bytes").unwrap();
-        let card = write_scorecard_html(tmp.path(), &rel, "app", "x", &zip).unwrap();
+        let card = write_scorecard_html(tmp.path(), &rel, "app", "x", &zip, Some(&report)).unwrap();
         let html = fs::read_to_string(&card).unwrap();
         // Self-contained: no external scripts/styles/images.
         assert!(!html.contains("src=\"http") && !html.contains("href=\"http"));
@@ -5498,6 +5565,22 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.name.contains("PRD") || c.name.contains("content")));
+    }
+
+    #[test]
+    fn quality_report_hands_back_the_verdict_it_wrote() {
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let (out, body) = run_quality_report(&o).unwrap();
+        assert_eq!(fs::read_to_string(&out.artifacts[0]).unwrap(), body);
+        assert!(
+            !extract_quality_score(&body).1,
+            "nothing was built: the gate fails"
+        );
+        // A process rewriting the report afterwards cannot change the verdict
+        // the caller already holds.
+        fs::write(&out.artifacts[0], r#"{"total_score": 100, "passed": true}"#).unwrap();
+        assert!(!extract_quality_score(&body).1);
     }
 
     #[test]
@@ -6080,9 +6163,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("verify.jsonl"),
-            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"t1"}
-{"step":"test","passed":true,"skipped":false,"timestamp":"t1"}
-{"step":"build","passed":true,"skipped":false,"timestamp":"t1"}
+            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"build","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
 "#,
         )
         .unwrap();
@@ -6099,8 +6182,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("verify.jsonl"),
-            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"t1"}
-{"step":"build","passed":false,"skipped":false,"timestamp":"t1"}
+            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
 "#,
         )
         .unwrap();
@@ -6110,15 +6193,36 @@ mod tests {
     }
 
     #[test]
+    fn verify_results_check_ignores_future_and_unstamped_rows() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        fs::write(
+            dir.join("verify.jsonl"),
+            format!(
+                r#"{{"step":"build","passed":false,"skipped":false,"timestamp":"{now}"}}
+{{"step":"build","passed":true,"skipped":false,"timestamp":"9999"}}
+{{"step":"build","passed":true,"skipped":false,"timestamp":"9999-01-01T00:00:00Z"}}
+{{"step":"build","passed":true,"skipped":false}}
+"#
+            ),
+        )
+        .unwrap();
+        let check = verify_results_check(tmp.path()).unwrap();
+        assert_eq!(check.status, "failed", "a forged later row cannot hide it");
+    }
+
+    #[test]
     fn verify_results_check_ignores_skipped_steps() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".umadev/audit");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("verify.jsonl"),
-            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"t1"}
-{"step":"lint","passed":false,"skipped":true,"timestamp":"t1"}
-{"step":"test","passed":true,"skipped":false,"timestamp":"t1"}
+            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"lint","passed":false,"skipped":true,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
 "#,
         )
         .unwrap();
@@ -6127,6 +6231,45 @@ mod tests {
             check.status, "passed",
             "skipped lint failure must not fail the check"
         );
+    }
+
+    #[test]
+    fn verify_results_check_keeps_a_batch_that_crosses_a_second_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("verify.jsonl"),
+            r#"{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-01T10:00:00Z"}
+{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-01T10:00:01Z"}
+"#,
+        )
+        .unwrap();
+        let check = verify_results_check(tmp.path()).unwrap();
+        assert_eq!(check.status, "failed", "{}", check.details);
+        assert_eq!(check.details, "1 of 2 steps passed");
+    }
+
+    #[test]
+    fn verify_results_check_reads_only_the_latest_batch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        // An older failing batch (a minute earlier, and one a second earlier)
+        // must not leak into the latest, green batch.
+        fs::write(
+            dir.join("verify.jsonl"),
+            r#"{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-01T09:59:00Z"}
+{"step":"lint","passed":false,"skipped":false,"timestamp":"2026-01-01T09:59:00Z"}
+{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-01T10:00:00Z"}
+{"step":"build","passed":true,"skipped":false,"timestamp":"2026-01-01T10:00:01Z"}
+{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-01T10:00:01Z"}
+"#,
+        )
+        .unwrap();
+        let check = verify_results_check(tmp.path()).unwrap();
+        assert_eq!(check.status, "passed", "{}", check.details);
+        assert_eq!(check.details, "2 of 2 steps passed");
     }
 
     // ---- phase_knowledge_digest BM25 path ----
@@ -6283,7 +6426,7 @@ mod tests {
         fs::create_dir_all(&audit).unwrap();
         fs::write(
             audit.join("verify.jsonl"),
-            r#"{"step":"test","passed":true,"skipped":false,"timestamp":"t"}"#,
+            r#"{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}"#,
         )
         .unwrap();
         let out = run_quality(&o).unwrap();
@@ -6306,7 +6449,7 @@ mod tests {
         fs::create_dir_all(&audit).unwrap();
         fs::write(
             audit.join("verify.jsonl"),
-            r#"{"step":"build","passed":false,"skipped":false,"timestamp":"t"}"#,
+            r#"{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}"#,
         )
         .unwrap();
         let out = run_quality(&o).unwrap();
@@ -6377,6 +6520,38 @@ mod tests {
         assert!(
             learned_dir.is_dir(),
             "learned dir should exist after delivery"
+        );
+    }
+
+    #[test]
+    fn delivery_records_validated_patterns_only_from_the_in_memory_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        run_research(&o, None).unwrap();
+        run_docs(&o, &DocsContent::default()).unwrap();
+        run_spec(&o).unwrap();
+        run_frontend(&o).unwrap();
+        run_backend(&o).unwrap();
+        let (_, json) = run_quality_report(&o).unwrap();
+        let mut report: QualityReport = serde_json::from_str(&json).unwrap();
+        report.passed = true;
+        let passing = serde_json::to_string_pretty(&report).unwrap();
+        let validated =
+            || crate::lessons::read_raw_lessons(tmp.path(), "validated-decisions.jsonl").len();
+
+        // A passing report on disk is the workspace's word, not a verdict.
+        fs::write(tmp.path().join("output/demo-quality-gate.json"), &passing).unwrap();
+        run_delivery(&o).unwrap();
+        assert_eq!(
+            validated(),
+            0,
+            "a report read back from output/ validated a pattern"
+        );
+
+        run_delivery_with_quality(&o, Some(&passing)).unwrap();
+        assert!(
+            validated() > 0,
+            "the in-memory pass must record the patterns"
         );
     }
 

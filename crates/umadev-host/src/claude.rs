@@ -23,7 +23,7 @@ use umadev_runtime::{
 
 use crate::{
     default_workspace, govern_root_env, merge_prompt, model_args, run_auth_status, run_subprocess,
-    run_subprocess_streaming, AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
+    run_subprocess_streaming, AuthState, HostDriver, ProbeResult, SubprocessCall,
 };
 
 /// Drives the `claude` CLI as a subprocess.
@@ -248,8 +248,8 @@ impl ClaudeCodeDriver {
     }
 
     /// The full argument vector for a `complete` call, resolving the session
-    /// strategy. Exposed for tests. The prompt is appended by the subprocess
-    /// layer as the last positional argument.
+    /// strategy. Exposed for tests. The subprocess layer writes the prompt to
+    /// stdin.
     ///
     /// - explicit id + resume  → `--resume <uuid>`   (continue our own session)
     /// - explicit id + fresh   → `--session-id <uuid>` (create it with our id)
@@ -361,10 +361,13 @@ impl ClaudeCodeDriver {
             self.permissions
         };
         let (permission_mode, allowed_tools) = match permissions {
-            BasePermissionProfile::Plan => ("plan", "Read,Grep,Glob,WebSearch,WebFetch"),
+            // Plan and Guarded pre-approve no web tool: they confirm every network
+            // reach, and a one-shot call has no approval channel, so a fetch that
+            // could carry data out is refused instead.
+            BasePermissionProfile::Plan => ("plan", "Read,Grep,Glob"),
             BasePermissionProfile::Guarded => (
                 "default",
-                "Read,Grep,Glob,WebSearch,WebFetch,TodoWrite,Agent,Task,TaskOutput,BashOutput,AgentOutput",
+                "Read,Grep,Glob,TodoWrite,Agent,Task,TaskOutput,BashOutput,AgentOutput",
             ),
             BasePermissionProfile::Auto => (
                 "bypassPermissions",
@@ -377,8 +380,11 @@ impl ClaudeCodeDriver {
             output_format.to_string(),
             "--permission-mode".to_string(),
             permission_mode.to_string(),
-            "--allowedTools".to_string(),
-            allowed_tools.to_string(),
+            // `--allowedTools <tools...>` is variadic: the space-separated form
+            // would swallow any following bare word — including the prompt the
+            // subprocess layer appends last — as another tool name. `=` binds
+            // exactly one value.
+            format!("--allowedTools={allowed_tools}"),
         ];
         if permissions.auto_approve() {
             args.push("--dangerously-skip-permissions".to_string());
@@ -439,7 +445,6 @@ impl Runtime for ClaudeCodeDriver {
             program: &self.program,
             args: &args,
             prompt: &prompt,
-            channel: PromptChannel::Arg,
             workspace: &ws,
             timeout: self.timeout,
             env: &govern_env,
@@ -459,14 +464,12 @@ impl Runtime for ClaudeCodeDriver {
                 assistant
             }
         });
-        Ok(crate::redaction::sanitize_completion_response(
-            &CompletionResponse {
-                text,
-                id: "claude-code-cli".to_string(),
-                model: req.model,
-                usage,
-            },
-        ))
+        Ok(CompletionResponse {
+            text,
+            id: "claude-code-cli".to_string(),
+            model: req.model,
+            usage,
+        })
     }
 
     /// Streaming completion via `claude --output-format stream-json --verbose`.
@@ -520,7 +523,6 @@ impl Runtime for ClaudeCodeDriver {
                 program: &program,
                 args: &args,
                 prompt: &prompt,
-                channel: PromptChannel::Arg,
                 workspace: &ws,
                 timeout,
                 env: &govern_env,
@@ -556,14 +558,12 @@ impl Runtime for ClaudeCodeDriver {
                 if let Some(msg) = abort {
                     on_event(umadev_runtime::StreamEvent::Warning { message: msg });
                 }
-                Ok(crate::redaction::sanitize_completion_response(
-                    &CompletionResponse {
-                        text: final_text,
-                        id: "claude-code-cli".to_string(),
-                        model,
-                        usage,
-                    },
-                ))
+                Ok(CompletionResponse {
+                    text: final_text,
+                    id: "claude-code-cli".to_string(),
+                    model,
+                    usage,
+                })
             }
             Err(e) => {
                 // Streaming broke mid-flight (commonly the base subprocess being
@@ -576,14 +576,12 @@ impl Runtime for ClaudeCodeDriver {
                 let partial = stream_buf.into_string();
                 if let Some(text) = salvage_partial_stream(&partial) {
                     let usage = extract_usage(&partial);
-                    return Ok(crate::redaction::sanitize_completion_response(
-                        &CompletionResponse {
-                            text,
-                            id: "claude-code-cli".to_string(),
-                            model,
-                            usage,
-                        },
-                    ));
+                    return Ok(CompletionResponse {
+                        text,
+                        id: "claude-code-cli".to_string(),
+                        model,
+                        usage,
+                    });
                 }
                 let stream_error = crate::map_subprocess_error(&e);
                 // A streaming timeout already consumed this logical call's
@@ -1005,7 +1003,6 @@ impl HostDriver for ClaudeCodeDriver {
             program: &self.program,
             args: &["--version".to_string()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: &tmp,
             timeout: Duration::from_secs(10),
             env: &[],
@@ -1542,12 +1539,38 @@ mod tests {
             .with_permissions(BasePermissionProfile::Plan)
             .base_args_with_format_for("text", false);
         let allowed = plan
-            .windows(2)
-            .find(|w| w[0] == "--allowedTools")
-            .map(|w| w[1].as_str())
+            .iter()
+            .find_map(|a| a.strip_prefix("--allowedTools="))
             .unwrap_or_default();
         for mutating in ["Write", "Edit", "Bash", "NotebookEdit", "Agent", "Task"] {
             assert!(!allowed.split(',').any(|tool| tool == mutating));
+        }
+    }
+
+    #[test]
+    fn allowed_tools_value_cannot_swallow_the_trailing_prompt() {
+        // `claude --allowedTools <tools...>` is VARIADIC: with the space-separated
+        // form, every following bare word is taken as another tool name. The
+        // non-streaming `complete` path appends nothing after the base args when
+        // there is no session flag and no model, so the prompt (appended last by
+        // the subprocess layer) was eaten as a tool and claude failed with
+        // "Input must be provided ...". The `=` form binds exactly one value.
+        for profile in [
+            BasePermissionProfile::Plan,
+            BasePermissionProfile::Guarded,
+            BasePermissionProfile::Auto,
+        ] {
+            let args = ClaudeCodeDriver::default()
+                .with_permissions(profile)
+                .call_args_with_format("json");
+            assert!(
+                !args.iter().any(|a| a == "--allowedTools"),
+                "profile {profile:?}: variadic flag must not take a separate value: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a.starts_with("--allowedTools=Read,")),
+                "profile {profile:?}: tools must be bound with `=`: {args:?}"
+            );
         }
     }
 
@@ -1788,8 +1811,7 @@ mod tests {
         let script = dir.path().join("fake-claude");
         std::fs::write(
             &script,
-            // Drain stdin (the Arg-channel path closes the write half, so this is
-            // an immediate EOF) so the fake mirrors the codex fake's structure,
+            // Drain the prompt from stdin so the fake mirrors the codex fake's structure,
             // which runs cleanly under dash on Linux CI where the no-drain form flaked.
             "#!/bin/sh\ncat >/dev/null 2>&1\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"the real answer\",\"usage\":{\"input_tokens\":1200,\"cache_read_input_tokens\":300,\"cache_creation_input_tokens\":50,\"output_tokens\":42}}'\n",
         )
@@ -1819,12 +1841,24 @@ mod tests {
         assert_eq!(resp.usage.cached_write_tokens, 50);
     }
 
+    /// A fake `claude` that ignores its flags and prints the prompt it reads
+    /// from stdin.
+    #[cfg(unix)]
+    fn stdin_echoing_claude(dir: &std::path::Path) -> ClaudeCodeDriver {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join("fake-claude");
+        std::fs::write(&script, "#!/bin/sh\ncat\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ClaudeCodeDriver::with_program(script.to_str().unwrap())
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn complete_drives_a_fake_claude_binary() {
-        // Use `echo` as a stand-in: it ignores --print and echoes the
-        // remaining args, proving the driver passes the merged prompt
-        // as a positional argument.
-        let d = ClaudeCodeDriver::with_program("echo");
+        // The merged prompt reaches the base on stdin.
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = stdin_echoing_claude(dir.path());
         let req = CompletionRequest {
             model: "claude-sonnet-4-6".into(),
             system: Some("be terse".into()),
@@ -1836,20 +1870,21 @@ mod tests {
             temperature: None,
         };
         let resp = d.complete(req).await.unwrap();
-        // echo prints "--print <prompt>"; the driver's clean_output trims it.
         assert!(resp.text.contains("be terse"));
         assert!(resp.text.contains("ping"));
         assert_eq!(resp.model, "claude-sonnet-4-6");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn complete_claude_response_contract_is_stable() {
         // Pin the claude bespoke driver's complete() contract: response.id is
         // "claude-code-cli", the model echoes the request model, and stdout
-        // (via echo) lands in text. This is the claude-code subprocess
+        // (the fake prints its stdin) lands in text. This is the claude-code subprocess
         // integration test (paired with codex's complete_drives_a_fake_codex_binary
         // (Claude Code + Codex are both bespoke drivers.)
-        let d = ClaudeCodeDriver::with_program("echo");
+        let dir = tempfile::TempDir::new().unwrap();
+        let d = stdin_echoing_claude(dir.path());
         let req = CompletionRequest {
             model: "claude-opus-4-7".into(),
             system: None,
@@ -1884,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_events_redact_synthetic_secrets() {
+    fn stream_events_keep_model_text_and_tool_input_whole() {
         const SECRET: &str = "SYNTH_CLAUDE_SECRET_DO_NOT_LEAK_71";
         let text = serde_json::json!({
             "type": "assistant",
@@ -1909,8 +1944,8 @@ mod tests {
             parse_claude_stream_line(&tool)
         );
         assert!(
-            !rendered.contains(SECRET),
-            "stream event leaked: {rendered}"
+            rendered.contains(SECRET),
+            "stream event was rewritten: {rendered}"
         );
     }
 }

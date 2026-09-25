@@ -21,8 +21,10 @@ use crate::config::UserConfig;
 use crate::local_command::{LocalCommandRequest, LocalCommandResult};
 use crate::prompt_queue_ui::PromptQueueUi;
 
+mod animation_settings;
 mod backend;
 mod bounded_text;
+mod deploy;
 mod dir_scan;
 mod file_index;
 mod frozen_plan;
@@ -33,12 +35,16 @@ mod live_meta;
 mod memory_view;
 pub(crate) mod permissions;
 mod plan_view;
+mod preview;
 mod read_only_metric;
 mod run_pause;
 mod submission;
 mod task_control;
 mod usage_meter;
 
+use animation_settings::{
+    animation_settings_root, animations_enabled_default, read_animation_settings,
+};
 pub(crate) use backend::{parse_probe_detail, PROBE_AUTH_SENTINEL};
 use backend::{refresh_picker_with_probes, step_items};
 use bounded_text::{prefix_with_char_limit, read_utf8 as read_bounded_utf8, trim_tail};
@@ -731,10 +737,10 @@ pub enum Action {
     },
     /// The user TYPED the decision for a paused consequential-action approval
     /// (「批准」/"approve"/"y" → `true`, 「拒绝」/"deny"/"n" → `false`) while
-    /// [`App::pending_approval`] was live. The event loop resolves the shared
-    /// approval waiter with it (A2#5 — the typed-reply path; the empty-input
-    /// y/n/Esc fast keys are handled before the key pipeline in lib.rs).
-    ApprovalReply(bool),
+    /// [`App::pending_approval`] showed the `(action, target)` carried here, which
+    /// an allow must still match. The event loop resolves the shared waiter (A2#5;
+    /// the empty-input y/n/Esc fast keys are handled before the key pipeline).
+    ApprovalReply(bool, (String, String)),
     /// `/compact` — fold the older conversation turns into one structured summary
     /// via a forked base `complete()`. The event loop drives the async summary
     /// (and falls back to FIFO if the base is unreachable); the slash handler only
@@ -3015,32 +3021,19 @@ pub struct App {
     /// Its settle/cancel path must never reset a parked Director run or consume
     /// any resident base-session identity.
     pub(crate) host_git_in_flight: bool,
-    /// Session-level override for `auto_approve_gates` set via `/manual`
-    /// (`Some(false)`) or `/auto` (`Some(true)`). `None` → use the project's
-    /// `.umadevrc` value. Lets the user flip review mode mid-session without
-    /// hand-editing config or losing it on restart-of-flow.
+    /// Session-level gate auto-approval set via `/manual` (`Some(false)`) or
+    /// `/auto` (`Some(true)`). `None` → the default `guarded` tier. Lets the
+    /// user flip review mode mid-session without losing it on restart-of-flow.
     ///
     /// Kept as the compatibility surface for the binary `/auto` `/manual`
     /// toggle; `trust_mode_override` is the richer three-tier control that
     /// supersedes it. The two stay consistent — flipping one updates the other.
     pub auto_approve_override: Option<bool>,
 
-    /// Session-level trust / autonomy tier override (`/mode plan|guarded|auto`).
-    /// `None` → derive from `.umadevrc` (`auto_approve_gates`). When `Some`, it
-    /// takes precedence and also drives the legacy `auto_approve_override`.
-    /// The default tier is `guarded` (the existing human-in-the-loop behaviour).
+    /// Session-level trust / autonomy tier override (`/mode plan|guarded|auto`,
+    /// Shift+Tab). `None` → the default `guarded` tier. When `Some`, it takes
+    /// precedence and also drives the legacy `auto_approve_override`.
     pub trust_mode_override: Option<umadev_agent::TrustMode>,
-
-    /// Process-local cache of the trust tier *derived from `.umadevrc`* (used
-    /// only when no session override is set). [`effective_trust_mode`] runs in
-    /// the render hot path (~12/s at the 80 ms tick); without this it would
-    /// `load_project_config` — i.e. read `.umadevrc` off disk — on every frame,
-    /// which stutters on a slow / network-mounted workspace. We read the config
-    /// once, memoise the result here, and only refresh when the config could
-    /// actually have changed (a `/mode` switch or an explicit reload). Interior
-    /// mutability keeps `effective_trust_mode` a `&self` reader. Fail-open: a
-    /// config read error resolves to `Guarded`, same as before.
-    config_trust_cache: std::cell::Cell<Option<umadev_agent::TrustMode>>,
 
     /// Per-project collaborative trust ledger (`.umadev/trust.json`). Records
     /// how many times in a row each gate passed; after a threshold it *suggests*
@@ -3182,7 +3175,7 @@ pub struct App {
     /// `PhaseStarted` so the status bar can show per-phase elapsed time.
     pub phase_started_at: Option<std::time::Instant>,
 
-    /// When `auto_approve_gates` is on and a gate just opened, this holds
+    /// When the tier auto-approves gates and a gate just opened, this holds
     /// the gate to auto-continue. The event loop picks it up right after
     /// `apply_engine_event` returns and fires `Action::Continue`.
     pub pending_auto_continue: Option<Gate>,
@@ -3228,6 +3221,15 @@ pub struct App {
     /// action payload stays source-compatible for the large command/test surface;
     /// the event loop takes this immediately before spawning the route task.
     pending_route_input: Option<SubmittedTurn>,
+
+    /// The deploy command most recently shown by a `/deploy` preview. `/deploy
+    /// confirm` runs only this exact command, so a recipe that changes on disk
+    /// between the preview and the confirmation is shown again instead of run.
+    pending_deploy_command: Option<String>,
+
+    /// The frontend-notes run command most recently shown by `/preview`;
+    /// `/preview confirm` starts only this exact command (as for deploys).
+    pending_preview_command: Option<String>,
 
     /// The EXACT text of the chat turn most recently dispatched to the base (a fresh
     /// `Action::Route`, or a drained queued turn). On an ordinary non-Director route
@@ -3569,6 +3571,8 @@ impl App {
         config_path: std::path::PathBuf,
         project_root: std::path::PathBuf,
     ) -> Self {
+        #[cfg(test)]
+        tests::isolate_state_directory();
         let phases = PHASE_CHAIN
             .iter()
             .map(|&phase| PhaseRow {
@@ -3746,7 +3750,6 @@ impl App {
             host_git_in_flight: false,
             auto_approve_override: None,
             trust_mode_override: None,
-            config_trust_cache: std::cell::Cell::new(None),
             trust_ledger: umadev_agent::TrustLedger::load(&project_root),
             backends: Vec::new(),
             backend_probe_generation: 0,
@@ -3793,6 +3796,8 @@ impl App {
             prompt_queue: PromptQueueUi::default(),
             queued_turn_inputs: VecDeque::new(),
             pending_route_input: None,
+            pending_deploy_command: None,
+            pending_preview_command: None,
             last_dispatched_chat: None,
             stream_tool_batch: None,
             stream_text_active: false,
@@ -3995,7 +4000,7 @@ impl App {
             // rebuilds the exact screen the user left instead of an empty one.
             display: Some(self.history.iter().cloned().collect()),
         };
-        let Ok(body) = serde_json::to_string_pretty(&session) else {
+        let Ok(body) = umadev_agent::redaction::to_redacted_json_pretty(&session) else {
             return;
         };
         if body.len() > usize::try_from(MAX_CHAT_FILE_BYTES).unwrap_or(usize::MAX) {
@@ -5657,8 +5662,8 @@ impl App {
     }
 
     /// Ctrl+click at screen `(col, row)`: open the URL / existing file under
-    /// the cursor with the platform opener, spawned detached (all stdio null,
-    /// reaped off-thread — see [`crate::link::spawn_opener`]). Arms
+    /// the cursor with the platform opener (or reveal a file that could run,
+    /// spawned detached — see [`crate::link::open_link_target`]). Arms
     /// [`Self::link_click_pending`] unconditionally so the rest of the mouse
     /// gesture (drag / up) never touches the selection layer. Affordance: one
     /// status note on success or on a failed spawn; a click that hits nothing
@@ -5669,11 +5674,7 @@ impl App {
         let Some(target) = self.link_target_at(col, row) else {
             return;
         };
-        let key = if crate::link::spawn_opener(&target).is_ok() {
-            "tui.link.opened"
-        } else {
-            "tui.link.open_failed"
-        };
+        let key = crate::link::open_link_target(&target);
         self.push(
             ChatRole::System,
             umadev_i18n::tf(self.lang, key, &[&target]),
@@ -10480,12 +10481,12 @@ impl App {
         // lanes below — a real steering message typed mid-pause still lands, and
         // the sticky bar keeps showing how to answer. The paused drain emits its
         // own allowed/denied Note, so only the user's turn is echoed here.
-        if self.pending_approval.is_some() {
+        if let Some(seen) = self.pending_approval.clone() {
             if let Some(allow) = classify_approval_reply(&text) {
                 self.pending_approval = None;
                 self.push(ChatRole::You, text);
                 self.refresh_status();
-                return Action::ApprovalReply(allow);
+                return Action::ApprovalReply(allow, seen);
             }
         }
         // An unfinished durable plan/gate turns a small, exact continuation
@@ -12826,7 +12827,7 @@ impl App {
                 }
                 Action::None
             }
-            "continue" => self.continue_run_action(),
+            "continue" => self.continue_run_command(rest),
             "revise" => {
                 if rest.is_empty() {
                     self.push(ChatRole::System, umadev_i18n::t(self.lang, "revise.usage"));
@@ -12890,7 +12891,7 @@ impl App {
             "sandbox" => self.slash_sandbox(rest),
             "lang" => self.slash_lang(rest),
             "setup" | "guide" => self.slash_setup(),
-            "preview" => self.slash_preview(),
+            "preview" => self.slash_preview(rest),
             "stop-preview" => self.slash_stop_preview(),
             "deploy" => self.slash_deploy(rest),
             "pr" => {
@@ -15287,164 +15288,6 @@ impl App {
         }
     }
 
-    /// Path to the frontend-notes markdown the worker writes (holds the
-    /// `## Preview URL` + `## Run command` sections).
-    fn frontend_notes_path(&self) -> std::path::PathBuf {
-        self.project_root
-            .join("output")
-            .join(format!("{}-frontend-notes.md", self.slug))
-    }
-
-    /// Extract the `## Preview URL` value from the frontend-notes file.
-    /// Returns `None` when the file is missing or the section is empty.
-    #[must_use]
-    pub fn preview_url_from_notes(&self) -> Option<String> {
-        let body = read_bounded_utf8(&self.frontend_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
-        parse_notes_section(&body, "Preview URL")
-            .map(str::to_string)
-            .filter(|u| crate::link::is_safe_url(u))
-    }
-
-    /// Extract the `## Run command` value from the frontend-notes file.
-    #[must_use]
-    pub fn run_command_from_notes(&self) -> Option<String> {
-        let body = read_bounded_utf8(&self.frontend_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
-        parse_notes_section(&body, "Run command").map(str::to_string)
-    }
-
-    fn notes_preview_is_acceptance_harness(&self) -> bool {
-        let Some(cmd) = self.run_command_from_notes() else {
-            return false;
-        };
-        let cmd = cmd.to_ascii_lowercase().replace('\\', "/");
-        // Mirror `verify::looks_like_root_acceptance_harness`: require a STRONG
-        // harness marker (UmaDev's generated backend entrypoint or its static
-        // frontend index). A bare `src/frontend` reference is too broad — a
-        // normal app may legitimately record `cd src/frontend && npm run dev`.
-        let looks_like_harness =
-            cmd.contains("src/backend/server.mjs") || cmd.contains("src/frontend/index.html");
-        if !looks_like_harness {
-            return false;
-        }
-        [
-            "jeecgboot-vue3",
-            "jeecg-boot",
-            "jeecguniapp",
-            "pigx-ai-ui",
-            "pigx-visual",
-            "frontend",
-            "web",
-            "ui",
-            "app",
-        ]
-        .iter()
-        .any(|d| self.project_root.join(d).is_dir())
-    }
-
-    fn preview_url_from_notes_for_product(&self) -> Option<String> {
-        if self.notes_preview_is_acceptance_harness() {
-            None
-        } else {
-            self.preview_url_from_notes()
-        }
-    }
-
-    fn run_command_from_notes_for_product(&self) -> Option<String> {
-        if self.notes_preview_is_acceptance_harness() {
-            None
-        } else {
-            self.run_command_from_notes()
-        }
-    }
-
-    /// `/preview` — read the Preview URL the worker recorded, start the dev
-    /// server in the background, open the browser, and tell the user. Falls
-    /// back to a clear hint when no notes / no URL yet.
-    fn slash_preview(&mut self) -> Action {
-        // If a server is already running, just re-open the browser.
-        let already = self.preview_server.lock().is_ok_and(|g| g.is_some());
-        if already {
-            let url = self.effective_preview_url();
-            if let Some(ref u) = url {
-                let _ = crate::preview::open_url(u);
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(self.lang, "preview.already_running", &[u]),
-                );
-            }
-            return Action::None;
-        }
-
-        // PREFERRED path: detect the dev server ourselves (Vite/Next/Astro/
-        // CRA/static) from the project manifest. This does NOT depend on the
-        // worker having recorded a Preview URL — it works even if the worker
-        // forgot or used a different file name. Only falls back to the
-        // worker-recorded URL when no manifest-based detection matches.
-        let detected = umadev_agent::verify::detect_dev_server(&self.project_root);
-        let url = self.effective_preview_url();
-        let command = match (&detected, self.run_command_from_notes_for_product()) {
-            // Self-detection wins — we control the command + know the URL.
-            (Some(ds), _) => Some(ds.command.clone()),
-            // Worker recorded a run command — use it.
-            (None, Some(cmd)) => Some(cmd),
-            (None, None) => None,
-        };
-
-        match (detected.as_ref(), url.as_ref(), command.as_ref()) {
-            (Some(ds), u, Some(cmd)) => {
-                let display_url = u.cloned().unwrap_or_else(|| ds.default_url.to_string());
-                self.push(
-                    ChatRole::UmaDev,
-                    umadev_i18n::tf(
-                        self.lang,
-                        "preview.detected",
-                        &[ds.label, cmd, &display_url],
-                    ),
-                );
-                Action::StartPreview {
-                    url: display_url,
-                    command: cmd.clone(),
-                }
-            }
-            (None, Some(u), Some(cmd)) => {
-                self.push(
-                    ChatRole::UmaDev,
-                    umadev_i18n::tf(self.lang, "preview.starting", &[u, cmd]),
-                );
-                Action::StartPreview {
-                    url: u.clone(),
-                    command: cmd.clone(),
-                }
-            }
-            (None, Some(u), None) => {
-                let _ = crate::preview::open_url(u);
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(self.lang, "preview.opened", &[u]),
-                );
-                Action::None
-            }
-            _ => {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::t(self.lang, "preview.none_yet").to_string(),
-                );
-                Action::None
-            }
-        }
-    }
-
-    /// The Preview URL to actually open: prefer the worker-recorded value
-    /// (it reflects the real port), fall back to the dev-server default
-    /// (e.g. 5173 for Vite) when the worker did not record one.
-    fn effective_preview_url(&self) -> Option<String> {
-        if let Some(u) = self.preview_url_from_notes_for_product() {
-            return Some(u);
-        }
-        umadev_agent::verify::detect_dev_server(&self.project_root)
-            .map(|ds| ds.default_url.to_string())
-    }
-
     /// Synthesize the **build-complete card** shown after EVERY effective build
     /// (chat / Fast / Delivery): a `done` headline + what changed + the key
     /// entry point + the run command. Plain markdown (the transcript renderer
@@ -15641,122 +15484,6 @@ impl App {
         Action::None
     }
 
-    /// Path to the delivery-notes markdown (holds deploy/URL/run sections).
-    fn delivery_notes_path(&self) -> std::path::PathBuf {
-        self.project_root
-            .join("output")
-            .join(format!("{}-delivery-notes.md", self.slug))
-    }
-
-    /// Read the `## Deploy command` the worker recorded.
-    #[must_use]
-    pub fn deploy_command_from_notes(&self) -> Option<String> {
-        let body = read_bounded_utf8(&self.delivery_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
-        parse_notes_section(&body, "Deploy command").map(str::to_string)
-    }
-
-    /// Read the `## Frontend URL` (live URL after a deploy).
-    #[must_use]
-    pub fn deploy_url_from_notes(&self) -> Option<String> {
-        let body = read_bounded_utf8(&self.delivery_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
-        parse_notes_section(&body, "Frontend URL")
-            .map(str::to_string)
-            .filter(|u| crate::link::is_safe_url(u))
-    }
-
-    /// `/deploy` — run the deploy command the worker recorded so the project
-    /// goes live. The command typically logs into a platform CLI and pushes
-    /// (e.g. `npx vercel --prod`). We run it in the foreground so its login
-    /// prompts / output reach the user; the URL is surfaced after.
-    fn slash_deploy(&mut self, arg: &str) -> Action {
-        // Detect the deploy target from the workspace's own files (Vercel /
-        // Netlify / Fly / Cloudflare / Docker / static host). This drives both
-        // the CLI pre-flight check and the fallback command when the base never
-        // recorded one.
-        let target = umadev_agent::detect_deploy_target(&self.project_root);
-
-        // Pre-flight: check the deploy CLI is installed. Prefer the detected
-        // platform's CLI; fall back to the common set so a generic project still
-        // gets a useful answer.
-        let deploy_cli = target
-            .cli_binary()
-            .filter(|c| which_on_path(c))
-            .or_else(|| {
-                ["vercel", "netlify", "wrangler", "flyctl", "docker"]
-                    .into_iter()
-                    .find(|c| which_on_path(c))
-            });
-        if deploy_cli.is_none() {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "deploy.cli_missing").to_string(),
-            );
-        } else {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "deploy.cli_ready").to_string(),
-            );
-        }
-
-        // Surface the detected platform so the user sees what we'll deploy to.
-        if target != umadev_agent::DeployTarget::None {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::tf(self.lang, "deploy.detected", &[target.label()]),
-            );
-        }
-
-        // Command priority: the base-recorded `## Deploy command` (most precise),
-        // then the detected platform's canonical command (fail-open fallback so
-        // /deploy still works when the base didn't fill in the recipe).
-        let Some(cmd) = self
-            .deploy_command_from_notes()
-            .or_else(|| target.deploy_command())
-        else {
-            self.push(
-                ChatRole::System,
-                umadev_i18n::t(self.lang, "deploy.no_command").to_string(),
-            );
-            return Action::None;
-        };
-        // Reversibility floor (fail-SAFE): a deploy reaches the network and
-        // ships outward, so it is irreversible BY NATURE — it must be confirmed
-        // REGARDLESS of the active trust tier (even `auto` cannot skip it). We
-        // consult the `trust::requires_confirmation` floor on a `git push`-class
-        // probe (a deploy is publish-outward, exactly the network class the floor
-        // escalates) so the gate is mode-independent even for a recipe the
-        // generic classifier wouldn't recognise on its own (e.g. `npx vercel
-        // --prod`). We protect the user's project — when in doubt, confirm.
-        // `/deploy confirm` (or yes / go / 确认) actually deploys.
-        let floor_requires_confirm = umadev_agent::requires_confirmation(
-            self.effective_trust_mode(),
-            &format!("git push (deploy) {cmd}"),
-            "",
-        );
-        let confirmed = matches!(arg.trim(), "confirm" | "yes" | "go" | "y" | "确认" | "確認");
-        if floor_requires_confirm && !confirmed {
-            self.push(
-                ChatRole::UmaDev,
-                umadev_i18n::tf(self.lang, "deploy.confirm_preflight", &[&cmd]),
-            );
-            return Action::None;
-        }
-        // NOTE: `/deploy confirm` deliberately records NOTHING in the trust ledger.
-        // The deploy gate above is mode-independent — it always consults an
-        // always-escalating `git push (deploy)` probe — so a remembered rule could
-        // never skip a future deploy anyway. But stock recipes (`npx vercel --prod`,
-        // `flyctl deploy`, `docker build …`) carry no network token, so they classify
-        // as a reversible Shell command: recording one here would mint a
-        // `shell:<recipe>` rule that silently auto-allows the identical raw shell
-        // invocation as an ordinary later tool call. A one-off outward deploy must not
-        // grant standing shell authority, so we do not remember it.
-        self.push(
-            ChatRole::UmaDev,
-            umadev_i18n::tf(self.lang, "deploy.starting", &[&cmd]),
-        );
-        Action::RunDeploy { command: cmd }
-    }
-
     /// Plan approval IS authorization to implement. When the user approves the
     /// base's plan review ("批准并开始实施") while the session runs under the
     /// read-only Plan tier, promote to Guarded — the least-privilege WRITABLE
@@ -15809,9 +15536,11 @@ impl App {
     }
 
     /// Resolve the active trust tier: an explicit `/mode` (or `/auto` /
-    /// `/manual`) session override wins; otherwise derive from `.umadevrc`'s
-    /// `auto_approve_gates` (`true` → `auto`, `false` → `guarded`). The default
-    /// is `guarded` — the existing human-in-the-loop behaviour.
+    /// `/manual`, Shift+Tab) session override wins; otherwise `guarded`.
+    ///
+    /// Project configuration never selects the tier. `.umadevrc` travels with
+    /// the repository, so honouring it would let a cloned project start itself
+    /// in Auto; only the user raises the tier, one session at a time.
     #[must_use]
     pub fn effective_trust_mode(&self) -> umadev_agent::TrustMode {
         if let Some(m) = self.trust_mode_override {
@@ -15819,31 +15548,10 @@ impl App {
         }
         // Legacy binary override (set via `/auto` / `/manual` before any
         // `/mode`) still maps onto a tier for back-compat.
-        if let Some(auto) = self.auto_approve_override {
-            return if auto {
-                umadev_agent::TrustMode::Auto
-            } else {
-                umadev_agent::TrustMode::Guarded
-            };
+        match self.auto_approve_override {
+            Some(true) => umadev_agent::TrustMode::Auto,
+            Some(false) | None => umadev_agent::TrustMode::Guarded,
         }
-        // No session override → derive from `.umadevrc`, but serve it from the
-        // process-local cache so the render hot path never touches disk. The
-        // cache is invalidated whenever the config could have changed (see
-        // `invalidate_trust_cache`), so this stays correct. Fail-open: a read
-        // error inside `load_project_config` yields the default (`guarded`).
-        if let Some(cached) = self.config_trust_cache.get() {
-            return cached;
-        }
-        let config_auto = umadev_agent::config::load_project_config(&self.project_root)
-            .pipeline
-            .auto_approve_gates;
-        let mode = if config_auto {
-            umadev_agent::TrustMode::Auto
-        } else {
-            umadev_agent::TrustMode::Guarded
-        };
-        self.config_trust_cache.set(Some(mode));
-        mode
     }
 
     /// Codex sandbox a newly opened worker will actually request for the
@@ -15879,15 +15587,6 @@ impl App {
         (self.effective_trust_mode().is_downgrade_to(next)
             && (self.has_interruptible_work() || self.thinking))
             || self.codex_mode_change_requires_idle(next)
-    }
-
-    /// Drop the cached config-derived trust tier so the next
-    /// [`effective_trust_mode`] re-reads `.umadevrc`. Call after anything that
-    /// could change the on-disk `auto_approve_gates` (a `/mode` switch is held
-    /// in `trust_mode_override` and wins outright, but clearing here keeps the
-    /// cache honest if the override is later removed). Cheap and fail-open.
-    fn invalidate_trust_cache(&self) {
-        self.config_trust_cache.set(None);
     }
 
     /// Whether gates currently auto-approve (true) or pause for review (false).
@@ -16194,8 +15893,6 @@ impl App {
         let changed = self.effective_trust_mode() != mode;
         self.trust_mode_override = Some(mode);
         self.auto_approve_override = Some(mode.gates_auto_approve());
-        // Keep a future config-derived fallback honest if this override is cleared.
-        self.invalidate_trust_cache();
         if changed {
             // Native sessions retain launch permissions and a persisted vendor id
             // is authority-bound to that exact profile. Rebuild at the boundary
@@ -16514,7 +16211,7 @@ impl App {
             .backend
             .clone()
             .unwrap_or_else(|| "offline".to_string());
-        let report = format!(
+        let report = umadev_agent::redaction::redact_text(&format!(
             "# UmaDev bug report\n\n\
              version: {}\n\
              backend: {backend}\n\
@@ -16540,7 +16237,7 @@ impl App {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-        );
+        ));
         let report_path = self.project_root.join("umadev-bug-report.md");
         match umadev_state::fs::atomic_write(&report_path, report.as_bytes()) {
             Ok(()) => {
@@ -16563,8 +16260,6 @@ impl App {
         Action::None
     }
 
-    /// Called by `apply_engine` when the preview gate opens: surface the
-    /// recorded URL so the user knows where to look before pressing `c`.
     /// Append the user's answer to `output/{slug}-clarify-answers.md`.
     /// Called during `ClarifyGate` so each answer is persisted; on resume
     /// `merged_requirement` reads this file and folds answers into the
@@ -16574,10 +16269,11 @@ impl App {
     /// false "recorded" line. On a write failure the resume path would lose the
     /// answer silently, so the user must be told.
     fn append_clarify_answer(&self, answer: &str) -> std::io::Result<()> {
-        let output = umadev_state::fs::ensure_real_child_dir(&self.project_root, "output")?;
-        let path = output.join(format!("{}-clarify-answers.md", self.slug));
-        let existing = match read_bounded_utf8(&path, MAX_UI_ARTIFACT_BYTES) {
-            Ok(body) => body,
+        // Rooted at the project so the slug can never lead the write outside it.
+        let root = umadev_state::fs::RootedDir::open(&self.project_root)?;
+        let path = std::path::Path::new("output").join(format!("{}-clarify-answers.md", self.slug));
+        let existing = match root.read_bounded(&path, MAX_UI_ARTIFACT_BYTES) {
+            Ok(body) => String::from_utf8_lossy(&body).into_owned(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error),
         };
@@ -16586,7 +16282,7 @@ impl App {
         } else {
             format!("{existing}\n{answer}")
         };
-        umadev_state::fs::atomic_write(&path, updated.as_bytes())
+        root.atomic_write(&path, updated.as_bytes(), true)
     }
 
     /// Called by `apply_engine` when the preview gate opens: surface the
@@ -17473,39 +17169,6 @@ pub(crate) fn spinner_frame(tick: u8, animated: bool, stalled: bool) -> char {
     SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
 }
 
-/// P5d: the initial animation state — `false` (static spinner) when stdout is not
-/// a real terminal (CI / piped output) OR the user persisted `animations_enabled
-/// = false`; `true` otherwise. Fail-open to `true` (animated, today's behaviour)
-/// on any read error.
-fn animations_enabled_default() -> bool {
-    use std::io::IsTerminal;
-    // A non-interactive stdout (piped / redirected) never benefits from a spinner
-    // and a strobing braille frame just spams the log — render static there.
-    if !std::io::stdout().is_terminal() {
-        return false;
-    }
-    // Honor a persisted `/animations off`. Absent / unreadable → animated.
-    animation_settings_root(false)
-        .as_ref()
-        .and_then(read_animation_settings)
-        .and_then(|v| {
-            v.get("animations_enabled")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(true)
-}
-
-fn animation_settings_root(create_state: bool) -> Option<umadev_state::fs::RootedDir> {
-    umadev_state::privacy::state_root(create_state)
-}
-
-fn read_animation_settings(settings: &umadev_state::fs::RootedDir) -> Option<serde_json::Value> {
-    let bytes = settings
-        .read_bounded(std::path::Path::new("settings.json"), MAX_UI_STATE_BYTES)
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
 pub(crate) fn has_open_code_fence(body: &str) -> bool {
     let mut open = false;
     for line in body.lines() {
@@ -17609,53 +17272,7 @@ fn new_chat_session_id() -> String {
 }
 
 fn which_on_path(program: &str) -> bool {
-    if program.trim().is_empty() {
-        return false;
-    }
-    let path = std::path::Path::new(program);
-    if path.components().count() > 1 {
-        return executable_file(path);
-    }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    #[cfg(windows)]
-    let extensions = {
-        let mut values = vec![String::new()];
-        values.extend(
-            std::env::var("PATHEXT")
-                .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-                .split(';')
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-        );
-        values
-    };
-    #[cfg(not(windows))]
-    let extensions = [String::new()];
-    std::env::split_paths(&paths).any(|directory| {
-        extensions
-            .iter()
-            .any(|extension| executable_file(&directory.join(format!("{program}{extension}"))))
-    })
-}
-
-fn executable_file(path: &std::path::Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    !program.trim().is_empty() && umadev_process::path_lookup::is_installed(program)
 }
 
 fn parse_notes_section<'a>(body: &'a str, heading: &str) -> Option<&'a str> {

@@ -131,7 +131,8 @@ fn latest_tasks(
     read_optional(project_root, &latest.join("tasks.md"), budget)
 }
 
-/// Scan for `FR-<digits>` tokens (case-insensitive on `FR`), normalised to a
+/// Scan for `FR-<digits>` tokens (case-insensitive on `FR`, starting at a word
+/// boundary so `NFR-<digits>` is not an FR), normalised to a
 /// canonical zero-padded `FR-NNN`. `FR-` and ASCII digits are single-byte, so
 /// byte indexing here is multibyte-safe even amid CJK prose.
 ///
@@ -146,7 +147,11 @@ fn extract_fr_ids(text: &str) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
     let mut i = 0;
     while i + 3 < n {
-        let is_fr = (b[i] | 0x20) == b'f' && (b[i + 1] | 0x20) == b'r' && b[i + 2] == b'-';
+        // Word boundary before `FR`: `NFR-004` (a non-functional requirement)
+        // or `xFR-5` must not be read as `FR-004` / `FR-005`.
+        let at_boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        let is_fr =
+            at_boundary && (b[i] | 0x20) == b'f' && (b[i + 1] | 0x20) == b'r' && b[i + 2] == b'-';
         if is_fr {
             let mut j = i + 3;
             while j < n && b[j].is_ascii_digit() {
@@ -197,6 +202,26 @@ mod tests {
         .unwrap();
         let uncovered = uncovered_requirements(root, "demo");
         assert_eq!(uncovered, vec!["FR-003".to_string()]);
+    }
+
+    #[test]
+    fn non_functional_ids_are_not_functional_requirements() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(
+            root.join("output").join("demo-prd.md"),
+            "| FR-001 | 登录 |\n| NFR-002 | p95 < 200ms |",
+        )
+        .unwrap();
+        let cdir = root.join(".umadev").join("changes").join("demo-20260101");
+        std::fs::create_dir_all(&cdir).unwrap();
+        std::fs::write(cdir.join("tasks.md"), "- [ ] 实现登录 _(FR-001)_").unwrap();
+        assert!(uncovered_requirements(root, "demo").is_empty());
+        assert_eq!(
+            extract_fr_ids("NFR-004, xFR-5, (FR-6), 需求FR-7"),
+            ["FR-006", "FR-007"].map(String::from).into()
+        );
     }
 
     #[test]
