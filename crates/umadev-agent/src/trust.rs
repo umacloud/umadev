@@ -872,6 +872,21 @@ fn shell_write_escapes_workspace(command: &str, root: Option<&std::path::Path>) 
             }
         } else if let Some(of) = t.strip_prefix("of=") {
             dests.push(of.to_string());
+        } else if let Some(file) = t
+            .strip_prefix("--output=")
+            .or_else(|| t.strip_prefix("--log-file="))
+        {
+            // `git diff --output=<file>`, `less --log-file=<file>`.
+            dests.push(file.to_string());
+        } else if matches!(
+            *t,
+            "--output" | "--log-file" | "-fprint" | "-fprint0" | "-fprintf" | "-fls"
+        ) {
+            // The same options with a separate file argument, and `find`'s
+            // file-printing actions.
+            if let Some(next) = toks.get(i + 1) {
+                dests.push((*next).to_string());
+            }
         }
     }
     dests.iter().any(|d| {
@@ -1450,7 +1465,46 @@ fn is_read_only_command(cmd: &str) -> bool {
     ];
     READ_VERBS
         .iter()
-        .any(|v| c == *v || c.starts_with(&format!("{v} ")))
+        .find(|v| c == **v || c.starts_with(&format!("{v} ")))
+        .is_some_and(|verb| {
+            let flags = SIDE_EFFECT_FLAGS
+                .iter()
+                .find_map(|(v, flags)| (v == verb).then_some(*flags))
+                .unwrap_or_default();
+            !c.split_whitespace()
+                .skip(1)
+                .any(|arg| is_side_effect_flag(arg, flags))
+        })
+}
+
+/// Options that make a read verb run a program or write a file: `rg --pre` runs
+/// a preprocessor, `find -exec`/`-delete`/`-fprint` execute or write, `git
+/// --output`/`--ext-diff`/`--textconv` write a file or run a diff driver, and
+/// `less -o`/`--log-file` copy the input to a file. Commands are lowercased.
+const SIDE_EFFECT_FLAGS: &[(&str, &[&str])] = &[
+    ("rg", &["--pre", "--pre-glob"]),
+    (
+        "find",
+        &[
+            "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf",
+            "-fls",
+        ],
+    ),
+    ("git log", &["--output", "--ext-diff", "--textconv"]),
+    ("git diff", &["--output", "--ext-diff", "--textconv"]),
+    ("git show", &["--output", "--ext-diff", "--textconv"]),
+    ("less", &["-o", "--log-file"]),
+];
+
+/// Whether `arg` is one of `flags`, in its bare, `--flag=value` or attached
+/// short (`-ofile`) spelling.
+fn is_side_effect_flag(arg: &str, flags: &[&str]) -> bool {
+    flags.iter().any(|flag| {
+        arg == *flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('=') || flag.len() == 2)
+    })
 }
 
 /// Per-capability autonomy posture: may an action of this capability run without
@@ -3732,5 +3786,47 @@ mod tests {
             "webfetch",
             "https://docs.rs/serde"
         ));
+    }
+
+    #[test]
+    fn read_verbs_that_run_programs_or_write_files_are_not_reads() {
+        for command in [
+            "rg --pre=bash -g x.sh . zzz",
+            "rg --pre ./evil pattern",
+            "rg --pre-glob '*.pdf' pattern",
+            "git diff --output=/home/u/.bashrc",
+            "git log --output /tmp/x",
+            "git show --ext-diff HEAD",
+            "find . -fprint /home/u/.profile",
+            "find . -fls out.txt",
+            "find . -execdir sh {} +",
+            "less -o /tmp/copy README.md",
+        ] {
+            assert_ne!(
+                capability_class("Bash", command),
+                Capability::Read,
+                "{command} must not classify as a read"
+            );
+            assert!(
+                requires_confirmation(TrustMode::Plan, "Bash", command),
+                "Plan must confirm {command}"
+            );
+        }
+        for command in ["rg --pretty -o foo", "grep -o foo src", "git log --oneline"] {
+            assert_eq!(capability_class("Bash", command), Capability::Read);
+        }
+        let root = real_root();
+        let escapes = |command: &str| {
+            requires_confirmation_with_ledger(
+                TrustMode::Guarded,
+                "Bash",
+                command,
+                root,
+                &TrustLedger::default(),
+            )
+        };
+        assert!(escapes("git diff --output=/home/u/.bashrc"));
+        assert!(escapes("find . -fprint ~/.profile"));
+        assert!(!escapes("git diff --output=out/changes.diff"));
     }
 }
