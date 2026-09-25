@@ -314,7 +314,7 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
 /// is best-effort (fail-open).
 fn print_scrollback_handoff(app: &App) {
     use std::io::Write;
-    let text = app.transcript_plaintext();
+    let text = crate::ui::terminal_safe_lines(&app.transcript_plaintext());
     if text.trim().is_empty() {
         return;
     }

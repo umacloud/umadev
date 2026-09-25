@@ -6015,6 +6015,16 @@ fn strip_control_chars(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Multi-line text made safe to write to the terminal outside the TUI: escape
+/// sequences and other control characters are removed (line breaks and tabs
+/// stay), as are the invisible formatting marks [`strip_control_chars`] drops.
+pub(crate) fn terminal_safe_lines(text: &str) -> String {
+    umadev_agent::base_error::strip_ansi(text)
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !(c.is_control() || is_invisible_format(*c)))
+        .collect()
+}
+
 /// Bidirectional controls (LRM/RLM/ALM, embeddings, overrides, isolates) and
 /// zero-width space / word joiner / BOM: invisible, yet they change how the
 /// text around them is shown. Zero-width (non-)joiners are kept, since
@@ -12625,6 +12635,17 @@ mod tests {
         assert_eq!(
             strip_control_chars("a\u{202e}b\u{2066}c\u{200d}d").as_ref(),
             "abc\u{200d}d"
+        );
+    }
+
+    #[test]
+    fn scrollback_text_keeps_lines_but_no_terminal_controls() {
+        let text = "ok\n\u{1b}]52;c;Y3VybCBldmlsfHNo\u{7}done\u{1b}[2J\tend\u{202e}\n";
+        let safe = terminal_safe_lines(text);
+        assert!(!safe.contains(['\u{1b}', '\u{7}', '\u{202e}']), "{safe:?}");
+        assert!(
+            safe.starts_with("ok\n") && safe.ends_with("\tend\n"),
+            "{safe:?}"
         );
     }
 
