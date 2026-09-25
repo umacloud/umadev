@@ -2069,17 +2069,27 @@ fn verify_results_check(project_root: &Path) -> Option<QualityCheck> {
         #[serde(default)]
         timestamp: String,
     }
-    let rows: Vec<VRow> = content
+    // The log can ship with the repository, and the latest run wins: a row
+    // must carry the RFC 3339 stamp `record_verify_outcome` writes, and one
+    // stamped in the future (a forged `"9999"` or year-9999 row that would
+    // outrank every real failure forever) is ignored. Small clock skew
+    // between processes is tolerated.
+    let now = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let rows: Vec<(chrono::DateTime<chrono::Utc>, VRow)> = content
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter_map(|l| serde_json::from_str::<VRow>(l).ok())
+        .filter_map(|r| {
+            let at = chrono::DateTime::parse_from_rfc3339(&r.timestamp).ok()?;
+            Some((at.with_timezone(&chrono::Utc), r)).filter(|(at, _)| *at <= now)
+        })
         .collect();
-    if rows.is_empty() {
-        return None;
-    }
-    let dts = String::new();
-    let lts = rows.iter().map(|r| &r.timestamp).max().unwrap_or(&dts);
-    let latest: Vec<&VRow> = rows.iter().filter(|r| r.timestamp == *lts).collect();
+    let lts = rows.iter().map(|(at, _)| *at).max()?;
+    let latest: Vec<&VRow> = rows
+        .iter()
+        .filter(|(at, _)| *at == lts)
+        .map(|(_, r)| r)
+        .collect();
     let ns: Vec<&VRow> = latest.iter().copied().filter(|r| !r.skipped).collect();
     let passed = ns.iter().filter(|r| r.passed).count();
     let total = ns.len();
@@ -6111,9 +6121,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("verify.jsonl"),
-            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"t1"}
-{"step":"test","passed":true,"skipped":false,"timestamp":"t1"}
-{"step":"build","passed":true,"skipped":false,"timestamp":"t1"}
+            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"build","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
 "#,
         )
         .unwrap();
@@ -6130,8 +6140,8 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("verify.jsonl"),
-            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"t1"}
-{"step":"build","passed":false,"skipped":false,"timestamp":"t1"}
+            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
 "#,
         )
         .unwrap();
@@ -6141,15 +6151,36 @@ mod tests {
     }
 
     #[test]
+    fn verify_results_check_ignores_future_and_unstamped_rows() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        fs::write(
+            dir.join("verify.jsonl"),
+            format!(
+                r#"{{"step":"build","passed":false,"skipped":false,"timestamp":"{now}"}}
+{{"step":"build","passed":true,"skipped":false,"timestamp":"9999"}}
+{{"step":"build","passed":true,"skipped":false,"timestamp":"9999-01-01T00:00:00Z"}}
+{{"step":"build","passed":true,"skipped":false}}
+"#
+            ),
+        )
+        .unwrap();
+        let check = verify_results_check(tmp.path()).unwrap();
+        assert_eq!(check.status, "failed", "a forged later row cannot hide it");
+    }
+
+    #[test]
     fn verify_results_check_ignores_skipped_steps() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join(".umadev/audit");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("verify.jsonl"),
-            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"t1"}
-{"step":"lint","passed":false,"skipped":true,"timestamp":"t1"}
-{"step":"test","passed":true,"skipped":false,"timestamp":"t1"}
+            r#"{"step":"install","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"lint","passed":false,"skipped":true,"timestamp":"2026-01-02T03:04:05Z"}
+{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}
 "#,
         )
         .unwrap();
@@ -6314,7 +6345,7 @@ mod tests {
         fs::create_dir_all(&audit).unwrap();
         fs::write(
             audit.join("verify.jsonl"),
-            r#"{"step":"test","passed":true,"skipped":false,"timestamp":"t"}"#,
+            r#"{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}"#,
         )
         .unwrap();
         let out = run_quality(&o).unwrap();
@@ -6337,7 +6368,7 @@ mod tests {
         fs::create_dir_all(&audit).unwrap();
         fs::write(
             audit.join("verify.jsonl"),
-            r#"{"step":"build","passed":false,"skipped":false,"timestamp":"t"}"#,
+            r#"{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-02T03:04:05Z"}"#,
         )
         .unwrap();
         let out = run_quality(&o).unwrap();
