@@ -48,7 +48,7 @@ pub(super) fn load(project_root: &Path) -> BTreeSet<String> {
     let Some(relative) = relative_path(project_root) else {
         return BTreeSet::new();
     };
-    umadev_state::privacy::state_root(false)
+    crate::checkpoint::store_trust::installation_state_root(false)
         .map(|state| read(&state, &relative).allow_rules)
         .unwrap_or_default()
 }
@@ -59,7 +59,7 @@ pub(super) fn remember(project_root: &Path, class: String) -> bool {
     let Some(relative) = relative_path(project_root) else {
         return false;
     };
-    let Some(state) = umadev_state::privacy::state_root(true) else {
+    let Some(state) = crate::checkpoint::store_trust::installation_state_root(true) else {
         return false;
     };
     let mut memory = read(&state, &relative);

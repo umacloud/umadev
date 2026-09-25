@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::checkpoint::store_trust::{installation_tag, project_root_bytes};
+use crate::checkpoint::store_trust::{
+    installation_state_root, installation_tag, project_root_bytes,
+};
 
 /// The saved-run files a resume acts on, all under `<project>/.umadev/`.
 pub(crate) const PLAN: &str = "plan.json";
@@ -72,7 +74,7 @@ pub(crate) fn record(project_root: &Path, file: &str, bytes: &[u8]) {
 fn record_all(project_root: &Path, files: &[(&str, &[u8])]) -> Option<()> {
     let root_bytes = project_root_bytes(project_root)?;
     let relative = stamp_path(&root_bytes)?;
-    let state = umadev_state::privacy::state_root(true)?;
+    let state = installation_state_root(true)?;
     let mut stamps = read_stamps(&state, &relative);
     for (file, bytes) in files {
         stamps
@@ -99,7 +101,7 @@ pub fn is_own(project_root: &Path) -> bool {
         return false;
     };
     let Some(stamps) = stamp_path(&root_bytes).and_then(|relative| {
-        umadev_state::privacy::state_root(false).map(|state| read_stamps(&state, &relative))
+        installation_state_root(false).map(|state| read_stamps(&state, &relative))
     }) else {
         return false;
     };
@@ -160,5 +162,15 @@ mod tests {
         assert!(is_own(tmp.path()));
         write(tmp.path(), PLAN, r#"{"steps":[2]}"#);
         assert!(!is_own(tmp.path()));
+    }
+
+    #[test]
+    fn unit_tests_keep_saved_run_stamps_out_of_the_real_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        record(tmp.path(), PLAN, b"{}");
+        let state = umadev_state::privacy::state_directory(false).expect("pinned state");
+        let scratch = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(state.starts_with(&scratch), "{}", state.display());
+        assert!(state.join(STAMP_DIR).is_dir());
     }
 }

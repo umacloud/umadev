@@ -1171,6 +1171,36 @@ fn clarify_answer_write_failure_does_not_claim_recorded() {
     );
 }
 
+#[test]
+fn a_repository_slug_never_leads_the_clarify_answer_outside_the_project() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Research);
+    state.slug = "../../escape".into();
+    umadev_agent::write_workflow_state(&project, &state).unwrap();
+
+    let mut app = fresh_app(Some("offline"));
+    app.project_root = project.clone();
+    app.slug.clear();
+    let _ = app.resume_run_requirement();
+    assert!(
+        !app.slug.contains(['/', '\\']) && !app.slug.contains(".."),
+        "adopted slug stays one file-name component: {}",
+        app.slug
+    );
+    app.append_clarify_answer("answer").unwrap();
+    let written = project
+        .join("output")
+        .join(format!("{}-clarify-answers.md", app.slug));
+    assert!(written.is_file(), "the answer lands under output/");
+
+    // Even a traversal slug set in memory cannot write outside the project.
+    app.slug = "../escape".into();
+    assert!(app.append_clarify_answer("answer").is_err());
+    assert!(!tmp.path().join("escape-clarify-answers.md").exists());
+}
+
 // ---- WorkerStream rendering tests ----
 
 #[test]

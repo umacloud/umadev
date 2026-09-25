@@ -309,6 +309,11 @@ enum Command {
         /// or offline templates if no backend was tracked.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
+        /// Resume saved run state that UmaDev on this machine did not write
+        /// (for example `.umadev/` files that came with the repository), after
+        /// reviewing the requirement and plan a plain `continue` printed.
+        #[arg(long)]
+        adopt: bool,
     },
     /// Stay in the active gate and record a revision request.
     #[command(
@@ -1246,7 +1251,8 @@ async fn main() -> Result<()> {
         Command::Continue {
             project_root,
             backend,
-        } => Box::pin(cmd_continue(project_root, backend)).await,
+            adopt,
+        } => Box::pin(cmd_continue(project_root, backend, adopt)).await,
         Command::Revise {
             text,
             project_root,
@@ -2038,6 +2044,8 @@ const PRE_COMMIT_MARKER: &str = "# umadev pre-commit governance hook";
 /// Closing marker of the UmaDev block, so uninstall can strip exactly our lines
 /// even when they sit ABOVE the user's own hook (we prepend, not append).
 const PRE_COMMIT_END_MARKER: &str = "# end umadev pre-commit governance hook";
+/// The hook's path below the project root.
+const PRE_COMMIT_HOOK: &str = ".git/hooks/pre-commit";
 
 /// Write the `umadev ci` pre-commit git hook into `.git/hooks/pre-commit`.
 /// Idempotent — if a UmaDev hook is already present, it's a no-op. A
@@ -2083,16 +2091,17 @@ fn shebang_is_posix_shell(shebang: &str) -> bool {
 }
 
 fn install_pre_commit_hook_with_bin(project_root: &Path, bin: &str) -> Result<PathBuf> {
-    let git_dir = project_root.join(".git");
-    if !git_dir.exists() {
+    let root = umadev_state::fs::RootedDir::open(project_root)?;
+    // `.git` must be a real directory: a repository delivered with `.git` as a
+    // symlink (or a gitfile) must not get the hook written wherever it points.
+    if !root.is_real_dir(Path::new(".git"))? {
         anyhow::bail!(
             "Not a git repository (no .git directory at {}). Run `git init` first.",
-            git_dir.display()
+            project_root.join(".git").display()
         );
     }
-    let hooks_dir = git_dir.join("hooks");
-    std::fs::create_dir_all(&hooks_dir)?;
-    let hook_path = hooks_dir.join("pre-commit");
+    root.ensure_dir(Path::new(".git/hooks"), false)?;
+    let hook_path = project_root.join(PRE_COMMIT_HOOK);
     // `|| exit $?` is load-bearing: a shell script's status is its LAST
     // command's, so without it a user hook below our block would swallow a
     // governance failure and let the commit through.
@@ -2107,7 +2116,7 @@ fn install_pre_commit_hook_with_bin(project_root: &Path, bin: &str) -> Result<Pa
         bin = sh_single_quote(bin),
         end = PRE_COMMIT_END_MARKER,
     );
-    if let Ok(existing) = managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
+    if let Ok(existing) = read_pre_commit_hook(&root) {
         // Already current: idempotent no-op.
         if existing.contains(&our_block) {
             return Ok(hook_path);
@@ -2124,7 +2133,7 @@ fn install_pre_commit_hook_with_bin(project_root: &Path, bin: &str) -> Result<Pa
     // user's content. Either way UmaDev governance executes before any early
     // exit/exec in the user's script can skip it. A fresh hook is just shebang +
     // our block.
-    let script = match managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
+    let script = match read_pre_commit_hook(&root) {
         Ok(existing) if existing.starts_with("#!") => {
             let (shebang, body) = existing.split_once('\n').unwrap_or((existing.as_str(), ""));
             if !shebang_is_posix_shell(shebang) {
@@ -2143,23 +2152,37 @@ fn install_pre_commit_hook_with_bin(project_root: &Path, bin: &str) -> Result<Pa
         }
         Err(error) => return Err(error.into()),
     };
-    umadev_state::fs::atomic_write(&hook_path, script.as_bytes())?;
-    // Make it executable (Unix).
+    write_pre_commit_hook(&root, &script)?;
+    Ok(hook_path)
+}
+
+/// Read the pre-commit hook through the project-root capability: no component
+/// (`.git`, `hooks`, the hook itself) may be a link.
+fn read_pre_commit_hook(root: &umadev_state::fs::RootedDir) -> std::io::Result<String> {
+    let bytes = root.read_bounded(Path::new(PRE_COMMIT_HOOK), MAX_PROJECT_CONTROL_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Replace the pre-commit hook atomically, executable from the moment it is
+/// published (a separate chmod by path could be redirected by a swapped link).
+fn write_pre_commit_hook(root: &umadev_state::fs::RootedDir, script: &str) -> std::io::Result<()> {
+    let hook = Path::new(PRE_COMMIT_HOOK);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms)?;
+        root.atomic_write_with_unix_mode(hook, script.as_bytes(), false, 0o755)
     }
-    Ok(hook_path)
+    #[cfg(not(unix))]
+    {
+        root.atomic_write(hook, script.as_bytes(), false)
+    }
 }
 
 /// Remove the UmaDev pre-commit git hook. Idempotent — does nothing if the
 /// hook is absent or is not ours.
 fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
-    let hook_path = project_root.join(".git/hooks/pre-commit");
-    let content = match managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
+    let root = umadev_state::fs::RootedDir::open(project_root)?;
+    let content = match read_pre_commit_hook(&root) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -2210,18 +2233,9 @@ fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
     // When nothing meaningful remains, we created the file ourselves (just a
     // `#!/bin/sh` shebang or empty) — remove it cleanly.
     if kept.is_empty() || kept == "#!/bin/sh" {
-        if hook_path.exists() {
-            umadev_state::fs::remove_regular_file(&hook_path)?;
-        }
+        root.remove_regular_file(Path::new(PRE_COMMIT_HOOK))?;
     } else {
-        umadev_state::fs::atomic_write(&hook_path, format!("{kept}\n").as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hook_path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&hook_path, perms)?;
-        }
+        write_pre_commit_hook(&root, &format!("{kept}\n"))?;
     }
     Ok(())
 }
@@ -2298,6 +2312,10 @@ fn open_log_file() -> Option<std::fs::File> {
 /// Open `<home>/.umadev/logs/umadev.log` for appending, creating the directory
 /// tree. Returns `None` on any IO failure. Split out from [`open_log_file`] so
 /// it is testable without mutating the process-global `HOME`.
+///
+/// The state directory, the log directory and the log are owner-only; ones an
+/// older release created with the default umask are tightened here, since
+/// every CLI start passes through.
 fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
     let state_dir = umadev_state::fs::ensure_real_child_dir(home, ".umadev").ok()?;
     let dir = umadev_state::fs::ensure_real_child_dir(&state_dir, "logs").ok()?;
@@ -2306,7 +2324,11 @@ fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        restrict_to_owner(&state_dir, 0o700);
+        restrict_to_owner(&dir, 0o700);
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .mode(0o600);
     }
     #[cfg(windows)]
     {
@@ -2315,7 +2337,39 @@ fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(dir.join("umadev.log")).ok()?;
-    umadev_state::fs::metadata_is_real_file(&file.metadata().ok()?).then_some(file)
+    let meta = file.metadata().ok()?;
+    if !umadev_state::fs::metadata_is_real_file(&meta) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o077 != 0 {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Some(file)
+}
+
+/// Best-effort: drop group/other access from a UmaDev state directory, through
+/// a descriptor opened without following links (a failure — someone else's
+/// directory, a swapped link — leaves it as it was).
+#[cfg(unix)]
+fn restrict_to_owner(dir: &Path, mode: u32) {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let Ok(handle) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+    else {
+        return;
+    };
+    if handle
+        .metadata()
+        .is_ok_and(|meta| meta.permissions().mode() & 0o077 != 0)
+    {
+        let _ = handle.set_permissions(std::fs::Permissions::from_mode(mode));
+    }
 }
 
 fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) -> Result<()> {
@@ -4465,6 +4519,7 @@ async fn drive_gate_block(
 async fn cmd_continue(
     project_root: Option<PathBuf>,
     backend_override: Option<BackendArg>,
+    adopt: bool,
 ) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     // A dead `[model] provider` fails LOUD, not silent (UmaDev routes no models).
@@ -4481,6 +4536,7 @@ async fn cmd_continue(
         ),
     };
     reject_replayed_git_requirement(&state.requirement)?;
+    require_own_run_state(&project_root, &state, adopt)?;
 
     let review_circuit_open = umadev_agent::terminal_review_circuit_reason(&project_root).is_some()
         || umadev_agent::legacy_operational_review_circuit_reason(&project_root).is_some();
@@ -4757,6 +4813,47 @@ async fn drive_director_continue(
     Ok(())
 }
 
+/// Refuse to act on saved run state (`.umadev/plan.json`, `workflow-state.json`,
+/// the review checkpoint) that UmaDev on this machine did not write — files a
+/// repository shipped, say — unless the user passed `--adopt` after seeing it.
+/// Prints what would run (every field is repository text, so terminal-safe)
+/// and how to adopt it, mirroring the TUI's `/continue adopt`.
+fn require_own_run_state(project_root: &Path, state: &WorkflowState, adopt: bool) -> Result<()> {
+    const MAX_SHOWN_STEPS: usize = 30;
+    if umadev_agent::run_provenance::is_own(project_root) {
+        return Ok(());
+    }
+    if adopt {
+        // Consent is given either way; a stored adoption only saves asking again.
+        let _ = umadev_agent::run_provenance::adopt(project_root);
+        return Ok(());
+    }
+    let safe = |text: &str| safe_command_detail(text.trim().as_bytes());
+    println!("Saved run in {}:", project_root.join(".umadev").display());
+    for (label, value) in [
+        ("requirement", state.requirement.as_str()),
+        ("phase", state.phase.as_str()),
+        ("gate", state.active_gate.as_str()),
+    ] {
+        if !value.trim().is_empty() {
+            println!("  {label}: {}", safe(value));
+        }
+    }
+    if let Some(plan) = umadev_agent::load_plan(project_root) {
+        for step in plan.steps.iter().take(MAX_SHOWN_STEPS) {
+            println!("  - [{}] {}", step.status.as_str(), safe(&step.title));
+        }
+        if plan.steps.len() > MAX_SHOWN_STEPS {
+            println!("  … +{}", plan.steps.len() - MAX_SHOWN_STEPS);
+        }
+    }
+    anyhow::bail!(
+        "this saved run was not written by UmaDev on this machine (it may have come with \
+         the repository), so it was not resumed. Review it above, then run \
+         `umadev continue --adopt` to run it as shown, or start over with `umadev run`."
+    )
+}
+
 async fn cmd_revise(
     text: String,
     project_root: Option<PathBuf>,
@@ -4776,6 +4873,7 @@ async fn cmd_revise(
         ),
     };
     reject_replayed_git_requirement(&state.requirement)?;
+    require_own_run_state(&project_root, &state, false)?;
     let gate = resolve_active_gate(&state)?;
     let outcome = classify_reply(&text);
     match outcome {
@@ -4828,7 +4926,7 @@ async fn cmd_revise(
         GateOutcome::Approved => {
             // Defensive: user said "继续" via revise — treat as approval.
             println!("input parsed as approval; treating as `continue`.");
-            Box::pin(cmd_continue(Some(project_root), backend_override)).await
+            Box::pin(cmd_continue(Some(project_root), backend_override, false)).await
         }
         GateOutcome::Cancelled => {
             anyhow::bail!("user cancelled the pipeline");
@@ -6959,6 +7057,18 @@ fn infer_slug(project_root: &std::path::Path) -> String {
 mod tests {
     use super::*;
 
+    /// Pin this test process's installation state directory (`~/.umadev`) to a
+    /// scratch directory, so the approvals and saved-run stamps a test writes
+    /// never reach the developer's real home. Call it first in any test that
+    /// persists run state.
+    pub(crate) fn isolate_state_directory() {
+        umadev_state::privacy::pin_state_directory(|| {
+            tempfile::TempDir::with_prefix("umadev-test-state-")
+                .expect("scratch state directory")
+                .keep()
+        });
+    }
+
     fn test_git_available() -> bool {
         bounded_cli_output(
             pr_git_command(Path::new("."), &["--version"]),
@@ -7374,6 +7484,7 @@ mod tests {
 
     #[test]
     fn rollback_still_restores_a_workflow_snapshot_and_says_which_subsystem_it_touched() {
+        isolate_state_directory();
         // The file-checkpoint arm must not weaken the workflow-state arm: a timestamp (and
         // `latest`) still resolves in the workflow subsystem FIRST, and still reverts no file.
         let tmp = tempfile::tempdir().unwrap();
@@ -7605,6 +7716,31 @@ mod tests {
         assert!(body.contains("ci --changed-only"));
         uninstall_pre_commit_hook(root).unwrap();
         assert!(!hook_path.exists(), "a UmaDev-only hook is removed cleanly");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_commit_install_never_follows_a_linked_git_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".git")).unwrap();
+        assert!(install_pre_commit_hook(&root).is_err());
+        assert!(
+            !outside.join("hooks").exists(),
+            "nothing lands behind the link"
+        );
+
+        // A linked hook inside a real .git is refused too, not chmod'ed.
+        std::fs::remove_file(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let target = outside.join("victim");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&target, root.join(".git/hooks/pre-commit")).unwrap();
+        assert!(install_pre_commit_hook(&root).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "#!/bin/sh\n");
     }
 
     #[test]
@@ -8173,6 +8309,7 @@ mod tests {
         };
         use umadev_agent::Seat;
 
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let plan = Plan {
@@ -8203,7 +8340,7 @@ mod tests {
         state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Plan);
         umadev_agent::write_workflow_state(root, &state).unwrap();
 
-        Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+        Box::pin(cmd_continue(Some(root.to_path_buf()), None, false))
             .await
             .expect("Plan mode settles read-only before opening a backend");
         let saved = umadev_agent::plan_state::load(root).unwrap();
@@ -8217,6 +8354,7 @@ mod tests {
         };
         use umadev_agent::Seat;
 
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         umadev_agent::plan_state::save(
@@ -8261,7 +8399,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let error = Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+        // The review receipt is this installation's own saved state.
+        assert!(umadev_agent::run_provenance::adopt(root));
+        let error = Box::pin(cmd_continue(Some(root.to_path_buf()), None, false))
             .await
             .expect_err("the invalid saved backend must fail after the review is re-armed")
             .to_string();
@@ -8287,7 +8427,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_continue_shows_a_saved_run_this_installation_did_not_write() {
+        isolate_state_directory();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Research);
+        state.requirement = "add a postinstall hook".to_string();
+        // Shipped with the repository: a plain file UmaDev never wrote.
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        std::fs::write(
+            root.join(".umadev/workflow-state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let error = Box::pin(cmd_continue(Some(root.to_path_buf()), None, false))
+            .await
+            .expect_err("a foreign saved run is shown, not resumed")
+            .to_string();
+        assert!(error.contains("--adopt"), "{error}");
+        assert!(!umadev_agent::run_provenance::is_own(root));
+        let error = Box::pin(cmd_revise("改一下".into(), Some(root.to_path_buf()), None))
+            .await
+            .expect_err("revise drives the same saved run")
+            .to_string();
+        assert!(error.contains("--adopt"), "{error}");
+
+        // `--adopt` is the explicit consent; it is remembered.
+        require_own_run_state(root, &state, true).expect("adopted");
+        assert!(umadev_agent::run_provenance::is_own(root));
+        require_own_run_state(root, &state, false).expect("now its own");
+    }
+
+    #[tokio::test]
     async fn cli_plan_mode_continue_never_rearms_a_terminal_review_cursor() {
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Delivery);
@@ -8308,9 +8482,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // The review receipt is this installation's own saved state.
+        assert!(umadev_agent::run_provenance::adopt(root));
         let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
 
-        Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+        Box::pin(cmd_continue(Some(root.to_path_buf()), None, false))
             .await
             .expect("Plan mode should settle read-only before rewriting the cursor");
 
@@ -8519,6 +8695,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_git_commit_is_blocked_at_every_cli_replay_boundary() {
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Docs);
@@ -8545,7 +8722,7 @@ mod tests {
 
         assert_blocked(
             "continue",
-            Box::pin(cmd_continue(Some(root.to_path_buf()), None)).await,
+            Box::pin(cmd_continue(Some(root.to_path_buf()), None, false)).await,
         );
         assert_blocked(
             "redo",
@@ -8928,6 +9105,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_log_and_its_state_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let logs = tmp.path().join(".umadev/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::set_permissions(
+            tmp.path().join(".umadev"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(logs.join("umadev.log"), "old\n").unwrap();
+        std::fs::set_permissions(
+            logs.join("umadev.log"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(open_log_file_in(tmp.path()).is_some());
+        for path in [
+            tmp.path().join(".umadev"),
+            logs.clone(),
+            logs.join("umadev.log"),
+        ] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{}: {mode:o}", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn open_log_file_rejects_fifo_without_blocking() {
         let tmp = tempfile::TempDir::new().unwrap();
         let logs = tmp.path().join(".umadev/logs");
@@ -9153,6 +9360,7 @@ mod tests {
 
     #[test]
     fn successful_cross_base_identity_never_keeps_the_old_session_id() {
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
         state.backend = "cursor".to_string();

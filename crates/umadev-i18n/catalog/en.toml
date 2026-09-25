@@ -771,6 +771,7 @@
 # /preview
 "preview.detected" = "[preview] Detected {}, starting preview…\n  command: `{}` -> {}"
 "preview.starting" = "Starting dev server and opening the preview: {}\n  command: `{}`"
+"preview.confirm_command" = "The preview command below was read from the frontend notes, which the repository or the model can edit. Not run yet:\n  {}\n  -> {}\nCheck it, then type /preview confirm to run it."
 "preview.opened" = "Opened the preview: {}\n  (no Run command found; if the page won't open, start the dev server manually)"
 "preview.none_yet" = "No previewable frontend yet. Type a requirement and run through the frontend phase (it pauses at the preview gate),\n                   or confirm the base wrote a Preview URL into output/xxx-frontend-notes.md."
 "preview.gate_announce" = "[preview] Frontend generated, preview at: {}\n                       Open it in the browser to see the result. Happy? type c to continue (into the backend);\n                       to change it, describe your edits. You can also /preview to auto-start the dev server, /stop-preview to stop."
@@ -1052,7 +1053,6 @@
 "diag.call_failed" = "[warn] {} phase: base call failed ({}) — falling back to an OFFLINE SKELETON for this phase (not a real generation). {}"
 
 # quality gate — inline score + findings instead of pointing at the JSON
-"quality.gate_unreadable" = "[warn] Quality gate file was written but can't be read back ({}) — treating as not-passed to avoid masking a write failure."
 "quality.gate_blocked" = "[warn] Quality gate did NOT pass (score {}/100) — blocking delivery (UD-EVID-003). Fix the items below, then:\n  /redo to re-run the whole pipeline\n  or /continue after fixing to resume"
 "quality.top_findings_header" = "Top findings to fix:"
 
@@ -1075,6 +1075,7 @@
 # Ctrl+click opened a URL / file from the transcript ({} = the opened target; iTerm2's native Cmd+click is unaffected)
 "tui.link.opened" = "Opened {}"
 "tui.link.open_failed" = "Could not open {}"
+"tui.link.revealed" = "Showed {} in its folder (not opened: it could run as a program)"
 # Tool-call rows: merged read/grep batch headline + grep metric
 "tui.tool.batch" = "inspected {} files"
 "tui.tool.matches" = "{} matches"

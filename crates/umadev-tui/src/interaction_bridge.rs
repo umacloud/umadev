@@ -1027,13 +1027,25 @@ pub(super) fn allow_pending_approval(holder: &ApprovalHolder, seen: &(String, St
 /// ordinary item (an npm install, an in-tree write) resolves Allow, matching the
 /// tier the user just opted into. Fail-open: a poisoned lock / no pending
 /// approval is a no-op.
-pub(super) fn release_pending_approval_on_auto_switch(holder: &ApprovalHolder) {
+pub(super) fn release_pending_approval_on_auto_switch(
+    holder: &ApprovalHolder,
+    project_root: &std::path::Path,
+) {
     if let Ok(mut g) = holder.lock() {
         if g.as_ref().is_some_and(|p| !p.auto_releasable) {
             return; // the base's effective policy still requires a human answer
         }
+        // The same root-aware decision the live gate makes under Auto: without the
+        // real workspace root a write escaping it (or into a permission file) would
+        // look in-tree and be released unanswered.
         let still_escalates = g.as_ref().is_some_and(|p| {
-            umadev_agent::requires_confirmation(umadev_agent::TrustMode::Auto, &p.action, &p.target)
+            umadev_agent::requires_confirmation_with_ledger(
+                umadev_agent::TrustMode::Auto,
+                &p.action,
+                &p.target,
+                project_root,
+                &umadev_agent::TrustLedger::load(project_root),
+            )
         });
         if still_escalates {
             return; // a true disaster keeps its explicit prompt even in Auto

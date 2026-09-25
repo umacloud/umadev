@@ -8743,7 +8743,7 @@ fn publish_trust_after_key(
     let current = app.effective_trust_mode();
     publish_live_trust(current);
     if current != trust_before_key && matches!(current, umadev_agent::TrustMode::Auto) {
-        release_pending_approval_on_auto_switch(approval_holder);
+        release_pending_approval_on_auto_switch(approval_holder, &app.project_root);
     }
 }
 

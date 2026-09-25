@@ -478,11 +478,11 @@ fn allow_pending_approval_resolves_the_waiter_as_allow() {
     let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
     let (tx, rx) = tokio::sync::oneshot::channel();
     *holder.lock().unwrap() = Some(test_pending_approval(tx));
-    release_pending_approval_on_auto_switch(&holder);
+    release_pending_approval_on_auto_switch(&holder, std::path::Path::new("."));
     assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
     // The holder is cleared, so a second call is a harmless no-op.
     assert!(holder.lock().unwrap().is_none());
-    release_pending_approval_on_auto_switch(&holder);
+    release_pending_approval_on_auto_switch(&holder, std::path::Path::new("."));
 
     // The EXPLICIT verdict path (typed 「批准」 → Action::ApprovalReply) resolves
     // the request the bar showed — whatever the item.
@@ -511,7 +511,7 @@ fn auto_switch_keeps_a_true_disaster_pending_but_explicit_approve_resolves() {
         auto_releasable: true,
         armed_at: None,
     });
-    release_pending_approval_on_auto_switch(&holder);
+    release_pending_approval_on_auto_switch(&holder, std::path::Path::new("."));
     assert!(
         holder.lock().unwrap().is_some(),
         "a still-escalating disaster stays pending across the mode switch"
@@ -598,6 +598,28 @@ async fn an_approval_that_replaces_a_pending_one_cannot_take_a_stale_answer() {
 }
 
 #[test]
+fn auto_switch_keeps_a_write_outside_the_real_workspace_pending() {
+    // Only the real project root tells an escaping write from an in-tree one.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let outside = tmp.path().join("other-project").join("notes.txt");
+    let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    *holder.lock().unwrap() = Some(PendingApproval {
+        reply_tx: tx,
+        req_id: String::new(),
+        action: "Write".to_string(),
+        target: outside.display().to_string(),
+        auto_releasable: true,
+        armed_at: None,
+    });
+    release_pending_approval_on_auto_switch(&holder, &root);
+    assert!(holder.lock().unwrap().is_some(), "still needs an answer");
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn auto_switch_never_releases_an_upstream_permission_boundary() {
     let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
     let (tx, mut rx) = tokio::sync::oneshot::channel();
@@ -610,7 +632,7 @@ fn auto_switch_never_releases_an_upstream_permission_boundary() {
         armed_at: None,
     });
 
-    release_pending_approval_on_auto_switch(&holder);
+    release_pending_approval_on_auto_switch(&holder, std::path::Path::new("."));
 
     assert!(
         holder.lock().unwrap().is_some(),
@@ -781,7 +803,7 @@ async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
         .unwrap()
         .as_ref()
         .is_some_and(|pending| !pending.auto_releasable));
-    release_pending_approval_on_auto_switch(&approval_holder);
+    release_pending_approval_on_auto_switch(&approval_holder, std::path::Path::new("."));
     assert!(approval_holder.lock().unwrap().is_some());
     assert!(allow_pending_approval(
         &approval_holder,

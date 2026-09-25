@@ -761,6 +761,7 @@
 # /preview
 "preview.detected" = "[preview] 偵測到 {},啟動預覽…\n  指令:`{}` -> {}"
 "preview.starting" = "啟動 dev server 並開啟預覽:{}\n  指令:`{}`"
+"preview.confirm_command" = "下面的預覽命令讀自前端說明檔案，儲存庫或模型都能修改它。尚未執行：\n  {}\n  -> {}\n確認無誤後輸入 /preview confirm 執行。"
 "preview.opened" = "已開啟預覽:{}\n  (未找到 Run command,如頁面打不開請手動啟動 dev server)"
 "preview.none_yet" = "還沒有可預覽的前端。先輸入需求跑完到 frontend 階段(會停在預覽 gate),\n                   或確認底座已把 Preview URL 寫進 output/xxx-frontend-notes.md。"
 "preview.gate_announce" = "[preview] 前端已生成,預覽位址:{}\n                       在瀏覽器開啟查看效果。滿意就輸入 c 繼續(進入後端);\n                       要改就描述修改意見。也可 /preview 自動啟動 dev server、/stop-preview 停止。"
@@ -1041,7 +1042,6 @@
 "diag.call_failed" = "[warn] {} 階段:底座呼叫失敗({})—— 本階段改用【離線骨架】佔位(非真實生成)。{}"
 
 # 品質門 — 內聯分數 + 問題清單,別讓使用者另開 json
-"quality.gate_unreadable" = "[warn] 品質門檔案寫出後無法讀回 ({}) — 判定未通過以防掩蓋寫盤失敗。"
 "quality.gate_blocked" = "[warn] 品質門未通過(得分 {}/100)— 阻斷 delivery(UD-EVID-003)。修復下列問題後重跑:\n  /redo 重跑整個流水線\n  或修復後 /continue 繼續"
 "quality.top_findings_header" = "待修復的主要問題:"
 
@@ -1064,6 +1064,7 @@
 # Ctrl+點擊開啟記錄裡的連結 / 檔案({} = 開啟的目標;iTerm2 原生 Cmd+點擊不受影響)
 "tui.link.opened" = "已開啟 {}"
 "tui.link.open_failed" = "無法開啟 {}"
+"tui.link.revealed" = "已在所在資料夾中顯示 {}（未直接開啟：它可能作為程式執行）"
 # 工具呼叫列:連續唯讀工具合併後的標題 + grep 命中計數
 "tui.tool.batch" = "讀取 {} 個檔案"
 "tui.tool.matches" = "{} 處符合"

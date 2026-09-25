@@ -21,6 +21,7 @@ use crate::config::UserConfig;
 use crate::local_command::{LocalCommandRequest, LocalCommandResult};
 use crate::prompt_queue_ui::PromptQueueUi;
 
+mod animation_settings;
 mod backend;
 mod bounded_text;
 mod deploy;
@@ -34,12 +35,16 @@ mod live_meta;
 mod memory_view;
 pub(crate) mod permissions;
 mod plan_view;
+mod preview;
 mod read_only_metric;
 mod run_pause;
 mod submission;
 mod task_control;
 mod usage_meter;
 
+use animation_settings::{
+    animation_settings_root, animations_enabled_default, read_animation_settings,
+};
 pub(crate) use backend::{parse_probe_detail, PROBE_AUTH_SENTINEL};
 use backend::{refresh_picker_with_probes, step_items};
 use bounded_text::{prefix_with_char_limit, read_utf8 as read_bounded_utf8, trim_tail};
@@ -3222,6 +3227,10 @@ pub struct App {
     /// between the preview and the confirmation is shown again instead of run.
     pending_deploy_command: Option<String>,
 
+    /// The frontend-notes run command most recently shown by `/preview`;
+    /// `/preview confirm` starts only this exact command (as for deploys).
+    pending_preview_command: Option<String>,
+
     /// The EXACT text of the chat turn most recently dispatched to the base (a fresh
     /// `Action::Route`, or a drained queued turn). On an ordinary non-Director route
     /// failure this is the authoritative "what just failed" key —
@@ -3562,6 +3571,8 @@ impl App {
         config_path: std::path::PathBuf,
         project_root: std::path::PathBuf,
     ) -> Self {
+        #[cfg(test)]
+        tests::isolate_state_directory();
         let phases = PHASE_CHAIN
             .iter()
             .map(|&phase| PhaseRow {
@@ -3786,6 +3797,7 @@ impl App {
             queued_turn_inputs: VecDeque::new(),
             pending_route_input: None,
             pending_deploy_command: None,
+            pending_preview_command: None,
             last_dispatched_chat: None,
             stream_tool_batch: None,
             stream_text_active: false,
@@ -5650,8 +5662,8 @@ impl App {
     }
 
     /// Ctrl+click at screen `(col, row)`: open the URL / existing file under
-    /// the cursor with the platform opener, spawned detached (all stdio null,
-    /// reaped off-thread — see [`crate::link::spawn_opener`]). Arms
+    /// the cursor with the platform opener (or reveal a file that could run,
+    /// spawned detached — see [`crate::link::open_link_target`]). Arms
     /// [`Self::link_click_pending`] unconditionally so the rest of the mouse
     /// gesture (drag / up) never touches the selection layer. Affordance: one
     /// status note on success or on a failed spawn; a click that hits nothing
@@ -5662,11 +5674,7 @@ impl App {
         let Some(target) = self.link_target_at(col, row) else {
             return;
         };
-        let key = if crate::link::spawn_opener(&target).is_ok() {
-            "tui.link.opened"
-        } else {
-            "tui.link.open_failed"
-        };
+        let key = crate::link::open_link_target(&target);
         self.push(
             ChatRole::System,
             umadev_i18n::tf(self.lang, key, &[&target]),
@@ -12883,7 +12891,7 @@ impl App {
             "sandbox" => self.slash_sandbox(rest),
             "lang" => self.slash_lang(rest),
             "setup" | "guide" => self.slash_setup(),
-            "preview" => self.slash_preview(),
+            "preview" => self.slash_preview(rest),
             "stop-preview" => self.slash_stop_preview(),
             "deploy" => self.slash_deploy(rest),
             "pr" => {
@@ -15280,164 +15288,6 @@ impl App {
         }
     }
 
-    /// Path to the frontend-notes markdown the worker writes (holds the
-    /// `## Preview URL` + `## Run command` sections).
-    fn frontend_notes_path(&self) -> std::path::PathBuf {
-        self.project_root
-            .join("output")
-            .join(format!("{}-frontend-notes.md", self.slug))
-    }
-
-    /// Extract the `## Preview URL` value from the frontend-notes file.
-    /// Returns `None` when the file is missing or the section is empty.
-    #[must_use]
-    pub fn preview_url_from_notes(&self) -> Option<String> {
-        let body = read_bounded_utf8(&self.frontend_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
-        parse_notes_section(&body, "Preview URL")
-            .map(str::to_string)
-            .filter(|u| crate::link::is_safe_url(u))
-    }
-
-    /// Extract the `## Run command` value from the frontend-notes file.
-    #[must_use]
-    pub fn run_command_from_notes(&self) -> Option<String> {
-        let body = read_bounded_utf8(&self.frontend_notes_path(), MAX_UI_ARTIFACT_BYTES).ok()?;
-        parse_notes_section(&body, "Run command").map(str::to_string)
-    }
-
-    fn notes_preview_is_acceptance_harness(&self) -> bool {
-        let Some(cmd) = self.run_command_from_notes() else {
-            return false;
-        };
-        let cmd = cmd.to_ascii_lowercase().replace('\\', "/");
-        // Mirror `verify::looks_like_root_acceptance_harness`: require a STRONG
-        // harness marker (UmaDev's generated backend entrypoint or its static
-        // frontend index). A bare `src/frontend` reference is too broad — a
-        // normal app may legitimately record `cd src/frontend && npm run dev`.
-        let looks_like_harness =
-            cmd.contains("src/backend/server.mjs") || cmd.contains("src/frontend/index.html");
-        if !looks_like_harness {
-            return false;
-        }
-        [
-            "jeecgboot-vue3",
-            "jeecg-boot",
-            "jeecguniapp",
-            "pigx-ai-ui",
-            "pigx-visual",
-            "frontend",
-            "web",
-            "ui",
-            "app",
-        ]
-        .iter()
-        .any(|d| self.project_root.join(d).is_dir())
-    }
-
-    fn preview_url_from_notes_for_product(&self) -> Option<String> {
-        if self.notes_preview_is_acceptance_harness() {
-            None
-        } else {
-            self.preview_url_from_notes()
-        }
-    }
-
-    fn run_command_from_notes_for_product(&self) -> Option<String> {
-        if self.notes_preview_is_acceptance_harness() {
-            None
-        } else {
-            self.run_command_from_notes()
-        }
-    }
-
-    /// `/preview` — read the Preview URL the worker recorded, start the dev
-    /// server in the background, open the browser, and tell the user. Falls
-    /// back to a clear hint when no notes / no URL yet.
-    fn slash_preview(&mut self) -> Action {
-        // If a server is already running, just re-open the browser.
-        let already = self.preview_server.lock().is_ok_and(|g| g.is_some());
-        if already {
-            let url = self.effective_preview_url();
-            if let Some(ref u) = url {
-                let _ = crate::preview::open_url(u);
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(self.lang, "preview.already_running", &[u]),
-                );
-            }
-            return Action::None;
-        }
-
-        // PREFERRED path: detect the dev server ourselves (Vite/Next/Astro/
-        // CRA/static) from the project manifest. This does NOT depend on the
-        // worker having recorded a Preview URL — it works even if the worker
-        // forgot or used a different file name. Only falls back to the
-        // worker-recorded URL when no manifest-based detection matches.
-        let detected = umadev_agent::verify::detect_dev_server(&self.project_root);
-        let url = self.effective_preview_url();
-        let command = match (&detected, self.run_command_from_notes_for_product()) {
-            // Self-detection wins — we control the command + know the URL.
-            (Some(ds), _) => Some(ds.command.clone()),
-            // Worker recorded a run command — use it.
-            (None, Some(cmd)) => Some(cmd),
-            (None, None) => None,
-        };
-
-        match (detected.as_ref(), url.as_ref(), command.as_ref()) {
-            (Some(ds), u, Some(cmd)) => {
-                let display_url = u.cloned().unwrap_or_else(|| ds.default_url.to_string());
-                self.push(
-                    ChatRole::UmaDev,
-                    umadev_i18n::tf(
-                        self.lang,
-                        "preview.detected",
-                        &[ds.label, cmd, &display_url],
-                    ),
-                );
-                Action::StartPreview {
-                    url: display_url,
-                    command: cmd.clone(),
-                }
-            }
-            (None, Some(u), Some(cmd)) => {
-                self.push(
-                    ChatRole::UmaDev,
-                    umadev_i18n::tf(self.lang, "preview.starting", &[u, cmd]),
-                );
-                Action::StartPreview {
-                    url: u.clone(),
-                    command: cmd.clone(),
-                }
-            }
-            (None, Some(u), None) => {
-                let _ = crate::preview::open_url(u);
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::tf(self.lang, "preview.opened", &[u]),
-                );
-                Action::None
-            }
-            _ => {
-                self.push(
-                    ChatRole::System,
-                    umadev_i18n::t(self.lang, "preview.none_yet").to_string(),
-                );
-                Action::None
-            }
-        }
-    }
-
-    /// The Preview URL to actually open: prefer the worker-recorded value
-    /// (it reflects the real port), fall back to the dev-server default
-    /// (e.g. 5173 for Vite) when the worker did not record one.
-    fn effective_preview_url(&self) -> Option<String> {
-        if let Some(u) = self.preview_url_from_notes_for_product() {
-            return Some(u);
-        }
-        umadev_agent::verify::detect_dev_server(&self.project_root)
-            .map(|ds| ds.default_url.to_string())
-    }
-
     /// Synthesize the **build-complete card** shown after EVERY effective build
     /// (chat / Fast / Delivery): a `done` headline + what changed + the key
     /// entry point + the run command. Plain markdown (the transcript renderer
@@ -16410,8 +16260,6 @@ impl App {
         Action::None
     }
 
-    /// Called by `apply_engine` when the preview gate opens: surface the
-    /// recorded URL so the user knows where to look before pressing `c`.
     /// Append the user's answer to `output/{slug}-clarify-answers.md`.
     /// Called during `ClarifyGate` so each answer is persisted; on resume
     /// `merged_requirement` reads this file and folds answers into the
@@ -16421,10 +16269,11 @@ impl App {
     /// false "recorded" line. On a write failure the resume path would lose the
     /// answer silently, so the user must be told.
     fn append_clarify_answer(&self, answer: &str) -> std::io::Result<()> {
-        let output = umadev_state::fs::ensure_real_child_dir(&self.project_root, "output")?;
-        let path = output.join(format!("{}-clarify-answers.md", self.slug));
-        let existing = match read_bounded_utf8(&path, MAX_UI_ARTIFACT_BYTES) {
-            Ok(body) => body,
+        // Rooted at the project so the slug can never lead the write outside it.
+        let root = umadev_state::fs::RootedDir::open(&self.project_root)?;
+        let path = std::path::Path::new("output").join(format!("{}-clarify-answers.md", self.slug));
+        let existing = match root.read_bounded(&path, MAX_UI_ARTIFACT_BYTES) {
+            Ok(body) => String::from_utf8_lossy(&body).into_owned(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error),
         };
@@ -16433,7 +16282,7 @@ impl App {
         } else {
             format!("{existing}\n{answer}")
         };
-        umadev_state::fs::atomic_write(&path, updated.as_bytes())
+        root.atomic_write(&path, updated.as_bytes(), true)
     }
 
     /// Called by `apply_engine` when the preview gate opens: surface the
@@ -17318,39 +17167,6 @@ pub(crate) fn spinner_frame(tick: u8, animated: bool, stalled: bool) -> char {
         return SPINNER_FRAMES[0];
     }
     SPINNER_FRAMES[(tick as usize) % SPINNER_FRAMES.len()]
-}
-
-/// P5d: the initial animation state — `false` (static spinner) when stdout is not
-/// a real terminal (CI / piped output) OR the user persisted `animations_enabled
-/// = false`; `true` otherwise. Fail-open to `true` (animated, today's behaviour)
-/// on any read error.
-fn animations_enabled_default() -> bool {
-    use std::io::IsTerminal;
-    // A non-interactive stdout (piped / redirected) never benefits from a spinner
-    // and a strobing braille frame just spams the log — render static there.
-    if !std::io::stdout().is_terminal() {
-        return false;
-    }
-    // Honor a persisted `/animations off`. Absent / unreadable → animated.
-    animation_settings_root(false)
-        .as_ref()
-        .and_then(read_animation_settings)
-        .and_then(|v| {
-            v.get("animations_enabled")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(true)
-}
-
-fn animation_settings_root(create_state: bool) -> Option<umadev_state::fs::RootedDir> {
-    umadev_state::privacy::state_root(create_state)
-}
-
-fn read_animation_settings(settings: &umadev_state::fs::RootedDir) -> Option<serde_json::Value> {
-    let bytes = settings
-        .read_bounded(std::path::Path::new("settings.json"), MAX_UI_STATE_BYTES)
-        .ok()?;
-    serde_json::from_slice(&bytes).ok()
 }
 
 pub(crate) fn has_open_code_fence(body: &str) -> bool {

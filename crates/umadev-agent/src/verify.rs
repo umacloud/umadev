@@ -319,14 +319,24 @@ fn named_test_step(
         skippable: true,
         timeout_secs,
     };
+    // The name comes from model output and is passed as its own argv entry: a
+    // leading `-` would be parsed as an OPTION by the tool (`cargo test
+    // --config=target.<triple>.runner=…` runs an arbitrary program), so it is
+    // never a test name.
+    if test.starts_with('-') {
+        return None;
+    }
     let t = test.to_string();
     match kind {
-        // `cargo test <substring>` is a plain SUBSTRING match, not a pattern — any
-        // name is safe to pass verbatim.
-        ProjectKind::Rust => Some(step(
-            "cargo",
-            vec!["test".into(), "--quiet".into(), t, "--".into()],
-        )),
+        // `cargo test <substring>` is a plain SUBSTRING match, not a pattern, but
+        // the filter sits BEFORE `--`, where cargo still parses its own options:
+        // accept only a Rust path (`module::tests::name`).
+        ProjectKind::Rust => test.split("::").all(is_plain_test_ident).then(|| {
+            step(
+                "cargo",
+                vec!["test".into(), "--quiet".into(), t, "--".into()],
+            )
+        }),
         ProjectKind::Node => {
             // Only meaningful when the project declares a test script AND that script
             // runs a runner for which `-t` means "filter by name" (jest / vitest).
@@ -517,17 +527,23 @@ fn detect_dev_server_in_dir(workspace: &Path) -> Option<DevServer> {
         });
     }
     // 3. Static HTML — Python's http.server as a zero-dependency fallback.
-    let has_html = ["index.html", "public/index.html"]
+    //    `http.server` listens on every interface by default, which would
+    //    publish the whole directory (`.env`, `.git/`, `.umadev/` chat logs)
+    //    to the LAN for the rest of the session: bind loopback only, and
+    //    serve `public/` rather than the workspace when the page lives there.
+    let served_dir = ["index.html", "public/index.html"]
         .iter()
-        .any(|p| workspace_file(workspace, p));
-    if has_html {
-        return Some(DevServer {
-            label: "Static file server",
-            command: "python3 -m http.server 8000".to_string(),
-            default_url: "http://localhost:8000",
-        });
-    }
-    None
+        .find(|p| workspace_file(workspace, p))
+        .and_then(|p| Path::new(p).parent())?;
+    let directory = match served_dir.to_str() {
+        Some("") | None => ".",
+        Some(dir) => dir,
+    };
+    Some(DevServer {
+        label: "Static file server",
+        command: format!("python3 -m http.server 8000 --bind 127.0.0.1 --directory {directory}"),
+        default_url: "http://127.0.0.1:8000",
+    })
 }
 
 fn looks_like_root_acceptance_harness(workspace: &Path) -> bool {
@@ -1268,8 +1284,22 @@ mod tests {
         let go = named_test_step(ProjectKind::Go, tmp.path(), "TestSum", 90).expect("askable");
         assert!(go.args.contains(&"^TestSum$".to_string()), "{:?}", go.args);
         assert!(named_test_step(ProjectKind::Python, tmp.path(), "test_sum", 90).is_some());
-        // Rust's filter is a plain SUBSTRING match — any name is safe there.
-        assert!(named_test_step(ProjectKind::Rust, tmp.path(), "sum[int]", 90).is_some());
+        // Rust's filter is a substring match, but it precedes `--`, where cargo
+        // still reads options: only a Rust path is askable.
+        assert!(named_test_step(ProjectKind::Rust, tmp.path(), "tests::sum_int", 90).is_some());
+        for hostile in [
+            "--config=target.x86_64-unknown-linux-gnu.runner=\"sh -c evil\"",
+            "-Zunstable-options",
+            "sum[int]",
+            "a::::b",
+        ] {
+            assert!(
+                named_test_step(ProjectKind::Rust, tmp.path(), hostile, 90).is_none(),
+                "rust: `{hostile}` must never reach cargo's option parser"
+            );
+        }
+        // No runner receives a name that would parse as one of its options.
+        assert!(named_test_step(ProjectKind::Deno, tmp.path(), "--allow-all", 90).is_none());
     }
 
     #[test]
@@ -2162,7 +2192,22 @@ mod tests {
         std::fs::write(tmp.path().join("index.html"), "<h1>hi</h1>").unwrap();
         let ds = detect_dev_server(tmp.path()).expect("static project");
         assert_eq!(ds.label, "Static file server");
-        assert_eq!(ds.command, "python3 -m http.server 8000");
+        assert_eq!(
+            ds.command,
+            "python3 -m http.server 8000 --bind 127.0.0.1 --directory ."
+        );
+    }
+
+    #[test]
+    fn static_server_serves_public_on_loopback_only() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("public")).unwrap();
+        std::fs::write(tmp.path().join("public/index.html"), "<h1>hi</h1>").unwrap();
+        let ds = detect_dev_server(tmp.path()).expect("static project");
+        assert_eq!(
+            ds.command, "python3 -m http.server 8000 --bind 127.0.0.1 --directory public",
+            "never the workspace root, never every interface"
+        );
     }
 
     #[test]
