@@ -264,7 +264,9 @@ pub(super) fn next_step_review_checkpoint(
     review_only: bool,
     evidence: OperationalReviewEvidence,
 ) -> OperationalReviewCheckpoint {
-    let consecutive_outages = match prior {
+    // Only a retry of the SAME boundary continues its outage count and its evidence
+    // trail; an earlier, unrelated boundary's findings must never be reported here.
+    let same_boundary = match prior {
         Some(
             checkpoint @ OperationalReviewCheckpoint::StepReview {
                 step_id: prior_step,
@@ -278,12 +280,14 @@ pub(super) fn next_step_review_checkpoint(
             && prior_seats == &required_seats
             && *prior_review_only == review_only =>
         {
-            checkpoint.effective_outages().saturating_add(1)
+            Some(checkpoint)
         }
-        _ => 1,
+        _ => None,
     };
+    let consecutive_outages =
+        same_boundary.map_or(1, |prior| prior.effective_outages().saturating_add(1));
     let evidence = OperationalReviewEvidence::merged(
-        prior.map(OperationalReviewCheckpoint::evidence),
+        same_boundary.map(OperationalReviewCheckpoint::evidence),
         evidence,
     );
     OperationalReviewCheckpoint::StepReview {
@@ -304,7 +308,9 @@ pub(super) fn next_final_review_checkpoint(
     entry_task_run_id: Option<String>,
     evidence: OperationalReviewEvidence,
 ) -> OperationalReviewCheckpoint {
-    let consecutive_outages = match prior {
+    // As for a step review: a prior step boundary, or a final review over different
+    // QC inputs, neither continues this boundary's count nor lends it evidence.
+    let same_boundary = match prior {
         Some(
             checkpoint @ OperationalReviewCheckpoint::FinalGateReview {
                 qc_source_fingerprint: prior_fingerprint,
@@ -312,12 +318,14 @@ pub(super) fn next_final_review_checkpoint(
                 ..
             },
         ) if prior_fingerprint == &qc_source_fingerprint && prior_seats == &required_seats => {
-            checkpoint.effective_outages().saturating_add(1)
+            Some(checkpoint)
         }
-        _ => 1,
+        _ => None,
     };
+    let consecutive_outages =
+        same_boundary.map_or(1, |prior| prior.effective_outages().saturating_add(1));
     let evidence = OperationalReviewEvidence::merged(
-        prior.map(OperationalReviewCheckpoint::evidence),
+        same_boundary.map(OperationalReviewCheckpoint::evidence),
         evidence,
     );
     OperationalReviewCheckpoint::FinalGateReview {
@@ -928,6 +936,82 @@ mod tests {
         clear_operational_review_checkpoint(temp.path());
         clear_operational_review_checkpoint(temp.path());
         assert!(!operational_review_checkpoint_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn a_later_review_boundary_never_inherits_an_earlier_boundarys_evidence() {
+        let step_a = next_step_review_checkpoint(
+            None,
+            "a".to_string(),
+            Some("tree-1".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            false,
+            OperationalReviewEvidence::new(
+                &["A: missing input validation".to_string()],
+                &["A: qa reviewer timed out".to_string()],
+            ),
+        );
+        let only_b = |checkpoint: &OperationalReviewCheckpoint| {
+            let evidence = checkpoint.evidence();
+            assert!(
+                !evidence
+                    .semantic_blocking
+                    .iter()
+                    .chain(&evidence.operational_unavailable)
+                    .any(|item| item.starts_with("A:")),
+                "a different boundary must not carry A's evidence: {evidence:?}"
+            );
+            assert_eq!(
+                evidence.operational_unavailable,
+                vec!["B: reviewer unavailable".to_string()]
+            );
+        };
+        let b_evidence =
+            || OperationalReviewEvidence::new(&[], &["B: reviewer unavailable".into()]);
+
+        // Step B's outage after A passed: its own counter AND its own evidence.
+        let step_b = next_step_review_checkpoint(
+            Some(&step_a),
+            "b".to_string(),
+            Some("tree-2".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            false,
+            b_evidence(),
+        );
+        assert_eq!(step_b.effective_outages(), 1);
+        only_b(&step_b);
+        // The final gate's outage after step A's pause: the same separation.
+        let final_gate = next_final_review_checkpoint(
+            Some(&step_a),
+            Some("tree-2".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            None,
+            b_evidence(),
+        );
+        assert_eq!(final_gate.effective_outages(), 1);
+        only_b(&final_gate);
+
+        // The SAME boundary retried over the same inputs keeps its trail.
+        let step_a_again = next_step_review_checkpoint(
+            Some(&step_a),
+            "a".to_string(),
+            Some("tree-1".to_string()),
+            Some(vec![Seat::QaEngineer]),
+            false,
+            OperationalReviewEvidence::new(&[], &["A: still timing out".to_string()]),
+        );
+        assert_eq!(step_a_again.effective_outages(), 2);
+        assert_eq!(
+            step_a_again.evidence().semantic_blocking,
+            vec!["A: missing input validation".to_string()]
+        );
+        assert_eq!(
+            step_a_again.evidence().operational_unavailable,
+            vec![
+                "A: qa reviewer timed out".to_string(),
+                "A: still timing out".to_string()
+            ]
+        );
     }
 
     #[cfg(unix)]
