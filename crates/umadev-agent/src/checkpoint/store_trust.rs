@@ -39,8 +39,9 @@ fn stamp_path() -> PathBuf {
 }
 
 /// The installation key, read once per process: every stamp this process
-/// writes or checks must agree even if `HOME` changes underneath it.
-fn installation_key() -> Option<[u8; umadev_state::privacy::PROVENANCE_KEY_BYTES]> {
+/// writes or checks must agree even if `HOME` changes underneath it. The
+/// trust module's approval memory is keyed with it too.
+pub(crate) fn installation_key() -> Option<[u8; umadev_state::privacy::PROVENANCE_KEY_BYTES]> {
     static KEY: std::sync::OnceLock<[u8; umadev_state::privacy::PROVENANCE_KEY_BYTES]> =
         std::sync::OnceLock::new();
     if let Some(key) = KEY.get() {

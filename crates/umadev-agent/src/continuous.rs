@@ -1422,7 +1422,7 @@ fn evaluate_tool_call(
 /// risky action.
 ///
 /// It also consults the per-project **trust ledger** of remembered approvals
-/// (`<root>/.umadev/trust.json`, [`requires_confirmation_with_ledger`]): a
+/// (kept in the user state directory, [`requires_confirmation_with_ledger`]): a
 /// reversible action class the user already approved for this project is not
 /// re-asked. Fail-open: a missing / corrupt ledger behaves exactly as the bare
 /// mode policy; the floor is never relaxed by a remembered rule.
