@@ -966,7 +966,8 @@ fn requires_confirmation_rooted(
         command
     };
     let out_of_tree_write = (matches!(cap, Capability::Write)
-        && target_escapes_workspace(target_path, workspace_root))
+        && write_targets(target_path)
+            .any(|target| target_escapes_workspace(target, workspace_root)))
         || shell_write_escapes_workspace(shell_cmd, workspace_root);
     match mode {
         // Fully autonomous: a write that ESCAPES the workspace (not
@@ -1045,6 +1046,16 @@ fn target_escapes_workspace(target_path: &str, workspace_root: Option<&Path>) ->
     // A project-relative path stays in-tree (it is written relative to the run cwd =
     // the workspace, and the checkpoint can rewind it).
     false
+}
+
+/// Every path a write target names. A base that changes several files in one
+/// request (Codex `fileChange` / `applyPatch`) reports them joined by `", "`, so
+/// each is classified on its own as well as the whole string: `src/a.ts,
+/// /home/u/.bashrc` has no root and no `..` as a whole, yet it writes outside
+/// the workspace.
+fn write_targets(target_path: &str) -> impl Iterator<Item = &str> {
+    let pieces = target_path.contains(", ").then(|| target_path.split(", "));
+    std::iter::once(target_path).chain(pieces.into_iter().flatten())
 }
 
 /// Whether absolute `path` lies under absolute `root`. A LEXICAL component-prefix check
@@ -1171,6 +1182,11 @@ fn remembered_class_rooted(
         // A read is auto-allowed in every mode → nothing to remember.
         // Network is always a floor action → handled above, never reaches here.
         Capability::Read | Capability::Network => None,
+        // A change that lists several files is remembered only when every one of them
+        // stays in the tree; one approval must not stand for an escaping file among them.
+        Capability::Write if write_targets(target_path).count() > 1 => write_targets(target_path)
+            .all(|target| !target_escapes_workspace(target, workspace_root))
+            .then(|| "write_in_tree".to_string()),
         Capability::Write => Some(if target_escapes_workspace(target_path, workspace_root) {
             // Scope an out-of-tree write approval to its PARENT DIRECTORY, so approving a
             // write under `~/.config/app` cannot silently auto-grant a later write to
@@ -3828,5 +3844,38 @@ mod tests {
         assert!(escapes("git diff --output=/home/u/.bashrc"));
         assert!(escapes("find . -fprint ~/.profile"));
         assert!(!escapes("git diff --output=out/changes.diff"));
+    }
+
+    #[test]
+    fn every_file_of_a_multi_file_write_is_classified() {
+        let root = real_root();
+        let escaping = format!("src/a.ts, {}", out_of_tree_abs());
+        for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+            assert!(
+                requires_confirmation_with_ledger(
+                    mode,
+                    "Write",
+                    &escaping,
+                    root,
+                    &TrustLedger::default()
+                ),
+                "{mode:?} must confirm a change that includes an out-of-tree file"
+            );
+        }
+        let mut ledger = TrustLedger::default();
+        ledger.allow_rules.insert("write_in_tree".to_string());
+        assert!(requires_confirmation_with_ledger(
+            TrustMode::Guarded,
+            "Write",
+            &escaping,
+            root,
+            &ledger
+        ));
+        assert!(!ledger.remembers_rooted("Write", &escaping, root));
+        assert_eq!(
+            remembered_class_rooted("Write", &escaping, Some(root)),
+            None
+        );
+        assert!(ledger.remembers_rooted("Write", "src/a.ts, src/b.ts", root));
     }
 }

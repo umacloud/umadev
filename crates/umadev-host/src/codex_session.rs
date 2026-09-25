@@ -1890,14 +1890,19 @@ async fn classify_server_request(
         "item/fileChange/requestApproval" => {
             let item_id = string_field(params, "itemId");
             let remembered = remembered_item(item_targets, item_id.as_deref()).await;
-            let target = nonempty(file_change_path(params))
-                .or_else(|| {
-                    remembered
-                        .map(|item| item.files.join(", "))
-                        .filter(|paths| !paths.is_empty())
-                })
-                .or_else(|| string_field(params, "grantRoot"))
-                .unwrap_or_default();
+            let files = nonempty(file_change_path(params)).or_else(|| {
+                remembered
+                    .map(|item| item.files.join(", "))
+                    .filter(|paths| !paths.is_empty())
+            });
+            // A `grantRoot` asks for write access to a whole directory. Show and
+            // classify it next to the files so an approval never grants a root
+            // the policy did not see.
+            let target = files
+                .into_iter()
+                .chain(string_field(params, "grantRoot"))
+                .collect::<Vec<_>>()
+                .join(", ");
             (
                 HostRequest::Approval {
                     action: "Write".to_string(),
@@ -4450,6 +4455,15 @@ mod tests {
         assert!(matches!(
             request,
             HostRequest::Approval { target, .. } if target == "src/a.ts"
+        ));
+
+        // A requested write root is shown and classified next to the files.
+        let grant = v(r#"{"changes":[{"path":"src/a.ts"}],"grantRoot":"/home/u"}"#);
+        let (request, _) =
+            classify_server_request("item/fileChange/requestApproval", &grant, &items).await;
+        assert!(matches!(
+            request,
+            HostRequest::Approval { target, .. } if target == "src/a.ts, /home/u"
         ));
     }
 
