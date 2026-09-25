@@ -849,7 +849,9 @@ fn singularize(word: &str) -> String {
 #[must_use]
 pub fn extract_entities(requirement: &str) -> Vec<String> {
     let lower = requirement.to_ascii_lowercase();
-    let ascii_tokens: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric()).collect();
+    // Split on anything that is not ASCII alphanumeric: CJK ideographs count as
+    // Unicode-alphanumeric, so `做一个todo应用` must still yield the token `todo`.
+    let ascii_tokens: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).collect();
 
     // Collect entities in PRIORITY ORDER (scene patterns first, then CJK,
     // then English nouns), deduping while preserving first-seen order. The
@@ -972,6 +974,20 @@ mod tests {
     fn cjk_orders_mapped() {
         let e = extract_entities("订单管理系统");
         assert!(e.contains(&"orders".to_string()));
+    }
+
+    #[test]
+    fn english_noun_written_against_chinese_text_is_recognised() {
+        // Mixed-script requirements often run an English noun straight into the
+        // Chinese text. CJK ideographs are Unicode-alphanumeric, so splitting on
+        // `!is_alphanumeric()` kept `做一个todo应用` as a single token.
+        let e = extract_entities("做一个todo应用");
+        assert!(e.contains(&"todos".to_string()), "{e:?}");
+        let e = extract_entities("开发user管理后台");
+        assert!(e.contains(&"users".to_string()), "{e:?}");
+        // A noun inside a longer English word is still not a match.
+        let e = extract_entities("做一个todolist应用");
+        assert!(!e.contains(&"todos".to_string()), "{e:?}");
     }
 
     #[test]
