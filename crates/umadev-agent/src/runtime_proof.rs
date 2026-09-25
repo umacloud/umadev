@@ -20,7 +20,10 @@
 //!    foreign process is never touched.
 //! 3. **Reuse-or-spawn**: if a server already answers the expected URL after the
 //!    reclaim, it is a foreign holder — reuse it (probe it directly, no duplicate
-//!    spawn). Otherwise spawn the dev command with its **stdout/stderr piped**.
+//!    spawn). Nothing ties such a server to this workspace, so it is verified
+//!    only against documented contract routes; without a contract the proof is
+//!    recorded as not verified. Otherwise spawn the dev command with its
+//!    **stdout/stderr piped**.
 //! 4. **Bounded boot**: read the child's output for readiness *and* conflict
 //!    signals ("Port X in use, using available port Y", "already running",
 //!    `EADDRINUSE`) while polling `curl`, all inside one timeout. A port fallback
@@ -497,6 +500,9 @@ async fn finish_proof(
 ///    default port, not this build. A `401/403/405` still proves the route EXISTS
 ///    (auth / method), so an auth-gated app the user runs themselves is NOT
 ///    false-failed — this only fires when every documented route is truly absent.
+///    With NO contract, a reused server's answer on `/` proves nothing about
+///    this build (any app on the default port answers it), so it never counts
+///    as verified.
 /// 2. **Booted-but-broken (#6)** — every probe was a `5xx` or no-response. A `4xx`
 ///    proves the server booted + is routing, so it keeps Verified (downgrading on
 ///    `!ok` wrongly failed working auth/POST-only backends).
@@ -521,6 +527,13 @@ fn downgrade_reason(
             "reused an already-running server on {base_url} that answered NONE of the {} \
              documented route(s) — likely a different app on a colliding port, not this build",
             routes.len()
+        ));
+    }
+    if reused && !had_contract {
+        return Some(format!(
+            "a server UmaDev did not start already answers {base_url}, and with no API contract \
+             to check it against it cannot be tied to this build — stop it so UmaDev can boot \
+             and probe this project"
         ));
     }
     if !routes.is_empty() && routes.iter().all(|r| r.status == 0 || r.status >= 500) {
@@ -2223,6 +2236,19 @@ mod tests {
         // The SAME 404s on a server WE spawned (reused=false) are not the foreign case —
         // a 404 keeps Verified (route-quirk tolerance), only 5xx/no-response downgrades.
         assert!(downgrade_reason(&routes, false, true, "http://localhost:3000", None).is_none());
+    }
+
+    #[test]
+    fn a_reused_server_without_a_contract_is_never_verified() {
+        // Any app on the default port answers `/`; without contract routes to check,
+        // a server we did not start cannot vouch for this build.
+        let root_ok = vec![probe("/", 200)];
+        let reason = downgrade_reason(&root_ok, true, false, "http://localhost:5173", None)
+            .expect("a foreign server with no contract is not verified");
+        assert!(reason.contains("did not start"), "{reason}");
+        assert!(reason.contains("http://localhost:5173"), "{reason}");
+        // The same answer from a server this run booted keeps Verified.
+        assert!(downgrade_reason(&root_ok, false, false, "http://localhost:5173", None).is_none());
     }
 
     #[test]
