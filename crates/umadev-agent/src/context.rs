@@ -78,14 +78,22 @@ use crate::router::{RouteClass, RoutePlan};
 
 /// The overall character ceiling for one composed firmware prompt.
 ///
-/// Deliberately conservative (~12K chars ≈ a few K tokens): the firmware rides
+/// Deliberately conservative (~24K chars ≈ a few K tokens): the firmware rides
 /// on TOP of the base's own (large) default system prompt and the per-turn
 /// directive, so it must stay a small, high-signal overlay — not a second
 /// corpus. The host's `merge_prompt` has its own much larger backstop
 /// (`MAX_SYSTEM = 90_000`) for the single-shot path; this is the tighter,
 /// JIT-discipline budget for the firmware overlay specifically. The layers are
 /// filled in priority order until this is hit (see [`compose_firmware`]).
-pub const FIRMWARE_BUDGET: usize = 12_000;
+///
+/// Sized from the heaviest work route. Its static head (identity + seat,
+/// context integrity, output language, craft, effort and design law, and the
+/// open-decisions and run-notes directives) is ~10.4K chars. The 17.2K head
+/// budget holds that, room for the recalled facts and open decisions, and ~4K
+/// for the repository's own AGENTS.md; the JIT tail keeps its whole 6.8K reserve
+/// on top. A ceiling, not a fill target: a turn with nothing to recall stays at
+/// its head size.
+pub const FIRMWARE_BUDGET: usize = 24_000;
 
 /// The character budget the JIT tail (repo-map + pitfall memory + knowledge
 /// digests) may add ON TOP of the always-on head (identity + 心法). Bounding the
@@ -96,7 +104,16 @@ pub const FIRMWARE_BUDGET: usize = 12_000;
 /// This is sized to hold the repo-map slice ([`REPO_MAP_BUDGET`]) plus the
 /// memory + knowledge digests together — so a brownfield turn carries its code
 /// outline AND its learned/curated knowledge, while the head still always leads.
+/// The head is assembled within `FIRMWARE_BUDGET - ALWAYS_ON_RESERVE`, so this
+/// reserve is a guarantee, not just a cap: the head can never eat it.
 const ALWAYS_ON_RESERVE: usize = 6_800;
+
+/// Head room kept for the per-turn recall blocks that follow the stable head —
+/// the recorded project facts and the open-decisions recall, at their own
+/// budgets — so a long AGENTS.md can never push them out of a work turn.
+const RECALL_RESERVE: usize = crate::project_facts::FACTS_FIRMWARE_BUDGET
+    + crate::open_decisions::DECISIONS_FIRMWARE_BUDGET
+    + 4; // two "\n\n" separators
 
 /// The character budget the brownfield repo-map slice (the signature outline of
 /// the user's OWN code) may take inside the JIT tail. ~2.8K chars ≈ a compact
@@ -170,7 +187,9 @@ impl FirmwareTier {
 
 /// Byte budget for the ingested project agent-instruction files (see
 /// [`project_agent_instructions`]). Modest on purpose: these are hard constraints
-/// that lead the stable head, not a place to dump a whole doc tree.
+/// that lead the stable head, not a place to dump a whole doc tree. A work turn
+/// renders them into the smaller head room it actually has left, so a long file
+/// is shortened rather than dropped.
 const AGENT_RULES_BUDGET: usize = 6000;
 
 /// Individual project-instruction files are user-controlled. Reject an
@@ -268,7 +287,9 @@ fn project_agent_instructions(root: &Path, budget: usize) -> String {
 /// spawn / drive seam; the retrieval itself is synchronous + fail-open.
 pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str) -> String {
     let tier = FirmwareTier::for_route(route);
-    let mut fw = FirmwareBuilder::new(FIRMWARE_BUDGET);
+    // The head is assembled inside the budget minus the JIT reserve, so no head
+    // block can eat the room the repo map, pitfalls and knowledge need.
+    let mut fw = FirmwareBuilder::new(FIRMWARE_BUDGET - ALWAYS_ON_RESERVE);
 
     // ── Layer 1: identity (always-on, highest priority) ──────────────────────
     // The director identity + the seat the route's work needs. Even a chat turn
@@ -330,8 +351,21 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
         // (build/test quirks, coding standards, gotchas) instead of ignoring them.
         // Part of the stable head like the charter (a user-authored constraint that
         // changes rarely). Bounded + fully fail-open: no files → empty, nothing
-        // injected, behaving exactly as before.
-        let agent_rules = project_agent_instructions(root, AGENT_RULES_BUDGET);
+        // injected, behaving exactly as before. Rendered into the head room left
+        // after the two static directives below and the recall reserve, so a long
+        // file is shortened instead of dropped whole and can neither cut those
+        // directives nor push out the recalled facts and open decisions. That room
+        // depends only on the stable blocks above, so the rendered block stays
+        // byte-stable across turns.
+        let following_directives = crate::open_decisions::decisions_directive().chars().count()
+            + run_notes_directive().chars().count()
+            + 4; // two "\n\n" separators
+        let agent_rules = project_agent_instructions(
+            root,
+            fw.room()
+                .saturating_sub(following_directives + RECALL_RESERVE)
+                .min(AGENT_RULES_BUDGET),
+        );
         if !agent_rules.trim().is_empty() {
             fw.push_block(&agent_rules);
         }
@@ -413,9 +447,9 @@ pub async fn compose_firmware(root: &Path, route: &RoutePlan, requirement: &str)
 
     // The route-sized head is now fully in `buf` and can no longer
     // be evicted (later blocks only get truncated, never the ones already pushed).
-    // Cap the JIT tail so the repo-map + memory + knowledge digests below add at most
-    // ALWAYS_ON_RESERVE chars on top of the head — a giant digest can never dominate
-    // the prompt, and the head always leads.
+    // Give the JIT tail exactly ALWAYS_ON_RESERVE chars on top of the head: the
+    // repo-map + memory + knowledge digests below always get that room (the head
+    // was bounded to leave it), and a giant digest can never grow past it.
     fw.reserve_jit_tail(ALWAYS_ON_RESERVE);
 
     // ── Layer 3: repo-map slice (JIT, brownfield-aware) ──────────────────────
@@ -898,7 +932,7 @@ pub fn rotate_run_notes(root: &Path) {
 
 /// A budget-bounded, priority-ordered prompt assembler. Blocks are pushed in
 /// descending priority; plain text is head-truncated at the cap, while reference
-/// data keeps only complete envelopes. A later [`reserve_jit_tail`] caps how much
+/// data keeps only complete envelopes. A later [`reserve_jit_tail`] sets how much
 /// the lower-priority JIT layers may add on top of the always-on head.
 ///
 /// [`reserve_jit_tail`]: FirmwareBuilder::reserve_jit_tail
@@ -915,14 +949,21 @@ impl FirmwareBuilder {
         }
     }
 
-    /// Cap the budget the JIT tail (every block pushed AFTER this call) may use,
-    /// to at most `tail` characters on top of the already-assembled always-on
-    /// head. Concretely: lower the cap to `min(cap, used + tail)` (never raise it),
-    /// so the head is kept whole and the JIT layers share only the smaller tail
-    /// budget — a giant lesson/knowledge digest can never dominate the prompt.
+    /// Characters the next pushed block may use without being shortened.
+    fn room(&self) -> usize {
+        let used = self.buf.chars().count();
+        let sep = if self.buf.is_empty() { 0 } else { 2 }; // "\n\n"
+        self.cap.saturating_sub(used + sep)
+    }
+
+    /// Set the budget the JIT tail (every block pushed AFTER this call) shares to
+    /// exactly `tail` characters on top of the already-assembled always-on head.
+    /// The builder starts at the head budget, so the head is kept whole, the tail
+    /// always gets its room, and a giant lesson/knowledge digest can never
+    /// dominate the prompt.
     fn reserve_jit_tail(&mut self, tail: usize) {
         let used = self.buf.chars().count();
-        self.cap = self.cap.min(used + tail);
+        self.cap = used + tail;
     }
 
     /// Append one block within the remaining budget. Reference envelopes are
@@ -1363,6 +1404,147 @@ mod tests {
         assert!(
             fw.contains("checkout.ts") || fw.contains("computeCartTotal"),
             "repo-map names real code from the repo: {fw}"
+        );
+    }
+
+    /// A repository the size of a small real project: ~40 exported functions
+    /// across five modules, so its signature outline is a real slice rather than
+    /// the two-file toy tree above.
+    fn seed_real_sized_repo(root: &Path) {
+        for module in ["orders", "billing", "customers", "catalog", "shipping"] {
+            let body: String = (0..8)
+                .map(|i| format!("export function {module}Step{i}(input) {{ return input; }}\n"))
+                .collect();
+            std::fs::write(root.join(format!("{module}.ts")), body).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn work_turn_keeps_agents_md_and_repo_map() {
+        // The zh-CN work head with a lead seat and the full design law must still
+        // leave room for the repository's own AGENTS.md, the recalled facts and
+        // open decisions, and the repo map: a long AGENTS.md is shortened, not
+        // dropped, and it neither cuts a static rule nor pushes out the recall.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_real_sized_repo(tmp.path());
+        let mut agents = String::from(
+            "# 团队约定\n\n- 首条约定：所有接口统一返回 code、data、message 三个字段。\n",
+        );
+        while agents.chars().count() < 3_000 {
+            agents.push_str("- 提交前运行 pnpm lint 与 pnpm test，并在 PR 描述里写明验证方式。\n");
+        }
+        std::fs::write(tmp.path().join("AGENTS.md"), &agents).unwrap();
+        crate::project_facts::record_fact(
+            tmp.path(),
+            crate::project_facts::Fact::new("订单导出格式", "CSV，UTF-8 带 BOM", Some("decision"))
+                .with_provenance("user_stated", "current_request"),
+        );
+        let register = tmp.path().join(crate::open_decisions::REGISTER_REL_PATH);
+        std::fs::create_dir_all(register.parent().unwrap()).unwrap();
+        std::fs::write(
+            &register,
+            "# Open Decisions Register\n\n\
+             ## OPEN — design-decision-to-evaluate — 订单导出是否分页\n\
+             - **Open item**: 大量订单导出时是否分页\n",
+        )
+        .unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "给订单模块加一个导出按钮").await;
+        assert!(
+            fw.contains("\"source\":\"AGENTS.md\"") && fw.contains("首条约定"),
+            "a long AGENTS.md must be shortened, not dropped ({} chars): {fw}",
+            fw.chars().count()
+        );
+        assert!(
+            fw.contains("RECALLED PROJECT FACTS") && fw.contains("UTF-8 带 BOM"),
+            "AGENTS.md pushed out the recalled facts: {fw}"
+        );
+        assert!(
+            fw.contains("订单导出是否分页"),
+            "AGENTS.md pushed out the open-decisions recall: {fw}"
+        );
+        assert!(
+            fw.contains("YOUR CODEBASE") && fw.contains("orders.ts"),
+            "a work turn on a real repo must carry the repo map ({} chars): {fw}",
+            fw.chars().count()
+        );
+        assert!(
+            fw.contains(crate::open_decisions::decisions_directive())
+                && fw.contains(run_notes_directive()),
+            "the static directives after AGENTS.md must stay whole"
+        );
+        assert!(fw.chars().count() <= FIRMWARE_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn work_turn_on_a_real_repo_carries_repo_map_pitfalls_and_knowledge() {
+        // README: a deliberate Build adds the repo map, recalled pitfalls and the
+        // relevant knowledge slice. All three must fit beside the full head.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_real_sized_repo(tmp.path());
+        let error = "Error: Cannot find module 'react-router-dom'".to_string();
+        for _ in 0..2 {
+            let _ = crate::lessons::capture_dev_errors_detailed(
+                tmp.path(),
+                std::slice::from_ref(&error),
+                "demo",
+                "修复路由依赖",
+            );
+        }
+        let kd = tmp.path().join("knowledge/frontend");
+        std::fs::create_dir_all(&kd).unwrap();
+        std::fs::write(
+            kd.join("routing.md"),
+            "# Routing\n\n## React router\n\nInstall react-router-dom before wiring \
+             routes; keep route components lazy-loaded.",
+        )
+        .unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let fw = compose_firmware(tmp.path(), &r, "修复 react-router-dom 路由错误").await;
+        assert!(fw.contains("YOUR CODEBASE"), "repo map missing: {fw}");
+        assert!(
+            fw.contains("Lessons from prior runs"),
+            "pitfall memory missing: {fw}"
+        );
+        assert!(
+            fw.contains("YOUR TEAM'S EXPERIENCE"),
+            "knowledge missing: {fw}"
+        );
+        assert!(fw.chars().count() <= FIRMWARE_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn heaviest_work_head_leaves_room_for_recall_and_the_jit_reserve() {
+        // Budget arithmetic guard: the heaviest static work head (zh-CN output
+        // language, a lead-seat persona, the brand design law) plus the recall
+        // reserve must leave at least 3K of the head budget for AGENTS.md, and the
+        // JIT tail keeps its whole reserve on top. Growing a static rule past this
+        // point must come with a new budget, not a silently starved block.
+        let _no_corpus = crate::test_support::NoBundledCorpus::new();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let r = route(
+            RouteClass::Build,
+            Depth::Standard,
+            vec![Seat::FrontendEngineer],
+        );
+        let head = compose_firmware(tmp.path(), &r, "build something").await;
+        assert!(head.contains(&anti_slop_law(umadev_governance::design::Register::Unknown)));
+        let needed = head.chars().count() + 2 + RECALL_RESERVE + 3_000;
+        assert!(
+            needed <= FIRMWARE_BUDGET - ALWAYS_ON_RESERVE,
+            "static head {} + recall reserve + 3K of AGENTS.md no longer fit the head budget {}",
+            head.chars().count(),
+            FIRMWARE_BUDGET - ALWAYS_ON_RESERVE
         );
     }
 
@@ -1826,12 +2008,12 @@ mod tests {
     }
 
     #[test]
-    fn firmware_builder_enforces_the_twelve_thousand_character_cap() {
-        assert_eq!(FIRMWARE_BUDGET, 12_000);
-        for input_chars in [11_999, 12_000, 12_001] {
+    fn firmware_builder_enforces_the_twenty_four_thousand_character_cap() {
+        assert_eq!(FIRMWARE_BUDGET, 24_000);
+        for input_chars in [23_999, 24_000, 24_001] {
             let mut b = FirmwareBuilder::new(FIRMWARE_BUDGET);
             b.push_block(&"x".repeat(input_chars));
-            assert_eq!(b.finish().chars().count(), input_chars.min(12_000));
+            assert_eq!(b.finish().chars().count(), input_chars.min(24_000));
         }
     }
 
@@ -2387,11 +2569,17 @@ mod tests {
         // relationships at COMPILE time so a future edit can't quietly let the firmware
         // crowd out the work (a `const {}` assertion fails the build, not just a run).
         const {
-            // The firmware stays a small overlay, not a second corpus.
-            assert!(FIRMWARE_BUDGET <= 16_000);
+            // The firmware stays a small overlay (a few K tokens), not a second
+            // corpus. The heaviest static work head alone is ~10.4K chars, so this
+            // ceiling must also hold it, the recall reserve, a slice of AGENTS.md
+            // and the JIT reserve (see
+            // `heaviest_work_head_leaves_room_for_recall_and_the_jit_reserve`).
+            assert!(FIRMWARE_BUDGET <= 24_000);
             // The JIT tail reserve is a fraction of the whole budget — the stable head
             // (identity + craft + law) always has room to lead.
             assert!(ALWAYS_ON_RESERVE < FIRMWARE_BUDGET);
+            // The recall reserve is a fraction of the head budget.
+            assert!(RECALL_RESERVE < FIRMWARE_BUDGET - ALWAYS_ON_RESERVE);
             // The repo-map slice is ONE part of the JIT tail, not all of it.
             assert!(REPO_MAP_BUDGET < ALWAYS_ON_RESERVE);
             // The user charter is a bounded slice of the head.
