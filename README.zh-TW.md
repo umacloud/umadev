@@ -731,7 +731,7 @@ umadev 有兩套入口，一一對應：
 | `umadev init` | 鷹架工作區（寫 `umadev.yaml` + 設計系統 / 範本 / 知識庫種子） |
 | `umadev`（無子命令） | 啟動對話 TUI |
 | `umadev doctor` | 自檢 |
-| `umadev verify` | 工作區合規 + 證據鏈狀態（加 `--runtime` 啟動應用並探測路由，寫入 `runtime-proof.json`） |
+| `umadev verify` | 工作區合規 + 證據鏈狀態，並實際執行專案的安裝 / lint / 型別檢查 / 測試 / 建置步驟（會執行專案程式碼、可能改寫鎖定檔，任一步失敗即以非零結束；加 `--runtime` 另外啟動應用並探測路由，寫入 `runtime-proof.json`） |
 | `umadev report` | 合規對應（SOC 2 / ISO 27001 / EU AI Act）；加 `--review` 產出 PR 前的評審報告與安全掃描 |
 | `umadev history` | 列出回滾快照 |
 | `umadev rollback latest` | 回滾到某快照 |

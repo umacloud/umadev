@@ -696,7 +696,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `umadev adopt [path]` | Onboard an existing repo: detect stack, index source, reverse-derive the API contract |
 | `umadev` | Launch the chat TUI |
 | `umadev doctor` | Self-test |
-| `umadev verify` | Workspace conformance and evidence chain; `--runtime` boots the app and hits its routes |
+| `umadev verify` | Workspace conformance and evidence chain, then runs the project's install / lint / typecheck / test / build steps (it executes project code, can rewrite a lockfile, and exits non-zero when a step fails); `--runtime` also boots the app and hits its routes |
 | `umadev report` | Compliance mapping (SOC 2 / ISO 27001 / EU AI Act); `--review` writes a PR-ready review report + runs the pre-PR security scan |
 | `umadev usage` | Per-run / per-phase token usage + a rough cost estimate |
 | `umadev lessons` | Curated reusable rules distilled from incidents and verified outcomes (the concrete incident ledger remains in TUI `/pitfalls`) |
