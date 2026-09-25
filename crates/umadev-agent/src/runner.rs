@@ -389,37 +389,21 @@ fn run_budget() -> std::time::Duration {
 /// turn it into an error path.
 async fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
     use std::process::Stdio;
+    use umadev_process::git::{hardened_git_tokio_command, GitAccess, IGNORE_DIRTY_SUBMODULES};
 
     const STDOUT_CAP: usize = 512 * 1024;
-    #[cfg(windows)]
-    const EMPTY_GIT_CONFIG: &str = "NUL";
-    #[cfg(not(windows))]
-    const EMPTY_GIT_CONFIG: &str = "/dev/null";
 
-    let mut command = tokio::process::Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        if key
-            .to_string_lossy()
-            .to_ascii_uppercase()
-            .starts_with("GIT_")
-        {
-            command.env_remove(key);
-        }
-    }
+    // Taken automatically around every code step, so the repository's own
+    // config, hooks and filter drivers must not run (see `umadev_process::git`).
+    let mut command = hardened_git_tokio_command(root, GitAccess::ReadOnly)
+        .await
+        .ok()?;
     command
-        .arg("--no-pager")
-        .arg("--literal-pathspecs")
-        .args(["-c", "core.fsmonitor=false"])
-        .arg("-C")
-        .arg(root)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", IGNORE_DIRTY_SUBMODULES])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", EMPTY_GIT_CONFIG)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "Never");
+        .env("GIT_CONFIG_GLOBAL", umadev_process::git::NULL_DEVICE);
     let out = umadev_process::run_bounded_command(
         command,
         umadev_process::BoundedCommandOptions {
@@ -10155,6 +10139,51 @@ error TS2304: Cannot find name 'Foo'
         let tmp = TempDir::new().unwrap();
         // No `git init` → not a repo → None (fail-open, the caller skips the check).
         assert!(git_worktree_snapshot(tmp.path()).await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn git_worktree_snapshot_never_runs_repository_hooks_or_filters() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git_init_repo(&root);
+        std::fs::write(root.join(".gitattributes"), "* filter=x\n").unwrap();
+        std::fs::write(root.join("app.ts"), "one\n").unwrap();
+        for args in [
+            vec!["add", "."],
+            vec!["-c", "core.hooksPath=/dev/null", "commit", "-qm", "init"],
+        ] {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let clean = format!("touch '{}'; cat", tmp.path().join("filter-ran").display());
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["config", "filter.x.clean", &clean])
+            .status()
+            .unwrap();
+        let hook = root.join(".git/hooks/post-index-change");
+        let script = format!(
+            "#!/bin/sh\ntouch '{}'\n",
+            tmp.path().join("hook-ran").display()
+        );
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(root.join("app.ts"), "two\n").unwrap();
+
+        let snapshot = git_worktree_snapshot(&root).await;
+        assert!(snapshot.is_some_and(|status| status.contains("app.ts")));
+        assert!(!tmp.path().join("filter-ran").exists(), "clean filter ran");
+        assert!(!tmp.path().join("hook-ran").exists(), "index hook ran");
     }
 
     #[test]
