@@ -7564,6 +7564,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pre_commit_hook_quotes_a_binary_path_with_spaces() {
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".git")).unwrap();
@@ -7576,7 +7577,6 @@ mod tests {
             format!("#!/bin/sh\necho \"$@\" > '{}'\n", ran.display()),
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let hook_path = install_pre_commit_hook_with_bin(root, bin.to_str().unwrap()).unwrap();

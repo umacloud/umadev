@@ -765,7 +765,7 @@ fn parse_line(raw: &str, source: &str, line: usize) -> ParsedLine {
 }
 
 enum StoredRow {
-    Record(UsageRecordV2),
+    Record(Box<UsageRecordV2>),
     Future(String),
 }
 
@@ -805,10 +805,10 @@ fn parse_file(path: &Path, config: LedgerConfig) -> std::io::Result<ParsedFile> 
     };
     for (index, line) in body.lines().enumerate() {
         match parse_line(line, &source, index) {
-            ParsedLine::V2(record) => parsed.rows.push(StoredRow::Record(record)),
+            ParsedLine::V2(record) => parsed.rows.push(StoredRow::Record(Box::new(record))),
             ParsedLine::Legacy(record) => {
                 parsed.changed = true;
-                parsed.rows.push(StoredRow::Record(record));
+                parsed.rows.push(StoredRow::Record(Box::new(record)));
             }
             ParsedLine::Future(raw) => parsed.rows.push(StoredRow::Future(raw)),
             ParsedLine::Corrupt => {
@@ -852,7 +852,7 @@ fn normalize_existing_files(path: &Path, config: LedgerConfig) -> std::io::Resul
             for row in &parsed.rows {
                 match row {
                     StoredRow::Record(record) => {
-                        body.extend(render_records(std::slice::from_ref(record))?);
+                        body.extend(render_records(std::slice::from_ref(record.as_ref()))?);
                     }
                     StoredRow::Future(raw) => {
                         body.extend_from_slice(raw.as_bytes());
@@ -1024,7 +1024,7 @@ fn read_ledger(path: &Path, config: LedgerConfig) -> ParsedLedger {
                         continue;
                     };
                     if seen.insert(record.record_id.clone()) {
-                        parsed.records.push(record);
+                        parsed.records.push(*record);
                     }
                 }
             }
