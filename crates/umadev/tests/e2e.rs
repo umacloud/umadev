@@ -622,6 +622,46 @@ fn install_writes_claude_hook() {
     );
 }
 
+/// REGRESSION: the install output promised that every Write/Edit is checked
+/// and every call audited, but the hooks only act in sessions UmaDev drives (it
+/// sets UMADEV_GOVERN_ROOT on the base it spawns); a Claude Code or Kimi Code
+/// session the user starts in the same project passes untouched.
+#[test]
+fn install_and_init_scope_the_hook_to_sessions_umadev_drives() {
+    let tmp = TempDir::new().unwrap();
+    let kimi_config = tmp.path().join(".umadev/e2e-home/.kimi-code");
+    std::fs::create_dir_all(kimi_config).unwrap();
+    for base in ["claude-code", "kimi-code"] {
+        let out = hermetic_command(tmp.path())
+            .args(["install", "--base", base, "--project-root"])
+            .arg(tmp.path())
+            .output()
+            .expect("install should run");
+        assert!(out.status.success(), "{base} install failed: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("sessions UmaDev drives") && stdout.contains("start yourself"),
+            "{base}: the install output must state the hook's scope: {stdout}"
+        );
+        assert!(
+            !stdout.contains("\nEvery Write/Edit tool call is checked"),
+            "{base}: {stdout}"
+        );
+    }
+    let init = hermetic_command(tmp.path())
+        .args(["init", "--project-root"])
+        .arg(tmp.path())
+        .output()
+        .expect("init should run");
+    assert!(init.status.success(), "init failed: {init:?}");
+    // The CLAUDE.md `init` writes must not promise governance of every call.
+    let claude_md = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+    assert!(
+        !claude_md.contains("\nYour Write/Edit/Bash calls pass through"),
+        "{claude_md}"
+    );
+}
+
 #[test]
 fn install_and_uninstall_manage_only_scoped_kimi_native_hooks() {
     let tmp = TempDir::new().unwrap();
