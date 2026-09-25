@@ -2050,6 +2050,8 @@ const PRE_COMMIT_MARKER: &str = "# umadev pre-commit governance hook";
 /// Closing marker of the UmaDev block, so uninstall can strip exactly our lines
 /// even when they sit ABOVE the user's own hook (we prepend, not append).
 const PRE_COMMIT_END_MARKER: &str = "# end umadev pre-commit governance hook";
+/// The hook's path below the project root.
+const PRE_COMMIT_HOOK: &str = ".git/hooks/pre-commit";
 
 /// Write the `umadev ci` pre-commit git hook into `.git/hooks/pre-commit`.
 /// Idempotent — if a UmaDev hook is already present, it's a no-op. A
@@ -2060,22 +2062,23 @@ const PRE_COMMIT_END_MARKER: &str = "# end umadev pre-commit governance hook";
 /// script that bailed early silence UmaDev entirely — governance that never
 /// runs is worse than no promise of it.
 fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
-    let git_dir = project_root.join(".git");
-    if !git_dir.exists() {
+    let root = umadev_state::fs::RootedDir::open(project_root)?;
+    // `.git` must be a real directory: a repository delivered with `.git` as a
+    // symlink (or a gitfile) must not get the hook written wherever it points.
+    if !root.is_real_dir(Path::new(".git"))? {
         anyhow::bail!(
             "Not a git repository (no .git directory at {}). Run `git init` first.",
-            git_dir.display()
+            project_root.join(".git").display()
         );
     }
-    let hooks_dir = git_dir.join("hooks");
-    std::fs::create_dir_all(&hooks_dir)?;
-    let hook_path = hooks_dir.join("pre-commit");
+    root.ensure_dir(Path::new(".git/hooks"), false)?;
+    let hook_path = project_root.join(PRE_COMMIT_HOOK);
     let bin = std::env::current_exe().map_or_else(
         |_| "umadev".to_string(),
         |p| p.to_string_lossy().to_string(),
     );
     // If the hook exists and already has our marker, it's idempotent.
-    if let Ok(existing) = managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
+    if let Ok(existing) = read_pre_commit_hook(&root) {
         if existing.contains(PRE_COMMIT_MARKER) {
             return Ok(hook_path);
         }
@@ -2096,7 +2099,7 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
     // user's content. Either way UmaDev governance executes before any early
     // exit/exec in the user's script can skip it. A fresh hook is just shebang +
     // our block.
-    let script = match managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
+    let script = match read_pre_commit_hook(&root) {
         Ok(existing) if existing.starts_with("#!") => {
             let (shebang, body) = existing.split_once('\n').unwrap_or((existing.as_str(), ""));
             format!("{shebang}\n{our_block}\n{body}")
@@ -2107,23 +2110,37 @@ fn install_pre_commit_hook(project_root: &Path) -> Result<PathBuf> {
         }
         Err(error) => return Err(error.into()),
     };
-    umadev_state::fs::atomic_write(&hook_path, script.as_bytes())?;
-    // Make it executable (Unix).
+    write_pre_commit_hook(&root, &script)?;
+    Ok(hook_path)
+}
+
+/// Read the pre-commit hook through the project-root capability: no component
+/// (`.git`, `hooks`, the hook itself) may be a link.
+fn read_pre_commit_hook(root: &umadev_state::fs::RootedDir) -> std::io::Result<String> {
+    let bytes = root.read_bounded(Path::new(PRE_COMMIT_HOOK), MAX_PROJECT_CONTROL_BYTES)?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+/// Replace the pre-commit hook atomically, executable from the moment it is
+/// published (a separate chmod by path could be redirected by a swapped link).
+fn write_pre_commit_hook(root: &umadev_state::fs::RootedDir, script: &str) -> std::io::Result<()> {
+    let hook = Path::new(PRE_COMMIT_HOOK);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&hook_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&hook_path, perms)?;
+        root.atomic_write_with_unix_mode(hook, script.as_bytes(), false, 0o755)
     }
-    Ok(hook_path)
+    #[cfg(not(unix))]
+    {
+        root.atomic_write(hook, script.as_bytes(), false)
+    }
 }
 
 /// Remove the UmaDev pre-commit git hook. Idempotent — does nothing if the
 /// hook is absent or is not ours.
 fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
-    let hook_path = project_root.join(".git/hooks/pre-commit");
-    let content = match managed_utf8(&hook_path, MAX_PROJECT_CONTROL_BYTES) {
+    let root = umadev_state::fs::RootedDir::open(project_root)?;
+    let content = match read_pre_commit_hook(&root) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -2174,18 +2191,9 @@ fn uninstall_pre_commit_hook(project_root: &Path) -> Result<()> {
     // When nothing meaningful remains, we created the file ourselves (just a
     // `#!/bin/sh` shebang or empty) — remove it cleanly.
     if kept.is_empty() || kept == "#!/bin/sh" {
-        if hook_path.exists() {
-            umadev_state::fs::remove_regular_file(&hook_path)?;
-        }
+        root.remove_regular_file(Path::new(PRE_COMMIT_HOOK))?;
     } else {
-        umadev_state::fs::atomic_write(&hook_path, format!("{kept}\n").as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hook_path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&hook_path, perms)?;
-        }
+        write_pre_commit_hook(&root, &format!("{kept}\n"))?;
     }
     Ok(())
 }
@@ -7513,6 +7521,31 @@ mod tests {
         assert!(body.contains("ci --changed-only"));
         uninstall_pre_commit_hook(root).unwrap();
         assert!(!hook_path.exists(), "a UmaDev-only hook is removed cleanly");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_commit_install_never_follows_a_linked_git_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".git")).unwrap();
+        assert!(install_pre_commit_hook(&root).is_err());
+        assert!(
+            !outside.join("hooks").exists(),
+            "nothing lands behind the link"
+        );
+
+        // A linked hook inside a real .git is refused too, not chmod'ed.
+        std::fs::remove_file(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let target = outside.join("victim");
+        std::fs::write(&target, "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(&target, root.join(".git/hooks/pre-commit")).unwrap();
+        assert!(install_pre_commit_hook(&root).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "#!/bin/sh\n");
     }
 
     #[test]
