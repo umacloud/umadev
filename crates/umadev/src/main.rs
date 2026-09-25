@@ -2358,7 +2358,7 @@ fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) ->
         let template = "# UmaDev project configuration. Edit and re-run to take effect.\n\
 # Docs: https://github.com/umacloud/umadev/blob/main/crates/umadev-agent/src/config.rs\n\
 \n[quality]\nthreshold = 90           # minimum weighted score to pass the quality gate\nskip_checks = []         # e.g. [\"Dark mode support\"]\n\
-\n[pipeline]\nskip_phases = []         # e.g. [\"research\"]\nmax_review_rounds = 3    # doc structural review retries\nauto_approve_gates = true # autonomous mode: auto-approve all gates (like /goal)\n\
+\n[pipeline]\nskip_phases = []         # e.g. [\"research\"]\nmax_review_rounds = 3    # doc structural review retries\nauto_approve_gates = false # gates ask for review; Auto is chosen per session (Shift+Tab, /mode auto)\n\
 \n[knowledge]\nenabled = true           # enable curated expert-knowledge retrieval\nengine = \"hybrid\"        # local vector + BM25; falls back to BM25 if unavailable\ntop_k = 6                # knowledge chunks injected per phase\n\
 \n[codex]\n# Codex main-worker access: danger-full-access (default) gives normal development\n# access to subprocesses, network, local ports, git, and the filesystem. Set\n# workspace-write or read-only here only when you intentionally want to restrict it.\nsandbox_mode = \"danger-full-access\"\n";
         umadev_state::fs::atomic_write(&umadevrc, template.as_bytes())
