@@ -58,12 +58,42 @@ function trustedUpdateManifest(version) {
       fileCount: 5,
       signatures: [{ keyid: 'test', sig: 'test' }],
       attestations: {
-        url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@${version}`,
+        // The registry percent-encodes the scope separator in this URL.
+        url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@${version}`,
         provenance: { predicateType: 'https://slsa.dev/provenance/v1' },
       },
     },
   };
 }
+
+// A verbatim copy of https://registry.npmjs.org/@umatech/umadev/latest as
+// published for 1.1.1: exactly what `umadev update` receives from npmjs.org.
+const LIVE_REGISTRY_LATEST_1_1_1 = JSON.parse(
+  '{"bin":{"umadev":"bin/cli.js"},"bugs":{"url":"https://github.com/umacloud/umadev/issues"},' +
+    '"dist":{"shasum":"c03f863db0064764ec74f2409483f14450a95774",' +
+    '"tarball":"https://registry.npmjs.org/@umatech/umadev/-/umadev-1.1.1.tgz","fileCount":5,' +
+    '"integrity":"sha512-0wqWluv4gYzuWnTtToVsIwGF61+kuY8Gn24FBRWX0oKBbA1Vm0M4ykd81AgZyc6SM3sGTBjbEBxkkSEVC0bofg==",' +
+    '"signatures":[{"sig":"MEYCIQDTHHMYpZhGUPmtaVGcS/yvUHAyJzF1A/+T/lmTtv/pbQIhAKFR/IYSUEF7TCyFrTik8jopt3MVNVTIAbe1efAFw5+E",' +
+    '"keyid":"SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U"}],' +
+    '"attestations":{"url":"https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.1.1",' +
+    '"provenance":{"predicateType":"https://slsa.dev/provenance/v1"}},"unpackedSize":75120},' +
+    '"name":"@umatech/umadev","_from":"file:/tmp/tmp.MXgKafSOWN/umatech-umadev-1.1.1.tgz",' +
+    '"author":{"name":"Shangyan Technology","email":"11964948@qq.com"},"engines":{"node":">=18"},' +
+    '"license":"MIT","_npmUser":{"name":"umatech","email":"umacloudtech@gmail.com"},' +
+    '"homepage":"https://github.com/umacloud/umadev","keywords":["ai","claude-code","codex","opencode",' +
+    '"grok-build","kimi-code","acp","tui","rust","agent","orchestrator","spec-driven","audit"],' +
+    '"_resolved":"/tmp/tmp.MXgKafSOWN/umatech-umadev-1.1.1.tgz",' +
+    '"_integrity":"sha512-0wqWluv4gYzuWnTtToVsIwGF61+kuY8Gn24FBRWX0oKBbA1Vm0M4ykd81AgZyc6SM3sGTBjbEBxkkSEVC0bofg==",' +
+    '"repository":{"url":"git+https://github.com/umacloud/umadev.git","type":"git"},"_npmVersion":"11.16.0",' +
+    '"description":"UmaDev: a Rust coding agent coordinating a real development team over five first-class base CLIs — Claude Code, Codex, OpenCode, Grok Build, and Kimi Code.",' +
+    '"directories":{},"maintainers":[{"name":"umatech","email":"umacloudtech@gmail.com"}],' +
+    '"_nodeVersion":"24.18.0","_hasShrinkwrap":false,"optionalDependencies":{"@umatech/knowledge":"1.1.1",' +
+    '"@umatech/cli-linux-x64":"1.1.1","@umatech/cli-win32-x64":"1.1.1","@umatech/cli-darwin-x64":"1.1.1",' +
+    '"@umatech/cli-linux-arm64":"1.1.1","@umatech/cli-darwin-arm64":"1.1.1",' +
+    '"@umatech/cli-linux-musl-x64":"1.1.1","@umatech/cli-linux-musl-arm64":"1.1.1"},' +
+    '"_npmOperationalInternal":{"tmp":"tmp/umadev_1.1.1_1787755352065_0.4279776176700856",' +
+    '"host":"s3://npm-registry-packages-npm-production"},"_id":"@umatech/umadev@1.1.1","version":"1.1.1"}',
+);
 
 const PLATFORM_LEAVES = {
   'darwin-arm64': 'cli-darwin-arm64',
@@ -184,7 +214,7 @@ test('terminal contract: updater accepts only inert Trusted Publishing releases'
   }
   lifecyclePayload.dist.tarball = 'https://registry.npmjs.org/@umatech/umadev/-/umadev-1.0.74.tgz';
   lifecyclePayload.dist.attestations.url =
-    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@1.0.74';
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.0.74';
   assert.match(validateTrustedUpdateManifest(lifecyclePayload).reason, /lifecycle scripts/);
 
   const noProvenance = structuredClone(clean);
@@ -200,6 +230,43 @@ test('terminal contract: updater accepts only inert Trusted Publishing releases'
     'npm install -g @umatech/umadev@1.0.73 --registry=https://registry.npmjs.org --force',
   );
   assert.throws(() => exactUpdateCommand('npm', 'latest; touch /tmp/owned'));
+});
+
+test('terminal contract: updater accepts the registry\'s real attestation URL encoding', () => {
+  // npmjs.org writes the scope separator as `%2f`. A properly published
+  // release must verify, or no package-managed user can run `umadev update`.
+  assert.deepEqual(validateTrustedUpdateManifest(LIVE_REGISTRY_LATEST_1_1_1), {
+    trusted: true,
+    version: '1.1.1',
+  });
+
+  // The literal spelling of the same URL names the same attestation.
+  for (const url of [
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@1.1.1',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2Fumadev@1.1.1',
+  ]) {
+    const spelled = structuredClone(LIVE_REGISTRY_LATEST_1_1_1);
+    spelled.dist.attestations.url = url;
+    assert.deepEqual(validateTrustedUpdateManifest(spelled), { trusted: true, version: '1.1.1' });
+  }
+
+  // Decoding does not loosen the comparison: another package, version or
+  // host, a suffix, a double encoding, a malformed escape, or a non-string
+  // is still refused.
+  for (const url of [
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fother@1.1.1',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.1.0',
+    'https://registry.example/-/npm/v1/attestations/@umatech%2fumadev@1.1.1',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.1.1%3Fx',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%252fumadev@1.1.1',
+    'https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@1.1.1%',
+    '',
+    ['https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@1.1.1'],
+  ]) {
+    const forged = structuredClone(LIVE_REGISTRY_LATEST_1_1_1);
+    forged.dist.attestations.url = url;
+    assert.match(validateTrustedUpdateManifest(forged).reason, /provenance/, String(url));
+  }
 });
 
 test('terminal contract: package managers never run from the caller cwd', () => {

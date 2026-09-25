@@ -105,7 +105,8 @@ trusted_manifest() {
         fileCount: 5,
         signatures: [{ keyid: "test", sig: "test" }],
         attestations: {
-          url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech/umadev@${version}`,
+          // npmjs.org percent-encodes the scope separator in this URL.
+          url: `https://registry.npmjs.org/-/npm/v1/attestations/@umatech%2fumadev@${version}`,
           provenance: { predicateType: "https://slsa.dev/provenance/v1" },
         },
       },
