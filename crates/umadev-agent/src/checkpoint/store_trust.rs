@@ -39,9 +39,8 @@ fn stamp_path() -> PathBuf {
 }
 
 /// The installation key, read once per process: every stamp this process
-/// writes or checks must agree even if `HOME` changes underneath it. The
-/// trust module's approval memory is keyed with it too.
-pub(crate) fn installation_key() -> Option<[u8; umadev_state::privacy::PROVENANCE_KEY_BYTES]> {
+/// writes or checks must agree even if `HOME` changes underneath it.
+fn installation_key() -> Option<[u8; umadev_state::privacy::PROVENANCE_KEY_BYTES]> {
     static KEY: std::sync::OnceLock<[u8; umadev_state::privacy::PROVENANCE_KEY_BYTES]> =
         std::sync::OnceLock::new();
     if let Some(key) = KEY.get() {
@@ -52,13 +51,38 @@ pub(crate) fn installation_key() -> Option<[u8; umadev_state::privacy::PROVENANC
 }
 
 fn expected_stamp(project_root: &Path) -> Option<String> {
-    let key = installation_key()?;
-    let canonical = std::fs::canonicalize(project_root).ok()?;
-    let tag = umadev_governance::privacy_fingerprint(
-        &key,
+    installation_tag(
         STAMP_DOMAIN,
-        canonical.as_os_str().as_encoded_bytes(),
-    );
+        &[project_root_bytes(project_root)?.as_slice()],
+    )
+}
+
+/// The canonical project path as bytes, the identity every per-project tag
+/// below is bound to.
+pub(crate) fn project_root_bytes(project_root: &Path) -> Option<Vec<u8>> {
+    let canonical = std::fs::canonicalize(project_root).ok()?;
+    Some(canonical.as_os_str().as_encoded_bytes().to_vec())
+}
+
+/// Hex HMAC of `parts` under the installation key, separated by `domain`.
+/// Parts are length-prefixed so no two different part lists share a tag.
+/// `None` without an installation key: callers then trust nothing.
+pub(crate) fn installation_tag(domain: &[u8], parts: &[&[u8]]) -> Option<String> {
+    let key = installation_key()?;
+    let value = if let [single] = parts {
+        single.to_vec()
+    } else {
+        parts
+            .iter()
+            .flat_map(|part| {
+                (part.len() as u64)
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain(part.iter().copied())
+            })
+            .collect()
+    };
+    let tag = umadev_governance::privacy_fingerprint(&key, domain, &value);
     Some(tag.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 

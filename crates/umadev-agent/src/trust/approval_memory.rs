@@ -29,14 +29,8 @@ struct ApprovalMemory {
 
 /// This project's memory file, relative to the state directory.
 fn relative_path(project_root: &Path) -> Option<PathBuf> {
-    let key = crate::checkpoint::store_trust::installation_key()?;
-    let canonical = std::fs::canonicalize(project_root).ok()?;
-    let tag = umadev_governance::privacy_fingerprint(
-        &key,
-        NAME_DOMAIN,
-        canonical.as_os_str().as_encoded_bytes(),
-    );
-    let name: String = tag.iter().map(|byte| format!("{byte:02x}")).collect();
+    use crate::checkpoint::store_trust::{installation_tag, project_root_bytes};
+    let name = installation_tag(NAME_DOMAIN, &[project_root_bytes(project_root)?.as_slice()])?;
     Some(Path::new(MEMORY_DIR).join(format!("{name}.json")))
 }
 
