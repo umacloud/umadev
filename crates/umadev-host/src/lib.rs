@@ -2492,8 +2492,30 @@ impl TerminalTextSanitizer {
 
     fn process_valid(&mut self, valid: &str, out: &mut String) {
         for ch in valid.chars() {
+            // A C1 code point decoded from well-formed UTF-8 is text, not an
+            // eight-bit control: JSON carries it unescaped inside strings, and
+            // treating it as an OSC/DCS/CSI introducer let one stray U+009D
+            // swallow every following line (the final `result` record
+            // included). Outside a string control it is dropped like DEL, so it
+            // never opens a sequence; inside one it may still terminate it.
+            // Raw C1 bytes keep their control meaning in `process_invalid_utf8`.
+            let ch = if ('\u{0080}'..='\u{009f}').contains(&ch) && !self.in_string_control() {
+                '\u{007f}'
+            } else {
+                ch
+            };
             self.process_char(ch, out);
         }
+    }
+
+    fn in_string_control(&self) -> bool {
+        matches!(
+            self.state,
+            TerminalControlState::Osc
+                | TerminalControlState::OscEscape
+                | TerminalControlState::StringControl
+                | TerminalControlState::StringEscape
+        )
     }
 
     fn process_char(&mut self, ch: char, out: &mut String) {
@@ -3507,6 +3529,26 @@ mod tests {
         assert_eq!(sanitizer.finish(), "");
         assert_eq!(sanitizer.push(b"safe"), "safe");
         assert_eq!(sanitizer.finish(), "");
+    }
+
+    #[test]
+    fn clean_output_keeps_lines_after_a_utf8_c1_code_point() {
+        // JSON allows U+0080..U+009F unescaped inside strings. As decoded text
+        // they must not open an OSC/DCS/CSI that swallows every later line —
+        // here the terminal result record.
+        let raw = "{\"c\":\"\u{9d}\"}\n{\"type\":\"result\",\"result\":\"FINAL\"}";
+        let cleaned = clean_output(raw);
+        assert!(cleaned.contains("FINAL"), "{cleaned:?}");
+        assert_eq!(
+            cleaned,
+            "{\"c\":\"\"}\n{\"type\":\"result\",\"result\":\"FINAL\"}"
+        );
+        for c1 in ['\u{90}', '\u{98}', '\u{9b}', '\u{9e}', '\u{9f}'] {
+            let cleaned = clean_output(&format!("a{c1}b\nc"));
+            assert_eq!(cleaned, "ab\nc", "{c1:?}");
+        }
+        // A decoded C1 right after ESC does not turn it into a string control.
+        assert_eq!(clean_output("x\x1b\u{9d}y\nz"), "xy\nz");
     }
 
     #[test]
