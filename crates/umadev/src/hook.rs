@@ -526,12 +526,11 @@ fn run_post_tool_scoped(stdin: &str, project_root: &Path, driving: bool) -> Opti
     if tool.is_empty() {
         return None;
     }
-    // The audited target: the file written / the command run. Fall back through
-    // the same field names the PreToolUse parsing understands.
-    let target = payload
-        .tool_input
-        .file_path
-        .as_deref()
+    // The audited target: the file written (Claude `file_path`, Kimi `path`,
+    // NotebookEdit `notebook_path`, exactly as the PreToolUse scan reads it) or
+    // else the command run.
+    let target = Some(payload.tool_input.scan_path())
+        .filter(|path| !path.is_empty())
         .or(payload.tool_input.command.as_deref())
         .or(payload.tool_input.cmd.as_deref())
         .or(payload.tool_input.script.as_deref())
@@ -1920,6 +1919,23 @@ mod tests {
         let log = root.join(".umadev/audit/tool-calls.jsonl");
         let body = std::fs::read_to_string(&log).unwrap();
         assert!(body.contains("src/App.tsx") && body.contains("\"audit\""));
+    }
+
+    #[test]
+    fn post_tool_audit_records_kimi_path_and_notebook_path_targets() {
+        // Kimi Code's native Write/Edit name the file `path`, and Claude's
+        // NotebookEdit names it `notebook_path`: the audit row must still say
+        // which file was written, not record an empty target.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let kimi = r#"{"tool_name":"Write","tool_input":{"path":"src/a.ts","content":"x"}}"#;
+        let rec = post_tool_in(kimi, tmp.path()).expect("a record is written");
+        assert_eq!(rec.file, "src/a.ts");
+        let notebook = concat!(
+            r#"{"tool_name":"NotebookEdit","#,
+            r#""tool_input":{"notebook_path":"nb/analysis.ipynb","new_source":"print(1)"}}"#
+        );
+        let rec = post_tool_in(notebook, tmp.path()).expect("a record is written");
+        assert_eq!(rec.file, "nb/analysis.ipynb");
     }
 
     #[test]
