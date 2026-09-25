@@ -747,14 +747,22 @@ pub(crate) fn scrub_leaked_secrets_env(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Spawn a one-shot base CLI call or probe as a managed child, scrubbing
+/// inherited secrets first as [`isolate_process_tree`] does for sessions. A
+/// one-shot Auto call runs the base with every tool pre-approved, so it is the
+/// likeliest place for an injected prompt to read the environment.
+fn spawn_base_child(mut cmd: Command) -> std::io::Result<umadev_process::ManagedChild> {
+    scrub_leaked_secrets_env(&mut cmd);
+    umadev_process::ManagedChild::spawn(cmd)
+}
+
 /// Put a long-lived machine-protocol child in its own process group.
 /// Descendants created by an npm/Node trampoline inherit that group, allowing
 /// shutdown to terminate the actual native base instead of only its wrapper.
 ///
-/// This is also the universal pre-spawn chokepoint every base CLI and base-driven
-/// tool subprocess passes through, so it scrubs inherited secrets
-/// ([`scrub_leaked_secrets_env`]) here too — guaranteeing no base spawn can bypass
-/// the credential scrub.
+/// Every resident session spawn passes through here, so it also scrubs inherited
+/// secrets ([`scrub_leaked_secrets_env`]). One-shot calls and probes get the same
+/// scrub from [`spawn_base_child`]; between them no base spawn skips it.
 pub(crate) fn isolate_process_tree(cmd: &mut tokio::process::Command) {
     scrub_leaked_secrets_env(cmd);
     // These children bypass `umadev_process`'s spawn helpers, so they take its
@@ -1734,7 +1742,7 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = umadev_process::ManagedChild::spawn(cmd).map_err(|e| {
+    let mut child = spawn_base_child(cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{}` not found on PATH", call.program)
         } else {
@@ -1883,7 +1891,7 @@ pub(crate) async fn run_auth_status(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = umadev_process::ManagedChild::spawn(cmd).ok()?;
+    let mut child = spawn_base_child(cmd).ok()?;
     // Close stdin immediately (EOF) so a status command that peeks stdin in a
     // non-interactive context returns instead of blocking to the timeout.
     drop(child.take_stdin());
@@ -1953,7 +1961,7 @@ pub(crate) async fn run_subprocess_streaming(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = umadev_process::ManagedChild::spawn(cmd).map_err(|e| {
+    let mut child = spawn_base_child(cmd).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!("`{}` not found on PATH", call.program)
         } else {
@@ -4780,6 +4788,33 @@ mod tests {
         let workspace = PathBuf::from(OsString::from_vec(raw.clone()));
         let env = govern_root_env(&workspace);
         assert_eq!(env[0].1.as_os_str().as_bytes(), raw);
+    }
+
+    /// One-shot calls and probes must not hand a base the publish or UmaDev
+    /// secrets the resident sessions already withhold. The variable name is
+    /// unique to this test, so setting it cannot disturb a concurrent test.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_shot_calls_and_probes_never_inherit_scrubbed_secrets() {
+        const SECRET: &str = "UMADEV_SCRUB_PROBE_SECRET";
+        let _secret = EnvRestore::set(SECRET, "leaked");
+        let script = format!("printf %s \"${{{SECRET}-scrubbed}}\"");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = run_subprocess(SubprocessCall {
+            program: "sh",
+            args: &["-c".to_string(), script.clone()],
+            prompt: "",
+            channel: PromptChannel::Stdin,
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(5),
+            env: &[],
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.stdout, "scrubbed");
+
+        let probe = run_auth_status("sh", &["-c".to_string(), script], true).await;
+        assert_eq!(probe.as_deref(), Some("scrubbed"));
     }
 
     // `printenv` exists on macOS/Linux; the env propagation it proves is the
