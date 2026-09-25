@@ -132,13 +132,32 @@ async fn run_git_status_command(
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// A read-only `git` invocation for the automatic working-tree snapshots taken
+/// around every turn. These run without the user asking, so a repository that
+/// arrived with its `.git/config` (an archive or shared folder rather than a
+/// clone) must not be able to execute commands through `core.fsmonitor`, and a
+/// background snapshot must not take the index lock the base may need.
+pub(crate) fn git_snapshot_command(root: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args([
+            "--no-pager",
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+        ])
+        .arg("-C")
+        .arg(root);
+    command
+}
+
 /// Async hot-path snapshot used before and after ordinary resident turns. Git
 /// owns a dedicated process tree, has a hard deadline, and drains only bounded
 /// output; an incomplete snapshot is discarded instead of being treated as a
 /// truthful partial status.
 pub(crate) async fn git_status_porcelain_bounded(root: &Path) -> Option<String> {
-    let mut command = tokio::process::Command::new("git");
-    command.arg("-C").arg(root).args(["status", "--porcelain"]);
+    let mut command = git_snapshot_command(root);
+    command.args(["status", "--porcelain"]);
     run_git_status_command(command, git_status_options()).await
 }
 
@@ -225,7 +244,10 @@ pub(crate) fn agentic_fact_line(changed: Option<&[String]>, claimed: bool) -> Op
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{changed_files_after_git_status, run_git_status_command, GIT_STATUS_READER_GRACE};
+    use super::{
+        changed_files_after_git_status, git_status_porcelain_bounded, run_git_status_command,
+        GIT_STATUS_READER_GRACE,
+    };
     use std::time::{Duration, Instant};
 
     fn options(timeout: Duration, stdout_bytes: usize) -> umadev_process::BoundedCommandOptions {
@@ -278,5 +300,30 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_status_snapshot_never_runs_repository_fsmonitor() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let marker = repo.path().join("fsmonitor-ran");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "--quiet"]);
+        let hook = format!("touch '{}'; exit 1", marker.display());
+        git(&["config", "core.fsmonitor", &hook]);
+        std::fs::write(repo.path().join("file.txt"), "x").unwrap();
+
+        let status = git_status_porcelain_bounded(repo.path()).await;
+        assert!(status.is_some_and(|out| out.contains("file.txt")));
+        assert!(!marker.exists(), "repository core.fsmonitor was executed");
     }
 }

@@ -111,8 +111,8 @@ use crate::clipboard::finish_mouse_selection_copy;
 #[cfg(test)]
 use crate::execution_postcondition::changed_files_between;
 use crate::execution_postcondition::{
-    agentic_fact_line, changed_files_after_git_status, git_status_porcelain_bounded,
-    ResidentExecutionPostcondition,
+    agentic_fact_line, changed_files_after_git_status, git_snapshot_command,
+    git_status_porcelain_bounded, ResidentExecutionPostcondition,
 };
 use crate::input::InputSource;
 use crate::interaction_bridge::{
@@ -2457,8 +2457,8 @@ async fn run_agentic(
 /// already modified. **Fail-open**: any failure returns `None` and the prompt
 /// simply omits the diff-stat section.
 async fn git_diff_stat(root: &std::path::Path) -> Option<String> {
-    let mut command = tokio::process::Command::new("git");
-    command.arg("-C").arg(root).args(["diff", "--stat"]);
+    let mut command = git_snapshot_command(root);
+    command.args(["diff", "--stat"]);
     let out = umadev_process::run_bounded_command(
         command,
         umadev_process::BoundedCommandOptions {
