@@ -1595,35 +1595,15 @@ async fn run_quality_gate(
     // 2. The scored gate (zero-source hard check + contract conformance +
     //    governance-audit checks + coverage), written to
     //    `output/<slug>-quality-gate.json`. Fail-open: a write error → proceed.
-    let Ok(quality_out) = crate::phases::run_quality(options) else {
+    //    The verdict comes from the JSON the gate produced in memory, never
+    //    from a read-back of that file: `output/` is model-writable, and a
+    //    left-running background process could forge a pass in between.
+    let Ok((_, qg_body)) = crate::phases::run_quality_report(options) else {
         return None;
     };
-    let produced_gate_file = quality_out
-        .artifacts
-        .iter()
-        .any(|p| p.to_string_lossy().ends_with("-quality-gate.json"));
 
-    // 3. Read the gate JSON back and extract `(score, passed)` the same way the
-    //    single-shot path does.
-    let qg_path = options
-        .project_root
-        .join("output")
-        .join(format!("{}-quality-gate.json", options.effective_slug()));
-    let qg_body = crate::bounded_fs::read_utf8_beneath(
-        &options.project_root,
-        &qg_path,
-        MAX_CONTINUOUS_ARTIFACT_BYTES,
-    )
-    .ok();
-    let (score, passed) = match qg_body.as_deref() {
-        Some(qg) => crate::phases::extract_quality_score(qg),
-        // The gate phase wrote a file we can't read back → a disk/permission
-        // failure, not "offline". Treat as not-passed so a write failure can't
-        // masquerade as success — but only when the gate file was actually
-        // produced; otherwise (no gate at all) fail-open to pass.
-        None if produced_gate_file => ("?".to_string(), false),
-        None => return None,
-    };
+    // 3. Extract `(score, passed)` the same way the single-shot path does.
+    let (score, passed) = crate::phases::extract_quality_score(&qg_body);
 
     // Honest verdict wording: a HARD gate (heavyweight gated code run) that
     // fails is "BLOCKED — deterministic hard signal" (it will stop the run); a
@@ -1657,10 +1637,7 @@ async fn run_quality_gate(
 
     // Surface the top findings inline so the user sees WHAT failed without
     // opening the JSON.
-    let findings = qg_body
-        .as_deref()
-        .map(|b| crate::phases::quality_findings(b, 5))
-        .unwrap_or_default();
+    let findings = crate::phases::quality_findings(&qg_body, 5);
     if !findings.is_empty() {
         let list = findings
             .iter()

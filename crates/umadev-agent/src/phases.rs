@@ -1080,6 +1080,14 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
     run_quality_with_kind(opts, None)
 }
 
+/// [`run_quality`], also handing back the gate JSON exactly as it was written.
+/// A caller that DECIDES on the verdict reads these bytes, never the file: the
+/// file sits in `output/`, where a model-left background process can rewrite it
+/// between the write and a read-back and forge a pass.
+pub fn run_quality_report(opts: &RunOptions) -> io::Result<(PhaseOutput, String)> {
+    run_quality_scored(opts, None)
+}
+
 /// [`run_quality`] with the run's EXECUTED kind threaded in (M8). The doc-N/A guard
 /// (which marks PRD / architecture / UIUX checks `n/a` for a lean plan that skips the
 /// Docs phase) must read the plan the run ACTUALLY executed — not a re-classification
@@ -1092,6 +1100,13 @@ pub fn run_quality_with_kind(
     opts: &RunOptions,
     executed_kind: Option<crate::planner::TaskKind>,
 ) -> io::Result<PhaseOutput> {
+    run_quality_scored(opts, executed_kind).map(|(out, _)| out)
+}
+
+fn run_quality_scored(
+    opts: &RunOptions,
+    executed_kind: Option<crate::planner::TaskKind>,
+) -> io::Result<(PhaseOutput, String)> {
     let slug = opts.effective_slug();
     let output_dir = opts.project_root.join("output");
     crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
@@ -1950,10 +1965,8 @@ pub fn run_quality_with_kind(
 
     let json_path = output_dir.join(format!("{slug}-quality-gate.json"));
     let md_path = output_dir.join(format!("{slug}-quality-gate.md"));
-    atomic_write(
-        &json_path,
-        &serde_json::to_string_pretty(&report).unwrap_or_default(),
-    )?;
+    let report_json = serde_json::to_string_pretty(&report).unwrap_or_default();
+    atomic_write(&json_path, &report_json)?;
     atomic_write(&md_path, &render_quality_md(&report))?;
 
     audit(
@@ -1990,12 +2003,13 @@ pub fn run_quality_with_kind(
         crate::lessons::capture_tech_debt(&opts.project_root, &debt_items, &opts.requirement);
     }
 
-    Ok(PhaseOutput {
+    let out = PhaseOutput {
         phase: Phase::Quality,
         artifacts: vec![json_path, md_path],
         gate: None,
         degraded: false,
-    })
+    };
+    Ok((out, report_json))
 }
 
 fn evidence_check(
@@ -5498,6 +5512,22 @@ mod tests {
             .checks
             .iter()
             .any(|c| c.name.contains("PRD") || c.name.contains("content")));
+    }
+
+    #[test]
+    fn quality_report_hands_back_the_verdict_it_wrote() {
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        let (out, body) = run_quality_report(&o).unwrap();
+        assert_eq!(fs::read_to_string(&out.artifacts[0]).unwrap(), body);
+        assert!(
+            !extract_quality_score(&body).1,
+            "nothing was built: the gate fails"
+        );
+        // A process rewriting the report afterwards cannot change the verdict
+        // the caller already holds.
+        fs::write(&out.artifacts[0], r#"{"total_score": 100, "passed": true}"#).unwrap();
+        assert!(!extract_quality_score(&body).1);
     }
 
     #[test]
