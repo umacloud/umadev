@@ -4751,6 +4751,26 @@ fn url_host_port_extracts_127_0_0_1_3000() {
 }
 
 #[test]
+fn url_host_port_defaults_port_and_strips_path_query_fragment() {
+    for (url, expected) in [
+        ("http://localhost/", "localhost:80"),
+        ("http://localhost", "localhost:80"),
+        ("https://example.com/app", "example.com:443"),
+        ("http://h:5173?x=1", "h:5173"),
+        ("http://h:5173#top", "h:5173"),
+        ("http://h?x=1", "h:80"),
+        ("http://[::1]:5173/", "[::1]:5173"),
+        ("https://[::1]", "[::1]:443"),
+        ("http://user@h:5173/", "h:5173"),
+    ] {
+        assert_eq!(url_host_port(url), Some(expected.into()), "{url}");
+    }
+    assert_eq!(url_host_port("http://"), None);
+    assert_eq!(url_host_port("http://h:/"), None);
+    assert_eq!(url_host_port("http://h:abc/"), None);
+}
+
+#[test]
 fn url_host_port_none_for_garbage() {
     assert_eq!(url_host_port("not a url"), None);
     assert_eq!(url_host_port("ftp://example.com"), None);

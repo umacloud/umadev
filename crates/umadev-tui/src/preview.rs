@@ -89,12 +89,26 @@ fn needs_shell(command: &str) -> bool {
 /// when parsing fails. Used by [`wait_for_port`] so we only open the browser
 /// after the dev server is actually accepting connections — not 0ms after
 /// spawn, when Vite is still compiling and the page would 404.
+/// A missing port defaults by scheme (80/443); `[ipv6]` hosts keep brackets.
 pub(super) fn url_host_port(url: &str) -> Option<String> {
-    let after_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let host_port = after_scheme.split('/').next()?;
-    Some(host_port.to_string())
+    let (after_scheme, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, 80)
+    } else {
+        (url.strip_prefix("https://")?, 443)
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?;
+    let (host, port) = match authority.rfind(':') {
+        Some(colon) if !authority[colon..].contains(']') => (
+            &authority[..colon],
+            authority[colon + 1..].parse::<u16>().ok()?,
+        ),
+        _ => (authority, default_port),
+    };
+    (!host.is_empty()).then(|| format!("{host}:{port}"))
 }
 
 /// Poll a `host:port` with a TCP connect until it succeeds or `timeout`
