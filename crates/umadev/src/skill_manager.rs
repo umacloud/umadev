@@ -144,7 +144,13 @@ impl SkillRegistry {
             &serde_json::to_string_pretty(&manifest).unwrap_or_default(),
         )?;
 
-        // Copy knowledge docs.
+        // Copy knowledge docs into an emptied directory, so docs an earlier
+        // version of this skill shipped and this manifest dropped are not
+        // left behind to be indexed.
+        let knowledge_rel = Path::new("knowledge").join("skills").join(&manifest.name);
+        if self.project_root.join(&knowledge_rel).exists() {
+            remove_project_tree(&self.project_root, &knowledge_rel)?;
+        }
         let mut knowledge_copied = 0;
         let knowledge_root = umadev_state::fs::ensure_real_child_dir(
             &umadev_state::fs::ensure_real_child_dir(&self.project_root, "knowledge")?,
@@ -194,30 +200,9 @@ impl SkillRegistry {
             knowledge_copied += 1;
         }
 
-        // Append system prompt to CLAUDE.md.
-        let prompt_updated = if manifest.system_prompt.is_empty() {
-            false
-        } else {
-            let claude_md = self.project_root.join("CLAUDE.md");
-            let existing = match bounded_text(&claude_md, MAX_PROJECT_TEXT_BYTES) {
-                Ok(existing) => existing,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(error) => return Err(error),
-            };
-            let marker = format!("<!-- skill:{} -->", manifest.name);
-            if existing.contains(&marker) {
-                false
-            } else {
-                let block = format!(
-                    "\n{marker}\n{}\n<!-- /skill:{} -->\n",
-                    manifest.system_prompt, manifest.name
-                );
-                // Atomic: a crash mid-write must not truncate the user's
-                // CLAUDE.md (the same atomic_write the manifest commit uses).
-                atomic_write(&claude_md, &(existing + &block))?;
-                true
-            }
-        };
+        // Bring the skill's CLAUDE.md block in line with this manifest.
+        let prompt_updated =
+            sync_managed_prompt_block(&self.project_root, &manifest.name, &manifest.system_prompt)?;
 
         // Merge the skill's declared governance clauses into rules.toml so the
         // engine actually enforces them (honesty fix: the old impl only COUNTED
@@ -430,6 +415,67 @@ fn remove_project_tree(project_root: &Path, relative: &Path) -> std::io::Result<
     }
     root.remove_empty_directory_tree(relative, MAX_SKILL_TREE_DEPTH, MAX_SKILL_TREE_NODES)?;
     Ok(())
+}
+
+/// Make skill `name`'s managed CLAUDE.md block hold `prompt`: append it on a
+/// first install, replace the text of a block an earlier version wrote (in
+/// place), or remove the block when the new version has no prompt. Returns
+/// whether CLAUDE.md changed; whitespace-only differences are not a change.
+fn sync_managed_prompt_block(
+    project_root: &Path,
+    name: &str,
+    prompt: &str,
+) -> std::io::Result<bool> {
+    let claude_md = project_root.join("CLAUDE.md");
+    let existing = match bounded_text(&claude_md, MAX_PROJECT_TEXT_BYTES) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let updated = match managed_prompt_range(&existing, name)? {
+        None if prompt.is_empty() => return Ok(false),
+        Some(_) if prompt.is_empty() => {
+            remove_managed_prompt_block(project_root, name)?;
+            return Ok(true);
+        }
+        Some(body) if existing[body.clone()].trim() == prompt.trim() => return Ok(false),
+        Some(body) => format!(
+            "{}\n{prompt}\n{}",
+            &existing[..body.start],
+            &existing[body.end..]
+        ),
+        None => format!("{existing}\n<!-- skill:{name} -->\n{prompt}\n<!-- /skill:{name} -->\n"),
+    };
+    // Atomic: a crash mid-write must not truncate the user's CLAUDE.md (the
+    // same atomic_write the manifest commit uses).
+    atomic_write(&claude_md, &updated)?;
+    Ok(true)
+}
+
+/// The byte range between skill `name`'s block markers in `content` (the text
+/// after `<!-- skill:name -->` up to `<!-- /skill:name -->`), or `None` when
+/// the skill has no block. A start marker without an end marker is an error:
+/// the block's extent is unknown, so nothing may be rewritten.
+fn managed_prompt_range(
+    content: &str,
+    name: &str,
+) -> std::io::Result<Option<std::ops::Range<usize>>> {
+    let start_marker = format!("<!-- skill:{name} -->");
+    let Some(start) = content.find(&start_marker) else {
+        return Ok(None);
+    };
+    let body_start = start + start_marker.len();
+    let end_marker = format!("<!-- /skill:{name} -->");
+    let end = content[body_start..]
+        .find(&end_marker)
+        .map(|offset| body_start + offset)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("CLAUDE.md has an incomplete managed block for skill `{name}`"),
+            )
+        })?;
+    Ok(Some(body_start..end))
 }
 
 fn remove_managed_prompt_block(project_root: &Path, name: &str) -> std::io::Result<()> {
@@ -725,6 +771,72 @@ mod tests {
         registry.install(&source).unwrap();
         let result = registry.install(&source).unwrap();
         assert!(!result.prompt_updated); // already present
+    }
+
+    #[test]
+    fn reinstall_replaces_changed_prompt_and_prunes_knowledge() {
+        // Upgrading a skill must leave CLAUDE.md and knowledge/ matching the
+        // new manifest, not keep v1's prompt and the docs v2 no longer ships.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = SkillRegistry::new(tmp.path());
+        std::fs::write(tmp.path().join("CLAUDE.md"), "# Mine\nKeep this line.\n").unwrap();
+        let source = make_skill_dir(tmp.path(), "test-skill");
+        std::fs::create_dir_all(source.join("extra")).unwrap();
+        std::fs::write(source.join("extra/old.md"), "# Old\n").unwrap();
+        let write_manifest = |prompt: &str, knowledge: Vec<String>| {
+            let manifest = SkillManifest {
+                name: "test-skill".into(),
+                description: "Test skill".into(),
+                version: "2.0".into(),
+                knowledge,
+                rules: vec![],
+                system_prompt: prompt.into(),
+            };
+            std::fs::write(
+                source.join("manifest.json"),
+                serde_json::to_string_pretty(&manifest).unwrap(),
+            )
+            .unwrap();
+        };
+        write_manifest("v1 prompt", vec!["guide.md".into(), "extra/old.md".into()]);
+        registry.install(&source).unwrap();
+        std::fs::write(tmp.path().join("CLAUDE.md"), {
+            let mut text = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+            text.push_str("After the block.\n");
+            text
+        })
+        .unwrap();
+        let knowledge = tmp.path().join("knowledge/skills/test-skill");
+        assert!(knowledge.join("extra/old.md").is_file());
+
+        write_manifest("v2 prompt", vec!["guide.md".into()]);
+        let result = registry.install(&source).unwrap();
+        assert!(result.prompt_updated, "a changed prompt must be rewritten");
+        let claude = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert!(claude.contains("v2 prompt"), "{claude}");
+        assert!(!claude.contains("v1 prompt"), "{claude}");
+        assert_eq!(claude.matches("<!-- skill:test-skill -->").count(), 1);
+        assert!(claude.contains("Keep this line.") && claude.contains("After the block."));
+        let block = claude.find("v2 prompt").unwrap();
+        assert!(
+            block < claude.find("After the block.").unwrap(),
+            "block moved: {claude}"
+        );
+        assert!(knowledge.join("guide.md").is_file());
+        assert!(
+            !knowledge.join("extra").exists(),
+            "a dropped knowledge doc stayed"
+        );
+
+        // The same manifest again changes nothing.
+        assert!(!registry.install(&source).unwrap().prompt_updated);
+
+        // A version without a prompt drops the managed block.
+        write_manifest("", vec!["guide.md".into()]);
+        assert!(registry.install(&source).unwrap().prompt_updated);
+        let claude = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert!(!claude.contains("skill:test-skill"), "{claude}");
+        assert!(claude.contains("Keep this line.") && claude.contains("After the block."));
     }
 
     #[test]
