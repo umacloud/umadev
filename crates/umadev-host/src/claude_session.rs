@@ -20,13 +20,18 @@
 //! `claude --print --input-format stream-json --output-format stream-json
 //! --verbose --session-id <uuid> --permission-mode <plan|default|bypassPermissions>
 //! --allowedTools <read-only + research + sub-agent set; auto adds the mutating
-//! Edit/Write/Bash/NotebookEdit>` (+ optional `--append-system-prompt`). The base's
+//! Edit/Write/Bash/NotebookEdit> --permission-prompt-tool stdio` (+ optional
+//! `--append-system-prompt`). The base's
 //! native read/research/delegate tools (incl. `Agent`/`Task` sub-agents) are
 //! pre-approved so they run natively instead of eating a per-tool approval — see
 //! the internal `PLAN_ALLOWED_TOOLS` / `GUARDED_ALLOWED_TOOLS` /
 //! `AUTO_ALLOWED_TOOLS` allowlists.
 //! We deliberately use `--append-system-prompt` (NOT `--system-prompt`, which
 //! would replace the tool guidance and degrade the base into a chat box).
+//!
+//! `--permission-prompt-tool stdio` makes claude send every permission "ask" to
+//! UmaDev as a `can_use_tool` control request on this same channel. Without it
+//! claude answers each ask itself and, in `--print` mode, denies it.
 //!
 //! The permission mode tracks the autonomy tier so claude is consistent with the
 //! codex / opencode drivers: `autonomous` (auto tier) → `bypassPermissions` (the
@@ -35,11 +40,15 @@
 //! ruleset; UmaDev's PreToolUse/PostToolUse governance hooks still see every
 //! tool call, since claude runs hooks regardless of the permission mode),
 //! Guarded → `default` (claude raises a
-//! `can_use_tool` approval for each tool, which becomes a `NeedApproval` the
-//! orchestrator answers — the human-in-the-loop floor, so the
+//! `can_use_tool` approval for each tool outside the allowlist, which becomes a
+//! `NeedApproval` the orchestrator answers — the human-in-the-loop floor, so the
 //! irreversible-action gate is not bypassed), and Plan → `plan` with a strict
-//! read-only allowlist. `UMADEV_CLAUDE_PERMISSION_MODE` can only tighten Auto;
-//! it can never widen Plan or Guarded.
+//! read-only allowlist. In `plan` mode claude asks before a write instead of
+//! refusing it, so a Plan-profile session (and every read-only fork) denies each
+//! ordinary tool request itself. On every tier `AskUserQuestion` and
+//! `ExitPlanMode` reach UmaDev as typed `HostRequest`s, and a request claude
+//! withdraws settles as `HostRequestSettled`. `UMADEV_CLAUDE_PERMISSION_MODE` can
+//! only tighten Auto; it can never widen Plan or Guarded.
 //!
 //! Fail-open by contract: a garbled line is skipped, a dead session surfaces a
 //! [`umadev_runtime::TurnStatus::Failed`], never a panic.
@@ -90,6 +99,13 @@ const KNOWN_COMMAND_CAP: usize = 256;
 /// Dropping an evicted sender wakes its waiter, so a hostile peer cannot retain
 /// futures indefinitely.
 const PENDING_CLIENT_CONTROL_CAP: usize = 128;
+/// The [`SessionEvent::HostRequestSettled`] reason when Claude withdraws a
+/// pending `can_use_tool` request (`control_cancel_request`).
+const CLAUDE_CANCELLED_REQUEST: &str = "base cancelled";
+/// What a Plan-profile session tells Claude when it denies an ordinary tool
+/// request itself (see [`ClaudeSession::read_only`]).
+const PLAN_SESSION_DENIAL: &str =
+    "UmaDev runs this Claude session read-only (Plan); this action is not allowed here";
 /// A protocol ACK is useful but must never hold the interactive surface
 /// hostage. Older Claude versions may accept the input without replaying a UUID;
 /// after this deadline the honest receipt remains `transport_written`.
@@ -143,9 +159,10 @@ impl PendingClaudeControls {
         self.by_id.get(req_id).cloned()
     }
 
-    fn remove(&mut self, req_id: &str) {
-        self.by_id.remove(req_id);
+    /// Forget one request; `true` when it was still pending.
+    fn remove(&mut self, req_id: &str) -> bool {
         self.order.retain(|id| id != req_id);
+        self.by_id.remove(req_id).is_some()
     }
 }
 
@@ -381,6 +398,13 @@ pub struct ClaudeSession {
     program: String,
     /// The workspace this session runs in, so a fork operates in the same dir.
     workspace: std::path::PathBuf,
+    /// `true` when Claude runs in its `plan` permission mode (the Plan profile
+    /// and every read-only fork). With the stdio permission channel, `plan` mode
+    /// asks the host before a write instead of refusing it, so this session
+    /// denies every ordinary tool request itself and never surfaces it: Plan
+    /// stays read-only whatever the caller would answer. Questions and plan
+    /// confirmation still reach the caller as typed requests.
+    read_only: bool,
     /// Temp file backing `--append-system-prompt-file` when the composed firmware
     /// was too large for the command line (the Windows `cmd.exe` ~8191 cap; see
     /// [`crate::command_line_budget`]). Held for the whole session lifetime so
@@ -615,6 +639,7 @@ impl ClaudeSession {
             session_id: session_id.to_string(),
             program: program.to_string(),
             workspace: workspace.to_path_buf(),
+            read_only: runs_in_plan_mode(&args),
             _firmware_file: firmware_file,
         })
     }
@@ -669,6 +694,18 @@ impl ClaudeSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(req_id);
+    }
+
+    /// Answer one pending `can_use_tool` request with its exact envelope.
+    async fn write_control_response(
+        &mut self,
+        req_id: &str,
+        payload: &Value,
+    ) -> Result<(), SessionError> {
+        self.write_line(&control_response_line(req_id, payload))
+            .await?;
+        self.forget_control(req_id);
+        Ok(())
     }
 
     /// Register before the stdin write so a fast replay cannot race ahead of
@@ -863,10 +900,23 @@ impl BaseSession for ClaudeSession {
         // No internal timeout BY DESIGN — the runner owns phase/run budgets and
         // races this against them (then calls `interrupt`). Keeping the session
         // a pure relay avoids a synthetic TurnDone racing a real one.
-        self.events
-            .recv()
-            .await
-            .map(crate::redaction::sanitize_session_event)
+        loop {
+            let event = self.events.recv().await?;
+            if let SessionEvent::NeedApproval { req_id, .. } = &event {
+                if self.read_only {
+                    // Plan mode's ask-before-write, answered the way `--print`
+                    // answered it before the stdio channel: a denial. A failed
+                    // write means the base is gone; its EOF terminal follows.
+                    if self.pending_control(req_id).is_some() {
+                        let _ = self
+                            .write_control_response(req_id, &deny_payload(PLAN_SESSION_DENIAL))
+                            .await;
+                    }
+                    continue;
+                }
+            }
+            return Some(crate::redaction::sanitize_session_event(event));
+        }
     }
 
     async fn respond(
@@ -883,12 +933,9 @@ impl BaseSession for ClaudeSession {
             return Ok(());
         };
         let payload = legacy_approval_payload(decision, Some(&pending));
-        let line = control_response_line(req_id, &payload);
-        self.write_line(&line)
+        self.write_control_response(req_id, &payload)
             .await
-            .map_err(crate::redaction::sanitize_session_error)?;
-        self.forget_control(req_id);
-        Ok(())
+            .map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn respond_host(
@@ -902,12 +949,9 @@ impl BaseSession for ClaudeSession {
             return Ok(());
         };
         let payload = typed_host_response_payload(response, Some(&pending));
-        let line = control_response_line(req_id, &payload);
-        self.write_line(&line)
+        self.write_control_response(req_id, &payload)
             .await
-            .map_err(crate::redaction::sanitize_session_error)?;
-        self.forget_control(req_id);
-        Ok(())
+            .map_err(crate::redaction::sanitize_session_error)
     }
 
     async fn interrupt(&mut self) -> Result<(), SessionError> {
@@ -1215,33 +1259,40 @@ fn claude_question_id(_question: &AskQuestion, index: usize) -> String {
 /// Record or cancel pending controls before their public events are sent. This
 /// preserves exact input without placing protocol-only mutable state in the
 /// runtime event type.
-fn observe_control_frame(line: &str, pending: &SharedPendingClaudeControls) {
-    let Ok(frame) = serde_json::from_str::<Value>(line.trim()) else {
-        return;
-    };
+///
+/// Claude withdraws a `can_use_tool` request with `control_cancel_request` when
+/// the turn is aborted or a hook decided first. A request that was still pending
+/// yields [`SessionEvent::HostRequestSettled`] so a surface can retract the
+/// approval or question it is showing for it.
+fn observe_control_frame(
+    line: &str,
+    pending: &SharedPendingClaudeControls,
+) -> Option<SessionEvent> {
+    let frame = serde_json::from_str::<Value>(line.trim()).ok()?;
     match frame.get("type").and_then(Value::as_str) {
         Some("control_request") => {
-            let Some((req_id, request)) = pending_control_from_frame(&frame) else {
-                return;
-            };
+            let (req_id, request) = pending_control_from_frame(&frame)?;
             pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(req_id, request);
+            None
         }
         Some("control_cancel_request") => {
-            if let Some(req_id) = frame
+            let req_id = frame
                 .get("request_id")
                 .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-            {
-                pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(req_id);
-            }
+                .filter(|id| !id.is_empty())?;
+            let was_pending = pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(req_id);
+            was_pending.then(|| SessionEvent::HostRequestSettled {
+                req_id: req_id.to_string(),
+                reason: CLAUDE_CANCELLED_REQUEST.to_string(),
+            })
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -1339,7 +1390,15 @@ async fn pump_stdout(
                     // model output. Never render the user's own input a second time.
                     continue;
                 }
-                observe_control_frame(line, &pending_controls);
+                if let Some(settled) = observe_control_frame(line, &pending_controls) {
+                    if tx
+                        .send(crate::redaction::sanitize_session_event(settled))
+                        .await
+                        .is_err()
+                    {
+                        return; // consumer dropped → stop
+                    }
+                }
                 if let Ok(frame) = serde_json::from_str::<Value>(line) {
                     protocol
                         .lock()
@@ -1709,6 +1768,7 @@ fn session_args_for_profile(
         "--allowedTools".to_string(),
         allowed_tools.to_string(),
     ];
+    push_permission_prompt_tool(&mut args);
     args.extend(crate::model_args(model));
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
@@ -1716,6 +1776,21 @@ fn session_args_for_profile(
         args.push(sys.to_string());
     }
     args
+}
+
+/// Route every permission "ask" to UmaDev as a `can_use_tool` control request on
+/// this stdio channel. Without it Claude resolves each ask itself and, in
+/// `--print` mode, denies it: no approval, question or plan confirmation would
+/// ever reach UmaDev, and a Guarded session could not change a file.
+fn push_permission_prompt_tool(args: &mut Vec<String>) {
+    args.push("--permission-prompt-tool".to_string());
+    args.push("stdio".to_string());
+}
+
+/// Whether an argument vector starts Claude in its `plan` permission mode.
+fn runs_in_plan_mode(args: &[String]) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == "--permission-mode" && pair[1] == "plan")
 }
 
 /// Append `--max-turns <n>` to `args` when a cap is set; a `None` cap appends
@@ -1783,6 +1858,7 @@ fn resume_session_args_for_profile(
         "--allowedTools".to_string(),
         allowed_tools.to_string(),
     ];
+    push_permission_prompt_tool(&mut args);
     args.extend(crate::model_args(model));
     push_max_turns(&mut args, max_turns);
     if let Some(sys) = append_system.filter(|s| !s.is_empty()) {
@@ -1824,13 +1900,15 @@ pub fn fork_session_args(fork_session_id: &str) -> Vec<String> {
         // line). The consult's model context is genuinely clean at the host level.
         "--session-id".to_string(),
         fork_session_id.to_string(),
-        // Read-only: plan mode never applies an edit. The tool list makes only
-        // Read/Grep/Glob prompt-free; it does not independently restrict tools.
+        // Read-only: plan mode asks before any edit, and the session denies
+        // every such ask itself (see `ClaudeSession::read_only`). The tool list
+        // makes only Read/Grep/Glob prompt-free; it does not restrict tools.
         "--permission-mode".to_string(),
         "plan".to_string(),
         "--allowedTools".to_string(),
         "Read,Grep,Glob".to_string(),
     ];
+    push_permission_prompt_tool(&mut args);
     // A read-only verdict consult is turn-capped LOW — a runaway backstop so a critic
     // can never spin a long agentic loop (see `CRITIC_FORK_MAX_TURNS`).
     push_max_turns(&mut args, Some(CRITIC_FORK_MAX_TURNS));
@@ -3867,6 +3945,56 @@ mod tests {
             guarded_accept[accept_pos + 1],
             "default",
             "Guarded cannot be widened by an environment override"
+        );
+    }
+
+    #[test]
+    fn claude_session_args_route_permission_prompts_over_stdio() {
+        // Claude sends a permission "ask" to its host only when started with
+        // `--permission-prompt-tool stdio`. Without it `--print` mode denies the
+        // ask itself, so no approval, question or plan confirmation reaches UmaDev.
+        let _lock = PERM_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _mode = EnvRestore::remove("UMADEV_CLAUDE_PERMISSION_MODE");
+        let _no_skip = EnvRestore::remove("UMADEV_NO_SKIP_PERMS");
+        let routed = |args: &[String]| {
+            args.windows(2)
+                .any(|pair| pair[0] == "--permission-prompt-tool" && pair[1] == "stdio")
+        };
+        for profile in [
+            BasePermissionProfile::Plan,
+            BasePermissionProfile::Guarded,
+            BasePermissionProfile::Auto,
+        ] {
+            let fresh = session_args_for_profile("fresh", None, profile, None, "");
+            assert!(routed(&fresh), "{profile:?} fresh: {fresh:?}");
+            let resumed = resume_session_args_for_profile("resumed", None, profile, None, "");
+            assert!(routed(&resumed), "{profile:?} resume: {resumed:?}");
+        }
+        let fork = fork_session_args("fork");
+        assert!(routed(&fork), "fork: {fork:?}");
+    }
+
+    #[test]
+    fn a_withdrawn_request_settles_only_while_it_is_pending() {
+        let pending: SharedPendingClaudeControls = Arc::default();
+        let request = r#"{"type":"control_request","request_id":"w-1","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"a.txt"}}}"#;
+        let cancel = r#"{"type":"control_cancel_request","request_id":"w-1"}"#;
+        assert_eq!(observe_control_frame(request, &pending), None);
+        assert_eq!(
+            observe_control_frame(cancel, &pending),
+            Some(SessionEvent::HostRequestSettled {
+                req_id: "w-1".to_string(),
+                reason: CLAUDE_CANCELLED_REQUEST.to_string(),
+            }),
+            "Claude withdrew a request UmaDev still has on screen"
+        );
+        assert!(pending.lock().unwrap().get("w-1").is_none());
+        assert_eq!(
+            observe_control_frame(cancel, &pending),
+            None,
+            "a request that is no longer pending settles nothing"
         );
     }
 
@@ -6099,6 +6227,82 @@ cat >/dev/null
             response["response"]["response"]["updatedInput"]["answers"]["Which database?"],
             "Postgres"
         );
+        let _ = session.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plan_profile_session_denies_ordinary_tool_requests_itself() {
+        // With the stdio permission channel Claude's `plan` mode ASKS the host
+        // before a write instead of refusing it. A Plan-profile session must stay
+        // read-only whatever its caller decides: an ordinary tool request is
+        // denied inside the session, while a question still reaches UmaDev.
+        let tmp = tempfile_dir();
+        let capture = tmp.join("write-response.json");
+        let body = format!(
+            "#!/bin/sh\n\
+             IFS= read -r _turn\n\
+             printf '%s\\n' '{{\"type\":\"control_request\",\"request_id\":\"q-1\",\"request\":{{\"subtype\":\"can_use_tool\",\"tool_name\":\"AskUserQuestion\",\"input\":{{\"questions\":[{{\"header\":\"DB\",\"question\":\"Which database?\",\"multiSelect\":false,\"options\":[{{\"label\":\"Postgres\",\"description\":\"SQL\"}}]}}]}}}}}}'\n\
+             IFS= read -r _answer\n\
+             printf '%s\\n' '{{\"type\":\"control_request\",\"request_id\":\"w-1\",\"request\":{{\"subtype\":\"can_use_tool\",\"tool_name\":\"Write\",\"input\":{{\"file_path\":\"a.txt\",\"content\":\"x\"}}}}}}'\n\
+             IFS= read -r response\n\
+             printf '%s\\n' \"$response\" > '{}'\n\
+             printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"stop_reason\":\"end_turn\"}}'\n\
+             cat >/dev/null\n",
+            capture.display()
+        );
+        let fake = write_fake_claude(&tmp, &body);
+        let args =
+            session_args_for_profile("sid-plan", None, BasePermissionProfile::Plan, None, "");
+        let mut session =
+            ClaudeSession::spawn_with_args(fake.to_str().unwrap(), &tmp, &args, "sid-plan")
+                .await
+                .expect("start");
+        session
+            .send_turn("look around".to_string())
+            .await
+            .expect("send");
+
+        let mut surfaced = Vec::new();
+        while let Some(event) = session.next_event().await {
+            match event {
+                SessionEvent::HostRequest { req_id, .. } => {
+                    surfaced.push(req_id.clone());
+                    session
+                        .respond_host(
+                            &req_id,
+                            HostResponse::UserInput {
+                                answers: vec![HostAnswer {
+                                    question_id: "claude-question-1".to_string(),
+                                    values: vec!["Postgres".to_string()],
+                                }],
+                            },
+                        )
+                        .await
+                        .expect("answer the question");
+                }
+                SessionEvent::NeedApproval { req_id, .. } => {
+                    surfaced.push(req_id.clone());
+                    // A caller that allows must still not unlock a Plan session.
+                    session
+                        .respond(&req_id, ApprovalDecision::Allow)
+                        .await
+                        .expect("respond");
+                }
+                SessionEvent::TurnDone { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            surfaced,
+            vec!["q-1".to_string()],
+            "only the question surfaces"
+        );
+        let response: Value =
+            serde_json::from_str(&std::fs::read_to_string(&capture).expect("captured response"))
+                .expect("response JSON");
+        assert_eq!(response["response"]["request_id"], "w-1");
+        assert_eq!(response["response"]["response"]["behavior"], "deny");
         let _ = session.end().await;
     }
 
