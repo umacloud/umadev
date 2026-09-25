@@ -344,18 +344,11 @@ pub fn calibrated_default(project_root: &Path, class: &str, default: SizeRank) -
 /// current run's route, the deterministic floor, loop termination, or any gate.
 #[must_use]
 pub fn advisory_nudge(project_root: &Path, class: &str) -> Option<String> {
-    match sizing_calibration(project_root, class)? {
-        SizingAdjustment::Heavier => Some(
-            "signal · 这一类需求历史上常被低估体量(轻量路径多次升级成真实多步构建)\
-             — 以后默认体量可更重一档(仅供参考,不改变本次处理与确定性底线)"
-                .to_string(),
-        ),
-        SizingAdjustment::Lighter => Some(
-            "signal · 这一类需求历史上常被高估体量(重型路径多次只产出微小结果)\
-             — 以后默认体量可更轻一档(仅供参考,不改变本次处理与确定性底线)"
-                .to_string(),
-        ),
-    }
+    let key = match sizing_calibration(project_root, class)? {
+        SizingAdjustment::Heavier => "signal.sizing_heavier",
+        SizingAdjustment::Lighter => "signal.sizing_lighter",
+    };
+    Some(umadev_i18n::tl(key).to_string())
 }
 
 /// A compact human summary of every tracked class with a trusted calibration (≥
@@ -455,7 +448,10 @@ mod tests {
             calibrated_default(tmp.path(), "build", SizeRank::Light),
             SizeRank::Heavy
         );
-        assert!(advisory_nudge(tmp.path(), "build").is_some());
+        assert_eq!(
+            advisory_nudge(tmp.path(), "build"),
+            Some(umadev_i18n::tl("signal.sizing_heavier").to_string())
+        );
     }
 
     #[test]
@@ -477,6 +473,10 @@ mod tests {
         assert_eq!(
             calibrated_default(tmp.path(), "build", SizeRank::Heavy),
             SizeRank::Light
+        );
+        assert_eq!(
+            advisory_nudge(tmp.path(), "build"),
+            Some(umadev_i18n::tl("signal.sizing_lighter").to_string())
         );
     }
 

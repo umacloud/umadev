@@ -5683,6 +5683,36 @@ async fn blocked_step_strands_its_dependent_which_is_honestly_marked_and_noted()
     );
 }
 
+#[test]
+fn director_transcript_notes_come_from_the_catalog_in_every_language() {
+    // These notes were hard-coded Simplified Chinese, so English and Traditional
+    // Chinese users read untranslated zh-CN in an otherwise localized transcript.
+    use umadev_i18n::{t, tf, Lang};
+    let has_cjk = |s: &str| s.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    let stranded = tf(Lang::En, "plan.stranded_skipped", &["2"]);
+    assert!(
+        stranded.contains('2') && !has_cjk(&stranded),
+        "English stranded-steps note: {stranded}"
+    );
+    for key in [
+        "plan.stranded_skipped",
+        "team.post_build_qc_started",
+        "signal.first_pass_low",
+        "signal.sizing_heavier",
+        "signal.sizing_lighter",
+    ] {
+        for lang in Lang::ALL {
+            assert_ne!(t(lang, key), key, "{key} is missing in {}", lang.code());
+        }
+        assert!(
+            !has_cjk(t(Lang::En, key)),
+            "{key} in en: {}",
+            t(Lang::En, key)
+        );
+        assert!(has_cjk(t(Lang::ZhTw, key)), "{key} in zh-TW");
+    }
+}
+
 #[tokio::test]
 async fn circuit_breaker_stops_a_flailing_plan_early_with_a_diagnosis() {
     // UD-FLOW-008 circuit breaker: a plan of INDEPENDENT build steps that each
