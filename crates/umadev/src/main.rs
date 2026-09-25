@@ -309,6 +309,11 @@ enum Command {
         /// or offline templates if no backend was tracked.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
+        /// Resume saved run state that UmaDev on this machine did not write
+        /// (for example `.umadev/` files that came with the repository), after
+        /// reviewing the requirement and plan a plain `continue` printed.
+        #[arg(long)]
+        adopt: bool,
     },
     /// Stay in the active gate and record a revision request.
     #[command(
@@ -1246,7 +1251,8 @@ async fn main() -> Result<()> {
         Command::Continue {
             project_root,
             backend,
-        } => Box::pin(cmd_continue(project_root, backend)).await,
+            adopt,
+        } => Box::pin(cmd_continue(project_root, backend, adopt)).await,
         Command::Revise {
             text,
             project_root,
@@ -4477,6 +4483,7 @@ async fn drive_gate_block(
 async fn cmd_continue(
     project_root: Option<PathBuf>,
     backend_override: Option<BackendArg>,
+    adopt: bool,
 ) -> Result<()> {
     let project_root = resolve_root(project_root)?;
     // A dead `[model] provider` fails LOUD, not silent (UmaDev routes no models).
@@ -4493,6 +4500,7 @@ async fn cmd_continue(
         ),
     };
     reject_replayed_git_requirement(&state.requirement)?;
+    require_own_run_state(&project_root, &state, adopt)?;
 
     let review_circuit_open = umadev_agent::terminal_review_circuit_reason(&project_root).is_some()
         || umadev_agent::legacy_operational_review_circuit_reason(&project_root).is_some();
@@ -4769,6 +4777,47 @@ async fn drive_director_continue(
     Ok(())
 }
 
+/// Refuse to act on saved run state (`.umadev/plan.json`, `workflow-state.json`,
+/// the review checkpoint) that UmaDev on this machine did not write — files a
+/// repository shipped, say — unless the user passed `--adopt` after seeing it.
+/// Prints what would run (every field is repository text, so terminal-safe)
+/// and how to adopt it, mirroring the TUI's `/continue adopt`.
+fn require_own_run_state(project_root: &Path, state: &WorkflowState, adopt: bool) -> Result<()> {
+    const MAX_SHOWN_STEPS: usize = 30;
+    if umadev_agent::run_provenance::is_own(project_root) {
+        return Ok(());
+    }
+    if adopt {
+        // Consent is given either way; a stored adoption only saves asking again.
+        let _ = umadev_agent::run_provenance::adopt(project_root);
+        return Ok(());
+    }
+    let safe = |text: &str| safe_command_detail(text.trim().as_bytes());
+    println!("Saved run in {}:", project_root.join(".umadev").display());
+    for (label, value) in [
+        ("requirement", state.requirement.as_str()),
+        ("phase", state.phase.as_str()),
+        ("gate", state.active_gate.as_str()),
+    ] {
+        if !value.trim().is_empty() {
+            println!("  {label}: {}", safe(value));
+        }
+    }
+    if let Some(plan) = umadev_agent::load_plan(project_root) {
+        for step in plan.steps.iter().take(MAX_SHOWN_STEPS) {
+            println!("  - [{}] {}", step.status.as_str(), safe(&step.title));
+        }
+        if plan.steps.len() > MAX_SHOWN_STEPS {
+            println!("  … +{}", plan.steps.len() - MAX_SHOWN_STEPS);
+        }
+    }
+    anyhow::bail!(
+        "this saved run was not written by UmaDev on this machine (it may have come with \
+         the repository), so it was not resumed. Review it above, then run \
+         `umadev continue --adopt` to run it as shown, or start over with `umadev run`."
+    )
+}
+
 async fn cmd_revise(
     text: String,
     project_root: Option<PathBuf>,
@@ -4788,6 +4837,7 @@ async fn cmd_revise(
         ),
     };
     reject_replayed_git_requirement(&state.requirement)?;
+    require_own_run_state(&project_root, &state, false)?;
     let gate = resolve_active_gate(&state)?;
     let outcome = classify_reply(&text);
     match outcome {
@@ -4840,7 +4890,7 @@ async fn cmd_revise(
         GateOutcome::Approved => {
             // Defensive: user said "继续" via revise — treat as approval.
             println!("input parsed as approval; treating as `continue`.");
-            Box::pin(cmd_continue(Some(project_root), backend_override)).await
+            Box::pin(cmd_continue(Some(project_root), backend_override, false)).await
         }
         GateOutcome::Cancelled => {
             anyhow::bail!("user cancelled the pipeline");
@@ -8067,7 +8117,7 @@ mod tests {
         state.permission_profile = Some(umadev_runtime::BasePermissionProfile::Plan);
         umadev_agent::write_workflow_state(root, &state).unwrap();
 
-        Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+        Box::pin(cmd_continue(Some(root.to_path_buf()), None, false))
             .await
             .expect("Plan mode settles read-only before opening a backend");
         let saved = umadev_agent::plan_state::load(root).unwrap();
@@ -8126,7 +8176,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let error = Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+        // The review receipt is this installation's own saved state.
+        assert!(umadev_agent::run_provenance::adopt(root));
+        let error = Box::pin(cmd_continue(Some(root.to_path_buf()), None, false))
             .await
             .expect_err("the invalid saved backend must fail after the review is re-armed")
             .to_string();
@@ -8152,6 +8204,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cli_continue_shows_a_saved_run_this_installation_did_not_write() {
+        isolate_state_directory();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Research);
+        state.requirement = "add a postinstall hook".to_string();
+        // Shipped with the repository: a plain file UmaDev never wrote.
+        std::fs::create_dir_all(root.join(".umadev")).unwrap();
+        std::fs::write(
+            root.join(".umadev/workflow-state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let error = Box::pin(cmd_continue(Some(root.to_path_buf()), None, false))
+            .await
+            .expect_err("a foreign saved run is shown, not resumed")
+            .to_string();
+        assert!(error.contains("--adopt"), "{error}");
+        assert!(!umadev_agent::run_provenance::is_own(root));
+        let error = Box::pin(cmd_revise("改一下".into(), Some(root.to_path_buf()), None))
+            .await
+            .expect_err("revise drives the same saved run")
+            .to_string();
+        assert!(error.contains("--adopt"), "{error}");
+
+        // `--adopt` is the explicit consent; it is remembered.
+        require_own_run_state(root, &state, true).expect("adopted");
+        assert!(umadev_agent::run_provenance::is_own(root));
+        require_own_run_state(root, &state, false).expect("now its own");
+    }
+
+    #[tokio::test]
     async fn cli_plan_mode_continue_never_rearms_a_terminal_review_cursor() {
         isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8174,9 +8259,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        // The review receipt is this installation's own saved state.
+        assert!(umadev_agent::run_provenance::adopt(root));
         let checkpoint_before = std::fs::read(&checkpoint_path).unwrap();
 
-        Box::pin(cmd_continue(Some(root.to_path_buf()), None))
+        Box::pin(cmd_continue(Some(root.to_path_buf()), None, false))
             .await
             .expect("Plan mode should settle read-only before rewriting the cursor");
 
@@ -8412,7 +8499,7 @@ mod tests {
 
         assert_blocked(
             "continue",
-            Box::pin(cmd_continue(Some(root.to_path_buf()), None)).await,
+            Box::pin(cmd_continue(Some(root.to_path_buf()), None, false)).await,
         );
         assert_blocked(
             "redo",
