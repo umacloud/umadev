@@ -116,21 +116,36 @@ pub fn hardened_git_command(
     root: &Path,
     access: GitAccess,
 ) -> std::io::Result<std::process::Command> {
+    let overrides = repository_filter_overrides(root)?;
+    Ok(command_with_overrides(root, access, &overrides))
+}
+
+/// Whether the repository itself, rather than the user's global or system
+/// configuration, defines a clean, smudge or process filter driver.
+///
+/// A hardened command that rewrites work-tree files (a branch switch) runs
+/// with those drivers blanked, which for git-crypt or a repository-local LFS
+/// setup would leave ciphertext or pointer files in the work tree. An automatic
+/// caller skips such a command when this is `true` instead.
+pub fn repository_defines_filters(root: &Path) -> std::io::Result<bool> {
+    Ok(!repository_filter_overrides(root)?.is_empty())
+}
+
+fn repository_filter_overrides(root: &Path) -> std::io::Result<Vec<String>> {
     let scoped = crate::run_bounded_std_command(
         config_listing_command(root, ConfigListing::Scoped),
         CONFIG_LISTING_OPTIONS,
     )?;
-    let overrides = match listing_overrides(&scoped, ConfigListing::Scoped) {
-        Some(overrides) => overrides?,
+    match listing_overrides(&scoped, ConfigListing::Scoped) {
+        Some(overrides) => overrides,
         None => {
             let unscoped = crate::run_bounded_std_command(
                 config_listing_command(root, ConfigListing::Unscoped),
                 CONFIG_LISTING_OPTIONS,
             )?;
-            listing_overrides(&unscoped, ConfigListing::Unscoped).ok_or_else(listing_failed)??
+            listing_overrides(&unscoped, ConfigListing::Unscoped).ok_or_else(listing_failed)?
         }
-    };
-    Ok(command_with_overrides(root, access, &overrides))
+    }
 }
 
 /// Async form of [`hardened_git_command`] for callers on a runtime thread.

@@ -392,7 +392,8 @@ pub enum BranchIsolation {
     },
     /// Isolation was deliberately skipped — fail-open. The run proceeds in the
     /// working tree exactly as before. Carries a short machine-ish reason
-    /// (`not-a-repo` / `git-unavailable` / `dirty-tree` / `detached` / `error`)
+    /// (`not-a-repo` / `git-unavailable` / `dirty-tree` / `detached` /
+    /// `repository-filters` / `error`)
     /// for the audit note; never an error the host has to handle.
     Skipped(&'static str),
 }
@@ -472,6 +473,12 @@ pub fn ensure_isolation_branch(project_root: &Path, slug: &str) -> BranchIsolati
     // gets a FRESH, uniquely-suffixed sibling derived from the real current HEAD.
     if git_branch_exists(project_root, &target) {
         if branch_descends_from_head(project_root, &target) {
+            // This switch rewrites work-tree files, and repository-defined filter
+            // drivers stay blanked for it: git-crypt or a repository-local LFS
+            // setup would check out ciphertext or pointer files. Stay in place.
+            if umadev_process::git::repository_defines_filters(project_root).unwrap_or(true) {
+                return BranchIsolation::Skipped("repository-filters");
+            }
             if run_git_mutating(project_root, &["switch", &target]).is_some()
                 || run_git_mutating(project_root, &["checkout", &target]).is_some()
             {
@@ -1091,12 +1098,12 @@ mod tests {
         // Stat-dirty but unchanged: status must re-read it through the driver.
         fs::write(root.join("seed.txt"), "v1").unwrap();
         assert!(!git_has_changes(root));
+        // Switching would rewrite `seed.txt` without its driver, so isolation
+        // stays in place rather than check out unfiltered content.
         let again = ensure_isolation_branch(root, "x");
-        assert!(matches!(
-            again,
-            BranchIsolation::Isolated { created: false, .. }
-        ));
-        assert_eq!(fs::read_to_string(root.join("seed.txt")).unwrap(), "v2");
+        assert_eq!(again, BranchIsolation::Skipped("repository-filters"));
+        assert_eq!(git_current_branch(root), "main");
+        assert_eq!(fs::read_to_string(root.join("seed.txt")).unwrap(), "v1");
         assert!(!markers.path().join("clean").exists(), "clean filter ran");
         assert!(!markers.path().join("smudge").exists(), "smudge filter ran");
     }
