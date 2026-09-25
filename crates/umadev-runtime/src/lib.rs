@@ -1089,7 +1089,7 @@ pub fn offline_chat_reply(req: &CompletionRequest) -> String {
         "[offline] No base CLI is connected, so I can't think this through yet. \
          Pick a base with /claude, /codex, /opencode, /grok or /kimi (or run `umadev` again to \
          re-open the picker), and I'll pick up the conversation with full context. \
-         離線:尚未连接底座 CLI / 離線:尚未連接底座 CLI。"
+         离线：尚未连接底座 CLI / 離線：尚未連接底座 CLI。"
             .to_string()
     } else {
         // Echo the ask + the concrete next step. Bilingual tail mirrors the rest
@@ -1099,7 +1099,7 @@ pub fn offline_chat_reply(req: &CompletionRequest) -> String {
             "[offline] I heard: \u{201c}{echo}\u{201d} — but no base CLI is connected, \
              so I can't actually work on it yet. Connect a base with /claude, /codex, \
              /opencode, /grok or /kimi and ask again; I'll keep this conversation's context. \
-             離線:已收到你的需求,但尚未连接底座 / 已收到你的需求,但尚未連接底座。"
+             离线：已收到你的需求，但尚未连接底座 / 離線：已收到你的需求，但尚未連接底座。"
         )
     }
 }
@@ -3781,6 +3781,40 @@ mod tests {
                 r.contains(alias),
                 "empty offline guidance must advertise every first-class base alias ({alias}): {r}"
             );
+        }
+    }
+
+    #[test]
+    fn offline_chat_reply_simplified_half_is_simplified() {
+        // Both offline replies end with a "Simplified / Traditional" pair. The
+        // Simplified half must not borrow Traditional characters, and both
+        // halves carry the same "offline:" prefix.
+        for r in [
+            offline_chat_reply(&req(vec![("user", "   ")])),
+            offline_chat_reply(&req(vec![("user", "做一个待办应用")])),
+        ] {
+            let start = r
+                .find("离线")
+                .unwrap_or_else(|| panic!("the Simplified half must say 离线: {r}"));
+            let (simplified, traditional) = r[start..]
+                .split_once(" / ")
+                .unwrap_or_else(|| panic!("the Chinese tail must be a pair: {r}"));
+            for traditional_only in ["離線", "連接"] {
+                assert!(
+                    !simplified.contains(traditional_only),
+                    "Simplified half uses Traditional {traditional_only}: {simplified}"
+                );
+            }
+            assert!(
+                traditional.starts_with("離線："),
+                "Traditional half must mirror the prefix: {traditional}"
+            );
+            for simplified_only in ["离线", "连接"] {
+                assert!(
+                    !traditional.contains(simplified_only),
+                    "Traditional half uses Simplified {simplified_only}: {traditional}"
+                );
+            }
         }
     }
 
