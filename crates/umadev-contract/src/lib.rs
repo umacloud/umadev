@@ -64,7 +64,7 @@ pub use derive::{
 };
 pub use extract::{extract_frontend_calls, FrontendCall};
 pub use parse::{parse_architecture, ApiSpec, Endpoint, HttpVerb, SecurityKind};
-pub use render::{render_json, render_yaml, write_contract};
+pub use render::{render_json, render_yaml};
 pub use validate::{
     extract_prd_routes, validate_backend_vs_contract, validate_frontend_vs_contract,
     validate_prd_vs_contract, ContractViolation,

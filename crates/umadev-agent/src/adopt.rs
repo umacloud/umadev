@@ -42,7 +42,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::verify::{detect_dev_server, detect_project, verify_steps, ProjectKind};
-use umadev_contract::{render_json, write_contract, ApiSpec, Endpoint, HttpVerb, SecurityKind};
+use umadev_contract::{
+    render_json, render_yaml, ApiSpec, Endpoint, HttpVerb, SecurityKind, CONTRACT_DIR,
+};
 use umadev_knowledge::{chunk_text, Bm25Index};
 
 /// Directory (relative to the project root) holding the adopted project's own
@@ -653,11 +655,84 @@ fn now_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
+/// Write `openapi.json` + `openapi.yaml` to `<project_root>/.umadev/contracts/`.
+/// Returns the paths written. Best-effort: a write failure returns the paths
+/// that succeeded (never errors — the quality gate reports "contract missing").
+///
+/// The project is untrusted input: a cloned repository can ship `.umadev`,
+/// `contracts`, or either output file as a symlink. Every component below the
+/// project root is therefore opened without following links, so the write can
+/// never land outside `.umadev/contracts/`.
+fn write_contract(project_root: &Path, spec: &ApiSpec) -> Vec<PathBuf> {
+    let Ok(root) = umadev_state::fs::RootedDir::open(project_root) else {
+        return Vec::new();
+    };
+    let mut written = Vec::new();
+    for (name, body) in [
+        ("openapi.json", render_json(spec)),
+        ("openapi.yaml", render_yaml(spec)),
+    ] {
+        let relative = Path::new(CONTRACT_DIR).join(name);
+        if root.atomic_write(&relative, body.as_bytes(), true).is_ok() {
+            written.push(project_root.join(relative));
+        }
+    }
+    written
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn one_endpoint_spec() -> ApiSpec {
+        ApiSpec {
+            endpoints: vec![Endpoint {
+                method: HttpVerb::Get,
+                path: "/api/users".to_string(),
+                operation_id: "listUsers".to_string(),
+                description: "List users".to_string(),
+                request_shape: String::new(),
+                response_shape: String::new(),
+                security: SecurityKind::None,
+            }],
+            title: "demo".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_contract_creates_both_files() {
+        let tmp = TempDir::new().unwrap();
+        let written = write_contract(tmp.path(), &one_endpoint_spec());
+        assert_eq!(written.len(), 2);
+        let body = fs::read_to_string(tmp.path().join(".umadev/contracts/openapi.json")).unwrap();
+        let _: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(tmp.path().join(".umadev/contracts/openapi.yaml").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_contract_never_follows_repository_symlinks() {
+        let spec = one_endpoint_spec();
+
+        // A symlinked `.umadev` directory pointing outside the project.
+        let project = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join(".umadev")).unwrap();
+        assert!(write_contract(project.path(), &spec).is_empty());
+        assert!(!outside.path().join("contracts").exists());
+
+        // A symlinked output file pointing at a victim file.
+        let project = TempDir::new().unwrap();
+        let victim = outside.path().join("authorized_keys");
+        fs::write(&victim, "original").unwrap();
+        let contracts = project.path().join(".umadev/contracts");
+        fs::create_dir_all(&contracts).unwrap();
+        std::os::unix::fs::symlink(&victim, contracts.join("openapi.yaml")).unwrap();
+        let _ = write_contract(project.path(), &spec);
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "original");
+    }
 
     struct EnvRestore {
         key: &'static str,

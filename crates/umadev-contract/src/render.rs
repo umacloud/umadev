@@ -9,8 +9,6 @@
 //! flat — paths → methods → operationId/responses/security. Keeping this
 //! crate dependency-light matches `umadev-spec` / `umadev-governance`.
 
-use std::path::{Path, PathBuf};
-
 use crate::parse::{ApiSpec, HttpVerb, SecurityKind};
 
 /// Render the spec as an OpenAPI 3.1 JSON document.
@@ -279,25 +277,6 @@ fn render_yaml_value_inline(out: &mut String, value: &serde_json::Value, indent:
     }
 }
 
-/// Write `openapi.json` + `openapi.yaml` to `<project_root>/.umadev/contracts/`.
-/// Returns the paths written. Best-effort: a write failure returns the paths
-/// that succeeded (never errors — the quality gate reports "contract missing").
-#[must_use]
-pub fn write_contract(project_root: &Path, spec: &ApiSpec) -> Vec<PathBuf> {
-    let dir = project_root.join(crate::CONTRACT_DIR);
-    let _ = std::fs::create_dir_all(&dir);
-    let mut written = Vec::new();
-    let json_path = dir.join("openapi.json");
-    let yaml_path = dir.join("openapi.yaml");
-    if std::fs::write(&json_path, render_json(spec)).is_ok() {
-        written.push(json_path);
-    }
-    if std::fs::write(&yaml_path, render_yaml(spec)).is_ok() {
-        written.push(yaml_path);
-    }
-    written
-}
-
 /// Quote a string as a YAML scalar (bare if simple, double-quoted if it
 /// contains special chars or would otherwise break single-line YAML).
 ///
@@ -490,29 +469,6 @@ mod tests {
         assert!(v["paths"].as_object().unwrap().is_empty());
         let yaml = render_yaml(&spec);
         assert!(yaml.contains("paths:\n  {}"));
-    }
-
-    #[test]
-    fn write_contract_creates_files() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let spec = parse_architecture(SAMPLE_ARCH, "demo");
-        let written = write_contract(tmp.path(), &spec);
-        assert_eq!(written.len(), 2);
-        let json_path = tmp.path().join(".umadev/contracts/openapi.json");
-        let yaml_path = tmp.path().join(".umadev/contracts/openapi.yaml");
-        assert!(json_path.is_file());
-        assert!(yaml_path.is_file());
-        // JSON is valid.
-        let body = std::fs::read_to_string(&json_path).unwrap();
-        let _: serde_json::Value = serde_json::from_str(&body).unwrap();
-    }
-
-    #[test]
-    fn yaml_scalar_quotes_special() {
-        assert_eq!(yaml_scalar("simple"), "simple");
-        assert_eq!(yaml_scalar(""), "\"\"");
-        assert_eq!(yaml_scalar("has: colon"), "\"has: colon\"");
-        assert_eq!(yaml_scalar("-123"), "\"-123\"");
     }
 
     #[test]
