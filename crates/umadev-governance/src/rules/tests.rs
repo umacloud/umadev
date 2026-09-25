@@ -1092,10 +1092,27 @@ fn bash_blocks_git_push_force_to_main() {
 }
 
 #[test]
-fn bash_allows_force_with_lease() {
-    // --force-with-lease is the safe variant — must pass.
-    let d = check_dangerous_bash("git push --force-with-lease origin main");
-    assert!(!d.block);
+fn bash_blocks_force_with_lease() {
+    // `--force-with-lease` still rewrites the remote's history (it only refuses
+    // when the remote moved since the last fetch), so it is a force push: the
+    // floor blocks it like `--force`, in every spelling and behind a prefix.
+    for cmd in [
+        "git push --force-with-lease origin main",
+        "git push -u origin HEAD --force-with-lease",
+        "git push --force-with-lease=main:abc123 origin main",
+        "git -C sub push --force-with-lease",
+    ] {
+        let d = check_dangerous_bash(cmd);
+        assert!(d.block, "force-with-lease must block: {cmd}");
+        assert_eq!(d.clause, "UD-SEC-002");
+        assert!(
+            !d.reason.contains("Use `git push --force-with-lease`"),
+            "the deny text must not recommend what it blocks: {}",
+            d.reason
+        );
+    }
+    // Inspection stays allowed.
+    assert!(!check_dangerous_bash("git push --force-with-lease --dry-run origin main").block);
 }
 
 #[test]

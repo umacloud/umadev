@@ -1865,18 +1865,12 @@ fn git_subcommand(tokens: &[String]) -> Option<(String, Vec<String>)> {
 
 /// Is this segment a `git push` — even behind a global-option prefix the fixed
 /// `git push` substring can't see? Mirrors the substring table's allow-list:
-/// `--dry-run` (inspection) and `--force-with-lease` still pass.
+/// only `--dry-run` (inspection) passes. `--force-with-lease` is a force push.
 fn git_push_behind_globals(tokens: &[String]) -> bool {
     let Some((sub, args)) = git_subcommand(tokens) else {
         return false;
     };
-    if sub != "push" {
-        return false;
-    }
-    let allowed = args.iter().any(|a| {
-        a == "--dry-run" || a == "--force-with-lease" || a.starts_with("--force-with-lease=")
-    });
-    !allowed
+    sub == "push" && !args.iter().any(|a| a == "--dry-run")
 }
 
 /// Is this segment a forced `git clean` (irreversible untracked-file wipe) in
@@ -8492,17 +8486,17 @@ const DESTRUCTIVE_BASH_PATTERNS: &[BashPattern] = &[
     // git push --force to main/master  —  history rewrite on protected branches.
     BashPattern {
         trigger: "push --force",
-        why: "`git push --force` rewrites remote history and can clobber teammates' work.",
-        fix: "Use `git push --force-with-lease` (it aborts if the remote moved) and never force-push to main/master.",
+        why: "`git push --force` (and `--force-with-lease`) rewrites remote history and can clobber teammates' work.",
+        fix: "Let the user run the force push; `git push --dry-run` is allowed for inspection.",
         git_only: true,
-        allow_if: &["--force-with-lease"],
+        allow_if: &["--dry-run"],
     },
     BashPattern {
         trigger: "push -f",
         why: "`git push -f` is a force-push that rewrites remote history.",
-        fix: "Use `git push --force-with-lease` instead.",
+        fix: "Let the user run the force push; `git push --dry-run` is allowed for inspection.",
         git_only: true,
-        allow_if: &["--force-with-lease"],
+        allow_if: &["--dry-run"],
     },
     // git reset --hard (no ref)  —  discards uncommitted work silently.
     BashPattern {
@@ -8532,9 +8526,8 @@ const DESTRUCTIVE_BASH_PATTERNS: &[BashPattern] = &[
         why: "`git push` sends commits to a remote and (per UmaDev's trust contract) UmaDev never auto-pushes — the customer reviews and pushes themselves.",
         fix: "Let the user run the push, or confirm the branch + remote explicitly. `git push --dry-run` is allowed for inspection.",
         git_only: true,
-        // `--dry-run` is inspection-only; `--force-with-lease` stays consistent
-        // with the dedicated `push --force` pattern above (which already allows it).
-        allow_if: &["--dry-run", "--force-with-lease"],
+        // `--dry-run` is inspection-only.
+        allow_if: &["--dry-run"],
     },
     BashPattern {
         trigger: "git merge ",

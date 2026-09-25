@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 mod approval_memory;
+mod publish;
 
 const MAX_TRUST_LEDGER_BYTES: usize = 1024 * 1024;
 
@@ -439,9 +440,20 @@ const PUBLISH_OUTWARD_TOKENS: &[&str] = &[
 ];
 
 /// Whether an already-lowercased NETWORK command publishes outward
-/// ([`PUBLISH_OUTWARD_TOKENS`]) — confirmed in EVERY mode, including Auto.
+/// ([`PUBLISH_OUTWARD_TOKENS`], or a registry publish / production deploy such as
+/// `pnpm publish`, `twine upload`, `docker push`, `gh release create`,
+/// `vercel --prod`, `firebase deploy`) — confirmed in EVERY mode, including Auto.
 fn network_publishes_outward(cmd: &str) -> bool {
-    PUBLISH_OUTWARD_TOKENS.iter().any(|t| cmd.contains(t))
+    PUBLISH_OUTWARD_TOKENS.iter().any(|t| cmd.contains(t)) || publish::publishes_or_deploys(cmd)
+}
+
+/// Whether an already-lowercased command (or its target) reaches the network:
+/// a [`NETWORK_TOKENS`] verb, a URL target, or a registry publish / production
+/// deploy the token list cannot spell out (`pnpm -r publish`, `npx vercel --prod`).
+fn reaches_network(cmd: &str, target_path: &str) -> bool {
+    NETWORK_TOKENS.iter().any(|t| cmd.contains(t))
+        || target_is_url(target_path)
+        || publish::publishes_or_deploys(cmd)
 }
 
 /// The EFFECTIVE lowercased command for floor predicates: a shell-exec tool call
@@ -633,7 +645,7 @@ pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
     if is_force_push(&cmd) {
         return Reversibility::VersionControl;
     }
-    if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) || target_is_url(target_path) {
+    if reaches_network(&cmd, target_path) {
         return Reversibility::Network;
     }
     // Touching `.git/` internals (config, refs, objects, hooks) can rewrite or
@@ -1495,7 +1507,7 @@ pub fn capability_class(command: &str, target_path: &str) -> Capability {
         if WRITE_ACTIONS.contains(&cmd.as_str()) {
             return Capability::Write;
         }
-        if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) || target_is_url(target_path) {
+        if reaches_network(&cmd, target_path) {
             return Capability::Network;
         }
         // A pure read verb stays Read; everything else that runs is Shell.
@@ -2730,6 +2742,67 @@ mod tests {
             );
             assert!(requires_confirmation(TrustMode::Guarded, cmd, path));
             assert!(requires_confirmation(TrustMode::Plan, cmd, path));
+        }
+    }
+
+    #[test]
+    fn registry_publish_and_production_deploy_confirm_in_every_tier() {
+        // Shipping to a public registry or to production is irrevocable, so it
+        // reaches the approval flow on every tier — as the bare command a base
+        // runs, as a shell-exec tool call, and behind the usual launchers.
+        for cmd in [
+            "npm publish",
+            "npm publish --access public",
+            "pnpm publish --no-git-checks",
+            "pnpm -r publish",
+            "yarn publish",
+            "yarn npm publish",
+            "cargo publish",
+            "twine upload dist/*",
+            "python -m twine upload dist/*",
+            "gem push pkg/app-1.0.0.gem",
+            "docker push registry.example.com/app:latest",
+            "sudo docker push app:latest",
+            "gh release create v1.0.0 --generate-notes",
+            "vercel --prod",
+            "npx vercel deploy --prod",
+            "netlify deploy --prod",
+            "npx netlify-cli deploy --prod --dir dist",
+            "firebase deploy --only hosting",
+            "fly deploy",
+            "flyctl deploy --remote-only",
+            "npm run build && npx firebase deploy",
+        ] {
+            // Network (or Destructive behind `sudo`): never remembered or relaxed.
+            assert!(reversibility_class(cmd, "").always_escalates(), "{cmd}");
+            for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+                assert!(
+                    requires_confirmation(mode, cmd, ""),
+                    "{mode:?} must confirm {cmd}"
+                );
+                assert!(
+                    requires_confirmation(mode, "bash", cmd),
+                    "{mode:?} must confirm the tool-call form of {cmd}"
+                );
+            }
+        }
+        // Local packaging, previews and read-only release queries are not a
+        // publish and stay automatic under Auto.
+        for cmd in [
+            "npm pack",
+            "npm run build",
+            "cargo package --list",
+            "docker build -t app .",
+            "gh release view v1.0.0",
+            "vercel",
+            "netlify deploy --dir dist",
+            "fly status",
+            "firebase emulators:start",
+        ] {
+            assert!(
+                !requires_confirmation(TrustMode::Auto, cmd, ""),
+                "auto must not confirm {cmd}"
+            );
         }
     }
 
