@@ -151,6 +151,39 @@ fn snapshot_limit_note_tells_the_user_how_to_recover() {
     assert!(note.contains("/mode plan"));
 }
 
+#[test]
+fn snapshot_note_in_the_home_directory_says_to_start_from_the_project() {
+    let home = tempfile::tempdir().unwrap();
+    let limit = || WorkspaceSnapshotError::Limit("file count exceeded 100000".to_string());
+
+    let note = snapshot_blocked_in(home.path(), Some(home.path()), limit()).into_note();
+    assert!(note.contains("[blocked]"));
+    assert!(note.contains("home directory or a drive root"), "{note}");
+    assert!(note.contains("File > Open Folder"), "{note}");
+    assert!(
+        !note.contains(".gitignore"),
+        "the launch directory is the fix: {note}"
+    );
+
+    // A project folder below home keeps the ordinary size hint.
+    let project = home.path().join("openschedule");
+    std::fs::create_dir(&project).unwrap();
+    let note = snapshot_blocked_in(&project, Some(home.path()), limit()).into_note();
+    assert!(note.contains(".gitignore"), "{note}");
+    assert!(!note.contains("drive root"), "{note}");
+}
+
+#[test]
+fn snapshot_note_at_a_filesystem_root_says_to_start_from_the_project() {
+    let note = snapshot_blocked_in(
+        Path::new(std::path::MAIN_SEPARATOR_STR),
+        None,
+        WorkspaceSnapshotError::Limit("file count exceeded 100000".to_string()),
+    )
+    .into_note();
+    assert!(note.contains("home directory or a drive root"), "{note}");
+}
+
 #[tokio::test]
 async fn git_commit_only_accepts_one_commit_of_three_preexisting_dirty_files() {
     let root = dirty_git_repo();

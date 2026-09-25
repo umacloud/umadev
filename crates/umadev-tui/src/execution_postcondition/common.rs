@@ -90,7 +90,7 @@ pub(crate) fn display_paths(paths: &[String]) -> String {
 }
 
 pub(crate) fn snapshot_blocked(error: WorkspaceSnapshotError) -> ResidentExecutionBlocked {
-    // A size ceiling is the one snapshot failure the user can fix directly.
+    // A size ceiling is the one snapshot failure the user can fix in place.
     let hint = if matches!(error, WorkspaceSnapshotError::Limit(_)) {
         "\n提示:把构建产物、依赖、数据等大目录写进项目的 .gitignore(不是 Git 仓库也生效)\
          后重试;只需分析时可先切换到 /mode plan / hint: add large build-output, dependency, \
@@ -99,6 +99,43 @@ pub(crate) fn snapshot_blocked(error: WorkspaceSnapshotError) -> ResidentExecuti
     } else {
         ""
     };
+    snapshot_blocked_with_hint(&error, hint)
+}
+
+/// [`snapshot_blocked`] for the capture at `root`. When `root` is the user's
+/// home directory or a filesystem root, the launch directory itself is the
+/// problem, so the note says to start from the project folder instead.
+pub(crate) fn snapshot_blocked_at(
+    root: &Path,
+    error: WorkspaceSnapshotError,
+) -> ResidentExecutionBlocked {
+    snapshot_blocked_in(root, crate::config::home_dir().as_deref(), error)
+}
+
+pub(crate) fn snapshot_blocked_in(
+    root: &Path,
+    home: Option<&Path>,
+    error: WorkspaceSnapshotError,
+) -> ResidentExecutionBlocked {
+    if !is_broad_launch_directory(root, home) {
+        return snapshot_blocked(error);
+    }
+    let shown = safe_display_path(&root.display().to_string());
+    let hint = format!(
+        "\n提示:UmaDev 把启动目录当作项目,当前启动目录 `{shown}` 是用户主目录或磁盘根目录,\
+         其下所有文件都会被计入。请在项目文件夹中启动 umadev(VS Code:文件 → 打开文件夹;\
+         终端:先 cd 到项目目录) / hint: UmaDev treats its launch directory as the project, \
+         and `{shown}` is your home directory or a drive root, so everything below it is in \
+         scope. Start umadev from the project folder instead (VS Code: File > Open Folder; \
+         a terminal: cd into the project first)"
+    );
+    snapshot_blocked_with_hint(&error, &hint)
+}
+
+fn snapshot_blocked_with_hint(
+    error: &WorkspaceSnapshotError,
+    hint: &str,
+) -> ResidentExecutionBlocked {
     ResidentExecutionBlocked {
         note: format!(
             "[blocked] 无法完整核对本轮工作区内容指纹,因此不能标记成功 / unable to \
@@ -106,6 +143,19 @@ pub(crate) fn snapshot_blocked(error: WorkspaceSnapshotError) -> ResidentExecuti
              successful: {error}{hint}"
         ),
     }
+}
+
+/// Whether `root` is too broad to be one project: the user's home directory or
+/// a filesystem root. VS Code's terminal opens in the home directory when no
+/// folder is open, so starting UmaDev there is an easy mistake.
+fn is_broad_launch_directory(root: &Path, home: Option<&Path>) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    root.parent().is_none()
+        || home
+            .and_then(|home| std::fs::canonicalize(home).ok())
+            .is_some_and(|home| home == root)
 }
 
 /// Snapshot the working tree as `git status --porcelain` for legacy reality
