@@ -5,7 +5,7 @@
 //! `multilingual-e5-small`, 384-dim, zh+en) from a directory pointed to by
 //! `UMADEV_EMBED_MODEL_DIR` and embeds text **fully offline** — no API key, no
 //! network, no separate service. The model ships with the npm package (a
-//! platform-independent `@umadev/model-e5-small` dir), so `npm i -g umadev` is
+//! platform-independent `@umatech/model-e5-small` dir), so `npm i -g @umatech/umadev` is
 //! the only thing the user installs.
 //!
 //! **Fail-open by contract:** ANY problem (no model dir, missing files,

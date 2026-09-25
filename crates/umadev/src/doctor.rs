@@ -20,7 +20,7 @@
 //!    global tree or a root-owned `~/.npm` cache — which wedge every LATER
 //!    non-root npm operation on that prefix, including the user's *other* global
 //!    packages — and the "installed locally, so the command is not on PATH"
-//!    confusion (`npm i @umatech/umadev` without `-g` → run it via `npx umadev`).
+//!    confusion (`npm i @umatech/umadev` without `-g` → run it via `npx @umatech/umadev`).
 //! 10. Workspace run-lock compatibility fence (`check_run_lock_fence`) — diagnoses
 //!     a legacy/incomplete fence and, with `--fix`, performs an explicit offline
 //!     migration after the user has stopped every older UmaDev process.
@@ -1027,7 +1027,7 @@ fn first_root_owned(_dir: &Path, _cap: usize) -> Option<std::path::PathBuf> {
 /// 2. **Local install** (`npm i @umatech/umadev`, no `-g`). npm deliberately does not put
 ///    a locally-installed command on PATH — `umadev` then reports "command not
 ///    found" and the install looks broken when it is in fact fine: it is reached
-///    via `npx umadev`.
+///    via `npx @umatech/umadev`.
 ///
 /// Fail-open: anything we cannot determine (no home dir, stat error, non-npm
 /// build) reports `Passed` — the doctor never invents a problem.
@@ -1057,7 +1057,7 @@ fn check_npm_install() -> CheckResult {
         return row(
             Status::Warning,
             "installed locally (`npm i @umatech/umadev`, no `-g`): npm does NOT put a local command on PATH, \
-             so bare `umadev` says \"command not found\" — the install is fine. Run it as `npx umadev`, \
+             so bare `umadev` says \"command not found\" — the install is fine. Run it as `npx @umatech/umadev`, \
              or install it as a command with a user-owned prefix (no sudo): \
              `npm config set prefix ~/.npm-global && npm i -g @umatech/umadev` \
              (then add ~/.npm-global/bin to PATH)."
