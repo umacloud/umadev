@@ -575,84 +575,18 @@ fn preferred_frontend_dirs(workspace: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Resolve a bare program name to a spawnable path. Mirrors the host crate:
-/// on Windows npm-installed tools are `.cmd`/`.exe`/`.bat` shims that
-/// `Command::new("npm")` won't find (CreateProcess only appends `.exe`), so we
-/// search `PATH` over `PATHEXT`. Unchanged off Windows, for explicit paths, or
-/// when nothing matches.
+/// Resolve a bare program name to a spawnable path. On Windows npm-installed
+/// tools are `.cmd`/`.exe`/`.bat` shims that `Command::new("npm")` won't find
+/// (CreateProcess only appends `.exe`). Unchanged for explicit paths or when
+/// nothing matches. See [`umadev_process::path_lookup`].
 fn resolve_program(program: &str) -> String {
-    if !cfg!(windows) || program.contains(std::path::is_separator) {
-        return program.to_string();
-    }
-    let Ok(path_var) = std::env::var("PATH") else {
-        return program.to_string();
-    };
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    for dir in path_var.split(';') {
-        if dir.is_empty() {
-            continue;
-        }
-        for ext in std::iter::once("").chain(pathext.split(';')) {
-            let candidate = Path::new(dir).join(format!("{program}{ext}"));
-            if candidate.is_file() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-    program.to_string()
-}
-
-/// Like [`resolve_program`] but Windows-aware: `.cmd`/`.bat` build tools are
-/// routed through `cmd /c` (CreateProcess rejects them with os error 193).
-/// Returns `(program, leading args)`.
-fn spawn_parts(program: &str) -> (String, Vec<String>) {
-    let resolved = resolve_program(program);
-    let ext = std::path::Path::new(&resolved)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if cfg!(windows) && (ext == "cmd" || ext == "bat") {
-        ("cmd".to_string(), vec!["/c".to_string(), resolved])
-    } else {
-        (resolved, Vec::new())
-    }
+    umadev_process::path_lookup::resolve_on_path(program)
 }
 
 /// Check whether a PATH-resolvable binary exists. Used to decide whether a
 /// step is genuinely missing (→ skip) vs the project being broken (→ fail).
-///
-/// Splits `PATH` on the platform-native separator (`:` on Unix, `;` on
-/// Windows). On Windows also honours `PATHEXT` so `which("cargo")` finds
-/// `cargo.exe`. Previously this split on `:` unconditionally, which meant
-/// every step was reported "skipped" on Windows.
 fn which(bin: &str) -> bool {
-    let Ok(path_var) = std::env::var("PATH") else {
-        return false;
-    };
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    // On Windows a bare "cargo" resolves via PATHEXT (`.exe`, `.bat`, …).
-    let exts: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.BAT;.CMD;.COM".to_string())
-            .split(';')
-            .map(str::to_string)
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    for dir in path_var.split(separator) {
-        if dir.is_empty() {
-            continue;
-        }
-        for ext in &exts {
-            let candidate = Path::new(dir).join(format!("{bin}{ext}"));
-            if candidate.is_file() {
-                return true;
-            }
-        }
-    }
-    false
+    umadev_process::path_lookup::is_installed(bin)
 }
 
 /// Read a file and check whether it contains a substring (best-effort).
@@ -1047,9 +981,11 @@ async fn run_step_command(
     timeout_secs: u64,
 ) -> VerifyOutcome {
     let started = Instant::now();
-    let (vprog, vlead) = spawn_parts(&step.program);
-    let mut vcmd = Command::new(vprog);
-    vcmd.args(&vlead).args(&step.args).current_dir(workspace);
+    // A resolved `.cmd`/`.bat` shim is spawned directly, never via `cmd /c`, so
+    // Rust's hardened batch-argument encoding applies to model-supplied
+    // arguments such as a red-to-green test name.
+    let mut vcmd = Command::new(resolve_program(&step.program));
+    vcmd.args(&step.args).current_dir(workspace);
     let options = umadev_process::BoundedCommandOptions {
         timeout: Duration::from_secs(timeout_secs),
         stdout_bytes: CAPTURE_CAP,

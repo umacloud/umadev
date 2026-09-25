@@ -28,6 +28,9 @@ use std::time::Instant;
 use crate::fswalk::{classify_no_follow, EntryKind};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+#[cfg(all(test, unix))]
+use umadev_process::path_lookup::find_in_dir;
+use umadev_process::path_lookup::{find_on_path, is_spawnable_file};
 
 /// Workspace-relative path of the persisted scan result.
 const SCAN_REL_PATH: &str = ".umadev/audit/security-scan.json";
@@ -560,61 +563,15 @@ pub fn write_security_scan(
 }
 
 /// Resolve `tool` without spawning `which`/`where` (which would itself need an
-/// output cap and timeout). Windows honors `PATHEXT`, preferring executable or
-/// batch extensions over npm's same-directory extensionless Unix shim.
+/// output cap and timeout). Bare names go through the shared `PATH` lookup,
+/// which skips relative entries and, on Windows, prefers executable or batch
+/// extensions over npm's same-directory extensionless Unix shim.
 fn tool_path(tool: &str) -> Option<PathBuf> {
     let path = Path::new(tool);
     if path.components().count() > 1 || path.is_absolute() {
-        return is_executable_file(path).then(|| path.to_path_buf());
+        return is_spawnable_file(path).then(|| path.to_path_buf());
     }
-    let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-            .split(';')
-            .filter(|extension| !extension.is_empty())
-            .map(str::to_string)
-            .chain(std::iter::once(String::new()))
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    let directories = std::env::var_os("PATH")
-        .as_deref()
-        .map(std::env::split_paths)
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    tool_path_in(tool, &directories, &extensions)
-}
-
-fn tool_path_in(tool: &str, directories: &[PathBuf], extensions: &[String]) -> Option<PathBuf> {
-    for directory in directories {
-        for extension in extensions {
-            let candidate = directory.join(format!("{tool}{extension}"));
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    find_on_path(tool)
 }
 
 fn tool_on_path(tool: &str) -> bool {
@@ -1055,7 +1012,9 @@ mod tests {
         let executable = write_scanner_script(&second, "scanner", "exit 0");
 
         assert_eq!(
-            tool_path_in("scanner", &[first, second], &[String::new()]),
+            [first, second]
+                .iter()
+                .find_map(|dir| find_in_dir(dir, "scanner", &[String::new()])),
             Some(executable)
         );
         assert_eq!(tool_path(shadow.to_str().unwrap()), None);

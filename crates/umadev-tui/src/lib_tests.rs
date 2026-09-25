@@ -4801,42 +4801,51 @@ fn parse_run_command_absolute_dir() {
     assert_eq!(args, exp_args);
 }
 
-#[test]
-fn parse_run_command_fallback_shells() {
-    let root = std::path::PathBuf::from("/proj");
-    let (dir, prog, args) = parse_run_command("npm run dev", &root);
-    // No `cd &&` prefix → fallback to the platform shell in the workspace root:
-    // `cmd /c` on Windows (which has no `sh`), `sh -c` elsewhere.
-    assert_eq!(dir, root);
-    let (shell, shell_arg) = if cfg!(windows) {
-        ("cmd", "/c")
+/// The command a run without a `cd X &&` prefix is expected to spawn: `sh -c`
+/// on Unix, and on Windows the resolved program itself, never `cmd /c`, which
+/// would look the program up in the workspace first.
+fn expected_root_run(command: &str) -> (String, Vec<String>) {
+    if cfg!(windows) {
+        let mut words = command.split_whitespace();
+        let (program, mut args) = umadev_host::spawn_parts(words.next().unwrap());
+        args.extend(words.map(str::to_string));
+        (program, args)
     } else {
-        ("sh", "-c")
-    };
-    assert_eq!(prog, shell);
-    assert_eq!(args, vec![shell_arg.to_string(), "npm run dev".into()]);
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), command.to_string()],
+        )
+    }
 }
 
 #[test]
-fn parse_run_command_picks_cmd_on_windows_sh_on_unix() {
+fn parse_run_command_without_cd_runs_in_the_workspace_root() {
+    let root = std::path::PathBuf::from("/proj");
+    let (dir, prog, args) = parse_run_command("npm run dev", &root);
+    assert_eq!(dir, root);
+    assert_eq!((prog, args), expected_root_run("npm run dev"));
+}
+
+#[test]
+fn parse_run_command_never_hands_windows_runs_to_cmd() {
     // Regression (HIGH): the preview dev-server never booted on Windows because
     // the fallback hardcoded `sh -c` (no `sh` on Windows) and the `cd` path
-    // spawned a bare `npm` (CreateProcess can't find `npm.cmd`). The fallback
-    // must pick `cmd /c` on Windows / `sh -c` on Unix...
+    // spawned a bare `npm` (CreateProcess can't find `npm.cmd`). A later
+    // `cmd /c` fallback let a repository's `python3.bat` shadow the real
+    // program, so Windows now spawns the resolved program directly.
     let root = std::path::PathBuf::from("/proj");
-    let (_, prog, args) = parse_run_command("npm run dev", &root);
+    let (_, prog, args) = parse_run_command("python3 -m http.server 8000", &root);
+    assert_ne!(prog, "cmd");
     if cfg!(windows) {
-        assert_eq!(prog, "cmd");
-        assert_eq!(args.first().map(String::as_str), Some("/c"));
+        assert_eq!(prog, umadev_host::spawn_parts("python3").0);
+        assert_eq!(args, ["-m", "http.server", "8000"]);
     } else {
         assert_eq!(prog, "sh");
         assert_eq!(args.first().map(String::as_str), Some("-c"));
     }
-    // ...and the `cd <dir> && <prog>` path must route the program through
-    // `spawn_parts` so a Windows `.cmd` shim runs via `cmd /c` (its lead prefix)
-    // instead of failing the spawn. `vite` is unlikely to be installed, so on
-    // every platform spawn_parts fail-opens to the bare name — but the contract
-    // (parse routes through spawn_parts) is still pinned.
+    // ...and the `cd <dir> && <prog>` path routes the program through
+    // `spawn_parts` on every platform. `vite` is unlikely to be installed, so
+    // spawn_parts fail-opens to the bare name, but the contract is still pinned.
     let (_, prog2, args2) = parse_run_command("cd web && vite --host", &root);
     let (exp_prog, mut exp_args) = umadev_host::spawn_parts("vite");
     exp_args.extend(["--host".to_string()]);
@@ -5031,21 +5040,12 @@ fn non_web_build_completion_card_pushes_card_without_a_server() {
 
 #[test]
 fn parse_run_command_npx_vercel_deploy() {
-    // The canonical /deploy command. No `cd &&` → sh -c fallback,
-    // preserving the full command (flags included).
+    // The canonical /deploy command. No `cd &&` → the workspace-root run,
+    // preserving every flag.
     let root = std::path::PathBuf::from("/proj");
     let (dir, prog, args) = parse_run_command("npx vercel --prod", &root);
     assert_eq!(dir, root);
-    let (shell, shell_arg) = if cfg!(windows) {
-        ("cmd", "/c")
-    } else {
-        ("sh", "-c")
-    };
-    assert_eq!(prog, shell);
-    assert_eq!(
-        args,
-        vec![shell_arg.to_string(), "npx vercel --prod".into()]
-    );
+    assert_eq!((prog, args), expected_root_run("npx vercel --prod"));
 }
 
 #[test]

@@ -111,7 +111,7 @@ use crate::clipboard::finish_mouse_selection_copy;
 #[cfg(test)]
 use crate::execution_postcondition::changed_files_between;
 use crate::execution_postcondition::{
-    agentic_fact_line, changed_files_after_git_status, git_status_porcelain_bounded,
+    agentic_fact_line, changed_files_after_git_status, git_diff_stat, git_status_porcelain_bounded,
     ResidentExecutionPostcondition,
 };
 use crate::input::InputSource;
@@ -2449,35 +2449,6 @@ async fn run_agentic(
             reactive.as_ref(),
         )
         .await;
-    }
-}
-
-/// A compact `git diff --stat` of the working tree (unstaged changes), run in
-/// `root`, used only to give the agentic system prompt a sense of what is
-/// already modified. **Fail-open**: any failure returns `None` and the prompt
-/// simply omits the diff-stat section.
-async fn git_diff_stat(root: &std::path::Path) -> Option<String> {
-    let mut command = tokio::process::Command::new("git");
-    command.arg("-C").arg(root).args(["diff", "--stat"]);
-    let out = umadev_process::run_bounded_command(
-        command,
-        umadev_process::BoundedCommandOptions {
-            timeout: std::time::Duration::from_secs(5),
-            stdout_bytes: 256 * 1024,
-            stderr_bytes: 16 * 1024,
-            reader_grace: std::time::Duration::from_millis(500),
-        },
-    )
-    .await
-    .ok()?;
-    if out.timed_out || out.stdout_truncated || !out.status.is_some_and(|status| status.success()) {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
     }
 }
 

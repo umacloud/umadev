@@ -1132,22 +1132,7 @@ fn check_npm_install() -> CheckResult {
 
 /// Check if an executable is on PATH (without spawning a subprocess).
 fn which_on_path(cmd: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        // Check common executable extensions on the current platform.
-        let candidates = if cfg!(windows) {
-            vec![
-                dir.join(format!("{cmd}.exe")),
-                dir.join(format!("{cmd}.bat")),
-                dir.join(format!("{cmd}.cmd")),
-            ]
-        } else {
-            vec![dir.join(cmd)]
-        };
-        candidates.iter().any(|p| p.is_file())
-    })
+    umadev_process::path_lookup::find_on_path(cmd).is_some()
 }
 
 /// Return true iff every result in `results` is `Passed`.
