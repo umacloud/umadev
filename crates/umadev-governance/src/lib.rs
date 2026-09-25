@@ -91,10 +91,10 @@ pub use rules::{
     check_prototype_pollution, check_r_hardcoded_path, check_react_list_key, check_redos_regex,
     check_referrer_redirect, check_render_side_effects, check_response_splitting,
     check_scala_null_return, check_sensitive_logging, check_state_mutation, check_toctou_race,
-    check_unhandled_fetch_error, check_unsafe_date_parse, check_unsafe_json_parse,
-    check_unsafe_parse, check_unsafe_post_message, check_unsafe_window_open,
-    check_unsynchronized_mutation, check_untyped_props, check_use_effect_cleanup,
-    check_var_declarations, check_websocket_auth, check_wildcard_imports,
+    check_unhandled_fetch_error, check_unhashed_password_storage, check_unsafe_date_parse,
+    check_unsafe_json_parse, check_unsafe_parse, check_unsafe_post_message,
+    check_unsafe_window_open, check_unsynchronized_mutation, check_untyped_props,
+    check_use_effect_cleanup, check_var_declarations, check_websocket_auth, check_wildcard_imports,
 };
 
 /// Re-export the spec marker so downstream crates can pin against it.

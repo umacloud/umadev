@@ -29,6 +29,8 @@ mod bash_guard;
 pub use bash_guard::check_dangerous_bash;
 mod test_paths;
 use test_paths::looks_like_secret_test_path;
+mod password_rules;
+pub use password_rules::{check_plaintext_password, check_unhashed_password_storage};
 mod secret_values;
 
 /// Outcome of a governance rule.
@@ -464,6 +466,7 @@ const CONTENT_CHECKS: &[fn(&str, &str) -> Decision] = &[
     check_unreliable_sources,
     check_hardcoded_config,
     check_plaintext_password,
+    check_unhashed_password_storage,
     check_file_upload_validation,
     check_open_redirect,
     check_sensitive_logging,
@@ -663,6 +666,7 @@ fn sast_severity(clause: &str) -> SastSeverity {
         | "UD-SEC-014" // command injection (string-built shell)
         | "UD-SEC-015" // JWT defects (alg:none / hardcoded secret)
         | "UD-SEC-018" // plaintext password comparison
+        | "UD-SEC-033" // password stored without a visible hash
         | "UD-SEC-020" // path traversal
         | "UD-ARCH-023" // OS command injection (shell exec of input)
         | "UD-ARCH-025" // ruby eval/send metaprogramming injection
@@ -710,6 +714,7 @@ const SAST_CHECKS: &[fn(&str, &str) -> Decision] = &[
     check_insecure_cors,
     check_insecure_cookie,
     check_plaintext_password,
+    check_unhashed_password_storage,
     check_path_traversal,
     check_open_redirect,
     check_client_redirect_injection,
@@ -5172,86 +5177,6 @@ pub fn check_dart_dynamic(file_path: &str, content: &str) -> Decision {
     } else {
         Decision::pass()
     }
-}
-
-/// **UD-SEC-018**: ban plaintext password handling — insecure storage/comparison.
-///
-/// Passwords must be hashed with bcrypt/argon2/scrypt — never stored in plain
-/// text or compared with `==`. Flags: (1) password assignment to a string
-/// literal or DB column without hashing; (2) `==` comparison of a password
-/// variable; (3) `password` field in a DB insert without a hash function.
-/// Runs on backend source.
-///
-/// Persistence is correlated inside one logical statement or an adjacent
-/// `owner.password = value; owner.save()` pair. An unrelated `HashMap::insert`,
-/// plan save, or API example elsewhere in the file is not evidence of password
-/// storage. Multi-line call arguments stay in one statement. A direct hash call,
-/// a hash-named password value, or a value assigned from a supported hasher is
-/// treated as hashed. This is intentionally lexical and fail-open: uncertain
-/// cross-function data flow is left to a semantic analyzer.
-/// Distant keywords are never combined into a synthetic finding.
-#[must_use]
-pub fn check_plaintext_password(file_path: &str, content: &str) -> Decision {
-    let ext = extension_of(file_path);
-    if !matches!(
-        ext.as_str(),
-        "ts" | "js" | "py" | "rb" | "go" | "java" | "rs"
-    ) || looks_like_secret_test_path(file_path)
-    {
-        return Decision::pass();
-    }
-    let content = if ext == "rs" {
-        rust_shipping_prefix(content)
-    } else {
-        content
-    };
-    let mut issues: Vec<&str> = Vec::new();
-
-    // 1. Password compared with == / === (should use bcrypt.compare).
-    for line in content.lines() {
-        let ll = line.to_ascii_lowercase();
-        let trimmed = ll.trim_start();
-        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with('*') {
-            continue;
-        }
-        let no_str = strip_string_literals(line);
-        // `password ==` or `== password` or `password ===`
-        if (no_str.to_ascii_lowercase().contains("password ==")
-            || no_str.to_ascii_lowercase().contains("password ===")
-            || no_str.to_ascii_lowercase().contains("== password")
-            || no_str.to_ascii_lowercase().contains("=== password"))
-            && !no_str.to_ascii_lowercase().contains("bcrypt")
-            && !no_str.to_ascii_lowercase().contains("compare")
-        {
-            issues.push("password compared with == (use bcrypt.compare)");
-        }
-    }
-
-    // 2. Password storage and its hash proof must share local data-flow context.
-    if crate::security_context::contains_unhashed_password_storage(content) {
-        issues.push("stores/creates a password without a hashing function (bcrypt/argon2)");
-    }
-
-    if issues.is_empty() {
-        return Decision::pass();
-    }
-    let labels: Vec<&str> = issues
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    Decision::block(
-        "UD-SEC-018",
-        format!(
-            "UmaDev: insecure password handling (UD-SEC-018). \
-             `{file_path}` — {}. Passwords must be hashed with bcrypt/argon2 \
-             before storage, and verified with `bcrypt.compare(input, hash)`, \
-             never `==`. Plaintext storage or comparison is a credential-breach \
-             vector.",
-            labels.join("; "),
-        ),
-    )
 }
 
 /// **UD-ARCH-041**: require file-upload validation (type + size checks).

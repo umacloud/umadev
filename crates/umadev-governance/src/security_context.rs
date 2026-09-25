@@ -198,35 +198,31 @@ fn contains_named_call(statement: &str, name: &str) -> bool {
     })
 }
 
+/// Password hashing calls. Django's `make_password` / `set_password` hash too.
+const PASSWORD_HASHERS: &[&str] = &[
+    "bcrypt",
+    "argon2",
+    "scrypt",
+    "pbkdf2",
+    "hashpassword",
+    "hash_password",
+    "password.hash",
+    "hash(",
+    "make_password",
+    "set_password",
+];
+
 fn has_password_hasher(statement: &str) -> bool {
-    [
-        "bcrypt",
-        "argon2",
-        "scrypt",
-        "pbkdf2",
-        "hashpassword",
-        "hash_password",
-        "password.hash",
-        "hash(",
-    ]
-    .into_iter()
-    .any(|marker| statement.contains(marker))
+    PASSWORD_HASHERS
+        .iter()
+        .any(|marker| statement.contains(marker))
 }
 
 fn assigned_identifier_before_hasher(statement: &str) -> Option<&str> {
-    let hasher_index = [
-        "bcrypt",
-        "argon2",
-        "scrypt",
-        "pbkdf2",
-        "hashpassword",
-        "hash_password",
-        "password.hash",
-        "hash(",
-    ]
-    .into_iter()
-    .filter_map(|marker| statement.find(marker))
-    .min()?;
+    let hasher_index = PASSWORD_HASHERS
+        .iter()
+        .filter_map(|marker| statement.find(marker))
+        .min()?;
     let assignment = statement[..hasher_index].rfind('=')?;
     let bytes = statement.as_bytes();
     let mut end = assignment;
