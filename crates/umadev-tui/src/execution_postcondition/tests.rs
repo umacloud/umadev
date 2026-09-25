@@ -1115,6 +1115,43 @@ async fn batch_index_info_preserves_split_index_semantics() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn host_commit_honors_core_file_mode_false_like_native_git() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Filesystems without a usable executable bit (WSL `/mnt/c`, exFAT, SMB)
+    // report every file as 0777; Git keeps the recorded mode there.
+    let root = dirty_git_repo();
+    git(root.path(), &["config", "core.fileMode", "false"]);
+    std::fs::write(root.path().join("new.txt"), "new\n").unwrap();
+    for path in ["one.txt", "new.txt"] {
+        std::fs::set_permissions(
+            root.path().join(path),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+    }
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt", "new.txt"]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["new.txt", "one.txt"]);
+    for path in ["one.txt", "new.txt"] {
+        let entry =
+            git_required_text(root.path(), &["ls-tree", "HEAD", "--", path], "test-tree").unwrap();
+        assert!(entry.starts_with("100644 blob "), "{entry}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn host_commit_hashes_a_symlink_target_without_following_it() {
     use std::os::unix::fs::symlink;
 
