@@ -880,22 +880,26 @@ fn install_has_failed(outcomes: &[VerifyOutcome]) -> bool {
         .any(|o| o.step == "install" && !o.passed && !o.skipped)
 }
 
-/// Resolve the effective per-step timeout: the env override wins, then
-/// the step's own budget (if non-zero), then the global default.
 /// Resolve the effective per-step timeout. Semantics:
-/// - A step with its own budget (`step_timeout_secs != 0`, i.e. the slow
-///   install/test/build steps) always gets AT LEAST that budget — even when
-///   `UMADEV_VERIFY_TIMEOUT_SECS` is set low, so a user who lowers the
-///   global default doesn't artificially time out `cargo build --release`.
-/// - The env override otherwise raises the default-budget steps (fmt/clippy).
-/// - Final fallback: [`DEFAULT_TIMEOUT_SECS`].
+/// - `UMADEV_VERIFY_TIMEOUT_SECS`, when set, is the budget of EVERY step,
+///   exactly as documented — it can lower the slow install/test/build budgets
+///   (a CI that wants to fail fast) as well as raise them.
+/// - Otherwise a step with its own budget (`step_timeout_secs != 0`, i.e. the
+///   slow install/test/build steps) gets that budget, and every other step gets
+///   [`DEFAULT_TIMEOUT_SECS`].
 fn effective_timeout(step_timeout_secs: u64, global_override: Option<u64>) -> u64 {
-    let baseline = global_override.unwrap_or(DEFAULT_TIMEOUT_SECS);
-    if step_timeout_secs != 0 {
-        baseline.max(step_timeout_secs)
-    } else {
-        baseline
+    match global_override {
+        Some(secs) => secs,
+        None if step_timeout_secs != 0 => step_timeout_secs,
+        None => DEFAULT_TIMEOUT_SECS,
     }
+}
+
+/// `UMADEV_VERIFY_TIMEOUT_SECS` as a budget: a positive whole number of seconds.
+/// Unset, unparsable or `0` (a budget no step could meet) means "not set".
+fn verify_timeout_override(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
 }
 
 /// Run the full verify step sequence for `workspace`. Returns one
@@ -919,9 +923,8 @@ pub async fn run_verify(workspace: &Path) -> Vec<VerifyOutcome> {
     };
 
     // A global env override, when set, overrides EVERY step's budget.
-    let global_override = std::env::var("UMADEV_VERIFY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
+    let global_override =
+        verify_timeout_override(std::env::var("UMADEV_VERIFY_TIMEOUT_SECS").ok().as_deref());
 
     // P1-8: once the dependency-install step FAILS (network/environment, not the
     // project's code), every step that needs the installed dependencies is
@@ -1631,29 +1634,32 @@ mod tests {
     }
 
     #[test]
-    fn effective_timeout_slow_step_keeps_its_budget() {
-        // A slow step keeps AT LEAST its own budget, even when the env
-        // override is lower — so a low global cap can't time out
-        // `cargo build --release`.
-        assert_eq!(effective_timeout(0, None), DEFAULT_TIMEOUT_SECS);
+    fn verify_timeout_override_applies_to_slow_steps() {
+        // CONFIG.md: `UMADEV_VERIFY_TIMEOUT_SECS` is the budget of EVERY step. A CI
+        // that sets 60 to fail fast must not still wait 600 s on install/test/build.
         assert_eq!(
-            effective_timeout(300, None),
-            300,
-            "slow step default = its budget"
+            effective_timeout(SLOW_STEP_TIMEOUT_SECS, Some(60)),
+            60,
+            "a lower override lowers the slow install/test/build budget too"
         );
         assert_eq!(effective_timeout(0, Some(45)), 45, "fast step honours env");
-        // Slow budget (300) wins over a lower env (45):
-        assert_eq!(
-            effective_timeout(300, Some(45)),
-            300,
-            "slow step must keep its 300s budget even when env is 45"
-        );
-        // Higher env (900) wins over slow budget (300):
         assert_eq!(
             effective_timeout(300, Some(900)),
             900,
-            "a higher env override raises the slow step too"
+            "a higher override raises the slow step too"
         );
+        // Unset: each step keeps its own budget.
+        assert_eq!(effective_timeout(300, None), 300, "slow step = its budget");
+        assert_eq!(effective_timeout(0, None), DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn verify_timeout_override_reads_a_positive_number_of_seconds() {
+        assert_eq!(verify_timeout_override(Some("60")), Some(60));
+        assert_eq!(verify_timeout_override(Some(" 90 ")), Some(90));
+        assert_eq!(verify_timeout_override(Some("0")), None);
+        assert_eq!(verify_timeout_override(Some("soon")), None);
+        assert_eq!(verify_timeout_override(None), None);
     }
 
     #[test]

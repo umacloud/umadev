@@ -782,7 +782,7 @@ umadev 有兩套入口，一一對應：
 | `UMADEV_GROK_BIN` | 覆寫 Grok Build 執行檔 | `grok` |
 | `UMADEV_KIMI_BIN` | 覆寫 Kimi Code 執行檔 | `kimi` |
 | `UMADEV_WORKER_TIMEOUT` | 單次 worker 逾時（秒） | `300` |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | verify 迴圈單次逾時（秒） | `120` |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | 每個 verify 步驟（安裝、lint、測試、建置）的逾時（秒）；未設定時各步驟使用自己的預算 | `120`（安裝 / 測試 / 建置為 `600`） |
 | `UMADEV_CONTINUOUS` | 設 `0`（或 `UMADEV_LEGACY_RUN=1`）退出持續單工作階段，改用每次單獨呼叫 | `1` |
 | `UMADEV_NO_GOAL_MODE` | 設 `1` 停用 `/goal` 原生模式 | — |
 | `UMADEV_SHOW_PROCESS_LOGS` | 預置底座即時行程日誌可見性（也可在 App 內用 `/logs` 切換） | 關 |

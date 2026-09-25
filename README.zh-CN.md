@@ -806,7 +806,7 @@ umadev 有两套入口，一一对应：
 | `UMADEV_GROK_BIN` | 覆盖 Grok Build 可执行文件 | `grok` |
 | `UMADEV_KIMI_BIN` | 覆盖 Kimi Code 可执行文件 | `kimi` |
 | `UMADEV_WORKER_TIMEOUT` | 单次 worker 超时（秒） | `300` |
-| `UMADEV_VERIFY_TIMEOUT_SECS` | verify 循环单次超时（秒） | `120` |
+| `UMADEV_VERIFY_TIMEOUT_SECS` | 每个 verify 步骤（安装、lint、测试、构建）的超时（秒）；未设置时各步骤使用自己的预算 | `120`（安装 / 测试 / 构建为 `600`） |
 | `UMADEV_NO_GOAL_MODE` | 置 `1` 关闭 `/goal` 模式 | — |
 | `UMADEV_SHOW_PROCESS_LOGS` | 预置底座实时进程日志可见性（也可在 App 内用 `/logs` 切换） | 关 |
 | `UMADEV_CONTINUOUS` | 置 `0`（或 `UMADEV_LEGACY_RUN=1`）退出持续单会话路径 | 开 |
