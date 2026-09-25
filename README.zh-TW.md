@@ -656,6 +656,7 @@ umadev 有兩套入口，一一對應：
 | `/redo [階段]` | 重跑某個階段塊 |
 | `/mode <plan\|guarded\|auto>` | 設定信任 / 自主檔位 |
 | `/manual` · `/auto` | 切換一般 gate 的人工確認 / 自動核准；不可逆操作始終確認（`shift+Tab` 也可切換） |
+| `/trust` | 查看並修改是否信任此專案 |
 | `/cancel` · `/abort` | 中止當前執行（工作區狀態保留，下次可續跑） |
 | `/tasks [stop\|resume]` | 列出 / 管理背景執行 |
 | `/adopt` | 接管現有（棕地）倉庫：偵測技術棧、索引原始碼、反推契約 |
@@ -741,7 +742,8 @@ umadev 有兩套入口，一一對應：
 | 命令 | 作用 |
 |---|---|
 | `umadev run "<需求>" --backend <id>` | 跑一次建置，停在 `docs_confirm` 閘 |
-| `umadev run --mode plan\|guarded\|auto` | 設定信任檔位（預設 `guarded`） |
+| `umadev run --mode plan\|guarded\|auto` | 設定信任檔位（預設 `guarded`；`auto` 僅限已信任的專案） |
+| `umadev trust [--revoke]` | 在本機信任此專案，或取消信任 |
 | `umadev continue [--backend <id>]` | 通過目前閘，或重試被暫停的執行期評審（自動沿用上次的 `--backend`） |
 | `umadev revise "<回饋>"` | 停在閘，記錄修改並重跑本塊 |
 | `umadev quick "<任務>"` | 非互動輕量路徑 |
@@ -816,7 +818,7 @@ skip_checks = []
 [pipeline]
 skip_phases = []
 max_review_rounds = 3
-auto_approve_gates = true
+auto_approve_gates = false
 
 [knowledge]
 enabled = true
@@ -824,7 +826,9 @@ engine = "hybrid"
 top_k = 6
 ```
 
-`umadev run` 與 `umadev quick` 的 CLI `--mode` 預設為 `guarded`。TUI 另會相容 `.umadevrc` 的 `pipeline.auto_approve_gates` 映射：目前產生的 `true` 對應 Auto 一般 gate，`false` 對應 Guarded；`/mode` 可修改當前檔位。這個舊設定不會移除不可逆操作確認；git merge/reset、刪除、部署與連網推送在任何檔位都要確認。
+TUI 與 `umadev run` / `umadev quick` 的預設檔位都是 `guarded`。Auto 只能由你在本機為目前工作階段選擇：TUI 裡的 `shift+Tab`、`/mode auto` 或 `/auto`，CLI 的 `--mode auto`。儲存庫無法替你選擇：`.umadevrc` 的 `pipeline.auto_approve_gates = true` 會被忽略並提示，已儲存執行的 Auto 檔位也只在已信任、且由本機 UmaDev 寫下執行狀態的專案中恢復。任何檔位都不會移除不可逆操作確認；git merge/reset、刪除、部署與連網推送在任何檔位都要確認。
+
+**專案信任。** UmaDev 第一次在某個專案執行時會詢問你是否信任它（TUI 裡是選擇器，CLI 終端裡是 `y/N`），答案保存在 `~/.umadev`，不寫進專案；可用 `/trust` 或 `umadev trust [--revoke]` 修改，`umadev doctor` 會顯示目前狀態。無人回應的腳本 / CI 執行預設不信任，除非傳入 `--trust-project` 或設定 `UMADEV_TRUST_PROJECT=1`（只對這一條命令生效）。未信任的專案最高以 `guarded` 執行（Plan 仍可用），底座啟動時不載入專案自帶的設定：Claude Code 使用 `--setting-sources user --strict-mcp-config`（已安裝的 UmaDev 治理鉤子改由 `--settings` 傳入），Codex 把專案及其上層目錄標為 `untrusted`，OpenCode 設定 `OPENCODE_DISABLE_PROJECT_CONFIG=1`；Grok Build 由它自己的資料夾信任把關；Kimi Code 無法略過專案的 MCP 檔案，因此未信任且帶有 `.mcp.json` 或 `.kimi-code/mcp.json` 的專案會拒絕啟動 Kimi。用 `umadev mcp-manage` 加入專案的 MCP 伺服器也要在信任專案後才會載入。
 
 ---
 

@@ -351,7 +351,9 @@ flowchart TB
 | "给用户模型加个字段" / "修结账的 bug" | bugfix / 小改（不组队） | 几分钟，硬门把关 |
 | "做一个订阅管理后台" | 完整 build（展开 9 阶段、全套团队） | 按需求规模从十几分钟到更长；中途在确认门停下等你 |
 
-> 看得见进度：完整 build 会显示实时计划和团队评审状态；长时间没有进展时状态区会提示，而不是把沉默当完成。CLI `run/quick --mode` 默认是 `guarded`；TUI 则兼容 `.umadevrc` 的 `auto_approve_gates` 映射，当前生成值 `true` 对应自动普通 gate。不可逆操作仍始终确认。
+> 看得见进度：完整 build 会显示实时计划和团队评审状态；长时间没有进展时状态区会提示，而不是把沉默当完成。TUI 和 CLI `run/quick --mode` 默认都是 `guarded`；Auto 只能由你在本机为当前会话选择（`shift+Tab`、`/mode auto`、`--mode auto`），仓库里的 `.umadevrc` 不能开启它。不可逆操作仍始终确认。
+
+> **项目信任**：UmaDev 第一次在某个项目里运行时会问你是否信任它（TUI 里是选择器，CLI 终端里是 `y/N`），答案保存在 `~/.umadev`，不写进项目；可用 `/trust` 或 `umadev trust [--revoke]` 修改，`umadev doctor` 会显示当前状态。无人应答的脚本 / CI 运行默认不信任，除非传 `--trust-project` 或设置 `UMADEV_TRUST_PROJECT=1`（只对这一条命令生效）。未信任的项目最高以 `guarded` 运行（Plan 仍可用），底座启动时不加载项目自带的配置：Claude Code 用 `--setting-sources user --strict-mcp-config`（已安装的 UmaDev 治理钩子改由 `--settings` 传入），Codex 把项目及其上级目录标为 `untrusted`，OpenCode 设置 `OPENCODE_DISABLE_PROJECT_CONFIG=1`；Grok Build 由它自己的文件夹信任把关；Kimi Code 无法跳过项目的 MCP 文件，所以未信任且带 `.mcp.json` 或 `.kimi-code/mcp.json` 的项目会拒绝启动 Kimi。用 `umadev mcp-manage` 加到项目里的 MCP 服务器也要在信任项目后才会加载。
 
 **命令可发现性**：
 
@@ -674,6 +676,7 @@ umadev 有两套入口，一一对应：
 | `/redo [阶段]` | 重跑某个阶段块 |
 | `/mode <plan\|guarded\|auto>` | 设置信任 / 自主档位 |
 | `/manual` · `/auto` | 切换普通 gate 的人工确认 / 自动批准；不可逆操作始终确认（`shift+Tab` 也可切换） |
+| `/trust` | 查看并修改是否信任此项目 |
 | `/cancel` · `/abort` | 中止当前运行（磁盘工作流状态保留，下次可续跑） |
 | `/tasks [stop\|resume]` | 列出 / 管理后台运行 |
 | `/adopt` | 接管现有（棕地）仓库：识别技术栈、索引源码、反推契约 |
@@ -761,6 +764,7 @@ umadev 有两套入口，一一对应：
 |---|---|
 | `umadev run "<需求>" --backend <id>` | 跑一次构建，停在 `docs_confirm` 门（`--mode plan\|guarded\|auto` 设信任档） |
 | `umadev quick "<任务>" --backend <id>` | 轻量快路径（跳过重阶段与门） |
+| `umadev trust [--revoke]` | 在本机信任此项目，或取消信任 |
 | `umadev continue [--backend <id>]` | 通过当前门，或重试被暂停的运行时评审（自动复用上次的 `--backend`） |
 | `umadev revise "<反馈>"` | 停在门，记录修改并重跑本块 |
 | `umadev redo <阶段> [--backend <id>]` | 复用上次上下文重跑某一阶段 |
@@ -850,7 +854,7 @@ skip_checks = []
 [pipeline]
 skip_phases = []
 max_review_rounds = 3
-auto_approve_gates = true
+auto_approve_gates = false
 
 [knowledge]
 enabled = true

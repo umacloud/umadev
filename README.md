@@ -620,6 +620,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `/redo [phase]` | Re-run a phase block |
 | `/mode <plan\|guarded\|auto>` | Set the trust / autonomy tier |
 | `/manual` · `/auto` | Per-gate confirmation vs. fully automatic (`shift+Tab` also toggles) |
+| `/trust` | Show whether this project is trusted and change it |
 | `/cancel` · `/abort` | Abort the current run (on-disk state kept, resumable later) |
 | `/tasks [stop\|resume]` | List / manage background runs |
 | `/processes [stop <id>]` | Fetch / stop native background processes owned by the current base session (where negotiated) |
@@ -708,6 +709,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 |---|---|
 | `umadev run "<requirement>" --backend <id>` | Run a pipeline, pausing at the `docs_confirm` gate (`--mode plan\|guarded\|auto` sets the trust tier) |
 | `umadev quick "<task>" --backend <id>` | Lean fast track for a trivial change (skips the heavy phases + gates) |
+| `umadev trust [--revoke]` | Trust this project on this machine, or stop trusting it |
 | `umadev continue [--backend <id>]` | Approve the current gate, or retry a parked operational review (reuses the previous backend) |
 | `umadev revise "<feedback>"` | Stay at the gate, record a revision, rerun the block |
 | `umadev redo <phase> [--backend <id>]` | Re-run one phase, reusing the prior run's context |
@@ -787,7 +789,7 @@ skip_checks = []
 [pipeline]
 skip_phases = []
 max_review_rounds = 3
-auto_approve_gates = true
+auto_approve_gates = false
 
 [knowledge]
 enabled = true
@@ -795,7 +797,9 @@ engine = "hybrid"
 top_k = 6
 ```
 
-For `umadev run` and `umadev quick`, the CLI `--mode` default is `guarded`. The TUI also maps `.umadevrc` `pipeline.auto_approve_gates = true` to its Auto gate behavior (the currently generated default), or `false` to Guarded; `/mode` can change the live tier. This legacy gate setting never removes the irreversible-action confirmation floor. Git merge/reset, deletes, deploys, and network pushes always require confirmation on every tier.
+The tier is `guarded` by default, in the TUI and for `umadev run` / `umadev quick`. Auto is only ever chosen on your machine, for the session: `shift+Tab`, `/mode auto` or `/auto` in the TUI, `--mode auto` on the CLI. A repository cannot choose it: `.umadevrc` `pipeline.auto_approve_gates = true` is ignored with a warning, and a saved run's Auto tier resumes only in a trusted project whose run state UmaDev on this machine wrote. No tier removes the irreversible-action confirmation floor. Git merge/reset, deletes, deploys, and network pushes always require confirmation on every tier.
+
+**Workspace trust.** The first time UmaDev runs in a project it asks whether you trust it (a picker in the TUI, a `y/N` question on a CLI terminal) and keeps the answer in `~/.umadev`, never in the project. Change it with `/trust` or `umadev trust [--revoke]`; `umadev doctor` shows it. A script or CI run that nobody can answer treats the project as untrusted unless it passes `--trust-project` or sets `UMADEV_TRUST_PROJECT=1`, which trust it for that command only. An untrusted project runs at most in `guarded` (Plan stays available), and every base starts without the project's own configuration: Claude Code with `--setting-sources user --strict-mcp-config` (UmaDev's own governance hooks, when installed, are passed with `--settings`), Codex with the project and its parents marked `untrusted`, and OpenCode with `OPENCODE_DISABLE_PROJECT_CONFIG=1`. Grok Build keeps project configuration behind its own folder trust. Kimi Code cannot skip a project's MCP files, so it is refused in an untrusted project that ships `.mcp.json` or `.kimi-code/mcp.json`. MCP servers added to the project with `umadev mcp-manage` load only once the project is trusted.
 
 ---
 
