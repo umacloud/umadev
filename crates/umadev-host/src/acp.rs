@@ -83,7 +83,7 @@ use crate::{
     default_workspace, govern_root_env, home_dir, isolate_process_tree,
     kill_isolated_process_tree_blocking, merge_prompt, reap_isolated_process_tree, resolve_program,
     run_subprocess, spawn_parts, spawn_retrying_etxtbsy, try_exit_isolated_process_tree, AuthState,
-    HostDriver, ProbeResult, PromptChannel, SubprocessCall, TerminalTextSanitizer, END_REAP_BUDGET,
+    HostDriver, ProbeResult, SubprocessCall, TerminalTextSanitizer, END_REAP_BUDGET,
 };
 
 const EVENT_CHANNEL_CAP: usize = 256;
@@ -9238,7 +9238,6 @@ async fn version_output(program: &str) -> Option<String> {
         program,
         args: &["--version".to_string()],
         prompt: "",
-        channel: PromptChannel::Stdin,
         workspace: &workspace,
         timeout: Duration::from_secs(10),
         env: &[],

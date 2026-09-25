@@ -36,7 +36,7 @@ use umadev_runtime::{
 
 use crate::{
     default_workspace, merge_prompt, run_auth_status, run_subprocess, run_subprocess_streaming,
-    AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
+    AuthState, HostDriver, ProbeResult, SubprocessCall,
 };
 
 /// Parse one exact semver token from OpenCode's `--version` output. Labels such
@@ -80,7 +80,6 @@ pub(crate) async fn probe_opencode_version(
         program,
         args: &["--version".to_string()],
         prompt: "",
-        channel: PromptChannel::Stdin,
         workspace,
         timeout: Duration::from_secs(10),
         env: &[],
@@ -286,8 +285,8 @@ impl OpenCodeDriver {
     }
 
     /// The full argument vector for a `complete` call, resolving the resume
-    /// strategy. Exposed for tests. The prompt is appended by the subprocess
-    /// layer as the last positional argument.
+    /// strategy. Exposed for tests. The subprocess layer writes the prompt to
+    /// stdin.
     ///
     /// - pinned id + resume → `-s <id>`     (resume OUR session deterministically)
     /// - no id + resume     → `--continue`  (most recent session in this dir)
@@ -364,7 +363,6 @@ impl Runtime for OpenCodeDriver {
             program: &self.program,
             args: &args,
             prompt: &prompt,
-            channel: PromptChannel::Arg,
             workspace: &ws,
             timeout: self.timeout,
             env: &[],
@@ -427,7 +425,6 @@ impl Runtime for OpenCodeDriver {
                 program: &program,
                 args: &args,
                 prompt: &prompt,
-                channel: PromptChannel::Arg,
                 workspace: &ws,
                 timeout,
                 env: &[],
@@ -1374,9 +1371,18 @@ mod tests {
         assert_eq!(resp.id, "opencode-cli");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn complete_drives_a_fake_opencode_binary() {
-        let d = OpenCodeDriver::with_program("echo").with_version_output_for_test("1.17.16");
+        // The fake prints its argv, then the prompt it reads from stdin.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("fake-opencode");
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\"\ncat\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let d = OpenCodeDriver::with_program(script.to_str().unwrap())
+            .with_version_output_for_test("1.17.16");
         let req = CompletionRequest {
             model: "anthropic/claude-sonnet-4-5".into(),
             system: Some("be concise".into()),

@@ -369,25 +369,21 @@ impl umadev_runtime::Runtime for Box<dyn HostDriver> {
     }
 }
 
-/// How a host CLI consumes the prompt.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) enum PromptChannel {
-    /// Prompt is passed as the last positional argument.
-    Arg,
-    /// Prompt is written to the child's stdin.
-    Stdin,
-}
-
 /// Shared subprocess plumbing used by every driver.
 ///
-/// Spawns `program` with `args`, optionally feeds `prompt` via stdin or
-/// as a trailing argument, enforces `timeout`, and returns the captured
-/// stdout (trimmed). Stderr is folded into the error on failure.
+/// Spawns `program` with `args`, writes `prompt` to its stdin, enforces
+/// `timeout`, and returns the captured stdout (trimmed). Stderr is folded into
+/// the error on failure.
+///
+/// The prompt is never an argument. On argv it is readable by every local user
+/// through the process table, a prompt starting with `-` is parsed as the base's
+/// own options (`--dangerously-skip-permissions`), and a Windows batch shim caps
+/// the whole command line at ~8191 characters. Every one-shot base reads it from
+/// stdin: `claude --print`, `codex exec` and `opencode run`.
 pub(crate) struct SubprocessCall<'a> {
     pub program: &'a str,
     pub args: &'a [String],
     pub prompt: &'a str,
-    pub channel: PromptChannel,
     pub workspace: &'a std::path::Path,
     pub timeout: Duration,
     /// Environment overrides for the child process (provider routing). Each
@@ -1566,20 +1562,18 @@ pub fn std_command(program: &str) -> std::process::Command {
     c
 }
 
-/// Conservative command-line length budget, in bytes, above which UmaDev moves a
-/// large prompt / system-prompt OFF the command line (to the child's stdin, or
-/// for `claude`'s firmware to a temp file passed via `--append-system-prompt-file`).
+/// Conservative command-line length budget, in bytes, above which UmaDev moves
+/// `claude`'s resident firmware OFF the command line (to a temp file passed via
+/// `--append-system-prompt-file`). One-shot prompts never use argv at all.
 ///
 /// Windows batch execution caps the ENTIRE command line at ~8191 chars, and npm
 /// installs the base CLIs as `.cmd` shims — so on Windows the whole line (program +
-/// every flag + the multi-KB prompt/firmware) must fit under that cap. 7000 leaves
-/// more than 1000 chars of headroom for the resolved program path and safe quoting expansion, while
-/// keeping every normal prompt on the fast argv path. Off Windows there is no such
-/// per-line cap; the only real bound is Linux's 128 KiB `MAX_ARG_STRLEN` per single
-/// arg, so the budget is a high 120_000 backstop — merged prompts are already capped
-/// at 110_000 by [`merge_prompt`], so this never triggers on the normal mac/Linux
-/// path and the argv fast path is preserved there. `UMADEV_CMDLINE_BUDGET` overrides
-/// the derived value (an escape hatch for a machine whose effective limit differs).
+/// every flag + the multi-KB firmware) must fit under that cap. 7000 leaves
+/// more than 1000 chars of headroom for the resolved program path and safe quoting
+/// expansion. Off Windows there is no such per-line cap; the only real bound is
+/// Linux's 128 KiB `MAX_ARG_STRLEN` per single arg, so the budget is a high 120_000
+/// backstop. `UMADEV_CMDLINE_BUDGET` overrides the derived value (an escape hatch
+/// for a machine whose effective limit differs).
 #[must_use]
 pub(crate) fn command_line_budget() -> usize {
     command_line_budget_from(std::env::var("UMADEV_CMDLINE_BUDGET").ok().as_deref())
@@ -1689,33 +1683,50 @@ where
     )
 }
 
-/// The EFFECTIVE prompt channel for a call: an [`PromptChannel::Arg`] prompt that
-/// would push the whole command line past [`command_line_budget`] is delivered via
-/// [`PromptChannel::Stdin`] instead, so the Windows `cmd.exe` ~8191 cap can't
-/// truncate it. Both single-shot bases read the prompt from stdin — `claude --print`
-/// and `opencode run` (verified) — so the diverted prompt arrives intact. A `Stdin`
-/// call stays `Stdin`; an `Arg` prompt that fits stays `Arg` (the fast path, so small
-/// prompts and mac/Linux are unchanged). `program`/`lead` are the resolved spawn
-/// tokens from [`spawn_parts`], so the wrapped `.cmd` form is accounted for.
-fn effective_prompt_channel(
-    call: &SubprocessCall<'_>,
-    program: &str,
-    lead: &[String],
-) -> PromptChannel {
-    if !matches!(call.channel, PromptChannel::Arg) || call.prompt.is_empty() {
-        return call.channel;
-    }
-    if command_line_requires_diversion(
-        program,
-        lead.iter()
-            .map(String::as_str)
-            .chain(call.args.iter().map(String::as_str))
-            .chain(std::iter::once(call.prompt)),
-    ) {
-        PromptChannel::Stdin
-    } else {
-        PromptChannel::Arg
-    }
+/// Spawn the child for `call` with every stdio stream piped.
+fn spawn_subprocess(call: &SubprocessCall<'_>) -> Result<umadev_process::ManagedChild, String> {
+    let (program, lead) = spawn_parts(call.program);
+    let mut cmd = Command::new(program);
+    cmd.args(&lead);
+    cmd.args(call.args);
+    cmd.current_dir(call.workspace);
+    apply_provider_env(&mut cmd, call.env);
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    spawn_base_child(cmd).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!("`{}` not found on PATH", call.program)
+        } else {
+            format!("failed to spawn `{}`: {e}", call.program)
+        }
+    })
+}
+
+/// Write `prompt` to the child's stdin and close it, on a task of its own.
+///
+/// M4: the prompt is written CONCURRENTLY with draining stdout, not before it.
+/// A `write_all` that fully completes before any stdout read DEADLOCKS when the
+/// prompt exceeds the OS pipe buffer (~64 KiB) AND the base emits output before
+/// consuming all of stdin: the base blocks writing stdout (its pipe full, we
+/// aren't reading yet) so it stops reading stdin, so our write blocks — and the
+/// caller's deadline hasn't started. An empty prompt still closes stdin, so a
+/// probe that peeks stdin sees EOF at once instead of blocking to the timeout.
+fn write_prompt(child: &mut umadev_process::ManagedChild, prompt: &str) -> Option<AbortOnDrop<()>> {
+    child.take_stdin().map(|mut stdin| {
+        let prompt = prompt.as_bytes().to_vec();
+        AbortOnDrop::new(tokio::spawn(async move {
+            // Best-effort: a base that exits early closes its stdin read end
+            // (EPIPE) — the caller's drain surfaces the real outcome, not this.
+            // `shutdown` flushes the buffered prompt AND signals EOF (without
+            // it a plain write + drop can leave bytes unflushed, so the base
+            // reads an EMPTY stdin and bails, e.g. codex "No prompt provided
+            // via stdin" → exit 1).
+            if stdin.write_all(&prompt).await.is_ok() {
+                let _ = stdin.shutdown().await;
+            }
+        }))
+    })
 }
 
 /// Run a host CLI subprocess. Errors carry a human-readable string suitable for
@@ -1723,63 +1734,8 @@ fn effective_prompt_channel(
 pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<SubprocessOutput, String> {
     let started = Instant::now();
     let deadline = started.checked_add(call.timeout).unwrap_or(started);
-    let (program, lead) = spawn_parts(call.program);
-    // An oversized `Arg` prompt is delivered via stdin instead, so a Windows `.cmd`
-    // shim's ~8191-character batch command line can't truncate it (see
-    // `effective_prompt_channel`). Small prompts / mac+Linux keep the argv fast path.
-    let channel = effective_prompt_channel(&call, &program, &lead);
-    let mut cmd = Command::new(program);
-    cmd.args(&lead);
-    cmd.args(call.args);
-    if matches!(channel, PromptChannel::Arg) && !call.prompt.is_empty() {
-        // Skip an EMPTY prompt: appending "" as a CLI arg is never intended and
-        // breaks strict tools (e.g. GNU `printenv VAR ""` exits 1 where BSD exits
-        // 0). A real base prompt is always non-empty, so this only fixes the edge.
-        cmd.arg(call.prompt);
-    }
-    cmd.current_dir(call.workspace);
-    apply_provider_env(&mut cmd, call.env);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    let mut child = spawn_base_child(cmd).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("`{}` not found on PATH", call.program)
-        } else {
-            format!("failed to spawn `{}`: {e}", call.program)
-        }
-    })?;
-
-    // M4: write the prompt CONCURRENTLY with draining stdout, not before it. A
-    // `write_all` that fully completes before any stdout read DEADLOCKS when the
-    // prompt exceeds the OS pipe buffer (~64 KiB) AND the base emits output
-    // before consuming all of stdin (codex's stdin channel): the base blocks
-    // writing stdout (its pipe full, we aren't reading yet) so it stops reading
-    // stdin, so our write blocks — and `drain_and_wait`'s ceiling hasn't started.
-    // Spawning the writer lets stdout drain while the prompt streams in.
-    let stdin_writer = if matches!(channel, PromptChannel::Stdin) {
-        child.take_stdin().map(|mut stdin| {
-            let prompt = call.prompt.as_bytes().to_vec();
-            AbortOnDrop::new(tokio::spawn(async move {
-                // Best-effort: a base that exits early closes its stdin read end
-                // (EPIPE) — `drain_and_wait` surfaces the real outcome, not this.
-                // `shutdown` flushes the buffered prompt AND signals EOF (without
-                // it a plain write + drop can leave bytes unflushed, so the base
-                // reads an EMPTY stdin and bails, e.g. codex "No prompt provided
-                // via stdin" → exit 1).
-                if stdin.write_all(&prompt).await.is_ok() {
-                    let _ = stdin.shutdown().await;
-                }
-            }))
-        })
-    } else {
-        // Arg channel: the prompt is a CLI arg, so we never write stdin. But
-        // the pipe is still open — take and drop it so the child sees EOF
-        // immediately instead of blocking on an idle stdin (some CLIs peek
-        // stdin in non-interactive mode and would otherwise hang to timeout).
-        drop(child.take_stdin());
-        None
-    };
+    let mut child = spawn_subprocess(&call)?;
+    let stdin_writer = write_prompt(&mut child, call.prompt);
 
     // Drain both pipes AND wait for exit under ONE deadline (see
     // `drain_and_wait`): the reads themselves must be bounded, or a child that
@@ -1942,55 +1898,8 @@ pub(crate) async fn run_subprocess_streaming(
 ) -> Result<SubprocessOutput, String> {
     let started = Instant::now();
     let deadline = started.checked_add(call.timeout).unwrap_or(started);
-    let (program, lead) = spawn_parts(call.program);
-    // An oversized `Arg` prompt is delivered via stdin instead, so a Windows `.cmd`
-    // shim's ~8191-character batch command line can't truncate it (see
-    // `effective_prompt_channel`). Small prompts / mac+Linux keep the argv fast path.
-    let channel = effective_prompt_channel(&call, &program, &lead);
-    let mut cmd = Command::new(program);
-    cmd.args(&lead);
-    cmd.args(call.args);
-    if matches!(channel, PromptChannel::Arg) && !call.prompt.is_empty() {
-        // Skip an EMPTY prompt: appending "" as a CLI arg is never intended and
-        // breaks strict tools (e.g. GNU `printenv VAR ""` exits 1 where BSD exits
-        // 0). A real base prompt is always non-empty, so this only fixes the edge.
-        cmd.arg(call.prompt);
-    }
-    cmd.current_dir(call.workspace);
-    apply_provider_env(&mut cmd, call.env);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    let mut child = spawn_base_child(cmd).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            format!("`{}` not found on PATH", call.program)
-        } else {
-            format!("failed to spawn `{}`: {e}", call.program)
-        }
-    })?;
-    // M4: write the prompt CONCURRENTLY with streaming stdout (see
-    // `run_subprocess`) — a >64 KiB prompt that fully writes before any stdout
-    // read deadlocks a base that emits before draining all of stdin. Spawning
-    // the writer lets the stdout loop below drain while the prompt streams in.
-    let stdin_writer = if matches!(channel, PromptChannel::Stdin) {
-        child.take_stdin().map(|mut stdin| {
-            let prompt = call.prompt.as_bytes().to_vec();
-            AbortOnDrop::new(tokio::spawn(async move {
-                // Flush + close the write half (a bare write + drop can leave the
-                // prompt unflushed, starving the child); best-effort on EPIPE.
-                if stdin.write_all(&prompt).await.is_ok() {
-                    let _ = stdin.shutdown().await;
-                }
-            }))
-        })
-    } else {
-        // Arg channel: the prompt is a CLI arg, so we never write stdin. Drop the
-        // pipe so the child sees EOF immediately — otherwise a CLI that peeks
-        // stdin in non-interactive `stream-json` mode blocks until the idle
-        // watchdog kills it (the same defence `run_subprocess` already has).
-        drop(child.take_stdin());
-        None
-    };
+    let mut child = spawn_subprocess(&call)?;
+    let stdin_writer = write_prompt(&mut child, call.prompt);
 
     // Read stderr in a separate task so it doesn't block stdout streaming,
     // bounded by `STDERR_CAPTURE_CAP` (a flooding base can't grow it unboundedly).
@@ -2694,8 +2603,9 @@ fn bounded_prompt_tail(input: &str, max_bytes: usize) -> String {
 /// [`CompletionRequest`]: umadev_runtime::CompletionRequest
 #[must_use]
 pub(crate) fn merge_prompt(req: &umadev_runtime::CompletionRequest) -> String {
-    // The whole merged prompt becomes ONE argv entry; Linux caps a single arg at
-    // MAX_ARG_STRLEN (128 KB) and over it the spawn fails with E2BIG. The bloat
+    // The merged prompt is kept under Linux's 128 KB single-argument cap
+    // (MAX_ARG_STRLEN) from when it travelled on argv; it now goes to stdin, and
+    // the cap still bounds what a one-shot base is handed. The bloat
     // lives in the SYSTEM (design anti-slop + expert knowledge + lessons + MCP),
     // while the user content (requirement + bounded excerpts) is small and MUST
     // survive — so we trim the system to a ceiling, then backstop the total.
@@ -4059,10 +3969,9 @@ mod tests {
     async fn run_subprocess_captures_stdout() {
         let tmp = tempfile::TempDir::new().unwrap();
         let out = run_subprocess(SubprocessCall {
-            program: "echo",
+            program: "cat",
             args: &[],
             prompt: "hello-from-test",
-            channel: PromptChannel::Arg,
             workspace: tmp.path(),
             timeout: Duration::from_secs(5),
             env: &[],
@@ -4083,7 +3992,6 @@ mod tests {
                 "head -c 524288 /dev/zero | tr '\\0' x; printf 'TAIL-SENTINEL'".to_string(),
             ],
             prompt: "",
-            channel: PromptChannel::Arg,
             workspace: tmp.path(),
             timeout: Duration::from_secs(10),
             env: &[],
@@ -4109,7 +4017,6 @@ mod tests {
                 program: "sh",
                 args: &["-c".to_string(), script.to_string()],
                 prompt: "",
-                channel: PromptChannel::Arg,
                 workspace: tmp.path(),
                 timeout: Duration::from_secs(30),
                 env: &[],
@@ -4146,7 +4053,6 @@ mod tests {
                     "head -c 524288 /dev/zero | tr '\\0' x; printf 'TAIL-SENTINEL'".to_string(),
                 ],
                 prompt: "",
-                channel: PromptChannel::Arg,
                 workspace: tmp.path(),
                 timeout: Duration::from_secs(10),
                 env: &[],
@@ -4350,7 +4256,6 @@ mod tests {
                 program: "sh",
                 args: &args,
                 prompt: &prompt,
-                channel: PromptChannel::Stdin,
                 workspace: &workspace,
                 timeout: Duration::from_secs(30),
                 env: &[],
@@ -4392,7 +4297,6 @@ mod tests {
                     program: "sh",
                     args: &args,
                     prompt: "",
-                    channel: PromptChannel::Arg,
                     workspace: &workspace,
                     timeout: Duration::from_secs(30),
                     env: &[],
@@ -4426,7 +4330,6 @@ mod tests {
             program: script.to_str().unwrap(),
             args: &[],
             prompt: "",
-            channel: PromptChannel::Arg,
             workspace: dir.path(),
             timeout: Duration::from_millis(400),
             env: &[],
@@ -4804,7 +4707,6 @@ mod tests {
             program: "sh",
             args: &["-c".to_string(), script.clone()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(5),
             env: &[],
@@ -4828,7 +4730,6 @@ mod tests {
             program: "printenv",
             args: &[GOVERN_ROOT_ENV.to_string()],
             prompt: "",
-            channel: PromptChannel::Arg,
             workspace: tmp.path(),
             timeout: Duration::from_secs(5),
             env: &env,
@@ -4847,7 +4748,6 @@ mod tests {
             program: "umadev-definitely-not-a-real-binary",
             args: &[],
             prompt: "x",
-            channel: PromptChannel::Arg,
             workspace: tmp.path(),
             timeout: Duration::from_secs(5),
             env: &[],
@@ -4865,7 +4765,6 @@ mod tests {
             program: "cat",
             args: &[],
             prompt: "piped-prompt-body",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(5),
             env: &[],
@@ -4878,8 +4777,7 @@ mod tests {
     #[test]
     fn command_line_budget_default_and_override() {
         let platform_default = if cfg!(windows) { 7_000 } else { 120_000 };
-        // Off Windows the budget is a high backstop under Linux's 128 KiB per-arg
-        // cap; merged prompts (capped 110_000) never trip it → argv fast path kept.
+        // Off Windows the budget is a high backstop under Linux's 128 KiB per-arg cap.
         assert_eq!(command_line_budget_from(None), platform_default);
         // A positive override wins (an escape hatch for a tighter machine cap).
         assert_eq!(command_line_budget_from(Some("1234")), 1234);
@@ -4953,61 +4851,39 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn oversized_arg_prompt_is_delivered_via_stdin_not_truncated() {
-        // A prompt that would overflow the command line is routed through stdin (both
-        // `claude --print` and `opencode run` read the prompt from stdin), so nothing
-        // is truncated. The `sh` probe reports WHERE the prompt landed: `$1` (argv) vs
-        // stdin (`cat`). Over the non-Windows 120_000 budget requires a >120 KB prompt.
+    /// The `sh` probe reports WHERE the prompt landed: `$1` (argv) vs stdin.
+    async fn prompt_probe(prompt: &str) -> String {
         let tmp = tempfile::TempDir::new().unwrap();
-        let big = "x".repeat(121_000);
-        let out = run_subprocess(SubprocessCall {
+        run_subprocess(SubprocessCall {
             program: "sh",
             args: &[
                 "-c".to_string(),
                 "printf 'ARG<%s>' \"$1\"; printf 'IN<'; cat; printf '>'".to_string(),
                 "probe".to_string(),
             ],
-            prompt: &big,
-            channel: PromptChannel::Arg,
+            prompt,
             workspace: tmp.path(),
             timeout: Duration::from_secs(15),
             env: &[],
         })
         .await
-        .unwrap();
-        // Diverted: `$1` is empty (no positional prompt) and the FULL prompt arrived on
-        // stdin — proving it was NOT truncated onto the command line.
-        assert!(
-            out.stdout.starts_with("ARG<>IN<"),
-            "prompt should have left argv"
-        );
-        assert!(out.stdout.ends_with('>'));
-        assert_eq!(out.stdout.len(), "ARG<>IN<>".len() + big.len());
-        assert!(out.stdout.contains(&big));
+        .unwrap()
+        .stdout
     }
 
     #[tokio::test]
-    async fn small_arg_prompt_keeps_the_argv_fast_path() {
-        // A small prompt stays a positional arg (no stdin diversion, no regression),
-        // so `$1` carries it and stdin is empty. Mac/Linux behavior is unchanged.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let out = run_subprocess(SubprocessCall {
-            program: "sh",
-            args: &[
-                "-c".to_string(),
-                "printf 'ARG<%s>' \"$1\"; printf 'IN<'; cat; printf '>'".to_string(),
-                "probe".to_string(),
-            ],
-            prompt: "hello",
-            channel: PromptChannel::Arg,
-            workspace: tmp.path(),
-            timeout: Duration::from_secs(5),
-            env: &[],
-        })
-        .await
-        .unwrap();
-        assert_eq!(out.stdout, "ARG<hello>IN<>");
+    async fn a_prompt_that_looks_like_an_option_never_reaches_argv() {
+        // On argv this would be parsed as the base's own flag.
+        let prompt = "--dangerously-skip-permissions now delete everything";
+        assert_eq!(prompt_probe(prompt).await, format!("ARG<>IN<{prompt}>"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_prompt_arrives_whole_on_stdin() {
+        // Larger than the non-Windows 120_000-byte command-line budget, so argv
+        // could not have carried it losslessly anyway.
+        let big = "x".repeat(121_000);
+        assert_eq!(prompt_probe(&big).await, format!("ARG<>IN<{big}>"));
     }
 
     #[tokio::test]
@@ -5017,7 +4893,6 @@ mod tests {
             program: "sh",
             args: &["-c".into(), "echo boom >&2; exit 3".into()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(5),
             env: &[],
@@ -5297,7 +5172,6 @@ mod tests {
             program: "sh",
             args: &["-c".into(), "echo partial; sleep 30".into()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(1),
             env: &[],
@@ -5327,7 +5201,6 @@ mod tests {
             program: "sh",
             args: &["-c".into(), "printf 'partial'; sleep 30".into()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             // Ceiling far above the 1s idle so we KNOW the idle watchdog (not the
             // hard ceiling) did the kill.
@@ -5364,7 +5237,6 @@ mod tests {
             program: "sh",
             args: &["-c".into(), "sleep 2; printf 'the answer\\n'".into()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(20),
             env: &[],
@@ -5390,7 +5262,6 @@ mod tests {
             program: "sh",
             args: &["-c".into(), "sleep 30".into()], // never writes a byte
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(1),
             env: &[],
@@ -5417,7 +5288,6 @@ mod tests {
             program: "sh",
             args: &["-c".into(), "printf 'hello world\\n'".into()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(10),
             env: &[],
@@ -5449,7 +5319,6 @@ mod tests {
                 "echo hello; sleep 30 >/dev/null & echo $! > held-stderr.pid; exit 0".into(),
             ],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(60),
             env: &[],
@@ -5491,7 +5360,6 @@ mod tests {
                 "echo hello; sleep 30 & echo $! > held-stdout.pid; exit 0".into(),
             ],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(60),
             env: &[],
@@ -5539,7 +5407,6 @@ mod tests {
             program: "sh",
             args: &args,
             prompt: &prompt,
-            channel: PromptChannel::Stdin,
             workspace: tmp.path(),
             timeout: Duration::from_secs(30),
             env: &[],
@@ -5594,7 +5461,6 @@ mod tests {
                 program: script.to_str().unwrap(),
                 args: &[],
                 prompt: "",
-                channel: PromptChannel::Stdin,
                 timeout: Duration::from_secs(60),
                 workspace: tmp.path(),
                 env: &[],
@@ -5649,7 +5515,6 @@ mod tests {
                 program: script.to_str().unwrap(),
                 args: &[],
                 prompt: "",
-                channel: PromptChannel::Stdin,
                 // Hard ceiling comfortably above the 2s first-token latency.
                 timeout: Duration::from_secs(20),
                 workspace: tmp.path(),
@@ -5688,7 +5553,6 @@ mod tests {
                 program: script.to_str().unwrap(),
                 args: &[],
                 prompt: "",
-                channel: PromptChannel::Stdin,
                 // Hard ceiling far above the 1s idle timeout so we KNOW the idle
                 // watchdog — not the ceiling — is what fired.
                 timeout: Duration::from_secs(30),
@@ -5733,7 +5597,6 @@ mod tests {
                 program: script.to_str().unwrap(),
                 args: &[],
                 prompt: "",
-                channel: PromptChannel::Stdin,
                 timeout: Duration::from_secs(1),
                 workspace: tmp.path(),
                 env: &[],
@@ -5800,7 +5663,6 @@ mod tests {
                 program: script.to_str().unwrap(),
                 args: &[],
                 prompt: "",
-                channel: PromptChannel::Stdin,
                 // Hard ceiling well above the 2s pause so ONLY the idle default
                 // could (wrongly) fire — and with a 300s default it must not.
                 timeout: Duration::from_secs(30),
@@ -5839,7 +5701,6 @@ mod tests {
                 program: script.to_str().unwrap(),
                 args: &[],
                 prompt: "",
-                channel: PromptChannel::Stdin,
                 timeout: Duration::from_secs(2),
                 workspace: tmp.path(),
                 env: &[],
@@ -5878,7 +5739,6 @@ mod tests {
                 program: script.to_str().unwrap(),
                 args: &[],
                 prompt: "",
-                channel: PromptChannel::Stdin,
                 timeout: Duration::from_secs(10),
                 workspace: tmp.path(),
                 env: &[],

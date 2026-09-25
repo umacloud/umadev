@@ -8,11 +8,11 @@
 //!
 //! IMPORTANT — the prompt goes on STDIN, not as a positional arg. codex 0.141's
 //! `exec` reads its prompt from stdin ("Reading prompt from stdin…"); when the
-//! prompt is passed as an arg and stdin is then closed (UmaDev's Arg channel
-//! closes stdin to avoid hangs), codex prints "Reading additional input from
-//! stdin…" and exits 1 — every call fails and falls back to an offline scaffold.
-//! Feeding the prompt via `PromptChannel::Stdin` is what makes real codex runs
-//! work. `--json` makes codex emit JSONL events we parse for the answer.
+//! prompt is passed as an arg and stdin is then closed, codex prints "Reading
+//! additional input from stdin…" and exits 1 — every call fails and falls back
+//! to an offline scaffold. The shared subprocess layer always writes the prompt
+//! to stdin, which is what makes real codex runs work. `--json` makes codex emit
+//! JSONL events we parse for the answer.
 //!
 //! Like the Claude Code driver, it uses the user's already-authenticated
 //! `codex` session — no API key required.
@@ -55,7 +55,7 @@ use umadev_runtime::{
 
 use crate::{
     default_workspace, merge_prompt, model_args, run_auth_status, run_subprocess,
-    run_subprocess_streaming, AuthState, HostDriver, ProbeResult, PromptChannel, SubprocessCall,
+    run_subprocess_streaming, AuthState, HostDriver, ProbeResult, SubprocessCall,
 };
 
 /// Drives the `codex` CLI as a subprocess.
@@ -308,7 +308,6 @@ impl Runtime for CodexDriver {
             program: &self.program,
             args: &args,
             prompt: &prompt,
-            channel: PromptChannel::Stdin,
             workspace: &ws,
             timeout: self.timeout,
             env: &[],
@@ -381,7 +380,6 @@ impl Runtime for CodexDriver {
                 program: &program,
                 args: &args,
                 prompt: &prompt,
-                channel: PromptChannel::Stdin,
                 workspace: &ws,
                 timeout,
                 env: &[],
@@ -761,7 +759,6 @@ impl HostDriver for CodexDriver {
             program: &self.program,
             args: &["--version".to_string()],
             prompt: "",
-            channel: PromptChannel::Stdin,
             workspace: &tmp,
             timeout: Duration::from_secs(10),
             env: &[],
