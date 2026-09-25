@@ -609,10 +609,11 @@ async fn chat_failed_turn_surfaces_api_error_not_a_false_done() {
                 note.contains("usage quota"),
                 "the full base error is shown: {note}"
             );
-            // The actionable rate-limit classifier line is prepended.
+            // The actionable quota line is prepended (an exhausted 5-hour quota
+            // is not a rate limit a retry can clear).
             assert!(
-                note.contains(umadev_i18n::tl("base.fail.ratelimit")),
-                "the rate-limit diagnosis is prepended: {note}"
+                note.contains(umadev_i18n::tl("base.fail.quota")),
+                "the quota diagnosis is prepended: {note}"
             );
         }
         other => panic!("expected RouteDecision::Failed, got {other:?}"),

@@ -15,10 +15,13 @@
 //!   panics, and empty / unrecognised input collapses to [`BaseFailure::Unknown`]
 //!   (which the mint points map back to today's behaviour). No `regex` dep — plain
 //!   `str` scanning keeps the crate light.
-//! - **Ordered cascade, most specific first.** Auth (401/403) is checked before a
-//!   generic rate limit; a JSON-RPC `-32001` / `529` "overloaded" before network;
-//!   the first family to match wins. A captured non-zero exit with no textual
-//!   match degrades to [`BaseFailure::Exited`] carrying the code, never a panic.
+//! - **Ordered cascade, most specific first.** An exhausted quota is checked
+//!   before auth and a generic rate limit; a context overflow before
+//!   "overloaded"; a JSON-RPC `-32001` / `529` "overloaded" before network; the
+//!   first family to match wins. Status codes match only as whole tokens, and
+//!   the markers include the Chinese wording that domestic gateways return. A
+//!   captured non-zero exit with no textual match degrades to
+//!   [`BaseFailure::Exited`] carrying the code, never a panic.
 //! - **Wiring is centralised.** The two failure mint points
 //!   (`director_loop::enrich_idle_reason` for the `/run` path,
 //!   `umadev-tui`'s `enrich_base_failure` for the chat path) call [`classify`]
@@ -35,9 +38,15 @@ pub enum BaseFailure {
     /// Not logged in / unauthorized / bad-or-expired API key (401/403). The user
     /// must re-auth the base; UmaDev cannot fix this itself.
     Auth,
-    /// The base hit a rate limit / quota / usage cap (429). Transient — retry or
+    /// The base hit a rate limit (429, too many requests). Transient — retry or
     /// switch model.
     RateLimit,
+    /// The account's usage quota or balance is used up (a 5-hour or weekly
+    /// usage cap, `insufficient_quota`, 402, 余额不足). It does not clear in
+    /// seconds, so unlike [`BaseFailure::RateLimit`] it is not
+    /// [`is_transient`]: a backoff-and-retry only burns time until the quota
+    /// resets or the user switches model or account.
+    Quota,
     /// The base model endpoint could not be reached. `ssl` is `true` when the
     /// failure is specifically an SSL/TLS/certificate verification problem (proxy
     /// or corporate CA), `false` for a plain connectivity failure (refused /
@@ -113,17 +122,23 @@ pub fn classify(
     if is_capability_unsupported(hay) {
         return BaseFailure::CapabilityUnsupported;
     }
+    // Quota before auth: a quota message may name the API key it applies to.
+    if is_quota(hay) {
+        return BaseFailure::Quota;
+    }
     if is_auth(hay) {
         return BaseFailure::Auth;
     }
     if is_rate_limit(hay) {
         return BaseFailure::RateLimit;
     }
-    if is_overloaded(hay) {
-        return BaseFailure::Overloaded;
-    }
+    // Context before overload: "exceeds the model's context capacity" is an
+    // overflow to compact, not a busy server to wait out.
     if is_context(hay) {
         return BaseFailure::Context;
+    }
+    if is_overloaded(hay) {
+        return BaseFailure::Overloaded;
     }
     if let Some(ssl) = is_network(hay) {
         return BaseFailure::Network { ssl };
@@ -151,6 +166,16 @@ pub fn is_transient(f: &BaseFailure) -> bool {
         f,
         BaseFailure::RateLimit | BaseFailure::Overloaded | BaseFailure::Network { .. }
     )
+}
+
+/// Whether a stop caused by `f` leaves a run worth resuming later with
+/// `/continue`: every [`is_transient`] hiccup, plus an exhausted
+/// [`BaseFailure::Quota`], which clears once the quota resets or the user
+/// switches model or account. Unlike [`is_transient`] this never means "retry
+/// now". Pure.
+#[must_use]
+pub fn is_resumable_later(f: &BaseFailure) -> bool {
+    is_transient(f) || matches!(f, BaseFailure::Quota)
 }
 
 /// Whether captured base evidence proves that the resident protocol transport
@@ -203,6 +228,7 @@ pub fn actionable_message(f: &BaseFailure, backend: &str) -> String {
     match f {
         BaseFailure::Auth => umadev_i18n::tl(auth_key(backend)).to_string(),
         BaseFailure::RateLimit => umadev_i18n::tl("base.fail.ratelimit").to_string(),
+        BaseFailure::Quota => umadev_i18n::tl("base.fail.quota").to_string(),
         BaseFailure::Overloaded => umadev_i18n::tl("base.fail.overloaded").to_string(),
         BaseFailure::Network { ssl: false } => umadev_i18n::tl("base.fail.network").to_string(),
         BaseFailure::Network { ssl: true } => umadev_i18n::tl("base.fail.network.ssl").to_string(),
@@ -439,8 +465,6 @@ fn is_auth(hay: &str) -> bool {
         "authorization failed",
         "auth failed",
         "auth error",
-        "401",
-        "403",
         "forbidden",
         "api key",
         "api-key",
@@ -462,23 +486,76 @@ fn is_auth(hay: &str) -> bool {
         "expired token",
         "token has expired",
         "session expired",
+        "未登录",
+        "登录已过期",
+        "登录失效",
+        "认证失败",
+        "鉴权失败",
+        "身份验证失败",
+        "未登入",
+        "登入已過期",
+        "認證失敗",
+        "驗證失敗",
     ];
-    MARKERS.iter().any(|m| hay.contains(m))
+    contains_token(hay, "401")
+        || contains_token(hay, "403")
+        || MARKERS.iter().any(|m| hay.contains(m))
 }
 
-/// Rate limit / quota / usage cap (429).
+/// Exhausted usage quota or account balance (402, `insufficient_quota`, a
+/// usage cap). A per-minute quota is a rate limit and stays out.
+fn is_quota(hay: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "quota",
+        "usage limit",
+        "usage cap",
+        "insufficient balance",
+        "insufficient_balance",
+        "credit balance",
+        "out of credits",
+        "billing",
+        "payment required",
+        "余额不足",
+        "额度",
+        "配额",
+        "欠费",
+        "用量已达上限",
+        "餘額不足",
+        "額度",
+        "配額",
+    ];
+    let exhausted = contains_token(hay, "402") || MARKERS.iter().any(|m| hay.contains(m));
+    exhausted && !is_per_minute(hay)
+}
+
+/// Whether the evidence describes a per-minute allowance (requests or tokens
+/// per minute), which refills on its own.
+fn is_per_minute(hay: &str) -> bool {
+    const MARKERS: &[&str] = &["per minute", "per-minute", "/min", "每分钟", "每分鐘"];
+    contains_token(hay, "rpm")
+        || contains_token(hay, "tpm")
+        || MARKERS.iter().any(|m| hay.contains(m))
+}
+
+/// Rate limit (429, too many requests, a per-minute quota).
 fn is_rate_limit(hay: &str) -> bool {
     const MARKERS: &[&str] = &[
         "rate limit",
         "rate-limit",
         "ratelimit",
         "rate_limit",
-        "429",
         "too many requests",
-        "quota",
-        "usage limit",
+        "请求过于频繁",
+        "请求太频繁",
+        "频率限制",
+        "限流",
+        "請求過於頻繁",
+        "請求太頻繁",
+        "頻率限制",
     ];
-    MARKERS.iter().any(|m| hay.contains(m))
+    contains_token(hay, "429")
+        || MARKERS.iter().any(|m| hay.contains(m))
+        || (hay.contains("quota") && is_per_minute(hay))
 }
 
 /// Overloaded / at capacity / busy (529, codex JSON-RPC `-32001`).
@@ -486,15 +563,37 @@ fn is_overloaded(hay: &str) -> bool {
     const MARKERS: &[&str] = &[
         "overloaded",
         "overload",
-        "529",
-        "-32001",
         "at capacity",
         "over capacity",
-        "capacity",
+        "no capacity",
+        "insufficient capacity",
         "server is busy",
         "service is busy",
+        "服务繁忙",
+        "服务器繁忙",
+        "系统繁忙",
+        "负载过高",
+        "过载",
+        "服務繁忙",
+        "伺服器忙碌",
+        "系統繁忙",
+        "過載",
     ];
-    MARKERS.iter().any(|m| hay.contains(m))
+    contains_token(hay, "529")
+        || contains_token(hay, "-32001")
+        || MARKERS.iter().any(|m| hay.contains(m))
+}
+
+/// Whether `hay` contains `token` with no ASCII letter or digit directly on
+/// either side, so a status code is not found inside a request id, a
+/// timestamp or a byte count.
+fn contains_token(hay: &str, token: &str) -> bool {
+    hay.match_indices(token).any(|(at, _)| {
+        let before = hay[..at].chars().next_back();
+        let after = hay[at + token.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    })
 }
 
 /// Prompt / conversation exceeded the model's maximum context length.
@@ -513,6 +612,14 @@ fn is_context(hay: &str) -> bool {
         "maximum number of tokens",
         "exceeds the maximum",
         "reduce the length",
+        "context capacity",
+        "上下文长度",
+        "上下文过长",
+        "上下文窗口",
+        "超出上下文",
+        "超过上下文",
+        "上下文長度",
+        "上下文過長",
     ];
     MARKERS.iter().any(|m| hay.contains(m))
 }
@@ -581,6 +688,13 @@ fn is_network(hay: &str) -> Option<bool> {
         "os error 232",
         "pipe is being closed",
         "管道正在被关闭",
+        "网络错误",
+        "网络连接失败",
+        "连接超时",
+        "无法连接",
+        "網路錯誤",
+        "連線逾時",
+        "無法連線",
     ];
     if SSL_MARKERS.iter().any(|m| hay.contains(m)) {
         return Some(true);
@@ -686,12 +800,97 @@ mod tests {
             BaseFailure::RateLimit
         );
         assert_eq!(
-            classify(None, Some("usage limit reached for this org"), None),
+            classify(None, Some("请求过于频繁，请稍后再试"), None),
             BaseFailure::RateLimit
         );
+        // A per-minute quota is a rate limit, not an exhausted quota.
         assert_eq!(
-            classify(None, Some("quota exceeded"), None),
+            classify(
+                None,
+                Some("Quota exceeded for requests per minute (RPM) on this key"),
+                None
+            ),
             BaseFailure::RateLimit
+        );
+    }
+
+    #[test]
+    fn an_exhausted_quota_is_terminal_not_a_rate_limit() {
+        for evidence in [
+            "API Error: Request rejected (429) · You have exceeded the 5-hour usage quota.",
+            "usage limit reached for this org",
+            r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota, please check your plan and billing details."}}"#,
+            "HTTP 402 Payment Required",
+            "Your credit balance is too low to access the API",
+            "Insufficient Balance",
+            "账户余额不足，请充值后再试",
+            "本月额度已用完",
+            "帳戶餘額不足",
+        ] {
+            assert_eq!(
+                classify(None, Some(evidence), None),
+                BaseFailure::Quota,
+                "{evidence}"
+            );
+        }
+        assert!(!is_transient(&BaseFailure::Quota));
+        // Not worth an immediate retry, but the run can resume once it resets.
+        assert!(is_resumable_later(&BaseFailure::Quota));
+        assert!(is_resumable_later(&BaseFailure::RateLimit));
+        assert!(!is_resumable_later(&BaseFailure::Auth));
+        assert!(!is_resumable_later(&BaseFailure::Context));
+    }
+
+    #[test]
+    fn status_codes_match_only_as_whole_tokens() {
+        for evidence in [
+            "request req_4291ab failed",
+            "wrote 4290 bytes then exited",
+            "trace id 1401f3",
+            "build 5290 finished",
+        ] {
+            assert_eq!(
+                classify(None, Some(evidence), None),
+                BaseFailure::Unknown,
+                "{evidence}"
+            );
+        }
+        assert_eq!(classify(None, Some("status=401"), None), BaseFailure::Auth);
+        assert_eq!(
+            classify(None, Some("error (529)"), None),
+            BaseFailure::Overloaded
+        );
+    }
+
+    #[test]
+    fn chinese_gateway_errors_are_classified() {
+        assert_eq!(
+            classify(None, Some("认证失败：无效的令牌"), None),
+            BaseFailure::Auth
+        );
+        assert_eq!(
+            classify(None, Some("服务繁忙，请稍后重试"), None),
+            BaseFailure::Overloaded
+        );
+        assert_eq!(
+            classify(None, Some("请求的上下文长度超出模型限制"), None),
+            BaseFailure::Context
+        );
+        assert_eq!(
+            classify(None, Some("网络错误：连接超时"), None),
+            BaseFailure::Network { ssl: false }
+        );
+    }
+
+    #[test]
+    fn a_context_overflow_is_not_read_as_overload() {
+        assert_eq!(
+            classify(
+                None,
+                Some("prompt exceeds the model's context capacity"),
+                None
+            ),
+            BaseFailure::Context
         );
     }
 
@@ -705,6 +904,7 @@ mod tests {
         // HARD (retrying is futile → fail honestly on the first hit): auth / context /
         // a non-zero exit / unclassifiable.
         assert!(!is_transient(&BaseFailure::Auth));
+        assert!(!is_transient(&BaseFailure::Quota));
         assert!(!is_transient(&BaseFailure::Context));
         assert!(!is_transient(&BaseFailure::Exited(2)));
         assert!(!is_transient(&BaseFailure::Unknown));
@@ -1019,6 +1219,10 @@ mod tests {
             umadev_i18n::tl("base.fail.ratelimit")
         );
         assert_eq!(
+            actionable_message(&BaseFailure::Quota, "codex"),
+            umadev_i18n::tl("base.fail.quota")
+        );
+        assert_eq!(
             actionable_message(&BaseFailure::Overloaded, "codex"),
             umadev_i18n::tl("base.fail.overloaded")
         );
@@ -1078,13 +1282,14 @@ mod tests {
 
     #[test]
     fn diagnose_turn_failure_prepends_actionable_line_and_keeps_raw_reason() {
-        // A 429 in the base's own error text → RateLimit diagnosis PREPENDED, the
-        // raw error kept as the detail (the user sees both the fix and the cause).
+        // An exhausted usage quota in the base's own error text → Quota diagnosis
+        // PREPENDED, the raw error kept as the detail (the user sees both the fix
+        // and the cause). The 429 in it does not make it a rate limit.
         let raw = "API Error: Request rejected (429) · You have exceeded the 5-hour usage quota.";
         let out = diagnose_turn_failure(raw, "claude-code");
         assert!(
-            out.starts_with(umadev_i18n::tl("base.fail.ratelimit")),
-            "the actionable rate-limit line is prepended: {out}"
+            out.starts_with(umadev_i18n::tl("base.fail.quota")),
+            "the actionable quota line is prepended: {out}"
         );
         assert!(out.contains("429"), "the raw base error is kept: {out}");
         assert!(out.contains("usage quota"), "the full cause is kept: {out}");

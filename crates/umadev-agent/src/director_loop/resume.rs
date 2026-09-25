@@ -798,8 +798,9 @@ pub fn is_budget_pause_reason(reason: &str) -> bool {
 }
 
 /// A ONE-LINE localized discoverability hint to emit when a director run stops with a
-/// still-resumable plan on disk AND the stop was either a **transient** base failure
-/// (a rate limit / an overloaded base / a network blip — [`crate::base_error::is_transient`])
+/// still-resumable plan on disk AND the stop was either a **resumable** base failure
+/// (a rate limit / an overloaded base / a network blip / an exhausted quota —
+/// [`crate::base_error::is_resumable_later`])
 /// OR a **run-time-budget** exhaustion ([`is_budget_pause_reason`]): the plan was
 /// saved and `/continue` picks up the unfinished steps.
 ///
@@ -827,7 +828,7 @@ pub fn transient_resume_hint(reason: &str, root: &Path) -> Option<String> {
     // progress for the budget-pause variant (done/total).
     let plan = load_resumable_plan(root)?;
     let failure = crate::base_error::classify(None, None, Some(reason.trim()));
-    if crate::base_error::is_transient(&failure) {
+    if crate::base_error::is_resumable_later(&failure) {
         return Some(umadev_i18n::tl("run.transient_resume_hint").to_string());
     }
     if is_budget_pause_reason(reason) {
