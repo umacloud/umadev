@@ -629,7 +629,7 @@ pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
     if is_force_push(&cmd) {
         return Reversibility::VersionControl;
     }
-    if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) {
+    if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) || target_is_url(target_path) {
         return Reversibility::Network;
     }
     // Touching `.git/` internals (config, refs, objects, hooks) can rewrite or
@@ -648,6 +648,15 @@ pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
         return Reversibility::Uncertain;
     }
     Reversibility::Reversible
+}
+
+/// Whether a tool's target is a URL. A fetch tool (`webfetch`, an MCP fetch) names
+/// the network only in its target, so its action alone carries no network token.
+fn target_is_url(target_path: &str) -> bool {
+    let target = target_path.trim_start().to_ascii_lowercase();
+    ["http://", "https://", "ftp://"]
+        .iter()
+        .any(|scheme| target.starts_with(scheme))
 }
 
 /// Whether a path/command string reaches into version-control internals.
@@ -1156,16 +1165,36 @@ fn remembered_class_rooted(
         } else {
             "write_in_tree".to_string()
         }),
-        // Key each shell / MCP / dynamic-tool action by its OWN effective command, NOT one
-        // coarse `"shell"` constant. `capability_class` funnels every non-read, non-write,
-        // non-network action into `Capability::Shell` — a local shell command, but ALSO
-        // every `mcp__server__tool`, sub-agent spawn, and the `Read` tool name. Sharing one
-        // key meant ONE approved `npm run build` auto-granted every later `mcp__*` delete,
-        // sub-agent, and arbitrary shell command for the life of the project (a blank check
-        // via the ordinary tool lane). Each distinct effective command / tool id now has its
-        // own key, so a remembered approval covers only the identical action.
-        Capability::Shell => Some(format!("shell:{}", effective_command(command, target_path))),
+        // Key each shell command by its OWN exact text, NOT one coarse `"shell"` constant.
+        // `capability_class` funnels every non-read, non-write, non-network action into
+        // `Capability::Shell` — a local shell command, but ALSO every `mcp__server__tool`,
+        // sub-agent spawn, and the `Read` tool name. Sharing one key meant ONE approved
+        // `npm run build` auto-granted every later `mcp__*` delete, sub-agent, and arbitrary
+        // shell command for the life of the project (a blank check via the ordinary tool
+        // lane). See [`remembered_shell_command`] for which actions have a key at all.
+        Capability::Shell => {
+            remembered_shell_command(command, target_path).map(|command| format!("shell:{command}"))
+        }
     }
+}
+
+/// The command a remembered shell approval is keyed on, or `None` when the action
+/// must re-ask every time.
+///
+/// A shell-exec tool (`Bash` + its command) and a bare command string are keyed on
+/// the command exactly as written: case is kept, because `./scripts/Build.sh` and
+/// `./scripts/build.sh` are different files on a case-sensitive filesystem. Any
+/// other tool with a target (`webfetch` + URL, `mcp__server__tool` + an argument,
+/// a sub-agent task) has none: its target is only the one argument the base chose
+/// to show, so a key on it (or on the tool name alone) would let one approval
+/// cover every later call with different arguments.
+fn remembered_shell_command<'a>(command: &'a str, target_path: &'a str) -> Option<&'a str> {
+    let action = command.trim();
+    let target = target_path.trim();
+    if SHELL_EXEC_ACTIONS.contains(&action.to_ascii_lowercase().as_str()) {
+        return (!target.is_empty()).then_some(target);
+    }
+    (target.is_empty() && !action.is_empty()).then_some(action)
 }
 
 /// The remember-scope for an OUT-of-tree write: its PARENT directory, so an approval is
@@ -1364,7 +1393,7 @@ pub fn capability_class(command: &str, target_path: &str) -> Capability {
         if WRITE_ACTIONS.contains(&cmd.as_str()) {
             return Capability::Write;
         }
-        if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) {
+        if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) || target_is_url(target_path) {
             return Capability::Network;
         }
         // A pure read verb stays Read; everything else that runs is Shell.
@@ -3663,5 +3692,45 @@ mod tests {
             Some(key) => ledger.allow_rules.insert(key),
             None => false,
         }
+    }
+
+    #[test]
+    fn remembered_shell_commands_keep_their_case() {
+        let root = real_root();
+        let mut ledger = TrustLedger::default();
+        let key = remembered_class_rooted("Bash", "./scripts/Build.sh", Some(root)).unwrap();
+        assert_eq!(key, "shell:./scripts/Build.sh");
+        ledger.allow_rules.insert(key);
+        assert!(ledger.remembers_rooted("Bash", "./scripts/Build.sh", root));
+        assert!(!ledger.remembers_rooted("Bash", "./scripts/build.sh", root));
+    }
+
+    #[test]
+    fn tool_approvals_are_never_keyed_on_the_tool_name_alone() {
+        let root = real_root();
+        for (tool, target) in [
+            ("webfetch", "https://docs.rs/serde"),
+            ("mcp__db__delete_rows", "users"),
+            ("task", "review the diff"),
+        ] {
+            assert_eq!(remembered_class_rooted(tool, target, Some(root)), None);
+            assert!(!remember_project_approval(root, tool, target));
+        }
+        // A URL target reaches the network whatever the tool is called, so
+        // Guarded confirms each fetch instead of treating it as local work.
+        assert_eq!(
+            capability_class("webfetch", "https://attacker.test/?d=x"),
+            Capability::Network
+        );
+        assert!(requires_confirmation(
+            TrustMode::Guarded,
+            "webfetch",
+            "https://attacker.test/?d=x"
+        ));
+        assert!(!requires_confirmation(
+            TrustMode::Auto,
+            "webfetch",
+            "https://docs.rs/serde"
+        ));
     }
 }
