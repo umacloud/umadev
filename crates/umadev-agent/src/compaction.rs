@@ -360,7 +360,10 @@ mod tests {
     fn oversized_fold_keeps_the_newest_turns_and_a_small_prior_summary() {
         let big = "a".repeat(13_000);
         let p = summary_prompt(&[msg("user", &big), msg("assistant", "DECISION_X")]);
-        assert!(p.user.contains("DECISION_X"), "newest folded turn must survive");
+        assert!(
+            p.user.contains("DECISION_X"),
+            "newest folded turn must survive"
+        );
 
         let p = summary_prompt(&[
             msg("user", "PRIOR_SUMMARY"),
@@ -369,10 +372,12 @@ mod tests {
         ]);
         assert!(p.user.contains("PRIOR_SUMMARY"));
         assert!(p.user.contains("DECISION_X"));
-        assert!(render_folded(&[msg("user", "PRIOR_SUMMARY"), msg("user", &big)])
-            .chars()
-            .count()
-            <= FOLDED_INPUT_CHARS);
+        assert!(
+            render_folded(&[msg("user", "PRIOR_SUMMARY"), msg("user", &big)])
+                .chars()
+                .count()
+                <= FOLDED_INPUT_CHARS
+        );
     }
 
     #[tokio::test]
