@@ -28,6 +28,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
 fs2 = { workspace = true }
+ignore = { workspace = true }
 same-file = "1"
 toml = { workspace = true }
 toml_edit = { workspace = true }

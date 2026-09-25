@@ -88,6 +88,10 @@ regex = "1.10"
 sha2 = "0.10"
 getrandom = "0.2"
 fs2 = "0.4"
+# ripgrep's `.gitignore` matcher. The workspace content snapshot uses only its
+# matcher (never its walker or file readers) so a project's own ignore rules
+# can prune generated trees without delegating the hardened, no-follow walk.
+ignore = "0.4.33"
 
 # --- time ---
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
