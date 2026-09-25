@@ -25,8 +25,8 @@ use crate::experts::{
 };
 use crate::gates::Gate;
 use crate::phases::{
-    run_backend, run_delivery, run_docs, run_frontend, run_frontend_with_kind, run_quality,
-    run_quality_with_kind, run_research, run_spec, DocsContent, PhaseOutput,
+    run_backend, run_delivery, run_delivery_with_quality, run_docs, run_frontend,
+    run_frontend_with_kind, run_quality, run_research, run_spec, DocsContent, PhaseOutput,
 };
 use crate::state::{write_workflow_state, WorkflowState};
 
@@ -875,32 +875,27 @@ fn unresolved_degraded_artifacts(options: &RunOptions) -> bool {
     })
 }
 
-fn recorded_quality_passed(options: &RunOptions) -> bool {
-    let path = options
-        .project_root
-        .join("output")
-        .join(format!("{}-quality-gate.json", options.effective_slug()));
-    match crate::bounded_fs::read_utf8_beneath(
-        &options.project_root,
-        &path,
-        RUN_ARTIFACT_FILE_BYTES,
-    ) {
-        Ok(body) => crate::phases::extract_quality_score(&body).1,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(_) => false,
-    }
-}
-
+/// Settle an entry's task-ledger record from how its block ended.
+///
+/// `quality_verdict` is the verdict of a quality phase this block ran, taken
+/// from the gate JSON it produced in memory (`None` when the block ran none).
+/// A block that ends at Quality or Delivery must carry a passing one: the
+/// report in `output/` is model-writable, so it never decides a success.
 fn settle_pipeline_entry(
     task: &mut crate::task_lifecycle::EntryTaskTracker,
     options: &RunOptions,
     result: &std::io::Result<RunReport>,
     quality_is_hard: bool,
+    quality_verdict: Option<bool>,
 ) -> std::io::Result<()> {
+    let quality_is_clean = |report: &RunReport| match report.final_phase {
+        Phase::Quality | Phase::Delivery => quality_verdict == Some(true),
+        _ => quality_verdict != Some(false),
+    };
     let terminal_evidence_is_clean = |report: &RunReport| {
         !report.completed.iter().any(|phase| phase.degraded)
             && !unresolved_degraded_artifacts(options)
-            && (!quality_is_hard || recorded_quality_passed(options))
+            && (!quality_is_hard || quality_is_clean(report))
     };
     let settle = match result {
         Err(error) => task.fail("pipeline block failed", vec![error.to_string()]),
@@ -1970,7 +1965,7 @@ impl<R: Runtime> AgentRunner<R> {
             })
         }
         .await;
-        settle_pipeline_entry(&mut task, &self.options, &result, use_runtime)?;
+        settle_pipeline_entry(&mut task, &self.options, &result, use_runtime, None)?;
         result
     }
 
@@ -2420,7 +2415,7 @@ impl<R: Runtime> AgentRunner<R> {
             })
         }
         .await;
-        settle_pipeline_entry(&mut task, &self.options, &result, use_runtime)?;
+        settle_pipeline_entry(&mut task, &self.options, &result, use_runtime, None)?;
         result
     }
 
@@ -5471,6 +5466,7 @@ impl<R: Runtime> AgentRunner<R> {
             &self.options,
             &result,
             !self.runtime.is_offline(),
+            None,
         )?;
         result
     }
@@ -5486,6 +5482,7 @@ impl<R: Runtime> AgentRunner<R> {
             "pipeline-worker",
             "execute and verify the legacy single-shot pipeline",
         )?;
+        let mut quality_verdict = None;
         let result: std::io::Result<RunReport> = async {
             let use_runtime = !self.runtime.is_offline();
             // Re-derive the (deterministic) plan to honour its skips in this block
@@ -5653,16 +5650,11 @@ impl<R: Runtime> AgentRunner<R> {
             let phase_start = std::time::Instant::now();
             self.transition(Phase::Quality, "")?;
             self.start_phase(Phase::Quality);
-            let quality_result = run_quality(&self.options);
-            // Did the quality phase PRODUCE a gate file? If it did and we can't
-            // read it back, that's a disk/permission failure, not "offline mode" —
-            // we must NOT assume pass (that would mask a write failure as success).
-            let produced_gate_file = quality_result.as_ref().is_ok_and(|o| {
-                o.artifacts
-                    .iter()
-                    .any(|p| p.to_string_lossy().ends_with("-quality-gate.json"))
-            });
-            completed.push(self.record_phase(Phase::Quality, quality_result)?);
+            // The verdict is the gate JSON as the quality phase produced it, never
+            // a read-back of the file: `output/` is model-writable, and a
+            // left-running background process could forge a pass in between.
+            let (quality_out, qg_body) = crate::phases::run_quality_report(&self.options)?;
+            completed.push(self.record_phase(Phase::Quality, Ok(quality_out))?);
             self.record_phase_timing(Phase::Quality, phase_start);
             self.maybe_verify(Phase::Quality).await;
 
@@ -5701,58 +5693,26 @@ impl<R: Runtime> AgentRunner<R> {
                 }
             }
 
-            let qg_path = self.options.project_root.join("output").join(format!(
-                "{}-quality-gate.json",
-                self.options.effective_slug()
-            ));
-            // Keep the gate JSON around: we need it both for the score line AND, when
-            // the gate blocks, to inline the top findings instead of telling the user
-            // to open the file themselves.
-            let qg_body = match crate::bounded_fs::read_utf8_beneath(
-                &self.options.project_root,
-                &qg_path,
-                RUN_ARTIFACT_FILE_BYTES,
-            ) {
-                Ok(body) => Some(body),
-                Err(error) => {
-                    self.note_unavailable_workspace_input("quality-gate.json", &error);
-                    None
+            // Keep the gate JSON around: we need it for the score line, when the
+            // gate blocks to inline the top findings instead of telling the user to
+            // open the file themselves, and as the verdict delivery acts on.
+            let (qg_score, quality_passed) = crate::phases::extract_quality_score(&qg_body);
+            self.emit(EngineEvent::Note(format!(
+                "质量门结果: {qg_score}/100 · {}",
+                if quality_passed {
+                    "PASSED [ok]"
+                } else {
+                    "BLOCKED [fail]"
                 }
-            };
-            let mut qg_score = "?".to_string();
-            let quality_passed = if let Some(qg) = qg_body.as_deref() {
-                let (score_str, passed) = crate::phases::extract_quality_score(qg);
-                self.emit(EngineEvent::Note(format!(
-                    "质量门结果: {score_str}/100 · {}",
-                    if passed {
-                        "PASSED [ok]"
-                    } else {
-                        "BLOCKED [fail]"
-                    }
-                )));
-                qg_score = score_str;
-                passed
-            } else if produced_gate_file {
-                // The quality phase wrote the file but we can't read it back —
-                // treat as a real failure rather than silently assuming pass.
-                self.emit(EngineEvent::Note(umadev_i18n::tlf(
-                    "quality.gate_unreadable",
-                    &[&qg_path.display().to_string()],
-                )));
-                false
-            } else {
-                true // no gate file produced = offline/empty run → assume pass
-            };
+            )));
+            quality_verdict = Some(quality_passed);
 
             if !quality_passed && use_runtime {
                 // Inline the score + top findings so the user sees WHAT failed and by
                 // HOW much, right here — no need to open the JSON. Fail-open: an
                 // unparsable gate yields no findings block, and we still print the
                 // blocked banner + next steps.
-                let findings = qg_body
-                    .as_deref()
-                    .map(|b| crate::phases::quality_findings(b, 5))
-                    .unwrap_or_default();
+                let findings = crate::phases::quality_findings(&qg_body, 5);
                 let findings_block = if findings.is_empty() {
                     String::new()
                 } else {
@@ -5830,7 +5790,10 @@ impl<R: Runtime> AgentRunner<R> {
                         ok: del_ok,
                     });
                 }
-                completed.push(self.record_phase(Phase::Delivery, run_delivery(&self.options))?);
+                completed.push(self.record_phase(
+                    Phase::Delivery,
+                    run_delivery_with_quality(&self.options, Some(&qg_body)),
+                )?);
                 // Base-driven self-evolution upkeep: reconcile the lesson corpus and
                 // write reusable skill cards (no-op offline; fail-open).
                 self.evolve_memory_at_delivery().await;
@@ -5875,6 +5838,7 @@ impl<R: Runtime> AgentRunner<R> {
             &self.options,
             &result,
             !self.runtime.is_offline(),
+            quality_verdict,
         )?;
         result
     }
@@ -6018,29 +5982,14 @@ impl<R: Runtime> AgentRunner<R> {
             // M8: thread the FORCED Light kind so the doc-N/A guard reads the EXECUTED
             // plan (no Docs) rather than re-classifying the requirement (which could
             // re-derive Greenfield and penalise the run for PRD/arch/UIUX it skipped).
-            let quality_result = run_quality_with_kind(&self.options, Some(plan.kind));
-            completed.push(self.record_phase(Phase::Quality, quality_result)?);
+            // The verdict is the gate JSON as produced, never a read-back of the
+            // model-writable file (see the full path).
+            let (quality_out, qg_body) =
+                crate::phases::run_quality_report_with_kind(&self.options, Some(plan.kind))?;
+            completed.push(self.record_phase(Phase::Quality, Ok(quality_out))?);
             self.record_phase_timing(Phase::Quality, phase_start);
             self.maybe_verify(Phase::Quality).await;
-
-            let quality_passed = {
-                let qg_path = self.options.project_root.join("output").join(format!(
-                    "{}-quality-gate.json",
-                    self.options.effective_slug()
-                ));
-                match crate::bounded_fs::read_utf8_beneath(
-                    &self.options.project_root,
-                    &qg_path,
-                    RUN_ARTIFACT_FILE_BYTES,
-                ) {
-                    Ok(qg) => crate::phases::extract_quality_score(&qg).1,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                    Err(error) => {
-                        self.note_unavailable_workspace_input("quality-gate.json", &error);
-                        false
-                    }
-                }
-            };
+            let quality_passed = crate::phases::extract_quality_score(&qg_body).1;
 
             // Mark the lean run complete — phase stays at quality (Light has no
             // delivery phase), gate cleared.

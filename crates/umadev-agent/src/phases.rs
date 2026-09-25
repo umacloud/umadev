@@ -1085,7 +1085,7 @@ pub fn run_quality(opts: &RunOptions) -> io::Result<PhaseOutput> {
 /// file sits in `output/`, where a model-left background process can rewrite it
 /// between the write and a read-back and forge a pass.
 pub fn run_quality_report(opts: &RunOptions) -> io::Result<(PhaseOutput, String)> {
-    run_quality_scored(opts, None)
+    run_quality_report_with_kind(opts, None)
 }
 
 /// [`run_quality`] with the run's EXECUTED kind threaded in (M8). The doc-N/A guard
@@ -1100,10 +1100,12 @@ pub fn run_quality_with_kind(
     opts: &RunOptions,
     executed_kind: Option<crate::planner::TaskKind>,
 ) -> io::Result<PhaseOutput> {
-    run_quality_scored(opts, executed_kind).map(|(out, _)| out)
+    run_quality_report_with_kind(opts, executed_kind).map(|(out, _)| out)
 }
 
-fn run_quality_scored(
+/// [`run_quality_with_kind`], also handing back the gate JSON exactly as it
+/// was written (see [`run_quality_report`]).
+pub fn run_quality_report_with_kind(
     opts: &RunOptions,
     executed_kind: Option<crate::planner::TaskKind>,
 ) -> io::Result<(PhaseOutput, String)> {
@@ -2497,21 +2499,32 @@ fn render_quality_md(r: &QualityReport) -> String {
 
 /// Run the `delivery` phase (`UD-EVID-005`). Emits compliance mapping
 /// and a proof-pack zip in `release/`.
+///
+/// Without the gate JSON of a quality phase this process just ran, the run
+/// is treated as not having passed: nothing is graduated or recorded as
+/// validated, and the report on disk is only shown. See
+/// [`run_delivery_with_quality`].
 pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
+    run_delivery_with_quality(opts, None)
+}
+
+/// [`run_delivery`] for a caller holding the gate JSON its quality phase
+/// produced (see [`run_quality_report`]). Only that verdict can graduate
+/// skills or word a lesson as "passed": `output/<slug>-quality-gate.json` is
+/// model-writable, so a report read back from it is display-only.
+pub fn run_delivery_with_quality(
+    opts: &RunOptions,
+    quality_json: Option<&str>,
+) -> io::Result<PhaseOutput> {
     let slug = opts.effective_slug();
     crate::bounded_fs::ensure_real_dir_beneath(&opts.project_root, Path::new("output"))?;
 
-    // Read the REAL quality-gate result first — it gates both the skill
-    // graduation below AND the wording of the captured-pattern lesson (we must
-    // never sediment "passed the quality gate" when it did not pass). Fail-open:
-    // a missing/unreadable gate file reads as "not passed".
-    let quality_passed = Some(read_phase_artifact(
-        &opts.project_root,
-        opts.project_root
-            .join(format!("output/{slug}-quality-gate.json")),
-    ))
-    .and_then(|j| serde_json::from_str::<QualityReport>(&j).ok())
-    .is_some_and(|r| r.passed);
+    // The verdict gates both the skill graduation below AND the wording of the
+    // captured-pattern lesson (we must never sediment "passed the quality
+    // gate" when it did not pass). Fail-closed: no in-memory verdict, or one
+    // that does not parse, reads as "not passed".
+    let quality_report = quality_json.and_then(|j| serde_json::from_str::<QualityReport>(j).ok());
+    let quality_passed = quality_report.as_ref().is_some_and(|r| r.passed);
 
     // 0. Capture validated patterns (D2: success -> sediment -> retrieval loop)
     let arch_text = read_phase_artifact(
@@ -2554,7 +2567,15 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
 
     // 1. Compliance mapping
     let mut artifacts = Vec::new();
-    if let Some((path, _)) = write_compliance_mapping(&opts.project_root, &slug) {
+    let compliance = match quality_json {
+        Some(json) => umadev_governance::compliance::write_compliance_mapping_with_quality(
+            &opts.project_root,
+            &slug,
+            Some(json.as_bytes()),
+        ),
+        None => write_compliance_mapping(&opts.project_root, &slug),
+    };
+    if let Some((path, _)) = compliance {
         audit(
             opts,
             "umadev/agent.delivery",
@@ -2660,8 +2681,22 @@ pub fn run_delivery(opts: &RunOptions) -> io::Result<PhaseOutput> {
 
     // Shareable, self-contained HTML scorecard — the visible, credible,
     // tamper-evident proof the user can open and hand to a teammate/client.
-    let scorecard =
-        write_scorecard_html(&opts.project_root, &release_dir, &slug, &run_id, &zip_path);
+    let scorecard_report = quality_report.or_else(|| {
+        serde_json::from_str(&read_phase_artifact(
+            &opts.project_root,
+            opts.project_root
+                .join(format!("output/{slug}-quality-gate.json")),
+        ))
+        .ok()
+    });
+    let scorecard = write_scorecard_html(
+        &opts.project_root,
+        &release_dir,
+        &slug,
+        &run_id,
+        &zip_path,
+        scorecard_report.as_ref(),
+    );
 
     artifacts.push(zip_path);
     artifacts.push(manifest_path);
@@ -2691,14 +2726,10 @@ fn write_scorecard_html(
     slug: &str,
     run_id: &str,
     zip_path: &Path,
+    report: Option<&QualityReport>,
 ) -> io::Result<PathBuf> {
-    let report: Option<QualityReport> = serde_json::from_str(&read_phase_artifact(
-        project_root,
-        project_root.join(format!("output/{slug}-quality-gate.json")),
-    ))
-    .ok();
-    let score = report.as_ref().map_or(0, |r| r.total_score);
-    let passed = report.as_ref().is_some_and(|r| r.passed);
+    let score = report.map_or(0, |r| r.total_score);
+    let passed = report.is_some_and(|r| r.passed);
     let has_compliance = crate::bounded_fs::is_real_file_beneath(
         project_root,
         &project_root.join(format!("output/{slug}-compliance-mapping.json")),
@@ -2722,7 +2753,7 @@ fn write_scorecard_html(
     };
 
     let mut rows = String::new();
-    if let Some(r) = &report {
+    if let Some(r) = report {
         for c in &r.checks {
             let cls = match c.status.as_str() {
                 "passed" => "ok",
@@ -5094,14 +5125,9 @@ mod tests {
                 details: "no tells".into(),
             }],
         };
-        fs::write(
-            out.join("app-quality-gate.json"),
-            serde_json::to_string(&report).unwrap(),
-        )
-        .unwrap();
         let zip = rel.join("proof-pack-app-x.zip");
         fs::write(&zip, b"zip-bytes").unwrap();
-        let card = write_scorecard_html(tmp.path(), &rel, "app", "x", &zip).unwrap();
+        let card = write_scorecard_html(tmp.path(), &rel, "app", "x", &zip, Some(&report)).unwrap();
         let html = fs::read_to_string(&card).unwrap();
         // Self-contained: no external scripts/styles/images.
         assert!(!html.contains("src=\"http") && !html.contains("href=\"http"));
@@ -6439,6 +6465,38 @@ mod tests {
         assert!(
             learned_dir.is_dir(),
             "learned dir should exist after delivery"
+        );
+    }
+
+    #[test]
+    fn delivery_records_validated_patterns_only_from_the_in_memory_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        run_research(&o, None).unwrap();
+        run_docs(&o, &DocsContent::default()).unwrap();
+        run_spec(&o).unwrap();
+        run_frontend(&o).unwrap();
+        run_backend(&o).unwrap();
+        let (_, json) = run_quality_report(&o).unwrap();
+        let mut report: QualityReport = serde_json::from_str(&json).unwrap();
+        report.passed = true;
+        let passing = serde_json::to_string_pretty(&report).unwrap();
+        let validated =
+            || crate::lessons::read_raw_lessons(tmp.path(), "validated-decisions.jsonl").len();
+
+        // A passing report on disk is the workspace's word, not a verdict.
+        fs::write(tmp.path().join("output/demo-quality-gate.json"), &passing).unwrap();
+        run_delivery(&o).unwrap();
+        assert_eq!(
+            validated(),
+            0,
+            "a report read back from output/ validated a pattern"
+        );
+
+        run_delivery_with_quality(&o, Some(&passing)).unwrap();
+        assert!(
+            validated() > 0,
+            "the in-memory pass must record the patterns"
         );
     }
 

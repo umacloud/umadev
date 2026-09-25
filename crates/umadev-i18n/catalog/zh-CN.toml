@@ -1041,7 +1041,6 @@
 "diag.call_failed" = "[warn] {} 阶段:底座调用失败({})—— 本阶段改用【离线骨架】占位(非真实生成)。{}"
 
 # 质量门 — 内联分数 + 问题清单,别让用户另开 json
-"quality.gate_unreadable" = "[warn] 质量门文件写出后无法读回 ({}) — 判定未通过以防掩盖写盘失败。"
 "quality.gate_blocked" = "[warn] 质量门未通过(得分 {}/100)— 阻断 delivery(UD-EVID-003)。修复下列问题后重跑:\n  /redo 重跑整个流水线\n  或修复后 /continue 继续"
 "quality.top_findings_header" = "待修复的主要问题:"
 
