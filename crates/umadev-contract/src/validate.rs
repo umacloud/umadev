@@ -359,6 +359,32 @@ mod tests {
     }
 
     #[test]
+    fn declared_path_with_query_matches_call() {
+        // Chinese API tables often document query parameters inline in the Path
+        // cell. The declared path must still match real calls, with or without a
+        // query string, while a different resource is still undeclared.
+        let spec = parse_architecture(
+            "| Method | Path | Description |\n|---|---|---|\n\
+             | GET | /api/products?page=&size= | 分页查询商品 |\n\
+             | GET | /api/orders/:id#详情 | 订单详情 |\n",
+            "demo",
+        );
+        let calls = vec![
+            call(HttpVerb::Get, "/api/products"),
+            call(HttpVerb::Get, "/api/products?page=2"),
+            call(HttpVerb::Get, "/api/orders/42"),
+        ];
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert!(v.is_empty(), "{v:?}");
+        let v = validate_frontend_vs_contract(&[call(HttpVerb::Get, "/api/carts")], &spec);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].kind, ViolationKind::UndeclaredCall);
+        // The PRD check finds the resource segment too.
+        let routes = vec!["/products".to_string()];
+        assert!(validate_prd_vs_contract(&routes, &spec).is_empty());
+    }
+
+    #[test]
     fn method_mismatch_flagged() {
         let spec = spec();
         // Contract declares GET /api/users, frontend calls DELETE /api/users.
