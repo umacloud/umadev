@@ -428,8 +428,8 @@ const STDERR_CAPTURE_CAP: usize = 262_144;
 /// Hard cap on stdout accumulated by [`run_subprocess_streaming`] — mirrors the
 /// 256 KiB post-hoc stdout truncation in [`run_subprocess`]. Without it a chatty
 /// newline-delimited stream (thousands of small JSONL events) grows the
-/// line buffer without bound. Past the cap we stop accumulating and append a
-/// single truncation marker; live streaming to `on_line` is unaffected.
+/// line buffer without bound. Past the cap we keep the head plus a rolling tail
+/// (see [`StreamStdout`]); live streaming to `on_line` is unaffected.
 const STREAM_STDOUT_CAP: usize = 262_144;
 
 /// Hard cap for one newline-delimited streaming record. The reader continues
@@ -582,26 +582,65 @@ fn spawn_stdout_line_capture(
     (rx, task)
 }
 
+/// Stdout accumulated by [`run_subprocess_streaming`], bounded by
+/// [`STREAM_STDOUT_CAP`]. Lines are kept in order until the cap is first hit;
+/// from then on a rolling tail of the newest lines is kept instead, because
+/// every base emits its final answer LAST (claude's `result`, codex's final
+/// `agent_message` / `turn.completed`, opencode's final text). When the tail
+/// needs room it evicts its own oldest lines first, then the newest head lines,
+/// so the terminal record survives even when it is large.
+#[derive(Default)]
+struct StreamStdout {
+    head: Vec<String>,
+    tail: std::collections::VecDeque<String>,
+    retained_bytes: usize,
+    truncated: bool,
+    lines_seen: usize,
+}
+
+impl StreamStdout {
+    fn push(&mut self, line: String) {
+        self.lines_seen += 1;
+        let cost = line.len() + 1;
+        if !self.truncated && self.retained_bytes + cost <= STREAM_STDOUT_CAP {
+            self.retained_bytes += cost;
+            self.head.push(line);
+            return;
+        }
+        self.truncated = true;
+        if cost > STREAM_STDOUT_CAP {
+            return;
+        }
+        while self.retained_bytes + cost > STREAM_STDOUT_CAP {
+            let Some(evicted) = self.tail.pop_front().or_else(|| self.head.pop()) else {
+                break;
+            };
+            self.retained_bytes -= evicted.len() + 1;
+        }
+        self.retained_bytes += cost;
+        self.tail.push_back(line);
+    }
+
+    fn into_string(self) -> String {
+        let mut lines = self.head;
+        if self.truncated {
+            lines
+                .push("...[umadev: stdout truncated at 256 KiB; middle lines omitted]".to_string());
+        }
+        lines.extend(self.tail);
+        lines.join("\n")
+    }
+}
+
 fn record_stream_line(
     line_buf: &[u8],
     on_line: &(dyn Fn(&str) + Send + Sync),
-    all_lines: &mut Vec<String>,
-    acc_bytes: &mut usize,
-    stdout_truncated: &mut bool,
+    stdout: &mut StreamStdout,
 ) {
     let line = String::from_utf8_lossy(line_buf);
     let line = line.trim_end_matches(['\r', '\n']).to_string();
     on_line(&line);
-    if *stdout_truncated {
-        return;
-    }
-    if acc_bytes.saturating_add(line.len() + 1) > STREAM_STDOUT_CAP {
-        *stdout_truncated = true;
-        all_lines.push("...[umadev: stdout truncated at 256 KiB]".to_string());
-    } else {
-        *acc_bytes += line.len() + 1;
-        all_lines.push(line);
-    }
+    stdout.push(line);
 }
 
 /// Spawn a task that drains a child's stderr into a byte buffer, bounded by
@@ -1930,14 +1969,12 @@ pub(crate) async fn run_subprocess_streaming(
                 .unwrap_or(300),
         ),
     );
-    let mut all_lines = Vec::new();
     // Total-bytes cap on the accumulated stdout, mirroring the non-streaming
     // 256 KiB cap in `run_subprocess` — a chatty JSONL stream (many small
-    // events) would otherwise grow `all_lines` without bound and exhaust memory.
-    // We keep *streaming* every line to `on_line` (the live UI is transient), but
-    // stop ACCUMULATING once past the cap and append a single truncation marker.
-    let mut acc_bytes: usize = 0;
-    let mut stdout_truncated = false;
+    // events) would otherwise grow without bound and exhaust memory. We keep
+    // *streaming* every line to `on_line` (the live UI is transient); the
+    // accumulator keeps the head plus the newest tail (see `StreamStdout`).
+    let mut stdout_acc = StreamStdout::default();
     let mut exited_status = None;
     // **First-line grace.** The idle watchdog measures line-to-line *silence*,
     // which only makes sense once a line has been seen. Some bases (claude /
@@ -1998,13 +2035,9 @@ pub(crate) async fn run_subprocess_streaming(
                     let _ = tokio::time::timeout(STDERR_FLUSH_GRACE, async {
                         while let Some(event) = line_rx.recv().await {
                             match event {
-                                StdoutLineEvent::Line(line_buf) => record_stream_line(
-                                    &line_buf,
-                                    on_line,
-                                    &mut all_lines,
-                                    &mut acc_bytes,
-                                    &mut stdout_truncated,
-                                ),
+                                StdoutLineEvent::Line(line_buf) => {
+                                    record_stream_line(&line_buf, on_line, &mut stdout_acc);
+                                }
                                 StdoutLineEvent::End | StdoutLineEvent::Error(_) => break,
                             }
                         }
@@ -2019,13 +2052,7 @@ pub(crate) async fn run_subprocess_streaming(
                 LineOrExit::Line(Ok(Some(StdoutLineEvent::End))) => break,
                 LineOrExit::Line(Ok(Some(StdoutLineEvent::Line(line_buf)))) => {
                     seen_first_line = true;
-                    record_stream_line(
-                        &line_buf,
-                        on_line,
-                        &mut all_lines,
-                        &mut acc_bytes,
-                        &mut stdout_truncated,
-                    );
+                    record_stream_line(&line_buf, on_line, &mut stdout_acc);
                 }
                 LineOrExit::Line(Ok(Some(StdoutLineEvent::Error(e)))) => {
                     terminate_and_reap_subprocess(&mut child).await;
@@ -2056,7 +2083,7 @@ pub(crate) async fn run_subprocess_streaming(
                     // #53584). Kill + return a distinguishable error so callers
                     // can retry.
                     terminate_and_reap_subprocess(&mut child).await;
-                    let lines_so_far = all_lines.len();
+                    let lines_so_far = stdout_acc.lines_seen;
                     return Err(format!(
                         "`{}` idle timeout: no stdout for {}s (stream-json hang? lines so far: {lines_so_far}). Set UMADEV_IDLE_TIMEOUT_SECS to adjust.",
                         call.program,
@@ -2120,7 +2147,8 @@ pub(crate) async fn run_subprocess_streaming(
         ));
     }
 
-    let stdout = all_lines.join("\n");
+    let lines_seen = stdout_acc.lines_seen;
+    let stdout = stdout_acc.into_string();
     let stdout = clean_output(&stdout);
 
     if stdout.trim().is_empty() && !stderr_buf.is_empty() {
@@ -2135,7 +2163,7 @@ pub(crate) async fn run_subprocess_streaming(
     tracing::debug!(
         program = call.program,
         millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        lines = all_lines.len(),
+        lines = lines_seen,
         "host streaming subprocess completed"
     );
     Ok(SubprocessOutput { stdout })
@@ -2308,8 +2336,30 @@ impl TerminalTextSanitizer {
 
     fn process_valid(&mut self, valid: &str, out: &mut String) {
         for ch in valid.chars() {
+            // A C1 code point decoded from well-formed UTF-8 is text, not an
+            // eight-bit control: JSON carries it unescaped inside strings, and
+            // treating it as an OSC/DCS/CSI introducer let one stray U+009D
+            // swallow every following line (the final `result` record
+            // included). Outside a string control it is dropped like DEL, so it
+            // never opens a sequence; inside one it may still terminate it.
+            // Raw C1 bytes keep their control meaning in `process_invalid_utf8`.
+            let ch = if ('\u{0080}'..='\u{009f}').contains(&ch) && !self.in_string_control() {
+                '\u{007f}'
+            } else {
+                ch
+            };
             self.process_char(ch, out);
         }
+    }
+
+    fn in_string_control(&self) -> bool {
+        matches!(
+            self.state,
+            TerminalControlState::Osc
+                | TerminalControlState::OscEscape
+                | TerminalControlState::StringControl
+                | TerminalControlState::StringEscape
+        )
     }
 
     fn process_char(&mut self, ch: char, out: &mut String) {
@@ -3327,6 +3377,26 @@ mod tests {
     }
 
     #[test]
+    fn clean_output_keeps_lines_after_a_utf8_c1_code_point() {
+        // JSON allows U+0080..U+009F unescaped inside strings. As decoded text
+        // they must not open an OSC/DCS/CSI that swallows every later line —
+        // here the terminal result record.
+        let raw = "{\"c\":\"\u{9d}\"}\n{\"type\":\"result\",\"result\":\"FINAL\"}";
+        let cleaned = clean_output(raw);
+        assert!(cleaned.contains("FINAL"), "{cleaned:?}");
+        assert_eq!(
+            cleaned,
+            "{\"c\":\"\"}\n{\"type\":\"result\",\"result\":\"FINAL\"}"
+        );
+        for c1 in ['\u{90}', '\u{98}', '\u{9b}', '\u{9e}', '\u{9f}'] {
+            let cleaned = clean_output(&format!("a{c1}b\nc"));
+            assert_eq!(cleaned, "ab\nc", "{c1:?}");
+        }
+        // A decoded C1 right after ESC does not turn it into a string control.
+        assert_eq!(clean_output("x\x1b\u{9d}y\nz"), "xy\nz");
+    }
+
+    #[test]
     fn clean_output_trims_and_strips() {
         let raw = "  \x1b[33m# PRD\x1b[0m\n\nbody  \n";
         assert_eq!(clean_output(raw), "# PRD\n\nbody");
@@ -4006,8 +4076,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn streaming_stdout_is_capped() {
-        // A chatty stream (~400 KiB of small lines) must not grow `all_lines`
-        // without bound: the accumulation is capped at `STREAM_STDOUT_CAP`
+        // A chatty stream (~400 KiB of small lines) must not grow the retained
+        // stdout without bound: the accumulation is capped at `STREAM_STDOUT_CAP`
         // (256 KiB) with a truncation marker, mirroring the non-streaming cap.
         let tmp = tempfile::TempDir::new().unwrap();
         // 2000 lines × 200 bytes ≈ 400 KiB — well past the 256 KiB cap.
@@ -4033,6 +4103,54 @@ mod tests {
         assert!(
             out.stdout.contains("stdout truncated at 256 KiB"),
             "the truncation marker must be present once the cap is hit"
+        );
+    }
+
+    #[test]
+    fn stream_stdout_evicts_head_for_a_large_terminal_record() {
+        let mut acc = StreamStdout::default();
+        acc.push("init".to_string());
+        for _ in 0..200 {
+            acc.push("x".repeat(1024));
+        }
+        let result = format!("RESULT{}", "y".repeat(200 * 1024));
+        acc.push(result.clone());
+        let out = acc.into_string();
+        assert!(out.len() <= STREAM_STDOUT_CAP + 128);
+        assert!(out.starts_with("init\n"));
+        assert!(out.ends_with(&result));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_stdout_cap_keeps_the_terminal_result_line() {
+        // Every base emits its final answer LAST (claude `{"type":"result"}`,
+        // codex's final agent_message / turn.completed, opencode's final text).
+        // Past the cap the accumulator must keep the tail, not only the head,
+        // or a long run's answer is silently replaced by its first events.
+        let tmp = tempfile::TempDir::new().unwrap();
+        // 300 lines x ~1 KiB ≈ 300 KiB — past the 256 KiB cap.
+        let script = r#"s=$(head -c 1000 /dev/zero | tr '\0' 'x'); i=0; while [ $i -lt 300 ]; do echo "$s"; i=$((i+1)); done; echo '{"type":"result","result":"FINAL"}'"#;
+        let out = run_subprocess_streaming(
+            SubprocessCall {
+                program: "sh",
+                args: &["-c".to_string(), script.to_string()],
+                prompt: "",
+                workspace: tmp.path(),
+                timeout: Duration::from_secs(30),
+                env: &[],
+            },
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        assert!(out.stdout.len() <= STREAM_STDOUT_CAP + 128);
+        assert!(out.stdout.contains("stdout truncated at 256 KiB"));
+        assert!(
+            out.stdout
+                .ends_with(r#"{"type":"result","result":"FINAL"}"#),
+            "the terminal result line must survive the cap: {:?}",
+            &out.stdout[out.stdout.len().saturating_sub(120)..]
         );
     }
 

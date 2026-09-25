@@ -378,8 +378,8 @@ fn run_budget() -> std::time::Duration {
 /// run in `root`. Two snapshots taken around a code phase let the runner detect
 /// "the base reported it implemented things, but the working tree did not
 /// change" — the file-level reality check the agentic chat already does, lifted
-/// into the `run` pipeline. Returns the raw porcelain output (one `XY path`
-/// line per changed path).
+/// into the `run` pipeline. Returns one `XY path<TAB>size mtime` line per
+/// changed path, with untracked directories expanded to their files.
 ///
 /// **Fail-open** (load-bearing): a non-git directory, a missing `git`, a
 /// non-zero exit, or any IO error returns `None`. The caller then SKIPS the
@@ -399,7 +399,13 @@ async fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
         .await
         .ok()?;
     command
-        .args(["status", "--porcelain", IGNORE_DIRTY_SUBMODULES])
+        .args([
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            IGNORE_DIRTY_SUBMODULES,
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -422,7 +428,25 @@ async fn git_worktree_snapshot(root: &std::path::Path) -> Option<String> {
     {
         return None; // not a git repo (or git refused) → fail-open, skip check
     }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    // Porcelain alone is not a change detector: re-editing an already-dirty
+    // file leaves its `XY path` line identical. Append each listed path's
+    // size + mtime (the same cheap fingerprint as the director loop's source
+    // snapshot) so a second edit reads as a change.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut entries = stdout.split('\0').filter(|entry| !entry.is_empty());
+    let mut snapshot = String::new();
+    while let Some(entry) = entries.next() {
+        let (status, path) = entry.split_at_checked(3).unwrap_or((entry, ""));
+        if status.contains(['R', 'C']) {
+            // `-z` emits a rename/copy's source path as its own entry.
+            entries.next();
+        }
+        let fingerprint = std::fs::symlink_metadata(root.join(path))
+            .map(|meta| format!("{} {:?}", meta.len(), meta.modified().ok()))
+            .unwrap_or_else(|_| "-".to_string());
+        snapshot.push_str(&format!("{status}{path}\t{fingerprint}\n"));
+    }
+    Some(snapshot)
 }
 
 /// `true` when the two `git status --porcelain` snapshots are byte-for-byte the
@@ -10132,6 +10156,44 @@ error TS2304: Cannot find name 'Foo'
             !worktree_unchanged("", "?? new.ts\n"),
             "going from clean to having a new file is a change"
         );
+    }
+
+    #[tokio::test]
+    async fn git_worktree_snapshot_sees_files_inside_untracked_dirs_and_re_edits() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        git_init_repo(root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        let before = git_worktree_snapshot(root).await.unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn b() {}\n").unwrap();
+        let after = git_worktree_snapshot(root).await.unwrap();
+        assert!(
+            !worktree_unchanged(&before, &after),
+            "a new file inside an already-untracked dir is a change"
+        );
+
+        std::fs::write(root.join("lib.rs"), "v1\n").unwrap();
+        for args in [vec!["add", "lib.rs"], vec!["commit", "-qm", "init"]] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(&args)
+                .output()
+                .unwrap();
+        }
+        std::fs::write(root.join("lib.rs"), "v2\n").unwrap();
+        let before = git_worktree_snapshot(root).await.unwrap();
+        std::fs::write(root.join("lib.rs"), "v3 edited again\n").unwrap();
+        let after = git_worktree_snapshot(root).await.unwrap();
+        assert!(
+            !worktree_unchanged(&before, &after),
+            "re-editing an already-dirty file is a change"
+        );
+        assert!(worktree_unchanged(
+            &after,
+            &git_worktree_snapshot(root).await.unwrap()
+        ));
     }
 
     #[tokio::test]

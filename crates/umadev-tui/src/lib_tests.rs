@@ -982,6 +982,36 @@ fn typed_host_questions_return_protocol_values_and_correlated_ids() {
 }
 
 #[test]
+fn secret_host_answers_keep_surrounding_whitespace() {
+    let umadev_runtime::HostRequest::UserInput { questions, .. } = secret_host_request() else {
+        unreachable!();
+    };
+    let response = parse_user_input_response(&questions, " p@ss word \n").unwrap();
+    let umadev_runtime::HostResponse::UserInput { answers } = response else {
+        panic!("expected a structured user-input response");
+    };
+    assert_eq!(answers[0].values, [" p@ss word "]);
+
+    let questions = vec![
+        umadev_runtime::HostQuestion {
+            id: "name".to_string(),
+            header: None,
+            prompt: "Name".to_string(),
+            kind: umadev_runtime::HostQuestionKind::Text,
+            required: true,
+            options: Vec::new(),
+        },
+        questions[0].clone(),
+    ];
+    let response = parse_user_input_response(&questions, "  alice  \r\n  s3cret \r\n").unwrap();
+    let umadev_runtime::HostResponse::UserInput { answers } = response else {
+        panic!("expected a structured user-input response");
+    };
+    assert_eq!(answers[0].values, ["alice"]);
+    assert_eq!(answers[1].values, ["  s3cret "]);
+}
+
+#[test]
 fn kimi_plan_review_picker_returns_exact_option_and_headless_paths_cancel() {
     let request = umadev_runtime::HostRequest::UserInput {
         questions: vec![umadev_runtime::HostQuestion {
@@ -1051,6 +1081,33 @@ fn mcp_elicitation_enforces_top_level_schema_without_losing_draft() {
             content: Some(_)
         }
     ));
+}
+
+#[test]
+fn mcp_string_elicitation_takes_json_looking_text_as_the_string() {
+    let request = umadev_runtime::HostRequest::McpElicitation {
+        server_name: Some("shipping".to_string()),
+        message: "Provide the ZIP code".to_string(),
+        requested_schema: serde_json::json!({"type":"string"}),
+        metadata: serde_json::Value::Null,
+    };
+    for (raw, expected) in [
+        ("94107", "94107"),
+        ("true", "true"),
+        ("null", "null"),
+        ("[1]", "[1]"),
+        ("plain text", "plain text"),
+        (r#""quoted""#, "quoted"),
+    ] {
+        assert_eq!(
+            parse_host_input_response(&request, raw).unwrap(),
+            umadev_runtime::HostResponse::McpElicitation {
+                action: umadev_runtime::HostElicitationAction::Accept,
+                content: Some(serde_json::Value::String(expected.to_string())),
+            },
+            "{raw}"
+        );
+    }
 }
 
 #[test]
@@ -4751,6 +4808,26 @@ fn url_host_port_extracts_127_0_0_1_3000() {
 }
 
 #[test]
+fn url_host_port_defaults_port_and_strips_path_query_fragment() {
+    for (url, expected) in [
+        ("http://localhost/", "localhost:80"),
+        ("http://localhost", "localhost:80"),
+        ("https://example.com/app", "example.com:443"),
+        ("http://h:5173?x=1", "h:5173"),
+        ("http://h:5173#top", "h:5173"),
+        ("http://h?x=1", "h:80"),
+        ("http://[::1]:5173/", "[::1]:5173"),
+        ("https://[::1]", "[::1]:443"),
+        ("http://user@h:5173/", "h:5173"),
+    ] {
+        assert_eq!(url_host_port(url), Some(expected.into()), "{url}");
+    }
+    assert_eq!(url_host_port("http://"), None);
+    assert_eq!(url_host_port("http://h:/"), None);
+    assert_eq!(url_host_port("http://h:abc/"), None);
+}
+
+#[test]
 fn url_host_port_none_for_garbage() {
     assert_eq!(url_host_port("not a url"), None);
     assert_eq!(url_host_port("ftp://example.com"), None);
@@ -4788,6 +4865,36 @@ fn parse_run_command_cd_form() {
     exp_args.extend(["run".to_string(), "dev".into()]);
     assert_eq!(prog, exp_prog);
     assert_eq!(args, exp_args);
+}
+
+#[test]
+fn parse_run_command_cd_form_shells_out_for_chains_and_env_assignments() {
+    // Only the leading `cd` is peeled off; on Unix anything that needs a shell
+    // (a further `&&` chain, an env assignment, quotes, redirects) must run via
+    // `sh -c` in the `cd` directory instead of becoming argv. Windows never
+    // hands a run to `cmd /c` (see `parse_run_command_never_hands_windows_runs_to_cmd`).
+    let root = std::path::PathBuf::from("/proj");
+    for (command, rest) in [
+        (
+            "cd web && npm install && npm run dev",
+            "npm install && npm run dev",
+        ),
+        ("cd web && PORT=3000 npm run dev", "PORT=3000 npm run dev"),
+        (
+            "cd web && npm run dev -- --host \"0.0.0.0\"",
+            "npm run dev -- --host \"0.0.0.0\"",
+        ),
+        ("cd web && npm run dev > dev.log", "npm run dev > dev.log"),
+    ] {
+        let (dir, prog, args) = parse_run_command(command, &root);
+        assert_eq!(dir, std::path::PathBuf::from("/proj/web"), "{command}");
+        if cfg!(windows) {
+            assert_ne!(prog, "cmd", "{command}");
+        } else {
+            assert_eq!(prog, "sh", "{command}");
+            assert_eq!(args, vec!["-c".to_string(), rest.into()], "{command}");
+        }
+    }
 }
 
 #[test]

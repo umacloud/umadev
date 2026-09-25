@@ -19,9 +19,11 @@ const PREVIEW_OWNER_SCRIPT: &str =
 /// npm/pnpm `.cmd` shim is found on `PATH` and Rust's hardened batch-argument
 /// encoder handles its argv. A command without a `cd X &&` prefix runs in the
 /// workspace root, through `sh -c` on Unix so a recorded command keeps its shell
-/// syntax. Windows never uses `cmd /c`: `cmd.exe` would look the program up in
-/// the workspace before `PATH`, so a static-HTML repository could ship a
-/// `python3.bat` that the automatic post-build preview then ran on the host.
+/// syntax; after a `cd X &&` prefix, Unix uses `sh -c` in `X` only when the rest
+/// needs a shell ([`needs_shell`]). Windows never uses `cmd /c`: `cmd.exe` would
+/// look the program up in the workspace before `PATH`, so a static-HTML
+/// repository could ship a `python3.bat` that the automatic post-build preview
+/// then ran on the host.
 pub(super) fn parse_run_command(
     command: &str,
     project_root: &std::path::Path,
@@ -35,6 +37,19 @@ pub(super) fn parse_run_command(
             } else {
                 project_root.join(dir)
             };
+            let rest = rest.trim();
+            if !cfg!(windows) && needs_shell(rest) {
+                // A further `&&` chain, env assignment, quoting, or redirect is
+                // shell syntax: run it verbatim through `sh -c` in the `cd`
+                // directory rather than splitting it into argv. Windows has no
+                // shell it can hand this to safely (see above), so it keeps the
+                // direct spawn.
+                return (
+                    resolved,
+                    "sh".to_string(),
+                    vec!["-c".to_string(), rest.to_string()],
+                );
+            }
             if let Some((program, args)) = direct_program(rest) {
                 return (resolved, program, args);
             }
@@ -62,16 +77,42 @@ fn direct_program(words: &str) -> Option<(String, Vec<String>)> {
     Some((program, args))
 }
 
+/// Whether `command` uses shell syntax that whitespace splitting would mangle:
+/// operators, redirects, quoting, expansions, or a leading `NAME=value`
+/// environment assignment.
+fn needs_shell(command: &str) -> bool {
+    command.contains([
+        '&', '|', ';', '<', '>', '(', ')', '$', '`', '\'', '"', '\\', '*', '?', '\n',
+    ]) || command
+        .split_whitespace()
+        .next()
+        .is_some_and(|program| program.contains('='))
+}
+
 /// Extract the host:port from a `http://host:port/...` URL, returning None
 /// when parsing fails. Used by [`wait_for_port`] so we only open the browser
 /// after the dev server is actually accepting connections — not 0ms after
 /// spawn, when Vite is still compiling and the page would 404.
+/// A missing port defaults by scheme (80/443); `[ipv6]` hosts keep brackets.
 pub(super) fn url_host_port(url: &str) -> Option<String> {
-    let after_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let host_port = after_scheme.split('/').next()?;
-    Some(host_port.to_string())
+    let (after_scheme, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, 80)
+    } else {
+        (url.strip_prefix("https://")?, 443)
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?;
+    let (host, port) = match authority.rfind(':') {
+        Some(colon) if !authority[colon..].contains(']') => (
+            &authority[..colon],
+            authority[colon + 1..].parse::<u16>().ok()?,
+        ),
+        _ => (authority, default_port),
+    };
+    (!host.is_empty()).then(|| format!("{host}:{port}"))
 }
 
 /// Poll a `host:port` with a TCP connect until it succeeds or `timeout`

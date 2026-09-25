@@ -380,8 +380,11 @@ impl ClaudeCodeDriver {
             output_format.to_string(),
             "--permission-mode".to_string(),
             permission_mode.to_string(),
-            "--allowedTools".to_string(),
-            allowed_tools.to_string(),
+            // `--allowedTools <tools...>` is variadic: the space-separated form
+            // would swallow any following bare word — including the prompt the
+            // subprocess layer appends last — as another tool name. `=` binds
+            // exactly one value.
+            format!("--allowedTools={allowed_tools}"),
         ];
         if permissions.auto_approve() {
             args.push("--dangerously-skip-permissions".to_string());
@@ -1542,12 +1545,38 @@ mod tests {
             .with_permissions(BasePermissionProfile::Plan)
             .base_args_with_format_for("text", false);
         let allowed = plan
-            .windows(2)
-            .find(|w| w[0] == "--allowedTools")
-            .map(|w| w[1].as_str())
+            .iter()
+            .find_map(|a| a.strip_prefix("--allowedTools="))
             .unwrap_or_default();
         for mutating in ["Write", "Edit", "Bash", "NotebookEdit", "Agent", "Task"] {
             assert!(!allowed.split(',').any(|tool| tool == mutating));
+        }
+    }
+
+    #[test]
+    fn allowed_tools_value_cannot_swallow_the_trailing_prompt() {
+        // `claude --allowedTools <tools...>` is VARIADIC: with the space-separated
+        // form, every following bare word is taken as another tool name. The
+        // non-streaming `complete` path appends nothing after the base args when
+        // there is no session flag and no model, so the prompt (appended last by
+        // the subprocess layer) was eaten as a tool and claude failed with
+        // "Input must be provided ...". The `=` form binds exactly one value.
+        for profile in [
+            BasePermissionProfile::Plan,
+            BasePermissionProfile::Guarded,
+            BasePermissionProfile::Auto,
+        ] {
+            let args = ClaudeCodeDriver::default()
+                .with_permissions(profile)
+                .call_args_with_format("json");
+            assert!(
+                !args.iter().any(|a| a == "--allowedTools"),
+                "profile {profile:?}: variadic flag must not take a separate value: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a.starts_with("--allowedTools=Read,")),
+                "profile {profile:?}: tools must be bound with `=`: {args:?}"
+            );
         }
     }
 

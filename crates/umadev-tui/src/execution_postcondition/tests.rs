@@ -1169,6 +1169,74 @@ async fn batch_index_info_preserves_split_index_semantics() {
     );
 }
 
+#[tokio::test]
+async fn early_git_failure_reports_its_own_error_instead_of_a_broken_pipe() {
+    let root = dirty_git_repo();
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt"]),
+        "提交git记录: one.txt",
+    )
+    .unwrap();
+    let baseline = postcondition.git_commit.as_ref().unwrap();
+    let mut transaction = GitTransactionGuard::new(root.path(), baseline);
+
+    // Git rejects the option and exits before reading any of the 1 MiB input.
+    let output = git_mutating_output_with_input(
+        root.path(),
+        &["hash-object", "--umadev-no-such-option", "--stdin"],
+        &vec![b'x'; 1024 * 1024],
+        Duration::from_secs(5),
+        "test-input-timeout",
+        "git hash-object",
+        &mut transaction,
+    )
+    .await
+    .unwrap();
+    transaction.disarm();
+
+    assert!(!output.status.success());
+    let note = git_command_failed("test-hash-failed", "git hash-object", &output).into_note();
+    assert!(note.contains("umadev-no-such-option"), "{note}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_commit_honors_core_file_mode_false_like_native_git() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Filesystems without a usable executable bit (WSL `/mnt/c`, exFAT, SMB)
+    // report every file as 0777; Git keeps the recorded mode there.
+    let root = dirty_git_repo();
+    git(root.path(), &["config", "core.fileMode", "false"]);
+    std::fs::write(root.path().join("new.txt"), "new\n").unwrap();
+    for path in ["one.txt", "new.txt"] {
+        std::fs::set_permissions(
+            root.path().join(path),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+    }
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt", "new.txt"]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["new.txt", "one.txt"]);
+    for path in ["one.txt", "new.txt"] {
+        let entry =
+            git_required_text(root.path(), &["ls-tree", "HEAD", "--", path], "test-tree").unwrap();
+        assert!(entry.starts_with("100644 blob "), "{entry}");
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn host_commit_hashes_a_symlink_target_without_following_it() {

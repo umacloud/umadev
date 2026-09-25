@@ -242,78 +242,90 @@ fn add_knowledge_unlocked(
         Err(error) => return Err(error),
     };
     let dest_dir = umadev_state::fs::ensure_real_child_dir(&custom_dir, &entry_name)?;
-
-    let mut files_copied = 0;
-    let mut skipped_non_md = 0;
-    let mut skipped_symlink = 0;
-    let mut total_bytes = 0_u64;
-    if umadev_state::fs::metadata_is_real_dir(&source_metadata) {
-        for entry in walk_source(source) {
-            // ONLY `.md` is indexed: the runtime RAG walker is markdown-only, so
-            // copying a `.txt` would print "[ok] Added" and let our own search
-            // find it while the BASE never sees it — a silent non-delivery.
-            // Restrict here so what we accept is exactly what the base indexes.
-            if is_markdown(&entry) {
-                // A SYMLINK with an innocuous `.md` name can point at any host
-                // file; SKIP it (continue) rather than abort the whole add via
-                // `?`, so legit `.md` siblings still get indexed. `symlink_metadata`
-                // does NOT follow the link. (Mirrors skill_manager's skip.)
-                if std::fs::symlink_metadata(&entry).map_or(true, |m| m.file_type().is_symlink()) {
-                    skipped_symlink += 1;
-                    continue;
+    // Copy everything first; any failure (an oversize file, the total cap, an
+    // unrepresentable subdirectory name) must not strand the files already
+    // copied in the indexed tree without a registry entry that `remove` could
+    // find, so a dir THIS call created is removed again on every error path.
+    let copy_all = || -> std::io::Result<usize> {
+        let mut files_copied = 0;
+        let mut skipped_non_md = 0;
+        let mut skipped_symlink = 0;
+        let mut total_bytes = 0_u64;
+        if umadev_state::fs::metadata_is_real_dir(&source_metadata) {
+            for entry in walk_source(source) {
+                // ONLY `.md` is indexed: the runtime RAG walker is markdown-only, so
+                // copying a `.txt` would print "[ok] Added" and let our own search
+                // find it while the BASE never sees it — a silent non-delivery.
+                // Restrict here so what we accept is exactly what the base indexes.
+                if is_markdown(&entry) {
+                    // A SYMLINK with an innocuous `.md` name can point at any host
+                    // file; SKIP it (continue) rather than abort the whole add via
+                    // `?`, so legit `.md` siblings still get indexed. `symlink_metadata`
+                    // does NOT follow the link. (Mirrors skill_manager's skip.)
+                    if std::fs::symlink_metadata(&entry)
+                        .map_or(true, |m| m.file_type().is_symlink())
+                    {
+                        skipped_symlink += 1;
+                        continue;
+                    }
+                    // Preserve the source's subdirectory structure — flattening to
+                    // the basename would silently overwrite same-named files from
+                    // different subdirs (a/x.md and b/x.md collide).
+                    let rel = entry.strip_prefix(source).unwrap_or(&entry);
+                    let parent = ensure_relative_parent(&dest_dir, rel.parent())?;
+                    let dest = parent.join(rel.file_name().unwrap_or_default());
+                    let copied = copy_no_follow_symlink(
+                        &entry,
+                        &dest,
+                        MAX_TOTAL_DOCUMENT_BYTES.saturating_sub(total_bytes),
+                    )?;
+                    total_bytes = total_bytes.saturating_add(copied);
+                    files_copied += 1;
+                } else if entry.extension().is_some() {
+                    skipped_non_md += 1;
                 }
-                // Preserve the source's subdirectory structure — flattening to
-                // the basename would silently overwrite same-named files from
-                // different subdirs (a/x.md and b/x.md collide).
-                let rel = entry.strip_prefix(source).unwrap_or(&entry);
-                let parent = ensure_relative_parent(&dest_dir, rel.parent())?;
-                let dest = parent.join(rel.file_name().unwrap_or_default());
-                let copied = copy_no_follow_symlink(
-                    &entry,
-                    &dest,
-                    MAX_TOTAL_DOCUMENT_BYTES.saturating_sub(total_bytes),
-                )?;
-                total_bytes = total_bytes.saturating_add(copied);
-                files_copied += 1;
-            } else if entry.extension().is_some() {
-                skipped_non_md += 1;
             }
+            if files_copied == 0 {
+                // Don't leave an empty registered entry that the base will never index —
+                // tell the user plainly what was skipped (non-markdown and/or symlinked
+                // files); the caller removes the dest dir.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "no .md files found under {} ({skipped_non_md} non-markdown, \
+                         {skipped_symlink} symlinked file(s) skipped). UmaDev only indexes regular \
+                         Markdown (.md); convert other docs to .md and avoid symlinks.",
+                        source.display()
+                    ),
+                ));
+            }
+        } else if umadev_state::fs::metadata_is_real_file(&source_metadata) {
+            if !is_markdown(source) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "`{}` is not a Markdown file. UmaDev only indexes `.md` (the runtime RAG \
+                         walker is markdown-only); convert it to .md and retry.",
+                        source.display()
+                    ),
+                ));
+            }
+            let dest = dest_dir.join(source.file_name().unwrap_or_default());
+            let _ = copy_no_follow_symlink(source, &dest, MAX_TOTAL_DOCUMENT_BYTES)?;
+            files_copied = 1;
         }
-        if files_copied == 0 {
-            // Don't leave an empty registered entry (or a stray dest dir) that the
-            // base will never index — clean up and tell the user plainly what was
-            // skipped (non-markdown and/or symlinked files).
+
+        Ok(files_copied)
+    };
+    let files_copied = match copy_all() {
+        Ok(files_copied) => files_copied,
+        Err(error) => {
             if !dest_pre_existed {
                 let _ = remove_custom_tree(project_root, &entry_name);
             }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "no .md files found under {} ({skipped_non_md} non-markdown, \
-                     {skipped_symlink} symlinked file(s) skipped). UmaDev only indexes regular \
-                     Markdown (.md); convert other docs to .md and avoid symlinks.",
-                    source.display()
-                ),
-            ));
+            return Err(error);
         }
-    } else if umadev_state::fs::metadata_is_real_file(&source_metadata) {
-        if !is_markdown(source) {
-            if !dest_pre_existed {
-                let _ = remove_custom_tree(project_root, &entry_name);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "`{}` is not a Markdown file. UmaDev only indexes `.md` (the runtime RAG \
-                     walker is markdown-only); convert it to .md and retry.",
-                    source.display()
-                ),
-            ));
-        }
-        let dest = dest_dir.join(source.file_name().unwrap_or_default());
-        let _ = copy_no_follow_symlink(source, &dest, MAX_TOTAL_DOCUMENT_BYTES)?;
-        files_copied = 1;
-    }
+    };
 
     // Update registry.
     registry.entries.insert(
@@ -595,6 +607,24 @@ mod tests {
             std::io::ErrorKind::InvalidData | std::io::ErrorKind::PermissionDenied
         ));
         assert!(!tmp.path().join(CUSTOM_DIR).join("huge/huge.md").exists());
+    }
+
+    #[test]
+    fn failed_directory_add_leaves_no_orphaned_files() {
+        // `a.md` copies before `b.md` trips the per-file cap. The copied file
+        // must not stay in the indexed tree: no registry entry points at it,
+        // so `remove` could never delete it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src_dir = tmp.path().join("docs");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("a.md"), "# A").unwrap();
+        let huge = std::fs::File::create(src_dir.join("b.md")).unwrap();
+        huge.set_len(MAX_DOCUMENT_BYTES + 1).unwrap();
+
+        assert!(add_knowledge(tmp.path(), &src_dir, Some("docs")).is_err());
+
+        assert!(list_knowledge(tmp.path()).is_empty());
+        assert!(!tmp.path().join(CUSTOM_DIR).join("docs").exists());
     }
 
     #[test]

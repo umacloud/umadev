@@ -44,11 +44,20 @@ pub(crate) const SKIP_DIRS: &[&str] = &[
     "vendor",
     "__pycache__",
     ".pytest_cache",
+    "venv",
     ".next",
     "out",
     "coverage",
     "output",
 ];
+
+/// Whether `dir` is a Python virtualenv, whatever it is named (`env`, `.env`,
+/// `py311` …): `venv` / `virtualenv` always write a `pyvenv.cfg` at its root.
+/// Its installed packages and interpreter symlinks are not project source, and
+/// walking them would exhaust the file cap or trip the symlink guard.
+pub(crate) fn is_python_venv(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir.join("pyvenv.cfg")).is_ok_and(|m| m.is_file())
+}
 
 /// Maximum directory depth for the source walk. Enterprise Vue/Java admin
 /// projects commonly nest real code below `src/views/.../components/...`, so an
@@ -104,7 +113,7 @@ fn collect(
         match classify_no_follow(&p) {
             EntryKind::Dir => {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+                if name.starts_with('.') || SKIP_DIRS.contains(&name) || is_python_venv(&p) {
                     continue;
                 }
                 collect(root, &p, scan, depth + 1, entries_seen, budget);
@@ -716,6 +725,31 @@ mod tests {
             found.iter().any(|p| p.ends_with("ProfilePanel.vue")),
             "deep real source must be visible to QA/source-present scans: {found:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_virtualenvs_are_not_scanned() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/app.py"), "print('hi')\n").unwrap();
+        // `python -m venv venv` / `virtualenv env`: a marker file, an interpreter
+        // symlink, and installed packages that are not the project's source.
+        for venv in ["venv", "env", "services/api/.venv"] {
+            let dir = tmp.path().join(venv);
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            fs::create_dir_all(dir.join("lib/site-packages")).unwrap();
+            fs::write(dir.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+            symlink("/usr/bin/python3", dir.join("bin/python")).unwrap();
+            fs::write(dir.join("lib/site-packages/six.py"), "x = 1\n").unwrap();
+        }
+        let scan = source_scan(tmp.path());
+        assert!(
+            !scan.incomplete,
+            "a virtualenv must not make the scan incomplete"
+        );
+        assert_eq!(scan.files, vec![tmp.path().join("src/app.py")]);
     }
 
     #[cfg(unix)]
