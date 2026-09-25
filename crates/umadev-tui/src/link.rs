@@ -471,6 +471,7 @@ pub fn reveal_argv(os: &str, path: &Path) -> Option<(String, Vec<String>)> {
 /// Open what a Ctrl+click resolved to — an `http(s)` URL as-is, or a
 /// canonical path from [`resolve_path`] opened or revealed per
 /// [`path_open_mode`] — and return the i18n key of the status note to show.
+#[must_use]
 pub fn open_link_target(target: &str) -> &'static str {
     let spawned = if is_safe_url(target) {
         spawn_opener(target).map(|()| "tui.link.opened")

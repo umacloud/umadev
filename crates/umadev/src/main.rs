@@ -8081,12 +8081,12 @@ mod tests {
 
     #[tokio::test]
     async fn cli_continue_routes_a_persisted_director_plan_before_legacy_gate_logic() {
-        isolate_state_directory();
         use umadev_agent::plan_state::{
             AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus,
         };
         use umadev_agent::Seat;
 
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let plan = Plan {
@@ -8126,12 +8126,12 @@ mod tests {
 
     #[tokio::test]
     async fn cli_continue_rearms_a_terminal_review_without_starting_a_replacement_plan() {
-        isolate_state_directory();
         use umadev_agent::plan_state::{
             AcceptanceSpec, Plan, PlanStep, StepFiles, StepKind, StepStatus,
         };
         use umadev_agent::Seat;
 
+        isolate_state_directory();
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         umadev_agent::plan_state::save(

@@ -7,7 +7,7 @@ use std::time::SystemTime;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// UmaDev's state directory name, both per project (`<workspace>/.umadev`)
+/// The state directory name, both per project (`<workspace>/.umadev`)
 /// and global (`~/.umadev`). It holds chat transcripts, approval state and
 /// shadow checkpoints that capture gitignored files such as `.env`, so every
 /// managed creation makes it owner-only and gives it a self-ignoring
