@@ -206,6 +206,7 @@ pub(super) fn start_preview_server(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    umadev_process::child_env::scrub_leaked_secrets(cmd.as_std_mut());
     // Port-conflict guard: if the port is already bound (the user's own
     // Vite/Next/Express), DON'T spawn a second server — it would either fail or
     // bind a different port while we open the wrong URL. Open / surface what's

@@ -118,7 +118,7 @@ pub fn set_windows_clipboard_text(text: &str) -> bool {
 /// spec-kit / any other project) sees the var UNSET and is completely
 /// unaffected. This is how UmaDev's governance stays scoped to its own runs
 /// instead of leaking into the user's whole environment.
-pub const GOVERN_ROOT_ENV: &str = "UMADEV_GOVERN_ROOT";
+pub const GOVERN_ROOT_ENV: &str = umadev_process::child_env::GOVERN_ROOT_ENV;
 
 /// Build the `[(key, value)]` env entry that scopes the governance hook to
 /// `workspace`. Spawn the base with this so the `PreToolUse` hook can tell it is
@@ -732,54 +732,14 @@ impl<T> Drop for AbortOnDrop<T> {
 /// so `end()` can never block the host.
 const END_REAP_BUDGET: Duration = Duration::from_secs(2);
 
-/// Whether an INHERITED env-var name (already ASCII-uppercased) is a secret UmaDev
-/// must never leak into a base CLI or a base-driven tool subprocess.
-///
-/// This is a conservative DENYLIST of credentials that (a) no base CLI needs to
-/// authenticate and (b) are the exact surface a compromised base / malicious
-/// transitive dependency would exfiltrate — the npm publish-token theft class.
-/// It deliberately does NOT pattern-match `*KEY*`/`*TOKEN*` broadly: a base
-/// self-authenticates through its OWN provider env (`ANTHROPIC_API_KEY`,
-/// `OPENAI_API_KEY`, `XAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
-/// `CLAUDE_CODE_OAUTH_TOKEN`, cloud-provider creds under an explicit bedrock/vertex
-/// switch, …), so a broad scrub would break base login — worse than the leak. Only
-/// the names below, none of which any base needs, are removed. `UMADEV_GOVERN_ROOT`
-/// is the ONE deliberate signal UmaDev sets on the base (the governance-hook scope)
-/// and is explicitly preserved.
-fn leaked_secret_env_name(upper: &str) -> bool {
-    if upper == GOVERN_ROOT_ENV {
-        return false;
-    }
-    // UmaDev's own internals (lessons token, telemetry, run knobs) — a base never
-    // needs any UMADEV_*/UMA_* except the governance-root signal preserved above.
-    if upper.starts_with("UMADEV_") || upper.starts_with("UMA_") {
-        return true;
-    }
-    // Publish / CI / signing credentials — no base CLI uses these; they are the
-    // release-pipeline secrets a stolen-token attack targets.
-    if upper.starts_with("APPLE_") || upper.starts_with("WINDOWS_CERTIFICATE") {
-        return true;
-    }
-    matches!(
-        upper,
-        "NPM_TOKEN" | "NODE_AUTH_TOKEN" | "GITHUB_TOKEN" | "GH_TOKEN" | "CARGO_REGISTRY_TOKEN"
-    )
-}
-
 /// Strip inherited secrets from a child command before spawn, so a base CLI (and
 /// any tool subprocess or transitive dependency it runs) can never READ UmaDev's
-/// own publish/CI credentials from the environment it inherits. Iterates only the
-/// parent's INHERITED env and removes the names [`leaked_secret_env_name`] flags;
-/// the base's deliberate governance override (set via `cmd.envs` before this) is a
-/// per-command value, not an inherited one, so it is untouched. Additive and
-/// fail-safe: it can only ever REMOVE a variable, never add or expose one.
+/// own publish/CI credentials from the environment it inherits. The list is
+/// [`umadev_process::child_env::is_leaked_secret_name`], shared with the
+/// commands UmaDev runs itself; it keeps the base's own provider auth and the
+/// governance-scope signal. It can only ever REMOVE a variable.
 pub(crate) fn scrub_leaked_secrets_env(cmd: &mut tokio::process::Command) {
-    for (key, _) in std::env::vars_os() {
-        let upper = key.to_string_lossy().to_ascii_uppercase();
-        if leaked_secret_env_name(&upper) {
-            cmd.env_remove(&key);
-        }
-    }
+    umadev_process::child_env::scrub_leaked_secrets(cmd.as_std_mut());
 }
 
 /// Spawn a one-shot base CLI call or probe as a managed child, scrubbing
@@ -4736,54 +4696,6 @@ mod tests {
                     .get_envs()
                     .any(|(key, set)| key == *name && set == Some(std::ffi::OsStr::new(value))),
                 "{name} missing from a session child"
-            );
-        }
-    }
-
-    #[test]
-    fn leaked_secret_env_scrub_removes_umadev_and_publish_secrets_only() {
-        // UmaDev's own internals + publish/CI/signing credentials are scrubbed …
-        for leaked in [
-            "UMADEV_LESSONS_MP_TOKEN",
-            "UMADEV_TELEMETRY_KEY",
-            "UMA_INTERNAL",
-            "NPM_TOKEN",
-            "NODE_AUTH_TOKEN",
-            "GITHUB_TOKEN",
-            "GH_TOKEN",
-            "CARGO_REGISTRY_TOKEN",
-            "APPLE_CERTIFICATE_P12_BASE64",
-            "APPLE_APP_SPECIFIC_PASSWORD",
-            "WINDOWS_CERTIFICATE_PFX_BASE64",
-        ] {
-            assert!(
-                leaked_secret_env_name(leaked),
-                "{leaked} must be scrubbed from a base child"
-            );
-        }
-        // … but the base's OWN provider auth (and normal environment) is PRESERVED,
-        // or the base could not log in — a broken scrub is worse than the leak.
-        for kept in [
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "OPENAI_API_KEY",
-            "XAI_API_KEY",
-            "GROK_CODE_XAI_API_KEY",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "PATH",
-            "HOME",
-            "USERPROFILE",
-            "TERM",
-            "LANG",
-            "OPENCODE_SERVER_PASSWORD",
-            // The one deliberate UMADEV_* signal UmaDev sets on the base.
-            GOVERN_ROOT_ENV,
-        ] {
-            assert!(
-                !leaked_secret_env_name(kept),
-                "{kept} must be preserved for the base to function"
             );
         }
     }

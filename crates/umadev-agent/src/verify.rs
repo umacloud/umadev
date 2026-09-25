@@ -986,6 +986,8 @@ async fn run_step_command(
     // arguments such as a red-to-green test name.
     let mut vcmd = Command::new(resolve_program(&step.program));
     vcmd.args(&step.args).current_dir(workspace);
+    // Install and test scripts are the project's (and its dependencies') code.
+    umadev_process::child_env::scrub_leaked_secrets(vcmd.as_std_mut());
     let options = umadev_process::BoundedCommandOptions {
         timeout: Duration::from_secs(timeout_secs),
         stdout_bytes: CAPTURE_CAP,

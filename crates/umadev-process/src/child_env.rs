@@ -32,6 +32,50 @@ pub fn child_env_overrides(windows: bool) -> &'static [(&'static str, &'static s
     }
 }
 
+/// The one `UMADEV_*` variable UmaDev deliberately passes to a base: the
+/// governance-hook scope. [`is_leaked_secret_name`] never flags it.
+pub const GOVERN_ROOT_ENV: &str = "UMADEV_GOVERN_ROOT";
+
+/// Whether an inherited variable (name already ASCII-uppercased) is a secret no
+/// child UmaDev starts may read: UmaDev's own `UMADEV_*`/`UMA_*` internals
+/// (except [`GOVERN_ROOT_ENV`]) and publish, CI and signing credentials.
+///
+/// A narrow denylist on purpose. It does not pattern-match `*KEY*`/`*TOKEN*`:
+/// a base authenticates through its own provider variables
+/// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, cloud
+/// credentials, ...), and a project's own tests may use them too, so a broad
+/// scrub would break both. None of the names below are needed by either; they
+/// are the publish-token theft surface a malicious dependency goes for.
+#[must_use]
+pub fn is_leaked_secret_name(upper: &str) -> bool {
+    if upper == GOVERN_ROOT_ENV {
+        return false;
+    }
+    // UmaDev's own internals (lessons token, telemetry, run knobs).
+    if upper.starts_with("UMADEV_") || upper.starts_with("UMA_") {
+        return true;
+    }
+    // Publish / CI / signing credentials.
+    if upper.starts_with("APPLE_") || upper.starts_with("WINDOWS_CERTIFICATE") {
+        return true;
+    }
+    matches!(
+        upper,
+        "NPM_TOKEN" | "NODE_AUTH_TOKEN" | "GITHUB_TOKEN" | "GH_TOKEN" | "CARGO_REGISTRY_TOKEN"
+    )
+}
+
+/// Remove every inherited variable [`is_leaked_secret_name`] flags from
+/// `command`'s environment, so a base CLI, a project's install or test script,
+/// or a dependency they run cannot read it. It only ever removes a variable.
+pub fn scrub_leaked_secrets(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        if is_leaked_secret_name(&key.to_string_lossy().to_ascii_uppercase()) {
+            command.env_remove(&key);
+        }
+    }
+}
+
 /// Apply [`child_env_overrides`] for the running platform to `command`.
 ///
 /// Every spawn helper in this crate calls this, so callers only need it for a
@@ -44,8 +88,51 @@ pub fn harden_child_env(command: &mut std::process::Command) {
 
 #[cfg(test)]
 mod tests {
-    use super::{child_env_overrides, harden_child_env, NO_CURRENT_DIRECTORY_EXE_SEARCH};
+    use super::{
+        child_env_overrides, harden_child_env, is_leaked_secret_name, GOVERN_ROOT_ENV,
+        NO_CURRENT_DIRECTORY_EXE_SEARCH,
+    };
     use std::ffi::OsStr;
+
+    #[test]
+    fn only_umadev_internals_and_publish_credentials_are_leaked_secrets() {
+        for leaked in [
+            "UMADEV_LESSONS_MP_TOKEN",
+            "UMADEV_TELEMETRY_KEY",
+            "UMA_INTERNAL",
+            "NPM_TOKEN",
+            "NODE_AUTH_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "CARGO_REGISTRY_TOKEN",
+            "APPLE_CERTIFICATE_P12_BASE64",
+            "APPLE_APP_SPECIFIC_PASSWORD",
+            "WINDOWS_CERTIFICATE_PFX_BASE64",
+        ] {
+            assert!(is_leaked_secret_name(leaked), "{leaked} must be scrubbed");
+        }
+        // Provider auth and the normal environment are preserved: a base must
+        // still log in, and a project's tests may need its own keys.
+        for kept in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "XAI_API_KEY",
+            "GROK_CODE_XAI_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "TERM",
+            "LANG",
+            "OPENCODE_SERVER_PASSWORD",
+            GOVERN_ROOT_ENV,
+        ] {
+            assert!(!is_leaked_secret_name(kept), "{kept} must be preserved");
+        }
+    }
 
     fn env_value<'a>(command: &'a std::process::Command, name: &str) -> Option<&'a OsStr> {
         command

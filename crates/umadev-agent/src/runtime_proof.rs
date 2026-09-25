@@ -643,6 +643,7 @@ fn preview_spawn_command(plan: &SpawnPlan, owner_token: &str) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    umadev_process::child_env::scrub_leaked_secrets(command.as_std_mut());
     command
 }
 
@@ -1521,6 +1522,7 @@ async fn run_e2e_if_present(workspace: &Path) -> Option<E2eResult> {
 
     let mut ecmd = Command::new(resolve_program(&program));
     ecmd.args(&args).current_dir(workspace);
+    umadev_process::child_env::scrub_leaked_secrets(ecmd.as_std_mut());
     let output = match umadev_process::run_bounded_detached_command(
         ecmd,
         umadev_process::BoundedCommandOptions {
