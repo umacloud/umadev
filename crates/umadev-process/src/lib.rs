@@ -6,6 +6,8 @@
 
 #![deny(unsafe_code)]
 
+pub mod git;
+
 use std::collections::VecDeque;
 
 /// A byte buffer that keeps only the newest `capacity` bytes while callers
