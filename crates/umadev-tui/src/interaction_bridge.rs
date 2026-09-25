@@ -1103,7 +1103,10 @@ async fn await_user_approval_with_auto_release(
     }
     sink.emit(EngineEvent::Note(umadev_i18n::tlf(
         "trust.pause.approve",
-        &[action, target],
+        &[
+            &crate::ui::visible_approval_text(action),
+            &crate::ui::visible_approval_text(target),
+        ],
     )));
     // Bounded wait. A dropped sender (cancel / quit / a cleared holder / a dead session)
     // resolves the inner `rx` to `Err` → DENY; the outer timeout is the walked-away-user
