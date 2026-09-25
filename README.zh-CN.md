@@ -758,7 +758,7 @@ umadev 有两套入口，一一对应：
 | `umadev history` | 列出回滚快照 |
 | `umadev rollback latest` | 回滚到某快照 |
 | `umadev update` | 通过实际所属包管理器（npm / pnpm / yarn / bun）升级；原生 / 独立安装则从 GitHub Release 校验并原子更新 |
-| `umadev uninstall` | 完整卸载：确认后删 `~/.umadev` + 本项目治理钩子 + 二进制（加 `--base <claude-code\|pre-commit>` 则仅卸钩子） |
+| `umadev uninstall` | 完整卸载：确认后删 `~/.umadev` + 本项目治理钩子 + 二进制；通过 npm/pnpm/yarn/bun 安装的，用当初安装它的包管理器卸载 `@umatech/umadev` 包（加 `--base <claude-code\|pre-commit>` 则仅卸钩子） |
 
 **脚本 / CI 运行（外层命令非交互）**
 

@@ -13,7 +13,8 @@
 //
 // It is deliberately minimal:
 //   - no dependencies (zero install-time cost beyond node itself)
-//   - only `update` is intercepted; every other flag goes straight to the binary
+//   - only `update` and a full `uninstall` are intercepted; every other flag
+//     goes straight to the binary
 //   - stdio is inherited so the ratatui TUI gets a real TTY
 
 'use strict';
@@ -1872,6 +1873,108 @@ async function runSelfUpdate(args, pkgRoot = PACKAGE_ROOT) {
   return true;
 }
 
+// ── Full `umadev uninstall` of a package-managed install, finished in the SHIM.
+//
+// The binary removes this project's hooks and UmaDev's global state. The package
+// itself must then be removed by the manager that owns it (`npm uninstall -g` on
+// a pnpm install, or of the retired unscoped name, removes nothing and still
+// exits 0), and only once the binary has exited: Windows cannot delete the
+// running `umadev.exe`, the same lock `update` avoids by staying in the shim. The
+// binary creates the handoff file only when its half finished (not when the user
+// declined or a hook could not be removed), and success is reported only once
+// the package directory is verifiably gone.
+const UNINSTALL_COMMANDS = {
+  pnpm: 'pnpm remove -g @umatech/umadev',
+  yarn: 'yarn global remove @umatech/umadev',
+  bun: 'bun remove -g @umatech/umadev',
+  npm: 'npm uninstall -g @umatech/umadev',
+};
+
+// `--base` / `--host` removes one base's hook and keeps UmaDev installed, and
+// `--help` wants the binary's help text: those stay with the binary.
+function isFullUninstall(args) {
+  return !args.some((arg) => arg === '--help' || arg === '-h' || /^--(?:base|host)(?:=|$)/.test(arg));
+}
+
+// Returns true if it handled the command (the caller exits), false to fall
+// through to the binary: a dev/cargo build removes itself.
+async function runPackageUninstall(args, pkgRoot = PACKAGE_ROOT) {
+  if (!isPackageManaged(pkgRoot) || !isFullUninstall(args)) return false;
+  const binary = resolveInstalledBinary(pkgRoot);
+  if (!binary) return false; // main() reports the missing platform package
+  const mgr = detectPackageManager(pkgRoot);
+  const command = UNINSTALL_COMMANDS[mgr];
+
+  const handoffDir = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev-uninstall-'));
+  const handoff = path.join(handoffDir, 'binary-done');
+  let result;
+  let handedOff = false;
+  try {
+    try {
+      fs.chmodSync(binary, 0o755);
+    } catch (_) {
+      // read-only install dir or already +x — spawnSync below reports real errors
+    }
+    result = spawnSync(binary, ['uninstall', ...args], {
+      stdio: 'inherit',
+      env: {
+        ...process.env,
+        UMADEV_UNINSTALL_HANDOFF: handoff,
+        UMADEV_UNINSTALL_PACKAGE_COMMAND: command,
+      },
+    });
+    handedOff = fs.existsSync(handoff);
+  } finally {
+    fs.rmSync(handoffDir, { recursive: true, force: true });
+  }
+  if (result.error) {
+    console.error(`umadev: failed to exec binary: ${result.error.message}`);
+    process.exitCode = 1;
+    return true;
+  }
+  if (result.status !== 0) {
+    process.exitCode = result.status === null ? 1 : result.status;
+    return true;
+  }
+  if (!handedOff) return true; // declined at the prompt: nothing was removed
+
+  if (isRootOwned(pkgRoot)) {
+    console.error(
+      `\numadev: this install is root-owned, so \`${command}\` would fail with EACCES.\n` +
+        '        Remove the package with:\n' +
+        `          sudo ${command}\n`,
+    );
+    process.exitCode = 1;
+    return true;
+  }
+  if (!managerRunnable(mgr)) {
+    console.error(
+      `\numadev: \`${mgr}\` owns this install but is not runnable from this terminal.\n` +
+        `        Restore \`${mgr}\` to PATH, then run:\n` +
+        `          ${command}\n`,
+    );
+    process.exitCode = 1;
+    return true;
+  }
+  console.log(`Removing the @umatech/umadev package via \`${command}\`…`);
+  // A constant command string — nothing from argv reaches the shell.
+  spawnSync(command, packageManagerSpawnOptions({ stdio: 'inherit' }));
+  // The manager's exit status is not evidence: npm exits 0 for a package that
+  // is not installed. The package itself must be gone.
+  if (fs.existsSync(path.join(pkgRoot, 'package.json'))) {
+    console.error(
+      `\numadev: \`${command}\` did not remove the package (still installed at ${pkgRoot}).\n` +
+        '        Run it yourself to see why:\n' +
+        `          ${command}\n`,
+    );
+    process.exitCode = 1;
+    return true;
+  }
+  console.log('[ok] Removed the @umatech/umadev package.');
+  console.log('\nUmaDev uninstalled. Thanks for trying it.');
+  return true;
+}
+
 async function main() {
   // Before anything else: `update` must not launch the binary it replaces.
   // EXCEPT `update --help` / `update -h`: those want the help text, not the
@@ -1881,6 +1984,13 @@ async function main() {
   const wantsUpdateHelp = updateArgs.some((a) => a === '--help' || a === '-h');
   if ((process.argv[2] || '') === 'update' && !wantsUpdateHelp) {
     if (await runSelfUpdate(updateArgs)) {
+      process.exit(process.exitCode || 0);
+    }
+  }
+  // Likewise a full `uninstall` must remove the package only after the binary
+  // has exited, and through the manager that owns it.
+  if ((process.argv[2] || '') === 'uninstall') {
+    if (await runPackageUninstall(process.argv.slice(3))) {
       process.exit(process.exitCode || 0);
     }
   }
@@ -1952,6 +2062,8 @@ module.exports = {
   rootOwnedRefusal,
   windowsLockRecoveryMessage,
   runSelfUpdate,
+  runPackageUninstall,
+  UNINSTALL_COMMANDS,
   installedVersionState,
   versionStateMatches,
   resolveInstalledBinary,
