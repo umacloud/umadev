@@ -754,6 +754,9 @@ pub(crate) fn scrub_leaked_secrets_env(cmd: &mut tokio::process::Command) {
 /// the credential scrub.
 pub(crate) fn isolate_process_tree(cmd: &mut tokio::process::Command) {
     scrub_leaked_secrets_env(cmd);
+    // These children bypass `umadev_process`'s spawn helpers, so they take its
+    // Windows environment hardening here (see `umadev_process::child_env`).
+    umadev_process::child_env::harden_child_env(cmd.as_std_mut());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -4768,6 +4771,20 @@ mod tests {
         .await
         .expect("a clean status command must return its stdout");
         assert!(got.contains("Logged in"));
+    }
+
+    #[test]
+    fn session_children_carry_the_windows_child_environment() {
+        let mut cmd = tokio::process::Command::new("base");
+        isolate_process_tree(&mut cmd);
+        for (name, value) in umadev_process::child_env::child_env_overrides(cfg!(windows)) {
+            assert!(
+                cmd.as_std()
+                    .get_envs()
+                    .any(|(key, set)| key == *name && set == Some(std::ffi::OsStr::new(value))),
+                "{name} missing from a session child"
+            );
+        }
     }
 
     #[test]

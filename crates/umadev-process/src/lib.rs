@@ -6,6 +6,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod child_env;
 pub mod git;
 
 use std::collections::VecDeque;
@@ -747,6 +748,7 @@ impl Drop for ManagedStdChild {
 fn spawn_managed_std_child(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
+    child_env::harden_child_env(command);
     #[cfg(unix)]
     for _ in 0..30 {
         match command.spawn() {
@@ -1313,6 +1315,7 @@ impl ManagedChild {
 fn spawn_managed_child(
     command: &mut tokio::process::Command,
 ) -> std::io::Result<tokio::process::Child> {
+    child_env::harden_child_env(command.as_std_mut());
     #[cfg(unix)]
     for _ in 0..30 {
         match command.spawn() {
