@@ -645,8 +645,8 @@ fn preview_spawn_command(plan: &SpawnPlan, owner_token: &str) -> Command {
 /// child's `current_dir` explicitly, so the working dir is real by construction
 /// and no nested `cd … &&` (with its fragile quoting, or a scheduled-task /
 /// `powershell` detach that silently mis-resolves the path) is ever built. The
-/// bare program is routed through [`spawn_parts`] so a Windows npm/pnpm `.cmd`
-/// shim runs via `cmd /c`.
+/// bare program is resolved through [`resolve_program`] so a Windows npm/pnpm
+/// `.cmd` shim is found on `PATH`.
 ///
 /// The working directory is `canonicalize`d up front, which both normalizes it
 /// and FAILS when it does not exist — turning a would-be raw OS path error at
@@ -666,12 +666,10 @@ fn resolve_spawn_plan(command: &str, workspace: &Path) -> Result<SpawnPlan, Stri
     if program.is_empty() {
         return Err("dev-server command is empty".to_string());
     }
-    let (vprog, mut lead) = spawn_parts(&program);
-    lead.extend(args);
     Ok(SpawnPlan {
         dir,
-        program: vprog,
-        args: lead,
+        program: resolve_program(&program),
+        args,
     })
 }
 
@@ -1506,11 +1504,10 @@ fn concretize_path(path: &str) -> String {
 async fn run_e2e_if_present(workspace: &Path) -> Option<E2eResult> {
     let cmd = detect_e2e_command(workspace)?;
     let (program, args) = split_command(&cmd);
-    let (vprog, vlead) = spawn_parts(&program);
     let started = Instant::now();
 
-    let mut ecmd = Command::new(vprog);
-    ecmd.args(&vlead).args(&args).current_dir(workspace);
+    let mut ecmd = Command::new(resolve_program(&program));
+    ecmd.args(&args).current_dir(workspace);
     let output = match umadev_process::run_bounded_detached_command(
         ecmd,
         umadev_process::BoundedCommandOptions {
@@ -1658,15 +1655,17 @@ fn which(bin: &str) -> bool {
 }
 
 /// Resolve a bare program name to a spawnable path on Windows (npm shims are
-/// `.cmd`/`.bat` that `Command::new` won't find), routing `.cmd`/`.bat` through
-/// `cmd /c`. No-op off Windows. Returns `(program, leading_args)`. Mirrors the
-/// verify module's private helper so dev-server spawn behaves the same.
-fn spawn_parts(program: &str) -> (String, Vec<String>) {
+/// `.cmd`/`.bat` that `Command::new` won't find). No-op off Windows. A resolved
+/// batch shim is returned as the program itself, never wrapped in `cmd /c`:
+/// Rust then applies its hardened batch-argument encoding, whereas an explicit
+/// `cmd /c <shim> <args>` lets `cmd.exe` expand `%VAR%` and run `&` / `|` found
+/// in the project's own run command. Mirrors `umadev_host::spawn_parts`.
+fn resolve_program(program: &str) -> String {
     if !cfg!(windows) || program.contains(std::path::is_separator) {
-        return (program.to_string(), Vec::new());
+        return program.to_string();
     }
     let Ok(path_var) = std::env::var("PATH") else {
-        return (program.to_string(), Vec::new());
+        return program.to_string();
     };
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     for dir in path_var.split(';') {
@@ -1676,16 +1675,11 @@ fn spawn_parts(program: &str) -> (String, Vec<String>) {
         for ext in std::iter::once("").chain(pathext.split(';')) {
             let candidate = Path::new(dir).join(format!("{program}{ext}"));
             if candidate.is_file() {
-                let resolved = candidate.to_string_lossy().into_owned();
-                let lower_ext = ext.to_ascii_lowercase();
-                if lower_ext == ".cmd" || lower_ext == ".bat" {
-                    return ("cmd".to_string(), vec!["/c".to_string(), resolved]);
-                }
-                return (resolved, Vec::new());
+                return candidate.to_string_lossy().into_owned();
             }
         }
     }
-    (program.to_string(), Vec::new())
+    program.to_string()
 }
 
 #[cfg(test)]
@@ -1807,12 +1801,9 @@ mod tests {
 
         assert_eq!(plan.dir, undecorate(tmp.path().canonicalize().unwrap()));
         assert_ne!(plan.program, "cd");
-        // The run tokens are preserved in order after any (possibly empty)
-        // `spawn_parts` lead — off Windows / when no `.cmd` shim resolves the lead
-        // is empty and program is `npm`; on Windows with an `npm.cmd` shim the lead
-        // is `cmd /c <npm.cmd>` — either way `run`/`dev` are still there, in order.
-        assert!(plan.args.iter().any(|a| a == "run"), "{:?}", plan.args);
-        assert_eq!(plan.args.last().map(String::as_str), Some("dev"));
+        // The run tokens are passed through unchanged; a Windows `npm.cmd` shim
+        // becomes the program itself rather than a `cmd /c` wrapper.
+        assert_eq!(plan.args, ["run", "dev"]);
     }
 
     #[test]

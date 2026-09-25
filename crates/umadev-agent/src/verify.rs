@@ -602,23 +602,6 @@ fn resolve_program(program: &str) -> String {
     program.to_string()
 }
 
-/// Like [`resolve_program`] but Windows-aware: `.cmd`/`.bat` build tools are
-/// routed through `cmd /c` (CreateProcess rejects them with os error 193).
-/// Returns `(program, leading args)`.
-fn spawn_parts(program: &str) -> (String, Vec<String>) {
-    let resolved = resolve_program(program);
-    let ext = std::path::Path::new(&resolved)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if cfg!(windows) && (ext == "cmd" || ext == "bat") {
-        ("cmd".to_string(), vec!["/c".to_string(), resolved])
-    } else {
-        (resolved, Vec::new())
-    }
-}
-
 /// Check whether a PATH-resolvable binary exists. Used to decide whether a
 /// step is genuinely missing (→ skip) vs the project being broken (→ fail).
 ///
@@ -1047,9 +1030,11 @@ async fn run_step_command(
     timeout_secs: u64,
 ) -> VerifyOutcome {
     let started = Instant::now();
-    let (vprog, vlead) = spawn_parts(&step.program);
-    let mut vcmd = Command::new(vprog);
-    vcmd.args(&vlead).args(&step.args).current_dir(workspace);
+    // A resolved `.cmd`/`.bat` shim is spawned directly, never via `cmd /c`, so
+    // Rust's hardened batch-argument encoding applies to model-supplied
+    // arguments such as a red-to-green test name.
+    let mut vcmd = Command::new(resolve_program(&step.program));
+    vcmd.args(&step.args).current_dir(workspace);
     let options = umadev_process::BoundedCommandOptions {
         timeout: Duration::from_secs(timeout_secs),
         stdout_bytes: CAPTURE_CAP,
