@@ -536,10 +536,16 @@ pub(super) fn parse_host_input_response(
             let expected = requested_schema
                 .get("type")
                 .and_then(serde_json::Value::as_str);
-            let content = match serde_json::from_str::<serde_json::Value>(raw) {
-                Ok(value) => value,
-                Err(_) if expected == Some("string") => serde_json::Value::String(raw.to_string()),
-                Err(error) => return Err(format!("invalid JSON response: {error}")),
+            let content = if expected == Some("string") {
+                // Only a JSON string literal is unwrapped; anything else
+                // (`94107`, `true`, `null`, prose) is the string as typed.
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .filter(serde_json::Value::is_string)
+                    .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+            } else {
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .map_err(|error| format!("invalid JSON response: {error}"))?
             };
             if !schema_accepts_top_level(requested_schema, &content) {
                 return Err(format!(

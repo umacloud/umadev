@@ -1084,6 +1084,33 @@ fn mcp_elicitation_enforces_top_level_schema_without_losing_draft() {
 }
 
 #[test]
+fn mcp_string_elicitation_takes_json_looking_text_as_the_string() {
+    let request = umadev_runtime::HostRequest::McpElicitation {
+        server_name: Some("shipping".to_string()),
+        message: "Provide the ZIP code".to_string(),
+        requested_schema: serde_json::json!({"type":"string"}),
+        metadata: serde_json::Value::Null,
+    };
+    for (raw, expected) in [
+        ("94107", "94107"),
+        ("true", "true"),
+        ("null", "null"),
+        ("[1]", "[1]"),
+        ("plain text", "plain text"),
+        (r#""quoted""#, "quoted"),
+    ] {
+        assert_eq!(
+            parse_host_input_response(&request, raw).unwrap(),
+            umadev_runtime::HostResponse::McpElicitation {
+                action: umadev_runtime::HostElicitationAction::Accept,
+                content: Some(serde_json::Value::String(expected.to_string())),
+            },
+            "{raw}"
+        );
+    }
+}
+
+#[test]
 fn secret_host_reply_is_masked_and_never_persisted_in_chat() {
     let tmp = tempfile::TempDir::new().unwrap();
     let mut app = App::new(
