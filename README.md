@@ -702,7 +702,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `umadev history` | List rollback snapshots |
 | `umadev rollback latest` | Roll back to a snapshot |
 | `umadev update` | Upgrade through the owning package manager (npm / pnpm / yarn / bun), or through GitHub Releases for a standalone/native install |
-| `umadev uninstall` | Full uninstall: removes `~/.umadev`, governance hooks, and the binary (`--base <id>` for hook-only) |
+| `umadev uninstall` | Full uninstall: removes `~/.umadev`, governance hooks, and the binary; an npm/pnpm/yarn/bun install's `@umatech/umadev` package is removed with the manager that installed it (`--base <id>` for hook-only) |
 
 **Script / CI run (non-interactive outer command)**
 

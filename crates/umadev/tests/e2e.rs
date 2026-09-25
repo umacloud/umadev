@@ -22,6 +22,11 @@ fn bin() -> PathBuf {
 /// directory; production defaults remain covered by unit tests, while these CLI
 /// flow tests stay focused on orchestration and artifacts.
 fn hermetic_command(cwd: &Path) -> Command {
+    hermetic_command_for(&bin(), cwd)
+}
+
+/// [`hermetic_command`] for a given copy of the binary.
+fn hermetic_command_for(program: &Path, cwd: &Path) -> Command {
     // Keep the sandbox under UmaDev's own ignored state tree. A top-level
     // `.e2e-home` would make the `init` E2E fixture look brownfield before the
     // command even starts, weakening its empty-project coverage.
@@ -29,7 +34,7 @@ fn hermetic_command(cwd: &Path) -> Command {
     let empty_model = home.join("empty-embed-model");
     std::fs::create_dir_all(&empty_model).expect("create hermetic E2E home");
 
-    let mut command = Command::new(bin());
+    let mut command = Command::new(program);
     command
         .current_dir(cwd)
         .env("HOME", &home)
@@ -769,6 +774,133 @@ fn uninstall_pre_commit_removes_our_own_hook() {
         !tmp.path().join(".git/hooks/pre-commit").exists(),
         "a hook we created should be removed entirely"
     );
+}
+
+/// A workspace for a full `umadev uninstall` of a package-manager install: the
+/// built binary placed inside `node_modules` (a hard link where possible, so
+/// the real test binary is never at stake), a project with its own `.git` so
+/// hook removal cannot walk up into a real checkout, and an `npm` first on
+/// PATH that records every call.
+struct PackageInstall {
+    _tmp: TempDir,
+    exe: PathBuf,
+    project: PathBuf,
+    npm_calls: PathBuf,
+    path: std::ffi::OsString,
+}
+
+fn package_install() -> PackageInstall {
+    // CARGO_TARGET_TMPDIR shares the target directory's file system, so the
+    // hard link below works on CI runners whose system temp is another drive.
+    let tmp = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let bin_dir = tmp.path().join("lib/node_modules/@umatech/cli-test/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let exe = bin_dir.join(format!("umadev{}", std::env::consts::EXE_SUFFIX));
+    if std::fs::hard_link(bin(), &exe).is_err() {
+        std::fs::copy(bin(), &exe).unwrap();
+    }
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    let fake_bin = tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    let npm_calls = tmp.path().join("npm-calls.txt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let npm = fake_bin.join("npm");
+        std::fs::write(
+            &npm,
+            format!("#!/bin/sh\necho \"$*\" >> '{}'\n", npm_calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    std::fs::write(
+        fake_bin.join("npm.cmd"),
+        format!("@echo off\r\necho %*>>\"{}\"\r\n", npm_calls.display()),
+    )
+    .unwrap();
+    let mut paths = vec![fake_bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+    PackageInstall {
+        _tmp: tmp,
+        exe,
+        project,
+        npm_calls,
+        path,
+    }
+}
+
+/// REGRESSION: a full uninstall of an npm install ran `npm uninstall -g umadev`
+/// (the retired unscoped name, a no-op that exits 0), claimed success, and left
+/// `@umatech/umadev` installed. The npm launcher now removes the scoped package
+/// with the manager that owns it once this process has exited; the binary only
+/// signals that its own half (hooks, global state) finished.
+#[test]
+fn full_uninstall_of_a_package_install_hands_the_package_to_the_launcher() {
+    let install = package_install();
+    let handoff = install.project.join("handoff");
+    let out = hermetic_command_for(&install.exe, &install.project)
+        .env("PATH", &install.path)
+        .env("UMADEV_UNINSTALL_HANDOFF", &handoff)
+        .env(
+            "UMADEV_UNINSTALL_PACKAGE_COMMAND",
+            "npm uninstall -g @umatech/umadev",
+        )
+        .args(["uninstall", "--yes"])
+        .output()
+        .expect("uninstall");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "uninstall failed: {out:?}");
+    assert!(
+        stdout.contains("npm uninstall -g @umatech/umadev"),
+        "the plan must name the scoped package command: {stdout}"
+    );
+    assert!(
+        !install.npm_calls.exists(),
+        "the binary ran npm itself: {}",
+        std::fs::read_to_string(&install.npm_calls).unwrap_or_default()
+    );
+    assert!(
+        handoff.exists(),
+        "the launcher was not told to remove the package"
+    );
+    assert!(install.exe.exists(), "the running binary deleted itself");
+    assert!(
+        !stdout.contains("UmaDev uninstalled"),
+        "success is the launcher's to report once the package is gone: {stdout}"
+    );
+}
+
+/// Without the launcher (the platform binary run directly) the binary cannot
+/// know which manager owns the install, so it prints the scoped commands and
+/// exits non-zero instead of claiming an uninstall it did not finish.
+#[test]
+fn full_uninstall_of_a_package_install_without_the_launcher_does_not_claim_success() {
+    let install = package_install();
+    let out = hermetic_command_for(&install.exe, &install.project)
+        .env("PATH", &install.path)
+        .env_remove("UMADEV_UNINSTALL_HANDOFF")
+        .args(["uninstall", "--yes"])
+        .output()
+        .expect("uninstall");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "an unfinished uninstall exited 0: {out:?}"
+    );
+    assert!(
+        stdout.contains("npm uninstall -g @umatech/umadev"),
+        "the scoped removal command is missing: {stdout}"
+    );
+    assert!(!stdout.contains("npm uninstall -g umadev"), "{stdout}");
+    assert!(!stdout.contains("UmaDev uninstalled"), "{stdout}");
+    assert!(!install.npm_calls.exists(), "the binary ran npm itself");
+    assert!(install.exe.exists());
 }
 
 /// `umadev report` outputs project health even on an empty workspace.

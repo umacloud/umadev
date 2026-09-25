@@ -673,7 +673,9 @@ enum Command {
     ///
     /// With NO `--base`: a full clean uninstall — removes `~/.umadev` (global
     /// config + data), this project's governance hooks, and the `umadev` binary
-    /// itself (asks for confirmation first).
+    /// itself (asks for confirmation first). An npm/pnpm/yarn/bun install is
+    /// removed as the `@umatech/umadev` package, by the package manager that
+    /// installed it.
     ///
     /// With `--base <claude-code|pre-commit>`: removes ONLY that base's
     /// governance hook and leaves everything else in place.
@@ -1580,14 +1582,32 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
         .into_iter()
         .filter(|d| d.exists())
         .collect();
-    let exe = std::env::current_exe().ok();
+    let removal = binary_removal(
+        std::env::current_exe().ok(),
+        std::env::var_os(UNINSTALL_HANDOFF_ENV),
+        std::env::var(UNINSTALL_PACKAGE_COMMAND_ENV).ok(),
+    );
     println!("This will completely uninstall UmaDev and remove:");
     for d in &state_dirs {
         println!("  - global config + data:  {}", d.display());
     }
     println!("  - this project's governance hooks (Claude Code, Kimi Code, git pre-commit)");
-    if let Some(e) = &exe {
-        println!("  - the umadev binary:     {}", e.display());
+    match &removal {
+        BinaryRemoval::Launcher {
+            command: Some(command),
+            ..
+        } => println!(
+            "  - the @umatech/umadev package:  {}",
+            safe_command_detail(command.as_bytes())
+        ),
+        BinaryRemoval::Launcher { command: None, .. } => {
+            println!("  - the @umatech/umadev package, through the package manager that owns it");
+        }
+        BinaryRemoval::PackageManager => println!(
+            "  - the @umatech/umadev package: you finish this step with the package manager that installed it"
+        ),
+        BinaryRemoval::Unlink(e) => println!("  - the umadev binary:     {}", e.display()),
+        BinaryRemoval::Unknown => {}
     }
     if !yes && !confirm("Continue?") {
         println!("Aborted. Nothing was removed.");
@@ -1621,45 +1641,91 @@ fn cmd_uninstall(base: Option<String>, yes: bool, project_root: Option<PathBuf>)
             Err(e) => println!("[!] Could not remove {} ({e}).", d.display()),
         }
     }
-    // 3. The binary LAST (so the steps above ran on a live binary). An npm
-    //    install is removed via npm so the package metadata is cleaned too; a
-    //    manual/dev binary is unlinked directly (safe while running on Unix).
-    let npm_managed = exe
-        .as_ref()
-        .is_some_and(|p| p.to_string_lossy().contains("node_modules"));
-    if npm_managed {
-        let mut command = umadev_host::std_command("npm");
-        command
-            .args(["uninstall", "-g", "umadev"])
-            .env("CI", "1")
-            .env("NO_COLOR", "1")
-            .env("NPM_CONFIG_AUDIT", "false")
-            .env("NPM_CONFIG_FUND", "false")
-            .env("NPM_CONFIG_UPDATE_NOTIFIER", "false")
-            .env("NPM_CONFIG_YES", "true");
-        match bounded_cli_output(
-            command,
-            Duration::from_secs(120),
-            1024 * 1024,
-            256 * 1024,
-        ) {
-            Ok(output) if output.status.success() => println!("[ok] npm uninstall -g umadev"),
-            Ok(output) => println!(
-                "[!] npm uninstall failed: {}. Run `npm uninstall -g umadev` to remove the binary.",
-                safe_command_detail(&output.stderr)
-            ),
-            Err(error) => println!(
-                "[!] npm uninstall could not complete safely: {error}. Run `npm uninstall -g umadev` to verify removal."
-            ),
+    // 3. The binary LAST (so the steps above ran on a live binary).
+    match removal {
+        BinaryRemoval::Launcher { handoff, .. } => {
+            // The launcher removes the package once this process has exited,
+            // checks that it is gone, and only then reports the uninstall.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&handoff)
+                .with_context(|| {
+                    format!(
+                        "could not hand the package removal to the npm launcher ({})",
+                        handoff.display()
+                    )
+                })?;
+            return Ok(());
         }
-    } else if let Some(e) = exe {
-        match std::fs::remove_file(&e) {
+        BinaryRemoval::PackageManager => {
+            println!(
+                "[!] UmaDev was installed by a package manager. Remove the package with the one that installed it:"
+            );
+            println!("      npm uninstall -g @umatech/umadev");
+            println!("      pnpm remove -g @umatech/umadev");
+            println!("      yarn global remove @umatech/umadev");
+            println!("      bun remove -g @umatech/umadev");
+            anyhow::bail!("the @umatech/umadev package is still installed");
+        }
+        BinaryRemoval::Unlink(e) => match std::fs::remove_file(&e) {
             Ok(()) => println!("[ok] Removed {}", e.display()),
             Err(err) => println!("[!] Delete the binary manually: {} ({err})", e.display()),
-        }
+        },
+        BinaryRemoval::Unknown => {}
     }
     println!("\nUmaDev uninstalled. Thanks for trying it.");
     Ok(())
+}
+
+/// Set by the npm launcher (`bin/cli-main.js`) when it runs a full `umadev
+/// uninstall` of a package-manager install: a file this binary creates once its
+/// half (hooks, global state) has finished. The launcher then removes the
+/// `@umatech/umadev` package with the manager that owns it, after this process
+/// has exited, because Windows cannot delete a running `umadev.exe`.
+const UNINSTALL_HANDOFF_ENV: &str = "UMADEV_UNINSTALL_HANDOFF";
+/// The removal command the launcher will run, shown in the uninstall plan.
+const UNINSTALL_PACKAGE_COMMAND_ENV: &str = "UMADEV_UNINSTALL_PACKAGE_COMMAND";
+
+/// How a full uninstall removes UmaDev's own executable.
+#[derive(Debug, PartialEq, Eq)]
+enum BinaryRemoval {
+    /// A package-manager install launched through the npm launcher, which
+    /// removes the package once this process has exited.
+    Launcher {
+        handoff: PathBuf,
+        command: Option<String>,
+    },
+    /// A package-manager install run without the launcher: which manager owns
+    /// it is unknown here, so the user removes the package.
+    PackageManager,
+    /// A standalone binary (`cargo install`, a release download), unlinked
+    /// directly (safe while running on Unix).
+    Unlink(PathBuf),
+    /// The executable's path is unknown.
+    Unknown,
+}
+
+/// Decide how [`cmd_uninstall`] removes the executable at `exe`, given the
+/// launcher's [`UNINSTALL_HANDOFF_ENV`] and [`UNINSTALL_PACKAGE_COMMAND_ENV`].
+fn binary_removal(
+    exe: Option<PathBuf>,
+    handoff: Option<std::ffi::OsString>,
+    command: Option<String>,
+) -> BinaryRemoval {
+    let Some(exe) = exe else {
+        return BinaryRemoval::Unknown;
+    };
+    if !exe.to_string_lossy().contains("node_modules") {
+        return BinaryRemoval::Unlink(exe);
+    }
+    match handoff.filter(|handoff| !handoff.is_empty()) {
+        Some(handoff) => BinaryRemoval::Launcher {
+            handoff: PathBuf::from(handoff),
+            command: command.filter(|command| !command.trim().is_empty()),
+        },
+        None => BinaryRemoval::PackageManager,
+    }
 }
 
 /// Candidate directories holding UmaDev's global config + data — `~/.umadev`
@@ -7628,6 +7694,40 @@ mod tests {
         // A single launcher (the healthy case) reports exactly one → no shadow warning.
         let single = std::env::join_paths([a.path(), empty.path()]).unwrap();
         assert_eq!(find_all_umadev_in(&single).len(), 1);
+    }
+
+    #[test]
+    fn full_uninstall_leaves_a_package_install_to_its_launcher() {
+        let packaged = PathBuf::from(
+            "/usr/lib/node_modules/@umatech/umadev/node_modules/@umatech/cli-linux-x64/bin/umadev",
+        );
+        assert_eq!(
+            binary_removal(
+                Some(packaged.clone()),
+                Some("/tmp/handoff".into()),
+                Some("pnpm remove -g @umatech/umadev".into()),
+            ),
+            BinaryRemoval::Launcher {
+                handoff: PathBuf::from("/tmp/handoff"),
+                command: Some("pnpm remove -g @umatech/umadev".into()),
+            }
+        );
+        // Without the launcher the owning manager is unknown: never guess one.
+        assert_eq!(
+            binary_removal(Some(packaged.clone()), None, None),
+            BinaryRemoval::PackageManager
+        );
+        assert_eq!(
+            binary_removal(Some(packaged), Some(std::ffi::OsString::new()), None),
+            BinaryRemoval::PackageManager
+        );
+        // A standalone binary is unlinked directly, whatever the environment says.
+        let standalone = PathBuf::from("/home/u/.cargo/bin/umadev");
+        assert_eq!(
+            binary_removal(Some(standalone.clone()), Some("/tmp/handoff".into()), None),
+            BinaryRemoval::Unlink(standalone)
+        );
+        assert_eq!(binary_removal(None, None, None), BinaryRemoval::Unknown);
     }
 
     #[test]

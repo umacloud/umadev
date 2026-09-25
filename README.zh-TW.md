@@ -733,7 +733,7 @@ umadev 有兩套入口，一一對應：
 | `umadev history` | 列出回滾快照 |
 | `umadev rollback latest` | 回滾到某快照 |
 | `umadev update` | 透過實際所屬套件管理器（npm / pnpm / yarn / bun）升級；原生 / 獨立安裝則從 GitHub Release 驗證並原子更新 |
-| `umadev uninstall` | 完整解除安裝：確認後刪 `~/.umadev` + 本專案治理掛鉤 + 二進位（加 `--base <claude-code\|pre-commit>` 則僅卸掛鉤） |
+| `umadev uninstall` | 完整解除安裝：確認後刪 `~/.umadev` + 本專案治理掛鉤 + 二進位；透過 npm/pnpm/yarn/bun 安裝的，用當初安裝它的套件管理器移除 `@umatech/umadev` 套件（加 `--base <claude-code\|pre-commit>` 則僅卸掛鉤） |
 | `umadev adopt` | 棕地專案：偵測技術棧、索引現有原始碼、反推 API 契約 |
 | `umadev lessons` | 檢視由復發事故或機械驗證結果形成的可重用規則及 pending / validated / needs-revision 狀態；具體事故看 TUI `/pitfalls` |
 | `umadev usage` | token 用量 + 大致成本 |

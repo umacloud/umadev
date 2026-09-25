@@ -33,6 +33,8 @@ const {
   releaseModelDownloadLock,
   modelDownloadTempPath,
   MODEL_DOWNLOAD_LOCK_NAME,
+  runPackageUninstall,
+  UNINSTALL_COMMANDS,
 } = require('../umadev/bin/cli.js');
 
 function trustedUpdateManifest(version) {
@@ -268,6 +270,135 @@ test('terminal contract: updater accepts the registry\'s real attestation URL en
     assert.match(validateTrustedUpdateManifest(forged).reason, /provenance/, String(url));
   }
 });
+
+// A package-managed install for the uninstall tests: the main package, a stub
+// platform binary that follows the launcher's handoff protocol (`mode`:
+// `complete` finishes its half, `decline` answers no, `fail` exits 1), and a
+// stub manager that records its arguments and removes the package unless
+// `managerRemoves` is false.
+function uninstallFixture(t, layout, mgr, { mode = 'complete', managerRemoves = true } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'umadev-uninstall-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const nodeModules = path.join(root, layout, 'node_modules');
+  const packageRoot = path.join(nodeModules, '@umatech', 'umadev');
+  const platformLeaf = PLATFORM_LEAVES[`${process.platform}-${process.arch}`];
+  const binary = path.join(nodeModules, '@umatech', platformLeaf, 'bin', 'umadev');
+  fs.mkdirSync(path.join(packageRoot, 'bin'), { recursive: true });
+  fs.mkdirSync(path.dirname(binary), { recursive: true });
+  fs.writeFileSync(
+    path.join(packageRoot, 'package.json'),
+    `${JSON.stringify({ name: '@umatech/umadev', version: '9.9.9' })}\n`,
+  );
+  const binaryLog = path.join(root, 'binary.log');
+  fs.writeFileSync(
+    binary,
+    '#!/bin/sh\n' +
+      `echo "args=$*" >> '${binaryLog}'\n` +
+      `echo "command=$UMADEV_UNINSTALL_PACKAGE_COMMAND" >> '${binaryLog}'\n` +
+      (mode === 'fail' ? 'exit 1\n' : '') +
+      (mode === 'complete' ? ': > "$UMADEV_UNINSTALL_HANDOFF"\n' : '') +
+      'exit 0\n',
+    { mode: 0o755 },
+  );
+  const binDir = path.join(root, 'manager-bin');
+  fs.mkdirSync(binDir);
+  const managerLog = path.join(root, 'manager.log');
+  fs.writeFileSync(
+    path.join(binDir, mgr),
+    '#!/bin/sh\n' +
+      'if [ "$1" = "--version" ]; then echo 9.9.9; exit 0; fi\n' +
+      `echo "$*" >> '${managerLog}'\n` +
+      (managerRemoves ? `rm -rf '${packageRoot}'\n` : '') +
+      'exit 0\n',
+    { mode: 0o755 },
+  );
+  return { packageRoot, binaryLog, managerLog, binDir };
+}
+
+async function runUninstall(fixture, args) {
+  const saved = {
+    path: process.env.PATH,
+    exitCode: process.exitCode,
+    log: console.log,
+    error: console.error,
+  };
+  const output = [];
+  process.env.PATH = `${fixture.binDir}${path.delimiter}${saved.path || ''}`;
+  process.exitCode = undefined;
+  console.log = (...parts) => output.push(parts.join(' '));
+  console.error = (...parts) => output.push(parts.join(' '));
+  try {
+    const handled = await runPackageUninstall(args, fixture.packageRoot);
+    return { handled, exitCode: process.exitCode, text: output.join('\n') };
+  } finally {
+    process.env.PATH = saved.path;
+    process.exitCode = saved.exitCode;
+    console.log = saved.log;
+    console.error = saved.error;
+  }
+}
+
+const readLog = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '');
+
+test(
+  'terminal contract: a full uninstall removes the scoped package through its owner manager',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const npm = uninstallFixture(t, 'npm-prefix/lib', 'npm');
+    const removed = await runUninstall(npm, ['--yes']);
+    assert.equal(removed.handled, true);
+    assert.equal(removed.exitCode, undefined, removed.text);
+    assert.match(readLog(npm.binaryLog), /^args=uninstall --yes$/m);
+    assert.match(readLog(npm.binaryLog), /^command=npm uninstall -g @umatech\/umadev$/m);
+    assert.equal(readLog(npm.managerLog), 'uninstall -g @umatech/umadev\n');
+    assert.equal(fs.existsSync(npm.packageRoot), false);
+    assert.match(removed.text, /UmaDev uninstalled/);
+
+    const pnpm = uninstallFixture(t, 'pnpm/global/5', 'pnpm');
+    const viaPnpm = await runUninstall(pnpm, ['--yes']);
+    assert.equal(viaPnpm.exitCode, undefined, viaPnpm.text);
+    assert.equal(UNINSTALL_COMMANDS.pnpm, 'pnpm remove -g @umatech/umadev');
+    assert.equal(readLog(pnpm.managerLog), 'remove -g @umatech/umadev\n');
+  },
+);
+
+test(
+  'terminal contract: uninstall reports success only when the package is really gone',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    // npm exits 0 for a package that is not installed (the retired unscoped
+    // name did exactly that), so its status is not evidence of removal.
+    const lingering = uninstallFixture(t, 'npm-prefix/lib', 'npm', { managerRemoves: false });
+    const result = await runUninstall(lingering, ['--yes']);
+    assert.equal(result.handled, true);
+    assert.equal(result.exitCode, 1);
+    assert.equal(fs.existsSync(lingering.packageRoot), true);
+    assert.match(result.text, /did not remove the package/);
+    assert.match(result.text, /npm uninstall -g @umatech\/umadev/);
+    assert.doesNotMatch(result.text, /UmaDev uninstalled/);
+
+    // Declining at the binary's prompt, or a failed hook removal, removes nothing.
+    for (const [mode, exitCode] of [
+      ['decline', undefined],
+      ['fail', 1],
+    ]) {
+      const fixture = uninstallFixture(t, 'npm-prefix/lib', 'npm', { mode });
+      const outcome = await runUninstall(fixture, []);
+      assert.equal(outcome.handled, true);
+      assert.equal(outcome.exitCode, exitCode, mode);
+      assert.equal(readLog(fixture.managerLog), '', `${mode}: the manager ran`);
+      assert.equal(fs.existsSync(fixture.packageRoot), true);
+    }
+
+    // A hook-only uninstall and the help text stay with the binary.
+    const hookOnly = uninstallFixture(t, 'npm-prefix/lib', 'npm');
+    for (const args of [['--base', 'claude-code'], ['--host=pre-commit'], ['--help']]) {
+      const outcome = await runUninstall(hookOnly, args);
+      assert.equal(outcome.handled, false, args.join(' '));
+    }
+    assert.equal(readLog(hookOnly.binaryLog), '');
+  },
+);
 
 test('terminal contract: package managers never run from the caller cwd', () => {
   const options = packageManagerSpawnOptions(
