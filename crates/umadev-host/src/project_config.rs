@@ -8,15 +8,18 @@
 //! hooks and plugins. In a project the user has not trusted, that is
 //! repository content deciding what code runs and what a tier allows, even in
 //! Plan. The application layer publishes the project roots the user trusts
-//! ([`set_project_trusted`]); every session and one-shot launch asks
-//! [`loads_project_config`] about its working directory and, when the answer
+//! ([`set_project_trusted`](crate::project_config::set_project_trusted)); every
+//! session and one-shot launch asks
+//! [`loads_project_config`](crate::project_config::loads_project_config) about
+//! its working directory and, when the answer
 //! is no, starts the vendor with its project-level configuration switched off:
 //!
 //! - Claude Code: `--setting-sources user --strict-mcp-config`, so only the
 //!   user's own settings load and no MCP server is started (UmaDev passes no
 //!   `--mcp-config` of its own). UmaDev's governance hooks, when the project's
 //!   `.claude/settings.local.json` registers them, are passed with `--settings`
-//!   instead, running this binary ([`claude_governance_hooks`]).
+//!   instead, running this binary
+//!   ([`claude_governance_hooks`](crate::project_config::claude_governance_hooks)).
 //! - Codex: the working directory and each of its ancestors are marked
 //!   `trust_level = "untrusted"` for that launch, which keeps project config,
 //!   hooks and exec policies disabled and stops app-server from recording the
@@ -25,7 +28,7 @@
 //! - Grok Build keeps project MCP servers, hooks and plugins behind its own
 //!   Folder Trust until the user grants it there; nothing is added here.
 //! - Kimi Code has no switch for its project MCP files, so a Kimi session is
-//!   refused in an untrusted project that has one ([`kimi_refusal`]).
+//!   refused in an untrusted project that has one (`kimi_refusal`).
 //!
 //! A directory nobody published is untrusted: launches fail closed.
 

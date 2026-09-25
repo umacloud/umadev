@@ -32,7 +32,7 @@
 //!    auto-passed). After a threshold of consecutive passes we *suggest* — never
 //!    silently switch — that the user let that gate auto-advance. The gate
 //!    counters are persisted to `.umadev/trust.json`; remembered approvals live
-//!    in the user's state directory ([`approval_memory`]). Fully fail-open.
+//!    in the user's state directory (`approval_memory`). Fully fail-open.
 //!
 //! Everything here is **deterministic**: the mode defines an execution ceiling
 //! and gate auto-pass policy, while the reversibility classifier is a pure
@@ -1355,7 +1355,7 @@ pub fn requires_confirmation_with_ledger(
 /// Persist that the user approved a guarded/plan confirmation for this action's
 /// class in `project_root` — the one-call entry point an interactive approval
 /// handler uses. The rule goes to this user's approval memory for the project
-/// ([`approval_memory`]), never into the project itself. Returns `true` when a
+/// (`approval_memory`), never into the project itself. Returns `true` when a
 /// new rule was recorded.
 ///
 /// Fully fail-open and floor-safe: an irreversible-floor action records nothing
