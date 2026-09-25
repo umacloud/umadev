@@ -53,8 +53,15 @@ pub(super) fn persisted_run_mode(
     if fallback == umadev_agent::TrustMode::Plan {
         return fallback;
     }
+    // The saved tier is honored only for run state this installation wrote in a
+    // project the user trusts; the repository could have written anything else.
+    let trusted = umadev_agent::workspace_trust::is_trusted(project_root);
     umadev_agent::read_workflow_state(project_root).map_or(fallback, |state| {
-        umadev_agent::TrustMode::from_base_permissions(state.resolved_permission_profile())
+        umadev_agent::workspace_trust::resume_tier(
+            project_root,
+            umadev_agent::TrustMode::from_base_permissions(state.resolved_permission_profile()),
+            trusted,
+        )
     })
 }
 

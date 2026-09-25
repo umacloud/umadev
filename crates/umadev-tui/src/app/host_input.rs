@@ -291,6 +291,7 @@ mod tests {
             tmp2.path().join("config.toml"),
             tmp2.path().to_path_buf(),
         );
+        auto_app.workspace_trust = Some(true);
         auto_app.trust_mode_override = Some(umadev_agent::TrustMode::Auto);
         let (holder2, rx2) = install_host_request(&mut auto_app, 62, grok_plan_request("步骤一"));
         assert!(host_key(&holder2, &mut auto_app, KeyCode::Char('a')));

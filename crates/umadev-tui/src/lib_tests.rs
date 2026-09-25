@@ -434,6 +434,16 @@ fn persisted_run_mode_preserves_plan_auto_and_safe_legacy_default() {
         TrustMode::Auto
     );
 
+    // A saved Auto tier resumes only in a project the user trusts.
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+    state.permission_profile = Some(BasePermissionProfile::Auto);
+    umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
+    assert_eq!(
+        persisted_run_mode(tmp.path(), TrustMode::Guarded),
+        TrustMode::Guarded
+    );
+    crate::app::workspace_trust::trust_for_test(tmp.path());
+
     for (profile, expected) in [
         (BasePermissionProfile::Plan, TrustMode::Plan),
         (BasePermissionProfile::Auto, TrustMode::Auto),
@@ -2707,6 +2717,7 @@ fn shift_tab_cycles_only_between_writable_tiers_never_read_only_plan() {
         tmp.path().join("config.toml"),
         tmp.path().to_path_buf(),
     );
+    app.workspace_trust = Some(true);
 
     // Auto → Guarded (NOT Plan). The reported bug: Shift+Tab from Auto landed in
     // read-only Plan, stripping ALL write permission ("current turn is read-only,
