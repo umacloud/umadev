@@ -30,7 +30,6 @@ const SENSITIVE_PATH_SUFFIXES: &[&str] = &[
     "credentials",
     "credentials.json",
     "service-account.json",
-    ".npmrc",
     ".netrc",
     ".pypirc",
     "id_rsa",
@@ -46,8 +45,14 @@ const SENSITIVE_PATH_SUFFIXES: &[&str] = &[
 /// not a quality check — it fires first and is exempt from any future
 /// "skip governance" toggle, mirroring Claude Code's bypass-immune
 /// safetyCheck (`utils/permissions/permissions.ts` step 1f/1g).
+///
+/// A project `.npmrc` is blocked only when `content` sets a registry
+/// credential (`_authToken`, `_auth`, `_password`): the registry mirror,
+/// `legacy-peer-deps` and pnpm hoisting settings it usually carries are not
+/// secrets, npm reads no other file name, and `.umadev/rules.toml` cannot
+/// exempt a floor path.
 #[must_use]
-pub fn check_sensitive_path(file_path: &str, _content: &str) -> Decision {
+pub fn check_sensitive_path(file_path: &str, content: &str) -> Decision {
     let normalized = file_path.replace('\\', "/");
     let lower = normalized.to_ascii_lowercase();
     // 1. Segment match for sensitive directories: any path component equal to
@@ -57,25 +62,70 @@ pub fn check_sensitive_path(file_path: &str, _content: &str) -> Decision {
     for seg in lower.split('/') {
         if SENSITIVE_DIRS.contains(&seg) {
             return Decision::block(
- "UD-SEC-001",
+                "UD-SEC-001",
                 format!(
- "UmaDev: write to sensitive path `{file_path}` blocked (UD-SEC-001).                      A parent segment (`{seg}`) holds version-control internals, secrets,                      or toolchain config — overwriting it can corrupt the repo or leak                      credentials. If this is intentional, exclude this path from the                      governance hook or run the host outside UmaDev's supervision."
+                    "UmaDev: write to sensitive path `{file_path}` blocked (UD-SEC-001). \
+                     A parent segment (`{seg}`) holds version-control internals, secrets, \
+                     or toolchain config — overwriting it can corrupt the repo or leak \
+                     credentials. {FLOOR_ADVICE}"
                 ),
             );
         }
     }
     // 2. Trailing-path-suffix match: `.env`, `id_rsa`, `settings.json`, etc.
     //    matched against the END of the normalized path so both `.env` and
-    // `apps/api/.env` are caught.
-    for suffix in SENSITIVE_PATH_SUFFIXES {
-        if lower == *suffix || lower.ends_with(&format!("/{suffix}")) {
-            return Decision::block(
- "UD-SEC-001",
-                format!(
- "UmaDev: write to sensitive file `{file_path}` blocked (UD-SEC-001). `{suffix}` typically holds secrets, credentials, or toolchain config.                      If this is intentional and not a real secret, rename the file or                      exclude it from the governance hook."
-                ),
-            );
-        }
+    //    `apps/api/.env` are caught.
+    let is_named = |name: &str| lower == name || lower.ends_with(&format!("/{name}"));
+    if let Some(suffix) = SENSITIVE_PATH_SUFFIXES
+        .iter()
+        .find(|suffix| is_named(suffix))
+    {
+        return Decision::block(
+            "UD-SEC-001",
+            format!(
+                "UmaDev: write to sensitive file `{file_path}` blocked (UD-SEC-001). \
+                 `{suffix}` typically holds secrets or credentials. {FLOOR_ADVICE}"
+            ),
+        );
+    }
+    // 3. A project `.npmrc` only when it sets a registry credential.
+    if is_named(".npmrc") && npmrc_sets_credential(content) {
+        return Decision::block(
+            "UD-SEC-001",
+            format!(
+                "UmaDev: write to sensitive file `{file_path}` blocked (UD-SEC-001). \
+                 This `.npmrc` sets a registry credential (`_authToken` / `_auth` / \
+                 `_password`). Reference an environment variable instead \
+                 (`//registry.npmjs.org/:_authToken=${{NPM_TOKEN}}`); registry, mirror and \
+                 install settings without a credential are allowed. {FLOOR_ADVICE}"
+            ),
+        );
     }
     Decision::pass()
+}
+
+/// The truthful way out of a UD-SEC-001 block: the floor ignores the project's
+/// policy file, so nothing in it can let this write through.
+const FLOOR_ADVICE: &str = "This safety floor ignores `.umadev/rules.toml`; if the change is \
+     intended, make it yourself outside the UmaDev run.";
+
+/// Whether `.npmrc` content assigns a literal registry credential. A value read
+/// from the environment (`${NPM_TOKEN}`) is not one.
+fn npmrc_sets_credential(content: &str) -> bool {
+    content.lines().any(|line| {
+        let line = line.trim();
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().trim_matches(['"', '\'']);
+        let credential_key = key.ends_with("_authtoken")
+            || key.ends_with("_auth")
+            || key.ends_with(":_password")
+            || key == "_password";
+        !line.starts_with(['#', ';'])
+            && credential_key
+            && !value.is_empty()
+            && !value.starts_with('$')
+    })
 }
