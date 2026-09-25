@@ -631,6 +631,7 @@
 "continue.resuming_chat" = "Resuming the previous conversation — the base picks up with full context."
 "continue.chat_directive" = "Continue the work from where we left off."
 "continue.resuming_plan" = "team · resuming the saved plan ({}/{} steps already done) — driving only what's left"
+"continue.unowned_run" = "The saved run in .umadev was not written by UmaDev on this machine (it may have come with the repository), so it was not resumed. Review it:\n{}\nTo run this plan as shown, send /continue adopt. To start over, type a new requirement."
 "revise.usage" = "Usage: /revise <revision notes>.\n  Example: /revise drop social login, keep only email + password"
 "revise.no_gate" = "No checkpoint is open, nothing to revise — to change output, wait for the run to pause at a checkpoint (confirm the core docs / confirm the frontend preview)."
 

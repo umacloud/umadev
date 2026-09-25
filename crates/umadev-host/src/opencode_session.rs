@@ -6349,7 +6349,7 @@ mod tests {
     }
 
     #[test]
-    fn native_events_redact_before_transcript_tool_activity_and_audit() {
+    fn native_events_keep_model_text_and_tool_traffic_whole() {
         const SECRET: &str = "SYNTH_OPENCODE_SESSION_SECRET_83";
         let mut tracker = PartTracker::default();
         let text = serde_json::json!({
@@ -6385,8 +6385,8 @@ mod tests {
         events.extend(translate_frame_tracked(&tool, "ses_secret", &mut tracker));
         let audit_view = format!("{events:?}");
         assert!(
-            !audit_view.contains(SECRET),
-            "event/audit leaked: {audit_view}"
+            audit_view.contains(SECRET),
+            "event was rewritten: {audit_view}"
         );
         assert!(audit_view.contains("safe-page-3"));
 

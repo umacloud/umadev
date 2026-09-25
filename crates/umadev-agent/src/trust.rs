@@ -30,8 +30,9 @@
 //! 2. **Collaborative trust tracking** ([`TrustLedger`]): per project, per gate,
 //!    we record how many times in a row the user auto-approved (or the gate
 //!    auto-passed). After a threshold of consecutive passes we *suggest* — never
-//!    silently switch — that the user let that gate auto-advance. Persisted to
-//!    `.umadev/trust.json`, fully fail-open.
+//!    silently switch — that the user let that gate auto-advance. The gate
+//!    counters are persisted to `.umadev/trust.json`; remembered approvals live
+//!    in the user's state directory ([`approval_memory`]). Fully fail-open.
 //!
 //! Everything here is **deterministic**: the mode defines an execution ceiling
 //! and gate auto-pass policy, while the reversibility classifier is a pure
@@ -40,6 +41,8 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+mod approval_memory;
 
 const MAX_TRUST_LEDGER_BYTES: usize = 1024 * 1024;
 
@@ -630,7 +633,7 @@ pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
     if is_force_push(&cmd) {
         return Reversibility::VersionControl;
     }
-    if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) {
+    if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) || target_is_url(target_path) {
         return Reversibility::Network;
     }
     // Touching `.git/` internals (config, refs, objects, hooks) can rewrite or
@@ -649,6 +652,15 @@ pub fn reversibility_class(command: &str, target_path: &str) -> Reversibility {
         return Reversibility::Uncertain;
     }
     Reversibility::Reversible
+}
+
+/// Whether a tool's target is a URL. A fetch tool (`webfetch`, an MCP fetch) names
+/// the network only in its target, so its action alone carries no network token.
+fn target_is_url(target_path: &str) -> bool {
+    let target = target_path.trim_start().to_ascii_lowercase();
+    ["http://", "https://", "ftp://"]
+        .iter()
+        .any(|scheme| target.starts_with(scheme))
 }
 
 /// Whether a path/command string reaches into version-control internals.
@@ -838,6 +850,20 @@ pub fn requires_confirmation(mode: TrustMode, command: &str, target_path: &str) 
 /// ESCAPING destination counts; an in-tree redirect stays automatic. Dependency-free +
 /// conservative: an unparsed form simply does not match (fail-safe toward not-escaping).
 fn shell_write_escapes_workspace(command: &str, root: Option<&std::path::Path>) -> bool {
+    shell_write_destinations(command).iter().any(|d| {
+        // The benign CHAR devices (/dev/null, /dev/stdout|stderr|stdin, /dev/tty,
+        // /dev/zero, /dev/random, /dev/fd/N) are NOT workspace escapes - a redirect to them
+        // is the ubiquitous `> /dev/null` / `2>/dev/null` idiom that must stay automatic in
+        // Guarded (a redirect to a real BLOCK device is caught as Destructive by
+        // reversibility_class upstream, so it is already handled).
+        !is_benign_char_device(d) && target_escapes_workspace(d, root)
+    })
+}
+
+/// The files a SHELL command writes through a redirect, a `tee`/`cp`/`install`/`mv`
+/// destination, `dd of=`, or a read verb's output option. Dependency-free and
+/// conservative: an unparsed form simply yields no destination.
+fn shell_write_destinations(command: &str) -> Vec<String> {
     let toks: Vec<&str> = command.split_whitespace().collect();
     let mut dests: Vec<String> = Vec::new();
     for (i, t) in toks.iter().enumerate() {
@@ -864,16 +890,24 @@ fn shell_write_escapes_workspace(command: &str, root: Option<&std::path::Path>) 
             }
         } else if let Some(of) = t.strip_prefix("of=") {
             dests.push(of.to_string());
+        } else if let Some(file) = t
+            .strip_prefix("--output=")
+            .or_else(|| t.strip_prefix("--log-file="))
+        {
+            // `git diff --output=<file>`, `less --log-file=<file>`.
+            dests.push(file.to_string());
+        } else if matches!(
+            *t,
+            "--output" | "--log-file" | "-fprint" | "-fprint0" | "-fprintf" | "-fls"
+        ) {
+            // The same options with a separate file argument, and `find`'s
+            // file-printing actions.
+            if let Some(next) = toks.get(i + 1) {
+                dests.push((*next).to_string());
+            }
         }
     }
-    dests.iter().any(|d| {
-        // The benign CHAR devices (/dev/null, /dev/stdout|stderr|stdin, /dev/tty,
-        // /dev/zero, /dev/random, /dev/fd/N) are NOT workspace escapes - a redirect to them
-        // is the ubiquitous `> /dev/null` / `2>/dev/null` idiom that must stay automatic in
-        // Guarded (a redirect to a real BLOCK device is caught as Destructive by
-        // reversibility_class upstream, so it is already handled).
-        !is_benign_char_device(d) && target_escapes_workspace(d, root)
-    })
+    dests
 }
 
 /// The character devices a shell redirect legitimately targets - never a workspace escape.
@@ -919,6 +953,11 @@ fn requires_confirmation_rooted(
     if floor_escalates(mode, command, target_path) {
         return true;
     }
+    // 1b) A write to a file that grants UmaDev or a base its permissions confirms in
+    //     EVERY mode, and is never remembered (see [`writes_permission_config`]).
+    if writes_permission_config(command, target_path, workspace_root) {
+        return true;
+    }
     // 2) The floor did not escalate. Apply the per-mode policy. A reversible
     //    in-tree write stays automatic in this confirmation classifier (else a
     //    legacy caller can enter a deny loop); Plan's execution-entry guard and
@@ -935,15 +974,10 @@ fn requires_confirmation_rooted(
     // lowercasing: the destination path is case-sensitive and `shell_write_escapes_workspace`
     // (like the already-correct raw-command path) relies on original case for exact
     // containment against the workspace root.
-    let shell_cmd = if SHELL_EXEC_ACTIONS.contains(&command.to_ascii_lowercase().as_str())
-        && !target_path.trim().is_empty()
-    {
-        target_path
-    } else {
-        command
-    };
+    let shell_cmd = shell_command(command, target_path);
     let out_of_tree_write = (matches!(cap, Capability::Write)
-        && target_escapes_workspace(target_path, workspace_root))
+        && write_targets(target_path)
+            .any(|target| target_escapes_workspace(target, workspace_root)))
         || shell_write_escapes_workspace(shell_cmd, workspace_root);
     match mode {
         // Fully autonomous: a write that ESCAPES the workspace (not
@@ -958,6 +992,70 @@ fn requires_confirmation_rooted(
         // escalated here, but Plan's entry/profile boundary still denies it.
         TrustMode::Plan => out_of_tree_write || matches!(cap, Capability::Shell),
     }
+}
+
+/// The shell command an action runs: the real command in `target_path` for a
+/// shell-exec tool call (`Bash` + its command), else `command` itself. Case is
+/// kept, since destination paths are case-sensitive.
+fn shell_command<'a>(command: &'a str, target_path: &'a str) -> &'a str {
+    if SHELL_EXEC_ACTIONS.contains(&command.to_ascii_lowercase().as_str())
+        && !target_path.trim().is_empty()
+    {
+        target_path
+    } else {
+        command
+    }
+}
+
+/// Project files that grant UmaDev or a base its permissions, hooks or servers.
+/// Directories count with everything beneath them.
+const PERMISSION_CONFIG_FILES: &[&str] =
+    &[".umadevrc", ".mcp.json", "opencode.json", "opencode.jsonc"];
+const PERMISSION_CONFIG_DIRS: &[&str] = &[".umadev", ".git", ".codex", ".opencode"];
+
+/// Whether `target` (project-relative, or absolute under `workspace_root`) is a
+/// permission-granting config file: `.umadevrc`, anything under `.umadev/`,
+/// `.git/`, `.codex/` or `.opencode/`, `.claude/settings*.json`, `.mcp.json`
+/// or `opencode.json(c)`. Compared case-insensitively, and ignoring the trailing
+/// dots and spaces Windows drops, since those spellings name the same file there.
+fn is_permission_config(target: &str, workspace_root: Option<&Path>) -> bool {
+    let path = Path::new(target.trim());
+    let relative = workspace_root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_lowercase();
+    let mut parts = relative
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .map(|part| part.trim_end_matches(['.', ' ']));
+    let (Some(first), second) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    PERMISSION_CONFIG_DIRS.contains(&first)
+        || (second.is_none() && PERMISSION_CONFIG_FILES.contains(&first))
+        || (first == ".claude"
+            && second.is_some_and(|name| {
+                name.starts_with("settings") && Path::new(name).extension() == Some("json".as_ref())
+            }))
+}
+
+/// Whether this action writes a permission-granting config file
+/// ([`is_permission_config`]), as a file-write tool or through a shell redirect.
+/// Such a write lets whoever makes it widen what UmaDev or the base may do next:
+/// set Auto in `.umadevrc`, allow every tool in `.claude/settings.json`, add an
+/// MCP server or a hook. It therefore confirms in every tier, Auto included, and
+/// is never remembered, so one approved edit can never cover it.
+fn writes_permission_config(
+    command: &str,
+    target_path: &str,
+    workspace_root: Option<&Path>,
+) -> bool {
+    (matches!(capability_class(command, target_path), Capability::Write)
+        && write_targets(target_path).any(|target| is_permission_config(target, workspace_root)))
+        || shell_write_destinations(shell_command(command, target_path))
+            .iter()
+            .any(|dest| is_permission_config(dest, workspace_root))
 }
 
 /// Whether a write `target` path escapes the project workspace — i.e. it is NOT
@@ -1022,6 +1120,16 @@ fn target_escapes_workspace(target_path: &str, workspace_root: Option<&Path>) ->
     // A project-relative path stays in-tree (it is written relative to the run cwd =
     // the workspace, and the checkpoint can rewind it).
     false
+}
+
+/// Every path a write target names. A base that changes several files in one
+/// request (Codex `fileChange` / `applyPatch`) reports them joined by `", "`, so
+/// each is classified on its own as well as the whole string: `src/a.ts,
+/// /home/u/.bashrc` has no root and no `..` as a whole, yet it writes outside
+/// the workspace.
+fn write_targets(target_path: &str) -> impl Iterator<Item = &str> {
+    let pieces = target_path.contains(", ").then(|| target_path.split(", "));
+    std::iter::once(target_path).chain(pieces.into_iter().flatten())
 }
 
 /// Whether absolute `path` lies under absolute `root`. A LEXICAL component-prefix check
@@ -1144,10 +1252,19 @@ fn remembered_class_rooted(
     if UNREMEMBERABLE_REQUEST_ACTIONS.contains(&command.trim()) {
         return None;
     }
+    // Each write to a permission-granting config file asks on its own.
+    if writes_permission_config(command, target_path, workspace_root) {
+        return None;
+    }
     match capability_class(command, target_path) {
         // A read is auto-allowed in every mode → nothing to remember.
         // Network is always a floor action → handled above, never reaches here.
         Capability::Read | Capability::Network => None,
+        // A change that lists several files is remembered only when every one of them
+        // stays in the tree; one approval must not stand for an escaping file among them.
+        Capability::Write if write_targets(target_path).count() > 1 => write_targets(target_path)
+            .all(|target| !target_escapes_workspace(target, workspace_root))
+            .then(|| "write_in_tree".to_string()),
         Capability::Write => Some(if target_escapes_workspace(target_path, workspace_root) {
             // Scope an out-of-tree write approval to its PARENT DIRECTORY, so approving a
             // write under `~/.config/app` cannot silently auto-grant a later write to
@@ -1157,16 +1274,36 @@ fn remembered_class_rooted(
         } else {
             "write_in_tree".to_string()
         }),
-        // Key each shell / MCP / dynamic-tool action by its OWN effective command, NOT one
-        // coarse `"shell"` constant. `capability_class` funnels every non-read, non-write,
-        // non-network action into `Capability::Shell` — a local shell command, but ALSO
-        // every `mcp__server__tool`, sub-agent spawn, and the `Read` tool name. Sharing one
-        // key meant ONE approved `npm run build` auto-granted every later `mcp__*` delete,
-        // sub-agent, and arbitrary shell command for the life of the project (a blank check
-        // via the ordinary tool lane). Each distinct effective command / tool id now has its
-        // own key, so a remembered approval covers only the identical action.
-        Capability::Shell => Some(format!("shell:{}", effective_command(command, target_path))),
+        // Key each shell command by its OWN exact text, NOT one coarse `"shell"` constant.
+        // `capability_class` funnels every non-read, non-write, non-network action into
+        // `Capability::Shell` — a local shell command, but ALSO every `mcp__server__tool`,
+        // sub-agent spawn, and the `Read` tool name. Sharing one key meant ONE approved
+        // `npm run build` auto-granted every later `mcp__*` delete, sub-agent, and arbitrary
+        // shell command for the life of the project (a blank check via the ordinary tool
+        // lane). See [`remembered_shell_command`] for which actions have a key at all.
+        Capability::Shell => {
+            remembered_shell_command(command, target_path).map(|command| format!("shell:{command}"))
+        }
     }
+}
+
+/// The command a remembered shell approval is keyed on, or `None` when the action
+/// must re-ask every time.
+///
+/// A shell-exec tool (`Bash` + its command) and a bare command string are keyed on
+/// the command exactly as written: case is kept, because `./scripts/Build.sh` and
+/// `./scripts/build.sh` are different files on a case-sensitive filesystem. Any
+/// other tool with a target (`webfetch` + URL, `mcp__server__tool` + an argument,
+/// a sub-agent task) has none: its target is only the one argument the base chose
+/// to show, so a key on it (or on the tool name alone) would let one approval
+/// cover every later call with different arguments.
+fn remembered_shell_command<'a>(command: &'a str, target_path: &'a str) -> Option<&'a str> {
+    let action = command.trim();
+    let target = target_path.trim();
+    if SHELL_EXEC_ACTIONS.contains(&action.to_ascii_lowercase().as_str()) {
+        return (!target.is_empty()).then_some(target);
+    }
+    (target.is_empty() && !action.is_empty()).then_some(action)
 }
 
 /// The remember-scope for an OUT-of-tree write: its PARENT directory, so an approval is
@@ -1218,27 +1355,20 @@ pub fn requires_confirmation_with_ledger(
 
 /// Persist that the user approved a guarded/plan confirmation for this action's
 /// class in `project_root` — the one-call entry point an interactive approval
-/// handler uses: load the project ledger, [`TrustLedger::remember_approval`],
-/// and atomically save. Returns `true` when a new rule was recorded.
+/// handler uses. The rule goes to this user's approval memory for the project
+/// ([`approval_memory`]), never into the project itself. Returns `true` when a
+/// new rule was recorded.
 ///
 /// Fully fail-open and floor-safe: an irreversible-floor action records nothing
-/// (returns `false`), and any IO error during load/save is swallowed so trust
-/// learning never blocks the pipeline.
+/// (returns `false`), and any IO error is swallowed so trust learning never
+/// blocks the pipeline.
 pub fn remember_project_approval(project_root: &Path, command: &str, target_path: &str) -> bool {
-    let mut ledger = TrustLedger::load(project_root);
     // Root-aware class (MEDIUM M4): record the key the root-aware gate
     // ([`requires_confirmation_with_ledger`]) actually checks, so approving an
     // out-of-tree write under THIS project records `write_out_of_tree` — matching the
     // gate — rather than the legacy heuristic's possibly-wrong `write_in_tree`.
-    let Some(key) = remembered_class_rooted(command, target_path, Some(project_root)) else {
-        return false;
-    };
-    if ledger.allow_rules.insert(key) {
-        ledger.save(project_root);
-        true
-    } else {
-        false
-    }
+    remembered_class_rooted(command, target_path, Some(project_root))
+        .is_some_and(|key| approval_memory::remember(project_root, key))
 }
 
 /// INTERACTIVE-ONLY decision (Fix ③): should a **Guarded** turn PAUSE and ask the
@@ -1365,7 +1495,7 @@ pub fn capability_class(command: &str, target_path: &str) -> Capability {
         if WRITE_ACTIONS.contains(&cmd.as_str()) {
             return Capability::Write;
         }
-        if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) {
+        if NETWORK_TOKENS.iter().any(|t| cmd.contains(t)) || target_is_url(target_path) {
             return Capability::Network;
         }
         // A pure read verb stays Read; everything else that runs is Shell.
@@ -1422,7 +1552,46 @@ fn is_read_only_command(cmd: &str) -> bool {
     ];
     READ_VERBS
         .iter()
-        .any(|v| c == *v || c.starts_with(&format!("{v} ")))
+        .find(|v| c == **v || c.starts_with(&format!("{v} ")))
+        .is_some_and(|verb| {
+            let flags = SIDE_EFFECT_FLAGS
+                .iter()
+                .find_map(|(v, flags)| (v == verb).then_some(*flags))
+                .unwrap_or_default();
+            !c.split_whitespace()
+                .skip(1)
+                .any(|arg| is_side_effect_flag(arg, flags))
+        })
+}
+
+/// Options that make a read verb run a program or write a file: `rg --pre` runs
+/// a preprocessor, `find -exec`/`-delete`/`-fprint` execute or write, `git
+/// --output`/`--ext-diff`/`--textconv` write a file or run a diff driver, and
+/// `less -o`/`--log-file` copy the input to a file. Commands are lowercased.
+const SIDE_EFFECT_FLAGS: &[(&str, &[&str])] = &[
+    ("rg", &["--pre", "--pre-glob"]),
+    (
+        "find",
+        &[
+            "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf",
+            "-fls",
+        ],
+    ),
+    ("git log", &["--output", "--ext-diff", "--textconv"]),
+    ("git diff", &["--output", "--ext-diff", "--textconv"]),
+    ("git show", &["--output", "--ext-diff", "--textconv"]),
+    ("less", &["-o", "--log-file"]),
+];
+
+/// Whether `arg` is one of `flags`, in its bare, `--flag=value` or attached
+/// short (`-ofile`) spelling.
+fn is_side_effect_flag(arg: &str, flags: &[&str]) -> bool {
+    flags.iter().any(|flag| {
+        arg == *flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('=') || flag.len() == 2)
+    })
 }
 
 /// Per-capability autonomy posture: may an action of this capability run without
@@ -1764,12 +1933,17 @@ pub struct GateTrust {
     pub suggested: bool,
 }
 
-/// Project-scoped trust ledger persisted to `.umadev/trust.json`. Two parts:
-/// per-gate auto-advance counters (keyed by gate id — `docs_confirm`,
-/// `preview_confirm`, `clarify`) and the self-learning **allow-rules** — the
-/// reversible action classes the user has explicitly approved for THIS project,
-/// so a class already OK'd is not re-asked ([`Self::remember_approval`] /
+/// Project-scoped trust ledger. Two parts: per-gate auto-advance counters (keyed
+/// by gate id — `docs_confirm`, `preview_confirm`, `clarify`), persisted to
+/// `.umadev/trust.json`, and the self-learning **allow-rules** — the reversible
+/// action classes the user has explicitly approved for THIS project, so a class
+/// already OK'd is not re-asked ([`Self::remember_approval`] /
 /// [`Self::remembers`], consulted by [`requires_confirmation_with_ledger`]).
+///
+/// The counters only ever produce a suggestion, so reading them from the project
+/// is harmless. The allow-rules relax confirmations, so they are never read from
+/// or written to the project: [`Self::load`] takes them from the user's state
+/// directory and [`remember_project_approval`] records them there.
 ///
 /// The whole struct is **fail-open**: a missing / corrupt file yields the empty
 /// default ([`Self::load`]), so the run behaves exactly as it would with no
@@ -1784,27 +1958,31 @@ pub struct TrustLedger {
     /// project (keys from the internal remembered-action classifier, e.g. `write_out_of_tree` /
     /// `shell`). NEVER contains an irreversible-floor class. A `BTreeSet` keeps
     /// the on-disk order stable. Defaulted so an older `trust.json` without this
-    /// field loads cleanly (back-compat / fail-open).
-    #[serde(default)]
+    /// field loads cleanly (back-compat / fail-open). Skipped by serde: rules in a
+    /// project's `trust.json` are ignored, and saving never writes them there.
+    #[serde(skip)]
     pub allow_rules: std::collections::BTreeSet<String>,
 }
 
 impl TrustLedger {
-    /// Load the ledger from `<root>/.umadev/trust.json`. Fail-open: a missing
-    /// or corrupt file yields a fresh empty ledger (never an error).
+    /// Load the gate counters from `<root>/.umadev/trust.json` and this user's
+    /// remembered approvals for the project. Fail-open: a missing or corrupt file
+    /// yields empty counters / no remembered approvals (never an error).
     #[must_use]
     pub fn load(project_root: &Path) -> Self {
-        crate::bounded_fs::read_utf8_beneath(
+        let mut ledger: Self = crate::bounded_fs::read_utf8_beneath(
             project_root,
             &Self::path(project_root),
             MAX_TRUST_LEDGER_BYTES,
         )
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+        ledger.allow_rules = approval_memory::load(project_root);
+        ledger
     }
 
-    /// Persist the ledger **atomically**: serialize, write a sibling temp file,
+    /// Persist the gate counters **atomically**: serialize, write a sibling temp file,
     /// then rename it over `trust.json` so a crash mid-write can never leave a
     /// half-written (corrupt) ledger — a torn read just falls back to the empty
     /// default on next load. Best-effort: any IO error is swallowed (fail-open —
@@ -1829,8 +2007,8 @@ impl TrustLedger {
     }
 
     /// Record that the user **approved** a guarded/plan confirmation for this
-    /// action's class, scoped to THIS project (the ledger lives at
-    /// `<root>/.umadev/trust.json`). A later action of the same class is then not
+    /// action's class, scoped to THIS project, in memory only (use
+    /// [`remember_project_approval`] to persist it). A later action of the same class is then not
     /// re-asked ([`Self::remembers`] / [`requires_confirmation_with_ledger`]).
     ///
     /// Returns `true` when a new rule was added. An **irreversible-floor** action
@@ -3663,6 +3841,200 @@ mod tests {
         match remembered_class_rooted(command, target, Some(root)) {
             Some(key) => ledger.allow_rules.insert(key),
             None => false,
+        }
+    }
+
+    #[test]
+    fn remembered_shell_commands_keep_their_case() {
+        let root = real_root();
+        let mut ledger = TrustLedger::default();
+        let key = remembered_class_rooted("Bash", "./scripts/Build.sh", Some(root)).unwrap();
+        assert_eq!(key, "shell:./scripts/Build.sh");
+        ledger.allow_rules.insert(key);
+        assert!(ledger.remembers_rooted("Bash", "./scripts/Build.sh", root));
+        assert!(!ledger.remembers_rooted("Bash", "./scripts/build.sh", root));
+    }
+
+    #[test]
+    fn tool_approvals_are_never_keyed_on_the_tool_name_alone() {
+        let root = real_root();
+        for (tool, target) in [
+            ("webfetch", "https://docs.rs/serde"),
+            ("mcp__db__delete_rows", "users"),
+            ("task", "review the diff"),
+        ] {
+            assert_eq!(remembered_class_rooted(tool, target, Some(root)), None);
+            assert!(!remember_project_approval(root, tool, target));
+        }
+        // A URL target reaches the network whatever the tool is called, so
+        // Guarded confirms each fetch instead of treating it as local work.
+        assert_eq!(
+            capability_class("webfetch", "https://attacker.test/?d=x"),
+            Capability::Network
+        );
+        assert!(requires_confirmation(
+            TrustMode::Guarded,
+            "webfetch",
+            "https://attacker.test/?d=x"
+        ));
+        assert!(!requires_confirmation(
+            TrustMode::Auto,
+            "webfetch",
+            "https://docs.rs/serde"
+        ));
+    }
+
+    #[test]
+    fn read_verbs_that_run_programs_or_write_files_are_not_reads() {
+        for command in [
+            "rg --pre=bash -g x.sh . zzz",
+            "rg --pre ./evil pattern",
+            "rg --pre-glob '*.pdf' pattern",
+            "git diff --output=/home/u/.bashrc",
+            "git log --output /tmp/x",
+            "git show --ext-diff HEAD",
+            "find . -fprint /home/u/.profile",
+            "find . -fls out.txt",
+            "find . -execdir sh {} +",
+            "less -o /tmp/copy README.md",
+        ] {
+            assert_ne!(
+                capability_class("Bash", command),
+                Capability::Read,
+                "{command} must not classify as a read"
+            );
+            assert!(
+                requires_confirmation(TrustMode::Plan, "Bash", command),
+                "Plan must confirm {command}"
+            );
+        }
+        for command in ["rg --pretty -o foo", "grep -o foo src", "git log --oneline"] {
+            assert_eq!(capability_class("Bash", command), Capability::Read);
+        }
+        let root = real_root();
+        let escapes = |command: &str| {
+            requires_confirmation_with_ledger(
+                TrustMode::Guarded,
+                "Bash",
+                command,
+                root,
+                &TrustLedger::default(),
+            )
+        };
+        assert!(escapes("git diff --output=/home/u/.bashrc"));
+        assert!(escapes("find . -fprint ~/.profile"));
+        assert!(!escapes("git diff --output=out/changes.diff"));
+    }
+
+    #[test]
+    fn every_file_of_a_multi_file_write_is_classified() {
+        let root = real_root();
+        let escaping = format!("src/a.ts, {}", out_of_tree_abs());
+        for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+            assert!(
+                requires_confirmation_with_ledger(
+                    mode,
+                    "Write",
+                    &escaping,
+                    root,
+                    &TrustLedger::default()
+                ),
+                "{mode:?} must confirm a change that includes an out-of-tree file"
+            );
+        }
+        let mut ledger = TrustLedger::default();
+        ledger.allow_rules.insert("write_in_tree".to_string());
+        assert!(requires_confirmation_with_ledger(
+            TrustMode::Guarded,
+            "Write",
+            &escaping,
+            root,
+            &ledger
+        ));
+        assert!(!ledger.remembers_rooted("Write", &escaping, root));
+        assert_eq!(
+            remembered_class_rooted("Write", &escaping, Some(root)),
+            None
+        );
+        assert!(ledger.remembers_rooted("Write", "src/a.ts, src/b.ts", root));
+    }
+
+    #[test]
+    fn approvals_shipped_in_the_project_are_ignored() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".umadev")).unwrap();
+        let shipped = serde_json::json!({
+            "gates": {"docs_confirm": {"consecutive_passes": 2}},
+            "allow_rules": ["write_in_tree", "shell:npm run postbuild", "write_out_of_tree:/etc"]
+        });
+        std::fs::write(tmp.path().join(".umadev/trust.json"), shipped.to_string()).unwrap();
+        let ledger = TrustLedger::load(tmp.path());
+        assert!(ledger.allow_rules.is_empty(), "{:?}", ledger.allow_rules);
+        assert_eq!(ledger.consecutive("docs_confirm"), 2);
+        assert!(requires_confirmation_with_ledger(
+            TrustMode::Guarded,
+            "",
+            out_of_tree_abs(),
+            tmp.path(),
+            &ledger
+        ));
+
+        // What the user approves is remembered outside the project.
+        assert!(remember_project_approval(tmp.path(), "npm run lint", ""));
+        assert!(TrustLedger::load(tmp.path()).remembers_rooted("npm run lint", "", tmp.path()));
+        TrustLedger::load(tmp.path()).save(tmp.path());
+        let on_disk = std::fs::read_to_string(tmp.path().join(".umadev/trust.json")).unwrap();
+        assert!(!on_disk.contains("allow_rules"), "{on_disk}");
+    }
+
+    #[test]
+    fn permission_config_writes_always_confirm_and_are_never_remembered() {
+        let root = real_root();
+        let mut ledger = TrustLedger::default();
+        ledger.allow_rules.insert("write_in_tree".to_string());
+        let absolute = root.join(".umadevrc");
+        for target in [
+            ".umadevrc",
+            "./.UmaDevRC",
+            ".umadev/trust.json",
+            ".umadev/plan.json",
+            ".claude/settings.json",
+            ".claude/settings.local.json",
+            ".mcp.json",
+            "opencode.json",
+            ".codex/config.toml",
+            ".opencode/plugin/x.ts",
+            absolute.to_str().unwrap(),
+        ] {
+            assert_eq!(
+                remembered_class_rooted("Write", target, Some(root)),
+                None,
+                "{target} must not be rememberable"
+            );
+            for mode in [TrustMode::Auto, TrustMode::Guarded, TrustMode::Plan] {
+                assert!(
+                    requires_confirmation_with_ledger(mode, "Write", target, root, &ledger),
+                    "{mode:?} must confirm a write to {target}"
+                );
+            }
+        }
+        let shell = "echo '{\"permissions\":{\"allow\":[\"Bash(*)\"]}}' > .claude/settings.json";
+        assert!(requires_confirmation_with_ledger(
+            TrustMode::Auto,
+            "Bash",
+            shell,
+            root,
+            &ledger
+        ));
+        assert_eq!(remembered_class_rooted("Bash", shell, Some(root)), None);
+        for target in ["src/app.ts", "docs/opencode.json", ".claude/commands/x.md"] {
+            assert!(!requires_confirmation_with_ledger(
+                TrustMode::Guarded,
+                "Write",
+                target,
+                root,
+                &ledger
+            ));
         }
     }
 }

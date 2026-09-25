@@ -484,11 +484,14 @@ fn allow_pending_approval_resolves_the_waiter_as_allow() {
     assert!(holder.lock().unwrap().is_none());
     release_pending_approval_on_auto_switch(&holder);
 
-    // The EXPLICIT verdict path (typed 「批准」 → Action::ApprovalReply(true))
-    // resolves unconditionally — whatever the item.
+    // The EXPLICIT verdict path (typed 「批准」 → Action::ApprovalReply) resolves
+    // the request the bar showed — whatever the item.
     let (tx, rx) = tokio::sync::oneshot::channel();
     *holder.lock().unwrap() = Some(test_pending_approval(tx));
-    allow_pending_approval(&holder);
+    assert!(allow_pending_approval(
+        &holder,
+        &pending_approval_item(&holder).unwrap()
+    ));
     assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
     assert!(holder.lock().unwrap().is_none());
 }
@@ -506,6 +509,7 @@ fn auto_switch_keeps_a_true_disaster_pending_but_explicit_approve_resolves() {
         action: "Bash".to_string(),
         target: "rm -rf node_modules".to_string(),
         auto_releasable: true,
+        armed_at: None,
     });
     release_pending_approval_on_auto_switch(&holder);
     assert!(
@@ -535,9 +539,62 @@ fn auto_switch_keeps_a_true_disaster_pending_but_explicit_approve_resolves() {
         action: "Bash".to_string(),
         target: "rm -rf node_modules".to_string(),
         auto_releasable: true,
+        armed_at: None,
     });
-    allow_pending_approval(&holder);
+    assert!(allow_pending_approval(
+        &holder,
+        &pending_approval_item(&holder).unwrap()
+    ));
     assert_eq!(rx.blocking_recv().ok(), Some(ApprovalReply::Allow));
+}
+
+#[tokio::test]
+async fn an_approval_that_replaces_a_pending_one_cannot_take_a_stale_answer() {
+    let holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let (sink, _events) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let ask = |target: &'static str| {
+        let (holder, sink) = (holder.clone(), sink.clone());
+        tokio::spawn(async move { await_user_approval(&holder, &sink, "Bash", target).await })
+    };
+    let pending_target = || {
+        holder
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pending| pending.target.clone())
+    };
+    let first = ask("npm test");
+    while pending_target().as_deref() != Some("npm test") {
+        tokio::task::yield_now().await;
+    }
+    let second = ask("rm -rf src");
+    while pending_target().as_deref() != Some("rm -rf src") {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(first.await.unwrap(), ApprovalReply::Deny);
+
+    // A `y` meant for the request on screen a moment ago is swallowed, and a
+    // typed approval of that request does not resolve its replacement.
+    assert!(resolve_pending_approval(
+        &holder,
+        KeyCode::Char('y'),
+        KeyModifiers::NONE,
+        true
+    ));
+    assert!(!allow_pending_approval(
+        &holder,
+        &("Bash".to_string(), "npm test".to_string())
+    ));
+    assert_eq!(pending_target().as_deref(), Some("rm -rf src"));
+
+    // Once it has been on screen, the new request is answerable as shown.
+    tokio::time::sleep(interaction_bridge::APPROVAL_ARM_DELAY).await;
+    assert!(allow_pending_approval(
+        &holder,
+        &("Bash".to_string(), "rm -rf src".to_string())
+    ));
+    assert_eq!(second.await.unwrap(), ApprovalReply::Allow);
 }
 
 #[test]
@@ -550,6 +607,7 @@ fn auto_switch_never_releases_an_upstream_permission_boundary() {
         action: "Bash".to_string(),
         target: "npm install".to_string(),
         auto_releasable: false,
+        armed_at: None,
     });
 
     release_pending_approval_on_auto_switch(&holder);
@@ -725,7 +783,10 @@ async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
         .is_some_and(|pending| !pending.auto_releasable));
     release_pending_approval_on_auto_switch(&approval_holder);
     assert!(approval_holder.lock().unwrap().is_some());
-    allow_pending_approval(&approval_holder);
+    assert!(allow_pending_approval(
+        &approval_holder,
+        &pending_approval_item(&approval_holder).unwrap()
+    ));
 
     let approved = tokio::time::timeout(TURN_HANG_GUARD, interactive)
         .await
@@ -863,6 +924,7 @@ fn test_pending_approval(tx: tokio::sync::oneshot::Sender<ApprovalReply>) -> Pen
         action: "Bash".to_string(),
         target: "npm install".to_string(),
         auto_releasable: true,
+        armed_at: None,
     }
 }
 
@@ -7471,7 +7533,10 @@ async fn guarded_git_commit_waits_for_exactly_one_current_turn_approval() {
         assert_eq!(approval.action, "git commit");
         assert_eq!(approval.target, tmp.path().display().to_string());
     }
-    allow_pending_approval(&approval_holder);
+    assert!(allow_pending_approval(
+        &approval_holder,
+        &pending_approval_item(&approval_holder).unwrap()
+    ));
     task.await.unwrap();
 
     assert!(matches!(

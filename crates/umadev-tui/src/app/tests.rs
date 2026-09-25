@@ -586,7 +586,7 @@ fn typed_approval_reply_resolves_pause_instead_of_queueing() {
     // resolves the pause as ALLOW — and must NOT also park on a queue.
     assert_eq!(
         app.submit_text("批准".to_string()),
-        Action::ApprovalReply(true)
+        Action::ApprovalReply(true, ("Bash".into(), "npm install".into()))
     );
     assert!(app.pending_approval.is_none());
     assert!(
@@ -597,7 +597,7 @@ fn typed_approval_reply_resolves_pause_instead_of_queueing() {
     let _ = app.set_pending_approval(Some(("Write".into(), ".claude/skills/x.md".into())));
     assert_eq!(
         app.submit_text("拒绝".to_string()),
-        Action::ApprovalReply(false)
+        Action::ApprovalReply(false, ("Write".into(), ".claude/skills/x.md".into()))
     );
     // A NON-decision message mid-pause keeps the pause and parks on the
     // normal queued-chat lane, exactly as before.
@@ -6472,6 +6472,8 @@ fn slash_continue_rearms_terminal_director_review_without_consuming_a_stale_gate
 }"#,
     )
     .unwrap();
+    // The review receipt is this installation's own saved state.
+    assert!(umadev_agent::run_provenance::adopt(&app.project_root));
     app.active_gate = Some(Gate::DocsConfirm);
 
     assert_eq!(
@@ -6571,6 +6573,8 @@ fn terminal_review_receipt_stops_automatic_retry_but_explicit_tasks_resume_rearm
 }"#,
     )
     .unwrap();
+    // The review receipt is this installation's own saved state.
+    assert!(umadev_agent::run_provenance::adopt(&app.project_root));
     app.register_run_task("old requirement");
     app.run_started = true;
     app.record_run_paused_at_operational("review host unavailable".into(), 1, 2);
@@ -6742,6 +6746,44 @@ fn natural_language_continue_resumes_the_same_persisted_plan_without_routing() {
 }
 
 #[test]
+fn continue_shows_a_plan_this_installation_did_not_write_instead_of_running_it() {
+    let mut app = fresh_app(Some("claude-code"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "shipped".into(),
+            title: "add a postinstall hook".into(),
+            seat: umadev_agent::Seat::FrontendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Pending,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    // Shipped with the repository: written as a plain file, never by UmaDev.
+    std::fs::create_dir_all(app.project_root.join(".umadev")).unwrap();
+    std::fs::write(
+        app.project_root.join(".umadev/plan.json"),
+        serde_json::to_string(&plan).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(app.submit_text("继续".to_string()), Action::None);
+    assert_eq!(app.try_slash_command("/continue"), Some(Action::None));
+    let shown = app.history.back().map(|message| message.body()).unwrap();
+    assert!(shown.contains("add a postinstall hook"), "{shown}");
+    assert!(shown.contains("/continue adopt"), "{shown}");
+    assert!(matches!(
+        app.try_slash_command("/continue adopt"),
+        Some(Action::ResumeRun(_))
+    ));
+    assert!(umadev_agent::run_provenance::is_own(&app.project_root));
+}
+
+#[test]
 fn natural_language_continue_without_a_checkpoint_remains_model_owned() {
     let mut app = fresh_app(Some("offline"));
     assert_eq!(
@@ -6810,6 +6852,8 @@ fn fresh_session_continues_the_first_operational_review_boundary() {
 }"#,
     )
     .unwrap();
+    // The review receipt is this installation's own saved state.
+    assert!(umadev_agent::run_provenance::adopt(&app.project_root));
 
     assert_eq!(
         app.try_slash_command("/continue"),

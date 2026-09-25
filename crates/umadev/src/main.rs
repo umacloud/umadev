@@ -4882,7 +4882,13 @@ fn cmd_history(project_root: Option<PathBuf>) -> Result<()> {
         println!("File checkpoints — restore the SOURCE TREE (newest first):\n");
         for c in &checkpoints {
             let when = c.when.split('T').next().unwrap_or(&c.when);
-            println!("  {}  {}  {}", c.id, when, c.label);
+            // Labels are commit messages in the project's shadow store.
+            println!(
+                "  {}  {}  {}",
+                safe_command_detail(c.id.as_bytes()),
+                safe_command_detail(when.as_bytes()),
+                safe_command_detail(c.label.as_bytes())
+            );
         }
         println!("\nRestore the files with:  umadev rollback <id>");
     }
@@ -6793,24 +6799,29 @@ fn pr_fallback(
     anyhow::bail!("PR was not created; see the manual recovery steps above")
 }
 
+/// Print the workflow state. Every field comes from `.umadev/workflow-state.json`,
+/// which a repository can ship, so each goes through [`safe_command_detail`]: an
+/// escape sequence in it must not reach the terminal (clipboard writes, cleared
+/// screens, spoofed links or titles).
 fn print_state(s: &WorkflowState) {
+    let safe = |text: &str| safe_command_detail(text.as_bytes());
     println!(
         "workflow-state: phase={} active_gate={} worker={} last_transition_at={}",
-        s.phase,
+        safe(&s.phase),
         if s.active_gate.is_empty() {
-            "<none>"
+            "<none>".to_string()
         } else {
-            &s.active_gate
+            safe(&s.active_gate)
         },
         if s.backend.is_empty() {
-            "offline-templates"
+            "offline-templates".to_string()
         } else {
-            s.backend.as_str()
+            safe(&s.backend)
         },
-        s.last_transition_at
+        safe(&s.last_transition_at)
     );
     if !s.note.is_empty() {
-        println!("note: {}", s.note);
+        println!("note: {}", safe(&s.note));
     }
 }
 

@@ -6623,7 +6623,7 @@ cat >/dev/null
     }
 
     #[test]
-    fn native_events_redact_before_transcript_tool_activity_and_audit() {
+    fn native_events_keep_model_text_and_tool_traffic_whole() {
         const SECRET: &str = "SYNTH_CLAUDE_SESSION_SECRET_81";
         let call = serde_json::json!({
             "type": "assistant",
@@ -6660,8 +6660,8 @@ cat >/dev/null
         events.extend(parse_stdout_line(&text));
         let audit_view = format!("{events:?}");
         assert!(
-            !audit_view.contains(SECRET),
-            "event/audit leaked: {audit_view}"
+            audit_view.contains(SECRET),
+            "event was rewritten: {audit_view}"
         );
         assert!(audit_view.contains("safe-page-2"));
 

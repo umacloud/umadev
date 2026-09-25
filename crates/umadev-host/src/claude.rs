@@ -464,14 +464,12 @@ impl Runtime for ClaudeCodeDriver {
                 assistant
             }
         });
-        Ok(crate::redaction::sanitize_completion_response(
-            &CompletionResponse {
-                text,
-                id: "claude-code-cli".to_string(),
-                model: req.model,
-                usage,
-            },
-        ))
+        Ok(CompletionResponse {
+            text,
+            id: "claude-code-cli".to_string(),
+            model: req.model,
+            usage,
+        })
     }
 
     /// Streaming completion via `claude --output-format stream-json --verbose`.
@@ -560,14 +558,12 @@ impl Runtime for ClaudeCodeDriver {
                 if let Some(msg) = abort {
                     on_event(umadev_runtime::StreamEvent::Warning { message: msg });
                 }
-                Ok(crate::redaction::sanitize_completion_response(
-                    &CompletionResponse {
-                        text: final_text,
-                        id: "claude-code-cli".to_string(),
-                        model,
-                        usage,
-                    },
-                ))
+                Ok(CompletionResponse {
+                    text: final_text,
+                    id: "claude-code-cli".to_string(),
+                    model,
+                    usage,
+                })
             }
             Err(e) => {
                 // Streaming broke mid-flight (commonly the base subprocess being
@@ -580,14 +576,12 @@ impl Runtime for ClaudeCodeDriver {
                 let partial = stream_buf.into_string();
                 if let Some(text) = salvage_partial_stream(&partial) {
                     let usage = extract_usage(&partial);
-                    return Ok(crate::redaction::sanitize_completion_response(
-                        &CompletionResponse {
-                            text,
-                            id: "claude-code-cli".to_string(),
-                            model,
-                            usage,
-                        },
-                    ));
+                    return Ok(CompletionResponse {
+                        text,
+                        id: "claude-code-cli".to_string(),
+                        model,
+                        usage,
+                    });
                 }
                 let stream_error = crate::map_subprocess_error(&e);
                 // A streaming timeout already consumed this logical call's
@@ -1925,7 +1919,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_events_redact_synthetic_secrets() {
+    fn stream_events_keep_model_text_and_tool_input_whole() {
         const SECRET: &str = "SYNTH_CLAUDE_SECRET_DO_NOT_LEAK_71";
         let text = serde_json::json!({
             "type": "assistant",
@@ -1950,8 +1944,8 @@ mod tests {
             parse_claude_stream_line(&tool)
         );
         assert!(
-            !rendered.contains(SECRET),
-            "stream event leaked: {rendered}"
+            rendered.contains(SECRET),
+            "stream event was rewritten: {rendered}"
         );
     }
 }

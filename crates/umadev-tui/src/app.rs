@@ -732,10 +732,10 @@ pub enum Action {
     },
     /// The user TYPED the decision for a paused consequential-action approval
     /// (「批准」/"approve"/"y" → `true`, 「拒绝」/"deny"/"n" → `false`) while
-    /// [`App::pending_approval`] was live. The event loop resolves the shared
-    /// approval waiter with it (A2#5 — the typed-reply path; the empty-input
-    /// y/n/Esc fast keys are handled before the key pipeline in lib.rs).
-    ApprovalReply(bool),
+    /// [`App::pending_approval`] showed the `(action, target)` carried here, which
+    /// an allow must still match. The event loop resolves the shared waiter (A2#5;
+    /// the empty-input y/n/Esc fast keys are handled before the key pipeline).
+    ApprovalReply(bool, (String, String)),
     /// `/compact` — fold the older conversation turns into one structured summary
     /// via a forked base `complete()`. The event loop drives the async summary
     /// (and falls back to FIFO if the base is unreachable); the slash handler only
@@ -3988,7 +3988,7 @@ impl App {
             // rebuilds the exact screen the user left instead of an empty one.
             display: Some(self.history.iter().cloned().collect()),
         };
-        let Ok(body) = serde_json::to_string_pretty(&session) else {
+        let Ok(body) = umadev_agent::redaction::to_redacted_json_pretty(&session) else {
             return;
         };
         if body.len() > usize::try_from(MAX_CHAT_FILE_BYTES).unwrap_or(usize::MAX) {
@@ -10473,12 +10473,12 @@ impl App {
         // lanes below — a real steering message typed mid-pause still lands, and
         // the sticky bar keeps showing how to answer. The paused drain emits its
         // own allowed/denied Note, so only the user's turn is echoed here.
-        if self.pending_approval.is_some() {
+        if let Some(seen) = self.pending_approval.clone() {
             if let Some(allow) = classify_approval_reply(&text) {
                 self.pending_approval = None;
                 self.push(ChatRole::You, text);
                 self.refresh_status();
-                return Action::ApprovalReply(allow);
+                return Action::ApprovalReply(allow, seen);
             }
         }
         // An unfinished durable plan/gate turns a small, exact continuation
@@ -12819,7 +12819,7 @@ impl App {
                 }
                 Action::None
             }
-            "continue" => self.continue_run_action(),
+            "continue" => self.continue_run_command(rest),
             "revise" => {
                 if rest.is_empty() {
                     self.push(ChatRole::System, umadev_i18n::t(self.lang, "revise.usage"));
@@ -16361,7 +16361,7 @@ impl App {
             .backend
             .clone()
             .unwrap_or_else(|| "offline".to_string());
-        let report = format!(
+        let report = umadev_agent::redaction::redact_text(&format!(
             "# UmaDev bug report\n\n\
              version: {}\n\
              backend: {backend}\n\
@@ -16387,7 +16387,7 @@ impl App {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-        );
+        ));
         let report_path = self.project_root.join("umadev-bug-report.md");
         match umadev_state::fs::atomic_write(&report_path, report.as_bytes()) {
             Ok(()) => {

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 mod reserved_names;
-mod store_trust;
+pub(crate) mod store_trust;
 
 const CHECKPOINT_EXCLUDED_DIRS: &[&str] = &[
     ".git",

@@ -1904,14 +1904,19 @@ async fn classify_server_request(
         "item/fileChange/requestApproval" => {
             let item_id = string_field(params, "itemId");
             let remembered = remembered_item(item_targets, item_id.as_deref()).await;
-            let target = nonempty(file_change_path(params))
-                .or_else(|| {
-                    remembered
-                        .map(|item| item.files.join(", "))
-                        .filter(|paths| !paths.is_empty())
-                })
-                .or_else(|| string_field(params, "grantRoot"))
-                .unwrap_or_default();
+            let files = nonempty(file_change_path(params)).or_else(|| {
+                remembered
+                    .map(|item| item.files.join(", "))
+                    .filter(|paths| !paths.is_empty())
+            });
+            // A `grantRoot` asks for write access to a whole directory. Show and
+            // classify it next to the files so an approval never grants a root
+            // the policy did not see.
+            let target = files
+                .into_iter()
+                .chain(string_field(params, "grantRoot"))
+                .collect::<Vec<_>>()
+                .join(", ");
             (
                 HostRequest::Approval {
                     action: "Write".to_string(),
@@ -4467,6 +4472,15 @@ mod tests {
             request,
             HostRequest::Approval { target, .. } if target == "src/a.ts"
         ));
+
+        // A requested write root is shown and classified next to the files.
+        let grant = v(r#"{"changes":[{"path":"src/a.ts"}],"grantRoot":"/home/u"}"#);
+        let (request, _) =
+            classify_server_request("item/fileChange/requestApproval", &grant, &items).await;
+        assert!(matches!(
+            request,
+            HostRequest::Approval { target, .. } if target == "src/a.ts, /home/u"
+        ));
     }
 
     #[test]
@@ -6875,7 +6889,7 @@ done
     }
 
     #[tokio::test]
-    async fn native_events_redact_before_transcript_tool_activity_and_audit() {
+    async fn native_events_keep_model_text_and_tool_traffic_whole() {
         const SECRET: &str = "SYNTH_CODEX_SESSION_SECRET_82";
         let (tx, mut rx) = chan();
         emit_text_delta(&json!({"delta": format!("password={SECRET}")}), &tx).await;
@@ -6898,8 +6912,8 @@ done
         }
         let audit_view = format!("{events:?}");
         assert!(
-            !audit_view.contains(SECRET),
-            "event/audit leaked: {audit_view}"
+            audit_view.contains(SECRET),
+            "event was rewritten: {audit_view}"
         );
 
         let mut activity = umadev_runtime::ToolActivity::default();
