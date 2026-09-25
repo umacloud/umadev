@@ -6190,6 +6190,7 @@ async fn cmd_deploy(
     command: Option<String>,
     yes: bool,
 ) -> Result<()> {
+    let explicit_root = project_root.is_some();
     let project_root = resolve_root(project_root)?;
     let lang = umadev_i18n::current();
     println!("workspace: {}", project_root.display());
@@ -6213,13 +6214,25 @@ async fn cmd_deploy(
     if !recipe.is_empty() {
         println!(
             "{}",
-            umadev_i18n::tf(lang, "deploy.confirm_preflight", &[&recipe])
+            umadev_i18n::tf(lang, "deploy.cli_preflight", &[&recipe])
         );
     }
 
     // Detect-and-print only: stop here unless the user explicitly opts in to a
-    // real deploy. The deploy is the user's outward-facing action.
+    // real deploy. The deploy is the user's outward-facing action. Name the CLI
+    // step that does it (the TUI's `/deploy confirm` does not exist here),
+    // carrying over the options that decide what gets deployed.
     if !run {
+        if !recipe.is_empty() {
+            let mut next = String::from("umadev deploy --run");
+            if let Some(command) = &command {
+                next.push_str(&format!(" --command \"{command}\""));
+            }
+            if explicit_root {
+                next.push_str(&format!(" --project-root \"{}\"", project_root.display()));
+            }
+            println!("{}", umadev_i18n::tf(lang, "deploy.cli_run_hint", &[&next]));
+        }
         return Ok(());
     }
     if recipe.trim().is_empty() {

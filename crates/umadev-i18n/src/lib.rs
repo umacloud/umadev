@@ -389,6 +389,8 @@ mod tests {
             "rewind.restored",
             "rewind.failed",
             "deploy.confirm_preflight",
+            "deploy.cli_preflight",
+            "deploy.cli_run_hint",
             "preview.confirm_command",
             "worker.init_failed",
             "pipeline.start_failed",
