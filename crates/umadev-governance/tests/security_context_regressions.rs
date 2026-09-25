@@ -1,4 +1,7 @@
-use umadev_governance::{check_hardcoded_secret, check_plaintext_password, check_sql_injection};
+use umadev_governance::{
+    check_hardcoded_secret, check_plaintext_password, check_sql_injection,
+    check_unhashed_password_storage,
+};
 
 #[test]
 fn entropy_fallback_allows_stable_code_owned_literals_on_shipping_paths() {
@@ -80,12 +83,16 @@ fn password_rule_does_not_correlate_unrelated_file_wide_words() {
     ];
 
     for (path, source) in cases {
-        let decision = check_plaintext_password(path, &source);
-        assert!(
-            !decision.block,
-            "unrelated local statements in {path} must pass: {}",
-            decision.reason
-        );
+        for decision in [
+            check_plaintext_password(path, &source),
+            check_unhashed_password_storage(path, &source),
+        ] {
+            assert!(
+                !decision.block,
+                "unrelated local statements in {path} must pass: {}",
+                decision.reason
+            );
+        }
     }
 }
 
@@ -97,15 +104,15 @@ fn password_rule_keeps_real_plaintext_storage_and_hash_flow_signal() {
         "word: inputPassword,\n});",
     ]
     .concat();
-    let plaintext = check_plaintext_password("server/user.ts", &plaintext_source);
+    let plaintext = check_unhashed_password_storage("server/user.ts", &plaintext_source);
     assert!(plaintext.block, "plaintext insert must still block");
-    assert_eq!(plaintext.clause, "UD-SEC-018");
+    assert_eq!(plaintext.clause, "UD-SEC-033");
 
     let adjacent_source = ["user.pass", "word = inputPassword;\nawait user.sa", "ve();"].concat();
-    let adjacent = check_plaintext_password("server/user.ts", &adjacent_source);
+    let adjacent = check_unhashed_password_storage("server/user.ts", &adjacent_source);
     assert!(adjacent.block, "plaintext assignment then save must block");
 
-    let hashed = check_plaintext_password(
+    let hashed = check_unhashed_password_storage(
         "server/user.ts",
         "const encoded = await argon2.hash(inputPassword);\n\
          await db.insert({ email, password: encoded });",
@@ -125,13 +132,20 @@ fn dynamic_sql_injection_signal_is_unchanged() {
 
 #[test]
 fn regression_fixture_is_not_itself_a_plaintext_finding() {
-    let decision = check_plaintext_password(
-        "crates/umadev-governance/tests/security_context_regressions.rs",
-        include_str!("security_context_regressions.rs"),
-    );
-    assert!(
-        !decision.block,
-        "the executable regression fixture must scan clean: {}",
-        decision.reason
-    );
+    for decision in [
+        check_plaintext_password(
+            "crates/umadev-governance/tests/security_context_regressions.rs",
+            include_str!("security_context_regressions.rs"),
+        ),
+        check_unhashed_password_storage(
+            "crates/umadev-governance/tests/security_context_regressions.rs",
+            include_str!("security_context_regressions.rs"),
+        ),
+    ] {
+        assert!(
+            !decision.block,
+            "the executable regression fixture must scan clean: {}",
+            decision.reason
+        );
+    }
 }

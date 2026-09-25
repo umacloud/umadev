@@ -4231,6 +4231,101 @@ fn sec_bans_password_equals_comparison() {
 }
 
 #[test]
+fn plaintext_password_floor_ignores_confirmation_and_model_hooks() {
+    // Confirm-password validation, empty checks, and registration where hashing
+    // lives in the model (a Mongoose pre-save hook, TypeORM `@BeforeInsert`,
+    // Rails `has_secure_password`, Django `make_password`) must reach disk: the
+    // bypass-immune floor only refuses a genuine plaintext comparison, and the
+    // lexical storage heuristic is overridable QC work.
+    let cases = [
+        (
+            "src/lib/validations/auth.ts",
+            "export const registerSchema = z.object({\n  password: z.string().min(8),\n  confirmPassword: z.string(),\n}).refine((data) => data.password === data.confirmPassword, {\n  message: \"两次输入的密码不一致\",\n  path: [\"confirmPassword\"],\n});",
+        ),
+        (
+            "src/lib/validations/signup.ts",
+            "if (form.confirmPassword !== undefined && form.confirmPassword === form.password) { ok(); }",
+        ),
+        (
+            "src/utils/validate.js",
+            "if (password === '') { return '请输入密码' }",
+        ),
+        (
+            "server/validators/user.go",
+            "if req.Password == \"\" {\n  return errors.New(\"password required\")\n}",
+        ),
+        (
+            "server/validators/form.py",
+            "if data.password == data.password_confirmation:\n    ok()\nif len(password) == 0:\n    fail()",
+        ),
+        (
+            "server/controllers/auth.js",
+            "const user = await User.create({ email, password });\nres.status(201).json({ id: user._id });",
+        ),
+        (
+            "app/controllers/users_controller.rb",
+            "@user = User.create(email: params[:email], password: params[:password])",
+        ),
+        (
+            "accounts/views.py",
+            "user = User.objects.create(username=username, password=make_password(raw))",
+        ),
+        (
+            "src/users/users.service.ts",
+            "const user = this.usersRepository.create({ email, password });\nreturn this.usersRepository.save(user);",
+        ),
+    ];
+    for (path, source) in cases {
+        let d = pre_write_floor_decision(path, source);
+        assert!(!d.block, "{path}: {} ", d.reason);
+    }
+    // Django's hashers are recognised by the storage heuristic too.
+    let django = scan_content_findings_with_context(
+        "accounts/views.py",
+        "user = User.objects.create(username=username, password=make_password(raw))\nuser.set_password(raw)\nuser.save()",
+        &crate::policy::Policy::default(),
+        ProjectContext::unknown(),
+    );
+    assert!(
+        django
+            .iter()
+            .all(|d| d.clause != "UD-SEC-018" && d.clause != "UD-SEC-033"),
+        "{django:?}"
+    );
+    // Genuine plaintext comparisons still hit the floor…
+    for (path, source) in [
+        (
+            "server/auth.ts",
+            "if (user.password === inputPassword) { login(); }",
+        ),
+        (
+            "server/auth.ts",
+            "if (password === 'admin123') { login(); }",
+        ),
+        (
+            "server/auth.go",
+            "if user.Password == req.Password {\n  login()\n}",
+        ),
+    ] {
+        let d = pre_write_floor_decision(path, source);
+        assert!(d.block, "{path}: {source}");
+        assert_eq!(d.clause, "UD-SEC-018");
+    }
+    // …and unhashed storage is still reported, as overridable QC.
+    let storage = scan_content_findings_with_context(
+        "server/user.ts",
+        "await db.insert({ email, password: inputPassword });",
+        &crate::policy::Policy::default(),
+        ProjectContext::unknown(),
+    );
+    assert!(
+        storage.iter().any(|d| d.clause == "UD-SEC-033"),
+        "{storage:?}"
+    );
+    assert!(!is_irreversible_write_floor("UD-SEC-033"));
+}
+
+#[test]
 fn sec_password_allows_bcrypt_compare() {
     let d = check_plaintext_password(
         "server/auth.ts",
@@ -4241,16 +4336,17 @@ fn sec_password_allows_bcrypt_compare() {
 
 #[test]
 fn sec_bans_store_without_hasher() {
-    let d = check_plaintext_password(
+    let d = check_unhashed_password_storage(
         "server/user.ts",
         "await db.insert({ email, password: inputPassword });",
     );
     assert!(d.block);
+    assert_eq!(d.clause, "UD-SEC-033");
 }
 
 #[test]
 fn sec_password_allows_store_with_hash() {
-    let d = check_plaintext_password("server/user.ts", "const hash = await bcrypt.hash(inputPassword, 10); await db.insert({ email, password: hash });");
+    let d = check_unhashed_password_storage("server/user.ts", "const hash = await bcrypt.hash(inputPassword, 10); await db.insert({ email, password: hash });");
     assert!(!d.block);
 }
 
@@ -4263,8 +4359,11 @@ fn sec_password_ignores_non_backend() {
 #[test]
 fn sec_password_ignores_test_fixtures_but_not_shipping_source() {
     let fixture = "await db.insert({ email, password: inputPassword });";
-    assert!(!check_plaintext_password("src/auth/tests.rs", fixture).block);
-    assert!(check_plaintext_password("src/auth/service.rs", fixture).block);
+    assert!(!check_unhashed_password_storage("src/auth/tests.rs", fixture).block);
+    assert!(check_unhashed_password_storage("src/auth/service.rs", fixture).block);
+    let comparison = "if user.password == input_password { login() }";
+    assert!(!check_plaintext_password("src/auth/tests.rs", comparison).block);
+    assert!(check_plaintext_password("src/auth/service.rs", comparison).block);
 }
 
 // --- UD-ARCH-041: file upload validation ----------------------------
