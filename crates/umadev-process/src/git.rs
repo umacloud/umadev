@@ -473,6 +473,24 @@ mod tests {
     }
 
     #[test]
+    fn git_children_are_noninteractive_and_ignore_environment_redirects() {
+        let command = command_with_overrides(Path::new("."), GitAccess::ReadOnly, &[]);
+        let env = command.get_envs().collect::<Vec<_>>();
+        let value = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == std::ffi::OsStr::new(name))
+                .and_then(|(_, value)| *value)
+        };
+        assert_eq!(value("GIT_TERMINAL_PROMPT"), Some("0".as_ref()));
+        assert_eq!(value("GCM_INTERACTIVE"), Some("Never".as_ref()));
+        assert_eq!(value("GIT_PAGER"), Some("cat".as_ref()));
+        assert_eq!(value("GIT_CONFIG_NOSYSTEM"), Some("1".as_ref()));
+        let args = command.get_args().collect::<Vec<_>>();
+        assert!(args.contains(&"--no-optional-locks".as_ref()));
+        assert!(args.contains(&INERT_HOOKS.as_ref()));
+    }
+
+    #[test]
     fn scoped_listing_blanks_only_repository_defined_drivers() {
         let listing = b"global\0filter.lfs.clean\ngit-lfs clean -- %f\0\
             global\0filter.Shared.clean\nuser\0\
