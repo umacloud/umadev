@@ -222,12 +222,150 @@ function findKnowledgeDir() {
 // existence, so a corrupt cache re-downloads). Every newly downloaded file is
 // also authenticated against its release SHA-256 sidecar. The ~224MB fp16 model is too large
 // for npm, so it's a one-time fetch into ~/.umadev/embed-model. Fail-open: any failure launches
-// anyway and the binary degrades to BM25 lexical retrieval, retrying next time.
+// anyway and the binary degrades to BM25 lexical retrieval, retrying after a day
+// (see MODEL_DOWNLOAD_BACKOFF_MS).
 function homeDir() {
   return process.env.HOME || process.env.USERPROFILE || os.homedir();
 }
 function modelTargetDir() {
   return path.join(homeDir(), '.umadev', 'embed-model');
+}
+
+// ── Language of the launcher's own notices, resolved the way the binary
+// resolves its UI language (umadev_i18n::Lang): the `lang` saved in UmaDev's
+// config.toml, else a Chinese locale variable, else the OS UI language, else
+// English for an `en*` locale and Simplified Chinese otherwise.
+function langFromCode(raw) {
+  const code = String(raw || '').trim().toLowerCase().replace(/_/g, '-');
+  if (['zh-cn', 'zh-hans', 'zh', 'cn'].includes(code)) return 'zh-CN';
+  if (['zh-tw', 'zh-hant', 'zh-hk', 'tw'].includes(code)) return 'zh-TW';
+  if (['en', 'en-us', 'en-gb', 'c', 'posix'].includes(code)) return 'en';
+  return null;
+}
+
+function langFromLocale(raw) {
+  const locale = String(raw || '').toLowerCase().replace(/[.@].*$/, '').replace(/_/g, '-');
+  if (locale.startsWith('zh')) return /hant|-tw|-hk|-mo/.test(locale) ? 'zh-TW' : 'zh-CN';
+  return locale.startsWith('en') ? 'en' : null;
+}
+
+function savedConfigLang() {
+  const file = process.env.XDG_CONFIG_HOME
+    ? path.join(process.env.XDG_CONFIG_HOME, 'umadev', 'config.toml')
+    : path.join(homeDir(), '.umadev', 'config.toml');
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (_) {
+    return null;
+  }
+  // `lang` is a top-level key: only the lines before the first table count.
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) break;
+    const match = /^\s*lang\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
+    if (match) return langFromCode(match[1] ?? match[2]);
+  }
+  return null;
+}
+
+// The OS UI language as sys-locale reports it to the binary: the preferred
+// languages list on macOS (a terminal's LANG there is usually en_US whatever the
+// UI language), the user locale on Windows, the locale variables elsewhere.
+function systemLocale() {
+  if (process.platform === 'darwin') {
+    try {
+      const r = spawnSync('defaults', ['read', '-g', 'AppleLanguages'], {
+        encoding: 'utf8',
+        timeout: 2000,
+      });
+      const first = /\(\s*"?([^",\s)]+)/.exec(r.stdout || '');
+      return first ? first[1] : '';
+    } catch (_) {
+      return '';
+    }
+  }
+  if (process.platform === 'win32') {
+    try {
+      return Intl.DateTimeFormat().resolvedOptions().locale;
+    } catch (_) {
+      return '';
+    }
+  }
+  const env = process.env;
+  const language = (env.LANGUAGE || '').split(':').find(Boolean);
+  return language || env.LC_ALL || env.LC_MESSAGES || env.LANG || '';
+}
+
+function launcherLang() {
+  const saved = savedConfigLang();
+  if (saved) return saved;
+  const env = process.env;
+  const raw = (
+    ['LC_ALL', 'LC_MESSAGES', 'LANG', 'LANGUAGE'].map((key) => env[key]).find(Boolean) || ''
+  ).toLowerCase();
+  if (raw.startsWith('zh')) return /tw|hk|mo|hant/.test(raw) ? 'zh-TW' : 'zh-CN';
+  return langFromLocale(systemLocale()) || (raw.startsWith('en') ? 'en' : 'zh-CN');
+}
+
+// The model download's notices. The two progress labels keep the same display
+// width so the bars line up.
+const MODEL_NOTICES = {
+  'zh-CN': {
+    unsafeCache: (reason) => `\n  [提示] 向量模型缓存目录不安全 (${reason});本次用 BM25 检索。\n\n`,
+    explicitIncomplete: (dir) =>
+      `\n  [提示] UMADEV_EMBED_MODEL_DIR 指向的 ${dir} 中没有完整的向量模型;本次用 BM25 检索。\n\n`,
+    downloading:
+      '\n  本地向量检索模型缺失，正在从当前版本的官方发布下载 multilingual-e5-small…\n' +
+      '  一次性下载;之后完全本地、运行时无需联网。失败不影响使用(降级为 BM25)。\n' +
+      '  按 Ctrl+C 可跳过(24 小时内不再尝试);设置 UMADEV_NO_MODEL_DOWNLOAD=1 可不再下载。\n',
+    tokenizerLabel: '下载分词器  ',
+    modelLabel: '下载向量模型',
+    ready: '  本地向量模型就绪 ✓\n\n',
+    busy: '\n  [提示] 另一个 UmaDev 进程正在下载向量模型;本次用 BM25 检索。\n\n',
+    failed: (reason, marker) =>
+      `\n  [提示] 向量模型下载未完成 (${reason});本次用 BM25 检索,24 小时后再重试。\n` +
+      `         删除 ${marker} 可提前重试;设置 UMADEV_NO_MODEL_DOWNLOAD=1 可不再下载。\n\n`,
+    skipped: '\n  [提示] 已跳过向量模型下载;本次用 BM25 检索,24 小时后再重试。\n\n',
+  },
+  'zh-TW': {
+    unsafeCache: (reason) => `\n  [提示] 向量模型快取目錄不安全 (${reason});本次改用 BM25 檢索。\n\n`,
+    explicitIncomplete: (dir) =>
+      `\n  [提示] UMADEV_EMBED_MODEL_DIR 指向的 ${dir} 中沒有完整的向量模型;本次改用 BM25 檢索。\n\n`,
+    downloading:
+      '\n  本機向量檢索模型缺失，正在從目前版本的官方發佈下載 multilingual-e5-small…\n' +
+      '  只需下載一次;之後完全在本機執行、無需連網。失敗不影響使用(降級為 BM25)。\n' +
+      '  按 Ctrl+C 可略過(24 小時內不再嘗試);設定 UMADEV_NO_MODEL_DOWNLOAD=1 可不再下載。\n',
+    tokenizerLabel: '下載分詞器  ',
+    modelLabel: '下載向量模型',
+    ready: '  本機向量模型就緒 ✓\n\n',
+    busy: '\n  [提示] 另一個 UmaDev 行程正在下載向量模型;本次改用 BM25 檢索。\n\n',
+    failed: (reason, marker) =>
+      `\n  [提示] 向量模型下載未完成 (${reason});本次改用 BM25 檢索,24 小時後再重試。\n` +
+      `         刪除 ${marker} 可提前重試;設定 UMADEV_NO_MODEL_DOWNLOAD=1 可不再下載。\n\n`,
+    skipped: '\n  [提示] 已略過向量模型下載;本次改用 BM25 檢索,24 小時後再重試。\n\n',
+  },
+  en: {
+    unsafeCache: (reason) =>
+      `\n  [note] The vector model cache directory is unsafe (${reason}); using BM25 search this time.\n\n`,
+    explicitIncomplete: (dir) =>
+      `\n  [note] UMADEV_EMBED_MODEL_DIR (${dir}) does not hold a complete vector model; using BM25 search this time.\n\n`,
+    downloading:
+      "\n  The local vector search model is missing; downloading multilingual-e5-small from this version's official release…\n" +
+      '  It is a one-time download and then runs fully offline. If it fails, UmaDev still works (BM25 search).\n' +
+      '  Press Ctrl+C to skip it (no retry for 24 hours); set UMADEV_NO_MODEL_DOWNLOAD=1 to never download it.\n',
+    tokenizerLabel: 'Tokenizer   ',
+    modelLabel: 'Vector model',
+    ready: '  Local vector model ready ✓\n\n',
+    busy: '\n  [note] Another UmaDev process is downloading the vector model; using BM25 search this time.\n\n',
+    failed: (reason, marker) =>
+      `\n  [note] The vector model download did not finish (${reason}); using BM25 search, retrying in 24 hours.\n` +
+      `         Delete ${marker} to retry sooner, or set UMADEV_NO_MODEL_DOWNLOAD=1 to never download it.\n\n`,
+    skipped: '\n  [note] Skipped the vector model download; using BM25 search, retrying in 24 hours.\n\n',
+  },
+};
+
+function modelNotices() {
+  return MODEL_NOTICES[launcherLang()];
 }
 function assertOrdinaryDirectory(directory) {
   const stat = fs.lstatSync(directory);
@@ -345,6 +483,7 @@ const MODEL_DOWNLOAD_LOCK_NAME = '.umadev-model-download.lock';
 const MODEL_DOWNLOAD_LOCK_WAIT_MS = 30000;
 const MODEL_DOWNLOAD_LOCK_POLL_MS = 250;
 const MODEL_DOWNLOAD_LOCK_OWNER_GRACE_MS = 30000;
+const MODEL_DOWNLOAD_BUSY = 'UMADEV_MODEL_DOWNLOAD_BUSY';
 
 function readModelLockState(lockPath) {
   try {
@@ -458,7 +597,9 @@ async function acquireModelDownloadLock(
     if (tryReclaimModelLock(lockPath)) continue;
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      throw new Error('another UmaDev process is downloading the vector model');
+      const busy = new Error('another UmaDev process is downloading the vector model');
+      busy.code = MODEL_DOWNLOAD_BUSY;
+      throw busy;
     }
     await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, remaining)));
   }
@@ -576,6 +717,10 @@ function isAllowedCustomModelUrl(raw, origin) {
   }
 }
 
+// Set while ensureModel downloads: Ctrl+C aborts it, so the launch skips the
+// model and starts UmaDev with BM25 instead of dying before it starts.
+let modelDownloadAbort = null;
+
 // Download one URL to `dest`, following redirects (GitHub → CDN), drawing a
 // progress bar when `withBar`. Resolves on success, rejects on any error.
 function downloadTo(
@@ -606,6 +751,15 @@ function downloadTo(
       reject(new Error('model download total timeout'));
       return;
     }
+    const signal = modelDownloadAbort ? modelDownloadAbort.signal : null;
+    if (signal && signal.aborted) {
+      reject(new Error('model download skipped'));
+      return;
+    }
+    const requestOptions = {
+      headers: { 'User-Agent': 'umadev-cli', Accept: 'application/octet-stream' },
+    };
+    if (signal) requestOptions.signal = signal;
     let settled = false;
     let totalTimer = null;
     const settle = (error) => {
@@ -620,7 +774,7 @@ function downloadTo(
     };
     const req = https.get(
       url,
-      { headers: { 'User-Agent': 'umadev-cli', Accept: 'application/octet-stream' } },
+      requestOptions,
       (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
@@ -810,12 +964,81 @@ async function downloadFile(bases, name, dest, withBar, label) {
   }
   throw lastErr || new Error('no source reachable');
 }
+// A download that failed, timed out or was skipped is not retried on every
+// launch: a link too slow to finish would otherwise block each start again. The
+// marker in the cache records the release it failed for, so an upgrade (whose
+// release may now serve the assets) retries at once, and success removes it.
+const MODEL_DOWNLOAD_FAILURE_NAME = '.umadev-model-download-failed';
+const MODEL_DOWNLOAD_BACKOFF_MS = 24 * 60 * 60 * 1000;
+
+function modelDownloadBackoffActive(dir, version, now = Date.now()) {
+  let recorded;
+  try {
+    const file = path.join(dir, MODEL_DOWNLOAD_FAILURE_NAME);
+    if (!fs.lstatSync(file).isFile()) return false;
+    recorded = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_) {
+    return false;
+  }
+  if (!recorded || recorded.version !== version) return false;
+  const age = now - Date.parse(recorded.failedAt);
+  return Number.isFinite(age) && age >= 0 && age < MODEL_DOWNLOAD_BACKOFF_MS;
+}
+
+function recordModelDownloadFailure(dir, version, reason) {
+  const file = path.join(dir, MODEL_DOWNLOAD_FAILURE_NAME);
+  const temp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}`;
+  try {
+    fs.writeFileSync(
+      temp,
+      `${JSON.stringify({ version, failedAt: new Date().toISOString(), reason })}\n`,
+      { flag: 'wx', mode: 0o600 },
+    );
+    fs.renameSync(temp, file);
+  } catch (_) {
+    try { fs.unlinkSync(temp); } catch (_) { /* best-effort cleanup */ }
+  }
+}
+
+function clearModelDownloadFailure(dir) {
+  try {
+    fs.unlinkSync(path.join(dir, MODEL_DOWNLOAD_FAILURE_NAME));
+  } catch (_) {
+    /* no failure recorded */
+  }
+}
+
+// UMADEV_NO_MODEL_DOWNLOAD=1 (or true / yes / on) turns the download off.
+function modelDownloadDisabled() {
+  return /^(?:1|true|yes|on)$/i.test((process.env.UMADEV_NO_MODEL_DOWNLOAD || '').trim());
+}
+
+// A UMADEV_EMBED_MODEL_DIR naming an ordinary directory is where the binary
+// looks for the model (see umadev-knowledge's model_source), so a copy the
+// launcher downloaded elsewhere would never be read. Returns that directory, or
+// null when the variable is unset or unusable and the binary falls back to the
+// ~/.umadev/embed-model cache this launcher maintains.
+function explicitModelDir() {
+  const raw = process.env.UMADEV_EMBED_MODEL_DIR;
+  if (!raw) return null;
+  const dir = path.resolve(raw);
+  if (dir === path.resolve(modelTargetDir())) return null;
+  try {
+    const stat = fs.lstatSync(dir);
+    return stat.isDirectory() && !stat.isSymbolicLink() ? dir : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function ensureModel() {
   const dir = modelTargetDir();
+  let notices = null;
+  const text = () => (notices ??= modelNotices());
   try {
     ensureModelCacheDirectory(dir);
   } catch (e) {
-    process.stderr.write(`\n  [提示] 向量模型缓存目录不安全 (${e.message});本次用 BM25 检索。\n\n`);
+    process.stderr.write(text().unsafeCache(e.message));
     return null;
   }
   if (modelPresent(dir)) return dir; // already installed & intact — fast path, no network
@@ -825,42 +1048,59 @@ async function ensureModel() {
   } catch (_) {
     /* keep default */
   }
+  if (modelDownloadBackoffActive(dir, version)) return null;
   const bases = releaseBases(version);
   let downloadLock = null;
+  const abort = new AbortController();
+  const skip = () => abort.abort();
   try {
     downloadLock = await acquireModelDownloadLock(dir);
     if (!downloadLock) return dir;
     if (modelPresent(dir)) return dir;
+    if (modelDownloadBackoffActive(dir, version)) return null;
     // modelPresent() was false — either absent (first run) or a corrupt/partial
     // cache. Drop any bad or leftover `.part` files first so this fetch self-heals
     // a corrupt download instead of being shadowed by it (P3).
     clearModelFiles(dir);
-    process.stderr.write(
-      '\n  本地向量检索模型缺失，正在从当前版本的官方发布下载 multilingual-e5-small…\n',
-    );
-    process.stderr.write(
-      '  一次性下载;之后完全本地、运行时无需联网。失败不影响使用(降级为 BM25)。\n',
-    );
+    process.stderr.write(text().downloading);
+    modelDownloadAbort = abort;
+    process.once('SIGINT', skip);
     await downloadFile(bases, 'config.json', path.join(dir, 'config.json'), false, '');
-    await downloadFile(bases, 'tokenizer.json', path.join(dir, 'tokenizer.json'), true, '下载分词器  ');
+    await downloadFile(
+      bases,
+      'tokenizer.json',
+      path.join(dir, 'tokenizer.json'),
+      true,
+      text().tokenizerLabel,
+    );
     await downloadFile(
       bases,
       'model.safetensors',
       path.join(dir, 'model.safetensors'),
       true,
-      '下载向量模型',
+      text().modelLabel,
     );
     if (!modelPresent(dir)) throw new Error('downloaded model cache did not pass validation');
-    process.stderr.write('  本地向量模型就绪 ✓\n\n');
+    clearModelDownloadFailure(dir);
+    process.stderr.write(text().ready);
     return dir;
   } catch (e) {
+    if (e && e.code === MODEL_DOWNLOAD_BUSY) {
+      // Another launcher holds the download; its outcome decides the back-off.
+      process.stderr.write(text().busy);
+      return null;
+    }
+    const skipped = abort.signal.aborted;
+    recordModelDownloadFailure(dir, version, skipped ? 'skipped' : e.message);
     process.stderr.write(
-      '\n  [提示] 向量模型下载未完成 (' +
-        e.message +
-        ');本次用 BM25 检索,下次启动重试。\n\n',
+      skipped
+        ? text().skipped
+        : text().failed(e.message, path.join(dir, MODEL_DOWNLOAD_FAILURE_NAME)),
     );
     return null;
   } finally {
+    process.removeListener('SIGINT', skip);
+    modelDownloadAbort = null;
     releaseModelDownloadLock(downloadLock);
   }
 }
@@ -885,6 +1125,23 @@ function invocationNeedsModel(argv) {
   const first = argv[2] || '';
   if (first === '') return true; // bare `umadev` → interactive TUI, which retrieves
   return NEEDS_MODEL.has(first);
+}
+
+// The model directory to hand the binary for this launch. A bundled model
+// package wins; otherwise the model is downloaded only when this invocation
+// retrieves knowledge and nothing rules the download out: a directory of the
+// user's own in UMADEV_EMBED_MODEL_DIR (which the binary reads itself), the
+// UMADEV_NO_MODEL_DOWNLOAD opt-out, or a recent failure (see ensureModel).
+async function resolveModelDir(argv = process.argv) {
+  const bundled = findModelDir();
+  if (bundled || !invocationNeedsModel(argv)) return bundled;
+  const explicit = explicitModelDir();
+  if (explicit) {
+    if (!modelPresent(explicit)) process.stderr.write(modelNotices().explicitIncomplete(explicit));
+    return null;
+  }
+  if (modelDownloadDisabled()) return null;
+  return ensureModel();
 }
 
 // ── The `sudo npm i -g` footgun, reported at RUNTIME.
@@ -1640,11 +1897,9 @@ async function main() {
   // Only the retrieval verbs (run/quick/redo/continue/revise) and the bare
   // interactive TUI fetch the model first; every other command — including
   // read-only/emergency verbs — returns instantly even before the model exists.
-  const needsModel = invocationNeedsModel(process.argv);
   // Prefer a bundled npm model package (dev / sibling layout); otherwise fetch
   // it on demand into ~/.umadev/embed-model (the binary's model_dir() fallback).
-  let modelDir = findModelDir();
-  if (needsModel && !modelDir) modelDir = await ensureModel();
+  const modelDir = await resolveModelDir(process.argv);
   if (modelDir && !process.env.UMADEV_EMBED_MODEL_DIR) {
     extraEnv.UMADEV_EMBED_MODEL_DIR = modelDir;
   }
@@ -1707,6 +1962,10 @@ module.exports = {
   sha256File,
   versionAtLeast,
   invocationNeedsModel,
+  resolveModelDir,
+  launcherLang,
+  MODEL_DOWNLOAD_FAILURE_NAME,
+  MODEL_DOWNLOAD_BACKOFF_MS,
   platformKey,
   linuxLibcFromEvidence,
   registryLatestRelease,

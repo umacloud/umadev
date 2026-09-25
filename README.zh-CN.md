@@ -817,7 +817,8 @@ umadev 有两套入口，一一对应：
 | `OPENAI_EMBED_KEY` | 远程向量专用 key；没有下面的显式上传开关时不生效 | — |
 | `UMADEV_ALLOW_CLOUD_EMBED` | 与专用 key 同时设为 `1` 才允许远程 embedding 上传 | 关 |
 | `OPENAI_EMBED_BASE` | 远程 embedding 服务基址；只在双重云端 opt-in 后读取 | `https://api.openai.com` |
-| `UMADEV_EMBED_MODEL_DIR` | 放置兼容 `config.json`、`tokenizer.json`、`model.safetensors` 的本地目录 | `~/.umadev/embed-model` |
+| `UMADEV_EMBED_MODEL_DIR` | 放置兼容 `config.json`、`tokenizer.json`、`model.safetensors` 的本地目录；指向一个目录时 npm 启动器不会再下载模型 | `~/.umadev/embed-model` |
+| `UMADEV_NO_MODEL_DOWNLOAD` | 置 `1` 后 npm 启动器不再下载向量模型（检索改用 BM25）。未设置时，下载失败或按 Ctrl+C 跳过后，24 小时后才会重试，而不是每次启动都重下 | 关 |
 | `XDG_CONFIG_HOME` | `config.toml` 的基目录 | `$HOME` |
 
 ## 配置
