@@ -386,7 +386,9 @@ fn read_max_seq_len(config_text: &str) -> usize {
 
 /// Embed `texts` with the bundled local model. `is_query` selects the e5
 /// instruction prefix. Returns `None` (fail-open) on any error so the caller
-/// can fall back to HTTP / BM25.
+/// can fall back to HTTP / BM25 — including a call over the per-call bounds
+/// (more than `MAX_LOCAL_EMBED_BATCH` texts or `MAX_LOCAL_EMBED_BATCH_BYTES` of
+/// text); [`embed_texts_batched`] takes any number of texts.
 #[must_use]
 pub fn embed_texts(texts: &[String], is_query: bool) -> Option<Vec<Vec<f32>>> {
     let bounded = bounded_embed_inputs(texts)?;
@@ -398,6 +400,50 @@ pub fn embed_texts(texts: &[String], is_query: bool) -> Option<Vec<Vec<f32>>> {
             None
         }
     }
+}
+
+/// Embed any number of `texts` with the bundled local model: they are split
+/// into groups within the per-call bounds of [`embed_texts`], and the vectors
+/// come back in input order. `None` (fail-open) when any group fails, like a
+/// single call. This is what the corpus build uses — the bundled corpus alone
+/// is thousands of chunks, far over the per-call cap.
+#[must_use]
+pub fn embed_texts_batched(texts: &[String], is_query: bool) -> Option<Vec<Vec<f32>>> {
+    embed_in_bounded_groups(texts, |group| embed_texts(group, is_query))
+}
+
+/// Embed `texts` through `embed`, one call per group of at most
+/// `MAX_LOCAL_EMBED_BATCH` texts and `MAX_LOCAL_EMBED_BATCH_BYTES` of text (each
+/// text counted at its `MAX_LOCAL_EMBED_TEXT_BYTES` cap, as the embedder counts
+/// it), concatenating the vectors in input order. `None` when a group fails or
+/// returns the wrong number of vectors.
+fn embed_in_bounded_groups(
+    texts: &[String],
+    mut embed: impl FnMut(&[String]) -> Option<Vec<Vec<f32>>>,
+) -> Option<Vec<Vec<f32>>> {
+    let mut out = Vec::with_capacity(texts.len());
+    let mut start = 0;
+    while start < texts.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < texts.len() && end - start < MAX_LOCAL_EMBED_BATCH {
+            let len = bounded_text_prefix(&texts[end], MAX_LOCAL_EMBED_TEXT_BYTES).len();
+            // One capped text always fits, so every group makes progress.
+            if end > start && bytes + len > MAX_LOCAL_EMBED_BATCH_BYTES {
+                break;
+            }
+            bytes += len;
+            end += 1;
+        }
+        let group = &texts[start..end];
+        let mut vectors = embed(group)?;
+        if vectors.len() != group.len() {
+            return None;
+        }
+        out.append(&mut vectors);
+        start = end;
+    }
+    Some(out)
 }
 
 fn embed_inner(
@@ -620,6 +666,69 @@ mod tests {
             MAX_LOCAL_EMBED_BATCH_BYTES / MAX_LOCAL_EMBED_TEXT_BYTES + 1
         ];
         assert!(bounded_embed_inputs(&over_aggregate).is_none());
+    }
+
+    #[test]
+    fn embed_batch_local_splits_over_cap() {
+        // The local embedder refuses a call over its per-call bounds, and the
+        // corpus build hands it every uncached chunk at once (thousands for the
+        // bundled corpus), so no vector store was ever built. Batches are split
+        // into bounded groups whose vectors come back in input order.
+        let texts: Vec<String> = (0..300_u16).map(|i| i.to_string()).collect();
+        let mut calls = Vec::new();
+        let vectors = embed_in_bounded_groups(&texts, |group| {
+            assert!(
+                bounded_embed_inputs(group).is_some(),
+                "a group of {} texts exceeds the per-call bounds",
+                group.len()
+            );
+            calls.push(group.len());
+            Some(
+                group
+                    .iter()
+                    .map(|text| vec![f32::from(text.parse::<u16>().unwrap())])
+                    .collect(),
+            )
+        })
+        .expect("300 texts embed in bounded groups");
+        assert_eq!(vectors.len(), 300);
+        assert!(
+            (0..300_u16).all(|i| vectors[usize::from(i)] == vec![f32::from(i)]),
+            "vectors stay in input order"
+        );
+        assert!(
+            calls.iter().all(|&n| n <= MAX_LOCAL_EMBED_BATCH),
+            "{calls:?}"
+        );
+        assert_eq!(calls.iter().sum::<usize>(), 300);
+    }
+
+    #[test]
+    fn local_embed_groups_respect_the_byte_bound() {
+        // Each text is capped at MAX_LOCAL_EMBED_TEXT_BYTES, and a group may not
+        // exceed MAX_LOCAL_EMBED_BATCH_BYTES in total.
+        let per_group = MAX_LOCAL_EMBED_BATCH_BYTES / MAX_LOCAL_EMBED_TEXT_BYTES;
+        let texts = vec!["x".repeat(MAX_LOCAL_EMBED_TEXT_BYTES + 10); per_group + 3];
+        let mut calls = Vec::new();
+        let vectors = embed_in_bounded_groups(&texts, |group| {
+            assert!(bounded_embed_inputs(group).is_some());
+            calls.push(group.len());
+            Some(vec![vec![0.0]; group.len()])
+        })
+        .unwrap();
+        assert_eq!(vectors.len(), per_group + 3);
+        assert_eq!(calls, vec![per_group, 3]);
+        // A failed group, or one that returns the wrong count, fails the batch.
+        assert!(embed_in_bounded_groups(&texts, |_| None).is_none());
+        assert!(
+            embed_in_bounded_groups(&texts, |group| Some(vec![vec![0.0]; group.len() - 1]))
+                .is_none()
+        );
+        // Nothing to embed is an empty, successful batch.
+        assert_eq!(
+            embed_in_bounded_groups(&[], |_| unreachable!("no call for no texts")),
+            Some(Vec::new())
+        );
     }
 
     #[test]

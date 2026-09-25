@@ -657,12 +657,15 @@ pub async fn embed_query(text: &str) -> Option<Vec<f32>> {
     }
 }
 
-/// Embed many texts in one (or a few batched) API call(s). Returns vectors
-/// in input order, or `None` on any failure. Batches internally at
-/// 100 texts per request to stay within API limits.
+/// Embed many texts in one (or a few batched) call(s). Returns vectors
+/// in input order, or `None` on any failure. Batches internally: the local
+/// model in groups within its per-call bounds, the HTTP API at 100 texts per
+/// request to stay within API limits.
 #[cfg_attr(not(feature = "vector"), allow(clippy::unused_async))]
 pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
-    // Local bundled model first (zero setup), off the async executor.
+    // Local bundled model first (zero setup), off the async executor. The
+    // corpus build hands over every uncached chunk at once, so the local call
+    // must split the batch rather than refuse it.
     #[cfg(feature = "vector-local")]
     {
         if crate::local_embed::is_available() {
@@ -670,11 +673,12 @@ pub async fn embed_batch(texts: &[String]) -> Option<Vec<Vec<f32>>> {
                 return Some(Vec::new());
             }
             let owned = texts.to_vec();
-            let local =
-                tokio::task::spawn_blocking(move || crate::local_embed::embed_texts(&owned, false))
-                    .await
-                    .ok()
-                    .flatten();
+            let local = tokio::task::spawn_blocking(move || {
+                crate::local_embed::embed_texts_batched(&owned, false)
+            })
+            .await
+            .ok()
+            .flatten();
             if let Some(v) = local {
                 if embeddings_have_valid_shape(&v, texts.len()) {
                     return Some(v);
