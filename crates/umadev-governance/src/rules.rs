@@ -27,6 +27,8 @@ mod sensitive_path;
 pub use sensitive_path::check_sensitive_path;
 mod bash_guard;
 pub use bash_guard::check_dangerous_bash;
+mod test_paths;
+use test_paths::looks_like_secret_test_path;
 mod secret_values;
 
 /// Outcome of a governance rule.
@@ -1684,55 +1686,6 @@ pub fn is_config_secret_path(file_path: &str) -> bool {
 /// The final path component of `file_path` (handles `/` and `\` separators).
 fn file_name_of(file_path: &str) -> &str {
     file_path.rsplit(['/', '\\']).next().unwrap_or(file_path)
-}
-
-/// `true` for a path where the NOISIEST secret detectors (the entropy + JWT
-/// fallback) must be suppressed to avoid flooding: a test / fixture / example /
-/// sample / template path (realistic-but-fake secrets), a generated LOCKFILE
-/// (full of SRI integrity hashes), or a minified bundle (one giant high-entropy
-/// line). The high-signal detectors (PEM, named keys, provider shapes) still fire
-/// on these, so a REAL key here is not a free pass.
-fn looks_like_secret_test_path(file_path: &str) -> bool {
-    let l = file_path.to_ascii_lowercase();
-    if l.contains(".test.")
-        || l.contains(".spec.")
-        || l.contains("_test.")
-        || l.contains("_tests.")
-        || l.ends_with("tests.rs")
-        || l.contains("test_")
-        || l.starts_with("tests/")
-        || l.starts_with("test/")
-        || l.contains("/tests/")
-        || l.contains("/test/")
-        || l.contains("/__tests__/")
-        || l.contains("/testdata/")
-        || l.contains("/fixtures/")
-        || l.contains("/fixture/")
-        || l.contains("/mocks/")
-        || l.contains("/examples/")
-        || l.contains("/example/")
-        || l.contains(".example")
-        || l.contains(".sample")
-        || l.contains(".template")
-        || l.contains(".dist")
-        || l.contains(".mock")
-        || l.contains(".min.")
-    {
-        return true;
-    }
-    // Generated lockfiles: high-entropy integrity hashes everywhere, no secrets.
-    // (`*.lock` covers Cargo.lock / yarn.lock / poetry.lock / composer.lock / …)
-    let name = file_name_of(&l);
-    if matches!(name, "test.rs" | "tests.rs") {
-        return true;
-    }
-    extension_of(name) == "lock"
-        || name == "package-lock.json"
-        || name == "npm-shrinkwrap.json"
-        || name == "pnpm-lock.yaml"
-        || name == "go.sum"
-        || name.ends_with("-lock.json")
-        || name.ends_with("-lock.yaml")
 }
 
 /// Scan `content` for a bare key-shape secret (a Stripe-style `sk_`/`pk_` key,

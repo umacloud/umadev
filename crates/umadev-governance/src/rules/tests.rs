@@ -1915,6 +1915,58 @@ fn secret_entropy_fallback_suppressed_on_test_paths() {
 }
 
 #[test]
+fn test_path_detection_is_segment_aware() {
+    // Shipping files whose names merely CONTAIN a marker are not test files.
+    for path in [
+        "server/latest_users.py",
+        "internal/nearest_store.go",
+        "src/pages/contest_detail/index.tsx",
+        "src/geo.distance.ts",
+        "src/mail/email.template.ts",
+        "src/contests.rs",
+        "src/api/attestation.ts",
+    ] {
+        assert!(
+            !looks_like_secret_test_path(path),
+            "not a test path: {path}"
+        );
+    }
+    // Real test / fixture / example files, including Windows paths.
+    for path in [
+        "tests/test_auth.py",
+        "test_auth.py",
+        "pkg/auth/auth_test.go",
+        "src/App.test.tsx",
+        "src/Api.spec.ts",
+        "src/config_tests.rs",
+        "src/tests.rs",
+        "src/__tests__/Card.tsx",
+        "C:\\proj\\tests\\factories\\user.py",
+        "C:\\proj\\src\\__tests__\\api.ts",
+        "D:\\work\\app\\fixtures\\seed.ts",
+        "internal/testdata/keys.go",
+        ".env.example",
+        "config/settings.py.sample",
+        "phpunit.xml.dist",
+        "config.example.json",
+        "src/api.mock.ts",
+        "public/app.min.js",
+        "package-lock.json",
+    ] {
+        assert!(looks_like_secret_test_path(path), "a test path: {path}");
+    }
+    // The consequence that mattered: the plaintext-password floor now scans a
+    // shipping `latest_*.py` file instead of skipping it as a "test".
+    assert!(
+        check_plaintext_password(
+            "server/latest_users.py",
+            "if user.password == input_password:\n    login()"
+        )
+        .block
+    );
+}
+
+#[test]
 fn secret_deny_reason_mentions_env_var() {
     let d = check_hardcoded_secret(
         "src/api.ts",
