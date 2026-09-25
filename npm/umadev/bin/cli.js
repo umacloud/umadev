@@ -34,6 +34,7 @@ function currentNodeVersion() {
 
 // Gate BEFORE touching the modern file. On too-old Node, print a clear upgrade
 // message and exit non-zero instead of crashing with a cryptic parse error.
+// (No trailing comma after a last call argument either: that is ES2017.)
 if (parseNodeMajor(currentNodeVersion()) < MIN_NODE_MAJOR) {
   process.stderr.write(
     'UmaDev requires Node >= ' +
@@ -41,7 +42,7 @@ if (parseNodeMajor(currentNodeVersion()) < MIN_NODE_MAJOR) {
       ', but you have ' +
       (currentNodeVersion() || 'an unknown version') +
       '.\n' +
-      'Please upgrade Node.js (https://nodejs.org) and re-run.\n',
+      'Please upgrade Node.js (https://nodejs.org) and re-run.\n'
   );
   process.exit(1);
 }
