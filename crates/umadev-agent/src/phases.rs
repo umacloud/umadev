@@ -2053,18 +2053,41 @@ fn verify_results_check(project_root: &Path) -> Option<QualityCheck> {
         skipped: bool,
         #[serde(default)]
         timestamp: String,
+        #[serde(default)]
+        source_fingerprint: Option<String>,
     }
     let rows: Vec<VRow> = content
         .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
-    if rows.is_empty() {
-        return None;
-    }
-    let dts = String::new();
-    let lts = rows.iter().map(|r| &r.timestamp).max().unwrap_or(&dts);
-    let latest: Vec<&VRow> = rows.iter().filter(|r| r.timestamp == *lts).collect();
+    let last = rows.last()?;
+    // The latest run is the trailing batch of rows. A batch is appended in one
+    // tight loop, but timestamps have 1 s resolution, so a batch can straddle a
+    // second boundary — matching only the newest timestamp would drop its
+    // earlier rows (e.g. a failed build). Walk back from the newest row while
+    // rows stay within a second of it, carry the same tree fingerprint, and
+    // don't repeat a step (each run records a step once).
+    let within_a_second = |ts: &str| {
+        ts == last.timestamp
+            || match (
+                chrono::DateTime::parse_from_rfc3339(ts),
+                chrono::DateTime::parse_from_rfc3339(&last.timestamp),
+            ) {
+                (Ok(a), Ok(b)) => (b - a).num_seconds().abs() <= 1,
+                _ => false,
+            }
+    };
+    let mut seen_steps = std::collections::HashSet::new();
+    let latest: Vec<&VRow> = rows
+        .iter()
+        .rev()
+        .take_while(|r| {
+            within_a_second(&r.timestamp)
+                && r.source_fingerprint == last.source_fingerprint
+                && seen_steps.insert(r.step.as_str())
+        })
+        .collect();
     let ns: Vec<&VRow> = latest.iter().copied().filter(|r| !r.skipped).collect();
     let passed = ns.iter().filter(|r| r.passed).count();
     let total = ns.len();
@@ -6127,6 +6150,45 @@ mod tests {
             check.status, "passed",
             "skipped lint failure must not fail the check"
         );
+    }
+
+    #[test]
+    fn verify_results_check_keeps_a_batch_that_crosses_a_second_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("verify.jsonl"),
+            r#"{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-01T10:00:00Z"}
+{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-01T10:00:01Z"}
+"#,
+        )
+        .unwrap();
+        let check = verify_results_check(tmp.path()).unwrap();
+        assert_eq!(check.status, "failed", "{}", check.details);
+        assert_eq!(check.details, "1 of 2 steps passed");
+    }
+
+    #[test]
+    fn verify_results_check_reads_only_the_latest_batch() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".umadev/audit");
+        fs::create_dir_all(&dir).unwrap();
+        // An older failing batch (a minute earlier, and one a second earlier)
+        // must not leak into the latest, green batch.
+        fs::write(
+            dir.join("verify.jsonl"),
+            r#"{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-01T09:59:00Z"}
+{"step":"lint","passed":false,"skipped":false,"timestamp":"2026-01-01T09:59:00Z"}
+{"step":"build","passed":false,"skipped":false,"timestamp":"2026-01-01T10:00:00Z"}
+{"step":"build","passed":true,"skipped":false,"timestamp":"2026-01-01T10:00:01Z"}
+{"step":"test","passed":true,"skipped":false,"timestamp":"2026-01-01T10:00:01Z"}
+"#,
+        )
+        .unwrap();
+        let check = verify_results_check(tmp.path()).unwrap();
+        assert_eq!(check.status, "passed", "{}", check.details);
+        assert_eq!(check.details, "2 of 2 steps passed");
     }
 
     // ---- phase_knowledge_digest BM25 path ----
