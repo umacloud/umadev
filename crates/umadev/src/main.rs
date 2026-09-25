@@ -1259,6 +1259,14 @@ async fn main() -> Result<()> {
         return Ok(());
     };
 
+    // Every CLI verb prints in the configured UI language (`lang` in the user
+    // config, else the system locale), as the TUI does. The governance hook and
+    // the MCP server run inside a base's tool loop and print no catalog text, so
+    // they skip reading the config.
+    if !matches!(command, Command::Hook { .. } | Command::Mcp { .. }) {
+        cli_lang();
+    }
+
     match command {
         Command::Init {
             slug,
@@ -2603,7 +2611,7 @@ opencode.json
     }
 
     println!("UmaDev workspace initialised with project-aware analysis.");
-    println!("{}", init_report.render_summary(cli_lang()));
+    println!("{}", init_report.render_summary(umadev_i18n::current()));
     println!("  manifest: {}", path.display());
     println!(
         "  spec: {} | level: {} | profile: {} | slug: {}",
@@ -2629,7 +2637,7 @@ opencode.json
 /// underlying `run_adopt` never errors, so this prints a summary even on a
 /// sparse / empty workspace.
 fn cmd_adopt(path: Option<PathBuf>, project_root: Option<PathBuf>) -> Result<()> {
-    let lang = cli_lang();
+    let lang = umadev_i18n::current();
     // `--project-root` wins over the positional `path`; else the positional;
     // else cwd.
     let workspace = resolve_root(project_root.or(path))?;
@@ -5180,8 +5188,9 @@ fn cmd_history(project_root: Option<PathBuf>) -> Result<()> {
 
 /// Resolve + set the process-wide UI language for CLI output, from the saved
 /// `~/.umadev/config.toml` (falling back to system-locale detection). Mirrors
-/// what the TUI does on launch so `umadev usage` / `umadev lessons` speak the
-/// same language as the chat. Returns the resolved language for `t`/`tf`.
+/// what the TUI does on launch; `main` calls it once before dispatching a verb,
+/// so every verb speaks the same language as the chat and reads it back with
+/// [`umadev_i18n::current`]. Returns the resolved language.
 fn cli_lang() -> umadev_i18n::Lang {
     let lang = umadev_tui::config::load().resolved_lang();
     umadev_i18n::set_lang(lang);
@@ -5191,7 +5200,7 @@ fn cli_lang() -> umadev_i18n::Lang {
 /// `umadev usage` — print quality-aware worker usage without inventing token
 /// precision or provider cost. Pure read of the bounded durable ledger.
 fn cmd_usage() -> Result<()> {
-    let lang = cli_lang();
+    let lang = umadev_i18n::current();
     let report = umadev_agent::runner::usage_report();
     println!(
         "{}",
@@ -5204,7 +5213,7 @@ fn cmd_usage() -> Result<()> {
 /// and verified outcomes. Incident rows themselves belong to TUI `/pitfalls`.
 /// Pure read of `.umadev/learned/`; never mutates the KB.
 fn cmd_lessons(project_root: Option<PathBuf>) -> Result<()> {
-    let lang = cli_lang();
+    let lang = umadev_i18n::current();
     let project_root = resolve_root(project_root)?;
     let report = umadev_agent::lessons::lessons_report(&project_root);
     println!("{}", format_lessons_report(lang, &report));
@@ -5321,7 +5330,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
             scope,
             project_root,
         } => {
-            let lang = cli_lang();
+            let lang = umadev_i18n::current();
             let root = resolve_root(project_root)?;
             for (index, scope) in memory_scopes(scope).iter().copied().enumerate() {
                 if index > 0 {
@@ -5344,7 +5353,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
             yes,
             project_root,
         } => {
-            let lang = cli_lang();
+            let lang = umadev_i18n::current();
             let root = resolve_root(project_root)?;
             let selected_store = store
                 .as_deref()
@@ -5526,7 +5535,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
                 memory_control::update_capture_stores(&root, scope, &stores, state.enabled())?;
                 println!(
                     "[ok] capture={} scope={} stores={}",
-                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    memory_state_label(umadev_i18n::current(), Some(state.enabled())),
                     scope.id(),
                     stores
                         .iter()
@@ -5538,7 +5547,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
                 memory_control::update_capture(&root, scope, None, state.enabled())?;
                 println!(
                     "[ok] capture={} scope={} stores=all-configurable",
-                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    memory_state_label(umadev_i18n::current(), Some(state.enabled())),
                     scope.id()
                 );
             }
@@ -5562,7 +5571,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
                 memory_control::update_recall_stores(&root, scope, &stores, state.enabled())?;
                 println!(
                     "[ok] recall={} scope={} stores={}",
-                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    memory_state_label(umadev_i18n::current(), Some(state.enabled())),
                     scope.id(),
                     stores
                         .iter()
@@ -5574,7 +5583,7 @@ fn cmd_memory(action: MemoryAction) -> Result<()> {
                 memory_control::update_recall(&root, scope, None, state.enabled())?;
                 println!(
                     "[ok] recall={} scope={} stores=all-configurable",
-                    memory_state_label(cli_lang(), Some(state.enabled())),
+                    memory_state_label(umadev_i18n::current(), Some(state.enabled())),
                     scope.id()
                 );
             }
