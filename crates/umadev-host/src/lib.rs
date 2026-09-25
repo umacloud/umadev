@@ -315,6 +315,18 @@ pub trait HostDriver: umadev_runtime::Runtime {
     /// owns continuity.
     fn set_session_id(&mut self, _session_id: Option<String>) {}
 
+    /// Make a pinned session CREATE its conversation on this driver's first
+    /// call and RESUME it on every later call.
+    ///
+    /// A caller that pins a fresh id ([`Self::set_session_id`]) and continues it
+    /// ([`Self::set_continue_session`]) across a whole run turns this on.
+    /// Without it the very first call already resumes an id the base has never
+    /// seen (`claude --resume <new id>` fails with "No conversation found"),
+    /// and so does every later call. The TUI sequences create and resume itself
+    /// and leaves this off. The default is a no-op for drivers that cannot pin
+    /// a caller-chosen id.
+    fn set_session_autoresume(&mut self, _on: bool) {}
+
     /// Set the working directory the host CLI subprocess runs in — the
     /// pipeline's project root.
     ///

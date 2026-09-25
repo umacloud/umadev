@@ -240,10 +240,11 @@ impl ClaudeCodeDriver {
     /// AND a pinned `session_id`, the first `complete` creates the session
     /// (`--session-id`) and every later call on this instance resumes it
     /// (`--resume`). Off (the default) keeps the literal session matrix the TUI
-    /// relies on. No-op without a pinned id. Builder form (mainly for tests).
+    /// relies on. No-op without a pinned id. Builder form of
+    /// [`HostDriver::set_session_autoresume`] (mainly for tests).
     #[must_use]
     pub fn with_session_autoresume(mut self, on: bool) -> Self {
-        self.session_started = on.then(|| Arc::new(AtomicBool::new(false)));
+        self.set_session_autoresume(on);
         self
     }
 
@@ -983,6 +984,10 @@ impl HostDriver for ClaudeCodeDriver {
         self.session_id = session_id;
     }
 
+    fn set_session_autoresume(&mut self, on: bool) {
+        self.session_started = on.then(|| Arc::new(AtomicBool::new(false)));
+    }
+
     fn set_workspace(&mut self, workspace: std::path::PathBuf) {
         self.workspace = Some(workspace);
     }
@@ -1679,6 +1684,33 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--resume", uuid.as_str()]));
         assert!(!args.contains(&"--continue".to_string()));
         assert!(!args.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn pinned_trait_session_first_call_creates_then_resumes() {
+        // `umadev quick` / `redo` / the legacy run configure this driver only
+        // through `HostDriver`, exactly like this. The first call must CREATE the
+        // fresh id: `--resume` of a conversation Claude never saw fails every call.
+        let id = "11111111-2222-4333-8444-555555555555".to_string();
+        let mut driver = ClaudeCodeDriver::default();
+        HostDriver::set_session_id(&mut driver, Some(id.clone()));
+        HostDriver::set_continue_session(&mut driver, true);
+        HostDriver::set_session_autoresume(&mut driver, true);
+
+        let first = driver.call_args_with_format("stream-json");
+        assert!(
+            first.windows(2).any(|w| w == ["--session-id", id.as_str()]),
+            "the first call creates the pinned session: {first:?}"
+        );
+        assert!(!first.iter().any(|arg| arg == "--resume"), "{first:?}");
+
+        driver.mark_session_started();
+        let later = driver.call_args_with_format("json");
+        assert!(
+            later.windows(2).any(|w| w == ["--resume", id.as_str()]),
+            "later calls resume the same session: {later:?}"
+        );
+        assert!(!later.iter().any(|arg| arg == "--session-id"), "{later:?}");
     }
 
     #[test]
