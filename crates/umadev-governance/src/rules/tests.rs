@@ -1363,6 +1363,85 @@ fn secret_allows_placeholder_api_key() {
 }
 
 #[test]
+fn secret_prefix_scan_ignores_env_and_settings_reads() {
+    // The contiguous `api_key=` / `secret=` / `access_token=` scan used to take
+    // everything up to the next quote as the "value", so code that READS the
+    // secret and the WeChat login URL templates were denied as leaked secrets.
+    for (path, source) in [
+        (
+            "app/services/ai.py",
+            "client = OpenAI(api_key=settings.OPENAI_API_KEY)",
+        ),
+        (
+            "src/lib/ai.ts",
+            "const client = new Anthropic({ api_key: process.env.ANTHROPIC_API_KEY });",
+        ),
+        (
+            "src/config.rs",
+            "let client = Client::new(Config { api_key: settings.openai_api_key.clone(), .. });",
+        ),
+        ("config.yaml", "model_list:\n  - litellm_params:\n      api_key: os.environ/AZURE_API_KEY\n"),
+        (
+            "src/types.ts",
+            "export interface LlmConfig { api_key: string; base_url: string }",
+        ),
+        (
+            "app/services/ai.py",
+            "client = OpenAI(api_key=OPENAI_API_KEY_PRODUCTION)",
+        ),
+        (
+            "handler/wechat.go",
+            "url := fmt.Sprintf(\"https://api.weixin.qq.com/sns/jscode2session?appid=%s&secret=%s&js_code=%s&grant_type=authorization_code\", appID, appSecret, code)",
+        ),
+        (
+            "app/wx.py",
+            "url = f\"https://api.weixin.qq.com/sns/jscode2session?appid={settings.WX_APPID}&secret={settings.WX_SECRET}&js_code={code}&grant_type=authorization_code\"",
+        ),
+        (
+            "handler/user.go",
+            "url := fmt.Sprintf(\"https://api.weixin.qq.com/cgi-bin/user/info?access_token=%s&openid=%s&lang=zh_CN\", token, openID)",
+        ),
+    ] {
+        let d = check_hardcoded_secret(path, source);
+        assert!(!d.block, "{path}: {source} -> {}", d.reason);
+    }
+    // A real key is still caught, including an unquoted config value and a key
+    // assigned after a harmless first occurrence of the same prefix.
+    for (path, source) in [
+        (
+            "src/api.ts",
+            concat!(
+                "const API_KEY = \"stripe_R8xQ2mK7",
+                "vN4pL9wB3yT6jH1sD5gF0\";"
+            ),
+        ),
+        (
+            "config.yaml",
+            concat!("api_key: a1B2c3D4e5F6", "g7H8i9J0kL3mN9pQ\n"),
+        ),
+        (
+            "app/services/ai.py",
+            concat!(
+                "client = OpenAI(api_key=settings.OPENAI_API_KEY)\n",
+                "fallback = Client(api_key=a1B2c3D4e5F6",
+                "g7H8i9J0kL3mN9pQ)\n"
+            ),
+        ),
+        (
+            "src/wx.ts",
+            concat!(
+                "const u = `https://api.weixin.qq.com/sns/oauth2?secret=9f8e7d6c5b4a",
+                "3210fedcba9876543210&code=${code}`;"
+            ),
+        ),
+    ] {
+        let d = check_hardcoded_secret(path, source);
+        assert!(d.block, "a real key must still block: {path}: {source}");
+        assert_eq!(d.clause, "UD-SEC-003");
+    }
+}
+
+#[test]
 fn secret_allows_env_var_usage() {
     // Reading from env is the correct pattern — must pass.
     let d = check_hardcoded_secret("src/api.ts", "const key = process.env.STRIPE_SECRET_KEY;");

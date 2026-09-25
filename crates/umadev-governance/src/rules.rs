@@ -25,6 +25,7 @@ mod var_declarations;
 pub use var_declarations::check_var_declarations;
 mod sensitive_path;
 pub use sensitive_path::check_sensitive_path;
+mod secret_values;
 
 /// Outcome of a governance rule.
 ///
@@ -1991,36 +1992,27 @@ pub(crate) fn check_hardcoded_secret_ungated(file_path: &str, content: &str) -> 
         );
     }
 
-    // 2. Contiguous assignment-style prefixes (`api_key=value`, env files).
+    // 2. Contiguous assignment-style prefixes (`api_key=value`, env files). Only an
+    //    opaque credential token counts: code reading the secret from settings /
+    //    env, a URL-template placeholder, or a type annotation does not.
     for prefix in SECRET_PREFIXES {
-        // Look for `prefix=...` or `prefix: ...` followed by a value that
-        // looks like a real key (length > 20, not a placeholder).
-        if let Some(idx) = lower.find(prefix) {
-            let after = &heuristic_content[idx + prefix.len()..];
-            let value: String = after
-                .trim_start_matches(['=', ':', ' ', '"', '\''])
-                .chars()
-                .take_while(|c| !matches!(c, '"' | '\'' | '\n' | '\r'))
-                .collect();
-            // Skip obvious placeholders / examples.
-            if value.chars().count() > 20 && !is_placeholder_value(&value) {
-                return Decision::block(
-                    "UD-SEC-003",
-                    format!(
-                        "UmaDev: hardcoded secret detected (UD-SEC-003). \
-                         `{file_path}` embeds what looks like a real `{}` (value length {}). \
-                         Secrets must come from environment variables, never source code. \
-                         Replace with `process.env.{}` / `std::env::var(...)` and move the \
-                         value to `.env` (gitignored).",
-                        prefix.trim_end_matches(['=', ':']).to_uppercase(),
-                        value.chars().count(),
-                        prefix
-                            .trim_end_matches(['=', ':'])
-                            .replace(' ', "_")
-                            .to_uppercase(),
-                    ),
-                );
-            }
+        if let Some(value) = secret_values::prefix_secret(&lower, heuristic_content, prefix) {
+            return Decision::block(
+                "UD-SEC-003",
+                format!(
+                    "UmaDev: hardcoded secret detected (UD-SEC-003). \
+                     `{file_path}` embeds what looks like a real `{}` (value length {}). \
+                     Secrets must come from environment variables, never source code. \
+                     Replace with `process.env.{}` / `std::env::var(...)` and move the \
+                     value to `.env` (gitignored).",
+                    prefix.trim_end_matches(['=', ':']).to_uppercase(),
+                    value.len(),
+                    prefix
+                        .trim_end_matches(['=', ':'])
+                        .replace(' ', "_")
+                        .to_uppercase(),
+                ),
+            );
         }
     }
     // 3. Bare key-shape prefixes carry no `=`/`:` separator, so a raw substring
