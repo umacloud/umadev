@@ -982,6 +982,36 @@ fn typed_host_questions_return_protocol_values_and_correlated_ids() {
 }
 
 #[test]
+fn secret_host_answers_keep_surrounding_whitespace() {
+    let umadev_runtime::HostRequest::UserInput { questions, .. } = secret_host_request() else {
+        unreachable!();
+    };
+    let response = parse_user_input_response(&questions, " p@ss word \n").unwrap();
+    let umadev_runtime::HostResponse::UserInput { answers } = response else {
+        panic!("expected a structured user-input response");
+    };
+    assert_eq!(answers[0].values, [" p@ss word "]);
+
+    let questions = vec![
+        umadev_runtime::HostQuestion {
+            id: "name".to_string(),
+            header: None,
+            prompt: "Name".to_string(),
+            kind: umadev_runtime::HostQuestionKind::Text,
+            required: true,
+            options: Vec::new(),
+        },
+        questions[0].clone(),
+    ];
+    let response = parse_user_input_response(&questions, "  alice  \r\n  s3cret \r\n").unwrap();
+    let umadev_runtime::HostResponse::UserInput { answers } = response else {
+        panic!("expected a structured user-input response");
+    };
+    assert_eq!(answers[0].values, ["alice"]);
+    assert_eq!(answers[1].values, ["  s3cret "]);
+}
+
+#[test]
 fn kimi_plan_review_picker_returns_exact_option_and_headless_paths_cancel() {
     let request = umadev_runtime::HostRequest::UserInput {
         questions: vec![umadev_runtime::HostQuestion {

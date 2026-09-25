@@ -373,7 +373,14 @@ pub(super) fn parse_host_question_answer(
     question: &umadev_runtime::HostQuestion,
     raw: &str,
 ) -> std::result::Result<umadev_runtime::HostAnswer, String> {
-    let raw = raw.trim();
+    let raw = if matches!(question.kind, umadev_runtime::HostQuestionKind::Secret) {
+        // Whitespace can be part of a password or token; only the line
+        // terminator is not.
+        raw.strip_suffix('\n')
+            .map_or(raw, |line| line.strip_suffix('\r').unwrap_or(line))
+    } else {
+        raw.trim()
+    };
     if question.required && raw.is_empty() {
         return Err(format!("`{}` requires an answer", question.id));
     }
@@ -475,7 +482,8 @@ pub(super) fn parse_user_input_response(
             })
             .collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        let lines = raw.lines().map(str::trim).collect::<Vec<_>>();
+        // Each answer is trimmed per its question kind (secrets are not).
+        let lines = raw.lines().collect::<Vec<_>>();
         if lines.len() != questions.len() {
             return Err(format!(
                 "expected {} answer lines or a JSON object keyed by question id",
