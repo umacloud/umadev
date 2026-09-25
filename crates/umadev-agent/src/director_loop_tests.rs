@@ -8712,6 +8712,86 @@ async fn a_budget_paused_plan_resumes_only_the_remaining_steps() {
     );
 }
 
+#[tokio::test]
+async fn a_budget_pause_after_a_blocked_step_resumes_to_a_clean_delivery() {
+    // A step settles Blocked (its ledger attempt goes Failed) and the run then parks at
+    // the budget. `/continue` reopens the SAME ledger, repairs the step as attempt 2 and
+    // every step passes — including a dependent queued against the failed attempt. The
+    // failed first attempt is history: the resumed run must deliver, not fail its
+    // clean-delivery invariant on an "incomplete" ledger.
+    use crate::plan_state::{AcceptanceSpec, EvidenceContract, Plan, PlanStep, StepKind};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    let (events, _rec) = sink();
+    let mk = |id: &str, deps: &[&str], evidence: Vec<EvidenceContract>| PlanStep {
+        files: test_step_files(id),
+        id: id.to_string(),
+        title: format!("STEP_{id} the work"),
+        seat: crate::critics::Seat::FrontendEngineer,
+        kind: StepKind::Build,
+        depends_on: deps.iter().map(|d| (*d).to_string()).collect(),
+        acceptance: AcceptanceSpec::SourcePresent,
+        evidence,
+        status: StepStatus::Pending,
+    };
+    let alpha_file = EvidenceContract::FileExists {
+        path: "src/alpha.rs".to_string(),
+    };
+    let plan = Plan {
+        steps: vec![
+            mk("alpha", &[], vec![alpha_file]),
+            mk("beta", &["alpha"], Vec::new()),
+        ],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    let o = opts(tmp.path());
+    let route = build_route();
+
+    // FIRST run: alpha's declared file never appears, so it settles Blocked; the spent
+    // budget then parks the run before beta.
+    let mut sess = FakeSession::new(
+        vec![text_turn("STEP_alpha attempted")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let already_past = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    let paused = drive_director_loop_with_idle(
+        &mut sess,
+        &o,
+        &events,
+        "GO".into(),
+        Some(plan),
+        Some(&route),
+        IdleBudget::new(Duration::from_millis(200), Duration::from_millis(200)),
+        already_past,
+    )
+    .await;
+    assert!(
+        matches!(
+            paused,
+            DirectorLoopOutcome::PausedAtBudget { done: 0, total: 2 }
+        ),
+        "alpha blocked, then the budget parked the run: {paused:?}"
+    );
+
+    // `/continue`: this session's turns write alpha's file, so attempt 2 passes.
+    let mut resume_sess = FakeSession::new(
+        vec![text_turn("STEP_alpha fixed"), text_turn("STEP_beta done")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    )
+    .with_main_send_write(tmp.path().join("src/alpha.rs"), "pub fn alpha() {}\n");
+    let outcome = drive_director_loop_resume(&mut resume_sess, &o, &events, &route).await;
+    assert!(
+        matches!(outcome, Some(DirectorLoopOutcome::Done { .. })),
+        "a repaired step's failed first attempt must not fail a clean delivery: {outcome:?}"
+    );
+}
+
 #[test]
 fn plan_progress_recitation_is_bounded_and_honest() {
     // PLAN RECITATION lock test: the compact per-step "where we are in the plan"

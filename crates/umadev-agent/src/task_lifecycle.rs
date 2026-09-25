@@ -708,12 +708,19 @@ impl AgentTaskLedger {
     /// Compute whether the run can truthfully publish success.
     #[must_use]
     pub fn readiness(&self) -> RunReadiness {
+        self.readiness_of(|_| true)
+    }
+
+    /// [`Self::readiness`] over only the records `include` selects, for an owner that
+    /// knows which terminal records are superseded history (an earlier attempt of a
+    /// retried plan step) rather than live obligations of the run.
+    pub(crate) fn readiness_of(&self, include: impl Fn(&AgentTaskRecord) -> bool) -> RunReadiness {
         if self.tasks.is_empty() {
             return RunReadiness::NotTracked;
         }
         let mut blocked = Vec::new();
         let mut in_progress = false;
-        for task in self.tasks.values() {
+        for task in self.tasks.values().filter(|task| include(task)) {
             match task.state {
                 AgentTaskState::Succeeded | AgentTaskState::Superseded => {}
                 AgentTaskState::Failed
