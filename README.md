@@ -761,7 +761,8 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `OPENAI_EMBED_KEY` | Dedicated key for remote embeddings; inert without the explicit opt-in below | — |
 | `UMADEV_ALLOW_CLOUD_EMBED` | Set to `1` to allow remote embedding when `OPENAI_EMBED_KEY` is also set | off |
 | `OPENAI_EMBED_BASE` | Remote embedding service base; consulted only after the two-part cloud opt-in | `https://api.openai.com` |
-| `UMADEV_EMBED_MODEL_DIR` | Directory containing a compatible local `config.json`, `tokenizer.json`, and `model.safetensors` | `~/.umadev/embed-model` |
+| `UMADEV_EMBED_MODEL_DIR` | Directory containing a compatible local `config.json`, `tokenizer.json`, and `model.safetensors`; when it names a directory, the npm launcher downloads nothing | `~/.umadev/embed-model` |
+| `UMADEV_NO_MODEL_DOWNLOAD` | Set to `1` to stop the npm launcher from downloading the embedding model (retrieval uses BM25). Without it, a failed download, or one skipped with Ctrl+C, is retried after 24 hours rather than on every launch | off |
 | `XDG_CONFIG_HOME` | Base directory for `config.toml` | `$HOME` |
 
 ---

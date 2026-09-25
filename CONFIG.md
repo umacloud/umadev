@@ -75,7 +75,7 @@ binary).
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `UMADEV_EMBED_MODEL_DIR` | Directory holding the local embedding model (`config.json`, `tokenizer.json`, `model.safetensors`). The npm launcher sets this automatically; a `cargo install` user can point it at a hand-placed model to enable offline hybrid search. Absent → keyword-only (BM25). | npm-managed / `~/.umadev/embed-model` |
+| `UMADEV_EMBED_MODEL_DIR` | Directory holding the local embedding model (`config.json`, `tokenizer.json`, `model.safetensors`). The npm launcher sets this automatically; a `cargo install` user can point it at a hand-placed model to enable offline hybrid search. When you set it to a directory, the npm launcher uses that directory and never downloads the model. Absent → keyword-only (BM25). | npm-managed / `~/.umadev/embed-model` |
 | `UMADEV_KNOWLEDGE_DIR` | Directory of the bundled curated knowledge corpus. The npm launcher sets this; the project's own `knowledge/` still wins. | npm-managed |
 | `UMADEV_ALLOW_CLOUD_EMBED` | Opt in to sending text to a cloud embedding API (requires an OpenAI-compatible key). Default is **local-only**; leaving it is a loud, intentional act. | off (local-only) |
 
@@ -125,6 +125,7 @@ npm/pnpm/yarn/bun installs.
 | --- | --- | --- |
 | `UMADEV_REGISTRY_URL` | Registry queried by `umadev update`'s "already latest?" check. Also honors npm's own `npm_config_registry`. | `https://registry.npmjs.org` |
 | `UMADEV_MODEL_BASE_URL` | HTTPS base URL for the one-time embedding-model download (an admin-controlled mirror). Redirects are then confined to that mirror's own origin. | the versioned official GitHub Release |
+| `UMADEV_NO_MODEL_DOWNLOAD` | Set to `1` (or `true`/`yes`/`on`) to never download the embedding model; retrieval then uses BM25. Without it, a download that fails, times out or is skipped with Ctrl+C is not retried for 24 hours (the marker is `~/.umadev/embed-model/.umadev-model-download-failed`; delete it to retry sooner), and upgrading UmaDev retries at once. | off |
 
 ---
 
