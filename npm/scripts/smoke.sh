@@ -134,7 +134,7 @@ make_install() {
 }
 
 # A stand-in package manager on PATH. It answers `--version` (so the shim sees it
-# as runnable), answers `npm view umadev version` with $3 (so the already-latest
+# as runnable), answers `npm view @umatech/umadev version` with $3 (so the already-latest
 # check never touches the network), and otherwise just records what it was told to
 # run — a real global install is never performed.
 make_stub() {
