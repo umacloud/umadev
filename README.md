@@ -343,7 +343,7 @@ Tool calls, verification runs, and critic verdicts are written to `.umadev/audit
 
 **4. Governance runs on every file write**
 
-113 content checks cover emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook into Claude Code, as a pre-commit hook in git, and as part of the quality gate. At write time only the irreversible floor (leaked secrets / credentials, sensitive-path writes, destructive shell) is hard-blocked; craft and quality findings (emoji, color, AI-slop) are flagged and repaired by the post-write QC loop rather than pinning the base's hands mid-file. All rules are configurable in `.umadev/rules.toml` and are fail-open — a bug in the governor never blocks your work.
+113 content checks cover emoji-as-icons, hardcoded colors, leaked secrets, AI-slop UI patterns, and unsafe code constructs. They run as a pre-write hook into Claude Code, as a pre-commit hook in git, and as part of the quality gate. At write time only the irreversible floor (leaked secrets / credentials, sensitive-path writes, destructive shell) is hard-blocked; craft and quality findings (emoji, color, AI-slop) are flagged and repaired by the post-write QC loop rather than pinning the base's hands mid-file. Every rule outside that floor is configurable in `.umadev/rules.toml`; the floor ignores that file, so a floor block is resolved by changing the content (for example, reading a secret from an environment variable) or by making the edit yourself. All checks are fail-open — a bug in the governor never blocks your work.
 
 ---
 
@@ -460,7 +460,7 @@ skip_checks = []
 
 umadev started as a governance tool and that remains a core capability.
 
-The spec layer has 34 normative clauses. The implementation includes 113 governance content checks across UI quality, security, frontend architecture, backend engineering, and language-specific hazards. Every check is configurable in `.umadev/rules.toml` — each rule can be disabled, path-excluded, or tuned. They exist to backstop the base's output, not to make the final engineering call for you.
+The spec layer has 34 normative clauses. The implementation includes 113 governance content checks across UI quality, security, frontend architecture, backend engineering, and language-specific hazards. Every check outside the irreversible write floor (leaked secrets and credentials, sensitive-path writes, destructive shell commands) is configurable in `.umadev/rules.toml` — each rule can be disabled, path-excluded, or tuned. They exist to backstop the base's output, not to make the final engineering call for you.
 
 Governance entry points:
 

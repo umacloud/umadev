@@ -116,13 +116,14 @@ fn is_sensitive_scan_path(rel: &str) -> bool {
     {
         return true;
     }
-    // Any dotenv variant: `.env`, `.env.local`, `.env.staging`, `.env.<x>`.
+    // Any dotenv variant: `.env`, `.env.local`, `.env.staging`, `.env.<x>`, and
+    // `.npmrc`, which the floor judges by content (a registry credential).
     let last = lower.rsplit('/').next().unwrap_or("");
-    if last == ".env" || last.starts_with(".env.") {
+    if last == ".env" || last.starts_with(".env.") || last == ".npmrc" {
         return true;
     }
     // Reuse the floor's EXACT path guard for the rest (`.ssh/` `.aws/` `.git/`
-    // segments, `id_rsa` / `credentials` / `.npmrc` / … suffixes) so CI stays in
+    // segments, `id_rsa` / `credentials` / `.netrc` / … suffixes) so CI stays in
     // lockstep with the floor rather than drifting from a hand-copied list.
     check_sensitive_path(rel, "").block
 }
@@ -2630,6 +2631,19 @@ mod tests {
         // placeholder file passes while a real `.env` is blocked on the path.
         assert!(is_sensitive_scan_path(".env.example"));
         assert!(!check_sensitive_path(".env.example", "").block);
+        // `.npmrc` is judged by content, so it stays in scope even though its
+        // path alone no longer blocks: a mirror passes, a literal token blocks.
+        assert!(is_sensitive_scan_path("web/.npmrc"));
+        assert!(
+            !pre_write_floor_decision(".npmrc", "registry=https://registry.npmmirror.com\n").block
+        );
+        assert!(
+            pre_write_floor_decision(
+                ".npmrc",
+                "//npm.corp.example/:_authToken=0f1e2d3c4b5a69788796a5b4c3d2e1f0\n"
+            )
+            .block
+        );
     }
 
     #[test]
