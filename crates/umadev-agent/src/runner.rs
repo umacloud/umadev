@@ -26,7 +26,8 @@ use crate::experts::{
 use crate::gates::Gate;
 use crate::phases::{
     run_backend, run_delivery, run_delivery_with_quality, run_docs, run_frontend,
-    run_frontend_with_kind, run_quality, run_research, run_spec, DocsContent, PhaseOutput,
+    run_frontend_with_kind, run_quality, run_research, run_spec, DeliveryVerdict, DocsContent,
+    PhaseOutput,
 };
 use crate::state::{write_workflow_state, WorkflowState};
 
@@ -5792,7 +5793,7 @@ impl<R: Runtime> AgentRunner<R> {
                 }
                 completed.push(self.record_phase(
                     Phase::Delivery,
-                    run_delivery_with_quality(&self.options, Some(&qg_body)),
+                    run_delivery_with_quality(&self.options, DeliveryVerdict::Gate(&qg_body)),
                 )?);
                 // Base-driven self-evolution upkeep: reconcile the lesson corpus and
                 // write reusable skill cards (no-op offline; fail-open).
@@ -6316,6 +6317,10 @@ impl<R: Runtime> AgentRunner<R> {
                     );
                     degraded = self.try_generate(phase, del_p).await.is_none();
                 }
+                // A redo runs this one phase body and no quality gate, so there is
+                // no verdict this process produced: the redo repackages the
+                // delivery but graduates nothing (the report in `output/` is
+                // model-writable and only shown). A full run delivers with one.
                 Ok((run_delivery(&self.options)?, degraded))
             }
             // The two gate phases have no body to re-run — they only pause the
