@@ -31,8 +31,10 @@
 //!    with a typed diagnosis instead of hanging. Exactly one spawn — never a
 //!    re-run loop. `curl` is used deliberately: near-universal, no new dep.
 //! 5. **Probe routes**: read `.umadev/contracts/openapi.json` (written by the
-//!    contract/adopt stage) and `curl` each documented path, recording
-//!    `{path, status, ms}`. With no contract, at least the root path is probed.
+//!    contract/adopt stage) — or, without one, the architecture doc's API table —
+//!    and `curl` each documented path, recording `{method, path, status, ms}`. With
+//!    no contract, at least the root path is probed. Routes a plan step declared in
+//!    `route-responds` evidence are probed too, each with its own method.
 //! 6. **Optional e2e**: if a Playwright/Cypress config or a `test:e2e` script is
 //!    present, run it once and capture the outcome.
 //! 7. **Tear down**: the managed process tree is killed and reaped within a
@@ -134,6 +136,24 @@ const OUTPUT_CAP: usize = 256 * 1024;
 const MAX_OPENAPI_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PACKAGE_JSON_BYTES: usize = 1024 * 1024;
 
+/// Methods a declared route may be probed with. DELETE is never sent: a probe must
+/// not delete the developer's data.
+const PROBE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"];
+
+/// Methods that change nothing on the server — the only ones sent to a server
+/// UmaDev did not start.
+const SAFE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
+
+/// Cap on the documented `GET` routes taken from the architecture doc's API table.
+const MAX_ARCHITECTURE_PROBES: usize = 20;
+
+/// Cap on the lines naming a failed proxy request kept from the dev server's output.
+const MAX_PROXY_ERROR_LINES: usize = 32;
+
+/// How long to let the dev server's output reader catch up before reading which
+/// probed routes it failed to proxy (it logs the error as it answers).
+const PROXY_LOG_GRACE_MS: u64 = 300;
+
 /// Whether the runtime check ran end-to-end or degraded (and why). This is the
 /// top-level verdict the proof-pack and the CLI surface.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -165,11 +185,16 @@ impl RuntimeStatus {
     }
 }
 
-/// One route probe result: the path we hit, the HTTP status we got, and how
-/// long it took. `status` is `0` when `curl` could not get any response at all
-/// (connection refused / timeout) — distinct from a real `5xx`.
+/// One route probe result: the method and path we sent, the HTTP status we got,
+/// and how long it took. `status` is `0` when `curl` could not get any response at
+/// all (connection refused / timeout) — distinct from a real `5xx`.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RouteProbe {
+    /// HTTP method sent. Contract and root probes are `GET`; a route a plan step
+    /// declared is probed with its own method, without a request body. A proof
+    /// written before the method was recorded probed only with `GET`.
+    #[serde(default = "default_probe_method")]
+    pub method: String,
     /// Path probed, relative to the base URL (e.g. `/` or `/api/users`).
     pub path: String,
     /// HTTP status code; `0` means "no response received".
@@ -180,6 +205,14 @@ pub struct RouteProbe {
     /// proves the route is wired; `4xx` on a contract route (e.g. missing auth)
     /// still proves the server is *up* but is flagged for the reader.
     pub ok: bool,
+    /// The dev server logged that it could not PROXY this request to the backend
+    /// behind it: the failure belongs to a process this proof did not start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub proxy_error: bool,
+}
+
+fn default_probe_method() -> String {
+    "GET".to_string()
 }
 
 /// The full runtime-proof record. Serialized to
@@ -289,14 +322,32 @@ impl RuntimeProof {
 /// (the tree as it stands at the moment the verdict is reached), so a proof that
 /// somehow raced a concurrent write reads as stale rather than falsely fresh.
 pub async fn run_runtime_proof(workspace: &Path) -> RuntimeProof {
-    let mut proof = run_runtime_proof_unstamped(workspace).await;
+    run_runtime_proof_probing(workspace, &[]).await
+}
+
+/// [`run_runtime_proof`], also probing `declared` — the `(method, path)` routes a
+/// plan step declared in `route-responds` evidence — each with its own method, so
+/// a step that declares `POST /api/login responds 200` is checked with a `POST` to
+/// that route rather than against whichever routes a contract happens to list.
+///
+/// Declared requests carry no body. DELETE is never sent, and a server UmaDev did
+/// not start only receives `GET` / `HEAD` / `OPTIONS`; such routes are simply not
+/// probed, which their evidence check reports as "not checked".
+pub async fn run_runtime_proof_probing(
+    workspace: &Path,
+    declared: &[(String, String)],
+) -> RuntimeProof {
+    let mut proof = run_runtime_proof_unstamped(workspace, declared).await;
     proof.source_fingerprint = crate::freshness::workspace_fingerprint(workspace);
     proof
 }
 
 /// The runtime-proof flow itself (see [`run_runtime_proof`], which stamps its result
 /// with the source fingerprint).
-async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
+async fn run_runtime_proof_unstamped(
+    workspace: &Path,
+    declared: &[(String, String)],
+) -> RuntimeProof {
     // 0. `curl` is the readiness/probe transport. No curl → cannot verify.
     if !has_curl() {
         return RuntimeProof::not_verified("curl not found on PATH");
@@ -326,7 +377,7 @@ async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
     let already_up = curl_status(&base_url, 3).await.is_some();
     if matches!(decide_boot_plan(already_up), BootPlan::Reuse) {
         // reused=true: this is a FOREIGN holder we did not spawn — verify strictly.
-        return finish_proof(workspace, &dev, base_url, Some(0), true).await;
+        return finish_proof(workspace, &dev, base_url, Some(0), true, declared, None).await;
     }
 
     // 4. Spawn the dev server, capturing its output so we can read readiness and
@@ -383,12 +434,24 @@ async fn run_runtime_proof_unstamped(workspace: &Path) -> RuntimeProof {
         BootOutcome::Ready {
             base_url: effective,
             ready_ms,
-        } => finish_proof(workspace, &dev, effective, Some(ready_ms), false).await,
+        } => {
+            let tail = Some(&tail);
+            finish_proof(
+                workspace,
+                &dev,
+                effective,
+                Some(ready_ms),
+                false,
+                declared,
+                tail,
+            )
+            .await
+        }
         BootOutcome::AlreadyRunning { base_url: existing } => {
             // The server reported another instance is already up at a known URL;
             // our spawn is a redundant duplicate. Probe the existing one — but it is
             // a PRE-EXISTING server we did not boot, so verify it strictly (reused=true).
-            finish_proof(workspace, &dev, existing, Some(0), true).await
+            finish_proof(workspace, &dev, existing, Some(0), true, declared, None).await
         }
         BootOutcome::Timeout | BootOutcome::Exited => {
             let reason = if outcome == BootOutcome::Exited {
@@ -470,13 +533,16 @@ fn with_last_output(reason: String, tail: &[String]) -> String {
 }
 
 /// Run the route-probe + optional e2e steps against a known-good base URL and
-/// assemble the verified proof. Shared by the fresh-boot and reuse paths.
+/// assemble the verified proof. Shared by the fresh-boot and reuse paths. `tail`
+/// is the output of a dev server this run spawned (`None` for a reused one).
 async fn finish_proof(
     workspace: &Path,
     dev: &DevServer,
     base_url: String,
     ready_ms: Option<u64>,
     reused: bool,
+    declared: &[(String, String)],
+    tail: Option<&BootTail>,
 ) -> RuntimeProof {
     let mut proof = RuntimeProof {
         timestamp: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -491,16 +557,17 @@ async fn finish_proof(
         source_fingerprint: None,
     };
 
-    // Probe the documented routes (from the contract), else just the root.
-    let paths = contract_route_paths(workspace);
-    let had_contract = !paths.is_empty();
-    let probe_paths = if paths.is_empty() {
-        vec!["/".to_string()]
-    } else {
-        paths
-    };
-    for path in &probe_paths {
-        proof.routes.push(probe_route(&base_url, path).await);
+    // Probe the documented routes (from the contract), else just the root, then
+    // the routes this step declared, each with its own method.
+    let (contract, from_architecture) = contract_routes(workspace);
+    let had_contract = !contract.is_empty();
+    for (method, path) in probe_plan(&contract, from_architecture, reused, declared) {
+        proof
+            .routes
+            .push(probe_route(&base_url, &method, &path).await);
+    }
+    if let Some(tail) = tail {
+        mark_proxy_errors(&mut proof.routes, tail).await;
     }
 
     // Optional e2e suite (run before the verdict so a failing suite can downgrade it).
@@ -539,6 +606,9 @@ async fn finish_proof(
 /// 3. **Failed e2e (#5)** — the route probes pass but the e2e suite that RAN came
 ///    back failing; the headline verdict must not claim "verified". A `None` e2e
 ///    (no suite detected) keeps the route-level verdict.
+///
+/// Only `GET` / `HEAD` probes count: a declared `POST` sent without its body
+/// answering `400` or `500` says nothing about whether the app is up.
 fn downgrade_reason(
     routes: &[RouteProbe],
     reused: bool,
@@ -546,6 +616,10 @@ fn downgrade_reason(
     base_url: &str,
     e2e: Option<&E2eResult>,
 ) -> Option<String> {
+    let routes: Vec<&RouteProbe> = routes
+        .iter()
+        .filter(|r| matches!(r.method.as_str(), "GET" | "HEAD"))
+        .collect();
     if reused
         && had_contract
         && !routes.is_empty()
@@ -1099,9 +1173,17 @@ fn replace_port(base_url: &str, port: u16) -> String {
 }
 
 /// The last lines a dev server printed, bounded to [`BOOT_TAIL_LINES`] lines of at
-/// most [`BOOT_TAIL_LINE_CHARS`] characters, shared by its stdout and stderr readers.
+/// most [`BOOT_TAIL_LINE_CHARS`] characters, shared by its stdout and stderr
+/// readers — plus, separately bounded, the lines reporting a request it failed to
+/// proxy.
 #[derive(Clone, Default)]
-struct BootTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+struct BootTail(std::sync::Arc<std::sync::Mutex<TailLines>>);
+
+#[derive(Default)]
+struct TailLines {
+    recent: std::collections::VecDeque<String>,
+    proxy_errors: std::collections::VecDeque<String>,
+}
 
 impl BootTail {
     fn push(&self, line: &str) {
@@ -1111,18 +1193,33 @@ impl BootTail {
             return;
         }
         let kept: String = line.chars().take(BOOT_TAIL_LINE_CHARS).collect();
-        if let Ok(mut lines) = self.0.lock() {
-            if lines.len() == BOOT_TAIL_LINES {
-                lines.pop_front();
+        let lower = kept.to_ascii_lowercase();
+        let proxy_error = lower.contains("proxy") && lower.contains("error");
+        if let Ok(mut tail) = self.0.lock() {
+            if proxy_error {
+                if tail.proxy_errors.len() == MAX_PROXY_ERROR_LINES {
+                    tail.proxy_errors.pop_front();
+                }
+                tail.proxy_errors.push_back(kept.clone());
             }
-            lines.push_back(kept);
+            if tail.recent.len() == BOOT_TAIL_LINES {
+                tail.recent.pop_front();
+            }
+            tail.recent.push_back(kept);
         }
     }
 
     fn lines(&self) -> Vec<String> {
         self.0
             .lock()
-            .map(|lines| lines.iter().cloned().collect())
+            .map(|tail| tail.recent.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn proxy_error_lines(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .map(|tail| tail.proxy_errors.iter().cloned().collect())
             .unwrap_or_default()
     }
 }
@@ -1501,17 +1598,100 @@ async fn kill_preview_tree(_pid: u32) -> bool {
     false
 }
 
-/// Probe one route: `curl` `base + path`, recording status + duration.
-async fn probe_route(base_url: &str, path: &str) -> RouteProbe {
+/// Probe one route: `curl` `method base + path`, recording status + duration.
+async fn probe_route(base_url: &str, method: &str, path: &str) -> RouteProbe {
     let url = join_url(base_url, path);
     let started = Instant::now();
-    let status = curl_status(&url, PROBE_TIMEOUT_SECS).await.unwrap_or(0);
+    let status = curl_request_status(&url, method, PROBE_TIMEOUT_SECS)
+        .await
+        .unwrap_or(0);
     let ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     RouteProbe {
+        method: method.to_string(),
         path: path.to_string(),
         status,
         ms,
         ok: status != 0 && status < 400,
+        proxy_error: false,
+    }
+}
+
+/// The requests the proof sends, in order: the contract's documented routes (with
+/// `GET`), or `/` when there is no contract — and `/` as well when the routes come
+/// from the architecture doc, whose API routes a frontend dev server may only
+/// proxy — then each route this step declared, with its own method. Duplicates are
+/// sent once.
+fn probe_plan(
+    contract: &[String],
+    from_architecture: bool,
+    reused: bool,
+    declared: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut plan: Vec<(String, String)> = Vec::new();
+    let mut add = |method: String, path: String| {
+        if !plan.iter().any(|(m, p)| *m == method && *p == path) {
+            plan.push((method, path));
+        }
+    };
+    if contract.is_empty() || (from_architecture && !reused) {
+        add("GET".to_string(), "/".to_string());
+    }
+    for path in contract {
+        add("GET".to_string(), path.clone());
+    }
+    for (method, path) in declared {
+        let (Some(method), Some(path)) = (probe_method(method, reused), probe_path(path)) else {
+            continue;
+        };
+        add(method, path);
+    }
+    plan
+}
+
+/// The method a declared route is probed with (`GET` when none was declared), or
+/// `None` when it is never sent: DELETE, anything unrecognised, and any method
+/// that could change data on a server UmaDev did not start.
+fn probe_method(method: &str, reused: bool) -> Option<String> {
+    let method = method.trim().to_ascii_uppercase();
+    let method = if method.is_empty() {
+        "GET".to_string()
+    } else {
+        method
+    };
+    let allowed = if reused { SAFE_METHODS } else { PROBE_METHODS };
+    allowed.contains(&method.as_str()).then_some(method)
+}
+
+/// A declared route path as the proof probes it: rooted at `/`, with each
+/// `{id}` / `:id` / `<id>` parameter replaced by `1` (see [`concretize_path`]).
+/// `None` for a path that is not a plain request path — a full URL, whitespace,
+/// control characters, or more than 512 bytes.
+pub(crate) fn probe_path(path: &str) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty()
+        || path.len() > 512
+        || path.contains("://")
+        || path.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(concretize_path(path))
+}
+
+/// Mark the failed probes the dev server says it could not PROXY to the backend
+/// behind it (`http proxy error: /api/x`, `[HPM] Error occurred while proxying …`,
+/// `Proxy error: Could not proxy request /api/x`): those routes are served by a
+/// process this proof did not start, so their failure says nothing about the app.
+async fn mark_proxy_errors(routes: &mut [RouteProbe], tail: &BootTail) {
+    let failed = |r: &RouteProbe| r.path.len() > 1 && (r.status == 0 || r.status >= 500);
+    if !routes.iter().any(failed) {
+        return;
+    }
+    // The server logs the error as it answers; let its output reader catch up.
+    tokio::time::sleep(Duration::from_millis(PROXY_LOG_GRACE_MS)).await;
+    let lines = tail.proxy_error_lines();
+    for route in routes.iter_mut().filter(|r| failed(r)) {
+        route.proxy_error = lines.iter().any(|line| line.contains(route.path.as_str()));
     }
 }
 
@@ -1519,6 +1699,12 @@ async fn probe_route(base_url: &str, path: &str) -> RouteProbe {
 /// parse the printed status code. Returns `None` when curl can't connect (exit
 /// non-zero, or a `000` status — curl's "no response" sentinel).
 async fn curl_status(url: &str, max_time_secs: u64) -> Option<u16> {
+    curl_request_status(url, "GET", max_time_secs).await
+}
+
+/// [`curl_status`] for a request with `method`, sent without a body (a `HEAD`
+/// through `--head`, which does not wait for a body that never comes).
+async fn curl_request_status(url: &str, method: &str, max_time_secs: u64) -> Option<u16> {
     let null_sink = if cfg!(windows) { "NUL" } else { "/dev/null" };
     let mut command = Command::new("curl");
     command
@@ -1528,8 +1714,20 @@ async fn curl_status(url: &str, max_time_secs: u64) -> Option<u16> {
         .arg("-w")
         .arg("%{http_code}")
         .arg("--max-time")
-        .arg(max_time_secs.to_string())
-        .arg(url);
+        .arg(max_time_secs.to_string());
+    match method {
+        "GET" => {}
+        "HEAD" => {
+            command.arg("--head");
+        }
+        _ => {
+            command.arg("-X").arg(method);
+            if matches!(method, "POST" | "PUT" | "PATCH") {
+                command.arg("-H").arg("Content-Length: 0");
+            }
+        }
+    }
+    command.arg(url);
     let out = umadev_process::run_bounded_command(
         command,
         umadev_process::BoundedCommandOptions {
@@ -1572,6 +1770,71 @@ fn join_url(base: &str, path: &str) -> String {
     }
 }
 
+/// The documented routes to probe with `GET`, and whether they came from the
+/// architecture doc: the `openapi.json` paths when there is one (only
+/// `umadev adopt` writes it), else the architecture API table's `GET` routes.
+fn contract_routes(workspace: &Path) -> (Vec<String>, bool) {
+    let openapi = contract_route_paths(workspace);
+    if openapi.is_empty() {
+        (architecture_route_paths(workspace), true)
+    } else {
+        (openapi, false)
+    }
+}
+
+/// The `GET` routes (at most [`MAX_ARCHITECTURE_PROBES`]) of the API table in the
+/// most recently written `output/*-architecture.md` — the current build's.
+fn architecture_route_paths(workspace: &Path) -> Vec<String> {
+    let Some(doc) = latest_architecture_doc(workspace) else {
+        return Vec::new();
+    };
+    let Ok(body) = crate::bounded_fs::read_utf8_beneath(workspace, &doc, MAX_OPENAPI_INPUT_BYTES)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for endpoint in umadev_contract::parse_architecture(&body, "").endpoints {
+        if endpoint.method != umadev_contract::HttpVerb::Get {
+            continue;
+        }
+        let path = concretize_path(&endpoint.path);
+        if !out.contains(&path) {
+            out.push(path);
+        }
+        if out.len() == MAX_ARCHITECTURE_PROBES {
+            break;
+        }
+    }
+    out
+}
+
+/// The most recently modified regular `output/*-architecture.md`, if any.
+fn latest_architecture_doc(workspace: &Path) -> Option<PathBuf> {
+    let output = workspace.join("output");
+    if !crate::bounded_fs::is_real_directory_beneath(workspace, &output) {
+        return None;
+    }
+    let mut latest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(&output).ok()?.flatten().take(4096) {
+        let path = entry.path();
+        let is_doc = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("-architecture.md"));
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !is_doc || !metadata.is_file() {
+            continue;
+        }
+        let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if latest.as_ref().is_none_or(|(newest, _)| modified > *newest) {
+            latest = Some((modified, path));
+        }
+    }
+    latest.map(|(_, path)| path)
+}
+
 /// Read the route paths from the adopt/contract-stage `openapi.json` in
 /// `.umadev/contracts/`. Returns a de-duplicated, ordered list of paths. An
 /// absent / malformed contract yields an empty list (caller falls back to `/`).
@@ -1610,15 +1873,15 @@ fn parse_openapi_paths(body: &str) -> Vec<String> {
 }
 
 /// Replace templated path params with a concrete placeholder so a probe lands
-/// on a real handler instead of a literal `{id}` / `:id` (which 404s).
-fn concretize_path(path: &str) -> String {
+/// on a real handler instead of a literal `{id}` / `:id` / `<id>` (which 404s).
+pub(crate) fn concretize_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for seg in path.split('/') {
         if seg.is_empty() {
             continue;
         }
         out.push('/');
-        if (seg.starts_with('{') && seg.ends_with('}')) || seg.starts_with(':') {
+        if is_path_parameter(seg) {
             out.push('1');
         } else {
             out.push_str(seg);
@@ -1628,6 +1891,18 @@ fn concretize_path(path: &str) -> String {
         out.push('/');
     }
     out
+}
+
+/// Whether a path segment is a parameter: `{id}`, `:id` or `<id>` / `<int:id>`.
+fn is_path_parameter(seg: &str) -> bool {
+    (seg.starts_with('{') && seg.ends_with('}'))
+        || seg.starts_with(':')
+        || (seg.starts_with('<') && seg.ends_with('>'))
+}
+
+/// Whether `path` has a parameter segment, which a probe fills in with `1`.
+pub(crate) fn is_templated_path(path: &str) -> bool {
+    path.split('/').any(is_path_parameter)
 }
 
 /// Detect + run an e2e suite once. Returns `None` when no suite is present.
@@ -1935,6 +2210,112 @@ mod tests {
         assert_eq!(concretize_path("/api/users/{id}"), "/api/users/1");
         assert_eq!(concretize_path("/api/users/:id"), "/api/users/1");
         assert_eq!(concretize_path("/api/{org}/repos/:repo"), "/api/1/repos/1");
+        assert_eq!(concretize_path("/users/<int:user_id>"), "/users/1");
+        assert!(is_templated_path("/api/users/:id"));
+        assert!(!is_templated_path("/api/users"));
+    }
+
+    #[test]
+    fn declared_routes_are_probed_with_their_own_method() {
+        let declared = vec![
+            ("POST".to_string(), "/api/login".to_string()),
+            ("get".to_string(), "api/users/:id".to_string()),
+            (String::new(), "/api/health".to_string()),
+            ("DELETE".to_string(), "/api/users/:id".to_string()),
+            ("POST".to_string(), "http://evil.example/x".to_string()),
+            ("TRACE".to_string(), "/api/x".to_string()),
+        ];
+        let plan = probe_plan(&[], false, false, &declared);
+        let plan: Vec<(&str, &str)> = plan.iter().map(|(m, p)| (m.as_str(), p.as_str())).collect();
+        assert_eq!(
+            plan,
+            [
+                ("GET", "/"),
+                ("POST", "/api/login"),
+                ("GET", "/api/users/1"),
+                ("GET", "/api/health"),
+            ],
+            "DELETE, full URLs and unknown methods are never sent"
+        );
+        // A server UmaDev did not start receives nothing that could change its data.
+        let reused = probe_plan(&["/api/items".to_string()], false, true, &declared);
+        assert!(reused.iter().all(|(m, _)| m == "GET"), "{reused:?}");
+        assert!(!reused.iter().any(|(_, p)| p == "/"), "{reused:?}");
+        // Documented routes from the architecture doc keep `/` on a server we booted.
+        let arch = probe_plan(&["/api/items".to_string()], true, false, &[]);
+        assert_eq!(arch[0], ("GET".to_string(), "/".to_string()));
+    }
+
+    #[test]
+    fn architecture_api_table_is_the_contract_without_openapi() {
+        let tmp = TempDir::new().unwrap();
+        let output = tmp.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        fs::write(
+            output.join("shop-architecture.md"),
+            "# Shop\n\n## API\n\n| Method | Path | Description | Request | Response | Auth |\n\
+             |---|---|---|---|---|---|\n\
+             | GET | /api/products | List products | - | Product[] | none |\n\
+             | GET | /api/products/:id | Get a product | - | Product | none |\n\
+             | POST | /api/login | Log in | {email,password} | {token} | none |\n",
+        )
+        .unwrap();
+        let (routes, from_architecture) = contract_routes(tmp.path());
+        assert!(from_architecture);
+        assert_eq!(
+            routes,
+            ["/api/products", "/api/products/1"],
+            "GET routes only"
+        );
+
+        // An adopted openapi.json stays the contract when present.
+        let contracts = tmp.path().join(".umadev/contracts");
+        fs::create_dir_all(&contracts).unwrap();
+        fs::write(
+            contracts.join("openapi.json"),
+            r#"{"paths":{"/api/ping":{"get":{}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            contract_routes(tmp.path()),
+            (vec!["/api/ping".to_string()], false)
+        );
+    }
+
+    #[test]
+    fn only_get_probes_decide_whether_the_app_is_up() {
+        // A declared POST sent without its body answering 500 does not make a booted
+        // app "broken".
+        let mut post = probe("/api/login", 500);
+        post.method = "POST".to_string();
+        let routes = vec![probe("/", 200), post.clone()];
+        assert!(downgrade_reason(&routes, false, false, "u", None).is_none());
+        let only_post = vec![post];
+        assert!(downgrade_reason(&only_post, false, false, "u", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_route_the_dev_server_failed_to_proxy_is_marked() {
+        let tail = BootTail::default();
+        tail.push("12:00:01 [vite] http proxy error: /api/health");
+        tail.push("Error: connect ECONNREFUSED 127.0.0.1:8080");
+        let mut routes = vec![
+            probe("/", 200),
+            probe("/api/health", 500),
+            probe("/api/orders", 500),
+        ];
+        mark_proxy_errors(&mut routes, &tail).await;
+        assert!(!routes[0].proxy_error);
+        assert!(routes[1].proxy_error, "{routes:?}");
+        assert!(
+            !routes[2].proxy_error,
+            "a crash of the app itself: {routes:?}"
+        );
+        // Older proofs without the fields still load.
+        let old: RouteProbe =
+            serde_json::from_str(r#"{"path":"/","status":200,"ms":3,"ok":true}"#).unwrap();
+        assert_eq!(old.method, "GET");
+        assert!(!old.proxy_error);
     }
 
     #[test]
@@ -2054,16 +2435,20 @@ mod tests {
             ready_ms: Some(1200),
             routes: vec![
                 RouteProbe {
+                    method: "GET".into(),
                     path: "/".into(),
                     status: 200,
                     ms: 12,
                     ok: true,
+                    proxy_error: false,
                 },
                 RouteProbe {
+                    method: "GET".into(),
                     path: "/api/users".into(),
                     status: 500,
                     ms: 30,
                     ok: false,
+                    proxy_error: false,
                 },
             ],
             e2e: None,
@@ -2148,7 +2533,7 @@ mod tests {
         if !has_curl() {
             return;
         }
-        let probe = probe_route("http://127.0.0.1:1", "/").await;
+        let probe = probe_route("http://127.0.0.1:1", "GET", "/").await;
         assert_eq!(probe.status, 0);
         assert!(!probe.ok);
         assert_eq!(probe.path, "/");
@@ -2353,10 +2738,12 @@ mod tests {
 
     fn probe(path: &str, status: u16) -> RouteProbe {
         RouteProbe {
+            method: "GET".to_string(),
             path: path.to_string(),
             status,
             ms: 1,
             ok: status < 400,
+            proxy_error: false,
         }
     }
 
