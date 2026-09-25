@@ -5233,6 +5233,64 @@ fn sec_secret_leak_ignores_backend() {
     assert!(!d.block);
 }
 
+#[test]
+fn client_secret_leak_ignores_next_server_components() {
+    // Server Components, route loaders/actions and `.server` modules never reach
+    // the browser bundle, so reading a server secret there is the correct pattern.
+    let stripe = "import Stripe from 'stripe';\nconst s = new Stripe(process.env.STRIPE_SECRET_KEY!);\nexport default async function P(){}";
+    for (path, source) in [
+        ("app/checkout/page.tsx", stripe),
+        ("src/app/checkout/page.tsx", stripe),
+        (
+            "app/page.tsx",
+            "import { neon } from '@neondatabase/serverless';\nexport default async function Page() {\n  const sql = neon(process.env.DATABASE_URL!);\n  const rows = await sql`select 1`;\n  return <p>{rows.length}</p>;\n}",
+        ),
+        (
+            "app/dashboard/layout.tsx",
+            "const db = process.env.DATABASE_URL;\nexport default function Layout({ children }) { return <main>{children}</main>; }",
+        ),
+        (
+            "app/lib/stripe.server.tsx",
+            "export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);",
+        ),
+        (
+            "app/routes/checkout.tsx",
+            "export async function loader() {\n  const s = new Stripe(process.env.STRIPE_SECRET_KEY!);\n  return json(await s.prices.list());\n}\nexport default function Checkout() { return <div />; }",
+        ),
+        (
+            "pages/checkout.tsx",
+            "export async function getServerSideProps() {\n  const s = new Stripe(process.env.STRIPE_SECRET_KEY);\n  return { props: {} };\n}\nexport default function Checkout() { return <div />; }",
+        ),
+        (
+            "src/actions/pay.tsx",
+            "'use server';\nexport async function pay() { return new Stripe(process.env.STRIPE_SECRET_KEY!); }",
+        ),
+    ] {
+        let d = check_client_secret_leak(path, source);
+        assert!(!d.block, "{path}: {}", d.reason);
+    }
+    // The same access in a client module still blocks.
+    for (path, source) in [
+        ("app/checkout/page.tsx", format!("'use client';\n{stripe}")),
+        (
+            "app/checkout/Pay.tsx",
+            format!("// Payment button\n\"use client\";\n{stripe}"),
+        ),
+        (
+            "src/components/Checkout.tsx",
+            "const key = process.env.STRIPE_SECRET_KEY;\nexport function Checkout() { return <button>{key}</button>; }".to_string(),
+        ),
+        (
+            "src/App.vue",
+            "<script setup>\nconst db = process.env.DATABASE_URL\n</script>".to_string(),
+        ),
+    ] {
+        let d = check_client_secret_leak(path, &source);
+        assert!(d.block, "client module must still block: {path}");
+        assert_eq!(d.clause, "UD-SEC-026");
+    }
+}
+
 // --- UD-SEC-027: insecure storage ----------------------------------
 
 #[test]

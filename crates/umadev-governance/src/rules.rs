@@ -31,6 +31,8 @@ mod test_paths;
 use test_paths::looks_like_secret_test_path;
 mod password_rules;
 pub use password_rules::{check_plaintext_password, check_unhashed_password_storage};
+mod client_secret;
+pub use client_secret::check_client_secret_leak;
 mod secret_values;
 
 /// Outcome of a governance rule.
@@ -6178,50 +6180,6 @@ pub fn check_websocket_auth(file_path: &str, content: &str) -> Decision {
                  that checks the auth token before accepting the connection.",
             ),
         );
-    }
-    Decision::pass()
-}
-
-/// **UD-SEC-026**: ban server-side env secrets leaked into client bundles.
-///
-/// `process.env.SECRET_KEY` / `process.env.DATABASE_URL` in frontend code
-/// (`.tsx`/`.jsx`/`.vue`) gets bundled into the client-side JS — anyone can
-/// read it from the browser. Only `NEXT_PUBLIC_*` / `VITE_*` prefixed vars
-/// are safe for client. Flags sensitive env var access in frontend files.
-#[must_use]
-pub fn check_client_secret_leak(file_path: &str, content: &str) -> Decision {
-    let ext = extension_of(file_path);
-    if !matches!(ext.as_str(), "jsx" | "tsx" | "vue" | "svelte" | "html") {
-        return Decision::pass();
-    }
-    let lower = content.to_ascii_lowercase();
-    // Sensitive env var names that must never reach the client.
-    let sensitive_env = [
-        "process.env.secret",
-        "process.env.database_url",
-        "process.env.db_url",
-        "process.env.private_key",
-        "process.env.api_key",
-        "process.env.jwt_secret",
-        "process.env.stripe",
-        "process.env.aws_secret",
-        "process.env.password",
-        "process.env.token",
-        "process.env.redis",
-    ];
-    for pattern in sensitive_env {
-        if lower.contains(pattern) {
-            return Decision::block(
-                "UD-SEC-026",
-                format!(
-                    "UmaDev: server secret leaked into client bundle (UD-SEC-026). \
-                     `{file_path}` accesses `{pattern}` in frontend code — this \
-                     gets bundled into the browser JS where anyone can read it. \
-                     Only `NEXT_PUBLIC_*` / `VITE_*` prefixed vars are safe for \
-                     client. Move the secret to a server-side API route.",
-                ),
-            );
-        }
     }
     Decision::pass()
 }
