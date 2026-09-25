@@ -266,9 +266,10 @@ pub(crate) fn is_template_param(segment: &str) -> bool {
         || (segment.len() > 2 && segment.starts_with('<') && segment.ends_with('>'))
 }
 
-/// Parse the architecture Markdown into an [`ApiSpec`]. Looks for a Markdown
-/// table whose header row contains `Method` and `Path` columns, then parses
-/// each data row into a typed [`Endpoint`].
+/// Parse the architecture Markdown into an [`ApiSpec`]. Looks for Markdown
+/// tables whose header row contains `Method` and `Path` columns — every such
+/// table in the API section, so a surface split into one table per module is
+/// read whole — then parses each data row into a typed [`Endpoint`].
 ///
 /// Tolerant: malformed rows are skipped, never cause failure. An architecture
 /// doc with no API table yields an empty spec (the quality gate then reports
@@ -317,87 +318,218 @@ const METHOD_SYNONYMS: &[&str] = &["method", "verb"];
 /// substring match).
 const PATH_SYNONYMS: &[&str] = &["path", "endpoint", "url", "route"];
 
-/// Walk the markdown, find the first table with Method+Path columns, and
-/// parse its rows.
-fn extract_endpoints_from_table(md: &str) -> Vec<Endpoint> {
-    let lines: Vec<&str> = md.lines().collect();
-    // Find the header row: a line starting with `|` whose cells include both a
-    // method-ish and a path-ish column. A whole-line `contains` of the synonyms
-    // is enough to locate the row (the per-column resolution below is precise).
-    let header_idx = lines.iter().position(|l| {
-        let lower = l.to_ascii_lowercase();
-        l.trim().starts_with('|')
-            && METHOD_SYNONYMS.iter().any(|s| lower.contains(s))
-            && PATH_SYNONYMS.iter().any(|s| lower.contains(s))
-    });
+/// Whether a line is the header row of an API table: it starts with `|` and
+/// names both a method-ish and a path-ish column. A whole-line `contains` of the
+/// synonyms is enough to locate the row (the per-column resolution in
+/// [`TableColumns::resolve`] is precise).
+fn is_api_header_row(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    line.trim().starts_with('|')
+        && METHOD_SYNONYMS.iter().any(|s| lower.contains(s))
+        && PATH_SYNONYMS.iter().any(|s| lower.contains(s))
+}
 
-    let Some(header_idx) = header_idx else {
-        return Vec::new();
-    };
+/// The column layout of one API table, resolved from its header row.
+struct TableColumns {
+    method: usize,
+    path: usize,
+    request: Option<usize>,
+    response: Option<usize>,
+    auth: Option<usize>,
+    description: Option<usize>,
+}
 
-    let headers = split_table_row(lines[header_idx]);
-    let col = |name: &str| -> Option<usize> {
-        headers
-            .iter()
-            .position(|h| h.to_ascii_lowercase().trim() == name)
-    };
-    // Resolve a column by ANY of a set of synonyms via `contains` — mirroring
-    // the tolerant Auth match below. The header row is found permissively, so
-    // Method/Path resolution must be permissive too: a descriptive header like
-    // `HTTP Method` / `API Path` / `Endpoint` / `Route` previously FOUND the
-    // header (it contains "method"+"path") but resolved NO columns under an
-    // exact `==` test, yielding an empty spec that VACUOUSLY passed the
-    // UD-CODE-003 contract gate.
-    let col_any = |synonyms: &[&str]| -> Option<usize> {
-        headers.iter().position(|h| {
+impl TableColumns {
+    /// Resolve the columns of a header row; `None` when it has no Method or
+    /// Path column.
+    fn resolve(header_row: &str) -> Option<Self> {
+        let headers = split_table_row(header_row);
+        let col = |name: &str| -> Option<usize> {
+            headers
+                .iter()
+                .position(|h| h.to_ascii_lowercase().trim() == name)
+        };
+        // Resolve a column by ANY of a set of synonyms via `contains` — mirroring
+        // the tolerant Auth match below. The header row is found permissively, so
+        // Method/Path resolution must be permissive too: a descriptive header like
+        // `HTTP Method` / `API Path` / `Endpoint` / `Route` previously FOUND the
+        // header (it contains "method"+"path") but resolved NO columns under an
+        // exact `==` test, yielding an empty spec that VACUOUSLY passed the
+        // UD-CODE-003 contract gate.
+        let col_any = |synonyms: &[&str]| -> Option<usize> {
+            headers.iter().position(|h| {
+                let h = h.to_ascii_lowercase();
+                let h = h.trim();
+                synonyms.iter().any(|s| h.contains(s))
+            })
+        };
+        // Auth column: accept common header variants so a correctly-authored doc
+        // ("Authentication" / "Authorization" / "Security" / "Protected" / 鉴权)
+        // isn't misread as all-public — which would falsely sink the auth-coverage
+        // quality gate.
+        let auth = headers.iter().position(|h| {
             let h = h.to_ascii_lowercase();
             let h = h.trim();
-            synonyms.iter().any(|s| h.contains(s))
+            h.contains("auth")
+                || h == "security"
+                || h == "protected"
+                || h.contains("鉴权")
+                || h.contains("权限")
+        });
+        Some(Self {
+            method: col_any(METHOD_SYNONYMS)?,
+            path: col_any(PATH_SYNONYMS)?,
+            request: col("request"),
+            response: col("response"),
+            auth,
+            description: col("description"),
         })
-    };
-    // `col_any` returns Option but this fn returns Vec, so we can't use `?`.
-    // Early-return empty when required columns are absent.
-    let (Some(method_col), Some(path_col)) = (col_any(METHOD_SYNONYMS), col_any(PATH_SYNONYMS))
-    else {
+    }
+}
+
+/// Whether a table row is the `|---|:---:|` separator under a header.
+fn is_separator_row(line: &str) -> bool {
+    let cells = line.trim().replace('|', "");
+    cells.contains('-')
+        && cells
+            .chars()
+            .all(|c| c == '-' || c == ':' || c.is_whitespace())
+}
+
+/// The ATX heading (`## API surface`) on each line as `(level, text)`. A `#` line
+/// inside a fenced code block (a `# comment` in a curl example) is not a heading.
+fn markdown_headings<'a>(lines: &[&'a str]) -> Vec<Option<(usize, &'a str)>> {
+    let mut in_fence = false;
+    lines
+        .iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                in_fence = !in_fence;
+                return None;
+            }
+            let level = trimmed.bytes().take_while(|b| *b == b'#').count();
+            let text = &trimmed[level..];
+            (!in_fence
+                && (1..=6).contains(&level)
+                && (text.is_empty() || text.starts_with([' ', '\t'])))
+            .then(|| (level, text.trim()))
+        })
+        .collect()
+}
+
+/// Whether a heading names the app's own API section: `API surface`, `REST
+/// APIs`, `Endpoints`, `Routes`, `接口设计`, `路由`. A heading about who may call
+/// the API (auth, roles, permissions) or about someone else's API (external,
+/// third-party) does not, even when it says "API".
+fn names_api_section(heading: &str) -> bool {
+    const NOT_OWN_SURFACE: &[&str] = &[
+        "auth",
+        "role",
+        "permission",
+        "external",
+        "third",
+        "upstream",
+        "vendor",
+        "鉴权",
+        "鑑權",
+        "认证",
+        "認證",
+        "授权",
+        "授權",
+        "权限",
+        "權限",
+        "角色",
+        "外部",
+        "第三方",
+        "上游",
+    ];
+    let lower = heading.to_ascii_lowercase();
+    if NOT_OWN_SURFACE.iter().any(|word| lower.contains(word)) {
+        return false;
+    }
+    lower.contains("接口")
+        || lower.contains("介面")
+        || lower.contains("路由")
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| {
+                matches!(word, "api" | "apis" | "openapi")
+                    || word.starts_with("endpoint")
+                    || word.starts_with("route")
+            })
+}
+
+/// The line index where the API section holding the first API table ends. The
+/// section starts at the nearest heading above that table which names the API
+/// (`## API surface`, `# 接口文档`), or failing that the nearest heading, and runs
+/// until a later heading of the same or a higher level that does not name the API
+/// itself. Further Method/Path tables are read only inside it, so a role matrix
+/// or a table of third-party endpoints elsewhere in the doc is never taken for the
+/// app's own API.
+fn api_section_end(lines: &[&str], first_header: usize) -> usize {
+    let headings = markdown_headings(lines);
+    let above = || headings[..first_header].iter().rev().flatten();
+    let level = above()
+        .find(|(_, text)| names_api_section(text))
+        .or_else(|| above().next())
+        .map_or(6, |(level, _)| *level);
+    headings
+        .iter()
+        .enumerate()
+        .skip(first_header + 1)
+        .find(|(_, heading)| {
+            heading.is_some_and(|(l, text)| l <= level && !names_api_section(text))
+        })
+        .map_or(lines.len(), |(idx, _)| idx)
+}
+
+/// Walk the markdown and parse the rows of every Method+Path table in the API
+/// section (see [`api_section_end`]), deduped by `(method, path)`.
+fn extract_endpoints_from_table(md: &str) -> Vec<Endpoint> {
+    let lines: Vec<&str> = md.lines().collect();
+    let Some(header_idx) = lines.iter().position(|l| is_api_header_row(l)) else {
         return Vec::new();
     };
-    let req_col = col("request");
-    let resp_col = col("response");
-    // Auth column: accept common header variants so a correctly-authored doc
-    // ("Authentication" / "Authorization" / "Security" / "Protected" / 鉴权)
-    // isn't misread as all-public — which would falsely sink the auth-coverage
-    // quality gate.
-    let auth_col = headers.iter().position(|h| {
-        let h = h.to_ascii_lowercase();
-        let h = h.trim();
-        h.contains("auth")
-            || h == "security"
-            || h == "protected"
-            || h.contains("鉴权")
-            || h.contains("权限")
-    });
-    let desc_col = col("description");
+    let section_end = api_section_end(&lines, header_idx);
 
     let mut endpoints: Vec<Endpoint> = Vec::new();
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    // The current table's columns (`None` for a non-API table), whether it has
+    // reached its data rows, and whether a non-pipe line came since the last row.
+    let mut columns = TableColumns::resolve(lines[header_idx]);
+    let mut has_rows = false;
+    let mut after_gap = false;
 
-    // Skip the separator row (`|---|---|`) immediately after the header.
-    for line in lines.iter().skip(header_idx + 1) {
+    for line in lines.iter().take(section_end).skip(header_idx + 1) {
         let trimmed = line.trim();
         if !trimmed.starts_with('|') {
-            // Tables end at the first non-pipe line.
-            if !endpoints.is_empty() {
-                break;
-            }
+            after_gap = true;
             continue;
         }
-        if trimmed
-            .replace('|', "")
-            .chars()
-            .all(|c| c == '-' || c.is_whitespace())
+        // A table ends at its first non-pipe line, except that an API table
+        // whose rows have not started yet tolerates a gap before them. The pipe
+        // line after a gap otherwise starts a new table, whose rows count only
+        // when it is another API table, with its own column layout.
+        if std::mem::take(&mut after_gap)
+            && (has_rows || columns.is_none() || is_api_header_row(trimmed))
         {
+            has_rows = false;
+            columns = if is_api_header_row(trimmed) {
+                TableColumns::resolve(trimmed)
+            } else {
+                None
+            };
+            continue;
+        }
+        if is_separator_row(trimmed) {
             continue; // separator row
         }
+        has_rows = true;
+        let Some(cols) = columns.as_ref() else {
+            continue; // a non-API table
+        };
+        let (method_col, path_col) = (cols.method, cols.path);
         let cells = split_table_row(trimmed);
         if cells.len() <= method_col.max(path_col) {
             continue;
@@ -427,19 +559,23 @@ fn extract_endpoints_from_table(md: &str) -> Vec<Endpoint> {
         if !seen.insert(key) {
             continue;
         }
-        let description = desc_col
+        let description = cols
+            .description
             .and_then(|i| cells.get(i))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let request_shape = req_col
+        let request_shape = cols
+            .request
             .and_then(|i| cells.get(i))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let response_shape = resp_col
+        let response_shape = cols
+            .response
             .and_then(|i| cells.get(i))
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        let security = auth_col
+        let security = cols
+            .auth
             .and_then(|i| cells.get(i))
             .map(|s| SecurityKind::parse(s))
             .unwrap_or(SecurityKind::None);
@@ -610,6 +746,93 @@ mod tests {
         assert_eq!(spec.endpoints[0].path, "/api/health");
         assert_eq!(spec.endpoints[1].method, HttpVerb::Post);
         assert_eq!(spec.endpoints[1].path, "/api/auth/login");
+    }
+
+    #[test]
+    fn parse_architecture_reads_every_api_table() {
+        // Multi-module docs split the API surface into one table per module.
+        // Every table in the API section counts, not just the first one.
+        let md = "# Architecture — shop\n\n\
+                  ## API surface\n\n\
+                  ### 用户模块\n\n\
+                  | Method | Path | Auth | Description |\n|---|---|---|---|\n\
+                  | POST | /api/auth/login | 无 | 登录 |\n\
+                  | GET | /api/users/:id | Bearer | 用户详情 |\n\n\
+                  调用示例：\n\n\
+                  ```bash\n# 获取订单列表\ncurl /api/orders\n```\n\n\
+                  ### 订单模块\n\n\
+                  | Path | Method | Description |\n|:---|:---:|---|\n\
+                  | /api/orders | GET | 订单列表 |\n\
+                  | /api/orders | POST | 下单 |\n\n\
+                  | Method | Path | Description |\n|---|---|---|\n\
+                  | DELETE | /api/orders/:id | 取消订单 |\n\n\
+                  ## API error convention\n\n\
+                  | HTTP | Code | Meaning |\n|---|---|---|\n| 404 | NOT_FOUND | missing |\n\n\
+                  ## Data model\n\n\
+                  | Field | Type | Description |\n|---|---|---|\n| id | uuid | key |\n";
+        let spec = parse_architecture(md, "shop");
+        let got: Vec<(HttpVerb, &str)> = spec.declared_paths();
+        assert_eq!(
+            got,
+            vec![
+                (HttpVerb::Post, "/api/auth/login"),
+                (HttpVerb::Get, "/api/users/:id"),
+                (HttpVerb::Get, "/api/orders"),
+                (HttpVerb::Post, "/api/orders"),
+                (HttpVerb::Delete, "/api/orders/:id"),
+            ]
+        );
+        assert_eq!(spec.endpoints[0].security, SecurityKind::None);
+        assert_eq!(spec.endpoints[1].security, SecurityKind::Bearer);
+    }
+
+    #[test]
+    fn method_path_table_outside_the_api_section_is_not_the_contract() {
+        // A role matrix (or a list of third-party endpoints) elsewhere in the
+        // doc may also have Method and Path columns. It must not add planned
+        // endpoints the app never promised to serve.
+        let md = "## API surface\n\n\
+                  | Method | Path | Description |\n|---|---|---|\n\
+                  | GET | /api/todos | List |\n\n\
+                  ## Authentication & authorization\n\n\
+                  | Role | Method | Path |\n|---|---|---|\n\
+                  | admin | DELETE | /api/admin/* |\n\n\
+                  ## External services\n\n\
+                  | Method | Path | Provider |\n|---|---|---|\n\
+                  | POST | /v1/chat/completions | OpenAI |\n";
+        let spec = parse_architecture(md, "t");
+        assert_eq!(spec.declared_paths(), vec![(HttpVerb::Get, "/api/todos")]);
+        // Saying "API" does not make a permissions or third-party section part
+        // of the app's own surface.
+        let md = "## API surface\n\n\
+                  | Method | Path | Description |\n|---|---|---|\n\
+                  | GET | /api/todos | List |\n\n\
+                  ## API 权限矩阵\n\n\
+                  | Role | Method | Path |\n|---|---|---|\n\
+                  | admin | DELETE | /api/admin/* |\n\n\
+                  ## Third-party APIs\n\n\
+                  | Method | Path | Provider |\n|---|---|---|\n\
+                  | POST | /v1/charges | Stripe |\n";
+        let spec = parse_architecture(md, "t");
+        assert_eq!(spec.declared_paths(), vec![(HttpVerb::Get, "/api/todos")]);
+    }
+
+    #[test]
+    fn blank_line_before_the_first_row_does_not_end_the_table() {
+        // The parser always tolerated a gap between an API table's header and
+        // its first row; reading every table must not lose that.
+        let md = "| Method | Path | Description |\n|---|---|---|\n\n\
+                  | GET | /api/todos | List |\n\
+                  | POST | /api/todos | Create |\n\n\
+                  | Field | Type |\n|---|---|\n| id | uuid |\n";
+        let spec = parse_architecture(md, "t");
+        assert_eq!(
+            spec.declared_paths(),
+            vec![
+                (HttpVerb::Get, "/api/todos"),
+                (HttpVerb::Post, "/api/todos")
+            ]
+        );
     }
 
     #[test]
