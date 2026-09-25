@@ -14,7 +14,9 @@
 //!
 //! - Claude Code: `--setting-sources user --strict-mcp-config`, so only the
 //!   user's own settings load and no MCP server is started (UmaDev passes no
-//!   `--mcp-config` of its own).
+//!   `--mcp-config` of its own). UmaDev's governance hooks, when the project's
+//!   `.claude/settings.local.json` registers them, are passed with `--settings`
+//!   instead, running this binary ([`claude_governance_hooks`]).
 //! - Codex: the working directory and each of its ancestors are marked
 //!   `trust_level = "untrusted"` for that launch, which keeps project config,
 //!   hooks and exec policies disabled and stops app-server from recording the
@@ -29,6 +31,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -38,6 +41,12 @@ static TRUSTED_ROOTS: RwLock<Vec<PathBuf>> = RwLock::new(Vec::new());
 /// The Claude Code flags that load only the user's own settings and no MCP
 /// servers from any settings file.
 const CLAUDE_USER_SETTINGS_ONLY: [&str; 3] = ["--setting-sources", "user", "--strict-mcp-config"];
+
+/// The `umadev hook` subcommands UmaDev registers with Claude Code.
+const HOOK_SUBCOMMANDS: [&str; 3] = ["pre-write", "pre-bash", "tool-audit"];
+
+/// Largest `.claude/settings.local.json` read to find UmaDev's hooks.
+const MAX_CLAUDE_SETTINGS_BYTES: u64 = 1024 * 1024;
 
 /// The OpenCode switch that ignores `opencode.json`, `.opencode/` and project
 /// instructions.
@@ -74,13 +83,81 @@ pub fn loads_project_config(workspace: &Path) -> bool {
 /// Extra `claude` arguments for a launch in `workspace`.
 pub(crate) fn claude_args(workspace: &Path) -> Vec<String> {
     if loads_project_config(workspace) {
-        Vec::new()
-    } else {
-        CLAUDE_USER_SETTINGS_ONLY
-            .iter()
-            .map(|arg| (*arg).to_string())
-            .collect()
+        return Vec::new();
     }
+    let mut args: Vec<String> = CLAUDE_USER_SETTINGS_ONLY
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+    if let Some(settings) = claude_governance_settings(workspace) {
+        args.extend(["--settings".to_string(), settings]);
+    }
+    args
+}
+
+/// UmaDev's Claude Code governance hooks running `bin`, as the `PreToolUse`
+/// and `PostToolUse` matcher lists: the pre-write and pre-bash guards and the
+/// post-tool audit. The one definition `umadev install --host claude-code`
+/// writes and an untrusted launch passes.
+#[must_use]
+pub fn claude_governance_hooks(bin: &str) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let handler = |subcommand: &str| serde_json::json!([{"type": "command", "command": bin, "args": ["hook", subcommand]}]);
+    // The write matchers MUST stay a superset of the hook's own write set
+    // (Write / Edit / MultiEdit / NotebookEdit): a tool the hook can govern but
+    // the matcher omits never fires the hook, so its writes (a secret leaked into
+    // an .ipynb via NotebookEdit, say) would bypass the irreversible floor.
+    let pre = vec![
+        serde_json::json!({
+            "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+            "hooks": handler("pre-write"),
+        }),
+        // The Bash guard (UD-SEC-002): command executions, not only file writes.
+        serde_json::json!({"matcher": "Bash", "hooks": handler("pre-bash")}),
+    ];
+    // The audit records every executed write and command to the tool-call
+    // JSONL. It is a pure evidence write and never blocks.
+    let post = vec![serde_json::json!({
+        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
+        "hooks": handler("tool-audit"),
+    })];
+    (pre, post)
+}
+
+/// `--settings` for an untrusted Claude launch in `workspace`: UmaDev's own
+/// governance hooks, when the project's `.claude/settings.local.json` registers
+/// them, running this binary. The file only says whether the user installed
+/// them; the program it names is never run.
+fn claude_governance_settings(workspace: &Path) -> Option<String> {
+    let path = workspace.join(".claude").join("settings.local.json");
+    // A regular file only: a FIFO or device would block or never end.
+    if !std::fs::symlink_metadata(&path).ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(MAX_CLAUDE_SETTINGS_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let registers_umadev_hook = ["PreToolUse", "PostToolUse"]
+        .iter()
+        .filter_map(|event| settings["hooks"][event].as_array())
+        .flatten()
+        .filter_map(|matcher| matcher["hooks"].as_array())
+        .flatten()
+        .any(|handler| {
+            handler["args"][0] == "hook"
+                && handler["args"][1]
+                    .as_str()
+                    .is_some_and(|sub| HOOK_SUBCOMMANDS.contains(&sub))
+        });
+    if !registers_umadev_hook {
+        return None;
+    }
+    let bin = std::env::current_exe().ok()?;
+    let (pre, post) = claude_governance_hooks(&bin.to_string_lossy());
+    Some(serde_json::json!({"hooks": {"PreToolUse": pre, "PostToolUse": post}}).to_string())
 }
 
 /// The spellings Codex may look `dir` up by in its `projects` table: the path
@@ -271,6 +348,40 @@ mod tests {
             args[1]
         );
         assert!(args[1].starts_with("projects={") && args[1].ends_with('}'));
+    }
+
+    #[test]
+    fn an_untrusted_launch_keeps_umadevs_governance_hooks_but_not_the_programs_they_name() {
+        let project = tempfile::TempDir::new().unwrap();
+        let claude = project.path().join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        // Without UmaDev's hooks installed, nothing is added.
+        std::fs::write(
+            claude.join("settings.local.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./evil"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(claude_args(project.path()).len(), 3);
+
+        // Installed hooks are passed again, running this binary, not the file's.
+        let (pre, post) = claude_governance_hooks("./evil/umadev");
+        let installed = serde_json::json!({"hooks": {"PreToolUse": pre, "PostToolUse": post}});
+        std::fs::write(claude.join("settings.local.json"), installed.to_string()).unwrap();
+        let args = claude_args(project.path());
+        assert_eq!(args[3], "--settings");
+        let passed: serde_json::Value = serde_json::from_str(&args[4]).unwrap();
+        let bin = std::env::current_exe().unwrap();
+        let (pre, post) = claude_governance_hooks(&bin.to_string_lossy());
+        assert_eq!(
+            passed,
+            serde_json::json!({"hooks": {"PreToolUse": pre, "PostToolUse": post}})
+        );
+        assert!(!args[4].contains("evil"));
+
+        // A trusted project loads the file itself.
+        set_project_trusted(project.path(), true);
+        assert!(claude_args(project.path()).is_empty());
+        set_project_trusted(project.path(), false);
     }
 
     #[test]

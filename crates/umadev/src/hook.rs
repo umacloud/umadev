@@ -960,21 +960,10 @@ fn install_claude_hook_at_home(
         handlers.retain(|handler| !is_umadev_hook_handler(handler, Some(&bin)));
         !handlers.is_empty()
     });
-    // NOTE: this matcher MUST stay a superset of `run_pre_write_scoped`'s
-    // `is_write` set (Write / Edit / MultiEdit / NotebookEdit) — a tool the
-    // hook can govern but that the matcher omits would never fire the hook at
-    // all, so its writes (e.g. a secret leaked into an .ipynb via NotebookEdit)
-    // silently bypass the irreversible floor.
-    matchers.push(serde_json::json!({
-        "matcher": "Write|Edit|MultiEdit|NotebookEdit",
-        "hooks": [{"type": "command", "command": bin, "args": ["hook", "pre-write"]}]
-    }));
-    // Also register the Bash guard (UD-SEC-002) so the host's command
-    // executions are intercepted, not just its file writes.
-    matchers.push(serde_json::json!({
-        "matcher": "Bash",
-        "hooks": [{"type": "command", "command": bin, "args": ["hook", "pre-bash"]}]
-    }));
+    // One definition of the hooks, shared with the launch of an untrusted
+    // project (see `umadev_host::project_config::claude_governance_hooks`).
+    let (pre_hooks, post_hooks) = umadev_host::project_config::claude_governance_hooks(&bin);
+    matchers.extend(pre_hooks);
     // The PreToolUse `matchers` borrow ends here; reborrow `hooks_obj` for the
     // PostToolUse AUDIT hook (Layer-3 governance: "PostToolUse hooks audit
     // results"). It records every executed Write/Edit/MultiEdit/Bash to the
@@ -1001,13 +990,7 @@ fn install_claude_hook_at_home(
         handlers.retain(|handler| !is_umadev_hook_handler(handler, Some(&bin)));
         !handlers.is_empty()
     });
-    // Same superset invariant as the PreToolUse matcher above: audit every
-    // write tool the hook understands (Write / Edit / MultiEdit / NotebookEdit)
-    // plus Bash, so a NotebookEdit write is recorded to the tool-call JSONL too.
-    post_matchers.push(serde_json::json!({
-        "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash",
-        "hooks": [{"type": "command", "command": bin, "args": ["hook", "tool-audit"]}]
-    }));
+    post_matchers.extend(post_hooks);
 
     write_claude_settings(&settings_path, &settings)?;
     // Migrate only after the new hook is durable. A malformed/unwritable local

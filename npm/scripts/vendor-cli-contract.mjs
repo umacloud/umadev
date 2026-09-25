@@ -82,6 +82,7 @@ requireText(
     "--verbose",
     "--setting-sources",
     "--strict-mcp-config",
+    "--settings",
   ],
   "Claude Code",
 );
@@ -124,6 +125,8 @@ const claudeStream = run("claude", [
   "--setting-sources",
   "user",
   "--strict-mcp-config",
+  "--settings",
+  '{"hooks":{}}',
 ]);
 assert.equal(
   claudeStream.status,
