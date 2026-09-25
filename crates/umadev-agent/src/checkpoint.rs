@@ -20,6 +20,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+mod reserved_names;
 mod store_trust;
 
 const CHECKPOINT_EXCLUDED_DIRS: &[&str] = &[
@@ -370,6 +371,9 @@ fn ensure_init(project_root: &Path) -> bool {
 
 fn checkpoint_path_is_excluded(relative: &Path, directory: bool) -> bool {
     let name = relative.file_name().and_then(|name| name.to_str());
+    if name.is_some_and(reserved_names::is_reserved_alias) {
+        return true;
+    }
     if directory && name.is_some_and(|name| CHECKPOINT_EXCLUDED_DIRS.contains(&name)) {
         return true;
     }
@@ -995,7 +999,8 @@ fn validated_tree_path(path: &str) -> std::io::Result<PathBuf> {
         || relative.components().enumerate().any(|(index, component)| {
             !matches!(component, Component::Normal(_))
                 || component.as_os_str().to_str().is_none_or(|name| {
-                    (index + 1 < count && CHECKPOINT_EXCLUDED_DIRS.contains(&name))
+                    reserved_names::is_reserved_alias(name)
+                        || (index + 1 < count && CHECKPOINT_EXCLUDED_DIRS.contains(&name))
                         || (index + 1 == count
                             && Path::new(name)
                                 .extension()
