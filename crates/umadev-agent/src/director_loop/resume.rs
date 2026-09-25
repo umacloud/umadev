@@ -336,7 +336,7 @@ pub(super) fn next_final_review_checkpoint(
 /// die between their renames. Keeping a distinctive cursor in the plan lets the
 /// loader reconstruct a missing checkpoint without scheduling an ordinary review
 /// and then immediately reviewing again in the final gate.
-pub(super) const FINAL_REVIEW_RETRY_STEP_ID: &str = "umadev-final-review-retry";
+pub(crate) const FINAL_REVIEW_RETRY_STEP_ID: &str = "umadev-final-review-retry";
 
 #[cfg(test)]
 fn operational_review_checkpoint_path(root: &Path) -> std::path::PathBuf {

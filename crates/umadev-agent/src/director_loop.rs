@@ -49,8 +49,9 @@ use resume::{
     clear_operational_review_checkpoint, load_operational_review_checkpoint,
     next_final_review_checkpoint, next_step_review_checkpoint,
     operational_review_checkpoint_for_plan, save_operational_review_checkpoint,
-    OperationalReviewCheckpoint, OperationalReviewEvidence, FINAL_REVIEW_RETRY_STEP_ID,
+    OperationalReviewCheckpoint, OperationalReviewEvidence,
 };
+pub(crate) use resume::FINAL_REVIEW_RETRY_STEP_ID;
 pub use resume::{
     has_resumable_director_plan, has_resumable_run, is_budget_pause_reason,
     rearm_operational_review_for_explicit_retry, terminal_review_circuit_reason,
