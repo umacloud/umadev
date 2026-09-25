@@ -2270,6 +2270,10 @@ fn open_log_file() -> Option<std::fs::File> {
 /// Open `<home>/.umadev/logs/umadev.log` for appending, creating the directory
 /// tree. Returns `None` on any IO failure. Split out from [`open_log_file`] so
 /// it is testable without mutating the process-global `HOME`.
+///
+/// The state directory, the log directory and the log are owner-only; ones an
+/// older release created with the default umask are tightened here, since
+/// every CLI start passes through.
 fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
     let state_dir = umadev_state::fs::ensure_real_child_dir(home, ".umadev").ok()?;
     let dir = umadev_state::fs::ensure_real_child_dir(&state_dir, "logs").ok()?;
@@ -2278,7 +2282,11 @@ fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        restrict_to_owner(&state_dir, 0o700);
+        restrict_to_owner(&dir, 0o700);
+        options
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .mode(0o600);
     }
     #[cfg(windows)]
     {
@@ -2287,7 +2295,39 @@ fn open_log_file_in(home: &std::path::Path) -> Option<std::fs::File> {
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(dir.join("umadev.log")).ok()?;
-    umadev_state::fs::metadata_is_real_file(&file.metadata().ok()?).then_some(file)
+    let meta = file.metadata().ok()?;
+    if !umadev_state::fs::metadata_is_real_file(&meta) {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o077 != 0 {
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Some(file)
+}
+
+/// Best-effort: drop group/other access from a UmaDev state directory, through
+/// a descriptor opened without following links (a failure — someone else's
+/// directory, a swapped link — leaves it as it was).
+#[cfg(unix)]
+fn restrict_to_owner(dir: &Path, mode: u32) {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let Ok(handle) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+    else {
+        return;
+    };
+    if handle
+        .metadata()
+        .is_ok_and(|meta| meta.permissions().mode() & 0o077 != 0)
+    {
+        let _ = handle.set_permissions(std::fs::Permissions::from_mode(mode));
+    }
 }
 
 fn cmd_init(slug: Option<String>, project_root: Option<PathBuf>, force: bool) -> Result<()> {
@@ -8751,6 +8791,36 @@ mod tests {
             "the log file is created on disk"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_log_and_its_state_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let logs = tmp.path().join(".umadev/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::set_permissions(
+            tmp.path().join(".umadev"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(logs.join("umadev.log"), "old\n").unwrap();
+        std::fs::set_permissions(
+            logs.join("umadev.log"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(open_log_file_in(tmp.path()).is_some());
+        for path in [
+            tmp.path().join(".umadev"),
+            logs.clone(),
+            logs.join("umadev.log"),
+        ] {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "{}: {mode:o}", path.display());
+        }
     }
 
     #[cfg(unix)]
