@@ -1,0 +1,14 @@
+# cargo-audit configuration, also read by rustsec/audit-check in
+# .github/workflows/security.yml. Every ignore must name the advisory, why it
+# does not apply, and what would let us drop the ignore.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2024-0436: `paste` is unmaintained (informational, no known
+    # vulnerability). It is a compile-time proc-macro only, reached solely
+    # through the optional `vector-local` feature: `gemm-*` (via candle-core)
+    # and `tokenizers` both still depend on it in their latest releases
+    # (gemm 0.19, candle 0.11, tokenizers 0.23), so no upgrade removes it.
+    # Drop this ignore once candle's gemm and tokenizers move off `paste`.
+    "RUSTSEC-2024-0436",
+]
