@@ -99,6 +99,7 @@ pub async fn run_all(workspace: &Path, fix: bool) -> Vec<CheckResult> {
         check_run_lock_fence(workspace, fix),
         check_workspace_rewind_marker(workspace, fix),
         check_spec_manifest(workspace),
+        check_workspace_trust(workspace),
     ];
     results.push(check_ai_backends().await);
     // Distinct from the reachability check above: when `claude-code` is the
@@ -776,6 +777,17 @@ fn check_spec_manifest(workspace: &Path) -> CheckResult {
             status: Status::Warning,
             detail: "no umadev.yaml — run `umadev init` to declare conformance".to_string(),
         },
+    }
+}
+
+/// Whether the user trusts this project. Informational: every answer is a
+/// valid choice, and an untrusted project still runs (at most in guarded mode,
+/// with bases ignoring the project's own settings).
+fn check_workspace_trust(workspace: &Path) -> CheckResult {
+    CheckResult {
+        name: "workspace trust".to_string(),
+        status: Status::Passed,
+        detail: crate::workspace_trust::describe(workspace),
     }
 }
 
@@ -1567,6 +1579,7 @@ mod tests {
                 umadev_i18n::tl("doctor.run_lock_fence_name"),
                 umadev_i18n::tl("doctor.rewind_marker_name"),
                 "spec manifest (UD-META-001)",
+                "workspace trust",
                 "AI host backends",
                 "Claude non-interactive auth",
                 "git (file checkpoints)",

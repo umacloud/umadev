@@ -11,6 +11,7 @@
 //! - (none)                  launch the chat TUI (the recommended entry)
 //! - `init`                  write the `umadev.yaml` spec manifest
 //! - `install --host <id>`   wire the real-time governance hook into a base CLI
+//! - `trust [--revoke]`      trust this project on this machine, or stop
 //!
 //! The rest (`run` / `continue` / `revise` / `spec` / `verify` / `deploy` /
 //! `report` / `doctor` / `examples` / `guide` / `rollback` / `history`) are
@@ -44,6 +45,7 @@ mod mcp;
 mod mcp_manager;
 mod self_update;
 mod skill_manager;
+mod workspace_trust;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -88,6 +90,11 @@ struct Cli {
     /// All other verbs are hidden but still work for scripts/CI.
     #[command(subcommand)]
     command: Option<Command>,
+    /// Trust the project for this command without asking or recording it
+    /// (`run`, `quick`, `redo`, `continue`, `revise`); `UMADEV_TRUST_PROJECT=1`
+    /// does the same. `umadev trust` records the decision instead.
+    #[arg(long, global = true)]
+    trust_project: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -190,8 +197,9 @@ enum Command {
         slug: String,
         /// Trust / autonomy tier: `plan` (research + plan only, read-only),
         /// `guarded` (default — pause at every confirmation gate), or `auto`
-        /// (fully autonomous). Irreversible actions (.git / network /
-        /// destructive shell) are always confirmed, even in `auto`.
+        /// (fully autonomous; only in a project you trust, see `umadev trust`).
+        /// Irreversible actions (.git / network / destructive shell) are
+        /// always confirmed, even in `auto`.
         #[arg(long, default_value = "guarded")]
         mode: String,
         /// Force the continuous long-session path (one base session for the whole
@@ -238,8 +246,9 @@ enum Command {
         /// Project slug used in artifact filenames.
         #[arg(long, default_value = "")]
         slug: String,
-        /// Trust / autonomy tier: `plan` / `guarded` (default) / `auto`.
-        /// See `umadev run --help`. Irreversible actions always confirm.
+        /// Trust / autonomy tier: `plan` / `guarded` (default) / `auto` (only in
+        /// a trusted project). See `umadev run --help`. Irreversible actions
+        /// always confirm.
         #[arg(long, default_value = "guarded")]
         mode: String,
     },
@@ -589,6 +598,29 @@ enum Command {
         /// marker whose snapshot no longer exists. Neither repair edits source files.
         #[arg(long)]
         fix: bool,
+    },
+    /// Trust this project on this machine, or stop trusting it.
+    #[command(
+        long_about = "Record whether you trust this project on this machine. The decision\n\
+                      is kept in your UmaDev state directory, never in the project.\n\
+                      \n\
+                      A trusted project may run in auto mode, and the bases UmaDev launches\n\
+                      in it load the project's own settings, hooks and MCP servers\n\
+                      (.claude/, .mcp.json, .codex/, opencode.json, ...). An untrusted\n\
+                      project runs at most in guarded mode and its bases start without them.\n\
+                      UmaDev asks the first time it runs in a project on a terminal.",
+        after_help = "EXAMPLES:\n  \
+                      umadev trust                       # trust the current directory\n  \
+                      umadev trust --revoke              # stop trusting it\n  \
+                      umadev trust --project-root ./app  # another project"
+    )]
+    Trust {
+        /// Stop trusting the project.
+        #[arg(long)]
+        revoke: bool,
+        /// Workspace root; defaults to current directory.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
     },
     /// Show common-workflow examples for new users.
     #[command(
@@ -1139,6 +1171,7 @@ fn session_resume_identity(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    workspace_trust::set_trust_flag(cli.trust_project);
 
     // The TUI owns the alternate screen, so a log line written to the terminal
     // corrupts the display and sticks in the input box. Detect the TUI launch
@@ -1289,6 +1322,10 @@ async fn main() -> Result<()> {
             yes,
         } => cmd_pr(slug, project_root, create, yes),
         Command::Doctor { project_root, fix } => cmd_doctor(project_root, fix).await,
+        Command::Trust {
+            revoke,
+            project_root,
+        } => workspace_trust::cmd_trust(&resolve_root(project_root)?, revoke),
         Command::Examples => cmd_examples(),
         Command::Guide => cmd_guide(),
         Command::Hook {
@@ -3401,7 +3438,10 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
-    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
+    let mode = workspace_trust::cap_mode(
+        &project_root,
+        umadev_agent::TrustMode::parse_or_default(&args.mode),
+    );
     if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
         return Ok(());
     }
@@ -3726,7 +3766,10 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
-    let mode = umadev_agent::TrustMode::parse_or_default(&args.mode);
+    let mode = workspace_trust::cap_mode(
+        &project_root,
+        umadev_agent::TrustMode::parse_or_default(&args.mode),
+    );
     if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
         return Ok(());
     }
@@ -3861,9 +3904,16 @@ fn reject_replayed_git_requirement(requirement: &str) -> Result<()> {
 
 /// Permission tier inherited by CLI continuation surfaces. The state owns the
 /// original run's posture; states written before the field existed resolve to
-/// Guarded through `resolved_permission_profile`.
-fn trust_for_resume(state: &umadev_agent::WorkflowState) -> umadev_agent::TrustMode {
-    umadev_agent::TrustMode::from_base_permissions(state.resolved_permission_profile())
+/// Guarded through `resolved_permission_profile`. A saved Auto tier resumes
+/// only in a trusted project (see [`workspace_trust::resume_mode`]).
+fn trust_for_resume(
+    project_root: &Path,
+    state: &umadev_agent::WorkflowState,
+) -> umadev_agent::TrustMode {
+    workspace_trust::resume_mode(
+        project_root,
+        umadev_agent::TrustMode::from_base_permissions(state.resolved_permission_profile()),
+    )
 }
 
 /// `umadev redo <phase>` — re-run a single named phase using the prior run's
@@ -3905,7 +3955,7 @@ async fn cmd_redo(
     };
     let requirement = require_recorded_requirement(&state)?;
     reject_replayed_git_requirement(&requirement)?;
-    let trust = trust_for_resume(&state);
+    let trust = trust_for_resume(&project_root, &state);
     // backend: explicit flag > persisted state > offline. Retired/unknown state
     // never silently changes brains.
     let backend_choice = resolve_resume_backend(&state, backend_override)?;
@@ -4244,7 +4294,7 @@ async fn drive_gate_block(
         None => require_recorded_requirement(state)?,
     };
     reject_replayed_git_requirement(&requirement)?;
-    let trust = trust_for_resume(state);
+    let trust = trust_for_resume(project_root, state);
 
     // Resolve backend: explicit flag > persisted state > offline. A retired or
     // unknown stored id requires an explicit handoff and never falls through.
@@ -4507,7 +4557,7 @@ async fn cmd_continue(
     // Re-arming the saved review cursor mutates durable run state. Keep Plan mode
     // genuinely read-only even though `/continue` would otherwise be explicit
     // authority to retry the same review.
-    if review_circuit_open && !trust_for_resume(&state).executes() {
+    if review_circuit_open && !trust_for_resume(&project_root, &state).executes() {
         println!("{}", umadev_i18n::tl("continuous.plan_mode_skip"));
         println!("{}", umadev_i18n::tl("mode.plan.gate"));
         return Ok(());
@@ -4590,7 +4640,7 @@ async fn drive_director_continue(
     } else {
         state.slug.clone()
     };
-    let trust = trust_for_resume(state);
+    let trust = trust_for_resume(project_root, state);
     if !trust.executes() {
         println!("{}", umadev_i18n::tl("continuous.plan_mode_skip"));
         println!("{}", umadev_i18n::tl("mode.plan.gate"));
@@ -4793,11 +4843,13 @@ fn require_own_run_state(project_root: &Path, state: &WorkflowState, adopt: bool
         return Ok(());
     }
     let safe = |text: &str| safe_command_detail(text.trim().as_bytes());
+    let mode = umadev_agent::TrustMode::from_base_permissions(state.resolved_permission_profile());
     println!("Saved run in {}:", project_root.join(".umadev").display());
     for (label, value) in [
         ("requirement", state.requirement.as_str()),
         ("phase", state.phase.as_str()),
         ("gate", state.active_gate.as_str()),
+        ("mode", mode.as_str()),
     ] {
         if !value.trim().is_empty() {
             println!("  {label}: {}", safe(value));
@@ -8577,6 +8629,9 @@ mod tests {
     async fn cli_run_and_quick_plain_commit_each_execute_one_host_transaction_only() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
+        // `--mode auto` below needs a project the user trusts.
+        isolate_state_directory();
+        umadev_agent::workspace_trust::record(root, true).unwrap();
         let git = |args: &[&str]| {
             let output = run_test_git(root, args);
             assert!(
@@ -9357,15 +9412,39 @@ mod tests {
         use umadev_agent::TrustMode;
         use umadev_runtime::BasePermissionProfile;
 
+        isolate_state_directory();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.permission_profile = Some(BasePermissionProfile::Auto);
+        umadev_agent::write_workflow_state(root, &state).unwrap();
+        umadev_agent::workspace_trust::record(root, true).unwrap();
+
         for (profile, expected) in [
             (Some(BasePermissionProfile::Plan), TrustMode::Plan),
             (Some(BasePermissionProfile::Auto), TrustMode::Auto),
             (None, TrustMode::Guarded),
         ] {
-            let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
             state.permission_profile = profile;
-            assert_eq!(trust_for_resume(&state), expected);
+            assert_eq!(trust_for_resume(root, &state), expected);
         }
+    }
+
+    #[test]
+    fn cli_resume_never_runs_an_untrusted_project_in_auto() {
+        use umadev_agent::TrustMode;
+        use umadev_runtime::BasePermissionProfile;
+
+        isolate_state_directory();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+        state.permission_profile = Some(BasePermissionProfile::Auto);
+        umadev_agent::write_workflow_state(root, &state).unwrap();
+        umadev_agent::workspace_trust::record(root, false).unwrap();
+        assert_eq!(trust_for_resume(root, &state), TrustMode::Guarded);
+        state.permission_profile = Some(BasePermissionProfile::Plan);
+        assert_eq!(trust_for_resume(root, &state), TrustMode::Plan);
     }
 
     /// The next continuous block resumes at the gate-anchored start phase — the

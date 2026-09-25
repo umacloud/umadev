@@ -68,6 +68,8 @@ impl Fixture {
                 "claude-code",
                 "--mode",
                 mode,
+                // `--mode auto` runs only in a project the user trusts.
+                "--trust-project",
                 "--project-root",
             ])
             .arg(self.repo.path())
