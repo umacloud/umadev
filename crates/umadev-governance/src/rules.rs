@@ -1979,7 +1979,7 @@ pub(crate) fn check_hardcoded_secret_ungated(file_path: &str, content: &str) -> 
     // 1. Named key + separator + quoted value: `const API_KEY = "…"`,
     //    `"apiKey": "…"`, `password: "…"` — the spaced / JSON-key forms the
     //    contiguous `SECRET_PREFIXES` scan cannot see.
-    if let Some((name, len)) = named_secret_match(heuristic_content) {
+    if let Some((name, len)) = secret_values::named_secret_match(heuristic_content) {
         return Decision::block(
             "UD-SEC-003",
             format!(
@@ -2298,39 +2298,6 @@ fn bare_secret_regex() -> &'static Regex {
     })
 }
 
-/// Match a NAMED secret assignment: a key NAME (`api_key`/`secret`/`token`/
-/// `password`/…) followed by `=`/`:` (with any spacing, and optionally a quoted
-/// name as in JSON) and a QUOTED value. This is the form a contiguous
-/// `name=value` prefix scan misses: `const API_KEY = "…"` (spaces) and
-/// `"apiKey": "…"` (quote-colon). Returns `(matched_name, value_char_len)` for
-/// the first non-placeholder hit. The quoted-value requirement keeps it off
-/// `process.env.X` references and bare code expressions.
-fn named_secret_match(content: &str) -> Option<(String, usize)> {
-    for caps in named_secret_regex().captures_iter(content) {
-        let (Some(name), Some(value)) = (caps.get(1), caps.get(2)) else {
-            continue;
-        };
-        let value = value.as_str();
-        if is_placeholder_value(value) {
-            continue;
-        }
-        // Same guards the entropy fallback already applies (see
-        // [`is_high_entropy_secret`]): a value that is a URL / data-URI /
-        // filesystem path, or a low-entropy lowercase kebab-/snake-case slug
-        // (a design token like `color-primary-strong`, an identifier, a
-        // pagination cursor) is NOT a credential — it must not hard-block on
-        // the un-overridable secret floor merely because it sits under a
-        // `token`/`auth`/`secret` name. A genuine secret-shaped value
-        // (`sk-ant-…`, `AKIA…`, a mixed-case / high-entropy base64 or hex blob)
-        // has no `://`/`/` and mixes case or entropy, so it still blocks here.
-        if looks_like_url_or_path(value) || looks_like_low_entropy_slug(value) {
-            continue;
-        }
-        return Some((name.as_str().to_string(), value.chars().count()));
-    }
-    None
-}
-
 /// `true` when `s` is a low-entropy lowercase kebab-/snake-case slug — a design
 /// token / identifier / cursor (`color-primary-strong`, `pagination-cursor-abc`,
 /// `page_size_default`), NOT a credential.
@@ -2355,28 +2322,6 @@ fn looks_like_low_entropy_slug(s: &str) -> bool {
         return false;
     }
     shannon_entropy(s) < 4.0
-}
-
-/// Compiled detector for a named secret key assigned a quoted literal value.
-///
-/// `["']?` around the name allows a JSON quoted key (`"apiKey":`); `\s*[:=]\s*`
-/// allows any spacing (`const API_KEY = "…"`); the value class excludes
-/// whitespace and structural punctuation so it stops at the literal's end and
-/// never runs into surrounding code. The 12-char value floor keeps it off short,
-/// low-signal values. The NAME (`\b`-bounded) is the high-signal part — `secret`
-/// will not match inside `secret_key`, which forces the longer alternative.
-fn named_secret_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(concat!(
-            r#"(?i)["']?\b("#,
-            r"api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token",
-            r"|access[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd",
-            r"|secret|token|auth",
-            r#")\b["']?\s*[:=]\s*["']([^\s"',;(){}]{12,})["']"#,
-        ))
-        .expect("named-secret regex is well-formed")
-    })
 }
 
 /// Compiled detector for a PEM private-key block — an unambiguous leaked key.

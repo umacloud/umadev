@@ -1918,6 +1918,39 @@ fn secret_still_blocks_real_secret_under_secret_name() {
     }
 }
 
+#[test]
+fn named_secret_ignores_cjk_messages_and_key_name_constants() {
+    // Field-keyed validation messages in Chinese and storage-key / header-name
+    // constants sit under `password` / `token` / `auth` keys but are not
+    // credentials; the bypass-immune floor used to deny the whole locale file.
+    for path in ["src/locales/zh-CN.json", "src/i18n/zh.ts"] {
+        for source in [
+            "{ \"password\": \"密码错误，请重新输入您的密码\" }",
+            "export default { password: '密码必须为6-20位字母、数字或符号组合' }",
+            "export default { auth: '身份验证失败，请检查您的用户名和密码' }",
+            "{ \"token\": \"登录状态已失效，请重新登录系统\" }",
+            "export const CacheKey = { token: 'ACCESS_TOKEN', user: 'USER_INFO' }",
+            "export const Keys = { secret: 'NEXT_PUBLIC_SECRET' }",
+            "export const Headers = { auth: 'Authorization' }",
+            "export const Headers = { token: 'X-Access-Token' }",
+        ] {
+            let d = check_hardcoded_secret(path, source);
+            assert!(!d.block, "{path}: {source} -> {}", d.reason);
+        }
+    }
+    // Credential-shaped values under the same keys still block: a mixed-case
+    // password, a digit-heavy upper-case key, and a provider key.
+    for source in [
+        "export default { password: 'Sup3rS3cretPassw0rd' }",
+        "{ \"token\": \"AB12-CD34-EF56-GH78-JK90\" }",
+        concat!("{ \"auth\": \"AKIA", "IOSFODNN7QRT4UVWZ\" }"),
+    ] {
+        let d = check_hardcoded_secret("src/i18n/zh.ts", source);
+        assert!(d.block, "a real secret must still block: {source}");
+        assert_eq!(d.clause, "UD-SEC-003");
+    }
+}
+
 // --- frontend DB access (UD-SEC-004) -------------------------------
 
 #[test]
