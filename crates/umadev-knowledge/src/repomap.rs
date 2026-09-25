@@ -70,7 +70,8 @@ const CODE_EXT: &[&str] = &[
 
 /// Directories never worth scanning — build output / vendored deps / VCS /
 /// UmaDev's own artifact dirs. Mirrors `acceptance::SKIP_DIRS` (kept local to
-/// avoid the cross-crate dependency). Leading-dot dirs are skipped separately.
+/// avoid the cross-crate dependency). Leading-dot dirs are skipped separately,
+/// and so is a Python virtualenv under any name (see [`PYVENV_MARKER`]).
 const SKIP_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -80,11 +81,19 @@ const SKIP_DIRS: &[&str] = &[
     "vendor",
     "__pycache__",
     ".pytest_cache",
+    "venv",
+    "site-packages",
     ".next",
     "out",
     "coverage",
     "output",
 ];
+
+/// The file `venv` / `virtualenv` write at the root of every Python virtualenv
+/// (`env`, `py311`, …). Its installed packages are not the project's code, and
+/// walking them exhausts the entry budget or crowds the user's files out of the
+/// map. Mirrors `acceptance::is_python_venv`.
+const PYVENV_MARKER: &str = "pyvenv.cfg";
 
 /// Filenames (stem, lowercased) that mark an **entry point** — symbols defined
 /// in these files get an importance boost (they are the repo's public face).
@@ -224,6 +233,10 @@ fn is_code_path(path: &Path) -> bool {
         .is_some_and(|extension| CODE_EXT.contains(&extension.as_str()))
 }
 
+/// Walk `relative_dir` into `out`, bounded by depth, file count and the total
+/// number of directory entries inspected. Returns `Ok(false)` once the entry
+/// budget runs out: the whole walk stops there, but the files already collected
+/// are kept — the map is advisory, and a partial outline beats none.
 fn collect_bounded(
     root: &RootedDir,
     relative_dir: &Path,
@@ -232,27 +245,39 @@ fn collect_bounded(
     visited: &mut usize,
     max_files: usize,
     max_nodes: usize,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     if depth > limits::MAX_DEPTH || out.len() >= max_files {
-        return Ok(());
+        return Ok(true);
     }
     let remaining = max_nodes.saturating_sub(*visited);
     if remaining == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "repo map exceeds its directory-entry bound",
-        ));
+        return Ok(false);
     }
-    let entries = root.list_entries(relative_dir, remaining)?;
+    let entries = match root.list_entries(relative_dir, remaining) {
+        Ok(entries) => entries,
+        // A directory with more entries than the budget has left is refused
+        // as `InvalidData` before any of it is collected.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(false),
+        Err(error) => return Err(error),
+    };
     *visited = visited.checked_add(entries.len()).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "repo map directory-entry count overflow",
         )
     })?;
+    // A virtualenv below the root is skipped whatever it is named. The root
+    // itself may be one (`python -m venv .`) and still hold the project's code.
+    if depth > 0
+        && entries
+            .iter()
+            .any(|entry| entry.kind == RootedEntryKind::RegularFile && entry.name == PYVENV_MARKER)
+    {
+        return Ok(true);
+    }
     for entry in entries {
         if out.len() >= max_files {
-            return Ok(());
+            return Ok(true);
         }
         let path = relative_dir.join(&entry.name);
         match entry.kind {
@@ -261,7 +286,9 @@ fn collect_bounded(
                 if name.starts_with('.') || SKIP_DIRS.contains(&name) {
                     continue;
                 }
-                collect_bounded(root, &path, out, depth + 1, visited, max_files, max_nodes)?;
+                if !collect_bounded(root, &path, out, depth + 1, visited, max_files, max_nodes)? {
+                    return Ok(false);
+                }
             }
             RootedEntryKind::RegularFile if is_code_path(&path) => out.push(RepoFile {
                 relative: path,
@@ -273,10 +300,12 @@ fn collect_bounded(
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-/// Collect the repo's code files beneath one pinned, no-follow root.
+/// Collect the repo's code files beneath one pinned, no-follow root. Running
+/// out of the entry budget keeps the files found so far; only an I/O failure
+/// yields `None`.
 fn code_files(root: &RootedDir, max_files: usize, max_nodes: usize) -> Option<Vec<RepoFile>> {
     let mut files = Vec::new();
     let mut visited = 0usize;
@@ -2892,10 +2921,76 @@ mod tests {
         write(root, "b.rs", "fn b() {}\n");
         write(root, "c.rs", "fn c() {}\n");
         let rooted = RootedDir::open_no_follow(root).unwrap();
-        assert!(
-            code_files(&rooted, limits::MAX_FILES, 2).is_none(),
-            "a directory larger than the node budget must fail closed"
+        // The root alone exceeds the node budget, so none of its entries are
+        // collected; the walk stops with what it had, which here is nothing.
+        assert_eq!(
+            code_files(&rooted, limits::MAX_FILES, 2).map(|files| files.len()),
+            Some(0),
+            "a directory larger than the node budget must not be collected"
         );
+    }
+
+    #[test]
+    fn node_bound_keeps_partial_file_list() {
+        // The map is advisory: running out of the entry budget keeps what the
+        // walk already collected instead of discarding the whole outline.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a/main.rs", "fn main() {}\n");
+        for index in 0..8 {
+            write(root, &format!("z/gen_{index}.rs"), "fn g() {}\n");
+        }
+        let rooted = RootedDir::open_no_follow(root).unwrap();
+        // Root [a, z] = 2 entries, a/ = 1 more, then z/ has 8 > the 3 left.
+        let files = code_files(&rooted, limits::MAX_FILES, 6).expect("a partial list, not None");
+        let paths: Vec<String> = files.iter().map(|f| rel_display(&f.relative)).collect();
+        assert_eq!(paths, vec!["a/main.rs"]);
+    }
+
+    #[test]
+    fn repo_map_skips_python_virtualenv() {
+        // `python -m venv venv` (or any other name) puts thousands of
+        // site-packages files in the project. Walking them exhausted the entry
+        // budget (no map at all) or crowded the user's own code out of it.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write(root, "app/main.py", "def create_app():\n    pass\n");
+        for venv in ["venv", "env"] {
+            write(root, &format!("{venv}/pyvenv.cfg"), "home = /usr/bin\n");
+            for index in 0..20 {
+                write(
+                    root,
+                    &format!("{venv}/lib/python3.12/site-packages/pkg/mod_{index}.py"),
+                    "def vendored():\n    pass\n",
+                );
+            }
+        }
+        // A `pip install --target` tree is site-packages too.
+        write(
+            root,
+            "deps/site-packages/lib.py",
+            "def vendored():\n    pass\n",
+        );
+        // A real package that happens to be named `env` is the user's code.
+        write(
+            root,
+            "src/env/settings.py",
+            "def load_settings():\n    pass\n",
+        );
+        let rooted = RootedDir::open_no_follow(root).unwrap();
+        let files = code_files(&rooted, limits::MAX_FILES, limits::MAX_NODES).unwrap();
+        let paths: Vec<String> = files.iter().map(|f| rel_display(&f.relative)).collect();
+        assert_eq!(paths, vec!["app/main.py", "src/env/settings.py"]);
+
+        // A project whose root is itself a venv (`python -m venv .`) is still
+        // mapped: only a venv BELOW the root is skipped.
+        let dir = tempdir().unwrap();
+        write(dir.path(), "pyvenv.cfg", "home = /usr/bin\n");
+        write(dir.path(), "app.py", "def main():\n    pass\n");
+        let rooted = RootedDir::open_no_follow(dir.path()).unwrap();
+        let files = code_files(&rooted, limits::MAX_FILES, limits::MAX_NODES).unwrap();
+        let paths: Vec<String> = files.iter().map(|f| rel_display(&f.relative)).collect();
+        assert_eq!(paths, vec!["app.py"]);
     }
 
     #[cfg(unix)]
