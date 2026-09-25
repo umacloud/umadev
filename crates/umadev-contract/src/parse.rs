@@ -375,8 +375,16 @@ fn extract_endpoints_from_table(md: &str) -> Vec<Endpoint> {
             continue; // skip rows whose method isn't a real verb (e.g. "TODO")
         };
         // Strip markdown backtick wrapping so `/api/subscribe` in
-        // `` `/api/subscribe` `` is recognized as a real path.
-        let path = cells[path_col].trim().trim_matches('`').trim().to_string();
+        // `` `/api/subscribe` `` is recognized as a real path. Query parameters
+        // or a fragment documented inline (`/api/products?page=&size=`) are not
+        // part of the route, so they are dropped from the declared path.
+        let path = cells[path_col].trim().trim_matches('`').trim();
+        let path = path
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(path)
+            .trim()
+            .to_string();
         if !path.starts_with('/') {
             continue; // not a real API path
         }
