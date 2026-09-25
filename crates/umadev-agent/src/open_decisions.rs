@@ -796,15 +796,13 @@ fn derive_title(head_text: &str, category: Option<&str>) -> String {
             break;
         }
     }
-    // Strip the category slug (ASCII) wherever it appears — only when the
-    // lowercased copy has the same byte length (true for ASCII + CJK), so the
-    // found offset is valid in the original.
+    // Strip the category slug (ASCII) wherever it appears. ASCII lowercasing keeps
+    // every byte offset of the original (full Unicode lowercasing does not: `İ`
+    // grows and `ẞ` shrinks), and an ASCII needle only matches on char
+    // boundaries, so the found range is always valid in `t`.
     if let Some(c) = category {
-        let lower = t.to_lowercase();
-        if lower.len() == t.len() {
-            if let Some(pos) = lower.find(c) {
-                t.replace_range(pos..pos + c.len(), "");
-            }
+        if let Some(pos) = t.to_ascii_lowercase().find(c) {
+            t.replace_range(pos..pos + c.len(), "");
         }
     }
     t.trim_matches(|ch: char| ch.is_whitespace() || "—–-·|:*#[]()".contains(ch))
@@ -951,6 +949,21 @@ mod tests {
         .unwrap();
         assert!(load_decisions(tmp.path()).is_empty());
         assert!(decisions_recall_block(tmp.path(), DECISIONS_FIRMWARE_BUDGET).is_empty());
+    }
+
+    #[test]
+    fn mixed_case_unicode_heading_strips_the_category_without_panicking() {
+        // `İ` grows by one byte when lowercased and `ẞ` shrinks by one, so the
+        // Unicode-lowercased heading has the SAME byte length as the original while
+        // every offset after `İ` is shifted — slicing the original at the lowercased
+        // copy's offset used to land inside `测` and panic on every work turn.
+        let parsed = parse_register("## OPEN — İ design-decision-to-evaluate测ẞ\n");
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(
+            parsed[0].category.as_deref(),
+            Some("design-decision-to-evaluate")
+        );
+        assert_eq!(parsed[0].title, "İ 测ẞ");
     }
 
     #[test]
