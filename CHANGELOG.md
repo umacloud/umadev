@@ -2,6 +2,30 @@
 
 本文件记录 UmaDev 的所有重要变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [1.1.2] - 2026-09-25
+
+依赖安全更新 · 旧包名安装提示收尾 · 发布终检修复
+
+### 安全(依赖)
+
+- `rustls` 升级到 0.23.45(RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc:TLS 1.3 握手消息跨加密级别被错误接受),同时带上 `rustls-webpki` 0.103.15。
+- `lru` 升级到 0.18.5(RUSTSEC-2026-0253:`LruCache::pop()` 非 panic 安全,可致释放后使用)。
+- 依赖锁文件整体刷新到各依赖的最新兼容补丁/小版本(如 tokio 1.53.1、hyper 1.11.1、clap 4.6.7、serde_json 1.0.151、chrono 0.4.45)。
+- `paste` 的“不再维护”提示(RUSTSEC-2024-0436,仅信息级,无已知漏洞)在 `.cargo/audit.toml` 中带理由忽略:它只是可选 `vector-local` 功能经 candle/tokenizers 引入的编译期宏,上游最新版仍依赖它,待上游移除后撤销该忽略。
+
+### 修复(旧包名收尾)
+
+- 所有剩余的安装提示统一指向 `@umatech/umadev`:官网首页的复制安装按钮与底部行动区(此前仍复制旧的未加 scope 包名 `umadev`)、文档中的 npx 用法、`umadev update` 在无法自更新时给出的升级命令、`umadev doctor` 的本地安装提示。官网按钮、npx 与升级命令显式固定 npm 官方 registry。
+- SECURITY.md 新增“已停用的包名”一节,列出不再发布的 `umadev` 与八个 `@umacloud/*` 包,并给出迁移命令;三语 README 的安装部分加上旧包迁移提示(先 `npm uninstall -g umadev`,用 `npx @umatech/umadev`,不要用 `npx umadev`)。
+
+### 文档
+
+- README(三语)与文档的安装说明精简为一行:`npm i -g @umatech/umadev`,去掉 sudo/prefix/npx 大段说明;权限或 PATH 问题交给 `umadev doctor` 给出确切修复命令。
+
+### 修复(发布链路)
+
+- 发布流程最后一步“核验所有公开发布面”仍在检查旧的未加 scope 包名 `umadev`(停在 `1.0.73`),导致 1.1.1 在 `@umatech/umadev` 已正确发布的情况下仍被判失败;现改为核验 `@umatech/umadev`,与其余八个包一致。
+
 ## [1.1.1] - 2026-08-26
 
 npm 发布渠道迁移到 @umatech · 自更新器修复
