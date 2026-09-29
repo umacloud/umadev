@@ -736,6 +736,7 @@
 "template.switched" = "Seed template switched to `{}` — the next run's frontend phase will follow this template's page structure and quality bar."
 
 # /run and /redo
+"run.resume_mode_narrowed" = "[mode] This run was saved in {} mode, but this session is in {} mode, so it continues with this session's permissions. To continue it with its saved permissions, switch with /mode {}."
 "run.busy_reopen" = "A pipeline is running — /cancel it before starting again, to avoid two pipelines writing the same workspace."
 "run.usage" = "Usage: /run [--slug <slug>] <requirement>\n  Example: /run --slug my-project build a login system\n  Example: /run build an end-to-end test suite (slug auto-uses the directory name)"
 "goal.busy_reopen" = "A task is already running — /cancel it before /goal, to avoid two tasks writing the same workspace."

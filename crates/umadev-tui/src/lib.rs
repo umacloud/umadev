@@ -150,7 +150,7 @@ use crate::resident_turn_support::{
 use crate::resident_turn_support::{first_chat_directive, scoped_chat_directive};
 use crate::route_decision::RouteDecision;
 use crate::run_options::{
-    current_run_options, persisted_run_mode, resume_run_options,
+    current_run_options, resume_run_mode, resume_run_options,
     settle_operational_review_before_fresh_block, start_failed_note,
 };
 use crate::session_slot::{
@@ -9043,7 +9043,7 @@ fn detach_parked_chat_session(chat_session_holder: &ChatSessionHolder) {
 }
 
 fn spawn_gate_continuation(
-    app: &App,
+    app: &mut App,
     opts: &LaunchOptions,
     sink: &Arc<ChannelSink>,
     session_holder: &SessionHolder,
@@ -9169,7 +9169,7 @@ fn start_requested_run(
         design_system: app.config.design_system.clone().unwrap_or_default(),
         seed_template: app.config.seed_template.clone().unwrap_or_default(),
         mode: if resume {
-            persisted_run_mode(&opts.project_root, app.effective_trust_mode())
+            resume_run_mode(app, &opts.project_root)
         } else {
             app.effective_trust_mode()
         },
@@ -9277,7 +9277,7 @@ fn start_revision(
         backend: app.backend.clone().unwrap_or_default(),
         design_system: app.config.design_system.clone().unwrap_or_default(),
         seed_template: app.config.seed_template.clone().unwrap_or_default(),
-        mode: persisted_run_mode(&opts.project_root, app.effective_trust_mode()),
+        mode: resume_run_mode(app, &opts.project_root),
         strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
     let gate = app.active_gate.take();

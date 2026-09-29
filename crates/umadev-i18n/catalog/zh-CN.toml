@@ -726,6 +726,7 @@
 "template.switched" = "种子模板切换为 `{}` — 下一个 run 的 frontend 阶段将参考此模板的页面结构和质量标准。"
 
 # /run and /redo
+"run.resume_mode_narrowed" = "[模式] 这次运行保存时处于 {} 模式，而本会话当前为 {} 模式，因此将按本会话的权限继续。如需按保存时的权限继续，请先用 /mode {} 切换。"
 "run.busy_reopen" = "流水线正在跑 — 先 /cancel 停掉再重开,避免两个流水线同时写同一个工作区。"
 "run.usage" = "用法:/run [--slug <slug>] <需求>\n  示例:/run --slug my-project 做一个登录系统\n  示例:/run 构建端到端测试套件 (slug 自动用目录名)"
 "goal.busy_reopen" = "已经有任务在跑 — 先 /cancel 停掉再 /goal,避免两个任务同时写同一个工作区。"

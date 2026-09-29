@@ -420,50 +420,67 @@ fn live_trust_round_trips_and_publishes() {
 }
 
 #[test]
-fn persisted_run_mode_preserves_plan_auto_and_safe_legacy_default() {
+fn a_resume_names_only_a_saved_tier_wider_than_the_session_that_trust_honours() {
+    use crate::run_options::saved_run_mode_wider_than;
     use umadev_agent::TrustMode;
     use umadev_runtime::BasePermissionProfile;
 
     let tmp = tempfile::TempDir::new().unwrap();
-    // A missing state means there is nothing to inherit: keep the user's
-    // current explicit choice rather than inventing a different tier.
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Plan),
-        TrustMode::Plan
-    );
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Auto),
-        TrustMode::Auto
-    );
-
-    // A saved Auto tier resumes only in a project the user trusts.
-    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
-    state.permission_profile = Some(BasePermissionProfile::Auto);
-    umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Guarded),
-        TrustMode::Guarded
-    );
-    crate::app::workspace_trust::trust_for_test(tmp.path());
-
-    for (profile, expected) in [
-        (BasePermissionProfile::Plan, TrustMode::Plan),
-        (BasePermissionProfile::Auto, TrustMode::Auto),
-    ] {
+    let save = |profile| {
         let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
         state.permission_profile = Some(profile);
         umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
-        assert_eq!(persisted_run_mode(tmp.path(), TrustMode::Guarded), expected);
-    }
+    };
+    // Trust is per project: trusting another one keeps this test's state
+    // directory private without trusting this project.
+    let other = tempfile::TempDir::new().unwrap();
+    crate::app::workspace_trust::trust_for_test(other.path());
 
-    // A currently selected Plan mode is a non-widening ceiling even when the
-    // old workflow was created under Auto.
+    // Nothing saved: nothing to report.
+    assert_eq!(saved_run_mode_wider_than(tmp.path(), TrustMode::Plan), None);
+
+    // In a project the user does not trust, a saved Auto asks for no more
+    // than Guarded.
+    save(BasePermissionProfile::Auto);
     assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Plan),
-        TrustMode::Plan
+        saved_run_mode_wider_than(tmp.path(), TrustMode::Guarded),
+        None
+    );
+    assert_eq!(
+        saved_run_mode_wider_than(tmp.path(), TrustMode::Plan),
+        Some(TrustMode::Guarded)
     );
 
-    // A pre-profile workflow remains readable and resumes conservatively.
+    crate::app::workspace_trust::trust_for_test(tmp.path());
+    for (saved, current, wider) in [
+        (
+            BasePermissionProfile::Auto,
+            TrustMode::Guarded,
+            Some(TrustMode::Auto),
+        ),
+        (
+            BasePermissionProfile::Auto,
+            TrustMode::Plan,
+            Some(TrustMode::Auto),
+        ),
+        (
+            BasePermissionProfile::Guarded,
+            TrustMode::Plan,
+            Some(TrustMode::Guarded),
+        ),
+        (BasePermissionProfile::Guarded, TrustMode::Auto, None),
+        (BasePermissionProfile::Plan, TrustMode::Guarded, None),
+        (BasePermissionProfile::Auto, TrustMode::Auto, None),
+    ] {
+        save(saved);
+        assert_eq!(
+            saved_run_mode_wider_than(tmp.path(), current),
+            wider,
+            "{saved:?} resumed in {current:?}"
+        );
+    }
+
+    // A pre-profile workflow reads as Guarded, which never outranks Auto.
     let legacy = r#"{
             "phase": "frontend",
             "active_gate": "preview_confirm",
@@ -475,10 +492,58 @@ fn persisted_run_mode_preserves_plan_auto_and_safe_legacy_default() {
             "spec_version": "UMADEV_HOST_SPEC_V1"
         }"#;
     std::fs::write(tmp.path().join(".umadev/workflow-state.json"), legacy).unwrap();
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Auto),
-        TrustMode::Guarded
+    assert_eq!(saved_run_mode_wider_than(tmp.path(), TrustMode::Auto), None);
+}
+
+#[test]
+fn a_resume_never_runs_with_more_authority_than_the_session_tier() {
+    use umadev_agent::TrustMode;
+    use umadev_runtime::BasePermissionProfile;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    crate::app::workspace_trust::trust_for_test(tmp.path());
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
+    state.permission_profile = Some(BasePermissionProfile::Auto);
+    umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
+    let mut app = App::new(
+        "resume-tier",
+        crate::config::UserConfig::default(),
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
     );
+    let launch = LaunchOptions {
+        project_root: tmp.path().to_path_buf(),
+        slug: "resume-tier".into(),
+        model: String::new(),
+    };
+    assert_eq!(
+        app.effective_trust_mode(),
+        TrustMode::Guarded,
+        "every session starts Guarded"
+    );
+
+    // The run saved in Auto continues in the session's Guarded, and the user
+    // is told how to give it its saved tier back.
+    let options = resume_run_options(&mut app, &launch);
+    assert_eq!(options.mode, TrustMode::Guarded);
+    assert_eq!(
+        base_permissions(options.mode),
+        BasePermissionProfile::Guarded
+    );
+    assert!(
+        app.transcript_plaintext().contains("/mode auto"),
+        "the user is told how to resume with the saved tier"
+    );
+
+    // A tier the user picks at the paused gate applies from that gate on.
+    app.trust_mode_override = Some(TrustMode::Auto);
+    let options = resume_run_options(&mut app, &launch);
+    assert_eq!(options.mode, TrustMode::Auto);
+    assert_eq!(base_permissions(options.mode), BasePermissionProfile::Auto);
+
+    // A currently selected Plan stays a ceiling for a run saved in Auto.
+    app.trust_mode_override = Some(TrustMode::Plan);
+    assert_eq!(resume_run_options(&mut app, &launch).mode, TrustMode::Plan);
 }
 
 #[test]

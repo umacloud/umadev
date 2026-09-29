@@ -2,7 +2,7 @@
 
 use crate::app::App;
 use crate::LaunchOptions;
-use umadev_agent::RunOptions;
+use umadev_agent::{RunOptions, TrustMode};
 
 /// Build the user-facing note for a failed runner start.
 pub(super) fn start_failed_note(error: &std::io::Error) -> String {
@@ -44,30 +44,44 @@ pub(super) fn current_run_options(app: &App, options: &LaunchOptions) -> RunOpti
     }
 }
 
-/// Resolve a continuation's permission posture from the workflow that created it.
-pub(super) fn persisted_run_mode(
-    project_root: &std::path::Path,
-    fallback: umadev_agent::TrustMode,
-) -> umadev_agent::TrustMode {
-    // The current Plan selection is a hard non-widening ceiling.
-    if fallback == umadev_agent::TrustMode::Plan {
-        return fallback;
+/// The tier a continuation runs under: always the session's current tier.
+///
+/// A resume never acts with more authority than the footer chip shows, and a
+/// tier the user picks at a paused gate applies from that gate on. When the
+/// saved run had more authority, say once how to give it back; the resumed
+/// run saves the current tier, so the next resume is silent.
+pub(super) fn resume_run_mode(app: &mut App, project_root: &std::path::Path) -> TrustMode {
+    let current = app.effective_trust_mode();
+    if let Some(saved) = saved_run_mode_wider_than(project_root, current) {
+        app.push_workspace_notice(umadev_i18n::tf(
+            app.lang,
+            "run.resume_mode_narrowed",
+            &[saved.as_str(), current.as_str(), saved.as_str()],
+        ));
     }
-    // The saved tier is honored only for run state this installation wrote in a
-    // project the user trusts; the repository could have written anything else.
-    let trusted = umadev_agent::workspace_trust::is_trusted(project_root);
-    umadev_agent::read_workflow_state(project_root).map_or(fallback, |state| {
-        umadev_agent::workspace_trust::resume_tier(
-            project_root,
-            umadev_agent::TrustMode::from_base_permissions(state.resolved_permission_profile()),
-            trusted,
-        )
-    })
+    current
+}
+
+/// The tier saved with the workflow being resumed, when it granted more
+/// authority than `current`. A saved tier counts only as far as workspace
+/// trust honours it: run state in a project the user does not trust, or that
+/// this installation did not write, never asks for more than Guarded.
+pub(super) fn saved_run_mode_wider_than(
+    project_root: &std::path::Path,
+    current: TrustMode,
+) -> Option<TrustMode> {
+    let state = umadev_agent::read_workflow_state(project_root)?;
+    let saved = umadev_agent::workspace_trust::resume_tier(
+        project_root,
+        TrustMode::from_base_permissions(state.resolved_permission_profile()),
+        umadev_agent::workspace_trust::is_trusted(project_root),
+    );
+    saved.is_downgrade_to(current).then_some(saved)
 }
 
 /// Build options for `/continue`, gate revision, and `/redo`.
-pub(super) fn resume_run_options(app: &App, options: &LaunchOptions) -> RunOptions {
+pub(super) fn resume_run_options(app: &mut App, options: &LaunchOptions) -> RunOptions {
     let mut run_options = current_run_options(app, options);
-    run_options.mode = persisted_run_mode(&options.project_root, run_options.mode);
+    run_options.mode = resume_run_mode(app, &options.project_root);
     run_options
 }

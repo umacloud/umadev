@@ -308,7 +308,7 @@ one command without recording anything.
 | | Trusted | Untrusted |
 |---|---|---|
 | Tier | Guarded by default; Auto by your choice (`shift+Tab`, `/mode auto`, `--mode auto`) | Plan or Guarded; Auto is refused |
-| Resuming a saved run | Its tier, if UmaDev on this machine wrote it or you adopted it | At most Guarded |
+| Resuming a saved run | TUI: the session's current tier (a run saved in Auto continues in Guarded until you `/mode auto`); CLI `continue` / `redo` / `revise`: the saved tier, if UmaDev on this machine wrote it or you adopted it | At most Guarded |
 | Claude Code | Project settings, hooks and MCP servers load | `--setting-sources user --strict-mcp-config`; UmaDev's own governance hooks, when installed, are passed with `--settings` |
 | Codex | Codex's own trust decision applies | The project and its parents are marked `untrusted`, so project config, hooks and exec policies stay off |
 | OpenCode | Project config loads | `OPENCODE_DISABLE_PROJECT_CONFIG=1` |
