@@ -34,7 +34,7 @@ pub fn scan_content_findings_with_context(
     let mut clauses = HashSet::new();
     let mut findings = Vec::new();
     for &check in CONTENT_CHECKS {
-        if skip_surface && is_server_surface_rule(check) {
+        if (skip_surface && is_server_surface_rule(check)) || super::i18n::stands_down(check, ctx) {
             continue;
         }
         let decision = run_check_guarded(check, file_path, content);

@@ -2724,6 +2724,97 @@ fn arch_i18n_ignores_non_ui_files() {
 }
 
 #[test]
+fn i18n_rule_does_not_block_single_language_cjk_ui() {
+    // A Chinese-only UI ("做一个记账页面") is the product's main audience writing
+    // their own language, not a missing i18n layer. Without multi-language intent
+    // the scan must not turn it into a blocking "add react-intl" rework.
+    let page =
+        "export const App = () => <div><h1>记账</h1><input placeholder=\"请输入金额\" /></div>;";
+    for ctx in [ProjectContext::unknown(), ProjectContext::static_frontend()] {
+        let findings = scan_content_findings_with_context(
+            "src/App.tsx",
+            page,
+            &crate::policy::Policy::default(),
+            ctx,
+        );
+        assert!(
+            findings.iter().all(|d| d.clause != "UD-ARCH-009"),
+            "{findings:?}"
+        );
+        assert_ne!(
+            scan_content_with_context("src/App.tsx", page, &crate::policy::Policy::default(), ctx)
+                .clause,
+            "UD-ARCH-009"
+        );
+    }
+    // A multi-language project still gets the finding (and so does the rule
+    // itself, which the scan only consults for such a project).
+    let multi = ProjectContext::unknown().with_i18n_intent(true);
+    let findings = scan_content_findings_with_context(
+        "src/App.tsx",
+        page,
+        &crate::policy::Policy::default(),
+        multi,
+    );
+    assert!(
+        findings.iter().any(|d| d.clause == "UD-ARCH-009"),
+        "{findings:?}"
+    );
+    assert!(check_i18n_required("src/App.tsx", page).block);
+}
+
+#[test]
+fn multi_language_intent_comes_from_the_requirement_or_the_project() {
+    for requirement in [
+        "做一个支持中英文切换的记账页面",
+        "做一个多语言官网",
+        "给后台加上国际化",
+        "Build a bilingual landing page",
+        "Add i18n to the settings screen",
+        "做一个记账页面，要有英文版",
+    ] {
+        assert!(requirement_asks_for_i18n(requirement), "{requirement}");
+    }
+    for requirement in ["做一个记账页面", "Build a todo list", "修复登录页的样式"] {
+        assert!(!requirement_asks_for_i18n(requirement), "{requirement}");
+    }
+
+    let empty = tempfile::TempDir::new().unwrap();
+    assert!(!project_declares_i18n(empty.path()));
+    std::fs::write(
+        empty.path().join("package.json"),
+        r#"{"dependencies":{"react":"18.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(empty.path().join("src/locales")).unwrap();
+    std::fs::write(empty.path().join("src/locales/zh-CN.json"), "{}").unwrap();
+    assert!(
+        !project_declares_i18n(empty.path()),
+        "one language is not a catalog"
+    );
+
+    let catalog = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(catalog.path().join("src/locales")).unwrap();
+    std::fs::write(catalog.path().join("src/locales/zh-CN.json"), "{}").unwrap();
+    std::fs::write(catalog.path().join("src/locales/en.json"), "{}").unwrap();
+    assert!(project_declares_i18n(catalog.path()));
+
+    let nested = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(nested.path().join("public/locales/en")).unwrap();
+    std::fs::create_dir_all(nested.path().join("public/locales/zh")).unwrap();
+    assert!(project_declares_i18n(nested.path()));
+
+    let library = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(library.path().join("web")).unwrap();
+    std::fs::write(
+        library.path().join("web/package.json"),
+        r#"{"dependencies":{"vue":"3.4.0","vue-i18n":"9.0.0"}}"#,
+    )
+    .unwrap();
+    assert!(project_declares_i18n(library.path()));
+}
+
+#[test]
 fn arch_i18n_allows_a_typed_custom_locale_catalog() {
     let d = check_i18n_required(
         "src/Demo.tsx",

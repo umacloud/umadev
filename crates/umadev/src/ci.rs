@@ -863,15 +863,22 @@ impl<'a> ContextCache<'a> {
         let mut at = Some(dir);
         while let Some(cur) = at {
             if umadev_state::fs::real_dir(&cur.join(".umadev")) {
-                return load_project_context(cur);
+                return with_workspace_i18n(load_project_context(cur), cur);
             }
             if cur == self.root {
                 break;
             }
             at = cur.parent();
         }
-        load_project_context(self.root)
+        with_workspace_i18n(load_project_context(self.root), self.root)
     }
+}
+
+/// A workspace that already localizes (an i18n library or a locale catalog) is
+/// multi-language whatever the stored context says, so hardcoded CJK UI text
+/// (UD-ARCH-009) is judged there — and only there.
+fn with_workspace_i18n(ctx: ProjectContext, root: &Path) -> ProjectContext {
+    ctx.with_i18n_intent(ctx.i18n_intent || umadev_governance::project_declares_i18n(root))
 }
 
 /// The requirement this workspace is currently being built from

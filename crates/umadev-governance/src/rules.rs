@@ -33,6 +33,8 @@ mod password_rules;
 pub use password_rules::{check_plaintext_password, check_unhashed_password_storage};
 mod client_secret;
 pub use client_secret::check_client_secret_leak;
+mod i18n;
+pub use i18n::{check_i18n_required, project_declares_i18n, requirement_asks_for_i18n};
 mod secret_values;
 
 /// Outcome of a governance rule.
@@ -158,6 +160,15 @@ pub struct ProjectContext {
     #[serde(default)]
     pub purple_allowed: bool,
 
+    /// The project is multi-language: the requirement asks for i18n / 多语言 /
+    /// 国际化, or the workspace already has an i18n library or a locale catalog
+    /// ([`requirement_asks_for_i18n`], [`project_declares_i18n`]). Only then is
+    /// hardcoded CJK UI text (UD-ARCH-009) a finding — a single-language Chinese
+    /// UI is its audience's own language. Defaults to `false`. Not covered by the
+    /// provenance tag: it can only turn a lint on, never stand a rule down.
+    #[serde(default)]
+    pub i18n_intent: bool,
+
     /// Legacy enumerable provenance written by UmaDev 1.0.70 and older. It remains
     /// deserializable so old JSON is compatible, but is never serialized or trusted: a raw
     /// FNV value lets an observer dictionary-test short requirements offline.
@@ -212,6 +223,7 @@ impl ProjectContext {
         Self {
             static_frontend_only: false,
             purple_allowed: false,
+            i18n_intent: false,
             requirement_hash: 0,
             requirement_fingerprint: [0; 32],
             provenance_auth: [0; 32],
@@ -227,6 +239,7 @@ impl ProjectContext {
         Self {
             static_frontend_only: true,
             purple_allowed: false,
+            i18n_intent: false,
             requirement_hash: 0,
             requirement_fingerprint: [0; 32],
             provenance_auth: [0; 32],
@@ -563,7 +576,7 @@ pub fn scan_content_with_context(
     for &check in CONTENT_CHECKS {
         // A surface-bound rule guards nothing on a proven static frontend → skip
         // it (in place, so precedence is untouched for every other project).
-        if skip_surface && is_server_surface_rule(check) {
+        if (skip_surface && is_server_surface_rule(check)) || i18n::stands_down(check, ctx) {
             continue;
         }
         let d = run_check_guarded(check, file_path, content);
@@ -2711,89 +2724,6 @@ pub fn check_eval_injection(file_path: &str, content: &str) -> Decision {
             labels.join(" / "),
         ),
     )
-}
-
-/// **UD-ARCH-009**: require i18n for hardcoded user-facing strings.
-///
-/// A commercial product must not hardcode UI text — it needs an i18n layer
-/// (react-intl / i18next / formatjs) so strings can be localized. Flags JSX
-/// files that contain CJK characters in JSX text nodes or string literals
-/// passed to user-facing props (`placeholder`/`label`/`title`/`<button>` text),
-/// when no i18n import is present. Conservative: only flags CJK (the clearest
-/// "this is a hardcoded UI string" signal) and only when no i18n setup exists.
-#[must_use]
-pub fn check_i18n_required(file_path: &str, content: &str) -> Decision {
-    let ext = extension_of(file_path);
-    if !matches!(ext.as_str(), "jsx" | "tsx" | "vue" | "svelte") {
-        return Decision::pass();
-    }
-    // If the file already imports an i18n library, it's set up correctly.
-    if content.contains("react-intl")
-        || content.contains("i18next")
-        || content.contains("useTranslation")
-        || content.contains("FormattedMessage")
-        || content.contains("@formatjs")
-        || content.contains("vue-i18n")
-        || content.contains("$t(")
-        || content.contains("i18n[")
-        || (content.contains("_zh") && content.contains("_en"))
-    {
-        return Decision::pass();
-    }
-    // Scan for CJK characters in user-facing contexts (JSX text / string props).
-    let has_cjk_ui = content
-        .lines()
-        .filter(|l| {
-            // Skip comment lines.
-            let t = l.trim_start();
-            !t.starts_with("//") && !t.starts_with('*') && !t.starts_with("/*")
-        })
-        .any(|line| {
-            // CJK between `>` and `<` (JSX text node) or in a UI prop string.
-            (line.contains('>') && line.contains('<') && has_cjk(line)) || has_cjk_in_prop(line)
-        });
-    if has_cjk_ui {
-        return Decision::block(
-            "UD-ARCH-009",
-            format!(
-                "UmaDev: hardcoded UI string without i18n (UD-ARCH-009). \
-                 `{file_path}` has CJK user-facing text but no i18n import. A \
-                 commercial product must localize UI strings. Wrap text with \
-                 `<FormattedMessage>` / `t(\"key\")` from react-intl or i18next, \
-                 and move the string to a locale file. (If this file is a test \
-                 or demo, disable this clause in .umadev/rules.toml.)",
-            ),
-        );
-    }
-    Decision::pass()
-}
-
-/// `true` when the line contains a CJK ideograph (Unicode CJK Unified block).
-fn has_cjk(s: &str) -> bool {
-    s.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
-}
-
-/// `true` when a UI-prop string literal contains CJK (placeholder/label/title).
-fn has_cjk_in_prop(line: &str) -> bool {
-    for prop in [
-        "placeholder=\"",
-        "placeholder='",
-        "label=\"",
-        "label='",
-        "title=\"",
-        "title='",
-    ] {
-        if let Some(start) = line.find(prop) {
-            let after = &line[start + prop.len()..];
-            let end_quote = after.find(if prop.ends_with('"') { '"' } else { '\'' });
-            if let Some(end) = end_quote {
-                if has_cjk(&after[..end]) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// **UD-SEC-008**: ban unsafe deserialization.

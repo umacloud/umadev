@@ -909,6 +909,10 @@ pub fn derive_project_context_with_color(
     purple_allowed: bool,
 ) -> umadev_governance::ProjectContext {
     let purple = purple_allowed;
+    // Multi-language intent, on every return path too: only then is hardcoded CJK UI
+    // text (UD-ARCH-009) a finding — a Chinese-only UI is its audience's own language.
+    let i18n = umadev_governance::requirement_asks_for_i18n(requirement)
+        || umadev_governance::project_declares_i18n(project_root);
     // PROVENANCE, on every return path. The context is persisted and read back by other
     // PROCESSES (the PreToolUse hook, `umadev ci` in the pre-commit hook) that have no idea
     // what produced it — so it carries WHICH requirement it was derived from and WHEN.
@@ -922,7 +926,11 @@ pub fn derive_project_context_with_color(
             .as_ref()
             .map_or(ctx, |key| ctx.derived_from(requirement, key, now_secs()))
     };
-    let strict = stamp(umadev_governance::ProjectContext::unknown().with_purple_allowed(purple));
+    let strict = stamp(
+        umadev_governance::ProjectContext::unknown()
+            .with_purple_allowed(purple)
+            .with_i18n_intent(i18n),
+    );
 
     // Signal 1: task kind must be a frontend-only / light build.
     let kind = classify(requirement);
@@ -960,7 +968,11 @@ pub fn derive_project_context_with_color(
         return strict;
     }
 
-    stamp(umadev_governance::ProjectContext::static_frontend().with_purple_allowed(purple))
+    stamp(
+        umadev_governance::ProjectContext::static_frontend()
+            .with_purple_allowed(purple)
+            .with_i18n_intent(i18n),
+    )
 }
 
 /// UNIX seconds, or 0 when the clock is unreadable (which reads as "unstamped" — the
@@ -1976,6 +1988,23 @@ mod tests {
             !ctx.static_frontend_only,
             "a produced server file proves a backend → strict"
         );
+    }
+
+    #[test]
+    fn context_records_multi_language_intent() {
+        // A Chinese-only page is not multi-language, so the hardcoded-CJK rule
+        // stays off for it; asking for 多语言 or shipping a locale catalog turns
+        // it on.
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!derive_project_context("做一个记账页面", tmp.path(), "ledger").i18n_intent);
+        assert!(
+            derive_project_context("做一个支持中英文切换的记账页面", tmp.path(), "ledger")
+                .i18n_intent
+        );
+        std::fs::create_dir_all(tmp.path().join("src/locales")).unwrap();
+        std::fs::write(tmp.path().join("src/locales/en.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("src/locales/zh-CN.json"), "{}").unwrap();
+        assert!(derive_project_context("做一个记账页面", tmp.path(), "ledger").i18n_intent);
     }
 
     #[test]
