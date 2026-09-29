@@ -991,6 +991,37 @@ mod tests {
     }
 
     #[test]
+    fn extract_entities_skips_generic_cjk_nouns() {
+        // Everyday words (页面 page, 搜索 search, 流程 flow, 问题 problem, 数据
+        // data, …) are not CRUD resources. Mapping them invented endpoints such
+        // as DELETE /api/search/:id, merged into the contract and later recorded
+        // as implemented.
+        let e1 = extract_entities("开发一个商品搜索页面，支持按分类筛选");
+        assert_eq!(e1, vec!["products".to_string(), "categories".to_string()]);
+        let e2 = extract_entities("实现用户注册登录流程，解决页面加载慢的问题");
+        assert_eq!(e2, vec!["users".to_string()]);
+        let e3 = extract_entities(
+            "支持数据导入导出、文件上传下载和动态效果，可在设置里切换版本，显示存储空间和模型名称",
+        );
+        assert_eq!(e3, vec!["files".to_string()]);
+        // Specific terms and whole scenes still map.
+        for (requirement, entity) in [
+            ("工单系统", "tickets"),
+            ("审批工作流", "workflows"),
+            ("朋友圈", "feeds"),
+            ("数据集管理", "datasets"),
+            ("故障上报", "issues"),
+            ("数据分析平台", "reports"),
+            ("知识库", "spaces"),
+            ("机器学习平台", "models"),
+            ("文件管理", "files"),
+        ] {
+            let e = extract_entities(requirement);
+            assert!(e.contains(&entity.to_string()), "{requirement} → {e:?}");
+        }
+    }
+
+    #[test]
     fn stopwords_filtered() {
         let e = extract_entities("build a modern web app with a nice dashboard");
         // "app", "web", "dashboard", "modern" are all stopwords.

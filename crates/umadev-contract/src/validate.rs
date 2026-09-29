@@ -385,6 +385,69 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_client_call_with_base_url_prefix_is_declared() {
+        // `const api = axios.create({ baseURL: '/api' })` then `api.get('/users')`:
+        // the client prepends its base URL, so the literal path is relative to
+        // it and is not an undeclared call against `/api/users`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("api.ts"),
+            "import axios from 'axios';\n\
+             export const api = axios.create({ baseURL: import.meta.env.VITE_API_BASE || '/api' });\n\
+             export const listUsers = () => api.get('/users');\n\
+             export const getUser = (id: string) => api.get(`/users/${id}`);\n\
+             export const removeUser = (id: string) => api.delete(`/users/${id}`);\n\
+             export const login = (form: unknown) => http.post('/auth/login', form);\n",
+        )
+        .unwrap();
+        let spec = parse_architecture(
+            "| Method | Path | Description |\n|---|---|---|\n\
+             | GET | /api/users | List |\n\
+             | GET | /api/users/:id | Get |\n\
+             | DELETE | /api/users/:id | Delete |\n\
+             | POST | /api/auth/login | Login |\n",
+            "demo",
+        );
+        let calls = crate::extract::extract_frontend_calls(tmp.path());
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert!(v.is_empty(), "{v:?}");
+
+        // Real drift through the same client is still reported: a resource the
+        // contract never declares, and a verb it does not allow. A plain fetch
+        // has no client base: its literal path is what the browser requests.
+        std::fs::write(
+            src.join("more.ts"),
+            "export const listOrders = () => api.get('/orders');\n\
+             export const renameUser = (id: string) => api.patch(`/users/${id}`);\n\
+             export const rawUsers = () => fetch('/users');\n",
+        )
+        .unwrap();
+        let calls = crate::extract::extract_frontend_calls(tmp.path());
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        let details: Vec<(ViolationKind, &str)> =
+            v.iter().map(|x| (x.kind, x.detail.as_str())).collect();
+        assert_eq!(v.len(), 3, "{details:?}");
+        assert!(
+            v.iter()
+                .any(|x| x.kind == ViolationKind::UndeclaredCall && x.detail.contains("/orders")),
+            "{details:?}"
+        );
+        assert!(
+            v.iter()
+                .any(|x| x.kind == ViolationKind::MethodMismatch && x.detail.contains("PATCH")),
+            "{details:?}"
+        );
+        assert!(
+            v.iter()
+                .any(|x| x.kind == ViolationKind::UndeclaredCall && x.detail.contains("GET /users ")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
     fn method_mismatch_flagged() {
         let spec = spec();
         // Contract declares GET /api/users, frontend calls DELETE /api/users.

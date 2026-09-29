@@ -911,6 +911,25 @@ pub fn route_registered(routes: &[BackendRoute], method: HttpVerb, path: &str) -
         .any(|r| method_covers(r.method, method) && paths_align(&r.path, path))
 }
 
+/// The mount prefixes one source file declares.
+#[must_use]
+pub fn extract_route_mounts_from_content(file: &str, content: &str) -> Vec<String> {
+    let _ = (file, content);
+    Vec::new()
+}
+
+/// [`route_registered`], given the project's mount prefixes.
+#[must_use]
+pub fn route_registered_with_mounts(
+    routes: &[BackendRoute],
+    mounts: &[String],
+    method: HttpVerb,
+    path: &str,
+) -> bool {
+    let _ = mounts;
+    route_registered(routes, method, path)
+}
+
 // ---------------------------------------------------------------------------
 // Comment stripping + tree walk
 // ---------------------------------------------------------------------------
@@ -1582,6 +1601,193 @@ mod tests {
             path: "/users".into(),
         }];
         assert!(route_registered(&reg, HttpVerb::Get, "/api/users"));
+    }
+
+    #[test]
+    fn route_registered_resource_mounted_router() {
+        // Express: `routes/users.js` registers `/` and `/:id` on a router that
+        // `app.js` mounts under `/api/users`. Those registrations carry no
+        // resource segment of their own; only the mount places them.
+        let routes = extract_backend_routes_from_content(
+            "routes/users.js",
+            "const router = express.Router();\n\
+             router.get('/', list);\nrouter.get('/:id', one);\nrouter.delete('/:id', remove);\n\
+             module.exports = router;\n",
+        );
+        let mounts = extract_route_mounts_from_content(
+            "app.js",
+            "const usersRouter = require('./routes/users');\n\
+             app.use(express.json());\n\
+             app.use('/api/users', usersRouter);\n",
+        );
+        assert_eq!(mounts, vec!["/api/users".to_string()]);
+        for (method, path) in [
+            (HttpVerb::Get, "/api/users"),
+            (HttpVerb::Get, "/api/users/:id"),
+            (HttpVerb::Delete, "/api/users/{id}"),
+        ] {
+            assert!(
+                route_registered_with_mounts(&routes, &mounts, method, path),
+                "{method:?} {path}"
+            );
+        }
+        // Real gaps stay gaps: a resource nothing mounts, a verb the router
+        // lacks, and a deeper path it does not serve.
+        for (method, path) in [
+            (HttpVerb::Get, "/api/orders"),
+            (HttpVerb::Get, "/api/orders/:id"),
+            (HttpVerb::Put, "/api/users/:id"),
+            (HttpVerb::Get, "/api/users/:id/orders"),
+        ] {
+            assert!(
+                !route_registered_with_mounts(&routes, &mounts, method, path),
+                "{method:?} {path}"
+            );
+        }
+        // Without a mount the bare registrations cannot be placed.
+        assert!(!route_registered(&routes, HttpVerb::Get, "/api/users"));
+        assert!(!route_registered_with_mounts(
+            &routes,
+            &[],
+            HttpVerb::Get,
+            "/api/users/:id"
+        ));
+    }
+
+    #[test]
+    fn mount_prefixes_extracted_across_frameworks() {
+        let cases: [(&str, &str, &[&str]); 6] = [
+            (
+                "server.js",
+                "app.use('/api/users', usersRouter);\n\
+                 router.use(`${API}/orders`, ordersRouter);\n\
+                 app.use(API_PREFIX + '/carts', cartsRouter);\n\
+                 app.use(express.static('public'));\n\
+                 app.use('/', homeRouter);\n",
+                &["/api/users", "/${API}/orders", "/carts"],
+            ),
+            (
+                "app.ts",
+                "fastify.register(require('./routes/users'), { prefix: '/api/users' });\n\
+                 app.route('/api/books', books);\n\
+                 router.route('/:id').get(one);\n",
+                &["/api/users", "/api/books"],
+            ),
+            (
+                "main.py",
+                "app.include_router(users.router, dependencies=[Depends(auth)], prefix=\"/api/users\")\n\
+                 app.register_blueprint(orders_bp, url_prefix='/api/orders')\n",
+                &["/api/users", "/api/orders"],
+            ),
+            (
+                "urls.py",
+                "urlpatterns = [\n    path('api/users/', include('users.urls')),\n    \
+                 re_path(r'^api/orders/', include('orders.urls')),\n    path('admin/', admin.site.urls),\n]\n",
+                &["/api/users", "/api/orders"],
+            ),
+            (
+                "main.go",
+                "r.Route(\"/api/users\", func(r chi.Router) {})\n\
+                 r.Mount(\"/api/orders\", ordersRouter())\n\
+                 carts := r.Group(\"/api/carts\")\n",
+                &["/api/users", "/api/orders", "/api/carts"],
+            ),
+            (
+                "main.rs",
+                "let app = Router::new().nest(\"/api/users\", users());\n\
+                 App::new().service(web::scope(\"/api/orders\"));\n",
+                &["/api/users", "/api/orders"],
+            ),
+        ];
+        for (file, src, want) in cases {
+            assert_eq!(
+                extract_route_mounts_from_content(file, src),
+                want.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "{file}"
+            );
+        }
+        // A commented-out mount is not a mount.
+        assert!(extract_route_mounts_from_content("app.js", "// app.use('/api/old', r)").is_empty());
+    }
+
+    #[test]
+    fn fastapi_router_prefix_applies_to_its_routes() {
+        let src = "router = APIRouter(dependencies=[Depends(get_user)], prefix=\"/api/users\")\n\
+                   @router.get(\"/\")\ndef list_users(): ...\n\
+                   @router.get(\"/{user_id}\")\ndef get_user(user_id: int): ...\n\
+                   @app.get(\"/health\")\ndef health(): ...\n";
+        let routes = extract_from_file("routers/users.py", src, Lang::Py);
+        let p = paths(&routes);
+        assert!(p.contains(&(Some(HttpVerb::Get), "/api/users")), "{p:?}");
+        assert!(
+            p.contains(&(Some(HttpVerb::Get), "/api/users/{user_id}")),
+            "{p:?}"
+        );
+        assert!(p.contains(&(Some(HttpVerb::Get), "/health")), "{p:?}");
+    }
+
+    #[test]
+    fn flask_blueprint_url_prefix_applies_to_its_routes() {
+        let src = "bp = Blueprint('users', __name__, url_prefix='/api/users')\n\
+                   @bp.route('/', methods=['GET', 'POST'])\ndef users(): ...\n\
+                   @bp.get('/<int:user_id>')\ndef user(user_id): ...\n";
+        let routes = extract_from_file("users.py", src, Lang::Py);
+        let p = paths(&routes);
+        assert!(p.contains(&(Some(HttpVerb::Get), "/api/users")), "{p:?}");
+        assert!(p.contains(&(Some(HttpVerb::Post), "/api/users")), "{p:?}");
+        assert!(
+            p.contains(&(Some(HttpVerb::Get), "/api/users/<int:user_id>")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn gin_group_prefixes_apply_to_their_routes() {
+        let src = "func Register(r *gin.Engine) {\n\
+                   \tapi := r.Group(\"/api\")\n\
+                   \tusers := api.Group(\"/users\")\n\
+                   \tusers.GET(\"/\", listUsers)\n\
+                   \tusers.GET(\"/:id\", getUser)\n\
+                   \tr.GET(\"/health\", health)\n\
+                   }\n\
+                   func RegisterOrders(rg *gin.RouterGroup) {\n\
+                   \tusers := rg.Group(\"/orders\")\n\
+                   \tusers.DELETE(\"/:id\", deleteOrder)\n\
+                   }\n";
+        let routes = extract_from_file("routes.go", src, Lang::Go);
+        let p = paths(&routes);
+        for want in [
+            (Some(HttpVerb::Get), "/api/users"),
+            (Some(HttpVerb::Get), "/api/users/:id"),
+            (Some(HttpVerb::Get), "/health"),
+            // A later group reusing the variable name has its own prefix.
+            (Some(HttpVerb::Delete), "/orders/:id"),
+        ] {
+            assert!(p.contains(&want), "{want:?} missing from {p:?}");
+        }
+        assert!(
+            !p.contains(&(Some(HttpVerb::Delete), "/api/users/:id")),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn spring_class_prefix_without_leading_slash_or_with_a_placeholder() {
+        let src = "@RestController\n@RequestMapping(\"api/users\")\nclass C {\n  @GetMapping\n List list(){}\n  @GetMapping(\"{id}\")\n One one(){}\n}";
+        let routes = extract_from_file("C.java", src, Lang::Java);
+        let p = paths(&routes);
+        assert!(p.contains(&(Some(HttpVerb::Get), "/api/users")), "{p:?}");
+        assert!(p.contains(&(Some(HttpVerb::Get), "/api/users/{id}")), "{p:?}");
+        let src = "@RestController\n\
+                   @RequestMapping(value = \"${api.prefix}/orders\", produces = \"application/json\")\n\
+                   class O {\n  @DeleteMapping(\"/{id}\")\n void remove(){}\n}";
+        let routes = extract_from_file("O.java", src, Lang::Java);
+        assert!(
+            route_registered(&routes, HttpVerb::Delete, "/api/orders/:id"),
+            "{:?}",
+            paths(&routes)
+        );
+        assert!(!route_registered(&routes, HttpVerb::Delete, "/api/users/:id"));
     }
 
     #[test]

@@ -97,9 +97,10 @@ pub struct FrontendCall {
 }
 
 /// Regex for `fetch('/api/...')` and `fetch('/api/...', {...})`.
-/// Captures the path in the `path` group, and an optional `method: 'POST'`
-/// in the `method` group. Query strings are stripped after capture (not in
-/// the regex — the `?` in a char class is fragile across regex versions).
+/// Captures the path in the `path` group; the match ends right after the URL
+/// literal, where [`call_method`] reads the rest of the call for its verb.
+/// Query strings are stripped after capture (not in the regex — the `?` in a
+/// char class is fragile across regex versions).
 fn fetch_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -112,18 +113,150 @@ fn fetch_regex() -> &'static Regex {
         // look-behind): a `fetch(` whose preceding char is an identifier char
         // is really the tail of `prefetch(` / `refetch(` / `router.prefetch(`,
         // not a fetch call, and is rejected in `extract_from_file`.
-        // The verb group is case-insensitive (`(?i:…)`): `HttpVerb::parse`
-        // accepts lower/mixed case, but a literal `method: 'post'` failed to
-        // capture here and fell through to the GET default with
-        // `method_known = true` — a systematic false MethodMismatch against a
-        // POST-only endpoint. The captured verb is normalised via
-        // `HttpVerb::parse` at the call site. A genuinely absent `method:` key
-        // still leaves the group unmatched → GET default (fetch's spec default).
         Regex::new(
-            r#"(?P<lead>[A-Za-z0-9_$.]?)fetch\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`](?:[^)]*?method\s*:\s*['"`](?P<method>(?i:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS))['"`])?"#,
+            r#"(?P<lead>[A-Za-z0-9_$.]?)fetch\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`]"#,
         )
         .expect("fetch regex well-formed")
     })
+}
+
+/// A literal `method: 'POST'` option (also `"method": "post"`, any case), with
+/// the key captured as `key` so its nesting depth can be checked.
+fn option_method_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r#"(?:^|[^A-Za-z0-9_$])(?P<key>['"`]?method['"`]?)\s*:\s*['"`](?P<method>(?i:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS))['"`]"#,
+        )
+        .expect("option-method regex well-formed")
+    })
+}
+
+/// Any `method` key — `method: verb`, or the shorthand `{ method, body }` —
+/// whose value is not a literal verb.
+fn method_key_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?:^|[^A-Za-z0-9_$])['"`]?method['"`]?\s*[:,}]"#)
+            .expect("method-key regex well-formed")
+    })
+}
+
+/// How a `fetch(url, …)` / `axios(url, …)` call goes on after its URL literal.
+enum CallOptions<'a> {
+    /// The call closes without a second argument.
+    Absent,
+    /// The source text of the second argument.
+    Present(&'a str),
+    /// The end of the call was not found within [`MAX_CALL_SCAN_BYTES`].
+    Unreadable,
+}
+
+/// How far past a URL literal the end of its call is looked for.
+const MAX_CALL_SCAN_BYTES: usize = 4096;
+
+/// Split the rest of a call (the text right after its URL literal) into its
+/// second argument, tracking nesting and string literals so a `)` inside the
+/// options (`JSON.stringify(x)`, `authHeaders()`) does not end the call.
+fn call_options(rest: &str) -> CallOptions<'_> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut second_start: Option<usize> = None;
+    for (i, c) in rest.char_indices() {
+        if i >= MAX_CALL_SCAN_BYTES {
+            return CallOptions::Unreadable;
+        }
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth > 0 => depth -= 1,
+            ')' => {
+                return match second_start {
+                    Some(start) if !rest[start..i].trim().is_empty() => {
+                        CallOptions::Present(&rest[start..i])
+                    }
+                    _ => CallOptions::Absent,
+                };
+            }
+            ']' | '}' => return CallOptions::Unreadable,
+            ',' if depth == 0 => match second_start {
+                None => second_start = Some(i + 1),
+                Some(start) => return CallOptions::Present(&rest[start..i]),
+            },
+            _ => {}
+        }
+    }
+    CallOptions::Unreadable
+}
+
+/// How many brackets are open at the end of `text`, outside string literals.
+fn open_brackets(text: &str) -> usize {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in text.chars() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => quote = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// The verb of a `fetch(url, init)` / `axios(url, config)` call, read from the
+/// text right after its URL literal, and whether it is known:
+/// - no second argument → GET, known (the default of both);
+/// - a literal `method: 'POST'` in the second argument → that verb, known (the
+///   least nested one wins, so a `method` inside a nested body object does not
+///   override the call's own);
+/// - an object literal that sets no `method` and spreads nothing → GET, known;
+/// - anything else (a variable, a helper call, a spread, `method: verb`, a call
+///   too long to read) → GET, unknown, so it is never reported as a mismatch.
+fn call_method(rest: &str) -> (HttpVerb, bool) {
+    let options = match call_options(rest) {
+        CallOptions::Absent => return (HttpVerb::Get, true),
+        CallOptions::Unreadable => return (HttpVerb::Get, false),
+        CallOptions::Present(options) => options,
+    };
+    let literal = option_method_regex()
+        .captures_iter(options)
+        .filter_map(|cap| {
+            let key = cap.name("key")?;
+            let verb = HttpVerb::parse(cap.name("method")?.as_str())?;
+            Some((open_brackets(&options[..key.start()]), verb))
+        })
+        .min_by_key(|(depth, _)| *depth);
+    if let Some((_, verb)) = literal {
+        return (verb, true);
+    }
+    let options = options.trim();
+    let plain_object = options.starts_with('{')
+        && !options.contains("...")
+        && !method_key_regex().is_match(options);
+    (HttpVerb::Get, plain_object)
 }
 
 /// Regex for `axios.get('/api/...')` / `axios.post(...)` etc.
@@ -178,18 +311,14 @@ fn use_mutation_regex() -> &'static Regex {
     })
 }
 
-/// Regex for a DIRECT `axios('/api/x', {...})` call (no `.method`).
-/// Method defaults to GET unless a `method:` option is present.
+/// Regex for a DIRECT `axios('/api/x', {...})` call (no `.method`). Like
+/// [`fetch_regex`], the match ends after the URL literal and the verb is read
+/// from the config by [`call_method`] (GET when there is none).
 fn axios_direct_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        // Verb group is case-insensitive (`(?i:…)`) for the same reason as
-        // `fetch_regex`: a lowercase `method: 'post'` must not fall through to
-        // the GET default. Normalised via `HttpVerb::parse` at the call site.
-        Regex::new(
-            r#"axios\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`](?:[^)]*?method\s*:\s*['"`](?P<method>(?i:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS))['"`])?"#,
-        )
-        .expect("axios-direct regex well-formed")
+        Regex::new(r#"axios\s*\(\s*['"`](?P<path>/[^'"`\#\s]+)['"`]"#)
+            .expect("axios-direct regex well-formed")
     })
 }
 
@@ -391,9 +520,9 @@ fn extract_from_file(file: &str, content: &str) -> Vec<FrontendCall> {
     };
 
     // fetch('/api/x') or fetch('/api/x', { method: 'POST' }).
-    // The verb is known only when a `method:` option is present; a bare
-    // fetch('/x') is GET by spec default → `method_known = true` still, because
-    // GET *is* fetch's defined default (not a guess).
+    // A bare fetch('/x') is GET by spec default → `method_known = true`,
+    // because GET *is* fetch's defined default (not a guess). With options the
+    // verb is known only when they can be read (see `call_method`).
     for cap in fetch_regex().captures_iter(content) {
         if reject_for_identifier_lead(cap.name("lead").map(|m| m.as_str()).unwrap_or("")) {
             continue; // `prefetch(` / `refetch(` / `router.prefetch(`, not `fetch(`
@@ -402,11 +531,9 @@ fn extract_from_file(file: &str, content: &str) -> Vec<FrontendCall> {
         if path.is_empty() {
             continue;
         }
-        let method = cap
-            .name("method")
-            .and_then(|m| HttpVerb::parse(m.as_str()))
-            .unwrap_or(HttpVerb::Get);
-        push(&mut calls, method, true, path);
+        let rest = cap.get(0).map_or("", |m| &content[m.end()..]);
+        let (method, method_known) = call_method(rest);
+        push(&mut calls, method, method_known, path);
     }
     // axios.get / axios.post / ... — verb is the function name, always known.
     for cap in axios_regex().captures_iter(content) {
@@ -449,17 +576,16 @@ fn extract_from_file(file: &str, content: &str) -> Vec<FrontendCall> {
             push(&mut calls, HttpVerb::Post, true, path);
         }
     }
-    // Direct axios('/api/x') (no .method) — GET unless a method: option is set.
+    // Direct axios('/api/x') (no .method) — GET unless the config sets a
+    // method, read the same way as fetch options.
     for cap in axios_direct_regex().captures_iter(content) {
         let path = cap.name("path").map(|m| m.as_str()).unwrap_or("");
         if path.is_empty() {
             continue;
         }
-        let method = cap
-            .name("method")
-            .and_then(|m| HttpVerb::parse(m.as_str()))
-            .unwrap_or(HttpVerb::Get);
-        push(&mut calls, method, true, path);
+        let rest = cap.get(0).map_or("", |m| &content[m.end()..]);
+        let (method, method_known) = call_method(rest);
+        push(&mut calls, method, method_known, path);
     }
     // Object-style wrapped clients: api.get / httpClient.post / client.delete.
     // Reject a match whose `lead` boundary captured an identifier char (the
@@ -894,6 +1020,78 @@ mod tests {
             .find(|c| c.path == "/api/list")
             .expect("bare fetch must be captured");
         assert_eq!(c.method, HttpVerb::Get, "no method: key → GET default");
+        assert!(c.method_known, "an options object without `method` is GET");
+    }
+
+    #[test]
+    fn extract_fetch_method_after_nested_call() {
+        // A `)` before `method:` (a nested call in the body or headers) stopped
+        // the old lazy `[^)]*?` scan, so the call was recorded as a KNOWN GET.
+        for (src, verb) in [
+            (
+                "fetch('/api/orders', { body: JSON.stringify(x), method: 'POST' })",
+                HttpVerb::Post,
+            ),
+            (
+                "fetch('/api/login', {\n  body: JSON.stringify({ email }),\n  method: 'POST',\n})",
+                HttpVerb::Post,
+            ),
+            (
+                "fetch(`/api/items/${id}`, { headers: authHeaders(), method: 'DELETE' })",
+                HttpVerb::Delete,
+            ),
+            (
+                "fetch('/api/me', { headers: { Authorization: `Bearer ${localStorage.getItem('t')}` }, method: 'PUT' })",
+                HttpVerb::Put,
+            ),
+            (
+                "fetch('/api/raw', { \"method\": \"patch\" })",
+                HttpVerb::Patch,
+            ),
+            (
+                "axios('/api/upload', { data: form(), method: 'post' })",
+                HttpVerb::Post,
+            ),
+        ] {
+            let calls = extract_from_file("src/a.ts", src);
+            assert_eq!(calls.len(), 1, "{src}: {calls:?}");
+            assert_eq!(calls[0].method, verb, "{src}");
+            assert!(calls[0].method_known, "{src}");
+        }
+        // When the options cannot be read at the call site, the verb is unknown
+        // rather than a guessed GET.
+        for src in [
+            "fetch('/api/orders', opts)",
+            "fetch('/api/orders', withAuth({ body }))",
+            "fetch('/api/orders', { ...opts, body })",
+            "fetch('/api/orders', { method, body })",
+            "fetch('/api/orders', { method: verb })",
+            "axios('/api/orders', config)",
+        ] {
+            let calls = extract_from_file("src/a.ts", src);
+            assert_eq!(calls.len(), 1, "{src}: {calls:?}");
+            assert!(!calls[0].method_known, "{src} has no readable verb");
+        }
+        // A call without options really is a GET, and a POST-only endpoint still
+        // reports it as a method mismatch.
+        use crate::parse::parse_architecture;
+        use crate::validate::{validate_frontend_vs_contract, ViolationKind};
+        let spec = parse_architecture(
+            "| Method | Path | Description |\n|---|---|---|\n| POST | /api/orders | Create |\n",
+            "demo",
+        );
+        let calls = extract_from_file("src/a.ts", "fetch('/api/orders').then(r => r.json())");
+        assert!(calls[0].method_known);
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert_eq!(v[0].kind, ViolationKind::MethodMismatch);
+        let calls = extract_from_file(
+            "src/a.ts",
+            "fetch('/api/orders', { body: JSON.stringify(x), method: 'PUT' })",
+        );
+        let v = validate_frontend_vs_contract(&calls, &spec);
+        assert_eq!(v.len(), 1, "a wrong literal verb is still drift: {v:?}");
+        assert_eq!(v[0].kind, ViolationKind::MethodMismatch);
     }
 
     #[test]

@@ -620,6 +620,106 @@ mod tests {
         );
     }
 
+    /// Architecture table for the prefix-mounted router tests: the users
+    /// resource the backends below implement, and an orders resource they
+    /// leave out.
+    fn users_and_orders_arch(root: &Path) {
+        fs::create_dir_all(root.join("output")).unwrap();
+        fs::write(
+            root.join("output/demo-architecture.md"),
+            "# API\n\n\
+             | Method | Path | Description | Auth |\n\
+             |---|---|---|---|\n\
+             | GET | /api/users | list users | bearer |\n\
+             | GET | /api/users/:id | get user | bearer |\n\
+             | DELETE | /api/users/:id | delete user | bearer |\n\
+             | GET | /api/orders | list orders | bearer |\n\
+             | GET | /api/orders/:id | get order | bearer |\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn fastapi_prefixed_router_satisfies_planned_endpoints() {
+        // The FastAPI "bigger applications" layout: `APIRouter(prefix=...)`
+        // routes registered as "/" and "/{user_id}". Only the orders endpoints,
+        // which nothing implements, are gaps.
+        let tmp = TempDir::new().unwrap();
+        users_and_orders_arch(tmp.path());
+        fs::create_dir_all(tmp.path().join("app/routers")).unwrap();
+        fs::write(
+            tmp.path().join("app/routers/users.py"),
+            "from fastapi import APIRouter\n\
+             router = APIRouter(prefix=\"/api/users\", tags=[\"users\"])\n\
+             @router.get(\"/\")\nasync def list_users(): ...\n\
+             @router.get(\"/{user_id}\")\nasync def get_user(user_id: int): ...\n\
+             @router.delete(\"/{user_id}\")\nasync def delete_user(user_id: int): ...\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("app/main.py"),
+            "from fastapi import FastAPI\nfrom .routers import users\n\
+             app = FastAPI()\napp.include_router(users.router)\n",
+        )
+        .unwrap();
+        let gaps = task_acceptance_gaps(tmp.path(), "demo");
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(gaps.iter().all(|g| g.contains("/api/orders")), "{gaps:?}");
+    }
+
+    #[test]
+    fn express_router_mounted_from_another_file_satisfies_planned_endpoints() {
+        // `app.use('/api/users', usersRouter)` in app.js, with `router.get('/')`
+        // and `router.get('/:id')` in routes/users.js: the idiomatic Express
+        // layout, where no registration names its resource.
+        let tmp = TempDir::new().unwrap();
+        users_and_orders_arch(tmp.path());
+        fs::create_dir_all(tmp.path().join("server/routes")).unwrap();
+        fs::write(
+            tmp.path().join("server/app.js"),
+            "const express = require('express');\n\
+             const usersRouter = require('./routes/users');\n\
+             const ordersRouter = require('./routes/orders');\n\
+             const app = express();\n\
+             app.use(express.json());\n\
+             app.use('/api/users', usersRouter);\n\
+             app.use('/api/orders', ordersRouter);\n\
+             module.exports = app;\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("server/routes/users.js"),
+            "const router = require('express').Router();\n\
+             router.get('/', listUsers);\n\
+             router.get('/:id', getUser);\n\
+             router.delete('/:id', deleteUser);\n\
+             module.exports = router;\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("server/routes/orders.js"),
+            "const router = require('express').Router();\n\
+             router.get('/', listOrders);\n\
+             router.get('/:id', getOrder);\n\
+             module.exports = router;\n",
+        )
+        .unwrap();
+        let gaps = task_acceptance_gaps(tmp.path(), "demo");
+        assert!(gaps.is_empty(), "both mounted routers are complete: {gaps:?}");
+
+        // Without the orders mount (and router), both orders endpoints are gaps.
+        fs::write(
+            tmp.path().join("server/app.js"),
+            "const usersRouter = require('./routes/users');\n\
+             app.use('/api/users', usersRouter);\n",
+        )
+        .unwrap();
+        fs::remove_file(tmp.path().join("server/routes/orders.js")).unwrap();
+        let gaps = task_acceptance_gaps(tmp.path(), "demo");
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(gaps.iter().all(|g| g.contains("/api/orders")), "{gaps:?}");
+    }
+
     #[test]
     fn pure_frontend_project_not_falsely_failed() {
         // No backend registration anywhere (only a frontend fetch). The endpoint
