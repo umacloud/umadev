@@ -375,3 +375,43 @@ async fn tick_flushed_double_esc_on_an_idle_paused_run_resets_the_parked_run() {
     assert!(!app.director_gate_paused);
     assert!(flush_loop.run_task.is_none() && flush_loop.cancel_drain.is_none());
 }
+
+#[test]
+fn an_unreadable_config_is_announced_and_kept_when_the_picker_saves() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("config.toml");
+    let original = "# mine\nbackend = \"codex\"\nshow_process_logs = \"yes\"\n";
+    std::fs::write(&path, original).unwrap();
+    let (cfg, notice) = crate::config::load_and_migrate_for_startup(&path);
+    let mut app = App::new("runtime-glue", cfg, path.clone(), tmp.path().to_path_buf());
+    crate::config_notice::show(&mut app, notice);
+
+    let notice = app.picker_notice.clone().expect("the picker shows it");
+    assert!(notice.contains("config.toml"), "{notice}");
+    assert!(notice.contains("line 3"), "{notice}");
+    assert!(notice.contains("expected a boolean"), "{notice}");
+    assert!(
+        !notice.contains('\n'),
+        "the picker footer is one line: {notice}"
+    );
+    assert!(app.transcript_plaintext().contains("expected a boolean"));
+
+    // The first-run picker reopened on defaults; its first Enter saves the
+    // chosen language, and the unreadable file is kept beside the new one.
+    assert_eq!(app.apply_key(KeyCode::Enter), Action::None);
+    let backups = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with("config.toml.bak-"))
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join(&backups[0])).unwrap(),
+        original
+    );
+    assert!(crate::config::load_strict(&path).is_ok());
+
+    let mut quiet = glue_app(tmp.path());
+    crate::config_notice::show(&mut quiet, None);
+    assert_eq!(quiet.picker_notice, None);
+}

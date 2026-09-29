@@ -526,6 +526,7 @@
 # Shared config write error
 "config.write_failed" = "(无法写入 {}: {})"
 "config.save_failed_note" = "[warn] 设置已对本会话生效,但未能持久化保存(下次启动会回退):{}"
+"config.unreadable" = "[warn] 无法读取设置文件 {}（{}）。UmaDev 已使用默认设置启动，未改动该文件。请修正后重启；如果在此之前修改了设置，原文件会先以 .bak 副本保存在同一目录。"
 
 # Chitchat replies (offline keyword heuristic)
 "chitchat.greeting" = "你好!我是 UmaDev — 你的 AI 编码项目总监 Agent。\n\n直接输入你要做的产品需求,我会启动 9 阶段流水线:\n  research -> docs -> spec -> frontend -> backend -> quality -> delivery\n\n例如:\n  做一个带邮箱登录的 SaaS 落地页\n  做一个 TODO 待办应用\n  做一个博客系统"

@@ -532,6 +532,7 @@
 # Shared config write error
 "config.write_failed" = "(could not write {}: {})"
 "config.save_failed_note" = "[warn] Setting applied for this session, but could not be saved (it will revert on next launch): {}"
+"config.unreadable" = "[warn] Your settings file {} could not be read ({}). UmaDev started with default settings and left the file unchanged. Fix it and restart; if you change a setting before then, the unreadable file is first copied next to it as a .bak file."
 
 # Chitchat replies (offline keyword heuristic)
 "chitchat.greeting" = "Hi! I'm UmaDev — your AI coding project-director Agent.\n\nJust type the product you want and I'll start the 9-phase pipeline:\n  research -> docs -> spec -> frontend -> backend -> quality -> delivery\n\nFor example:\n  A SaaS landing page with email login\n  A to-do app\n  A blog system"

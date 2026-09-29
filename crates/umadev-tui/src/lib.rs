@@ -38,6 +38,7 @@ mod base_session_config;
 mod clipboard;
 mod clipboard_image;
 pub mod config;
+mod config_notice;
 #[cfg(test)]
 mod cross_platform_terminal_tests;
 mod director_run;
@@ -217,9 +218,8 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     // once per session, never on the ordinary text-paste path.
     clipboard_image::cleanup_old(&opts.project_root);
     let config_path = config::default_path();
-    // Run the once-per-upgrade config migration runner at startup (fail-soft):
-    // repairs config drift across releases, then persists the bumped version.
-    let (cfg, retired_backend) = config::load_and_migrate_for_startup(&config_path);
+    // Load and migrate the user config once (fail-soft; unreadable is reported).
+    let (cfg, notice) = config::load_and_migrate_for_startup(&config_path);
     let startup_slug = umadev_agent::SpecManifest::read_from(&opts.project_root)
         .and_then(|manifest| manifest.slug)
         .filter(|slug| !slug.trim().is_empty())
@@ -233,7 +233,7 @@ pub async fn run(opts: LaunchOptions) -> Result<()> {
     let _preview_guard = PreviewServerGuard {
         handle: std::sync::Arc::clone(&app.preview_server),
     };
-    app.show_retired_backend_migration(retired_backend.as_deref());
+    config_notice::show(&mut app, notice);
     // WORKSPACE INTEGRITY, said to the person it concerns. The startup heal already ran
     // (in `main`, before the terminal was taken over) — it may have put the user's source
     // tree back after a run was killed mid-rewind, or found a rewind it could NOT undo.
