@@ -255,29 +255,23 @@ impl RoutePlan {
     }
 
     /// A one-line human rationale for this route — what UmaDev decided and why, for
-    /// the [`crate::events::EngineEvent::IntentDecided`] card. Bilingual-friendly,
-    /// derived deterministically from the typed fields (no model call).
+    /// the [`crate::events::EngineEvent::IntentDecided`] card, in the current UI
+    /// language (the card shows it under a localized headline). Derived
+    /// deterministically from the typed fields (no model call).
     #[must_use]
     pub fn rationale(&self) -> String {
-        match self.class {
-            RouteClass::Chat => "这是对话,直接回应,不进开发流程。".to_string(),
-            RouteClass::Explain => "这是一次讲解/答疑,只读理解,不改动工作区。".to_string(),
-            RouteClass::QuickEdit => "这是一个小修改,快速单写 + 定向校验即可。".to_string(),
-            RouteClass::Debug => {
-                if self.depth.is_deliberate() {
-                    "这是一个排障任务,影响面待定,进研发流程定位+修复+回归。".to_string()
-                } else {
-                    "这是一个小排障,快速定位并修复。".to_string()
-                }
-            }
-            RouteClass::Build => {
-                // A REASON (why build), not a restatement of the localized
-                // intent.build headline the card already shows - otherwise the card
-                // printed the full-build line twice (the reported duplicate).
-                "判定为完整构建:需求规模较大、涉及多个环节,交由多角色团队分阶段交付更稳妥。"
-                    .to_string()
-            }
-        }
+        let key = match self.class {
+            RouteClass::Chat => "intent.rationale.chat",
+            RouteClass::Explain => "intent.rationale.explain",
+            RouteClass::QuickEdit => "intent.rationale.quick_edit",
+            RouteClass::Debug if self.depth.is_deliberate() => "intent.rationale.debug_deep",
+            RouteClass::Debug => "intent.rationale.debug_fast",
+            // A REASON (why build), not a restatement of the localized
+            // intent.build headline the card already shows - otherwise the card
+            // printed the full-build line twice (the reported duplicate).
+            RouteClass::Build => "intent.rationale.build",
+        };
+        umadev_i18n::tl(key).to_string()
     }
 
     /// The **generous turn ceiling** for a base session driving this route — the

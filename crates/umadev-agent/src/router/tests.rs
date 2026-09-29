@@ -551,6 +551,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn route_rationale_follows_ui_language() {
+        // The intent card shows the rationale under a localized headline, so it
+        // must come from the catalog of the current UI language.
+        for (class, depth, key) in [
+            (RouteClass::Chat, Depth::Fast, "intent.rationale.chat"),
+            (RouteClass::Explain, Depth::Fast, "intent.rationale.explain"),
+            (RouteClass::QuickEdit, Depth::Fast, "intent.rationale.quick_edit"),
+            (RouteClass::Debug, Depth::Fast, "intent.rationale.debug_fast"),
+            (RouteClass::Debug, Depth::Standard, "intent.rationale.debug_deep"),
+            (RouteClass::Build, Depth::Standard, "intent.rationale.build"),
+        ] {
+            let route = RoutePlan {
+                class,
+                kind: TaskKind::Light,
+                depth,
+                team: Vec::new(),
+                scope: Vec::new(),
+                needs_clarify: None,
+                est_budget: Budget::for_route(class, depth),
+                confidence: 0.5,
+            };
+            assert_eq!(route.rationale(), umadev_i18n::tl(key), "{key}");
+            let english = umadev_i18n::t(umadev_i18n::Lang::En, key);
+            assert!(!english.is_empty() && english != key, "{key}");
+            assert!(
+                !english
+                    .chars()
+                    .any(|ch| ('\u{3400}'..='\u{9fff}').contains(&ch)),
+                "{key}: {english}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_deliberate_build_gets_a_higher_turn_cap_than_a_chat() {
         // The route's turn cap is derived from its depth: a real build (Standard/Deep)
