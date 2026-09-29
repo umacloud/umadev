@@ -4845,7 +4845,9 @@ async fn drive_director_continue(
         mode: trust,
         strict_coverage: umadev_agent::strict_coverage_from_env(),
     };
-    let route = umadev_agent::router::for_run(&opts.requirement);
+    // Resume under the route the paused run was planned under (saved beside its
+    // plan), not one re-derived from the requirement text.
+    let route = umadev_agent::resume_route(project_root, &opts.requirement);
     let firmware = umadev_agent::compose_firmware(project_root, &route, &opts.requirement).await;
     let firmware = (!firmware.trim().is_empty()).then_some(firmware);
 

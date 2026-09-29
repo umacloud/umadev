@@ -2669,7 +2669,7 @@ fn build_clarify(brain: &BrainRoute) -> Option<ClarifyQuestion> {
 
 /// Map the brain's free-text `class` to a [`RouteClass`] (tolerant; `None` on an
 /// unrecognised value so reconciliation keeps the floor's class).
-fn parse_class(s: &str) -> Option<RouteClass> {
+pub(crate) fn parse_class(s: &str) -> Option<RouteClass> {
     match s
         .trim()
         .to_ascii_lowercase()
@@ -2688,7 +2688,7 @@ fn parse_class(s: &str) -> Option<RouteClass> {
 }
 
 /// Map the brain's `complexity` to a [`Depth`] (tolerant; `None` on unrecognised).
-fn parse_depth(s: &str) -> Option<Depth> {
+pub(crate) fn parse_depth(s: &str) -> Option<Depth> {
     match s.trim().to_ascii_lowercase().as_str() {
         "simple" | "trivial" | "small" | "fast" => Some(Depth::Fast),
         "medium" | "moderate" | "standard" => Some(Depth::Standard),
@@ -2698,7 +2698,7 @@ fn parse_depth(s: &str) -> Option<Depth> {
 }
 
 /// Map the brain's `kind` to a [`TaskKind`] (tolerant; `None` on unrecognised).
-fn parse_kind(s: &str) -> Option<TaskKind> {
+pub(crate) fn parse_kind(s: &str) -> Option<TaskKind> {
     match s
         .trim()
         .to_ascii_lowercase()

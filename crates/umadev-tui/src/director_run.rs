@@ -277,9 +277,16 @@ pub(super) async fn run_director_loop(
         // (a bare goal still builds). A natural-language build passes the healthy
         // model verdict already produced on the read-only intent child, so Director
         // drives the exact class/kind/depth/team the selected brain chose. The
-        // deterministic availability fallback never reaches this entry.
-        let route =
-            route_override.unwrap_or_else(|| umadev_agent::router::for_run(&options.requirement));
+        // deterministic availability fallback never reaches this entry. A resume
+        // (`/continue`, a gate approval) keeps the route its run was planned under,
+        // saved beside the plan, instead of re-deriving one from the text.
+        let route = route_override.unwrap_or_else(|| {
+            if resume {
+                umadev_agent::resume_route(&root, &options.requirement)
+            } else {
+                umadev_agent::router::for_run(&options.requirement)
+            }
+        });
         let firmware = umadev_agent::compose_firmware(&root, &route, &options.requirement).await;
         let firmware = (!firmware.trim().is_empty()).then_some(firmware);
 

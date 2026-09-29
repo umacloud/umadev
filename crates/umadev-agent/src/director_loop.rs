@@ -60,7 +60,7 @@ use resume::{
 };
 pub use resume::{
     has_resumable_director_plan, has_resumable_run, is_budget_pause_reason,
-    rearm_operational_review_for_explicit_retry, terminal_review_circuit_reason,
+    rearm_operational_review_for_explicit_retry, resume_route, terminal_review_circuit_reason,
     transient_resume_hint,
 };
 use resume::{load_resumable_plan, record_artifact_versions};
@@ -844,6 +844,8 @@ pub async fn drive_director_loop_routed(
     // Nor may a planning turn that fails open leave this run judged against, or
     // `/continue` resuming, the previous run's plan.
     resume::retire_previous_plan(&options.project_root);
+    // Save the route this run executes under, so a resume after any pause keeps it.
+    resume::record_run_route(&options.project_root, route);
 
     // Attribute governance findings to this run. The snapshot survives a
     // cross-process `/continue`, so unchanged brownfield findings are not

@@ -398,6 +398,85 @@ pub(super) fn retire_previous_plan(root: &Path) {
     }
 }
 
+/// The route a run was planned under, saved beside its plan so a resume — after a
+/// gate, budget or review pause — keeps its class, kind, depth and team instead of
+/// re-deriving them from the requirement text (which can resize the review team
+/// and flip every depth-gated floor).
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedRoute {
+    class: String,
+    kind: String,
+    depth: String,
+    #[serde(default)]
+    team: Vec<crate::critics::Seat>,
+    #[serde(default)]
+    scope: Vec<String>,
+    #[serde(default)]
+    confidence: f32,
+}
+
+const MAX_RUN_ROUTE_BYTES: u64 = 64 * 1024;
+
+/// Save (`Some`) or retire (`None`) the route of the run that now owns `.umadev/`.
+/// Best-effort: a resume without a saved route falls back to the explicit-run
+/// route for the requirement, as before.
+pub(super) fn record_run_route(root: &Path, route: Option<&crate::router::RoutePlan>) {
+    let Some(route) = route else {
+        if let Some(dir) = existing_umadev_dir(root) {
+            let _ =
+                umadev_state::fs::remove_regular_file(&dir.join(crate::run_provenance::RUN_ROUTE));
+        }
+        return;
+    };
+    let saved = SavedRoute {
+        class: route.class.as_str().to_string(),
+        kind: route.kind.id().to_string(),
+        depth: route.depth.as_str().to_string(),
+        team: route.team.clone(),
+        scope: route.scope.clone(),
+        confidence: route.confidence,
+    };
+    let Ok(body) = serde_json::to_vec_pretty(&saved) else {
+        return;
+    };
+    let Ok(dir) = crate::bounded_fs::ensure_real_dir_beneath(root, Path::new(".umadev")) else {
+        return;
+    };
+    if umadev_state::fs::atomic_write(&dir.join(crate::run_provenance::RUN_ROUTE), &body).is_ok() {
+        crate::run_provenance::record(root, crate::run_provenance::RUN_ROUTE, &body);
+    }
+}
+
+fn load_run_route(root: &Path) -> Option<crate::router::RoutePlan> {
+    let body = umadev_state::fs::read_bounded_beneath(
+        root,
+        &Path::new(".umadev").join(crate::run_provenance::RUN_ROUTE),
+        MAX_RUN_ROUTE_BYTES,
+    )
+    .ok()?;
+    let saved: SavedRoute = serde_json::from_slice(&body).ok()?;
+    let class = crate::router::parse_class(&saved.class)?;
+    let depth = crate::router::parse_depth(&saved.depth)?;
+    Some(crate::router::RoutePlan {
+        class,
+        kind: crate::router::parse_kind(&saved.kind)?,
+        depth,
+        team: saved.team,
+        scope: saved.scope,
+        needs_clarify: None,
+        est_budget: crate::router::Budget::for_route(class, depth),
+        confidence: saved.confidence.clamp(0.0, 1.0),
+    })
+}
+
+/// The route a `/continue` or a gate approval resumes under: the one the paused
+/// run was planned under, when it was saved, else the explicit-run route for the
+/// requirement.
+#[must_use]
+pub fn resume_route(project_root: &Path, requirement: &str) -> crate::router::RoutePlan {
+    load_run_route(project_root).unwrap_or_else(|| crate::router::for_run(requirement))
+}
+
 fn existing_umadev_dir(root: &Path) -> Option<std::path::PathBuf> {
     let canonical_root = std::fs::canonicalize(root).ok()?;
     if !umadev_state::fs::real_dir(&canonical_root) {
@@ -946,6 +1025,31 @@ mod tests {
         clear_operational_review_checkpoint(temp.path());
         clear_operational_review_checkpoint(temp.path());
         assert!(!operational_review_checkpoint_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn a_resume_uses_the_route_its_run_saved() {
+        use crate::router::{Budget, Depth};
+        let temp = tempfile::tempdir().unwrap();
+        let requirement = "做一个完整的电商平台，包含用户、商品、订单、支付和后台管理";
+        let keyword = crate::router::for_run(requirement);
+        // Nothing saved (a plan from before routes were saved): the explicit-run
+        // route for the requirement, exactly as before.
+        assert_eq!(resume_route(temp.path(), requirement), keyword);
+
+        let mut planned = keyword.clone();
+        planned.kind = crate::planner::TaskKind::FrontendOnly;
+        planned.depth = Depth::Fast;
+        planned.team = vec![Seat::FrontendEngineer];
+        planned.est_budget = Budget::for_route(planned.class, planned.depth);
+        planned.needs_clarify = None;
+        assert_ne!(planned, keyword);
+        record_run_route(temp.path(), Some(&planned));
+        assert_eq!(resume_route(temp.path(), requirement), planned);
+
+        // A fresh run with no route of its own retires the saved one.
+        record_run_route(temp.path(), None);
+        assert_eq!(resume_route(temp.path(), requirement), keyword);
     }
 
     #[test]

@@ -119,3 +119,58 @@ async fn tui_gate_approval_resumes_a_plan_whose_last_step_opened_docs_confirm() 
         "the resume re-attached to the saved plan: {events:?}"
     );
 }
+
+#[tokio::test]
+async fn director_resume_keeps_the_route_the_run_was_planned_under() {
+    // A natural-language build ran under the model-decided route (here a Fast,
+    // one-seat frontend route). `/continue` after a pause must drive the rest under
+    // that same class / depth / team, not a route the keyword router re-derives
+    // from the requirement text (another review team, other depth-gated floors).
+    use umadev_agent::critics::Seat;
+    use umadev_agent::plan_state::StepStatus;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let root = tmp.path();
+    let requirement =
+        "做一个完整的电商平台，包含用户注册登录、商品管理、购物车、订单、支付和后台管理";
+    let keyword = umadev_agent::router::for_run(requirement);
+    assert!(
+        keyword.depth != umadev_agent::router::Depth::Fast
+            || keyword.team != vec![Seat::FrontendEngineer],
+        "precondition: the keyword route differs from the planned one"
+    );
+    save_plan_step(
+        root,
+        "ui",
+        Seat::FrontendEngineer,
+        "src/ui.tsx",
+        StepStatus::Pending,
+    );
+    // The route the run saved beside its plan when it started.
+    std::fs::write(
+        root.join(".umadev/director-route.json"),
+        r#"{"class":"build","kind":"frontend_only","depth":"fast","team":["frontend-engineer"],"scope":[],"confidence":0.9}"#,
+    )
+    .unwrap();
+
+    let (session, _sent, _ended) = FakeChatSession::new(Vec::new());
+    let (events, _decision) = resume_director(resume_options(root, requirement), session).await;
+
+    let intent = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::IntentDecided {
+                class, depth, team, ..
+            } => Some((class.clone(), depth.clone(), team.clone())),
+            _ => None,
+        })
+        .expect("the resume surfaces its route");
+    assert_eq!(
+        intent,
+        (
+            "build".to_string(),
+            "fast".to_string(),
+            vec!["frontend-engineer".to_string()]
+        ),
+        "the resumed run keeps the route it was planned under"
+    );
+}

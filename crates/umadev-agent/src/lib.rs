@@ -160,8 +160,9 @@ pub use director_loop::{
     cancel_operational_review_pause, checkpoint_post_build_review_pause, drive_director_loop,
     drive_director_loop_resume, drive_director_loop_routed, has_resumable_director_plan,
     has_resumable_run, is_budget_pause_reason, persist_run_governance_context,
-    rearm_operational_review_for_explicit_retry, run_post_build_qc, terminal_review_circuit_reason,
-    transient_resume_hint, DirectorLoopOutcome, PostBuildOperationalPause, PostBuildQcOutcome,
+    rearm_operational_review_for_explicit_retry, resume_route, run_post_build_qc,
+    terminal_review_circuit_reason, transient_resume_hint, DirectorLoopOutcome,
+    PostBuildOperationalPause, PostBuildQcOutcome,
 };
 pub use events::{ChannelReceiver, ChannelSink, EngineEvent, EventSink, NullSink, RecordingSink};
 pub use execution_contract::{ContractViolation, ExecutionContract};

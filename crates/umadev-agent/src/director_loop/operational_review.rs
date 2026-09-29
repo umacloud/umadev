@@ -502,6 +502,7 @@ pub fn checkpoint_post_build_review_pause(
     }
 
     record_artifact_versions(&options.project_root);
+    super::resume::record_run_route(&options.project_root, Some(route));
     let (done, total) = plan.progress();
     Ok(PostBuildOperationalPause {
         reason,

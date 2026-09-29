@@ -3946,6 +3946,32 @@ async fn failed_synthesis_does_not_reuse_the_previous_plan() {
 }
 
 #[tokio::test]
+async fn a_routed_run_saves_the_route_its_resume_keeps() {
+    // A natural-language build runs under the model-decided route (here Fast,
+    // frontend-only). That route is saved beside the plan, so a later `/continue`
+    // resumes under it rather than under the route the keyword router derives from
+    // the requirement text.
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![text_turn("not json"), text_turn("Built it. Done.")],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    );
+    let mut o = opts(tmp.path());
+    o.requirement = "做一个完整的电商平台，包含用户、商品、订单、支付和后台管理".to_string();
+    let mut route = build_route();
+    route.kind = crate::planner::TaskKind::FrontendOnly;
+    route.depth = crate::router::Depth::Fast;
+    route.est_budget = crate::router::Budget::for_route(route.class, route.depth);
+    assert_ne!(crate::router::for_run(&o.requirement).depth, route.depth);
+
+    let _ = drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+    assert_eq!(resume_route(tmp.path(), &o.requirement), route);
+}
+
+#[tokio::test]
 async fn routed_loop_synthesizes_and_posts_a_plan_when_the_brain_replies() {
     // The planning turn runs on the MAIN session (its first turn) and replies
     // with a valid plan JSON → the loop synthesises the plan, persists
