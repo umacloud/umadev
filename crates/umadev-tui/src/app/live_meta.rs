@@ -493,4 +493,22 @@ mod tests {
             assert_eq!(classify_live_meta(mutation), None, "{mutation}");
         }
     }
+
+    #[test]
+    fn live_meta_does_not_intercept_product_questions() {
+        // A progress bar or upload progress is product work, and "where are we
+        // storing X" asks about the code — the base must answer these.
+        for question in [
+            "进度条怎么样实现？",
+            "上传进度如何显示",
+            "下载进度怎么样计算比较好",
+            "加个上传进度显示吗？",
+            "进度条的颜色如何调整",
+            "where are we storing the auth tokens?",
+            "where are we handling 401 errors?",
+            "what are you doing with the database migrations?",
+        ] {
+            assert_eq!(classify_live_meta(question), None, "{question}");
+        }
+    }
 }

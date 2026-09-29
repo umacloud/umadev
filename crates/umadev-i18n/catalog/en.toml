@@ -1251,6 +1251,7 @@
 "tui.cmd.grok" = "switch the worker to Grok Build"
 "tui.cmd.kimi" = "switch the worker to Kimi Code"
 "tui.cmd.thinking" = "view or change native thinking for Kimi's current model"
+"tui.cmd.base" = "send a native command to the current base, e.g. /base /cost"
 "tui.cmd.goal" = "set a goal — keep the worker going until it's met"
 "tui.cmd.plan" = "show / steer the live plan"
 "tui.cmd.queue" = "Open the base-native message queue pane (also Ctrl+; or Ctrl+')"

@@ -367,6 +367,67 @@ mod tests {
     }
 
     #[test]
+    fn every_base_plan_review_uses_the_picker_and_sends_typed_feedback() {
+        // Claude / Codex / ACP plan reviews used to get only a y/n bar, and a
+        // rejection sent the base's own prompt back as the user's reason. They
+        // now get the same picker, answered in their own reply shape.
+        use umadev_runtime::{ApprovalDecision, HostResponse};
+        let claude_plan = || umadev_runtime::HostRequest::PlanConfirmation {
+            plan: "1. 登录页\n2. 注册页".to_string(),
+            message: Some("Claude is ready to leave plan mode and begin execution".to_string()),
+            metadata: serde_json::json!({ "protocol": "claude-stream-json" }),
+        };
+        let reply = |token: u64, keys: &[KeyCode], feedback: Option<&str>| {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut app = App::new(
+                "base-plan-picker",
+                crate::config::UserConfig::default(),
+                tmp.path().join("config.toml"),
+                tmp.path().to_path_buf(),
+            );
+            let (holder, rx) = install_host_request(&mut app, token, claude_plan());
+            for key in keys {
+                assert!(host_key(&holder, &mut app, *key), "{key:?}");
+                if let Some(text) = feedback.filter(|_| *key == KeyCode::Char('r')) {
+                    app.input = text.to_string();
+                    app.input_cursor = app.input.chars().count();
+                }
+            }
+            rx.blocking_recv().unwrap()
+        };
+
+        assert_eq!(
+            reply(71, &[KeyCode::Char('r'), KeyCode::Enter], Some("先补回滚方案")),
+            HostResponse::PlanConfirmation {
+                decision: ApprovalDecision::Deny,
+                feedback: Some("先补回滚方案".to_string()),
+            }
+        );
+        assert_eq!(
+            reply(72, &[KeyCode::Char('a')], None),
+            HostResponse::PlanConfirmation {
+                decision: ApprovalDecision::Allow,
+                feedback: None,
+            }
+        );
+        let HostResponse::PlanConfirmation {
+            decision: ApprovalDecision::Deny,
+            feedback: Some(abandoned),
+        } = reply(73, &[KeyCode::Char('x')], None)
+        else {
+            panic!("abandon is a denial with an explanation");
+        };
+        assert!(!abandoned.contains("ready to leave plan mode"), "{abandoned}");
+        assert_eq!(
+            reply(74, &[KeyCode::Esc], None),
+            HostResponse::PlanConfirmation {
+                decision: ApprovalDecision::Deny,
+                feedback: None,
+            }
+        );
+    }
+
+    #[test]
     fn grok_exit_plan_panel_scrolls_complete_cjk_plan_and_marks_empty_plan() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut app = App::new(

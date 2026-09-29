@@ -1228,6 +1228,7 @@
 "tui.cmd.grok" = "把底座切換到 Grok Build"
 "tui.cmd.kimi" = "把底座切換到 Kimi Code"
 "tui.cmd.thinking" = "查看或切換 Kimi 目前模型的原生思考狀態"
+"tui.cmd.base" = "向目前底座傳送它的原生指令，例如 /base /cost"
 "tui.cmd.goal" = "設定目標 — 讓底座持續工作直到達成"
 "tui.cmd.plan" = "檢視 / 調度即時計畫"
 "tui.cmd.queue" = "打開底座原生訊息佇列面板(也可 Ctrl+; 或 Ctrl+')"

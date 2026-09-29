@@ -485,6 +485,52 @@ fn grok_queue_enter_tail_ctrl_enter_send_now_and_empty_enter_promotes_top() {
 }
 
 #[test]
+fn ctrl_enter_dispatches_slash_and_bang_commands() {
+    // "Send now" is still a submission: `/cancel` must cancel, not be queued
+    // at the front of the base's prompt queue as text.
+    let ctrl = crossterm::event::KeyModifiers::CONTROL;
+    let mut app = fresh_app(Some("grok-build"));
+    app.thinking = true;
+    app.agentic_in_flight = true;
+    app.prompt_queue.set_ready(true);
+    app.input = "/cancel".to_string();
+    app.input_cursor = app.input_len();
+    assert_eq!(app.apply_key_with_mods(KeyCode::Enter, ctrl), Action::Cancel);
+
+    let mut idle = fresh_app(Some("grok-build"));
+    idle.prompt_queue.set_ready(true);
+    idle.input = "!ls".to_string();
+    idle.input_cursor = idle.input_len();
+    assert_eq!(
+        idle.apply_key_with_mods(KeyCode::Enter, ctrl),
+        Action::RunLocalShell("ls".to_string())
+    );
+}
+
+#[test]
+fn pasted_chip_starting_with_slash_or_bang_is_sent_as_text() {
+    // A large paste shows only a `[粘贴 N 行]` chip. Its content — an ESLint
+    // report starting with an absolute path, or notes starting with `!` — is
+    // text for the base, never a slash command or a local shell script.
+    let report = std::iter::once("/Users/me/app/src/App.tsx".to_string())
+        .chain((1..20).map(|i| format!("  {i}:5  error  'x' is unused  no-unused-vars")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = fresh_app(Some("offline"));
+    app.handle_paste(&report);
+    assert!(!app.input.starts_with('/'), "a chip is shown: {}", app.input);
+    assert_eq!(app.apply_key(KeyCode::Enter), Action::Route(report.clone()));
+
+    let notes = std::iter::once("!important: 请先阅读以下说明".to_string())
+        .chain((1..20).map(|i| format!("第 {i} 条说明")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = fresh_app(Some("offline"));
+    app.handle_paste(&notes);
+    assert_eq!(app.apply_key(KeyCode::Enter), Action::Route(notes.clone()));
+}
+
+#[test]
 fn queue_pane_keys_select_and_request_without_optimistic_changes() {
     let mut app = fresh_app(Some("grok-build"));
     app.prompt_queue.set_ready(true);
@@ -1654,6 +1700,27 @@ fn bare_ctrl_u_and_ctrl_d_no_longer_scroll_transcript() {
         "bare Ctrl-D must not move the transcript"
     );
     assert!(app.should_quit, "bare Ctrl-D on empty input quits (EOF)");
+}
+
+#[test]
+fn ctrl_d_mid_run_does_not_quit() {
+    // Esc never quits while work is live and Ctrl+C only interrupts; an EOF
+    // habit on an empty composer must not abort a running build either.
+    let ctrl = crossterm::event::KeyModifiers::CONTROL;
+    let mut app = fresh_app(Some("offline"));
+    app.thinking = true;
+    assert_ne!(
+        app.apply_key_with_mods(KeyCode::Char('d'), ctrl),
+        Action::Quit
+    );
+    assert!(!app.should_quit);
+    let mut gate = fresh_app(Some("offline"));
+    gate.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+    assert_ne!(
+        gate.apply_key_with_mods(KeyCode::Char('d'), ctrl),
+        Action::Quit
+    );
+    assert!(!gate.should_quit);
 }
 
 #[test]
@@ -4660,6 +4727,62 @@ fn picker_refreshes_on_backend_probed() {
     assert_eq!(app.backend_label, "claude-code");
 }
 
+#[test]
+fn setup_escape_returns_to_chat_and_closes_help_first() {
+    let mut app = fresh_app(Some("offline"));
+    assert_eq!(app.try_slash_command("/setup"), Some(Action::Reconfigure));
+    assert_eq!(app.mode, AppMode::Picker);
+    let _ = app.apply_key(KeyCode::F(1));
+    assert!(app.show_help);
+    assert_eq!(app.apply_key(KeyCode::Esc), Action::None, "Esc closes help");
+    assert!(!app.show_help);
+    assert_eq!(app.mode, AppMode::Picker);
+    assert_eq!(app.apply_key(KeyCode::Esc), Action::None);
+    assert!(!app.should_quit, "Esc on step 1 goes back instead of quitting");
+    assert_eq!(app.mode, AppMode::Chat);
+
+    // The launch picker keeps its meaning: Esc on step 1 quits.
+    let mut first_run = fresh_app(None);
+    assert_eq!(first_run.apply_key(KeyCode::Esc), Action::Quit);
+}
+
+#[test]
+fn setup_is_refused_mid_run() {
+    // The picker would switch the base under the live run's pinned session.
+    let mut app = fresh_app(Some("offline"));
+    app.agentic_in_flight = true;
+    app.thinking = true;
+    assert_eq!(app.try_slash_command("/setup"), Some(Action::None));
+    assert_eq!(app.mode, AppMode::Chat);
+    assert!(app
+        .history
+        .iter()
+        .any(|m| m.body() == umadev_i18n::t(app.lang, "backend.busy_no_switch")));
+}
+
+#[test]
+fn setup_repicking_the_same_base_keeps_the_session() {
+    let mut app = fresh_app(Some("claude-code"));
+    app.apply_engine(EngineEvent::BackendProbed {
+        backend_id: "claude-code".into(),
+        ready: true,
+        detail: "claude 1.6.0".into(),
+    });
+    app.chat_session_id = Some("native-1".into());
+    app.host_chat_session_active = true;
+    assert_eq!(app.try_slash_command("/setup"), Some(Action::Reconfigure));
+    let _ = app.apply_key(KeyCode::Enter); // keep the current language
+    app.picker_selected = app
+        .picker_items
+        .iter()
+        .position(|i| i.backend_id.as_deref() == Some("claude-code"))
+        .unwrap();
+    assert_ne!(app.apply_key(KeyCode::Enter), Action::BackendChanged);
+    assert_eq!(app.mode, AppMode::Chat);
+    assert_eq!(app.chat_session_id.as_deref(), Some("native-1"));
+    assert!(app.host_chat_session_active);
+}
+
 // --- Wave 1: intent card / live plan / team review event rendering ---
 
 #[test]
@@ -5343,6 +5466,24 @@ fn automatic_tui_persistence_stays_with_the_workspace_opened_at_launch() {
         .unwrap(),
         "{}"
     );
+}
+
+#[test]
+fn oversized_input_history_still_persists_recent_entries() {
+    // Large pasted prompts used to push the ring past its 1 MiB file cap, and
+    // every later write was then skipped without a word.
+    let mut app = fresh_app(Some("offline"));
+    let big = "粘".repeat(100_000);
+    for index in 0..6 {
+        app.input_history.push_back(format!("{index}:{big}"));
+    }
+    app.input_history.push_back("newest prompt".to_string());
+    app.persist_history();
+    let saved =
+        std::fs::read_to_string(app.project_root.join(".umadev/input-history.txt")).unwrap();
+    assert!(saved.len() <= 1024 * 1024);
+    let entries: Vec<String> = serde_json::from_str(&saved).unwrap();
+    assert_eq!(entries.last().map(String::as_str), Some("newest prompt"));
 }
 
 #[test]
@@ -7278,6 +7419,27 @@ fn commands_and_dispatch_are_in_lockstep() {
 }
 
 #[test]
+fn every_command_description_is_a_command_description() {
+    // `/help` and the palette used to describe `/base` with the delivery-receipt
+    // label "Native", so users were never told what the command does.
+    for c in App::COMMANDS {
+        assert!(
+            !c.desc_key.starts_with("input.delivery."),
+            "/{} borrows the delivery-receipt label {}",
+            c.name,
+            c.desc_key
+        );
+    }
+    let base = App::COMMANDS
+        .iter()
+        .find(|c| c.name == "base")
+        .expect("/base is registered");
+    let desc = umadev_i18n::t(umadev_i18n::Lang::En, base.desc_key);
+    assert_ne!(desc, "Native");
+    assert!(desc.contains("/base /cost"), "{desc}");
+}
+
+#[test]
 fn slash_unknown_command_hints() {
     let mut app = fresh_app(Some("offline"));
     for c in "/foo".chars() {
@@ -7411,6 +7573,26 @@ fn current_gate_query_result_is_displayed_and_recorded_atomically() {
         app.conversation.last().map(|turn| turn.content.as_str()),
         Some("因为有可复核证据。")
     );
+}
+
+#[test]
+fn cancel_during_gate_query_keeps_gate_open() {
+    // The busy note offers /cancel "before continuing, revising …": cancelling
+    // the slow question must leave the checkpoint open for that decision.
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+    app.director_gate_paused = true;
+    let Action::GateQuery { epoch, .. } = app.submit_text("为什么这样设计?".into()) else {
+        panic!("query expected");
+    };
+    let action = app.try_slash_command("/cancel");
+    assert!(!matches!(action, Some(Action::Cancel)), "{action:?}");
+    assert!(!app.gate_query_in_flight);
+    assert!(!app.thinking);
+    assert_eq!(app.active_gate, Some(Gate::DocsConfirm));
+    assert!(app.director_gate_paused, "the parked Director stays parked");
+    assert!(!app.record_gate_query_done(epoch, "late answer".into()));
+    assert_eq!(app.submit_text("c".into()), Action::Continue(Gate::DocsConfirm));
 }
 
 #[test]
@@ -7739,6 +7921,89 @@ fn rewind_is_refused_while_a_run_is_writing_the_workspace() {
 }
 
 #[test]
+fn run_is_refused_while_local_command_runs() {
+    // `!cmd` / `/adopt` / `/pr` only set `thinking`; a second writer must not
+    // start beside them, and the busy note must be shown.
+    for (command, busy) in [
+        ("/run build x", "run.already_active"),
+        ("/goal build x", "run.already_active"),
+        ("/quick fix typo", "run.already_active"),
+        ("/rewind c1", "rewind.busy"),
+    ] {
+        let mut app = fresh_app(Some("offline"));
+        let root = app.project_root.clone();
+        app.begin_local_command(&LocalCommandRequest::shell(&root, "sleep 30"));
+        assert_eq!(
+            app.try_slash_command(command),
+            Some(Action::None),
+            "{command}"
+        );
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.body() == umadev_i18n::t(app.lang, busy)),
+            "{command}: the busy note is shown"
+        );
+    }
+
+    // `/continue` on a resumable aborted run must not dispatch either.
+    let mut app = fresh_app(Some("codex"));
+    let plan = umadev_agent::Plan {
+        steps: vec![umadev_agent::PlanStep {
+            files: umadev_agent::StepFiles::default(),
+            id: "remaining".into(),
+            title: "finish existing work".into(),
+            seat: umadev_agent::Seat::BackendEngineer,
+            kind: umadev_agent::StepKind::Build,
+            depends_on: vec![],
+            acceptance: umadev_agent::AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: umadev_agent::StepStatus::Pending,
+        }],
+        risks: vec![],
+        open_questions: vec![],
+    };
+    umadev_agent::save_plan(&plan, &app.project_root).unwrap();
+    let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Backend);
+    state.requirement = "完成已有计划".into();
+    state.backend = "codex".into();
+    umadev_agent::write_workflow_state(&app.project_root, &state).unwrap();
+    app.aborted = true;
+    let root = app.project_root.clone();
+    app.begin_local_command(&LocalCommandRequest::shell(&root, "sleep 30"));
+    assert_eq!(app.try_slash_command("/continue"), Some(Action::None));
+}
+
+#[test]
+fn redo_uses_last_run_requirement_after_chat() {
+    // Every routed chat turn overwrites `requirement`; `/redo` must rebuild the
+    // last RUN, never the last chat question.
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::PipelineStarted {
+        slug: "todo".into(),
+        requirement: "做一个待办应用".into(),
+    });
+    app.apply_engine(EngineEvent::BlockCompleted {
+        final_phase: Phase::Delivery,
+        paused_at: None,
+    });
+    app.requirement = "怎么启动？".into(); // what a later Route turn records
+    assert_eq!(
+        app.try_slash_command("/redo"),
+        Some(Action::StartRun("做一个待办应用".into()))
+    );
+
+    // A chat-only session has no run to redo.
+    let mut chat = fresh_app(Some("offline"));
+    chat.requirement = "怎么启动？".into();
+    assert_eq!(chat.try_slash_command("/redo"), Some(Action::None));
+    assert!(chat
+        .history
+        .iter()
+        .any(|m| m.body() == umadev_i18n::t(chat.lang, "redo.no_requirement")));
+}
+
+#[test]
 fn plain_text_after_delivery_routes_to_worker() {
     let mut app = fresh_app(Some("offline"));
     app.run_started = true;
@@ -7932,6 +8197,47 @@ fn no_real_code_failure_completion_reads_degraded() {
     });
     assert_eq!(app.run_state(), RunState::Degraded);
     assert!(app.degraded && !app.finished);
+}
+
+#[test]
+fn text_after_degraded_block_routes_as_chat() {
+    // A degraded block is over: the next message is an ordinary chat turn, not
+    // parked behind a run that will never drain it.
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::PipelineStarted {
+        slug: "quick".into(),
+        requirement: "改一下标题".into(),
+    });
+    app.apply_engine(EngineEvent::Note(
+        "[WARN][降级] 本次有 1 个阶段因底座离线只产出了占位模板(非真实交付)".into(),
+    ));
+    app.apply_engine(EngineEvent::BlockCompleted {
+        final_phase: Phase::Backend,
+        paused_at: None,
+    });
+    assert!(app.degraded);
+    assert!(matches!(
+        app.submit_text("为什么失败了".into()),
+        Action::Route(_)
+    ));
+    assert_eq!(app.queued_count(), 0, "nothing is parked");
+
+    // `/continue` never claims the finished block is still running.
+    let mut app = fresh_app(Some("offline"));
+    app.apply_engine(EngineEvent::PipelineStarted {
+        slug: "quick".into(),
+        requirement: "改一下标题".into(),
+    });
+    app.apply_engine(EngineEvent::Note(
+        "[WARN][降级] 本次有 1 个阶段因底座离线只产出了占位模板(非真实交付)".into(),
+    ));
+    app.apply_engine(EngineEvent::BlockCompleted {
+        final_phase: Phase::Backend,
+        paused_at: None,
+    });
+    assert_eq!(app.try_slash_command("/continue"), Some(Action::None));
+    let running = umadev_i18n::t(app.lang, "continue.running");
+    assert!(app.history.iter().all(|m| m.body() != running));
 }
 
 #[test]
@@ -9045,6 +9351,68 @@ fn gate_picker_revise_option_hands_off_to_free_text_then_revises() {
     }
     let action = a.apply_key(KeyCode::Enter);
     assert_eq!(action, Action::Revise("make the header sticky".to_string()));
+}
+
+#[test]
+fn gate_picker_revise_then_plain_cjk_feedback_revises() {
+    // After "Request changes" / "Add more" UmaDev asks for the change, so the
+    // next line IS the change — even ordinary Chinese wording that the narrow
+    // mid-run steering vocabulary does not recognise.
+    for (key, text) in [
+        ('2', "标题改成红色"),
+        ('2', "导航栏固定在顶部"),
+        ('2', "数据库用 PostgreSQL"),
+        ('3', "还需要支持暗色模式"),
+    ] {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+        assert_eq!(a.apply_key(KeyCode::Char(key)), Action::None, "{text}");
+        for c in text.chars() {
+            let _ = a.apply_key(KeyCode::Char(c));
+        }
+        assert_eq!(
+            a.apply_key(KeyCode::Enter),
+            Action::Revise(text.to_string()),
+            "{text}"
+        );
+        assert!(!a.gate_query_in_flight, "{text}");
+    }
+}
+
+#[test]
+fn unprompted_edit_feedback_at_open_gate_revises() {
+    // The gate card promises that typing a revision re-runs the work. A line
+    // that asks for an edit is that revision even without picking option 2.
+    for text in [
+        "标题改成红色",
+        "PRD 里加上导出 Excel 功能",
+        "配色太暗了，换亮一点",
+        "登录页删掉第三方登录",
+    ] {
+        let mut a = fresh_app(Some("offline"));
+        a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+        assert_eq!(
+            a.submit_text(text.to_string()),
+            Action::Revise(text.to_string()),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn natural_language_approval_clears_gate_picker() {
+    // 「确认」 approves through the continuation path; the dead picker must not
+    // stay armed and swallow Enter / digits / ↑↓ for the rest of the run.
+    let mut a = fresh_app(Some("offline"));
+    a.apply_engine(EngineEvent::gate_opened(Gate::DocsConfirm));
+    assert!(a.gate_choice.is_some());
+    assert_eq!(
+        a.submit_text("确认".to_string()),
+        Action::Continue(Gate::DocsConfirm)
+    );
+    assert!(a.gate_choice.is_none(), "the picker is retired with the gate");
+    assert_eq!(a.apply_key(KeyCode::Char('1')), Action::None);
+    assert_eq!(a.input, "1", "a digit types into the composer again");
 }
 
 #[test]
@@ -11096,6 +11464,25 @@ fn mention_fuzzy_ranks_path_match_above_incidental_hit() {
 }
 
 #[test]
+fn mention_index_refreshes_for_files_created_later() {
+    // The index used to be a one-time snapshot, so files the base generated
+    // after the first scan (the greenfield flow) were never offered.
+    let mut a = fresh_app(Some("offline"));
+    seed_mention_files(&a);
+    std::fs::write(a.project_root.join("src/new_page.tsx"), "").unwrap();
+    for c in "@new_p".chars() {
+        let _ = a.apply_key(KeyCode::Char(c));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut found = a.mention_matches();
+    while !found.iter().any(|p| p == "src/new_page.tsx") && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        found = a.mention_matches();
+    }
+    assert!(found.iter().any(|p| p == "src/new_page.tsx"), "{found:?}");
+}
+
+#[test]
 fn arrow_up_with_input_not_in_palette_recalls_history() {
     let mut a = fresh_app(Some("offline"));
     // Submit a prompt to populate history.
@@ -11323,6 +11710,62 @@ fn esc_rewind_never_fires_mid_run() {
     assert!(a.input.is_empty(), "rewind did not fire — input untouched");
     assert_eq!(a.history.len(), len_before, "transcript untouched mid-run");
     assert!(!a.should_quit);
+}
+
+#[test]
+fn rewind_after_slash_command_keeps_recorded_exchange() {
+    // A slash command is shown as a `You` row but never enters model memory.
+    // Rewinding it must not drop the previous, recorded exchange from memory
+    // or delete the saved chat that still backs the visible transcript.
+    let mut a = fresh_app(Some("offline"));
+    a.push(ChatRole::You, "first");
+    a.record_user_turn("first");
+    a.record_chat_reply("reply one".to_string());
+    let path = a.chat_path(&a.chat_id);
+    assert!(path.exists());
+    for c in "/mode auto".chars() {
+        let _ = a.apply_key(KeyCode::Char(c));
+    }
+    let _ = a.apply_key(KeyCode::Enter);
+    let _ = a.apply_key(KeyCode::Esc);
+    let _ = a.apply_key(KeyCode::Esc);
+    assert_eq!(a.input, "/mode auto", "the shown row is the one rewound");
+    let memory = |turns: &[umadev_runtime::Message]| {
+        turns
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(memory(&a.conversation), ["first", "reply one"]);
+    assert_eq!(memory(&a.full_transcript), ["first", "reply one"]);
+    assert!(path.exists(), "the saved chat still backs the transcript");
+    assert!(a
+        .history
+        .iter()
+        .any(|m| m.role == ChatRole::You && m.body() == "first"));
+}
+
+#[test]
+fn stale_rewind_arm_is_cleared_by_submission() {
+    // One Esc arms the rewind. Pasting and sending a message must disarm it,
+    // so a single Esc after that turn completes cannot silently erase it.
+    let mut a = fresh_app(Some("offline"));
+    a.push(ChatRole::You, "first");
+    a.record_user_turn("first");
+    a.record_chat_reply("reply one".to_string());
+    let _ = a.apply_key(KeyCode::Esc);
+    assert!(a.pending_rewind);
+    a.handle_paste("second");
+    assert!(matches!(a.apply_key(KeyCode::Enter), Action::Route(_)));
+    a.record_chat_reply("reply two".to_string());
+    let _ = a.apply_key(KeyCode::Esc);
+    assert!(a.input.is_empty(), "one Esc only re-arms the rewind");
+    assert!(a.pending_rewind);
+    assert_eq!(a.conversation.len(), 4, "the new exchange is kept");
+    assert!(a
+        .history
+        .iter()
+        .any(|m| m.role == ChatRole::You && m.body() == "second"));
 }
 
 #[test]

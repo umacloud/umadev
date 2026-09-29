@@ -9383,3 +9383,42 @@ async fn run_lane_host_requests_fall_back_to_protocol_shaped_rejection_with_no_s
         "folder trust with no surface stays KeepGated: {resolved:?}"
     );
 }
+
+#[tokio::test]
+async fn a_base_plan_review_uses_the_host_picker_and_its_typed_feedback() {
+    use umadev_runtime::{ApprovalDecision, HostRequest, HostResponse};
+    // Claude's ExitPlanMode on the /run lane used to get the y/n approval bar
+    // and a fixed "not approved" reason. The hosted plan picker answers it now,
+    // so the user's own revision text reaches the base.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut options = opts(tmp.path());
+    options.mode = TrustMode::Guarded;
+    let (events, _rec) = sink();
+    let request = HostRequest::PlanConfirmation {
+        plan: "# 计划\n1. 实现登录".to_string(),
+        message: Some("Claude is ready to leave plan mode and begin execution".to_string()),
+        metadata: serde_json::json!({ "protocol": "claude-stream-json" }),
+    };
+    let typed = HostResponse::PlanConfirmation {
+        decision: ApprovalDecision::Deny,
+        feedback: Some("先补回滚方案".to_string()),
+    };
+    let picker_reply = typed.clone();
+    let interaction = RunInteraction {
+        approval: Some(Arc::new(|_action, _target| {
+            Box::pin(async { false }) as crate::interaction::ApprovalFuture
+        })),
+        host_request: Some(Arc::new(move |_req_id, _request| {
+            let reply = picker_reply.clone();
+            Box::pin(async move { Some(reply) }) as crate::interaction::HostRequestFuture
+        })),
+        confirm_gates: true,
+        ..RunInteraction::default()
+    };
+    let resolved = crate::interaction::hosted(
+        interaction,
+        resolve_host_request(&options, &events, "plan-1", &request),
+    )
+    .await;
+    assert_eq!(resolved, typed);
+}

@@ -729,6 +729,82 @@ async fn auto_tier_auto_approves_the_grok_plan_review_and_guarded_still_asks() {
 }
 
 #[tokio::test]
+async fn every_base_plan_review_parks_the_picker_and_relays_typed_feedback() {
+    use umadev_runtime::{ApprovalDecision, HostRequest, HostResponse};
+
+    // Claude's ExitPlanMode (and Codex / generic ACP plan reviews) used to get a
+    // bare y/n bar, and a denial sent the base's OWN prompt back as the user's
+    // rejection reason. They now park the same plan picker Grok uses.
+    let root = tempfile::tempdir().unwrap();
+    let approval_holder: ApprovalHolder = Arc::new(std::sync::Mutex::new(None));
+    let host_input_holder: HostInputHolder = Arc::new(std::sync::Mutex::new(None));
+    let (sink, _events) = ChannelSink::new();
+    let sink = Arc::new(sink);
+    let request = HostRequest::PlanConfirmation {
+        plan: "# 实现计划\n1. 登录页".to_string(),
+        message: Some("Claude is ready to leave plan mode and begin execution".to_string()),
+        metadata: serde_json::json!({ "protocol": "claude-stream-json" }),
+    };
+
+    let review = resolve_resident_host_request(
+        &request,
+        "plan-1",
+        root.path(),
+        umadev_agent::TrustMode::Guarded,
+        true,
+        &approval_holder,
+        &host_input_holder,
+        &sink,
+    );
+    tokio::pin!(review);
+    assert!(tokio::time::timeout(Duration::from_millis(10), &mut review)
+        .await
+        .is_err());
+    assert!(approval_holder.lock().unwrap().is_none(), "no bare y/n bar");
+    let pending = host_input_holder
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the plan picker is parked for the user");
+    let typed = HostResponse::PlanConfirmation {
+        decision: ApprovalDecision::Deny,
+        feedback: Some("先补回滚方案".to_string()),
+    };
+    let _ = pending.reply_tx.send(typed.clone());
+    assert_eq!(
+        tokio::time::timeout(TURN_HANG_GUARD, review).await.unwrap(),
+        typed
+    );
+
+    // With no live user the host denies for its own reason — never by echoing
+    // the base's prompt as if the user had typed it.
+    let headless = resolve_resident_host_request(
+        &request,
+        "plan-2",
+        root.path(),
+        umadev_agent::TrustMode::Guarded,
+        false,
+        &approval_holder,
+        &host_input_holder,
+        &sink,
+    )
+    .await;
+    let HostResponse::PlanConfirmation {
+        decision: ApprovalDecision::Deny,
+        feedback,
+    } = headless
+    else {
+        panic!("a headless plan review is denied: {headless:?}");
+    };
+    assert!(
+        !feedback
+            .unwrap_or_default()
+            .contains("ready to leave plan mode"),
+        "the base's own prompt is not the rejection reason"
+    );
+}
+
+#[tokio::test]
 async fn upstream_auto_permission_requires_a_live_explicit_verdict() {
     use umadev_runtime::{
         ApprovalDecision, HostApprovalOption, HostApprovalOptionKind, HostRequest, HostResponse,
@@ -2168,6 +2244,24 @@ fn a_wheel_burst_within_one_budget_draws_once() {
     // (the deadline flush). 20 keys → 20 immediate paints (latency wins).
     assert_eq!(count_draws(&wheel), 1, "a wheel burst must coalesce");
     assert_eq!(count_draws(&key), 20, "keys must never be coalesced");
+}
+
+#[test]
+fn a_degraded_continuous_run_is_settled_like_a_finished_one() {
+    // A degraded block is terminal: the continuous run must release its parked
+    // session and stop claiming to be live (redraw ticks, /continue routing).
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = App::new(
+        "degraded-continuous-test",
+        crate::config::UserConfig::default(),
+        tmp.path().join("config.toml"),
+        tmp.path().to_path_buf(),
+    );
+    app.degraded = true;
+    let session_holder: SessionHolder = Arc::new(tokio::sync::Mutex::new(None));
+    let mut active = true;
+    finish_terminal_continuous_run(&app, &mut active, &session_holder);
+    assert!(!active);
 }
 
 // --- M1: cancel-drain absolute-deadline bound ---------------------------
