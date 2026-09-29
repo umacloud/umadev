@@ -35,6 +35,18 @@ pub(super) fn parse_run_command(
             } else {
                 project_root.join(dir)
             };
+            let rest = rest.trim();
+            if !cfg!(windows) && needs_shell(rest) {
+                // A further `&&` chain, env assignment, quoting, or redirect is
+                // shell syntax: run it verbatim through `sh -c` in the `cd`
+                // directory rather than splitting it into argv. (Windows has no
+                // safe shell for this; see the doc comment above.)
+                return (
+                    resolved,
+                    "sh".to_string(),
+                    vec!["-c".to_string(), rest.to_string()],
+                );
+            }
             if let Some((program, args)) = direct_program(rest) {
                 return (resolved, program, args);
             }
@@ -62,16 +74,42 @@ fn direct_program(words: &str) -> Option<(String, Vec<String>)> {
     Some((program, args))
 }
 
+/// Whether `command` uses shell syntax that whitespace splitting would mangle:
+/// operators, redirects, quoting, expansions, or a leading `NAME=value`
+/// environment assignment.
+fn needs_shell(command: &str) -> bool {
+    command.contains([
+        '&', '|', ';', '<', '>', '(', ')', '$', '`', '\'', '"', '\\', '*', '?', '\n',
+    ]) || command
+        .split_whitespace()
+        .next()
+        .is_some_and(|program| program.contains('='))
+}
+
 /// Extract the host:port from a `http://host:port/...` URL, returning None
 /// when parsing fails. Used by [`wait_for_port`] so we only open the browser
 /// after the dev server is actually accepting connections — not 0ms after
 /// spawn, when Vite is still compiling and the page would 404.
+/// A missing port defaults by scheme (80/443); `[ipv6]` hosts keep brackets.
 pub(super) fn url_host_port(url: &str) -> Option<String> {
-    let after_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let host_port = after_scheme.split('/').next()?;
-    Some(host_port.to_string())
+    let (after_scheme, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, 80)
+    } else {
+        (url.strip_prefix("https://")?, 443)
+    };
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?;
+    let (host, port) = match authority.rfind(':') {
+        Some(colon) if !authority[colon..].contains(']') => (
+            &authority[..colon],
+            authority[colon + 1..].parse::<u16>().ok()?,
+        ),
+        _ => (authority, default_port),
+    };
+    (!host.is_empty()).then(|| format!("{host}:{port}"))
 }
 
 /// Poll a `host:port` with a TCP connect until it succeeds or `timeout`

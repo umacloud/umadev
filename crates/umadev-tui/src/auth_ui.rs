@@ -575,6 +575,9 @@ impl AuthUiState {
         if self.phase != AuthUiPhase::Challenge || !self.editing_code {
             return true;
         }
+        // Copying a code usually drags a trailing newline (or padding) along;
+        // only control characters inside the code itself are an error.
+        let text = text.trim();
         if text.chars().any(char::is_control) {
             self.error = Some("authentication code cannot contain control characters".to_string());
             return true;
@@ -960,6 +963,28 @@ mod tests {
                 if code.reveal() == "secret-code"
         ));
         assert!(!format!("{state:?}").contains("secret-code"));
+    }
+
+    #[test]
+    fn manual_code_paste_trims_a_trailing_newline_but_rejects_interior_controls() {
+        let mut state = AuthUiState::new(6, offer());
+        state.apply_event(AuthUiEvent::Starting {
+            generation: 6,
+            attempt_id: SessionOpenId::new(61),
+            method_id: "grok.com".to_string(),
+        });
+        state.apply_event(AuthUiEvent::Challenge {
+            generation: 6,
+            challenge: challenge(61, AuthMode::Loopback),
+        });
+        state.handle_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        state.handle_paste("  secret-code\r\n");
+        assert_eq!(state.error, None);
+        assert_eq!(state.manual_code.0, "secret-code");
+
+        state.handle_paste("more\ncode\n");
+        assert!(state.error.as_deref().unwrap().contains("control"));
+        assert_eq!(state.manual_code.0, "secret-code");
     }
 
     #[test]

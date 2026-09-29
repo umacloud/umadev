@@ -603,6 +603,12 @@ fn base_agent_task_id(parent_task_id: &str, source_key: &str) -> String {
 
 fn plan_scope(backend: &str, requirement: &str, plan: &Plan) -> Result<String, PlanTaskError> {
     let mut identity = plan.clone();
+    // The final-review retry cursor is appended by the host when the final gate
+    // pauses on a reviewer outage. It is not part of the plan's identity: counting
+    // it would make `/continue` mint a new ledger and strand the waiting one.
+    identity
+        .steps
+        .retain(|step| step.id != crate::director_loop::resume::FINAL_REVIEW_RETRY_STEP_ID);
     for step in &mut identity.steps {
         step.status = StepStatus::Pending;
     }
@@ -689,6 +695,34 @@ mod tests {
             tracker.finish(true, "delivered", vec![]).unwrap(),
             RunReadiness::Succeeded
         );
+    }
+
+    #[test]
+    fn appending_the_final_review_retry_cursor_keeps_the_same_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan();
+        let run_id = PlanTaskTracker::open(temp.path(), "codex", "build API", &plan)
+            .unwrap()
+            .run_id()
+            .to_string();
+
+        let mut resumed = plan.clone();
+        let mut retry = step(
+            crate::director_loop::resume::FINAL_REVIEW_RETRY_STEP_ID,
+            StepKind::Review,
+            &["api"],
+        );
+        retry.title = "Retry final whole-build review".into();
+        resumed.steps.push(retry);
+        let tracker = PlanTaskTracker::open(temp.path(), "codex", "build API", &resumed).unwrap();
+        assert_eq!(
+            tracker.run_id(),
+            run_id,
+            "/continue after a final-review outage must reopen the waiting ledger"
+        );
+        assert!(tracker
+            .logical_to_task
+            .contains_key(crate::director_loop::resume::FINAL_REVIEW_RETRY_STEP_ID));
     }
 
     #[test]

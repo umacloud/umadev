@@ -280,6 +280,48 @@ pub(crate) fn configured_git_path(
     Ok(Some(PathBuf::from(value)))
 }
 
+/// Read a boolean from the user's effective Git configuration (repository,
+/// global, and system), normalized by Git itself.
+pub(crate) fn configured_git_bool(
+    root: &Path,
+    key: &str,
+) -> Result<Option<bool>, ResidentExecutionBlocked> {
+    let mut command = Command::new("git");
+    command
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--bool", "--get", key]);
+    remove_git_environment_overrides(&mut command);
+    let output = bounded_git_command_output(
+        command,
+        GitCommandLimits {
+            stdout_bytes: 1024,
+            ..GitCommandLimits::default()
+        },
+        "git-config-unverifiable",
+        "git config --bool --get",
+    )?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(git_command_failed(
+            "git-config-unverifiable",
+            "git config --bool --get",
+            &output,
+        ));
+    }
+    match output.stdout.trim_ascii() {
+        b"true" => Ok(Some(true)),
+        b"false" => Ok(Some(false)),
+        _ => Err(git_commit_blocked(
+            "git-config-invalid",
+            "Git 布尔配置无效 / Git boolean configuration is invalid",
+        )),
+    }
+}
+
 pub(crate) fn git_output(
     root: &Path,
     args: &[&str],

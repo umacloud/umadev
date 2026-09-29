@@ -1,8 +1,7 @@
-#[cfg(not(unix))]
-use super::git_stage_zero_entry;
 use super::{
-    git_command_failed, git_commit_blocked, git_mutating_output, git_mutating_output_with_input,
-    git_output, GitCommitBaseline, GitTransactionGuard, ResidentExecutionBlocked,
+    configured_git_bool, git_command_failed, git_commit_blocked, git_mutating_output,
+    git_mutating_output_with_input, git_output, git_stage_zero_entry, GitCommitBaseline,
+    GitTransactionGuard, ResidentExecutionBlocked,
 };
 use std::path::Path;
 use std::time::Duration;
@@ -16,9 +15,13 @@ pub(crate) async fn stage_paths_without_filters(
 ) -> Result<(), ResidentExecutionBlocked> {
     reject_index_info_paths(paths)?;
     reject_content_transforming_attributes(root, paths)?;
+    // Like native Git, trust the working tree's executable bit only when
+    // `core.fileMode` allows it (it is `false` on WSL `/mnt/c`, exFAT, SMB).
+    let trust_executable_bit =
+        cfg!(unix) && configured_git_bool(root, "core.fileMode")?.unwrap_or(true);
     let mut index_info = Vec::new();
     for path in paths {
-        let Some(mode) = raw_index_mode(root, path)? else {
+        let Some(mode) = raw_index_mode(root, path, trust_executable_bit)? else {
             let zero = deletion_object_id(transaction)?;
             append_index_info_record(&mut index_info, "0", &zero, path);
             continue;
@@ -243,7 +246,11 @@ fn symlink_target_bytes(root: &Path, path: &str) -> Result<Vec<u8>, ResidentExec
     }
 }
 
-fn raw_index_mode(root: &Path, path: &str) -> Result<Option<String>, ResidentExecutionBlocked> {
+fn raw_index_mode(
+    root: &Path,
+    path: &str,
+    trust_executable_bit: bool,
+) -> Result<Option<String>, ResidentExecutionBlocked> {
     let metadata = match std::fs::symlink_metadata(root.join(path)) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -264,25 +271,25 @@ fn raw_index_mode(root: &Path, path: &str) -> Result<Option<String>, ResidentExe
         ));
     }
     #[cfg(unix)]
-    {
+    if trust_executable_bit {
         use std::os::unix::fs::PermissionsExt as _;
-        Ok(Some(
-            if metadata.permissions().mode() & 0o111 == 0 {
+        // Git records only the owner's executable bit.
+        return Ok(Some(
+            if metadata.permissions().mode() & 0o100 == 0 {
                 "100644"
             } else {
                 "100755"
             }
             .to_string(),
-        ))
+        ));
     }
-    #[cfg(not(unix))]
-    {
-        let executable =
-            git_stage_zero_entry(root, path)?.is_some_and(|(mode, _)| mode == "100755");
-        Ok(Some(
-            if executable { "100755" } else { "100644" }.to_string(),
-        ))
-    }
+    // Without a trusted executable bit Git keeps a regular file's recorded
+    // mode and gives new files 100644.
+    let executable = !trust_executable_bit
+        && git_stage_zero_entry(root, path)?.is_some_and(|(mode, _)| mode == "100755");
+    Ok(Some(
+        if executable { "100755" } else { "100644" }.to_string(),
+    ))
 }
 
 fn reject_content_transforming_attributes(
