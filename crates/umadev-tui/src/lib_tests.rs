@@ -93,7 +93,7 @@ fn live_queue_ui_clears_when_its_worker_registration_ends_without_a_keypress() {
         prompt_queue: umadev_runtime::PromptQueueCapability::ServerAuthoritativeVersioned,
         ..SessionCapabilities::default()
     };
-    let (_receiver, registration) = hub.register("grok-build", capabilities);
+    let registration = hub.register("grok-build", capabilities);
     let tmp = tempfile::TempDir::new().unwrap();
     let mut app = App::new(
         "queue-registration",
@@ -146,25 +146,25 @@ fn live_input_distinguishes_codex_same_turn_from_grok_safe_point() {
 
     let codex = same_turn_capabilities();
     assert_eq!(codex.steer, SteerSemantics::SameTurn);
-    let (mut codex_rx, _codex_registration) = hub.register("codex", codex);
+    let mut codex_lane = hub.register("codex", codex);
     assert!(matches!(
         hub.dispatch(turn.clone()),
         LiveInputDispatch::EnqueuedSameTurn
     ));
     assert!(matches!(
-        codex_rx.try_recv().unwrap(),
+        codex_lane.receiver.try_recv().unwrap(),
         LiveInputRequest::Steer { turn: received } if received == turn
     ));
 
     let grok = safe_point_capabilities();
     assert_eq!(grok.steer, SteerSemantics::SameTurnOrImmediateNext);
-    let (mut grok_rx, _grok_registration) = hub.register("grok-build", grok);
+    let mut grok_lane = hub.register("grok-build", grok);
     assert!(matches!(
         hub.dispatch(turn.clone()),
         LiveInputDispatch::EnqueuedSafePointOrNext
     ));
     assert!(matches!(
-        grok_rx.try_recv().unwrap(),
+        grok_lane.receiver.try_recv().unwrap(),
         LiveInputRequest::Steer { turn: received } if received == turn
     ));
 }
@@ -172,7 +172,7 @@ fn live_input_distinguishes_codex_same_turn_from_grok_safe_point() {
 #[test]
 fn live_same_turn_lane_backpressures_into_the_visible_fifo() {
     let hub = LiveInputHub::default();
-    let (_receiver, _registration) = hub.register("codex", same_turn_capabilities());
+    let _registration = hub.register("codex", same_turn_capabilities());
 
     for index in 0..LIVE_INPUT_CHANNEL_CAP {
         assert!(matches!(
@@ -199,7 +199,7 @@ fn live_same_turn_lane_backpressures_into_the_visible_fifo() {
 #[test]
 fn live_safe_point_lane_backpressures_without_claiming_same_turn() {
     let hub = LiveInputHub::default();
-    let (_receiver, _registration) = hub.register("grok-build", safe_point_capabilities());
+    let _registration = hub.register("grok-build", safe_point_capabilities());
 
     for index in 0..LIVE_INPUT_CHANNEL_CAP {
         assert!(matches!(
@@ -415,58 +415,6 @@ fn live_trust_round_trips_and_publishes() {
     assert_eq!(live_trust_tier(), TrustMode::Auto);
     publish_live_trust(TrustMode::Guarded);
     assert_eq!(live_trust_tier(), TrustMode::Guarded);
-}
-
-#[test]
-fn persisted_run_mode_preserves_plan_auto_and_safe_legacy_default() {
-    use umadev_agent::TrustMode;
-    use umadev_runtime::BasePermissionProfile;
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    // A missing state means there is nothing to inherit: keep the user's
-    // current explicit choice rather than inventing a different tier.
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Plan),
-        TrustMode::Plan
-    );
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Auto),
-        TrustMode::Auto
-    );
-
-    for (profile, expected) in [
-        (BasePermissionProfile::Plan, TrustMode::Plan),
-        (BasePermissionProfile::Auto, TrustMode::Auto),
-    ] {
-        let mut state = umadev_agent::WorkflowState::new(umadev_spec::Phase::Frontend);
-        state.permission_profile = Some(profile);
-        umadev_agent::write_workflow_state(tmp.path(), &state).unwrap();
-        assert_eq!(persisted_run_mode(tmp.path(), TrustMode::Guarded), expected);
-    }
-
-    // A currently selected Plan mode is a non-widening ceiling even when the
-    // old workflow was created under Auto.
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Plan),
-        TrustMode::Plan
-    );
-
-    // A pre-profile workflow remains readable and resumes conservatively.
-    let legacy = r#"{
-            "phase": "frontend",
-            "active_gate": "preview_confirm",
-            "slug": "old",
-            "requirement": "do thing",
-            "last_transition_at": "2026-01-01T00:00:00Z",
-            "note": "",
-            "backend": "codex",
-            "spec_version": "UMADEV_HOST_SPEC_V1"
-        }"#;
-    std::fs::write(tmp.path().join(".umadev/workflow-state.json"), legacy).unwrap();
-    assert_eq!(
-        persisted_run_mode(tmp.path(), TrustMode::Auto),
-        TrustMode::Guarded
-    );
 }
 
 #[test]
@@ -4543,6 +4491,9 @@ fn init_git_repo() -> tempfile::TempDir {
     run(&["init", "-q"]);
     run(&["config", "user.email", "t@t.t"]);
     run(&["config", "user.name", "t"]);
+    // The host commit lane refuses signed commits; keep a developer's global
+    // signing setting out of these fixtures.
+    run(&["config", "commit.gpgSign", "false"]);
     tmp
 }
 
@@ -11763,3 +11714,6 @@ async fn interactive_askuserquestion_parks_and_waits_same_session() {
 
 #[path = "tests/resident_chat_terminal_tests.rs"]
 mod resident_chat_terminal_tests;
+
+#[path = "tests/runtime_glue_tests.rs"]
+mod runtime_glue_tests;

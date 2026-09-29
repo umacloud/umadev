@@ -361,16 +361,36 @@ pub fn load_from(path: &std::path::Path) -> UserConfig {
 /// a save error is swallowed so idempotent migrations can retry next launch.
 #[must_use]
 pub fn load_and_migrate(path: &std::path::Path) -> UserConfig {
-    load_and_migrate_for_startup(path).0
+    load_and_migrate_for_startup(path).config
 }
 
-/// Startup variant that also reports which retired backend was cleared during
-/// this launch. The report is deliberately transient: it is never serialized,
-/// so the TUI can show one clear migration notice exactly on the upgrade launch.
+/// What startup loaded, plus the one-launch notices the TUI shows about it.
+/// Neither report is serialized, so each is shown exactly on the launch that
+/// found it.
+#[derive(Debug)]
+pub(crate) struct StartupConfig {
+    pub(crate) config: UserConfig,
+    /// The retired backend a migration cleared during this launch.
+    pub(crate) retired_backend: Option<String>,
+    /// Why the existing file could not be read; it was left untouched.
+    pub(crate) unreadable: Option<String>,
+}
+
+/// Startup variant of [`load_and_migrate`] that also reports what the user
+/// must be told: a retired backend cleared by this launch's migration, or a
+/// config file that could not be read (defaults are used and the file is left
+/// untouched; [`save_to`] keeps a copy before it ever replaces it).
 #[must_use]
-pub(crate) fn load_and_migrate_for_startup(path: &std::path::Path) -> (UserConfig, Option<String>) {
-    let Ok(mut cfg) = load_strict(path) else {
-        return (UserConfig::default(), None);
+pub(crate) fn load_and_migrate_for_startup(path: &std::path::Path) -> StartupConfig {
+    let mut cfg = match load_strict(path) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            return StartupConfig {
+                config: UserConfig::default(),
+                retired_backend: None,
+                unreadable: Some(error),
+            };
+        }
     };
     // The retired-backend step is migration index 1 (target version 2). Capture
     // the old id only while that step is pending; once v2 is persisted, a later
@@ -384,7 +404,11 @@ pub(crate) fn load_and_migrate_for_startup(path: &std::path::Path) -> (UserConfi
         let _ = save_to(&cfg, path);
     }
     let retired_backend = retired_backend.filter(|_| cfg.backend.is_none());
-    (cfg, retired_backend)
+    StartupConfig {
+        config: cfg,
+        retired_backend,
+        unreadable: None,
+    }
 }
 
 /// Strictly load the config, surfacing a parse error instead of the fail-soft
@@ -413,9 +437,17 @@ pub fn save(config: &UserConfig) -> std::io::Result<PathBuf> {
 }
 
 /// Write to a specific path. Same semantics.
+///
+/// An existing file that cannot be read as a config (startup already told the
+/// user and ran on defaults) is first copied beside itself as
+/// `config.toml.bak-<unix seconds>`, so a save never silently discards the
+/// user's other settings; when that copy fails, nothing is written.
 pub fn save_to(config: &UserConfig, path: &std::path::Path) -> std::io::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    if load_strict(path).is_err() {
+        fs::copy(path, unused_backup_path(path))?;
     }
     let body = toml::to_string_pretty(config).map_err(|e| std::io::Error::other(e.to_string()))?;
     // Resolve the parent first so dotfile-manager symlinked directories keep
@@ -455,6 +487,24 @@ pub fn save_to(config: &UserConfig, path: &std::path::Path) -> std::io::Result<P
     };
     umadev_state::fs::atomic_write(&target, body.as_bytes())?;
     Ok(path.to_path_buf())
+}
+
+/// `config.toml.bak-<unix seconds>` beside `path`, with a counter when a copy
+/// from the same second already exists.
+fn unused_backup_path(path: &std::path::Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let name = path
+        .file_name()
+        .map_or_else(|| FILE_NAME.into(), std::ffi::OsStr::to_string_lossy);
+    let mut candidate = path.with_file_name(format!("{name}.bak-{stamp}"));
+    let mut counter = 1_u32;
+    while candidate.exists() && counter < 1_000 {
+        candidate = path.with_file_name(format!("{name}.bak-{stamp}-{counter}"));
+        counter += 1;
+    }
+    candidate
 }
 
 #[cfg(test)]
@@ -741,18 +791,55 @@ mod tests {
         )
         .unwrap();
 
-        let (first, first_notice) = load_and_migrate_for_startup(&path);
-        assert_eq!(first.backend, None);
-        assert_eq!(first_notice.as_deref(), Some("qwen-code"));
-        assert_eq!(first.migration_version, CURRENT_MIGRATION_VERSION);
+        let first = load_and_migrate_for_startup(&path);
+        assert_eq!(first.config.backend, None);
+        assert_eq!(first.retired_backend.as_deref(), Some("qwen-code"));
+        assert_eq!(first.config.migration_version, CURRENT_MIGRATION_VERSION);
+        assert_eq!(first.unreadable, None);
 
-        let (second, second_notice) = load_and_migrate_for_startup(&path);
-        assert_eq!(second.backend, None);
-        assert_eq!(second.lang.as_deref(), Some("zh-CN"));
+        let second = load_and_migrate_for_startup(&path);
+        assert_eq!(second.config.backend, None);
+        assert_eq!(second.config.lang.as_deref(), Some("zh-CN"));
         assert_eq!(
-            second_notice, None,
+            second.retired_backend, None,
             "persisted v2 must not repeat the notice"
         );
+    }
+
+    #[test]
+    fn corrupt_config_is_reported_and_backed_up_before_save() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = "# my settings\nbackend = \"codex\"\nshow_process_logs = \"yes\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let startup = load_and_migrate_for_startup(&path);
+        assert!(startup.unreadable.is_some(), "a parse error is reported");
+        assert_eq!(startup.config, UserConfig::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let chosen = UserConfig {
+            lang: Some("en".into()),
+            ..Default::default()
+        };
+        save_to(&chosen, &path).unwrap();
+        assert_eq!(load_strict(&path).unwrap(), chosen);
+        let backups = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &path)
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert!(backups[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("config.toml.bak-"));
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+
+        // A readable config is replaced in place without another copy.
+        save_to(&UserConfig::default(), &path).unwrap();
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 2);
     }
 
     #[test]

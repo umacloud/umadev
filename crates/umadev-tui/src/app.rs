@@ -18,12 +18,12 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthChar;
 
 use crate::config::UserConfig;
-use crate::local_command::{LocalCommandRequest, LocalCommandResult};
 use crate::prompt_queue_ui::PromptQueueUi;
 
 mod animation_settings;
 mod backend;
 mod bounded_text;
+mod config_notice;
 mod deploy;
 mod dir_scan;
 mod file_index;
@@ -32,6 +32,7 @@ mod host_git;
 pub(crate) mod host_input;
 mod lessons_view;
 mod live_meta;
+mod local_task;
 mod memory_view;
 pub(crate) mod permissions;
 mod plan_view;
@@ -3021,6 +3022,9 @@ pub struct App {
     /// Its settle/cancel path must never reset a parked Director run or consume
     /// any resident base-session identity.
     pub(crate) host_git_in_flight: bool,
+    /// Stop handle of the running TUI-local task (`!cmd`, a helper command or a
+    /// confirmed `/deploy`); a cancel stops only that task.
+    pub(crate) local_task: Option<crate::local_command::LocalTaskStop>,
     /// Session-level gate auto-approval set via `/manual` (`Some(false)`) or
     /// `/auto` (`Some(true)`). `None` → the default `guarded` tier. Lets the
     /// user flip review mode mid-session without losing it on restart-of-flow.
@@ -3748,6 +3752,7 @@ impl App {
             thinking_block_idx: None,
             agentic_in_flight: false,
             host_git_in_flight: false,
+            local_task: None,
             auto_approve_override: None,
             trust_mode_override: None,
             trust_ledger: umadev_agent::TrustLedger::load(&project_root),
@@ -3840,23 +3845,6 @@ impl App {
         }
         app.refresh_status();
         app
-    }
-
-    /// Surface the one-time retired-backend migration and take the user directly
-    /// to the five-base picker. The notice exists only for this process launch;
-    /// the migration version persisted by `config` prevents it recurring.
-    pub(crate) fn show_retired_backend_migration(&mut self, retired_backend: Option<&str>) {
-        let Some(retired_backend) = retired_backend else {
-            return;
-        };
-        self.mode = AppMode::Picker;
-        self.goto_picker_step(PickerStep::BaseCli);
-        self.picker_notice = Some(umadev_i18n::tf(
-            self.lang,
-            "backend.migration.retired",
-            &[retired_backend],
-        ));
-        self.refresh_status();
     }
 
     /// Resolve which "brain" runs the pipeline: the selected base CLI, or the
@@ -11376,38 +11364,6 @@ impl App {
         true
     }
 
-    /// Mark a confirmed `/deploy` as the sole cancellable workspace task.
-    pub(crate) fn begin_deploy(&mut self) {
-        self.thinking = true;
-        self.thinking_started = Some(std::time::Instant::now());
-        self.agentic_in_flight = true;
-        self.tool_in_progress = true;
-        self.refresh_status();
-    }
-
-    /// Settle a tracked deploy and release its single-task guard.
-    pub(crate) fn record_deploy_done(&mut self, succeeded: bool) {
-        self.stream_compacted = None;
-        self.arm_completion_bell(self.thinking_started);
-        self.thinking = false;
-        self.thinking_started = None;
-        self.agentic_in_flight = false;
-        self.tool_in_progress = false;
-        self.record_turn(
-            "assistant",
-            format!(
-                "[control: deploy task settled — {}]",
-                if succeeded {
-                    "deployed"
-                } else {
-                    "not deployed"
-                }
-            ),
-        );
-        self.persist_chat();
-        self.refresh_status();
-    }
-
     /// Surface steering that never reached a step boundary when a director run
     /// settled (A2#4 — a queued directive must never be dropped silently, and the
     /// queued chip must never stick). Folds the shared intake's `leftover` with
@@ -12480,7 +12436,7 @@ impl App {
     /// Code's `!` convenience-shell convention), so it never touches the base
     /// session. A bare `!` (or `!` + only whitespace) is a consumed no-op — it
     /// neither runs anything nor leaks the literal `!` to the base. Fully
-    /// fail-open: a spawn error / nonzero exit / >10s hang all surface as a
+    /// fail-open: a spawn error / nonzero exit / timeout all surface as a
     /// finished row with an explanatory line, never a panic or a frozen UI.
     fn try_bang_command(&mut self, raw: &str) -> Option<Action> {
         let cmd = raw.strip_prefix('!')?.trim();
@@ -12506,87 +12462,6 @@ impl App {
             return Some(Action::None);
         }
         Some(Action::RunLocalShell(cmd.to_string()))
-    }
-
-    /// Mark a TUI-owned local command as running before its async task starts.
-    pub(crate) fn begin_local_command(&mut self, request: &LocalCommandRequest) {
-        self.thinking = true;
-        self.thinking_started = Some(std::time::Instant::now());
-        self.last_output_at = None;
-        self.tool_in_progress = true;
-        self.push_tool_use_correlated(
-            local_command_call_id(request.presentation),
-            "Bash",
-            &request.display,
-        );
-        self.refresh_status();
-    }
-
-    /// Settle the exact local-command row without relying on transcript
-    /// adjacency: users can queue input or receive status notices while the
-    /// child is running, so "last row wins" would update the wrong message.
-    pub(crate) fn record_local_command_done(&mut self, result: LocalCommandResult) {
-        let call_id = local_command_call_id(result.request.presentation);
-        let target = self.history.iter().rposition(|message| {
-            message.role == ChatRole::Host
-                && matches!(
-                    &message.kind,
-                    MessageBody::Tool(tool)
-                        if tool.status == ToolStatus::Running
-                            && tool.call_id.as_deref() == Some(call_id)
-                )
-        });
-        if let Some(tool) = target
-            .and_then(|index| self.history.get_mut(index))
-            .and_then(|message| match &mut message.kind {
-                MessageBody::Tool(tool) => Some(tool),
-                _ => None,
-            })
-        {
-            tool.status = if result.ok {
-                ToolStatus::Ok
-            } else {
-                ToolStatus::Fail
-            };
-            tool.result = Some(result.output);
-            tool.progress = None;
-            tool.collapsed = result.ok;
-        } else {
-            self.push_local_command_row(&result.request.display, result.ok, result.output);
-        }
-        self.thinking = false;
-        self.thinking_started = None;
-        self.last_output_at = Some(std::time::Instant::now());
-        self.tool_in_progress = false;
-        self.transient_status = None;
-        self.refresh_status();
-    }
-
-    /// Append a terminal fallback row when the matching running row was lost
-    /// (for example after a lenient persisted-session recovery).
-    fn push_local_command_row(&mut self, command: &str, ok: bool, output: String) {
-        // A one-off shell row is its own row; never fold it into a low-signal
-        // read batch.
-        self.stream_tool_batch = None;
-        let arg: String = command.chars().take(80).collect();
-        self.history.push_back(ChatMessage {
-            role: ChatRole::Host,
-            kind: MessageBody::Tool(ToolCall {
-                call_id: None,
-                name: "Bash".to_string(),
-                arg,
-                status: if ok { ToolStatus::Ok } else { ToolStatus::Fail },
-                result: (!output.trim().is_empty()).then_some(output),
-                progress: None,
-                merged: false,
-                count: 1,
-                collapsed: ok,
-            }),
-            collapsed: false,
-        });
-        while self.history.len() > HISTORY_CAP {
-            self.history.pop_front();
-        }
     }
 
     fn native_command_action(&mut self, payload: String) -> Action {

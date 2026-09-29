@@ -266,6 +266,7 @@
 "intent.writer_lock_blocked" = "[blocked] 意图 · 写入任务无法取得工作区单写者锁：{}"
 "intent.targeted_verification_missing" = "[blocked] 定向代码修改已经落盘，但没有观察到成功的定向测试/构建/lint 证据。本轮不会标记为完成；请运行最小相关校验后重试。"
 "intent.git_commit_host_boundary" = "[blocked] Git 提交是宿主独占事务，绝不交给 AI 底座执行。请先单独发送普通提交请求（例如“提交git记录”）；测试、修改、推送、amend 或其他动作请在提交完成后另发一条请求。"
+"intent.git_commit_done" = "[ok] 已创建本地提交 {}\n提交的文件：{}"
 "intent.git_commit_cancelled" = "Git 提交已取消；原项目流程与会话暂停状态保持不变。请核对 git status 确认工作区。"
 "intent.git_commit_worker_failed" = "Git 提交事务异常终止，未发布结果；原项目流程与会话暂停状态保持不变。请核对 git status 确认工作区。"
 
@@ -307,6 +308,7 @@
 "input.steer.opencode_not_guaranteed" = "OpenCode 在当前传输上不保证同一轮 steer；已原样排到下一轮。"
 "input.steer.grok_acp_unsupported" = "Grok Build 当前协商出的 ACP 会话不支持 steer；已原样排到下一轮。"
 "input.steer.kimi_acp_unsupported" = "Kimi Code 当前协商出的 ACP 会话不支持同一轮 steer；已原样排到下一轮。"
+"input.steer.returned" = "这条消息送达底座之前本轮已结束,因此没有发送;它已放回输入框。"
 "input.steer.not_active_queued" = "常驻会话尚未进入可接收实时输入的状态；已原样排到下一轮。"
 "input.steer.backpressure_queued" = "同一轮输入通道正忙；已完整、可见地排到下一轮。"
 "input.steer.safe_point_backpressure_queued" = "实时 steer 通道正忙，本条尚未提交到底座；已完整、可见地排到下一普通回合。"
@@ -700,6 +702,7 @@
 "template.switched" = "种子模板切换为 `{}` — 下一个 run 的 frontend 阶段将参考此模板的页面结构和质量标准。"
 
 # /run and /redo
+"run.resume_mode_narrowed" = "[模式] 该运行保存时处于 {} 模式,而本会话当前为 {} 模式,因此将按本会话的权限继续。如需按保存时的权限继续,请使用 /mode {} 切换。"
 "run.busy_reopen" = "流水线正在跑 — 先 /cancel 停掉再重开,避免两个流水线同时写同一个工作区。"
 "run.usage" = "用法:/run [--slug <slug>] <需求>\n  示例:/run --slug my-project 做一个登录系统\n  示例:/run 构建端到端测试套件 (slug 自动用目录名)"
 "goal.busy_reopen" = "已经有任务在跑 — 先 /cancel 停掉再 /goal,避免两个任务同时写同一个工作区。"
@@ -1217,6 +1220,7 @@
 "tui.bang.spawn_failed" = "无法执行:{}"
 "tui.bang.timeout" = "命令超时"
 "tui.bang.no_output" = "(无输出)"
+"tui.local.cancelled" = "[已取消] 已按你的要求停止;该命令及其启动的所有进程均已终止。"
 "tui.local.output_truncated" = "[较早的命令输出已截断]"
 # 帮助浮层 + 命令面板共享的斜杠命令描述(单一来源)。
 # 多数命令复用上面的 tui.help.* 文案;以下覆盖此前只有英文面板提示(或没有提示)、
@@ -1469,3 +1473,4 @@
 "design.picker.pending" = "[pending]"
 "design.preview.unreadable" = "  (文件不可读)"
 "design.preview.use" = "  适用: {}\n"
+"config.unreadable" = "[warn] 无法读取设置文件 {}({})。UmaDev 已使用默认设置启动,未改动该文件。请修正后重启;如果先修改了设置,原文件会先作为 .bak 副本保存在同一目录。"

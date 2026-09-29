@@ -158,6 +158,35 @@ pub(crate) fn git_std_command(root: &Path) -> Command {
     command
 }
 
+/// A `check-attr` probe that sees every attribute native Git applies: the
+/// system file, the user's global file (`core.attributesFile`, else Git's own
+/// XDG default) and the repository's. `check-attr` only reads attribute files,
+/// so no filter or other configured program can run.
+pub(crate) fn git_attribute_probe_command(root: &Path, attributes_file: Option<&Path>) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("--no-pager")
+        .arg("--literal-pathspecs")
+        .arg("--no-optional-locks")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            INERT_HOOKS_CONFIG,
+            "-c",
+            "gc.auto=0",
+        ]);
+    if let Some(file) = attributes_file {
+        let mut value = std::ffi::OsString::from("core.attributesFile=");
+        value.push(file);
+        command.arg("-c").arg(value);
+    }
+    command.arg("-C").arg(root);
+    isolate_git_configuration(&mut command);
+    command.env_remove("GIT_ATTR_NOSYSTEM");
+    command
+}
+
 pub(crate) fn git_tokio_command(root: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new("git");
     command

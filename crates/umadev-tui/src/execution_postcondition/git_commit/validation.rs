@@ -1,7 +1,7 @@
 use super::{
-    configured_git_path, display_paths, git_command_failed, git_commit_blocked, git_output,
-    git_output_without_filter_programs, git_required_text, BTreeSet, ExecutionContract, Path,
-    PathBuf, ResidentExecutionBlocked,
+    configured_git_bool, configured_git_path, display_paths, git_command_failed,
+    git_commit_blocked, git_output, git_output_without_filter_programs, git_required_text,
+    BTreeSet, ExecutionContract, Path, PathBuf, ResidentExecutionBlocked,
 };
 use umadev_agent::{parse_git_commit_intent, GitCommitIntent};
 
@@ -325,6 +325,20 @@ pub(crate) fn reject_active_commit_hooks(root: &Path) -> Result<(), ResidentExec
             ),
         ))
     }
+}
+
+/// The lane cannot run the user's signing program (it could be anything the
+/// configuration names), and an unsigned commit reported as success is only
+/// discovered when a protected branch rejects the push. Refuse up front, the
+/// same way active hooks are refused.
+pub(crate) fn reject_commit_signing(root: &Path) -> Result<(), ResidentExecutionBlocked> {
+    if configured_git_bool(root, "commit.gpgSign")? == Some(true) {
+        return Err(git_commit_blocked(
+            "git-signing-requires-native-git",
+            "检测到 commit.gpgSign=true;host-only 事务不会运行签名程序,也不会创建未签名的提交。请用原生 Git 提交(例如 `git commit`) / commit signing is enabled (commit.gpgSign=true); this host-only transaction never runs a signing program and will not create an unsigned commit, so it was refused before staging; commit with native Git instead",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]

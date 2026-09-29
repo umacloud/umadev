@@ -266,6 +266,7 @@
 "intent.writer_lock_blocked" = "[blocked] 意圖 · 寫入任務無法取得工作區單寫者鎖：{}"
 "intent.targeted_verification_missing" = "[blocked] 定向程式碼修改已經落盤，但沒有觀察到成功的定向測試/建置/lint 證據。本輪不會標記為完成；請執行最小相關校驗後重試。"
 "intent.git_commit_host_boundary" = "[blocked] Git 提交是宿主獨占交易，絕不交給 AI 底座執行。請先單獨傳送普通提交請求（例如「提交git紀錄」）；測試、修改、推送、amend 或其他動作請在提交完成後另傳一條請求。"
+"intent.git_commit_done" = "[ok] 已建立本機提交 {}\n提交的檔案：{}"
 "intent.git_commit_cancelled" = "Git 提交已取消；原專案流程與工作階段暫停狀態維持不變。請核對 git status 確認工作區。"
 "intent.git_commit_worker_failed" = "Git 提交交易異常終止，未發布結果；原專案流程與工作階段暫停狀態維持不變。請核對 git status 確認工作區。"
 
@@ -307,6 +308,7 @@
 "input.steer.opencode_not_guaranteed" = "OpenCode 在目前傳輸上不保證同一輪 steer；已原樣排到下一輪。"
 "input.steer.grok_acp_unsupported" = "Grok Build 目前協商出的 ACP 工作階段不支援 steer；已原樣排到下一輪。"
 "input.steer.kimi_acp_unsupported" = "Kimi Code 目前協商出的 ACP 工作階段不支援同一輪 steer；已原樣排到下一輪。"
+"input.steer.returned" = "這則訊息送達底座之前本輪已結束,因此沒有送出;它已放回輸入框。"
 "input.steer.not_active_queued" = "常駐工作階段尚未進入可接收即時輸入的狀態；已原樣排到下一輪。"
 "input.steer.backpressure_queued" = "同一輪輸入通道正忙；已完整、可見地排到下一輪。"
 "input.steer.safe_point_backpressure_queued" = "即時 steer 通道正忙，本則尚未提交到底座；已完整、可見地排到下一個普通回合。"
@@ -700,6 +702,7 @@
 "template.switched" = "種子範本切換為 `{}` — 下一個 run 的 frontend 階段將參考此範本的頁面結構和品質標準。"
 
 # /run and /redo
+"run.resume_mode_narrowed" = "[模式] 此執行儲存時處於 {} 模式,而本工作階段目前為 {} 模式,因此將依本工作階段的權限繼續。如需依儲存時的權限繼續,請使用 /mode {} 切換。"
 "run.busy_reopen" = "流水線正在跑 — 先 /cancel 停掉再重開,避免兩個流水線同時寫同一個工作區。"
 "run.usage" = "用法:/run [--slug <slug>] <需求>\n  範例:/run --slug my-project 做一個登入系統\n  範例:/run 建立端到端測試套件 (slug 自動用目錄名)"
 "goal.busy_reopen" = "已經有任務在跑 — 先 /cancel 停掉再 /goal,避免兩個任務同時寫同一個工作區。"
@@ -1218,6 +1221,7 @@
 "tui.bang.spawn_failed" = "無法執行:{}"
 "tui.bang.timeout" = "命令逾時"
 "tui.bang.no_output" = "(無輸出)"
+"tui.local.cancelled" = "[已取消] 已依你的要求停止;該指令及其啟動的所有程序均已終止。"
 "tui.local.output_truncated" = "[較早的命令輸出已截斷]"
 # 說明浮層 + 命令面板共用的斜線命令描述(單一來源)。
 # 多數命令沿用上面的 tui.help.* 文案;以下涵蓋此前只有英文面板提示(或沒有提示)、
@@ -1470,3 +1474,4 @@
 "design.picker.pending" = "[pending]"
 "design.preview.unreadable" = "  (檔案不可讀)"
 "design.preview.use" = "  適用: {}\n"
+"config.unreadable" = "[warn] 無法讀取設定檔 {}({})。UmaDev 已使用預設設定啟動,未變更該檔案。請修正後重新啟動;如果先修改了設定,原檔案會先以 .bak 副本保存在同一目錄。"

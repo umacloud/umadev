@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 
 pub mod child_env;
+pub mod console_output;
 pub mod git;
 pub mod path_lookup;
 

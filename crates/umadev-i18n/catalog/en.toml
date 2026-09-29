@@ -272,6 +272,7 @@
 "intent.writer_lock_blocked" = "[blocked] intent · the mutating turn could not acquire the workspace writer lock: {}"
 "intent.targeted_verification_missing" = "[blocked] The scoped code change landed, but no successful targeted test/build/lint evidence was observed. The turn is not marked complete; run the narrowest relevant check and retry."
 "intent.git_commit_host_boundary" = "[blocked] Git commits are host-owned transactions and are never delegated to an AI base. Send a standalone ordinary commit request first (for example, `commit the current changes`), then send any test, edit, push, amend, or other action as a separate request."
+"intent.git_commit_done" = "[ok] Created local commit {}\nCommitted files: {}"
 "intent.git_commit_cancelled" = "Git commit cancelled; the existing workflow and session pause state is unchanged. Check `git status` to verify the working tree."
 "intent.git_commit_worker_failed" = "The Git commit transaction ended unexpectedly before publishing a result; the existing workflow and session pause state is unchanged. Check `git status` to verify the working tree."
 
@@ -313,6 +314,7 @@
 "input.steer.opencode_not_guaranteed" = "OpenCode does not guarantee same-turn steering on this transport; queued intact for the next turn."
 "input.steer.grok_acp_unsupported" = "Grok Build's negotiated ACP session does not support steering; queued intact for the next turn."
 "input.steer.kimi_acp_unsupported" = "Kimi Code's negotiated ACP session does not support same-turn steering; queued intact for the next turn."
+"input.steer.returned" = "The turn ended before this message reached the base, so it was not sent; it is back in the input box."
 "input.steer.not_active_queued" = "The resident turn is not ready for live input yet; queued intact for the next turn."
 "input.steer.backpressure_queued" = "The same-turn input lane is busy; queued intact and visibly for the next turn."
 "input.steer.safe_point_backpressure_queued" = "The live steer lane is busy, so this was not submitted to the base; queued intact and visibly for the next ordinary turn."
@@ -710,6 +712,7 @@
 "template.switched" = "Seed template switched to `{}` — the next run's frontend phase will follow this template's page structure and quality bar."
 
 # /run and /redo
+"run.resume_mode_narrowed" = "[mode] This run was saved in {} mode, but this session is in {} mode, so it continues with this session's permissions. To continue it with its saved permissions, switch with /mode {}."
 "run.busy_reopen" = "A pipeline is running — /cancel it before starting again, to avoid two pipelines writing the same workspace."
 "run.usage" = "Usage: /run [--slug <slug>] <requirement>\n  Example: /run --slug my-project build a login system\n  Example: /run build an end-to-end test suite (slug auto-uses the directory name)"
 "goal.busy_reopen" = "A task is already running — /cancel it before /goal, to avoid two tasks writing the same workspace."
@@ -1241,6 +1244,7 @@
 "tui.bang.spawn_failed" = "failed to run: {}"
 "tui.bang.timeout" = "command timed out"
 "tui.bang.no_output" = "(no output)"
+"tui.local.cancelled" = "[cancelled] Stopped at your request; the command and everything it started were terminated."
 "tui.local.output_truncated" = "[older command output truncated]"
 # Slash-command descriptions that the help overlay + palette share (one source).
 # Most commands reuse the tui.help.* strings above; these cover the verbs that
@@ -1493,3 +1497,4 @@
 "design.picker.pending" = "[pending]"
 "design.preview.unreadable" = "  (file not readable)"
 "design.preview.use" = "  Use: {}\n"
+"config.unreadable" = "[warn] Your settings file {} could not be read ({}). UmaDev started with default settings and left the file unchanged. Fix it and restart; if you change a setting first, the unreadable file is kept next to it as a .bak copy."
