@@ -175,6 +175,26 @@ impl ScriptedKimi {
                 writeln!(stdout, "{request}").unwrap();
                 stdout.flush().unwrap();
             }
+            "invalid utf8" => {
+                stdout.write_all(b"\xff\xfe\n").unwrap();
+                emit(
+                    stdout,
+                    &session_update(&json!({
+                        "sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"still here"}
+                    })),
+                );
+                self.finish_prompt(stdout);
+            }
+            "oversized" => {
+                // One line past the 64 MiB frame limit; the process stays alive.
+                let chunk = vec![b'x'; 1024 * 1024];
+                for _ in 0..=MAX_FRAME_BYTES / chunk.len() {
+                    stdout.write_all(&chunk).unwrap();
+                }
+                stdout.write_all(b"\n").unwrap();
+                stdout.flush().unwrap();
+            }
             other => panic!("scripted Kimi received an unexpected prompt {other:?}"),
         }
     }
@@ -497,5 +517,63 @@ async fn unparseable_permission_request_is_answered_not_dropped() {
         reply(workspace.path(), "perm-unparseable"),
         json!({"outcome":{"outcome":"cancelled"}})
     );
+    session.end().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_utf8_line_is_skipped_not_fatal() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut session = start_scripted_kimi(workspace.path()).await;
+    session.send_turn("invalid utf8".to_string()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut text = String::new();
+    let status = loop {
+        match next_event_within(&mut session, deadline).await {
+            SessionEvent::TextDelta(delta) => text.push_str(&delta),
+            SessionEvent::TurnDone { status, .. } => break status,
+            _ => {}
+        }
+    };
+    assert_eq!(status, TurnStatus::Completed);
+    assert_eq!(text, "still here");
+    session.end().await.unwrap();
+}
+
+#[tokio::test]
+async fn reader_failure_fails_the_next_prompt_fast() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut session = start_scripted_kimi(workspace.path()).await;
+    session.send_turn("oversized".to_string()).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let SessionEvent::TurnDone { status, .. } =
+            next_event_within(&mut session, deadline).await
+        {
+            break status;
+        }
+    };
+    assert!(
+        matches!(&status, TurnStatus::Failed(reason) if reason.contains("64 MiB")),
+        "{status:?}"
+    );
+    // Nothing reads the base's replies any more: a new prompt must fail now,
+    // not wait for the idle watchdog.
+    let next = tokio::time::timeout(
+        Duration::from_secs(1),
+        session.send_turn("next".to_string()),
+    )
+    .await
+    .expect("send_turn must not wait on a session whose reader stopped");
+    assert!(matches!(next, Err(SessionError::Closed)), "{next:?}");
+    // The base is told too: its stdin closes, so it exits instead of working on
+    // unobserved.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while session.try_exit_status().is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the base kept running after its reader stopped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     session.end().await.unwrap();
 }

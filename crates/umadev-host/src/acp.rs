@@ -1477,6 +1477,8 @@ pub struct AcpSession {
     stderr: StderrTail,
     stderr_drain: StderrDrain,
     reader_task: Option<tokio::task::JoinHandle<()>>,
+    /// Set once the reader has stopped: nothing will answer a new request.
+    closed: Arc<AtomicBool>,
     turn_active: Arc<AtomicBool>,
     latest_usage: LatestUsage,
     grok_client_source_capabilities: GrokSourceCapabilities,
@@ -1915,6 +1917,7 @@ impl AcpSession {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let approvals: ApprovalMap = Arc::new(Mutex::new(HashMap::new()));
         let turn_active = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
         let grok_source_capabilities = Arc::new(AtomicU32::new(0));
         // Fresh sessions have no replay window. Recovery flips this only for
         // the bounded resume/load request and clears it on every result path.
@@ -1940,6 +1943,7 @@ impl AcpSession {
             vendor,
             writer: Arc::clone(&writer),
             pending: Arc::clone(&pending),
+            closed: Arc::clone(&closed),
             approvals: Arc::clone(&approvals),
             turn_active: Arc::clone(&turn_active),
             active_session_id: Arc::clone(&active_session_id),
@@ -1985,6 +1989,7 @@ impl AcpSession {
             stderr: stderr_tail,
             stderr_drain,
             reader_task: Some(reader_task),
+            closed,
             turn_active,
             latest_usage,
             grok_client_source_capabilities,
@@ -3043,6 +3048,9 @@ impl AcpSession {
                     None,
                 ));
             }
+            Err(SessionError::Closed) => {
+                return Err((self.process_closed_open_error(label, None).await, None));
+            }
             Err(error) => return Err((error, None)),
         };
         match tokio::time::timeout(handshake_timeout(), receiver).await {
@@ -3108,6 +3116,11 @@ impl AcpSession {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
+            // Checked under the lock the reader drains on exit, so a request
+            // is either failed by that drain or refused here.
+            if self.closed.load(Ordering::Acquire) {
+                return Err(SessionError::Closed);
+            }
             if pending.len() >= MAX_PENDING_REQUESTS {
                 return Err(SessionError::Send(
                     "ACP pending-request limit reached".to_string(),
@@ -3238,6 +3251,9 @@ impl AcpSession {
                 self.vendor.display_name()
             )));
         }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SessionError::Closed);
+        }
         if self.turn_active.swap(true, Ordering::AcqRel) {
             return Err(SessionError::Send(
                 "an ACP turn is already in progress".to_string(),
@@ -3259,12 +3275,19 @@ impl AcpSession {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            if pending.len() >= MAX_PENDING_REQUESTS {
+            let refusal = if self.closed.load(Ordering::Acquire) {
+                Some(SessionError::Closed)
+            } else if pending.len() >= MAX_PENDING_REQUESTS {
+                Some(SessionError::Send(
+                    "ACP pending-request limit reached".to_string(),
+                ))
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
                 self.turn_active.store(false, Ordering::Release);
                 clear_active_prompt(&self.active_prompt, &prompt_id);
-                return Err(SessionError::Send(
-                    "ACP pending-request limit reached".to_string(),
-                ));
+                return Err(refusal);
             }
             pending.insert(id, tx);
         }
@@ -3365,6 +3388,9 @@ impl AcpSession {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
+            if self.closed.load(Ordering::Acquire) {
+                return Err(SessionError::Closed);
+            }
             if pending.len() >= MAX_PENDING_REQUESTS {
                 return Err(SessionError::Send(
                     "ACP pending-request limit reached".to_string(),
@@ -4424,6 +4450,7 @@ struct ReaderContext {
     vendor: AcpVendor,
     writer: SharedWriter,
     pending: PendingMap,
+    closed: Arc<AtomicBool>,
     approvals: ApprovalMap,
     turn_active: Arc<AtomicBool>,
     active_session_id: ActiveSessionId,
@@ -4463,26 +4490,18 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext
                 Ok(frame) => dispatch_frame(frame, &context, &mut tools).await,
                 Err(error) => settle_unreadable_frame(&line, &error.to_string(), &context).await,
             },
+            // One corrupt line is skipped like a malformed one; it does not
+            // end the session.
+            Ok(Some(FrameRead::InvalidUtf8(line))) => {
+                settle_unreadable_frame(&line, "not UTF-8", &context).await;
+            }
             Ok(Some(FrameRead::Oversized)) => {
                 terminal_error = "ACP frame exceeded the 64 MiB safety limit".to_string();
-                if context.turn_active.swap(false, Ordering::AcqRel) {
-                    let _ = context
-                        .event_tx
-                        .send(SessionEvent::TurnDone {
-                            status: TurnStatus::Failed(terminal_error.clone()),
-                            usage: None,
-                        })
-                        .await;
-                }
                 break;
             }
             Ok(None) => break,
-            Err(error) => {
-                terminal_error = if error.kind() == std::io::ErrorKind::InvalidData {
-                    "ACP emitted invalid UTF-8".to_string()
-                } else {
-                    "ACP stdout read failed".to_string()
-                };
+            Err(_) => {
+                terminal_error = "ACP stdout read failed".to_string();
                 break;
             }
         }
@@ -4492,7 +4511,13 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext
         active_prompt.take();
     }
 
+    // Whatever stopped the reader, nothing reads the base's replies any more.
+    // The session is marked closed under the pending lock, so a request is
+    // either failed by the drain below or refused when it registers, before
+    // the turn's failure is reported; stdin is closed last so the base sees
+    // EOF too.
     let mut pending = context.pending.lock().await;
+    context.closed.store(true, Ordering::Release);
     for (_, sender) in pending.drain() {
         let _ = sender.send(Err(AcpResponseError::message(terminal_error.clone())));
     }
@@ -4508,6 +4533,7 @@ async fn reader_loop(stdout: tokio::process::ChildStdout, context: ReaderContext
             })
             .await;
     }
+    let _ = tokio::time::timeout(CONTROL_WRITE_WAIT, close_acp_stdin(&context.writer)).await;
 }
 
 /// Parse one peer line. A line strict JSON rejects is retried once with every
@@ -9157,6 +9183,8 @@ async fn write_json_line(writer: &SharedWriter, frame: &Value) -> Result<(), Ses
 
 enum FrameRead {
     Line(String),
+    /// A whole line that is not UTF-8, decoded lossily. It has been consumed.
+    InvalidUtf8(String),
     Oversized,
 }
 
@@ -9195,10 +9223,12 @@ async fn read_bounded_frame<R: AsyncBufRead + Unpin>(
     while matches!(bytes.last(), Some(b'\n' | b'\r')) {
         bytes.pop();
     }
-    let line = String::from_utf8(bytes).map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error())
-    })?;
-    Ok(Some(FrameRead::Line(line)))
+    Ok(Some(match String::from_utf8(bytes) {
+        Ok(line) => FrameRead::Line(line),
+        Err(error) => {
+            FrameRead::InvalidUtf8(String::from_utf8_lossy(error.as_bytes()).into_owned())
+        }
+    }))
 }
 
 fn validate_initialize(vendor: AcpVendor, result: &Value) -> Result<(), SessionError> {
