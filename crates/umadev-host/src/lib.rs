@@ -418,6 +418,25 @@ pub(crate) struct SubprocessOutput {
     pub stdout: String,
 }
 
+/// A subprocess that ran to its exit, whatever the status: the status and the
+/// retained tail of each pipe (see `STDOUT_CAPTURE_CAP`).
+pub(crate) struct SubprocessExit {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    started: Instant,
+}
+
+/// The last `max_bytes` of `s`, moved forward to a UTF-8 char boundary so a
+/// multibyte character straddling the cut is dropped, never split.
+fn tail_on_boundary(s: &str, max_bytes: usize) -> &str {
+    let mut start = s.len().saturating_sub(max_bytes);
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 /// Truncate `s` to at most `max_bytes`, walking back to a UTF-8 char boundary
 /// so it never panics on a multibyte character (CJK / emoji) straddling the
 /// cut. `String::truncate` panics on a non-boundary index — host error
@@ -1745,9 +1764,19 @@ fn write_prompt(child: &mut umadev_process::ManagedChild, prompt: &str) -> Optio
 /// Run a host CLI subprocess. Errors carry a human-readable string suitable for
 /// `RuntimeError::HostProcess`.
 pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<SubprocessOutput, String> {
+    let exit = run_subprocess_to_exit(&call).await?;
+    subprocess_output(&call, exit)
+}
+
+/// Run `call` to its exit and keep both pipes. A spawn failure or a timeout is
+/// an error; a non-zero exit is not: [`subprocess_output`] maps it, and a
+/// driver that understands its CLI's own failure report can read that first.
+pub(crate) async fn run_subprocess_to_exit(
+    call: &SubprocessCall<'_>,
+) -> Result<SubprocessExit, String> {
     let started = Instant::now();
     let deadline = started.checked_add(call.timeout).unwrap_or(started);
-    let mut child = spawn_subprocess(&call)?;
+    let mut child = spawn_subprocess(call)?;
     let stdin_writer = write_prompt(&mut child, call.prompt);
 
     // Drain both pipes AND wait for exit under ONE deadline (see
@@ -1760,15 +1789,41 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     if let Some(writer) = stdin_writer {
         let _ = reap_bounded(writer.into_inner()).await;
     }
-    let (status, stdout_buf, stderr_buf) = drained?;
+    let (status, stdout, stderr) = drained?;
+    Ok(SubprocessExit {
+        status,
+        stdout,
+        stderr,
+        started,
+    })
+}
 
+/// The output of a finished subprocess, or the error its exit reports.
+pub(crate) fn subprocess_output(
+    call: &SubprocessCall<'_>,
+    exit: SubprocessExit,
+) -> Result<SubprocessOutput, String> {
+    let SubprocessExit {
+        status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+        started,
+    } = exit;
     if !status.success() {
         let code = status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+        // A CLI that reports its failure on stdout (Claude's `--output-format
+        // json` result envelope) leaves stderr empty; the end of its stdout is
+        // then the only cause, never a bare "exited with code 1:".
+        let detail = if stderr.trim().is_empty() {
+            let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+            clean_output(tail_on_boundary(&stdout, 2048))
+        } else {
+            truncate_on_boundary(&stderr, 2048).trim().to_string()
+        };
         return Err(format!(
-            "`{}` exited with code {code}: {}",
-            call.program,
-            truncate_on_boundary(&stderr, 2048).trim()
+            "`{}` exited with code {code}: {detail}",
+            call.program
         ));
     }
 
@@ -3854,6 +3909,37 @@ mod tests {
         assert!(merged.contains("User: 你好"));
         assert!(merged.contains("Assistant: 你好,我是底座"));
         assert!(merged.ends_with("User: 我刚才说了什么?"));
+    }
+
+    #[test]
+    fn tail_on_boundary_keeps_the_end_without_splitting_a_character() {
+        assert_eq!(tail_on_boundary("abcdef", 3), "def");
+        assert_eq!(tail_on_boundary("ab", 8), "ab");
+        // "底座" is 6 bytes; a 4-byte tail would cut inside the first character.
+        assert_eq!(tail_on_boundary("底座", 4), "座");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_exit_with_empty_stderr_quotes_the_end_of_stdout() {
+        // A CLI that reports its failure only on stdout must not surface as a
+        // bare "exited with code 1:".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let err = run_subprocess(SubprocessCall {
+            program: "/bin/sh",
+            args: &[
+                "-c".to_string(),
+                "echo 'progress 1/2'; echo 'fatal: the quota is used up'; exit 1".to_string(),
+            ],
+            prompt: "",
+            workspace: tmp.path(),
+            timeout: Duration::from_secs(30),
+            env: &[],
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("exited with code 1"), "{err}");
+        assert!(err.contains("fatal: the quota is used up"), "{err}");
     }
 
     #[test]
