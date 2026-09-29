@@ -1062,6 +1062,223 @@ async fn malicious_fsmonitor_and_signing_programs_are_not_executed() {
     );
 }
 
+/// Rewrite `path` with `bytes` and move its mtime forward, so Git has to
+/// compare contents the way it does after an editor rewrites a file.
+fn rewrite_later(path: &Path, bytes: &[u8]) {
+    std::fs::write(path, bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(10))
+        .unwrap();
+}
+
+fn autocrlf_git_repo() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    git(root.path(), &["init", "-q"]);
+    for (key, value) in [
+        ("user.name", "UmaDev Test"),
+        ("user.email", "umadev-test@example.invalid"),
+        ("commit.gpgSign", "false"),
+    ] {
+        git(root.path(), &["config", key, value]);
+    }
+    root
+}
+
+/// Git for Windows defaults to `core.autocrlf=true`: native `git add` stores
+/// LF, and a CRLF file rewritten with identical bytes is clean. The host
+/// commit must record exactly what native Git would.
+#[tokio::test]
+async fn host_commit_honours_autocrlf_like_native_git() {
+    let root = autocrlf_git_repo();
+    git(root.path(), &["config", "core.autocrlf", "true"]);
+    std::fs::write(root.path().join("edited.txt"), b"line1\r\nline2\r\n").unwrap();
+    std::fs::write(root.path().join("touched.txt"), b"same\r\nbytes\r\n").unwrap();
+    git(root.path(), &["add", "edited.txt", "touched.txt"]);
+    git(root.path(), &["commit", "-q", "-m", "initial"]);
+    std::fs::write(
+        root.path().join("edited.txt"),
+        b"line1\r\nline2 changed\r\n",
+    )
+    .unwrap();
+    rewrite_later(&root.path().join("touched.txt"), b"same\r\nbytes\r\n");
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &[]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["edited.txt"]);
+    let blob = git_output(root.path(), &["cat-file", "blob", "HEAD:edited.txt"]).unwrap();
+    assert_eq!(blob.stdout, b"line1\nline2 changed\n");
+    assert!(git_dirty_paths(root.path()).unwrap().is_empty());
+}
+
+/// An editor or agent that rewrites a tracked file with identical bytes leaves
+/// it stat-dirty only. `git diff` would refresh the index for it even under
+/// `--no-optional-locks`, and the lane would then refuse its own commit as
+/// "index changed after the baseline".
+#[tokio::test]
+async fn a_rewritten_but_unchanged_file_does_not_break_the_commit() {
+    let root = dirty_git_repo();
+    git(root.path(), &["add", "two.txt", "three.txt"]);
+    git(root.path(), &["commit", "-q", "-m", "second"]);
+    rewrite_later(&root.path().join("two.txt"), b"ready to commit\n");
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &[]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["one.txt"]);
+}
+
+/// "Safer autocrlf": a file whose stored blob already has CRLF is committed
+/// as it is, exactly like native `git add`, instead of rewriting every line.
+#[tokio::test]
+async fn host_commit_keeps_crlf_that_is_already_stored() {
+    let root = autocrlf_git_repo();
+    std::fs::write(root.path().join("legacy.txt"), b"a\r\nb\r\n").unwrap();
+    git(root.path(), &["add", "legacy.txt"]);
+    git(root.path(), &["commit", "-q", "-m", "initial"]);
+    git(root.path(), &["config", "core.autocrlf", "true"]);
+    std::fs::write(root.path().join("legacy.txt"), b"a\r\nb changed\r\n").unwrap();
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &[]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["legacy.txt"]);
+    let blob = git_output(root.path(), &["cat-file", "blob", "HEAD:legacy.txt"]).unwrap();
+    assert_eq!(blob.stdout, b"a\r\nb changed\r\n");
+    assert!(git_dirty_paths(root.path()).unwrap().is_empty());
+}
+
+/// A `text` attribute from the user's own attributes file converts line
+/// endings in native Git just like one in `.gitattributes`, so it is refused.
+#[tokio::test]
+async fn attributes_from_the_users_attributes_file_fail_closed() {
+    let root = dirty_git_repo();
+    let attributes = root.path().join(".git").join("user-attributes");
+    std::fs::write(&attributes, "*.txt text=auto\n").unwrap();
+    git(
+        root.path(),
+        &[
+            "config",
+            "core.attributesFile",
+            attributes.to_string_lossy().as_ref(),
+        ],
+    );
+    std::fs::write(root.path().join("one.txt"), b"ready\r\nto commit\r\n").unwrap();
+    let before = git_required_text(root.path(), &["rev-parse", "HEAD"], "test-head").unwrap();
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &["one.txt"]),
+        "提交git记录: one.txt",
+    )
+    .unwrap();
+    let note = postcondition
+        .execute_git_commit(root.path(), "提交git记录: one.txt")
+        .await
+        .unwrap_err()
+        .into_note();
+
+    assert!(
+        note.contains("git-content-transformation-blocked"),
+        "{note}"
+    );
+    assert_eq!(
+        git_required_text(root.path(), &["rev-parse", "HEAD"], "test-head").unwrap(),
+        before
+    );
+}
+
+/// The host commit decides line endings like the user's own Git, including
+/// `-text` (or `binary`) from the user's attributes file, which its other
+/// children skip: with it, a script whose blob was normalized now differs from
+/// its CRLF copy, and `git add` stores such a file byte for byte.
+#[tokio::test]
+async fn line_endings_follow_the_users_attributes_file_like_native_git() {
+    let root = autocrlf_git_repo();
+    git(root.path(), &["config", "core.autocrlf", "true"]);
+    for path in ["build.bat", "notes.txt"] {
+        std::fs::write(root.path().join(path), b"one\r\ntwo\r\n").unwrap();
+    }
+    git(root.path(), &["add", "build.bat", "notes.txt"]);
+    git(root.path(), &["commit", "-q", "-m", "initial"]);
+    let attributes = root.path().join(".git").join("user-attributes");
+    std::fs::write(&attributes, "*.bat -text\n").unwrap();
+    git(
+        root.path(),
+        &[
+            "config",
+            "core.attributesFile",
+            attributes.to_string_lossy().as_ref(),
+        ],
+    );
+    // Both tracked files are rewritten with the same bytes; two new files arrive.
+    for path in ["build.bat", "notes.txt"] {
+        rewrite_later(&root.path().join(path), b"one\r\ntwo\r\n");
+    }
+    for path in ["deploy.bat", "readme.txt"] {
+        std::fs::write(root.path().join(path), b"new\r\nfile\r\n").unwrap();
+    }
+    let native = Command::new("git")
+        .arg("-C")
+        .arg(root.path())
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        " M build.bat\n?? deploy.bat\n?? readme.txt\n"
+    );
+
+    let postcondition = ResidentExecutionPostcondition::capture(
+        root.path(),
+        &route(RouteClass::QuickEdit, Depth::Fast, &[]),
+        "提交git记录",
+    )
+    .unwrap();
+    let receipt = postcondition
+        .execute_git_commit(root.path(), "提交git记录")
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.paths, ["build.bat", "deploy.bat", "readme.txt"]);
+    for (path, bytes) in [
+        ("build.bat", &b"one\r\ntwo\r\n"[..]),
+        ("deploy.bat", &b"new\r\nfile\r\n"[..]),
+        ("readme.txt", &b"new\nfile\n"[..]),
+    ] {
+        let blob = git_output(root.path(), &["cat-file", "blob", &format!("HEAD:{path}")]).unwrap();
+        assert_eq!(blob.stdout, bytes, "{path}");
+    }
+    assert!(git_dirty_paths(root.path()).unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn content_transforming_attributes_fail_closed_without_creating_a_commit() {
     let root = dirty_git_repo();
