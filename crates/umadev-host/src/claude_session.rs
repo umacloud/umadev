@@ -60,7 +60,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use umadev_runtime::{
     ApprovalDecision, AskQuestion, AskUserQuestion, BackgroundTaskSignal, BasePermissionProfile,
     BaseSession, DeliveryReceiptStage, DeliveryReport, ExitPlanMode, FileInputMode, HostAnswer,
@@ -390,6 +390,9 @@ pub struct ClaudeSession {
     pending_controls: SharedPendingClaudeControls,
     /// Exact client UUID → replay ACK waiters. Prompt content is never stored.
     pending_replay_acks: SharedPendingClaudeReplayAcks,
+    /// Bumped by the stdout pump for every frame that only a working turn
+    /// produces (see [`frame_marks_turn_activity`]).
+    turn_activity: watch::Receiver<u64>,
     /// UUID-only lifecycle/capability state for typed interrupt receipts. This
     /// lets Esc cancel only UmaDev-originated queued commands and ignore Claude's
     /// internally queued UUIDs.
@@ -723,12 +726,14 @@ impl ClaudeSession {
         let pending_controls = Arc::new(Mutex::new(PendingClaudeControls::default()));
         let pending_replay_acks = Arc::new(Mutex::new(PendingClaudeReplayAcks::default()));
         let protocol = Arc::new(Mutex::new(ClaudeProtocolState::default()));
+        let (activity_tx, turn_activity) = watch::channel(0_u64);
         tokio::spawn(pump_stdout(
             stdout,
             tx,
             Arc::clone(&pending_controls),
             Arc::clone(&pending_replay_acks),
             Arc::clone(&protocol),
+            activity_tx,
         ));
 
         Ok(Self {
@@ -739,6 +744,7 @@ impl ClaudeSession {
             events: rx,
             pending_controls,
             pending_replay_acks,
+            turn_activity,
             protocol,
             stderr: stderr_tail,
             stderr_drain,
@@ -855,6 +861,12 @@ impl ClaudeSession {
     /// Write one user frame and wait only for Claude's documented replay ACK.
     /// Timeout/old-version shapes retain the truthful transport receipt; they
     /// never become a send error and never claim that the model processed input.
+    ///
+    /// Claude 2.1.x before the typed receipt replays the input only once the
+    /// turn's first content block is complete, while its deltas start at once.
+    /// The wait therefore also ends as soon as the base is visibly working on
+    /// the turn: the caller can render that output now, and the receipt stays
+    /// the honest transport one.
     async fn write_user_line_with_receipt(
         &mut self,
         line: &str,
@@ -862,16 +874,20 @@ impl ClaudeSession {
     ) -> Result<DeliveryReceiptStage, SessionError> {
         self.register_command(uuid);
         let receiver = self.register_replay_ack(uuid);
+        // Output the base produces from here on belongs to this turn.
+        self.turn_activity.mark_unchanged();
         if let Err(error) = self.write_line(line).await {
             self.forget_replay_ack(uuid);
             self.forget_command(uuid);
             return Err(error);
         }
         self.turn_in_flight = Some(uuid.to_string());
-        let acknowledged = matches!(
-            tokio::time::timeout(REPLAY_ACK_BUDGET, receiver).await,
-            Ok(Ok(()))
-        );
+        let acknowledged = tokio::select! {
+            biased;
+            ack = receiver => ack.is_ok(),
+            _ = self.turn_activity.changed() => false,
+            () = tokio::time::sleep(REPLAY_ACK_BUDGET) => false,
+        };
         self.forget_replay_ack(uuid);
         Ok(if acknowledged {
             DeliveryReceiptStage::ProtocolAcknowledged
@@ -1533,6 +1549,7 @@ async fn pump_stdout(
     pending_controls: SharedPendingClaudeControls,
     pending_replay_acks: SharedPendingClaudeReplayAcks,
     protocol: SharedClaudeProtocolState,
+    activity: watch::Sender<u64>,
 ) {
     // Read raw bytes per line and decode LOSSY: `next_line` returns `Err` on a
     // single invalid UTF-8 byte, and the old `while let Ok(Some)` treated that as
@@ -1574,6 +1591,9 @@ async fn pump_stdout(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .observe(&frame);
+                    if frame_marks_turn_activity(&frame) {
+                        activity.send_modify(|seen| *seen = seen.wrapping_add(1));
+                    }
                 }
                 for ev in gate.on_line(line) {
                     if tx
@@ -1623,6 +1643,17 @@ async fn pump_stdout(
             },
         ))
         .await;
+}
+
+/// Main-line frames that only a turn in progress produces. `system`, lifecycle
+/// and control-response frames also arrive between turns, a background
+/// sub-agent's frames are not the turn's, and a replay is the ACK itself.
+fn frame_marks_turn_activity(frame: &Value) -> bool {
+    parent_tool_use_id(frame).is_none()
+        && matches!(
+            frame.get("type").and_then(Value::as_str),
+            Some("stream_event" | "assistant" | "user" | "result" | "control_request")
+        )
 }
 
 /// Read one LF-delimited stream-json record while bounding retained memory.
@@ -6773,6 +6804,74 @@ cat >/dev/null
             0
         );
         let _ = session.end().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_input_does_not_block_on_late_replay() {
+        // Claude 2.1.42 streams its first delta at once but replays the input
+        // only after the first whole content block, often seconds later.
+        let tmp = tempfile_dir();
+        let fake = write_fake_claude(
+            &tmp,
+            r#"#!/bin/sh
+IFS= read -r line
+uuid=$(printf '%s\n' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"first"}},"parent_tool_use_id":null}'
+sleep 3
+printf '{"type":"user","uuid":"%s","session_id":"s","message":{"role":"user","content":"late"},"parent_tool_use_id":null,"isReplay":true}\n' "$uuid"
+printf '%s\n' '{"type":"result","subtype":"success","stop_reason":"end_turn"}'
+cat >/dev/null
+"#,
+        );
+        let mut session = ClaudeSession::start_with_program(
+            fake.to_str().unwrap(),
+            &tmp,
+            None,
+            "sid-late-replay",
+            false,
+            None,
+        )
+        .await
+        .expect("start");
+        let started = tokio::time::Instant::now();
+        let report = session
+            .send_input(TurnInput::text("hello"))
+            .await
+            .expect("send");
+        assert!(
+            started.elapsed() < REPLAY_ACK_BUDGET,
+            "the send waited for a replay while output was already streaming: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(report.receipt, DeliveryReceiptStage::TransportWritten);
+        assert_eq!(
+            session.next_event().await,
+            Some(SessionEvent::TextDelta("first".to_string()))
+        );
+        let _ = session.end().await;
+    }
+
+    #[test]
+    fn only_a_main_line_turn_frame_counts_as_turn_activity() {
+        for frame in [
+            r#"{"type":"stream_event","event":{"type":"message_start"},"parent_tool_use_id":null}"#,
+            r#"{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool"}}"#,
+        ] {
+            let frame: Value = serde_json::from_str(frame).unwrap();
+            assert!(frame_marks_turn_activity(&frame), "{frame}");
+        }
+        for frame in [
+            r#"{"type":"system","subtype":"init"}"#,
+            r#"{"type":"command_lifecycle","state":"queued"}"#,
+            r#"{"type":"control_response","response":{"subtype":"success"}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_start"},"parent_tool_use_id":"toolu_bg"}"#,
+        ] {
+            let frame: Value = serde_json::from_str(frame).unwrap();
+            assert!(!frame_marks_turn_activity(&frame), "{frame}");
+        }
     }
 
     #[cfg(unix)]
