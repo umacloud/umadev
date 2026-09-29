@@ -165,3 +165,35 @@ async fn only_an_unconfirmed_live_steer_is_handed_back() {
     assert!(!sync_live_input_readiness(&mut app, &hub));
     assert!(app.input.is_empty());
 }
+
+#[tokio::test]
+async fn restart_does_not_block_on_a_turn_holding_the_holder() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = glue_app(tmp.path());
+    let holder = ChatSessionHolder::new(None);
+    let pending_ask: PendingAskHolder = Arc::new(tokio::sync::Mutex::new(None));
+    let generation = holder.generation();
+    // A turn lazily opening its session holds the slot for seconds.
+    let busy = holder.clone();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let turn = tokio::spawn(async move {
+        let _slot = busy.lock().await;
+        let _ = locked_tx.send(());
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+    locked_rx.await.unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        restart_resident_chat_session(&mut app, &holder, &pending_ask),
+    )
+    .await
+    .expect("the loop must not wait for the turn's session open");
+
+    assert_ne!(
+        holder.generation(),
+        generation,
+        "the new generation still fences the turn's session"
+    );
+    turn.abort();
+}

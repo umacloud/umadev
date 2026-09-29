@@ -9369,9 +9369,9 @@ async fn restart_resident_chat_session(
     // between open and park will then fail its generation check even if it lands
     // after this close and after the replacement preload starts.
     chat_session_holder.invalidate();
-    if let Some(stale) = chat_session_holder.lock().await.take() {
-        detach_resident_close(stale);
-    }
+    // Never wait on the slot: a turn opening its session holds it for seconds,
+    // and the new generation makes that turn close its session, not park it.
+    detach_parked_chat_session(chat_session_holder);
     *pending_ask_holder.lock().await = None;
     spawn_chat_session_preload(
         app.backend.as_deref(),
