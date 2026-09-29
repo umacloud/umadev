@@ -416,6 +416,16 @@ pub(crate) struct SubprocessOutput {
     pub stdout: String,
 }
 
+/// The last `max_bytes` of `s`, moved forward to a UTF-8 char boundary so a
+/// multibyte character straddling the cut is dropped, never split.
+fn tail_on_boundary(s: &str, max_bytes: usize) -> &str {
+    let mut start = s.len().saturating_sub(max_bytes);
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
 /// Truncate `s` to at most `max_bytes`, walking back to a UTF-8 char boundary
 /// so it never panics on a multibyte character (CJK / emoji) straddling the
 /// cut. `String::truncate` panics on a non-boundary index — host error
@@ -1763,10 +1773,18 @@ pub(crate) async fn run_subprocess(call: SubprocessCall<'_>) -> Result<Subproces
     if !status.success() {
         let code = status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
+        // A CLI that reports its failure on stdout (Claude's `--output-format
+        // json` result envelope) leaves stderr empty; the end of its stdout is
+        // then the only cause, never a bare "exited with code 1:".
+        let detail = if false && stderr.trim().is_empty() {
+            let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+            tail_on_boundary(&stdout, 2048).trim().to_string()
+        } else {
+            truncate_on_boundary(&stderr, 2048).trim().to_string()
+        };
         return Err(format!(
-            "`{}` exited with code {code}: {}",
-            call.program,
-            truncate_on_boundary(&stderr, 2048).trim()
+            "`{}` exited with code {code}: {detail}",
+            call.program
         ));
     }
 
@@ -3852,6 +3870,14 @@ mod tests {
         assert!(merged.contains("User: 你好"));
         assert!(merged.contains("Assistant: 你好,我是底座"));
         assert!(merged.ends_with("User: 我刚才说了什么?"));
+    }
+
+    #[test]
+    fn tail_on_boundary_keeps_the_end_without_splitting_a_character() {
+        assert_eq!(tail_on_boundary("abcdef", 3), "def");
+        assert_eq!(tail_on_boundary("ab", 8), "ab");
+        // "底座" is 6 bytes; a 4-byte tail would cut inside the first character.
+        assert_eq!(tail_on_boundary("底座", 4), "座");
     }
 
     #[test]
