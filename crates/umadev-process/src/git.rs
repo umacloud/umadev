@@ -10,6 +10,12 @@
 //! run. The user's own global configuration is still honoured; only a program
 //! the repository defines is suppressed.
 //!
+//! The system configuration is not loaded, but its line-ending settings are
+//! forwarded (see [`LineEndings`]): Git for Windows keeps `core.autocrlf=true`
+//! there, and without it every CRLF work-tree file would read as rewritten.
+//! Paths are printed verbatim (`core.quotePath=false`), so a status line names
+//! `docs/需求.md` instead of its octal escape.
+//!
 //! Two controls depend on the subcommand, so callers add them:
 //! - diff/log family: [`NO_DIFF_PROGRAMS`]. Git has no neutral value for
 //!   `diff.<driver>.textconv` or `diff.<driver>.command` (an empty one is an
@@ -107,6 +113,172 @@ impl From<FilterConfigError> for std::io::Error {
     }
 }
 
+/// A line-ending setting whose value Git itself rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidLineEndingSetting {
+    /// The configuration key, such as `core.autocrlf`.
+    pub key: &'static str,
+}
+
+impl std::fmt::Display for InvalidLineEndingSetting {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid Git line-ending setting {}", self.key)
+    }
+}
+
+impl std::error::Error for InvalidLineEndingSetting {}
+
+impl From<InvalidLineEndingSetting> for std::io::Error {
+    fn from(error: InvalidLineEndingSetting) -> Self {
+        Self::new(std::io::ErrorKind::InvalidData, error)
+    }
+}
+
+/// The user's effective line-ending settings: `core.autocrlf`, `core.eol` and
+/// `core.safecrlf`, resolved across every configuration scope.
+///
+/// These are plain values that never name a program, so a hardened child that
+/// loads only part of the user's configuration forwards them with `-c`. Its
+/// `status`, `diff`, `hash-object` and checkout then convert CRLF the way the
+/// user's own Git does, even when a setting lives in a scope the child skips
+/// (Git for Windows writes `core.autocrlf=true` into the system configuration).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineEndings {
+    autocrlf: Option<&'static str>,
+    eol: Option<&'static str>,
+    safecrlf: Option<&'static str>,
+}
+
+impl LineEndings {
+    /// Resolve the settings from a `git config --null --list` listing that
+    /// includes the system and global scopes. As in Git, the last value wins.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on a value Git itself rejects, such as
+    /// `core.autocrlf=sometimes`.
+    pub fn from_listing(
+        listing: &[u8],
+        kind: ConfigListing,
+    ) -> Result<Self, InvalidLineEndingSetting> {
+        let mut settings = Self::default();
+        let mut records = listing.split(|byte| *byte == 0);
+        while let Some(first) = records.next() {
+            let record = match kind {
+                ConfigListing::Unscoped => first,
+                ConfigListing::Scoped => match records.next() {
+                    Some(record) => record,
+                    None => break,
+                },
+            };
+            // A key written without `=` is listed without a newline.
+            let (key, value) = match record.iter().position(|byte| *byte == b'\n') {
+                Some(end) => (&record[..end], Some(&record[end + 1..])),
+                None => (record, None),
+            };
+            if key.eq_ignore_ascii_case(b"core.autocrlf") {
+                settings.autocrlf = Some(autocrlf_value(value)?);
+            } else if key.eq_ignore_ascii_case(b"core.eol") {
+                settings.eol = Some(eol_value(value));
+            } else if key.eq_ignore_ascii_case(b"core.safecrlf") {
+                settings.safecrlf = Some(safecrlf_value(value)?);
+            }
+        }
+        Ok(settings)
+    }
+
+    /// `-c` overrides that give a child these settings. A key the user never
+    /// set is left out, so the child keeps Git's own default for it.
+    #[must_use]
+    pub fn overrides(&self) -> Vec<String> {
+        [
+            ("core.autocrlf", self.autocrlf),
+            ("core.eol", self.eol),
+            ("core.safecrlf", self.safecrlf),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| format!("{key}={value}")))
+        .collect()
+    }
+
+    /// Whether `git add` stores a text file with LF line endings although its
+    /// path sets no `text` or `eol` attribute (`core.autocrlf` is `true` or
+    /// `input`).
+    #[must_use]
+    pub fn normalizes_stored_text(&self) -> bool {
+        matches!(self.autocrlf, Some("true" | "input"))
+    }
+}
+
+/// `core.autocrlf` is `input` or a Git boolean.
+fn autocrlf_value(value: Option<&[u8]>) -> Result<&'static str, InvalidLineEndingSetting> {
+    if value.is_some_and(|value| value.eq_ignore_ascii_case(b"input")) {
+        return Ok("input");
+    }
+    git_bool(value)
+        .map(|enabled| if enabled { "true" } else { "false" })
+        .ok_or(InvalidLineEndingSetting {
+            key: "core.autocrlf",
+        })
+}
+
+/// Git reads any `core.eol` other than `lf` or `crlf` as unset, which behaves
+/// exactly like `native`.
+fn eol_value(value: Option<&[u8]>) -> &'static str {
+    match value {
+        Some(value) if value.eq_ignore_ascii_case(b"lf") => "lf",
+        Some(value) if value.eq_ignore_ascii_case(b"crlf") => "crlf",
+        _ => "native",
+    }
+}
+
+/// `core.safecrlf` is `warn` or a Git boolean.
+fn safecrlf_value(value: Option<&[u8]>) -> Result<&'static str, InvalidLineEndingSetting> {
+    if value.is_some_and(|value| value.eq_ignore_ascii_case(b"warn")) {
+        return Ok("warn");
+    }
+    git_bool(value)
+        .map(|enabled| if enabled { "true" } else { "false" })
+        .ok_or(InvalidLineEndingSetting {
+            key: "core.safecrlf",
+        })
+}
+
+/// Git's boolean spelling: a key without a value is true, an empty value is
+/// false, and otherwise yes/no, on/off, true/false or an integer.
+fn git_bool(value: Option<&[u8]>) -> Option<bool> {
+    let Some(value) = value else {
+        return Some(true);
+    };
+    let value = std::str::from_utf8(value).ok()?.to_ascii_lowercase();
+    match value.as_str() {
+        "" | "false" | "no" | "off" => Some(false),
+        "true" | "yes" | "on" => Some(true),
+        number => number.parse::<i64>().ok().map(|number| number != 0),
+    }
+}
+
+/// The `-c` overrides one configuration listing yields for a hardened child.
+struct ListingOverrides {
+    filters: Vec<String>,
+    line_endings: LineEndings,
+}
+
+impl ListingOverrides {
+    fn parse(listing: &[u8], kind: ConfigListing) -> std::io::Result<Self> {
+        Ok(Self {
+            filters: filter_driver_overrides(listing, kind)?,
+            line_endings: LineEndings::from_listing(listing, kind)?,
+        })
+    }
+
+    fn into_args(self) -> Vec<String> {
+        let mut args = self.filters;
+        args.extend(self.line_endings.overrides());
+        args
+    }
+}
+
 /// Build a hardened `git` command rooted at `root` (see the module docs).
 ///
 /// Discovering the filter drivers to blank spawns one bounded
@@ -116,7 +288,7 @@ pub fn hardened_git_command(
     root: &Path,
     access: GitAccess,
 ) -> std::io::Result<std::process::Command> {
-    let overrides = repository_filter_overrides(root)?;
+    let overrides = repository_overrides(root)?.into_args();
     Ok(command_with_overrides(root, access, &overrides))
 }
 
@@ -128,10 +300,10 @@ pub fn hardened_git_command(
 /// setup would leave ciphertext or pointer files in the work tree. An automatic
 /// caller skips such a command when this is `true` instead.
 pub fn repository_defines_filters(root: &Path) -> std::io::Result<bool> {
-    Ok(!repository_filter_overrides(root)?.is_empty())
+    Ok(!repository_overrides(root)?.filters.is_empty())
 }
 
-fn repository_filter_overrides(root: &Path) -> std::io::Result<Vec<String>> {
+fn repository_overrides(root: &Path) -> std::io::Result<ListingOverrides> {
     let scoped = crate::run_bounded_std_command(
         config_listing_command(root, ConfigListing::Scoped),
         CONFIG_LISTING_OPTIONS,
@@ -168,7 +340,9 @@ pub async fn hardened_git_tokio_command(
         }
     };
     Ok(tokio::process::Command::from(command_with_overrides(
-        root, access, &overrides,
+        root,
+        access,
+        &overrides.into_args(),
     )))
 }
 
@@ -253,6 +427,9 @@ fn filter_driver_name(key: &str) -> Option<&str> {
         .map(|suffix| &key["filter.".len()..key.len() - suffix.len()])
 }
 
+/// The listing includes the system scope so a line-ending setting kept there
+/// is forwarded; the hardened children themselves never load that scope, so a
+/// filter driver defined only there cannot run either way.
 fn config_listing_command(root: &Path, kind: ConfigListing) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     remove_git_environment(&mut command);
@@ -261,7 +438,6 @@ fn config_listing_command(root: &Path, kind: ConfigListing) -> std::process::Com
         .arg(root)
         .args(["config", "--null", "--list", "--includes"])
         .args((kind == ConfigListing::Scoped).then_some("--show-scope"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0");
     command
 }
@@ -271,7 +447,7 @@ fn config_listing_command(root: &Path, kind: ConfigListing) -> std::process::Com
 fn listing_overrides(
     output: &crate::BoundedCommandOutput,
     kind: ConfigListing,
-) -> Option<std::io::Result<Vec<String>>> {
+) -> Option<std::io::Result<ListingOverrides>> {
     if output.timed_out || output.stdout_truncated {
         return Some(Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -281,7 +457,7 @@ fn listing_overrides(
     if !output.status.is_some_and(|status| status.success()) {
         return None;
     }
-    Some(filter_driver_overrides(&output.stdout, kind).map_err(Into::into))
+    Some(ListingOverrides::parse(&output.stdout, kind))
 }
 
 fn listing_failed() -> std::io::Error {
@@ -314,6 +490,8 @@ fn command_with_overrides(
         "gc.auto=0",
         "-c",
         "protocol.allow=never",
+        "-c",
+        "core.quotePath=false",
     ]);
     for value in overrides {
         command.arg("-c").arg(value);
@@ -503,6 +681,120 @@ mod tests {
         let args = command.get_args().collect::<Vec<_>>();
         assert!(args.contains(&"--no-optional-locks".as_ref()));
         assert!(args.contains(&INERT_HOOKS.as_ref()));
+        assert!(args.contains(&"core.quotePath=false".as_ref()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardened_status_reports_unicode_paths_verbatim() {
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        std::fs::write(temp.path().join("需求.md"), "# 需求\n").unwrap();
+
+        let mut status = hardened_git_command(temp.path(), GitAccess::ReadOnly).unwrap();
+        status.args(["status", "--porcelain", IGNORE_DIRTY_SUBMODULES]);
+        let status = run(status);
+
+        assert!(status.status.success(), "{status:?}");
+        assert_eq!(String::from_utf8_lossy(&status.stdout), "?? 需求.md\n");
+    }
+
+    #[test]
+    fn line_endings_take_the_last_value_across_scopes() {
+        let listing = b"system\0core.autocrlf\ntrue\0\
+            global\0core.eol\nLF\0\
+            global\0core.safecrlf\0\
+            local\0core.autocrlf\nInput\0\
+            local\0core.bare\nfalse\0";
+        let settings = LineEndings::from_listing(listing, ConfigListing::Scoped).unwrap();
+        assert_eq!(
+            settings.overrides(),
+            ["core.autocrlf=input", "core.eol=lf", "core.safecrlf=true"]
+        );
+        assert!(settings.normalizes_stored_text());
+
+        let unscoped = b"core.autocrlf\nyes\0core.autocrlf\n0\0core.eol\nunix\0";
+        let settings = LineEndings::from_listing(unscoped, ConfigListing::Unscoped).unwrap();
+        assert_eq!(
+            settings.overrides(),
+            ["core.autocrlf=false", "core.eol=native"]
+        );
+        assert!(!settings.normalizes_stored_text());
+
+        let unset = LineEndings::from_listing(b"core.bare\nfalse\0", ConfigListing::Unscoped);
+        assert_eq!(unset.unwrap().overrides(), Vec::<String>::new());
+
+        assert_eq!(
+            LineEndings::from_listing(b"core.autocrlf\nsometimes\0", ConfigListing::Unscoped),
+            Err(InvalidLineEndingSetting {
+                key: "core.autocrlf"
+            })
+        );
+    }
+
+    /// Git for Windows writes `core.autocrlf=true` into the system config. The
+    /// listing must see that scope even though the children never load it.
+    #[cfg(unix)]
+    #[test]
+    fn config_listing_forwards_a_system_line_ending_setting() {
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        let system = temp.path().join("system-gitconfig");
+        std::fs::write(&system, "[core]\n\tautocrlf = true\n").unwrap();
+
+        for kind in [ConfigListing::Scoped, ConfigListing::Unscoped] {
+            let mut listing = config_listing_command(temp.path(), kind);
+            listing
+                .env("GIT_CONFIG_SYSTEM", &system)
+                .env("GIT_CONFIG_GLOBAL", NULL_DEVICE);
+            let listing = run(listing);
+            assert!(listing.status.success(), "{listing:?}");
+            let overrides = ListingOverrides::parse(&listing.stdout, kind)
+                .unwrap()
+                .into_args();
+            assert_eq!(overrides, ["core.autocrlf=true"], "{kind:?}");
+        }
+    }
+
+    /// With the forwarded setting, a CRLF work-tree copy of an LF blob is as
+    /// clean for a hardened child as it is for the user's own `git status`.
+    #[cfg(unix)]
+    #[test]
+    fn forwarded_autocrlf_reads_a_crlf_work_tree_like_native_git() {
+        if !git_available() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        git(temp.path(), &["init", "-q"]);
+        let notes = temp.path().join("notes.txt");
+        std::fs::write(&notes, "one\r\ntwo\r\n").unwrap();
+        // The user's `git add` stored LF; an editor then rewrites the same bytes.
+        git(
+            temp.path(),
+            &["-c", "core.autocrlf=true", "add", "notes.txt"],
+        );
+        git(temp.path(), &["commit", "-qm", "initial"]);
+        std::fs::write(&notes, "one\r\ntwo\r\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&notes)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
+
+        let status = |overrides: &[String]| {
+            let mut command = command_with_overrides(temp.path(), GitAccess::ReadOnly, overrides);
+            command.args(["status", "--porcelain", IGNORE_DIRTY_SUBMODULES]);
+            String::from_utf8(run(command).stdout).unwrap()
+        };
+        assert_eq!(status(&[]), " M notes.txt\n");
+        assert_eq!(status(&["core.autocrlf=true".to_string()]), "");
     }
 
     #[test]
