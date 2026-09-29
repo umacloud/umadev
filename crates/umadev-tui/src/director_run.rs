@@ -257,6 +257,12 @@ pub(super) async fn run_director_loop(
             s.base_session_id = prior_base_session_id.clone();
             s.base_resume_identity = resume_identity.base_resume_identity.clone();
             s.permission_profile = Some(options.mode.base_permissions());
+            // A resume keeps the confirmation gate it is parked at: a gate opened by
+            // the plan's LAST step (a docs-only run's docs_confirm) is that plan's
+            // only resume cursor, and the resume clears it once it has re-attached.
+            if let Some(state) = persisted_state.as_ref() {
+                s.active_gate.clone_from(&state.active_gate);
+            }
             s
         };
         let _ = umadev_agent::write_workflow_state(&root, &baseline);

@@ -11777,3 +11777,6 @@ async fn interactive_askuserquestion_parks_and_waits_same_session() {
 
 #[path = "tests/resident_chat_terminal_tests.rs"]
 mod resident_chat_terminal_tests;
+
+#[path = "tests/director_resume_tests.rs"]
+mod director_resume_tests;
