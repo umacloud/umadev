@@ -681,4 +681,64 @@ mod tests {
     async fn reconcile_invalidate_persists_and_is_recalled_next_turn() {
         assert_mutating_reconcile_persists_and_recalls("INVALIDATE").await;
     }
+
+    fn notes(recorder: &RecordingSink) -> Vec<String> {
+        recorder
+            .events()
+            .into_iter()
+            .filter_map(|event| match event {
+                EngineEvent::Note(note) => Some(note),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn learned_notes_come_from_the_ui_catalog() {
+        // Like the sibling lesson notes, the self-evolution [learned] notes follow
+        // the user's UI language instead of one hard-coded Simplified Chinese text.
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_reconcile_pair(tmp.path());
+        let recorder = Arc::new(RecordingSink::new());
+        let events: Arc<dyn EventSink> = recorder.clone();
+        let mut brain = Brain::forking("UPDATE");
+        reconcile_at_delivery(&mut brain, tmp.path(), &events).await;
+        let localized = [
+            umadev_i18n::tl("lessons.progress.reconcile_rules_refreshed").to_string(),
+            umadev_i18n::tlf("lessons.progress.reconcile_retired", &["1"]),
+            umadev_i18n::tlf("lessons.progress.reconcile_retired_and_refreshed", &["1"]),
+        ];
+        let reconcile_notes = notes(&recorder);
+        assert!(
+            reconcile_notes
+                .iter()
+                .any(|note| !note.is_empty() && localized.contains(note)),
+            "the reconcile note is not the catalog text: {reconcile_notes:?}"
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        seed_recurring_pitfall(tmp.path());
+        let recorder = Arc::new(RecordingSink::new());
+        let events: Arc<dyn EventSink> = recorder.clone();
+        let mut brain = Brain::forking("Pin lodash and reinstall from a clean lockfile.");
+        let mut reflected: HashSet<String> = HashSet::new();
+        assert!(
+            reflect_on_recurring_failure(
+                &mut brain,
+                tmp.path(),
+                &events,
+                "Error: Cannot find module 'lodash'",
+                &mut reflected,
+            )
+            .await
+        );
+        let expected = umadev_i18n::tl("lessons.progress.reflection_recorded");
+        let reflection_notes = notes(&recorder);
+        assert!(
+            reflection_notes
+                .iter()
+                .any(|note| !note.is_empty() && note == expected),
+            "the reflection note is not the catalog text: {reflection_notes:?}"
+        );
+    }
 }

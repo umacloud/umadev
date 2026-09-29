@@ -2124,4 +2124,114 @@ mod tests {
         );
         assert!(r.proof_pack, "a clean build still delivers (not failed)");
     }
+
+    /// A deliberate build's architecture contract and the source implementing it,
+    /// with no quality phase run.
+    fn seed_deliberate_build(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("output")).unwrap();
+        std::fs::write(
+            root.join("output/demo-architecture.md"),
+            "# API\n\n| Method | Path | Description | Auth |\n|---|---|---|---|\n\
+             | GET | /api/articles | list articles | none |\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/server.ts"),
+            "app.get('/api/articles', listArticles);\n",
+        )
+        .unwrap();
+    }
+
+    /// The contents of the one `release/` file whose name ends with `suffix`.
+    fn release_file(root: &std::path::Path, suffix: &str) -> String {
+        let path = std::fs::read_dir(root.join("release"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(suffix))
+            .unwrap_or_else(|| panic!("no release/*{suffix} file"));
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn director_finalize_scorecard_reflects_the_clean_director_qc() {
+        // The director never runs the scored quality gate. Its clean QC is this
+        // run's verdict: the scorecard must show it (not an "offline, 0/100"
+        // placeholder) and the implemented contract becomes a validated pattern.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        seed_deliberate_build(tmp.path());
+        assert!(!tmp.path().join("output/demo-quality-gate.json").exists());
+        let route = build_route(crate::router::Depth::Standard);
+        let r = finalize(&o, &sink(), Some(&route), true);
+        assert!(r.proof_pack);
+        let card = release_file(tmp.path(), ".html");
+        assert!(!card.contains("离线运行"), "offline placeholder: {card}");
+        assert!(!card.contains("0<small>/100"), "a 0/100 score: {card}");
+        assert!(card.contains("通过 · PASSED"), "clean QC not shown: {card}");
+        assert!(
+            !crate::lessons::read_raw_lessons(tmp.path(), "validated-decisions.jsonl").is_empty(),
+            "the clean director QC must record the implemented contract"
+        );
+    }
+
+    #[test]
+    fn director_finalize_ignores_a_stale_quality_gate() {
+        // A gate report an earlier `/run` left under the same slug is not this
+        // run's verdict: it must not be shown, hashed into the compliance mapping
+        // or packed into the proof pack.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let o = opts(tmp.path());
+        seed_deliberate_build(tmp.path());
+        let stale = crate::phases::QualityReport {
+            passed: false,
+            total_score: 12,
+            weighted_score: 12.0,
+            scenario: "legacy".to_string(),
+            critical_failures: vec!["Stale legacy check".to_string()],
+            recommendations: Vec::new(),
+            summary: crate::phases::QualitySummary {
+                executive_summary: "stale".to_string(),
+                summary_context: std::collections::BTreeMap::new(),
+            },
+            checks: vec![crate::phases::QualityCheck {
+                name: "Stale legacy check".to_string(),
+                category: "artifact".to_string(),
+                description: "left by an earlier run".to_string(),
+                status: "failed".to_string(),
+                score: 12,
+                weight: 1.0,
+                details: "stale".to_string(),
+            }],
+        };
+        let gate = tmp.path().join("output/demo-quality-gate.json");
+        std::fs::write(&gate, serde_json::to_string(&stale).unwrap()).unwrap();
+        let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        std::fs::File::options()
+            .write(true)
+            .open(&gate)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+        let route = build_route(crate::router::Depth::Standard);
+        let r = finalize(&o, &sink(), Some(&route), true);
+        assert!(r.proof_pack);
+        let card = release_file(tmp.path(), ".html");
+        assert!(!card.contains("12<small>/100"), "stale score shown: {card}");
+        assert!(!card.contains("Stale legacy check"), "stale checks shown");
+        assert!(card.contains("通过 · PASSED"), "clean QC not shown: {card}");
+        let mapping =
+            std::fs::read_to_string(tmp.path().join("output/demo-compliance-mapping.json"))
+                .unwrap();
+        assert!(
+            !mapping.contains("quality-gate"),
+            "the stale gate was hashed as this run's evidence: {mapping}"
+        );
+        let manifest = release_file(tmp.path(), ".manifest.txt");
+        assert!(
+            !manifest.contains("quality-gate"),
+            "the stale gate was packed: {manifest}"
+        );
+    }
 }

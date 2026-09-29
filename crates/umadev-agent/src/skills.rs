@@ -2361,6 +2361,109 @@ mod tests {
         assert!(read_skills(tmp2.path()).is_empty());
     }
 
+    fn articles_spec() -> umadev_contract::ApiSpec {
+        umadev_contract::parse_architecture(
+            "| Method | Path | Request | Response | Auth | Description |\n|---|---|---|---|---|---|\n| GET | /api/articles | - | - | none | List |\n",
+            "demo",
+        )
+    }
+
+    /// Rewrite every row of one raw ledger in place (test-only surgery on the
+    /// append-only store: mark a row invalidated, or date it before this run).
+    fn rewrite_raw(root: &Path, file: &str, edit: impl Fn(&mut Lesson)) {
+        let mut rows = crate::lessons::read_raw_lessons(root, file);
+        for row in &mut rows {
+            edit(row);
+        }
+        let body: String = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+            .collect();
+        std::fs::write(root.join(crate::lessons::RAW_DIR).join(file), body).unwrap();
+    }
+
+    fn date_before_this_run(row: &mut Lesson) {
+        const EARLIER: &str = "2020-01-01T00:00:00Z";
+        row.first_seen = EARLIER.to_string();
+        if let Some(efficacy) = row.efficacy.as_mut() {
+            efficacy.last_recurred_at.clear();
+            for observation in &mut efficacy.recent_observations {
+                observation.observed_at = EARLIER.to_string();
+            }
+        }
+    }
+
+    #[test]
+    fn invalidated_validated_pattern_is_not_regraduated() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        crate::lessons::capture_validated_patterns(
+            root,
+            "demo",
+            "做一个博客",
+            &articles_spec(),
+            &[],
+            true,
+        );
+        rewrite_raw(root, "validated-decisions.jsonl", |row| {
+            row.invalidated = true;
+        });
+        seed_multi_step(root);
+        assert_eq!(graduate_validated_patterns(root, "", true), 0);
+        assert!(
+            read_skills(root).is_empty(),
+            "an invalidated validated pattern became a skill"
+        );
+    }
+
+    #[test]
+    fn graduation_counts_only_this_runs_patterns_and_evidence() {
+        // A pattern validated, and a quality warning captured, in an EARLIER run
+        // must not graduate again (or make this run multi-step) at a later delivery.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        crate::lessons::capture_validated_patterns(
+            root,
+            "legacy",
+            "做一个博客",
+            &articles_spec(),
+            &[],
+            true,
+        );
+        seed_multi_step(root);
+        rewrite_raw(root, "validated-decisions.jsonl", date_before_this_run);
+        rewrite_raw(root, "quality-failures.jsonl", date_before_this_run);
+        assert!(crate::checkpoint::ensure_run_baseline(root, "skills-test").is_some());
+        assert_eq!(
+            graduate_validated_patterns(root, "", true),
+            0,
+            "an earlier run's pattern graduated again"
+        );
+
+        // This run validates its own pattern, but in one pass: still no skill.
+        crate::lessons::capture_validated_patterns(
+            root,
+            "demo",
+            "做一个博客",
+            &articles_spec(),
+            &[],
+            true,
+        );
+        assert_eq!(
+            graduate_validated_patterns(root, "", true),
+            0,
+            "an earlier run's warning made this one-pass run count as multi-step"
+        );
+
+        // This run's own quality warning makes it multi-step: only its pattern
+        // graduates.
+        seed_multi_step(root);
+        assert_eq!(graduate_validated_patterns(root, "", true), 1);
+        let store = read_skills(root);
+        assert_eq!(store.len(), 1);
+        assert!(store[0].title.contains("demo"), "{:?}", store[0].title);
+    }
+
     #[test]
     fn slug_and_id_roundtrip() {
         assert_eq!(

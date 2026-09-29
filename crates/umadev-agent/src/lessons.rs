@@ -2640,40 +2640,44 @@ fn domain_for_check(name: &str) -> String {
 fn extract_keywords(source: &str, details: &str, requirement: &str) -> Vec<String> {
     let mut kws: Vec<String> = Vec::new();
     for text in [source, details, requirement] {
-        // ASCII words: split on non-alphanumeric, keep len>=3.
-        for word in text.split(|c: char| !c.is_alphanumeric()) {
-            let w = word.trim().to_ascii_lowercase();
-            if w.len() >= 3 && !kws.contains(&w) {
-                kws.push(w);
-            }
-        }
-        // CJK: the split above yields one giant token per CJK run (all CJK
-        // chars are alphanumeric), which is useless for BM25 discoverability.
-        // Emit CJK unigrams + bigrams so a Chinese requirement like
-        // "登录系统" produces "登录" / "系统" / "登录系统" keywords. Mirrors the
-        // knowledge crate's tokenizer strategy.
-        let chars: Vec<char> = text.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if is_cjk_char(chars[i]) {
-                // unigram
-                let uni = chars[i].to_string();
-                if !kws.contains(&uni) {
-                    kws.push(uni);
-                }
-                // bigram with next CJK char
-                if i + 1 < chars.len() && is_cjk_char(chars[i + 1]) {
-                    let bi: String = chars[i..=i + 1].iter().collect();
-                    if !kws.contains(&bi) {
-                        kws.push(bi);
-                    }
-                }
-            }
-            i += 1;
-        }
+        push_keyword_tokens(text, &mut kws);
     }
     kws.truncate(20);
     kws
+}
+
+/// Append `text`'s keyword tokens to `kws`, skipping ones already present and
+/// request filler ([`crate::retrieval_relevance::is_filler_term`]), which would
+/// match any request and make unrelated lessons look alike.
+fn push_keyword_tokens(text: &str, kws: &mut Vec<String>) {
+    let mut push = |token: String| {
+        if !crate::retrieval_relevance::is_filler_term(&token) && !kws.contains(&token) {
+            kws.push(token);
+        }
+    };
+    // ASCII words: split on non-alphanumeric, keep len>=3.
+    for word in text.split(|c: char| !c.is_alphanumeric()) {
+        let w = word.trim().to_ascii_lowercase();
+        if w.len() >= 3 {
+            push(w);
+        }
+    }
+    // CJK: the split above yields one giant token per CJK run (all CJK
+    // chars are alphanumeric), which is useless for BM25 discoverability.
+    // Emit CJK unigrams + bigrams so a Chinese requirement like
+    // "登录注册" produces "登录" / "注册" / "登录注册" keywords. Mirrors the
+    // knowledge crate's tokenizer strategy.
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if is_cjk_char(c) {
+            // unigram
+            push(c.to_string());
+            // bigram with next CJK char
+            if chars.get(i + 1).is_some_and(|&next| is_cjk_char(next)) {
+                push(chars[i..=i + 1].iter().collect());
+            }
+        }
+    }
 }
 
 /// Whether a char is in the common CJK unified ideograph ranges (same set
@@ -3093,16 +3097,48 @@ pub fn parse_reconcile_decision(reply: &str) -> ReconcileDecision {
 /// base" → every decision is NOOP (pure append, zero behaviour change).
 pub type ReconcileJudge<'a> = &'a dyn Fn(&Lesson, &[Lesson]) -> ReconcileDecision;
 
-/// Cosine-free cheap similarity between two lessons: shared keyword count plus a
-/// same-domain bonus. Used only to pick the top-s neighbours to hand the judge —
-/// the judge (base) makes the actual semantic call.
-fn lesson_similarity(a: &Lesson, b: &Lesson) -> i64 {
-    let bset: std::collections::HashSet<&str> = b.keywords.iter().map(String::as_str).collect();
-    let shared = a
-        .keywords
-        .iter()
-        .filter(|k| bset.contains(k.as_str()))
-        .count() as i64;
+/// The keywords that say what each lesson of `pool` is ABOUT: its own keywords
+/// minus request filler, single CJK characters, and the words of the requirement
+/// it was captured under. Every lesson of one run shares that requirement, so its
+/// words say which product a lesson came from, not which problem it records.
+/// Each distinct requirement is tokenised once (a run's lessons share one).
+fn topic_sets<'a>(pool: &[&'a Lesson]) -> Vec<std::collections::HashSet<&'a str>> {
+    let mut requirements: std::collections::HashMap<&str, Vec<String>> =
+        std::collections::HashMap::new();
+    pool.iter()
+        .map(|lesson| {
+            let requirement = requirements
+                .entry(lesson.source_requirement.as_str())
+                .or_insert_with(|| {
+                    let mut tokens = Vec::new();
+                    push_keyword_tokens(&lesson.source_requirement, &mut tokens);
+                    tokens
+                });
+            lesson
+                .keywords
+                .iter()
+                .map(String::as_str)
+                .filter(|k| {
+                    k.chars().nth(1).is_some()
+                        && !crate::retrieval_relevance::is_filler_term(k)
+                        && !requirement.iter().any(|r| r == k)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Cosine-free cheap similarity between two lessons: shared topic keywords (see
+/// [`topic_sets`]) plus a same-domain bonus. Drives belief folding, the
+/// contradiction scan and the choice of neighbours handed to the reconcile
+/// judge — the judge (base) makes the actual semantic call.
+fn topic_similarity(
+    a: &Lesson,
+    a_topic: &std::collections::HashSet<&str>,
+    b: &Lesson,
+    b_topic: &std::collections::HashSet<&str>,
+) -> i64 {
+    let shared = a_topic.intersection(b_topic).count() as i64;
     let domain_bonus = i64::from(a.domain == b.domain);
     shared * 2 + domain_bonus
 }
@@ -3155,9 +3191,9 @@ fn read_reconcilable_lessons_for_recall(project_root: &Path) -> Vec<Lesson> {
 // back to the raw lessons.
 // =====================================================================
 
-/// Minimum [`lesson_similarity`] for two raw lessons to be clustered into one
-/// belief. `3` ≈ "shares at least one keyword AND the same domain, or shares two
-/// keywords" — tight enough that only genuinely-about-the-same-thing lessons
+/// Minimum [`topic_similarity`] for two raw lessons to be clustered into one
+/// belief. `3` ≈ "shares at least one topic keyword AND the same domain, or shares
+/// two topic keywords" — tight enough that only genuinely-about-the-same-thing lessons
 /// fold, loose enough to catch the near-duplicates the ledgers accumulate.
 const BELIEF_FOLD_THRESHOLD: i64 = 3;
 
@@ -3322,7 +3358,7 @@ pub fn fold_beliefs(project_root: &Path) -> usize {
 
 /// Build ONE belief lesson from a cluster of raw lessons. The belief's body is a
 /// deterministic, template-built distillation: the shared domain, the most
-/// common keywords, and the representative fix (the longest/richest member fix).
+/// common keywords, and the representative fix (the one most members share).
 /// `evidence_count` records the cluster size; `evidence` records the per-lesson
 /// keys so recall can demote those exact originals. `first_seen` is the most
 /// recent member timestamp (= last confirmation / freshness).
@@ -3340,28 +3376,15 @@ fn fold_one_cluster(
         .map(|l| l.first_seen.clone())
         .max()
         .unwrap_or_else(|| now.to_string());
-    // Representative fix = the richest (longest) member fix — the most actionable.
-    let rep_fix = members
-        .iter()
-        .map(|l| l.fix.as_str())
-        .max_by_key(|f| f.len())
-        .unwrap_or("")
-        .to_string();
-    let rep_root = members
-        .iter()
-        .map(|l| l.root_cause.as_str())
-        .max_by_key(|r| r.len())
-        .unwrap_or("")
-        .to_string();
+    // Representative fix = the one most members agree on (ties: the richest),
+    // never merely the wordiest member's advice.
+    let rep_fix = most_agreed(members.iter().map(|l| l.fix.as_str())).to_string();
+    let rep_root = most_agreed(members.iter().map(|l| l.root_cause.as_str())).to_string();
     // Union of member keywords, capped, most-shared first.
     let keywords = top_shared_keywords(members, 12);
-    // A short, human title summarising the cluster.
-    let topic = keywords
-        .iter()
-        .take(3)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(" / ");
+    // A short, human title summarising the cluster: what its members are about,
+    // not the words of the requests they came from.
+    let topic = rank_shared(topic_sets(members), 3).join(" / ");
     let title = if topic.is_empty() {
         format!("Belief [{domain}] ({} lessons)", members.len())
     } else {
@@ -3416,11 +3439,24 @@ fn fold_one_cluster(
 /// capped at `max`. Deterministic (count desc, then lexical) so a re-fold of the
 /// same cluster yields the same belief.
 fn top_shared_keywords(members: &[&Lesson], max: usize) -> Vec<String> {
+    // Count each keyword once per member (dedup within a member first).
+    rank_shared(
+        members
+            .iter()
+            .map(|l| l.keywords.iter().map(String::as_str).collect()),
+        max,
+    )
+}
+
+/// The terms present in the most of `sets`, most-common first (ties lexical),
+/// capped at `max`.
+fn rank_shared<'a>(
+    sets: impl IntoIterator<Item = std::collections::HashSet<&'a str>>,
+    max: usize,
+) -> Vec<String> {
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for l in members {
-        // Count each keyword once per member (dedup within a member first).
-        let uniq: std::collections::HashSet<&str> = l.keywords.iter().map(String::as_str).collect();
-        for k in uniq {
+    for set in sets {
+        for k in set {
             *counts.entry(k).or_insert(0) += 1;
         }
     }
@@ -3433,14 +3469,32 @@ fn top_shared_keywords(members: &[&Lesson], max: usize) -> Vec<String> {
         .collect()
 }
 
+/// The non-empty value most members give (ties: the longest, then the lexically
+/// smallest), so a belief states the rule its members agree on.
+fn most_agreed<'a>(values: impl Iterator<Item = &'a str>) -> &'a str {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for value in values.filter(|v| !v.trim().is_empty()) {
+        *counts.entry(value).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.0.len().cmp(&b.0.len()))
+                .then_with(|| b.0.cmp(a.0))
+        })
+        .map_or("", |(value, _)| value)
+}
+
 /// Deterministic connected-components clustering of `pool` by
-/// [`lesson_similarity`] ≥ [`BELIEF_FOLD_THRESHOLD`]. Returns clusters as index
+/// [`topic_similarity`] ≥ [`BELIEF_FOLD_THRESHOLD`]. Returns clusters as index
 /// lists into `pool`, each cluster's indices sorted ascending and the clusters
 /// ordered by their smallest index — fully deterministic. O(n²) over the pool
 /// with an upper bound so a huge ledger can't blow up (extra lessons are simply
 /// not clustered this pass).
 fn cluster_lessons(pool: &[&Lesson]) -> Vec<Vec<usize>> {
     let n = pool.len().min(BELIEF_SCAN_LIMIT);
+    let topics = topic_sets(&pool[..n]);
     // Union-find over the first `n` lessons.
     let mut parent: Vec<usize> = (0..n).collect();
     fn find(parent: &mut [usize], mut x: usize) -> usize {
@@ -3452,7 +3506,7 @@ fn cluster_lessons(pool: &[&Lesson]) -> Vec<Vec<usize>> {
     }
     for i in 0..n {
         for j in (i + 1)..n {
-            if lesson_similarity(pool[i], pool[j]) >= BELIEF_FOLD_THRESHOLD {
+            if topic_similarity(pool[i], &topics[i], pool[j], &topics[j]) >= BELIEF_FOLD_THRESHOLD {
                 let ri = find(&mut parent, i);
                 let rj = find(&mut parent, j);
                 if ri != rj {
@@ -3504,7 +3558,7 @@ fn prune_beliefs(beliefs: &mut Vec<Lesson>) {
 // Pure-local; no base call. Fail-open: any error marks nothing.
 // =====================================================================
 
-/// Minimum keyword/domain overlap ([`lesson_similarity`]) for two lessons to be
+/// Minimum topic/domain overlap ([`topic_similarity`]) for two lessons to be
 /// "about the same thing" — the FIRST half of the contradiction test.
 const CONTRA_TOPIC_OVERLAP: i64 = 4;
 
@@ -3623,19 +3677,19 @@ fn contradiction_loser<'a>(a: &'a Lesson, b: &'a Lesson) -> &'a Lesson {
 
 /// Whether two same-corpus lessons GENUINELY contradict — the shared triple gate
 /// both the full-corpus scan and the record-time resolver fold into: high topic
-/// overlap ([`CONTRA_TOPIC_OVERLAP`]), BOTH sides carrying enough advice tokens
+/// overlap (`topic_overlap`, their [`topic_similarity`], at least
+/// [`CONTRA_TOPIC_OVERLAP`]), BOTH sides carrying enough advice tokens
 /// ([`CONTRA_MIN_ADVICE_TOKENS`]), low advice-text overlap ([`CONTRA_TEXT_SIM_MAX`]),
 /// AND an explicit [`antonym_conflict`]. The antonym + min-token gates are the
 /// false-positive guard: "agree but worded differently" and "both short /
 /// boilerplate" pairs fail here and are NEVER judged a contradiction. `ta`/`tb`
 /// are the pre-tokenised advice sets ([`advice_tokens`]).
 fn genuine_contradiction(
-    a: &Lesson,
+    topic_overlap: i64,
     ta: &std::collections::HashSet<String>,
-    b: &Lesson,
     tb: &std::collections::HashSet<String>,
 ) -> bool {
-    lesson_similarity(a, b) >= CONTRA_TOPIC_OVERLAP
+    topic_overlap >= CONTRA_TOPIC_OVERLAP
         && ta.len() >= CONTRA_MIN_ADVICE_TOKENS
         && tb.len() >= CONTRA_MIN_ADVICE_TOKENS
         && jaccard_of(ta, tb) <= CONTRA_TEXT_SIM_MAX
@@ -3671,6 +3725,7 @@ pub fn scan_contradictions(project_root: &Path) -> usize {
     // Jaccard + antonym gates) so the O(n²) scan does O(n) tokenisation.
     let tokens: Vec<std::collections::HashSet<String>> =
         pool.iter().map(|l| advice_tokens(l)).collect();
+    let topics = topic_sets(&pool);
 
     let mut to_invalidate: std::collections::HashSet<(String, String, String)> =
         std::collections::HashSet::new();
@@ -3678,7 +3733,8 @@ pub fn scan_contradictions(project_root: &Path) -> usize {
         for j in (i + 1)..pool.len() {
             let a = pool[i];
             let b = pool[j];
-            if !genuine_contradiction(a, &tokens[i], b, &tokens[j]) {
+            let overlap = topic_similarity(a, &topics[i], b, &topics[j]);
+            if !genuine_contradiction(overlap, &tokens[i], &tokens[j]) {
                 continue;
             }
             // Demote the LOSER — the lower-efficacy side, or the OLDER one on a tie
@@ -3812,6 +3868,7 @@ pub fn resolve_new_lesson_conflicts(project_root: &Path, new_lessons: &[Lesson])
     // Pre-tokenise + pre-mark "is new" once per lesson so the pair loop is O(1) each.
     let tokens: Vec<std::collections::HashSet<String>> =
         pool.iter().map(|l| advice_tokens(l)).collect();
+    let topics = topic_sets(&pool);
     let is_new: Vec<bool> = pool
         .iter()
         .map(|l| new_ids.contains(&lesson_identity(l)))
@@ -3825,7 +3882,8 @@ pub fn resolve_new_lesson_conflicts(project_root: &Path, new_lessons: &[Lesson])
             if !is_new[i] && !is_new[j] {
                 continue;
             }
-            if !genuine_contradiction(pool[i], &tokens[i], pool[j], &tokens[j]) {
+            let overlap = topic_similarity(pool[i], &topics[i], pool[j], &topics[j]);
+            if !genuine_contradiction(overlap, &tokens[i], &tokens[j]) {
                 continue;
             }
             to_invalidate.insert(lesson_identity(contradiction_loser(pool[i], pool[j])));
@@ -3858,24 +3916,24 @@ pub fn reconcile_candidates(project_root: &Path) -> Vec<(Lesson, Vec<Lesson>)> {
         .filter(|l| l.kind != LessonKind::DevError && !l.invalidated)
         .collect();
     pool.sort_by(|a, b| b.first_seen.cmp(&a.first_seen));
+    let topics = topic_sets(&pool);
 
     let mut out: Vec<(Lesson, Vec<Lesson>)> = Vec::new();
     for (i, fresh) in pool.iter().enumerate() {
         let fresh_id = lesson_identity(fresh);
-        let mut similar: Vec<&Lesson> = pool[i + 1..]
-            .iter()
-            .filter(|c| lesson_identity(c) != fresh_id)
-            .copied()
+        let similarity = |j: usize| topic_similarity(fresh, &topics[i], pool[j], &topics[j]);
+        let mut similar: Vec<usize> = (i + 1..pool.len())
+            .filter(|&j| lesson_identity(pool[j]) != fresh_id)
             .collect();
-        similar.sort_by_key(|c| std::cmp::Reverse(lesson_similarity(fresh, c)));
-        similar.retain(|c| lesson_similarity(fresh, c) > 0);
+        similar.sort_by_key(|&j| std::cmp::Reverse(similarity(j)));
+        similar.retain(|&j| similarity(j) > 0);
         similar.truncate(RECONCILE_TOP_S);
         if similar.is_empty() {
             continue;
         }
         out.push((
             (*fresh).clone(),
-            similar.iter().map(|l| (*l).clone()).collect(),
+            similar.iter().map(|&j| pool[j].clone()).collect(),
         ));
     }
     out
@@ -3901,6 +3959,7 @@ fn reconcile_lessons(project_root: &Path, all: &[Lesson], judge: Option<Reconcil
         .filter(|l| l.kind != LessonKind::DevError && !l.invalidated)
         .collect();
     pool.sort_by(|a, b| b.first_seen.cmp(&a.first_seen));
+    let topics = topic_sets(&pool);
 
     // Identities to mark invalid (the superseded/contradicted priors).
     let mut to_invalidate: std::collections::HashSet<(String, String, String)> =
@@ -3910,31 +3969,30 @@ fn reconcile_lessons(project_root: &Path, all: &[Lesson], judge: Option<Reconcil
         // Older candidates = everything after this one in the newest-first order,
         // excluding ones already slated for invalidation and exact self-identity.
         let fresh_id = lesson_identity(fresh);
-        let mut similar: Vec<&Lesson> = pool[i + 1..]
-            .iter()
-            .filter(|c| {
-                let cid = lesson_identity(c);
+        let similarity = |j: usize| topic_similarity(fresh, &topics[i], pool[j], &topics[j]);
+        let mut similar: Vec<usize> = (i + 1..pool.len())
+            .filter(|&j| {
+                let cid = lesson_identity(pool[j]);
                 cid != fresh_id && !to_invalidate.contains(&cid)
             })
-            .copied()
             .collect();
         if similar.is_empty() {
             continue;
         }
         // Keep the top-s most-similar (drop zero-similarity neighbours so the
         // judge isn't asked to compare unrelated lessons).
-        similar.sort_by_key(|c| std::cmp::Reverse(lesson_similarity(fresh, c)));
-        similar.retain(|c| lesson_similarity(fresh, c) > 0);
+        similar.sort_by_key(|&j| std::cmp::Reverse(similarity(j)));
+        similar.retain(|&j| similarity(j) > 0);
         similar.truncate(RECONCILE_TOP_S);
         if similar.is_empty() {
             continue;
         }
-        let owned: Vec<Lesson> = similar.iter().map(|l| (*l).clone()).collect();
+        let owned: Vec<Lesson> = similar.iter().map(|&j| pool[j].clone()).collect();
         match judge(fresh, &owned) {
             ReconcileDecision::Update | ReconcileDecision::Invalidate => {
                 // Supersede / contradict the single most-similar older lesson.
-                if let Some(target) = similar.first() {
-                    to_invalidate.insert(lesson_identity(target));
+                if let Some(&target) = similar.first() {
+                    to_invalidate.insert(lesson_identity(pool[target]));
                 }
             }
             ReconcileDecision::Add | ReconcileDecision::Noop => {}
@@ -4973,7 +5031,7 @@ const MEMORY_PLAYBOOK_MAX_DELTAS: usize = 3;
 /// memory digest). The selection is already COUNT-capped to a small ranked set
 /// (see [`select_relevant_lessons`] — at most [`MEMORY_PLAYBOOK_MAX_DELTAS`]),
 /// but an individual distilled delta's body is not itself byte-bounded: a
-/// belief's representative fix is the LONGEST member fix (see
+/// belief's representative fix is whichever member fix most members share (see
 /// [`fold_one_cluster`]) and a captured pitfall's `fix`/`root_cause` are
 /// whatever the classifier produced. Without a block-level ceiling, a few fat
 /// deltas could still crowd the firmware budget / dilute signal — the exact
@@ -9072,7 +9130,7 @@ mod tests {
 
     #[test]
     fn injected_playbook_is_byte_bounded_under_huge_deltas() {
-        // A single fat delta (e.g. a belief's longest-member fix, or a verbose
+        // A single fat delta (e.g. a belief's representative fix, or a verbose
         // captured fix) must NOT blow the block: the byte budget head-truncates so
         // the playbook can never crowd the firmware / dilute signal. This is the
         // unbounded-path guard — count cap alone (≤3) doesn't bound bytes.
@@ -9621,6 +9679,86 @@ mod tests {
                 .unwrap()
                 .invalidated,
             "the higher-efficacy (older, proven) lesson is KEPT above the cut"
+        );
+    }
+
+    /// A quality check with its own detail text (the shared `check` helper gives
+    /// every check the same "details for" words).
+    fn detailed_check(name: &str, details: &str) -> QualityCheck {
+        QualityCheck {
+            details: details.to_string(),
+            ..check(name, "warning", 60)
+        }
+    }
+
+    #[test]
+    fn distinct_checks_from_one_run_do_not_fold() {
+        // One run's warnings share only the requirement's words. They are
+        // different lessons: they must not fold into one belief whose single
+        // "rule" then hides the others from recall.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        capture_quality_failures(
+            root,
+            &[
+                detailed_check(
+                    "Dark mode support",
+                    "3 of 12 color tokens lack a dark value",
+                ),
+                detailed_check(
+                    "Pagination strategy",
+                    "List endpoints return unbounded arrays",
+                ),
+                detailed_check("Auth coverage", "Two routes lack an authentication guard"),
+            ],
+            "demo",
+            "做一个记账应用，支持分类统计",
+        );
+        let _ = fold_beliefs(root);
+        for belief in read_raw_lessons(root, BELIEFS_FILE) {
+            let titles: std::collections::BTreeSet<&str> = belief
+                .evidence
+                .iter()
+                .filter_map(|key| key.split('\u{0}').nth(1))
+                .collect();
+            assert!(
+                titles.len() <= 1,
+                "one belief folded different checks: {titles:?}"
+            );
+        }
+        let selected = select_relevant_lessons(root, "给记账应用加一个预算提醒");
+        assert!(
+            selected
+                .iter()
+                .any(|l| l.fix.contains("prefers-color-scheme: dark")),
+            "the dark-mode fix was hidden: {:?}",
+            selected.iter().map(|l| &l.title).collect::<Vec<_>>()
+        );
+
+        // English requirements must not chain unrelated checks through filler words.
+        let english = TempDir::new().unwrap();
+        capture_quality_failures(
+            english.path(),
+            &[detailed_check(
+                "Dark mode support",
+                "3 of 12 color tokens lack a dark value",
+            )],
+            "todo",
+            "Build a todo app with user login and dashboards",
+        );
+        capture_quality_failures(
+            english.path(),
+            &[detailed_check(
+                "Pagination strategy",
+                "List endpoints return unbounded arrays",
+            )],
+            "inventory",
+            "Create an inventory dashboard with charts and export",
+        );
+        let _ = fold_beliefs(english.path());
+        assert!(
+            read_raw_lessons(english.path(), BELIEFS_FILE).is_empty(),
+            "two unrelated English checks folded through 'with'/'and'"
         );
     }
 

@@ -1268,6 +1268,57 @@ mod tests {
         assert!(block.contains("RECALLED PROJECT FACTS"));
     }
 
+    /// The fact lines inside a recalled block's reference payload.
+    fn recalled_fact_lines(block: &str) -> Vec<String> {
+        let payload = block
+            .lines()
+            .find_map(|line| line.strip_prefix("payload_json="))
+            .expect("the block carries a reference payload");
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        payload["content"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn facts_block_never_cuts_a_fact_value() {
+        // A recalled fact is either whole or absent: a command or path cut at the
+        // budget boundary would be presented to the base as a real value.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stored = [
+            ("build", "pnpm build"),
+            ("test", "pnpm vitest run --coverage"),
+            ("lint", "pnpm eslint . --max-warnings 0"),
+            ("typecheck", "pnpm tsc --noEmit -p tsconfig.json"),
+            ("dev", "pnpm dev --port 5173"),
+            ("e2e", "pnpm playwright test --project chromium"),
+        ];
+        for (key, value) in stored {
+            record_fact(
+                tmp.path(),
+                Fact::new(key, value, Some("command"))
+                    .with_provenance("repository_verified", "package.json"),
+            );
+        }
+        let block = facts_firmware_block(tmp.path(), FACTS_FIRMWARE_BUDGET);
+        assert!(block.chars().count() <= FACTS_FIRMWARE_BUDGET);
+        let lines = recalled_fact_lines(&block);
+        assert!(!lines.is_empty(), "{block}");
+        for line in &lines {
+            let value = line
+                .split_once(" → ")
+                .map(|(_, value)| value)
+                .unwrap_or_else(|| panic!("a fact line was cut before its value: {line:?}"));
+            assert!(
+                stored.iter().any(|(_, stored)| *stored == value),
+                "a recalled value is not a stored value: {value:?}"
+            );
+        }
+    }
+
     #[test]
     fn record_is_fail_open_on_an_unwritable_root() {
         // A root whose PARENT is a regular file can never be created/written
