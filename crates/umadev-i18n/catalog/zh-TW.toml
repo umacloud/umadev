@@ -321,6 +321,7 @@
 "input.steer.opencode_not_guaranteed" = "OpenCode 在目前傳輸上不保證同一輪 steer；已原樣排到下一輪。"
 "input.steer.grok_acp_unsupported" = "Grok Build 目前協商出的 ACP 工作階段不支援 steer；已原樣排到下一輪。"
 "input.steer.kimi_acp_unsupported" = "Kimi Code 目前協商出的 ACP 工作階段不支援同一輪 steer；已原樣排到下一輪。"
+"input.steer.returned" = "本輪結束前，這則訊息未確認送達底座，已放回輸入框；如仍需要，請重新送出。"
 "input.steer.not_active_queued" = "常駐工作階段尚未進入可接收即時輸入的狀態；已原樣排到下一輪。"
 "input.steer.backpressure_queued" = "同一輪輸入通道正忙；已完整、可見地排到下一輪。"
 "input.steer.safe_point_backpressure_queued" = "即時 steer 通道正忙，本則尚未提交到底座；已完整、可見地排到下一個普通回合。"

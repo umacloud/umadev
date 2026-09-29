@@ -116,3 +116,52 @@ fn a_gate_decision_waits_for_a_running_local_command() {
     });
     assert_eq!(app.apply_key(KeyCode::Enter), Action::Continue(gate));
 }
+
+#[test]
+fn accepted_live_steer_is_restored_when_the_drain_exits() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut app = glue_app(tmp.path());
+    let hub = LiveInputHub::default();
+    let lane = hub.register("codex", same_turn_capabilities());
+    let turn = SubmittedTurn::text("不要改数据库,只改前端".to_string());
+    assert!(matches!(
+        hub.dispatch(turn.clone()),
+        LiveInputDispatch::EnqueuedSameTurn
+    ));
+
+    // The turn ended (it finished, failed or was cancelled) before its drain
+    // read the lane.
+    drop(lane);
+
+    assert!(sync_live_input_readiness(&mut app, &hub));
+    assert_eq!(app.input, turn.text, "the text is back in the input box");
+    assert!(app
+        .transcript_plaintext()
+        .contains(umadev_i18n::t(app.lang, "input.steer.returned")));
+}
+
+#[tokio::test]
+async fn only_an_unconfirmed_live_steer_is_handed_back() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let hub = LiveInputHub::default();
+
+    // Aborted while writing the steer to the base: its delivery is unknown.
+    let mut lane = hub.register("codex", same_turn_capabilities());
+    let pending = SubmittedTurn::text("换成 SQLite".to_string());
+    hub.dispatch(pending.clone());
+    assert!(lane.recv().await.is_some());
+    drop(lane);
+    let mut app = glue_app(tmp.path());
+    assert!(sync_live_input_readiness(&mut app, &hub));
+    assert_eq!(app.input, pending.text);
+
+    // A steer whose delivery was confirmed is not handed back.
+    let mut lane = hub.register("codex", same_turn_capabilities());
+    hub.dispatch(SubmittedTurn::text("already delivered".to_string()));
+    assert!(lane.recv().await.is_some());
+    lane.settle();
+    drop(lane);
+    let mut app = glue_app(tmp.path());
+    assert!(!sync_live_input_readiness(&mut app, &hub));
+    assert!(app.input.is_empty());
+}

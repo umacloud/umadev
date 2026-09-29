@@ -110,14 +110,16 @@ pub(super) type HostInputHolder = Arc<std::sync::Mutex<Option<PendingHostInput>>
 /// Registration is owned by a worker task and can disappear on a terminal
 /// route decision without another keypress. Keeping this sync at loop cadence
 /// prevents a completed/failed session from leaving a stale, actionable-looking
-/// native queue pane and queued-count chip on an otherwise idle screen.
+/// native queue pane and queued-count chip on an otherwise idle screen. Input
+/// the ended lane never delivered is put back into the editor at the same time.
 pub(super) fn sync_live_input_readiness(app: &mut App, hub: &super::LiveInputHub) -> bool {
+    let restored = crate::live_input_lane::restore_returned_live_input(app, hub);
     let live_ready = hub.is_ready();
     let queue_ready = hub.prompt_queue_ready();
     let changed = app.live_input_ready != live_ready || app.prompt_queue.ready() != queue_ready;
     app.live_input_ready = live_ready;
     app.prompt_queue.set_ready(queue_ready);
-    changed
+    changed || restored
 }
 
 pub(super) static NEXT_HOST_INPUT_TOKEN: std::sync::atomic::AtomicU64 =

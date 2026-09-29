@@ -46,6 +46,7 @@ mod host_git;
 pub mod input;
 mod interaction_bridge;
 pub mod link;
+mod live_input_lane;
 mod local_command;
 mod preview;
 mod prompt_queue_ui;
@@ -591,6 +592,7 @@ pub fn cold_judge_surface(
     })
 }
 
+#[derive(Clone)]
 enum LiveInputRequest {
     Steer { turn: SubmittedTurn },
     PromptQueue { request: PromptQueueRequest },
@@ -614,6 +616,8 @@ struct LiveInputHub {
 struct LiveInputHubState {
     next_generation: u64,
     endpoint: Option<LiveInputEndpoint>,
+    /// Accepted input an ended turn never delivered; the loop restores it.
+    returned: Vec<LiveInputRequest>,
 }
 
 struct LiveInputEndpoint {
@@ -650,13 +654,15 @@ enum PromptQueueDispatch {
 struct LiveInputRegistration {
     hub: LiveInputHub,
     generation: u64,
+    receiver: tokio::sync::mpsc::Receiver<LiveInputRequest>,
+    /// The request the turn is delivering right now (see `live_input_lane`).
+    in_flight: Option<LiveInputRequest>,
 }
 
 impl Drop for LiveInputRegistration {
     fn drop(&mut self) {
-        let mut state = self
-            .hub
-            .state
+        let hub = Arc::clone(&self.hub.state);
+        let mut state = hub
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state
@@ -666,6 +672,7 @@ impl Drop for LiveInputRegistration {
         {
             state.endpoint = None;
         }
+        self.hand_back(&mut state);
     }
 }
 
@@ -691,14 +698,7 @@ impl LiveInputHub {
             })
     }
 
-    fn register(
-        &self,
-        backend: &str,
-        capabilities: SessionCapabilities,
-    ) -> (
-        tokio::sync::mpsc::Receiver<LiveInputRequest>,
-        LiveInputRegistration,
-    ) {
+    fn register(&self, backend: &str, capabilities: SessionCapabilities) -> LiveInputRegistration {
         let (sender, receiver) = tokio::sync::mpsc::channel(LIVE_INPUT_CHANNEL_CAP);
         let mut state = self
             .state
@@ -712,13 +712,12 @@ impl LiveInputHub {
             capabilities,
             sender,
         });
-        (
+        LiveInputRegistration {
+            hub: self.clone(),
+            generation,
             receiver,
-            LiveInputRegistration {
-                hub: self.clone(),
-                generation,
-            },
-        )
+            in_flight: None,
+        }
     }
 
     fn dispatch(&self, turn: SubmittedTurn) -> LiveInputDispatch {
@@ -5470,8 +5469,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
             }
         }
         let capabilities = session.capabilities();
-        let (mut live_input_rx, _live_input_registration) =
-            live_input_hub.register(&backend, capabilities);
+        let mut live_input = live_input_hub.register(&backend, capabilities);
         match session.send_input(first_input).await {
             Ok(report) => sink.emit(EngineEvent::TransientStatus(Some(delivery_report_status(
                 &report,
@@ -5506,7 +5504,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                 Ok(Some(event))
             } else {
                 tokio::select! {
-                    request = live_input_rx.recv() => {
+                    request = live_input.recv() => {
                         if let Some(request) = request {
                             match request {
                                 LiveInputRequest::Steer { turn } => {
@@ -5569,6 +5567,7 @@ async fn drive_chat_session_turn_inner(turn: ChatSessionTurn) {
                                 },
                             }
                         }
+                        live_input.settle();
                         continue;
                     }
                     event = next_chat_event_idle(

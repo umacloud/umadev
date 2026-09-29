@@ -327,6 +327,7 @@
 "input.steer.opencode_not_guaranteed" = "OpenCode does not guarantee same-turn steering on this transport; queued intact for the next turn."
 "input.steer.grok_acp_unsupported" = "Grok Build's negotiated ACP session does not support steering; queued intact for the next turn."
 "input.steer.kimi_acp_unsupported" = "Kimi Code's negotiated ACP session does not support same-turn steering; queued intact for the next turn."
+"input.steer.returned" = "This message was not confirmed as delivered before the turn ended, so it is back in the input box; send it again if you still need it."
 "input.steer.not_active_queued" = "The resident turn is not ready for live input yet; queued intact for the next turn."
 "input.steer.backpressure_queued" = "The same-turn input lane is busy; queued intact and visibly for the next turn."
 "input.steer.safe_point_backpressure_queued" = "The live steer lane is busy, so this was not submitted to the base; queued intact and visibly for the next ordinary turn."

@@ -93,7 +93,7 @@ fn live_queue_ui_clears_when_its_worker_registration_ends_without_a_keypress() {
         prompt_queue: umadev_runtime::PromptQueueCapability::ServerAuthoritativeVersioned,
         ..SessionCapabilities::default()
     };
-    let (_receiver, registration) = hub.register("grok-build", capabilities);
+    let registration = hub.register("grok-build", capabilities);
     let tmp = tempfile::TempDir::new().unwrap();
     let mut app = App::new(
         "queue-registration",
@@ -146,25 +146,25 @@ fn live_input_distinguishes_codex_same_turn_from_grok_safe_point() {
 
     let codex = same_turn_capabilities();
     assert_eq!(codex.steer, SteerSemantics::SameTurn);
-    let (mut codex_rx, _codex_registration) = hub.register("codex", codex);
+    let mut codex_lane = hub.register("codex", codex);
     assert!(matches!(
         hub.dispatch(turn.clone()),
         LiveInputDispatch::EnqueuedSameTurn
     ));
     assert!(matches!(
-        codex_rx.try_recv().unwrap(),
+        codex_lane.receiver.try_recv().unwrap(),
         LiveInputRequest::Steer { turn: received } if received == turn
     ));
 
     let grok = safe_point_capabilities();
     assert_eq!(grok.steer, SteerSemantics::SameTurnOrImmediateNext);
-    let (mut grok_rx, _grok_registration) = hub.register("grok-build", grok);
+    let mut grok_lane = hub.register("grok-build", grok);
     assert!(matches!(
         hub.dispatch(turn.clone()),
         LiveInputDispatch::EnqueuedSafePointOrNext
     ));
     assert!(matches!(
-        grok_rx.try_recv().unwrap(),
+        grok_lane.receiver.try_recv().unwrap(),
         LiveInputRequest::Steer { turn: received } if received == turn
     ));
 }
@@ -172,7 +172,7 @@ fn live_input_distinguishes_codex_same_turn_from_grok_safe_point() {
 #[test]
 fn live_same_turn_lane_backpressures_into_the_visible_fifo() {
     let hub = LiveInputHub::default();
-    let (_receiver, _registration) = hub.register("codex", same_turn_capabilities());
+    let _registration = hub.register("codex", same_turn_capabilities());
 
     for index in 0..LIVE_INPUT_CHANNEL_CAP {
         assert!(matches!(
@@ -199,7 +199,7 @@ fn live_same_turn_lane_backpressures_into_the_visible_fifo() {
 #[test]
 fn live_safe_point_lane_backpressures_without_claiming_same_turn() {
     let hub = LiveInputHub::default();
-    let (_receiver, _registration) = hub.register("grok-build", safe_point_capabilities());
+    let _registration = hub.register("grok-build", safe_point_capabilities());
 
     for index in 0..LIVE_INPUT_CHANNEL_CAP {
         assert!(matches!(
