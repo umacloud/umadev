@@ -724,6 +724,14 @@ pub struct PlanStep {
 }
 
 impl PlanStep {
+    /// Whether this Build step will still run a writer without a declared file
+    /// surface — an execution-contract preflight failure. A Done step never runs
+    /// again, so a missing surface on it (a Fast single-turn plan, a plan saved
+    /// before surfaces existed) is history, not a reason to refuse a continuation.
+    pub(crate) fn lacks_pending_surface(&self) -> bool {
+        self.kind == StepKind::Build && self.status != StepStatus::Done && self.files.is_empty()
+    }
+
     /// Typed evidence summary when present, otherwise the coarse acceptance bar.
     pub(crate) fn criterion_label(&self) -> String {
         if self.evidence.is_empty() {

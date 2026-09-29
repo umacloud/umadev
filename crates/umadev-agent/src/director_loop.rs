@@ -1716,15 +1716,12 @@ async fn drive_plan_steps(
     // runs; otherwise the scope denominator is unknowable and the old scope floor
     // silently stood down. Planning already performs one bounded repair re-ask. If
     // it is still incomplete, fail explicitly and keep the workspace untouched —
-    // never widen to the legacy end-to-end mega-turn.
+    // never widen to the legacy end-to-end mega-turn. Only steps that will still run
+    // are gated: a resumed Done step keeps its truth even if it predates surfaces.
     let contract =
         crate::execution_contract::ExecutionContract::from_plan(route, &options.requirement, plan);
     if let Some(violation) = contract.preflight_violations().into_iter().next() {
-        for step in plan
-            .steps
-            .iter_mut()
-            .filter(|step| step.kind == plan_state::StepKind::Build && step.files.is_empty())
-        {
+        for step in plan.steps.iter_mut().filter(|step| step.lacks_pending_surface()) {
             step.status = StepStatus::Blocked;
             events.emit(EngineEvent::plan_step_status(
                 step.id.clone(),

@@ -70,9 +70,10 @@ impl ExecutionContract {
     }
 
     /// Build the strict contract for an owned plan. The plan's declared surfaces,
-    /// not the router's advisory hints, are authoritative. Every Build step must
-    /// contribute a surface; missing declarations are explicit preflight failures
-    /// instead of silently disabling scope enforcement for the whole run.
+    /// not the router's advisory hints, are authoritative. Every Build step that will
+    /// still run must contribute a surface; missing declarations are explicit
+    /// preflight failures instead of silently disabling scope enforcement for the
+    /// whole run. A Done step never runs a writer again, so it is not one of them.
     #[must_use]
     pub fn from_plan(route: &RoutePlan, objective: &str, plan: &Plan) -> Self {
         let allowed_paths = normalized_unique(plan.steps.iter().flat_map(|step| step.files.all()));
@@ -80,7 +81,7 @@ impl ExecutionContract {
         let mut verification = BTreeSet::new();
         let mut missing_surface_steps = Vec::new();
         for step in &plan.steps {
-            if step.kind == StepKind::Build && step.files.is_empty() {
+            if step.lacks_pending_surface() {
                 missing_surface_steps.push(format!("{} · {}", step.id, step.title));
             }
             verification.insert(format!("{}: {}", step.id, step.criterion_label()));
@@ -503,6 +504,32 @@ mod tests {
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].code, "execution-contract-incomplete");
         assert!(violations[0].message.contains("backend"));
+    }
+
+    #[test]
+    fn a_done_step_without_a_surface_does_not_fail_the_preflight() {
+        // A resumed plan's Done step never runs a writer again; only the steps that
+        // still will are held to the preflight.
+        let mut done = step("single-turn-build", &[]);
+        done.status = StepStatus::Done;
+        let route = route(RouteClass::Build, Depth::Standard, &[]);
+        let plan = Plan {
+            steps: vec![done.clone()],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        assert!(ExecutionContract::from_plan(&route, "resume", &plan)
+            .preflight_violations()
+            .is_empty());
+        let plan = Plan {
+            steps: vec![done, step("frontend", &[])],
+            risks: Vec::new(),
+            open_questions: Vec::new(),
+        };
+        let violations = ExecutionContract::from_plan(&route, "resume", &plan).preflight_violations();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].message.contains("frontend"));
+        assert!(!violations[0].message.contains("single-turn-build"));
     }
 
     #[test]
