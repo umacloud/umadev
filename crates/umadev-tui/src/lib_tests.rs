@@ -2495,6 +2495,59 @@ fn legacy_input_tolerates_a_single_transient_error() {
 }
 
 #[test]
+fn paste_while_search_open_filters_the_query() {
+    // An IME phrase commit ("错误") and a Cmd+V both arrive as ONE paste on the
+    // owned input path. With Ctrl+F open it must filter the search — not land
+    // in the composer hidden behind the bar.
+    let (mut app, _tmp) = build_test_app();
+    app.open_search();
+    handle_paste_event(&mut app, "错误");
+    assert_eq!(app.search.as_ref().map(|s| s.query.as_str()), Some("错误"));
+    assert!(app.input.is_empty(), "the composer must not receive the paste");
+    // A multi-line paste flattens to one query line.
+    handle_paste_event(&mut app, " 在\r\n第二行\n");
+    assert_eq!(
+        app.search.as_ref().map(|s| s.query.as_str()),
+        Some("错误 在 第二行")
+    );
+    app.close_search();
+
+    // Ctrl+R prompt-history search takes the paste the same way.
+    app.input_history.push_back("修复登录错误".into());
+    app.open_history_search();
+    handle_paste_event(&mut app, "登录");
+    assert_eq!(
+        app.history_search.as_ref().map(|s| s.query.as_str()),
+        Some("登录")
+    );
+    assert_eq!(app.history_search_preview(), Some("修复登录错误"));
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn paste_is_dropped_while_help_an_overlay_or_the_picker_owns_the_keyboard() {
+    let (mut app, _tmp) = build_test_app();
+    app.show_help = true;
+    handle_paste_event(&mut app, "hidden help paste");
+    assert!(app.input.is_empty(), "help swallows the paste like typed text");
+    app.show_help = false;
+
+    app.overlay = Some(crate::app::Overlay::from_body("log".to_string(), "body"));
+    handle_paste_event(&mut app, "hidden overlay paste");
+    assert!(app.input.is_empty(), "an overlay swallows the paste");
+    app.overlay = None;
+
+    app.mode = crate::app::AppMode::Picker;
+    handle_paste_event(&mut app, "hidden picker paste");
+    assert!(app.input.is_empty(), "the first-run picker swallows the paste");
+    app.mode = crate::app::AppMode::Chat;
+
+    // With nothing modal open, the composer takes it as before.
+    handle_paste_event(&mut app, "visible");
+    assert_eq!(app.input, "visible");
+}
+
+#[test]
 fn clipboard_capture_result_runs_the_full_image_chip_to_submit_path() {
     let (mut app, _tmp) = build_test_app();
     let dir = app.project_root.join(".umadev/pasted");

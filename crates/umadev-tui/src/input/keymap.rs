@@ -83,14 +83,46 @@ pub(crate) fn char_to_key(c: char) -> KeyEvent {
 /// The CONTROL guard mirrors the historical per-arm catches: a control char
 /// that arrives WITH an explicit CONTROL modifier is an intentional
 /// already-decoded combo from the backend and is left alone (fail-open).
+///
+/// On Windows an AltGr character is then folded to plain text (the internal
+/// `fold_altgr_text` function).
 #[must_use]
 pub fn normalize_key(code: KeyCode, mods: KeyModifiers) -> (KeyCode, KeyModifiers) {
-    match code {
+    let (code, mods) = match code {
         KeyCode::Char(c)
             if (c <= '\u{1f}' || c == '\u{7f}') && !mods.contains(KeyModifiers::CONTROL) =>
         {
             let k = char_to_key(c);
             (k.code, k.modifiers | mods)
+        }
+        _ => (code, mods),
+    };
+    if cfg!(windows) {
+        fold_altgr_text(code, mods)
+    } else {
+        (code, mods)
+    }
+}
+
+/// Fold a Windows AltGr character to plain text.
+///
+/// The Windows console reports AltGr as LEFT_CTRL + RIGHT_ALT, so a character
+/// typed with it (`@ { } [ ] \ | ~ €` on German / French / Nordic layouts,
+/// `ą ę ł ó ś ż` on Polish Programmer) arrives as `Char(c)` with CONTROL | ALT
+/// and every text arm (`!ctrl && !alt`) dropped it. A printable char other than
+/// an ASCII letter is text: CONTROL | ALT are stripped (SHIFT is kept). A real
+/// Ctrl+Alt+letter arrives as the base ASCII letter and keeps both modifiers,
+/// so the Ctrl+Alt+U/B/D/F bindings still fire. Applied only on Windows: unix
+/// terminals send AltGr text unmodified, and a Ctrl+Alt+Space or Ctrl+Alt+\
+/// there is a real chord.
+#[must_use]
+pub(crate) fn fold_altgr_text(code: KeyCode, mods: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    match code {
+        KeyCode::Char(c)
+            if mods.contains(altgr) && !c.is_ascii_alphabetic() && !c.is_control() =>
+        {
+            (code, mods - altgr)
         }
         _ => (code, mods),
     }
@@ -138,6 +170,63 @@ mod tests {
                 "Alt + literal {c:?} must fold to Alt+Backspace (delete word)"
             );
         }
+    }
+
+    #[test]
+    fn altgr_text_folds_to_plain_chars_while_ctrl_alt_letters_stay_chords() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        // German / French / Nordic / Polish Programmer AltGr characters.
+        for c in ['@', '{', '}', '[', ']', '\\', '|', '~', '€', 'ą', 'ł', 'µ', '²'] {
+            assert_eq!(
+                fold_altgr_text(KeyCode::Char(c), altgr),
+                (KeyCode::Char(c), KeyModifiers::NONE),
+                "AltGr {c:?} is text"
+            );
+        }
+        // AltGr+Shift keeps SHIFT (an uppercase AltGr letter).
+        assert_eq!(
+            fold_altgr_text(KeyCode::Char('Ł'), altgr | KeyModifiers::SHIFT),
+            (KeyCode::Char('Ł'), KeyModifiers::SHIFT)
+        );
+        // A real Ctrl+Alt+letter arrives as the base ASCII letter: still a chord.
+        for c in ['u', 'b', 'd', 'f', 'U'] {
+            assert_eq!(
+                fold_altgr_text(KeyCode::Char(c), altgr),
+                (KeyCode::Char(c), altgr),
+                "Ctrl+Alt+{c} must stay a chord"
+            );
+        }
+        // Only the CONTROL|ALT pair means AltGr; other keys pass through.
+        assert_eq!(
+            fold_altgr_text(KeyCode::Char('@'), KeyModifiers::CONTROL),
+            (KeyCode::Char('@'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            fold_altgr_text(KeyCode::Char('@'), KeyModifiers::ALT),
+            (KeyCode::Char('@'), KeyModifiers::ALT)
+        );
+        assert_eq!(fold_altgr_text(KeyCode::Enter, altgr), (KeyCode::Enter, altgr));
+        // Idempotent: a folded pair folds to itself.
+        let once = fold_altgr_text(KeyCode::Char('€'), altgr);
+        assert_eq!(fold_altgr_text(once.0, once.1), once);
+    }
+
+    #[test]
+    fn normalize_key_folds_altgr_only_on_windows() {
+        let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let folded = normalize_key(KeyCode::Char('@'), altgr);
+        if cfg!(windows) {
+            assert_eq!(folded, (KeyCode::Char('@'), KeyModifiers::NONE));
+        } else {
+            // Unix terminals send AltGr text unmodified; CONTROL|ALT there is a
+            // real chord (e.g. `ESC NUL` = Ctrl+Alt+Space) and stays one.
+            assert_eq!(folded, (KeyCode::Char('@'), altgr));
+        }
+        // Ctrl+Alt+D stays a chord everywhere.
+        assert_eq!(
+            normalize_key(KeyCode::Char('d'), altgr),
+            (KeyCode::Char('d'), altgr)
+        );
     }
 
     #[test]
@@ -202,6 +291,14 @@ mod tests {
             (KeyCode::Char('x'), KeyModifiers::NONE),
             (KeyCode::Backspace, KeyModifiers::NONE),
             (KeyCode::Enter, KeyModifiers::SHIFT),
+            (
+                KeyCode::Char('@'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+            (
+                KeyCode::Char('\u{4}'),
+                KeyModifiers::ALT,
+            ),
         ];
         for (code, mods) in samples {
             let once = normalize_key(code, mods);

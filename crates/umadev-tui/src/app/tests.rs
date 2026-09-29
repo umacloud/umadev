@@ -10444,6 +10444,52 @@ fn ctrl_v_requests_image_capture_without_touching_the_text_paste_path() {
 }
 
 #[test]
+fn ctrl_click_opens_a_path_written_inside_chinese_prose() {
+    // Inline code in Chinese prose renders without its backticks, so the row
+    // reads "请修改src/app.rs中的函数". A Ctrl+click on the path must open it.
+    let app = fresh_app(Some("offline"));
+    std::fs::create_dir_all(app.project_root.join("src")).unwrap();
+    std::fs::write(app.project_root.join("src/app.rs"), "fn main() {}").unwrap();
+    *app.transcript_rows.borrow_mut() = vec!["请修改src/app.rs中的函数".to_string()];
+    *app.transcript_gutters.borrow_mut() = vec![0];
+    *app.transcript_row_wraps.borrow_mut() = vec![false];
+    app.transcript_area.set((0, 0, 80, 10));
+    app.transcript_first_visible.set(0);
+    // "请修改" is six cells wide and `src/` four more, so `a` sits in column 10.
+    let target = app.link_target_at(10, 0).expect("the glued path must open");
+    let expected = app.project_root.join("src/app.rs").canonicalize().unwrap();
+    assert_eq!(std::path::PathBuf::from(&target), expected);
+}
+
+#[test]
+fn alt_v_and_slash_paste_image_request_image_capture() {
+    // Windows Terminal, conhost and the VS Code terminal keep Ctrl+V for their
+    // own paste, so it never reaches UmaDev there. Alt+V and /paste-image are
+    // the triggers those terminals leave alone.
+    use crossterm::event::KeyModifiers;
+    let mut app = fresh_app(Some("claude-code"));
+    app.input = "draft ".into();
+    app.input_cursor = app.input_len();
+    assert_eq!(
+        app.apply_key_with_mods(KeyCode::Char('v'), KeyModifiers::ALT),
+        Action::PasteImage
+    );
+    assert_eq!(app.input, "draft ", "the chord never types a letter");
+    // Ctrl+Alt+V is neither chord.
+    assert_eq!(
+        app.apply_key_with_mods(KeyCode::Char('v'), KeyModifiers::CONTROL | KeyModifiers::ALT),
+        Action::None
+    );
+    assert_eq!(app.input, "draft ");
+
+    let mut slash = fresh_app(Some("claude-code"));
+    slash.input = "/paste-image".into();
+    slash.input_cursor = slash.input_len();
+    assert_eq!(slash.apply_key(KeyCode::Enter), Action::PasteImage);
+    assert!(slash.input.is_empty(), "the chip lands in the cleared composer");
+}
+
+#[test]
 fn ctrl_j_post_decode_form_also_inserts_a_newline() {
     // The already-decoded form (`Char('j')` + CONTROL) — what the dispatch
     // actually matches — must reach the same newline-insert arm.
@@ -10495,6 +10541,104 @@ fn shift_enter_via_kitty_csi_u_inserts_a_newline() {
     let action = a.apply_key_with_mods(code, mods);
     assert_eq!(action, Action::None, "Shift+Enter (CSI-u) must NOT submit");
     assert!(a.input.contains("line1\n"));
+}
+
+/// Drive the owned input pipeline (tokenizer → decoder) over `bytes` and apply
+/// every decoded key to `app`, the way the event loop does.
+fn feed_owned_keys(app: &mut App, bytes: &[u8]) -> Vec<crossterm::event::KeyEvent> {
+    let mut tk = crate::input::tokenize::Tokenizer::for_stdin();
+    let mut dec = crate::input::decode::Decoder::new();
+    let mut keys = Vec::new();
+    for token in tk.feed(bytes) {
+        for ev in dec.feed_token(token) {
+            if let crate::input::decode::InputEvent::Key(k) = ev {
+                keys.push(k);
+            }
+        }
+    }
+    for k in &keys {
+        let _ = app.apply_key_with_mods(k.code, k.modifiers);
+    }
+    keys
+}
+
+#[test]
+fn esc_prefixed_ctrl_alt_d_scrolls_instead_of_quitting() {
+    // Without the kitty protocol, tmux / Apple Terminal ("Use Option as Meta")
+    // send Ctrl+Alt+D as `ESC ^D`. It must reach the app as ONE Ctrl+Alt+D
+    // (half-page scroll) — not a bare Esc plus a Ctrl+D that quits an idle
+    // session with an empty composer.
+    let mut a = fresh_app(Some("offline"));
+    assert!(a.input.is_empty());
+    let keys = feed_owned_keys(&mut a, b"\x1b\x04");
+    assert!(!a.should_quit, "Ctrl+Alt+D must never quit UmaDev");
+    assert!(!a.pending_quit_confirm, "no stray Esc may arm the quit confirm");
+    assert_eq!(keys.len(), 1, "one chord, one key: {keys:?}");
+    assert_eq!(keys[0].code, KeyCode::Char('d'));
+    assert_eq!(
+        keys[0].modifiers,
+        crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT
+    );
+
+    // Ctrl+Alt+U (`ESC ^U`) scrolls too; it must not kill the typed line.
+    let mut b = fresh_app(Some("offline"));
+    for c in "draft".chars() {
+        let _ = b.apply_key(KeyCode::Char(c));
+    }
+    let _ = feed_owned_keys(&mut b, b"\x1b\x15");
+    assert_eq!(b.input, "draft", "Ctrl+Alt+U must not act as Ctrl+U");
+    assert!(!b.pending_quit_confirm);
+}
+
+#[test]
+fn altgr_char_is_inserted_while_ctrl_alt_letters_keep_scrolling() {
+    // The Windows console reports AltGr+Q (German `@`) as `Char('@')` with
+    // CONTROL|ALT. The shared keymap fold (applied on Windows) must turn it
+    // into text for the composer and both search bars, while a real
+    // Ctrl+Alt+D (the base ASCII letter) still scrolls and never types.
+    use crate::input::keymap::fold_altgr_text;
+    use crossterm::event::KeyModifiers;
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    let mut a = fresh_app(Some("offline"));
+    for c in ['@', '{', '€'] {
+        let (code, mods) = fold_altgr_text(KeyCode::Char(c), altgr);
+        let _ = a.apply_key_with_mods(code, mods);
+    }
+    assert_eq!(a.input, "@{€");
+    let (code, mods) = fold_altgr_text(KeyCode::Char('d'), altgr);
+    assert_eq!(mods, altgr, "Ctrl+Alt+D stays a chord");
+    let _ = a.apply_key_with_mods(code, mods);
+    assert_eq!(a.input, "@{€", "Ctrl+Alt+D must not type a letter");
+    assert!(!a.should_quit);
+
+    a.open_search();
+    let (code, mods) = fold_altgr_text(KeyCode::Char('\\'), altgr);
+    let _ = a.apply_key_with_mods(code, mods);
+    assert_eq!(a.search.as_ref().map(|s| s.query.as_str()), Some("\\"));
+    a.close_search();
+    a.input_history.push_back("mail me@example.com".into());
+    a.open_history_search();
+    let (code, mods) = fold_altgr_text(KeyCode::Char('@'), altgr);
+    let _ = a.apply_key_with_mods(code, mods);
+    assert_eq!(
+        a.history_search.as_ref().map(|s| s.query.as_str()),
+        Some("@")
+    );
+}
+
+/// The real Windows key path: the console's raw AltGr event reaches
+/// `apply_key_with_mods` unmodified and the shared fold turns it into text.
+#[cfg(windows)]
+#[test]
+fn altgr_char_is_inserted_from_the_raw_windows_event() {
+    use crossterm::event::KeyModifiers;
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    let mut a = fresh_app(Some("offline"));
+    let _ = a.apply_key_with_mods(KeyCode::Char('@'), altgr);
+    assert_eq!(a.input, "@");
+    let _ = a.apply_key_with_mods(KeyCode::Char('d'), altgr);
+    assert_eq!(a.input, "@", "Ctrl+Alt+D scrolls; it never types");
+    assert!(!a.should_quit);
 }
 
 #[test]

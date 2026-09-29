@@ -21,10 +21,13 @@
 //!   timer (~50 ms for a lone ESC, ~500 ms while a bracketed paste is open,
 //!   with a queued-bytes pre-gate — Wave 2 P1) + a SIGWINCH→resize handler,
 //!   and exposes [`reader::InputSource`] (the owned path by default, the
-//!   legacy `EventStream` behind `UMADEV_LEGACY_INPUT=1` / on Windows).
+//!   legacy `EventStream` behind `UMADEV_LEGACY_INPUT=1` / on Windows);
+//! - [`legacy`] — that legacy path, which on Windows delivers a burst of
+//!   already-queued key events (how the console delivers a paste) as one paste.
 
 pub mod decode;
 pub mod keymap;
+pub mod legacy;
 pub mod reader;
 pub mod tokenize;
 
@@ -155,6 +158,48 @@ mod contract {
     }
 
     #[test]
+    fn esc_prefixed_ctrl_alt_letters_and_alt_enter_converge() {
+        // ESC-prefix Meta terminals (tmux, Apple Terminal "Use Option as Meta",
+        // xterm without the kitty protocol) send Alt+<control key> as ESC plus
+        // the C0 byte. Crossterm's parser decodes the byte after ESC and adds
+        // ALT; the owned path must too — never a bare Esc followed by the
+        // unmodified control key (Esc + Ctrl+D quit an idle session).
+        let alt = KeyModifiers::ALT;
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        for (name, bytes, letter, literal) in [
+            ("ctrl+alt+d", b"\x1b\x04" as &[u8], 'd', '\u{4}'),
+            ("ctrl+alt+u", b"\x1b\x15", 'u', '\u{15}'),
+            ("ctrl+alt+b", b"\x1b\x02", 'b', '\u{2}'),
+            ("ctrl+alt+f", b"\x1b\x06", 'f', '\u{6}'),
+        ] {
+            assert_converges(
+                name,
+                bytes,
+                &[
+                    // The decoded combo (crossterm unix parser / Windows native).
+                    vec![press(KeyCode::Char(letter), ctrl_alt)],
+                    // The literal control-char form carrying ALT.
+                    vec![press(KeyCode::Char(literal), alt)],
+                ],
+            );
+        }
+        assert_converges(
+            "alt+enter",
+            b"\x1b\r",
+            &[
+                vec![press(KeyCode::Enter, alt)],
+                vec![press(KeyCode::Char('\r'), alt)],
+            ],
+        );
+        assert_converges("alt+tab", b"\x1b\t", &[vec![press(KeyCode::Tab, alt)]]);
+        assert_converges(
+            "ctrl+alt+space",
+            b"\x1b\x00",
+            &[vec![press(KeyCode::Char(' '), ctrl_alt)]],
+        );
+    }
+
+    #[test]
     fn ctrl_j_universal_newline_converges() {
         // Ctrl+J is a literal LF (0x0A) on every terminal — the terminal-agnostic
         // newline. The owned path tokenizes it as text and folds it to
@@ -181,6 +226,23 @@ mod contract {
             "shift+enter (CSI-u)",
             b"\x1b[13;2u",
             &[vec![press(KeyCode::Enter, KeyModifiers::SHIFT)]],
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_form_converges() {
+        // tmux `extended-keys always` and xterm `modifyOtherKeys` send the
+        // `CSI 27 ; mods ; key ~` form. It must reach the app as the same key
+        // the Windows console / a kitty terminal delivers natively.
+        assert_converges(
+            "shift+enter (modifyOtherKeys)",
+            b"\x1b[27;2;13~",
+            &[vec![press(KeyCode::Enter, KeyModifiers::SHIFT)]],
+        );
+        assert_converges(
+            "ctrl+j (modifyOtherKeys)",
+            b"\x1b[27;5;106~",
+            &[vec![press(KeyCode::Char('j'), KeyModifiers::CONTROL)]],
         );
     }
 

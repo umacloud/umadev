@@ -258,6 +258,54 @@ fn looks_like_path(tok: &str) -> bool {
 #[must_use]
 pub fn path_candidate_at(line: &str, col: usize) -> Option<String> {
     let chars: Vec<char> = line.chars().collect();
+    let (start, end) = path_span_at(&chars, col)?;
+    path_token(&chars[start..end])
+}
+
+/// Most path candidates [`path_candidates_at`] offers for one click, so a long
+/// mixed-script token costs a bounded number of filesystem lookups.
+const MAX_PATH_CANDIDATES: usize = 8;
+
+/// Every path candidate under char offset `col` of `line`, most complete first:
+/// the whole path-shaped token, then — for prose that glues a path to CJK text
+/// with no space, the way Chinese inline code renders (`请修改src/app.rs中的函数`)
+/// — each sub-token that starts and ends on a CJK ↔ non-CJK boundary and still
+/// contains the click, longest first. [`link_target`] opens the first one that
+/// exists, so a real CJK file name (`docs/用户指南.md`) still resolves whole.
+#[must_use]
+pub fn path_candidates_at(line: &str, col: usize) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let Some((start, end)) = path_span_at(&chars, col) else {
+        return Vec::new();
+    };
+    if end <= start {
+        return Vec::new();
+    }
+    let col = col.min(end - 1);
+    let mut cuts = vec![start];
+    cuts.extend((start + 1..end).filter(|&i| is_cjk(chars[i - 1]) != is_cjk(chars[i])));
+    cuts.push(end);
+    let mut spans: Vec<(usize, usize)> = cuts
+        .iter()
+        .filter(|&&s| s <= col)
+        .flat_map(|&s| cuts.iter().filter(|&&e| e > col).map(move |&e| (s, e)))
+        .collect();
+    spans.sort_by_key(|&(s, e)| std::cmp::Reverse(e - s));
+    let mut candidates: Vec<String> = Vec::new();
+    for (s, e) in spans.into_iter().take(MAX_PATH_CANDIDATES) {
+        let e = shed_trailing_punctuation(&chars, s, e);
+        if let Some(tok) = path_token(&chars[s..e]) {
+            if !candidates.contains(&tok) {
+                candidates.push(tok);
+            }
+        }
+    }
+    candidates
+}
+
+/// The `[start, end)` char span of the path-character run under `col`, with
+/// trailing sentence punctuation shed; `None` when `col` is not on a path char.
+fn path_span_at(chars: &[char], col: usize) -> Option<(usize, usize)> {
     if col >= chars.len() || !is_path_char(chars[col]) {
         return None;
     }
@@ -269,18 +317,54 @@ pub fn path_candidate_at(line: &str, col: usize) -> Option<String> {
     while end < chars.len() && is_path_char(chars[end]) {
         end += 1;
     }
-    // Trailing sentence punctuation is decoration, not path: `see a/b.png,`.
+    Some((start, shed_trailing_punctuation(chars, start, end)))
+}
+
+/// Trailing sentence punctuation is decoration, not path: `see a/b.png,`.
+fn shed_trailing_punctuation(chars: &[char], start: usize, mut end: usize) -> usize {
     while end > start && matches!(chars[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
         end -= 1;
     }
-    if end <= start {
+    end
+}
+
+/// `chars` as a path candidate: non-empty, carrying at least one alphanumeric
+/// char (a lone `/` or `..` is not a click target), and path-shaped.
+fn path_token(chars: &[char]) -> Option<String> {
+    if !chars.iter().any(|c| c.is_alphanumeric()) {
         return None;
     }
-    let tok: String = chars[start..end].iter().collect();
-    if !tok.chars().any(char::is_alphanumeric) {
-        return None;
-    }
+    let tok: String = chars.iter().collect();
     looks_like_path(&tok).then_some(tok)
+}
+
+/// CJK script (ideographs, kana, Hangul, CJK and fullwidth punctuation) —
+/// text that Chinese / Japanese / Korean prose writes flush against a path.
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3000}'..='\u{30FF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{4E00}'..='\u{9FFF}'
+            | '\u{AC00}'..='\u{D7AF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FF00}'..='\u{FFEF}'
+            | '\u{20000}'..='\u{3134F}'
+    )
+}
+
+/// The Ctrl+click target under char offset `col` of `line`: the URL there,
+/// else the first of [`path_candidates_at`] that [`resolve_path`] finds on
+/// disk (relative to `workspace_root`), as a display path.
+#[must_use]
+pub fn link_target(line: &str, col: usize, workspace_root: &Path) -> Option<String> {
+    if let Some(url) = url_at(line, col) {
+        return Some(url);
+    }
+    path_candidates_at(line, col)
+        .iter()
+        .find_map(|tok| resolve_path(tok, workspace_root))
+        .map(|p| p.display().to_string())
 }
 
 /// Find the openable candidate under char offset `col` of `line`: URL first
@@ -759,6 +843,45 @@ mod tests {
         // Non-existent rejects (no creation, no guessing).
         assert_eq!(resolve_path("missing.png", dir.path()), None);
         assert_eq!(resolve_path("/no/such/dir/x.png", dir.path()), None);
+    }
+
+    #[test]
+    fn a_path_glued_to_chinese_prose_still_opens() {
+        // "请修改`src/app.rs`中的函数" renders without the backticks, so the
+        // path-char run swallows the CJK prose on both sides. The click must
+        // still find the file; a real CJK file name still resolves whole.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/app.rs"), b"fn main() {}").unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/用户指南.md"), b"# guide").unwrap();
+        let app_rs = resolve_path("src/app.rs", dir.path()).unwrap();
+
+        let line = "请修改src/app.rs中的函数";
+        let col_a = line.chars().position(|c| c == 'a').unwrap();
+        assert_eq!(
+            link_target(line, col_a, dir.path()),
+            Some(app_rs.display().to_string())
+        );
+        assert_eq!(
+            path_candidates_at(line, col_a).first().map(String::as_str),
+            Some(line),
+            "the whole token is still tried first"
+        );
+        // A click on the prose itself opens nothing.
+        assert_eq!(link_target(line, 0, dir.path()), None);
+
+        let line = "见docs/用户指南.md。";
+        let guide = resolve_path("docs/用户指南.md", dir.path()).unwrap();
+        for col in [1, 6] {
+            assert_eq!(
+                link_target(line, col, dir.path()),
+                Some(guide.display().to_string()),
+                "click at {col}"
+            );
+        }
+        // Without CJK nothing changes: one candidate, the token itself.
+        assert_eq!(path_candidates_at("see src/app.rs, ok", 6), vec!["src/app.rs"]);
     }
 
     #[test]

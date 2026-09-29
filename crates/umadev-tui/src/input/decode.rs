@@ -360,6 +360,16 @@ fn decode_tilde(params: &[u8]) -> Vec<InputEvent> {
         .and_then(|m| m.split(':').next())
         .and_then(|m| m.parse::<u8>().ok())
         .map_or(KeyModifiers::NONE, parse_modifiers);
+    // xterm `modifyOtherKeys` / tmux `extended-keys`: `CSI 27 ; mods ; key ~`
+    // carries the key as a codepoint, exactly like the kitty `CSI u` form.
+    if first == 27 {
+        return match it.next().and_then(|cp| cp.parse::<u32>().ok()) {
+            Some(codepoint) => codepoint_key(codepoint, mods)
+                .map(|code| vec![InputEvent::Key(key(code, mods))])
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+    }
     let code = match first {
         1 | 7 => KeyCode::Home,
         2 => KeyCode::Insert,
@@ -394,25 +404,26 @@ fn decode_csi_u(params: &[u8]) -> Vec<InputEvent> {
         .and_then(|m| m.split(':').next())
         .and_then(|m| m.parse::<u8>().ok())
         .map_or(KeyModifiers::NONE, parse_modifiers);
+    codepoint_key(codepoint, mods)
+        .map(|code| vec![InputEvent::Key(key(code, mods))])
+        .unwrap_or_default()
+}
 
-    let code = match functional_key(codepoint) {
-        Some(c) => c,
-        None => match char::from_u32(codepoint) {
-            Some('\u{1b}') => KeyCode::Esc,
-            Some('\r') => KeyCode::Enter,
-            Some('\t') => {
-                if mods.contains(KeyModifiers::SHIFT) {
-                    KeyCode::BackTab
-                } else {
-                    KeyCode::Tab
-                }
-            }
-            Some('\u{8}' | '\u{7f}') => KeyCode::Backspace,
-            Some(c) => KeyCode::Char(c),
-            None => return Vec::new(),
-        },
-    };
-    vec![InputEvent::Key(key(code, mods))]
+/// Map the key codepoint of a `CSI u` / `modifyOtherKeys` report to its key:
+/// a functional key, a control key (Esc / Enter / Tab / Backspace), or the
+/// char itself. `None` for a codepoint that is not a scalar value.
+fn codepoint_key(codepoint: u32, mods: KeyModifiers) -> Option<KeyCode> {
+    if let Some(code) = functional_key(codepoint) {
+        return Some(code);
+    }
+    Some(match char::from_u32(codepoint)? {
+        '\u{1b}' => KeyCode::Esc,
+        '\r' => KeyCode::Enter,
+        '\t' if mods.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
+        '\t' => KeyCode::Tab,
+        '\u{8}' | '\u{7f}' => KeyCode::Backspace,
+        c => KeyCode::Char(c),
+    })
 }
 
 /// A small subset of kitty functional key codepoints (numpad + nav) we care
@@ -640,6 +651,28 @@ mod tests {
         let k = one_key(&seq(b"\x1b[13;5u"));
         assert_eq!(k.code, KeyCode::Enter);
         assert!(k.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn modify_other_keys_tilde_form_decodes() {
+        // xterm `modifyOtherKeys` and tmux `extended-keys` (default xterm
+        // format) report keys as `CSI 27 ; mods ; codepoint ~`.
+        let k = one_key(&seq(b"\x1b[27;2;13~"));
+        assert_eq!((k.code, k.modifiers), (KeyCode::Enter, KeyModifiers::SHIFT));
+        let k = one_key(&seq(b"\x1b[27;5;13~"));
+        assert_eq!((k.code, k.modifiers), (KeyCode::Enter, KeyModifiers::CONTROL));
+        let k = one_key(&seq(b"\x1b[27;5;106~"));
+        assert_eq!(
+            (k.code, k.modifiers),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL)
+        );
+        let k = one_key(&seq(b"\x1b[27;2;9~"));
+        assert_eq!(k.code, KeyCode::BackTab);
+        let k = one_key(&seq(b"\x1b[27;3;127~"));
+        assert_eq!((k.code, k.modifiers), (KeyCode::Backspace, KeyModifiers::ALT));
+        // Without its key field the form is still no key (fail-open drop).
+        assert!(seq(b"\x1b[27;2~").is_empty());
+        assert!(seq(b"\x1b[27;2;x~").is_empty());
     }
 
     #[test]

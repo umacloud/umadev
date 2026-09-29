@@ -7760,7 +7760,10 @@ fn render_help_overlay(frame: &mut Frame, app: &App) {
                     ("↑ / ↓", umadev_i18n::t(lang, "tui.help.edit.recall")),
                     ("Tab", umadev_i18n::t(lang, "tui.help.edit.autocomplete")),
                     ("@", umadev_i18n::t(lang, "tui.help.key.mention")),
-                    ("Ctrl+V", umadev_i18n::t(lang, "tui.help.key.paste_image")),
+                    (
+                        "Ctrl+V / Alt+V",
+                        umadev_i18n::t(lang, "tui.help.key.paste_image"),
+                    ),
                     ("!", umadev_i18n::t(lang, "tui.help.key.shell")),
                     ("Shift+Tab", umadev_i18n::t(lang, "tui.help.key.trust")),
                     ("Ctrl+O", umadev_i18n::t(lang, "tui.help.key.expand_all")),
@@ -9977,7 +9980,10 @@ mod tests {
         assert!(out.contains(umadev_i18n::t(app.lang, "tui.help.group.editing").trim()));
         for label in [
             "Shift+Tab",
-            "Ctrl+V",
+            "Ctrl+V / Alt+V",
+            // Windows terminals keep Ctrl+V for their own paste: help must name
+            // the triggers that reach UmaDev there.
+            "/paste-image",
             "Ctrl+O",
             "Ctrl+R",
             "Ctrl+F",

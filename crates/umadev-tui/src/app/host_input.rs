@@ -254,6 +254,73 @@ mod tests {
     }
 
     #[test]
+    fn a_picker_paste_is_cleaned_like_a_composer_paste() {
+        // VTE / iTerm2 / Windows Terminal deliver pasted newlines as bare `\r`.
+        // Adopted raw, the note rendered its lines joined while the caret sat
+        // one column right per `\r`, and the answer carried the raw bytes.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = App::new(
+            "paste-picker-clean",
+            crate::config::UserConfig::default(),
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        let (_holder, _rx) = install_host_request(&mut app, 52, grok_question_request("plan"));
+        assert!(app.paste_into_active_picker("a\rb\x1b[31m!\x1b[0m\x07"));
+        assert_eq!(app.input, "a\nb!", "CR becomes a newline; escapes are gone");
+        let view = app.pending_host_input.as_ref().unwrap();
+        let HostInputKind::GrokQuestion(state) = &view.kind else {
+            panic!("expected a question picker");
+        };
+        assert_eq!(state.progress[state.current].notes, "a\nb!");
+        // The caret lands at the end of the rendered last row.
+        let rows = crate::ui::wrap_input_rows(&app.input, 40);
+        let last = rows.last().unwrap();
+        assert_eq!(
+            crate::ui::caret_in_wrapped(&app.input, app.input_cursor, 40),
+            (
+                u16::try_from(rows.len() - 1).unwrap(),
+                u16::try_from(last.width()).unwrap()
+            )
+        );
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut plan_app = App::new(
+            "paste-plan-clean",
+            crate::config::UserConfig::default(),
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        let (_holder, _rx) = install_host_request(&mut plan_app, 53, grok_plan_request("步骤一"));
+        assert!(plan_app.paste_into_active_picker("先改\r\n再测"));
+        assert_eq!(plan_app.input, "先改\n再测");
+    }
+
+    #[test]
+    fn a_paste_into_folder_trust_is_consumed_with_a_visible_note() {
+        // Folder trust takes no text. The paste used to fall through to the
+        // composer and be discarded silently later; now it is dropped on the
+        // spot and the user is told why.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut app = App::new(
+            "paste-folder-trust",
+            crate::config::UserConfig::default(),
+            tmp.path().join("config.toml"),
+            tmp.path().to_path_buf(),
+        );
+        let (_holder, _rx) = install_host_request(&mut app, 54, folder_trust_request());
+        let before = app.history.len();
+        assert!(app.paste_into_active_picker("yes trust it"));
+        assert!(app.input.is_empty(), "nothing reaches the composer");
+        assert_eq!(app.history.len(), before + 1, "one visible note");
+        assert_eq!(
+            app.history.back().unwrap().body(),
+            umadev_i18n::t(app.lang, "host.grok.folder_trust.paste_ignored")
+        );
+        assert!(app.pending_host_input.is_some(), "the decision stays pending");
+    }
+
+    #[test]
     fn approving_the_plan_under_the_read_only_tier_promotes_to_guarded_execution() {
         // "批准并开始实施" must actually lead to implementation: under the
         // read-only Plan tier the approval used to be a dead letter (writes
@@ -977,6 +1044,18 @@ fn wrap_plan_rows(plan: &str) -> Vec<String> {
     rows
 }
 
+/// Clean a paste before a picker adopts it as composer text, exactly as the
+/// composer's own paste does: CR / CRLF line breaks become `\n` (VTE, iTerm2
+/// and Windows Terminal deliver pasted newlines as bare `\r`), terminal escape
+/// sequences are removed, and any other control character except `\n` / `\t`
+/// is dropped.
+fn picker_paste_text(pasted: &str) -> String {
+    App::normalize_paste_text(pasted)
+        .chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
 fn set_composer_text(app: &mut App, text: String) {
     app.input = text;
     app.input_cursor = app.input.chars().count();
@@ -1015,7 +1094,7 @@ impl App {
                 } else {
                     state.focus = QuestionFocus::Notes;
                     let mut buffer = state.progress[state.current].notes.clone();
-                    buffer.push_str(pasted);
+                    buffer.push_str(&picker_paste_text(pasted));
                     set_composer_text(self, buffer.clone());
                     state.progress[state.current].notes = buffer;
                     true
@@ -1027,13 +1106,20 @@ impl App {
                 } else {
                     state.editing_feedback = true;
                     state.cursor = Some(1);
-                    set_composer_text(self, pasted.to_string());
+                    set_composer_text(self, picker_paste_text(pasted));
                     true
                 }
             }
             // FolderTrust takes no free text; drop the paste with a visible note
             // rather than stashing it in a composer the picker ignores.
-            HostInputKind::FolderTrust(_) | HostInputKind::Generic => false,
+            HostInputKind::FolderTrust(_) => {
+                self.push(
+                    ChatRole::System,
+                    umadev_i18n::t(self.lang, "host.grok.folder_trust.paste_ignored"),
+                );
+                true
+            }
+            HostInputKind::Generic => false,
         };
         self.pending_host_input = Some(view);
         consumed

@@ -76,6 +76,17 @@ fn is_esc_final(b: u8) -> bool {
     (0x30..=0x7e).contains(&b) || b == 0x08 || b == 0x7f
 }
 
+/// Whether `b`, right after a lone ESC, is the control byte of an Alt-modified
+/// control key: every C0 byte except ESC itself (`ESC ^D` is Ctrl+Alt+D,
+/// `ESC CR` Alt+Enter, `ESC TAB` Alt+Tab). Like BS/DEL it closes a two-byte
+/// sequence that `super::decode` maps to the ALT-modified key — the crossterm
+/// reading — instead of rewinding to text that decodes as a bare Esc plus the
+/// unmodified control key.
+#[inline]
+fn is_alt_control(b: u8) -> bool {
+    b < 0x20 && b != ESC
+}
+
 /// Length of the longest prefix of `bytes` that is **complete** valid UTF-8.
 ///
 /// Used at end-of-input in the ground state to hold back a partial trailing
@@ -298,8 +309,9 @@ impl Tokenizer {
                     } else if is_csi_intermediate(code) {
                         state = State::EscapeIntermediate;
                         i += 1;
-                    } else if is_esc_final(code) {
-                        // Two-byte escape (e.g. Alt+letter `ESC c`).
+                    } else if is_esc_final(code) || is_alt_control(code) {
+                        // Two-byte escape (e.g. Alt+letter `ESC c`, Ctrl+Alt+D
+                        // `ESC ^D`).
                         i += 1;
                         emit_seq!();
                     } else {
@@ -672,6 +684,40 @@ mod tests {
             assert!(tk.feed(&bytes[..1]).is_empty());
             assert_eq!(tk.feed(&bytes[1..]), vec![Token::Sequence(bytes.to_vec())]);
         }
+    }
+
+    #[test]
+    fn esc_plus_control_byte_is_one_two_byte_sequence() {
+        // ESC + a C0 byte is Alt+<control key> on ESC-prefix Meta terminals
+        // (`ESC ^D` = Ctrl+Alt+D, `ESC CR` = Alt+Enter). It must stay ONE
+        // sequence however the reads split it — rewound to text it decoded as
+        // a bare Esc plus the unmodified control key.
+        for bytes in [
+            b"\x1b\x04".as_slice(),
+            b"\x1b\x15".as_slice(),
+            b"\x1b\r".as_slice(),
+            b"\x1b\t".as_slice(),
+            b"\x1b\x00".as_slice(),
+            b"\x1b\x1f".as_slice(),
+        ] {
+            let mut tk = Tokenizer::for_stdin();
+            assert_eq!(
+                tk.feed(bytes),
+                vec![Token::Sequence(bytes.to_vec())],
+                "{bytes:?} must be one atomic two-byte sequence"
+            );
+            assert!(!tk.has_pending_escape());
+            let mut tk = Tokenizer::for_stdin();
+            assert!(tk.feed(&bytes[..1]).is_empty());
+            assert_eq!(tk.feed(&bytes[1..]), vec![Token::Sequence(bytes.to_vec())]);
+        }
+        // A control byte after an ESC *intermediate* still fails open to text:
+        // only the two-byte Alt form is widened.
+        let mut tk = Tokenizer::for_stdin();
+        assert_eq!(
+            normalize(&tk.feed(b"\x1b(\x04")),
+            vec![Token::Text("\x1b(\x04".into())]
+        );
     }
 
     #[test]

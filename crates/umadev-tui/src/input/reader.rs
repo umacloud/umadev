@@ -34,12 +34,12 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream};
-use futures::StreamExt;
 use tokio::sync::mpsc::Receiver;
 #[cfg(test)]
 use tokio::sync::mpsc::Sender;
 
 use super::decode::{Decoder, InputEvent};
+use super::legacy::LegacyInput;
 use super::tokenize::Tokenizer;
 
 /// Default lone-ESC flush timeout. Deferred-verdict window: a real Esc resolves
@@ -448,8 +448,9 @@ impl InputEvent {
 pub enum InputSource {
     /// The owned byte-tokenizer source (default).
     Owned(Box<OwnedInput>),
-    /// The legacy crossterm stream (`UMADEV_LEGACY_INPUT=1`).
-    Legacy(Box<EventStream>),
+    /// The legacy crossterm stream (`UMADEV_LEGACY_INPUT=1`; the Windows
+    /// default, where queued key bursts are delivered as pastes).
+    Legacy(Box<LegacyInput>),
 }
 
 impl InputSource {
@@ -457,7 +458,10 @@ impl InputSource {
     #[must_use]
     pub fn from_env() -> Self {
         if cfg!(windows) || legacy_input_from_env() {
-            InputSource::Legacy(Box::new(EventStream::new()))
+            InputSource::Legacy(Box::new(LegacyInput::new(
+                EventStream::new(),
+                cfg!(windows),
+            )))
         } else {
             InputSource::Owned(Box::<OwnedInput>::default())
         }

@@ -8648,8 +8648,8 @@ fn handle_mouse_event(app: &mut App, terminal: &mut Term, event: MouseEvent) {
     if handle_transcript_scrollbar_mouse(app, event) {
         return;
     }
-    let selection_enabled =
-        app.mouse_scroll && app.overlay.is_none() && matches!(app.mode, crate::app::AppMode::Chat);
+    // Help / an overlay / the picker hide the transcript: no selection or links.
+    let selection_enabled = app.transcript_mouse_enabled();
     let (column, row) = (event.column, event.row);
     match event.kind {
         MouseEventKind::ScrollUp => {
@@ -8700,9 +8700,9 @@ fn handle_transcript_scrollbar_mouse(app: &mut App, event: MouseEvent) -> bool {
 fn handle_paste_event(app: &mut App, pasted: &str) {
     if let Some(auth) = app.auth_ui.as_mut() {
         auth.handle_paste(pasted);
-    } else if app.paste_into_active_picker(pasted) {
-        // Consumed by the specialized picker (routed into its notes/feedback
-        // buffer) — never leak into the chat composer behind the picker.
+    } else if app.paste_into_modal(pasted) || app.paste_into_active_picker(pasted) {
+        // Consumed by the surface that owns the keyboard (a search query, a
+        // picker's notes buffer) — never leak into the composer behind it.
     } else {
         app.handle_paste(pasted);
     }

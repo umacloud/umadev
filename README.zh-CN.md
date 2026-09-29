@@ -734,6 +734,7 @@ umadev 有两套入口，一一对应：
 | `/setup` | 重新走首启底座选择器 |
 | `/logs` | 切换底座实时进程输出的可见性（默认关） |
 | `/mouse` · `/animations` · `/redraw` | 切换鼠标捕获 · 动画 · 强制重绘 |
+| `/paste-image`（或 Ctrl+V · Alt+V） | 从系统剪贴板附加图片；Windows 终端会把 Ctrl+V 留给自己的粘贴功能，请在那里改用 Alt+V 或这个命令 |
 | `/bug` | 打开预填的 bug 反馈 |
 | `/clear` | 清空聊天 |
 | `/quit`（或 Esc） | 退出（工作流状态已保存，可续跑） |

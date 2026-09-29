@@ -33,6 +33,7 @@ pub(crate) mod host_input;
 mod lessons_view;
 mod live_meta;
 mod memory_view;
+mod modal_input;
 pub(crate) mod permissions;
 mod plan_view;
 mod preview;
@@ -5178,9 +5179,7 @@ impl App {
     /// Start dragging the visible transcript scrollbar, if the point hits its track.
     pub(crate) fn transcript_scrollbar_begin(&mut self, col: u16, row: u16) -> bool {
         let (left, top, width, height) = self.transcript_scrollbar_area.get();
-        if !self.mouse_scroll
-            || self.overlay.is_some()
-            || !matches!(self.mode, AppMode::Chat)
+        if !self.transcript_mouse_enabled()
             || self.transcript_max_scroll.get() == 0
             || width == 0
             || height == 0
@@ -5271,37 +5270,6 @@ impl App {
     /// Jump to the renderer-published bottom of the help overlay.
     fn help_scroll_to_bottom(&mut self) {
         self.help_scroll = self.help_max_scroll.get();
-    }
-
-    /// Route one mouse-wheel notch (`up` = `ScrollUp`) to the right surface.
-    ///
-    /// Precedence: a modal **overlay**, when open, owns the viewport and scrolls
-    /// regardless of the `/mouse` wheel-capture toggle — it is content the user is
-    /// actively reading, so the wheel must move IT, not the transcript hidden
-    /// behind it (the reported "overlay won't scroll" was the wheel scrolling that
-    /// hidden transcript). With no overlay open, the wheel scrolls the chat
-    /// transcript, but only when wheel-capture is enabled (`/mouse`) and we're on
-    /// the chat screen, matching the existing chat-mode gating. Returns `true` if
-    /// the notch was consumed. Fail-open: an out-of-range notch is clamped by the
-    /// underlying scroll helpers, never panics.
-    pub fn mouse_wheel(&mut self, up: bool, step: usize) -> bool {
-        if let Some(ov) = self.overlay.as_mut() {
-            if up {
-                ov.scroll_up(step);
-            } else {
-                ov.scroll_down(step);
-            }
-            return true;
-        }
-        if self.mouse_scroll && matches!(self.mode, AppMode::Chat) {
-            if up {
-                self.transcript_scroll_up(step);
-            } else {
-                self.transcript_scroll_down(step);
-            }
-            return true;
-        }
-        false
     }
 
     /// Half the transcript viewport, for Ctrl-U / Ctrl-D — at least one row so a
@@ -5647,18 +5615,12 @@ impl App {
     #[must_use]
     pub fn link_target_at(&self, col: u16, row: u16) -> Option<String> {
         let point = self.map_mouse_point(col, row)?;
-        let candidate = {
+        let (line, off) = {
             let rows = self.transcript_rows.borrow();
             let wraps = self.transcript_row_wraps.borrow();
-            let (line, off) = crate::link::logical_line_at(&rows, &wraps, point.0, point.1)?;
-            crate::link::find_link(&line, off)?
+            crate::link::logical_line_at(&rows, &wraps, point.0, point.1)?
         };
-        match candidate {
-            crate::link::LinkCandidate::Url(url) => Some(url),
-            crate::link::LinkCandidate::Path(tok) => {
-                crate::link::resolve_path(&tok, &self.project_root).map(|p| p.display().to_string())
-            }
-        }
+        crate::link::link_target(&line, off, &self.project_root)
     }
 
     /// Ctrl+click at screen `(col, row)`: open the URL / existing file under
@@ -7405,6 +7367,13 @@ impl App {
             "tui.cmd.animations",
         ),
         Self::cmd("mouse", &[], None, CmdGroup::System, "tui.cmd.mouse"),
+        Self::cmd(
+            "paste-image",
+            &[],
+            None,
+            CmdGroup::System,
+            "tui.cmd.paste_image",
+        ),
         Self::cmd(
             "theme",
             &[],
@@ -9890,12 +9859,12 @@ impl App {
                 Action::None
             }
 
-            // Ctrl+V is the explicit image-clipboard action. A PTY cannot emit
-            // an image as bracketed paste, so the event loop asks the LOCAL OS
-            // clipboard on the blocking pool. Ordinary text paste remains an
-            // `Event::Paste` handled by `handle_paste` and never touches this
-            // arm — zero new work on the overwhelmingly common path.
-            KeyCode::Char('v') if ctrl && !alt => Action::PasteImage,
+            // Ctrl+V / Alt+V are the explicit image-clipboard action (Alt+V and
+            // `/paste-image` for Windows terminals that keep Ctrl+V for their own
+            // paste). A PTY cannot emit an image as bracketed paste, so the event
+            // loop asks the LOCAL OS clipboard on the blocking pool. Ordinary text
+            // paste remains an `Event::Paste` that never touches this arm.
+            KeyCode::Char('v') if ctrl ^ alt => Action::PasteImage,
 
             // ---- enter: accept the highlighted @-mention (popover open) ----
             // Wins over submit so Enter on the file typeahead inserts the path
@@ -12922,6 +12891,7 @@ impl App {
             "usage" => self.slash_usage(),
             "animations" => self.slash_toggle_animations(),
             "mouse" => self.slash_toggle_mouse(),
+            "paste-image" => Action::PasteImage,
             "theme" => self.slash_theme(rest),
             "logs" => self.slash_logs(),
             "questions" => self.slash_questions(rest),

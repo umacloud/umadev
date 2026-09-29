@@ -681,6 +681,7 @@ Typing `/` in the TUI opens a command palette — `Tab` to autocomplete, `↑`/`
 | `/setup` | Re-run the first-launch base picker |
 | `/logs` | Toggle visibility of the base's live process output (off by default) |
 | `/mouse` · `/animations` · `/redraw` | Toggle mouse capture · animations · force a repaint |
+| `/paste-image` (or Ctrl+V · Alt+V) | Attach an image from the system clipboard; Windows terminals keep Ctrl+V for their own paste, so use Alt+V or this command there |
 | `/bug` | Open a pre-filled bug report |
 | `/clear` | Clear the chat |
 | `/quit` (or Esc) | Exit (workflow state is saved, resumable) |
