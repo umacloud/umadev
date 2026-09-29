@@ -300,6 +300,24 @@ pub(crate) fn budget_exhausted(
     now >= hard_cap || now.saturating_duration_since(last_progress) >= idle
 }
 
+/// Where the scheduler's sliding between-steps window restarts once a step settles.
+/// The window counts wall-clock WITHOUT base activity: a doer or review turn that
+/// actually ran is activity even when the step then failed its acceptance. Only a
+/// step whose base completed no turn leaves the window running. Pure.
+#[must_use]
+pub(crate) fn slide_step_budget_clock(
+    last_activity: std::time::Instant,
+    drove: bool,
+    made_progress: bool,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    if drove || made_progress {
+        now
+    } else {
+        last_activity
+    }
+}
+
 /// The EFFECTIVE deadline instant for the next idle wait: the sliding idle window
 /// (`last_progress + idle`) clamped to never exceed the ABSOLUTE `hard_cap`. Threaded
 /// as the run-budget `deadline` into [`next_event_idle`] so a live-but-silent tool is
@@ -2189,15 +2207,18 @@ async fn drive_plan_steps(
         // Fail-open. This is what keeps `/status` honest as the build progresses.
         sync_phase_from_plan(plan, options);
 
-        // SLIDING run-budget reset (Stage 3): a step that made genuine forward
-        // progress is base productivity at the scheduling level — slide the between-
-        // steps idle window so a build that keeps completing (even slow) steps is
-        // never guillotined between them (bounded only by the ABSOLUTE cap). A step
-        // that drove NOTHING forward does not reset it, so a truly stalled run still
-        // winds down to a resumable budget pause.
-        if made_progress {
-            last_progress = std::time::Instant::now();
-        }
+        // SLIDING run-budget reset (Stage 3): a step whose turn the base actually ran
+        // is base activity at the scheduling level, accepted or not — slide the
+        // between-steps idle window so a build that keeps working (even slow, even
+        // through failed acceptance) is bounded only by the ABSOLUTE cap, as
+        // CONFIG.md documents. A step whose base completed no turn does not reset it,
+        // so a truly stalled run still winds down to a resumable budget pause.
+        last_progress = slide_step_budget_clock(
+            last_progress,
+            drove,
+            made_progress,
+            std::time::Instant::now(),
+        );
 
         if status == StepStatus::Done && made_progress {
             let kind = match step.kind {

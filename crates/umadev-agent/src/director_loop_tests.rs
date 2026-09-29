@@ -3416,6 +3416,35 @@ fn budget_exhausted_slides_on_productivity_but_keeps_an_absolute_cap() {
 }
 
 #[test]
+fn a_driven_step_that_fails_acceptance_still_slides_the_between_steps_window() {
+    // CONFIG.md: the director budget is an idle window of NO base activity. Two
+    // steps whose turns the base worked through for 20 minutes each, both Blocked by
+    // their acceptance, are 40 minutes of activity: the run must not pause at the
+    // 30-minute window between them, only at the absolute cap.
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let idle = Duration::from_secs(30 * 60);
+    let hard_cap = start + idle * RUN_BUDGET_ABSOLUTE_MULT;
+    let first = start + Duration::from_secs(20 * 60);
+    let clock = slide_step_budget_clock(start, true, false, first);
+    let second = first + Duration::from_secs(20 * 60);
+    let clock = slide_step_budget_clock(clock, true, false, second);
+    assert!(
+        !budget_exhausted(second, hard_cap, clock, idle),
+        "an active build is not paused between steps"
+    );
+    assert!(budget_exhausted(hard_cap, hard_cap, hard_cap, idle));
+
+    // A step whose base completed no turn is no activity: a stalled run still winds
+    // down one window after the last activity.
+    let stalled = slide_step_budget_clock(start, false, false, first);
+    assert_eq!(stalled, start);
+    assert!(budget_exhausted(start + idle, hard_cap, stalled, idle));
+    // Accepted progress (e.g. a step verified on evidence alone) still counts.
+    assert_eq!(slide_step_budget_clock(start, false, true, first), first);
+}
+
+#[test]
 fn sliding_deadline_clamps_the_idle_window_to_the_absolute_cap() {
     use std::time::{Duration, Instant};
     let now = Instant::now();
