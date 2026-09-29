@@ -312,22 +312,10 @@ impl PlanTaskTracker {
     /// Task ids the run still answers for: the coordinator, the latest attempt of
     /// every step in the active plan, and the base-native children of those attempts.
     fn current_task_ids(&self) -> BTreeSet<&str> {
-        let attempts = self
-            .logical_to_task
-            .values()
-            .map(String::as_str)
-            .collect::<BTreeSet<_>>();
-        let children = self.ledger.tasks().filter(|task| {
-            task.parent_task_id
-                .as_deref()
-                .is_some_and(|parent| attempts.contains(parent))
-        });
-        let mut current = children
-            .map(|task| task.task_id.as_str())
-            .collect::<BTreeSet<_>>();
-        current.extend(attempts);
-        current.insert(ROOT_TASK_ID);
-        current
+        current_tasks(
+            &self.ledger,
+            self.logical_to_task.values().map(String::as_str).collect(),
+        )
     }
 
     /// Settle the coordinator and return the mechanically-derived run readiness
@@ -629,6 +617,63 @@ fn existing_step_tasks(ledger: &AgentTaskLedger, plan: &Plan) -> BTreeMap<String
                 .map(|task_id| (step.id.clone(), task_id))
         })
         .collect()
+}
+
+/// Task ids a run still answers for, given each step's current attempt: the
+/// coordinator, those attempts, and the base-native children of those attempts.
+fn current_tasks<'a>(
+    ledger: &'a AgentTaskLedger,
+    attempts: BTreeSet<&'a str>,
+) -> BTreeSet<&'a str> {
+    let mut current = ledger
+        .tasks()
+        .filter(|task| {
+            task.parent_task_id
+                .as_deref()
+                .is_some_and(|parent| attempts.contains(parent))
+        })
+        .map(|task| task.task_id.as_str())
+        .collect::<BTreeSet<_>>();
+    current.extend(attempts);
+    current.insert(ROOT_TASK_ID);
+    current
+}
+
+/// A director plan's run readiness from its ledger alone, for status surfaces such
+/// as `/tasks`, judged like [`PlanTaskTracker::readiness`]: on each logical step's
+/// LATEST attempt (with that attempt's base-native children) plus the coordinator,
+/// so an earlier attempt of a retried step is history. `None` for a ledger that no
+/// director plan wrote.
+///
+/// Without the plan, a step's attempts are grouped by their shared task-id prefix,
+/// so the task of a step a validated re-plan removed still reads as current here.
+/// A coordinator that settled successfully has already judged exactly the plan's
+/// latest attempts ([`PlanTaskTracker::finish`]), so its success stands.
+pub(crate) fn plan_ledger_readiness(ledger: &AgentTaskLedger) -> Option<RunReadiness> {
+    let coordinator = ledger
+        .task(ROOT_TASK_ID)
+        .filter(|task| task.parent_task_id.is_none())?;
+    if coordinator.state == AgentTaskState::Succeeded {
+        return Some(RunReadiness::Succeeded);
+    }
+    let mut latest = BTreeMap::<&str, &str>::new();
+    for task in ledger.tasks() {
+        if let Some(step) = step_attempt_base(&task.task_id) {
+            let attempt = latest.entry(step).or_default();
+            *attempt = (*attempt).max(task.task_id.as_str());
+        }
+    }
+    let current = current_tasks(ledger, latest.into_values().collect());
+    Some(ledger.readiness_of(|task| current.contains(task.task_id.as_str())))
+}
+
+/// The logical-step prefix of a plan-step attempt id (`step-<digest>-NNN` →
+/// `step-<digest>-`, as [`step_task_id`] mints it), or `None` for any other task.
+fn step_attempt_base(task_id: &str) -> Option<&str> {
+    let (digest, attempt) = task_id.strip_prefix("step-")?.split_once('-')?;
+    let is_digest = digest.len() == 16 && digest.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let is_attempt = !attempt.is_empty() && attempt.bytes().all(|byte| byte.is_ascii_digit());
+    (is_digest && is_attempt).then(|| &task_id[..task_id.len() - attempt.len()])
 }
 
 fn task_mode(step: &PlanStep) -> AgentTaskMode {
@@ -980,6 +1025,113 @@ mod tests {
             tracker.finish(true, "delivered", vec![]).unwrap(),
             RunReadiness::Blocked(_)
         ));
+        assert!(matches!(
+            listed_readiness(temp.path(), tracker.run_id()),
+            RunReadiness::Blocked(_)
+        ));
+    }
+
+    /// The run's readiness as the `/tasks` list shows it.
+    fn listed_readiness(root: &Path, run_id: &str) -> RunReadiness {
+        crate::task_lifecycle::recent_agent_runs(root, 8)
+            .into_iter()
+            .find(|run| run.run_id == run_id)
+            .map(|run| run.readiness)
+            .expect("the run is listed")
+    }
+
+    #[test]
+    fn the_run_list_judges_a_retried_step_by_its_latest_attempt() {
+        // `/tasks` labelled a delivered run "failed": it judged every attempt,
+        // including the failed first attempt of a step `/continue` repaired.
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan();
+        {
+            let mut tracker =
+                PlanTaskTracker::open(temp.path(), "codex", "build API", &plan).unwrap();
+            tracker.start_step(&plan, &plan.steps[0]).unwrap();
+            tracker
+                .settle_step(
+                    &plan.steps[0],
+                    StepStatus::Blocked,
+                    false,
+                    "acceptance failed",
+                    vec!["src/api.rs is absent".into()],
+                )
+                .unwrap();
+            tracker.wait_for_user("run time budget exhausted").unwrap();
+            // Parked with that failure as the step's latest attempt: still failed.
+            assert!(matches!(
+                listed_readiness(temp.path(), tracker.run_id()),
+                RunReadiness::Blocked(_)
+            ));
+        }
+        let mut tracker = PlanTaskTracker::open(temp.path(), "codex", "build API", &plan).unwrap();
+        tracker.start_step(&plan, &plan.steps[0]).unwrap();
+        tracker
+            .settle_step(&plan.steps[0], StepStatus::Done, false, "green", vec![])
+            .unwrap();
+        // The repair passed, so the run is under way again, not failed.
+        assert_eq!(
+            listed_readiness(temp.path(), tracker.run_id()),
+            RunReadiness::InProgress
+        );
+        tracker.start_step(&plan, &plan.steps[1]).unwrap();
+        tracker
+            .settle_step(&plan.steps[1], StepStatus::Done, false, "clean", vec![])
+            .unwrap();
+        assert_eq!(
+            tracker.finish(true, "delivered", vec![]).unwrap(),
+            RunReadiness::Succeeded
+        );
+        assert_eq!(
+            listed_readiness(temp.path(), tracker.run_id()),
+            RunReadiness::Succeeded
+        );
+        let listed = crate::task_lifecycle::recent_agent_runs(temp.path(), 8);
+        assert!(
+            listed
+                .iter()
+                .flat_map(|run| &run.tasks)
+                .any(|task| task.state == AgentTaskState::Failed),
+            "the failed first attempt is still listed, as history"
+        );
+    }
+
+    #[test]
+    fn the_run_list_shows_a_delivered_run_with_a_replanned_step_as_done() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut plan = plan();
+        let mut tracker = PlanTaskTracker::open(temp.path(), "codex", "build API", &plan).unwrap();
+        tracker.start_step(&plan, &plan.steps[0]).unwrap();
+        tracker
+            .settle_step(
+                &plan.steps[0],
+                StepStatus::Blocked,
+                false,
+                "acceptance failed",
+                vec!["no route".into()],
+            )
+            .unwrap();
+        plan.steps = vec![
+            step("api2", StepKind::Build, &[]),
+            step("review2", StepKind::Review, &["api2"]),
+        ];
+        for index in 0..plan.steps.len() {
+            let step = plan.steps[index].clone();
+            tracker.start_step(&plan, &step).unwrap();
+            tracker
+                .settle_step(&step, StepStatus::Done, false, "green", vec![])
+                .unwrap();
+        }
+        assert_eq!(
+            tracker.finish(true, "delivered", vec![]).unwrap(),
+            RunReadiness::Succeeded
+        );
+        assert_eq!(
+            listed_readiness(temp.path(), tracker.run_id()),
+            RunReadiness::Succeeded
+        );
     }
 
     #[test]

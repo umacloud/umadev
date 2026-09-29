@@ -166,7 +166,9 @@ pub struct AgentRunSnapshot {
     pub run_id: String,
     /// Pointer creation time used for newest-first ordering.
     pub created_at: String,
-    /// Mechanically-derived run state.
+    /// Mechanically-derived run state. A director plan's run is judged on each
+    /// logical step's latest attempt, as the run itself is: an earlier attempt of a
+    /// retried step is history, listed in `tasks` but never a failure of the run.
     pub readiness: RunReadiness,
     /// Current task records, including immutable prior attempts.
     pub tasks: Vec<AgentTaskRecord>,
@@ -1351,7 +1353,8 @@ pub fn recent_agent_runs(project_root: &Path, limit: usize) -> Vec<AgentRunSnaps
             Some(AgentRunSnapshot {
                 run_id: pointer.run_id,
                 created_at: pointer.created_at,
-                readiness: ledger.readiness(),
+                readiness: crate::plan_tasks::plan_ledger_readiness(&ledger)
+                    .unwrap_or_else(|| ledger.readiness()),
                 tasks: ledger.tasks().cloned().collect(),
             })
         })
