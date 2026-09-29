@@ -3862,6 +3862,61 @@ async fn routed_loop_emits_intent_decided() {
 }
 
 #[tokio::test]
+async fn failed_synthesis_does_not_reuse_the_previous_plan() {
+    // A second deliberate run whose planning turn fails open (the base replied with
+    // no JSON) builds in one end-to-end turn. It must not be judged against the
+    // PREVIOUS run's plan (its new file would read as unplanned work to delete), and
+    // `/continue` must not later resume the old plan under the new requirement.
+    use crate::plan_state::{AcceptanceSpec, Plan, PlanStep, StepKind};
+    let tmp = tempfile::TempDir::new().unwrap();
+    seed_source(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    let old = Plan {
+        steps: vec![PlanStep {
+            files: plan_state::StepFiles {
+                create: vec!["old/".into()],
+                modify: Vec::new(),
+            },
+            id: "old-api".into(),
+            title: "Build the old API".into(),
+            seat: crate::critics::Seat::BackendEngineer,
+            kind: StepKind::Build,
+            depends_on: Vec::new(),
+            acceptance: AcceptanceSpec::SourcePresent,
+            evidence: Vec::new(),
+            status: StepStatus::Pending,
+        }],
+        risks: Vec::new(),
+        open_questions: Vec::new(),
+    };
+    plan_state::save(&old, tmp.path()).unwrap();
+    let (events, _rec) = sink();
+    let mut sess = FakeSession::new(
+        vec![
+            text_turn("not json at all"),
+            text_turn("Built the new feature. Done."),
+        ],
+        true,
+        r#"{"accepts": true, "blocking": []}"#,
+    )
+    .with_main_send_write(tmp.path().join("src/new.ts"), "export const fresh = 1;\n");
+    let o = opts(tmp.path());
+    let route = build_route();
+
+    let outcome =
+        drive_director_loop_routed(&mut sess, &o, &events, "GO".into(), Some(&route)).await;
+    assert!(
+        !matches!(&outcome, DirectorLoopOutcome::Failed(reason) if reason.contains("src/new.ts")),
+        "{outcome:?}"
+    );
+    assert!(
+        plan_state::load(tmp.path()).is_none_or(|p| !p.steps.iter().any(|s| s.id == "old-api")),
+        "the previous run's plan must not stand in for this run's"
+    );
+    assert!(!has_resumable_director_plan(tmp.path()));
+}
+
+#[tokio::test]
 async fn routed_loop_synthesizes_and_posts_a_plan_when_the_brain_replies() {
     // The planning turn runs on the MAIN session (its first turn) and replies
     // with a valid plan JSON → the loop synthesises the plan, persists

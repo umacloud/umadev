@@ -388,6 +388,16 @@ fn plan_repair_closed(root: &Path) -> bool {
     .is_ok()
 }
 
+/// Retire the previous run's plan when a FRESH routed run starts. If this run's
+/// planning turn fails open, its changes must not be judged against the old plan's
+/// claims, and `/continue` must not resume the old plan's steps under the new
+/// requirement. A plan this run synthesises is saved in its place.
+pub(super) fn retire_previous_plan(root: &Path) {
+    if let Some(dir) = existing_umadev_dir(root) {
+        let _ = umadev_state::fs::remove_regular_file(&dir.join(crate::run_provenance::PLAN));
+    }
+}
+
 fn existing_umadev_dir(root: &Path) -> Option<std::path::PathBuf> {
     let canonical_root = std::fs::canonicalize(root).ok()?;
     if !umadev_state::fs::real_dir(&canonical_root) {

@@ -823,6 +823,9 @@ pub async fn drive_director_loop_routed(
         events.emit(EngineEvent::Note(format!("team · {reason}")));
         return DirectorLoopOutcome::Failed(reason);
     }
+    // Nor may a planning turn that fails open leave this run judged against, or
+    // `/continue` resuming, the previous run's plan.
+    resume::retire_previous_plan(&options.project_root);
 
     // Attribute governance findings to this run. The snapshot survives a
     // cross-process `/continue`, so unchanged brownfield findings are not
