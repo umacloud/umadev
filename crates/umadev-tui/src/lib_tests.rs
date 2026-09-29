@@ -332,8 +332,10 @@ fn delivery_receipt_shows_actual_modes_sizes_and_mime_without_paths() {
     };
     let status = delivery_report_status(&report);
 
-    assert!(status.contains("Native"));
-    assert!(status.contains("MaterializedText"));
+    // The delivery labels are localized (e.g. 原生 / 转为文本 in zh-CN), and the
+    // UI language is process-wide, so compare against the active catalog.
+    assert!(status.contains(umadev_i18n::tl("input.delivery.native")));
+    assert!(status.contains(umadev_i18n::tl("input.delivery.materialized_text")));
     assert!(status.contains("2.0 KiB"));
     assert!(status.contains("1.0 MiB"));
     assert!(status.contains("image/png"));
