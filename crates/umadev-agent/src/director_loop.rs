@@ -441,14 +441,14 @@ pub(crate) enum IdleEvent {
     },
     /// The watchdog settled the turn without a real event — either a NON-tool hang
     /// (no event for the base window with no tool in flight → genuinely hung, so the
-    /// watchdog issued a best-effort, bounded `interrupt()` before settling), OR a base
-    /// that was still mid-tool when the overall run-budget `deadline` was reached (the
-    /// liveness backstop: a live base running a tool keeps waiting only until the run
-    /// budget is exhausted, then settles WITHOUT an interrupt — the run finalization /
-    /// `session.end()` releases it). The pump settles the turn as a failure so
-    /// `thinking` clears rather than blocking forever. Carries the base's diagnosis
-    /// captured at the settle (for the hang case, AFTER the bounded interrupt — an
-    /// interrupt may have made a hung child exit, surfacing its status/stderr).
+    /// watchdog interrupted it, bounded, closing a session whose turn did not settle),
+    /// OR a base that was still mid-tool when the overall run-budget `deadline` was
+    /// reached (the liveness backstop: a live base running a tool keeps waiting only
+    /// until the run budget is exhausted, then settles WITHOUT an interrupt — the run
+    /// finalization / `session.end()` releases it). The pump settles the turn as a
+    /// failure so `thinking` clears rather than blocking forever. Carries the base's
+    /// diagnosis captured at the settle (for the hang case, AFTER the interrupt — an
+    /// interrupt or a close may have made a hung child exit, surfacing its status).
     IdleTimedOut {
         /// The base child's exit status if it had already exited (else `None`).
         exit: Option<std::process::ExitStatus>,
@@ -477,9 +477,9 @@ pub(crate) enum IdleEvent {
 ///   [`IdleEvent::IdleTimedOut`]). A tool of ANY duration with a live base survives.
 /// - **No tool in flight** (`in_tool_call == false`): the `budget.base` window IS the
 ///   hang deadline — pure silence past it means the base is genuinely hung, so the
-///   watchdog issues a best-effort `interrupt()` (itself bounded by
-///   [`INTERRUPT_TIMEOUT_SECS`] so a wedged interrupt path can't re-introduce the hang)
-///   and settles as [`IdleEvent::IdleTimedOut`]. The non-tool case is NEVER unbounded.
+///   watchdog interrupts it (bounded by [`INTERRUPT_TIMEOUT_SECS`]), closes a session
+///   whose turn did not settle (it could end the next turn), and settles as
+///   [`IdleEvent::IdleTimedOut`]. The non-tool case is NEVER unbounded.
 ///
 /// ANY real event returns immediately ([`IdleEvent::Event`]); the caller loops, calling
 /// this again, so the next wait re-reads the window for the (possibly changed)
@@ -540,15 +540,15 @@ pub(crate) async fn next_event_idle(
                     continue;
                 }
                 // NOT in a tool → pure silence past the base window means the base is
-                // genuinely hung. Best-effort interrupt to release the child, bounded
-                // so a dead pipe can't wedge it (the watchdog must always make
-                // progress), then settle. Capture AFTER the interrupt — a hung child
-                // the interrupt just killed now has an exit status / final stderr line.
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
-                    session.interrupt(),
-                )
-                .await;
+                // genuinely hung. Interrupt it, bounded so a dead pipe can't wedge the
+                // watchdog (it must always make progress), then settle. A turn the
+                // interrupt did not settle may still end later and land in the next
+                // turn, so its session is closed and the caller cannot re-drive onto
+                // it (see `crate::turn_interrupt`). Capture AFTER the interrupt — a
+                // hung child the interrupt (or the close) just ended now has an exit
+                // status / final stderr line.
+                let bound = Duration::from_secs(INTERRUPT_TIMEOUT_SECS);
+                crate::turn_interrupt::interrupt_or_close(session, bound).await;
                 return IdleEvent::IdleTimedOut {
                     exit: session.try_exit_status(),
                     stderr_tail: session.stderr_tail(),
@@ -5826,11 +5826,11 @@ async fn drive_one_turn_with_backoff_and_memories(
         // turn runs to the absolute cap; a silent one settles after one idle window.
         let eff = sliding_deadline(deadline, last_progress, idle_window);
         if std::time::Instant::now() >= eff {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
-                session.interrupt(),
-            )
-            .await;
+            // An interrupt that did not settle closes the session: the turn could
+            // still end later, and a later step's turn would read that end as its own
+            // (see `crate::turn_interrupt`).
+            let bound = Duration::from_secs(INTERRUPT_TIMEOUT_SECS);
+            crate::turn_interrupt::interrupt_or_close(session, bound).await;
             record_turn_usage(options, events, None, est_tokens);
             capture_turn_pitfalls(options, events, &pitfalls);
             events.emit(EngineEvent::Note(
@@ -5897,11 +5897,11 @@ async fn drive_one_turn_with_backoff_and_memories(
                 // delivery purely because the deadline happened to land mid-tool rather
                 // than mid-stream).
                 if in_tool_call && std::time::Instant::now() >= eff {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(INTERRUPT_TIMEOUT_SECS),
-                        session.interrupt(),
-                    )
-                    .await;
+                    // Stopped like the mid-turn budget settle above: an interrupt
+                    // that did not settle closes the session, so no later step reads
+                    // this turn's late end as its own.
+                    let bound = Duration::from_secs(INTERRUPT_TIMEOUT_SECS);
+                    crate::turn_interrupt::interrupt_or_close(session, bound).await;
                     record_turn_usage(options, events, None, est_tokens);
                     capture_turn_pitfalls(options, events, &pitfalls);
                     events.emit(EngineEvent::Note(
@@ -5918,13 +5918,13 @@ async fn drive_one_turn_with_backoff_and_memories(
                 }
                 // Watchdog re-drive (bounded SINGLE retry): a NON-tool silent hang on a
                 // base that is STILL ALIVE (no exit captured even after the watchdog's
-                // bounded interrupt) may be a SILENTLY DROPPED stream, not a dead base —
-                // so re-drive the SAME directive ONCE before failing. Strictly gated so
-                // it never fights the legitimate long-tool wait: it fires ONLY when no
-                // tool was in flight (`!in_tool_call`, so the in-tool budget-reached
-                // settle is excluded), the base is alive (`exit.is_none()`), and we have
+                // settled interrupt; one that did not settle closed the session) may be
+                // a SILENTLY DROPPED stream, not a dead base — so re-drive the SAME
+                // directive ONCE before failing. Strictly gated so it never fights the
+                // legitimate long-tool wait: it fires ONLY when no tool was in flight
+                // (`!in_tool_call`), the base is alive (`exit.is_none()`), and we have
                 // not already re-driven. Fail-open: a re-send error, a second hang, or a
-                // dead base all fall through to the honest failure below.
+                // dead or closed base all fall through to the honest failure below.
                 if !in_tool_call && exit.is_none() && !watchdog_retried {
                     watchdog_retried = true;
                     // The abandoned (hung) attempt still spent its tokens — record the

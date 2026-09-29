@@ -2334,6 +2334,189 @@ async fn non_tool_silent_hang_on_a_live_base_redrives_once_then_fails() {
     );
 }
 
+/// A hung base whose interrupt never settles (`InterruptPending`), like a real
+/// driver: once closed it refuses sends and reports its process exit. Counts the
+/// turns it actually accepted and how often it was closed.
+struct UnsettledHangSession {
+    sends: Arc<std::sync::Mutex<u32>>,
+    ends: Arc<std::sync::Mutex<u32>>,
+    exited: Option<std::process::ExitStatus>,
+    /// Start a tool before hanging, so the hang is mid-tool.
+    tool_first: bool,
+}
+
+impl UnsettledHangSession {
+    fn new() -> Self {
+        Self {
+            sends: Arc::new(std::sync::Mutex::new(0)),
+            ends: Arc::new(std::sync::Mutex::new(0)),
+            exited: None,
+            tool_first: false,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BaseSession for UnsettledHangSession {
+    async fn send_turn(&mut self, _directive: String) -> Result<(), SessionError> {
+        if self.exited.is_some() {
+            return Err(SessionError::Closed);
+        }
+        *self.sends.lock().unwrap() += 1;
+        Ok(())
+    }
+    async fn next_event(&mut self) -> Option<SessionEvent> {
+        if std::mem::take(&mut self.tool_first) {
+            return Some(SessionEvent::ToolCall {
+                name: "Bash".into(),
+                input: serde_json::json!({"command": "docker build ."}),
+            });
+        }
+        std::future::pending::<()>().await;
+        None
+    }
+    async fn respond(
+        &mut self,
+        _req_id: &str,
+        _decision: ApprovalDecision,
+    ) -> Result<(), SessionError> {
+        Ok(())
+    }
+    async fn interrupt(&mut self) -> Result<(), SessionError> {
+        Err(SessionError::InterruptPending(
+            "the hung turn has not ended".into(),
+        ))
+    }
+    async fn end(&mut self) -> Result<(), SessionError> {
+        *self.ends.lock().unwrap() += 1;
+        self.exited = Some(a_real_exit_status());
+        Ok(())
+    }
+    fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+        self.exited
+    }
+}
+
+#[tokio::test]
+async fn next_event_idle_closes_a_session_whose_interrupt_does_not_settle() {
+    // The hung turn may still end later; left open, its result would end the next
+    // turn sent on this session.
+    let mut sess = UnsettledHangSession::new();
+    let ends = Arc::clone(&sess.ends);
+    let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
+    let ev = tokio::time::timeout(
+        Duration::from_secs(10),
+        next_event_idle(&mut sess, budget, false, None),
+    )
+    .await
+    .expect("the watchdog settles");
+    assert!(
+        matches!(ev, IdleEvent::IdleTimedOut { exit: Some(_), .. }),
+        "the closed base's exit is surfaced: {ev:?}"
+    );
+    assert_eq!(*ends.lock().unwrap(), 1, "the unsettled session is closed");
+}
+
+#[tokio::test]
+async fn non_tool_hang_whose_interrupt_does_not_settle_is_not_redriven() {
+    // A re-drive would send the same directive onto a session whose hung turn can
+    // still deliver its result, ending the re-driven turn with it and leaving the
+    // conversation one turn out of step. The turn fails honestly instead.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, rec) = sink();
+    let mut sess = UnsettledHangSession::new();
+    let sends = Arc::clone(&sess.sends);
+    let budget = IdleBudget::new(Duration::from_millis(20), Duration::from_millis(20));
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        drive_one_turn(
+            &mut sess,
+            &opts(tmp.path()),
+            &events,
+            "build it".to_string(),
+            budget,
+            std::time::Instant::now() + Duration::from_secs(3_600),
+        ),
+    )
+    .await
+    .expect("the watchdog settles");
+    match out {
+        Err(reason) => assert!(
+            reason.contains("UMADEV_IDLE_TIMEOUT_SECS"),
+            "the hang fails honestly as an idle settle: {reason}"
+        ),
+        Ok(_) => panic!("a hung base must fail its turn"),
+    }
+    assert_eq!(
+        *sends.lock().unwrap(),
+        1,
+        "no turn is re-driven onto a session whose interrupt did not settle"
+    );
+    // In any language: the UI language is process-wide state.
+    let is_redrive = |note: &str| {
+        umadev_i18n::Lang::ALL
+            .iter()
+            .any(|&lang| note == umadev_i18n::t(lang, "tui.retry.silent_redrive"))
+    };
+    assert!(
+        !rec.events()
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Note(n) if is_redrive(n))),
+        "no re-drive is announced"
+    );
+}
+
+#[tokio::test]
+async fn a_run_budget_settle_closes_a_session_whose_interrupt_does_not_settle() {
+    // The budget settle hands the step on gracefully, and a later step can run on
+    // the same session, so a turn the interrupt did not settle must not stay open to
+    // end that step's turn. Covers the deadline passing mid-turn and mid-tool.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (events, rec) = sink();
+    let budget = IdleBudget::new(Duration::from_millis(40), Duration::from_millis(20));
+    for tool_first in [false, true] {
+        let mut sess = UnsettledHangSession::new();
+        sess.tool_first = tool_first;
+        let ends = Arc::clone(&sess.ends);
+        let deadline = std::time::Instant::now() + Duration::from_millis(100);
+        let deadline = if tool_first {
+            deadline
+        } else {
+            std::time::Instant::now()
+        };
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            drive_one_turn(
+                &mut sess,
+                &opts(tmp.path()),
+                &events,
+                "build it".to_string(),
+                budget,
+                deadline,
+            ),
+        )
+        .await
+        .expect("the budget settles");
+        assert!(
+            out.is_ok(),
+            "the settle stays graceful (mid-tool: {tool_first})"
+        );
+        assert_eq!(
+            *ends.lock().unwrap(),
+            1,
+            "the unsettled session is closed (mid-tool: {tool_first})"
+        );
+    }
+    for path in ["run budget reached mid-turn", "run budget reached mid-tool"] {
+        assert!(
+            rec.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::Note(n) if n.contains(path))),
+            "the {path} settle ran"
+        );
+    }
+}
+
 #[tokio::test]
 async fn in_tool_silent_hang_on_a_live_base_never_redrives() {
     // Part 2 guard: an IN-TOOL live base (a long `docker build`) goes silent but must

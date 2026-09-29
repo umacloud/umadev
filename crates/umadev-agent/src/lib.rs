@@ -108,6 +108,7 @@ pub mod task_lifecycle;
 pub mod tech_debt;
 pub mod test_integrity;
 pub mod trust;
+pub(crate) mod turn_interrupt;
 pub mod usage_ledger;
 pub mod verify;
 pub mod workspace_diff;

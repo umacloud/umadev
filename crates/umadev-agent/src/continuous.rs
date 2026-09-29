@@ -962,11 +962,11 @@ async fn drive_phase(
         // the absolute cap; a streaming turn keeps `eff` ahead.
         let eff = crate::director_loop::sliding_deadline(deadline, last_progress, idle_window);
         if std::time::Instant::now() >= eff {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS),
-                session.interrupt(),
-            )
-            .await;
+            // An interrupt that did not settle closes the session, so the next turn
+            // fails to send instead of reading this turn's late end as its own.
+            let bound =
+                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS);
+            crate::turn_interrupt::interrupt_or_close(session, bound).await;
             events.emit(EngineEvent::Note(
                 "team · run budget reached mid-turn — interrupted the base and finalizing \
                  on what's built (raise UMADEV_RUN_BUDGET_SECS for a longer run)"
@@ -2959,11 +2959,11 @@ async fn drive_rework_turn_with_idle_and_memories(
         // turn keeps `eff` ahead, so only a stalled turn or the absolute cap settles.
         let eff = crate::director_loop::sliding_deadline(deadline, last_progress, idle_window);
         if std::time::Instant::now() >= eff {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS),
-                session.interrupt(),
-            )
-            .await;
+            // An interrupt that did not settle closes the session, so the next turn
+            // fails to send instead of reading this turn's late end as its own.
+            let bound =
+                std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS);
+            crate::turn_interrupt::interrupt_or_close(session, bound).await;
             crate::director_loop::record_estimated_usage(&options.backend, est_tokens);
             events.emit(EngineEvent::Note(
                 "team · run budget reached mid-turn — interrupted the base and finalizing \
@@ -4843,6 +4843,11 @@ mod tests {
         /// Count of `interrupt()` calls — a test asserts the idle watchdog issued
         /// its best-effort interrupt before settling.
         interrupts: Arc<Mutex<usize>>,
+        /// When true, `interrupt()` reports the turn as still running
+        /// (`InterruptPending`), as a real driver does when the turn did not end.
+        interrupt_pending: bool,
+        /// Count of `end()` calls.
+        ends: Arc<Mutex<usize>>,
         realtime_governance: bool,
     }
 
@@ -4861,6 +4866,8 @@ mod tests {
                 next_event_hangs: false,
                 active_forever: false,
                 interrupts: Arc::new(Mutex::new(0)),
+                interrupt_pending: false,
+                ends: Arc::new(Mutex::new(0)),
                 realtime_governance: false,
             }
         }
@@ -4893,6 +4900,14 @@ mod tests {
         }
         fn interrupts_handle(&self) -> Arc<Mutex<usize>> {
             Arc::clone(&self.interrupts)
+        }
+        /// Every interrupt leaves the turn running (`InterruptPending`).
+        fn with_unsettled_interrupt(mut self) -> Self {
+            self.interrupt_pending = true;
+            self
+        }
+        fn ends_handle(&self) -> Arc<Mutex<usize>> {
+            Arc::clone(&self.ends)
         }
         /// A session whose every `fork()` hangs forever (a wedged fork handshake).
         fn fork_wedged() -> Self {
@@ -5026,9 +5041,15 @@ mod tests {
         }
         async fn interrupt(&mut self) -> Result<(), SessionError> {
             *self.interrupts.lock().unwrap() += 1;
+            if self.interrupt_pending {
+                return Err(SessionError::InterruptPending(
+                    "the turn has not ended".into(),
+                ));
+            }
             Ok(())
         }
         async fn end(&mut self) -> Result<(), SessionError> {
+            *self.ends.lock().unwrap() += 1;
             Ok(())
         }
     }
@@ -9102,6 +9123,94 @@ mod tests {
             .memory_receipt
             .expect("sent memory receipt")
             .settle(crate::knowledge_feedback::TurnOutcome::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_budget_settle_closes_a_session_whose_interrupt_does_not_settle() {
+        // The interrupted turn could still end later, and the next phase or rework
+        // turn on this session would read that end as its own. Closed, that next
+        // turn fails to send instead. The settle itself stays graceful.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let past_deadline = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        let idle = crate::director_loop::IdleBudget::new(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(3600),
+        );
+
+        let mut phase_session = FakeBaseSession::active_forever().with_unsettled_interrupt();
+        let phase_ends = phase_session.ends_handle();
+        let phase = drive_phase(
+            &mut phase_session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            idle,
+            past_deadline,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert!(matches!(phase, PhaseResult::Done), "{phase:?}");
+        assert_eq!(
+            *phase_ends.lock().unwrap(),
+            1,
+            "the phase session is closed"
+        );
+
+        let mut rework_session = FakeBaseSession::active_forever().with_unsettled_interrupt();
+        let rework_ends = rework_session.ends_handle();
+        let turn = drive_rework_turn_with_idle(
+            &mut rework_session,
+            &options,
+            &events,
+            "build it".to_string(),
+            idle,
+            past_deadline,
+        )
+        .await;
+        assert!(turn.done);
+        assert_eq!(
+            *rework_ends.lock().unwrap(),
+            1,
+            "the rework session is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_phase_idle_watchdog_closes_a_session_whose_interrupt_does_not_settle() {
+        // The hung turn could still end later and end the next phase's turn.
+        let tmp = tempfile::tempdir().unwrap();
+        let options = opts(tmp.path(), "build a dashboard", TrustMode::Auto);
+        let (events, _rec) = sink();
+        let mut session = FakeBaseSession::hanging().with_unsettled_interrupt();
+        let ends = session.ends_handle();
+        let result = drive_phase(
+            &mut session,
+            &options,
+            &events,
+            Phase::Frontend,
+            false,
+            crate::planner::TaskKind::Greenfield,
+            crate::director_loop::IdleBudget::new(
+                std::time::Duration::from_millis(80),
+                std::time::Duration::from_millis(80),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(5),
+        )
+        .await;
+        assert!(
+            matches!(&result, PhaseResult::Failed(reason) if reason.contains("UMADEV_IDLE_TIMEOUT_SECS")),
+            "a hung base still settles as an idle failure: {result:?}"
+        );
+        assert_eq!(*ends.lock().unwrap(), 1, "the unsettled session is closed");
     }
 
     #[tokio::test]

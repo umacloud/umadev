@@ -2199,7 +2199,9 @@ fn normalize_declared_path(raw: &str) -> Option<String> {
 /// approval would wedge the base waiting on a decision — poisoning this same shared
 /// session for the later fallback build. Cleanly denying ends the turn and leaves
 /// the session usable. Fail-open: a dead session / a timeout / an empty reply →
-/// `None` (the caller then runs the plain build on the still-usable session).
+/// `None` (the caller then runs the plain build on the same session). A turn that
+/// timed out is stopped first; if it cannot be stopped the session is closed, so
+/// the plain build fails honestly instead of reading the plan turn's end.
 async fn drain_plan_turn(
     session: &mut dyn BaseSession,
     directive: String,
@@ -2250,14 +2252,14 @@ async fn drain_plan_turn_traced(
             // The plan turn forbids tools; an approval request means the base tried to
             // act anyway. DENY it (best-effort) so the JSON-only turn ends cleanly and
             // the shared session stays usable for the fallback build. If `respond`
-            // fails, interrupt the turn to un-wedge the session, then bail.
+            // fails, stop the turn (see `stop_plan_turn`), then bail.
             Ok(Some(SessionEvent::NeedApproval { req_id, .. })) => {
                 if session
                     .respond(&req_id, ApprovalDecision::Deny)
                     .await
                     .is_err()
                 {
-                    let _ = session.interrupt().await;
+                    stop_plan_turn(session).await;
                     return TracedPlanTurn {
                         text: None,
                         recipe_receipt,
@@ -2272,11 +2274,11 @@ async fn drain_plan_turn_traced(
             // fallback build a shared session that still carried an unanswered RPC
             // (exactly the wedge the NeedApproval arm above exists to prevent).
             // A JSON-only plan turn forbids tools: safe-reject it and, if the
-            // reply cannot be written, interrupt to un-wedge the session.
+            // reply cannot be written, stop the turn (see `stop_plan_turn`).
             Ok(Some(SessionEvent::HostRequest { req_id, request })) => {
                 let rejection = request.safe_rejection("plan-only turn does not run tools");
                 if session.respond_host(&req_id, rejection).await.is_err() {
-                    let _ = session.interrupt().await;
+                    stop_plan_turn(session).await;
                     return TracedPlanTurn {
                         text: None,
                         recipe_receipt,
@@ -2286,11 +2288,20 @@ async fn drain_plan_turn_traced(
             // A JSON-only plan turn should emit no other tools; ignore anything else
             // and let the next-event timeout bound a misbehaving turn.
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 return TracedPlanTurn {
                     text: None,
                     recipe_receipt,
                 }
+            }
+            // The turn is still running: stop it before the fallback build reuses
+            // the session, or its result would end the build's first turn.
+            Err(_) => {
+                stop_plan_turn(session).await;
+                return TracedPlanTurn {
+                    text: None,
+                    recipe_receipt,
+                };
             }
         }
     }
@@ -2299,6 +2310,14 @@ async fn drain_plan_turn_traced(
         text: (!text.is_empty()).then_some(text),
         recipe_receipt,
     }
+}
+
+/// Stop a plan turn that is being abandoned. The session is shared with the
+/// fallback build, so a turn the interrupt did not settle closes it: the build's
+/// send then fails honestly instead of reading the plan turn's end as its own.
+async fn stop_plan_turn(session: &mut dyn BaseSession) {
+    let bound = std::time::Duration::from_secs(crate::director_loop::INTERRUPT_TIMEOUT_SECS);
+    crate::turn_interrupt::interrupt_or_close(session, bound).await;
 }
 
 /// Plan plus the exact recipe receipt (when a prior was actually accepted by the
@@ -2929,15 +2948,20 @@ mod tests {
     // ── drain_plan_turn cleanly handles a mid-turn approval (MEDIUM #3) ──
 
     /// A minimal scripted [`BaseSession`] for `drain_plan_turn` tests: it replays a
-    /// fixed event batch after `send_turn`, records approval replies + interrupts, and
-    /// can be told to FAIL `respond` (to exercise the interrupt fallback).
+    /// fixed event batch after `send_turn`, records approval replies, interrupts and
+    /// closes, and can be told to FAIL `respond` (to exercise the interrupt
+    /// fallback), to leave its interrupt pending, or to hang once the batch is out.
+    #[allow(clippy::struct_excessive_bools)]
     struct ScriptedSession {
         events: std::collections::VecDeque<umadev_runtime::SessionEvent>,
         responded:
             std::sync::Arc<std::sync::Mutex<Vec<(String, umadev_runtime::ApprovalDecision)>>>,
         interrupts: std::sync::Arc<std::sync::Mutex<usize>>,
+        ends: std::sync::Arc<std::sync::Mutex<usize>>,
         respond_fails: bool,
         send_fails: bool,
+        interrupt_pending: bool,
+        hang_when_empty: bool,
     }
 
     impl ScriptedSession {
@@ -2946,8 +2970,11 @@ mod tests {
                 events: events.into_iter().collect(),
                 responded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 interrupts: std::sync::Arc::new(std::sync::Mutex::new(0)),
+                ends: std::sync::Arc::new(std::sync::Mutex::new(0)),
                 respond_fails,
                 send_fails: false,
+                interrupt_pending: false,
+                hang_when_empty: false,
             }
         }
 
@@ -2973,6 +3000,9 @@ mod tests {
             }
         }
         async fn next_event(&mut self) -> Option<umadev_runtime::SessionEvent> {
+            if self.events.is_empty() && self.hang_when_empty {
+                std::future::pending::<()>().await;
+            }
             self.events.pop_front()
         }
         async fn respond(
@@ -2994,9 +3024,16 @@ mod tests {
         }
         async fn interrupt(&mut self) -> Result<(), umadev_runtime::SessionError> {
             *self.interrupts.lock().unwrap() += 1;
-            Ok(())
+            if self.interrupt_pending {
+                Err(umadev_runtime::SessionError::InterruptPending(
+                    "the plan turn has not ended".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
         async fn end(&mut self) -> Result<(), umadev_runtime::SessionError> {
+            *self.ends.lock().unwrap() += 1;
             Ok(())
         }
     }
@@ -3208,6 +3245,7 @@ mod tests {
             true, // respond fails
         );
         let interrupts = std::sync::Arc::clone(&s.interrupts);
+        let ends = std::sync::Arc::clone(&s.ends);
         let out = drain_plan_turn(
             &mut s,
             "plan please".into(),
@@ -3220,6 +3258,86 @@ mod tests {
             1,
             "the session was interrupted to un-wedge it for the fallback build"
         );
+        assert_eq!(
+            *ends.lock().unwrap(),
+            0,
+            "a settled interrupt leaves the session to the fallback build"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_plan_turn_closes_the_session_when_its_interrupt_does_not_settle() {
+        use umadev_runtime::{HostRequest, SessionEvent};
+        // The fallback build reuses this session. A plan turn the interrupt did not
+        // settle may still end later, and its result would end the build's first
+        // turn, so the session is closed instead: the build then fails honestly.
+        let approval = SessionEvent::NeedApproval {
+            req_id: "req-1".into(),
+            action: "write".into(),
+            target: "app.rs".into(),
+        };
+        let question = SessionEvent::HostRequest {
+            req_id: "hr-1".into(),
+            request: HostRequest::UserInput {
+                questions: Vec::new(),
+                metadata: serde_json::Value::Null,
+            },
+        };
+        for event in [approval, question] {
+            let mut s = ScriptedSession::new(vec![event], true);
+            s.interrupt_pending = true;
+            let interrupts = std::sync::Arc::clone(&s.interrupts);
+            let ends = std::sync::Arc::clone(&s.ends);
+            let out = drain_plan_turn(
+                &mut s,
+                "plan please".into(),
+                std::time::Instant::now() + std::time::Duration::from_secs(3_600),
+            )
+            .await;
+            assert!(out.is_none(), "a failed reply bails out fail-open");
+            assert_eq!(*interrupts.lock().unwrap(), 1, "the turn was interrupted");
+            assert_eq!(
+                *ends.lock().unwrap(),
+                1,
+                "a session whose plan turn may still end is closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_plan_turn_stops_a_timed_out_turn_before_the_build_reuses_the_session() {
+        // A plan turn that outlives its wait is still running. Handing the session
+        // on without stopping it lets that turn's result end the fallback build's
+        // first turn. It is interrupted, and closed when the interrupt does not
+        // settle.
+        for (interrupt_pending, closed) in [(false, 0), (true, 1)] {
+            let mut s = ScriptedSession::new(Vec::new(), false);
+            s.hang_when_empty = true;
+            s.interrupt_pending = interrupt_pending;
+            let interrupts = std::sync::Arc::clone(&s.interrupts);
+            let ends = std::sync::Arc::clone(&s.ends);
+            let out = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                drain_plan_turn(
+                    &mut s,
+                    "plan please".into(),
+                    std::time::Instant::now() + std::time::Duration::from_millis(50),
+                ),
+            )
+            .await
+            .expect("the drain settles on its deadline");
+            assert!(out.is_none(), "a timed-out plan turn bails out fail-open");
+            assert_eq!(
+                *interrupts.lock().unwrap(),
+                1,
+                "the timed-out turn was stopped (interrupt pending: {interrupt_pending})"
+            );
+            assert_eq!(
+                *ends.lock().unwrap(),
+                closed,
+                "closed only when the interrupt did not settle (interrupt pending: {interrupt_pending})"
+            );
+        }
     }
 
     /// A session whose `next_event` never resolves (the base hangs holding the pipe
