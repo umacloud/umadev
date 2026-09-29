@@ -587,7 +587,7 @@ fn is_overloaded(hay: &str) -> bool {
 /// Whether `hay` contains `token` with no ASCII letter or digit directly on
 /// either side, so a status code is not found inside a request id, a
 /// timestamp or a byte count.
-fn contains_token(hay: &str, token: &str) -> bool {
+pub(crate) fn contains_token(hay: &str, token: &str) -> bool {
     hay.match_indices(token).any(|(at, _)| {
         let before = hay[..at].chars().next_back();
         let after = hay[at + token.len()..].chars().next();
