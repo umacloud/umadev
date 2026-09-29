@@ -3590,10 +3590,7 @@ async fn cmd_run(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
-    let mode = workspace_trust::cap_mode(
-        &project_root,
-        args.mode,
-    );
+    let mode = workspace_trust::cap_mode(&project_root, args.mode);
     if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
         return Ok(());
     }
@@ -3920,10 +3917,7 @@ async fn cmd_quick(args: RunArgs) -> Result<()> {
         );
     }
     let project_root = resolve_root(args.project_root)?;
-    let mode = workspace_trust::cap_mode(
-        &project_root,
-        args.mode,
-    );
+    let mode = workspace_trust::cap_mode(&project_root, args.mode);
     if handle_cli_git_operation(&args.requirement, &project_root, mode).await? {
         return Ok(());
     }
