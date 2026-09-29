@@ -3452,6 +3452,10 @@ fn source_digest(options: &RunOptions, kind: ReviewKind) -> SourceDigest {
     source_digest_with_stats(options, kind)
 }
 
+/// A file represented in the review bundle: its path, the sampled `(chars, bytes)`
+/// when it is not included whole, and whether it is a required focus file.
+type IncludedFile = (String, Option<(usize, u64)>, bool);
+
 /// Build the bounded review bundle. Tests also observe the exact source bytes read
 /// so the I/O ceiling remains mechanically enforceable.
 fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDigest {
@@ -3494,8 +3498,7 @@ fn source_digest_with_stats(options: &RunOptions, kind: ReviewKind) -> SourceDig
     let mandatory_shares = mandatory_char_shares(&files, &mandatory, CONTENT_CHARS * 3 / 4);
     let mut order = sampling_focus.clone();
     order.extend((0..files.len()).filter(|index| !sampling_focus.contains(index)));
-    // (path, sampled `(chars, bytes)` when not whole, required?)
-    let mut included: Vec<(String, Option<(usize, u64)>, bool)> = Vec::new();
+    let mut included: Vec<IncludedFile> = Vec::new();
     let mut omitted: Vec<(String, &str, bool)> = Vec::new();
     let mut sections = String::new();
     let mut used = 0usize;
